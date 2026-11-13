@@ -3785,7 +3785,7 @@ def _failure_matches(observed: str, failed: set[str]) -> bool:
 
 
 def prefix_failures(worktree: Path, composition: Composition,
-                    failures: list[dict], *, timeout: int,
+                    failures: list[dict], *, timeout: int, start: int = 1,
                     replay=None, log=print, guard=None,
                     deadline: float | None = None,
                     ) -> tuple[dict[int, list[dict]], str, list[dict]]:
@@ -3797,6 +3797,11 @@ def prefix_failures(worktree: Path, composition: Composition,
     de la composition à ce point. Une unité est retenue pour un test dès que
     le préfixe correspondant le rend rouge ; les préfixes suivants ne le
     rejouent plus.
+
+    #7239 : `start` (1 par défaut) commence au préfixe de l'unité d'indice
+    `start` et ne rejoue pas celles qui précèdent ; les tests sont alors
+    situés au premier rouge entre cette unité et la tête. Sert à confirmer un
+    retrait #3801 sur le préfixe de l'unité désignée, sans rejouer avant elle.
 
     Rend `({lot: [échecs]}, "", [])`, ou `({}, "", [échecs])` quand des tests
     restent rouges sur la tête mais verts sur **tous** les préfixes : ce sont
@@ -3821,11 +3826,12 @@ def prefix_failures(worktree: Path, composition: Composition,
         return {}, "aucun nom de test à rejouer sur les préfixes", []
     if not composition.units:
         return {}, "composition sans unité à rejouer", []
+    start = max(1, min(int(start or 1), len(composition.units)))
     replay = replay or run_tests
     parent = temporary_parent()
     path = Path(tempfile.mkdtemp(prefix="paquet-auto-prefixe-", dir=str(parent)))
     path.rmdir()
-    first = composition.units[0].commit
+    first = composition.units[start - 1].commit
     added = git(worktree, "worktree", "add", "--detach", str(path), first,
                 check=False)
     if added.returncode != 0:
@@ -3835,14 +3841,15 @@ def prefix_failures(worktree: Path, composition: Composition,
     try:
         unresolved = tests
         found: dict[int, list[dict]] = {}
-        for index, unit in enumerate(composition.units, start=1):
-            if index > 1 and guard is not None:
+        for index, unit in enumerate(composition.units[start - 1:],
+                                     start=start):
+            if index > start and guard is not None:
                 guard()
             limit = series_timeout(timeout, deadline)
             if limit is None:
                 raise BudgetSpent("borne totale atteinte avant le préfixe %d "
                                   "(#%d)" % (index, unit.lot))
-            if index > 1:
+            if index > start:
                 moved = git(path, "reset", "--hard", unit.commit, check=False)
                 if moved.returncode != 0:
                     return {}, ("préfixe %d (#%d) illisible : %s"
@@ -4016,6 +4023,142 @@ def designated_removals(attribution: dict, failures: list[dict], *,
     return list(by_lot.values()), ""
 
 
+def designated_prefix(worktree: Path, composition: Composition,
+                      removals: list[Removal], *, timeout: int,
+                      prefix=None, log=print, guard=None,
+                      deadline: float | None = None,
+                      ) -> tuple[list[Removal], list[dict], str]:
+    """#7239 : la couverture #3801 seule ne retire plus une unité innocente.
+
+    Paquet h-20261113-11 : #7066 (unité 1) était désignée par la couverture
+    pour un contrat que seul #7108 (unité 2) cassait, et #7229 (unité 3) pour
+    un test rouge sous charge qui passait au rejeu. Avant un retrait #3801,
+    les tests rouges sont rejoués sur le préfixe qui s'arrête à l'unité
+    désignée, puis sur les préfixes suivants (`prefix_failures(start=…)`,
+    injectable par `prefix`) :
+
+    * rouge dès le préfixe de l'unité : le retrait est confirmé, gardé tel
+      quel (preuve #3801) ;
+    * vert au préfixe de l'unité et rouge plus loin : l'unité est innocente ;
+      son retrait est abandonné et la première unité dont le préfixe le rend
+      rouge est retirée à sa place (preuve `prefixes`, comme #4217) ;
+    * vert sur tous les préfixes jusqu'à la tête : le test est instable
+      (#4221), consigné non concluant, sans retrait.
+
+    Un rejeu non concluant (worktree impossible, délai, run illisible) garde
+    le retrait #3801 : c'est le geste antérieur, comme `earlier_red`. Les
+    retraits d'une autre preuve passent inchangés. Rend `(retraits, tests
+    instables, pourquoi)` ; `pourquoi` non vide signale un rejeu non concluant
+    dont le retrait a été gardé.
+    """
+    subjects: list[Removal] = []
+    untouched: list[Removal] = []
+    for removal in removals:
+        if removal.proof == "3801" and removal.tests and all(removal.tests):
+            subjects.append(removal)
+        else:
+            untouched.append(removal)
+    if not subjects:
+        return removals, [], ""
+    positions = {unit.lot: index for index, unit in enumerate(
+        composition.units, start=1)}
+    groups: dict[int, list[Removal]] = {}
+    for removal in subjects:
+        position = positions.get(removal.lot)
+        if position is None:
+            untouched.append(removal)
+            continue
+        groups.setdefault(position, []).append(removal)
+    replay = prefix or prefix_failures
+    confirmed: list[Removal] = []
+    later: list[Removal] = []
+    flaky: list[dict] = []
+    why = ""
+    for position in sorted(groups):
+        group = groups[position]
+        limit = series_timeout(timeout, deadline)
+        if limit is None:
+            confirmed.extend(group)
+            why = ("borne totale atteinte avant le préfixe de #%d"
+                   % group[0].lot)
+            continue
+        if guard is not None:
+            guard()
+        names: list[str] = []
+        for removal in group:
+            for test in removal.tests:
+                if test not in names:
+                    names.append(test)
+        bounds = ({"guard": guard} if guard is not None else {}) | (
+            {"deadline": deadline} if deadline is not None else {})
+        try:
+            found, group_why, group_flaky = replay(
+                worktree, composition,
+                [{"test": name} for name in names], timeout=timeout,
+                start=position, log=log, **bounds)
+        except BudgetSpent as spent:
+            confirmed.extend(group)
+            why = str(spent)
+            log("tests ciblés : rejeu du préfixe de #%d NON CONCLUANT (%s) — "
+                "retrait #3801 gardé (geste antérieur)"
+                % (group[0].lot, spent))
+            continue
+        if group_why:
+            confirmed.extend(group)
+            why = group_why
+            log("tests ciblés : rejeu du préfixe de #%d NON CONCLUANT (%s) — "
+                "retrait #3801 gardé (geste antérieur)"
+                % (group[0].lot, group_why))
+            continue
+        by_test = {_failure_name(failure): lot
+                   for lot, failures in found.items() for failure in failures}
+        flaky_names = {_failure_name(failure) for failure in group_flaky}
+        later_by_lot: dict[int, list[str]] = {}
+        for removal in group:
+            keep: list[str] = []
+            for test in removal.tests:
+                lot = by_test.get(test)
+                if lot == position:
+                    keep.append(test)
+                elif lot is not None and lot > position:
+                    later_by_lot.setdefault(lot, []).append(test)
+                elif test in flaky_names:
+                    flaky.append({"test": test})
+                else:
+                    # ni confirmé ni situé : garder le retrait antérieur.
+                    keep.append(test)
+            if keep:
+                confirmed.append(Removal(
+                    lot=removal.lot, tests=keep,
+                    evidence=list(removal.evidence), attributed=True,
+                    proof="3801"))
+            for test in removal.tests:
+                lot = by_test.get(test)
+                if lot is not None and lot > position:
+                    log("tests ciblés : #%d désignée (#3801) mais %s rouge au "
+                        "préfixe de #%d, vert au sien — unité innocente, "
+                        "retrait de #%d à sa place"
+                        % (removal.lot, test, lot, lot))
+                elif test in flaky_names:
+                    log("tests ciblés : #%d désignée (#3801) mais %s vert sur "
+                        "tous les préfixes depuis son unité (instable) — "
+                        "consigné non concluant, sans retrait"
+                        % (removal.lot, test))
+        for lot, tests in later_by_lot.items():
+            later.append(Removal(
+                lot=lot, tests=tests, attributed=True, proof="prefixes",
+                evidence=["préfixe base+u1…u%d (rouge à #%d, vert au préfixe "
+                          "de #%d)" % (lot, lot, position)]))
+    if flaky:
+        names = sorted({_failure_name(failure) for failure in flaky
+                        if _failure_name(failure)})
+        log("tests ciblés : %d test(s) rouge(s) sur la tête mais vert(s) au "
+            "rejeu des préfixes depuis l'unité (instable) : %s — consigné(s) "
+            "non concluant(s), le paquet continue"
+            % (len(names), ", ".join(names[:5])))
+    return _merge_removals(untouched, confirmed, later), flaky, why
+
+
 def _run_series(jobs: list, *, parallel: int, guard=None) -> list[TestRun]:
     """#4271 : les séries `jobs` (sans argument), leurs résultats dans l'ordre.
 
@@ -4134,12 +4277,51 @@ def budget_spent(label: str, modules: list[str]) -> TestRun:
                    direct=list(modules))
 
 
+def _consign_flaky(red: list[tuple[TestRun, list[dict]]],
+                   runs: list[TestRun], names: list[str],
+                   ) -> list[tuple[TestRun, list[dict]]]:
+    """#4221/#7239 : consigne des tests verts au rejeu comme non concluants.
+
+    Retire de `red` les échecs dont le nom est dans `names` : une série qui ne
+    garde aucun rouge devient non concluante (`flaky_tests`), une série mixte
+    est scindée en un rouge réel et une série instable consignée à part. Rend
+    `red` sans ces échecs ; `runs` porte les séries non concluantes.
+    """
+    flaky_names = set(names)
+    kept: list[tuple[TestRun, list[dict]]] = []
+    for run, found in red:
+        names_here = sorted({_failure_name(failure) for failure in found
+                             if _failure_name(failure) in flaky_names})
+        left = [failure for failure in found
+                if _failure_name(failure) not in flaky_names]
+        if len(left) == len(found):
+            kept.append((run, found))
+            continue
+        if left:
+            # des rouges réels restent dans la même série : la série reste
+            # rouge, l'instable est consigné à part.
+            kept.append((run, left))
+            runs.append(TestRun(
+                label="%s (instable)" % run.label,
+                modules=sorted({"tests." + str(failure.get("module"))
+                                for failure in found
+                                if failure.get("module")
+                                and _failure_name(failure) in names_here}),
+                returncode=1,
+                output="tests rouges sur la tête mais verts sur tous les "
+                       "préfixes : %s" % ", ".join(names_here),
+                seconds=0.0, flaky_tests=names_here,
+                log_path=run.log_path))
+        else:
+            run.flaky_tests = names_here
+    return kept
+
 
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
                       select=None, on_base=None, guard=None,
-                      prefix=None, earlier=None,
+                      prefix=None, earlier=None, confirm=None,
                       parallel: int = DEFAULT_PARALLEL,
                       deadline: float | None = None,
                       contract_report: ContractPass | None = None,
@@ -4171,6 +4353,13 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     #6232 : un retrait dont les tests rouges le sont déjà sur le préfixe d'une
     unité antérieure retirée est abandonné (`earlier_red`, injectable par
     `earlier`) : l'unité innocente n'est pas retirée avec la fautive.
+
+    #7239 : avant un retrait #3801, ses tests rouges sont rejoués sur le
+    préfixe de l'unité puis au-delà (`designated_prefix`, injectable par
+    `confirm`). Préfixe vert = unité innocente (le premier préfixe rouge
+    suivant est retiré à sa place) ; vert partout = instable consigné
+    (#4221) ; rouge dès son préfixe = retrait confirmé. Un rejeu non concluant
+    garde le retrait #3801 (geste antérieur).
 
     #4025 : la série d'une unité joue aussi ses modules voisins
     (`neighbor_modules`, injectable par `select`). Dans le geste antérieur,
@@ -4489,35 +4678,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                 "sur tous les préfixes (instable) : %s — consigné(s) non "
                 "concluant(s), le paquet continue"
                 % (len(flaky_names), ", ".join(flaky_names[:5])))
-            kept_red: list[tuple[TestRun, list[dict]]] = []
-            for run, found in red:
-                names_here = sorted({_failure_name(failure)
-                                     for failure in found
-                                     if _failure_name(failure) in flaky_names})
-                left = [failure for failure in found
-                        if _failure_name(failure) not in flaky_names]
-                if len(left) == len(found):
-                    kept_red.append((run, found))
-                    continue
-                if left:
-                    # des rouges réels restent dans la même série : la série
-                    # reste rouge, l'instable est consigné à part.
-                    kept_red.append((run, left))
-                    runs.append(TestRun(
-                        label="%s (instable)" % run.label,
-                        modules=sorted({"tests." + str(failure.get("module"))
-                                        for failure in found
-                                        if failure.get("module")
-                                        and _failure_name(failure)
-                                        in names_here}),
-                        returncode=1,
-                        output="tests rouges sur la tête mais verts sur tous "
-                               "les préfixes : %s" % ", ".join(names_here),
-                        seconds=0.0, flaky_tests=names_here,
-                        log_path=run.log_path))
-                else:
-                    run.flaky_tests = names_here
-            red = kept_red
+            red = _consign_flaky(red, runs, flaky_names)
             if not red:
                 return runs, [], []
             failures = [failure for failure in failures
@@ -4561,6 +4722,36 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             log("tests contrats : rouge non attribuable (%s) — retrait des "
                 "unités aux tests propres rouges, puis recomposition"
                 % (why or "attribution incertaine"))
+    if any(removal.proof == "3801" for removal in removals):
+        # #7239 : le préfixe de l'unité désignée par la couverture tranche.
+        if guard is not None:
+            guard()
+        bounds = ({"guard": guard} if guard is not None else {}) | (
+            {"deadline": deadline} if deadline is not None else {})
+        try:
+            removals, flaky_designated, designation_why = (
+                confirm or designated_prefix)(
+                    worktree, composition, removals, timeout=timeout,
+                    log=log, **bounds)
+        except BudgetSpent as spent:
+            flaky_designated = []
+            designation_why = str(spent)
+        if designation_why:
+            log("tests ciblés : rejeu du préfixe de l'unité NON CONCLUANT "
+                "(%s) — retrait #3801 gardé (geste antérieur)"
+                % designation_why)
+        if flaky_designated:
+            flaky_names = sorted({_failure_name(failure)
+                                  for failure in flaky_designated
+                                  if _failure_name(failure)})
+            if flaky_names:
+                log("tests ciblés : %d test(s) rouge(s) sur la tête mais "
+                    "vert(s) au rejeu des préfixes (instable) : %s — "
+                    "consigné(s) non concluant(s), le paquet continue"
+                    % (len(flaky_names), ", ".join(flaky_names[:5])))
+                red = _consign_flaky(red, runs, flaky_names)
+                if not red and not removals:
+                    return runs, [], []
     if len(removals) > 1:
         if guard is not None:
             guard()
