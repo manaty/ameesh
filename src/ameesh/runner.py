@@ -8586,6 +8586,8 @@ class AgentWorker(threading.Thread):
                 storage.of(self.db).turn_resources.close_turn(
                     turn_id, orphan=orphelin, containers=conteneurs or None)
             except Exception as exc:  # ne casse jamais la fin d'un tour
+                self.runner.defer_resource_close(turn_id, orphan=orphelin,
+                                                  containers=conteneurs or None)
                 log("[%s] could not close the resources of turn %s (%s)"
                     % (self.name, turn_id[:8], exc))
                 return
@@ -11747,6 +11749,10 @@ class Runner:
         #: jamais un cgroup encore vivant
         self._turn_cgroups_live: set[str] = set()
         self._turn_cgroups_lock = threading.Lock()
+        # #6999: closing a resource must survive a temporary database outage.
+        # Workers enqueue immutable end-of-turn verdicts; the runner retries.
+        self._resource_close_lock = threading.Lock()
+        self._resource_closes: dict[str, dict] = {}
         #: #453 : une suite de tests lancée hors `ameesh heavy` a le plafond
         #: de durée d'une commande lourde
         from . import suite_cap
@@ -15895,6 +15901,40 @@ class Runner:
                 log_async("per-turn cgroup: delegated root %s" % root)
         return self._turn_cgroup_root
 
+    def defer_resource_close(self, turn_id: str, *, orphan: bool,
+                             containers: list[str] | None) -> None:
+        """Queue the verdict already measured at turn end, without reaping again."""
+        retry = Reprise(self.db_retry_max)
+        entry = dict(orphan=bool(orphan), containers=list(containers) if containers else None,
+                     retry=retry, due=time.monotonic() + retry.echec())
+        with self._resource_close_lock:
+            self._resource_closes.setdefault(turn_id, entry)
+
+    def retry_resource_closes(self) -> int:
+        """One nonblocking pass; the accounting backoff bounds successive retries.
+
+        No lease is needed to finish an old resource row. Shutdown/restart may
+        lose this local queue; settle_dead_turns independently recovers rows.
+        """
+        with self._resource_close_lock:
+            pending = list(self._resource_closes.items())
+        closed = 0
+        for turn_id, entry in pending:
+            if time.monotonic() < entry['due']:
+                continue
+            try:
+                storage.of(self.db).turn_resources.close_turn(
+                    turn_id, orphan=entry['orphan'], containers=entry['containers'])
+            except Exception as exc:
+                entry['due'] = time.monotonic() + entry['retry'].echec()
+                log_async("turn %s resource close deferred (%s)" % (turn_id[:8], exc))
+                continue
+            with self._resource_close_lock:
+                if self._resource_closes.get(turn_id) is entry:
+                    del self._resource_closes[turn_id]
+            closed += 1
+        return closed
+
     def _live_turn_ids(self) -> set | None:
         """Les tours de CE processus encore ouverts : cgroup posé au lancement
         et pas encore clos, et travail de fond en grâce. None si le suivi du
@@ -16070,6 +16110,9 @@ class Runner:
         n'est soldée que si elle n'a pas changé depuis sa lecture
         (`settle_unchanged`). Rien n'est supprimé ; au plus
         BOOT_REVIEW_MAX_ROWS lignes par passage, la suite au passage suivant.
+        #6999 : les tours encore suivis localement et les verdicts en attente
+        de reprise sont exclus ; un cgroup noté doit être absent ou lisiblement
+        vide. Un suivi local illisible interdit tout règlement.
         Rend les lignes soldées. Ne lève jamais."""
         from . import containers as containers_mod, platform as os_layer
         from . import resources as resources_mod
@@ -16099,6 +16142,13 @@ class Runner:
                 self.live_review_at = time.monotonic()  # la suite sans attendre
             if not rows:
                 return []
+            live = self._live_turn_ids()
+            if live is None:
+                return []
+            with self._resource_close_lock:
+                pending = set(self._resource_closes)
+            # A queued close owns its end-of-turn verdict until it is written.
+            rows = [row for row in rows if row['turn_id'] not in live | pending]
             groups = running_groups(int(row["pgid"]) for row in rows if row.get("pgid"))
             if groups is None:
                 return []  # unknown membership never proves a turn dead
@@ -16160,6 +16210,17 @@ class Runner:
             # sans moteur, une ligne qui note des conteneurs reste
             dead = [row for row in candidates
                     if self._containers_alive(running, engines or None, row) == []]
+            from .platform import turn_cgroup
+            dead = [row for row in dead if not row.get('cgroup')
+                    or turn_cgroup.gone_or_empty(row['cgroup'])]
+            # Take a fresh local reference after the OS snapshots, as in the
+            # cgroup reconciler. Unknown background tracking never proves death.
+            live = self._live_turn_ids()
+            if live is None:
+                return []
+            with self._resource_close_lock:
+                pending = set(self._resource_closes)
+            dead = [row for row in dead if row['turn_id'] not in live | pending]
             settled = set(turns.settle_unchanged(dead))
             dead = [row for row in dead if row["turn_id"] in settled]
             for row in dead:
@@ -16297,6 +16358,7 @@ class Runner:
                     self.power_guard()
                 except Exception as exc:  # la garde ne fait jamais tomber l'exécuteur
                     log_async("power guard failed (%s)" % type(exc).__name__)
+                self.retry_resource_closes()        # #6999: preserved close verdicts
                 if self.boot_review_at is not None and time.monotonic() >= self.boot_review_at:
                     self.report_boot_orphans()      # #220 r2 : solde différé
                 if time.monotonic() >= self.live_review_at:
