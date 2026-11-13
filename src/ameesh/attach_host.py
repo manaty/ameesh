@@ -223,11 +223,16 @@ class HostSession:
         self._stop = threading.Event()
         self._closed = threading.Event()
         self._thread: threading.Thread | None = None
+        self._lock = threading.RLock()
         self.pty: attach_pty.PtyProcess | None = None
         self.created = time.monotonic()
         self.bytes_to_host = 0
         self.bytes_to_station = 0
         self.refusal = ""
+
+    def _current_pty(self) -> attach_pty.PtyProcess | None:
+        with self._lock:
+            return self.pty
 
     # -- entrées -----------------------------------------------------------
 
@@ -262,7 +267,7 @@ class HostSession:
         try:
             self._send(*self.channel.key_frame())
             while not self._stop.is_set():
-                if self.pty is None:
+                if self._current_pty() is None:
                     # pas de PTY avant REQ : on attend la trame suivante sans
                     # tourner à vide (la poignée de main est asynchrone)
                     try:
@@ -273,7 +278,7 @@ class HostSession:
                         break
                     continue
                 self._drain()
-                if self._stop.is_set() or self.pty is None:
+                if self._stop.is_set() or self._current_pty() is None:
                     continue
                 self._pump()
         finally:
@@ -309,12 +314,13 @@ class HostSession:
             elif kind == "request":
                 self._request(value)
             elif kind == "data":
-                if self.pty is None:
+                pty = self._current_pty()
+                if pty is None:
                     self.close("not_ready", "DATA before the session is accepted")
                     return
                 self.bytes_to_host += len(value)
                 try:
-                    self.pty.write(value)
+                    pty.write(value)
                 except attach_pty.PtyOverflow as exc:
                     self.close("pty_overflow", str(exc))
                     return
@@ -325,13 +331,15 @@ class HostSession:
                 if ack is not None:
                     self._send(*self._seal(*ack))
             elif kind == "winsize":
-                if self.pty is not None:
+                pty = self._current_pty()
+                if pty is not None:
                     rows, cols, xpix, ypix = value
-                    self.pty.resize(rows, cols, xpix, ypix)
+                    pty.resize(rows, cols, xpix, ypix)
             elif kind == "signal":
-                if self.pty is not None:
+                pty = self._current_pty()
+                if pty is not None:
                     try:
-                        self.pty.send_signal(value)
+                        pty.send_signal(value)
                     except attach_pty.PtyError as exc:
                         self.close("pty_error", str(exc))
                         return
@@ -342,7 +350,7 @@ class HostSession:
                 return
 
     def _request(self, data: dict) -> None:
-        if self.pty is not None:
+        if self._current_pty() is not None:
             self.close("protocol", "duplicate REQ")
             return
         try:
@@ -377,7 +385,13 @@ class HostSession:
         except attach_pty.PtyError as exc:
             self._refuse("spawn_failed", str(exc))
             return
-        self.pty = pty
+        # fermeture concurrente pendant la vérification ou le spawn : le PTY
+        # ne doit jamais survivre à la session qui l'a créé
+        with self._lock:
+            if self._closed.is_set():
+                pty.close()
+                return
+            self.pty = pty
         self.connector.note("session accepted", self, human=result.human[:128],
                             attach_id=request.attach_id, rows=request.rows,
                             cols=request.cols, pid=pty.pid)
@@ -439,12 +453,14 @@ class HostSession:
     # -- pont PTY ----------------------------------------------------------
 
     def _pump(self) -> None:
-        assert self.pty is not None
+        pty = self._current_pty()
+        if pty is None:
+            return
         if time.monotonic() - self.created > self.connector.config.max_session_seconds:
             self.close("max_duration", "maximum session duration reached")
             return
-        read_fd = self.pty.master if self.channel.can_send else None
-        write_fd = self.pty.master if self.pty.writable() else None
+        read_fd = pty.master if self.channel.can_send else None
+        write_fd = pty.master if pty.writable() else None
         try:
             ready, writable, _ = select.select(
                 [read_fd] if read_fd is not None else [],
@@ -454,21 +470,21 @@ class HostSession:
             return
         if writable:
             try:
-                self.pty.flush()
+                pty.flush()
             except attach_pty.PtyError as exc:
                 self.close("pty_error", str(exc))
                 return
         if ready:
-            chunk = self.pty.read(transport.MAX_DATA)
+            chunk = pty.read(transport.MAX_DATA)
             if chunk:
                 self.bytes_to_station += len(chunk)
                 self._send(*self._seal(transport.DATA, chunk))
-                if self._closed.is_set() or self.pty is None:
+                if self._closed.is_set() or self._current_pty() is None:
                     return
-            elif self.pty.eof:
+            elif pty.eof:
                 self.close("eof", "the terminal closed")
                 return
-        if self.pty.poll() is not None:
+        if pty.poll() is not None:
             self.close("exit", "the interactive command exited")
 
     def _seal(self, ftype: int, payload: bytes) -> tuple[int, bytes]:
@@ -481,18 +497,19 @@ class HostSession:
     # -- fermeture ---------------------------------------------------------
 
     def close(self, code: str = "closed", reason: str = "") -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        self._stop.set()
+        with self._lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            self._stop.set()
+            pty, self.pty = self.pty, None
         if self.channel.ready and not self.channel.closed:
             try:
                 self._send(*self.channel.close_frame(code, reason))
             except transport.ProtocolError:
                 pass
-        if self.pty is not None:
-            self.pty.close()
-            self.pty = None
+        if pty is not None:
+            pty.close()
         self.connector.unregister(self.session_id)
         self.connector.note("session closed", self, code=code,
                             bytes_to_host=self.bytes_to_host,
@@ -578,7 +595,8 @@ class HostConnector:
                                        token=self.config.token))
             with self._io_lock:
                 sock.sendall(hello)
-            frame = transport.read_frame(self._recv, max_frame=transport.MAX_FRAME)
+            frame = transport.read_frame(self._recv, max_frame=transport.MAX_FRAME,
+                                         frame_timeout=self.config.connect_timeout)
             if frame is None:
                 raise OSError("relay closed before WELCOME")
             if frame.type == transport.RELAY_ERR:

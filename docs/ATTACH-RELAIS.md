@@ -58,8 +58,10 @@ poste (station)  ──TLS──►  relais  ◄──TLS──  hôte de l'agen
 
 Trame sur le fil : `longueur u32 | session 16 octets | type 1 octet | charge`.
 La longueur est bornée avant lecture (`MAX_FRAME` = 64 Kio) ; les charges de
-session sont bornées par type (`MAX_DATA` = 16 Kio). Une session de contrôle
-avant appariement porte l'identifiant nul.
+session sont bornées par type (`MAX_DATA` = 16 Kio). Une trame commencée mais
+incomplète est bornée (30 s) puis ferme la connexion : jamais de
+resynchronisation au milieu du flux. Une session de contrôle avant appariement
+porte l'identifiant nul.
 
 1. Le poste envoie `OPEN` (agent, hôte, tenant, reçu) ; l'hôte envoie
    `HELLO` (hôte, tenant, jeton). Le relais vérifie le jeton d'hôte en

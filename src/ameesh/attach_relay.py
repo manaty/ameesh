@@ -257,7 +257,8 @@ class _Peer:
     def run(self) -> None:
         try:
             self.sock.settimeout(self.relay.config.handshake_timeout)
-            first = transport.read_frame(self._recv, max_frame=self.relay.config.max_frame)
+            first = transport.read_frame(self._recv, max_frame=self.relay.config.max_frame,
+                                         frame_timeout=self.relay.config.handshake_timeout)
             if first is None:
                 self.close("eof", notify=False)
                 return
@@ -643,8 +644,14 @@ class Session:
         if self._closed.is_set():
             return
         self._closed.set()
-        self.relay.sessions.pop(self.session_id, None)
-        self.relay.by_attach.pop(self.attach_id, None)
+        with self.relay._lock:
+            self.relay.sessions.pop(self.session_id, None)
+            self.relay.by_attach.pop(self.attach_id, None)
+            count = self.relay._ip_sessions.get(self.station.ip, 0)
+            if count <= 1:
+                self.relay._ip_sessions.pop(self.station.ip, None)
+            else:
+                self.relay._ip_sessions[self.station.ip] = count - 1
         with self.host.lock:
             self.host.sessions.pop(self.session_id, None)
         if notify_station:
@@ -856,6 +863,9 @@ class RelayServer:
             if len(self.sessions) >= self.config.max_sessions:
                 station.fail(RELAY_BUSY, "relay is at its session quota")
                 return
+            if self._ip_sessions.get(station.ip, 0) >= self.config.max_sessions_per_ip:
+                station.fail(QUOTA_SESSIONS, "too many sessions for this address")
+                return
             if attach_id in self.by_attach:
                 station.fail(GRANT_IN_USE, "this attach grant already has a session")
                 return
@@ -876,9 +886,11 @@ class RelayServer:
         if not host_peer.send_json(session_id, transport.PAIR, **payload):
             session.close(SLOW_PEER, "host is not reading", notify_station=True)
             return
-        station.send_json(session_id, transport.PAIRED, v=transport.VERSION,
-                          session=session_id.hex(), attach_id=attach_id,
-                          receipt_digest=digest.hex())
+        if not station.send_json(session_id, transport.PAIRED, v=transport.VERSION,
+                                 session=session_id.hex(), attach_id=attach_id,
+                                 receipt_digest=digest.hex()):
+            session.close(SLOW_PEER, "station is not reading", notify_station=False)
+            return
         self.note("session paired", station, session=session_id.hex(), agent=agent,
                   host=host, tenant=tenant, attach_id=attach_id)
 
@@ -951,7 +963,8 @@ class _FirstPeer(_Peer):
         delegate = None
         try:
             self.sock.settimeout(self.relay.config.handshake_timeout)
-            first = transport.read_frame(self._recv, max_frame=self.relay.config.max_frame)
+            first = transport.read_frame(self._recv, max_frame=self.relay.config.max_frame,
+                                         frame_timeout=self.relay.config.handshake_timeout)
             if first is None:
                 self.close("eof", notify=False)
                 return

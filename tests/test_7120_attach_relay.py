@@ -307,12 +307,43 @@ class PtyTest(unittest.TestCase):
 
     def test_fermeture_tue_le_groupe(self):
         proc = attach_pty.PtyProcess(["/bin/sh", "-c", "sleep 30"])
-        started = time.monotonic()
         proc.close()
-        self.assertLess(time.monotonic() - started, 5)
         self.assertIsNotNone(proc.poll())
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(proc.pid, 0)
         with self.assertRaises(attach_pty.PtyError):
             proc.send_signal(9)
+
+    @staticmethod
+    def _live_group(pgid):
+        """PID vivants (hors zombies) du groupe, via /proc (Linux)."""
+        members = []
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open("/proc/%s/stat" % name, "rb") as fh:
+                    fields = fh.read().rsplit(b")", 1)[1].split()
+            except (OSError, IndexError):
+                continue
+            if len(fields) > 2 and fields[0] != b"Z" and int(fields[2]) == pgid:
+                members.append(int(name))
+        return members
+
+    def test_fermeture_tue_le_descendant_apres_le_leader(self):
+        # le shell sort tout de suite ; le descendant ignore TERM et HUP
+        proc = attach_pty.PtyProcess(
+            ["/bin/sh", "-c", "trap '' TERM HUP; sleep 30 & exit 0"])
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and proc.poll() is None:
+            time.sleep(0.01)
+        self.assertIsNotNone(proc.poll())
+        self.assertTrue(self._live_group(proc.pid), "the descendant must be alive")
+        proc.close()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and self._live_group(proc.pid):
+            time.sleep(0.01)
+        self.assertEqual(self._live_group(proc.pid), [])
 
 
 class RelayTest(unittest.TestCase):
@@ -397,6 +428,40 @@ class RelayTest(unittest.TestCase):
         self.assertNotIn(receipt["request"]["device_key"], logs)
         self.assertNotIn("signature", logs)
 
+    def test_fermeture_pendant_la_verification_ne_laisse_pas_de_pty(self):
+        self.start()
+        self.host()
+        created = []
+
+        class FakePty:
+            def __init__(self, *args, **kwargs):
+                self.closed = False
+                created.append(self)
+
+            def close(self):
+                self.closed = True
+
+        def verify(_request):
+            session = next(iter(self.connector.sessions.values()))
+            session.close("test", "closed during verification")
+            return attach_host.GrantResult(True, "ok", "granted", human="human:alice")
+
+        self.verifier.result = verify
+        receipt, device = make_grant()
+        station = Station(self.relay.port, receipt, device)
+        self.addCleanup(station.close)
+        station.handshake()
+        with mock.patch.object(attach_host.attach_pty, "PtyProcess", FakePty):
+            with self.assertRaises((AssertionError, TimeoutError)):
+                station.request(timeout=0.5)
+            # le spawn peut suivre la fermeture : il doit rester sous le mock
+            deadline = time.monotonic() + 2
+            while not created and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(len(created), 1, self.logs.getvalue())
+        self.assertTrue(created[0].closed)
+        self.assertEqual(self.connector.sessions, {})
+
     def test_refus_de_la_porte(self):
         self.start()
         self.verifier.result = attach_host.GrantResult(False, "not_authorized",
@@ -455,6 +520,23 @@ class RelayTest(unittest.TestCase):
         second_receipt, second_device = make_grant()
         frame = open_only(self.relay.port, second_receipt)
         self.assertEqual(t.parse_json(frame.payload, "err")["code"], "host_busy")
+
+    def test_quota_par_adresse_rendu_a_la_fermeture(self):
+        self.start(max_sessions_per_ip=1)
+        self.host()
+        first_receipt, first_device = make_grant()
+        first = Station(self.relay.port, first_receipt, first_device)
+        first.handshake()
+        first.request()
+        first.close()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and self.connector.sessions:
+            time.sleep(0.02)
+        second_receipt, second_device = make_grant()
+        second = Station(self.relay.port, second_receipt, second_device)
+        self.addCleanup(second.close)
+        second.handshake()
+        self.assertEqual(second.request()["v"], 1)
 
     def test_quota_du_relais(self):
         self.start(max_sessions=1)
@@ -533,11 +615,11 @@ class TlsTest(unittest.TestCase):
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
         import ipaddress
-        now = datetime.datetime.now(datetime.timezone.utc)
+        # dates fixes : le test ne dépend pas du jour où il tourne
         cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
                 .public_key(key.public_key()).serial_number(x509.random_serial_number())
-                .not_valid_before(now - datetime.timedelta(minutes=5))
-                .not_valid_after(now + datetime.timedelta(hours=1))
+                .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
+                .not_valid_after(datetime.datetime(2035, 1, 1, tzinfo=datetime.timezone.utc))
                 .add_extension(x509.SubjectAlternativeName(
                     [x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
                 .sign(key, hashes.SHA256()))
@@ -574,6 +656,38 @@ class TlsTest(unittest.TestCase):
         self.addCleanup(station.close)
         station.handshake()
         self.assertEqual(station.request()["v"], 1)
+
+
+class FrameTimeoutTest(unittest.TestCase):
+    def test_timeout_avant_le_premier_octet_remonte(self):
+        def recv(_size):
+            raise TimeoutError()
+        with self.assertRaises(TimeoutError):
+            t.read_frame(recv)
+
+    def test_trame_commencee_ne_se_resynchronise_pas(self):
+        header = struct.pack(">I", t.SESSION_BYTES + 3) + b"\x00" * t.SESSION_BYTES + b"\x19"
+        pieces = [header, b"a", TimeoutError(), TimeoutError()]
+        def recv(size):
+            item = pieces.pop(0) if pieces else TimeoutError()
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        with self.assertRaises(t.ProtocolError) as caught:
+            t.read_frame(recv, frame_timeout=0.05)
+        self.assertEqual(caught.exception.code, "frame_timeout")
+
+    def test_entete_partiel_borne(self):
+        pieces = [b"\x00\x00", TimeoutError(), TimeoutError()]
+        def recv(size):
+            item = pieces.pop(0) if pieces else TimeoutError()
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        with mock.patch.object(t, "FRAME_TIMEOUT", 0.05):
+            with self.assertRaises(t.ProtocolError) as caught:
+                t.read_frame(recv)
+        self.assertEqual(caught.exception.code, "frame_timeout")
 
 
 class CliAndConfigTest(unittest.TestCase):

@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import struct
+import time
 from typing import Callable, Iterable
 
 from . import jcs
@@ -106,6 +107,9 @@ MAX_PAYLOAD = {
 
 #: attente maximale d'une lecture quand aucune donnée n'est prête (s)
 RECV_POLL = 0.1
+
+#: borne d'une trame commencée (en-tête lu) mais jamais terminée (s)
+FRAME_TIMEOUT = 30.0
 
 #: surcharge d'une trame scellée : séquence (8) + tag GCM (16)
 SEAL_OVERHEAD = 8 + 16
@@ -199,13 +203,15 @@ def encode_frame(session: bytes, ftype: int, payload: bytes = b"") -> bytes:
     return struct.pack(">I", len(body)) + body
 
 
-def _read_exact(recv: Callable[[int], bytes], size: int) -> bytes | None:
+def _read_exact(recv: Callable[[int], bytes], size: int, *,
+                deadline: float | None) -> bytes | None:
     """`size` octets, ou None si le pair a fermé avant (fin propre).
 
-    Un délai d'attente est rendu à l'appelant s'il tombe AVANT le premier
-    octet (le tour de boucle peut alors vérifier inactivité et keepalive) ;
-    au milieu d'une trame il est absorbé : une trame à moitié reçue ne doit
-    jamais être perdue.
+    Avant le premier octet d'une trame, un délai d'attente est rendu à
+    l'appelant (le tour de boucle vérifie inactivité et keepalive). Dès
+    qu'une trame est commencée, le délai est absorbé mais borné par
+    `deadline` ; une trame interrompue lève `frame_timeout` et la connexion
+    est fermée, jamais resynchronisée au milieu du flux.
     """
     chunks = []
     remaining = size
@@ -213,9 +219,17 @@ def _read_exact(recv: Callable[[int], bytes], size: int) -> bytes | None:
         try:
             chunk = recv(remaining)
         except TimeoutError:
-            if not chunks:
-                raise
+            if deadline is None:
+                if not chunks:
+                    raise
+                deadline = time.monotonic() + FRAME_TIMEOUT
+                continue
+            if time.monotonic() >= deadline:
+                raise ProtocolError("frame_timeout", "incomplete frame after %d bytes"
+                                    % (size - remaining))
             continue
+        if deadline is None:
+            deadline = time.monotonic() + FRAME_TIMEOUT
         if not chunk:
             if remaining == size:
                 return None
@@ -225,14 +239,16 @@ def _read_exact(recv: Callable[[int], bytes], size: int) -> bytes | None:
     return b"".join(chunks)
 
 
-def read_frame(recv: Callable[[int], bytes], *, max_frame: int = MAX_FRAME) -> Frame | None:
+def read_frame(recv: Callable[[int], bytes], *, max_frame: int = MAX_FRAME,
+               frame_timeout: float = FRAME_TIMEOUT) -> Frame | None:
     """Lit une trame d'un flux ; None sur fin de flux entre deux trames.
 
     `recv` est `socket.recv` ou un équivalent de test. Une longueur hors
     bornes est refusée AVANT de lire la charge (jamais d'allocation sur la
-    foi d'un champ non vérifié).
+    foi d'un champ non vérifié). Un délai avant le premier octet remonte
+    tel quel ; une fois la trame commencée, `frame_timeout` la borne.
     """
-    header = _read_exact(recv, 4)
+    header = _read_exact(recv, 4, deadline=None)
     if header is None:
         return None
     length = struct.unpack(">I", header)[0]
@@ -241,7 +257,7 @@ def read_frame(recv: Callable[[int], bytes], *, max_frame: int = MAX_FRAME) -> F
     if length > max_frame:
         raise ProtocolError("frame_too_large", "frame length %d, maximum %d"
                             % (length, max_frame))
-    body = _read_exact(recv, length)
+    body = _read_exact(recv, length, deadline=time.monotonic() + frame_timeout)
     if body is None:
         raise ProtocolError("truncated", "connection closed after a frame header")
     session = body[:SESSION_BYTES]

@@ -219,30 +219,39 @@ class PtyProcess:
     # -- fermeture ---------------------------------------------------------
 
     def close(self) -> None:
-        """Arrête le groupe (SIGTERM puis SIGKILL) et libère le PTY."""
+        """Arrête le groupe (SIGTERM puis SIGKILL) et libère le PTY.
+
+        Le signal vise le **groupe**, pas seulement le leader : un shell déjà
+        sorti peut laisser un descendant, et un descendant qui ignore TERM
+        doit recevoir KILL même si le leader est mort entre-temps. On ne
+        s'appuie donc jamais sur le seul statut du leader pour décider de
+        l'escalade.
+        """
         if self._closed:
             return
         self._closed = True
-        if self._status is None:
-            try:
-                os.killpg(self.pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            deadline = time.monotonic() + max(0.0, self.close_timeout)
-            while time.monotonic() < deadline:
-                if self.poll() is not None:
-                    break
-                time.sleep(0.02)
-            if self._status is None:
-                try:
-                    os.killpg(self.pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-                deadline = time.monotonic() + max(0.0, self.close_timeout)
-                while time.monotonic() < deadline:
-                    if self.poll() is not None:
-                        break
-                    time.sleep(0.02)
+        self.poll()  # reap the leader if it already exited
+        try:
+            os.killpg(self.pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        deadline = time.monotonic() + max(0.0, self.close_timeout)
+        while time.monotonic() < deadline:
+            if self.poll() is not None:
+                break
+            time.sleep(0.02)
+        # toujours KILL : le groupe peut encore porter un descendant vivant
+        # alors que le leader est déjà sorti (et reaped)
+        try:
+            os.killpg(self.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        deadline = time.monotonic() + max(0.0, min(self.close_timeout, 0.5))
+        while time.monotonic() < deadline:
+            if self.poll() is not None:
+                break
+            time.sleep(0.02)
+        self.poll()
         try:
             os.close(self.master)
         except OSError:
