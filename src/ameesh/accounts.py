@@ -175,6 +175,16 @@ CAP_LABEL_PRIMARY = "primary cap"
 #: L242b (2): a non-critical agent stops this much below the pace cap, so that
 #: the critical agents keep the margin up to it
 RESERVE = 0.10
+#: #7006 : marge de résumé d'un agent critique. Il quitte son compte de session
+#: à sa saturation (100 %) ; or le tour de résumé d'une rotation est refusé sur
+#: une jauge saturée (`account_turn.summary_possible`) : sans cette marge, la
+#: bascule ne peut jamais résumer et repart du brief déterministe. Le critique
+#: quitte donc son compte `SUMMARY_MARGIN` avant 100 %, tant que le résumé sous
+#: l'ancien compte est encore possible. Les jauges sont publiées arrondies au
+#: point : le dernier relevé avant 100 % vaut 0,99 (incident du 11/11), une
+#: marge d'un point suffirait tout juste — deux points gardent un relevé
+#: d'avance et couvrent le tour de résumé lui-même.
+SUMMARY_MARGIN = 0.02
 OVERAGE_CAP = 0.80          #: an account that may be billed beyond its plan stops early
 PRIMARY_PRIORITY = 100      #: the default account comes last
 OTHER_PRIORITY = 50
@@ -1592,6 +1602,22 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
     return out
 
 
+def summary_margin_gauge(result, now: float,
+                         margin: float = SUMMARY_MARGIN) -> tuple | None:
+    """#7006 : la jauge qui impose de quitter le compte avant sa saturation.
+
+    Rend `(jauge, usage effectif)` de la jauge la plus proche de 100 % quand
+    elle est à moins de `margin` de la saturation, sinon None. `used_at`
+    (fenêtre remise à zéro : 0 %) : une jauge échue ne retient rien.
+    """
+    worst = None
+    for gauge in result.gauges:
+        used = float(gauge.used_at(now) or 0.0)
+        if used >= 1.0 - margin and (worst is None or used > worst[1]):
+            worst = (gauge, used)
+    return worst
+
+
 def _release(profile: Profile, depasses, hard, now: float,
              cut: float, ceilings: dict | None = None) -> tuple[float | None, object | None]:
     """La fenêtre qui bloque le plus longtemps, et l'heure où elle libère.
@@ -2677,6 +2703,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     (`RESERVE`) sous le rythme — sans cette marge, chaque franchissement du
     plafond coûterait une rotation avec résumé.
 
+    #7006 : toujours pour un agent critique, la continuité cède dans la
+    **marge de résumé** (`SUMMARY_MARGIN`) avant la saturation d'une jauge :
+    la rotation se fait alors sous l'ancien compte, encore résumable. Sans
+    autre compte plaçable, le choix attend dans la marge plutôt que de
+    consommer les derniers points — le compte reste résumable quand un autre
+    se libère, au lieu d'imposer le brief déterministe.
+
     `model` (#1580 tranche 3) : le modèle de la session qui va tourner ; ses
     seaux propres (widget omarchy) comptent pour lui seul. Défaut `''` :
     modèle inconnu, les seaux de modèle sont écartés — jamais attribués au
@@ -2885,8 +2918,20 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # retenu ne l'est pas : c'est le PROCHAIN tour que ce choix décide, il ne
         # part pas sur un compte facturé au-delà du plan (R1 auditeur, B1).
         own = by_name(items, session_account) if session_account else None
+        own_ev = ev(own) if own is not None else None
+        # #7006 : un agent critique quitte son compte avant sa saturation. À
+        # 100 %, `account_turn.summary_possible` refuse le tour de résumé (le
+        # fournisseur le refuserait) et la rotation repart du brief déterministe.
+        # La marge ne vaut que sous la garde de rythme : garde coupée, seules
+        # les règles absolues de L226b décident, et le chemin de repli au-delà
+        # du plafond du compte par défaut reste inchangé.
+        near = (summary_margin_gauge(own_ev, now)
+                if (critical and paced and own_ev is not None and own_ev.ok
+                    and own is not None and own in candidates
+                    and own.name not in ecartes and own.name not in epuises)
+                else None)
         if (own is not None and own in candidates and own.name not in ecartes
-                and own.name not in epuises and ev(own).ok):
+                and own.name not in epuises and own_ev.ok and near is None):
             return Choice(own, active, kept=True,
                           why="continuity: the session stays on %s, under its "
                               "threshold" % own.name)
@@ -2902,25 +2947,36 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # deux dossiers
         if ecartes:
             candidates = [p for p in candidates if p.name not in ecartes]
+        # #7006 : la marge se relit après #6961 — une pause partagée levée par
+        # le relevé local du compte ne doit pas faire manquer la bascule.
+        near = (summary_margin_gauge(own_ev, now)
+                if (critical and paced and own_ev is not None and own_ev.ok
+                    and own is not None and own in candidates
+                    and own.name not in ecartes and own.name not in epuises)
+                else None)
+        # #7006 : dans la marge de résumé, le compte de la session n'est plus
+        # candidat — on cherche un autre compte à rejoindre avant la saturation.
+        rankable = ([p for p in candidates if p.name != own.name]
+                    if near is not None else candidates)
         # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
-        ranked = rank(candidates, cache, now)
+        ranked = rank(rankable, cache, now)
         if not ranked and not paced:
             # L226b: past its pace a healthy account stays usable, never past an
             # absolute rule
-            ranked = rank(candidates, cache, now, paced=False)
+            ranked = rank(rankable, cache, now, paced=False)
         beyond = False
         if not ranked and critical:
             # L242b : le compte par défaut au-delà de son plafond de 50 %, pour un
             # agent critique seulement, en dernier (jamais en overage) ; au retour
             # d'un emprunt, avec la même marge (#389 r2)
             relaxed = dict(cache)
-            for profile in candidates:
+            for profile in rankable:
                 if profile.default and profile.cap is None:
                     relaxed[profile.name] = evaluate(book, profile, items, now, environ,
                                                      record=False, critical=True,
                                                      reserve=margin, probe=False)
             # le rythme tient ici même garde désactivée (#324 r1)
-            ranked = rank(candidates, relaxed, now)
+            ranked = rank(rankable, relaxed, now)
             if ranked:
                 beyond = True
                 cache = relaxed
@@ -2946,6 +3002,24 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 return Choice(stuck, active, why=(
                     "no %s account to place: provider credits exhausted on %s "
                     "(bounded probe only)" % (harness, stuck.name)))
+            # #7006 : aucun autre compte à rejoindre. On s'arrête DANS la marge
+            # plutôt que de consommer les derniers points : la session garde un
+            # compte encore résumable, et la bascule vers un compte libéré plus
+            # tard produira le résumé de l'agent au lieu du brief déterministe.
+            if near is not None:
+                from .cost import until_label
+                gauge, used = near
+                echeance = ""
+                if gauge.resets_at:
+                    echeance = " until %s@%d" % (
+                        until_label(float(gauge.resets_at), now),
+                        int(float(gauge.resets_at)) // 60 * 60)
+                return Choice(None, active, reason=(
+                    "pause (account %s, %s %.1f %%)%s; summary margin — no other %s "
+                    "account is placeable before saturation would make the rotation "
+                    "summary impossible; %s" % (
+                        own.name, gauge.key, used * 100, echeance, harness,
+                        _label(cache))))
             # #1672 : un relevé plus vieux que toute fenêtre encore ouverte est
             # écarté du placement — le dire, plutôt que de le compter comme « au
             # seuil » (le relevé ne mesure plus l'état du compte). C'est une
@@ -3024,6 +3098,12 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             why = ("critical agent: %s beyond its %.0f%% cap, every other account at "
                    "threshold (owner decision 2026-10-12); %s" % (
                        target.name, PRIMARY_CAP * 100, why))
+        if near is not None:
+            gauge, used = near
+            why = ("summary margin: %s is at %.1f %% on %s, within %.0f points of "
+                   "saturation; leaving it before the summary under it becomes "
+                   "impossible — %s" % (
+                       own.name, used * 100, gauge.key, SUMMARY_MARGIN * 100, why))
         left = own if own is not None else (active if target.name != active.name else None)
         if left is not None and left.name in sick:
             why = "%s authentication failing (%s); %s" % (
