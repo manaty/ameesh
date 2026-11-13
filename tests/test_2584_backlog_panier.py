@@ -290,6 +290,28 @@ class ReviewFollowupRefusalTest(_Base):
             self.element("N : sur le constat relu", 5,
                          source="verdict dev7 sur #%d (N1)" % item["id"])
 
+    def test_a_bare_suite_in_a_ticket_lot_is_not_a_review_followup(self):
+        # #7269 : « suite #7251 » (continuation) dans le titre d'un lot de
+        # ticket n'en fait pas une suite d'avis : --review-of l'accepte
+        title = ("C1 #659 prérequis (suite #7251) — ContentAccess : rapports et "
+                 "lecture journalisée servis côté content quand T1 est retiré")
+        ticket = self.lot(title, type="bug", issue_ref="manaty/nexlink#4455")
+        self.assertTrue(backlog.followup_hint(title=title))     # l'avis reste
+        self.assertFalse(backlog.is_review_followup(ticket))
+        line = self.element("N : libellé du rapport", 5, review_of=ticket["id"])
+        self.assertTrue(line["basket"])
+        # une suite qui nomme un défaut mineur ou une relecture reste refusée
+        for named in ("Suite #956 (N R2 bureau) : ORDER BY id",
+                      "suite #956 : défaut non bloquant du tri",
+                      "suite de la R1 de #956 : libellé"):
+            suite = self.lot(named)
+            self.assertTrue(backlog.is_review_followup(suite), named)
+            with self.assertRaises(backlog.BacklogError):
+                self.element("N : libellé", 5, review_of=suite["id"])
+        # un défaut bloquant cité en suite garde son lot, comme avant
+        self.assertFalse(backlog.is_review_followup(
+            self.lot("B : suite #956 — perte de messages")))
+
     def test_after_merge_review_points_to_its_lot(self):
         suite = self.lot("#2452 N2 : train_reviews hors des classes")
         revue = self.lot("REVUE #%d : relecture après fusion" % suite["id"],
