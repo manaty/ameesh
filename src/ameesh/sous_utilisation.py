@@ -392,6 +392,9 @@ def plan_underused(db, listing: list, now: float, *,
     déclaré ; à 63 % utilisés pour un plafond de 63,35 %, l'alerte annonçait
     une capacité que la pause des non-critiques refusait, et les relevés de
     la pause nourrissaient un débit nul (37 % de perte « au rythme courant »).
+    #7193 : un forfait `scope: organization` n'a pas de réserve personnelle
+    (#7023) — le seuil de pause, le plafond annoncé et le crible des relevés
+    de débit valent sans les dix points, comme `accounts.limits`.
     """
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
@@ -409,6 +412,11 @@ def plan_underused(db, listing: list, now: float, *,
         profile = _declared_profile(items, account)
         multiplier = profile.pace_multiplier if profile else 1.0
         ceiling = profile.pace_ceiling if profile else cost_mod.PACE_CEILING
+        # #7193 : même réserve effective que `accounts.limits` — nulle pour
+        # un forfait d'organisation (#7023), personnelle sinon, et par défaut
+        # sans compte déclaré (comportement historique).
+        cut = (0.0 if profile is not None and profile.scope == "organization"
+               else accounts_mod.RESERVE)
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
@@ -422,7 +430,9 @@ def plan_underused(db, listing: list, now: float, *,
             measured = cost_mod.Gauges(g for g, _ in gauges)
             # #2233 : l'historique ne porte pas la capacité d'overage. Ne
             # lire le journal du compte que si son plafond pourrait bloquer.
-            if profile.overage == "auto" and any(
+            # #7193 : la borne dure de 95 % d'un forfait d'organisation
+            # remplace `overage_cap` (#7023) ; son journal n'est jamais lu.
+            if profile.scope != "organization" and profile.overage == "auto" and any(
                     g.used_at(now) >= profile.overage_cap for g, _ in blocking):
                 try:
                     if book is None:
@@ -438,7 +448,7 @@ def plan_underused(db, listing: list, now: float, *,
             # fenêtre dans cette bande (ex. seven_day à 83 % pour un rythme
             # ramené à 80 %) laissait annoncer une capacité qu'aucun agent ne
             # pouvait consommer : la pause jugeait le compte au seuil.
-            caps = accounts_mod.limits(profile, measured, now, reserve=True,
+            caps = accounts_mod.limits(profile, measured, now, reserve=bool(cut),
                                        ceilings={
                                            g.key: accounts_mod.Ceiling(ceiling)
                                            for g in measured})
@@ -454,14 +464,15 @@ def plan_underused(db, listing: list, now: float, *,
             # #5408 : la même comparaison vaut sans compte déclaré (`caps`
             # vide) — c'est la pause, pas la déclaration, qui ferme la
             # capacité — et laisse un point de résolution à la jauge.
-            cap = gauge.held_cap(now, accounts_mod.RESERVE, multiplier, ceiling)
+            # #7193 : `cut` est nulle pour un forfait d'organisation.
+            cap = gauge.held_cap(now, cut, multiplier, ceiling)
             if gauge.used_at(now) >= cap - GAUGE_STEP:
                 continue
             if caps and gauge.used_at(now) >= caps[gauge.key][0] - GAUGE_STEP:
                 continue
             if profile is None and any(
                     other.used_at(now) >= (other.held_cap(
-                        now, accounts_mod.RESERVE, multiplier, ceiling) - GAUGE_STEP)
+                        now, cut, multiplier, ceiling) - GAUGE_STEP)
                     for other, _ in blocking if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
@@ -472,7 +483,7 @@ def plan_underused(db, listing: list, now: float, *,
                 history = _gauge_history(db, since_s=PLAN_RATE_WINDOW_S)
             lost_at_pace, rate_source, rate_span = _projected_plan_loss(
                 gauge, account, now, history, multiplier=multiplier,
-                ceiling=ceiling, reserve=accounts_mod.RESERVE)
+                ceiling=ceiling, reserve=cut)
             if gap_min > 0 and lost_at_pace <= gap_min:
                 continue
             reason = None
