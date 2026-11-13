@@ -198,6 +198,19 @@ class SpawnApplyTest(unittest.TestCase):
         self.assertEqual(document["spawn"]["tools"], ["git"])
         turn_context.validate(document)
 
+    def test_a_known_environment_secret_is_refused(self):
+        # B 40591 : le filtre couvre les valeurs des variables secrètes, pas
+        # seulement les motifs génériques (design #7031 §4.3).
+        from unittest import mock
+        value = "synthetic-value-7034"
+        path = os.path.join(self.cwd, "context.md")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("mission %s" % value)
+        with mock.patch.dict(os.environ, {"REVIEW_7034_API_KEY": value}):
+            with self.assertRaises(spawn.SpawnToolsError) as ctx:
+                spawn.read_context(path)
+        self.assertEqual(ctx.exception.code, "spawn-context-secret")
+
     def test_context_reads_one_utf8_file_and_refuses_a_directory(self):
         path = os.path.join(self.cwd, "context.md")
         with open(path, "w", encoding="utf-8") as handle:
@@ -286,6 +299,24 @@ class ChildReportTest(_CanonDbCase):
                                 status="completed")
         self.assertEqual(self.messages()[-1]["payload"]["child_report"],
                          {"child": "aide", "kind": "final", "status": "expired"})
+
+    def test_turn_end_removes_the_private_files_every_turn(self):
+        text = "turn context\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        canon_sync.spawn(self.db, "aide5", "orchestre", 3600, canon=self.load(),
+                         tools=["git"], context=(text, digest))
+        directory = self.cfg.agent_dir("aide5")
+        spawn.write_profile(directory, storage.of(self.db).ephemerals.profile("aide5"),
+                            self.cwd)
+        spawn.write_context(directory, text)
+        child_reports.turn_end(self.db, self.cfg, "aide5", final="progress",
+                                status="completed")
+        for filename in (spawn.PROFILE_FILE, spawn.MCP_FILE, spawn.CONTEXT_FILE):
+            self.assertFalse(os.path.exists(os.path.join(directory, filename)),
+                             filename)
+        # Les données restent en base : le tour suivant réécrit les fichiers.
+        self.assertIsNotNone(storage.of(self.db).ephemerals.profile("aide5"))
+        self.assertIsNotNone(storage.of(self.db).ephemerals.context("aide5"))
 
     def test_a_final_report_purges_the_context_even_before_expiry(self):
         text = "private context\n"
@@ -381,10 +412,17 @@ class SpawnRunnerTest(PgTestCase):
         import shlex
         import sys
         report_out = os.path.join(self.tmp, "child-report.txt")
+        state = self.cfg.agent_dir(name)
+        modes_out = os.path.join(self.tmp, "private-modes.txt")
+        private = " ".join(shlex.quote(os.path.join(state, filename))
+                           for filename in (spawn.PROFILE_FILE, spawn.MCP_FILE,
+                                            spawn.CONTEXT_FILE))
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
-               "AMEESH_TEST_RUN": 'cp "$AMEESH_TURN_CONTEXT" %s; %s -m ameesh child'
+               "AMEESH_TEST_RUN": 'cp "$AMEESH_TURN_CONTEXT" %s; stat -c "%%a %%n" %s'
+                                  ' > %s; %s -m ameesh child'
                                   ' report --kind progress --text "explicit report" > %s 2>&1'
-                                  % (shlex.quote(capture), shlex.quote(sys.executable),
+                                  % (shlex.quote(capture), private, shlex.quote(modes_out),
+                                     shlex.quote(sys.executable),
                                      shlex.quote(report_out)),
                "PYTHONPATH": os.path.join(REPO, "src")}
         with mock.patch.dict(os.environ, env, clear=False):
@@ -412,11 +450,15 @@ class SpawnRunnerTest(PgTestCase):
         self.assertTrue(self.db.query(
             "SELECT 1 AS x FROM agent_mailbox WHERE sender = %s AND body = %s",
             (name, "explicit report")))
-        state = self.cfg.agent_dir(name)
+        # Pendant le tour, les fichiers privés existent en 0600 ; le tour
+        # fini, ils ne survivent pas (B 40591), le suivant les réécrit.
+        with open(modes_out, encoding="utf-8") as handle:
+            modes = {line.split(" ", 1)[1].strip(): line.split(" ", 1)[0]
+                     for line in handle if line.strip()}
         for filename in (spawn.PROFILE_FILE, spawn.MCP_FILE, spawn.CONTEXT_FILE):
             path = os.path.join(state, filename)
-            self.assertTrue(os.path.exists(path), path)
-            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            self.assertEqual(modes.get(path), "600", path)
+            self.assertFalse(os.path.exists(path), path)
         # The child's final report reaches the parent, and the expiry sweep
         # purges the private context.
         self.db.execute("UPDATE agent_registry SET ephemeral_expires_at ="

@@ -247,7 +247,20 @@ def mcp_servers(cwd: str | None, source: str | None,
 
 
 def _has_secret(text: str) -> bool:
-    return any(pattern.search(text) for pattern in SECRET_PATTERNS)
+    """Known patterns AND the exact values of secret environment variables.
+
+    Design #7031 §4.3: `turn_context.environment_secrets` is part of the
+    filter, not only the generic patterns. A context or an MCP server that
+    carries a declared credential value is refused before it can cross hosts.
+    """
+    if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+        return True
+    try:
+        from . import turn_context
+        values = turn_context.environment_secrets()
+    except Exception:  # pragma: no cover — a filter failure never widens
+        return True
+    return any(value and value in text for value in values)
 
 
 def check_text(text: str, what: str, limit: int) -> str:

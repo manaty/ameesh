@@ -136,6 +136,11 @@ def turn_end(db, cfg, child: str, *, final: str | None,
     A `final` is sent when the ephemeral is expired or stopped; a failed turn
     is reported as failed progress otherwise (the child may resume).
     """
+    # B 40591 : les fichiers privés de l'enfant ne survivent pas au tour qui
+    # les a utilisés, même sur un hôte de placement où le parent ne peut pas
+    # les supprimer. Un enfant mort à l'arrêt n'en laisse donc aucun ; le
+    # prochain tour les réécrit depuis la base.
+    _remove_child_state(cfg, child)
     parent, _profile_row, row = _child(db, child)
     expires = row.get("ephemeral_expires_ts")
     expired = bool(expires and expires <= time.time())
