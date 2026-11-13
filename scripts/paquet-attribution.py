@@ -48,10 +48,13 @@ que paquet-auto joue en plus des modules propres de l'unité :
 
 #7195 (B1) : les fichiers et les blocs d'une unité se lisent depuis le même
 point de départ. Un commit de composition (`paquet-compose.py`) est une
-fusion et garde son premier parent ; une unité de plusieurs commits ordinaires
-se lit depuis `merge-base(base, unit_sha)`, sinon seul son dernier commit
-serait vu. Un fichier changé dont le découpage ne rend aucun bloc retombe sur
-`<module>`, et la couverture le dit si même ce bloc manque.
+fusion qui porte le trailer `ameesh-work:` et garde son premier parent ; une
+unité de plusieurs commits ordinaires se lit depuis `merge-base(base, unit_sha)`,
+sinon seul son dernier commit serait vu. #7211 : une fusion sans ce trailer
+(une tête de lot qui a fusionné la cible) ne prend pas son premier parent,
+sinon `sha^1..sha` lirait le delta de la cible. Un fichier changé dont le
+découpage ne rend aucun bloc retombe sur `<module>`, et la couverture le dit
+si même ce bloc manque.
 
 Une carte absente ou antérieure à `base` est dite dans `card`, sans bloquer.
 
@@ -80,7 +83,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from ameesh import packet_red  # noqa: E402
+from ameesh import packet_red, plan_git  # noqa: E402
 
 SCHEMA = "ameesh-paquet-attribution/1"
 REQUEST_SCHEMA = "ameesh-paquet-attribution-request/1"
@@ -274,17 +277,39 @@ def _parents(repo: Path, sha: str) -> list[str]:
     return _text(proc.stdout).split()[1:]
 
 
+def _message(repo: Path, sha: str) -> str:
+    """Le message complet de `sha`, ou "" s'il est illisible."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "show", "-s", "--format=%B", sha],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _composition(repo: Path, sha: str, parents: list[str]) -> bool:
+    """#7211 : une fusion n'est de composition que si son message porte le
+    trailer `ameesh-work:` (même reconnaissance que `packet_link`). Une
+    fusion sans trailer — une tête de lot qui a fusionné la cible — n'en est
+    pas une : son premier parent ne décrit pas le delta de l'unité."""
+    return len(parents) >= 2 and bool(
+        plan_git.WORK_TRAILER_RE.search(_message(repo, sha)))
+
+
 def unit_left(repo: Path, base: str, sha: str) -> str:
     """#7195 : la gauche du diff des blocs d'une unité.
 
-    Un commit de composition (`paquet-compose.py`) est une fusion : son
-    premier parent est la composition précédente, donc `sha^1..sha` est
-    exactement le delta de l'unité. Un commit d'unité ordinaire (branche de
-    lot) peut porter plusieurs commits : la gauche est alors
-    `merge-base(base, sha)`, le même point de départ que ses fichiers.
+    Un commit de composition (`paquet-compose.py`) est une fusion qui porte
+    le trailer `ameesh-work:` : son premier parent est la composition
+    précédente, donc `sha^1..sha` est exactement le delta de l'unité. Un
+    commit d'unité ordinaire (branche de lot) peut porter plusieurs commits ;
+    une tête de lot qui a fusionné la cible est aussi une fusion, mais sans
+    trailer : la gauche est alors `merge-base(base, sha)`, le même point de
+    départ que ses fichiers (#7211).
     """
     parents = _parents(repo, sha)
-    if len(parents) >= 2:
+    if _composition(repo, sha, parents):
         return parents[0]
     return _merge_base(repo, base, sha) or (parents[0] if parents else sha + "^1")
 
