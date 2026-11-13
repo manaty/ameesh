@@ -563,16 +563,21 @@ def publish_sequence_readiness(db, cfg, options, problem, descriptor) -> None:
     newest event: the guard is the live `sequence_problem` before the take.
     The event is rate-limited; a changed verdict is published at once, and a
     recovery removes the reason on the next pass.
+    #7259: it also carries `executor_venv`, the version this tick runs: the
+    alerts pass reads it after an install, which no completed pass records
+    until the next staging. A changed version is published at once too.
     """
     object_name = "staging-executor:%s:%s" % (options.get("role") or "", cfg.host)
     ready = problem is None
+    version = executor_venv(options)
     try:
         rows = storage.of(db).events.recent_type(
             SEQUENCE_EVENT, 1, 1, object=object_name)
         previous = (rows[0].get("data") or {}) if rows else {}
         fresh = bool(rows) and time.time() - float(rows[0].get("ts") or 0) \
             < SEQUENCE_REPORT_S
-        if previous.get("ready") == ready and fresh:
+        if previous.get("ready") == ready and fresh and (
+                previous.get("executor_venv") == version):
             return
         storage.of(db).events.record(
             SEQUENCE_EVENT, object_name, None,
@@ -580,7 +585,7 @@ def publish_sequence_readiness(db, cfg, options, problem, descriptor) -> None:
              "host": cfg.host, "ready": ready,
              "diagnostic": "" if ready else public_reason(problem),
              "candidates": list(options.get("candidates") or []),
-             "config": descriptor})
+             "config": descriptor, "executor_venv": version})
     except Exception as exc:  # noqa: BLE001 - the refusal itself remains
         print("ameesh: staging preparation not published: %s"
               % type(exc).__name__, file=sys.stderr)

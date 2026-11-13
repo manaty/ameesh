@@ -328,6 +328,69 @@ class AlertTest(unittest.TestCase):
             (key, row), = staging_watch.executor_versions(object())
         self.assertEqual((key, row["id"]), ("mesh", 2))
 
+    def tick(self, version, *, ident=6, host="ameesh-agents-1"):
+        return {("mesh", host): dict(id=ident, ts=self.NOW, data=dict(
+            key="mesh", host=host, executor_venv=version))}
+
+    def test_install_after_the_last_pass_is_read_from_a_later_tick(self):
+        """#7259 : exécutant mis à jour après la dernière passe, sans nouvelle
+        passe : aucune alerte."""
+        old = dict(host="ameesh-agents-1",
+                   executor_venv=dict(running="1111111", live="1111111"),
+                   venv_refresh=dict(state="refused", step="manifest"))
+        self.assertEqual(staging_watch.executor_version_findings(
+            [("mesh", dict(id=5, data=dict(old, state="completed", sha=self.SHA)))],
+            now=self.NOW, ticks=self.tick(dict(running="aaaaaaa",
+                                               live="aaaaaaa"))), [])
+        # A refresh marked under way past its bound is settled by the tick.
+        running = dict(old, venv_refresh=dict(state="running", started=0))
+        self.assertEqual(staging_watch.executor_version_findings(
+            [("mesh", dict(id=5, data=dict(running, state="completed",
+                                           sha=self.SHA)))],
+            now=self.NOW, ticks=self.tick(dict(running="aaaaaaa"))), [])
+
+    def test_a_stale_tick_names_its_source(self):
+        data = dict(host="ameesh-agents-1",
+                    executor_venv=dict(running="1111111", live="aaaaaaa"))
+        alert, = staging_watch.executor_version_findings(
+            [("mesh", dict(id=5, data=dict(data, state="completed", sha=self.SHA)))],
+            now=self.NOW, ticks=self.tick(dict(running="2222222",
+                                               live="2222222")))
+        self.assertEqual(alert["executor_venv"], "2222222")
+        self.assertIn("the tick of ameesh-agents-1 at", alert["detail"])
+
+    def test_an_older_or_foreign_tick_is_not_read(self):
+        data = dict(host="ameesh-agents-1",
+                    executor_venv=dict(running="1111111", live="1111111"))
+        rows = [("mesh", dict(id=5, data=dict(data, state="completed",
+                                              sha=self.SHA)))]
+        for ticks in (self.tick(dict(running="aaaaaaa"), ident=4),
+                      self.tick(dict(running="aaaaaaa"), host="ameesh-agents-2"),
+                      self.tick({})):
+            alert, = staging_watch.executor_version_findings(
+                rows, now=self.NOW, ticks=ticks)
+            self.assertIn("version read from its last completed pass",
+                          alert["detail"])
+        # No reading anywhere: "not recorded", and only then.
+        alert, = staging_watch.executor_version_findings(
+            [("mesh", dict(id=5, data=dict(state="completed", sha=self.SHA,
+                                           host="ameesh-agents-1")))],
+            now=self.NOW, ticks=self.tick({}))
+        self.assertIn("not recorded", alert["detail"])
+
+    def test_newest_tick_per_key_and_host(self):
+        events = mock.Mock()
+        events.latest_type.return_value = [
+            dict(id=3, data=dict(key="mesh", host="h1")),
+            dict(id=7, data=dict(key="mesh", host="h1")),
+            dict(id=2, data=dict(key="mesh", host="h2")),
+            dict(id=9, data="?")]
+        with mock.patch.object(staging_watch.storage, "of",
+                               return_value=mock.Mock(events=events)):
+            ticks = staging_watch.executor_ticks(object())
+        self.assertEqual({k: v["id"] for k, v in ticks.items()},
+                         {("mesh", "h1"): 7, ("mesh", "h2"): 2})
+
     def test_alert_type_is_wired(self):
         from ameesh import alert_briefs, exploitation, notify
         self.assertIn("staging_executor_stale", exploitation.ALERT_TYPES)
