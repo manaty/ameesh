@@ -32,7 +32,7 @@ from unittest import mock
 # son canon déclare un registre de contrats absent des dépôts jetables.
 from tests import support  # noqa: F401  (L142 : environnement isolé)
 
-REPO =pathlib.Path(__file__).resolve().parent.parent
+REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
 def _load(name: str, filename: str):
