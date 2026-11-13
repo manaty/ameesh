@@ -25,6 +25,8 @@ class InventoryTest(unittest.TestCase):
             row for row in self.ops.items.return_value if row["state"] == kw["state"]]
         self.marks = [dict(id=1, kind="frozen", sha="a" * 40)]
         self.ops.milestones.return_value = self.marks
+        # #6993 : the inventory also reads the recorded packet memberships.
+        self.ops.packet_members.return_value = []
         self.result = dict(sha="a" * 40, origin="frozen", declared=self.marks[0],
                            verdict=None, notes=["no-verdict"], causes=[])
         self.reader = mock.Mock(return_value=self.result)
@@ -44,11 +46,13 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(result["candidates"][0]["candidate"], self.result)
         self.assertEqual(result["candidates"][0]["target"], "develop")
         self.assertEqual(result["candidates"][0]["causes"], [])
-        self.assertEqual([call[0] for call in self.ops.mock_calls], ["items", "milestones", "items"])
+        self.assertEqual([call[0] for call in self.ops.mock_calls],
+                         ["items", "milestones", "items", "packet_members"])
         self.assertEqual(self.ops.items.call_args_list, [
             mock.call(state="qa", assignee=None, limit=None),
             mock.call(state="validated", assignee=None, limit=None)])
         self.ops.milestones.assert_called_once_with(2005, None)
+        self.ops.packet_members.assert_called_once_with(item_ids=[2005])
         self.reader.assert_called_once_with(self.marks, waived=False)
         self.assertEqual((self.item, self.marks, self.result), before)
         self.assertNotIn("generation", result["candidates"][0])

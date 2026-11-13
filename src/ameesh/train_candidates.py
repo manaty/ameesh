@@ -4,6 +4,13 @@
 A candidate is neither a queue generation nor historical review/CI evidence.
 The published branch, exact provenance and policy still need qualification
 before enrollment; no provider or live runner profile is selected here.
+
+#6993 : a lot already composed in an open packet has exactly one landing path,
+the packet (§11 bis/§12). The inventory refuses it (`packet-member`) and the
+preparation rechecks the link before enrollment, from the recorded composition
+(`work_packet_members`, written by `work packet record`), never from a guessed
+manifest. A missing or unreadable link refuses the list rather than silently
+enrolling a second landing.
 """
 from __future__ import annotations
 
@@ -15,6 +22,55 @@ from dataclasses import asdict
 from . import lot_class, merge_queue, packet_guard, storage
 from .train import TrainError
 from .train_admissions import hold_refusal, pilot_holds, refuse_held, requirement_of
+
+#: #6993 : stable cause of a lot already carried by an open packet.
+PACKET_MEMBER = "packet-member"
+
+
+def packet_member_causes(db, ids) -> dict[int, str]:
+    """`{lot: cause}` of the lots already composed in an open packet (§11 bis).
+
+    The link is the one `work packet record` writes (`work_packet_members`,
+    #2443): a composition replaces the whole unit set, so a lot removed from
+    the vehicle no longer appears. A completed carrier (`delivered`, `closed`)
+    carries nothing any more. A carried lot keeps a single landing path, its
+    packet: the train must not enroll it a second time (#6993). An unreadable
+    table refuses the list, never a lot declared free.
+    """
+    lots = sorted({int(lot) for lot in ids})
+    if not lots:
+        return {}
+    try:
+        members = storage.of(db).work.packet_members(item_ids=lots)
+    except Exception as exc:  # noqa: BLE001 - unreadable link: incomplete list
+        raise TrainError("cannot read the packet memberships: %s" % exc) from exc
+    out: dict[int, str] = {}
+    for member in members or ():
+        if not isinstance(member, dict):
+            raise TrainError("malformed packet membership reading")
+        try:
+            lot = int(member["work_item_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TrainError("malformed packet membership reading") from exc
+        if lot not in lots:
+            continue
+        if str(member.get("package_state") or "") in lifecycle.COMPLETED:
+            continue
+        branch = str(member.get("package_branch")
+                     or member.get("carrier_branch") or "")
+        if not packet_guard.is_packet_branch(branch):
+            continue
+        out.setdefault(lot, "%s: #%s %s carries the lot; the packet is its "
+                            "landing path" % (PACKET_MEMBER,
+                                              member.get("package_id"), branch))
+    return out
+
+
+def refuse_packet_member(db, lot) -> None:
+    """#6993 : refuse enrollment of a lot already carried by an open packet."""
+    cause = packet_member_causes(db, [lot]).get(int(lot))
+    if cause:
+        raise TrainError(cause)
 
 
 class Inventory:
@@ -63,6 +119,14 @@ class Inventory:
         for row in candidates:
             if row["work_item_id"] in holds:
                 row["causes"].append(hold_refusal(holds[row["work_item_id"]]))
+        # #6993 : un lot déjà composé dans un paquet ouvert garde cette unique
+        # voie d'atterrissage ; le train ne l'inscrit pas une seconde fois.
+        carried = packet_member_causes(
+            self.db, [row["work_item_id"] for row in candidates])
+        for row in candidates:
+            cause = carried.get(row["work_item_id"])
+            if cause:
+                row["causes"].append(cause)
         return dict(schema="ameesh-train-candidates/1", project=self.project.name,
                     source=merge_queue.source_of(self.project.repo), target=self.target,
                     candidates=candidates)
@@ -101,6 +165,10 @@ class Preparation:
         if lot_class.release_reason(item, target):
             raise TrainError("release lots cannot enter an automatic train")
         refuse_held(self.history.db, item["id"])
+        # #6993 : la composition du paquet peut être enregistrée entre
+        # l'inventaire et l'enrôlement ; la liaison est revérifiée ici, comme
+        # le hold (#6972), pour ne jamais ouvrir un second atterrissage.
+        refuse_packet_member(self.history.db, item["id"])
         subject = dict(work_item_id=item["id"], branch=item["branch"], target=target,
                        source=self.repository.source, frozen_id=declared["id"],
                        frozen_sha=origin["sha"])
