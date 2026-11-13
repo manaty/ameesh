@@ -3816,9 +3816,32 @@ class Ephemerals(Domain):
 
     @abc.abstractmethod
     def create(self, name: str, creator: str, *, cwd: str | None,
-               ttl_seconds: float) -> dict | None:
+               ttl_seconds: float, host: str | None = None,
+               admitted_hosts: Sequence[str] | None = None,
+               credential_mode: str | None = None,
+               placement: dict | None = None,
+               evaluated_profile: dict | None = None,
+               evaluated_identity: dict | None = None) -> dict | None:
         """Crée l'éphémère atomiquement (INSERT … SELECT sur la ligne du
-        créateur) ; None si le nom est pris ou si le créateur a changé."""
+        créateur) ; None si le nom est pris ou si le créateur a changé.
+
+        Sans `host` : comportement R14, l'enfant hérite de l'hôte, du dossier
+        et du verdict de placement du créateur (un verdict admis n'est hérité
+        que si le profil est encore celui évalué).
+
+        Avec `host` (#7107, avatar B5) : l'enfant est placé sur cet hôte, avec
+        `admitted_hosts` (le sien seulement), `credential_mode` et le verdict
+        `placement` (`{ok, diagnostic, ref}`) évalué pour cet hôte. Son
+        `placement_profile` est calculé sur la ligne écrite (hôte, harnais,
+        fournisseur, modèle, mode), jamais recopié du créateur. Le dossier
+        `cwd` est celui de l'enfant ; None n'hérite pas de celui du créateur.
+        `evaluated_profile` (`{harness, provider, model}`) est le profil que le
+        verdict a jugé : l'INSERT refuse de copier du créateur des valeurs
+        différentes (profil jamais évalué). `evaluated_identity`
+        (`{host, responsible, created_by, lineage}`) est l'identité de lignée
+        au moment du choix : l'INSERT refuse un parent déplacé, un responsable
+        changé, un `created_by` modifié ou un ancêtre revenu sur l'hôte
+        d'arrivée."""
 
     @abc.abstractmethod
     def exists(self, name: str) -> bool:

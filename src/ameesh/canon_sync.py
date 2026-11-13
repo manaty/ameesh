@@ -147,6 +147,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 
+from . import avatar_children
 from . import canon as canon_mod
 from . import fil
 from . import harnesses
@@ -1526,14 +1527,77 @@ def _lineage_root(by_name: dict[str, dict], creator: str | None) -> tuple[dict |
     return None, "lineage of more than %d creators" % registry._LINEAGE_MAX
 
 
+def _lineage_hosts(by_name: dict[str, dict], creator: str | None) -> list[str]:
+    """Hôtes de la lignée d'un éphémère (créateur compris), sans doublon."""
+    hosts: list[str] = []
+    seen: set[str] = set()
+    name = creator
+    while name and name not in seen and len(seen) < registry._LINEAGE_MAX:
+        seen.add(name)
+        row = by_name.get(name)
+        if row is None:
+            break
+        host = str(row.get("host") or "")
+        if host and host not in hosts:
+            hosts.append(host)
+        if not row.get("ephemeral") or row.get("canon_ref"):
+            break
+        name = row.get("created_by")
+    return hosts
+
+
+def _own_child_verdict(canon: Canon | None, row: dict, root: dict, host: str,
+                       by_name: dict[str, dict]) -> placement_mod.Verdict:
+    """#7107 : verdict d'un enfant d'avatar placé sur SON hôte.
+
+    Le verdict mono-hôte du parent ne s'hérite pas : on réévalue l'admission
+    de l'avatar sur l'hôte de l'enfant, on refuse un hôte revenu dans la
+    lignée, et on exige que le profil réellement écrit soit celui évalué."""
+    if canon is None:
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "own placement cannot be re-evaluated without the canon")
+    if host not in (row.get("admitted_hosts") or []):
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "host %s is not in the child's own admitted hosts: own placement lost" % host)
+    lineage_hosts = _lineage_hosts(by_name, row.get("created_by"))
+    if host in lineage_hosts:
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "host %s belongs to the child's lineage (%s): own placement lost"
+            % (host, ", ".join(lineage_hosts)))
+    verdict = placement_mod.evaluate(canon, root["name"], host)
+    if verdict.ok is not True:
+        return verdict
+    card = canon.agent(root["name"])
+    if card is None:
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "avatar card %s is no longer readable: own placement not granted"
+            % root["name"])
+    actual = (row.get("harness"), row.get("provider"), row.get("model"),
+              row.get("credential_mode"))
+    expected = (card.harness, card.provider, card.model, verdict.credential_mode)
+    if actual != expected:
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "profile diverged from the one evaluated for avatar %s (evaluated: %r; "
+            "child: %r): own placement not granted" % (root["name"], expected, actual),
+            verdict.ref)
+    verdict.profile = row.get("profile_now")
+    return verdict
+
+
 def _inherit_placements(db: Db, host: str, canon: Canon | None = None) -> None:
     """Les éphémères de cet hôte héritent du verdict de placement de leur
     créateur racine du canon (C4), à condition d'avoir le profil que ce
     verdict a jugé : même hôte, même harnais, même fournisseur, même modèle,
     même mode (profil courant de l'éphémère = profil évalué du créateur).
     Sinon, refusé : « profil divergé ». Un éphémère issu d'un agent inscrit à
-    la main n'est pas gouverné : il n'est pas touché. Ni action, ni colonne
-    d'état."""
+    la main n'est pas gouverné : il n'est pas touché. Un enfant d'avatar
+    (#7107, `admitted_hosts` posé) est réévalué sur SON hôte, jamais jugé au
+    verdict mono-hôte du parent. Ni action, ni colonne d'état."""
     rows = storage.of(db).canon.lineage_rows()
     by_name = {row["name"]: row for row in rows}
     for row in sorted(rows, key=lambda r: r["name"]):
@@ -1548,6 +1612,10 @@ def _inherit_placements(db: Db, host: str, canon: Canon | None = None) -> None:
             verdict = placement_mod.Verdict(
                 row["name"], host, False,
                 "unverifiable lineage (%s): placement not inherited" % broken)
+        elif row.get("admitted_hosts"):
+            # #7107 : enfant d'avatar sur son propre hôte — le verdict du
+            # parent (mono-hôte) ne s'hérite pas ; on réévalue le sien.
+            verdict = _own_child_verdict(canon, row, root, host, by_name)
         elif root.get("host") != host:
             verdict = placement_mod.Verdict(
                 row["name"], host, False,
@@ -2795,13 +2863,19 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
     L'insertion est atomique (INSERT … SELECT sur la ligne du créateur) : le
     responsable copié est celui du créateur au moment de la création. Un
     créateur éphémère transmet aussi son échéance (l'enfant ne lui survit pas).
-    Le verdict de placement (C4) est recopié lui aussi, avec le profil évalué
-    du créateur : l'éphémère tourne sur le même hôte, avec le même harnais, le
-    même fournisseur, le même modèle et le même mode — mais un verdict admis
-    n'est hérité que si ce profil (celui du créateur au moment de la
-    création) est encore le profil évalué ; sinon l'éphémère naît refusé
-    (« profil divergé »). `canon sync` le rafraîchit ensuite depuis le
-    créateur racine.
+
+    Sans carte `avatar` lue (créateur non gouverné, ou `canon=None`), le
+    verdict de placement (C4) est recopié du créateur, avec le profil évalué :
+    l'éphémère tourne sur le même hôte, avec le même harnais, le même
+    fournisseur, le même modèle et le même mode — mais un verdict admis n'est
+    hérité que si ce profil est encore le profil évalué (« profil divergé »).
+
+    #7107 (avatar B5, docs/design/5322-avatar-humain.md §3.6) : un avatar
+    (`avatar.children`, défaut `own-host`) place son enfant sur un hôte propre,
+    jamais sur l'hôte, l'UID ou le runner de sa lignée ; voir
+    `avatar_children.place_child`. `none` refuse (`spawn-forbidden`), `pod`
+    est hors lot (B5b, `spawn-pod-unsupported`), et sans placement propre
+    `spawn` refuse (`spawn-no-placement`) au lieu de replier sur le parent.
     """
     if not NAME_RE.match(name or ""):
         raise SpawnError("invalid agent name: %r" % (name,))
@@ -2824,11 +2898,55 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
         raise SpawnError("creator %s is an expired ephemeral" % creator)
     if parent.get("status") == "stopped":
         raise SpawnError("creator %s is stopped" % creator)
-    created = storage.of(db).ephemerals.create(
-        name, creator, cwd=os.path.abspath(os.path.expanduser(cwd)) if cwd else None,
-        ttl_seconds=ttl_seconds)
+    placement = None
+    canons = (None if canon is None else
+              list(canon) if isinstance(canon, (list, tuple)) else [canon])
+    if canons is not None:
+        try:
+            lineage = avatar_children.lineage(db, creator)
+        except avatar_children.PlacementError as exc:
+            raise SpawnError(str(exc)) from exc
+        if not lineage:
+            raise SpawnError("%s: creator %s disappeared from the registry"
+                             % (avatar_children.SPAWN_LINEAGE_BROKEN, creator))
+        root = lineage[-1]
+        canon_obj, root_card = avatar_children.canon_for(
+            canons, root.get("name") or "", root.get("canon"))
+        if root_card is None:
+            # Une ligne gouvernée par un canon qu'on n'a pas pu lire ne retombe
+            # jamais sur le placement du parent : fail closed (une carte
+            # `children: none` ou `own-host` ne doit pas devenir invisible
+            # parce que le canon est momentanément illisible).
+            if (root.get("canon_ref") or "").strip():
+                raise SpawnError(
+                    "%s: creator %s is governed by %s but no readable canon declares "
+                    "it: refusing instead of placing the child on the parent's host"
+                    % (avatar_children.SPAWN_CANON_UNREADABLE,
+                       creator, root.get("canon_ref")))
+        else:
+            try:
+                placement = avatar_children.place_child(
+                    db, canon_obj, root_card, name, lineage_rows=lineage, cwd=cwd)
+            except avatar_children.PlacementError as exc:
+                raise SpawnError(str(exc)) from exc
+    if placement is None:
+        created = storage.of(db).ephemerals.create(
+            name, creator, cwd=os.path.abspath(os.path.expanduser(cwd)) if cwd else None,
+            ttl_seconds=ttl_seconds)
+    else:
+        created = storage.of(db).ephemerals.create(
+            name, creator, cwd=placement.cwd, ttl_seconds=ttl_seconds,
+            host=placement.host, admitted_hosts=[placement.host],
+            credential_mode=placement.credential_mode,
+            evaluated_profile=placement.evaluated_profile,
+            evaluated_identity=placement.evaluated_identity,
+            placement={"ok": placement.verdict.ok,
+                       "diagnostic": placement.verdict.diagnostic,
+                       "ref": placement.verdict.ref})
     if created is None:
         if storage.of(db).ephemerals.exists(name):
             raise SpawnError("an agent %s already exists" % name)
         raise SpawnError("creator %s changed during creation: retry" % creator)
+    if placement is not None:
+        created["placement"] = placement.describe()
     return created
