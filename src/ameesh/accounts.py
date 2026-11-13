@@ -157,6 +157,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, NamedTuple
 
 from . import auth_failure, gauge_probe, harnesses, platform, storage
+from . import db as db_mod
 from .config import NAME_RE
 from .cost import PACE_CEILING, reading_outdated, stale_reading
 
@@ -167,6 +168,10 @@ TYPES = ("config_dir", "api_key_env")
 #: L226b (owner decision 2026-10-07, "primaries last, capped"): defaults of the
 #: per-account settings `cap`, `overage_cap` and `priority`
 PRIMARY_CAP = 0.50          #: the harness's default account leaves half of each window to the owner
+#: L226b/#6961 : libellé du plafond implicite du compte par défaut, que L242b
+#: écarte pour un agent critique — il ne se partage donc jamais en pause de
+#: compte (`Evaluation.hard_all`).
+CAP_LABEL_PRIMARY = "primary cap"
 #: L242b (2): a non-critical agent stops this much below the pace cap, so that
 #: the critical agents keep the margin up to it
 RESERVE = 0.10
@@ -1130,6 +1135,12 @@ class Evaluation:
     #: L226b: held back by an absolute rule (in overage, past a fixed cap),
     #: not only by its pace: no budget setting lifts it
     hard: bool = False
+    #: #6961 (l242b) : le plafond fixe qui retient vaut AUSSI pour un agent
+    #: critique — plafond du compte (`cap`), d'overage, ou compte en overage.
+    #: Faux quand seul le plafond implicite de 50 % du compte par défaut
+    #: retient : L242b l'écarte pour un critique, et une pause partagée
+    #: publiée sur ce seul motif l'écarterait à tort.
+    hard_all: bool = False
     #: #3647 : {clé de jauge: perte prévue au reset} des fenêtres dont le
     #: rythme est relevé (`underused_floor`)
     raises: dict = field(default_factory=dict)
@@ -1517,7 +1528,7 @@ def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tupl
     if critical and profile.cap is None:
         cap = None
     if cap is not None:
-        fixed.append((cap, "primary cap" if profile.cap is None else "account cap"))
+        fixed.append((cap, CAP_LABEL_PRIMARY if profile.cap is None else "account cap"))
     if overage_capable(profile, getattr(gauges, "overage", None)):
         fixed.append((profile.overage_cap, "overage cap"))
     return fixed
@@ -1670,6 +1681,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # #313 : le refus d'un compte partagé avec un autre mesh est une règle
         # absolue — la garde de budget désactivée ne le lève pas
         result.hard = bool(getattr(profile, "refused", ""))
+        result.hard_all = result.hard
         return result
     from .codex_gauges import AmbiguousCodexGauges
     if _gauges is not None:
@@ -1681,6 +1693,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         except AmbiguousCodexGauges as exc:
             result.reason = str(exc)
             result.hard = True
+            result.hard_all = True
             return result
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
@@ -1689,6 +1702,9 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # L226b: an account in overage is never chosen (no spending beyond the plan)
         result.reason = "%s plan: in overage (billed beyond the plan)" % profile.harness
         result.hard = True
+        # #6961 : l'overage est un plafond du compte, il vaut aussi pour un
+        # agent critique (contrairement au plafond implicite de 50 %).
+        result.hard_all = True
         # eligible again once the windows that ran out have reset
         spent = result.gauges.spent()
         resets = [g.resets_at for g in spent if g.resets_at]
@@ -1721,6 +1737,10 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         fixed = fixed_caps(profile, result.gauges, critical=critical)
         hard = [(g, pair) for g in depasses for pair in fixed if g.used_at(now) >= pair[0]]
         result.hard = bool(hard)
+        # #6961 (l242b) : « primary cap » est le plafond implicite de 50 % du
+        # compte par défaut, que L242b écarte pour un agent critique. Seul un
+        # plafond qui vaut aussi pour lui (compte, overage) est partageable.
+        result.hard_all = any(label != CAP_LABEL_PRIMARY for _gauge, (_cap, label) in hard)
         # an absolute cap first in the reason: the pace may be lower, it is
         # not what holds the account
         gauge, (cap, label) = hard[0] if hard else (depasses[0],
@@ -2503,6 +2523,74 @@ def _holds_valid(holds: dict, now: float) -> set[str]:
             if hold.get("until_ts") is not None and float(hold["until_ts"]) > now}
 
 
+#: #6961 : tolérance entre deux horodatages de relevé (secondes). Les dates
+#: Codex varient de quelques millisecondes pour un même événement ; en deçà,
+#: un relevé n'est pas « plus récent » que la pause qu'il devrait lever.
+PAUSE_READ_EPS = 1e-3
+
+
+def _pause_valid(pause: dict | None, now: float) -> bool:
+    """#6961 : la pause partagée court-elle encore à `now` ?"""
+    if not pause:
+        return False
+    until = pause.get("until_ts")
+    try:
+        return until is not None and float(until) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def _pause_lifted_by(pause: dict | None, ev: Evaluation | None) -> bool:
+    """#6961 : un relevé PLUS RÉCENT que la pause et sous le plafond la lève.
+
+    La comparaison porte sur `observed_at` (l'instant du relevé qui a fondé la
+    pause), jamais sur l'heure d'insertion : un relevé ancien arrivé tard ne
+    contredit pas une observation plus fraîche (#1132). Un relevé non daté ne
+    lève rien — la prudence garde la pause. `hard_all` (#6961, l242b), jamais
+    `hard` : le plafond implicite de 50 % d'un non-critique ne maintient pas
+    une pause partagée que le critique a le droit de franchir."""
+    if pause is None or ev is None or ev.hard_all:
+        return False
+    observed = pause.get("observed_at")
+    read_at = _read_at_of(ev.gauges)
+    if observed is None or read_at is None:
+        return False
+    return float(read_at) > float(observed) + PAUSE_READ_EPS
+
+
+def _read_pauses(store, harness: str) -> dict:
+    """#6961 : lit la pause partagée sans jamais casser la garde.
+
+    Une table absente (déploiement par vagues, migration pas encore appliquée)
+    ou un droit refusé ne doit pas suspendre tous les tours du harnais : la
+    garde locale reste la décision, la pause partagée est une défense en plus.
+    Une base réellement injoignable a déjà fait échouer `_etat_placement`
+    avant cet appel."""
+    try:
+        return store.account_pauses(harness)
+    except db_mod.DbError:
+        return {}
+
+
+def _paused_names(pauses: dict, cache: dict, now: float) -> set[str]:
+    """#6961 : les comptes que la pause partagée écarte du placement.
+
+    Une pause échue ne compte pas ; une pause qu'un relevé local plus récent
+    et sous le plafond a levée non plus (la fenêtre s'est remise à zéro).
+    Un compte non encore évalué reste écarté : c'est justement le cas d'un
+    agent dont la lecture locale est plus ancienne que l'observation qui a
+    posé la pause."""
+    out = set()
+    for name, pause in (pauses or {}).items():
+        if not _pause_valid(pause, now):
+            continue
+        ev = cache.get(name)
+        if _pause_lifted_by(pause, ev):
+            continue
+        out.add(name)
+    return out
+
+
 def _etat_placement(store, host: str, harness: str, items: list[Profile],
                     now: float) -> tuple[set[str], set[str]]:
     """#1883 (R3 auditeur, B1) : retenues valides et identités contredites,
@@ -2675,20 +2763,29 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     if not simulate:
         _publish_identities(store, host, harness, items, cfg=cfg, environ=environ)
     retenus, conflits = _etat_placement(store, host, harness, items, now)
+    # #6961 : la pause de compte est l'observation PARTAGÉE (tous hôtes) du
+    # plafond dur. Elle se lit même en simulation (le prochain tour réel la
+    # subira) ; elle n'est publiée que par une décision réelle. Un compte
+    # qu'elle frappe ne reçoit aucun tour, même si la lecture locale de cet
+    # agent est plus ancienne et le dit sous le seuil — c'est le témoin du
+    # lot (deux agents, le premier pose la pause, le second ne démarre pas).
+    pauses = _read_pauses(store, harness)
 
     # #1883 (R2 auditeur, B1) : la décision est une fonction du jeu d'écartés
     # (retenues d'overage, identités en conflit) ; `choose` la rejoue sur un
     # jeu FRAIS avant de rendre un compte (voir la reprise après l'appel).
-    def decide(retenus: set[str], conflits: set[str], sick: dict) -> Choice:
+    def decide(retenus: set[str], conflits: set[str], sick: dict,
+               pauses: dict) -> Choice:
         """La décision de placement pour un jeu d'écartés donné.
 
-        Un compte retenu ou d'identité contredite ne reçoit aucun tour : ces
-        écartés priment sur le forçage, la continuité et le classement.
-        Les jeux sont relus à l'instant du placement (R2 auditeur, B1), comme
-        les échecs d'authentification `sick` (#4489)."""
+        Un compte retenu, d'identité contredite ou frappé d'une pause de
+        compte (#6961) ne reçoit aucun tour : ces écartés priment sur le
+        forçage, la continuité et le classement. Les jeux sont relus à
+        l'instant du placement (R2 auditeur, B1), comme les échecs
+        d'authentification `sick` (#4489)."""
         nonlocal row, cache
         candidates = [p for p in healthy(items, sick) if p.name not in epuises]
-        ecartes = retenus | conflits
+        ecartes = retenus | conflits | _paused_names(pauses, cache, now)
 
         def stuck_exhausted(own: Profile | None) -> Profile | None:
             """Le compte épuisé à rendre quand aucun autre n'est plaçable : la
@@ -2706,15 +2803,21 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             if profile.name in sick:
                 return Choice(None, profile, forced=True, auth_blocked=True,
                               reason="forced account %s: authentication failing on this host" % profile.name)
+            if profile.name in retenus:
+                return Choice(None, profile, reason=(
+                    "account %s forced (ameesh accounts use): in overage for another "
+                    "runner of this host" % profile.name), forced=True)
+            if profile.name in _paused_names(pauses, cache, now):
+                return Choice(None, profile, reason=(
+                    "account %s forced (ameesh accounts use): paused at its "
+                    "account hard cap for every host (%s)"
+                    % (profile.name, (pauses.get(profile.name) or {}).get("reason")
+                       or "hard cap")), forced=True)
             if profile.name in conflits:
                 return Choice(None, profile, reason=(
                     "account %s forced (ameesh accounts use): declared with another "
                     "folder by a second configuration of this host" % profile.name),
                     forced=True)
-            if profile.name in retenus:
-                return Choice(None, profile, reason=(
-                    "account %s forced (ameesh accounts use): in overage for another "
-                    "runner of this host" % profile.name), forced=True)
             if profile.name in epuises:
                 return Choice(None, profile, reason=(
                     "account %s forced (ameesh accounts use): provider credits "
@@ -2734,6 +2837,14 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             # the force is lifted (journaled `auto`) and the automatic choice runs.
             # #1672 : le remplaçant doit être réellement plaçable — un compte à
             # relevé périmé ne lève pas le forçage pour une pause.
+            # #6961 : les relevés de TOUS les comptes peuvent lever une pause
+            # partagée plus ancienne (le forçage de l'actif vient d'être évalué,
+            # pas les autres). Les évaluer avant la liste des remplaçants,
+            # sinon un compte libre reste écarté sur la pause que sa lecture
+            # locale, plus récente, contredit.
+            for profile in candidates:
+                ev(profile)
+            ecartes = retenus | conflits | _paused_names(pauses, cache, now)
             free = [p for p in candidates if p.name != active.name
                     and p.name not in ecartes
                     and placeable(ev(p), now)
@@ -2781,6 +2892,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                               "threshold" % own.name)
         for profile in items:
             ev(profile)
+        # #6961 : les relevés viennent d'être lus. Une pause que l'un d'eux —
+        # plus récent que l'observation partagée et sous le plafond — vient de
+        # lever ne doit plus écarter le compte ; inversement, une pause lue
+        # avant l'évaluation reste valable pour un compte non évalué.
+        ecartes = retenus | conflits | _paused_names(pauses, cache, now)
         # #1883 : jamais de placement sur un compte qu'un autre runner a fui en
         # dépassement, ni sur un nom que deux configurations déclarent vers
         # deux dossiers
@@ -2850,6 +2966,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             why = "%sall %s accounts at threshold — %s" % (
                 pause_label(cache), harness, _label(cache))
             ecartes_why = []
+            frappes = _paused_names(pauses, cache, now) - retenus - conflits
             if conflits:
                 ecartes_why.append(
                     "%s declared with different folders by two configurations of "
@@ -2857,6 +2974,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             if retenus:
                 ecartes_why.append("%s held for overage seen on this host"
                                    % ", ".join(sorted(retenus)))
+            if frappes:
+                ecartes_why.append(
+                    "%s paused at the account hard cap (seen on another host of "
+                    "the mesh; no local reading contradicts it)"
+                    % ", ".join(sorted(frappes)))
             if invalides:
                 why = invalides + "".join("; %s" % e for e in ecartes_why)
             elif ecartes_why:
@@ -2891,7 +3013,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                         _gauges=gauge_probe.merge(state.gauges, fresh, now=now))
                     refreshed = True
                 if refreshed:
-                    return decide(retenus, conflits, sick)
+                    return decide(retenus, conflits, sick, pauses)
             return Choice(None, active, reason=why)
         target = ranked[0]
         why = reason_of(ranked, cache, now)
@@ -2972,28 +3094,92 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # publié par un autre runner de l'hôte entre la lecture de `sick` et la
     # bascule ne fait pas partir un tour sur ce compte (la reprise saute au
     # suivant sain, ou rend `auth_blocked`).
-    choice = decide(retenus, conflits, sick)
+    def _sync_pauses() -> None:
+        """#6961 : publie les plafonds durs observés, lève les pauses dépassées.
+
+        Seuls les relevés HARD et DATÉS (`ev.until`) publient : une pause sans
+        échéance serait éternelle. La publication la plus récente gagne (le
+        stockage compare `observed_at`) ; un relevé plus récent, sous le
+        plafond, lève la pause — la fenêtre s'est remise à zéro ou un autre
+        hôte l'a vue repasser sous son plafond. En simulation (L39), rien
+        n'est écrit."""
+        for profile in items:
+            state = cache.get(profile.name)
+            pause = pauses.get(profile.name)
+            observed = _read_at_of(state.gauges) if state is not None else None
+            # #6961 (l242b) : `hard_all`, jamais `hard` — le plafond implicite
+            # de 50 % d'un non-critique ne se partage pas : une pause publiée
+            # dessus écarterait un agent critique autorisé au-delà (défaut
+            # trouvé par tests.test_l242b_critical_accounts).
+            if state is not None and state.hard_all and state.until \
+                    and float(state.until) > now:
+                stamp = observed if observed is not None else now
+                if (pause is not None
+                        and float(pause.get("until_ts") or 0.0) >= float(state.until)
+                        and float(pause.get("observed_at") or 0.0) >= float(stamp)):
+                    continue
+                if not simulate:
+                    try:
+                        store.publish_account_pause(
+                            harness, profile.name, float(state.until), float(stamp),
+                            state.reason or "account at hard cap",
+                            source="%s@%s" % (agent or "?", host))
+                    except db_mod.DbError:
+                        # défense en plus : la clôture/le refus local tient
+                        continue
+                pauses[profile.name] = {
+                    "until_ts": float(state.until), "observed_at": float(stamp),
+                    "reason": state.reason or "account at hard cap",
+                    "source": "%s@%s" % (agent or "?", host)}
+            elif pause is not None and (not _pause_valid(pause, now)
+                                        or _pause_lifted_by(pause, state)):
+                # #6961 (B codex) : la levée compare et supprime dans la même
+                # instruction, sur l'observation de la pause LUE. Une pause
+                # publiée entre cette lecture et la suppression (un autre hôte
+                # voit le plafond dur plus tard) n'est jamais effacée : la
+                # relecture finale la verrait vide et placerait le compte au
+                # plafond. Sans observation (ligne impossible : NOT NULL), on
+                # ne supprime pas — la prudence garde la pause.
+                seen = pause.get("observed_at")
+                if seen is None:
+                    continue
+                leve = True
+                if not simulate:
+                    try:
+                        leve = store.release_account_pause(
+                            harness, profile.name, float(seen))
+                    except db_mod.DbError:
+                        leve = False    # la pause reste pour les autres : prudent
+                if leve:
+                    pauses.pop(profile.name, None)
+
+    choice = decide(retenus, conflits, sick, pauses)
+    _sync_pauses()
     for _ in range(VALIDATION_ESSAIS):
         if choice.profile is None or choice.auth_blocked:
             return choice
         frais, conflits_frais = _etat_placement(store, host, harness, items, now)
+        pauses_frais = _read_pauses(store, harness)
         sick = auth_failure.failing(db, host, harness)
         if (choice.profile.name not in frais
                 and choice.profile.name not in conflits_frais
+                and choice.profile.name not in _paused_names(pauses_frais, cache, now)
                 and choice.profile.name not in sick):
             return choice
         # reprise : la décision est rejouée sur l'état frais — forçage levé
-        # pour un compte libre, continuité rompue, compte écarté du classement.
-        # Le compte actif partagé est relu : une bascule de la décision
-        # précédente a pu le déplacer.
+        # pour un compte libre, continuité rompue, compte écarté du classement
+        # ou frappé d'une pause de compte (#6961). Le compte actif partagé est
+        # relu : une bascule de la décision précédente a pu le déplacer.
         row = store.active(host, harness) or row
         active_name = row.get("account")
         active = by_name(items, active_name) or active
-        choice = decide(frais, conflits_frais, sick)
+        pauses = pauses_frais
+        choice = decide(frais, conflits_frais, sick, pauses)
+        _sync_pauses()
     return Choice(None, active, reason=(
         "no %s account to place: the placement state changed on every re-read "
-        "(a hold, an identity conflict or an authentication failure was "
-        "published while deciding); "
+        "(a hold, an account pause, an identity conflict or an authentication "
+        "failure was published while deciding); "
         "retrying next turn" % harness))
 
 

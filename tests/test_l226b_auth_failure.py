@@ -949,12 +949,17 @@ class UnpacedChoiceTest(_AuthBase):
     def setUp(self) -> None:
         super().setUp()
         self.now = time.time()
+        # #6961 : les relevés partagés sont datés (`read_at`) ; une pause de
+        # compte ne se lève que sur un relevé PLUS RÉCENT que l'observation
+        # qui l'a posée. Le relevé en overage précède celui qui ne l'est plus.
         self.overage = cost.Gauges([cost.Gauge(
-            "claude", "five_hour", 0.10, self.now + HOUR, 5 * HOUR)],
+            "claude", "five_hour", 0.10, self.now + HOUR, 5 * HOUR,
+            read_at=self.now - 600)],
             cost.Overage(capable=True, in_use=True))
         # past its pace only (95 % at a third of the window)
         self.paced = cost.Gauges([cost.Gauge(
-            "claude", "five_hour", 0.95, self.now + 3.5 * HOUR, 5 * HOUR)])
+            "claude", "five_hour", 0.95, self.now + 3.5 * HOUR, 5 * HOUR,
+            read_at=self.now)])
 
     def _choose(self, items, gauges, **kwargs):
         return accounts.choose(self.db, self.cfg.host, "claude", items, _Book(gauges),
