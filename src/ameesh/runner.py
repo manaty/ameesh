@@ -8614,6 +8614,14 @@ class AgentWorker(threading.Thread):
         from . import resident_runner
         if not resident_runner.enabled(self._state_read(resident_runner.SETTING)):
             return "resident=off"
+        if self.agent.get("created_by"):
+            # #7034 (B de revue 39559) : la politique d'outils/MCP d'un enfant
+            # n'est appliquée qu'à l'argv du tour par événement. Un processus
+            # résident tourne avec `--dangerously-skip-permissions` et sans
+            # `--tools`/`--mcp-config` : l'y laisser servir un tour élargirait
+            # l'enfant à tous les outils et tous les MCP, exactement ce que le
+            # lot interdit. Fail closed, quel que soit le réglage `resident`.
+            return "spawned child (#7034): policy applied per turn only"
         if self.runner.once:
             return "one turn only (--once)"
         if getattr(self.runner, "mediated", False):
@@ -16961,6 +16969,16 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
               file=sys.stderr)
     if (agent.get("host") or "") != cfg.host:
         print("agent %s pinned to %s, not to %s" % (name, agent.get("host") or "?", cfg.host),
+              file=sys.stderr)
+        return 1
+    # #7034 (N1 de la revue 39559) : la session interactive ne reçoit ni
+    # `--tools` ni `--mcp-config` ; attach à un enfant restreint serait une
+    # session avec tous les outils et tous les MCP. Refus explicite, jamais un
+    # élargissement silencieux : le parent reste attachable, et les rapports
+    # de l'enfant disent ce qu'il a fait.
+    if storage.of(db).ephemerals.profile(name) is not None:
+        print("agent %s is a restricted child (#7034): its tool/MCP policy is not "
+              "applied to an interactive session; attach the parent instead" % name,
               file=sys.stderr)
         return 1
     try:

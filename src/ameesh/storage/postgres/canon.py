@@ -798,7 +798,8 @@ class Ephemerals(interface.Ephemerals):
     def create(self, name, creator, *, cwd, ttl_seconds, host=None,
                admitted_hosts=None, credential_mode=None,
                placement=None, evaluated_profile=None,
-               evaluated_identity=None) -> dict | None:
+               evaluated_identity=None, profile=None,
+               context=None) -> dict | None:
         """Insertion atomique (INSERT … SELECT sur la ligne du créateur).
 
         Sans `host` : comportement R14, le responsable, l'hôte, le dossier et

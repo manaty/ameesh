@@ -46,6 +46,10 @@ class SpawnPolicyTest(_CanonDbCase):
         self.assertEqual(profile["harness"], self.row("aide")["harness"])
         self.assertEqual(profile["tools"], ["git"])
         self.assertEqual(profile["mcp"], ["transport-readonly"])
+        # #7034 × #7107 : les serveurs retenus sont joints au profil, pour un
+        # enfant placé sur un hôte qui n'a pas le `.mcp.json` du parent.
+        self.assertEqual(profile["mcp_servers"],
+                         {"transport-readonly": {"command": "true"}})
         self.assertRegex(profile["config_digest"], r"^[0-9a-f]{64}$")
         self.assertEqual(profile["config_digest"],
                          spawn.policy_digest(["git"], ["transport-readonly"]))
@@ -150,6 +154,16 @@ class SpawnApplyTest(unittest.TestCase):
         with self.assertRaises(spawn.SpawnToolsError) as ctx:
             spawn.write_profile(self.state, self.profile(harness="codex"), self.cwd)
         self.assertEqual(ctx.exception.code, "spawn-tools-unsupported")
+
+    def test_stored_servers_are_written_without_the_project_file(self):
+        profile = self.profile(mcp_servers={"readonly": {"command": "true"}})
+        elsewhere = tempfile.mkdtemp(prefix="ameesh-7034-other-host-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(elsewhere, True))
+        path, mcp_path = spawn.write_profile(self.state, profile, elsewhere)
+        self.assertTrue(os.path.exists(path))
+        with open(mcp_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["mcpServers"],
+                             {"readonly": {"command": "true"}})
 
     def test_context_reads_one_utf8_file_and_refuses_a_directory(self):
         path = os.path.join(self.cwd, "context.md")
@@ -358,3 +372,54 @@ class SpawnRunnerTest(PgTestCase):
         self.assertTrue(self.db.query(
             "SELECT 1 AS x FROM conversation_log WHERE agent = %s"
             " AND event_id = %s", (parent, "child:%s:final" % name)))
+
+
+class RestrictedNeverResidentTest(PgTestCase):
+    """B de la revue 39559 : le chemin résident ne sert jamais un enfant.
+
+    Le processus résident tourne avec `--dangerously-skip-permissions` et sans
+    les arguments de la politique : l'y laisser servir un tour élargirait
+    l'enfant à tous les outils et tous les MCP. Le refus vaut même si le
+    réglage `resident` est à `on` ; `attach` est refusé pour la même raison,
+    sans second chemin qui contournerait la liste.
+    """
+
+    def child(self, name: str):
+        from ameesh import registry
+        from ameesh.runner import AgentWorker, Runner
+        cwd = os.path.join(self.tmp, "work", name)
+        os.makedirs(cwd, exist_ok=True)
+        runner = Runner(self.cfg, self.db, once=False)
+        self.register(name, "claude", cwd=cwd)
+        self.register("parent", "claude", cwd=cwd)
+        self.db.execute(
+            "UPDATE agent_registry SET ephemeral = true, created_by = 'parent',"
+            " ephemeral_expires_at = now() + interval '1 hour' WHERE name = %s",
+            (name,))
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        os.makedirs(worker.state_dir, exist_ok=True)
+        with open(os.path.join(worker.state_dir, "resident"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("on")
+        return runner, worker
+
+    def test_a_spawned_child_never_uses_a_resident(self):
+        _runner, worker = self.child("child-resident")
+        self.assertIn("spawned child", worker._resident_refusal(None, False))
+
+    def test_attach_of_a_restricted_child_is_refused(self):
+        import contextlib
+        import io
+        from ameesh import runner as runner_mod
+        _runner, worker = self.child("child-attach")
+        self.db.execute(
+            "INSERT INTO spawn_profiles (child, parent, harness, tools, mcp, config_digest)"
+            " VALUES (%s, 'parent', 'claude', ARRAY['git'], ARRAY[]::text[], %s)",
+            (worker.name, spawn.policy_digest(["git"], [])))
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(runner_mod.run_attach(self.cfg, self.db, worker.name), 1)
+        self.assertIn("restricted child", error.getvalue())
