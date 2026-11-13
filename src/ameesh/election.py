@@ -1119,8 +1119,10 @@ def handover_due(db, role: Mapping, holder_host: str, *,
 # observability
 # --------------------------------------------------------------------------
 def elected_names(db) -> list[str]:
+    """The cross-host roles listed by `ameesh role status` without argument:
+    `election` and, since #7059, `preference` (#7048, same lease)."""
     rows = db.query(
-        "SELECT name FROM agent_registry WHERE releve = 'election'"
+        "SELECT name FROM agent_registry WHERE releve IN ('election', 'preference')"
         " ORDER BY name")
     return [row["name"] for row in rows]
 
@@ -1163,7 +1165,7 @@ def status(db, name: str) -> dict:
     return {
         "name": role.get("name"),
         "releve": role.get("releve"),
-        "elected": role.get("releve") == "election",
+        "elected": role.get("releve") in ("election", "preference"),
         "holder": holder,
         "lease_owner": role.get("lease_owner"),
         "epoch": role.get("lease_epoch"),
@@ -1181,6 +1183,9 @@ def format_status(report: Mapping) -> list[str]:
     name = report.get("name") or "?"
     if not report.get("elected"):
         return ["%s: not an elected role" % name]
+    # #7059 : un rôle `preference` se classe par l'ordre du Placement, pas
+    # par la disponibilité ; l'en-tête le dit, la colonne `pref` le montre.
+    preference = report.get("releve") == "preference"
     if report.get("stopped"):
         head = "%s: stopped (not elected)" % name
     elif report.get("holder"):
@@ -1189,6 +1194,8 @@ def format_status(report: Mapping) -> list[str]:
                    max(0, int(report.get("lease_left_s") or 0))))
     else:
         head = "%s: no holder (epoch %s)" % (name, report.get("epoch"))
+    if preference:
+        head += " — releve: preference (ranked by Placement order)"
     lines = [head]
     alerts = report.get("alerts_delegate") or {}
     if alerts.get("delegate") and alerts.get("delegate") != report.get("holder"):
@@ -1219,6 +1226,9 @@ def format_status(report: Mapping) -> list[str]:
                         "—" if item.get("ahead_s") is None
                         else "%dmn" % int(item["ahead_s"] // 60),
                         item.get("diagnostic") or ""))
+        if preference:
+            lines[-1] += "  (pref %s)" % ("—" if item.get("preference_rank") is None
+                                          else item["preference_rank"])
     lines.append("  (* holder; rank eligible = fresh, locally ready, gate "
                  "open, canon ok, placement admitted; route = can push an "
                  "alert from this host (#3568); delay = rank × %ds)"

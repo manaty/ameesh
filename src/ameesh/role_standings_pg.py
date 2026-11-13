@@ -64,9 +64,16 @@ def candidate(db, name: str, host: str) -> dict | None:
     return rows[0] if rows else None
 
 
-def elected_roles(db, host: str) -> list[dict]:
-    """Rows of the elected roles for which `host` is a declared candidate.
+CROSS_HOST_RELEVES = ("election", "preference")
 
+
+def elected_roles(db, host: str, *,
+                  releves: tuple[str, ...] = CROSS_HOST_RELEVES) -> list[dict]:
+    """Rows of the cross-host roles for which `host` is a declared candidate.
+
+    `releves` defaults to every cross-host relay (#7048: `preference` publishes
+    its standing like `election`); a reader that means "elected" only passes
+    `("election",)` — see `election_roles`.
     A stopped role is not elected: it is left out here, so no new standing is
     published until a human revives it (the lease, if any, still wears out).
     """
@@ -77,12 +84,22 @@ def elected_roles(db, host: str) -> list[dict]:
                session_account, operator_paused, operator_pause_reason,
                budget_usd, spent_usd
           FROM agent_registry
-         WHERE releve IN ('election', 'preference')
+         WHERE releve = ANY(%s)
            AND %s = ANY(candidats)
            AND status <> 'stopped'
            AND mode = 'execute'
          ORDER BY name
-        """, (host,))
+        """, (list(releves), host))
+
+
+def election_roles(db, host: str) -> list[dict]:
+    """#7059: the `releve: election` roles only, for which `host` is a candidate.
+
+    The merge guard of `forge_checks.doctor_lines` concerns the governance
+    roles elected by availability (§11); a `preference` avatar does not merge
+    on behalf of the mesh, so its candidate hosts are not held to it.
+    """
+    return elected_roles(db, host, releves=("election",))
 
 
 def latest_reading(db, host: str) -> dict | None:

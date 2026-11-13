@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         if not names:
             if args.json:
                 return 0
-            print("no elected role declared (releve: election)")
+            print("no elected role declared (releve: election or preference)")
             return 0
         reports = [election.status(db, name) for name in names]
         if args.json:
