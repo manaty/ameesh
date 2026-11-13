@@ -37,6 +37,9 @@ FILENAME = "turn-context.json"
 #: environment variable carrying the absolute path of the document
 ENV = "AMEESH_TURN_CONTEXT"
 FILE_MODE = 0o600
+#: #7050 : the additive `conversation` field (never the segment text)
+CONVERSATION_KEYS = ("move_id", "from_seq", "to_seq", "digest", "source_host",
+                     "source_session", "file")
 DIR_MODE = 0o700
 
 #: environment names whose value is a secret by construction
@@ -182,8 +185,13 @@ def build(*, turn_id: str, agent: str, host: str, kind: str, started_ts: float,
           requests: Iterable[dict], harness: str, model: str | None,
           budget_usd: float | None, spent_usd: float | None,
           spend_key: str | None, marker: dict | None,
-          reservation: dict | None, generated_ts: float | None = None) -> dict:
-    """Build and validate the ``ameesh-turn-context/1`` document."""
+          reservation: dict | None, generated_ts: float | None = None,
+          conversation: dict | None = None) -> dict:
+    """Build and validate the ``ameesh-turn-context/1`` document.
+
+    `conversation` (#7050, additive): the conversation move this turn
+    rehydrates — ids, bounds, digest and the path of the ``0600`` segment
+    file, never the segment text."""
     document = {
         "schema": SCHEMA,
         "generated_ts": time.time() if generated_ts is None else float(generated_ts),
@@ -216,6 +224,8 @@ def build(*, turn_id: str, agent: str, host: str, kind: str, started_ts: float,
             "reservation": _reservation(reservation),
         },
     }
+    if conversation is not None:
+        document["conversation"] = {key: conversation.get(key) for key in CONVERSATION_KEYS}
     validate(document)
     return document
 
@@ -280,6 +290,23 @@ def validate(document: Any) -> None:
         _number(reservation.get("usd"), "accounting.reservation.usd")
         _text(reservation.get("period"), "accounting.reservation.period")
         _text(reservation.get("state"), "accounting.reservation.state")
+    if "conversation" in document:
+        _conversation_validate(document["conversation"])
+
+
+def _conversation_validate(value: Any) -> None:
+    move = _object(value, "conversation")
+    _text(move.get("move_id"), "conversation.move_id")
+    for key in ("from_seq", "to_seq"):
+        seq = move.get(key)
+        if seq is not None and (isinstance(seq, bool) or not isinstance(seq, int)):
+            raise ContextError("conversation.%s must be an integer or null" % key)
+    digest = _text(move.get("digest"), "conversation.digest")
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ContextError("conversation.digest must be a SHA-256 hex digest")
+    _text(move.get("source_host"), "conversation.source_host")
+    _text(move.get("source_session"), "conversation.source_session", nullable=True)
+    _text(move.get("file"), "conversation.file")
 
 
 def _request_validate(row: Any, index: int) -> None:
@@ -337,18 +364,24 @@ def write(state_dir: str, document: dict, *, secrets: Iterable[str] | None = Non
     structural = {key: value for key, value in document.items() if key != "requests"}
     _refuse_secrets(json.dumps(structural, ensure_ascii=False, sort_keys=True,
                                separators=(",", ":")), secrets)
+    return write_private(state_dir, FILENAME, serialized)
+
+
+def write_private(state_dir: str, filename: str, text: str) -> str:
+    """Atomic ``0600`` file in the agent's ``0700`` state directory; a symlink
+    at the target is replaced, never followed. Returns the absolute path."""
     os.makedirs(state_dir, mode=DIR_MODE, exist_ok=True)
-    target = path(state_dir)
+    target = os.path.join(os.path.abspath(state_dir), filename)
     temporary = os.path.join(
         os.path.dirname(target),
-        ".%s.%d.%s.tmp" % (FILENAME, os.getpid(), uuid.uuid4().hex))
+        ".%s.%d.%s.tmp" % (filename, os.getpid(), uuid.uuid4().hex))
     flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
              | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
     handle = os.fdopen(os.open(temporary, flags, FILE_MODE), "w", encoding="utf-8")
     try:
         with handle:
             os.fchmod(handle.fileno(), FILE_MODE)
-            handle.write(serialized)
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)

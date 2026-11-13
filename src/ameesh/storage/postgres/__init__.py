@@ -26,6 +26,7 @@ from .ci import CiResults
 from .decisions import Decisions
 from .costs import TurnCosts
 from .conversations import Conversations
+from .conversation_moves import ConversationMoves
 from .credentials import Credentials
 from .events import Events
 from .external_executors import ExternalExecutors
@@ -47,6 +48,7 @@ from .prevalidation import PrevalidationReports
 from .progress import Progress
 from .projects import Projects
 from .provenance import Provenance
+from .attach_grants import AttachGrants
 from .roadmap import Roadmap
 from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
@@ -96,6 +98,7 @@ class PostgresStorage(interface.Storage):
         self.work_dependencies = WorkDependencies(db)
         self.work_footprints = WorkFootprints(db)
         self.provenance = Provenance(db)
+        self.attach_grants = AttachGrants(db)
         self.migration_reservations = MigrationReservations(db)
         self.lot_sessions = LotSessions(db)
         self.packages = WorkPackages(db)
@@ -123,3 +126,4 @@ class PostgresStorage(interface.Storage):
         self.ci = CiResults(db)
         self.prevalidation = PrevalidationReports(db)
         self.conversations = Conversations(db)
+        self.conversation_moves = ConversationMoves(db)

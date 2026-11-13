@@ -2,7 +2,8 @@
 #
 # Contrôle de santé local de la grappe etcd + Patroni (EP8.4b, lot #6870).
 # Le service écrit un JSON dans le journal et, s'il y a des alertes,
-# /run/ameesh-db/alertes.json pour le chemin de notification (EP8.5).
+# /run/ameesh-db/alertes.json, que le passage local d'ameesh notify relaie
+# sans la base (EP8.5, #6862 : src/ameesh/db_sante.py).
 # Une observation ratée n'échoue pas le service : elle produit une alerte
 # db_no_primary / db_etcd_no_quorum, pas un statut systemd en échec.
 [Unit]
@@ -18,7 +19,9 @@ EnvironmentFile=/etc/ameesh/patroni.env
 StateDirectory=ameesh-db
 StateDirectoryMode=0700
 RuntimeDirectory=ameesh-db
-RuntimeDirectoryMode=0750
+# #6862 : 0755, le notifieur d'ameesh (utilisateur ameesh) lit alertes.json
+# (0644 : types, seuils, noms de membres ; aucun secret). L'état reste 0700.
+RuntimeDirectoryMode=0755
 # Type=oneshot : sans cette option systemd supprime /run/ameesh-db à la fin
 # de la sonde, et alertes.json ne survit pas jusqu'à la notification EP8.5.
 # Vérifié sur le cycle réel d'une unité utilisateur (systemd 255).

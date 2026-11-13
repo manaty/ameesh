@@ -12,6 +12,10 @@ sentinelle `paquet (run proof unavailable)` sur une PR verte (h-17, run
 Témoin : les mêmes lecteurs que #2876 (preuve stricte `ci_green`, `fire`,
 `packet_automerge`, `merge_pr`) doivent verdir sur ce run, et bloquer dès
 qu'un check du portier n'a pas conclu sans échec.
+
+#6982 : l'admission d'un run annulé sans check CANCELLED repose sur une liste
+blanche de conclusions (SUCCESS, SKIPPED, NEUTRAL) ; TIMED_OUT et
+STARTUP_FAILURE ne sont pas des preuves de vert et bloquent.
 """
 import unittest
 
@@ -72,6 +76,20 @@ class PacketCancelledFinishedTest(unittest.TestCase):
             rows[1].update(conclusion=conclusion, status=status,
                            completedAt=OLD if status == "COMPLETED" else None)
             with self.subTest(conclusion=conclusion, status=status):
+                self.assert_gate(rows, False)
+
+    def test_the_cancelled_run_is_admitted_only_on_allowed_conclusions(self):
+        # #6982 : l'allowlist remplace l'exclusion du seul FAILURE. Un check
+        # du portier TIMED_OUT ou STARTUP_FAILURE n'établit aucune preuve.
+        for conclusion in ("SUCCESS", "SKIPPED", "NEUTRAL"):
+            rows = witness()
+            rows[1]["conclusion"] = conclusion
+            with self.subTest(conclusion=conclusion):
+                self.assert_gate(rows, True)
+        for conclusion in ("TIMED_OUT", "STARTUP_FAILURE"):
+            rows = witness()
+            rows[1]["conclusion"] = conclusion
+            with self.subTest(conclusion=conclusion):
                 self.assert_gate(rows, False)
 
     def test_a_cancelled_check_of_another_run_does_not_prove_the_latest(self):

@@ -238,6 +238,30 @@ class EnrollmentTest(unittest.TestCase):
         self.assertEqual(self.apply(stop=True)['outcome'], 'stopped')
         self.assertEqual(json.loads((self.stage / 'bundle.json').read_text()), prepared['bundle'])
 
+    def test_fresh_questions_refuse_a_window_no_signature_covers(self):
+        # #7019: an artifact-length window (+2 days) is refused at preparation,
+        # before any staging write, never at execution with a signature spent.
+        far = int(time.time()) + 2 * 86400
+        self.write(self.stage / 'input.json', dict(version=1, expires_at=far))
+        for ask in (self.prepare, lambda: self.engine.key_question(self.operation)):
+            with self.assertRaisesRegex(enroll.EnrollmentError, 'cannot be covered.*at most'):
+                ask()
+        self.assertFalse((self.stage / 'bundle.json').exists())
+        near = int(time.time()) + 50 * 60
+        self.write(self.stage / 'input.json', dict(version=1, expires_at=near))
+        self.assertIn('sign, then the gesture runs before',
+                      self.engine.key_question(self.operation)['deadline'])
+        prepared = self.prepare()
+        self.assertEqual(prepared['bundle']['expires_at'], near)
+        self.assertIn('sign, then the gesture runs before', prepared['deadline'])
+        # A stop question gets its own fresh window, bounded the same way.
+        with self.assertRaisesRegex(enroll.EnrollmentError, 'cannot be covered'):
+            self.engine.stop_question(self.operation, far)
+        stop = self.engine.stop_question(self.operation, near)
+        self.assertEqual(stop['options'], enroll.STOP_OPTIONS)
+        self.assertIn('sign, then the gesture runs before', stop['deadline'])
+        self.assertIn('sign, then', self.engine.stop_question(self.operation)['deadline'])
+
     def test_missing_signature_has_no_effect_and_drift_refuses_before_start(self):
         self.prepare()
         self.allow.validate.return_value = False

@@ -49,6 +49,9 @@ REWRITTEN = (
     "agent_registry.retired_by", "agent_watches.agent", "agent_watches.enabled_by",
     "alert_acknowledgements.actor", "budget_events.actor", "budget_limits.set_by",
     "commitments.created_by", "commitments.owner", "conversation_heads.agent",
+    # #7050 (0572): the move attempt follows the agent; its requester is an
+    # ordinary actor (not an approval), renamed like `work_items.planned_by`
+    "conversation_moves.agent", "conversation_moves.requested_by",
     "estimate_references.published_by", "external_executors.declared_by",
     "external_executors.retired_by", "github_watch_pending.agent", "host_lifecycle.actor",
     "host_lifecycle.return_requested_by", "host_lifecycle_transitions.actor",
@@ -106,6 +109,9 @@ KEPT = (
     # #6873 (0566) : la révocation est une preuve datée (acteur, raison), au
     # même titre que le reçu qu'elle retire ; un renommage ne la réécrit pas.
     "provenance_revocations.actor",
+    # #7119 (0574) : le journal des grants d'attach est une preuve datée (grant
+    # accepté ou refusé pour CET agent) ; un renommage ne le réécrit pas.
+    "attach_grant_events.agent", "attach_grant_events.checked_by",
     # #6669 (0564) : le journal additif des résolutions de constat est une
     # preuve historique (retrait, correction) que l'append-only interdit de
     # réécrire ; un renommage ne le déplace pas (corrector/adjudicator ne

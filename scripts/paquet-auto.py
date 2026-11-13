@@ -185,6 +185,12 @@ juste avant le gel et la poussée, quand rien n'est encore poussé : une cible
 qui atterrit pendant les ~12 min de contrats sort en 6 au lieu du refus
 `paquet-candidats` (rc 2) traduit en rc 1 et lot d'empreinte §16 par
 `paquet-horaire.py`.
+#6981 : une cible avancée par les **seuls commits d'atterrissage** d'une
+coupure (§12 : version et notes, `[skip ci]`) garde la composition, aux deux
+relectures comme à celle du gel ; tout autre commit lève encore `TargetMoved`.
+Seul un déplacement (`behind`, `diverged`) relance aussitôt : une référence
+illisible (`absent`, `dirty`, `unknown`) sort en 1 avec sa cause. Des contrats
+rouges restent le verdict même si la cible a bougé pendant eux (rc 5).
 
 Modes :
 
@@ -1766,13 +1772,19 @@ def changed_units(units: list[Unit], current: dict[int, str]) -> list[Discarded]
 
 
 def compute_candidates(worktree: Path, target: str, base_sha: str,
-                       ready_out: Path) -> tuple[list[Candidate], dict]:
+                       ready_out: Path, *, tolerate_landing: bool = False
+                       ) -> tuple[list[Candidate], dict]:
     """`paquet-candidats.py` **du worktree**, à la base exacte du paquet.
 
     #3813 : rc 3 est une liste utilisable avec des lots en erreur ; ces lots
     sont écartés (`errors_by_lot`), jamais composés. rc 1/2, ou un rc 3 sans
     `errors_by_lot`, interrompent : on ne compose pas sur une liste dont la
     lecture globale a échoué.
+
+    #6981 : avec `tolerate_landing`, le décalage #3782 est assumé
+    (`--allow-code-mismatch`) puis relu ici : il ne passe que si le code est
+    `base_sha`, propre, et que la référence n'en diffère que par des commits
+    d'atterrissage de coupure (§12). Tout autre décalage reste un refus.
     """
     script = worktree / CANDIDATES_SCRIPT
     if not script.is_file():
@@ -1783,6 +1795,8 @@ def compute_candidates(worktree: Path, target: str, base_sha: str,
     cmd = [python, str(script), "--repo", str(worktree),
            "--target", target, "--base", base_sha, "--json",
            "--ready-out", str(ready_out)]
+    if tolerate_landing:
+        cmd.append("--allow-code-mismatch")
     proc = run_command(cmd, cwd=worktree, timeout=DEFAULT_TIMEOUT,
                        env=python_env(worktree))
     stdout = _decode(proc.stdout)
@@ -1823,6 +1837,10 @@ def compute_candidates(worktree: Path, target: str, base_sha: str,
         raise PaquetAutoError(
             "paquet-candidats n'a pas lu la base imposée (%r) : la liste ne "
             "correspond pas au worktree" % payload.get("base_source"))
+    if tolerate_landing:
+        refusal = landing_mismatch(worktree, base_sha, payload)
+        if refusal:
+            raise PaquetAutoError("paquet-candidats a refusé (rc 2) : %s" % refusal)
     error_lots = {item.lot for item in errored}
     by_id = {int(entry["work_item"]): entry for entry in payload.get("candidates") or []}
     candidates: list[Candidate] = []
@@ -1859,10 +1877,63 @@ def candidates_guard():
         spec = importlib.util.spec_from_file_location(
             "paquet_candidats_guard", path)
         module = importlib.util.module_from_spec(spec)
-        sys.modules.setdefault("paquet_candidats_guard", module)
-        spec.loader.exec_module(module)
+        sys.modules["paquet_candidats_guard"] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            # #6981 : un chargement en échec ne laisse pas de module à moitié
+            # exécuté dans `sys.modules` ; l'appel suivant recharge.
+            sys.modules.pop("paquet_candidats_guard", None)
+            raise
         _CANDIDATES_GUARD = module
     return _CANDIDATES_GUARD
+
+
+#: #6981 : les relations #3782 qui disent une cible déplacée (le code de la
+#: base lui est antérieur, ou elle a été réécrite). Les autres refus
+#: (`absent`, `dirty`, `unknown`) sont une lecture en panne, pas un
+#: déplacement : ils ne consomment pas les relances immédiates de
+#: `paquet-horaire.py`.
+MOVED_RELATIONS = frozenset(("behind", "diverged"))
+
+
+def cutoff_landing_only(repo: Path, base: str, head: str) -> bool:
+    """#6981 : `head` ne diffère de `base` que par des commits d'atterrissage.
+
+    §12 : « sauf pour les seuls commits d'atterrissage d'une coupure (version,
+    notes) ». La preuve est celle de la fusion automatique
+    (`packet_automerge._cutoff_landing_only`, #3534) : chaque commit de
+    l'intervalle porte `ameesh-release:` et ne change que la ligne de version
+    de `pyproject.toml` et `docs/versions/*.md`. Illisible = False.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh.packet_automerge import _cutoff_landing_only
+    return _cutoff_landing_only(str(repo), base, head)
+
+
+def landing_mismatch(worktree: Path, base_sha: str, payload: dict) -> str:
+    """#6981 : le refus #3782 d'une liste lue avec `--allow-code-mismatch`.
+
+    "" si le code est la référence, ou s'il est `base_sha`, propre, et que la
+    référence n'en diffère que par des atterrissages de coupure ; sinon le
+    motif du refus que `paquet-candidats` aurait rendu.
+    """
+    relation = str(payload.get("code_relation") or "unknown")
+    code = str(payload.get("code_sha") or "")
+    ref = str(payload.get("code_ref") or "")
+    if relation == "same" and not payload.get("code_dirty"):
+        return ""
+    if (relation == "behind" and code == base_sha and ref
+            and not payload.get("code_dirty")
+            and cutoff_landing_only(worktree, base_sha, ref)):
+        print("paquet-candidats : référence %s en avance sur la base %s par "
+              "des atterrissages de coupure seuls, décalage toléré (§12)"
+              % (ref[:12], base_sha[:12]), flush=True)
+        return ""
+    return candidates_guard().code_refusal(
+        payload, ref, str(payload.get("code_ref_source") or "project-target")) \
+        or "code %s décalé de la référence %s (%s)" % (
+            code[:12] or "?", ref[:12] or "?", relation)
 
 
 def ensure_reference(repo: Path, target: str, base_sha: str) -> None:
@@ -1882,9 +1953,21 @@ def ensure_reference(repo: Path, target: str, base_sha: str) -> None:
     `code_refusal` fait foi : un code qui *contient* la référence (`ahead`)
     passe, comme pour `paquet-candidats` ; seuls les cas qu'il refuse
     (`behind`, `absent`, `diverged`, `dirty`, `unknown`) arrêtent les tests.
+
+    #6981 : une cible avancée par les seuls commits d'atterrissage d'une
+    coupure (§12 : version et notes, `[skip ci]`) garde la composition ; la
+    relecture du gel tolère ce même décalage (`tolerate_landing`).
+    Seuls `behind` et `diverged` lèvent `TargetMoved` (relance immédiate) ; un
+    autre refus (`absent`, `dirty`, `unknown`) n'est pas un déplacement de la
+    cible et lève `PaquetAutoError` avec sa cause, sans relance immédiate.
     """
     fresh = fresh_base(repo, target)
     if fresh == base_sha:
+        return
+    if cutoff_landing_only(repo, base_sha, fresh):
+        print("cible %s avancée par des atterrissages de coupure seuls (%s → "
+              "%s) : composition gardée (§12)"
+              % (target, base_sha[:12], fresh[:12]), flush=True)
         return
     # Un worktree de lecture à la base exacte : c'est ce code-là que les tests
     # locaux exécuteraient, et `code_provenance` y lit l'arbre, pas le clone.
@@ -1898,6 +1981,12 @@ def ensure_reference(repo: Path, target: str, base_sha: str) -> None:
         remove_worktree(repo, reader)
     if not refusal:
         return
+    relation = str(provenance.get("code_relation") or "unknown")
+    if relation not in MOVED_RELATIONS:
+        raise PaquetAutoError(
+            "référence #3782 illisible pour la cible %s (%s → %s, relation "
+            "%s) : %s ; tests locaux non lancés, pas de relance immédiate"
+            % (target, base_sha[:12], fresh[:12], relation, refusal))
     raise TargetMoved(
         "la cible %s a avancé pendant la composition (%s → %s) : %s ; "
         "tests locaux non lancés, clone mis à jour, recomposition immédiate"
@@ -5935,13 +6024,16 @@ def compose_packet(args: argparse.Namespace) -> int:
 
             `paquet-candidats` refuse un code qui n'est pas la tête de la cible
             (#3782) : l'arbre composé ne convient pas, d'où le worktree de
-            lecture à `base_sha`, créé une fois pour tout le lancement.
+            lecture à `base_sha`, créé une fois pour tout le lancement. #6981 :
+            une cible avancée par les seuls atterrissages de coupure ne refuse
+            pas la relecture (§12), avant comme après la poussée.
             """
             nonlocal reader
             if reader is None:
                 reader = reader_worktree(repo, base_sha)
             refreshed = Path(tmp.name) / "prets-relus.txt"
-            fresh, _ = compute_candidates(reader, args.target, base_sha, refreshed)
+            fresh, _ = compute_candidates(reader, args.target, base_sha,
+                                          refreshed, tolerate_landing=True)
             return changed_units(composition.units,
                                  {candidate.lot: candidate.source
                                   for candidate in fresh})
@@ -6050,7 +6142,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                     # recomposition immédiate de #6891. Relue ici, avant le gel
                     # et la poussée, elle garde le même geste : rien n'est
                     # poussé, `TARGET_MOVED_RC` et relance aussitôt.
-                    ensure_reference(repo, args.target, base_sha)
+                    try:
+                        ensure_reference(repo, args.target, base_sha)
+                    except TargetMoved as moved:
+                        # #6981 : des contrats rouges restent le verdict :
+                        # le pilote reçoit le rouge, pas « cible avancée ».
+                        run = contract_report.run if contract_report else None
+                        if run is None or run.green or run.inconclusive:
+                            raise
+                        raise CompositionRed(
+                            "contrats rouges sur la tête composée %s (la cible "
+                            "a aussi avancé : %s)" % (head[:12], moved)) from moved
                 # #6566 : le gel de chaque unité est relu sur la base exacte
                 # juste avant la poussée ; une unité regelée (ou sortie de la
                 # liste prête) pendant la composition ne part pas sur cette

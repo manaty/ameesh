@@ -247,9 +247,17 @@ def dump_timeout(value):
     return value
 
 
-def dump(config, output, *, timeout=DEFAULT_DUMP_TIMEOUT):
+def dump(config, output, *, timeout=DEFAULT_DUMP_TIMEOUT, primary=False):
     timeout = dump_timeout(timeout)
-    return dump_parameters(parameters_from(config), output, timeout=timeout)
+    parameters = parameters_from(config)
+    if primary:
+        # #6862 (EP8.5): with the multi-host DSN, libpq may reach a standby.
+        # The daily dump reads the primary: a dump of a standby can be
+        # cancelled by replay conflicts, and the primary's last_seq_scan is
+        # what `mesh_backup_unseen` (#4609) watches. A single host that is a
+        # standby is refused rather than dumped.
+        parameters["target_session_attrs"] = "read-write"
+    return dump_parameters(parameters, output, timeout=timeout)
 
 
 def dump_parameters(parameters, output, *, snapshot=None, source_major=None, timeout=DEFAULT_DUMP_TIMEOUT):
@@ -785,6 +793,8 @@ def main():
     backup.add_argument("--config", required=True)
     backup.add_argument("--output", required=True)
     backup.add_argument("--timeout", default=DEFAULT_DUMP_TIMEOUT)
+    backup.add_argument("--primary", action="store_true",
+                        help="read-write server only (target_session_attrs)")
     snapshot = commands.add_parser("snapshot-dump")
     snapshot.add_argument("--config", required=True)
     snapshot.add_argument("--output", required=True)
@@ -814,7 +824,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "dump":
-            dump(args.config, args.output, timeout=args.timeout)
+            dump(args.config, args.output, timeout=args.timeout, primary=args.primary)
         elif args.command == "snapshot-dump":
             proof = snapshot_dump(args.config, args.output, args.inventory, schema=args.schema,
                                   tables=args.tables or ("agent_registry", "agent_mailbox"))

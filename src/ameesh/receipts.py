@@ -102,6 +102,10 @@ LOGIN_DECISIONS = ("view", "done", "cancel")
 #: champs qu'un appelant peut lier dans `expected_login` (le reste du reçu
 #: n'est jamais cru sur parole)
 LOGIN_BINDING_FIELDS = ("login_id", "host", "provider", "account", "scope", "exp")
+#: #7119 (D1) : champs qu'un appelant lie dans `expected_attach` — tous, pour
+#: consommer (un grant d'attach ne vaut que pour CET agent, CET hôte, CE tenant
+#: et CET appareil)
+ATTACH_BINDING_FIELDS = ("attach_id", "agent", "host", "tenant", "device_key", "exp")
 ACTION_CLASSES = ("read", "reversible", "irreversible", "costly")
 ACTION_DIGEST_FIELDS = ("action_id", "project", "connector", "operation", "target",
                         "args", "amount", "currency", "policy_version")
@@ -121,6 +125,7 @@ KIND = "kind"
 UNBOUND = "unbound"
 ACTION_MISMATCH = "action_mismatch"
 LOGIN_MISMATCH = "login_mismatch"
+ATTACH_MISMATCH = "attach_mismatch"
 DIGEST_MISMATCH = "digest_mismatch"
 DECISION = "decision"
 EXPIRED = "expired"
@@ -155,6 +160,7 @@ _LOGIN_ID_RE = re.compile(r"^lgn_[0-9a-z]{26}$")
 _LOGIN_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 _LOGIN_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$")
 _LOGIN_SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+ -]{0,255}$")
+_ATTACH_ID_RE = re.compile(r"^att_[0-9a-z]{26}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CREDENTIAL_RE = re.compile(r"^[A-Za-z0-9_:.=-]{1,1024}$")
 _IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
@@ -172,6 +178,10 @@ _ACTION_FIELDS = _COMMON_FIELDS | {"action_id", "digest"}
 #: porte l'hôte, le fournisseur, le compte, la portée et l'échéance (le code
 #: et l'URL restent dans l'état privé du service, jamais ici)
 _LOGIN_FIELDS = _COMMON_FIELDS | {"login_id", "host", "provider", "account", "scope"}
+#: #7119 (D1) : grant d'attach — l'agent, son hôte, le tenant ('' sur un hôte
+#: dédié) et la clé d'appareil du poste (credential_id d'un authentificateur
+#: `device-es256` du même humain) ; ni action ni empreinte d'action
+_ATTACH_FIELDS = _COMMON_FIELDS | {"attach_id", "agent", "host", "tenant", "device_key"}
 _STANDING_FIELDS = _COMMON_FIELDS | {"standing"}
 _STANDING_KEYS = frozenset({"connector", "operations", "class", "max_amount", "currency", "until"})
 _PROOF_FIELDS = {
@@ -364,6 +374,7 @@ class ReceiptVerdict:
     action_id: str = ""
     digest: str = ""
     login_id: str = ""
+    attach_id: str = ""
     nonce: str = ""
     challenge: str = ""
     iat: int = 0
@@ -436,7 +447,7 @@ def _check_standing(standing, iat: int) -> None:
 
 def check_request(request) -> str:
     """Valide la forme d'une demande ; renvoie sa nature
-    (`action` | `standing` | `login`)."""
+    (`action` | `standing` | `login` | `attach`)."""
     if not isinstance(request, dict):
         raise ReceiptError("request: object expected")
     keys = set(request)
@@ -444,10 +455,12 @@ def check_request(request) -> str:
         kind = "standing"
     elif "login_id" in keys:
         kind = "login"
+    elif "attach_id" in keys:
+        kind = "attach"
     else:
         kind = "action"
     expected = {"standing": _STANDING_FIELDS, "login": _LOGIN_FIELDS,
-                "action": _ACTION_FIELDS}[kind]
+                "attach": _ATTACH_FIELDS, "action": _ACTION_FIELDS}[kind]
     if keys != expected:
         raise ReceiptError("request (%s): missing fields %s, extra %s"
                            % (kind, sorted(expected - keys), sorted(keys - expected)))
@@ -489,6 +502,21 @@ def check_request(request) -> str:
             pattern = _LOGIN_ACCOUNT_RE if name == "account" else _LOGIN_SCOPE_RE
             if not isinstance(value, str) or (value and not pattern.fullmatch(value)):
                 raise ReceiptError("request.%s: identifier expected (empty allowed)" % name)
+    elif kind == "attach":
+        if not isinstance(request["attach_id"], str) or not _ATTACH_ID_RE.fullmatch(
+                request["attach_id"]):
+            raise ReceiptError("request.attach_id: \"att_\" + 26 characters expected")
+        if not isinstance(request["agent"], str) or not _IDENT_RE.fullmatch(request["agent"]):
+            raise ReceiptError("request.agent: agent name expected")
+        if not isinstance(request["host"], str) or not _LOGIN_HOST_RE.fullmatch(request["host"]):
+            raise ReceiptError("request.host: host name expected")
+        tenant = request["tenant"]
+        if not isinstance(tenant, str) or (tenant and not _IDENT_RE.fullmatch(tenant)):
+            raise ReceiptError("request.tenant: identifier expected (empty on a dedicated "
+                               "host)")
+        device = request["device_key"]
+        if not isinstance(device, str) or not _CREDENTIAL_RE.fullmatch(device):
+            raise ReceiptError("request.device_key: device credential_id expected")
     else:
         _check_standing(request["standing"], iat)
     return kind
@@ -645,6 +673,14 @@ def _find_authenticator(db: Db, approver: str, facade: str, credential_id: str,
         facade, credential_id[:16], approver)
 
 
+def active_authenticator(db: Db, approver: str, facade: str, credential_id: str,
+                         canon: str = "") -> tuple[dict | None, str, str]:
+    """La ligne ACTIVE de (approbateur, façade, credential) déclarée par
+    `canon`, ou (None, code, raison) — mêmes règles que pour un reçu (#7119 :
+    la clé d'appareil d'un grant d'attach)."""
+    return _find_authenticator(db, approver, facade, credential_id, canon)
+
+
 # --------------------------------------------------------------------------
 # vérification
 # --------------------------------------------------------------------------
@@ -719,7 +755,8 @@ def _verify_webauthn(parsed: Receipt, key: cose.PublicKey, policy: Policy,
 def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
             expected_digest: str | None, expected_action_id: str | None,
             expected_login: dict | None, expect_decision: str | None,
-            consume_by: str | None, now: float | None) -> tuple[ReceiptVerdict, Receipt | None]:
+            consume_by: str | None, now: float | None,
+            expected_attach: dict | None = None) -> tuple[ReceiptVerdict, Receipt | None]:
     policy = policy or Policy()
     moment = time.time() if now is None else float(now)
     ctx: dict = {}
@@ -736,7 +773,7 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         kind=parsed.kind, approver=request["approver"], facade=parsed.facade,
         credential_id=parsed.credential_id, decision=request["decision"],
         action_id=request.get("action_id", ""), digest=request.get("digest", ""),
-        login_id=request.get("login_id", ""),
+        login_id=request.get("login_id", ""), attach_id=request.get("attach_id", ""),
         nonce=request["nonce"], challenge=parsed.challenge.hex(),
         iat=request["iat"], exp=request["exp"], standing=request.get("standing"),
     )
@@ -774,8 +811,39 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
                                      or expected_action_id is not None):
         return refuse(KIND, "a login receipt is bound by expected_login (host, provider, "
                             "account, expiry), not by an action digest")
+    if expected_attach is not None:
+        if parsed.kind != "attach":
+            return refuse(KIND, "expected_attach given for a receipt of kind %s"
+                          % parsed.kind)
+        if not isinstance(expected_attach, dict) or not expected_attach:
+            return refuse(FORMAT, "expected_attach: non-empty object expected")
+        unknown = sorted(set(expected_attach) - set(ATTACH_BINDING_FIELDS))
+        if unknown:
+            return refuse(FORMAT, "expected_attach: unknown fields %s" % unknown)
+        for name in sorted(expected_attach):
+            expected = expected_attach[name]
+            if name == "exp":
+                if type(expected) is not int or request["exp"] != expected:
+                    return refuse(ATTACH_MISMATCH, "the grant expires at %s, not at %r"
+                                  % (request["exp"], expected))
+                continue
+            actual = request.get(name, "")
+            if not isinstance(expected, str) or not _same(expected, actual):
+                return refuse(ATTACH_MISMATCH, "the grant is for %s %r, not %r"
+                              % (name, actual, expected))
+    elif parsed.kind == "attach" and (expected_digest is not None
+                                      or expected_action_id is not None
+                                      or expected_login is not None):
+        return refuse(KIND, "an attach receipt is bound by expected_attach (agent, host, "
+                            "tenant, device), not by an action or a login challenge")
     if consume_by:
-        if parsed.kind == "login":
+        if parsed.kind == "attach":
+            required = set(ATTACH_BINDING_FIELDS)
+            if not isinstance(expected_attach, dict) or set(expected_attach) != required:
+                return refuse(UNBOUND, "consuming an attach receipt requires expected_attach "
+                                       "with %s (otherwise it would open any session)"
+                              % sorted(required))
+        elif parsed.kind == "login":
             required = {"login_id", "host", "provider", "account", "exp"}
             if not isinstance(expected_login, dict) or not required <= set(expected_login):
                 return refuse(UNBOUND, "consuming a login receipt requires expected_login "
@@ -865,7 +933,8 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
                    expected_action_id: str | None = None,
                    expected_login: dict | None = None,
                    expect_decision: str | None = "approve", consume_by: str | None = None,
-                   now: float | None = None) -> ReceiptVerdict:
+                   now: float | None = None,
+                   expected_attach: dict | None = None) -> ReceiptVerdict:
     """Vérifie un reçu ; le consomme (une fois, atomiquement) si `consume_by`.
 
     Sans `consume_by`, le nonce est seulement contrôlé (non encore consommé) :
@@ -874,8 +943,10 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     depuis l'action, jamais lus dans le reçu) ; pour un reçu de défi de
     connexion (`login`), `expected_login` (login_id, host, provider, account,
     exp — champs de `LOGIN_BINDING_FIELDS`) les remplace : il est recalculé par
-    l'appelant depuis SA demande, jamais lu dans le reçu.
-    `kind=None` accepte les trois natures ; `expect_decision=None` toutes les
+    l'appelant depuis SA demande, jamais lu dans le reçu. Pour un grant
+    d'attach (#7119), c'est `expected_attach` (tous les champs de
+    `ATTACH_BINDING_FIELDS`), recalculé par l'hôte de l'agent.
+    `kind=None` accepte les quatre natures ; `expect_decision=None` toutes les
     décisions.
     `now` ne règle que les contrôles faits ici : une consommation recontrôle
     exp et iat en SQL, après le dernier verrou, à l'heure réelle de la base
@@ -885,7 +956,8 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     verdict, _parsed = _verify(
         db, receipt, policy, kind=kind, expected_digest=expected_digest,
         expected_action_id=expected_action_id, expected_login=expected_login,
-        expect_decision=expect_decision, consume_by=consume_by, now=now)
+        expect_decision=expect_decision, consume_by=consume_by, now=now,
+        expected_attach=expected_attach)
     return verdict
 
 

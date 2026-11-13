@@ -69,6 +69,8 @@ class Flux:
         #: #6566 : lectures successives de la liste prête (composition, relecture).
         self.candidate_reads = list(candidate_reads or [])
         self.candidate_calls = 0
+        #: #6981 : options de chaque lecture (`tolerate_landing`).
+        self.candidate_kwargs: list[dict] = []
         #: #6891 : têtes successives lues de la cible (base, puis relecture
         #: avant les tests). La dernière valeur se répète.
         self.fresh_bases = list(fresh_bases or ["a" * 40])
@@ -121,8 +123,9 @@ class Flux:
         # aucun gel ne change et la poussée part directement.
         initial = [(unit.lot, unit.source) for unit in first.units]
 
-        def candidates(*_args, **_kwargs):
+        def candidates(*_args, **kwargs):
             self.candidate_calls += 1
+            self.candidate_kwargs.append(kwargs)
             if self.candidate_reads:
                 return self.candidate_reads.pop(0)
             return ([paquet_auto.Candidate(lot, source) for lot, source in initial],

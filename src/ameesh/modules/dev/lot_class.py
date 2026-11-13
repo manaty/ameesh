@@ -244,6 +244,57 @@ def repository(cfg, item: dict) -> Optional[str]:
     return project_repo
 
 
+def declared_repo_paths(cfg, item: dict) -> list[str]:
+    """Les clones locaux que cet hôte déclare pour l'app du lot (#6984).
+
+    `radar.projects.<app>.repo` reste le dépôt du projet ([`repository`]) ;
+    un hôte sans bloc `radar` — pc-smichea — déclare le sien dans
+    `packet_watch.projects.<app>.repo` ou `release.projects.<app>.repo`. Ces
+    deux blocs ne servaient qu'à la composition et aux coupures : la
+    désignation au gel et la lecture d'auteurs ne voyaient alors aucun clone
+    du projet sur cet hôte, même quand la tête gelée y était (checkout ou
+    miroir bare). Le chemin n'est qu'une **piste** : l'appelant garde la
+    règle « seul le commit exact décide », donc un bloc déclaré pour un autre
+    hôte ne peut rien faire gagner de faux.
+
+    L'ordre est radar, packet-watch, release ; les doublons et les chemins
+    vides sont retirés. Une configuration illisible est ignorée, les autres
+    chemins restent : un doute ne retire jamais une piste valide.
+    """
+    if cfg is None:
+        return []
+    name = str((item or {}).get("app") or "").strip()
+    paths: list[str] = []
+
+    def add(value) -> None:
+        text = str(value or "").strip()
+        if text and text not in paths:
+            paths.append(text)
+
+    try:
+        add(repository(cfg, dict(item or {})))
+    except Exception:  # noqa: BLE001 - pas de réglage radar : les blocs suivants
+        pass
+    if not name:
+        return paths
+    for block_name in ("packet_watch", "release"):
+        block = getattr(cfg, block_name, None)
+        if not isinstance(block, dict):
+            continue
+        projects = block.get("projects")
+        if not isinstance(projects, dict):
+            continue
+        for project_name, entry in sorted(projects.items()):
+            if not isinstance(entry, dict):
+                continue
+            # `repository()` ne nomme le dépôt du lot que par l'app ; les deux
+            # autres blocs nomment le projet. Un lot sans app ne reçoit rien.
+            if str(project_name or "").strip() != name:
+                continue
+            add(entry.get("repo"))
+    return paths
+
+
 def project_target(cfg, app: str) -> str:
     """La cible déclarée du projet, ou "" (#6525).
 
@@ -490,7 +541,10 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
     except Exception:  # noqa: BLE001 - registre illisible : les autres pistes
         pass
     try:
-        candidates.append(repository(cfg, item) or "")
+        # #6984 : le dépôt du projet et les clones que l'hôte déclare pour lui
+        # (`packet_watch`, `release`). Sur un hôte sans `radar`, la porte et la
+        # lecture d'auteurs n'avaient aucune piste et rendaient un doute.
+        candidates.extend(declared_repo_paths(cfg, item))
     except Exception:  # noqa: BLE001 - pas de réglage radar : les autres pistes
         pass
     try:
@@ -509,7 +563,9 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
         if not path or not os.path.isdir(path):
             continue
         try:
-            root = _TOPLEVELS.get(path) or canon_mod.git_toplevel(path)
+            # #6984 : un miroir bare est un dépôt lisible par SHA ; il n'a
+            # simplement pas d'arbre de travail (`git_toplevel` le sautait).
+            root = _TOPLEVELS.get(path) or canon_mod.git_repository(path)
         except Exception:  # noqa: BLE001 - pas un dépôt : piste suivante
             root = None
         if root:

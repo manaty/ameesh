@@ -290,6 +290,23 @@ def create_request(cfg: Config, *, action_id: str, approver: str, requested_by: 
     return data
 
 
+def create_attach_request(cfg: Config, *, agent: str, host: str, tenant: str,
+                          device_key: str, approver: str, requested_by: str,
+                          canon: str = "") -> dict:
+    """`POST /attach-requests` (#7119) : grant d'attach de 5 min ; le reçu se
+    lit ensuite par `fetch_receipt`."""
+    status, payload = _call(cfg, "POST", "/attach-requests", {
+        "agent": agent, "host": host, "tenant": tenant, "device_key": device_key,
+        "approver": approver, "requested_by": requested_by, "canon": canon})
+    if status != 201:
+        raise _refusal(status, payload)
+    data = _json(payload)
+    if not REQUEST_ID_RE.fullmatch(str(data.get("request_id") or "")) \
+            or not isinstance(data.get("link"), str):
+        raise ApproveClientError("format", "unreadable response from ameesh-approve", status)
+    return data
+
+
 def fetch_receipt(cfg: Config, request_id: str) -> tuple[str, bytes | dict]:
     """`GET /receipts/<id>` : ("signed", octets du reçu) | ("pending", infos) |
     ("expired", infos). Toute autre réponse : ApproveClientError."""

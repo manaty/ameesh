@@ -24,6 +24,9 @@
         RP ID/origin agreement between ameesh-approve and this verifier;
   ameesh attach <agent> [--wait] [--ttl S] [--max 2h]
         bounded native access: sleep the resident, then return its lease (L82);
+  ameesh attach-grant request <agent> --host H --device-key K [--tenant T] |
+        who <agent> | audit [--agent A]   remote attach grant: 5 min WebAuthn
+        grant bound to the station's device key, who may ask, journal (#7119);
   ameesh auditor tick [--dry-run] [--json]
         the hourly short-pass gate: mails the auditor only when something moved
         (mail, debit --check 2, deadline in the hour, head/gate change), journals
@@ -588,6 +591,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "approve-check":
         from . import approve_check
         return approve_check.main(rest)
+    if command == "attach-grant":
+        from . import attach_grant_cli
+        return attach_grant_cli.main(rest)
     if command == "process-approvals":
         # #4006 : pont d'approbation GitHub (projection locale fail-closed)
         from . import process_approvals_cli

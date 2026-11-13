@@ -144,7 +144,11 @@ Approve the exact independent release controller enrollment below:
 Les options sont celles de `enroler-controleur.OPTIONS` (`enroll`, `leave`). Le
 bureau crée la demande `ameesh decide ask --needs-signature` sur le lot ; il
 utilise la question sauvegardée sans la réécrire ni en modifier les octets.
-Le signataire doit couvrir toute la fenêtre `expires_at`. Un courrier, une
+Le signataire doit couvrir toute la fenêtre `expires_at`. Une approbation vit
+une heure (`SIGN_TTL_S`) : `prepare`, `key-question` et `stop-question` refusent
+dès la préparation une échéance qu'une signature fraîche ne couvrirait pas, en
+donnant la valeur maximale, et rendent `deadline` (« sign, then the gesture runs
+before HH:MMZ ») à citer dans la décision (#7019). Un courrier, une
 réponse non signée ou l'ancienne décision de bootstrap ne vaut pas ce mandat.
 
 Après vérification de la signature, le bureau appelle le même enrôleur root et

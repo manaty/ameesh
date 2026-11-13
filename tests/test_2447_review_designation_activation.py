@@ -1360,6 +1360,30 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(os.path.realpath(found), os.path.realpath(local.root))
         self.assertEqual(local.git("cat-file", "-t", self.frozen), "commit")
 
+    def test_a_declared_bare_mirror_serves_the_freeze(self):
+        # #6984 : pc-smichea n'a pas de bloc `radar` ; son clone du projet
+        # n'est déclaré que par `packet_watch.projects.<app>.repo`, et c'est
+        # un miroir **bare** (pas d'arbre de travail). Le gel doit y lire la
+        # tête exacte et désigner, pas journaliser « no repository holds ».
+        mirror = os.path.join(self.tmp, "ameesh.git")
+        subprocess.run(["git", "clone", "--bare", "-q", self.repo.root, mirror],
+                       check=True, capture_output=True)
+        session = os.path.join(self.tmp, "session-bare")
+        os.makedirs(session)
+        self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = 'author'",
+                        (session,))
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(session)
+        cfg = dataclasses.replace(
+            self.cfg, radar={},
+            packet_watch={"projects": {"ameesh": {"repo": mirror}}})
+        _row, out = self.freeze(cfg=cfg)
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]),
+                         ["r1", "r2"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
+
     def test_a_canon_policy_arriving_later_is_retried_on_the_same_freeze(self):
         # #2561 (#2522/#1854): the canon publication arrived after the freeze.
         # The unavailable note is the retry marker; the same frozen head is
@@ -1639,6 +1663,40 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         again = act.designate(self.cfg, self.db, self.lot)
         self.assertEqual(again["state"], rd.DESIGNATED, again)
         self.assertEqual(sorted(r["name"] for r in again["reviewers"]), ["r1", "r2"])
+
+    def test_a_blind_replay_keeps_the_recorded_waiting_designation(self):
+        # #6984 : la reprise d'une attente depuis un hôte qui ne peut pas lire
+        # la tête gelée (miroir bare absent, dépôt non déclaré) ne la dégrade
+        # pas en « unavailable » et ne vide pas la colonne : la marque et le
+        # siège de r2 restent la désignation valide du gel.
+        self._move_to_lost("r1")
+        self._lose_host()
+        _row, waiting = self.freeze()
+        self.assertEqual(waiting["state"], rd.WAITING, waiting)
+        self.assertEqual([r["name"] for r in waiting["reviewers"]], ["r2"])
+        marks = self.marks()
+        notes = self.notes()
+        mails = self.mailbox()
+        column = self.db.query(
+            "SELECT reviewers FROM work_items WHERE id = %s",
+            (self.lot,))[0]["reviewers"]
+        self.assertEqual(column, ["r2"])
+        blind = act.Unavailable(
+            "no repository holds the frozen head 0123456789ab: cannot read"
+            " the frozen diff")
+        with mock.patch.object(act, "prepare", return_value=blind):
+            again = act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(again["state"], rd.WAITING, again)
+        self.assertEqual([r["name"] for r in again["reviewers"]], ["r2"])
+        self.assertIn("recorded waiting designation kept", again["why"])
+        # rien n'est écrit : ni marque, ni note, ni courrier, et la colonne des
+        # relecteurs garde son siège.
+        self.assertEqual(self.marks(), marks)
+        self.assertEqual(self.notes(), notes)
+        self.assertEqual(self.mailbox(), mails)
+        self.assertEqual(self.db.query(
+            "SELECT reviewers FROM work_items WHERE id = %s",
+            (self.lot,))[0]["reviewers"], column)
 
     def test_an_existing_designation_is_reassigned_when_its_host_is_lost(self):
         # Une désignation écrite avant la perte est reprise au passage du
