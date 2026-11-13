@@ -5040,6 +5040,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     # L30 (0027) : comptes multiples par fournisseur
     p_acc = sub.add_parser("accounts", help="accounts per provider: active, gauges, forcing (L30)")
     acc_sub = p_acc.add_subparsers(dest="accounts_command")
+    pa_exception = acc_sub.add_parser("exception", help="register a signed one-turn owner exception")
+    pa_exception.add_argument("decision", type=int)
+    pa_exception.set_defaults(func=cmd_accounts)
     pa_list = acc_sub.add_parser("list", help="declared accounts, active account, gauges, switches")
     pa_list.add_argument("--json", action="store_true")
     pa_list.add_argument("--last", type=int, default=5, help="latest switches shown")
@@ -5345,6 +5348,19 @@ def cmd_accounts(cfg: Config, args) -> int:
     un profil se montre par son type et son emplacement.
     """
     what = getattr(args, "accounts_command", None) or "list"
+    if what == "exception":
+        from . import account_exception, decisions
+        db = _open(cfg)
+        try:
+            token = account_exception.register(db, args.decision)
+        except (account_exception.ExceptionError, decisions.DecisionError) as exc:
+            print("accounts exception: %s" % exc, file=sys.stderr)
+            return 1
+        finally:
+            db.close()
+        print("one-turn exception #%d registered for %s on %s/%s" % (
+            args.decision, token["agent"], token["harness"], token["account"]))
+        return 0
     declares = accounts_mod.parse(cfg.accounts)  # AccountError -> code 1, message
     qui = "human:%s" % (os.environ.get("USER") or getpass.getuser())
     db = _open(cfg)

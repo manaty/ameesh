@@ -175,3 +175,4 @@ test_6473_cause_observation  # stockage : identité A3, deux écrivains et réci
 
 test_6486_repair_ancestor  # stockage : prédicat git A4 injecté par ingest, ancien SHA classé version antérieure (#6486)
 test_6485_fingerprint_key_scan  # stockage : clé d'empreinte historique portée par le balayage des alertes, refus de ligne si inutilisable (#6485)
+test_7066_account_exception  # stockage : preuve signée, jeton unique et début de tour atomiques (#7066)

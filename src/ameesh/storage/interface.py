@@ -1249,6 +1249,26 @@ class Accounts(Domain):
     ne passent jamais par ce domaine, qui ne voit que des NOMS de comptes."""
 
     @abc.abstractmethod
+    def register_exception(self, decision_id: int, agent: str, harness: str, account: str):
+        """Index a signed token once; a consumed token cannot be re-armed."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def pending_exceptions(self, agent: str, harness: str) -> list:
+        """Read unconsumed decision ids indexed for this named agent."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def lock_exception(self, decision_id: int) -> bool:
+        """Lock an unconsumed token in the caller's turn-start transaction."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def consume_exception(self, decision_id: int, host: str):
+        """Record consumption in the same transaction as turn start."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def active(self, host: str, harness: str) -> dict | None:
         """La ligne `account_active` (account, forced, forced_until,
         updated_at), ou None. `forced_until` (epoch, #3755) est l'échéance du

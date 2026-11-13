@@ -1261,3 +1261,46 @@ les lignes du grand livre et leurs montants. Une mesure manquante, annulée
 ou provenant seulement de l'appareil refuse l'abandon ; une réservation
 inconnue ne devient jamais une dépense nulle. Les réservations liées à une
 tranche exigent leur propre protocole de réconciliation et sont refusées.
+
+## Exception signée pour un seul tour nommé
+
+`ameesh accounts exception ID_DECISION` enregistre une exception depuis une
+réponse owner signée. Cette réponse commence exactement par la ligne suivante,
+puis contient le document JSON (les valeurs ci-dessous sont un exemple) :
+
+```text
+I authorize one named account turn within these bounds:
+{"kind":"ameesh-account-turn-exception/1","agent":"dev-a","harness":"codex","account":"primary","turns":1,"extra_points":15,"expires_at":1800000600}
+```
+
+`expires_at` est une échéance Unix en secondes. Le propriétaire signe cette
+réponse avec le parcours habituel `ameesh decide … --key …` ; le compte et
+l'agent sont des noms exacts. Le document entier et la décision sont liés à
+la signature. Une réponse non signée, modifiée, remplacée, expirée ou dont la
+clé owner a été révoquée est refusée. La preuve de signature doit elle-même
+être encore valide (une heure au maximum dans le parcours habituel).
+
+L'exception sert lorsque le choix ordinaire ne trouve aucun compte. Pour le
+seul agent nommé, chaque seuil de jauge normalement applicable (plafond fixe,
+plafond d'overage et rythme avec sa réserve) gagne `extra_points` points,
+sans atteindre 100 %. Ainsi, un seuil de 80 % et une borne de 15 points
+admettent 91 %, mais refusent 95 %. Un seuil de rythme courant de 60 % reste
+borné à 75 %. Aucun plafond partagé ni forçage d'hôte n'est modifié.
+
+Le jeton n'est consommé qu'au début effectif du tour, dans la transaction
+d'admission : les précontrôles ne le consomment pas, un bail refusé le conserve,
+et un rejeu de l'enregistrement ne le réarme pas. Le journal
+`account_turn_exceptions` conserve l'id de décision, l'agent, le harnais, le
+compte, l'heure d'enregistrement, puis l'heure et l'hôte de consommation.
+Au tour suivant, les gardes ordinaires s'appliquent à nouveau.
+Pendant le tour autorisé, la relecture aux points sûrs conserve la pause
+partagée pour les autres agents et applique la borne signée à ce seul tour ;
+elle demande sa clôture si la borne est atteinte, si la décision expire ou
+si sa preuve n'est plus valide.
+
+Cette exception concerne les comptes personnels de forfait avec des jauges
+datées de moins d'une heure. Les erreurs d'authentification, les identités
+contradictoires, les restrictions de partage, l'overage fournisseur déjà actif,
+une observation partagée plus récente que la jauge locale, les fenêtres
+courtes et les enveloppes monétaires restent gardés. Les comptes facturés au
+token et les exécuteurs médiés ne disposent pas de ce parcours transactionnel.
