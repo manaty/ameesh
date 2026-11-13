@@ -800,6 +800,29 @@ def _range(repo: str, base: str, head: str, *, bounded: bool = True) -> tuple[st
     return start, paths, commits
 
 
+def _reading_range(db, item: Mapping, repo: str, base: str,
+                   head: str) -> tuple[str, list, list]:
+    """`(start, paths, commits)` de la plage que la lecture du gel lira.
+
+    Même calcul pour `prepare` et pour le rapatriement hors transaction
+    (`prefetch_freeze_objects`) : les citations d'un correctif retiré (#7252)
+    sont résolues sur **exactement** les commits que la lecture verra, au lieu
+    d'une plage recomposée qui pourrait en différer. #2766 : un véhicule ne
+    désigne que pour son delta propre ; les membres portent leurs avis sur
+    leur propre tête gelée.
+    """
+    from . import packet_reviews
+
+    start, paths, commits = _range(repo, base, head,
+                                   bounded=not packet_reviews.is_vehicle(item))
+    if packet_reviews.is_vehicle(item):
+        own = packet_reviews.designation_changes(db, int(item["id"]), item,
+                                                 repo, start, head)
+        if own is not None:
+            paths, commits = own["paths"], own["commits"]
+    return start, paths, commits
+
+
 # --------------------------------------------------------------------------
 # the authors: one reading shared with the train and the merge gate (#2681)
 # --------------------------------------------------------------------------
@@ -1855,20 +1878,11 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     # elle que la lecture de provenance reçoit (#3116), sans la re-résoudre.
     read_target = base
     try:
-        start, paths, commits = _range(repo, base, frozen_sha,
-                                       bounded=not packet_reviews.is_vehicle(item))
+        start, paths, commits = _reading_range(db, item, repo, base, frozen_sha)
+    except packet_reviews.VehicleError as exc:
+        return Unavailable("vehicle review unreadable: %s" % exc)
     except ActivationError as exc:
         return Unavailable(str(exc))
-    if packet_reviews.is_vehicle(item):
-        # #2766 : un véhicule ne désigne que pour son delta propre ; les
-        # membres portent leurs avis sur leur propre tête gelée.
-        try:
-            own = packet_reviews.designation_changes(db, int(lot), item, repo, start,
-                                                     frozen_sha)
-        except packet_reviews.VehicleError as exc:
-            return Unavailable("vehicle review unreadable: %s" % exc)
-        if own is not None:
-            paths, commits = own["paths"], own["commits"]
     project = str(item.get("app") or "").strip()
     if not project:
         return Unavailable("lot #%d declares no project: the review policy is unknown"
@@ -2051,6 +2065,10 @@ def prefetch_freeze_objects(db, item: Mapping, target, head: str) -> list[str]:
     la forge du dépôt de lecture les objets absents des gels antérieurs : la
     désignation retrouve alors les mêmes auteurs qu'avant, sans jamais tenir
     les verrous du gel pendant un `git fetch` (180 s par objet au plus).
+    #7252 : elle prépare aussi les commits **cités** par une réécriture
+    d'auteur, sur la même plage que la lecture (`_reading_range`) ; sans cela,
+    la lecture `fetch=False` les déclarerait non préparés au lieu d'exclure le
+    correcteur qu'ils nomment.
 
     `target` est le `Target` épinglé par `prepare_target` (ou `Unavailable`) ;
     une cible illisible ne rapatrie rien, la désignation attendra. Jamais
@@ -2058,8 +2076,15 @@ def prefetch_freeze_objects(db, item: Mapping, target, head: str) -> list[str]:
     """
     if target is None or isinstance(target, Unavailable):
         return []
+    commits: Sequence[str] = ()
     try:
-        return review_authors.prefetch_prior_freezes(db, item, target.repo, head)
+        _start, _paths, commits = _reading_range(db, item, target.repo,
+                                                 target.sha, head)
+    except Exception:  # noqa: BLE001 - plage illisible : la lecture attendra
+        commits = ()
+    try:
+        return review_authors.prefetch_prior_freezes(
+            db, item, target.repo, head, commits=commits)
     except Exception:  # noqa: BLE001 - rapatriement au mieux : le gel continue
         return []
 

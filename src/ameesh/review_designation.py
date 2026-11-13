@@ -1463,18 +1463,22 @@ def doubts_note(doubts: Iterable = (), fixers: Iterable = ()) -> str:
     excluded = {str((row or {}).get("name") or "").strip().casefold()
                 for row in fixers or () if isinstance(row, Mapping)}
     reported: dict[str, list] = {"": [], "never-pushed": []}
-    cited: list[tuple[str, str]] = []
+    cited: dict[str, list[tuple[str, str]]] = {}
     for row in doubts or ():
         if not isinstance(row, Mapping):
             continue
         name = str(row.get("name") or "").strip()
         sha = str(row.get("sha") or "").strip()
         reason = str(row.get("reason") or "").strip()
-        if reason == "forge-unreadable" and sha:
+        if reason in ("forge-unreadable", "not-prefetched") and sha:
             # #7252 B/P2 auditeur : la citation d'un commit absent du clone
             # n'est ni exécutée ni tue si la forge ne le sert pas. Sans
-            # acteur, elle ne peut pas exclure : elle est dite au gel.
-            cited.append((sha, str(row.get("cited") or "").strip()))
+            # acteur, elle ne peut pas exclure : elle est dite au gel. Une
+            # citation non préparée (#3836, lecture sans réseau) est dite à
+            # part : le remède est le prefetch hors transaction, pas un
+            # accès réseau sous les verrous.
+            cited.setdefault(reason, []).append(
+                (sha, str(row.get("cited") or "").strip()))
             continue
         if name and sha and name.casefold() not in excluded:
             reported.setdefault(reason, []).append((name, sha))
@@ -1492,11 +1496,14 @@ def doubts_note(doubts: Iterable = (), fixers: Iterable = ()) -> str:
             % (len(unique), label,
                ", ".join("%s %s" % (name, sha[:12]) for name, sha in unique[:4]),
                ", …" if len(unique) > 4 else ""))
-    if cited:
-        unique = sorted(set(cited))
+    for reason, label in (("forge-unreadable", "unreadable at the forge"),
+                          ("not-prefetched", "not prepared before the freeze")):
+        unique = sorted(set(cited.get(reason) or ()))
+        if not unique:
+            continue
         notes.append(
-            "%d cited commit(s) unreadable at the forge, no exclusion: %s%s"
-            % (len(unique),
+            "%d cited commit(s) %s, no exclusion: %s%s"
+            % (len(unique), label,
                ", ".join("%s cited by %s" % (sha[:12], who[:12] or "?")
                          for sha, who in unique[:4]),
                ", …" if len(unique) > 4 else ""))

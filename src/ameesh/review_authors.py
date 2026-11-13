@@ -4269,7 +4269,8 @@ def _fetch_refused(stderr) -> bool:
     return any(marker in low for marker in _FETCH_REFUSAL_MARKERS)
 
 
-def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list[str]:
+def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "",
+                           *, commits: Sequence[str] = ()) -> list[str]:
     """Rapatrie, **hors transaction**, les objets des gels antérieurs (#3836).
 
     La désignation d'un gel lit les gels antérieurs du lot pour savoir quels
@@ -4285,6 +4286,13 @@ def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list
     gel ne peut plus bloquer le mesh sur le réseau. Un objet que la forge ne
     sert pas reste absent ; la lecture du gel le traite comme avant (un gel
     remplacé est ignoré, un autre rend la désignation en attente).
+
+    #7252 : `commits` est la plage que la lecture du gel lira. Elle prépare
+    aussi les commits **cités** par la réécriture de l'auteur sur cette plage
+    (résolution de l'abrégé par la forge, rapatriement de l'objet exact) : la
+    lecture `fetch=False` de la transaction les trouve alors dans le clone et
+    exclut le correcteur qu'ils nomment, au lieu de tracer un doute « non
+    préparé ». Une plage vide ne prépare aucune citation.
 
     Rend les SHA effectivement rapatriés. Jamais d'exception : une forge
     injoignable est une absence, pas une erreur du gel.
@@ -4328,8 +4336,14 @@ def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list
     # #6934 : la lecture du gel (`fetch=False`) ne sait dire « jamais poussé »
     # que par le refus mémorisé (`fetch_cache`) et les têtes locales : le même
     # balayage des correctifs retirés, ici avec la forge, les prépare.
+    # #7252 : avec la plage gelée, il prépare aussi les commits **cités** par
+    # la réécriture de l'auteur (résolution de l'abrégé, rapatriement exact) ;
+    # la lecture de la transaction les lira localement, sans réseau.
     try:
-        _rewritten_after_freeze(db, item, None, repo, head=current, fetch=True)
+        _rewritten_after_freeze(
+            db, item, None, repo, head=current, fetch=True,
+            commits=tuple(str(sha).strip().lower() for sha in commits or ()
+                          if str(sha or "").strip()))
     except Exception:  # noqa: BLE001 - au mieux : la lecture du gel doute
         pass
     return fetched
@@ -5141,6 +5155,10 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     `cited` nomme le commit qui le cite. Une citation d'un commit encore dans
     la tête, d'un ancêtre ou d'un commit étranger au lot ne prouve rien et
     n'exclut personne ; une forge muette est un doute tracé (`unattached`).
+    Avec `fetch=False` (lecture de la transaction du gel, #3836), la forge
+    n'est **jamais** interrogée : une citation absente localement est un doute
+    `not-prefetched`, dit au gel ; `prefetch_prior_freezes` l'a préparée hors
+    transaction, sur cette même plage.
     """
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
@@ -5416,7 +5434,9 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         `cited` nomme le commit qui le cite. Une citation d'un commit encore
         dans la tête, d'un ancêtre ou d'un commit étranger au lot ne prouve
         rien : elle n'exclut personne. Une forge muette sur un commit absent
-        localement est un doute tracé, jamais une exclusion.
+        localement est un doute tracé, jamais une exclusion. `fetch=False`
+        (#3836) interdit toute interrogation de la forge : l'objet absent
+        localement est un doute `not-prefetched`, à préparer hors transaction.
         """
         if not commits or not author:
             return {}
@@ -5474,12 +5494,13 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         check()
         found: dict[str, dict] = {}
 
-        def cite_doubt(token: str, citing: str) -> None:
+        def cite_doubt(token: str, citing: str, *,
+                       reason: str = "forge-unreadable") -> None:
             """#7252 B/P2 auditeur : une citation non concluante se dit au gel."""
             if unattached is not None:
                 ignored.setdefault(("", "cited:" + token), {
                     "name": "", "sha": token,
-                    "reason": "forge-unreadable", "cited": citing})
+                    "reason": reason, "cited": citing})
 
         for token, citing in sorted(cited.items()):
             check()
@@ -5490,6 +5511,13 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 # (push forcé). La forge le résout par l'abrégé, puis sert
                 # l'objet exact pour les contrôles de topologie. Forge muette :
                 # un doute est tracé, jamais une exclusion silencieuse.
+                # #3836 : la lecture du gel (`fetch=False`) ne touche jamais au
+                # réseau ; ses citations sont préparées hors transaction
+                # (`prefetch_prior_freezes`). Un objet encore absent reste un
+                # doute tracé, sans fetch sous les verrous du gel.
+                if not fetch:
+                    cite_doubt(token, citing, reason="not-prefetched")
+                    continue
                 resolved = _forge_commit(repo, token, timeout=remaining())
                 if not resolved:
                     cite_doubt(token, citing)
@@ -5894,8 +5922,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
 
     `fetch=False` (#3836) ne rapatrie rien : c'est la lecture d'une
     transaction de gel, qui ne doit jamais attendre le réseau en tenant ses
-    verrous. Les objets des gels antérieurs se préparent hors transaction par
-    `prefetch_prior_freezes`.
+    verrous. Les objets des gels antérieurs **et les commits cités** (#7252)
+    se préparent hors transaction par `prefetch_prior_freezes`, sur la même
+    plage ; un objet encore absent est un doute tracé, jamais un fetch.
     """
     item = dict(item or {})
     packet = bool(packet_composer(item))

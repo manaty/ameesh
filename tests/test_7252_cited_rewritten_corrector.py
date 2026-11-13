@@ -13,7 +13,10 @@ famille reste éligible (§2) ; un correctif qui reste dans la tête garde la
 règle existante (famille du correcteur interdite) ; une citation d'un commit
 encore dans la tête n'exclut personne ; un commit cité absent du clone est
 résolu par la forge puis rapatrié (B/P2 auditeur) ; une forge muette trace un
-doute au gel, sans exclure.
+doute au gel, sans exclure ; la lecture de la transaction (`fetch=False`,
+#3836) n'interroge jamais la forge et dit la citation non préparée ; le
+prefetch hors transaction, sur la plage gelée, la prépare et l'exclusion tient
+alors sans réseau.
 """
 from __future__ import annotations
 
@@ -157,16 +160,18 @@ class _Fixture:
         self._receipt("author", "deepseek", [head_b])
         return fix, head_b
 
-    def _reading(self, head_b, doubts=None):
+    def _reading(self, head_b, doubts=None, *, fetch=True):
         commits = self.repo.git("rev-list", "--no-merges",
                                 "%s..%s" % (self.base, head_b)).split()
         freeze = self._milestone("frozen", head_b)
         return review_authors.reading(
             self.db, work.get(self.db, self.lot), freeze, commits,
-            self.repo.root, FAMILIES, doubts_out=doubts), freeze
+            self.repo.root, FAMILIES, doubts_out=doubts,
+            fetch=fetch), freeze
 
-    def _select(self, head_b, doubts=None):
-        (authors, unknown, correctors), _freeze = self._reading(head_b, doubts)
+    def _select(self, head_b, doubts=None, *, fetch=True):
+        (authors, unknown, correctors), _freeze = self._reading(
+            head_b, doubts, fetch=fetch)
         self.assertEqual(unknown, [])
         out = rd.select(
             required=2, authors=authors,
@@ -259,6 +264,67 @@ class _Fixture:
         self.assertIn("1 cited commit(s) unreadable at the forge", note)
         self.assertIn(fix[:12], note)
         self.assertIn("cited by %s" % head_b[:12], note)
+
+    def test_a_transaction_reading_never_queries_the_forge(self):
+        # #3836 (B/P2 cx2) : `fetch=False` est la lecture de la transaction du
+        # gel ; elle ne doit tenir aucun verrou pendant un accès réseau. Une
+        # citation absente localement est un doute, jamais un `_forge_commit`
+        # ni un `git fetch`.
+        fix, head_b = self._remote_rewrite()
+        doubts: list = []
+        calls: list = []
+
+        def forbidden(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("fetch=False must not reach the forge")
+
+        with mock.patch.object(review_authors, "_forge_commit", forbidden), \
+                mock.patch.object(review_authors, "_forge_fetch", forbidden), \
+                mock.patch.object(review_authors, "_forge_serves", forbidden):
+            _authors, correctors, _out = self._select(head_b, doubts,
+                                                      fetch=False)
+        self.assertEqual(calls, [])
+        self.assertEqual(correctors, [])
+        self.assertEqual([row["name"] for row in doubts], [""])
+        self.assertEqual(doubts[0]["sha"], fix[:12])
+        self.assertEqual(doubts[0]["reason"], "not-prefetched")
+        self.assertEqual(doubts[0]["cited"], head_b)
+        note = rd.doubts_note(doubts)
+        self.assertIn("1 cited commit(s) not prepared before the freeze", note)
+        self.assertIn(fix[:12], note)
+        self.assertIn("cited by %s" % head_b[:12], note)
+
+    def test_prefetch_prepares_the_cited_commit_before_the_transaction(self):
+        # #3836 (B/P2 cx2) : le rapatriement hors transaction reçoit la plage
+        # gelée et prépare les commits cités ; la lecture `fetch=False` les
+        # trouve alors localement et exclut le correcteur, sans réseau.
+        fix, head_b = self._remote_rewrite()
+        self.assertNotEqual(subprocess.run(
+            ["git", "-C", self.repo.root, "cat-file", "-e", fix],
+            capture_output=True).returncode, 0)
+        commits = self.repo.git("rev-list", "--no-merges",
+                                "%s..%s" % (self.base, head_b)).split()
+        with mock.patch.object(review_authors, "_forge_commit",
+                               lambda repo, token, **kw: fix):
+            review_authors.prefetch_prior_freezes(
+                self.db, work.get(self.db, self.lot), self.repo.root, head_b,
+                commits=commits)
+        self.assertEqual(self.repo.git("rev-parse", fix + "^{commit}"), fix)
+        doubts: list = []
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("the prefetch must have prepared the object")
+
+        with mock.patch.object(review_authors, "_forge_commit", forbidden), \
+                mock.patch.object(review_authors, "_forge_fetch", forbidden), \
+                mock.patch.object(review_authors, "_forge_serves", forbidden):
+            _authors, correctors, out = self._select(head_b, doubts,
+                                                     fetch=False)
+        self.assertEqual(doubts, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head_b)
+        self.assertNotIn("cx3", [row["name"] for row in out["reviewers"]])
 
 
 class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
