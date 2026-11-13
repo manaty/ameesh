@@ -288,12 +288,14 @@ def _staging_config(explicit):
 
 
 def _venv_pin(key, live):
-    """#7212 : (nouvelle clé, chemin à hacher) d'une épingle de venv, sinon None.
+    """#7212 : (racine de la nouvelle clé, suffixe dans le venv vivant), sinon None.
 
     Seuls les chemins sous un venv voisin du venv changé sont concernés :
-    `venv-<version>` et le venv stable sont réécrits vers `live`, le lien
-    `venv-courant` garde son chemin stable. Le parent doit être celui du venv
-    changé : une épingle d'un autre compte reste intacte."""
+    `venv-<version>` est réécrit vers `live`, le lien `venv-courant` garde sa
+    racine stable. Le suffixe est résolu dans `live` par l'appelant (version
+    Python comprise), pour que la clé nomme le chemin réellement lancé. Le
+    parent doit être celui du venv changé : une épingle d'un autre compte
+    reste intacte."""
     base = os.path.dirname(live)
     parts = os.path.abspath(key).split(os.sep)
     for index, name in enumerate(parts):
@@ -305,9 +307,7 @@ def _venv_pin(key, live):
         suffix = os.path.join(*parts[index + 1:]) if parts[index + 1:] else ""
         if not suffix or suffix.startswith(os.pardir):
             return None
-        if name == CURRENT:
-            return key, os.path.join(live, suffix)
-        return os.path.join(live, suffix), os.path.join(live, suffix)
+        return (root if name == CURRENT else live), suffix
     return None
 
 
@@ -362,11 +362,13 @@ def _repin_staging_config(path, live):
         target = _venv_pin(key, live)
         if target is None:
             continue
-        new_key, path_in_live = target
-        suffix = os.path.relpath(path_in_live, live)
+        new_root, suffix = target
         path_in_live = _live_counterpart(live, suffix)
         if path_in_live is None:
             raise ValueError("%s n'a pas de correspondance dans %s" % (key, live))
+        # #7212 B1 : la clé nomme le chemin réellement lancé, version Python
+        # comprise ; le lien stable `venv-courant` garde sa racine.
+        new_key = os.path.join(new_root, os.path.relpath(path_in_live, live))
         try:
             digest = _pin_digest(path_in_live)
         except OSError as exc:
@@ -1577,6 +1579,9 @@ def activer(args):
     cible = _version_dir(venv, version)
     if not os.path.isfile(os.path.join(cible, MARKER)):
         _die("venv-%s n'est pas préparé (lancer « preparer »)" % version)
+    # #7212 B3 : le réépinglage est calculé et validé AVANT toute mutation
+    # (adoption, pointeur, lanceurs) : un refus laisse l'hôte intact.
+    config, pins, changes = _pins_for(getattr(args, "staging_config", None), cible)
     vivante = _live_target(venv)
     precedent = vivante
     restore = vivante
@@ -1597,9 +1602,7 @@ def activer(args):
         scripts = _installer_lanceurs(venv, version)
     except OSError as exc:
         _die(str(exc))
-    config, pins, changes = _pins_for(getattr(args, "staging_config", None), cible)
     if _live_target(venv) == version:
-        _retirer_lanceurs(venv, scripts)
         print("bascule: venv-%s déjà actif" % version)
         if pins is not None:
             try:
@@ -1608,23 +1611,25 @@ def activer(args):
                 _die("réépinglage de %s impossible (%s)" % (config, exc))
             print("bascule: %d empreinte(s) réépinglée(s) sur venv-%s"
                   % (len(changes), version))
+        _retirer_lanceurs(venv, scripts)
         _menager_apres_bascule(venv)
         return 0
     if precedent and precedent != version:
         _write_report(venv, precedent)
     _pointer(venv, version)
-    _retirer_lanceurs(venv, scripts)
     if pins is not None:
         try:
             _write_pins(config, pins)
         except OSError as exc:
             # La bascule et son épingle sont un seul geste : sans épingle
-            # valide, on revient au venv dont la configuration répond.
+            # valide, on revient au venv dont la configuration répond, et
+            # aucun lanceur n'a été retiré (#7212 B2).
             _pointer(venv, restore)
             _die("réépinglage de %s impossible (%s) : bascule annulée"
                  % (config, exc))
         print("bascule: %d empreinte(s) réépinglée(s) sur venv-%s"
               % (len(changes), version))
+    _retirer_lanceurs(venv, scripts)
     print("bascule: venv-%s actif%s" % (version, "" if not precedent else " (avant : %s)" % precedent))
     _menager_apres_bascule(venv)
     return 0
@@ -1663,23 +1668,26 @@ def retour(args):
     # lecture seule ne doit pas empêcher un retour manuel. On bascule d'abord,
     # puis on réinstalle les lanceurs en best-effort.
     _pointer(venv, precedent)
+    scripts = None
     try:
         scripts = _installer_lanceurs(venv, precedent)
     except OSError as exc:
         print("bascule: retour effectué, lanceurs non réécrits : %s" % exc,
               file=sys.stderr)
-    else:
-        _retirer_lanceurs(venv, scripts)
     if pins is not None:
         try:
             _write_pins(config, pins)
         except OSError as exc:
+            # #7212 B2 : les lanceurs de l'ancienne version n'ont pas encore
+            # été retirés ; restaurer le lien suffit à les garder utiles.
             if vivante:
                 _pointer(venv, vivante)
             _die("réépinglage de %s impossible (%s) : retour annulé"
                  % (config, exc))
         print("bascule: %d empreinte(s) réépinglée(s) sur venv-%s"
               % (len(changes), precedent))
+    if scripts is not None:
+        _retirer_lanceurs(venv, scripts)
     print("bascule: retour sur venv-%s (sans pip)" % precedent)
     return 0
 

@@ -6,8 +6,10 @@ changement de `venv-courant` réécrit les entrées de venv de
 `staging-executor.json` (chemin et empreinte), laisse les autres entrées
 intactes, et `staging_executor.fingerprints` accepte la demande. Témoins :
 deux bascules de suite, un retour arrière, une entrée stable `venv-courant`,
-un refus qui ne change rien, et la garde toujours active après réépinglage
-(une modification sur place reste refusée).
+une version Python qui change (clé versionnée et clé stable), un échec
+d'écriture qui laisse les lanceurs de la version quittée en place, un refus
+en première conversion qui ne touche à rien, et la garde toujours active
+après réépinglage (une modification sur place reste refusée).
 """
 from __future__ import annotations
 
@@ -30,20 +32,27 @@ bascule = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bascule)
 
 
-def faux_venv(base: Path, version: str, code: str) -> Path:
+def faux_venv(base: Path, version: str, code: str, py: str = "python3.12") -> Path:
     """Un venv versionné factice : `.pret`, python et paquet ameesh."""
     path = base / ("venv-%s" % version)
     (path / "bin").mkdir(parents=True)
     (path / "bin" / "python").write_bytes(("interpreter-" + version).encode())
-    package = path / "lib" / "python3.12" / "site-packages" / "ameesh"
+    package = path / "lib" / py / "site-packages" / "ameesh"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("CODE = %r\n" % code)
     (path / bascule.MARKER).write_text(json.dumps({"version": version}))
     return path
 
 
-def package_of(venv: Path) -> Path:
-    return venv / "lib" / "python3.12" / "site-packages" / "ameesh"
+def package_of(venv: Path, py: str = "python3.12") -> Path:
+    return venv / "lib" / py / "site-packages" / "ameesh"
+
+
+def add_console(venv: Path, name: str) -> None:
+    """Un script console pip de la version (pour les lanceurs stables)."""
+    script = venv / "bin" / name
+    script.write_text("#!/usr/bin/env python3\nprint(%r)\n" % name)
+    script.chmod(0o755)
 
 
 class PinTest(unittest.TestCase):
@@ -211,6 +220,79 @@ class PinTest(unittest.TestCase):
         code = self.run_activer(extra=("--staging-config", str(self.config)))
         self.assertEqual(code, 1)
         self.assertEqual(os.readlink(self.base / bascule.CURRENT), "venv-aaa")
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_a_python_minor_change_moves_a_versioned_pin(self):
+        third = faux_venv(self.base, "ccc", "third", py="python3.13")
+        self.write_config(self.initial_pins())
+        self.assertEqual(0, self.run_activer(
+            "ccc", "aaa", ("--staging-config", str(self.config))))
+        expected = self.pins()
+        self.assertIn(str(package_of(third, "python3.13")), expected)
+        self.assertNotIn(str(package_of(third, "3.12")), expected)
+        self.assert_accepted()
+
+    def test_a_python_minor_change_moves_the_stable_pin(self):
+        faux_venv(self.base, "ccc", "third", py="python3.13")
+        stable = {
+            str(self.base / bascule.CURRENT / "lib" / "python3.12"
+                / "site-packages" / "ameesh"):
+                executor._tree_sha256(package_of(self.first)),
+        }
+        self.write_config(stable)
+        self.assertEqual(0, self.run_activer(
+            "ccc", "aaa", ("--staging-config", str(self.config))))
+        wanted = str(self.base / bascule.CURRENT / "lib" / "python3.13"
+                     / "site-packages" / "ameesh")
+        self.assertEqual(set(self.pins()), {wanted})
+        self.assert_accepted()
+
+    def test_a_failed_pin_write_keeps_the_previous_launchers(self):
+        add_console(self.first, "oldtool")
+        add_console(self.second, "newtool")
+        self.write_config(self.initial_pins())
+        bascule._installer_lanceurs(self.venv, "aaa")
+        self.assertTrue(bascule._est_lanceur(self.venv / "bin" / "oldtool"))
+        with mock.patch.object(bascule, "_write_pins",
+                               side_effect=OSError(28, "disque plein")):
+            code = self.run_activer(
+                "bbb", "aaa", ("--staging-config", str(self.config)))
+        self.assertEqual(code, 1)
+        self.assertEqual(os.readlink(self.base / bascule.CURRENT), "venv-aaa")
+        self.assertTrue(bascule._est_lanceur(self.venv / "bin" / "oldtool"))
+
+    def test_a_failed_pin_write_on_retour_keeps_the_live_launchers(self):
+        add_console(self.first, "oldtool")
+        add_console(self.second, "newtool")
+        self.write_config(self.initial_pins())
+        self.assertEqual(0, self.run_activer(
+            "bbb", "aaa", ("--staging-config", str(self.config))))
+        self.assertTrue(bascule._est_lanceur(self.venv / "bin" / "newtool"))
+        with mock.patch.object(bascule, "_write_pins",
+                               side_effect=OSError(28, "disque plein")):
+            code = self.run_retour()
+        self.assertEqual(code, 1)
+        self.assertEqual(os.readlink(self.base / bascule.CURRENT), "venv-bbb")
+        self.assertTrue(bascule._est_lanceur(self.venv / "bin" / "newtool"))
+
+    def test_first_conversion_refusal_happens_before_any_change(self):
+        os.unlink(self.base / bascule.CURRENT)
+        (self.venv / "pyvenv.cfg").write_text(
+            "home = /usr/bin\nexecutable = /usr/bin/python3\n")
+        (self.venv / "bin" / "python").write_bytes(b"#!/bin/sh\nexit 0\n")
+        (self.venv / "bin" / "python").chmod(0o755)
+        live_package = package_of(self.venv)
+        live_package.mkdir(parents=True)
+        (live_package / "__init__.py").write_text("CODE = 'live'\n")
+        self.config.write_text("{pas du json\n")
+        before = self.config.read_bytes()
+        code = self.run_activer(
+            "bbb", "precedent", ("--staging-config", str(self.config)))
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.lexists(self.base / bascule.CURRENT))
+        self.assertFalse((self.base / "venv-precedent").exists())
+        self.assertFalse((self.venv / bascule.LAUNCHERS).exists())
+        self.assertTrue((live_package / "__init__.py").is_file())
         self.assertEqual(self.config.read_bytes(), before)
 
     def test_config_without_pins_is_left_untouched(self):

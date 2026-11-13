@@ -1034,14 +1034,16 @@ réécrivent, dans la configuration privée du compte
 (`~/.config/ameesh/staging-executor.json`, ou le fichier nommé par
 `--staging-config`), les seules entrées `expected_sha256` qui nomment le venv
 changé : un chemin `venv-<version>` passe au venv vivant, un chemin stable
-`venv-courant/…` garde son chemin, et l'empreinte est recalculée avec la
-même règle que l'exécutant (arbre du paquet, `__pycache__` exclu ; la version
-Python vivante si elle a changé). Les autres entrées (sonde de quiescence,
-scripts) ne bougent pas. Le calcul et le contrôle se font **avant** le
-rename ; un refus (entrée sans correspondance dans le nouveau venv, JSON
-illisible, fichier d'un autre compte) laisse la bascule et la configuration
-intactes, et un échec d'écriture ramène le lien au venv précédent : la
-bascule et son épingle sont un seul geste. La mise à jour automatique #7164
+`venv-courant/…` garde sa racine. La clé suit le chemin réellement lancé,
+version Python comprise (`lib/python3.12` → `lib/python3.13`), et l'empreinte
+est recalculée avec la même règle que l'exécutant (arbre du paquet,
+`__pycache__` exclu). Les autres entrées (sonde de quiescence, scripts) ne
+bougent pas. Le calcul et le contrôle se font **avant toute mutation**
+(adoption, rename, lanceurs) ; un refus (entrée sans correspondance dans le
+nouveau venv, JSON illisible, fichier d'un autre compte) laisse la bascule et
+la configuration intactes. Un échec d'écriture ramène le lien au venv
+précédent sans avoir retiré les lanceurs de la version quittée : la bascule et
+son épingle sont un seul geste. La mise à jour automatique #7164
 en hérite ; une bascule manuelle du venv de l'exécutant doit donc se faire
 avec le `bascule.py` du commit posé, sous le compte (c'est ce qui manquait au
 geste du 13/11 01:1xZ, qui a laissé l'épingle sur `venv-97285a0`).
