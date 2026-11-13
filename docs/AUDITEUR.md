@@ -180,7 +180,7 @@ le JSON plutôt que le texte.
 | 9 | Ses propres suites | `ameesh work list --assignee auditeur --json`, `gh pr checks <n>` | correctif qui attend la CI ou un verdict ; fusionné mais pas déployé ; déploiement sans courrier de résultat ; mesure due sept jours après un déploiement |
 | 10 | Demandes d'humains sans lot (L130) | `ameesh work unrecorded --since 2h --json` (`--since 24h` en analyse profonde) | message d'un humain, réponse à une décision ou demande transmise par son chat qui n'est rattachée à aucun lot, n'en cite aucun et dont aucun lot ne reprend la phrase ; le rapport la nomme (numéro du message, expéditeur, destinataire, extrait) à l'orchestrateur du projet, qui l'enregistre ([ORCHESTRATEUR.md](ORCHESTRATEUR.md), « Toute demande d'un humain devient un lot ») |
 | 11 | Estimations (L157, L157b, L157c) | `ameesh alerts --json` (`estimate_bias`), `ameesh work estimates --json`, `ameesh projects --json` (`lot_estimate` de chaque agent), `ameesh work list --json` (`estimate_minutes`), `ameesh work show <id> --json` (`measure`), `ameesh work schedule --json` | lot ouvert sans durée estimée ; lot en cours au-delà de son estimation (`overrun`) ; médiane réel/estimé d'un type de lot ou d'un auteur hors de ×0,7–×1,5, ou p80 au-delà de ×2 ; estimations tardives (posées après le début) ou ré-estimations nombreuses ; lots livrés sans début mesuré ; L157c: delivered lots without a measure (`measure` null) or with CI unknown; measured size differing from the declared size (`size_match` false) for one estimator again and again; the phase that carries the gap (agent, CI, review, human); open lots left unplanned by `work schedule` |
-| 12 | Conformité aux procédures (L234) | `ameesh work list --json`, `ameesh decisions --json`, `ameesh fil show <projet> --last 200`, `ameesh work show <id> --json`, requêtes 10–12, journaux et forge | attente humaine sans demande ouverte ; question hors `ameesh decide` ; réparation manuelle par humain/bureau ; annonce sans fait correspondant — suivre la méthode ci-dessous |
+| 12 | Conformité aux procédures (L234) | `ameesh work list --json`, `ameesh decisions --json`, `ameesh fil show <projet> --last 200`, `ameesh work show <id> --json`, requêtes 10–12, journaux et forge | attente humaine sans demande ouverte ; question hors `ameesh decide ask` ; réparation manuelle par humain/bureau ; annonce sans fait correspondant — suivre la méthode ci-dessous |
 | 13 | Version numbers (L158) | `gh release list -L 5`, then for each version published since the last pass `python3 ameesh/scripts/version-level.py release v<n>` (after `git -C ameesh fetch --tags`) | `WRONG NUMBER`: the number is below what its content needs (a minor shipped as a patch, a break without a major) or skips a number; a level above the floor found with no reason in the release notes; a published version without its `v<n>` tag. Level 3: it reports it to the owner, who decides whether to publish a corrected number |
 
 ### Contrôles apportés par les modules (point 12, L317b)
@@ -201,7 +201,7 @@ configuration par défaut, jamais de l'assigné ou de son hôte.
 Le nom `auditeur` seul ne donne pas accès aux constats des modules ; aucun
 repli vers les agents d'un autre projet. Sans destinataire agent, le canal
 propriétaire reste le circuit de signalement. Une décision
-nécessaire ensuite passe par `ameesh decide`, jamais par courrier libre au
+nécessaire ensuite passe par `ameesh decide ask`, jamais par courrier libre au
 propriétaire. Au passage suivant, vérifier que le constat a disparu après
 la correction, ou expliquer la preuve encore manquante.
 
@@ -215,7 +215,7 @@ ni la fusion, ni le déploiement. Les requêtes 10 à 12 ci-dessous fournissent
 les candidats ; le fil, le registre, les journaux et la forge les confirment.
 
 1. **Attente humaine sans demande ouverte** : pour chaque lot
-   `waiting_human`, retrouver sa demande `ameesh decide` encore ouverte.
+   `waiting_human`, retrouver sa demande `ameesh decide ask` encore ouverte.
    Sans demande, signaler le lot, l'assigné et le début de l'attente à
    l'orchestrateur ; lui demander de poser la demande par `ameesh decide ask`
    ou de rétablir l'état réel du lot. Une réponse récente peut expliquer un
