@@ -60,6 +60,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from . import canon as canon_mod
@@ -117,6 +118,8 @@ CALLER_BUDGET_S = 420.0
 #: sous le même ``FREEZE_TIMEOUT`` de 600 s du compositeur. Les deux étapes
 #: partagent cette échéance au lieu d'additionner leurs plafonds (300 + 420) ;
 #: la marge de 30 s couvre le démarrage du processus et la sortie.
+#: #7161 : l'attente d'un créneau heavy est hors de cette échéance
+#: (`Deadline.pause`) ; elle allonge le mur du geste, jamais le travail.
 FREEZE_BUDGET_S = 570.0
 
 
@@ -144,6 +147,64 @@ def freeze_deadline(clock=time.monotonic) -> Deadline:
     return Deadline(FREEZE_BUDGET_S, clock=clock)
 
 
+#: #7161 — la prévalidation passe par la file des suites lourdes de l'hôte
+#: (`ameesh heavy`, L131) : au plus `max_heavy_suites` en parallèle, comme une
+#: suite. Un gel qui attend son tour est « en file » : l'attente est suspendue
+#: de son échéance (`Deadline.pause`) et n'est jamais un `run-incomplete`.
+#: Passé ce délai, la prévalidation est rendue « en file » sans run ; le gel,
+#: lui, est déjà écrit et n'est pas défait.
+PREVALIDATION_QUEUE_S = 900.0
+#: le même délai, réglable pour les bancs et les témoins
+PREVALIDATION_QUEUE_ENV = "AMEESH_PREVALIDATION_QUEUE_S"
+
+
+def queue_wait_seconds() -> float:
+    """Le délai d'attente d'un créneau heavy : le défaut ou l'environnement."""
+    raw = os.environ.get(PREVALIDATION_QUEUE_ENV)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return PREVALIDATION_QUEUE_S
+    return value if value >= 0 else PREVALIDATION_QUEUE_S
+
+
+def _queue_note(text: str) -> None:
+    print("prévalidation en file : %s" % text, file=sys.stderr, flush=True)
+
+
+@contextmanager
+def heavy_queue(cfg, command: str, *, say=None,
+                deadline: Deadline | None = None):
+    """#7161 — tient un créneau de la file heavy de l'hôte pendant le passage.
+
+    Rend le temps d'attente en secondes. L'échéance du passage est suspendue
+    pendant cette attente : le run qui suit garde le budget qu'il avait, et
+    l'attente n'est jamais comptée comme un `run-incomplete`. Sans créneau
+    dans [`PREVALIDATION_QUEUE_S`], lève `queued` : la prévalidation est « en
+    file », le gel reste écrit."""
+    from . import heavy
+
+    if cfg is None or not str(getattr(cfg, "state_dir", "") or ""):
+        yield 0.0
+        return
+    started = time.monotonic()
+    log = _queue_note if say is None else say
+    held = heavy.acquire(cfg, command=command, log=log,
+                         max_wait_s=queue_wait_seconds())
+    waited = time.monotonic() - started
+    if held is None:
+        raise prevalidation.PrevalidationError(
+            "queued",
+            "aucun créneau heavy libre après %ds ; la prévalidation est en "
+            "file, le gel reste écrit" % int(waited))
+    try:
+        if deadline is not None:
+            deadline.pause(waited)
+        yield waited
+    finally:
+        heavy.release(held[1])
+
+
 def _timeout_error(deadline: Deadline, where: str) -> prevalidation.PrevalidationError:
     """Une échéance de l'appelant épuisée : indisponible, motif ``timeout``."""
     return prevalidation.PrevalidationError("run-incomplete", _timed_out(deadline, where))
@@ -153,7 +214,10 @@ def _timed_out(deadline: Deadline | None, why: str) -> str:
     """``why`` préfixé de « timeout » quand l'échéance de l'appelant est épuisée."""
     if deadline is None or not deadline.expired() or str(why).startswith("timeout"):
         return why
-    head = "timeout — budget de l'appelant (%d s) épuisé" % round(deadline.at - deadline.started)
+    #: #7161 : `Deadline.pause` allonge `at` ; le motif nomme le budget reçu,
+    #: pas le temps de mur (une attente de créneau heavy ne le gonfle pas).
+    budget = getattr(deadline, "budget", deadline.at - deadline.started)
+    head = "timeout — budget de l'appelant (%d s) épuisé" % round(budget)
     return "%s%s" % (head, (" " + why) if why else "")
 
 
@@ -930,10 +994,13 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
     `default`, sans base : les contrats tombaient en `setUpClass` et la
     prévalidation rendait un faux rouge (#4008).
 
-    Avec ``deadline`` (#4067), le passage entier — canon, carte, plan, run
-    sur l'hôte (attente de la file comprise), nettoyage — lit la même
-    échéance : le job distant est annulé à l'échéance (``--wait-timeout``) et
-    le geste rend ``run-incomplete`` (« timeout ») dans le délai de l'appelant.
+    Avec ``deadline`` (#4067), le passage — canon, carte, plan, run sur
+    l'hôte, nettoyage — lit la même échéance : le job distant est annulé à
+    l'échéance (``--wait-timeout``) et le geste rend ``run-incomplete``
+    (« timeout ») dans le délai de l'appelant. #7161 : la prévalidation prend
+    un créneau de la file heavy de l'hôte avant son travail lourd (plan,
+    snapshot, run) ; le temps d'attente de ce créneau est suspendu de
+    l'échéance, il n'est jamais un ``run-incomplete``.
     """
     profile = (profile or project or "").strip()
     params = parameters(cfg, project, deadline=deadline)
@@ -958,33 +1025,46 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
             % ", ".join(declared))
     tooling(repo, head, params, deadline=deadline)
     carte, cleanup = map_for(repo_slug, repo, explicit=map_path, deadline=deadline)
+    if deadline is not None and deadline.expired():
+        raise _timeout_error(deadline, "avant la file heavy")
     prepared = None
     try:
-        if deadline is not None and deadline.expired():
-            raise _timeout_error(deadline, "avant l'arbre du SHA")
-        prepared = prepare(repo, head, base, map_path=carte,
-                           plan_script=getattr(params.params, "plan_script", None)
-                           or DEFAULT_PLAN_SCRIPT,
-                           project=params.project, deadline=deadline)
-        fallback = contract_fallback(prepared, params, head=head, base=base,
-                                     deadline=deadline)
-        if deadline is not None and deadline.expired():
-            raise _timeout_error(deadline, "avant l'hôte")
-        report = _run_hosts(prepared, params, lot=lot, head=head, base=base,
-                            branch=branch, profile=profile, say=say,
-                            executable=executable, validate=validate,
-                            deadline=deadline)
-        if fallback:
-            #: #4071 : le plan de repli est filtré par `validate` avant le run ;
-            #: quand le rapport ne porte pas déjà son bloc (validate simulé),
-            #: il dit au moins les modules réellement planifiés et les exclus.
-            played = dict(fallback)
-            if isinstance(report.get("planned"), list):
-                played["modules"] = list(report["planned"])
-            if "excluded" in report:
-                played["excluded"] = list(report.get("excluded") or ())
-            report.setdefault("fallback", played)
-            report.setdefault("selection", "contract")
+        #: #7161 : le plan, le snapshot et le run invité passent par la file
+        #: des suites lourdes de l'hôte (`ameesh heavy`, L131). L'attente d'un
+        #: créneau est suspendue de l'échéance : elle n'est jamais un
+        #: `run-incomplete`, et le run garde le budget qu'il avait.
+        with heavy_queue(cfg, "prévalidation #%d %s"
+                         % (lot, (head or "?")[:12]),
+                         say=say, deadline=deadline) as waited:
+            if deadline is not None and deadline.expired():
+                raise _timeout_error(deadline, "avant l'arbre du SHA")
+            prepared = prepare(repo, head, base, map_path=carte,
+                               plan_script=getattr(params.params, "plan_script", None)
+                               or DEFAULT_PLAN_SCRIPT,
+                               project=params.project, deadline=deadline)
+            fallback = contract_fallback(prepared, params, head=head, base=base,
+                                         deadline=deadline)
+            if deadline is not None and deadline.expired():
+                raise _timeout_error(deadline, "avant l'hôte")
+            report = _run_hosts(prepared, params, lot=lot, head=head, base=base,
+                                branch=branch, profile=profile, say=say,
+                                executable=executable, validate=validate,
+                                deadline=deadline)
+            if waited and isinstance(report, dict):
+                #: #7161 : la note du gel dit que la prévalidation a attendu son
+                #: créneau ; la preuve ne le cache pas.
+                report.setdefault("queue_wait_s", round(waited, 1))
+            if fallback:
+                #: #4071 : le plan de repli est filtré par `validate` avant le run ;
+                #: quand le rapport ne porte pas déjà son bloc (validate simulé),
+                #: il dit au moins les modules réellement planifiés et les exclus.
+                played = dict(fallback)
+                if isinstance(report.get("planned"), list):
+                    played["modules"] = list(report["planned"])
+                if "excluded" in report:
+                    played["excluded"] = list(report.get("excluded") or ())
+                report.setdefault("fallback", played)
+                report.setdefault("selection", "contract")
     finally:
         if prepared is not None:
             prepared.close(timeout=TRAIN_CLEANUP_TIMEOUT if deadline is None
@@ -1170,6 +1250,12 @@ def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
                      repo_slug=str(decision.get("repo") or ""), say=say, warn=warn,
                      deadline=deadline)
     except prevalidation.PrevalidationError as exc:
+        if exc.cause == "queued":
+            #: #7161 : aucun créneau heavy dans le délai. Ce n'est pas un
+            #: run-incomplete : la porte du paquet cite « en file » et
+            #: laisse la CI complète rester la preuve finale.
+            return {"state": "unavailable", "cause": "queued",
+                    "why": "prévalidation en file : %s" % exc.why}
         return {"state": "unavailable", "cause": exc.cause,
                 "why": _timed_out(deadline, exc.why)}
     except Exception as exc:  # noqa: BLE001 - une indisponibilité, jamais un vert
@@ -1306,6 +1392,12 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
                      repo_slug=_repo_slug(cfg, item), say=say, warn=warn,
                      deadline=deadline)
     except prevalidation.PrevalidationError as exc:
+        if exc.cause == "queued":
+            #: #7161 : le gel attend un créneau heavy ; il est déjà écrit et
+            #: n'est pas défait. « en file » n'est pas un run-incomplete.
+            key = "%s en file" % JOURNAL_PREFIX
+            _journal(db, lot, "%s: %s" % (key, exc.why), key=key)
+            return {"state": "queued", "cause": "queued", "why": exc.why}
         why = _timed_out(deadline, exc.why)
         key = "%s unavailable: %s" % (JOURNAL_PREFIX, exc.cause)
         text = "%s%s" % (key, (" — " + why) if why else "")
@@ -1313,6 +1405,8 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
         return {"state": "unavailable", "cause": exc.cause, "why": why}
     state = report_state(report)
     why = describe(report)
+    wait = report.get("queue_wait_s")
+    suffix = (" (en file %ss)" % wait) if wait else ""
     if state == "unavailable":
         why = _timed_out(deadline, why)
         cause = (report.get("causes") or ("run-incomplete",))[0]
@@ -1320,13 +1414,15 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
         fingerprint = ""
         if cause == "run-incomplete" and report.get("missing"):
             fingerprint = _modules_fingerprint(report.get("missing"))
-            _journal(db, lot, "%s %s — tête %s: %s"
-                     % (key, fingerprint, head[:12], why),
+            _journal(db, lot, "%s %s — tête %s: %s%s"
+                     % (key, fingerprint, head[:12], why, suffix),
                      key=key, fingerprint=fingerprint)
         else:
-            _journal(db, lot, "%s — tête %s: %s" % (key, head[:12], why), key=key)
+            _journal(db, lot, "%s — tête %s: %s%s" % (key, head[:12], why, suffix),
+                     key=key)
     else:
-        _journal(db, lot, "%s %s %s: %s" % (JOURNAL_PREFIX, state, head[:12], why))
+        _journal(db, lot, "%s %s %s: %s%s"
+                 % (JOURNAL_PREFIX, state, head[:12], why, suffix))
     return {"state": state, "report": report}
 
 

@@ -96,6 +96,7 @@ CAUSES = (
     "transport-lost",     # connexion perdue, résultat non authentifié
     "block-missing",      # le canon ne porte pas le bloc `prevalidation` (#1770)
     "tooling-missing",    # le dépôt candidat n'a pas le plan ni le lanceur (#2794)
+    "queued",             # aucun créneau heavy dans le délai : « en file » (#7161)
 )
 
 #: #4071 — tests qu'un guest d'offload ne peut pas exécuter, par profil
