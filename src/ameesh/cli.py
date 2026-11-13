@@ -907,7 +907,13 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
         print("usage: agent-mail inbox [--unread] [NAME]", file=sys.stderr)
         return 2
     if rest:
-        name = rest[0]  # lire la boîte d'un autre n'accorde rien et ne consomme rien
+        # Lire la boîte d'un autre n'accorde rien et ne consomme rien : un nom
+        # est une lecture de diagnostic, pas une revendication d'identité.
+        # #7149 (regel, h-20261113-04) : la garde ci-dessous ne vise donc que
+        # SA propre boîte, celle que l'identité annoncée ou liée revendique ;
+        # un `inbox <nom>` explicite reste la lecture sans marquage décrite
+        # par docs/V1-MAILBOX-RUNNER.md (`inbox <nom>`).
+        name = rest[0]
     else:
         binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
         if not binding.ok:
@@ -915,6 +921,22 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
                   file=sys.stderr)
             return 1
         name = binding.name
+        if bk.kind == "pg":
+            # #7149 : la boîte d'un agent mené par l'exécuteur n'est lue comme
+            # sienne que par la session liée à ce nom. Un AGENT_MAIL_NAME hérité
+            # ne suffit pas : l'incident a montré un lecteur qui traitait le
+            # courrier de claude2 comme le sien. Les personas externes (sans
+            # exécuteur) restent lisibles pour le diagnostic et l'export.
+            own = binding.ok and binding.source in ("session", "runner")
+            if not own:
+                row = registry.get(bk.db, name) or {}
+                if (row.get("mode") or "") == "execute" and not row.get("retired_ts"):
+                    print("box of %s: driven by its executor (mode execute); only "
+                          "its bound session reads it — its runner delivers its "
+                          "mail. To inspect it without claiming its identity, "
+                          "unset AGENT_MAIL_NAME and read it by name (`ameesh "
+                          "mail inbox %s`)." % (name, name), file=sys.stderr)
+                    return 1
     if bk.kind != "pg":
         from .agent_names import resolve
         name = resolve(name, cfg=cfg, operation="mail.inbox")
@@ -967,6 +989,16 @@ def cmd_show(bk, cfg: Config, rest: list[str]) -> int:
         print("unbound identity: %s" % (binding.reason or "AGENT_MAIL_NAME not set"),
               file=sys.stderr)
         return 1
+    if binding.source == "explicit":
+        # #7149 : même garde que `inbox` — un AGENT_MAIL_NAME hérité ne lit
+        # pas le courrier d'un agent mené par l'exécuteur. Seule sa session
+        # liée (source session/runner) le lit.
+        agent_row = registry.get(bk.db, binding.name) or {}
+        if (agent_row.get("mode") or "") == "execute" and not agent_row.get("retired_ts"):
+            print("message #%d: %s is driven by its executor (mode execute); "
+                  "only its bound session reads its mail"
+                  % (message_id, binding.name), file=sys.stderr)
+            return 1
     row = mail.get_received(bk.db, message_id, binding.name)
     if row is None:
         print("no message #%d addressed to %s: only its recipient (or a copy) "

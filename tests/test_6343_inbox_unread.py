@@ -8,7 +8,10 @@ from .support import PgTestCase
 class InboxUnreadTest(PgTestCase):
     def setUp(self):
         super().setUp()
-        registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
+        # #7149 : `inbox` d'un agent `execute` exige sa session liée ; ce test
+        # porte sur `--unread`, pas sur la garde d'identité.
+        registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host,
+                        mode="externe")
 
     def inbox(self, *args):
         result = self.cli("inbox", *args, env=self.env(AGENT_MAIL_NAME="beta"))

@@ -300,14 +300,18 @@ class L41LiaisonsTest(PgTestCase):
         self.assertIn("driven by the runner", proc.stderr)
         self.assertEqual(self.undelivered("alpha"), 1)
 
-    def test_agent_mail_name_reste_prioritaire(self):
+    def test_agent_mail_name_contredisant_la_liaison_est_refuse(self):
+        # #7149 : un nom annoncé qui contredit la liaison de la session ne
+        # remet pas le courrier d'un autre agent ; la liaison fait l'identité.
         self.bind("alpha", "--session", "s-1", "--harness", "claude")
         registry.upsert(self.db, "gamma", harness="claude", host=self.cfg.host)
         self.send("gamma", "Pour gamma.")
         self.send("alpha", "Pour alpha.")
         proc = self.hook("s-1", env=self.env(AGENT_MAIL_NAME="gamma"))
-        self.assertIn("Pour gamma.", proc.stdout)
-        self.assertNotIn("Pour alpha.", proc.stdout)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("ambiguous identity", proc.stderr)
+        self.assertEqual(self.undelivered("gamma"), 1)
+        self.assertEqual(self.undelivered("alpha"), 1)
 
     # -- whoami et commandes dans une session liée ---------------------------
     def test_whoami_source_session(self):
