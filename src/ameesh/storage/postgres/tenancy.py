@@ -86,7 +86,8 @@ class Tenancy(interface.Tenancy):
             """
             SELECT t.host, t.tenant, t.unix_user, t.uid, t.runner_id, t.registered_by,
                    extract(epoch from t.registered_at)::float8 AS registered_ts,
-                   p.version, extract(epoch from p.seen_at)::float8 AS seen_ts,
+                   p.version, p.profiles,
+                   extract(epoch from p.seen_at)::float8 AS seen_ts,
                    extract(epoch from clock_timestamp())::float8 AS now_ts
               FROM host_tenants t
               LEFT JOIN runner_presence p ON p.host = t.host AND p.tenant = t.tenant
@@ -96,27 +97,32 @@ class Tenancy(interface.Tenancy):
             (host, host))
         return [dict(row) for row in rows]
 
-    def beat(self, host, tenant, runner_id, *, uid, version):
+    def beat(self, host, tenant, runner_id, *, uid, version, profiles=()):
         # La présence n'existe que sous une liaison qui nomme CE runner : un
         # runner mal configuré ne se déclare pas présent pour un autre tenant.
+        published = [str(p) for p in profiles or () if p]
         rows = self.db.query(
             """
-            INSERT INTO runner_presence (host, tenant, runner_id, uid, version, seen_at)
-            SELECT t.host, t.tenant, t.runner_id, %s, %s, clock_timestamp()
+            INSERT INTO runner_presence
+                (host, tenant, runner_id, uid, version, profiles, seen_at)
+            SELECT t.host, t.tenant, t.runner_id, %s, %s,
+                   ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)),
+                   clock_timestamp()
               FROM host_tenants t
              WHERE t.host = %s AND t.tenant = %s AND t.runner_id = %s
             ON CONFLICT (host, tenant) DO UPDATE
                SET runner_id = excluded.runner_id, uid = excluded.uid,
-                   version = excluded.version, seen_at = excluded.seen_at
+                   version = excluded.version, profiles = excluded.profiles,
+                   seen_at = excluded.seen_at
             RETURNING tenant
             """,
-            (uid, version, host, tenant, runner_id))
+            (uid, version, json.dumps(published), host, tenant, runner_id))
         return bool(rows)
 
     def presence(self, host, tenant):
         rows = self.db.query(
             """
-            SELECT p.runner_id, p.version,
+            SELECT p.runner_id, p.version, p.profiles,
                    extract(epoch from p.seen_at)::float8 AS seen_ts,
                    extract(epoch from clock_timestamp())::float8 AS now_ts
               FROM runner_presence p

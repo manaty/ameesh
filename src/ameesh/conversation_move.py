@@ -72,10 +72,28 @@ def plan(db, agent: str, target_host: str, *, requested_by: str,
                            requested_by=requested_by)
 
 
+def manual(db, agent: str, target_host: str, target_cwd: str, *,
+           actor: str, source_host: str,
+           move_id: str | None = None) -> dict | None:
+    """#7108: one transaction for an operator move of a `preference` agent.
+
+    The caller has already run the preflight (presence, tenant, account
+    profile, harness, no turn, no open handoff, no host hold); this write
+    rechecks the registry guards — including that the agent still sits on
+    `source_host`, the host the caller saw — and opens the attempt `switched`,
+    or `recovered` when the source lease is no longer live (its interrupted
+    instruction is then replayed once). Returns the moved row, or None when a
+    guard changed since the preflight.
+    """
+    return _moves(db).manual(move_id or str(uuid.uuid4()), agent, target_host,
+                             target_cwd, actor=actor, source_host=source_host)
+
+
 def handover(db, agent: str, *, holdoff_s: float = 0.0) -> dict | None:
     """#7052: the conversation this `preference` role has just handed over.
 
-    Returns the newest post-switch attempt whose target has not claimed yet,
+    Returns the newest post-switch attempt whose target has not claimed yet
+    (reason `preference` from the B2 return, `manual` from a B4 operator move),
     with `left_s` = seconds of holdoff remaining on the database clock
     (negative once the margin is over), or None. The holdoff is computed from
     `switched_at`, so it survives a runner restart without in-memory state.

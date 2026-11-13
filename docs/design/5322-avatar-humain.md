@@ -572,7 +572,10 @@ reste réservé à l'élection) — la préférence vient de l'ordre du `Placeme
   profils `accounts` (`accounts.py:227-248`) ; aucun dossier de compte n'est
   partagé entre tenants ;
 - une ligne `runner_presence(host, tenant, runner_id, seen_at, version)`, et
-  une identité DB `tenant:<membre>` vérifiée par l'hôte.
+  une identité DB `tenant:<membre>` vérifiée par l'hôte. Depuis B4 (#7108),
+  son battement publie aussi les **noms** des profils de compte qu'il offre
+  (`profiles`, `harnais/compte`, migration 0576), jamais un chemin ni un
+  secret : c'est la preuve lisible à distance du préflight de déplacement.
 
 **Superviseur d'hôte.** Un service d'hôte (utilisateur système dédié, sans
 harnais d'agent) possède l'état **machine** : `host_resources`,
@@ -631,6 +634,25 @@ le poste garde les siens, le cloud garde les siens ; aucun fichier
 d'identifiants ne traverse. C'est la différence avec `relocate` quand
 `shared_sessions` est vrai : ici le stockage des sessions n'est jamais
 partagé.
+
+**Implémenté par B4 (#7108).** Le préflight lit la présence recalculée
+(`election.candidate_state` : relevé frais, porte, canon, placement, verdict
+local et battement du runner du tenant), puis le tenant lié (`host_tenants`)
+et les profils de compte `harnais/compte` que son runner publie dans
+`runner_presence.profiles` (migration 0576 ; des noms seulement, jamais un
+chemin ni un secret) — l'absence de profil pour le harnais est refusée
+`move-account-missing` avant toute écriture. Une seule transaction verrouille
+la ligne de registre, revérifie les gardes, ouvre la tentative
+`conversation_moves` (raison `manual`, source copiée, dossier de travail de la
+cible venu de son `canon sync`) directement en `switched`, ou en `recovered`
+quand le bail source n'est plus vivant (hôte disparu : le tour interrompu est
+rejoué une fois, comme en B2) ; elle passe la ligne sur la cible, révoque le
+bail source (époque + 1) et écrit `agent.moved` ; la session native reste
+provisoire jusqu'au premier tour de la cible, qui reconstruit le segment
+depuis le journal. Un `--keep-session` est refusé (rien de natif ne traverse).
+Le holdoff de B2 (`claim_wait`/`open_handover`) vaut aussi pour ce
+déplacement : la source ne reprend pas l'avatar pendant que la cible claim, et
+le récupère après `HANDOVER_TTL_S` si personne ne l'a fait.
 
 ### 3.6 Placement des enfants
 

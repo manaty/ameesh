@@ -104,18 +104,37 @@ def admits(cfg, policy: Mapping, agent: Mapping) -> bool:
     return bool(tenant) and canon_mod.tenant_key(agent.get("responsible")) == tenant
 
 
+def published_profiles(cfg) -> list[str]:
+    """#7108 : profils de compte que CE runner peut offrir, `harnais/compte`.
+
+    Le runner d'un tenant lit sa propre configuration (`accounts`), sous son
+    home 0700 : le superviseur ne peut pas la lire. Seuls des noms passent au
+    battement, jamais un chemin ni un secret. Une configuration illisible ne
+    publie rien (fail closed : le déplacement vers ce tenant est refusé)."""
+    from . import accounts as accounts_mod
+    try:
+        declared = accounts_mod.parse(getattr(cfg, "accounts", None) or {})
+    except accounts_mod.AccountError:
+        return []
+    out = {"%s/%s" % (harness, profile.name)
+           for harness, profiles in declared.items() for profile in profiles}
+    return sorted(out)
+
+
 def beat(cfg, db, *, version: str | None = None) -> bool:
     """Battement du runner d'un tenant (`runner_presence`) ; faux sans tenant
     configuré ou sans liaison qui nomme ce runner (le superviseur n'a pas
-    encore enregistré le tenant, ou l'identifiant diffère)."""
+    encore enregistré le tenant, ou l'identifiant diffère). Le battement
+    publie les profils de compte (#7108) avec la présence."""
     tenant = runner_tenant(cfg)
     if not tenant:
         return False
     if version is None:
         from . import version as package_version
         version = package_version()
-    return storage.of(db).tenancy.beat(cfg.host, tenant, cfg.runner, uid=os.getuid(),
-                                       version=str(version or "") or None)
+    return storage.of(db).tenancy.beat(
+        cfg.host, tenant, cfg.runner, uid=os.getuid(),
+        version=str(version or "") or None, profiles=published_profiles(cfg))
 
 
 def presence_reason(db, role: Mapping, host: str, *, now: float,

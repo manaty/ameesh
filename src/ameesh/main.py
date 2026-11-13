@@ -12,7 +12,9 @@
         an existing (closed) interactive session moves under the runner (L39);
   ameesh agent move NOM --to HOST [--keep-session]   manual move of a pinned agent
         to another admitted host, without a live lease when the source executor
-        is stopped (#3299);
+        is stopped (#3299) ; an avatar `releve: preference` moves with its
+        conversation, preflight and one `agent.moved` + `conversation_moves`
+        transaction, no session or credential copied (#7108);
   ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh agent retire <name> --reason R | restore <name>   take an agent out of the
         active registry (never designated, claimed nor mailed), or back (#3460);
