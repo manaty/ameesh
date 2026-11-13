@@ -2837,6 +2837,14 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             # the force is lifted (journaled `auto`) and the automatic choice runs.
             # #1672 : le remplaçant doit être réellement plaçable — un compte à
             # relevé périmé ne lève pas le forçage pour une pause.
+            # #6961 : les relevés de TOUS les comptes peuvent lever une pause
+            # partagée plus ancienne (le forçage de l'actif vient d'être évalué,
+            # pas les autres). Les évaluer avant la liste des remplaçants,
+            # sinon un compte libre reste écarté sur la pause que sa lecture
+            # locale, plus récente, contredit.
+            for profile in candidates:
+                ev(profile)
+            ecartes = retenus | conflits | _paused_names(pauses, cache, now)
             free = [p for p in candidates if p.name != active.name
                     and p.name not in ecartes
                     and placeable(ev(p), now)
