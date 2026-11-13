@@ -4150,6 +4150,44 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
         return None
 
 
+def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> str:
+    """Le SHA complet d'un commit cité **abrégé**, résolu par la forge (#7252).
+
+    Le correctif d'un relecteur retiré par un push forcé n'est plus dans la
+    branche : un hôte qui n'a pas fetché entre le correctif et la réécriture ne
+    l'a pas localement, et `git fetch` d'un SHA abrégé (`5e2c911418d2`) ne le
+    résout pas. L'API de la forge du clone résout l'abrégé, y compris un objet
+    devenu pendant (`repos/<slug>/commits/<token>`), et rend le SHA complet ;
+    `_forge_fetch` rapatrie ensuite l'objet exact pour les contrôles de
+    topologie. Rend `""` sans forge, sur réponse illisible ou sur échéance :
+    un doute, jamais une exclusion silencieuse.
+    """
+    token = str(token or "").strip()
+    if not repo or not token:
+        return ""
+    slug = _repository_slug(repo)
+    if not slug:
+        return ""
+    bound = plan_git.FETCH_TIMEOUT if timeout is None else min(
+        float(timeout), plan_git.FETCH_TIMEOUT)
+    sweep = active_sweep()
+    if sweep is not None:
+        sweep.check("forge cited commit")
+        bound = min(bound, sweep.deadline.remaining())
+    if bound <= 0:
+        return ""
+    try:
+        from . import plan_github
+
+        client = plan_github.client(timeout=bound, caller="review-authors")
+        data = client.get("repos/%s/commits/%s" % (slug, token))
+    except Exception:  # noqa: BLE001 - forge injoignable ou muette : doute
+        return ""
+    full = str((data or {}).get("sha") or "").strip().lower() \
+        if isinstance(data, Mapping) else ""
+    return full if re.fullmatch(r"[0-9a-f]{40}", full) else ""
+
+
 def _forge_serves(repo: str, sha: str, *, timeout: Optional[float] = None):
     """La forge du clone sert-elle le commit exact `sha` ? (#6934, B/P2 cx2)
 
@@ -5095,12 +5133,14 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     #7252 : le reçu exact peut manquer — correctif poussé hors du hook, agent
     de gouvernance sans tour lié. Le commit de réécriture de l'auteur cite
     alors le commit retiré par son SHA. La citation est lue dans la plage
-    gelée (`commits`) : le commit cité doit exister, descendre d'un gel
-    antérieur du lot, ne plus être ancêtre de la tête, avoir été écrit par un
-    relecteur désigné de ce gel et avoir été publié. Son acteur reste exclu
-    par son nom, sa famille redevient éligible (§2) ; `cited` nomme le commit
-    qui le cite. Une citation d'un commit encore dans la tête, d'un ancêtre ou
-    d'un commit étranger au lot ne prouve rien et n'exclut personne.
+    gelée (`commits`) : le commit cité doit exister (dans le clone, sinon
+    résolu par la forge à partir de l'abrégé et rapatrié par son SHA exact),
+    descendre d'un gel antérieur du lot, ne plus être ancêtre de la tête,
+    avoir été écrit par un relecteur désigné de ce gel et avoir été publié.
+    Son acteur reste exclu par son nom, sa famille redevient éligible (§2) ;
+    `cited` nomme le commit qui le cite. Une citation d'un commit encore dans
+    la tête, d'un ancêtre ou d'un commit étranger au lot ne prouve rien et
+    n'exclut personne ; une forge muette est un doute tracé (`unattached`).
     """
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
@@ -5367,13 +5407,16 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         par l'auteur de référence : un relecteur qui cite un autre commit ne
         fait pas de son auteur un correcteur de cette tête.
 
-        Le commit cité doit ensuite être un commit présent, descendre d'un gel
-        antérieur du lot, ne plus être ancêtre de la tête, avoir été écrit par
-        un relecteur désigné de ce gel (reçu exact, committer ou auteur Git) et
-        avoir été publié. Son acteur est exclu par son nom, sans famille (#4457,
-        §2) ; `cited` nomme le commit qui le cite. Une citation d'un commit
-        encore dans la tête, d'un ancêtre ou d'un commit étranger au lot ne
-        prouve rien : elle n'exclut personne.
+        Le commit cité doit ensuite exister — dans le clone, ou résolu par la
+        forge quand un push forcé l'a fait disparaître (`_forge_commit`, puis
+        `_forge_fetch` de l'objet exact) —, descendre d'un gel antérieur du
+        lot, ne plus être ancêtre de la tête, avoir été écrit par un relecteur
+        désigné de ce gel (reçu exact, committer ou auteur Git) et avoir été
+        publié. Son acteur est exclu par son nom, sans famille (#4457, §2) ;
+        `cited` nomme le commit qui le cite. Une citation d'un commit encore
+        dans la tête, d'un ancêtre ou d'un commit étranger au lot ne prouve
+        rien : elle n'exclut personne. Une forge muette sur un commit absent
+        localement est un doute tracé, jamais une exclusion.
         """
         if not commits or not author:
             return {}
@@ -5430,13 +5473,36 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         present = _present_commits(repo, sorted(cited), timeout=remaining())
         check()
         found: dict[str, dict] = {}
+
+        def cite_doubt(token: str, citing: str) -> None:
+            """#7252 B/P2 auditeur : une citation non concluante se dit au gel."""
+            if unattached is not None:
+                ignored.setdefault(("", "cited:" + token), {
+                    "name": "", "sha": token,
+                    "reason": "forge-unreadable", "cited": citing})
+
         for token, citing in sorted(cited.items()):
             check()
-            if present is None:
-                full = _read_local_commit(repo, token)
-            else:
-                full = present.get(token)
-            if not full or plan_git.same_commit(full, head_sha):
+            full = (_read_local_commit(repo, token) if present is None
+                    else present.get(token))
+            if not full:
+                # #7252 B/P2 auditeur : le commit réécrit a disparu du clone
+                # (push forcé). La forge le résout par l'abrégé, puis sert
+                # l'objet exact pour les contrôles de topologie. Forge muette :
+                # un doute est tracé, jamais une exclusion silencieuse.
+                resolved = _forge_commit(repo, token, timeout=remaining())
+                if not resolved:
+                    cite_doubt(token, citing)
+                    continue
+                check()
+                if _forge_fetch(repo, resolved, timeout=remaining()) is not True:
+                    cite_doubt(token, citing)
+                    continue
+                full = _read_local_commit(repo, resolved) or ""
+                if not full:
+                    cite_doubt(token, citing)
+                    continue
+            if plan_git.same_commit(full, head_sha):
                 continue
             if _is_ancestor(repo, full, head_sha) is True:
                 continue                # encore dans la tête : la plage le lit
@@ -5753,8 +5819,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     citation du commit retiré dans le message de réécriture de l'auteur le
     retrouve ; l'acteur reste dans `correctors` avec une famille vide et
     `cited` nomme le commit qui le cite. La citation ne vaut que pour un
-    commit qui descend d'un gel antérieur, n'est plus ancêtre de la tête et
-    dont l'acteur était relecteur désigné de ce gel.
+    commit qui existe (dans le clone, sinon résolu par la forge depuis
+    l'abrégé puis rapatrié), descend d'un gel antérieur, n'est plus ancêtre de
+    la tête et dont l'acteur était relecteur désigné de ce gel. Une forge
+    muette sur un commit absent localement est un doute (`doubts_out`).
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui

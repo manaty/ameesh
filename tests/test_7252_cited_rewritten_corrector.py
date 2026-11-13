@@ -11,11 +11,16 @@ correcteur.
 Témoins : le commit retiré cité par l'auteur est exclu **par son nom**, sa
 famille reste éligible (§2) ; un correctif qui reste dans la tête garde la
 règle existante (famille du correcteur interdite) ; une citation d'un commit
-encore dans la tête n'exclut personne.
+encore dans la tête n'exclut personne ; un commit cité absent du clone est
+résolu par la forge puis rapatrié (B/P2 auditeur) ; une forge muette trace un
+doute au gel, sans exclure.
 """
 from __future__ import annotations
 
 import os
+import subprocess
+
+from unittest import mock
 
 from ameesh import registry, review_authors, review_designation as rd, work
 
@@ -106,16 +111,62 @@ class _Fixture:
         self._receipt("author", "deepseek", [head_b])
         return fix, head_b
 
-    def _reading(self, head_b):
+    def _remote_rewrite(self):
+        """Le correctif de cx3 n'existe que sur la forge, pas dans le clone lu.
+
+        Le clone lu pousse F1 sur une forge nue, un second clone y ajoute le
+        correctif, puis l'auteur réécrit depuis F1 : le SHA cité est absent du
+        clone lu (push forcé), comme sur un hôte qui n'a pas fetché entre le
+        correctif et la réécriture.
+        """
+        forge = os.path.join(self.tmp, "forge.git")
+        fixer = os.path.join(self.tmp, "fixer")
+        self.repo.git("init", "--bare", "-q", forge)
+        self.repo.git("remote", "add", "origin", forge)
+        self.repo.git("push", "-q", "origin",
+                      "%s:refs/heads/main" % self.head_a)
+        self.repo.git("--git-dir", forge, "symbolic-ref", "HEAD",
+                      "refs/heads/main")
+        subprocess.run(["git", "clone", "-q", forge, fixer], check=True,
+                       capture_output=True, text=True)
+        with open(os.path.join(fixer, "src/ameesh/mail.py"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("lot\ncx3 petit correctif\n")
+        env = dict(os.environ,
+                   GIT_AUTHOR_NAME="cx3",
+                   GIT_AUTHOR_EMAIL="cx3@ameesh.invalid",
+                   GIT_COMMITTER_NAME="cx3",
+                   GIT_COMMITTER_EMAIL="cx3@ameesh.invalid")
+        for argv in (["add", "-A"], ["commit", "-qm",
+                                     "cx3: correctif de relecture"]):
+            subprocess.run(["git", "-C", fixer, *argv], check=True,
+                           capture_output=True, text=True, env=env)
+        fix = subprocess.run(["git", "-C", fixer, "rev-parse", "HEAD"],
+                             check=True, capture_output=True, text=True,
+                             env=env).stdout.strip()
+        subprocess.run(["git", "-C", fixer, "push", "-q", "origin",
+                        "HEAD:refs/heads/main"], check=True,
+                       capture_output=True, text=True, env=env)
+        self.repo.git("reset", "--hard", self.head_a)
+        self.repo.write("src/ameesh/mail.py",
+                        "lot\ncx3 petit correctif\nauteur : reprise\n")
+        head_b = self.repo.commit(
+            "author: reprise du correctif\n\nB #40556 : le correctif du"
+            " relecteur %s est retiré de l'historique et remplacé par cette"
+            " réécriture d'auteur." % fix[:12], agent="author")
+        self._receipt("author", "deepseek", [head_b])
+        return fix, head_b
+
+    def _reading(self, head_b, doubts=None):
         commits = self.repo.git("rev-list", "--no-merges",
                                 "%s..%s" % (self.base, head_b)).split()
         freeze = self._milestone("frozen", head_b)
         return review_authors.reading(
             self.db, work.get(self.db, self.lot), freeze, commits,
-            self.repo.root, FAMILIES), freeze
+            self.repo.root, FAMILIES, doubts_out=doubts), freeze
 
-    def _select(self, head_b):
-        (authors, unknown, correctors), _freeze = self._reading(head_b)
+    def _select(self, head_b, doubts=None):
+        (authors, unknown, correctors), _freeze = self._reading(head_b, doubts)
         self.assertEqual(unknown, [])
         out = rd.select(
             required=2, authors=authors,
@@ -174,6 +225,40 @@ class _Fixture:
         _fix, head_b = self._rewrite(cite=self.base)
         _authors, correctors, _out = self._select(head_b)
         self.assertEqual(correctors, [])
+
+    def test_a_cited_commit_absent_from_the_clone_is_resolved_at_the_forge(self):
+        fix, head_b = self._remote_rewrite()
+        self.assertNotEqual(subprocess.run(
+            ["git", "-C", self.repo.root, "cat-file", "-e", fix],
+            capture_output=True).returncode, 0)
+        with mock.patch.object(review_authors, "_forge_commit",
+                               lambda repo, token, **kw: fix):
+            _authors, correctors, out = self._select(head_b)
+        # B/P2 auditeur : le clone de lecture n'avait pas l'objet ; la forge
+        # a résolu l'abrégé, l'objet exact a été rapatrié, l'exclusion tient.
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head_b)
+        self.assertEqual(self.repo.git("rev-parse", fix + "^{commit}"), fix)
+        names = [row["name"] for row in out["reviewers"]]
+        self.assertNotIn("cx3", names)
+        self.assertIn("r2", names)      # §2 : la famille codex reste éligible
+
+    def test_an_unreadable_forge_traces_a_doubt_without_excluding(self):
+        fix, head_b = self._remote_rewrite()
+        doubts: list = []
+        with mock.patch.object(review_authors, "_forge_commit",
+                               lambda repo, token, **kw: ""):
+            _authors, correctors, _out = self._select(head_b, doubts)
+        self.assertEqual(correctors, [])
+        self.assertEqual([row["name"] for row in doubts], [""])
+        self.assertEqual(doubts[0]["sha"], fix[:12])
+        self.assertEqual(doubts[0]["reason"], "forge-unreadable")
+        self.assertEqual(doubts[0]["cited"], head_b)
+        note = rd.doubts_note(doubts)
+        self.assertIn("1 cited commit(s) unreadable at the forge", note)
+        self.assertIn(fix[:12], note)
+        self.assertIn("cited by %s" % head_b[:12], note)
 
 
 class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):

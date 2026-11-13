@@ -1451,6 +1451,58 @@ class Port(Protocol):
         """Writes the freeze's designation in one transaction and returns its shape."""
 
 
+def doubts_note(doubts: Iterable = (), fixers: Iterable = ()) -> str:
+    """#4679/#6934/#7252 : les doutes du gel, dits sans exclure personne.
+
+    Un reçu de correctif introuvable **sans rattachement de lot** ne prouve
+    rien sur cette tête ; un commit local jamais poussé est une sonde ; une
+    citation (#7252) que la forge ne résout pas reste non concluante. Tous
+    sont dits dans la raison du gel, jamais dans `fixers` ni dans la porte.
+    Un acteur déjà correcteur de la tête n'est pas répété.
+    """
+    excluded = {str((row or {}).get("name") or "").strip().casefold()
+                for row in fixers or () if isinstance(row, Mapping)}
+    reported: dict[str, list] = {"": [], "never-pushed": []}
+    cited: list[tuple[str, str]] = []
+    for row in doubts or ():
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("name") or "").strip()
+        sha = str(row.get("sha") or "").strip()
+        reason = str(row.get("reason") or "").strip()
+        if reason == "forge-unreadable" and sha:
+            # #7252 B/P2 auditeur : la citation d'un commit absent du clone
+            # n'est ni exécutée ni tue si la forge ne le sert pas. Sans
+            # acteur, elle ne peut pas exclure : elle est dite au gel.
+            cited.append((sha, str(row.get("cited") or "").strip()))
+            continue
+        if name and sha and name.casefold() not in excluded:
+            reported.setdefault(reason, []).append((name, sha))
+    notes: list[str] = []
+    #: #6934 : un commit local jamais poussé (refusé par la forge, aucune
+    #: poussée de l'acteur sur la branche du lot) est une sonde, dite à part.
+    for reason, label in (("", "without a lot attachment"),
+                          ("never-pushed", "never pushed (local probe)")):
+        unique = sorted(set(reported.get(reason) or ()))
+        if not unique:
+            continue
+        notes.append(
+            "%d unresolved correction receipt(s) %s ignored, no exclusion:"
+            " %s%s"
+            % (len(unique), label,
+               ", ".join("%s %s" % (name, sha[:12]) for name, sha in unique[:4]),
+               ", …" if len(unique) > 4 else ""))
+    if cited:
+        unique = sorted(set(cited))
+        notes.append(
+            "%d cited commit(s) unreadable at the forge, no exclusion: %s%s"
+            % (len(unique),
+               ", ".join("%s cited by %s" % (sha[:12], who[:12] or "?")
+                         for sha, who in unique[:4]),
+               ", …" if len(unique) > 4 else ""))
+    return "; ".join(notes)
+
+
 def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
@@ -1610,30 +1662,9 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     # ne prouve rien sur cette tête. Il n'entre ni dans `fixers` ni dans la
     # porte ; le gel le dit, pour que l'objet absent ne disparaisse pas en
     # silence. Un acteur déjà correcteur de la tête n'est pas répété.
-    excluded = {str((row or {}).get("name") or "").strip().casefold()
-                for row in fixers or () if isinstance(row, Mapping)}
-    reported: dict[str, list] = {"": [], "never-pushed": []}
-    for row in doubts or ():
-        if not isinstance(row, Mapping):
-            continue
-        name = str(row.get("name") or "").strip()
-        sha = str(row.get("sha") or "").strip()
-        reason = str(row.get("reason") or "").strip()
-        if name and sha and name.casefold() not in excluded:
-            reported.setdefault(reason, []).append((name, sha))
-    #: #6934 : un commit local jamais poussé (refusé par la forge, aucune
-    #: poussée de l'acteur sur la branche du lot) est une sonde, dite à part.
-    for reason, label in (("", "without a lot attachment"),
-                          ("never-pushed", "never pushed (local probe)")):
-        unique = sorted(set(reported.get(reason) or ()))
-        if not unique:
-            continue
+    note = doubts_note(doubts, fixers)
+    if note:
         selection = dict(selection)
-        note = ("%d unresolved correction receipt(s) %s ignored, no exclusion:"
-                " %s%s"
-                % (len(unique), label,
-                   ", ".join("%s %s" % (name, sha[:12]) for name, sha in unique[:4]),
-                   ", …" if len(unique) > 4 else ""))
         selection["why"] = ("%s; %s" % (selection["why"], note)
                             if selection.get("why") else note)
     if (existing is not None and existing.get("state") == WAITING
