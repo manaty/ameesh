@@ -557,6 +557,49 @@ interrupted instruction is replayed once at the target's claim (same
 `pending_prompt_id`), prefixed with the interruption notice; the lease CAS and
 the epoch remain the only arbiters, so two holders never serve a turn.
 
+## Shared multi-tenant host (#7106, avatar B3)
+
+A Host card may declare `policy.shared: true` with `policy.tenants:
+[human:<id>, …]` (docs/design/5322-avatar-humain.md §3.4). `canon check`
+refuses tenants without `shared`, `shared` without tenants, a tenant that is
+not a Member, and any `credential_modes` other than `[api-key]`: decision Q2
+(#213954) allows organization keys only on a shared host; personal
+subscriptions stay on the workstation. Placement admits on that host only an
+agent whose `responsible` is a tenant.
+
+Each tenant has its own system user (`ameesh-<id>`, own group, home 0700,
+linger), its own runner (`AMEESH_TENANT=human:<id>`, unit
+`ameesh-runner-tenant@<id>.service`) and its own account folders under its
+home; no account folder is shared. The **host supervisor** is the runner of
+the `ameesh` user, without `tenant`: it keeps the machine state (canon sync,
+`host_resources`, lifecycle, gates, housekeeping) and claims no agent. A
+tenant runner does not publish readings: it beats `runner_presence` and takes
+the leases of its own agents.
+
+The guard is in the database (`ameesh_tenant_claim_ok`, migration 0575):
+`canon sync` writes the host policy in `host_tenancy`; the supervisor writes
+the tenant binding (system user, UID read from the system, runner id) in
+`host_tenants`. On a shared host a claim (or an `attach`) succeeds only for
+the runner bound to the agent's `responsible` (or `attach:<its user>@<host>`),
+whatever the runner's agent filter says. For `releve: preference`, a shared
+candidate is present only with a fresh beat of the tenant's runner.
+`require_isolation` (persona memory) compares verified UIDs: two tenants are
+isolated; the same tenant, an unknown UID or a process under another UID is
+refused.
+
+Provisioning is a bureau gesture, never an agent:
+
+    ameesh host tenant add human:alice --host banc          # prints the plan
+    # (run the plan as root, install the organization keys as the tenant)
+    ameesh host tenant add human:alice --host banc --register --actor human:<id>
+    ameesh host tenant list [--host banc] [--json]
+    ameesh host tenant remove human:alice --host banc --actor human:<id>
+
+`remove` is refused while an agent of the tenant is still on the host
+(lease, turn or row not moved). Honest limit: a tenant runner still holds the
+mesh connection string; its identity is the one of its configuration. SQL
+isolation by role (0033/L155) is separate work and not claimed here.
+
 ## Standby executors and the election briefing (L165/EP3)
 
 Every candidate host runs the role's runner, and none of them takes a turn

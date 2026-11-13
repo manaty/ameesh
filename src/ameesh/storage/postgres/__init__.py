@@ -32,6 +32,7 @@ from .events import Events
 from .external_executors import ExternalExecutors
 from .grants import Grants
 from .host_lifecycle import HostLifecycle
+from .tenancy import Tenancy
 from .handoffs import Handoffs
 from .hosts import Hosts, TurnResources, Visibility
 from .github_watch import GithubWatch
@@ -118,6 +119,7 @@ class PostgresStorage(interface.Storage):
         self.handoffs = Handoffs(db)
         self.hosts = Hosts(db)
         self.host_lifecycle = HostLifecycle(db)
+        self.tenancy = Tenancy(db)
         self.turn_resources = TurnResources(db)
         self.turn_observation = TurnObservation(db)
         self.visibility = Visibility(db)

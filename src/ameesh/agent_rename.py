@@ -94,6 +94,9 @@ KEPT = (
     # administrator (role-bureau.sql) — a rename does not move it; the guard
     # refuses until the role is reinstalled under the new name (fails closed).
     "limited_logins.agent",
+    # #7106 (0575): who registered a tenant of a shared host, dated evidence
+    # like `executors.enrolled_by`; a rename does not rewrite it.
+    "host_tenants.registered_by",
     "action_attempts.approver", "action_attempts.launched_by", "action_attempts.settled_by",
     "action_events.actor", "actions.auth_by", "actions.proposed_by", "actions.replaced_by",
     "agent_name_resolutions.primary_name", "agent_name_resolutions.supplied_name",
