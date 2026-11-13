@@ -72,6 +72,57 @@ def plan(db, agent: str, target_host: str, *, requested_by: str,
                            requested_by=requested_by)
 
 
+def handover(db, agent: str, *, holdoff_s: float = 0.0) -> dict | None:
+    """#7052: the conversation this `preference` role has just handed over.
+
+    Returns the newest post-switch attempt whose target has not claimed yet,
+    with `left_s` = seconds of holdoff remaining on the database clock
+    (negative once the margin is over), or None. The holdoff is computed from
+    `switched_at`, so it survives a runner restart without in-memory state.
+    """
+    row = _moves(db).open_handover(agent)
+    if row is None:
+        return None
+    left = (float(row.get("switched_ts") or 0.0) + max(0.0, float(holdoff_s))
+            - float(row.get("now_ts") or 0.0))
+    return dict(row, left_s=left)
+
+
+def release_wait(db, agent: str, host: str, *, holdoff_s: float = 0.0) -> dict | None:
+    """#7052: the open handover this host released to a preferred host.
+
+    Returns the attempt (`switched`, `recovered` or `rehydrating`) whose
+    source was `host` and whose source lease is no longer live, with
+    `left_s` = seconds of holdoff remaining (negative once the margin is
+    over). None when this host has no such attempt. A target that claimed
+    holds the lease: the attempt is then live and must not be reclaimed.
+    """
+    row = handover(db, agent, holdoff_s=holdoff_s)
+    if row is None or row.get("source_host") != host:
+        return None
+    return row
+
+
+def reclaim(db, agent: str, host: str, *, holdoff_s: float = 0.0,
+            error: str = "preferred host did not claim") -> dict | None:
+    """#7052: close an attempt the preferred host never claimed.
+
+    After the holdoff, the source closes the abandoned attempt: `fail` returns
+    the registry row to `host` with its own session, so the source claims
+    locally and resumes it (instead of a cross-host claim with an election
+    brief, which would drop the conversation). None while the holdoff runs or
+    when the target holds a live lease."""
+    row = release_wait(db, agent, host, holdoff_s=holdoff_s)
+    if row is None or float(row.get("left_s") or 0.0) > 0:
+        return None
+    return _moves(db).fail(row["move_id"], error=error)
+
+
+def holds(db, agent: str) -> bool:
+    """An attempt still holds the agent's session back (see `BEGIN_REFUSAL`)."""
+    return bool(_moves(db).holds(agent))
+
+
 def advance(db, host: str, *, probes: Callable[[dict], Mapping[str, bool]],
             cwd_for: Callable[[dict], str | None],
             agents: Iterable[str] | None = None) -> list[tuple[str, str]]:
