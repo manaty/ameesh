@@ -43,10 +43,10 @@ HOST_PUBLIC_KEY = Ed25519PrivateKey.from_private_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 #: un shell qui répond et reste vivant (le PTY est le terminal)
 COMMAND = ["/bin/sh", "-c", 'while IFS= read -r line; do printf "echo:%s\\n" "$line"; done']
-#: borne généreuse d'une poignée de main locale : sous la charge d'une partie
-#: psycopg, 5 s ne suffisent pas. Ce n'est jamais un délai à l'aveugle : le
-#: réveil vient de l'événement de connexion, et un refus échoue tout de suite.
-HOST_READY_TIMEOUT = 30.0
+#: borne généreuse des échanges locaux du module : sous la charge d'une partie
+#: psycopg ou des unités voisines, 5 s ne suffisent pas. La condition reste un
+#: événement ou une trame attendue ; la borne n'est qu'un garde-fou.
+LOCAL_IO_TIMEOUT = 30.0
 
 
 class _ObservedConnector(attach_host.HostConnector):
@@ -70,7 +70,7 @@ class _ObservedConnector(attach_host.HostConnector):
             raise
 
 
-def _wait_host_connected(connector, thread, *, timeout=HOST_READY_TIMEOUT):
+def _wait_host_connected(connector, thread, *, timeout=LOCAL_IO_TIMEOUT):
     """Attend l'événement de connexion ; un refus définitif échoue aussitôt.
 
     La borne est un garde-fou, pas le mécanisme d'attente : le réveil vient de
@@ -129,7 +129,7 @@ class Station:
     """Le poste de test : OPEN, poignée de main, REQ, DATA (comme D3 le fera)."""
 
     def __init__(self, port, receipt, device, *, agent=AGENT, host=HOST, tenant=TENANT,
-                 tls_context=None, timeout=5.0):
+                 tls_context=None, timeout=LOCAL_IO_TIMEOUT):
         raw = socket.create_connection(("127.0.0.1", port), timeout=timeout)
         if tls_context is not None:
             raw = tls_context.wrap_socket(raw, server_hostname="127.0.0.1")
@@ -151,14 +151,14 @@ class Station:
             receipt, self.session, agent=agent, host=host, tenant=tenant))
         self._confirm_sent = False
 
-    def _read(self, timeout=5.0):
+    def _read(self, timeout=LOCAL_IO_TIMEOUT):
         self.sock.settimeout(timeout)
         return t.read_frame(self.sock.recv)
 
     def _send(self, ftype, payload):
         self.sock.sendall(t.encode_frame(self.session, ftype, payload))
 
-    def handshake(self, timeout=5.0):
+    def handshake(self, timeout=LOCAL_IO_TIMEOUT):
         self._send(*self.channel.key_frame())
         deadline = time.monotonic() + timeout
         while not self.channel.ready:
@@ -172,7 +172,7 @@ class Station:
                 self._send(*self.channel.confirm_frame())
                 self._confirm_sent = True
 
-    def request(self, *, term="xterm", rows=24, cols=80, timeout=5.0,
+    def request(self, *, term="xterm", rows=24, cols=80, timeout=LOCAL_IO_TIMEOUT,
                 transcript_hash=None):
         transcript_hash = transcript_hash or self.channel.transcript_hash
         signature = self.device.key.sign(attach_grant.device_message(
@@ -199,7 +199,7 @@ class Station:
     def send_data(self, data: bytes):
         self._send(t.DATA, self.channel.seal(t.DATA, data))
 
-    def read_data(self, timeout=3.0, *, until: bytes | None = None) -> bytes:
+    def read_data(self, timeout=LOCAL_IO_TIMEOUT, *, until: bytes | None = None) -> bytes:
         output = bytearray()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -237,8 +237,8 @@ class Station:
 
 def open_only(port, receipt, *, agent=AGENT, host=HOST, tenant=TENANT):
     """Envoie OPEN et rend la première trame (pour les refus du relais)."""
-    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
-    sock.settimeout(5)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=LOCAL_IO_TIMEOUT)
+    sock.settimeout(LOCAL_IO_TIMEOUT)
     sock.sendall(t.encode_frame(t.ZERO_SESSION, t.OPEN, t.json_payload(
         v=1, role="station", agent=agent, host=host, tenant=tenant, receipt=receipt)))
     frame = t.read_frame(sock.recv)
@@ -609,8 +609,9 @@ class RelayTest(unittest.TestCase):
         receipt, device = make_grant()
         first = Station(self.relay.port, receipt, device)
         self.addCleanup(first.close)
-        second_sock = socket.create_connection(("127.0.0.1", self.relay.port), timeout=5)
-        second_sock.settimeout(5)
+        second_sock = socket.create_connection(("127.0.0.1", self.relay.port),
+                                               timeout=LOCAL_IO_TIMEOUT)
+        second_sock.settimeout(LOCAL_IO_TIMEOUT)
         second_sock.sendall(t.encode_frame(t.ZERO_SESSION, t.OPEN, t.json_payload(
             v=1, role="station", agent=AGENT, host=HOST, tenant=TENANT,
             receipt=receipt)))
