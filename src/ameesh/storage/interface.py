@@ -4884,17 +4884,21 @@ class Tenancy(Domain):
 
     @abc.abstractmethod
     def bindings(self, host: str | None = None) -> list[dict]:
-        """Liaisons (avec la présence de leur runner : `seen_ts`, `version`)."""
+        """Liaisons (avec la présence de leur runner : `seen_ts`, `version`,
+        `profiles`)."""
 
     @abc.abstractmethod
     def beat(self, host: str, tenant: str, runner_id: str, *, uid: int | None,
-             version: str | None) -> bool:
-        """Battement du runner d'un tenant ; faux sans liaison qui le nomme."""
+             version: str | None, profiles: Sequence[str] = ()) -> bool:
+        """Battement du runner d'un tenant ; faux sans liaison qui le nomme.
+
+        #7108 : `profiles` publie les profils de compte `harnais/compte` que
+        ce runner peut offrir (noms seulement, jamais un chemin ni un secret)."""
 
     @abc.abstractmethod
     def presence(self, host: str, tenant: str) -> dict | None:
         """Dernier battement du tenant sur l'hôte (`seen_ts`, `now_ts`,
-        `runner_id`), ou None."""
+        `runner_id`, `profiles`), ou None."""
 
 
 # --------------------------------------------------------------------------

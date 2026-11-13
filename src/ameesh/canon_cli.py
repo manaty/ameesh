@@ -1094,10 +1094,16 @@ def cmd_move(cfg: Config, args: argparse.Namespace) -> int:
         payload = dict(result, actor=actor, canon_sync=sync)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
-    print("%s moved from %s to %s%s" % (
-        result["agent"], result["from"], arrival,
-        " (native session kept)" if result["keep_session"]
-        else " (native session forgotten; a resume brief is queued)"))
+    if result.get("conversation_move"):
+        print("%s moved from %s to %s (conversation move %s; native session kept "
+              "provisionally until the first turn on %s)" % (
+                  result["agent"], result["from"], arrival,
+                  result["conversation_move"], arrival))
+    else:
+        print("%s moved from %s to %s%s" % (
+            result["agent"], result["from"], arrival,
+            " (native session kept)" if result["keep_session"]
+            else " (native session forgotten; a resume brief is queued)"))
     print("journal: agent.moved #%d%s" % (
         result["event"],
         " (source executor proven stopped)" if result["source_stopped"] else ""))

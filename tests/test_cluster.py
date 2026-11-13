@@ -420,6 +420,12 @@ FERMEES = {
                                    "adjudicator_family", "judged_families",
                                    "independent", "review_room", "note",
                                    "created_at"},
+    # #7108 (0576) : profils de compte publiés par le runner du tenant (noms
+    # `harnais/compte`, jamais un chemin ni un secret), lus par le préflight
+    # du déplacement manuel d'avatar ; données de compte, pas un état de
+    # supervision : colonne fermée aux deux rôles superviseur, aucun GRANT
+    # modifié.
+    "runner_presence": {"profiles"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+import uuid
 
 from . import resources, storage
 from .config import NAME_RE
@@ -44,6 +45,10 @@ MANUAL_EVENT = "agent.moved"
 
 #: #3299 : unité systemd de l'exécuteur d'un agent (deploy/systemd/…@.service)
 RUNNER_UNIT = "ameesh-runner-agent@%s.service"
+
+#: #7108 : refus stable d'un déplacement d'avatar vers un tenant sans profil
+#: de compte pour le harnais de l'agent (conception 5322 §3.5)
+ACCOUNT_MISSING = "move-account-missing"
 
 
 class MoveError(ValueError):
@@ -136,6 +141,224 @@ def open_handoff_refusal(name: str, handoff: dict) -> str:
                handoff.get("target"), handoff.get("id"), handoff.get("id")))
 
 
+def _preference_tenant_refusal(db, row: dict, target: str) -> str:
+    """#7108 : sur un hôte partagé, l'agent doit être un tenant lié de la cible."""
+    from . import canon as canon_mod, tenancy
+
+    policy = tenancy.host_policy(db, target)
+    if not policy.get("shared"):
+        return ""
+    tenant = canon_mod.tenant_key(row.get("responsible"))
+    if not tenant or tenant not in policy.get("tenants", ()):
+        return ("move-tenant-missing: %s is not a declared tenant of shared host %s"
+                " (declared: %s)"
+                % (tenant or "undeclared", target,
+                   ", ".join(policy.get("tenants") or ()) or "none"))
+    bound = [b for b in storage.of(db).tenancy.bindings(target) if b["tenant"] == tenant]
+    if not bound:
+        return ("move-tenant-missing: tenant %s is not bound on shared host %s"
+                " (run 'ameesh host tenant add' on %s, as the host supervisor)"
+                % (tenant, target, target))
+    return ""
+
+
+def _preference_presence_refusal(db, row: dict, target: str) -> str:
+    """#7108 : la cible doit être PRÉSENTE (relevé, porte, canon, runner).
+
+    `candidate_state` recomputes the whole presence from the database — fresh
+    resource reading, host lifecycle and gate, canon state, placement verdict
+    and fresh standing — and adds the tenant runner's heartbeat on a shared
+    host (§3.2 point 5). The target host's standing itself carries the local
+    harness/account readiness: this is why an unsupported harness is named
+    here too, before any effect."""
+    from . import election
+
+    state = election.candidate_state(db, row, target)
+    if state["ready"]:
+        return ""
+    diagnostic = state.get("diagnostic") or "not present"
+    low = diagnostic.lower()
+    # Un compte qui manque ou un identifiant en échec n'est pas un harnais
+    # absent : « harness login failing » contient le mot « harness » et doit
+    # rester `move-account-missing` (le refus que le demandeur doit corriger).
+    if any(word in low for word in ("no usable account", "no account profile",
+                                    "login", "credential", "all accounts",
+                                    "account ")):
+        return "move-account-missing: %s: %s" % (target, diagnostic)
+    if "harness" in low:
+        return "move-harness-missing: %s: %s" % (target, diagnostic)
+    if "tenant" in low:
+        return "move-tenant-missing: %s: %s" % (target, diagnostic)
+    return "move-presence: %s: %s" % (target, diagnostic)
+
+
+def _preference_account_refusal(db, row: dict, target: str) -> str:
+    """#7108 : le tenant de la cible publie-t-il un profil pour le harnais ?
+
+    Le profil vit sous le home 0700 du tenant, que le superviseur ne lit pas :
+    le runner du tenant publie des noms `harnais/compte` dans son battement
+    (0576). L'absence de profil est refusée AVANT tout effet, alors que les
+    identifiants eux-mêmes restent locaux à chaque hôte (aucun fichier ne
+    traverse). Un hôte non partagé n'a pas de tenant : sa préparation reste
+    celle de l'exécuteur d'arrivée (présence et `conversation_move`)."""
+    from . import canon as canon_mod, tenancy
+
+    policy = tenancy.host_policy(db, target)
+    if not policy.get("shared"):
+        return ""
+    tenant = canon_mod.tenant_key(row.get("responsible"))
+    presence = storage.of(db).tenancy.presence(target, tenant) if tenant else None
+    profiles = list((presence or {}).get("profiles") or ())
+    harness = row.get("harness") or ""
+    if not any(profile.split("/", 1)[0] == harness for profile in profiles):
+        return ("%s: tenant %s of shared host %s publishes no account profile for "
+                "harness %s (published: %s)"
+                % (ACCOUNT_MISSING, tenant or "?", target, harness or "?",
+                   ", ".join(profiles) or "none"))
+    return ""
+
+
+def _preference_target_cwd(db, name: str, target: str) -> str:
+    """Le dossier de travail de la cible, écrit par son `canon sync`."""
+    rows = db.query(
+        "SELECT cwd FROM agent_candidates WHERE name = %s AND host = %s",
+        (name, target))
+    cwd = rows[0].get("cwd") if rows else None
+    if not cwd:
+        raise MoveError(
+            'move-folder-missing: %s has no work folder on %s yet: run "ameesh '
+            'canon sync --host %s" on %s, then retry'
+            % (name, target, target, target))
+    return cwd
+
+
+def _preference_refusal(db, row: dict, target: str, *, actor: str) -> None:
+    """Toutes les gardes du déplacement d'un avatar, avant toute écriture.
+
+    Ordre : tour, handoff ouvert, tentative de conversation ouverte, pause de
+    l'hôte, tenant, présence, profil de compte. Aucune ne lit ni ne copie un
+    fichier de session ou d'identifiant ; les erreurs sont actionnables."""
+    from . import host_holds, registry
+
+    name = row["name"]
+    # Un `status = running` sans bail vivant n'est pas un tour : l'hôte est
+    # peut-être mort. `conversation_moves.manual` le traite en `recovered` et
+    # rejoue une fois la consigne interrompue (design §2.3) ; seul un tour
+    # vivant interdit le déplacement.
+    if registry.turn_in_progress(db, name):
+        raise MoveError("%s has a turn in progress: never moved mid-turn" % name)
+    handoff = storage.of(db).handoffs.active(name)
+    if handoff:
+        raise MoveError(open_handoff_refusal(name, handoff))
+    attempt = storage.of(db).conversation_moves.open_for(name)
+    if attempt:
+        raise MoveError(
+            "move-conversation-open: %s already has an open conversation move %s"
+            " (%s -> %s, %s): finish it, or let it expire, before moving by hand"
+            % (name, attempt.get("move_id"), attempt.get("source_host"),
+               attempt.get("target_host"), attempt.get("state")))
+    if target in host_holds.live(db):
+        raise MoveError("host %s is on hold: no agent is moved onto it" % target)
+    for guard in (_preference_tenant_refusal, _preference_presence_refusal,
+                  _preference_account_refusal):
+        reason = guard(db, row, target)
+        if reason:
+            raise MoveError(reason)
+    if not actor:
+        raise MoveError(
+            "a preference move needs an actor (its event journals who moved it)")
+
+
+def move_preference(cfg, db, name: str, target: str, *, actor: str = "",
+                    keep_session: bool = False, row: dict | None = None) -> dict:
+    """#7108 (avatar B4) : `ameesh agent move` d'un avatar `releve: preference`.
+
+    Préflight sans effet (présence, tenant, profil de compte, harnais, aucun
+    tour, aucun handoff ouvert, aucune pause d'hôte), puis UNE transaction :
+    `agent.moved` et la tentative `conversation_moves` (raison `manual`, état
+    `switched` — `recovered` si le bail source n'est plus vivant, le tour
+    interrompu est alors rejoué une fois) sont écrits en même temps que la
+    ligne de registre passe sur la cible, le bail source est révoqué (époque +
+    1) et la session native reste provisoire. La cible réclame ; son premier
+    tour reprend le segment bâti sur le journal. Aucune session ni aucun
+    identifiant ne traverse : le poste garde les siens, le cloud garde les
+    siens (§3.5)."""
+    from . import conversation_move, registry
+
+    row = row if row is not None else registry.get(db, name)
+    if row is None:
+        raise MoveError("unknown agent: %s" % name)
+    if keep_session:
+        raise MoveError(
+            "%s is a conversation move (releve: preference): --keep-session is "
+            "refused; the native session never crosses hosts and the target "
+            "rehydrates the conversation from the journal" % name)
+    source = row.get("host") or ""
+    if not source:
+        raise MoveError("%s has no execution host yet: run canon sync first" % name)
+    if target == source:
+        raise MoveError("%s is already on %s" % (name, target))
+    if (row.get("mode") or "execute") != "execute":
+        raise MoveError("%s is not an executor agent (mode: %s): it cannot move"
+                        % (name, row.get("mode")))
+    if target not in (row.get("admitted_hosts") or ()):
+        raise MoveError(
+            "%s is not admitted on %s (admitted: %s): add the host to its "
+            'Placement and refresh its admitted hosts with "ameesh canon sync"'
+            % (name, target, ", ".join(row.get("admitted_hosts") or ()) or "nowhere"))
+    _preference_refusal(db, row, target, actor=actor)
+    target_cwd = _preference_target_cwd(db, name, target)
+    move_id = str(uuid.uuid4())
+    diagnostic = "moved from %s to %s by operator%s: conversation follows" % (
+        source, target, " (%s)" % actor if actor else "")
+    with db.transaction() as tx:
+        def recheck(locked: dict) -> str:
+            # #7108 (B #40410) : le préflight hors transaction peut avoir lu
+            # un battement, un profil ou un placement périmés. Revalide la
+            # cible sur la ligne FRAÎCHE, sous le verrou de l'écriture, avant
+            # tout effet : tenant lié, présence, profil de compte/harnais.
+            for guard in (_preference_tenant_refusal, _preference_presence_refusal,
+                          _preference_account_refusal):
+                reason = guard(tx, locked, target)
+                if reason:
+                    return reason
+            return ""
+
+        try:
+            moved = conversation_move.manual(
+                tx, name, target, target_cwd, actor=actor, source_host=source,
+                recheck=recheck, move_id=move_id)
+        except conversation_move.RecheckRefused as exc:
+            raise MoveError(str(exc)) from exc
+        if moved is None:
+            raise MoveError(
+                "%s was not moved: its state changed during the preflight (host, "
+                "lease, turn, handoff, hold or target admission); retry" % name)
+        previous_owner = moved.get("previous_lease_owner") or ""
+        previous_epoch = int(moved.get("previous_lease_epoch") or 0)
+        data = {"agent": name, "from": source, "to": target,
+                "keep_session": True, "reason": "manual",
+                "conversation_move": moved["move_id"],
+                "move_state": moved.get("state") or "switched",
+                "session_copied": False, "credential_copied": False,
+                "actor": actor or "", "source_stopped": False,
+                "lease_held": bool(previous_owner),
+                "revoked_lease_owner": previous_owner,
+                "revoked_lease_epoch": previous_epoch,
+                "lease_epoch": previous_epoch + 1,
+                "runner_seen_ts": row.get("runner_seen_ts"),
+                "runner_seen_host": row.get("runner_seen_host") or ""}
+        event = storage.of(tx).events.record(
+            MANUAL_EVENT, "agent:%s" % name, None, data)
+    return {"agent": name, "from": source, "to": target, "keep_session": True,
+            "summary": "", "event": int(event), "source_stopped": False,
+            "move_state": moved.get("state") or "switched",
+            "revoked_lease_owner": previous_owner,
+            "revoked_lease_epoch": previous_epoch,
+            "conversation_move": moved["move_id"], "target_cwd": target_cwd,
+            "diagnostic": diagnostic}
+
+
 def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
                 actor: str = "") -> dict:
     """#3299 : déplace `name` vers `target` à la main, sans bail de l'appelant.
@@ -165,11 +388,16 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
         raise MoveError("%s has no execution host yet: run canon sync first" % name)
     if target == source:
         raise MoveError("%s is already on %s" % (name, target))
-    if (row.get("releve") or "hote") in ("election", "preference"):
-        # #7048 : `agent move` d'un agent `preference` est le sous-lot B4
+    releve = row.get("releve") or "hote"
+    if releve == "election":
         raise MoveError(
-            "%s is a cross-host role (releve: %s): its candidates take the "
-            "lease; a manual move would bypass the relief" % (name, row.get("releve")))
+            "%s is a cross-host role (releve: election): its election takes the "
+            "lease; a manual move would bypass the relief" % name)
+    if releve == "preference":
+        # #7108 (avatar B4, conception 5322 §3.5) : déplacement immédiat d'un
+        # avatar, même transaction `agent.moved` + `conversation_moves`.
+        return move_preference(cfg, db, name, target, actor=actor,
+                               keep_session=keep_session, row=row)
     admitted = list(row.get("admitted_hosts") or ())
     if target not in admitted:
         raise MoveError(
