@@ -949,7 +949,16 @@ def _budget_pause_long(alert: dict) -> str:
 
     #6031 : l'âge du relevé est dans le détail ; un relevé ancien est une
     cause possible de la pause (la fenêtre du fournisseur a pu changer sans
-    qu'aucun tour ne publie de relevé neuf)."""
+    qu'aucun tour ne publie de relevé neuf).
+
+    #7175 : tous les comptes du harnais au seuil sur l'hôte, remise à zéro
+    connue — aucun geste, dit une fois, sans relance avant l'échéance."""
+    if alert.get("waits_reset"):
+        return ("Agent paused on budget until its window reset: %s. Expected action: "
+                "none — every account of its harness on the host is at its threshold "
+                "and the agent resumes on its own at the reset; this is said once, "
+                "without reminder before the reset. A new alert follows if the pause "
+                "outlives it." % (alert.get("detail") or "?"))
     return ("Agent paused on budget for a long time: %s. Expected action: check the caps "
             "(ameesh budget), the accounts (ameesh accounts list) and the configuration "
             "the runner reads (ameesh doctor; a profile can diverge from the host's "
