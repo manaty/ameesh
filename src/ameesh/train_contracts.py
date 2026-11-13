@@ -115,25 +115,32 @@ def stale_pins(root: str, workflows=None) -> list[tuple[str, str | None, str, st
 
 
 #: Nexlink target commit whose selector was audited. Only the shared
-#: plan/status workflows and the due-parts selector are frozen; the 23 suite
-#: definitions are the reviewed project code and are selected per packet.
-NEXLINK_AUDIT_COMMIT = "9103c1673dc451396db0202ff3fca7f87cd87bf8"
+#: plan/status workflows, their fetch helper and the due-parts selector are
+#: frozen; the 23 suite definitions are the reviewed project code and are
+#: selected per packet.
+NEXLINK_AUDIT_COMMIT = "c1277f0681e261e3a71d987eb34b6c01f252e1f9"
 
 _NEXLINK_LOT_PLAN = (".github/workflows/lot-plan.yml",
-                     "ae94763e5fcec34cf92cf0e3cadc6c4ec780afde")
+                     "13e91b5d27dd9f09f33938717f29d4f72e18a436")
 _NEXLINK_LOT_STATUS = (".github/workflows/lot-status.yml",
                        "237d75fc555ca37281ea562ed49aca47857d6e7f")
 _NEXLINK_LOT_SELECTOR = ("scripts/ci/lot-plan.mjs",
                          "7b9f01de9ab4075b16c5bb80032c762b45299d0c")
+#: #7246: lot-plan delegates its fetch to this bounded retry helper (#6589).
+#: Pin the executable too: auditing only its caller would leave the due-parts
+#: computation dependent on an unchecked script at the dispatched head.
+_NEXLINK_FETCH_RETRY = ("scripts/ci/git-fetch-retry.sh",
+                        "d68cfb30adb894a59206ccfc9f5367a0ad898349")
 
 #: The shared execution contract of a Nexlink packet: the selector that
 #: computes the due parts, the reusable plan job and the reusable status
-#: publisher. The suite workflows themselves are not pinned: they are the
-#: project's reviewed code, selected per packet by the selector.
+#: publisher, including the plan's fetch helper. The suite workflows are not
+#: pinned: they are the project's reviewed code, selected per packet by the selector.
 _NEXLINK_SOURCES = {
     _NEXLINK_LOT_PLAN[0]: _NEXLINK_LOT_PLAN[1],
     _NEXLINK_LOT_STATUS[0]: _NEXLINK_LOT_STATUS[1],
     _NEXLINK_LOT_SELECTOR[0]: _NEXLINK_LOT_SELECTOR[1],
+    _NEXLINK_FETCH_RETRY[0]: _NEXLINK_FETCH_RETRY[1],
 }
 
 
