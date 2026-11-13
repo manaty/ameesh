@@ -79,28 +79,45 @@ def _tls_context(cert: str | None, key: str | None) -> ssl.SSLContext | None:
     return context
 
 
-def _db_grant_checker(policy, cfg):
+def _db_grant_checker(policy, cfg, *, canon_loader=None, db_opener=None):
     """Vérifie la signature WebAuthn d'un reçu d'attach, sans le consommer.
 
     Le relais contrôle la preuve avant d'apparier ; l'hôte reste la porte qui
-    consomme le nonce (`attach_grant.redeem`). Une base ou un registre
-    injoignable refuse (fail closed), et l'erreur n'est jamais journalisée
-    avec la preuve.
+    consomme le nonce (`attach_grant.redeem`). Le canon est résolu par agent
+    (comme la porte de l'hôte) et la façade forcée à WebAuthn : un reçu
+    signé par la seule clé d'appareil `device-es256` est refusé. Une base,
+    un canon ou un registre injoignable refuse (fail closed).
     """
+    from . import attach_grant as grant_mod
     from . import attach_relay as relay_mod
+    from . import canon as canon_mod
     from . import db as db_mod
-    from . import receipts as receipts_mod
+
+    if canon_loader is None:
+        def canon_loader(cfg, agent):
+            for canon in canon_mod.load_configured(cfg):
+                if canon.agent(agent) is not None:
+                    return canon
+            return None
+    opener = db_opener or db_mod.open_db
 
     def check(document, expected):
         try:
-            db = db_mod.open_db(cfg)
+            canon = canon_loader(cfg, expected.get("agent") or "")
+        except Exception as exc:  # noqa: BLE001 — canon illisible : refus
+            return False, relay_mod.GRANT_UNVERIFIED, (
+                "canon unreadable (%s)" % type(exc).__name__)
+        if canon is None:
+            return (False, relay_mod.GRANT_INVALID,
+                    "agent %s unknown to the canon" % (expected.get("agent") or ""))
+        try:
+            db = opener(cfg)
         except Exception as exc:  # noqa: BLE001 — refus par défaut
             return False, relay_mod.GRANT_UNVERIFIED, (
                 "database unreachable (%s)" % type(exc).__name__)
         try:
-            verdict = receipts_mod.verify_receipt(
-                db, document, policy, kind="attach", expected_attach=expected,
-                expect_decision="approve", consume_by=None)
+            return grant_mod.check_receipt(
+                db, document, canon=canon, policy=policy, expected=expected)
         except Exception as exc:  # noqa: BLE001
             return False, relay_mod.GRANT_UNVERIFIED, (
                 "grant verification failed (%s)" % type(exc).__name__)
@@ -109,7 +126,6 @@ def _db_grant_checker(policy, cfg):
                 db.close()
             except Exception:  # noqa: BLE001
                 pass
-        return verdict.ok, verdict.code, verdict.reason
 
     return check
 

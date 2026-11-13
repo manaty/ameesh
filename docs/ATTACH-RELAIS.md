@@ -40,7 +40,9 @@ poste (station)  ──TLS──►  relais  ◄──TLS──  hôte de l'agen
   ≤ 300 s, digest canonique, puis **signature WebAuthn** de la clé
   d'approbation, avec un authentificateur encore actif. Il ne consomme pas
   le nonce : `grant_checker` est injecté par la CLI (base + politique
-  `AMEESH_APPROVE_RP_ID` / `AMEESH_APPROVE_ORIGINS`). Sans vérificateur, le
+  `AMEESH_APPROVE_RP_ID` / `AMEESH_APPROVE_ORIGINS`). Le canon de l'agent est
+  résolu comme chez l'hôte et la façade est forcée à WebAuthn : un reçu
+  signé par la seule clé `device-es256` est refusé. Sans vérificateur, le
   service refuse tout `OPEN` (`grant_unverified`, fail closed).
 - La **porte faisant foi est l'hôte** : à la réception du `REQ`, il appelle
   `attach_grant.redeem` (D1) avec la politique, la preuve de la clé

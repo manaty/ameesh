@@ -307,6 +307,30 @@ def redeem(db: Db, receipt, *, canon, agent: str, host: str, tenant: str, device
                         **dict(base, **seen)))
 
 
+def check_receipt(db: Db, receipt, *, canon, policy: receipts.Policy,
+                  expected: dict) -> tuple[bool, str, str]:
+    """Vérifie un reçu d'attach **sans le consommer** (relais D2).
+
+    Même politique que `redeem` : le canon de l'agent est résolu par
+    l'appelant, la façade est forcée à `webauthn` et la durée à GRANT_TTL.
+    Le nonce n'est pas consommé et rien n'est écrit : le verdict n'autorise
+    rien à lui seul, l'hôte reste la porte qui consomme. Retourne
+    `(ok, code, raison)`.
+    """
+    if canon is None:
+        return (False, UNKNOWN_AGENT,
+                "agent %s unknown to the canon" % (expected.get("agent") or ""))
+    gate = dataclasses.replace(policy, allow_facades=frozenset({"webauthn"}),
+                               max_ttl=GRANT_TTL, canon=canon_key(canon))
+    try:
+        verdict = receipts.verify_receipt(
+            db, receipt, gate, kind="attach", expected_attach=expected,
+            expect_decision="approve", consume_by=None)
+    except DbError as exc:
+        return False, AUDIT, "trust registry unreachable (%s)" % type(exc).__name__
+    return verdict.ok, verdict.code, verdict.reason
+
+
 def audit(db: Db, *, agent: str | None = None, limit: int = 50) -> list[dict]:
     """Les dernières issues de grant (acceptés et refus)."""
     return storage.of(db).attach_grants.recent(agent=agent,
