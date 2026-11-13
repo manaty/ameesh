@@ -3819,7 +3819,8 @@ class Ephemerals(Domain):
                ttl_seconds: float, host: str | None = None,
                admitted_hosts: Sequence[str] | None = None,
                credential_mode: str | None = None,
-               placement: dict | None = None) -> dict | None:
+               placement: dict | None = None,
+               evaluated_profile: dict | None = None) -> dict | None:
         """Crée l'éphémère atomiquement (INSERT … SELECT sur la ligne du
         créateur) ; None si le nom est pris ou si le créateur a changé.
 
@@ -3832,7 +3833,10 @@ class Ephemerals(Domain):
         `placement` (`{ok, diagnostic, ref}`) évalué pour cet hôte. Son
         `placement_profile` est calculé sur la ligne écrite (hôte, harnais,
         fournisseur, modèle, mode), jamais recopié du créateur. Le dossier
-        `cwd` est celui de l'enfant ; None n'hérite pas de celui du créateur."""
+        `cwd` est celui de l'enfant ; None n'hérite pas de celui du créateur.
+        `evaluated_profile` (`{harness, provider, model}`) est le profil que le
+        verdict a jugé : l'INSERT refuse de copier du créateur des valeurs
+        différentes (profil jamais évalué)."""
 
     @abc.abstractmethod
     def exists(self, name: str) -> bool:

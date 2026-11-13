@@ -19,8 +19,9 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest import mock
 
-from ameesh import canon, canon_sync, registry, storage, tenancy
+from ameesh import avatar_children, canon, canon_sync, registry, storage, tenancy
 
 from . import test_canon
 from .test_canon import codes, fiche, write
@@ -140,6 +141,90 @@ class ChildrenPlacementTest(test_canon._CanonDbCase):
         self.assertIn("atelier", message)
         self.assertIn("enfants", message)
         self.assertIsNone(self.row("petit1"))
+
+    # -- le sync de l'hôte d'arrivée ne ferme pas le placement propre -------
+    def test_sync_de_l_hote_ne_ferme_pas_le_placement_propre(self):
+        self.spawn()
+        report = canon_sync.sync(self.db, self.load(), "enfants")
+        self.assertEqual(report.status, canon_sync.CANON_OK, report.diagnostic)
+        full = self.row("enfant1")
+        self.assertEqual(full["host"], "enfants")
+        self.assertEqual(full["admitted_hosts"], ["enfants"])
+        placement = self.db.query(
+            "SELECT placement_ok, placement_diagnostic FROM agent_registry "
+            "WHERE name = %s", ("enfant1",))[0]
+        self.assertTrue(placement["placement_ok"], placement["placement_diagnostic"])
+        lease = registry.claim(self.db, "enfant1", "enfants/alice", 600)
+        self.assertIsNotNone(lease)
+
+    # -- profil réellement inséré ------------------------------------------
+    def test_parent_au_profil_divergent_refuse(self):
+        # la fiche de l'avatar (canon) sera évaluée avec claude-opus ; la
+        # ligne du parent porte un autre modèle : profil jamais évalué
+        self.db.execute(
+            "UPDATE agent_registry SET model = 'claude-haiku-20251001' "
+            "WHERE name = 'avatar'")
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            self.spawn("enfant2")
+        message = str(ctx.exception)
+        self.assertIn("spawn-profile-diverged", message)
+        self.assertIn("claude-opus", message)
+        self.assertIsNone(self.row("enfant2"))
+
+    def test_profil_modifie_entre_evaluation_et_insertion_refuse(self):
+        # course : le parent change après l'évaluation, avant l'INSERT ; la
+        # garde de l'INSERT doit refuser de copier un profil non évalué.
+        original = avatar_children.place_child
+
+        def raced(*args, **kwargs):
+            placement = original(*args, **kwargs)
+            self.db.execute(
+                "UPDATE agent_registry SET provider = 'openai' "
+                "WHERE name = 'avatar'")
+            return placement
+
+        with mock.patch.object(avatar_children, "place_child", side_effect=raced):
+            with self.assertRaises(canon_sync.SpawnError) as ctx:
+                self.spawn("enfant2")
+        self.assertIn("changed during creation", str(ctx.exception))
+        self.assertIsNone(self.row("enfant2"))
+
+    # -- lignée incomplète : refus, jamais de repli ------------------------
+    def test_lignee_avec_ancetre_absent_refuse(self):
+        self.spawn()
+        self.db.execute(
+            "UPDATE agent_registry SET created_by = 'fantome' WHERE name = 'enfant1'")
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            canon_sync.spawn(self.db, "petit1", "enfant1", 600, canon=self.load())
+        self.assertIn("spawn-lineage-broken", str(ctx.exception))
+        self.assertIsNone(self.row("petit1"))
+
+    def test_lignee_en_cycle_refuse(self):
+        self.spawn()
+        self.db.execute(
+            "UPDATE agent_registry SET created_by = 'enfant1' WHERE name = 'enfant1'")
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            canon_sync.spawn(self.db, "petit1", "enfant1", 600, canon=self.load())
+        self.assertIn("spawn-lineage-broken", str(ctx.exception))
+        self.assertIsNone(self.row("petit1"))
+
+    def test_lignee_trop_profonde_refuse(self):
+        self.db.execute(
+            """
+            INSERT INTO agent_registry
+                (name, harness, host, cwd, responsible, team, ephemeral,
+                 ephemeral_expires_at, created_by, status)
+            SELECT 'profond' || i, 'claude', 'enfants', '/tmp/profond' || i,
+                   %s, 'acme-web', true, now() + interval '1 hour',
+                   CASE WHEN i = 1 THEN 'avatar' ELSE 'profond' || (i - 1) END,
+                   'idle'
+              FROM generate_series(1, 33) AS i
+            """, (ALICE,))
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            canon_sync.spawn(self.db, "profond34", "profond33", 600,
+                             canon=self.load())
+        self.assertIn("spawn-lineage-broken", str(ctx.exception))
+        self.assertIsNone(self.row("profond34"))
 
     # -- refus ------------------------------------------------------------
     def test_children_none_refuse(self):

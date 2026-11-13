@@ -1527,14 +1527,77 @@ def _lineage_root(by_name: dict[str, dict], creator: str | None) -> tuple[dict |
     return None, "lineage of more than %d creators" % registry._LINEAGE_MAX
 
 
+def _lineage_hosts(by_name: dict[str, dict], creator: str | None) -> list[str]:
+    """Hôtes de la lignée d'un éphémère (créateur compris), sans doublon."""
+    hosts: list[str] = []
+    seen: set[str] = set()
+    name = creator
+    while name and name not in seen and len(seen) < registry._LINEAGE_MAX:
+        seen.add(name)
+        row = by_name.get(name)
+        if row is None:
+            break
+        host = str(row.get("host") or "")
+        if host and host not in hosts:
+            hosts.append(host)
+        if not row.get("ephemeral") or row.get("canon_ref"):
+            break
+        name = row.get("created_by")
+    return hosts
+
+
+def _own_child_verdict(canon: Canon | None, row: dict, root: dict, host: str,
+                       by_name: dict[str, dict]) -> placement_mod.Verdict:
+    """#7107 : verdict d'un enfant d'avatar placé sur SON hôte.
+
+    Le verdict mono-hôte du parent ne s'hérite pas : on réévalue l'admission
+    de l'avatar sur l'hôte de l'enfant, on refuse un hôte revenu dans la
+    lignée, et on exige que le profil réellement écrit soit celui évalué."""
+    if canon is None:
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "own placement cannot be re-evaluated without the canon")
+    if host not in (row.get("admitted_hosts") or []):
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "host %s is not in the child's own admitted hosts: own placement lost" % host)
+    lineage_hosts = _lineage_hosts(by_name, row.get("created_by"))
+    if host in lineage_hosts:
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "host %s belongs to the child's lineage (%s): own placement lost"
+            % (host, ", ".join(lineage_hosts)))
+    verdict = placement_mod.evaluate(canon, root["name"], host)
+    if verdict.ok is not True:
+        return verdict
+    card = canon.agent(root["name"])
+    if card is None:
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "avatar card %s is no longer readable: own placement not granted"
+            % root["name"])
+    actual = (row.get("harness"), row.get("provider"), row.get("model"),
+              row.get("credential_mode"))
+    expected = (card.harness, card.provider, card.model, verdict.credential_mode)
+    if actual != expected:
+        return placement_mod.Verdict(
+            row["name"], host, False,
+            "profile diverged from the one evaluated for avatar %s (evaluated: %r; "
+            "child: %r): own placement not granted" % (root["name"], expected, actual),
+            verdict.ref)
+    verdict.profile = row.get("profile_now")
+    return verdict
+
+
 def _inherit_placements(db: Db, host: str, canon: Canon | None = None) -> None:
     """Les éphémères de cet hôte héritent du verdict de placement de leur
     créateur racine du canon (C4), à condition d'avoir le profil que ce
     verdict a jugé : même hôte, même harnais, même fournisseur, même modèle,
     même mode (profil courant de l'éphémère = profil évalué du créateur).
     Sinon, refusé : « profil divergé ». Un éphémère issu d'un agent inscrit à
-    la main n'est pas gouverné : il n'est pas touché. Ni action, ni colonne
-    d'état."""
+    la main n'est pas gouverné : il n'est pas touché. Un enfant d'avatar
+    (#7107, `admitted_hosts` posé) est réévalué sur SON hôte, jamais jugé au
+    verdict mono-hôte du parent. Ni action, ni colonne d'état."""
     rows = storage.of(db).canon.lineage_rows()
     by_name = {row["name"]: row for row in rows}
     for row in sorted(rows, key=lambda r: r["name"]):
@@ -1549,6 +1612,10 @@ def _inherit_placements(db: Db, host: str, canon: Canon | None = None) -> None:
             verdict = placement_mod.Verdict(
                 row["name"], host, False,
                 "unverifiable lineage (%s): placement not inherited" % broken)
+        elif row.get("admitted_hosts"):
+            # #7107 : enfant d'avatar sur son propre hôte — le verdict du
+            # parent (mono-hôte) ne s'hérite pas ; on réévalue le sien.
+            verdict = _own_child_verdict(canon, row, root, host, by_name)
         elif root.get("host") != host:
             verdict = placement_mod.Verdict(
                 row["name"], host, False,
@@ -2835,7 +2902,10 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
     canons = (None if canon is None else
               list(canon) if isinstance(canon, (list, tuple)) else [canon])
     if canons is not None:
-        lineage = avatar_children.lineage(db, creator)
+        try:
+            lineage = avatar_children.lineage(db, creator)
+        except avatar_children.PlacementError as exc:
+            raise SpawnError(str(exc)) from exc
         if not lineage:
             raise SpawnError("%s: creator %s disappeared from the registry"
                              % (avatar_children.SPAWN_LINEAGE_BROKEN, creator))
@@ -2868,6 +2938,7 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
             name, creator, cwd=placement.cwd, ttl_seconds=ttl_seconds,
             host=placement.host, admitted_hosts=[placement.host],
             credential_mode=placement.credential_mode,
+            evaluated_profile=placement.evaluated_profile,
             placement={"ok": placement.verdict.ok,
                        "diagnostic": placement.verdict.diagnostic,
                        "ref": placement.verdict.ref})

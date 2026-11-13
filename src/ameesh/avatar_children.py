@@ -59,6 +59,7 @@ SPAWN_POLICY_INVALID = "spawn-policy-invalid"
 SPAWN_CANON_UNREADABLE = "spawn-canon-unreadable"
 SPAWN_LINEAGE_BROKEN = "spawn-lineage-broken"
 SPAWN_CWD_REFUSED = "spawn-cwd-refused"
+SPAWN_PROFILE_DIVERGED = "spawn-profile-diverged"
 
 
 class PlacementError(ValueError):
@@ -82,6 +83,10 @@ class ChildPlacement:
     uid: int
     runner_id: str
     verdict: placement.Verdict
+    #: profil réellement inséré : le harnais, le fournisseur et le modèle que
+    #: `Ephemerals.create` copie du parent, et que l'INSERT doit vérifier
+    #: égaux aux valeurs évaluées ci-dessus (`evaluated_profile`).
+    evaluated_profile: dict
 
     def describe(self) -> dict:
         return {"host": self.host, "cwd": self.cwd, "tenant": self.tenant,
@@ -133,24 +138,45 @@ def canon_for(canons: Iterable[Any], root: str, row_canon: str | None):
 
 
 def lineage(db: Db, creator: str) -> list[dict]:
-    """Lignée de `creator` : la ligne du créateur, puis ses créateurs, racine en dernier.
+    """Lignée de `creator` : sa ligne, puis ses créateurs, racine en dernier.
 
-    Un `created_by` absent ou inconnu arrête la marche ; l'appelant refuse si
-    la racine est un éphémère dont le canon n'est pas lisible. Borné pour ne
-    jamais boucler sur une donnée incohérente."""
+    Toute lignée incomplète REFUSE (`spawn-lineage-broken`) au lieu de rendre
+    une liste partielle : un ancêtre absent, un cycle, un éphémère sans
+    `created_by` ou une profondeur au-delà de la borne ne disent pas si la
+    racine est gouvernée. Replier sur le dernier maillon trouvé ferait passer
+    un enfant d'avatar pour un éphémère R14 et le placerait sur l'hôte du
+    parent."""
     from . import registry
 
     rows: list[dict] = []
     seen: set[str] = set()
     name: str | None = creator
-    while name and name not in seen and len(rows) < 32:
+    while name:
+        if name in seen:
+            raise PlacementError(SPAWN_LINEAGE_BROKEN, (
+                "cycle in the created_by lineage at %s: refusing instead of falling "
+                "back to the parent's host" % name))
+        if len(rows) >= registry._LINEAGE_MAX:
+            raise PlacementError(SPAWN_LINEAGE_BROKEN, (
+                "lineage of more than %d creators: refusing instead of falling back "
+                "to the parent's host" % registry._LINEAGE_MAX))
         seen.add(name)
         row = registry.get(db, name)
         if row is None:
-            break
+            raise PlacementError(SPAWN_LINEAGE_BROKEN, (
+                "creator %s of the lineage is unknown to the registry: refusing instead "
+                "of falling back to the parent's host" % name))
         rows.append(row)
-        name = row.get("created_by") if row.get("ephemeral") else None
-    return rows
+        if not row.get("ephemeral"):
+            return rows
+        name = row.get("created_by") or None
+        if not name:
+            raise PlacementError(SPAWN_LINEAGE_BROKEN, (
+                "ephemeral %s has no created_by: incomplete lineage, refusing instead "
+                "of falling back to the parent's host" % row.get("name")))
+    raise PlacementError(SPAWN_LINEAGE_BROKEN, (
+        "empty lineage for %s: refusing instead of falling back to the parent's host"
+        % creator))
 
 
 def _tenant_of(responsible: str | None) -> str:
@@ -303,6 +329,24 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
         raise PlacementError(SPAWN_NO_PLACEMENT, (
             "avatar %s has no resolved responsible tenant: no host can bind a runner "
             "for its children" % root_card.title))
+    # Le profil qui sera réellement inséré est celui du parent (harnais,
+    # fournisseur, modèle copiés par l'INSERT), pas celui de la fiche évaluée
+    # plus haut : s'ils diffèrent (ligne du parent modifiée à la main, ou canon
+    # mis à jour avant le sync du parent), le verdict admis jugerait un autre
+    # profil. Refus avant écriture ; `Ephemerals.create` re-vérifie dans
+    # l'INSERT pour clore la course.
+    parent = lineage_rows[0]
+    evaluated = {"harness": getattr(root_card, "harness", None),
+                 "provider": getattr(root_card, "provider", None),
+                 "model": getattr(root_card, "model", None)}
+    actual = {key: parent.get(key) for key in evaluated}
+    if actual != evaluated:
+        raise PlacementError(SPAWN_PROFILE_DIVERGED, (
+            "parent %s has harness/provider/model %r, but the avatar placement was "
+            "evaluated on %r: sync the parent before spawning, the child would inherit "
+            "a profile that was never evaluated (%s)"
+            % (parent.get("name") or "?", actual, evaluated,
+               "docs/design/5322-avatar-humain.md §3.6")))
     admission = placement.admission_of(canon, root_card.title)
     if admission is None:
         raise PlacementError(SPAWN_NO_PLACEMENT, (
@@ -329,6 +373,6 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
                 host=host, cwd=workdir, credential_mode=verdict.credential_mode,
                 tenant=tenant, unix_user=str(binding["unix_user"]),
                 uid=int(binding["uid"]), runner_id=str(binding["runner_id"]),
-                verdict=verdict)
+                verdict=verdict, evaluated_profile=dict(evaluated))
         reasons.append((host, why))
     raise _failure(root_card, policy, admitted, excluded, reasons)

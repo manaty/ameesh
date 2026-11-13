@@ -543,6 +543,7 @@ class Canon(interface.Canon):
         return self.db.query(
             """
             SELECT name, created_by, ephemeral, canon_ref, canon, host,
+                   harness, provider, model, credential_mode, admitted_hosts,
                    placement_ok, placement_diagnostic, placement_ref, placement_profile,
                    __PROFILE__ AS profile_now
               FROM agent_registry
@@ -796,7 +797,7 @@ class Ephemerals(interface.Ephemerals):
 
     def create(self, name, creator, *, cwd, ttl_seconds, host=None,
                admitted_hosts=None, credential_mode=None,
-               placement=None) -> dict | None:
+               placement=None, evaluated_profile=None) -> dict | None:
         """Insertion atomique (INSERT … SELECT sur la ligne du créateur).
 
         Sans `host` : comportement R14, le responsable, l'hôte, le dossier et
@@ -808,16 +809,24 @@ class Ephemerals(interface.Ephemerals):
         `placement` évalué pour cet hôte ; `placement_profile` est calculé sur
         la ligne écrite (hôte, harnais, fournisseur, modèle, mode), jamais
         recopié du créateur. `cwd=None` ne reprend pas le dossier du créateur :
-        un enfant sans dossier sur son hôte n'hérite pas de celui du parent."""
+        un enfant sans dossier sur son hôte n'hérite pas de celui du parent.
+        `evaluated_profile` (`{harness, provider, model}`) est joint à
+        l'INSERT : le harnais, le fournisseur et le modèle copiés du créateur
+        doivent être ceux que le verdict a jugés, sinon aucune ligne n'est
+        écrite (le profil inséré ne serait pas le profil évalué)."""
         placed = host is not None
         if placed and placement is None:
             raise ValueError("Ephemerals.create: a placement verdict is required with host")
         if placed and not admitted_hosts:
             raise ValueError("Ephemerals.create: admitted_hosts is required with host")
+        if placed and not evaluated_profile:
+            raise ValueError("Ephemerals.create: evaluated_profile is required with host")
         # Ordre des paramètres = ordre des `%s` dans le SQL : verrou, nom,
         # hôte/dossier/mode, les deux durées (leur CASE précède created_by),
-        # puis la partie placée (admission, verdict, profil), le créateur.
+        # puis la partie placée (admission, verdict, profil), le créateur,
+        # enfin la garde de profil (après `c.name`).
         params: list = [name_lock_key(name), name]
+        profile_guard = ""
         if placed:
             host_expr, cwd_expr = "%s", "%s"
             mode_expr = "%s"
@@ -827,6 +836,10 @@ class Ephemerals(interface.Ephemerals):
             ref_expr = "%s"
             profile_expr = ("ameesh_placement_profile(%s::text, c.harness, c.provider, "
                             "c.model, %s::text)")
+            profile_guard = (
+                "\n               AND c.harness IS NOT DISTINCT FROM %s"
+                "\n               AND c.provider IS NOT DISTINCT FROM %s"
+                "\n               AND c.model IS NOT DISTINCT FROM %s")
             params.extend([host, cwd, credential_mode])
             params.extend([ttl_seconds, ttl_seconds])
             params.extend(admitted_hosts)
@@ -853,6 +866,10 @@ class Ephemerals(interface.Ephemerals):
             params.append(cwd)
             params.extend([ttl_seconds, ttl_seconds])
         params.append(creator)
+        if placed:
+            params.extend([evaluated_profile.get("harness"),
+                           evaluated_profile.get("provider"),
+                           evaluated_profile.get("model")])
         created = self.db.query(
             """
             __LOCK__
@@ -877,6 +894,7 @@ class Ephemerals(interface.Ephemerals):
               FROM agent_registry c
              CROSS JOIN l
              WHERE c.name = %s
+               __PROFILE_GUARD__
                AND coalesce(c.responsible, '') <> ''
                AND c.status <> 'stopped'
                AND (NOT c.ephemeral OR c.ephemeral_expires_at > now())
@@ -894,6 +912,7 @@ class Ephemerals(interface.Ephemerals):
             .replace("__REF__", ref_expr)
             .replace("__PROFILE__", profile_expr)
             .replace("__ADMITTED__", admitted_expr)
+            .replace("__PROFILE_GUARD__", profile_guard)
             # après l'insertion des expressions : __NOW__ vit dans __OK__ et
             # __DIAGNOSTIC__ (héritage du créateur), pas dans le SQL nu
             .replace("__NOW__", profile_sql("c")),
