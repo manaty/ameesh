@@ -6,7 +6,8 @@ After the 2026-10-11 disk outage (335 worktrees, 144 with their own
 housekeeping pass frees what a build regenerates:
 
 * **What**: directories named by the policy rules (`artifacts`, default
-  `node_modules` at any depth, and `target` only next to a `Cargo.toml`),
+  `node_modules` and `__pycache__` at any depth, `target` only next to a
+  `Cargo.toml`, `dist` only next to a `pyproject.toml`, #7189),
   inside the non-main worktrees of the repositories of the registered agents.
   Never inside `.git`, never in a nested checkout (judged on its own), never
   through a symbolic link (a `node_modules` shared by #248 is a link into the
@@ -80,8 +81,11 @@ from dataclasses import dataclass
 
 from . import platform
 
-#: default rules: a directory name, optionally `:<file>` that must sit beside it
-DEFAULT_RULES = ("node_modules", "target:Cargo.toml")
+#: default rules: a directory name, optionally `:<file>` that must sit beside it.
+#: #7189 : `__pycache__` (bytecode) et `dist` à côté d'un `pyproject.toml`
+#: (sortie de build Python) retenaient les worktrees gardés comme « ignored
+#: files outside build artifacts » ; chaque lot en recrée.
+DEFAULT_RULES = ("node_modules", "target:Cargo.toml", "__pycache__", "dist:pyproject.toml")
 #: never bypassable by the policy: a `target` only counts beside a `Cargo.toml`
 FORCED_BESIDE = {"target": "Cargo.toml"}
 DEFAULT_IDLE_S = 24 * 3600.0
@@ -122,6 +126,15 @@ class Rule:
 
     def __str__(self) -> str:
         return "%s:%s" % (self.name, self.beside) if self.beside else self.name
+
+
+def regenerable_link(parent: str, name: str, rules) -> bool:
+    """#7189 : `parent/name` is a symbolic link named by a rule (a
+    `node_modules` shared per lockfile by #248 is a link into the cache).
+    Never followed nor unlinked by the artifact pass; removing the worktree
+    unlinks it, its target stays: it does not hold the worktree back."""
+    return os.path.islink(os.path.join(parent, name)) \
+        and any(rule.matches(parent, name) for rule in rules)
 
 
 def _plain_name(text: str) -> bool:
