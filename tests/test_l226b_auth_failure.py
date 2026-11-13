@@ -191,6 +191,64 @@ class CapsAndOrderTest(_CapsBase):
         self.assertFalse(evs["tertiaire"].ok)
         self.assertIn("in overage", evs["tertiaire"].reason)
 
+    def test_organization_plan_at_80_percent_is_eligible_without_reserve(self):
+        # #7023 (owner 12/11): secondaire, an organization plan, read at
+        # Session 14 % / Weekly 80 % with paid overage possible
+        now = 1_800_000_000.0
+        gauges = {"secondaire": self._gauges(0.14, 0.80, now, cost.Overage(capable=True))}
+        items = self._items(secondaire={"scope": "organization"})
+        shared = items[1]
+        self.assertEqual(shared.scope, "organization")
+        ev = accounts.evaluate(_Book(gauges), shared, items, now, reserve=True)
+        self.assertTrue(ev.ok, ev.reason)
+        self.assertFalse(ev.reserve)
+        # the pace cap stays (90 % by default), without the 10-point reserve
+        self.assertEqual(ev.limits["seven_day"], (0.90, "pace cap"))
+        # the same account declared personal keeps its reserve and overage cap
+        personal = self._items()
+        self.assertEqual(personal[1].scope, "personal")
+        ev = accounts.evaluate(_Book(gauges), personal[1], personal, now, reserve=True)
+        self.assertFalse(ev.ok)
+        self.assertTrue(ev.reserve)
+        self.assertIn("overage cap 80%", ev.reason)
+
+    def test_organization_hard_cap_holds_even_when_overage_is_possible(self):
+        now = 1_800_000_000.0
+        items = self._items(secondaire={"scope": "organization", "pace_ceiling": 0.99})
+        shared = items[1]
+        for overage in (cost.Overage(capable=True), None):
+            under = {"secondaire": self._gauges(0.14, 0.93, now, overage)}
+            ev = accounts.evaluate(_Book(under), shared, items, now, reserve=True)
+            self.assertTrue(ev.ok, ev.reason)
+            self.assertEqual(ev.limits["seven_day"],
+                             (accounts.ORGANIZATION_CAP, "organization cap"))
+            spent = {"secondaire": self._gauges(0.14, 0.95, now, overage)}
+            ev = accounts.evaluate(_Book(spent), shared, items, now, reserve=True)
+            self.assertFalse(ev.ok)
+            self.assertTrue(ev.hard)
+            self.assertIn("organization cap 95%", ev.reason)
+        # `cap` tightens it; a short window cap still replaces the pace cap
+        tight = self._items(secondaire={"scope": "organization", "cap": 0.85,
+                                        "short_window_cap": 0.85})
+        gauges = {"secondaire": self._gauges(0.14, 0.86, now)}
+        ev = accounts.evaluate(_Book(gauges), tight[1], tight, now, reserve=True)
+        self.assertFalse(ev.ok)
+        self.assertIn("account cap 85%", ev.reason)
+        self.assertEqual(ev.limits["five_hour"], (0.85, "short window cap"))
+
+    def test_organization_scope_is_explicit_and_checked(self):
+        # never inferred from the name: an account named like an organization
+        # one, or the harness default, stays personal without the setting
+        items = self._items()
+        self.assertEqual({p.scope for p in items}, {"personal"})
+        self.assertEqual(accounts.account_cap(items[0]), accounts.PRIMARY_CAP)
+        org_default = self._items(primaire={"scope": "organization"})
+        self.assertEqual(accounts.account_cap(org_default[0]), None)
+        with self.assertRaises(accounts.AccountError):
+            self._items(secondaire={"scope": "unknown"})
+        with self.assertRaises(accounts.AccountError):
+            self._items(secondaire={"scope": "organization", "overage_cap": 0.95})
+
     def test_short_window_cap_replaces_the_pace_cap(self):
         # bureau's sprint patch of 2026-10-11 (sprint.json short_window_cap 0.80)
         now = 1_800_000_000.0
