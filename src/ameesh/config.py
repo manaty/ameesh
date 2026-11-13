@@ -303,6 +303,10 @@ class Config:
     patroni_url: str = ""
     db_min_standbys: int = 0
     db_lag_threshold_s: float = 30.0
+    #: #6862 (EP8.5) : le document du collecteur de santé de la grappe
+    #: (`sante-base.py`), lu par le passage local du notifieur ; vide = le
+    #: chemin de l'unité, `/run/ameesh-db/alertes.json`.
+    db_health_file: str = ""
     #: L304 : session en lecture seule (`default_transaction_read_only`) ;
     #: jamais lu de l'environnement, posé par `ameesh progress --serve`
     read_only: bool = False
@@ -1178,6 +1182,8 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
                                   cfg.db_min_standbys),
         db_lag_threshold_s=_as_seconds(pick("AMEESH_DB_LAG_THRESHOLD_S"),
                                        cfg.db_lag_threshold_s),
+        db_health_file=str(pick("AMEESH_DB_HEALTH_FILE",
+                                default=cfg.db_health_file) or "").strip(),
         mesh_backup_window=_as_window(
             pick("AMEESH_MESH_BACKUP_WINDOW", default=cfg.mesh_backup_window),
             cfg.mesh_backup_window),

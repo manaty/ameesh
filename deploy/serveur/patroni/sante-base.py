@@ -8,9 +8,9 @@ Lit l'API REST de Patroni, `etcdctl endpoint health`, `df` et
 `db_disk_low`, `db_archive_stale`. Les seuils viennent de `patroni.env` et
 peuvent être surchargés en ligne de commande.
 
-Le branchement de ces alertes dans `ameesh alerts`/`ameesh doctor` et le
-chemin de notification avec le PC éteint appartiennent à EP8.5 (#6862) : ici
-le collecteur écrit `/run/ameesh-db/alertes.json` et le journal systemd.
+Le collecteur écrit `/run/ameesh-db/alertes.json` et le journal systemd ;
+le passage local d'`ameesh notify` relaie ce fichier sans la base (EP8.5,
+#6862, `src/ameesh/db_sante.py`), donc aussi sans primaire et PC éteint.
 
 Mode hors ligne, pour les essais et les tests : `--lecture FICHIER` lit une
 observation JSON au lieu de sonder le réseau. Une observation ratée n'est pas
@@ -294,7 +294,7 @@ def ecrire_alertes(chemin, grappe, maintenant, alertes):
     document = {"schema": SCHEMA, "grappe": grappe,
                 "genere": round(float(maintenant), 3), "alertes": alertes}
     try:
-        cible.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+        cible.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         fd, temporaire = tempfile.mkstemp(dir=str(cible.parent), prefix=".alertes-", text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as flux:
             json.dump(document, flux, ensure_ascii=False, sort_keys=True)
