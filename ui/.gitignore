@@ -1,4 +1,5 @@
-node_modules/
+# #7189 : sans « / » final, un LIEN node_modules (cache partagé #248) est ignoré aussi
+node_modules
 .test-build/
 dist/
 LICENSE

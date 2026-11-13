@@ -125,7 +125,8 @@ class _Base(unittest.TestCase):
 
 class RulesTest(unittest.TestCase):
     def test_rules_and_policy(self):
-        self.assertEqual([str(r) for r in ba.rules_of(None)], ["node_modules", "target:Cargo.toml"])
+        self.assertEqual([str(r) for r in ba.rules_of(None)], [
+            "node_modules", "target:Cargo.toml", "__pycache__", "dist:pyproject.toml"])
         self.assertEqual(ba.rules_of([]), ())
         for bad in ("node_modules", [".."], ["a/b"], ["target:../x"], [3], [".ameesh-trash-x"]):
             self.assertIsNone(ba.parse_rules(bad)[0], bad)
@@ -1065,6 +1066,70 @@ class MergedKeptTest(_Repo):
         st = menage.worktree_state(wt)
         self.assertTrue(st["integrated"], st)
         self.assertEqual(snapshot(), before)
+
+
+class RegenerableLeftoversTest(_Repo):
+    """#7189 : `__pycache__`, `dist` à côté d'un `pyproject.toml` et un LIEN
+    `node_modules` ignoré ne retiennent plus un worktree gardé ; un ignoré
+    non reconnu le retient toujours."""
+    row = MergedKeptTest.row
+    run_pass = MergedKeptTest.run_pass
+
+    def python_worktree(self, branch: str) -> str:
+        wt = self.add_worktree(branch)
+        # sans « / » final, le lien node_modules est ignoré lui aussi
+        _write(os.path.join(wt, ".gitignore"),
+               text="node_modules\n.env\n__pycache__/\ndist/\n")
+        _write(os.path.join(wt, "pyproject.toml"), text="[project]\nname = 'p'\n")
+        _git("add", ".gitignore", "pyproject.toml", cwd=wt)
+        _git("commit", "-q", "-m", "python", cwd=wt)
+        _git("push", "-q", "origin", branch, cwd=wt)
+        _write(os.path.join(wt, "pkg", "__pycache__", "m.cpython-312.pyc"))
+        _write(os.path.join(wt, "dist", "p-0.1-py3-none-any.whl"))
+        self.cache = os.path.join(self.base, "cache", "nm", "abc")
+        _write(os.path.join(self.cache, "left-pad", "index.js"))
+        os.symlink(self.cache, os.path.join(wt, "node_modules"))
+        return wt
+
+    def test_ignored_leftovers_exempts_build_output_and_rule_links(self):
+        wt = self.python_worktree("lot-21")
+        rules = ba.rules_of(None)
+        self.assertEqual(menage.ignored_leftovers(wt, rules), [])
+        # the final check of the removal: only the links stay exempt
+        self.assertEqual(sorted(menage.ignored_leftovers(wt, links=rules)),
+                         ["dist", "pkg/__pycache__"])
+        self.assertEqual(sorted(menage.ignored_leftovers(wt)),
+                         ["dist", "node_modules", "pkg/__pycache__"])
+        _write(os.path.join(wt, "docs", "dist", "book.pdf"))   # no pyproject.toml beside
+        self.assertEqual(menage.ignored_leftovers(wt, rules), ["docs/dist"])
+        # only `*.pyc` ignored: matching lists the bytecode file by file
+        _write(os.path.join(wt, ".gitignore"), text="node_modules\n*.pyc\ndist/\n")
+        self.assertEqual(sorted(menage.ignored_leftovers(wt, rules)), [".gitignore", "docs/dist"])
+        self.assertEqual(sorted(menage.ignored_leftovers(wt, links=rules)), [
+            ".gitignore", "dist", "docs/dist", "pkg/__pycache__/m.cpython-312.pyc"])
+
+    def test_kept_worktree_with_pycache_dist_and_link_is_removed(self):
+        wt = self.python_worktree("lot-22")
+        plan = self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="22")], {22: "merged"},
+                             dry_run=True)[2]
+        self.assertEqual(plan[0]["action"], "retrait", plan[0]["detail"])
+        store, entries, plan = self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="22")],
+                                             {22: "merged"})
+        self.assertEqual(plan[0]["action"], "retrait", plan[0]["detail"])
+        self.assertFalse(os.path.lexists(wt))
+        self.assertEqual(store.statuses[0][1], "removed")
+        self.assertEqual(sorted(os.path.basename(e["path"]) for e in entries
+                                if e.get("kind") == "artifact"), ["__pycache__", "dist"])
+        # the shared cache the link pointed to is left as is
+        self.assertTrue(os.path.isfile(os.path.join(self.cache, "left-pad", "index.js")))
+
+    def test_unrecognised_ignored_file_still_keeps_it(self):
+        wt = self.python_worktree("lot-23")
+        _write(os.path.join(wt, ".env"), text="SECRET=1\n")
+        plan = self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="23")], {23: "merged"})[2]
+        self.assertEqual(plan[0]["action"], "garde")
+        self.assertIn("1 ignored file(s) outside build artifacts (.env)", plan[0]["detail"])
+        self.assertTrue(os.path.isfile(os.path.join(wt, "dist", "p-0.1-py3-none-any.whl")))
 
 
 class ArtifactPassTest(_Repo):

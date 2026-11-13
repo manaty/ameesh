@@ -817,8 +817,9 @@ def designations(milestones: list[dict], events: list[dict], *,
       n'attend aucun avis ;
     * les désignations manuelles (`reviewer X designated`) et leurs retraits,
       qui survivent aux rotations : un nom jamais porté par une marque compte
-      tant qu'il n'est pas retiré ; un nom déjà porté par une marque ne compte
-      sur la nouvelle tête que s'il a été redésigné depuis le gel (#3033) ;
+      tant qu'il n'est pas retiré ; un nom qu'une marque a porté reste manuel
+      si une ligne de désignation le suit (#3602), et une marque plus récente
+      le rend automatique (le gel suivant peut alors le retirer) ;
       un auteur ou correcteur de la tête, nommé par la marque du dernier gel,
       ne compte jamais (#2888/#2739) ;
     * la dispense `verdict not required:` depuis le gel, levée par une
@@ -851,7 +852,11 @@ def designations(milestones: list[dict], events: list[dict], *,
     latest_mark = None
     none_mark = False
     waived = False
-    ever: set[str] = set()
+    #: #3602/#7176 : `{nom: id de la dernière marque qui le porte}`. L'id du
+    #: journal, jamais l'instant du gel, ordonne une redésignation manuelle et
+    #: la marque qu'elle suit : deux gestes dans la même seconde restent
+    #: distincts. Un nom qu'aucune marque ne porte n'a pas d'entrée.
+    ever_id: dict[str, int] = {}
     manual: dict[str, dict] = {}
     quorum_at: float | None = None
     for event in sorted(events or (),
@@ -873,8 +878,10 @@ def designations(milestones: list[dict], events: list[dict], *,
                 quorum_at = None
         parsed = _mark(event)
         if parsed is not None:
+            event_id = int(event.get("id") or 0)
             for name in parsed["names"]:
-                ever.add(_norm(name))
+                key = _norm(name)
+                ever_id[key] = max(ever_id.get(key, 0), event_id)
             if parsed.get("unreadable"):
                 unreadable.append("designation mark #%s unreadable" % event.get("id"))
             if parsed["freeze"] == int(freeze.get("id") or 0):
@@ -890,7 +897,8 @@ def designations(milestones: list[dict], events: list[dict], *,
             name = manual_match.group(1).strip()
             manual[_norm(name)] = {"name": name,
                                    "kind": manual_match.group(2),
-                                   "at": float(event.get("at_ts") or 0.0)}
+                                   "at": float(event.get("at_ts") or 0.0),
+                                   "id": int(event.get("id") or 0)}
     # #3818/#1979 : la dispense vaut pour ce gel seulement. Un nouveau
     # gel ou une désignation explicite rend la revue à nouveau due.
     if waived:
@@ -920,12 +928,19 @@ def designations(milestones: list[dict], events: list[dict], *,
         if latest_mark is not None:
             designated = max(designated, float(latest_mark.get("at") or 0.0))
         designees.append((name, designated))
+    auto_names = {_norm(name) for name in auto}
     for key, choice in manual.items():
         if choice["kind"] != "designated" or key in seen or key in authors:
             continue
-        if key in ever and choice["at"] < freeze_at and key not in {_norm(n) for n in auto}:
-            # #3033 : un nom déjà porté par une marque ne vaut sur la nouvelle
-            # tête que s'il a été redésigné depuis le gel.
+        last_mark = ever_id.get(key)
+        if (last_mark is not None and choice["id"] <= last_mark
+                and key not in auto_names):
+            # #3602/#7176 : un nom déjà porté par une marque ne redevient
+            # manuel que si une ligne de désignation le suit. Comparer l'id
+            # du journal à la dernière marque qui le porte, jamais l'instant
+            # du gel : un siège redésigné après la marque survit au nouveau
+            # gel et reste dû (cx2 sur #6961, 13/11 03:17Z), comme le lit
+            # `pending_reviews` (#3033).
             continue
         seen.add(key)
         designees.append((choice["name"], max(freeze_at, choice["at"])))
@@ -1851,6 +1866,12 @@ def build(*, items: Iterable[Mapping[str, Any]],
     for agent in agents or ():
         agent = dict(agent)
         if str(agent.get("status") or "") != "idle":
+            continue
+        #: #7176 : une pause opérateur laisse le statut `idle` (le registre ne
+        #: change que la colonne `operator_paused`). L'agent ne lira pas la
+        #: relance : la ligne « avis dus » le nomme et marque la pause, il
+        #: n'est pas une capacité au repos avec du travail.
+        if agent.get("operator_paused"):
             continue
         due = due_by_agent.get(str(agent.get("name")))
         if not due:

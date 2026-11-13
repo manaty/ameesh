@@ -2954,29 +2954,48 @@ def _scratch_merge_tree(path: str, ref: str, budget: PassBudget | None = None):
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def ignored_leftovers(path: str, rules=(), budget: PassBudget | None = None
-                      ) -> list[str] | None:
+def ignored_leftovers(path: str, rules=(), budget: PassBudget | None = None, *,
+                      links=None) -> list[str] | None:
     """L230: what `git status --ignored` lists in the worktree (modified,
     untracked or ignored; a directory with nothing tracked inside as one
     line), except the directories of the build output `rules` (none:
-    nothing is exempt). An ignored `.env` or dataset that removing the
-    worktree would delete. None if git cannot say."""
-    proc = _git(["--no-optional-locks", "status", "--porcelain", "--ignored",
+    nothing is exempt) and, #7189, the ignored symbolic links named by
+    `links` (`rules` by default: a `node_modules` linked into the #248 cache
+    is unlinked with the worktree, its target stays). An ignored `.env` or
+    dataset that removing the worktree would delete. None if git cannot say.
+    #7189 : `--ignored=matching` names each ignored path: a directory left
+    with only a `__pycache__` (module gone from the branch) is no longer one
+    opaque `!! pkg/` line; a directory ignored as a whole stays one line."""
+    proc = _git(["--no-optional-locks", "status", "--porcelain", "--ignored=matching",
                  "--untracked-files=normal"], path, budget=budget)
     if proc is None or proc.returncode != 0:
         return None
+    links = rules if links is None else links
     out = []
     for line in proc.stdout.splitlines():
         if not line.strip():
             continue
         rel = line[3:].strip().strip('"').rstrip("/")
         parent, name = os.path.split(os.path.join(path, rel))
-        if line.startswith("!! ") and os.path.isdir(os.path.join(parent, name)) \
-                and not os.path.islink(os.path.join(parent, name)) \
-                and any(rule.matches(parent, name) for rule in rules):
+        if line.startswith("!! ") and (_under_artifact(path, rel, rules) or
+                                       build_artifacts.regenerable_link(parent, name, links)):
             continue
         out.append(rel)
     return out
+
+
+def _under_artifact(path: str, rel: str, rules) -> bool:
+    """`rel` is, or lies inside, a directory of the build output `rules` (a
+    real directory, not a link). #7189 : `--ignored=matching` lists the
+    files of a `__pycache__` one by one when only `*.pyc` is ignored."""
+    current = path
+    for part in rel.split("/"):
+        parent, current = current, os.path.join(current, part)
+        if not os.path.isdir(current) or os.path.islink(current):
+            return False
+        if any(rule.matches(parent, part) for rule in rules):
+            return True
+    return False
 
 
 def _default_remote_ref(path: str, budget: PassBudget | None = None) -> str:
@@ -4441,7 +4460,8 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
     host lock of the deleting passes (`build_artifacts`). Its build output
     goes first like an idle worktree's (descriptors, journal, `.git`,
     filesystem and managed-root protections); then the tree must be fully
-    clean, ignored files included (nothing exempt); then the processes are
+    clean, ignored files included (nothing exempt but an ignored link named by a
+    rule, #7189); then the processes are
     read again, and the git lock (`<gitdir>/locked`) and submodules checked
     again (`submodules`), right before its directory, still the planned one,
     is renamed to a trash recorded in the journal and deleted; git forgets
@@ -4451,6 +4471,8 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
     #3728 : `archive` (appelable, rend un refus ou "") remplace l'exigence
     d'un arbre propre : appelé sous le verrou, après la sortie de build, il
     archive les fichiers modifiés et non suivis ; un refus garde le worktree.
+    #7189 : un lien ignoré nommé par une règle (`node_modules` partagé)
+    n'empêche pas le retrait : il est délié, sa cible reste.
 
     (outcome, bytes freed, note, build output deleted): outcome `removed`,
     `partial` (gone from its path, something left in its trash), or `garde`
@@ -4535,7 +4557,8 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
             if refusal:
                 return "garde", freed, refusal, built
         else:
-            leftovers = ignored_leftovers(path, budget=window)
+            # the build output is gone; its links (#7189) were never artifacts
+            leftovers = ignored_leftovers(path, budget=window, links=rules)
             if leftovers is None:
                 return "garde", freed, "git state unreadable (git status --ignored)", built
             if leftovers:

@@ -640,9 +640,14 @@ def _sourced_literal(path: str, name: str) -> tuple:
         match = assignment.fullmatch(line)
         if match:
             raw = match.group(1).strip()
-            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+            quoted = len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\""
+            if quoted:
                 raw = raw[1:-1]
-            if not re.fullmatch(r"[A-Za-z0-9_./+:@%-]*", raw):
+            # #7185 : « ~ » n'est développé par le shell qu'en tête d'un mot
+            # non cité ou après « : » dans une affectation ; ailleurs (TMPDIR
+            # d'agent `.menage/tmp/<agent>~<id>`) c'est un caractère littéral.
+            tilde_expands = not quoted and (raw.startswith("~") or ":~" in raw)
+            if tilde_expands or not re.fullmatch(r"[A-Za-z0-9_./+:@%~-]*", raw):
                 return None, "%s in %s is not a plain path" % (name, path)
             value = raw
         elif unset.fullmatch(line):
