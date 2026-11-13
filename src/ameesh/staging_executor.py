@@ -125,6 +125,19 @@ def settings(path: str) -> dict:
         if not math.isfinite(value) or value <= 0:
             raise ValueError(key + " must be finite and positive")
         data[key] = value
+    # #7164: the executor's own venv follows the commits it deploys. Every
+    # path is absolute; the block is optional (absent: never updated, and
+    # `staging_executor_stale` says so).
+    update = data.get("venv_update")
+    if update is not None:
+        if not isinstance(update, dict) or not all(
+                isinstance(update.get(field), str)
+                and os.path.isabs(update[field])
+                for field in ("venv", "package", "work")):
+            raise ValueError("venv_update needs absolute venv, package and work")
+        python = update.setdefault("python", "/usr/bin/python3")
+        if not isinstance(python, str) or not os.path.isabs(python):
+            raise ValueError("venv_update python must be an absolute path")
     # #5500: the file itself is guarded; never a path named inside it.
     data["config_path"] = os.path.abspath(path)
     return data
@@ -809,6 +822,191 @@ def refresh_canon(cfg) -> dict:
         return {"state": "refused", "reason": "git: %s" % str(exc)[:200]}
 
 
+#: #7164: the stable venv of the dedicated account when no `venv_update`
+#: block names it (the unit's `ExecStart`).
+EXECUTOR_VENV = ".local/share/ameesh/venv"
+#: #7164: one derived operator package per deployed commit, under `work`;
+#: this link names the last one installed, the base of the next derivation.
+VENV_PACKAGE_CURRENT = "paquet-courant"
+VENV_LOCK = "requirements-staging.lock"
+VENV_WHEELHOUSE = "wheelhouse"
+VENV_MANIFEST = "manifeste.json"
+#: #7164: each step builds at most a venv offline; generous but bounded.
+VENV_STEP_TIMEOUT_S = 900
+#: #7164 review B2: the state of a refresh under way in the terminal record.
+VENV_REFRESH_RUNNING = "running"
+
+
+def _venv_path(options) -> str:
+    update = options.get("venv_update") or {}
+    return update.get("venv") or str(Path.home() / EXECUTOR_VENV)
+
+
+def _venv_name(path: str) -> str:
+    name = os.path.basename(os.path.normpath(path))
+    return name[len("venv-"):] if name.startswith("venv-") else ""
+
+
+def executor_venv(options) -> dict:
+    """#7164: the version this process runs and the one its venv now names.
+
+    `running` is read from this interpreter (`sys.prefix`), `live` from the
+    `venv-courant` link that the next timer pass starts on. Evidence only:
+    an unreadable value is empty, never a refusal."""
+    running = _venv_name(str(Path(sys.prefix).resolve()))
+    try:
+        live = _venv_name(os.readlink(os.path.join(
+            os.path.dirname(_venv_path(options)), BASCULE_CURRENT)))
+    except OSError:
+        live = ""
+    return {"running": running, "live": live}
+
+
+def _venv_step(argv, *, cwd=None) -> str | None:
+    """Run one bounded step; its last named error, None when it succeeded."""
+    try:
+        proc = subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=VENV_STEP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return "timed out after %d s" % VENV_STEP_TIMEOUT_S
+    except OSError as exc:
+        return exc.strerror or type(exc).__name__
+    if proc.returncode == 0:
+        return None
+    lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+    return public_reason(lines[-1] if lines else "code %d" % proc.returncode, 200)
+
+
+def refresh_venv(options, repo: str, tree: str, sha: str) -> dict:
+    """#7164: `_refresh_venv`, whose surprises are a refusal, never raised."""
+    try:
+        return _refresh_venv(options, repo, tree, sha)
+    except Exception as exc:  # noqa: BLE001 - the pass is already completed
+        return {"state": "refused", "to": sha[:7],
+                "reason": "executor error: " + type(exc).__name__}
+
+
+def _refresh_venv(options, repo: str, tree: str, sha: str) -> dict:
+    """#7164: bring the executor's own venv to the commit it just deployed.
+
+    The sealed route of DEPLOIEMENT-HOTE-AGENTS (#5711), from this account's
+    clone and the deployed tree, never the package index: derive the operator
+    package of `sha` from the last installed one (only the ameesh wheel is
+    rebuilt), produce its sealed manifest, `bascule.py preparer` with the four
+    locked options, `activer`, then a launch check on the new venv; a failed
+    check is a `retour`. Forward only: a live version that is not an ancestor
+    of `sha` is left alone. Never raised: the record carries the outcome."""
+    update = options.get("venv_update")
+    if not update:
+        return {"state": "unconfigured"}
+    venv, work, python = update["venv"], update["work"], update["python"]
+    version = sha[:7]
+    live = executor_venv(options)["live"]
+    if live and sha.startswith(live):
+        return {"state": "current", "from": live}
+    if not live:
+        return {"state": "refused", "reason": "live venv unreadable (%s)"
+                % os.path.join(os.path.dirname(venv), BASCULE_CURRENT)}
+    try:
+        base_sha = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", "--quiet",
+             "--end-of-options", live + "^{commit}"], capture_output=True,
+            text=True, timeout=30).stdout.strip()
+        forward = bool(base_sha) and subprocess.run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor", base_sha, sha],
+            capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"state": "refused", "from": live,
+                "reason": "git: " + type(exc).__name__}
+    if not forward:
+        return {"state": "refused", "from": live, "to": version,
+                "reason": "not a fast-forward from venv-" + live}
+    tools = os.path.join(tree, "deploy", "mise-a-jour")
+    current = os.path.join(work, VENV_PACKAGE_CURRENT)
+    package = os.path.join(work, "paquet-" + version)
+    lock = os.path.join(package, VENV_LOCK)
+    wheelhouse = os.path.join(package, VENV_WHEELHOUSE)
+    manifest = os.path.join(package, VENV_MANIFEST)
+    # The last installed package first; the operator package next, so a
+    # package redone by hand after a dependency change (the derivation of
+    # the last one then fails) is taken without removing anything.
+    bases = [os.path.realpath(current)] if os.path.isdir(current) else []
+    if update["package"] not in bases:
+        bases.append(update["package"])
+    failure = None
+    for base in bases:
+        if os.path.lexists(package) and os.path.realpath(package) != base:
+            shutil.rmtree(package, ignore_errors=True)
+        steps = []
+        if not os.path.isdir(package):
+            steps.append(("derive", [
+                python, "-I", os.path.join(tools, "venv-staging.py"), "deriver",
+                "--clone", repo, "--sha", sha,
+                "--lock", os.path.join(base, VENV_LOCK),
+                "--wheelhouse", os.path.join(base, VENV_WHEELHOUSE),
+                "--python", python, "--output", package]))
+        steps.append(("manifest", [
+            python, "-I", os.path.join(tools, "venv-staging.py"), "produire",
+            "--clone", repo, "--sha", sha, "--lock", lock,
+            "--wheelhouse", wheelhouse, "--python", python, "--scelle",
+            "--output", manifest]))
+        failure = None
+        for step, argv in steps:
+            error = _venv_step(argv)
+            if error:
+                failure = {"state": "refused", "from": live, "to": version,
+                           "step": step, "reason": error}
+                break
+        if failure is None:
+            break
+    if failure is not None:
+        return failure
+    steps = [
+        ("prepare", [python, "-I", os.path.join(tools, "bascule.py"),
+                     "preparer", "--venv", venv, "--src", tree,
+                     "--version", version, "--python", python,
+                     "--lock", lock, "--wheelhouse", wheelhouse,
+                     "--manifeste", manifest, "--verificateur",
+                     os.path.join(tools, "venv-staging.py")]),
+        ("activate", [python, "-I", os.path.join(tools, "bascule.py"),
+                      "activer", "--venv", venv, "--version", version,
+                      "--precedent", live]),
+    ]
+    for step, argv in steps:
+        error = _venv_step(argv)
+        if error:
+            return {"state": "refused", "from": live, "to": version,
+                    "step": step, "reason": error}
+    # The next timer pass starts the new venv: prove it launches the
+    # executor first, through the link that pass reads.
+    error = _venv_step([os.path.join(os.path.dirname(venv), BASCULE_CURRENT,
+                                     "bin", "python"), "-I", "-m",
+                        "ameesh.staging_executor", "--help"])
+    if error:
+        back = _venv_step([python, "-I", os.path.join(tools, "bascule.py"),
+                           "retour", "--venv", venv])
+        return {"state": "rolled back" if back is None else "refused",
+                "from": live, "to": version, "step": "launch",
+                "reason": error if back is None
+                else "%s; retour: %s" % (error, back)}
+    # The package becomes the base of the next derivation; older ones go.
+    link = current + ".tmp"
+    try:
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(os.path.basename(package), link)
+        os.replace(link, current)
+        for name in os.listdir(work):
+            path = os.path.join(work, name)
+            if (name.startswith("paquet-") and name != VENV_PACKAGE_CURRENT
+                    and path not in (package, base)):
+                shutil.rmtree(path, ignore_errors=True)
+    except OSError as exc:
+        return {"state": "installed", "from": live, "to": version,
+                "note": "package link: " + (exc.strerror or type(exc).__name__)}
+    return {"state": "installed", "from": live, "to": version}
+
+
 def forge_runs(slug: str, sha: str) -> list:
     """The workflow runs of one exact commit, read anonymously at the forge."""
     url = "%s/repos/%s/actions/runs?head_sha=%s&per_page=100" % (FORGE_API, slug, sha)
@@ -1147,7 +1345,9 @@ def tick(db, cfg, options) -> dict:
         # Every record of this pass carries them, the probe's refusal too.
         # #5727: so does the commit of the canon this host reads, compared
         # with the agents' canon by the alerts pass.
-        request = dict(request, fingerprints=prints, canon_ref=canon_commit(cfg))
+        # #7164: and the version this executor runs, read by the same pass.
+        request = dict(request, fingerprints=prints, canon_ref=canon_commit(cfg),
+                       executor_venv=executor_venv(options))
         # #6520 second review: tie the request to this execution before the
         # long preparation below (host operations, fetch, worktree), so a
         # reader can tell a pending handoff this host is working on from a
@@ -1431,7 +1631,27 @@ def tick(db, cfg, options) -> dict:
             if result["state"] == "completed":
                 result["canon_refresh"] = refresh_canon(cfg)
                 result["canon_ref"] = canon_commit(cfg)
+                # #7164 review B2: the venv refresh below takes minutes; the
+                # terminal record says it is under way, so the alerts pass
+                # does not read the old version as a missed update meanwhile.
+                if options.get("venv_update"):
+                    result["venv_refresh"] = {"state": VENV_REFRESH_RUNNING,
+                                              "started": time.time()}
             _record(db, options["key"], result, lease=lease)
+            # #7164: the executor's venv follows the deployed commit, from
+            # the same tree, after the terminal record (the build may take
+            # minutes; the request's outcome must not wait for it). A second
+            # record carries the outcome and the version now live.
+            if result["state"] == "completed" and not execution.lost.is_set():
+                result = dict(result, venv_refresh=refresh_venv(
+                    options, repo, tree, sha), executor_venv=executor_venv(options))
+                try:
+                    if not execution.lost.is_set():
+                        _record(db, options["key"], result, lease=lease)
+                except RuntimeError:
+                    # The terminal record stands; only this evidence is lost,
+                    # and the next pass reads the version again.
+                    pass
             return result
         finally:
             if drop:

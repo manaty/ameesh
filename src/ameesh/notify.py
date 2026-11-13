@@ -319,6 +319,7 @@ TYPE_LABELS = {
     "mesh_backup_unseen": "mesh database backup not seen",
     "migration_pending_non_additive": "non-additive migration waiting",
     "staging_canon_stale": "staging executor canon behind the agents' canon",
+    "staging_executor_stale": "staging executor venv behind the staging it deploys",
     # #6649: routine GitHub polls deferred to keep the gate/merge reserve
     "github_quota_low": "GitHub API quota reserve reached",
     "host_migration_pending_non_additive": (
