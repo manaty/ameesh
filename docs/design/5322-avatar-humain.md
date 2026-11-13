@@ -338,6 +338,40 @@ Points de sûreté :
   continue si elle a la base pour ses tours ; sinon elle s'arrête, comme
   aujourd'hui.
 
+**Implémenté par A2 (#7050)** : table `conversation_moves` (migration 0572),
+contrat `storage.conversation_moves`, protocole `src/ameesh/conversation_move.py`
+et trois points de l'exécuteur ; aucun déclencheur de production avant B1/B4
+(`conversation_move.plan` n'a pas encore d'appelant). Précisions :
+
+- la source est retenue par `begin_turn`, qui répond `conversation_move` sous
+  le verrou de la ligne tant qu'une tentative `planned`/`prepared` de moins de
+  15 min (`PLAN_TTL_S`, compilé) la vise ; la consigne repart en attente ;
+- `advance` (passe de réclamation de l'hôte cible) prépare par sondes sans
+  appel modèle (harnais, binaire, compte, dossier, interactif ; `checks` ne
+  garde que des booléens), puis bascule : sous le verrou de la ligne, jamais
+  pendant un tour source (`status = running`), jamais sur un bail `attach:`,
+  ni sur un détenteur que le plan n'a pas vu ; le bail est rendu (epoch + 1)
+  et la ligne passe à l'hôte et au dossier cible, **sa session gardée** ;
+  `recovered` si le bail source avait expiré ; la cible réclame ensuite par
+  le `claim` ordinaire ;
+- le worker cible lie la tentative à son bail (`bind`, état `rehydrating`,
+  bornes et digest), ouvre une session neuve (`current_session` rend celle
+  de la tentative), écrit le rendu du segment dans
+  `<état>/conversation-segment.md` (0600) et ne met dans `argv` qu'une note
+  qui renvoie au champ `conversation.file` du document de tour ; la session
+  vue au lancement n'est notée que sur la tentative ;
+- fin du premier tour lancé : réussi avec une session → `verified` (le
+  registre prend `session_id`, `session_account`, `session_harness`,
+  `session_cwd` dans la même transaction) ; sinon `failed` : bail rendu,
+  ligne rendue à l'hôte et au dossier source, session source intacte, et une
+  consigne d'avertissement si le tour cible a été lancé ; un tour jamais
+  lancé (admission différée) garde la tentative pour le tour suivant ;
+- une cible relancée (autre bail) ne reprend pas la tentative d'un autre
+  bail : elle l'échoue et la ligne revient à la source ;
+- aucun fichier de session n'est copié ni supprimé ; le fichier de session
+  local de la cible est retiré à l'échec. La purge de `stale-cache` attend
+  Q7.
+
 ### 2.4 Livraison au harnais, sans `argv`
 
 Le segment peut contenir une conversation privée : il ne doit pas apparaître

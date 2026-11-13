@@ -166,6 +166,7 @@ from __future__ import annotations
 from ameesh import work_lifecycle as lifecycle
 
 from .conversations import Conversations
+from .conversation_moves import ConversationMoves
 from .external_executors import SYSTEM_PREFIX, ExternalExecutors
 from .provenance import Provenance
 from .work_dependencies import WorkDependencies
@@ -6246,5 +6247,6 @@ class Storage(abc.ABC):
     session_bindings: SessionBindings
     ci: CiResults
     conversations: Conversations
+    conversation_moves: ConversationMoves
     handoffs: Handoffs
     prevalidation: PrevalidationReports

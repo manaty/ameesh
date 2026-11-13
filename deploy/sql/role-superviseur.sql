@@ -368,6 +368,16 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L78 (0368): conversation cursors and state, without message content.
     ('conversation_heads', ARRAY['agent', 'seq']),
+    -- #7050 (0572): conversation move attempts — ids, hosts, folders, bounds,
+    -- digest and boolean checks only, never the segment text
+    ('conversation_moves', ARRAY[
+        'move_id', 'agent', 'epoch_source', 'state', 'reason', 'requested_by',
+        'source_host', 'source_cwd', 'source_owner', 'source_session',
+        'source_cache', 'target_host', 'target_cwd', 'target_owner',
+        'target_epoch', 'target_session', 'target_turn_started', 'checks',
+        'from_seq', 'to_seq', 'digest', 'error', 'created_at', 'updated_at',
+        'prepared_at', 'switched_at', 'verified_at', 'failed_at'
+    ]),
     ('agent_peek', ARRAY['agent', 'host', 'lease_epoch', 'captured_at']),
     ('conversation_log', ARRAY[
         'agent', 'seq', 'session', 'turn', 'kind', 'author', 'truncated',
