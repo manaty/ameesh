@@ -172,6 +172,9 @@ class LeaseRenewTest(_Restore):
         worker = SimpleNamespace(
             db=SimpleNamespace(cfg=config_mod.Config(dsn="postgresql://u@h/db")),
             name="mty-amh-impl-13", epoch=4, lease_held_until=0.0,
+            # #7052 : `_renew_call` lit le TTL effectif du worker, pas celui
+            # du runner ; la doublure porte donc les deux.
+            lease_ttl=100,
             _held_until=lambda: 0.0, renewals=[], call_budget=lambda: 5.0,
             runner=SimpleNamespace(runner_id="rid", lease_ttl=100))
         with mock.patch.object(runner_mod.db_mod, "connect", side_effect=connect), \

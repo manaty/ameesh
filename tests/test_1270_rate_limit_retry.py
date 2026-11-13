@@ -918,6 +918,9 @@ class CadenceTest(unittest.TestCase):
     def _bail(self, ttl: float, deadline: float):
         bail = SimpleNamespace(lease_deadline=deadline,
                                runner=SimpleNamespace(lease_ttl=ttl))
+        # #7052 : le worker lit son TTL effectif (`AgentWorker.lease_ttl`), plus
+        # celui du runner ; la doublure le porte donc, comme un vrai worker.
+        bail.lease_ttl = ttl
         # la branche d'échec borne l'attente par `wait_timeout`
         bail.wait_timeout = lambda cap: AgentWorker.wait_timeout(bail, cap)
         return bail
@@ -971,6 +974,9 @@ class CadenceTest(unittest.TestCase):
         faux.stopping = threading.Event()
         faux.runner = SimpleNamespace(stop=threading.Event(), draining=threading.Event(),
                                       gate_holds=lambda: False, lease_ttl=300.0)
+        # #7052 : `renew`, `renew_wait`, `call_budget`… lisent le TTL effectif
+        # du worker (`AgentWorker.lease_ttl`), pas `runner.lease_ttl`.
+        faux.lease_ttl = faux.runner.lease_ttl
         # échéance réelle (pas une constante arbitraire) : `renew_wait` lit
         # `time.time`, donc une échéance déjà passée rendrait la tranche nulle
         # et la boucle tournerait à vide.
