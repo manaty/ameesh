@@ -165,6 +165,7 @@ from __future__ import annotations
 
 from ameesh import work_lifecycle as lifecycle
 
+from .attach_grants import AttachGrants
 from .conversations import Conversations
 from .conversation_moves import ConversationMoves
 from .external_executors import SYSTEM_PREFIX, ExternalExecutors
@@ -6222,6 +6223,7 @@ class Storage(abc.ABC):
     work_dependencies: WorkDependencies
     work_footprints: WorkFootprints
     provenance: Provenance
+    attach_grants: AttachGrants
     migration_reservations: MigrationReservations
     lot_sessions: LotSessions
     packages: WorkPackages

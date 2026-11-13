@@ -330,6 +330,52 @@ def approval_page(view: dict) -> str:
     return _page(title, body, base="../")
 
 
+def attach_page(view: dict) -> str:
+    """Page d'un grant d'attach (#7119). `view` : ApproveService.attach_view.
+
+    Même JavaScript que l'approbation (`ameesh-approval`) : approuver ou
+    refuser signe le reçu ; rien d'autre n'est montré ni ouvert ici.
+    """
+    request = view["request"]
+    non_ascii = "Warning: contains non-ASCII characters (lookalike risk)"
+    fields = [
+        _field("Agent", request["agent"],
+               warn=non_ascii if has_non_ascii(request["agent"]) else ""),
+        _field("Agent host", request["host"]),
+        _field("Tenant", request["tenant"] or "(dedicated host)"),
+        _field("Device", request["device_key"]),
+        _field("Requested by", request["requested_by"]),
+        _field("Approver", request["approver"]),
+        _field("Grant valid until", _moment(request["exp"])),
+    ]
+    data = {
+        "kind": "attach",
+        "rp-id": view["rp_id"],
+        "challenge-approve": view["challenge_approve"],
+        "challenge-deny": view["challenge_deny"],
+        "credentials": ",".join(view["credentials"]),
+        "level": view["level"],
+    }
+    attributes = " ".join("data-%s=\"%s\"" % (name, _e(value)) for name, value in data.items())
+    body = (
+        "<main id=\"ameesh-approval\" %s>\n"
+        "<h1>Remote attach requested</h1>\n"
+        "<p class=\"lead\">Approve only if YOU are opening this session, from the device "
+        "shown below. The grant is valid for 5 minutes, once.</p>\n"
+        "<dl class=\"fields\">\n%s\n</dl>\n"
+        "<section>\n<h2>Signed summary</h2>\n<pre class=\"summary\">%s</pre>\n"
+        "<p class=\"digest\">summary digest: <code>%s</code></p>\n</section>\n"
+        "<div class=\"buttons\">\n"
+        "<button id=\"approve\" type=\"button\" class=\"approve\">Approve the attach</button>\n"
+        "<button id=\"deny\" type=\"button\" class=\"deny\">Deny</button>\n"
+        "</div>\n"
+        "<p id=\"status\" role=\"status\" aria-live=\"polite\"></p>\n"
+        "<noscript><p>JavaScript is required to sign with your passkey.</p></noscript>\n"
+        "</main>"
+    ) % (attributes, "\n".join(fields), _e(view["summary"]), _e(request["summary_digest"]))
+    return _page("Remote attach — ameesh", body, base="../")
+
+
 def enroll_page(view: dict) -> str:
     data = {
         "rp-id": view["rp_id"],
