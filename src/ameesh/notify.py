@@ -3371,6 +3371,11 @@ class Notifier:
                     # pause. L'épisode (compte, fenêtre) est le même : garder
                     # l'entrée jusqu'à l'échéance évite un brief par retour.
                     continue  # same budget episode, even if no lot waits for a pass
+                if entry.get("type") == "budget_pause_long" \
+                        and entry.get("resume_ts") is not None and now < entry["resume_ts"]:
+                    # #7175 : l'attente d'une remise à zéro, déjà dite ; le
+                    # statut qui clignote ne la refait pas briefer
+                    continue
                 if entry.get("type") == "idle_capacity" and now - _last_brief_ts(entry) \
                         < alert_briefs.REMIND_AFTER_S:
                     # #2602: brief gaps in available capacity are not a fresh
@@ -3693,7 +3698,9 @@ class Notifier:
                              # (compte, fenêtre) ; sa durée est couverte par
                              # `budget_pause_long`, pas par un second brief.
                              "reminded": kind in ("mail_undeliverable", "review_family_paused",
-                                                  "critical_budget_pause"),
+                                                  "critical_budget_pause")
+                             # #7175 : une attente de remise à zéro, sans relance
+                             or bool(alert.get("waits_reset")),
                              "resume_ts": alert.get("resume_ts"),
                              "to": sorted(set(delivered)),
                              # #3036 : les écartés, pour réévaluer la passe
