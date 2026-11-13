@@ -113,7 +113,8 @@
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
   ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
-        tenants of a shared host: plan, binding, presence (#7106, bureau only);
+        tenants of a shared host: plan, binding, presence (#7106, bureau or
+        human only; --register runs on the target host);
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh hosts HOST --hold --until 2h --reason R | --release
                                         the owner holds a host on purpose: its
