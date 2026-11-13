@@ -8091,7 +8091,7 @@ class AgentWorker(threading.Thread):
             if spec.get("scheduled_wake"):
                 self._forget_wake_claim()
             self._settle_runner_retry(spec)
-            if (self.agent or {}).get("created_by"):
+            if (getattr(self, "agent", None) or {}).get("created_by"):
                 # B 40615 : toute sortie du tour (préparation refusée, échec
                 # avant le Recorder, exception) exécute le nettoyage. Le
                 # marqueur ne survit donc qu'à une mort du processus, cas que
