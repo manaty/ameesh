@@ -17,8 +17,12 @@
 --
 -- Aucune de ces tables ne porte d'autorité : elle disent ce que le runner a
 -- le droit de donner à un enfant, jamais un droit du parent.
+-- `on update cascade` (#4299) : un renommage de l'agent déplace la ligne de
+-- son enfant avec lui (`child` est classée CASCADED) ; la suppression de
+-- l'agent emporte la ligne.
 create table if not exists spawn_profiles (
-    child           text primary key references agent_registry(name) on delete cascade,
+    child           text primary key references agent_registry(name)
+                    on delete cascade on update cascade,
     parent          text not null,
     harness         text not null,
     tools           text[] not null default '{}',
@@ -36,7 +40,8 @@ create table if not exists spawn_profiles (
 create index if not exists spawn_profiles_parent on spawn_profiles(parent);
 
 create table if not exists spawn_contexts (
-    child       text primary key references agent_registry(name) on delete cascade,
+    child       text primary key references agent_registry(name)
+                on delete cascade on update cascade,
     parent      text not null,
     digest      text not null check (digest ~ '^[0-9a-f]{64}$'),
     bytes       integer not null check (bytes between 0 and 16384),
@@ -45,7 +50,8 @@ create table if not exists spawn_contexts (
 );
 
 create table if not exists spawn_reports (
-    child       text primary key references agent_registry(name) on delete cascade,
+    child       text primary key references agent_registry(name)
+                on delete cascade on update cascade,
     seq         bigint not null default 0 check (seq >= 0),
     started_at  timestamptz,
     final_at    timestamptz,
