@@ -565,6 +565,20 @@ ordinary rotation (size, context cap, L11) passes the guards of a turn first
 (budget and caps, authentication) and runs only on the session's own account;
 otherwise it waits, and the account switch of the next turn rotates.
 
+A **critical** agent may run up to 100 % of a window (its account's
+`pace_ceiling: 1.0`, or the end-of-window raise). Its account choice keeps a
+**summary margin** (`accounts.SUMMARY_MARGIN`, 2 points): the agent leaves its
+session account before a gauge gets within the margin of saturation, so the
+rotation summary still runs under the old account (`summary_possible` refuses
+a saturated gauge, as the provider would). Two points, because the gauges are
+published rounded to the point — the last reading before 100 % is 0.99 — and
+the summary turn itself consumes a little. If no other account is placeable,
+it waits inside the margin instead of burning it; the session stays
+summarizable when an account frees up, and the next rotation produces the
+agent's summary rather than the deterministic brief (#7006). Non-critical
+agents keep their own reserve (`RESERVE`, 10 points under the pace cap), which
+already leaves the summary possible under the pace.
+
 For the order "Claude tertiary > secondary > primary, Codex secondary >
 primary" on a host that declared `primaire, secondaire, tertiaire`:
 
