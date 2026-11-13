@@ -43,6 +43,53 @@ HOST_PUBLIC_KEY = Ed25519PrivateKey.from_private_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 #: un shell qui répond et reste vivant (le PTY est le terminal)
 COMMAND = ["/bin/sh", "-c", 'while IFS= read -r line; do printf "echo:%s\\n" "$line"; done']
+#: borne généreuse d'une poignée de main locale : sous la charge d'une partie
+#: psycopg, 5 s ne suffisent pas. Ce n'est jamais un délai à l'aveugle : le
+#: réveil vient de l'événement de connexion, et un refus échoue tout de suite.
+HOST_READY_TIMEOUT = 30.0
+
+
+class _ObservedConnector(attach_host.HostConnector):
+    """Connecteur qui retient le refus définitif du relais.
+
+    Un refus (jeton, version, rôle) est une erreur du connecteur, pas une
+    connexion lente : le test doit le rendre tout de suite, sans attendre.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.refused = threading.Event()
+        self.refusal = ""
+
+    def _connect(self):
+        try:
+            return super()._connect()
+        except attach_host.HostRefused as exc:
+            self.refusal = str(exc)
+            self.refused.set()
+            raise
+
+
+def _wait_host_connected(connector, thread, *, timeout=HOST_READY_TIMEOUT):
+    """Attend l'événement de connexion ; un refus définitif échoue aussitôt.
+
+    La borne est un garde-fou, pas le mécanisme d'attente : le réveil vient de
+    l'événement du connecteur. Un refus est rendu sans attendre la borne, et un
+    fil mort n'est jamais pris pour une connexion.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError("the host did not connect within %.1fs"
+                                 % timeout)
+        if connector.wait_connected(min(0.05, remaining)):
+            return
+        if connector.refused.is_set():
+            raise AssertionError("the relay refused the host: %s"
+                                 % connector.refusal)
+        if not thread.is_alive():
+            raise AssertionError("the host connector stopped before connecting")
 
 
 def make_grant(*, agent=AGENT, host=HOST, tenant=TENANT, ttl=300, exp=None,
@@ -428,11 +475,11 @@ class RelayTest(unittest.TestCase):
                       command=COMMAND, host_signing_key=HOST_SIGNING_KEY,
                       max_sessions=4, max_session_seconds=10.0, keepalive=1.0)
         config.update(overrides)
-        self.connector = attach_host.HostConnector(
+        self.connector = _ObservedConnector(
             attach_host.HostConfig(**config), self.verifier, logger=self.logger)
         thread = threading.Thread(target=self.connector.run_forever, daemon=True)
         thread.start()
-        self.assertTrue(self.connector.wait_connected(5), "the host did not connect")
+        _wait_host_connected(self.connector, thread)
         self.addCleanup(thread.join, 2.0)
 
     def test_session_e2e_ptyt_et_journaux_sans_contenu(self):
@@ -610,7 +657,7 @@ class RelayTest(unittest.TestCase):
 
     def test_mauvais_jeton(self):
         self.start()
-        self.connector = attach_host.HostConnector(
+        self.connector = _ObservedConnector(
             attach_host.HostConfig(relay_host="127.0.0.1", relay_port=self.relay.port,
                                    token="mauvais-" + "b" * 40, host=HOST,
                                    agents=(AGENT,), plaintext_loopback=True,
@@ -620,7 +667,11 @@ class RelayTest(unittest.TestCase):
         thread = threading.Thread(target=self.connector.run_forever, daemon=True)
         thread.start()
         self.addCleanup(thread.join, 2.0)
-        self.assertFalse(self.connector.wait_connected(1.0))
+        # un refus est rendu tout de suite, jamais attendu comme un délai
+        with self.assertRaisesRegex(AssertionError,
+                                    "refused the host: auth_failed"):
+            _wait_host_connected(self.connector, thread)
+        self.assertFalse(self.connector.wait_connected(0))
 
     def test_deconnexion_du_poste_ferme_la_session(self):
         self.start()
@@ -706,7 +757,7 @@ class TlsTest(unittest.TestCase):
         relay.start()
         self.addCleanup(relay.stop)
         verifier = FakeVerifier()
-        connector = attach_host.HostConnector(attach_host.HostConfig(
+        connector = _ObservedConnector(attach_host.HostConfig(
             relay_host="127.0.0.1", relay_port=relay.port, token=TOKEN, host=HOST,
             agents=(AGENT,), tls_context=self.client_ctx, command=COMMAND,
             host_signing_key=HOST_SIGNING_KEY), verifier)
@@ -714,7 +765,7 @@ class TlsTest(unittest.TestCase):
         thread.start()
         self.addCleanup(connector.stop)
         self.addCleanup(thread.join, 2.0)
-        self.assertTrue(connector.wait_connected(5))
+        _wait_host_connected(connector, thread)
         receipt, device = make_grant()
         station = Station(relay.port, receipt, device, tls_context=self.client_ctx)
         self.addCleanup(station.close)
