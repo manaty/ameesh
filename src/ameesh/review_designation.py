@@ -73,6 +73,11 @@ NO_ROLES = "no-roles"
 #: the reasons that are a **read failure**, not a clean refusal: they are
 #: journaled (an absent/unreadable field is not evidence of anything)
 UNREADABLE_PROFILE_REASONS = frozenset((CAPABILITIES_UNREADABLE, ROLES_UNREADABLE))
+#: #7174: the role names that make an agent a reviewer by its card. The
+#: registry copies the card's `roles` (`canon_sync`); the aliases are the ones
+#: the canon reader recognises (`sous_utilisation.ROLE_SYNONYMS`), kept here
+#: so this module stays independent from the canon loader.
+REVIEWER_ROLES = frozenset(("relecture", "review", "reviewer"))
 #: the human-readable explanation of each refusal reason
 PROFILE_REASONS = {
     CAPABILITIES_UNREADABLE: "its `capabilities` are absent or unreadable in the registry",
@@ -476,6 +481,29 @@ def _array_values(value) -> Optional[list[str]]:
         # un élément NULL d'un tableau Postgres n'est pas un rôle
         return [str(part).strip() for part in value if part is not None]
     return None
+
+
+def reviewer_role(row: Mapping) -> bool:
+    """#7174: does the registry card declare the reviewer role?
+
+    An agent whose card declares `relecture` (or its aliases, `REVIEWER_ROLES`)
+    is a reviewer by role: the roadmap sleep never pauses it and the capacity
+    does not count it (#3256 §2.3, `AUDITEUR.md`, « Capacité au repos »). The
+    role is read on the registry column `canon_sync` copies from the card, like
+    `reviewer_eligibility` reads `capabilities` and `roles`.
+
+    `roles` NULL means the card declares none (a clean non-reviewer, as
+    `reviewer_eligibility` reads it). A value that cannot be read is a doubt:
+    True, so the sleep spares the agent rather than pausing a possible
+    reviewer on unreadable input.
+    """
+    roles = (row or {}).get("roles")
+    if roles is None:
+        return False
+    values = _array_values(roles)
+    if values is None:
+        return True
+    return any(str(value).strip().lower() in REVIEWER_ROLES for value in values)
 
 
 def reviewer_eligibility(row: Mapping) -> tuple[bool, str]:
