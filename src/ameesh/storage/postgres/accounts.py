@@ -319,3 +319,51 @@ class Accounts(interface.Accounts):
             "select id, harness, from_account, to_account, kind, reason, agent,"
             " extract(epoch from at)::float8 as at_ts from account_switches where "
             + " and ".join(clauses) + " order by at desc, id desc limit %s", tuple(params))
+
+    # -- #6961 : pause partagée par compte --------------------------------
+
+    def account_pauses(self, harness) -> dict:
+        rows = self.db.query(
+            "select account, until_ts, observed_at, reason, source"
+            " from account_pauses where harness = %s", (harness,))
+        return {r["account"]: {"until_ts": r["until_ts"],
+                               "observed_at": r["observed_at"],
+                               "reason": r["reason"], "source": r["source"]}
+                for r in rows}
+
+    def publish_account_pause(self, harness, account, until_ts, observed_at,
+                              reason, source="") -> None:
+        """#6961 : la publication la plus RÉCENTE gagne.
+
+        `observed_at` est comparé dans la même instruction que l'écriture :
+        une lecture ancienne qui arrive après une plus fraîche (deux hôtes,
+        deux threads) ne raccourcit ni ne déplace la pause. Une pause de la
+        même fenêtre garde son échéance ; l'échéance ne peut qu'être portée
+        par un relevé plus récent (fenêtre suivante)."""
+        self.db.execute(
+            "insert into account_pauses"
+            " (harness, account, until_ts, observed_at, reason, source)"
+            " values (%s, %s, %s, %s, %s, %s)"
+            " on conflict (harness, account) do update"
+            " set until_ts = excluded.until_ts,"
+            " observed_at = excluded.observed_at,"
+            " reason = excluded.reason, source = excluded.source,"
+            " updated_at = now()"
+            " where excluded.observed_at >= account_pauses.observed_at",
+            (harness, account, float(until_ts), float(observed_at),
+             reason or "", source or ""))
+
+    def release_account_pause(self, harness, account, observed_at) -> bool:
+        """#6961 (B codex) : compare et supprime dans la même instruction.
+
+        `observed_at` est l'observation de la pause que la décision a lue.
+        Une publication concurrente plus récente (observed_at supérieur) est
+        conservée : sans cette garde, deux agents pouvaient lire une pause
+        ancienne, l'un publiait un plafond dur plus récent, l'autre le
+        supprimait sans condition et la relecture finale, vide, plaçait le
+        compte au plafond. Rend True si la ligne a été supprimée."""
+        rows = self.db.query(
+            "delete from account_pauses where harness = %s and account = %s"
+            " and observed_at <= %s returning observed_at",
+            (harness, account, float(observed_at)))
+        return bool(rows)

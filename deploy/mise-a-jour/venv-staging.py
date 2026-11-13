@@ -42,6 +42,18 @@ porte alors ``scellement`` et ses scripts d'entrée ``pip*`` de lanceur
 ``scelle`` : un venv non scellé, ou dont un octet ou un mode diffère, est
 refusé. Le manifeste de format 2 reste celui d'un venv non scellé.
 
+``deriver`` (#7164) écrit un nouveau paquet opérateur pour un commit
+descendant, sans réseau : les roues et épinglages du paquet de base sont
+repris tels quels, seule la roue ``ameesh`` est reconstruite depuis le commit
+avec le setuptools verrouillé ; son épinglage reçoit le SHA-256 de cette roue.
+Une dépendance nouvelle ou changée n'y entre jamais : l'installation
+``--require-hashes`` de ``produire`` la refuse, et le paquet reste à refaire
+à la main.
+
+    venv-staging.py deriver --clone DÉPÔT --sha SHA \\
+        --lock BASE.lock --wheelhouse BASE_WHEELHOUSE \\
+        --python /usr/bin/python3 --output NOUVEAU_PAQUET
+
 La vérification est en lecture seule et fail closed : elle épingle
 l'interpréteur (``version``, ``home``, ``executable`` et SHA-256 du binaire
 résolu) et le compare avant de l'exécuter, puis contrôle le ``pyvenv.cfg``
@@ -1341,6 +1353,83 @@ def _produire(depot, *, sha, tag, lock_path, wheelhouse, python, output,
                 pass
 
 
+#: #7164 : noms du paquet dérivé, ceux du paquet opérateur (§5 du plan L2).
+LOCK_DERIVE = 'requirements-staging.lock'
+WHEELHOUSE_DERIVE = 'wheelhouse'
+
+
+def _deriver(depot, *, sha, lock_path, wheelhouse, python, output):
+    """#7164 : le paquet du commit ``sha``, dérivé d'un paquet vérifié.
+
+    Le paquet de base est lu avec les mêmes refus que ``produire`` ; seule la
+    roue ``ameesh`` change. Rien n'est écrit hors de ``output``, créé neuf."""
+    if os.geteuid() == 0:
+        raise Erreur('la dérivation doit se faire hors root')
+    output = Path(output).absolute()
+    if output.exists() or output.is_symlink():
+        raise Erreur('sortie existante refusée : %s' % output)
+    _dossier_protege(output.parent)
+    sha, epoch = _resoudre_commit(depot, sha=sha)
+    lock = _lire_lock(Path(lock_path).absolute())
+    roues = _lire_wheelhouse(Path(wheelhouse).absolute())
+    par_nom = _apparier_lock_wheelhouse(lock, roues)
+    racine = Path(tempfile.mkdtemp(prefix='ameesh-venv-derive-'))
+    ancien_masque = os.umask(0o022)
+    try:
+        home = racine / 'home'
+        home.mkdir(mode=0o700)
+        (home / 'tmp').mkdir(mode=0o700)
+        env_pip = _pip_env(home, epoch)
+        source = racine / 'source'
+        _extraire_source(Path(depot).absolute(), sha, source, _git_env(home))
+        outil = _preparer_outil(python, par_nom['setuptools'], racine, env_pip)
+        sortie = racine / 'roue'
+        sortie.mkdir(mode=0o700)
+        construite = _construire_roue(outil, source, sortie, env_pip)
+        nouvelle = _analyser_roue(construite['name'])
+        if nouvelle['name'] != 'ameesh':
+            raise Erreur('roue ameesh attendue : %s' % construite['name'])
+        output.mkdir(mode=0o755)
+        cible = output / WHEELHOUSE_DERIVE
+        cible.mkdir(mode=0o755)
+        for roue in roues:
+            if roue['name'] != 'ameesh':
+                shutil.copyfile(roue['path'], cible / roue['filename'])
+                os.chmod(cible / roue['filename'], 0o644)
+        shutil.copyfile(construite['path'], cible / construite['name'])
+        os.chmod(cible / construite['name'], 0o644)
+        lignes = []
+        for nom in sorted(lock['records']):
+            record = lock['records'][nom]
+            version, hashes = record['version'], record['hashes']
+            if nom == 'ameesh':
+                version, hashes = nouvelle['version'], (construite['sha256'],)
+            lignes.append('%s%s==%s %s\n' % (
+                nom, '[%s]' % record['extras'] if record['extras'] else '',
+                version, ' '.join('--hash=sha256:' + digest
+                                  for digest in hashes)))
+        chemin = output / LOCK_DERIVE
+        fd = os.open(chemin, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o444)
+        with os.fdopen(fd, 'w', encoding='utf-8') as flux:
+            flux.write(''.join(lignes))
+        # Le paquet écrit se relit avec les refus de la production.
+        derive = _lire_lock(chemin)
+        _apparier_lock_wheelhouse(derive, _lire_wheelhouse(cible))
+        return dict(sha=sha, wheel=construite['name'],
+                    wheel_sha256=construite['sha256'], lock_sha256=derive['digest'])
+    except BaseException:
+        if output.is_dir() and not output.is_symlink():
+            _supprimer(output)
+        raise
+    finally:
+        os.umask(ancien_masque)
+        try:
+            _supprimer(racine)
+        except OSError:
+            pass
+
+
 def _comparer(attendu, mesure, etiquette):
     if attendu == mesure:
         return
@@ -1419,6 +1508,14 @@ def main(argv=None):
     produire.add_argument('--output', required=True)
     produire.add_argument('--scelle', action='store_true',
                           help='décrire le venv scellé posé par bascule.py (#5711)')
+    deriver = sous.add_parser(
+        'deriver', help='dériver le paquet opérateur d\'un commit descendant (#7164)')
+    deriver.add_argument('--clone', required=True)
+    deriver.add_argument('--sha', required=True)
+    deriver.add_argument('--lock', required=True)
+    deriver.add_argument('--wheelhouse', required=True)
+    deriver.add_argument('--python', default='/usr/bin/python3')
+    deriver.add_argument('--output', required=True)
     verifier = sous.add_parser('verifier', help='vérifier un venv installé')
     verifier.add_argument('--manifeste', required=True)
     verifier.add_argument('--venv', required=True)
@@ -1435,6 +1532,13 @@ def main(argv=None):
             print('arbre installé: %s' % document['installed']['tree_sha256'])
             print('distributions: %d, roues: %d'
                   % (len(document['distributions']), len(document['wheels'])))
+            return 0
+        if arguments.commande == 'deriver':
+            resultat = _deriver(
+                arguments.clone, sha=arguments.sha, lock_path=arguments.lock,
+                wheelhouse=arguments.wheelhouse, python=arguments.python,
+                output=arguments.output)
+            print(json.dumps(resultat, sort_keys=True))
             return 0
         document = _verifier(arguments.manifeste, arguments.venv)
         print('venv conforme: %s' % Path(arguments.venv))

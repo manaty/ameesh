@@ -57,6 +57,9 @@ class PrimaireAuDelaDuPlafondTest(_Comptes):
         ordinaire = self.choose()
         self.assertIsNone(ordinaire.profile)
         self.assertIn("at threshold", ordinaire.reason)
+        # #6961 : le plafond implicite de 50 % d'un non-critique ne se publie
+        # pas en pause partagée — elle écarterait le critique autorisé au-delà.
+        self.assertEqual(storage.of(self.db).accounts.account_pauses("codex"), {})
         critique = self.choose(critical=True)
         self.assertEqual(critique.profile.name, "primaire")
         self.assertTrue(critique.per_agent)
