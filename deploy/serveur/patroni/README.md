@@ -350,7 +350,9 @@ primaire est tué par la commande de l'exploitant (`--tuer`) ; le script ne
 touche aucun hôte. Il mesure le délai jusqu'au nouveau primaire (cible 60 s,
 exigence 300 s), la reprise de l'écouteur, les messages de la coupure remis
 par le balayage, et le RPO : chaque COMMIT confirmé doit se retrouver sur le
-nouveau primaire. Hors des hôtes locaux, `--geste-reel` est exigé. Une table
+nouveau primaire. Après une coupure, l'écouteur attend un COMMIT confirmé de
+l'écrivain avant de se réabonner : une coupure sans message est un écart, le
+balayage n'étant alors pas prouvé (#7117). Hors des hôtes locaux, `--geste-reel` est exigé. Une table
 `verif_bascule_<hex>` est créée puis supprimée.
 
 ```bash
