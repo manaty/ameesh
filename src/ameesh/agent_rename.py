@@ -85,6 +85,9 @@ CASCADED = (
     "conversation_log.agent", "host_handoffs.agent",
     "host_lifecycle_agents.agent", "operator_pause_events.agent", "role_handover.name",
     "role_standings.name",
+    # #7034 (0571): the restricted child's rows follow the identity; the FKs
+    # are `on update cascade`, deleted with the child.
+    "spawn_contexts.child", "spawn_profiles.child", "spawn_reports.child",
 )
 
 # Evidence, authority and unrelated names: never rewritten. Executor
