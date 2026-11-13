@@ -102,10 +102,10 @@
         heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
         durable withdrawal, return and verified lost-host recovery (L232e);
-  ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
-        tenants of a shared host: plan, binding, presence (#7106, bureau only);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
+  ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
+        tenants of a shared host: plan, binding, presence (#7106, bureau only);
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh hosts HOST --hold --until 2h --reason R | --release
                                         the owner holds a host on purpose: its
