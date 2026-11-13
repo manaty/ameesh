@@ -213,8 +213,16 @@ def wakeable(listing: list, canons, *, configured: bool, closed_hosts=()) -> lis
     agents réveillables — leur hôte n'ouvrira pas de tour (drainage, hôte
     perdu, porte fermée, pause de l'owner). Les compter diluerait la part au
     repos et le découpage (#5122) créerait des lots pour une capacité absente.
+
+    #7174 : un agent dont la fiche porte le rôle `relecture` n'est pas une
+    capacité de feuille de route, même quand aucun avis n'est dû à cet
+    instant : un gel peut le désigner à tout moment, et le sommeil
+    « feuille de route épuisée » ne doit jamais retirer un siège de relecture
+    (§2.3, `AUDITEUR.md` « Capacité au repos »). Le rôle est lu sur la fiche
+    (`review_designation.reviewer_role`), pas sur le nom.
     """
     from .chat import is_chat_agent
+    from . import review_designation as rd
     closed = {str(host) for host in (closed_hosts or ())}
     out = []
     for row in listing:
@@ -230,6 +238,8 @@ def wakeable(listing: list, canons, *, configured: bool, closed_hosts=()) -> lis
             continue
         critical, _unknown = su.critical_verdict(row, canons, configured=configured)
         if critical:
+            continue
+        if rd.reviewer_role(row):
             continue
         out.append(row)
     return out
@@ -405,8 +415,8 @@ def body_of(project: str, item: Measure, since_ts: float, now: float,
     if losses:
         lines.append("Quota perdu au reset si rien ne change : %s." % "; ".join(losses))
     lines += [
-        "Feuille de route : la source déclarée du projet (docs/ROADMAP.md, décisions "
-        "owner `ameesh decide`).",
+        "Feuille de route : le plan du projet dans le canon (fiches WorkPackage "
+        "sous `plan/%s/`) et les décisions owner (`ameesh decide`)." % project,
         "",
         "Attendu du pilote : des lots démarrables, d'au plus une journée chacun et de "
         "classe conforme au §1 du canon, pour %d agent(s) ; ce lot se ferme quand la "

@@ -19,9 +19,15 @@ from .support import PgTestCase
 class MailShowTest(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
-        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
-        registry.upsert(self.db, "beta", harness="codex", host="autre")
-        registry.upsert(self.db, "gamma", harness="deepseek", host="autre")
+        # #7149 : `show` refuse une identité annoncée non liée pour un agent
+        # `execute` (sa session liée seule lit son courrier) ; ce test porte
+        # sur la restriction au destinataire, avec des personas externes.
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop",
+                        mode="externe")
+        registry.upsert(self.db, "beta", harness="codex", host="autre",
+                        mode="externe")
+        registry.upsert(self.db, "gamma", harness="deepseek", host="autre",
+                        mode="externe")
 
     def _row(self, message_id) -> dict:
         rows = self.db.query(

@@ -10,6 +10,8 @@ Une session a une identité si, et seulement si :
    l'identité *liée au bail*, qui empêche une session périmée ou une autre
    machine de consommer le courrier ;
 3. sinon, c'est une identité *explicite* (session hors runner, repli fichier) ;
+   si le nom annoncé est celui de la liaison de CETTE session (#7149), c'est
+   la liaison qui fait l'identité (source `session`) ;
 4. sans `AGENT_MAIL_NAME`, une session EXTERNE (lancée par un humain) a une
    identité si elle est **liée** (L41, décision 0030) : `ameesh mail bind
    <agent> --session <id> --harness <h> [--pid N]` lie l'identifiant de
@@ -129,6 +131,12 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
     `harness` et `session_id` (reçus du harnais) : seule la liaison de CETTE
     session compte. Sans eux, la liaison est cherchée par l'ascendance du
     processus.
+
+    #7149 : quand AGENT_MAIL_NAME nomme la liaison de CETTE session, la
+    liaison rend l'identité (source `session`) et l'identité explicite
+    s'efface. Un shell qui a encore hérité du nom annoncé lit donc sa propre
+    boîte ; un nom différent de la liaison reste une identité ambiguë,
+    refusée.
     """
     name = os.environ.get("AGENT_MAIL_NAME") or ""
     if not name:
@@ -151,6 +159,29 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
         return Binding(name=canonical, source="runner", runner_id=runner_id, epoch=epoch,
                        ok=ok, reason=reason, projects=_projects_of(row))
     name = resolve(name, db=db, cfg=cfg, operation="identity.binding")
+    if db is not None:
+        # #7149 : un AGENT_MAIL_NAME hérité (pont local, shell, session
+        # reprise) ne prend pas l'identité d'une session DÉJÀ liée à un autre
+        # nom. L'incident a montré un lecteur qui se croyait claude2 et
+        # répondait à son courrier ; la liaison de #4485 est lue sans repasser
+        # par AGENT_MAIL_NAME. Une simple identité annoncée, sans liaison,
+        # garde le comportement v0.
+        try:
+            bound = _session_binding(cfg, db, harness, session_id)
+        except Exception:
+            bound = Binding(reason=_UNBOUND)
+        if bound.name and bound.name != name:
+            return Binding(
+                name=name, source="explicit",
+                reason="ambiguous identity: AGENT_MAIL_NAME is %s but this "
+                       "session is bound to %s; unset AGENT_MAIL_NAME or "
+                       "rebind (ameesh mail bind)" % (name, bound.name))
+        if bound.ok:
+            # #7149 (B1 de la revue) : le nom annoncé EST celui de la liaison ;
+            # c'est la liaison qui fait l'identité, pas la variable héritée.
+            # Les lecteurs (`inbox`, `show`) exigent cette source pour ouvrir
+            # la boîte d'un agent mené par l'exécuteur.
+            return bound
     return Binding(name=name, source="explicit", ok=True)
 
 

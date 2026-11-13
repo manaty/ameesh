@@ -1655,7 +1655,19 @@ def build(*, items: Iterable[Mapping[str, Any]],
             add_wait("qa_merge", row, row["frozen_ts"], "paquet",
                      GESTURES["qa_merge"], level=2, human=_human_wait(state),
                      **dependents_of(row["lot"]))
+    def window_open(lot) -> bool:
+        """#4235 : la fenêtre d'observation du lot tient encore (non échue)."""
+        window = window_by_lot.get(int(lot))
+        return (window is not None and int(lot) not in external_by_lot
+                and now < float(window["observation"]["due_ts"]))
+
     for row in blocked_reviews:
+        # #7090 : une correction due sous une fenêtre d'observation non échue
+        # est dans `window_waits` (attente voulue et datée) ; elle redevient
+        # une attente `blocking_review` à l'échéance, sans retour au backlog.
+        if window_open(row["lot"]):
+            row["window"] = True
+            continue
         add_wait("blocking_review", row, row["blocked_ts"],
                  row.get("assignee") or row.get("reviewer") or "auteur",
                  GESTURES["blocking_review"].format(
@@ -1828,8 +1840,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
                                     float(review.get("age_s") or 0.0))
     for row in blocked_reviews:
         name = row.get("assignee")
-        if not name:
-            continue
+        if not name or row.get("window"):
+            continue                    # #7090 : rien n'est dû avant l'échéance
         entry = due_by_agent.setdefault(name, {"reviews": [], "fixes": [],
                                                "oldest_age_s": 0.0})
         entry["fixes"].append(row["lot"])
@@ -2193,8 +2205,9 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
 
     * `agents` : le relevé des agents (`operations.listing`) ; un agent
       **réveillable** l'est au sens de #4273 (`file_decoupage.wakeable` :
-      exécution, ni éphémère, ni chat, ni arrêté, ni en pause, ni critique ni
-      relecteur — `critical_verdict` sur `canons`, `configured`), et en
+      exécution, ni éphémère, ni chat, ni arrêté, ni en pause, ni critique
+      (`critical_verdict` sur `canons`, `configured`), ni relecteur de rôle
+      (`review_designation.reviewer_role`, #7174)), et en
       plus ni retiré (`retired_ts`), ni sans exécuteur vivant
       (`_awake_runner`), ni tenu par son budget (`held`), ni d'une famille
       exclue des prises (`excluded_families`, #5005 : cette capacité-là est
