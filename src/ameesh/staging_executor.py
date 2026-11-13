@@ -966,6 +966,13 @@ def _refresh_venv(options, repo: str, tree: str, sha: str) -> dict:
             break
     if failure is not None:
         return failure
+    # #7212: the switch re-pins the config this executor actually reads; a
+    # caller without one (older callers, tests) keeps the previous argv.
+    activate = [python, "-I", os.path.join(tools, "bascule.py"),
+                "activer", "--venv", venv, "--version", version,
+                "--precedent", live]
+    if options.get("config_path"):
+        activate += ["--staging-config", options["config_path"]]
     steps = [
         ("prepare", [python, "-I", os.path.join(tools, "bascule.py"),
                      "preparer", "--venv", venv, "--src", tree,
@@ -973,9 +980,7 @@ def _refresh_venv(options, repo: str, tree: str, sha: str) -> dict:
                      "--lock", lock, "--wheelhouse", wheelhouse,
                      "--manifeste", manifest, "--verificateur",
                      os.path.join(tools, "venv-staging.py")]),
-        ("activate", [python, "-I", os.path.join(tools, "bascule.py"),
-                      "activer", "--venv", venv, "--version", version,
-                      "--precedent", live]),
+        ("activate", activate),
     ]
     for step, argv in steps:
         error = _venv_step(argv)
@@ -988,8 +993,11 @@ def _refresh_venv(options, repo: str, tree: str, sha: str) -> dict:
                                      "bin", "python"), "-I", "-m",
                         "ameesh.staging_executor", "--help"])
     if error:
-        back = _venv_step([python, "-I", os.path.join(tools, "bascule.py"),
-                           "retour", "--venv", venv])
+        retour = [python, "-I", os.path.join(tools, "bascule.py"),
+                  "retour", "--venv", venv]
+        if options.get("config_path"):
+            retour += ["--staging-config", options["config_path"]]
+        back = _venv_step(retour)
         return {"state": "rolled back" if back is None else "refused",
                 "from": live, "to": version, "step": "launch",
                 "reason": error if back is None
