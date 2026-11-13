@@ -87,16 +87,17 @@ class SelectionHelperTest(unittest.TestCase):
         self.git("commit", "-qm", message)
         return self.git("rev-parse", "HEAD")
 
-    def card(self, commit: str) -> None:
+    def card(self, commit: str, blocs: dict | None = None) -> None:
         card = {
             "schema": "ameesh-carte/1", "commit": commit,
             "genere": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "blocs": {"src/pkg/mod.py": {
-                "<module>": {"modules": ["test_chaud_lent", "test_chaud_rapide",
-                                         "test_froid", "test_import_seul"]},
-                "chaude": {"modules": ["test_chaud_lent", "test_chaud_rapide"]},
-                "froide": {"modules": ["test_froid"]},
-            }},
+            "blocs": blocs if blocs is not None else {
+                "src/pkg/mod.py": {
+                    "<module>": {"modules": ["test_chaud_lent", "test_chaud_rapide",
+                                             "test_froid", "test_import_seul"]},
+                    "chaude": {"modules": ["test_chaud_lent", "test_chaud_rapide"]},
+                    "froide": {"modules": ["test_froid"]},
+                }},
             "modules": {
                 "test_chaud_rapide": {"durations": {"psycopg": 1.0, "psql": 50.0}},
                 "test_chaud_lent": {"durations": {"psycopg": 40.0}},
@@ -147,6 +148,55 @@ class SelectionHelperTest(unittest.TestCase):
         self.assertNotIn("tests.test_chaud_lent", modules)
         self.assertEqual(unit["dropped"], 1)
         self.assertEqual(unit["added"][2]["files"], ["src/pkg/mod.py"])
+
+    def test_7195_bloc_rare_mesure_garde_sa_place(self) -> None:
+        # #7195 : 150 tests mesurés à 1,2 s couvrent le bloc `chaude` ; le bloc
+        # rare `froide` a trois tests mesurés (14,4 ; 45,6 ; 60 s). L'ancien
+        # ordre global (le moins cher d'abord) dépensait les 180 s dans
+        # `chaude` et laissait tomber le test ciblé à 45,6 s ; le tour par
+        # bloc, durées mesurées d'abord, le garde.
+        large = ["test_large_%03d" % index for index in range(150)]
+        for name in large:
+            self.write("tests/%s.py" % name, "X = 1\n")
+        cibles = ["test_cible_rapide", "test_cible_moyen", "test_cible_lent"]
+        for name in cibles:
+            self.write("tests/%s.py" % name, "X = 1\n")
+        prices = {name: 1.2 for name in large}
+        prices.update({"test_cible_rapide": 14.4, "test_cible_moyen": 45.6,
+                       "test_cible_lent": 60.0})
+        self.write("tests/parts/durees.json", json.dumps({"psycopg": prices}))
+        self.base = self.commit("base large")
+        self.card(self.base, {"src/pkg/mod.py": {
+            "chaude": {"modules": large},
+            "froide": {"modules": cibles},
+        }})
+        self.write("src/pkg/mod.py",
+                   SOURCE_V1.replace("return 1", "return 10")
+                   .replace("return 2", "return 20"))
+        report = self.select(self.commit("unité deux blocs"), budget=180)
+        (unit,) = report["units"]
+        modules = [row["module"] for row in unit["added"]]
+        self.assertIn("tests.test_cible_moyen", modules)
+        self.assertLess(modules.index("tests.test_cible_moyen"), 5)
+        self.assertLessEqual(unit["seconds"], 180)
+        self.assertEqual(unit["coverage"],
+                         {"unknown_paths": [], "unmapped_blocks": []})
+
+    def test_7195_couverture_nomme_fichier_et_bloc_hors_carte(self) -> None:
+        # #7195 : un fichier `src/` neuf et un bloc neuf absents de la carte
+        # sont dits, pour qu'une carte antérieure ne fasse pas croire à une
+        # sélection complète.
+        self.card(self.base)
+        self.write("src/pkg/mod.py", SOURCE_V1.replace(
+            "return 1", "return 10") + "\n\ndef neuve():\n    return 3\n")
+        self.write("src/pkg/neuf.py", "def neuf():\n    return 1\n")
+        report = self.select(self.commit("unité carte incomplète"), budget=100)
+        (unit,) = report["units"]
+        self.assertEqual(unit["coverage"]["unknown_paths"], ["src/pkg/neuf.py"])
+        self.assertEqual(unit["coverage"]["unmapped_blocks"],
+                         ["src/pkg/mod.py:neuve"])
+        self.assertIn("tests.test_chaud_rapide",
+                      [row["module"] for row in unit["added"]])
 
     def test_4814_support_partage_borne_par_le_budget(self) -> None:
         # #4814 : `tests/support.py` importé par ~545 modules faisait de la
@@ -396,6 +446,43 @@ class LocalNeighborsTest(unittest.TestCase):
             self.worktree, self.composition, "4" * 40)
         self.assertEqual(found, {})
         self.assertIn("absent", note)
+
+    def test_7195_note_dit_la_carte_incomplete(self) -> None:
+        # #7195 : la note du manifeste nomme les fichiers/blocs que la carte
+        # ne couvre pas, sans bloquer la sélection.
+        (self.worktree / "scripts").mkdir()
+        (self.worktree / "scripts/paquet-attribution.py").write_text("")
+        (self.worktree / "tests").mkdir()
+        (self.worktree / "tests/test_voisin.py").write_text("X = 1\n")
+        report = {
+            "status": "ok",
+            "card": {"commit": "a" * 40, "status": "lue", "base": "antérieure"},
+            "durations": {"table": "tests/parts/durees.json"},
+            "units": [{
+                "lot": 1,
+                "added": [{"module": "tests.test_voisin", "reason": "carte",
+                           "files": ["src/ameesh/x.py"], "seconds": 10.0}],
+                "dropped": 0, "seconds": 10.0,
+                "coverage": {"unknown_paths": ["src/ameesh/neuf.py"],
+                             "unmapped_blocks": ["src/ameesh/x.py:neuve"]},
+            }],
+        }
+        proc = type("Proc", (), {"returncode": 0,
+                                 "stdout": json.dumps(report).encode(),
+                                 "stderr": b""})()
+        from unittest import mock
+        with mock.patch.object(paquet_auto, "project_python",
+                               return_value="python3"), \
+                mock.patch.object(paquet_auto, "test_driver",
+                                  return_value="psycopg"), \
+                mock.patch.object(paquet_auto, "python_env", return_value={}), \
+                mock.patch.object(paquet_auto, "run_command", return_value=proc):
+            found, note = paquet_auto.neighbor_modules(
+                self.worktree, self.composition, "4" * 40)
+        self.assertEqual([row["module"] for row in found[1]],
+                         ["tests.test_voisin"])
+        self.assertIn("carte incomplète : 1 fichier(s) hors carte, 1 bloc(s) "
+                      "non mesuré(s) (#7195)", note)
 
 
 if __name__ == "__main__":

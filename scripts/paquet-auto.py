@@ -2505,7 +2505,8 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
     ceux que la carte d'impact relie aux blocs `src/` qu'elle change
     (`carte`, dans `budget` secondes). Un outil absent ou illisible n'ajoute
     rien et le dit : les tests propres et les contrats restent joués, la
-    ci-full tranche.
+    ci-full tranche. #7195 : une carte qui ne couvre pas un fichier ou un bloc
+    changé est dite « incomplète » dans la note, sans bloquer.
     """
     script = worktree / ATTRIBUTION_SCRIPT
     if not composition.units:
@@ -2536,6 +2537,8 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
     out: dict[int, list[dict]] = {}
     dropped = 0
     spent = 0.0
+    unknown_paths: set[str] = set()
+    unmapped_blocks: set[str] = set()
     for entry in report.get("units") or []:
         lot = int(entry.get("lot") or 0)
         rows = []
@@ -2549,6 +2552,13 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
         out.setdefault(lot, []).extend(rows)
         dropped += int(entry.get("dropped") or 0)
         spent += float(entry.get("seconds") or 0)
+        # #7195 : une carte antérieure ne couvre pas les fichiers/blocs neufs ;
+        # le dire, sinon la série paraît complète alors qu'elle ne l'est pas.
+        coverage = entry.get("coverage") or {}
+        unknown_paths.update(str(path) for path in
+                             coverage.get("unknown_paths") or [] if path)
+        unmapped_blocks.update(str(block) for block in
+                               coverage.get("unmapped_blocks") or [] if block)
     card = report.get("card") or {}
     if card.get("commit"):
         note = "carte d'impact `%s` (%s, %s)" % (
@@ -2568,6 +2578,10 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
     note += " ; budget de carte %d s par unité, %.0f s pris" % (budget, spent)
     if dropped:
         note += ", %d module(s) au-delà du budget non joué(s)" % dropped
+    if unknown_paths or unmapped_blocks:
+        note += (" ; carte incomplète : %d fichier(s) hors carte, %d bloc(s) "
+                 "non mesuré(s) (#7195)"
+                 % (len(unknown_paths), len(unmapped_blocks)))
     return out, note
 
 
@@ -2802,7 +2816,9 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
 
     #4463 : avec `wall` (le temps restant de l'échéance totale), attente du
     créneau et exécution tiennent ensemble dans `wall` secondes (`run_walled`) ;
-    au-delà, la série est non concluante."""
+    au-delà, la série est non concluante. #7195 : `timeout` reste le plafond
+    d'exécution (`ameesh heavy --max-duration`), l'attente du créneau ne le
+    consomme donc pas."""
     if not modules:
         return TestRun(label=label, modules=[], returncode=0, output="",
                        seconds=0.0)
@@ -4172,7 +4188,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     est bornée au temps restant ; une série qui n'est pas partie à l'échéance
     est non concluante sans être jouée. L'attente d'un créneau `ameesh heavy`
     compte dans ce temps (`run_tests(wall=…)`) : à l'échéance la série est
-    arrêtée, au plus `WALL_GRACE_S` après.
+    arrêtée, au plus `WALL_GRACE_S` après. #7195 : pour une série `heavy`,
+    cette attente ne consomme plus sa part d'exécution (`timeout`, passée à
+    `ameesh heavy --max-duration`) ; seule la série directe voit sa part
+    borner aussi son temps mural.
     """
     contract_run = None
     if contract_report is not None:
@@ -4228,8 +4247,16 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             log("tests %s : part de %d s sur la borne totale (%d série(s) à "
                 "partir, %d à la fois)" % (label, limit, here,
                                            max(1, parallel)))
-        # sous l'échéance, attente du créneau comprise (relecture cx3)
-        walled = {"wall": limit} if deadline is not None else {}
+        # #4463 : l'attente du créneau compte dans l'échéance totale mais,
+        # #7195, pas dans la part d'exécution d'une série `heavy` : une série
+        # qui attend longtemps son créneau garde sa part pour jouer ses
+        # tests, la borne restant le temps restant jusqu'à l'échéance. Une
+        # série directe n'attend aucun créneau : sa part borne aussi son
+        # temps mural.
+        walled = {}
+        if deadline is not None:
+            wall = max(1, int(deadline - time.monotonic())) if slots else limit
+            walled = {"wall": wall}
         run = run_tests(worktree, label, modules, timeout=limit, **slots, **walled)
         run.direct = list(modules)
         return run
