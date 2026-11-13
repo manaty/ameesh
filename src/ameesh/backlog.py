@@ -264,6 +264,9 @@ BLOCKING_DEFECT = re.compile(
 #: the canon's bare "B", uppercase ("B : suite #956 — perte de messages",
 #: R1 cx2, P2 1): a lone lowercase b is not a verdict
 BLOCKING_B = re.compile(r"(?:^|[\s\[(\"«])B[0-9]*\b")
+#: an explicitly minor defect: N1/N2, the bare N, P2/P3, "non bloquant"
+EXPLICIT_MINOR = re.compile(
+    r"(?:^|[\s\[(\"«])(?:(?-i:N[0-9]+\b)|p[23]\b|non[ -]?bloquant\w*|pas bloquant)", re.I)
 #: "P2 sensible": on ameesh only, it keeps its blocking nature
 SENSITIVE_P2 = re.compile(r"p2[^.;\n]{0,30}sensible|sensible[^.;\n]{0,30}p2", re.I)
 #: a review-after-merge lot is the rule, not a review follow-up
@@ -322,9 +325,7 @@ def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
     # (N/P2/P3), without cancelling B/P1/incident/outage.
     blocking_text = re.sub(r"\b(?:non[ -]?bloquant\w*|pas bloquant\w*)", " ",
                            text, flags=re.I)
-    explicit_minor = bool(re.search(
-        r"(?:^|[\s\[(\"«])(?:(?-i:N[0-9]+\b)|p[23]\b|non[ -]?bloquant\w*|pas bloquant)",
-        text, re.I) or STANDALONE_N.search(text))
+    explicit_minor = bool(EXPLICIT_MINOR.search(text) or STANDALONE_N.search(text))
     if explicit_minor:
         blocking_text = re.sub(r"\br[eé]gressions?\b", " ", blocking_text, flags=re.I)
     if BLOCKING_DEFECT.search(blocking_text) or BLOCKING_B.search(text):
@@ -447,6 +448,15 @@ def is_basket(item: dict) -> bool:
             and str(item.get("source") or "").startswith(BASKET_PREFIX))
 
 
+def _names_a_review(title: str, source: str) -> bool:
+    """Le texte nomme-t-il un défaut mineur (N, P2, P3, « non bloquant ») ou
+    une relecture (R1, relecture, verdict, avis, review) ? Une suite de
+    **tests** n'en est pas une (`TEST_SUITE`)."""
+    text = TEST_SUITE.sub(" ", " ".join([str(title or ""), str(source or "")]))
+    return bool(EXPLICIT_MINOR.search(text) or STANDALONE_N.search(text)
+                or REVIEW_WORDS.search(text))
+
+
 def is_review_followup(item: dict) -> bool:
     """Le lot est-il une **suite d'avis** (canon §2, owner 19/10/2026) ?
 
@@ -454,7 +464,13 @@ def is_review_followup(item: dict) -> bool:
     ou origine lisible sur sa source ou son titre, `review_origin`) ; un lot
     marqué comme suite non bloquante (N, P2, P3 : `followup_hint`). Un lot de
     relecture après fusion n'en est pas une : il relit le lot d'origine ; un
-    P2 sensible d'ameesh non plus (`sensitive_p2`), même né d'une relecture."""
+    P2 sensible d'ameesh non plus (`sensitive_p2`), même né d'une relecture.
+
+    #7269 : l'avertissement de `followup_hint` est consultatif ; il ne fait
+    une suite d'avis que s'il nomme un défaut mineur (N, P2, P3, « non
+    bloquant ») ou une relecture (`_names_a_review`). « suite #7251 » seul
+    (continuation, découpage) dans le titre d'un lot de ticket ou planifié
+    n'est pas une suite d'avis : `--review-of` ne le refuse pas."""
     item = item or {}
     if is_basket(item):
         return True
@@ -462,7 +478,7 @@ def is_review_followup(item: dict) -> bool:
     if sensitive_p2(title=title, source=source, app=item.get("app") or ""):
         return False
     if followup_hint(title=title, source=source, issue_ref=item.get("issue_ref") or "",
-                     app=item.get("app") or ""):
+                     app=item.get("app") or "") and _names_a_review(title, source):
         return True
     return item.get("type") == ITEM_TYPE and review_origin(title=title, source=source) is not None
 
