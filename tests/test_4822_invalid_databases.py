@@ -80,8 +80,14 @@ class CancelledDropPurgeTest(PgTestCase):
     """Le vrai état invalide, produit par un DROP annulé, part à la passe."""
 
     def _admin(self):
+        # CREATE/DROP DATABASE sont des gestes d'administration, pas des
+        # écritures du schéma : pas d'admission écrivaine (#7163). Celle-ci lit
+        # le marqueur de compatibilité sous le statement_timeout hérité (rôle,
+        # base, PGOPTIONS ou `options=` du DSN) ; un délai de 20 ms la faisait
+        # échouer sous charge sur « schema compatibility marker unreadable ».
+        # Le zéro de session reste posé par execute_without_statement_timeout.
         return db_mod.connect(dataclasses.replace(
-            self.cfg, statement_timeout_ms=0))
+            self.cfg, statement_timeout_ms=0), writer=False)
 
     def _force_drop(self, database: str) -> None:
         try:
@@ -254,7 +260,12 @@ class CancelledDropPurgeTest(PgTestCase):
         dsn = urllib.parse.urlunsplit(parts._replace(query=query))
         cfg = dataclasses.replace(self.cfg, dsn=dsn,
                                   statement_timeout_ms=0)
-        admin = db_mod.connect(cfg)
+        # `writer=False` : le DROP est le geste de réparation, pas une écriture
+        # du schéma. L'admission écrivaine lirait le marqueur de compatibilité
+        # sous les 20 ms du DSN, avant que le zéro de session ne soit posé :
+        # sous charge, cette lecture dépasse le délai et le témoin échoue sur
+        # « schema compatibility marker unreadable » (#7163).
+        admin = db_mod.connect(cfg, writer=False)
         try:
             setting = admin.query(
                 "SELECT current_setting('statement_timeout') AS statement_timeout"
