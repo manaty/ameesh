@@ -27,6 +27,9 @@
   ameesh attach-grant request <agent> --host H --device-key K [--tenant T] |
         who <agent> | audit [--agent A]   remote attach grant: 5 min WebAuthn
         grant bound to the station's device key, who may ask, journal (#7119);
+  ameesh attach-relay serve | host …   distant attach relay: mesh-only service,
+        outgoing host connection, X25519/AES-GCM frames, PTY, quotas, content-free
+        logs (#7120) ;
   ameesh auditor tick [--dry-run] [--json]
         the hourly short-pass gate: mails the auditor only when something moved
         (mail, debit --check 2, deadline in the hour, head/gate change), journals
@@ -600,6 +603,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "attach-grant":
         from . import attach_grant_cli
         return attach_grant_cli.main(rest)
+    if command == "attach-relay":
+        from . import attach_relay_cli
+        return attach_relay_cli.main(rest)
     if command == "process-approvals":
         # #4006 : pont d'approbation GitHub (projection locale fail-closed)
         from . import process_approvals_cli

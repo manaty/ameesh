@@ -14,7 +14,7 @@ import unittest
 from ameesh import attach_grant, receipts
 
 from .support import apply_authenticators
-from .test_7119_attach_grant import AGENT as AVATAR, HOST, POLICY, load_canon
+from .test_7119_attach_grant import AGENT as AVATAR, HOST, POLICY, TRANSCRIPT, load_canon
 from .test_approve import ALICE, ApproveBase, member
 from .webauthn_soft import SoftDevice
 
@@ -62,12 +62,12 @@ class AttachApproveTest(ApproveBase):
 
         # l'hôte de l'agent consomme, une fois, avec la preuve de l'appareil
         proof = self.station.key.sign(attach_grant.device_message(
-            receipts.challenge(receipt["request"])))
+            receipts.challenge(receipt["request"]), TRANSCRIPT))
         def redeem():
             return attach_grant.redeem(
                 self.db, receipt, canon=load_canon(), agent=AVATAR, host=HOST, tenant="",
                 device_key=self.station.credential_id, device_signature=proof,
-                policy=POLICY, checked_by="runner:" + HOST)
+                transcript_hash=TRANSCRIPT, policy=POLICY, checked_by="runner:" + HOST)
         grant = redeem()
         self.assertTrue(grant.ok, grant.reason)
         self.assertEqual(grant.attach_id, data["attach_id"])
