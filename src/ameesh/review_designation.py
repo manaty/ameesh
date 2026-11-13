@@ -913,6 +913,16 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
             name = str(row.get("name") or "").strip()
             if name:
                 fixer_doubts[name] = str(row.get("unresolved") or "").strip()
+    #: #7252 : un correctif retiré retrouvé par la citation de l'auteur. Le
+    #: nom suffit à exclure ; le SHA et la citation disent la preuve au gel.
+    fixer_rewrites: dict[str, tuple[str, str]] = {}
+    for row in all_fixers:
+        if not isinstance(row, Mapping) or not row.get("rewritten"):
+            continue
+        name = str(row.get("name") or "").strip()
+        if name:
+            fixer_rewrites[name] = (str(row.get("rewritten") or "").strip(),
+                                    str(row.get("cited") or "").strip())
 
     def excluded_fixers_text() -> str:
         text = "%s registered" % (", ".join(sorted(fixer_names)) or "none")
@@ -921,6 +931,11 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
                      " excluded by doubt)" % ", ".join(
                          "%s %s" % (name, sha[:12])
                          for name, sha in sorted(fixer_doubts.items())))
+        if fixer_rewrites:
+            text += (" (rewritten correction: %s)" % ", ".join(
+                "%s %s%s" % (name, sha[:12],
+                             " cited by %s" % cited[:12] if cited else "")
+                for name, (sha, cited) in sorted(fixer_rewrites.items())))
         if hypothetical_names:
             text += ("; hypothetical corrector: %s"
                      % ", ".join(sorted(hypothetical_names)))
