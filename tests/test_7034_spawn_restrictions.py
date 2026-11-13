@@ -75,6 +75,22 @@ class SpawnPolicyTest(_CanonDbCase):
                              tools=["write"], cwd=self.cwd)
         self.assertIn("spawn-tool-not-in-parent", str(ctx.exception))
 
+    def test_a_restricted_parent_never_produces_an_unrestricted_child(self):
+        # B 40580 : demander aucun outil n'est pas hériter de tout.
+        canon_sync.spawn(self.db, "aide", "orchestre", 3600, canon=self.loaded(),
+                         tools=["git"], cwd=self.cwd)
+        child = canon_sync.spawn(self.db, "petit", "aide", 3600,
+                                 canon=self.loaded(), cwd=self.cwd)
+        self.assertEqual((child["tools"], child["mcp"]), ([], []))
+        profile = storage.of(self.db).ephemerals.profile("petit")
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["tools"], [])
+        self.assertEqual(profile["mcp"], [])
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            canon_sync.spawn(self.db, "petit2", "aide", 3600,
+                             canon=self.loaded(), tools=["write"], cwd=self.cwd)
+        self.assertIn("spawn-tool-not-in-parent", str(ctx.exception))
+
     def test_unsupported_harness_is_refused_before_creation(self):
         self.db.execute("UPDATE agent_registry SET harness = 'codex' WHERE name = 'orchestre'")
         with self.assertRaises(canon_sync.SpawnError) as ctx:
@@ -165,6 +181,23 @@ class SpawnApplyTest(unittest.TestCase):
             self.assertEqual(json.load(handle)["mcpServers"],
                              {"readonly": {"command": "true"}})
 
+    def test_the_turn_context_accepts_spawn_alongside_a_conversation(self):
+        # B 40580 : les validations #7034 vivaient dans
+        # `_conversation_validate` et levaient NameError dès qu'un document
+        # portait une conversation portable.
+        from ameesh import turn_context
+        from .test_l2894_turn_context import _document
+        digest = "a" * 64
+        document = _document(
+            conversation={"move_id": "m1", "from_seq": 1, "to_seq": 2,
+                          "digest": digest, "source_host": "h1",
+                          "source_session": None, "file": "/tmp/segment"},
+            spawn={"path": "/tmp/profile", "parent": "chef",
+                   "tools": ["git"], "mcp": [], "digest": digest},
+            spawn_context={"path": "/tmp/context", "digest": digest, "bytes": 3})
+        self.assertEqual(document["spawn"]["tools"], ["git"])
+        turn_context.validate(document)
+
     def test_context_reads_one_utf8_file_and_refuses_a_directory(self):
         path = os.path.join(self.cwd, "context.md")
         with open(path, "w", encoding="utf-8") as handle:
@@ -253,6 +286,27 @@ class ChildReportTest(_CanonDbCase):
                                 status="completed")
         self.assertEqual(self.messages()[-1]["payload"]["child_report"],
                          {"child": "aide", "kind": "final", "status": "expired"})
+
+    def test_a_final_report_purges_the_context_even_before_expiry(self):
+        text = "private context\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        canon_sync.spawn(self.db, "aide3", "orchestre", 3600, canon=self.load(),
+                         tools=["git"], context=(text, digest))
+        self.assertIsNotNone(storage.of(self.db).ephemerals.context("aide3"))
+        child_reports.report(self.db, self.cfg, "aide3", "final", "done")
+        self.assertIsNone(storage.of(self.db).ephemerals.context("aide3"))
+
+    def test_a_finalized_child_still_returns_to_the_expiry_sweep(self):
+        text = "private context 2\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        canon_sync.spawn(self.db, "aide4", "orchestre", 3600, canon=self.load(),
+                         tools=["git"], context=(text, digest))
+        storage.of(self.db).ephemerals.set_report("aide4", final="completed")
+        self.db.execute("UPDATE agent_registry SET ephemeral_expires_at ="
+                        " now() - interval '1 second' WHERE name = 'aide4'")
+        done = child_reports.sweep_expired(self.db, self.cfg, "orchestre")
+        self.assertIn("aide4", [row["child"] for row in done])
+        self.assertIsNone(storage.of(self.db).ephemerals.context("aide4"))
 
     def test_human_copy_only_between_the_same_responsible(self):
         entry = child_reports.copy_human(self.db, self.cfg, "aide",
@@ -423,3 +477,53 @@ class RestrictedNeverResidentTest(PgTestCase):
         with contextlib.redirect_stderr(error):
             self.assertEqual(runner_mod.run_attach(self.cfg, self.db, worker.name), 1)
         self.assertIn("restricted child", error.getvalue())
+
+
+class ContextOnlyRunnerTest(PgTestCase):
+    """B 40580 : `spawn --context` seul n'écrit pas de profil."""
+
+    def test_context_alone_is_delivered_without_a_profile(self):
+        import shlex
+        from unittest import mock
+        from ameesh import mail, registry
+        from ameesh.runner import AgentWorker, Runner
+        from .support import FAKEBIN
+
+        self.clear_turns()
+        name, parent = "child-ctx", "parent-ctx"
+        cwd = os.path.join(self.tmp, "work", name)
+        os.makedirs(cwd, exist_ok=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        self.register(name, "claude", cwd=cwd)
+        self.register(parent, "claude", cwd=cwd)
+        self.db.execute(
+            "UPDATE agent_registry SET ephemeral = true, created_by = %s,"
+            " ephemeral_expires_at = now() + interval '1 hour' WHERE name = %s",
+            (parent, name))
+        text = "context without profile\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        self.db.execute(
+            "INSERT INTO spawn_contexts (child, parent, digest, bytes, text)"
+            " VALUES (%s, %s, %s, %s, %s)",
+            (name, parent, digest, len(text.encode()), text))
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        mail.send(self.db, parent, name, "travail", kind="request")
+        capture = os.path.join(self.tmp, "turn-context-ctx.json")
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+               "AMEESH_TEST_RUN": 'cp "$AMEESH_TURN_CONTEXT" %s'
+                                  % shlex.quote(capture),
+               "PYTHONPATH": os.path.join(REPO, "src")}
+        with mock.patch.dict(os.environ, env, clear=False):
+            spec = worker.pick()
+            self.assertTrue(worker.run_turn(spec))
+        with open(capture, encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertNotIn("spawn", document)
+        self.assertEqual(document["spawn_context"]["digest"], digest)
+        argv = next(row["argv"] for row in self.turns() if "argv" in row)
+        self.assertIn("SPAWN CONTEXT", argv[-1])
+        self.assertIn("spawn-context.md", argv[-1])
+        self.assertNotIn("context without profile", argv[-1])

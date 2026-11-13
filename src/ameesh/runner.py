@@ -8124,6 +8124,11 @@ class AgentWorker(threading.Thread):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             self._servir(())  # #2810 : le tour est reporté
             return None
+        # B 40580 : un enfant échu du parent laisse un rapport final et son
+        # contexte est purgé au début de CHAQUE tour du parent, pas seulement
+        # quand un plafond clôt un tour : un enfant mort sans tour final ne
+        # doit pas attendre un plafond qui peut ne jamais venir.
+        self._sweep_child_reports()
         self._session_turn_depth = getattr(self, "_session_turn_depth", 0) + 1
         # #2096 : le RSS avant le tour, pour ne rendre les arènes au noyau que
         # si le tour a fait croître le processus (voir `_release_turn_memory`).
@@ -9423,6 +9428,7 @@ class AgentWorker(threading.Thread):
         # contexte sont lus en base ; un harnais qui ne prouve plus leur
         # application refuse le tour (fail closed).
         spawn_profile = None
+        spawn_context_row = None
         spawn_args: list[str] = []
         spawn_document = None
         spawn_context_document = None
@@ -9431,32 +9437,19 @@ class AgentWorker(threading.Thread):
         if self.agent.get("created_by"):
             try:
                 spawn_profile = storage.of(self.db).ephemerals.profile(self.name)
+                # B 40580 : le contexte est indépendant du profil. Un
+                # `spawn --context` seul n'écrit pas de `spawn_profiles` ;
+                # le lier au profil le perdrait silencieusement.
+                spawn_context_row = storage.of(self.db).ephemerals.context(self.name)
             except db_mod.DbError as exc:
                 self.fail_turn("spawn policy unavailable",
-                               "spawn profile not read: %s" % exc)
+                               "spawn profile/context not read: %s" % exc)
                 return False
         if spawn_profile is not None:
             try:
                 profile_path, _mcp_path = spawn_policy.write_profile(
                     self.state_dir, spawn_profile, cwd)
                 spawn_args = spawn_policy.argv(spawn_profile, profile_path)
-                context_row = storage.of(self.db).ephemerals.context(self.name)
-                if context_row:
-                    context_path = spawn_policy.write_context(
-                        self.state_dir, context_row.get("text") or "",
-                        digest=context_row.get("digest"))
-                    spawn_context_path = context_path
-                    if context_path and not session:
-                        # §4.3 : le CONTENU ne passe jamais par argv ; le
-                        # premier tour ne porte que le chemin privé à lire.
-                        resume += ("\n\nSPAWN CONTEXT: before starting, read the file %s "
-                                   "(SHA-256 %s). It is your bounded context from the "
-                                   "parent.\n" % (context_path, context_row.get("digest")))
-                    spawn_context_document = {
-                        "path": context_path or None,
-                        "digest": context_row.get("digest"),
-                        "bytes": context_row.get("bytes"),
-                    }
                 spawn_document = {
                     "path": profile_path,
                     "parent": spawn_profile.get("parent"),
@@ -9467,6 +9460,27 @@ class AgentWorker(threading.Thread):
             except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
                 self.fail_turn("spawn policy unavailable",
                                "spawn policy not applied: %s" % exc)
+                return False
+        if spawn_context_row is not None:
+            try:
+                context_path = spawn_policy.write_context(
+                    self.state_dir, spawn_context_row.get("text") or "",
+                    digest=spawn_context_row.get("digest"))
+                spawn_context_path = context_path
+                if context_path and not session:
+                    # §4.3 : le CONTENU ne passe jamais par argv ; le
+                    # premier tour ne porte que le chemin privé à lire.
+                    resume += ("\n\nSPAWN CONTEXT: before starting, read the file %s "
+                               "(SHA-256 %s). It is your bounded context from the "
+                               "parent.\n" % (context_path, spawn_context_row.get("digest")))
+                spawn_context_document = {
+                    "path": context_path or None,
+                    "digest": spawn_context_row.get("digest"),
+                    "bytes": spawn_context_row.get("bytes"),
+                }
+            except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+                self.fail_turn("spawn context unavailable",
+                               "spawn context not delivered: %s" % exc)
                 return False
         if self.agent.get("created_by") and not session:
             try:
@@ -10943,16 +10957,26 @@ class AgentWorker(threading.Thread):
         self.runner.wake_all.set()
         return ok
 
+    def _sweep_child_reports(self) -> None:
+        """Rapports finaux des enfants échus et purge de leur contexte.
+
+        Best effort : le tour de l'agent ne dépend jamais d'un rapport
+        d'enfant. B 40580 : appelé au début du tour et à la clôture.
+        """
+        try:
+            child_reports.sweep_expired(self.db, self.cfg, self.name, warn=log_async)
+        except Exception as exc:  # noqa: BLE001 — rapport non bloquant
+            log_async("[%s] child report sweep skipped (%s)" % (self.name, exc))
+
     def _turn_closed(self, raison: str, duration: float) -> None:
         """Après un tour clos par un plafond (L105) : la suite au tour suivant,
         et, pour le plafond de contexte, la rotation avec résumé de reprise
         avant lui. Journalisé, et noté dans le fil."""
         # #7034 : un enfant échu du parent laisse un rapport final, jamais un
-        # silence. Best effort : le tour du parent ne l'attend pas.
-        try:
-            child_reports.sweep_expired(self.db, self.cfg, self.name, warn=log_async)
-        except Exception as exc:  # noqa: BLE001 — rapport non bloquant
-            log_async("[%s] child report sweep skipped (%s)" % (self.name, exc))
+        # silence. Best effort : le tour du parent ne l'attend pas. Le
+        # balayage tourne aussi au début du tour (B 40580) ; celui-ci est la
+        # seconde chance d'un tour clos par un plafond.
+        self._sweep_child_reports()
 
         self.last_turn_closed = raison
         self.suite = raison

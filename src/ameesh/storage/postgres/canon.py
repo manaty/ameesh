@@ -1037,7 +1037,11 @@ class Ephemerals(interface.Ephemerals):
               LEFT JOIN spawn_reports p ON p.child = r.name
              WHERE r.ephemeral AND r.created_by = %s
                AND r.ephemeral_expires_at <= now()
-               AND (p.final_at IS NULL)
+               -- B 40580 : un final déjà posé ne doit pas retenir le contexte
+               -- (le balayage purge ; il ne renvoie pas de rapport).
+               AND (p.final_at IS NULL
+                    OR EXISTS (SELECT 1 FROM spawn_contexts c
+                                WHERE c.child = r.name))
              ORDER BY r.ephemeral_expires_at
              LIMIT %s
             """,

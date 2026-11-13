@@ -101,6 +101,10 @@ def report(db, cfg, child: str, kind: str, body: str, *,
         result = _deliver(db, cfg, child, "final", body,
                           event_id=_event(child, "final"), status=status)
         storage.of(db).ephemerals.set_report(child, final=status)
+        # B 40580 : un final ne laisse pas le contexte derrière lui, même si
+        # l'enfant n'est pas encore échu (privauté, design §4.3).
+        storage.of(db).ephemerals.purge_context(child)
+        _remove_child_state(cfg, child)
         return result
     seq = storage.of(db).ephemerals.next_report_seq(child)
     return _deliver(db, cfg, child, kind, body,
@@ -145,6 +149,9 @@ def turn_end(db, cfg, child: str, *, final: str | None,
         result = _deliver(db, cfg, child, "final", body,
                           event_id=_event(child, "final"), status=state)
         storage.of(db).ephemerals.set_report(child, final=state)
+        # B 40580 : le contexte ne survit pas au rapport final (design §4.3).
+        storage.of(db).ephemerals.purge_context(child)
+        _remove_child_state(cfg, child)
         return result
     if not text:
         return None

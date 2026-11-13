@@ -299,6 +299,11 @@ def validate(document: Any) -> None:
         _text(reservation.get("state"), "accounting.reservation.state")
     if "conversation" in document:
         _conversation_validate(document["conversation"])
+    # #7034 : champs additifs, présents seulement pour un enfant restreint.
+    if document.get("spawn") is not None:
+        _spawn_validate(document["spawn"])
+    if document.get("spawn_context") is not None:
+        _spawn_context_validate(document["spawn_context"])
 
 
 def _conversation_validate(value: Any) -> None:
@@ -314,13 +319,6 @@ def _conversation_validate(value: Any) -> None:
     _text(move.get("source_host"), "conversation.source_host")
     _text(move.get("source_session"), "conversation.source_session", nullable=True)
     _text(move.get("file"), "conversation.file")
-
-
-    # #7034 : champs additifs, présents seulement pour un enfant restreint.
-    if document.get("spawn") is not None:
-        _spawn_validate(document["spawn"])
-    if document.get("spawn_context") is not None:
-        _spawn_context_validate(document["spawn_context"])
 
 
 def _spawn_validate(value: Any) -> None:

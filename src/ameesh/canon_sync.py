@@ -2951,8 +2951,14 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
                     "harness %r does not declare an MCP source"
                     % parent.get("harness"))
             servers = spawn_policy.mcp_servers(policy_cwd, support.mcp_source, mcp)
+        # #7034 (B 40580) : un parent qui a une politique ne produit jamais un
+        # enfant SANS profil. Demander aucun outil n'est pas « hériter de
+        # tout » : c'est une liste vide, donc zéro outil. Sans cette règle, un
+        # petit-enfant né sans --tool échappait à la liste de son parent
+        # (transitivité rompue).
         profile = None
-        if tools or mcp:
+        if (parent_tools is not None or parent_mcp is not None
+                or tools or mcp):
             profile = {
                 "parent": creator,
                 "harness": parent.get("harness"),
