@@ -9,6 +9,7 @@ Authentificateurs logiciels (tests/webauthn_soft.py), aucun réseau.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import os
 import tempfile
@@ -25,6 +26,8 @@ from .webauthn_soft import ORIGIN, RP_ID, SoftDevice, SoftWebAuthn, make_receipt
 ALICE, BOB, DAN = "human:alice", "human:bob", "human:dan"
 AGENT, HOST, TENANT = "avatar-alice", "ameesh-agents-2", ""
 POLICY = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,))
+#: hash du transcript E2E que la preuve d'appareil lie (D2, #7120)
+TRANSCRIPT = hashlib.sha256(b"ameesh-7119-transcript").digest()
 COMMIT = "a" * 40
 
 
@@ -149,11 +152,12 @@ class RedeemTest(PgTestCase):
         station = station or self.alice_station
         if signature is None:
             chal = receipts.challenge(receipt["request"])
-            signature = station.key.sign(attach_grant.device_message(chal))
+            signature = station.key.sign(attach_grant.device_message(chal, TRANSCRIPT))
         return attach_grant.redeem(
             self.db, receipt, canon=self.canon, agent=agent, host=host, tenant=TENANT,
             device_key=device_key or station.credential_id, device_signature=signature,
-            policy=POLICY, checked_by="runner:ameesh-agents-2")
+            transcript_hash=TRANSCRIPT, policy=POLICY,
+            checked_by="runner:ameesh-agents-2")
 
     def events(self):
         return list(reversed(attach_grant.audit(self.db)))
@@ -225,6 +229,19 @@ class RedeemTest(PgTestCase):
         bare = self.alice_station.key.sign(receipts.challenge(receipt["request"]))
         self.assertRefused(self.redeem(receipt, signature=bare), attach_grant.DEVICE_PROOF)
         # le grant n'a pas été consommé : la bonne preuve passe encore
+        self.assertTrue(self.redeem(receipt).ok)
+
+    def test_preuve_d_appareil_liee_au_transcript(self):
+        receipt = self.grant()
+        chal = receipts.challenge(receipt["request"])
+        # preuve signée pour un AUTRE canal E2E : le relais qui terminerait
+        # deux canaux distincts ne peut pas la transposer
+        other = hashlib.sha256(b"un-autre-canal").digest()
+        signature = self.alice_station.key.sign(
+            attach_grant.device_message(chal, other))
+        self.assertRefused(self.redeem(receipt, signature=signature),
+                           attach_grant.DEVICE_PROOF)
+        # le grant n'a pas été consommé : la preuve du bon transcript passe
         self.assertTrue(self.redeem(receipt).ok)
 
     def test_cle_d_appareil_ne_signe_pas_son_grant(self):

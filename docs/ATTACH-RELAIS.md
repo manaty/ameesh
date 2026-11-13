@@ -23,8 +23,9 @@ poste (station)  ──TLS──►  relais  ◄──TLS──  hôte de l'agen
 
 - **Relais** : écoute une adresse de boucle locale ou du mesh, refuse tout
   pair hors du mesh, apparie par `attach_id`, route les trames par
-  `session_id`. Il ne se connecte à aucune base et ne conserve rien après la
-  session.
+  `session_id`. Il **vérifie la signature WebAuthn** du reçu en lecture dans
+  le registre (sans consommer le nonce) avant tout appariement, et ne
+  conserve rien après la session.
 - **Hôte** : ouvre **une** connexion sortante vers le relais, s'authentifie
   par un jeton, reçoit les `PAIR`, vérifie le grant avec D1, ouvre un PTY
   pour la commande interactive et pont les octets. Aucun port entrant.
@@ -34,25 +35,38 @@ poste (station)  ──TLS──►  relais  ◄──TLS──  hôte de l'agen
 
 ## Décisions de confiance
 
-- Le relais **pré-contrôle** le reçu (`ameesh-receipt/1` de D1) : forme,
-  nature `attach`, liaison agent/hôte/tenant, `iat`/`exp` cohérents,
-  validité ≤ 300 s, non expiré, digest canonique. Il **ne vérifie pas** la
-  signature WebAuthn et n'a pas de base.
+- Le relais **vérifie le reçu** (`ameesh-receipt/1` de D1) : forme, nature
+  `attach`, liaison agent/hôte/tenant, `iat`/`exp` cohérents, validité
+  ≤ 300 s, digest canonique, puis **signature WebAuthn** de la clé
+  d'approbation, avec un authentificateur encore actif. Il ne consomme pas
+  le nonce : `grant_checker` est injecté par la CLI (base + politique
+  `AMEESH_APPROVE_RP_ID` / `AMEESH_APPROVE_ORIGINS`). Sans vérificateur, le
+  service refuse tout `OPEN` (`grant_unverified`, fail closed).
 - La **porte faisant foi est l'hôte** : à la réception du `REQ`, il appelle
-  `attach_grant.redeem` (D1) avec la politique `AMEESH_APPROVE_RP_ID` /
-  `AMEESH_APPROVE_ORIGINS`, la signature de la clé d'appareil et le canon de
-  l'agent. Le grant est à usage unique ; un refus ne crée pas de PTY et
-  n'ouvre aucune session.
-- L'E2E protège le contenu **contre le relais** : clés X25519 éphémères,
+  `attach_grant.redeem` (D1) avec la politique, la preuve de la clé
+  d'appareil et le canon de l'agent. Le grant est à usage unique ; un refus
+  ne crée pas de PTY et n'ouvre aucune session.
+- L'E2E est **authentifiée aux deux bouts**, pas seulement chiffrée :
+  - l'hôte possède une clé Ed25519 ; sa clé publique est **épinglée dans le
+    canon** de l'hôte (`attach_host_key`, 32 octets en base64url ou hex) et
+    le poste la passe dans `Context.host_key`. L'hôte **signe son `KEY`**
+    (domaine `ameesh-attach-host/1`) sur le hash de la transcription ; un
+    `KEY` non signé, signé par une autre clé ou sans clé épinglée est refusé
+    (`host_unauthenticated`, `host_signature`) ;
+  - la preuve d'appareil signe `"ameesh-attach-device/2\0" ‖ challenge du
+    reçu ‖ hash du transcript` : elle est liée à CETTE session chiffrée. Le
+    `REQ` porte ce hash et l'hôte le compare à celui de son canal avant
+    toute vérification.
+  Un relais qui terminerait deux canaux (poste↔relais, relais↔hôte) obtient
+  deux transcriptions différentes : il ne peut ni transposer la preuve
+  d'appareil, ni signer le `KEY` de l'hôte. Le contenu reste protégé
+  **même contre un relais actif**.
+- L'E2E protège aussi le contenu en transit : clés X25519 éphémères,
   HKDF-SHA-256 salé par la transcription (protocole, session, agent, hôte,
-  tenant, `attach_id`, digest du reçu, clés publiques), AES-256-GCM par
-  direction, nonce = séquence, AAD liant type, séquence et transcription.
-  Une trame rejouée, réordonnée, altérée ou d'un autre contexte est refusée.
-- Un relais **activement malveillant** (qui altère le routage ou monte un
-  faux hôte) n'est pas couvert par l'E2E seule ; le modèle D2 est celui d'un
-  relais **interne au mesh, cru pour le routage**, avec l'hôte comme seule
-  autorité d'ouverture. Une exposition publique devrait ajouter la
-  vérification du reçu côté relais et une décision owner.
+  tenant, `attach_id`, digest du reçu, clé d'hôte épinglée, clés publiques),
+  AES-256-GCM par direction, nonce = séquence, AAD liant type, séquence et
+  transcription. Une trame rejouée, réordonnée, altérée ou d'un autre
+  contexte est refusée.
 
 ## Protocole
 
@@ -65,15 +79,18 @@ porte l'identifiant nul.
 
 1. Le poste envoie `OPEN` (agent, hôte, tenant, reçu) ; l'hôte envoie
    `HELLO` (hôte, tenant, jeton). Le relais vérifie le jeton d'hôte en
-   temps constant, pré-contrôle le reçu, puis envoie `PAIR` à l'hôte et
-   `PAIRED` au poste avec le `session_id`, l'`attach_id` et l'empreinte du
-   reçu.
+   temps constant, vérifie le reçu (dont la signature), puis envoie `PAIR` à
+   l'hôte et `PAIRED` au poste avec le `session_id`, l'`attach_id` et
+   l'empreinte du reçu.
 2. Les deux extrémités échangent `KEY` puis `CONFIRM` dans la session ;
-   toute trame de session avant la confirmation est refusée.
-3. Le poste envoie `REQ` (reçu, signature de l'appareil, clé d'appareil,
-   taille de fenêtre, `TERM`). L'hôte vérifie, ouvre le PTY et répond `OK`
-   (ou `NO` avec un code stable). Les `DATA` circulent ensuite dans les deux
-   sens, avec `WINSIZE`, `SIGNAL`, `ACK` et `CLOSE`.
+   le `KEY` de l'hôte porte sa signature Ed25519, que le poste vérifie
+   contre la clé épinglée. Toute trame de session avant la confirmation est
+   refusée.
+3. Le poste envoie `REQ` (reçu, signature de l'appareil, hash du transcript,
+   clé d'appareil, taille de fenêtre, `TERM`). L'hôte compare le hash à son
+   propre canal, vérifie, ouvre le PTY et répond `OK` (ou `NO` avec un code
+   stable). Les `DATA` circulent ensuite dans les deux sens, avec `WINSIZE`,
+   `SIGNAL`, `ACK` et `CLOSE`.
 4. Une déconnexion est un échec de session : l'hôte ferme le PTY, le relais
    oublie la session, aucun état ne survit. Le poste ne reçoit ni session
    ni credential.
@@ -100,8 +117,12 @@ n'apparaît dans aucun journal (test dédié).
 ## Exploitation
 
 Le jeton d'hôte est un fichier **0600** (JSON `{"hôte": "jeton"}`), jamais
-dans l'environnement ni dans un journal. Le service refuse une adresse
-d'écoute hors boucle locale/mesh et refuse le clair hors boucle locale.
+dans l'environnement ni dans un journal. La clé privée Ed25519 de l'hôte est
+un fichier **0600** (32 octets bruts, hex ou base64url) ; sa clé publique est
+épinglée dans la carte canon de l'hôte (`attach_host_key`). Le service refuse
+une adresse d'écoute hors boucle locale/mesh et refuse le clair hors boucle
+locale ; il exige `AMEESH_APPROVE_RP_ID` / `AMEESH_APPROVE_ORIGINS` et une
+base joignable pour vérifier les reçus.
 
 ```sh
 # service (sur un hôte du mesh, TLS obligatoire hors boucle locale)
@@ -112,13 +133,17 @@ ameesh attach-relay serve --listen 10.20.0.5:8790 --mesh-cidr 10.20.0.0/16 \
 # hôte de l'agent : une connexion sortante, la commande interactive en argv
 ameesh attach-relay host --relay https://relay.interne:8790 \
   --host ameesh-agents-1 --token-file /etc/ameesh/attach-token \
-  --ca-file /etc/ameesh/tls/ca.pem \
+  --host-key-file /etc/ameesh/attach-host-key \
+  --ca-file /etc/ameesh/tls/ca.pem --agent avatar-alice \
   --command 'ameesh runner attach --agent avatar-alice'
 ```
 
 `--command` est un argv découpé par `shlex.split`, **jamais** passé à un
-shell. L'enfant reçoit `AMEESH_ATTACH_REMOTE=1` et `TERM` du poste. Sur un
-hôte partagé, `--tenant` et `--agent` restreignent ce que l'hôte sert.
+shell. Une commande statique est liée à **exactement un** `--agent` : sans
+cette contrainte, un grant valide pour un agent lancerait le harnais d'un
+autre agent du même hôte (refus à la configuration). L'enfant reçoit
+`AMEESH_ATTACH_REMOTE=1` et `TERM` du poste. Sur un hôte partagé, `--tenant`
+et `--agent` restreignent ce que l'hôte sert.
 
 Unité systemd utilisateur (l'application survit au tour ; jamais lancée
 depuis le shell du tour) :
@@ -131,7 +156,9 @@ After=network-online.target
 [Service]
 ExecStart=/usr/local/bin/ameesh attach-relay host --relay https://relay.interne:8790 \
   --host ameesh-agents-1 --token-file %h/.config/ameesh/attach-token \
-  --ca-file %h/.config/ameesh/tls/ca.pem --command 'ameesh runner attach --agent avatar-alice'
+  --host-key-file %h/.config/ameesh/attach-host-key \
+  --ca-file %h/.config/ameesh/tls/ca.pem --agent avatar-alice \
+  --command 'ameesh runner attach --agent avatar-alice'
 Restart=on-failure
 RestartSec=2
 
@@ -146,8 +173,12 @@ libère le port.
 
 ## Tests
 
-`tests/test_7120_attach_relay.py` couvre les bornes de trames, la poignée de
-main, le rejeu, l'altération, le mauvais contexte, le PTY (echo, resize,
-signal, fermeture), l'appariement et les refus du relais, les quotas, la
-reconnexion de l'hôte, TLS et le CLI, et l'absence de contenu dans les
-journaux. Tout tourne sur `127.0.0.1`, sans base ni réseau externe.
+`tests/test_7120_attach_relay.py` couvre les bornes de trames (échéance
+unique, y compris sous arrivée lente), la poignée de main et la signature
+d'hôte, le rejeu, l'altération, le mauvais contexte, le PTY (echo, resize,
+signal, fermeture), l'appariement et les refus du relais (dont la
+vérification du reçu), les quotas et leur restitution, la reconnexion de
+l'hôte, TLS et le CLI, et l'absence de contenu dans les journaux. Tout tourne
+sur `127.0.0.1`, sans réseau externe. Les tests D1
+(`tests/test_7119_attach_grant.py`) couvrent la preuve d'appareil liée au
+transcript.

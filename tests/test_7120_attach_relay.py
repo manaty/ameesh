@@ -9,6 +9,7 @@ propres tests. Aucun réseau externe : tout tourne sur 127.0.0.1.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import logging
 import os
@@ -21,6 +22,9 @@ import time
 import unittest
 from unittest import mock
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from ameesh import attach_grant, attach_host, attach_pty, attach_relay
 from ameesh import attach_transport as t
 from ameesh import receipts
@@ -32,6 +36,11 @@ HOST = "ameesh-agents-1"
 AGENT = "avatar-alice"
 TENANT = ""
 POLICY = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,))
+#: clé d'hôte épinglée : le poste la connaît par le canon, l'hôte la détient
+HOST_SIGNING_KEY = hashlib.sha256(b"ameesh-7120-host-key").digest()
+HOST_PUBLIC_KEY = Ed25519PrivateKey.from_private_bytes(
+    HOST_SIGNING_KEY).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 #: un shell qui répond et reste vivant (le PTY est le terminal)
 COMMAND = ["/bin/sh", "-c", 'while IFS= read -r line; do printf "echo:%s\\n" "$line"; done']
 
@@ -53,7 +62,7 @@ def make_grant(*, agent=AGENT, host=HOST, tenant=TENANT, ttl=300, exp=None,
 def context_for(receipt, session, *, agent=AGENT, host=HOST, tenant=TENANT):
     return t.Context(session=session, agent=agent, host=host, tenant=tenant,
                      attach_id=receipt["request"]["attach_id"],
-                     digest=t.receipt_digest(receipt))
+                     digest=t.receipt_digest(receipt), host_key=HOST_PUBLIC_KEY)
 
 
 class FakeVerifier(attach_host.GrantVerifier):
@@ -116,12 +125,15 @@ class Station:
                 self._send(*self.channel.confirm_frame())
                 self._confirm_sent = True
 
-    def request(self, *, term="xterm", rows=24, cols=80, timeout=5.0):
+    def request(self, *, term="xterm", rows=24, cols=80, timeout=5.0,
+                transcript_hash=None):
+        transcript_hash = transcript_hash or self.channel.transcript_hash
         signature = self.device.key.sign(attach_grant.device_message(
-            receipts.challenge(self.receipt["request"])))
+            receipts.challenge(self.receipt["request"]), transcript_hash))
         payload = t.json_payload(
             receipt=self.receipt,
             device_signature=receipts.b64u_encode(signature),
+            transcript_hash=receipts.b64u_encode(transcript_hash),
             device_key=self.device.credential_id, rows=rows, cols=cols,
             xpix=0, ypix=0, term=term)
         self._send(t.REQ, self.channel.seal(t.REQ, payload))
@@ -193,7 +205,8 @@ class ChannelTest(unittest.TestCase):
         self.session = os.urandom(16)
         self.ctx = context_for(self.receipt, self.session)
         self.station = t.Channel(t.ROLE_STATION, self.ctx)
-        self.host = t.Channel(t.ROLE_HOST, self.ctx)
+        self.host = t.Channel(t.ROLE_HOST, self.ctx,
+                              host_signing_key=HOST_SIGNING_KEY)
 
     def test_handshake_data_ack_and_close(self):
         t.handshake(self.station, self.host)
@@ -207,6 +220,14 @@ class ChannelTest(unittest.TestCase):
         frame = self.station.seal(t.CLOSE, t.json_payload(code="bye"))
         self.assertEqual(self.station._send_seq, 3)
         self.assertEqual(self.host.feed(t.CLOSE, frame)[0][0], "close")
+
+    def test_signature_de_l_hote_refusee_si_cle_non_epinglee(self):
+        # l'hôte signe avec une autre clé que celle épinglée par le poste
+        host = t.Channel(t.ROLE_HOST, self.ctx,
+                         host_signing_key=bytes(range(32)))
+        with self.assertRaises(t.ProtocolError) as caught:
+            t.handshake(self.station, host)
+        self.assertEqual(caught.exception.code, "host_signature")
 
     def test_replay_et_reordonnancement_refuses(self):
         t.handshake(self.station, self.host)
@@ -232,10 +253,12 @@ class ChannelTest(unittest.TestCase):
         # contexte d'origine (séquence 1), récepteur dans un autre contexte
         other_session = os.urandom(16)
         other_ctx = context_for(self.receipt, other_session)
-        other = t.Channel(t.ROLE_HOST, other_ctx)
+        other = t.Channel(t.ROLE_HOST, other_ctx,
+                          host_signing_key=HOST_SIGNING_KEY)
         t.handshake(t.Channel(t.ROLE_STATION, other_ctx), other)
         sender = t.Channel(t.ROLE_STATION, self.ctx)
-        t.handshake(sender, t.Channel(t.ROLE_HOST, self.ctx))
+        t.handshake(sender, t.Channel(t.ROLE_HOST, self.ctx,
+                                      host_signing_key=HOST_SIGNING_KEY))
         with self.assertRaises(t.ProtocolError) as caught:
             other.feed(t.DATA, sender.seal(t.DATA, b"x"))
         self.assertEqual(caught.exception.code, "decrypt")
@@ -267,7 +290,8 @@ class ChannelTest(unittest.TestCase):
 
     def test_fenetre_acquittement(self):
         small = t.Channel(t.ROLE_STATION, self.ctx, window=2 * t.MAX_DATA)
-        host = t.Channel(t.ROLE_HOST, self.ctx, window=2 * t.MAX_DATA)
+        host = t.Channel(t.ROLE_HOST, self.ctx, window=2 * t.MAX_DATA,
+                         host_signing_key=HOST_SIGNING_KEY)
         t.handshake(small, host)
         while small.can_send:
             frame = small.seal(t.DATA, b"x" * 1024)
@@ -352,6 +376,8 @@ class RelayTest(unittest.TestCase):
         self.relay = None
         self.connector = None
         self.verifier = FakeVerifier()
+        self.grant_calls = []
+        self.grant_result = (True, "", "")
         self.logs = io.StringIO()
         self.log_handler = logging.StreamHandler(self.logs)
         self.log_handler.setLevel(logging.DEBUG)
@@ -379,9 +405,14 @@ class RelayTest(unittest.TestCase):
         self.host_log.handlers[:] = self._old_host_handlers
         self.logger.handlers[:] = []
 
+    def _check_grant(self, document, expected):
+        self.grant_calls.append((document, expected))
+        return self.grant_result
+
     def start(self, **overrides):
         config = dict(listen_host="127.0.0.1", listen_port=0,
                       hosts={HOST: TOKEN}, plaintext_loopback=True,
+                      grant_checker=self._check_grant,
                       pair_timeout=0.3, idle_timeout=10.0,
                       max_session_seconds=10.0, max_sessions=8,
                       max_sessions_per_host=4, max_sessions_per_ip=8)
@@ -393,7 +424,8 @@ class RelayTest(unittest.TestCase):
 
     def host(self, **overrides):
         config = dict(relay_host="127.0.0.1", relay_port=self.relay.port, token=TOKEN,
-                      host=HOST, plaintext_loopback=True, command=COMMAND,
+                      host=HOST, agents=(AGENT,), plaintext_loopback=True,
+                      command=COMMAND, host_signing_key=HOST_SIGNING_KEY,
                       max_sessions=4, max_session_seconds=10.0, keepalive=1.0)
         config.update(overrides)
         self.connector = attach_host.HostConnector(
@@ -477,6 +509,33 @@ class RelayTest(unittest.TestCase):
         time.sleep(0.2)
         self.assertEqual(self.connector.sessions, {})
 
+    def test_req_d_un_autre_transcript_refuse(self):
+        self.start()
+        self.host()
+        receipt, device = make_grant()
+        station = Station(self.relay.port, receipt, device)
+        self.addCleanup(station.close)
+        station.handshake()
+        answer = station.request(transcript_hash=hashlib.sha256(b"autre").digest())
+        self.assertEqual(answer.get("code"), "bad_request")
+        self.assertEqual(self.verifier.requests, [])
+
+    def test_relais_refuse_sans_verificateur_de_recu(self):
+        self.start(grant_checker=None)
+        receipt, _device = make_grant()
+        frame = open_only(self.relay.port, receipt)
+        self.assertEqual(frame.type, t.RELAY_ERR)
+        self.assertEqual(t.parse_json(frame.payload, "err")["code"], "grant_unverified")
+
+    def test_relais_refuse_un_recu_dont_la_signature_est_invalide(self):
+        self.start()
+        self.grant_result = (False, "bad_signature", "forged")
+        receipt, _device = make_grant()
+        frame = open_only(self.relay.port, receipt)
+        self.assertEqual(t.parse_json(frame.payload, "err")["code"], "grant_invalid")
+        _document, expected = self.grant_calls[-1]
+        self.assertEqual(expected, {"agent": AGENT, "host": HOST, "tenant": TENANT})
+
     def test_hote_inconnu_et_grant_invalide(self):
         self.start()
         receipt, _device = make_grant()
@@ -554,7 +613,9 @@ class RelayTest(unittest.TestCase):
         self.connector = attach_host.HostConnector(
             attach_host.HostConfig(relay_host="127.0.0.1", relay_port=self.relay.port,
                                    token="mauvais-" + "b" * 40, host=HOST,
-                                   plaintext_loopback=True, command=COMMAND),
+                                   agents=(AGENT,), plaintext_loopback=True,
+                                   command=COMMAND,
+                                   host_signing_key=HOST_SIGNING_KEY),
             self.verifier, logger=self.logger)
         thread = threading.Thread(target=self.connector.run_forever, daemon=True)
         thread.start()
@@ -639,6 +700,7 @@ class TlsTest(unittest.TestCase):
     def test_session_tls(self):
         relay = attach_relay.RelayServer(attach_relay.RelayConfig(
             listen_host="127.0.0.1", listen_port=0, hosts={HOST: TOKEN},
+            grant_checker=lambda document, expected: (True, "", ""),
             tls_context=self.server_ctx, pair_timeout=0.3, idle_timeout=10.0,
             max_session_seconds=10.0))
         relay.start()
@@ -646,7 +708,8 @@ class TlsTest(unittest.TestCase):
         verifier = FakeVerifier()
         connector = attach_host.HostConnector(attach_host.HostConfig(
             relay_host="127.0.0.1", relay_port=relay.port, token=TOKEN, host=HOST,
-            tls_context=self.client_ctx, command=COMMAND), verifier)
+            agents=(AGENT,), tls_context=self.client_ctx, command=COMMAND,
+            host_signing_key=HOST_SIGNING_KEY), verifier)
         thread = threading.Thread(target=connector.run_forever, daemon=True)
         thread.start()
         self.addCleanup(connector.stop)
@@ -659,6 +722,23 @@ class TlsTest(unittest.TestCase):
         self.assertEqual(station.request()["v"], 1)
 
 
+class _ScriptedRecv:
+    """Flux scripté : morceaux, exceptions, et respect de la taille demandée."""
+
+    def __init__(self, pieces):
+        self.pieces = list(pieces)
+        self.buffer = b""
+
+    def __call__(self, size):
+        while not self.buffer:
+            item = self.pieces.pop(0) if self.pieces else TimeoutError()
+            if isinstance(item, BaseException):
+                raise item
+            self.buffer = item
+        chunk, self.buffer = self.buffer[:size], self.buffer[size:]
+        return chunk
+
+
 class FrameTimeoutTest(unittest.TestCase):
     def test_timeout_avant_le_premier_octet_remonte(self):
         def recv(_size):
@@ -666,28 +746,40 @@ class FrameTimeoutTest(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             t.read_frame(recv)
 
-    def test_trame_commencee_ne_se_resynchronise_pas(self):
-        header = struct.pack(">I", t.SESSION_BYTES + 3) + b"\x00" * t.SESSION_BYTES + b"\x19"
-        pieces = [header, b"a", TimeoutError(), TimeoutError()]
-        def recv(size):
-            item = pieces.pop(0) if pieces else TimeoutError()
-            if isinstance(item, BaseException):
-                raise item
-            return item
+    def test_trame_valide_avec_delais_intermediaires(self):
+        session = b"\x11" * t.SESSION_BYTES
+        frame = t.encode_frame(session, t.DATA, b"ab")
+        recv = _ScriptedRecv([frame[:2], TimeoutError(), frame[2:9],
+                              TimeoutError(), frame[9:]])
+        parsed = t.read_frame(recv, frame_timeout=0.5)
+        self.assertEqual((parsed.session, parsed.type, parsed.payload),
+                         (session, t.DATA, b"ab"))
+
+    def test_entete_partiel_borne(self):
+        recv = _ScriptedRecv([b"\x00\x00", TimeoutError(), TimeoutError()])
         with self.assertRaises(t.ProtocolError) as caught:
             t.read_frame(recv, frame_timeout=0.05)
         self.assertEqual(caught.exception.code, "frame_timeout")
 
-    def test_entete_partiel_borne(self):
-        pieces = [b"\x00\x00", TimeoutError(), TimeoutError()]
+    def test_corps_commence_ne_se_resynchronise_pas(self):
+        frame = t.encode_frame(b"\x22" * t.SESSION_BYTES, t.DATA, b"ab")
+        recv = _ScriptedRecv([frame[:4], TimeoutError(), TimeoutError()])
+        with self.assertRaises(t.ProtocolError) as caught:
+            t.read_frame(recv, frame_timeout=0.05)
+        self.assertEqual(caught.exception.code, "frame_timeout")
+
+    def test_octet_regulier_ne_depasse_pas_le_deadline(self):
+        frame = t.encode_frame(b"\x33" * t.SESSION_BYTES, t.DATA, b"ab")
+
+        position = {"n": 0}
+
         def recv(size):
-            item = pieces.pop(0) if pieces else TimeoutError()
-            if isinstance(item, BaseException):
-                raise item
-            return item
-        with mock.patch.object(t, "FRAME_TIMEOUT", 0.05):
-            with self.assertRaises(t.ProtocolError) as caught:
-                t.read_frame(recv)
+            time.sleep(0.02)
+            index = position["n"]
+            position["n"] = index + 1
+            return frame[index:index + 1]
+        with self.assertRaises(t.ProtocolError) as caught:
+            t.read_frame(recv, frame_timeout=0.05)
         self.assertEqual(caught.exception.code, "frame_timeout")
 
 
@@ -711,3 +803,32 @@ class CliAndConfigTest(unittest.TestCase):
                 attach_relay.load_hosts_file(path)
             os.chmod(path, 0o600)
             self.assertEqual(attach_relay.load_hosts_file(path), {HOST: TOKEN})
+
+    def test_cle_d_hote_fichier_et_liaison_statique(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, data in (
+                    ("raw", HOST_SIGNING_KEY),
+                    ("hex", HOST_SIGNING_KEY.hex().encode("ascii")),
+                    ("b64", receipts.b64u_encode(HOST_SIGNING_KEY).encode("ascii"))):
+                path = os.path.join(tmp, name + ".key")
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                os.chmod(path, 0o600)
+                self.assertEqual(attach_host.host_key_from_file(path),
+                                 HOST_SIGNING_KEY)
+            path = os.path.join(tmp, "open.key")
+            with open(path, "wb") as fh:
+                fh.write(HOST_SIGNING_KEY)
+            os.chmod(path, 0o644)
+            with self.assertRaises(attach_host.HostConfigError):
+                attach_host.host_key_from_file(path)
+
+        base = dict(relay_host="127.0.0.1", relay_port=1, token=TOKEN, host=HOST,
+                    command=COMMAND, host_signing_key=HOST_SIGNING_KEY,
+                    plaintext_loopback=True)
+        with self.assertRaises(attach_host.HostConfigError):
+            attach_host.HostConfig(**base)
+        with self.assertRaises(attach_host.HostConfigError):
+            attach_host.HostConfig(**dict(base, agents=(AGENT, "avatar-bob")))
+        self.assertEqual(attach_host.HostConfig(**dict(base, agents=(AGENT,))).agents,
+                         (AGENT,))

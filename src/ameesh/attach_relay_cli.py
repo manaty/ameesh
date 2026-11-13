@@ -4,12 +4,14 @@
   ameesh attach-relay serve --hosts-file F [--listen H:PORT] [--mesh-cidr C]…
        [--tls-cert F --tls-key F] [--plaintext-loopback] [quotas]
   ameesh attach-relay host --relay URL --host H --token-file F
-       [--tenant T] [--agent A]… [--command "…"] [—] [quotas]
+       --host-key-file F --agent A [--tenant T] --command "…" [—] [quotas]
 
 `serve` écoute le réseau du mesh (jamais une adresse publique) et apparie
-postes et hôtes. `host` ouvre la connexion **sortante** de l'hôte de
-l'agent : aucun port entrant. Le jeton d'hôte est lu dans un fichier 0600,
-jamais dans l'environnement. TLS est exigé hors boucle locale ; le mode
+postes et hôtes, après avoir vérifié la signature du reçu (base + politique
+`AMEESH_APPROVE_RP_ID` / `AMEESH_APPROVE_ORIGINS`). `host` ouvre la
+connexion **sortante** de l'hôte de l'agent : aucun port entrant. Le jeton
+d'hôte et la clé Ed25519 de l'hôte sont lus dans des fichiers 0600, jamais
+dans l'environnement. TLS est exigé hors boucle locale ; le mode
 `--plaintext-loopback` ne sert qu'aux tests locaux.
 
 Ce n'est pas encore `ameesh attach` distant (D3) : la commande interactive
@@ -77,13 +79,61 @@ def _tls_context(cert: str | None, key: str | None) -> ssl.SSLContext | None:
     return context
 
 
-def cmd_serve(args) -> int:
+def _db_grant_checker(policy, cfg):
+    """Vérifie la signature WebAuthn d'un reçu d'attach, sans le consommer.
+
+    Le relais contrôle la preuve avant d'apparier ; l'hôte reste la porte qui
+    consomme le nonce (`attach_grant.redeem`). Une base ou un registre
+    injoignable refuse (fail closed), et l'erreur n'est jamais journalisée
+    avec la preuve.
+    """
     from . import attach_relay as relay_mod
+    from . import db as db_mod
+    from . import receipts as receipts_mod
+
+    def check(document, expected):
+        try:
+            db = db_mod.open_db(cfg)
+        except Exception as exc:  # noqa: BLE001 — refus par défaut
+            return False, relay_mod.GRANT_UNVERIFIED, (
+                "database unreachable (%s)" % type(exc).__name__)
+        try:
+            verdict = receipts_mod.verify_receipt(
+                db, document, policy, kind="attach", expected_attach=expected,
+                expect_decision="approve", consume_by=None)
+        except Exception as exc:  # noqa: BLE001
+            return False, relay_mod.GRANT_UNVERIFIED, (
+                "grant verification failed (%s)" % type(exc).__name__)
+        finally:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return verdict.ok, verdict.code, verdict.reason
+
+    return check
+
+
+def cmd_serve(args) -> int:
+    from . import actions
+    from . import attach_relay as relay_mod
+    policy = actions.policy_from_env()
+    if not policy.rp_id or not policy.origins:
+        print("attach-relay: AMEESH_APPROVE_RP_ID/AMEESH_APPROVE_ORIGINS absents : "
+              "le relais ne peut pas vérifier les reçus", file=sys.stderr)
+        return 2
+    try:
+        cfg = config_mod.load()
+    except Exception as exc:  # noqa: BLE001 — sans configuration, pas de registre
+        print("attach-relay: configuration illisible (%s)" % type(exc).__name__,
+              file=sys.stderr)
+        return 2
     try:
         hosts = relay_mod.load_hosts_file(args.hosts_file)
         config = relay_mod.RelayConfig(
             listen_host=args.listen[0], listen_port=args.listen[1],
             mesh_cidrs=tuple(args.mesh_cidr or ()), hosts=hosts,
+            grant_checker=_db_grant_checker(policy, cfg),
             tls_context=_tls_context(args.tls_cert, args.tls_key),
             plaintext_loopback=args.plaintext_loopback,
             max_sessions=args.max_sessions,
@@ -143,6 +193,7 @@ def cmd_host(args) -> int:
             args.relay, plaintext_loopback=args.plaintext_loopback,
             ca_file=args.ca_file, insecure=args.insecure_tls)
         token = attach_host.token_from_file(args.token_file)
+        host_signing_key = attach_host.host_key_from_file(args.host_key_file)
     except (attach_host.HostConfigError, ssl.SSLError, OSError) as exc:
         print("attach-relay host: %s" % exc, file=sys.stderr)
         return 2
@@ -165,7 +216,8 @@ def cmd_host(args) -> int:
             tenant=args.tenant or "", agents=tuple(args.agent or ()),
             tls_context=context, plaintext_loopback=args.plaintext_loopback,
             command=argv, cwd=args.cwd, max_sessions=args.max_sessions,
-            max_session_seconds=args.max_session, keepalive=args.keepalive)
+            max_session_seconds=args.max_session, keepalive=args.keepalive,
+            host_signing_key=host_signing_key)
     except attach_host.HostConfigError as exc:
         print("attach-relay host: %s" % exc, file=sys.stderr)
         return 2
@@ -233,8 +285,12 @@ def main(argv: list[str] | None = None) -> int:
     host.add_argument("--host", default=None, help="nom de l'hôte (défaut : configuration)")
     host.add_argument("--tenant", default="", help="tenant sur un hôte partagé")
     host.add_argument("--token-file", required=True, help="jeton du relais, fichier 0600")
+    host.add_argument("--host-key-file", required=True,
+                      help="clé privée Ed25519 de l'hôte (32 octets, hex ou base64url), "
+                           "fichier 0600 ; la clé publique est épinglée dans le canon")
     host.add_argument("--agent", action="append", default=[],
-                      help="agent servi (répétable ; défaut : tous ceux de l'hôte)")
+                      help="agent servi (exactement un : la commande statique est liée "
+                           "à cet agent)")
     host.add_argument("--command", required=True,
                       help="argv interactif de l'hôte (harnais), entre guillemets")
     host.add_argument("--cwd", default=None)

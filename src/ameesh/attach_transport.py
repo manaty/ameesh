@@ -15,13 +15,16 @@ elle est bornée par `MAX_FRAME` avant toute lecture et une trame de
 longueur nulle ou trop courte est refusée. Une session de contrôle (avant
 appariement) porte l'identifiant nul `ZERO_SESSION`.
 
-**Poignée de main** (par session, après appariement) : chaque extrémité
-envoie `KEY` (version, rôle, clé publique X25519), dérive la clé partagée,
-puis envoie `CONFIRM`. La transcription lie la version, l'identifiant de
-session, l'agent, l'hôte, le tenant, l'`attach_id`, l'empreinte du reçu et
-les deux clés publiques : deux sessions ne partagent jamais une clé, et un
-reçu substitué change la transcription. La confirmation est chiffrée et
-authentifiée ; un désaccord ferme la session (`handshake_failed`).
+**Poignée de main** (par session, après appariement) : le poste envoie son
+`KEY` (version, rôle, clé publique X25519), l'hôte répond par son `KEY`
+(version, rôle, clé publique, **signature Ed25519** de la transcription par
+la clé d'hôte épinglée), puis chacun envoie `CONFIRM`. La transcription lie
+la version, l'identifiant de session, l'agent, l'hôte, le tenant,
+l'`attach_id`, l'empreinte du reçu, la clé d'hôte épinglée et les deux clés
+publiques : deux sessions ne partagent jamais une clé, un reçu substitué ou
+un relais interposé change la transcription. La confirmation est chiffrée et
+authentifiée ; un désaccord ferme la session (`handshake_failed`,
+`host_signature`).
 
 **Trames de données** : ``séquence u64 | chiffré+tag``. Le nonce AES-GCM
 est la séquence sur 12 octets, l'AAD lie le type, la séquence et la
@@ -48,6 +51,7 @@ from . import jcs
 
 #: protocole et version : une trame d'une autre version est refusée
 PROTOCOL = "ameesh-attach-relay/1"
+HOST_SIG_DOMAIN = b"ameesh-attach-host/1\x00"
 VERSION = 1
 
 #: identifiant de session (16 octets) et identifiant nul des trames de contrôle
@@ -93,7 +97,8 @@ _ROLE_NAME = {1: ROLE_STATION, 2: ROLE_HOST}
 #: types qu'un canal de bout en bout sait sceller/ouvrir, et leur borne
 E2E_TYPES = frozenset({KEY, CONFIRM, REQ, OK, NO, DATA, WINSIZE, SIGNAL, ACK, CLOSE})
 MAX_PAYLOAD = {
-    KEY: 64,
+    # KEY : version + rôle + clé X25519 + signature Ed25519 de l'hôte
+    KEY: 2 + 32 + 64,
     CONFIRM: 64,
     REQ: MAX_CONTROL,
     OK: MAX_CONTROL,
@@ -204,39 +209,41 @@ def encode_frame(session: bytes, ftype: int, payload: bytes = b"") -> bytes:
 
 
 def _read_exact(recv: Callable[[int], bytes], size: int, *,
-                deadline: float | None) -> bytes | None:
-    """`size` octets, ou None si le pair a fermé avant (fin propre).
+                deadline: float | None,
+                frame_timeout: float) -> tuple[bytes | None, float | None]:
+    """`size` octets (et l'échéance de trame), ou None si le pair a fermé.
 
     Avant le premier octet d'une trame, un délai d'attente est rendu à
     l'appelant (le tour de boucle vérifie inactivité et keepalive). Dès
-    qu'une trame est commencée, le délai est absorbé mais borné par
-    `deadline` ; une trame interrompue lève `frame_timeout` et la connexion
-    est fermée, jamais resynchronisée au milieu du flux.
+    qu'une trame est commencée, une **échéance unique** la borne, vérifiée
+    même quand `recv` réussit : un pair qui envoie un octet avant chaque
+    délai ne peut pas étirer la trame indéfiniment. Une trame interrompue
+    lève `frame_timeout` et la connexion est fermée, jamais resynchronisée
+    au milieu du flux.
     """
     chunks = []
     remaining = size
     while remaining:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ProtocolError("frame_timeout", "incomplete frame after %d bytes"
+                                % (size - remaining))
         try:
             chunk = recv(remaining)
         except TimeoutError:
             if deadline is None:
                 if not chunks:
                     raise
-                deadline = time.monotonic() + FRAME_TIMEOUT
-                continue
-            if time.monotonic() >= deadline:
-                raise ProtocolError("frame_timeout", "incomplete frame after %d bytes"
-                                    % (size - remaining))
+                deadline = time.monotonic() + frame_timeout
             continue
         if deadline is None:
-            deadline = time.monotonic() + FRAME_TIMEOUT
+            deadline = time.monotonic() + frame_timeout
         if not chunk:
             if remaining == size:
-                return None
+                return None, deadline
             raise ProtocolError("truncated", "connection closed inside a frame")
         chunks.append(chunk)
         remaining -= len(chunk)
-    return b"".join(chunks)
+    return b"".join(chunks), deadline
 
 
 def read_frame(recv: Callable[[int], bytes], *, max_frame: int = MAX_FRAME,
@@ -248,7 +255,8 @@ def read_frame(recv: Callable[[int], bytes], *, max_frame: int = MAX_FRAME,
     foi d'un champ non vérifié). Un délai avant le premier octet remonte
     tel quel ; une fois la trame commencée, `frame_timeout` la borne.
     """
-    header = _read_exact(recv, 4, deadline=None)
+    header, deadline = _read_exact(recv, 4, deadline=None,
+                                   frame_timeout=frame_timeout)
     if header is None:
         return None
     length = struct.unpack(">I", header)[0]
@@ -257,7 +265,8 @@ def read_frame(recv: Callable[[int], bytes], *, max_frame: int = MAX_FRAME,
     if length > max_frame:
         raise ProtocolError("frame_too_large", "frame length %d, maximum %d"
                             % (length, max_frame))
-    body = _read_exact(recv, length, deadline=time.monotonic() + frame_timeout)
+    body, _ = _read_exact(recv, length, deadline=deadline,
+                          frame_timeout=frame_timeout)
     if body is None:
         raise ProtocolError("truncated", "connection closed after a frame header")
     session = body[:SESSION_BYTES]
@@ -272,6 +281,22 @@ def json_payload(**fields) -> bytes:
     """Charge JSON compacte et triée (déterministe, sans flottants)."""
     return json.dumps(fields, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":")).encode("utf-8")
+
+
+def _ed25519_private(raw: bytes | None):
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    except ImportError as exc:  # pragma: no cover
+        raise ProtocolError("crypto_unavailable", "cryptography is absent") from exc
+    return Ed25519PrivateKey.from_private_bytes(bytes(raw or b""))
+
+
+def _ed25519_public(raw: bytes):
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError as exc:  # pragma: no cover
+        raise ProtocolError("crypto_unavailable", "cryptography is absent") from exc
+    return Ed25519PublicKey.from_public_bytes(bytes(raw))
 
 
 def parse_json(payload: bytes, what: str, *, limit: int = MAX_CONTROL) -> dict:
@@ -315,12 +340,16 @@ class Context:
     tenant: str
     attach_id: str
     digest: bytes
+    host_key: bytes
 
     def __post_init__(self) -> None:
         check_session(self.session)
         if not isinstance(self.digest, (bytes, bytearray)) or len(self.digest) != 32:
             raise ProtocolError("bad_digest", "receipt digest must be 32 bytes")
         object.__setattr__(self, "digest", bytes(self.digest))
+        if not isinstance(self.host_key, (bytes, bytearray)) or len(self.host_key) != 32:
+            raise ProtocolError("bad_key", "host key must be 32 bytes")
+        object.__setattr__(self, "host_key", bytes(self.host_key))
         for name in ("agent", "host", "tenant", "attach_id"):
             value = getattr(self, name)
             if not isinstance(value, str) or "\x00" in value:
@@ -344,6 +373,7 @@ def transcript(context: Context, station_public: bytes, host_public: bytes) -> b
         _part(context.tenant.encode("utf-8")),
         _part(context.attach_id.encode("utf-8")),
         _part(context.digest),
+        _part(context.host_key),
         _part(bytes(station_public)),
         _part(bytes(host_public)),
     ))
@@ -366,7 +396,8 @@ class Channel:
     """
 
     def __init__(self, role: str, context: Context, *,
-                 window: int = DEFAULT_WINDOW, private_key: bytes | None = None):
+                 window: int = DEFAULT_WINDOW, private_key: bytes | None = None,
+                 host_signing_key: bytes | None = None):
         if role not in _ROLE_BYTE:
             raise ProtocolError("bad_role", "role %r" % (role,))
         if not isinstance(window, int) or window < MAX_DATA:
@@ -378,6 +409,12 @@ class Channel:
         self._private_raw = bytes(private_key) if private_key is not None else os.urandom(32)
         if len(self._private_raw) != 32:
             raise ProtocolError("bad_key", "X25519 private key must be 32 bytes")
+        if role == ROLE_HOST and (host_signing_key is None
+                                  or len(bytes(host_signing_key)) != 32):
+            raise ProtocolError("host_key_required",
+                                "the host needs its Ed25519 signing key")
+        self._host_signing_key = (bytes(host_signing_key)
+                                  if host_signing_key is not None else None)
         hashes, serialization, X25519PrivateKey, _X25519PublicKey, AESGCM, HKDF = _crypto()
         self._Hashes, self._Serialization, self._AESGCM, self._HKDF = hashes, serialization, AESGCM, HKDF
         self._private = X25519PrivateKey.from_private_bytes(self._private_raw)
@@ -412,6 +449,16 @@ class Channel:
         return self._public
 
     @property
+    def key_sent(self) -> bool:
+        return self._sent_key
+
+    @property
+    def transcript_hash(self) -> bytes:
+        if self._transcript_hash is None:
+            raise ProtocolError("handshake_order", "transcript is not derived yet")
+        return self._transcript_hash
+
+    @property
     def ready(self) -> bool:
         return self._ready
 
@@ -438,6 +485,16 @@ class Channel:
         if self._sent_key:
             raise ProtocolError("handshake_order", "KEY already sent")
         payload = bytes([VERSION, _ROLE_BYTE[self.role]]) + self._public
+        if self.role == ROLE_HOST:
+            if self._station_public is None:
+                raise ProtocolError("handshake_order",
+                                    "the host signs after the station KEY")
+            signing = _ed25519_private(self._host_signing_key)
+            transcript_bytes = transcript(self.context, self._station_public,
+                                          self._host_public)
+            signature = signing.sign(HOST_SIG_DOMAIN + hashlib.sha256(
+                transcript_bytes).digest())
+            payload += signature
         self._sent_key = True
         return KEY, payload
 
@@ -542,8 +599,9 @@ class Channel:
         return self._events
 
     def _feed_key(self, payload: bytes) -> None:
-        if len(payload) != 2 + 32:
-            raise ProtocolError("bad_key", "KEY: %d bytes, 34 expected" % len(payload))
+        if len(payload) < 2 + 32:
+            raise ProtocolError("bad_key", "KEY: %d bytes, at least 34 expected"
+                                % len(payload))
         if payload[0] != VERSION:
             raise ProtocolError("bad_version", "KEY: version %d, %d expected"
                                 % (payload[0], VERSION))
@@ -554,17 +612,38 @@ class Channel:
             raise ProtocolError("bad_role", "KEY: peer claims our role %s" % role)
         if self._peer_key:
             raise ProtocolError("handshake_replay", "KEY: peer key already received")
-        public = payload[2:]
+        expected = 2 + 32 + (64 if role == ROLE_HOST else 0)
+        if len(payload) != expected:
+            raise ProtocolError("bad_key", "KEY: %d bytes, %d expected"
+                                % (len(payload), expected))
+        public = payload[2:34]
         if public == b"\x00" * 32:
             raise ProtocolError("bad_key", "KEY: null public key")
         if role == ROLE_STATION:
             self._station_public = public
         else:
             self._host_public = public
+            self._check_host_proof(payload[34:])
         self._peer_key = True
         if self._station_public and self._host_public:
             self._derive()
         self._events.append(("key", role))
+
+    def _check_host_proof(self, signature: bytes) -> None:
+        if self.role != ROLE_STATION:
+            return
+        if not self.context.host_key:
+            raise ProtocolError("host_unauthenticated",
+                                "no host key is pinned for this relay")
+        transcript_bytes = transcript(self.context, self._station_public,
+                                      self._host_public)
+        public = _ed25519_public(self.context.host_key)
+        try:
+            public.verify(signature, HOST_SIG_DOMAIN + hashlib.sha256(
+                transcript_bytes).digest())
+        except Exception as exc:  # InvalidSignature
+            raise ProtocolError("host_signature",
+                                "the host did not prove its pinned key") from exc
 
     def _feed_confirm(self, payload: bytes) -> None:
         if not self._keys_ready():

@@ -5,8 +5,11 @@ L'hôte ne prend **aucun port entrant** : il ouvre une connexion TCP/TLS
 sortante vers le relais, s'y annonce avec un jeton 0600, puis sert les
 sessions appariées. Pour chaque session :
 
-1. poignée de main X25519/AES-GCM (`attach_transport`) ;
-2. `REQ` chiffré qui porte le reçu d'attach (D1) et la preuve d'appareil ;
+1. poignée de main X25519/AES-GCM (`attach_transport`) : l'hôte signe son
+   `KEY` avec sa clé Ed25519, dont la clé publique est épinglée dans le
+   canon du poste ;
+2. `REQ` chiffré qui porte le reçu d'attach (D1), la preuve d'appareil —
+   signée avec le hash de CETTE transcription — et ce hash ;
 3. vérification et **consommation** du grant (`attach_grant.redeem`), par
    défaut sur la base et le canon de l'hôte — l'hôte est la porte ;
 4. ouverture du PTY (`attach_pty`) et lancement de la commande interactive
@@ -25,6 +28,7 @@ terminal.
 from __future__ import annotations
 
 import dataclasses
+import hmac
 import logging
 import os
 import queue
@@ -72,6 +76,7 @@ class AttachRequest:
     attach_id: str
     receipt: dict
     device_signature: bytes
+    transcript_hash: bytes
     device_key: str
     rows: int = 24
     cols: int = 80
@@ -143,7 +148,8 @@ class DbGrantVerifier(GrantVerifier):
             grant = attach_grant.redeem(
                 db, request.receipt, canon=canon, agent=request.agent, host=request.host,
                 tenant=request.tenant, device_key=request.device_key,
-                device_signature=request.device_signature, policy=policy,
+                device_signature=request.device_signature,
+                transcript_hash=request.transcript_hash, policy=policy,
                 checked_by=self.checked_by)
         except Exception as exc:  # noqa: BLE001 — jamais d'ouverture sur erreur
             return GrantResult(False, "audit_unavailable",
@@ -170,10 +176,12 @@ class HostConfig:
     tls_context: ssl.SSLContext | None = None
     plaintext_loopback: bool = False
     command: Callable[[AttachRequest], list] | list | None = None
+    host_signing_key: bytes | None = None
     env: dict | None = None
     cwd: str | None = None
     max_sessions: int = 4
     max_session_seconds: float = 2 * 3600.0
+    request_timeout: float = 30.0
     keepalive: float = 30.0
     connect_timeout: float = 10.0
 
@@ -195,14 +203,32 @@ class HostConfig:
             argv = list(self.command)
             if not argv or not all(isinstance(part, str) and part for part in argv):
                 raise HostConfigError("command must be a non-empty argv")
+            if len(self.agents) != 1:
+                raise HostConfigError(
+                    "a static command requires exactly one --agent: it would "
+                    "otherwise run the same harness for every agent of the host")
         if not 1 <= self.max_sessions <= 64:
             raise HostConfigError("max_sessions must be between 1 and 64")
         if not 1 <= self.max_session_seconds <= 24 * 3600:
             raise HostConfigError("max_session_seconds must be between 1 s and 24 h")
+        if not 1 <= self.request_timeout <= 300:
+            raise HostConfigError("request_timeout must be between 1 s and 5 min")
         for agent in self.agents:
             if not isinstance(agent, str) or not re.fullmatch(
                     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", agent):
                 raise HostConfigError("invalid agent name %r" % (agent,))
+        if not isinstance(self.host_signing_key, (bytes, bytearray)) or len(
+                bytes(self.host_signing_key)) != 32:
+            raise HostConfigError(
+                "host_signing_key: a 32-byte Ed25519 private key is required")
+
+    @property
+    def host_public_key(self) -> bytes:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        key = Ed25519PrivateKey.from_private_bytes(bytes(self.host_signing_key))
+        return key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
 
 class HostSession:
@@ -217,8 +243,11 @@ class HostSession:
         self.attach_id = attach_id
         self.context = transport.Context(session=session_id, agent=agent,
                                          host=connector.config.host, tenant=tenant,
-                                         attach_id=attach_id, digest=digest)
-        self.channel = transport.Channel(transport.ROLE_HOST, self.context)
+                                         attach_id=attach_id, digest=digest,
+                                         host_key=connector.config.host_public_key)
+        self.channel = transport.Channel(
+            transport.ROLE_HOST, self.context,
+            host_signing_key=connector.config.host_signing_key)
         self.inbox: queue.Queue = queue.Queue(maxsize=512)
         self._stop = threading.Event()
         self._closed = threading.Event()
@@ -265,11 +294,15 @@ class HostSession:
 
     def run(self) -> None:
         try:
-            self._send(*self.channel.key_frame())
             while not self._stop.is_set():
                 if self._current_pty() is None:
                     # pas de PTY avant REQ : on attend la trame suivante sans
-                    # tourner à vide (la poignée de main est asynchrone)
+                    # tourner à vide (la poignée de main est asynchrone), mais
+                    # une session appariée qui n'envoie jamais REQ expire
+                    if (time.monotonic() - self.created
+                            > self.connector.config.request_timeout):
+                        self.close("timeout", "no REQ before the deadline")
+                        break
                     try:
                         item = self.inbox.get(timeout=0.1)
                     except queue.Empty:
@@ -308,6 +341,10 @@ class HostSession:
             return
         for kind, value in events:
             if kind == "key":
+                # la station parle d'abord : l'hôte signe la transcription
+                # avec les deux clés une fois la sienne reçue
+                if not self.channel.key_sent:
+                    self._send(*self.channel.key_frame())
                 confirms = self.channel.confirm_frame()
                 if confirms is not None:
                     self._send(*confirms)
@@ -422,6 +459,20 @@ class HostSession:
         if not raw_signature or len(raw_signature) > MAX_SIGNATURE:
             raise ValueError("device_signature: %d bytes, maximum %d"
                              % (len(raw_signature), MAX_SIGNATURE))
+        transcript = data.get("transcript_hash")
+        if not isinstance(transcript, str):
+            raise ValueError("transcript_hash: base64url text expected")
+        try:
+            transcript_hash = receipts.b64u_decode(transcript, "transcript_hash")
+        except receipts.ReceiptError as exc:
+            raise ValueError("transcript_hash: %s" % exc) from exc
+        if len(transcript_hash) != 32:
+            raise ValueError("transcript_hash: %d bytes, 32 expected"
+                             % len(transcript_hash))
+        if not self.channel.ready:
+            raise ValueError("transcript_hash: the channel is not established")
+        if not hmac.compare_digest(transcript_hash, self.channel.transcript_hash):
+            raise ValueError("transcript_hash: differs from this session")
         device_key = data.get("device_key")
         if not isinstance(device_key, str) or not CREDENTIAL_RE.fullmatch(device_key):
             raise ValueError("device_key: invalid credential id")
@@ -437,7 +488,8 @@ class HostSession:
         return AttachRequest(session=self.session_id.hex(), agent=self.agent,
                              host=self.connector.config.host, tenant=self.tenant,
                              attach_id=self.attach_id, receipt=parsed.document,
-                             device_signature=raw_signature, device_key=device_key,
+                             device_signature=raw_signature,
+                             transcript_hash=transcript_hash, device_key=device_key,
                              rows=rows, cols=cols, xpix=xpix, ypix=ypix, term=term)
 
     def _refuse(self, code: str, reason: str) -> None:
@@ -877,3 +929,44 @@ def token_from_file(path: str) -> str:
     if len(token) < 32 or any(ch.isspace() for ch in token):
         raise HostConfigError("relay token must be at least 32 non-space characters")
     return token
+
+
+def host_key_from_file(path: str) -> bytes:
+    """Clé privée Ed25519 de l'hôte, fichier 0600.
+
+    Le fichier porte 32 octets bruts, ou leur écriture en hexadécimal (64
+    caractères) ou en base64url (43 caractères). La clé publique
+    correspondante est épinglée dans le canon du poste ; elle n'est jamais
+    lue dans l'environnement.
+    """
+    path = os.path.abspath(os.path.expanduser(path))
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise HostConfigError("cannot read the host key file: %s" % exc.strerror) from exc
+    from . import httpkit
+    httpkit.check_private(st, "attach host key", path, error=HostConfigError)
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(4096)
+    except OSError as exc:
+        raise HostConfigError("cannot read the host key file: %s" % exc.strerror) from exc
+    if len(raw) == 32:
+        return raw
+    data = raw.strip()
+    if len(data) == 32:
+        key = data
+    elif len(data) == 64:
+        try:
+            key = bytes.fromhex(data.decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise HostConfigError("host key file: invalid hexadecimal key") from exc
+    else:
+        try:
+            key = receipts.b64u_decode(data.decode("ascii"), "host key")
+        except (UnicodeDecodeError, receipts.ReceiptError) as exc:
+            raise HostConfigError("host key file: 32 raw bytes, hex or base64url "
+                                  "expected") from exc
+    if len(key) != 32:
+        raise HostConfigError("host key file: %d bytes, 32 expected" % len(key))
+    return key

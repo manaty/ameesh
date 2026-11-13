@@ -14,7 +14,10 @@ Décision owner Q3 (#213938, option a, signée, approbation #345) :
 * **appareil** : `device_key` est le credential_id d'un authentificateur
   `device-es256` ACTIF du même humain, déclaré par le canon de l'agent ; le
   poste prouve qu'il détient cette clé en signant
-  `"ameesh-attach-device/1\\0" ‖ challenge du reçu` (ES256).
+  `"ameesh-attach-device/2\\0" ‖ challenge du reçu ‖ hash du transcript`
+  (ES256), le hash étant celui du canal E2E (D2). La preuve est donc liée à
+  CETTE session chiffrée : un relais qui terminerait deux canaux distincts
+  ne peut pas la transposer.
 
 `redeem` est la porte de l'hôte de l'agent : refus par défaut, chaque issue
 (grant accepté ou refus, avec son code stable) est écrite dans
@@ -34,7 +37,7 @@ from .db import Db, DbError
 
 #: durée maximale d'un grant (décision Q3 : 5 min)
 GRANT_TTL = 300
-DEVICE_DOMAIN = b"ameesh-attach-device/1\x00"
+DEVICE_DOMAIN = b"ameesh-attach-device/2\x00"
 #: clé de la carte d'agent qui porte la liste explicite
 CARD_SECTION = "avatar"
 CARD_LIST = "attach_authorized"
@@ -148,10 +151,15 @@ def build_request(*, approver: str, agent: str, host: str, tenant: str, device_k
     return request, summary
 
 
-def device_message(challenge: bytes) -> bytes:
-    """Ce que signe la clé d'appareil du poste : le challenge du reçu, sous
-    un domaine propre (jamais réutilisable comme reçu `device-es256`)."""
-    return DEVICE_DOMAIN + bytes(challenge)
+def device_message(challenge: bytes, transcript_hash: bytes) -> bytes:
+    """Ce que signe la clé d'appareil du poste : le challenge du reçu et le
+    hash du transcript E2E, sous un domaine propre (jamais réutilisable comme
+    reçu `device-es256` ni hors de cette session)."""
+    if (not isinstance(transcript_hash, (bytes, bytearray))
+            or len(transcript_hash) != 32):
+        raise receipts.ReceiptError(
+            "attach device proof: a 32-byte transcript hash is required")
+    return DEVICE_DOMAIN + bytes(challenge) + bytes(transcript_hash)
 
 
 @dataclass(frozen=True)
@@ -190,15 +198,17 @@ def _record(db: Db, grant: Grant, *, nonce: str, checked_by: str) -> int | None:
 
 
 def redeem(db: Db, receipt, *, canon, agent: str, host: str, tenant: str, device_key: str,
-           device_signature: bytes, policy: receipts.Policy, checked_by: str,
-           now: float | None = None) -> Grant:
+           device_signature: bytes, transcript_hash: bytes, policy: receipts.Policy,
+           checked_by: str, now: float | None = None) -> Grant:
     """Vérifie et CONSOMME un grant d'attach sur l'hôte de l'agent.
 
     `agent`, `host`, `tenant` sont ceux de l'hôte qui vérifie (jamais lus dans
     le reçu) ; `device_key` et `device_signature` sont présentés par le poste.
-    `policy` donne RP ID et origines ; la façade est forcée à `webauthn`, la
-    durée à GRANT_TTL et le canon à celui de l'agent. Refus par défaut : tout
-    écart rend un Grant refusé, journalisé avec son code.
+    `transcript_hash` est celui du canal E2E où la preuve a circulé (D2) : le
+    poste l'a signé avec le challenge, donc la preuve ne vaut que pour cette
+    session. `policy` donne RP ID et origines ; la façade est forcée à
+    `webauthn`, la durée à GRANT_TTL et le canon à celui de l'agent. Refus par
+    défaut : tout écart rend un Grant refusé, journalisé avec son code.
     """
     base = {"agent": agent, "host": host, "tenant": tenant, "device_key": device_key}
     nonce = ""
@@ -274,10 +284,12 @@ def redeem(db: Db, receipt, *, canon, agent: str, host: str, tenant: str, device
             row["public_key"], "stored device key"))
     except receipts.ReceiptError as exc:
         return refuse(DEVICE, "device key unusable: %s" % exc, **seen)
+    if not isinstance(transcript_hash, (bytes, bytearray)) or len(transcript_hash) != 32:
+        return refuse(DEVICE_PROOF, "transcript hash: 32 bytes expected", **seen)
     if not isinstance(device_signature, (bytes, bytearray)) or not key.verify(
-            device_message(parsed.challenge), bytes(device_signature)):
-        return refuse(DEVICE_PROOF, "the station does not prove possession of device %s"
-                      % device_key[:16], **seen)
+            device_message(parsed.challenge, transcript_hash), bytes(device_signature)):
+        return refuse(DEVICE_PROOF, "the station does not prove possession of device %s "
+                      "for this transcript" % device_key[:16], **seen)
 
     gate = dataclasses.replace(policy, allow_facades=frozenset({"webauthn"}),
                                max_ttl=GRANT_TTL, canon=registry)

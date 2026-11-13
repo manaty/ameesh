@@ -13,27 +13,31 @@ dans un CIDR de mesh déclaré, et un pair hors de ces plages est refusé.
 reste connecté ; plusieurs sessions partagent sa connexion (l'identifiant
 de session est dans chaque trame). Un poste demande (`OPEN`) une session
 pour un agent, un hôte et un tenant, en présentant le reçu d'attach (D1,
-`ameesh-receipt/1`). Le relais **pré-contrôle** le reçu (forme, nature,
-liaison agent/hôte/tenant, échéance, durée ≤ 5 min) et l'empreinte, puis
-apparie ; il ne vérifie pas la signature WebAuthn — c'est l'hôte qui la
-vérifie et qui consomme le nonce (`attach_grant.redeem`). Aucun octet de
-terminal n'est routé avant que l'hôte n'ait lui-même accepté la preuve.
+`ameesh-receipt/1`). Le relais contrôle le reçu (forme, nature, liaison
+agent/hôte/tenant, échéance, durée ≤ 5 min), l'empreinte, puis sa
+**signature WebAuthn** par le vérificateur injecté (`grant_checker`, base et
+politique de la CLI) ; sans vérificateur il refuse tout `OPEN`. Il ne
+consomme **pas** le nonce : l'hôte reste la porte qui vérifie et consomme
+(`attach_grant.redeem`). Aucun octet de terminal n'est routé avant que
+l'hôte n'ait lui-même accepté la preuve.
 
-**E2E.** Dès l'appariement, les deux extrémités échangent leurs clés
-X25519 et une confirmation AES-256-GCM (voir `attach_transport`) ; le
-relais ne voit que `KEY`/`CONFIRM` (clés publiques, chiffré) puis des
-trames opaques. Les journaux ne portent que l'identité de routage, les
-tailles, la durée et le code de fermeture : jamais un reçu, une clé, un
-octet de terminal.
+**E2E.** Dès l'appariement, le poste envoie son `KEY` X25519, l'hôte répond
+par le sien signé par sa clé Ed25519 épinglée, puis une confirmation
+AES-256-GCM (voir `attach_transport`) ; le relais ne voit que `KEY`/
+`CONFIRM` (clés publiques, chiffré) puis des trames opaques. Un relais
+interposé ne peut pas transposer la preuve d'appareil (liée au transcript)
+ni signer le `KEY` de l'hôte. Les journaux ne portent que l'identité de
+routage, les tailles, la durée et le code de fermeture : jamais un reçu, une
+clé, un octet de terminal.
 
 **Quotas.** Sessions simultanées (globales, par hôte, par adresse), durée
 maximale, inactivité, octets et trames par seconde, octets par session,
 file d'écriture bornée. Un dépassement ferme la session avec un code stable
 (`quota_*`, `rate_*`, `slow_peer`) : le relais ne bloque pas les autres.
 
-Le service ne dépend pas de la base : il ne lit ni n'écrit le registre ;
-c'est l'hôte qui reste la porte d'autorisation. TLS est exigé hors boucle
-locale (`--plaintext-loopback` réservé aux tests).
+Le service ne conserve rien du reçu : le vérificateur lit le registre sans
+consommer le nonce ; c'est l'hôte qui reste la porte d'autorisation. TLS est
+exigé hors boucle locale (`--plaintext-loopback` réservé aux tests).
 """
 from __future__ import annotations
 
@@ -67,6 +71,7 @@ AUTH_FAILED = "auth_failed"
 GRANT_INVALID = "grant_invalid"
 GRANT_EXPIRED = "grant_expired"
 GRANT_MISMATCH = "grant_mismatch"
+GRANT_UNVERIFIED = "grant_unverified"
 GRANT_IN_USE = "grant_in_use"
 UNKNOWN_HOST = "unknown_host"
 HOST_BUSY = "host_busy"
@@ -160,6 +165,11 @@ class RelayConfig:
     listen_port: int = 8790
     mesh_cidrs: tuple = ()
     hosts: dict = dataclasses.field(default_factory=dict, hash=False)
+    #: vérifie la signature du reçu avant tout appariement :
+    #: `(document, {agent, host, tenant}) -> (ok, code, raison)`. Absent, le
+    #: relais refuse tout `OPEN` (fail closed) : le service ne croit jamais un
+    #: reçu qu'il n'a pas vérifié.
+    grant_checker: Callable[[dict, dict], tuple] | None = None
     tls_context: ssl.SSLContext | None = None
     plaintext_loopback: bool = False
     max_connections: int = 128
@@ -456,13 +466,8 @@ class HostPeer(_Peer):
     def handle(self, frame: transport.Frame) -> None:
         if frame.session == transport.ZERO_SESSION:
             if frame.type == transport.PING:
-                # le keepalive de l'hôte couvre ses sessions : un harnais qui
-                # réfléchit n'est pas une session morte
-                now = time.monotonic()
-                with self.lock:
-                    sessions = list(self.sessions.values())
-                for session in sessions:
-                    session.last_activity = now
+                # le keepalive ne vaut que pour la connexion de l'hôte : une
+                # session inactive doit expirer malgré les PING
                 self.send(transport.ZERO_SESSION, transport.PONG)
                 return
             if frame.type == transport.PONG:
@@ -558,6 +563,20 @@ class StationPeer(_Peer):
         except transport.ProtocolError:
             self.fail(GRANT_INVALID, "OPEN: receipt cannot be canonicalized")
             return
+        checker = self.relay.config.grant_checker
+        if checker is None:
+            self.fail(GRANT_UNVERIFIED, "OPEN: the relay has no grant verifier")
+            return
+        try:
+            ok, code, reason = checker(
+                parsed.document, {"agent": agent, "host": host, "tenant": tenant})
+        except Exception:  # noqa: BLE001 — un vérificateur qui casse ne vaut rien
+            self.fail(GRANT_UNVERIFIED, "OPEN: grant verification failed")
+            return
+        if not ok:
+            self.fail(GRANT_INVALID, "OPEN: attach grant refused (%s): %s"
+                      % (str(code)[:64], str(reason)[:200]))
+            return
         self.relay.open_station(self, agent, host, tenant, request["attach_id"], digest)
 
     def handle(self, frame: transport.Frame) -> None:
@@ -597,6 +616,7 @@ class Session:
         self.bytes_to_station = 0
         self.frames = 0
         self._closed = threading.Event()
+        self._close_lock = threading.Lock()
         self._window_start = self.created
         self._window_bytes = 0
         with host.lock:
@@ -641,9 +661,10 @@ class Session:
             self.close(SLOW_PEER, "peer is not reading", notify_station=True)
 
     def close(self, code: str, reason: str, *, notify_station: bool = False) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
+        with self._close_lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
         with self.relay._lock:
             self.relay.sessions.pop(self.session_id, None)
             self.relay.by_attach.pop(self.attach_id, None)
@@ -694,6 +715,7 @@ class RelayServer:
         self._slots = threading.BoundedSemaphore(config.max_connections)
         self._ip_limiter = httpkit.RateLimiter(config.connection_rate_per_minute)
         self._ip_sessions: dict[str, int] = {}
+        self._pending_pairs = 0
         self.port = 0
 
     # -- démarrage / arrêt -------------------------------------------------
@@ -785,15 +807,16 @@ class RelayServer:
                 self.log.warning("attach relay: too many connections")
                 continue
             try:
-                conn.settimeout(self.config.handshake_timeout)
-                if self.config.tls_context is not None:
-                    conn = self.config.tls_context.wrap_socket(conn, server_side=True)
-                secure = self.config.tls_context is not None
-                peer = _FirstPeer(self, conn, address, secure)
+                # la poignée de main TLS se fait dans le fil du pair, jamais
+                # dans celui d'acceptation : un client muet ne bloque pas les
+                # autres connexions
+                peer = _FirstPeer(self, conn, address,
+                                  self.config.tls_context is not None,
+                                  tls_context=self.config.tls_context)
                 with self._peer_lock:
                     self._peers.add(peer)
                 peer.start()
-            except (OSError, ssl.SSLError):
+            except OSError:
                 self._slots.release()
                 self._close_quietly(conn)
 
@@ -851,10 +874,19 @@ class RelayServer:
             if self._ip_sessions.get(station.ip, 0) >= self.config.max_sessions_per_ip:
                 station.fail(QUOTA_SESSIONS, "too many sessions for this address")
                 return
+            if self._pending_pairs >= self.config.max_pending_pairs:
+                station.fail(RELAY_BUSY, "too many pending pairs")
+                return
             if attach_id in self.by_attach:
                 station.fail(GRANT_IN_USE, "this attach grant already has a session")
                 return
-        host_peer = self._wait_host(host, tenant, deadline=now + self.config.pair_timeout)
+            self._pending_pairs += 1
+        try:
+            host_peer = self._wait_host(host, tenant,
+                                        deadline=now + self.config.pair_timeout)
+        finally:
+            with self._lock:
+                self._pending_pairs -= 1
         if host_peer is None:
             station.fail(UNKNOWN_HOST, "no host %s%s is connected"
                          % (host, " (tenant %s)" % tenant if tenant else ""))
@@ -950,9 +982,10 @@ class _FirstPeer(_Peer):
     trame n'est écrite avant ce choix.
     """
 
-    def __init__(self, relay, sock, address, secure):
+    def __init__(self, relay, sock, address, secure, *, tls_context=None):
         super().__init__(relay, sock, address, secure)
         self._delegate: _Peer | None = None
+        self._tls_context = tls_context
 
     def start(self) -> None:
         self._reader = threading.Thread(target=self.run, name="attach-relay-peer",
@@ -963,6 +996,9 @@ class _FirstPeer(_Peer):
         delegate = None
         try:
             self.sock.settimeout(self.relay.config.handshake_timeout)
+            if self._tls_context is not None:
+                self.sock = self._tls_context.wrap_socket(self.sock, server_side=True)
+                self.secure = True
             first = transport.read_frame(self._recv, max_frame=self.relay.config.max_frame,
                                          frame_timeout=self.relay.config.handshake_timeout)
             if first is None:
