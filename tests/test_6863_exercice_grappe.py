@@ -74,3 +74,96 @@ class ExerciceGrappeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FausseSurveillance:
+    """Surveillance sans réseau : un nouveau primaire et un retour immédiats."""
+
+    def __init__(self, cible, intervalle=0.5):
+        pass
+
+    def start(self):
+        pass
+
+    def arreter(self):
+        pass
+
+    def attendre_nouveau_primaire(self, ancien, timeout):
+        return "ameesh-agents-2", 12.0
+
+    def attendre_role(self, nom, attendu, timeout):
+        return "t", 5.0
+
+    def primaires_simultanes(self):
+        return 0.0, []
+
+
+class PosteHorsScenarioTest(unittest.TestCase):
+    """B de cx2 (#216056) : sans écrivain, une panne de grappe ne touche pas au
+    poste. L'action du poste (ici « le PC ne répond pas ») n'appartient qu'au
+    scénario pc-eteint ; l'appeler ailleurs ferait échouer l'exercice réel
+    après la panne, PC allumé."""
+
+    def _pilote(self, exercer):
+        actions = []
+
+        class FausseGrappe:
+            nom = "grappe"
+            noeuds = []
+            noeuds_noms = ["ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1"]
+            ecrivain_disponible = False
+            table_jalon = "public.ep86_jalon"
+
+            def versions(self):
+                return ""
+
+            def accessibilite(self):
+                return ""
+
+            def tuer(self, nom):
+                actions.append(("perte_noeud", nom))
+
+            def demarrer_noeud(self, nom):
+                actions.append(("retour_noeud", nom))
+
+            def couper(self, nom):
+                actions.append(("coupure_reseau", nom))
+
+            def retablir(self, nom):
+                actions.append(("retablissement_reseau", nom))
+
+            def arreter_pc(self):
+                actions.append(("arret_pc", None))
+                raise exercer.Erreur("le PC répond au ping")
+
+            def demarrer_pc(self):
+                actions.append(("demarrage_pc", None))
+
+            def journal(self, nom, lignes=400):
+                return "running pg_rewind\npg_rewind exit code=0"
+
+        pilote = exercer.Pilote(FausseGrappe(), exercer.Options())
+        pilote.preparer = lambda: "ameesh-agents-1"
+        pilote.inserer_jalon = lambda primaire, scenario: 7
+        pilote.jalon_present = lambda nom, jalon: True
+        pilote.attendre_sain = lambda timeout=0: "ameesh-agents-2"
+        return pilote, actions
+
+    def _jouer(self, scenario):
+        exercer = _charger_exercer()
+        exercer.Surveillance = _FausseSurveillance
+        pilote, actions = self._pilote(exercer)
+        resultat = getattr(pilote, "_scenario_" + scenario)()
+        return resultat, [a for a, _ in actions]
+
+    def test_perte_primaire_sans_action_du_poste(self):
+        resultat, actions = self._jouer("perte_primaire")
+        self.assertEqual(actions, ["perte_noeud", "retour_noeud"])
+        self.assertEqual(resultat["verdict"], "ok")
+        self.assertFalse(resultat["preuves"]["fenetre_close_par_arret_du_poste"])
+
+    def test_coupure_reseau_sans_action_du_poste(self):
+        resultat, actions = self._jouer("coupure_reseau")
+        self.assertEqual(actions, ["coupure_reseau", "retablissement_reseau"])
+        self.assertNotEqual(resultat["verdict"], "blocked")
+        self.assertFalse(resultat["preuves"]["fenetre_close_par_arret_du_poste"])

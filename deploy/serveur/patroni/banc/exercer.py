@@ -1019,9 +1019,12 @@ class Pilote:
             # Toute confirmation qu'il contient (y compris celles obtenues
             # pendant la bascule) doit se retrouver à l'identique sur la
             # branche finale, jeton compris.
-            self.cible.arreter_pc()
-            pc_arrete = True
-            time.sleep(0.3)
+            # #6863 : sans écrivain (grappe réelle), il n'y a pas de journal à
+            # figer ; l'action du poste n'appartient qu'au scénario pc-eteint.
+            if self.cible.ecrivain_disponible:
+                self.cible.arreter_pc()
+                pc_arrete = True
+                time.sleep(0.3)
             fenetre = self.ecritures()
             rpo_jalon = self.jalon_present(nouveau, jalon)
             max_apres = self.max_ecriture(nouveau)
@@ -1035,8 +1038,9 @@ class Pilote:
             manquantes, substituees = self.ecritures_non_prouvees(
                 fin, fenetre["paires"]
             )
-            self.cible.demarrer_pc()
-            pc_redemarre = True
+            if pc_arrete:
+                self.cible.demarrer_pc()
+                pc_redemarre = True
             jalon_final = self.jalon_present(fin, jalon)
             journal = self.cible.journal(primaire, 400)
             split, periodes = surveillance.primaires_simultanes()
@@ -1123,7 +1127,7 @@ class Pilote:
                 "periodes_deux_primaires": len(periodes),
                 "ecritures_absentes_ids": manquantes[:20],
                 "ecritures_substituees_ids": substituees[:20],
-                "fenetre_close_par_arret_du_poste": True,
+                "fenetre_close_par_arret_du_poste": pc_arrete,
             },
             [note],
             verdict,
@@ -1161,9 +1165,12 @@ class Pilote:
             # Fenêtre de panne close : le poste est arrêté et le journal figé
             # après la bascule ; les confirmations de la fenêtre seront
             # comparées à l'identique sur la branche finale (id + jeton).
-            self.cible.arreter_pc()
-            pc_arrete = True
-            time.sleep(0.3)
+            # #6863 : sans écrivain (grappe réelle), il n'y a pas de journal à
+            # figer ; l'action du poste n'appartient qu'au scénario pc-eteint.
+            if self.cible.ecrivain_disponible:
+                self.cible.arreter_pc()
+                pc_arrete = True
+                time.sleep(0.3)
             fenetre = self.ecritures()
             rpo_jalon = self.jalon_present(nouveau, jalon)
             max_apres = self.max_ecriture(nouveau)
@@ -1176,8 +1183,9 @@ class Pilote:
             manquantes, substituees = self.ecritures_non_prouvees(
                 fin, fenetre["paires"]
             )
-            self.cible.demarrer_pc()
-            pc_redemarre = True
+            if pc_arrete:
+                self.cible.demarrer_pc()
+                pc_redemarre = True
             jalon_final = self.jalon_present(fin, jalon)
             journal = self.cible.journal(primaire, 400)
             split, periodes = surveillance.primaires_simultanes()
@@ -1275,7 +1283,7 @@ class Pilote:
                 "demotion_observee": demotion is not None,
                 "ecritures_absentes_ids": manquantes[:20],
                 "ecritures_substituees_ids": substituees[:20],
-                "fenetre_close_par_arret_du_poste": True,
+                "fenetre_close_par_arret_du_poste": pc_arrete,
             },
             notes,
             verdict,
