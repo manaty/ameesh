@@ -1618,11 +1618,18 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
     #6664: an unavailable manual reviewer (budget pause, stopped/dead,
     closed host) covers nothing either — the freeze must fall back on
     another seat of the same family or of an eligible family instead of
-    re-sending the request to a reviewer that will not read it. An operator
-    pause keeps its seat: #2627/#5129's automatic sleep is lifted by the
-    designation path, and a human pause is a temporary hold. A seat whose
-    reviewer already rendered a verdict on the frozen head (`answered`) still
-    covers: the opinion exists, the pause only follows it.
+    re-sending the request to a reviewer that will not read it. #7174: an
+    operator pause covers nothing either unless its verdict is already on the
+    frozen head: the incident of #6961 showed that a manual seat on a
+    reviewer asleep by the roadmap sleep counted as coverage, so the
+    designation sent its request to an agent that could not read it and
+    never woke it. The seat stays in the column (a pilot gesture); only its
+    counting stops. The automatic selection then names an available
+    same-family reviewer, or `_wake_sleeping_reviewers` lifts the automatic
+    roadmap sleep of this very reviewer when no other seat of the family is
+    available. A seat whose reviewer already rendered a verdict on the frozen
+    head (`answered`) still covers: the opinion exists, the pause only follows
+    it.
     """
     forbidden_names, forbidden_families = rd.families_of(authors)
     _names, corrector_families = rd.families_of(correctors)
@@ -1643,14 +1650,10 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
         eligible, _reason = rd.reviewer_eligibility(row)
         if not eligible:
             continue
-        # #6664 : un relecteur que le registre dit indisponible ne couvre pas
-        # le siège. Un avis déjà rendu sur la tête gelée reste une preuve.
-        # La pause opérateur est lue comme avant (#2627/#5129) : le sommeil
-        # automatique de la feuille de route reste couvert par la levée de
-        # `_wake_sleeping_reviewers`, et une pause humaine garde son siège
-        # manuel. Une pause budget de jauge, elle, ne se lève pas seule.
-        probe = dict(row, operator_paused=False)
-        if not rd.is_available(probe, closed_hosts=closed) \
+        # #6664/#7174 : un relecteur que le registre dit indisponible (budget,
+        # arrêt, hôte fermé, pause opérateur) ne couvre pas le siège. Un avis
+        # déjà rendu sur la tête gelée reste une preuve.
+        if not rd.is_available(row, closed_hosts=closed) \
                 and name.casefold() not in answered_names:
             continue
         family = rd.live_family(row, families=families)
@@ -3134,9 +3137,27 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
             pilot=pilot, closed_hosts=closed)
         shadow_by_name = {str(candidate.name or "").strip(): candidate
                           for candidate in inputs.candidates or ()}
+        # #7174 : un relecteur disponible de la même famille rend le dormeur
+        # inutile. La désignation le choisit plutôt que de lever un sommeil
+        # (constat #6961 : codex3 disponible alors que cx2 dormait). Les
+        # familles des auteurs et correcteurs, et les sièges déjà acquis, ne
+        # comptent pas : ils ne peuvent pas couvrir le siège manquant.
+        forbidden_names = (rd.names_of(inputs.authors) | rd.names_of(inputs.correctors)
+                           | {str((seat or {}).get("name") or "").strip()
+                              for seat in inputs.manual_seats or ()})
+        forbidden_families = (rd.families_of(inputs.authors)[1]
+                              | rd.families_of(inputs.correctors)[1])
+        available_families = {
+            str(candidate.family or "").strip().lower()
+            for candidate in inputs.candidates or ()
+            if candidate.eligible(forbidden_names=forbidden_names,
+                                  forbidden_families=forbidden_families,
+                                  families=families)}
         for candidate in awake_candidates:
             key = str(candidate.name or "").strip()
             if key in sleeping and key in shadow_by_name:
+                if str(candidate.family or "").strip().lower() in available_families:
+                    continue
                 shadow_by_name[key] = candidate
         shadow = list(shadow_by_name.values())
         # #5136 : la prévision reprend les sièges que la sélection réelle

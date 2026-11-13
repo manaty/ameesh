@@ -303,6 +303,15 @@ class IdleHoursTest(unittest.TestCase):
         self.assertEqual(cap["projects"][0]["wakeable"], 1)
         self.assertEqual(cap["mesh"]["idle_agent_hours"], 6.0)
 
+    def test_a_reviewer_role_counts_no_idle_hours(self):
+        # #7174 : un agent dont la fiche porte le rôle `relecture` n'est pas
+        # une capacité de feuille de route (AUDITEUR.md, « Capacité au
+        # repos ») : il ne compte ni dans les réveillables ni dans les
+        # heures-agent, même sans avis dû à cet instant.
+        cap = measure([agent("a"), agent("rev", roles=["implementation", "relecture"])])
+        self.assertEqual(cap["projects"][0]["wakeable"], 1)
+        self.assertEqual(cap["mesh"]["idle_agent_hours"], 6.0)
+
     def test_an_excluded_family_counts_no_idle_hours(self):
         # #5043 : une famille exclue des prises (#5005) est une capacité
         # volontairement écartée, pas une perte : elle ne compte ni dans les

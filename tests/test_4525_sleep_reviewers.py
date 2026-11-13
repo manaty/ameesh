@@ -188,13 +188,32 @@ class SleepSparesTest(PgTestCase):
         self.assertFalse(by_agent["codex3"]["slept"])
         self.assertTrue(by_agent["codex1"]["slept"])
 
-    def test_without_a_pending_freeze_every_reviewer_can_sleep(self):
+    def test_agents_without_a_reviewer_role_can_sleep(self):
         split = self.make_split()
         work.note(self.db, split, "roadmap: épuisée ameesh (test)", actor="pilote")
         out = self.run_pass(1900)
         sleep = next(g for g in out if g["kind"] == "sleep")
         self.assertEqual(sorted(row["agent"] for row in sleep["agents"] if row["slept"]),
                          ["codex1", "codex2", "codex3", "dev0", "dev1"])
+
+    def test_a_reviewer_role_is_never_slept(self):
+        # #7174 : un agent dont la fiche porte `relecture` n'est pas une
+        # capacité de feuille de route : il n'est jamais endormi, même sans
+        # avis dû à cet instant, pour qu'un gel puisse le désigner.
+        split = self.make_split()
+        work.note(self.db, split, "roadmap: épuisée ameesh (test)", actor="pilote")
+        registry.upsert(self.db, "rev", harness="claude", host=self.cfg.host,
+                        cwd=self.tmp)
+        self.db.execute(
+            "UPDATE agent_registry SET responsible = 'human:alice',"
+            " team = 'ameesh', capabilities = ARRAY['read','propose'],"
+            " roles = ARRAY['implementation','relecture'] WHERE name = 'rev'")
+        listing = self.listing() + [
+            agent("rev", harness="claude", roles=["implementation", "relecture"])]
+        out = self.run_pass(1900, listing)
+        sleep = next(g for g in out if g["kind"] == "sleep")
+        self.assertNotIn("rev", [row["agent"] for row in sleep["agents"]])
+        self.assertFalse(registry.get(self.db, "rev")["operator_paused"])
 
     def test_a_light_freeze_without_review_keeps_no_family_awake(self):
         split = self.make_split()

@@ -236,12 +236,21 @@ class ManualSeatUnitTest(unittest.TestCase):
         self.assertEqual([s["name"] for s in self.seats(
             "m1", status="blocked", text=SHORT)], ["m1"])
 
-    def test_la_pause_operateur_garde_son_siege_manuel(self):
-        # #2627/#5129 : le sommeil de la feuille de route est levé par la
-        # désignation, une pause humaine garde le siège manuel du pilote.
+    def test_la_pause_operateur_ne_couvre_plus_le_siege(self):
+        # #7174 : #2627/#5129 gardaient le siège, en comptant sur la levée du
+        # sommeil par la désignation. Le gel de #6961 a montré le défaut : le
+        # siège manuel d'un relecteur endormi couvrait la famille, donc la
+        # désignation n'appelait pas la levée et la demande partait vers un
+        # agent qui ne la lirait pas. Le siège reste dans la colonne (geste du
+        # pilote) ; il ne couvre plus, et la désignation se replie sur un
+        # relecteur disponible de la même famille ou lève le sommeil.
         self.assertEqual([s["name"] for s in self.seats(
             "m1", status="idle", text="last turn: mail",
-            operator_paused=True)], ["m1"])
+            operator_paused=True)], [])
+        # Un avis déjà rendu sur la tête gelée reste une preuve.
+        self.assertEqual([s["name"] for s in self.seats(
+            "m1", status="idle", text="last turn: mail",
+            operator_paused=True, answered=("m1",))], ["m1"])
 
 
 class SloPauseRelayTest(unittest.TestCase):
