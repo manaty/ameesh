@@ -8,6 +8,7 @@ import sys
 import time
 import threading
 import types
+import threading
 import unittest
 from unittest import mock
 
@@ -67,6 +68,9 @@ class LiveReviewTest(unittest.TestCase):
         executor.host, executor.cfg = 'host', types.SimpleNamespace()
         executor.db = object()
         executor._live_review_after = 0
+        executor._live_turn_ids = lambda: set()
+        executor._resource_close_lock = threading.Lock()
+        executor._resource_closes = {}
         executor._boot_settle_ready = lambda _uptime: True
         rows = [{'id': 1, 'turn_id': 'turn', 'agent': 'a1', 'status': 'orphan',
                  'pgid': 4242, 'started_ts': 1.0, 'containers': []}]
