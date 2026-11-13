@@ -516,7 +516,7 @@ def runner_view(runner_id, name, *, busy=True, status="online", labels=None):
 
 
 def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=None,
-             conclusion=None, labels=None):
+             started_at=None, completed_at=None, conclusion=None, labels=None):
     job = {"name": name, "status": status, "runner_name": runner}
     if conclusion is not None:
         job["conclusion"] = conclusion
@@ -524,6 +524,10 @@ def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=N
         job["id"] = job_id
     if created_at is not None:
         job["created_at"] = created_at
+    if started_at is not None:
+        job["started_at"] = started_at
+    if completed_at is not None:
+        job["completed_at"] = completed_at
     if labels is not None:
         job["labels"] = list(labels)
     return job
@@ -2977,9 +2981,10 @@ class WatcherTest(PgTestCase):
         """#7015 : cinq parts `mesure psql` en file parce que `carte.yml` borne
         sa matrice à 8 (`strategy.max-parallel`), 8 parts déjà en cours et 7
         runners `ameesh-ci` libres : la capacité existe, ce n'est pas une
-        saturation (alerte du 12/11 02:05Z, run carte 43131365562). #7148 : la
-        retenue est bornée à deux SLO de file ; à 20 min elle tient encore et
-        le job ne compte pas."""
+        saturation (alerte du 12/11 02:05Z, run carte 43131365562). #7148 (B
+        de l'auditeur) : les parts en file gardent le `created_at` du run
+        (3720 s) ; la retenue tient parce que des parts de la même exécution
+        ont démarré récemment, pas à cause de l'âge des jobs."""
         horloge = FauxHorloge()
         self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
         labels = ["self-hosted", "linux", "ameesh-ci"]
@@ -2991,11 +2996,12 @@ class WatcherTest(PgTestCase):
         self.api.live = [run]
         self.api.jobs[912] = [
             job_view("mesure psycopg %d/12" % (i + 1),
-                     runner="ameesh-ci-%d" % (i + 1), job_id=9120 + i, labels=labels)
+                     runner="ameesh-ci-%d" % (i + 1), job_id=9120 + i, labels=labels,
+                     started_at=iso(horloge.t - 60 - 120 * i))
             for i in range(8)]
         self.api.jobs[912].extend(
             job_view("mesure psql %d/9" % (i + 1), status="queued", job_id=9130 + i,
-                     created_at=iso(horloge.t - 1200 + i), labels=labels)
+                     created_at=iso(horloge.t - 3720 + i), labels=labels)
             for i in range(5))
         self.watcher.tick(self.db)
         (row,) = storage.of(self.db).ci.queued_oldest()
@@ -3007,12 +3013,47 @@ class WatcherTest(PgTestCase):
         self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
                           if a["type"] == "ci_runner_stuck"], [])
 
-    def test_garde_file_reintegre_un_job_retenu_apres_deux_slo(self):
-        """#7148 (N/P3 de #7015) : la retenue par la propre exécution est
-        bornée à deux SLO de file ; à la borne, le job réintègre la file même
-        si un runner libre porte ses labels et que la matrice tourne encore —
-        le plafond `max-parallel` n'est pas lu, et un blocage de dispatch
-        GitHub doit finir par alerter au lieu de rester muet indéfiniment."""
+    def test_garde_file_ne_compte_pas_une_matrice_apres_une_fin_recente(self):
+        """#7148 : le progrès de l'exécution est aussi une **fin** de job ; une
+        part terminée il y a 5 min retient les parts en file d'une matrice au
+        plafond, même si celles-ci portent le `created_at` du run et que les
+        parts en cours ont démarré il y a plus de deux SLO de file."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        labels = ["self-hosted", "linux", "ameesh-ci"]
+        self.api.runners = [
+            runner_view(21 + i, "ameesh-ci-%d" % (i + 1), busy=i < 8, labels=labels)
+            for i in range(15)]
+        run = run_view(912, "d1" * 20, "main", workflow="carte.yml")
+        run.update({"status": "in_progress", "created_at": iso(horloge.t - 4200)})
+        self.api.live = [run]
+        self.api.jobs[912] = [
+            job_view("mesure psycopg %d/12" % (i + 1),
+                     runner="ameesh-ci-%d" % (i + 1), job_id=9120 + i, labels=labels,
+                     started_at=iso(horloge.t - 3600))
+            for i in range(8)]
+        self.api.jobs[912].append(
+            job_view("mesure psycopg 9/12", status="completed", job_id=9128,
+                     conclusion="success", labels=labels,
+                     started_at=iso(horloge.t - 3900),
+                     completed_at=iso(horloge.t - 300)))
+        self.api.jobs[912].extend(
+            job_view("mesure psql %d/9" % (i + 1), status="queued", job_id=9130 + i,
+                     created_at=iso(horloge.t - 3720 + i), labels=labels)
+            for i in range(5))
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(int(row["queued"]), 0)
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_queue_saturated"], [])
+
+    def test_garde_file_alerte_quand_la_matrice_ne_progresse_plus(self):
+        """#7148 (B de l'auditeur) : la retenue par la propre exécution est
+        bornée par le **progrès** du run, pas par l'âge des jobs. Même matrice
+        au plafond, mêmes parts en file sous le `created_at` du run, mais aucun
+        job de l'exécution n'a démarré ni fini depuis deux SLO de file : le
+        dispatch est gelé, les parts réintègrent la file et l'alerte se lève
+        (le plafond `max-parallel` n'est pas lu)."""
         horloge = FauxHorloge()
         self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
         self.assertEqual(ci.GUARD_QUEUE_HELD_S, 2 * exploitation.CI_QUEUE_SLO_S)
@@ -3025,11 +3066,12 @@ class WatcherTest(PgTestCase):
         self.api.live = [run]
         self.api.jobs[912] = [
             job_view("mesure psycopg %d/12" % (i + 1),
-                     runner="ameesh-ci-%d" % (i + 1), job_id=9120 + i, labels=labels)
+                     runner="ameesh-ci-%d" % (i + 1), job_id=9120 + i, labels=labels,
+                     started_at=iso(horloge.t - 3600))
             for i in range(8)]
         self.api.jobs[912].extend(
             job_view("mesure psql %d/9" % (i + 1), status="queued", job_id=9130 + i,
-                     created_at=iso(horloge.t - ci.GUARD_QUEUE_HELD_S), labels=labels)
+                     created_at=iso(horloge.t - 3720 + i), labels=labels)
             for i in range(5))
         self.watcher.tick(self.db)
         (row,) = storage.of(self.db).ci.queued_oldest()
@@ -3037,7 +3079,7 @@ class WatcherTest(PgTestCase):
         (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
                      if a["type"] == "ci_queue_saturated"]
         self.assertEqual(int(alerte["value"]), 5)
-        self.assertIn("30 min", alerte["detail"])
+        self.assertIn("62 min", alerte["detail"])
         self.assertIn("waiting for a free runner", alerte["detail"])
 
     def test_garde_file_alerte_quand_aucun_runner_libre(self):
