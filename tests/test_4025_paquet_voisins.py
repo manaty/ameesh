@@ -198,6 +198,30 @@ class SelectionHelperTest(unittest.TestCase):
         self.assertIn("tests.test_chaud_rapide",
                       [row["module"] for row in unit["added"]])
 
+    def test_7195_unite_deux_commits_lue_depuis_la_base(self) -> None:
+        # B1 de l'auditeur (#7195) : une unité de deux commits, le premier
+        # change le bloc `chaude` couvert par `test_chaud_rapide`, le second
+        # un autre fichier. `sha^1..sha` ne voit que le second commit et perd
+        # le test attendu ; les blocs et les fichiers se lisent depuis
+        # `merge-base(base, unit)`.
+        self.card(self.base, {
+            "src/pkg/mod.py": {"chaude": {"modules": ["test_chaud_rapide"]}},
+            "src/pkg/autre.py": {"<module>": {"modules": ["test_sans_lien"]}},
+        })
+        self.write("src/pkg/mod.py", SOURCE_V2)
+        self.commit("unité, premier commit")
+        self.write("src/pkg/autre.py", "def autre():\n    return 1\n")
+        self.write("tests/test_autre.py", "X = 1\n")
+        self.write("tests/parts/durees.json", json.dumps({"psycopg": {
+            "test_chaud_rapide": 1.0, "test_sans_lien": 1.0}}))
+        report = self.select(self.commit("unité, second commit"), budget=30)
+        (unit,) = report["units"]
+        modules = [row["module"] for row in unit["added"]]
+        self.assertIn("tests.test_chaud_rapide", modules)
+        self.assertIn("tests.test_sans_lien", modules)
+        self.assertEqual(unit["coverage"]["unmapped_blocks"],
+                         ["src/pkg/autre.py:autre"])
+
     def test_4814_support_partage_borne_par_le_budget(self) -> None:
         # #4814 : `tests/support.py` importé par ~545 modules faisait de la
         # série de l'unité la suite entière ; le support entre au budget, le

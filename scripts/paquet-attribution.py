@@ -46,6 +46,13 @@ que paquet-auto joue en plus des modules propres de l'unité :
   `coverage` nomme les fichiers `src/` hors carte et les blocs non mesurés,
   pour qu'une carte antérieure ne fasse pas croire à une sélection complète.
 
+#7195 (B1) : les fichiers et les blocs d'une unité se lisent depuis le même
+point de départ. Un commit de composition (`paquet-compose.py`) est une
+fusion et garde son premier parent ; une unité de plusieurs commits ordinaires
+se lit depuis `merge-base(base, unit_sha)`, sinon seul son dernier commit
+serait vu. Un fichier changé dont le découpage ne rend aucun bloc retombe sur
+`<module>`, et la couverture le dit si même ce bloc manque.
+
 Une carte absente ou antérieure à `base` est dite dans `card`, sans bloquer.
 
 #4271 — la durée d'un module est celle de `tests/parts/durees.json` de l'arbre
@@ -242,12 +249,74 @@ def _map_blocks():
     return getattr(module, "blocks", None)
 
 
-def changed_blocks(repo: Path, sha: str, path: str, blocks) -> set | None:
-    """Les blocs de `path` que le commit change (nom de la carte), ou None
-    quand le découpage est illisible (l'appelant prend le fichier entier)."""
+def _merge_base(repo: Path, base: str, sha: str) -> str:
+    """#7195 : `merge-base(base, sha)`, le point de départ de l'unité, ou ""."""
+    if not base or not sha:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", base, sha],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return _text(proc.stdout) if proc.returncode == 0 else ""
+
+
+def _parents(repo: Path, sha: str) -> list[str]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "--parents", "-n", "1", sha],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    return _text(proc.stdout).split()[1:]
+
+
+def unit_left(repo: Path, base: str, sha: str) -> str:
+    """#7195 : la gauche du diff des blocs d'une unité.
+
+    Un commit de composition (`paquet-compose.py`) est une fusion : son
+    premier parent est la composition précédente, donc `sha^1..sha` est
+    exactement le delta de l'unité. Un commit d'unité ordinaire (branche de
+    lot) peut porter plusieurs commits : la gauche est alors
+    `merge-base(base, sha)`, le même point de départ que ses fichiers.
+    """
+    parents = _parents(repo, sha)
+    if len(parents) >= 2:
+        return parents[0]
+    return _merge_base(repo, base, sha) or (parents[0] if parents else sha + "^1")
+
+
+def diff_files(repo: Path, left: str, sha: str) -> set[str]:
+    """#7195 : les fichiers changés entre `left` et `sha`."""
+    if not left or not sha:
+        return set()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only", "-z",
+             "--no-renames", left, sha],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    return {_text(name) for name in proc.stdout.split("\0") if _text(name)}
+
+
+def changed_blocks(repo: Path, sha: str, path: str, blocks,
+                   left: str = "") -> set | None:
+    """Les blocs de `path` que l'unité change (nom de la carte), ou None
+    quand le découpage est illisible (l'appelant prend le fichier entier).
+
+    `left` est le point de départ (`unit_left`) ; à défaut `sha^1`, le geste
+    antérieur des commits de composition.
+    """
     if blocks is None:
         return None
-    old, new = _show(repo, sha + "^1", path), _show(repo, sha, path)
+    start = left or sha + "^1"
+    old, new = _show(repo, start, path), _show(repo, sha, path)
     try:
         before = blocks(old)[0] if old is not None else {}
         after = blocks(new)[0] if new is not None else {}
@@ -341,7 +410,7 @@ def _resolve_entry(by_block: dict, name: str) -> tuple[str, dict | None]:
 
 
 def card_candidates(repo: Path, card, sha: str,
-                    files) -> tuple[dict, dict]:
+                    files, left: str = "") -> tuple[dict, dict]:
     """Les modules voisins d'une unité, et ce que la carte ne couvre pas.
 
     Rend `({module: {"blocks": [...], "files": [...]}}, couverture)` : chaque
@@ -349,7 +418,8 @@ def card_candidates(repo: Path, card, sha: str,
     partage le budget entre blocs (#7195). `couverture` nomme les `src/*.py`
     changés absents de la carte (`unknown_paths`) et les blocs qu'elle ne
     mesure pas (`unmapped_blocks`) : une carte antérieure ne peut pas faire
-    croire à une sélection complète.
+    croire à une sélection complète. `left` est le point de départ des blocs
+    (`unit_left`) : une unité de plusieurs commits se lit depuis la base.
     """
     coverage = {"unknown_paths": [], "unmapped_blocks": []}
     raw = (card or {}).get("blocs")
@@ -364,9 +434,14 @@ def card_candidates(repo: Path, card, sha: str,
         if not isinstance(by_block, dict):
             coverage["unknown_paths"].append(path)
             continue
-        names = changed_blocks(repo, sha, path, blocks)
+        names = changed_blocks(repo, sha, path, blocks, left)
         if names is None:
             names = set(by_block)
+        if not names:
+            # #7195 : le fichier change mais le découpage ne rend aucun bloc.
+            # Le module entier reste le seul recours ; si `<module>` manque
+            # aussi, la couverture le dira au lieu de se taire.
+            names = {"<module>"}
         for name in _leaf_blocks(names):
             resolved, entry = _resolve_entry(by_block, name)
             if not isinstance(entry, dict):
@@ -409,7 +484,12 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
               "measured": len(durations), "card": card_durations}
     out_units = []
     for unit in units:
-        files = set(unit.get("files") or ())
+        sha = _text(unit.get("unit_sha"))
+        # #7195 : le point de départ des fichiers et des blocs est le même.
+        # Une unité de plusieurs commits se lit depuis `merge-base(base, sha)`,
+        # pas depuis son seul dernier commit.
+        left = unit_left(repo, base, sha)
+        files = set(unit.get("files") or ()) | diff_files(repo, left, sha)
         own = {match.group(1) for match in map(TEST_FILE_RE.fullmatch, files)
                if match and (repo / match.group(0)).is_file()}
         touched_tests = {path for path in files
@@ -437,8 +517,7 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
             added.append({"module": "tests." + module, "reason": "support",
                           "files": hit, "seconds": round(seconds, 1)})
         dropped = len(supports) - supported
-        found, coverage = (card_candidates(repo, card,
-                                           _text(unit.get("unit_sha")), files)
+        found, coverage = (card_candidates(repo, card, sha, files, left)
                            if card is not None else ({}, {}))
         candidates: dict[str, dict] = {}
         for module, row in found.items():
