@@ -493,9 +493,19 @@ class GrappeCible(Cible):
             )
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", self.table_jalon):
             raise Erreur("grappe : nom de table jalon invalide")
+        # #6863 : la table se crée et se lit sur le primaire du moment, pas sur
+        # le premier nœud déclaré : après une bascule, une invocation suivante
+        # (un scénario par invocation) trouve ce nœud en secours.
+        primaires = [nom for nom in self.noeuds_noms if self.role(nom) == "f"]
+        if len(primaires) != 1:
+            raise Echec(
+                "grappe : un seul primaire attendu pour préparer la table jalon, "
+                "trouvé %s" % (", ".join(primaires) or "aucun")
+            )
+        primaire = primaires[0]
         if self.creer_table_jalon:
             self.sql(
-                self.noeuds[0]["nom"],
+                primaire,
                 "CREATE TABLE IF NOT EXISTS %s ("
                 "id bigserial PRIMARY KEY, scenario text NOT NULL, "
                 "cree_le timestamptz NOT NULL DEFAULT clock_timestamp())"
@@ -505,7 +515,7 @@ class GrappeCible(Cible):
         else:
             try:
                 existe = self.sql(
-                    self.noeuds[0]["nom"],
+                    primaire,
                     "SELECT to_regclass('%s') IS NOT NULL" % self.table_jalon,
                     timeout=10,
                 )

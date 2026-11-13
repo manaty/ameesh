@@ -167,3 +167,38 @@ class PosteHorsScenarioTest(unittest.TestCase):
         self.assertEqual(actions, ["coupure_reseau", "retablissement_reseau"])
         self.assertNotEqual(resultat["verdict"], "blocked")
         self.assertFalse(resultat["preuves"]["fenetre_close_par_arret_du_poste"])
+
+
+class JalonSurLePrimaireTest(unittest.TestCase):
+    """B de docs-01 (#216064) : après perte-primaire, ameesh-agents-1 est
+    secours ; l'invocation suivante doit créer la table jalon sur le primaire
+    du moment, pas sur le premier nœud déclaré."""
+
+    def _cible(self, roles):
+        exercer = _charger_exercer()
+        cible = exercer.GrappeCible(FICHIER)
+        requetes = []
+
+        def sql(nom, requete, timeout=8):
+            requetes.append((nom, requete))
+            if requete.startswith("SELECT pg_is_in_recovery()"):
+                return roles[nom]
+            return "t"
+
+        cible.sql = sql
+        return exercer, cible, requetes
+
+    def test_creation_sur_le_primaire_courant(self):
+        _, cible, requetes = self._cible({"ameesh-agents-1": "t", "ameesh-agents-2": "f",
+                                          "manaty-mesh-1": "t"})
+        cible.preparer_jalon()
+        creations = [nom for nom, r in requetes if r.startswith("CREATE TABLE")]
+        self.assertEqual(creations, ["ameesh-agents-2"])
+
+    def test_aucun_ou_deux_primaires_refuses(self):
+        for roles in ({"ameesh-agents-1": "t", "ameesh-agents-2": "t", "manaty-mesh-1": "t"},
+                      {"ameesh-agents-1": "f", "ameesh-agents-2": "f", "manaty-mesh-1": "t"}):
+            exercer, cible, requetes = self._cible(roles)
+            with self.assertRaises(exercer.Echec):
+                cible.preparer_jalon()
+            self.assertFalse([r for _, r in requetes if r.startswith("CREATE TABLE")])

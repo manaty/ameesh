@@ -1811,9 +1811,10 @@ pc-smichea`, written in the report).
 
 **3. Exercise**, one scenario at a time, `--scenarios <name>`, each in its
 announced window, `ameesh db status` and `patronictl list` before and
-after. The jalon table `public.ep86_jalon` is created on
-`ameesh-agents-1` in the `postgres` database (not `ameesh`): run the first
-scenario while `ameesh-agents-1` is leader.
+after. The jalon table `public.ep86_jalon` is created (or found) on the
+leader of the moment, in the `postgres` database (not `ameesh`); each
+invocation looks the leader up again, so the scenarios can follow one
+another without switching back in between.
 
 ```bash
 python3 deploy/serveur/patroni/banc/exercer.py --cible grappe --geste-reel \
@@ -1828,9 +1829,13 @@ python3 deploy/serveur/patroni/banc/exercer.py --cible grappe --geste-reel \
 | `pc-eteint` | none: the PC is off (owner) and the hub's `ping` proves it | leader and etcd quorum unchanged | none |
 | `deux-noeuds` | loss of the leader and the sync standby; the hub (`nofailover`) survives | the hub does **not** promote (1 etcd voter of 3), no write without quorum, jalon present after both return — the study's documented limit | **writes stop for the whole scenario**: separate window, owner told the duration beforehand |
 
-Also measure the client side once, on `perte-primaire`:
-`verifier-clients.py` with `--tuer` (README Patroni, “Preuve côté client”):
-listener resubscribed, sweep delivered, RPO 0 on confirmed commits.
+Then measure the client side once, as its **own** leader loss (another
+30–60 s, same window rules): `verifier-clients.py` kills the leader itself
+through `--tuer` (README Patroni, “Preuve côté client”), so it is not
+combined with an `exercer.py` run. `--tuer` is the cluster file's
+`perte_noeud` command run over SSH on the current leader; bring that node
+back afterwards with `retour_noeud`. Pass: listener resubscribed, sweep
+delivered, RPO 0 on confirmed commits.
 
 **4. Clean-up and report.** After the last scenario: `patronictl list` back
 to the start state (`patronictl switchover --candidate ameesh-agents-1` if
@@ -1838,8 +1843,9 @@ needed, “Planned switchover”), `DROP TABLE public.ep86_jalon` in the
 `postgres` database on the leader, `ameesh doctor` and `ameesh alerts` on
 the four hosts. The `rapport.json` and `rapport.md` of each scenario, the
 `verifier-clients.py` JSON and the before/after outputs go to lot #6863;
-`limite` is accepted only for `deux-noeuds`, `blocked` anywhere fails the
-lot.
+`limite` (target of 1 min missed, 5 min requirement held; or the
+documented `deux-noeuds` limit) is accepted and written in the report,
+`blocked` anywhere fails the lot.
 
 **5. Canon host cards** (`manaty/home`, reviewed PR, after step 4): the
 cards of `ameesh-agents-1`, `ameesh-agents-2` and `manaty-mesh-1` state the
