@@ -61,6 +61,7 @@ class NexlinkContractTest(unittest.TestCase):
             ".github/workflows/lot-plan.yml",
             ".github/workflows/lot-status.yml",
             "scripts/ci/lot-plan.mjs",
+            "scripts/ci/git-fetch-retry.sh",
         })
         self.assertNotIn(".github/workflows/backend-suite.yml", sources)
 
@@ -438,6 +439,27 @@ class DynamicGitHubTest(unittest.TestCase):
     def test_start_dispatches_only_the_due_suite(self):
         self.ci().start(self.plan)
         self.assertEqual([call[2] for call in self.dispatch], [self.due.path])
+
+    def test_nexlink_audited_fetch_helper_allows_dispatch(self):
+        self.contract = train_contracts.nexlink()
+        self.sources = dict(train_contracts._NEXLINK_SOURCES)
+        with mock.patch.object(self.contract, "resolve", return_value=(self.due,)):
+            self.ci().start(self.plan)
+        self.assertEqual([call[2] for call in self.dispatch], [self.due.path])
+        self.assertTrue(any("/contents/scripts/ci/git-fetch-retry.sh?ref=" in call[-1]
+                            for call in self.calls))
+
+    def test_nexlink_changed_fetch_helper_refuses_before_dispatch(self):
+        """#7246: the real contract also audits the script lot-plan executes."""
+        self.contract = train_contracts.nexlink()
+        self.sources = dict(train_contracts._NEXLINK_SOURCES)
+        self.sources["scripts/ci/git-fetch-retry.sh"] = "f" * 40
+        with mock.patch.object(self.contract, "resolve", return_value=(self.due,)):
+            with self.assertRaisesRegex(
+                    train.TrainError,
+                    r"source differs from audited CI contract: scripts/ci/git-fetch-retry\.sh"):
+                self.ci().start(self.plan)
+        self.assertEqual(self.dispatch, [])
 
     def test_read_requires_every_non_tolerated_job_and_is_green(self):
         self.jobs.extend([
