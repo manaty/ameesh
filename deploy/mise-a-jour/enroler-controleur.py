@@ -122,6 +122,15 @@ def question(operation, bundle, expires_at, *, stop=False):
     return text
 
 
+def deadline(expires_at):
+    """Refuse a window no fresh owner signature covers (#7019); its deadline.
+
+    Only freshly prepared questions are bounded: `render` re-checks stored
+    bytes at execution, where `_proof_live` already decides.
+    """
+    return admin.bootstrap.deadline(expires_at, EnrollmentError)
+
+
 class SignedEnrollmentAuthority(admin.bootstrap.SignedBootstrapAuthority):
     steps, option, options, prefix = ('publish', 'admit', 'start', 'verify'), 'enroll', OPTIONS, PREFIX
 
@@ -256,6 +265,19 @@ class Enrollment:
                     private_path=STAGE + '/' + operation + '/transport/identity',
                     executor_account=turn['account'], executor_uid=executor.pw_uid,
                     turn_sha256=sha(read(turn_path)), backup='excluded; never export; re-enroll if lost')
+
+    def key_question(self, operation):
+        scope = self.key_scope(operation)
+        return dict(scope=scope, question=KEY_PREFIX + canonical(scope), options=KEY_OPTIONS,
+                    deadline=deadline(scope['expires_at']))
+
+    def stop_question(self, operation, expires_at=None):
+        _, bundle, _ = self.load(operation, allow_expired=True)
+        expires = bundle['expires_at'] if expires_at is None else expires_at
+        if expires <= self.clock():
+            raise EnrollmentError('fresh stop decision window required; use --expires-at UNIX_SECONDS')
+        return dict(question=question(operation, bundle, expires, stop=True), options=STOP_OPTIONS,
+                    deadline=deadline(expires))
 
     def keygen(self, operation, decision):
         scope = self.key_scope(operation)
@@ -438,6 +460,8 @@ class Enrollment:
 
     def prepare(self, operation):
         stage, spec, data, values = self.inputs(operation)
+        # Before any write: a window no fresh signature covers is never staged.
+        owner_deadline = deadline(spec['expires_at'])
         self.observe(data)
         if self.system.state().get('ActiveState') not in ('inactive', 'failed'):
             raise EnrollmentError('controller must be stopped before preparation')
@@ -455,7 +479,8 @@ class Enrollment:
                 raise EnrollmentError('prepared bundle changed')
         else:
             admin.Backend.write(target, canonical(bundle))
-        return dict(bundle=bundle, question=question(operation, bundle, spec['expires_at']), options=OPTIONS)
+        return dict(bundle=bundle, question=question(operation, bundle, spec['expires_at']), options=OPTIONS,
+                    deadline=owner_deadline)
 
     def load(self, operation, *, allow_expired=False):
         stage, spec, data, values = self.inputs(operation, allow_expired=allow_expired)
@@ -624,18 +649,13 @@ def main(argv=None):
         native = admin.Backend(system=admin.channel_installer.LinuxChannels(), enrollment=enrollment, db=db)
         tool = Enrollment(native)
         if args[0] == 'key-question':
-            scope = tool.key_scope(args[1])
-            result = dict(scope=scope, question=KEY_PREFIX + canonical(scope), options=KEY_OPTIONS)
+            result = tool.key_question(args[1])
         elif args[0] == 'keygen':
             result = tool.keygen(args[1], int(args[3]))
         elif args[0] == 'prepare':
             result = tool.prepare(args[1])
         elif args[0] == 'stop-question':
-            _, bundle, _ = tool.load(args[1], allow_expired=True)
-            expires = int(args[3]) if len(args) == 4 else bundle['expires_at']
-            if expires <= tool.clock():
-                raise EnrollmentError('fresh stop decision window required; use --expires-at UNIX_SECONDS')
-            result = dict(question=question(args[1], bundle, expires, stop=True), options=STOP_OPTIONS)
+            result = tool.stop_question(args[1], int(args[3]) if len(args) == 4 else None)
         else:
             result = tool.apply(args[1], int(args[3]), stop=args[0] == 'stop')
         print(canonical(result))
