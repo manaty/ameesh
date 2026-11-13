@@ -4611,7 +4611,8 @@
    "provider_credits": "crédits du compte fournisseur (#4164) : état partagé du compte, tenu par les runners du mesh ; l'exécuteur médié passe par le relais",
    "veille": "relevé propre à la veille (#4291) : serveur seulement, l'appareil ne lit ni n'écrit le relevé",
    "turn_observation": "observation des tours et des requêtes (#2167) : document du serveur pour /api/v1, jamais servi à l'exécuteur médié",
-   "repair_signals": "A1 journal privé (#6320) : stockage serveur seulement"
+   "repair_signals": "A1 journal privé (#6320) : stockage serveur seulement",
+   "tenancy": "shared multi-tenant host (#7106): canon sync, host supervisor and tenant runners of the mesh only; a device is never a shared host"
   },
   "operations": {
    "account_windows": [
@@ -5268,6 +5269,15 @@
     "retry_get",
     "retry_attempts",
     "retry_summary"
+   ],
+   "tenancy": [
+    "beat",
+    "bind",
+    "bindings",
+    "policy",
+    "presence",
+    "unbind",
+    "write_policy"
    ]
   }
  },

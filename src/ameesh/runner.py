@@ -11439,6 +11439,35 @@ def _admits_nobody(runner) -> bool:
     return flt is not None and not flt
 
 
+def _tenant_runner(runner) -> bool:
+    """#7106 : cet exécuteur est le runner d'un tenant d'hôte partagé ;
+    l'état machine (canon, relevés, cycle de vie, ménage) est alors au
+    superviseur d'hôte. Fonction et `getattr`, comme `_admits_nobody` : les
+    doublures des tests n'ont pas toujours de configuration."""
+    from . import tenancy
+    cfg = getattr(runner, "cfg", None)
+    tenant = getattr(cfg, "tenant", "") if cfg is not None else ""
+    return isinstance(tenant, str) and bool(tenancy.runner_tenant(cfg))
+
+
+def _tenant_candidates(runner, candidates: list[dict]) -> list[dict]:
+    """#7106 : les agents réclamables que CET exécuteur peut prendre sur un
+    hôte partagé (`tenancy.admits`) ; hôte non partagé : inchangé. Une
+    politique illisible ne filtre pas : la garde reste la base."""
+    if not candidates or getattr(runner, "mediated", False):
+        return candidates  # un appareil médié n'est jamais un hôte partagé
+    from . import tenancy
+    try:
+        policy = tenancy.host_policy(runner.db, runner.host)
+    except db_mod.Unavailable:
+        raise
+    except db_mod.DbError:
+        return candidates
+    if not isinstance(policy, dict) or policy.get("shared") is not True:
+        return candidates
+    return [agent for agent in candidates if tenancy.admits(runner.cfg, policy, agent)]
+
+
 class Runner:
     def __init__(
         self,
@@ -12926,6 +12955,9 @@ class Runner:
         # lit une liste vide comme « tous »)
         candidates = ([] if _admits_nobody(self)
                       else registry.claimable(self.db, self.host, self.agents_filter))
+        # #7106 : sur un hôte partagé, un runner de tenant ne tente que ses
+        # agents, le superviseur aucun (la base refuserait le CAS)
+        candidates = _tenant_candidates(self, candidates)
         # #5601 : avec des réservations, admission par classe puis par date du
         # prochain lot ; sans réservation, l'ordre du registre reste intact
         candidates = self._admission_order(candidates)
@@ -14053,6 +14085,11 @@ class Runner:
         if getattr(self, "mediated", False):
             self._gate_settled.set()
             return  # canon sync is server-side for mediated devices
+        if _tenant_runner(self):
+            # #7106 : le canon de l'hôte partagé est synchronisé par son
+            # superviseur ; le runner d'un tenant lit l'état en base
+            self._gate_settled.set()
+            return
         if not self.cfg.canon:
             self._gate_settled.set()
             return
@@ -14138,8 +14175,32 @@ class Runner:
         """Relève et publie les ressources de l'hôte ; ne lève jamais.
 
         Un relevé ne doit jamais empêcher un tour : toute erreur (poste sans
-        `/proc`, base indisponible) est journalisée et rend None."""
+        `/proc`, base indisponible) est journalisée et rend None.
+
+        #7106 : le runner d'un tenant (`tenant` configuré) ne publie ni relevé
+        ni cycle de vie — c'est l'état machine du superviseur d'hôte ; il bat
+        seulement `runner_presence` et rend None."""
         from . import resources as resources_mod
+        from . import tenancy
+        if tenancy.runner_tenant(self.cfg) and not getattr(self, "mediated", False):
+            beat_db = None
+            try:
+                from .scoped_db import ScopedDb
+                beat_db = ScopedDb(self.cfg, family="runner.scoped.resource")
+                if not tenancy.beat(self.cfg, beat_db):
+                    log_async("tenant %s: no binding names runner %s on %s "
+                              "(ameesh host tenant add --register)"
+                              % (tenancy.runner_tenant(self.cfg), self.cfg.runner,
+                                 self.host))
+            except Exception as exc:  # jamais fatal pour l'exécuteur
+                log_async("tenant presence: beat failed (%s)" % type(exc).__name__)
+            finally:
+                if beat_db is not None:
+                    try:
+                        beat_db.close()
+                    except Exception:
+                        pass
+            return None
         if getattr(self, "mediated", False):
             # L109 : relevé auto-déclaré par la connexion distante (`hosts.record`)
             try:
@@ -14253,7 +14314,11 @@ class Runner:
         #4435: a one-shot executor is the only scanner of its host; it makes
         one explicit bounded pass (no automatic withdrawal) and closes the
         returns it reopened, then hands back.
+
+        #7106 : le cycle de vie d'un hôte partagé est au superviseur.
         """
+        if _tenant_runner(self):
+            return
         if getattr(self, "mediated", False):
             return
         if self.once:
@@ -14977,6 +15042,8 @@ class Runner:
             self._start_thread_expiry_notice()
         if interval <= 0 or self.once or getattr(self, "mediated", False):
             return  # exécuteur médié : pas de base, pas de ménage local (contrat 1.1)
+        if _tenant_runner(self):
+            return  # #7106 : le ménage de l'hôte partagé est au superviseur
 
         def boucle() -> None:
             import random

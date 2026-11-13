@@ -115,10 +115,13 @@ class ConversationMoves(abc.ABC):
 
     @abc.abstractmethod
     def fail(self, move_id: str, *, error: str, owner: str | None = None,
-             epoch: int | None = None) -> dict | None:
+             epoch: int | None = None, only: tuple[str, ...] | None = None) -> dict | None:
         """→ `failed`. Before the switch the source still holds everything:
         only the attempt changes. After it, with the live lease `(owner,
         epoch)` or with no live lease, the lease is released (epoch + 1) and
         the registry row goes back to the source host and folder, its session
         untouched; a launched target turn leaves a notice in the pending
-        prompt. None if the attempt is closed or the caller is fenced out."""
+        prompt. None if the attempt is closed or the caller is fenced out.
+        `only`, when given, restricts the transition to those states: the
+        target's pass fails a preparation only while the attempt is still
+        `planned`, never one a concurrent pass prepared or switched."""

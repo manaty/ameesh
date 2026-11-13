@@ -27,6 +27,9 @@
   ameesh attach-grant request <agent> --host H --device-key K [--tenant T] |
         who <agent> | audit [--agent A]   remote attach grant: 5 min WebAuthn
         grant bound to the station's device key, who may ask, journal (#7119);
+  ameesh attach-relay serve | host …   distant attach relay: mesh-only service,
+        outgoing host connection, X25519/AES-GCM frames, PTY, quotas, content-free
+        logs (#7120) ;
   ameesh auditor tick [--dry-run] [--json]
         the hourly short-pass gate: mails the auditor only when something moved
         (mail, debit --check 2, deadline in the hour, head/gate change), journals
@@ -107,6 +110,8 @@
         durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
+  ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
+        tenants of a shared host: plan, binding, presence (#7106, bureau only);
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh hosts HOST --hold --until 2h --reason R | --release
                                         the owner holds a host on purpose: its
@@ -495,6 +500,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # #5250 (CTX-06) : pilote réversible de la politique d'un agent.
         from . import context_pilot
         return context_pilot.main(rest[1:])
+    if command == "host" and rest[:1] == ["tenant"]:
+        # #7106 (avatar B3) : tenants d'un hôte partagé, geste d'infrastructure
+        from . import tenancy
+        return tenancy.main(rest[1:])
     if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
@@ -594,6 +603,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "attach-grant":
         from . import attach_grant_cli
         return attach_grant_cli.main(rest)
+    if command == "attach-relay":
+        from . import attach_relay_cli
+        return attach_relay_cli.main(rest)
     if command == "process-approvals":
         # #4006 : pont d'approbation GitHub (projection locale fail-closed)
         from . import process_approvals_cli

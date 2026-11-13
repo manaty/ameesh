@@ -59,16 +59,28 @@ def isolation_policy(cfg, canon_id: str | None = None) -> str:
 
 
 def require_isolation(cfg, db, agent: str) -> None:
-    rows = db.query("SELECT canon FROM agent_registry WHERE name = %s", (agent,))
+    rows = db.query("SELECT name, canon, responsible FROM agent_registry WHERE name = %s",
+                    (agent,))
     if not rows:
         raise MemoryError("unknown persona")
     if isolation_policy(cfg, rows[0].get("canon")) == "shared-uid-accepted":
         return
     peers = db.query(
-        "SELECT name FROM agent_registry WHERE host = %s AND name <> %s "
+        "SELECT name, responsible FROM agent_registry WHERE host = %s AND name <> %s "
         "AND (status = 'running' OR (lease_owner IS NOT NULL AND "
         "(lease_expires_at IS NULL OR lease_expires_at > clock_timestamp())))",
         (cfg.host, agent))
+    # #7106 : sur un hôte partagé, les UID sont vérifiés (liaison du tenant
+    # écrite par le superviseur) : des personas de tenants distincts sont
+    # isolées ; même tenant, UID inconnu ou processus sous un autre UID :
+    # refus, comme avant.
+    from . import tenancy
+    if tenancy.host_policy(db, cfg.host).get("shared"):
+        problem = tenancy.isolation_problem(db, cfg.host, rows[0], peers)
+        if problem:
+            raise MemoryError("memory transport disabled on shared host %s: %s"
+                              % (cfg.host, problem))
+        return
     # The registry has no verified per-persona OS UID. All active peers on this
     # host are conservatively treated as sharing the executor's UID; 0700 does
     # not provide isolation between them. Actual UID isolation is separate work.

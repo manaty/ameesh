@@ -9,6 +9,7 @@ Authentificateurs logiciels (tests/webauthn_soft.py), aucun réseau.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import os
 import tempfile
@@ -25,6 +26,8 @@ from .webauthn_soft import ORIGIN, RP_ID, SoftDevice, SoftWebAuthn, make_receipt
 ALICE, BOB, DAN = "human:alice", "human:bob", "human:dan"
 AGENT, HOST, TENANT = "avatar-alice", "ameesh-agents-2", ""
 POLICY = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,))
+#: hash du transcript E2E que la preuve d'appareil lie (D2, #7120)
+TRANSCRIPT = hashlib.sha256(b"ameesh-7119-transcript").digest()
 COMMIT = "a" * 40
 
 
@@ -149,11 +152,12 @@ class RedeemTest(PgTestCase):
         station = station or self.alice_station
         if signature is None:
             chal = receipts.challenge(receipt["request"])
-            signature = station.key.sign(attach_grant.device_message(chal))
+            signature = station.key.sign(attach_grant.device_message(chal, TRANSCRIPT))
         return attach_grant.redeem(
             self.db, receipt, canon=self.canon, agent=agent, host=host, tenant=TENANT,
             device_key=device_key or station.credential_id, device_signature=signature,
-            policy=POLICY, checked_by="runner:ameesh-agents-2")
+            transcript_hash=TRANSCRIPT, policy=POLICY,
+            checked_by="runner:ameesh-agents-2")
 
     def events(self):
         return list(reversed(attach_grant.audit(self.db)))
@@ -226,6 +230,64 @@ class RedeemTest(PgTestCase):
         self.assertRefused(self.redeem(receipt, signature=bare), attach_grant.DEVICE_PROOF)
         # le grant n'a pas été consommé : la bonne preuve passe encore
         self.assertTrue(self.redeem(receipt).ok)
+
+    def test_preuve_d_appareil_liee_au_transcript(self):
+        receipt = self.grant()
+        chal = receipts.challenge(receipt["request"])
+        # preuve signée pour un AUTRE canal E2E : le relais qui terminerait
+        # deux canaux distincts ne peut pas la transposer
+        other = hashlib.sha256(b"un-autre-canal").digest()
+        signature = self.alice_station.key.sign(
+            attach_grant.device_message(chal, other))
+        self.assertRefused(self.redeem(receipt, signature=signature),
+                           attach_grant.DEVICE_PROOF)
+        # le grant n'a pas été consommé : la preuve du bon transcript passe
+        self.assertTrue(self.redeem(receipt).ok)
+
+    def test_verification_de_lecture_du_relais(self):
+        from ameesh import attach_relay_cli
+
+        class Borrowed:
+            """La base du banc, non fermée par le vérificateur du relais."""
+
+            def __init__(self, db):
+                self._db = db
+
+            def __getattr__(self, name):
+                return getattr(self._db, name)
+
+            def close(self):
+                pass
+
+        expected = {"agent": AGENT, "host": HOST, "tenant": TENANT}
+        # le vrai résolveur de canon (load_configured) est exercé ; seule la
+        # connexion est empruntée pour ne pas fermer la base du banc
+        with mock.patch.object(canon_mod, "load_configured",
+                               return_value=[self.canon]):
+            checker = attach_relay_cli._db_grant_checker(
+                POLICY, self.cfg, db_opener=lambda cfg: Borrowed(self.db))
+            receipt = self.grant()
+            ok, code, reason = checker(receipt, expected)
+            self.assertTrue(ok, reason)
+            # le relais ne consomme pas le nonce : une seconde lecture passe
+            self.assertTrue(checker(receipt, expected)[0])
+            self.assertEqual(self.events(), [])
+            # la façade est forcée à WebAuthn : la seule clé d'appareil est refusée
+            device_receipt = self.alice_station.receipt(self.grant()["request"])
+            ok, code, _reason = checker(device_receipt, expected)
+            self.assertFalse(ok)
+            self.assertEqual(code, receipts.FACADE)
+            # la liaison agent/hôte/tenant est vérifiée par le relais
+            ok, code, _reason = checker(receipt, dict(expected, host="autre-hote"))
+            self.assertFalse(ok)
+            self.assertEqual(code, receipts.ATTACH_MISMATCH)
+
+    def test_lecture_du_relais_sans_canon(self):
+        receipt = self.grant()
+        ok, code, _reason = attach_grant.check_receipt(
+            self.db, receipt, canon=None, policy=POLICY,
+            expected={"agent": AGENT, "host": HOST, "tenant": TENANT})
+        self.assertEqual((ok, code), (False, attach_grant.UNKNOWN_AGENT))
 
     def test_cle_d_appareil_ne_signe_pas_son_grant(self):
         request = self.grant()["request"]

@@ -385,9 +385,10 @@ utilisateur d'un hôte partagé). Il est donc envoyé :
   fichier 0600 dans l'état de l'agent dont le chemin est passé dans
   `AMEESH_TURN_CONTEXT` ; jamais dans la ligne de commande ;
 - `turn_context` gagne un champ **additif** `conversation` :
-  `{move_id, from_seq, to_seq, digest, source_host, source_session}` — jamais
-  le texte ; le document est 0600 (`turn_context.py:38-39`) et le writer
-  refuse déjà les secrets connus.
+  `{move_id, from_seq, to_seq, digest, source_host, source_session, file}` —
+  `file` est le chemin 0600 du segment rendu, jamais son texte ; le document
+  est 0600 (`turn_context.py:38-39`) et le writer refuse déjà les secrets
+  connus.
 
 Le premier tour cible est un tour normal pour le `Recorder` : il enregistre
 les entrées du tour (la réponse), pas le segment. L'entrée `state` du

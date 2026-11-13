@@ -175,13 +175,27 @@ class BorneTotaleTest(unittest.TestCase):
         self.assertEqual([run.inconclusive for run in runs],
                          [False, False, True, True])
 
-    def test_en_parallele_l_attente_du_creneau_compte_dans_l_echeance(self) -> None:
-        # relecture cx3 : la borne passe en temps mural à chaque série
+    def test_en_parallele_l_attente_ne_consomme_pas_la_part(self) -> None:
+        # #7195 : une série `heavy` garde sa part d'exécution (`timeout`) ;
+        # l'attente du créneau reste dans l'échéance totale (temps restant).
         local = LocalTests()
         local.run(parallel=4, which="/bin/ameesh", deadline=time.monotonic() + 600)
         self.assertEqual(len(local.walls), 4)
-        self.assertTrue(all(wall is not None and 470 <= wall <= 480
+        self.assertEqual([timeout for _label, timeout in local.calls],
+                         [480, 480, 480, 480])
+        self.assertTrue(all(wall is not None and 595 <= wall <= 600
                             for wall in local.walls), local.walls)
+        self.assertTrue(all(wall > timeout for wall, (_label, timeout)
+                            in zip(local.walls, local.calls)))
+
+    def test_serie_directe_bornee_par_sa_part(self) -> None:
+        # #7195 : sans créneau à attendre, la part borne aussi le temps mural
+        # (les séries parties rendent leur part : 120, 160, 240 puis 480 s).
+        local = LocalTests()
+        local.run(deadline=time.monotonic() + 600)
+        self.assertEqual([timeout for _label, timeout in local.calls],
+                         [120, 160, 240, 480])
+        self.assertEqual(local.walls, [120, 160, 240, 480])
 
     def test_sans_borne_totale_inchange(self) -> None:
         local = LocalTests()

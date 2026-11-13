@@ -39,10 +39,19 @@ que paquet-auto joue en plus des modules propres de l'unité :
   la série la suite entière, jamais finie dans sa borne ;
 * `carte` : les modules que la carte d'impact locale relie aux **blocs**
   `src/` que l'unité change (empreintes de `scripts/map.py`, un bloc nouveau
-  lu à son bloc englobant) ; ceux qui couvrent une fonction ou une classe
-  passent avant ceux qui ne couvrent que `<module>`, puis le moins cher
-  d'abord, dans ce qui reste du `budget` ; le reste, support compris, est
-  compté (`dropped`).
+  lu à son bloc englobant) ; #7195 : le budget se partage entre les blocs
+  changés, les plus rares d'abord (`<module>` en dernier), chacun proposant
+  son test le moins cher à tour de rôle, pour qu'un bloc très couvert ne
+  consomme pas seul la borne ; `dropped` compte les modules non retenus ;
+  `coverage` nomme les fichiers `src/` hors carte et les blocs non mesurés,
+  pour qu'une carte antérieure ne fasse pas croire à une sélection complète.
+
+#7195 (B1) : les fichiers et les blocs d'une unité se lisent depuis le même
+point de départ. Un commit de composition (`paquet-compose.py`) est une
+fusion et garde son premier parent ; une unité de plusieurs commits ordinaires
+se lit depuis `merge-base(base, unit_sha)`, sinon seul son dernier commit
+serait vu. Un fichier changé dont le découpage ne rend aucun bloc retombe sur
+`<module>`, et la couverture le dit si même ce bloc manque.
 
 Une carte absente ou antérieure à `base` est dite dans `card`, sans bloquer.
 
@@ -240,12 +249,74 @@ def _map_blocks():
     return getattr(module, "blocks", None)
 
 
-def changed_blocks(repo: Path, sha: str, path: str, blocks) -> set | None:
-    """Les blocs de `path` que le commit change (nom de la carte), ou None
-    quand le découpage est illisible (l'appelant prend le fichier entier)."""
+def _merge_base(repo: Path, base: str, sha: str) -> str:
+    """#7195 : `merge-base(base, sha)`, le point de départ de l'unité, ou ""."""
+    if not base or not sha:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", base, sha],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return _text(proc.stdout) if proc.returncode == 0 else ""
+
+
+def _parents(repo: Path, sha: str) -> list[str]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "--parents", "-n", "1", sha],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    return _text(proc.stdout).split()[1:]
+
+
+def unit_left(repo: Path, base: str, sha: str) -> str:
+    """#7195 : la gauche du diff des blocs d'une unité.
+
+    Un commit de composition (`paquet-compose.py`) est une fusion : son
+    premier parent est la composition précédente, donc `sha^1..sha` est
+    exactement le delta de l'unité. Un commit d'unité ordinaire (branche de
+    lot) peut porter plusieurs commits : la gauche est alors
+    `merge-base(base, sha)`, le même point de départ que ses fichiers.
+    """
+    parents = _parents(repo, sha)
+    if len(parents) >= 2:
+        return parents[0]
+    return _merge_base(repo, base, sha) or (parents[0] if parents else sha + "^1")
+
+
+def diff_files(repo: Path, left: str, sha: str) -> set[str]:
+    """#7195 : les fichiers changés entre `left` et `sha`."""
+    if not left or not sha:
+        return set()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only", "-z",
+             "--no-renames", left, sha],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    return {_text(name) for name in proc.stdout.split("\0") if _text(name)}
+
+
+def changed_blocks(repo: Path, sha: str, path: str, blocks,
+                   left: str = "") -> set | None:
+    """Les blocs de `path` que l'unité change (nom de la carte), ou None
+    quand le découpage est illisible (l'appelant prend le fichier entier).
+
+    `left` est le point de départ (`unit_left`) ; à défaut `sha^1`, le geste
+    antérieur des commits de composition.
+    """
     if blocks is None:
         return None
-    old, new = _show(repo, sha + "^1", path), _show(repo, sha, path)
+    start = left or sha + "^1"
+    old, new = _show(repo, start, path), _show(repo, sha, path)
     try:
         before = blocks(old)[0] if old is not None else {}
         after = blocks(new)[0] if new is not None else {}
@@ -270,59 +341,126 @@ def read_durations(repo: Path, driver: str) -> dict[str, float]:
             and value >= 0}
 
 
-def _module_seconds(card, module: str, durations: dict | None = None,
-                    card_durations: bool = True) -> float:
-    """#4271 : la durée mesurée pour le pilote, puis celle de la carte si elle
-    vaut pour ce pilote et cette base, sinon `UNKNOWN_DURATION_S`."""
+def _module_price(card, module: str, durations: dict | None = None,
+                  card_durations: bool = True) -> tuple[float, bool]:
+    """#4271 : `(durée, mesurée)` pour le pilote.
+
+    La durée mesurée de `tests/parts/durees.json`, puis celle de la carte si
+    elle vaut pour ce pilote et cette base, sinon `UNKNOWN_DURATION_S` et
+    `False` : le forfait n'est pas une mesure et ne doit pas primer un test
+    dont la durée est connue (#7195).
+    """
     if durations and module in durations:
-        return durations[module]
+        return durations[module], True
     if not card_durations:
-        return UNKNOWN_DURATION_S
+        return UNKNOWN_DURATION_S, False
     entry = ((card or {}).get("modules") or {}).get(module) or {}
-    durations = entry.get("durations") or entry.get("durees") or {}
+    table = entry.get("durations") or entry.get("durees") or {}
     try:
-        if "psycopg" in durations:
-            return float(durations["psycopg"])
-        if durations:
-            return float(max(durations.values()))
+        if "psycopg" in table:
+            return float(table["psycopg"]), True
+        if table:
+            return float(max(table.values())), True
     except (TypeError, ValueError):
         pass
-    return UNKNOWN_DURATION_S
+    return UNKNOWN_DURATION_S, False
 
 
-def card_candidates(repo: Path, card, sha: str, files) -> dict:
-    """{module: (couvre une fonction ou une classe, fichiers)} d'une unité."""
+def _module_seconds(card, module: str, durations: dict | None = None,
+                    card_durations: bool = True) -> float:
+    """#4271 : la durée prêtée à un module (voir `_module_price`)."""
+    return _module_price(card, module, durations, card_durations)[0]
+
+
+def _leaf_blocks(names) -> list[str]:
+    """#7195 : les blocs changés les plus précis.
+
+    `scripts/map.py` rend le bloc changé et ses parents (`<module>`,
+    `Classe`, `methode`) : garder les parents ferait couvrir un module pour
+    un changement voisin et noierait la sélection. Un parent n'est retenu que
+    si aucun de ses enfants n'a changé ; `<module>` seul quand rien de plus
+    précis n'est mesuré.
+    """
+    names = {str(name) for name in names or () if str(name)}
+    precise = {name for name in names if name != "<module>"}
+    leaves = [name for name in precise
+              if not any(other != name and other.startswith(name + ".")
+                         for other in precise)]
+    if leaves:
+        return sorted(leaves)
+    return ["<module>"] if "<module>" in names else []
+
+
+def _resolve_entry(by_block: dict, name: str) -> tuple[str, dict | None]:
+    """L'entrée de carte du bloc changé, ou de son parent le plus proche.
+
+    Un bloc neuf n'est pas mesuré : on remonte `Classe.methode` → `Classe`,
+    puis `<module>` ; l'appelant dit que le bloc précis reste hors carte
+    (#7195) mais garde les tests du parent, plutôt que rien.
+    """
+    parts = name.split("#")[0].split(".")
+    while parts:
+        key = ".".join(parts)
+        entry = by_block.get(key)
+        if isinstance(entry, dict):
+            return key, entry
+        parts = parts[:-1]
+    entry = by_block.get("<module>")
+    return ("<module>", entry) if isinstance(entry, dict) else ("", None)
+
+
+def card_candidates(repo: Path, card, sha: str,
+                    files, left: str = "") -> tuple[dict, dict]:
+    """Les modules voisins d'une unité, et ce que la carte ne couvre pas.
+
+    Rend `({module: {"blocks": [...], "files": [...]}}, couverture)` : chaque
+    module est rattaché aux blocs changés qu'il couvre, pour que `select`
+    partage le budget entre blocs (#7195). `couverture` nomme les `src/*.py`
+    changés absents de la carte (`unknown_paths`) et les blocs qu'elle ne
+    mesure pas (`unmapped_blocks`) : une carte antérieure ne peut pas faire
+    croire à une sélection complète. `left` est le point de départ des blocs
+    (`unit_left`) : une unité de plusieurs commits se lit depuis la base.
+    """
+    coverage = {"unknown_paths": [], "unmapped_blocks": []}
     raw = (card or {}).get("blocs")
     if not isinstance(raw, dict):
-        return {}
+        raw = {}
     blocks = _map_blocks()
-    out: dict[str, list] = {}
+    out: dict[str, dict] = {}
     for path in sorted(files):
         if not (path.startswith("src/") and path.endswith(".py")):
             continue
         by_block = raw.get(path)
         if not isinstance(by_block, dict):
+            coverage["unknown_paths"].append(path)
             continue
-        names = changed_blocks(repo, sha, path, blocks)
+        names = changed_blocks(repo, sha, path, blocks, left)
         if names is None:
             names = set(by_block)
-        for name in sorted(names):
-            entry = by_block.get(name)
-            parts = name.split("#")[0].split(".")
-            while not isinstance(entry, dict) and len(parts) > 1:
-                parts = parts[:-1]
-                entry = by_block.get(".".join(parts))
+        if not names:
+            # #7195 : le fichier change mais le découpage ne rend aucun bloc.
+            # Le module entier reste le seul recours ; si `<module>` manque
+            # aussi, la couverture le dira au lieu de se taire.
+            names = {"<module>"}
+        for name in _leaf_blocks(names):
+            resolved, entry = _resolve_entry(by_block, name)
             if not isinstance(entry, dict):
+                coverage["unmapped_blocks"].append("%s:%s" % (path, name))
                 continue
-            specific = name != "<module>"
+            if resolved != name:
+                # le bloc précis n'est pas mesuré : les tests du parent sont
+                # pris, et la carte est dite incomplète (#7195)
+                coverage["unmapped_blocks"].append("%s:%s" % (path, name))
             for module in entry.get("modules") or ():
                 module = _text(module)
                 if module.startswith("tests."):
                     module = module[len("tests."):]
-                row = out.setdefault(module, [False, set()])
-                row[0] = row[0] or specific
-                row[1].add(path)
-    return {module: (row[0], sorted(row[1])) for module, row in out.items()}
+                row = out.setdefault(module, {"blocks": set(), "files": set()})
+                row["blocks"].add(name)
+                row["files"].add(path)
+    return ({module: {"blocks": sorted(row["blocks"]),
+                      "files": sorted(row["files"])}
+             for module, row in out.items()}, coverage)
 
 
 def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
@@ -346,7 +484,12 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
               "measured": len(durations), "card": card_durations}
     out_units = []
     for unit in units:
-        files = set(unit.get("files") or ())
+        sha = _text(unit.get("unit_sha"))
+        # #7195 : le point de départ des fichiers et des blocs est le même.
+        # Une unité de plusieurs commits se lit depuis `merge-base(base, sha)`,
+        # pas depuis son seul dernier commit.
+        left = unit_left(repo, base, sha)
+        files = set(unit.get("files") or ()) | diff_files(repo, left, sha)
         own = {match.group(1) for match in map(TEST_FILE_RE.fullmatch, files)
                if match and (repo / match.group(0)).is_file()}
         touched_tests = {path for path in files
@@ -365,34 +508,85 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
         # #4814 : un support partagé (`tests/support.py`, importé par ~545
         # modules) ne fait plus de la série de l'unité la suite entière
         supports.sort()
-        spent, dropped = 0.0, 0
+        spent, supported = 0.0, 0
         for seconds, module, hit in supports:
             if spent + seconds > budget:
-                dropped += 1
                 continue
             spent += seconds
+            supported += 1
             added.append({"module": "tests." + module, "reason": "support",
                           "files": hit, "seconds": round(seconds, 1)})
-        ranked = []
-        found = card_candidates(repo, card, _text(unit.get("unit_sha")), files) \
-            if card is not None else {}
-        for module, (specific, hit) in found.items():
+        dropped = len(supports) - supported
+        found, coverage = (card_candidates(repo, card, sha, files, left)
+                           if card is not None else ({}, {}))
+        candidates: dict[str, dict] = {}
+        for module, row in found.items():
             if module in taken or not re.fullmatch(r"test_[A-Za-z0-9_]+", module) \
                     or not (tests_dir / (module + ".py")).is_file():
                 continue
-            seconds = _module_seconds(card, module, durations, card_durations)
-            ranked.append((not specific, seconds, module, hit))
-        ranked.sort()
-        for _broad, seconds, module, hit in ranked:
+            seconds, measured = _module_price(card, module, durations,
+                                              card_durations)
+            candidates[module] = {"seconds": seconds, "measured": measured,
+                                  "blocks": row["blocks"], "files": row["files"]}
+        # #7195 : le budget se partage entre les blocs changés, pas seulement
+        # par ordre de durée. Un bloc rare (peu de tests le couvrent) passe
+        # avant un bloc très couvert ; `<module>` passe en dernier. Chaque
+        # bloc propose son test le moins cher à tour de rôle : un test ciblé
+        # d'un bloc rare n'est plus doublé par des tests d'un bloc voisin.
+        # Les durées mesurées passent avant le forfait `UNKNOWN_DURATION_S` :
+        # un forfait ne doit pas chasser un test ciblé mesuré plus court.
+        by_block: dict[str, list[str]] = {}
+        for module, row in candidates.items():
+            for block in row["blocks"]:
+                by_block.setdefault(block, []).append(module)
+        order = sorted(by_block, key=lambda block: (block == "<module>",
+                                                    len(by_block[block]), block))
+        queues = []
+        for block in order:
+            measured = [name for name in by_block[block]
+                        if candidates[name]["measured"]]
+            unknown = [name for name in by_block[block]
+                       if not candidates[name]["measured"]]
+            measured.sort(key=lambda name: (candidates[name]["seconds"], name))
+            unknown.sort(key=lambda name: (candidates[name]["seconds"], name))
+            queues.append((measured, unknown))
+        selected: set[str] = set()
+
+        def offer(module: str) -> None:
+            nonlocal spent
+            if module in taken or module in selected:
+                return
+            seconds = candidates[module]["seconds"]
             if spent + seconds > budget:
-                dropped += 1
-                continue
+                return
             spent += seconds
+            selected.add(module)
             added.append({"module": "tests." + module, "reason": "carte",
-                          "files": hit, "seconds": round(seconds, 1)})
+                          "files": candidates[module]["files"],
+                          "seconds": round(seconds, 1)})
+
+        def drain(known: bool) -> None:
+            pending = [entry for entry in queues
+                       if (entry[0] if known else entry[1])]
+            while pending:
+                still = []
+                for measured, unknown in pending:
+                    queue = measured if known else unknown
+                    while queue and queue[0] in selected:
+                        queue.pop(0)
+                    if not queue:
+                        continue
+                    still.append((measured, unknown))
+                    offer(queue.pop(0))
+                pending = still
+
+        drain(True)
+        drain(False)
+        dropped += len(candidates) - len(selected)
         out_units.append({"lot": int(unit["lot"]),
                           "unit_sha": _text(unit.get("unit_sha")),
                           "added": added, "dropped": dropped,
+                          "coverage": coverage,
                           "seconds": round(spent, 1)})
     return {"schema": SELECTION_SCHEMA, "status": "ok", "repo": str(repo),
             "slug": slug, "budget": budget, "card": card_prov,
