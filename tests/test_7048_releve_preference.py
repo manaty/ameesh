@@ -216,6 +216,74 @@ class PreferenceRankTest(_RoleCase):
         from ameesh import role_standings_pg as pg
         self.assertIn("pilote", [r["name"] for r in pg.elected_roles(self.db, self.CLOUD)])
 
+    # -- #7059 : défauts non bloquants de la revue #7048 ----------------------
+    # Écriture N-1 de `write_candidate` (avant 0570) : sans `preference_rank`.
+    N1_UPSERT = """
+        INSERT INTO agent_candidates
+            (name, host, canon, cwd, placement_ok, placement_diagnostic,
+             placement_ref, placement_profile, updated_at)
+        SELECT %s, %s, '', %s, true, '', 'canon:placements/test@abc',
+               ameesh_placement_profile(%s, 'claude', NULL, NULL, NULL), now()
+        ON CONFLICT (name, host) DO UPDATE SET
+            canon = excluded.canon,
+            cwd = excluded.cwd,
+            placement_ok = excluded.placement_ok,
+            placement_diagnostic = excluded.placement_diagnostic,
+            placement_ref = excluded.placement_ref,
+            placement_profile = excluded.placement_profile,
+            updated_at = now()
+        """
+
+    def test_ecrivain_n1_ne_touche_pas_au_rang(self):
+        # un canon sync N-1 sur une ligne rangée : le rang survit
+        self.previous_write(self.N1_UPSERT,
+                            ("pilote", self.CLOUD, "/work/" + self.CLOUD, self.CLOUD),
+                            added=("preference_rank",))
+        self.standing("pilote", self.CLOUD, 99.0)
+        self.standing("pilote", self.POSTE, 10.0)
+        ranked = election.candidacy(self.db, "pilote")
+        self.assertEqual([(i["host"], i["preference_rank"], i["rank"]) for i in ranked],
+                         [(self.POSTE, 0, 0), (self.CLOUD, 1, 1)])
+
+    def test_ligne_n1_sans_rang_passe_apres_les_ranges(self):
+        # une ligne neuve écrite par un N-1 n'a pas de rang : NULL, classée après
+        self.db.execute("DELETE FROM agent_candidates WHERE name = 'pilote' AND host = %s",
+                        (self.POSTE,))
+        self.previous_write(self.N1_UPSERT,
+                            ("pilote", self.POSTE, "/work/" + self.POSTE, self.POSTE),
+                            added=("preference_rank",))
+        self.standing("pilote", self.CLOUD, 10.0)
+        self.standing("pilote", self.POSTE, 99.0)
+        ranked = election.candidacy(self.db, "pilote")
+        self.assertEqual([(i["host"], i["preference_rank"], i["rank"]) for i in ranked],
+                         [(self.CLOUD, 1, 0), (self.POSTE, None, 1)])
+
+    def test_garde_de_fusion_reservee_aux_roles_elus(self):
+        from ameesh import role_standings_pg as pg
+        self.assertEqual(pg.election_roles(self.db, self.CLOUD), [])
+        self.db.execute("UPDATE agent_registry SET releve = 'election' WHERE name = 'pilote'")
+        self.assertEqual([r["name"] for r in pg.election_roles(self.db, self.CLOUD)],
+                         ["pilote"])
+
+    def test_doctor_ignore_un_candidat_d_avatar(self):
+        from ameesh import forge_checks
+        cfg = self.cfg.__class__(**{**self.cfg.__dict__, "host": self.CLOUD})
+        ko, lines = forge_checks.doctor_lines(cfg, self.db, gh=object())
+        self.assertFalse(ko)
+        self.assertIn("not a candidate host of an elected role", lines[0])
+
+    def test_role_status_liste_et_affiche_la_preference(self):
+        self.assertIn("pilote", election.elected_names(self.db))
+        self.standing("pilote", self.CLOUD, 99.0)
+        self.standing("pilote", self.POSTE, 10.0)
+        report = election.status(self.db, "pilote")
+        self.assertTrue(report["elected"])
+        lines = election.format_status(report)
+        self.assertIn("releve: preference", lines[0])
+        self.assertNotIn("not an elected role", "\n".join(lines))
+        self.assertTrue(any(self.POSTE in line and "(pref 0)" in line for line in lines),
+                        lines)
+
 
 if __name__ == "__main__":
     unittest.main()
