@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#7149 : la boîte d'un agent mené par l'exécuteur n'est pas lisible par un autre.
+"""#7149 : la boîte d'un agent mené par l'exécuteur n'est pas lue comme sienne.
 
 Incident : un watcher du bureau a lu en SQL direct le courrier de claude2
 (64 messages depuis le 10/11) et en a traité trois comme siens.  La remise
-agent-mail n'était pas en cause ; ces gardes ferment les chemins CLI de
-lecture croisée : une identité annoncée qui contredit la liaison de la session
-est refusée, et `inbox`/`show` refusent le courrier d'un agent `execute` à qui
-n'y est pas lié.
+agent-mail n'était pas en cause ; ces gardes ferment les chemins CLI où une
+identité se réclame de la boîte : une identité annoncée qui contredit la
+liaison de la session est refusée, et `inbox` sans nom / `show` refusent le
+courrier d'un agent `execute` à une identité qui n'y est pas liée. Une lecture
+nommée (`inbox <nom>`) reste, elle, une lecture de diagnostic : elle n'accorde
+rien et ne consomme rien (docs/V1-MAILBOX-RUNNER.md) — la refuser cassait
+`test_l61_allers_retours.test_mail_inbox` et le contrat de la commande.
 """
 from __future__ import annotations
 
@@ -32,11 +35,16 @@ class InboxIdentityTest(PgTestCase):
         mail.send(self.db, "sender", "persona", "courrier de persona")
         mail.send(self.db, "sender", "bureau", "courrier du bureau")
 
-    def test_another_execute_box_is_refused_by_name(self):
+    def test_another_execute_box_is_read_by_name_without_consuming(self):
+        # #7149 (regel) : nommer la boîte est une lecture de diagnostic, pas
+        # une revendication d'identité ; elle n'accorde rien et ne consomme
+        # rien (docs/V1-MAILBOX-RUNNER.md, `inbox <nom>`). Le message reste
+        # non remis pour la session liée à victim.
+        avant = [m["id"] for m in mail.unread(self.db, "victim")]
         proc = self.cli("inbox", "victim")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn("driven by its executor", proc.stderr)
-        self.assertNotIn("secret pour victim", proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("secret pour victim", proc.stdout)
+        self.assertEqual([m["id"] for m in mail.unread(self.db, "victim")], avant)
 
     def test_another_execute_box_is_refused_with_inherited_name(self):
         proc = self.cli("inbox", env=self.env(AGENT_MAIL_NAME="victim"))
