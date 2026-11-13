@@ -118,8 +118,9 @@ CALLER_BUDGET_S = 420.0
 #: sous le même ``FREEZE_TIMEOUT`` de 600 s du compositeur. Les deux étapes
 #: partagent cette échéance au lieu d'additionner leurs plafonds (300 + 420) ;
 #: la marge de 30 s couvre le démarrage du processus et la sortie.
-#: #7161 : l'attente d'un créneau heavy est hors de cette échéance
-#: (`Deadline.pause`) ; elle allonge le mur du geste, jamais le travail.
+#: #7161 : l'attente d'un créneau heavy est hors du budget de travail
+#: (`Deadline.pause`), jamais au-delà de la borne murale de l'appelant : la
+#: prévalidation rend « en file » avant que le compositeur ne tue la commande.
 FREEZE_BUDGET_S = 570.0
 
 
@@ -129,11 +130,20 @@ def caller_deadline(budget: float | None = None, clock=time.monotonic,
 
     ``limit`` (#4073) plafonne le budget par le temps qui reste d'une échéance
     déjà commencée — celle du gel entier, contrôles statiques compris.
+
+    #7161 : la borne murale du geste appelant est transmise à part
+    (``Deadline.wall``) ; l'attente d'un créneau heavy peut être suspendue du
+    budget de travail, jamais du temps avant cette borne. Sans ``limit``, le
+    geste est composé sous les 600 s du compositeur, comme le gel.
     """
     seconds = CALLER_BUDGET_S if budget is None else float(budget)
     if limit is not None:
         seconds = min(seconds, limit.remaining())
-    return Deadline(max(0.0, seconds), clock=clock)
+        wall = limit.at
+    else:
+        seconds = max(0.0, seconds)
+        wall = clock() + max(FREEZE_BUDGET_S, seconds)
+    return Deadline(seconds, clock=clock, wall=wall)
 
 
 def freeze_deadline(clock=time.monotonic) -> Deadline:
@@ -142,7 +152,8 @@ def freeze_deadline(clock=time.monotonic) -> Deadline:
     Elle commence avant les contrôles statiques et se partage entre eux et la
     prévalidation, pour que la commande rende la main sous les 600 s du
     compositeur (``FREEZE_TIMEOUT`` de paquet-auto, ``COMMAND_TIMEOUT`` de
-    paquet-horaire).
+    paquet-horaire). Sa borne murale est le geste entier : la prévalidation
+    n'en hérite que le temps qui reste.
     """
     return Deadline(FREEZE_BUDGET_S, clock=clock)
 
@@ -150,12 +161,16 @@ def freeze_deadline(clock=time.monotonic) -> Deadline:
 #: #7161 — la prévalidation passe par la file des suites lourdes de l'hôte
 #: (`ameesh heavy`, L131) : au plus `max_heavy_suites` en parallèle, comme une
 #: suite. Un gel qui attend son tour est « en file » : l'attente est suspendue
-#: de son échéance (`Deadline.pause`) et n'est jamais un `run-incomplete`.
+#: du budget de travail (`Deadline.pause`) et n'est jamais un `run-incomplete`.
 #: Passé ce délai, la prévalidation est rendue « en file » sans run ; le gel,
 #: lui, est déjà écrit et n'est pas défait.
 PREVALIDATION_QUEUE_S = 900.0
 #: le même délai, réglable pour les bancs et les témoins
 PREVALIDATION_QUEUE_ENV = "AMEESH_PREVALIDATION_QUEUE_S"
+#: #7161 : marge gardée avant la borne murale de l'appelant pour rendre
+#: « en file » (écriture du journal, sortie du processus) ; même marge que
+#: celle de ``FREEZE_BUDGET_S`` sous les 600 s du compositeur.
+PREVALIDATION_QUEUE_MARGIN_S = 30.0
 
 
 def queue_wait_seconds() -> float:
@@ -168,6 +183,19 @@ def queue_wait_seconds() -> float:
     return value if value >= 0 else PREVALIDATION_QUEUE_S
 
 
+def queue_bound_seconds(deadline: Deadline | None = None) -> float:
+    """#7161 — l'attente maximale d'un créneau, jamais au-delà du mur appelant.
+
+    Le budget de travail peut être rendu après l'attente (``Deadline.pause``),
+    mais la commande extérieure a une borne murale (570 s de gel, 600 s du
+    compositeur) : on rend « en file » avant, jamais après.
+    """
+    bound = queue_wait_seconds()
+    if deadline is not None:
+        bound = min(bound, deadline.wall_remaining() - PREVALIDATION_QUEUE_MARGIN_S)
+    return max(0.0, bound)
+
+
 def _queue_note(text: str) -> None:
     print("prévalidation en file : %s" % text, file=sys.stderr, flush=True)
 
@@ -177,21 +205,23 @@ def heavy_queue(cfg, command: str, *, say=None,
                 deadline: Deadline | None = None):
     """#7161 — tient un créneau de la file heavy de l'hôte pendant le passage.
 
-    Rend le temps d'attente en secondes. L'échéance du passage est suspendue
-    pendant cette attente : le run qui suit garde le budget qu'il avait, et
-    l'attente n'est jamais comptée comme un `run-incomplete`. Sans créneau
-    dans [`PREVALIDATION_QUEUE_S`], lève `queued` : la prévalidation est « en
-    file », le gel reste écrit."""
+    Rend le temps d'attente en secondes. L'attente est suspendue du budget de
+    travail (`Deadline.pause`) : le run qui suit garde le budget qu'il avait,
+    et l'attente n'est jamais comptée comme un `run-incomplete`. Elle reste
+    bornée par le mur de l'appelant : sans créneau dans
+    [`PREVALIDATION_QUEUE_S`] ou avant ce mur, lève `queued` : la prévalidation
+    est « en file », le gel reste écrit."""
     from . import heavy
 
     if cfg is None or not str(getattr(cfg, "state_dir", "") or ""):
         yield 0.0
         return
-    started = time.monotonic()
+    clock = deadline.clock if deadline is not None else time.monotonic
+    started = clock()
     log = _queue_note if say is None else say
     held = heavy.acquire(cfg, command=command, log=log,
-                         max_wait_s=queue_wait_seconds())
-    waited = time.monotonic() - started
+                         max_wait_s=queue_bound_seconds(deadline))
+    waited = clock() - started
     if held is None:
         raise prevalidation.PrevalidationError(
             "queued",
@@ -999,8 +1029,9 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
     l'échéance (``--wait-timeout``) et le geste rend ``run-incomplete``
     (« timeout ») dans le délai de l'appelant. #7161 : la prévalidation prend
     un créneau de la file heavy de l'hôte avant son travail lourd (plan,
-    snapshot, run) ; le temps d'attente de ce créneau est suspendu de
-    l'échéance, il n'est jamais un ``run-incomplete``.
+    snapshot, run) ; le temps d'attente de ce créneau est suspendu du budget
+    de travail, il n'est jamais un ``run-incomplete``, mais la commande rend
+    « en file » avant la borne murale de l'appelant (``Deadline.wall``).
     """
     profile = (profile or project or "").strip()
     params = parameters(cfg, project, deadline=deadline)

@@ -74,7 +74,7 @@ class QueueTest(unittest.TestCase):
         one = SimpleNamespace(state_dir=self.cfg.state_dir, max_heavy_suites=1)
         held = heavy.acquire(one, command="suite")
         self.release_later(held)
-        deadline = Deadline(5.0)
+        deadline = Deadline(5.0, wall=time.monotonic() + 60.0)
         with calls.heavy_queue(one, "prévalidation #7161", say=lambda text: None,
                                deadline=deadline) as waited:
             self.assertGreaterEqual(waited, 0.3)
@@ -121,7 +121,8 @@ class QueueTest(unittest.TestCase):
             try:
                 results.append(calls.run(
                     cfg, None, 7161, repo="/repo", head="a" * 40, base="b" * 40,
-                    project="ameesh", record=False, deadline=Deadline(30.0)))
+                    project="ameesh", record=False,
+                    deadline=Deadline(30.0, wall=time.monotonic() + 120.0)))
             except Exception as exc:  # noqa: BLE001 - le fil rend son échec
                 results.append(exc)
 
@@ -162,7 +163,7 @@ class QueueTest(unittest.TestCase):
                 mock.patch.object(calls, "_run_hosts", side_effect=fake_run_hosts):
             report = calls.run(cfg, None, 7161, repo="/repo", head="a" * 40,
                                base="b" * 40, project="ameesh", record=False,
-                               deadline=Deadline(1.5))
+                               deadline=Deadline(1.5, wall=time.monotonic() + 60.0))
         self.assertTrue(report.get("ok"))
         self.assertGreaterEqual(report.get("queue_wait_s", 0), 0.3,
                                 "la preuve dit que la prévalidation a attendu")
@@ -193,13 +194,56 @@ class QueueTest(unittest.TestCase):
     def test_the_timeout_reason_keeps_the_caller_budget_after_a_wait(self):
         """Le motif nomme le budget reçu, pas le temps de mur gonflé par l'attente."""
         now = [100.0]
-        deadline = Deadline(90.0, clock=lambda: now[0])
+        deadline = Deadline(90.0, clock=lambda: now[0], wall=now[0] + 2000.0)
         deadline.pause(600.0)
         now[0] = 800.0
         self.assertTrue(deadline.expired())
         why = calls._timed_out(deadline, "run")
         self.assertIn("budget de l'appelant (90 s)", why)
         self.assertNotIn("(700 s)", why)
+
+    def test_a_wait_past_the_freeze_wall_returns_queued_under_the_composer_timeout(self):
+        """Créneaux pris au-delà du mur du gel : « en file » rendu avant 570 s.
+
+        Chemin réel de la porte : `gate_packet` -> `run`, avec l'échéance d'un
+        gel (contrôles statiques déjà passés), horloge simulée et créneaux qui
+        restent pris. Sans la borne murale, l'attente irait jusqu'aux 900 s de
+        la file et le compositeur tuerait la commande à 600 s (#40078/#40089)."""
+        now = [1000.0]
+        clock = lambda: now[0]
+        freeze = calls.freeze_deadline(clock=clock)
+        now[0] += 40.0                 # les contrôles statiques du gel
+        deadline = calls.caller_deadline(clock=clock, limit=freeze)
+        seen: dict = {}
+
+        def busy(cfg, *, command="", log=None, max_wait_s=None, **kwargs):
+            seen["bound"] = max_wait_s
+            now[0] += float(max_wait_s or 0.0)   # aucun créneau ne se libère
+            return None
+
+        cfg = SimpleNamespace(state_dir=self.cfg.state_dir, max_heavy_suites=2)
+        params = calls.Parameters(params=block(hosts=("vm1",)), repo="/canon",
+                                  commit="c" * 40, project="ameesh")
+        item = {"id": 7161, "app": "ameesh", "branch": "lot/7161-x"}
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_PREVALIDATION_QUEUE_S": "900"}), \
+                mock.patch.object(calls, "parameters", return_value=params), \
+                mock.patch.object(calls, "tooling"), \
+                mock.patch.object(calls, "map_for", return_value=("", "")), \
+                mock.patch.object(calls, "composer_tested", return_value=None), \
+                mock.patch.object(calls, "repository", return_value="/repo"), \
+                mock.patch.object(calls, "prepare") as prepare, \
+                mock.patch.object(heavy, "acquire", side_effect=busy):
+            got = calls.gate_packet(cfg, None, item,
+                                    {"sha": "a" * 40, "base": "b" * 40},
+                                    deadline=deadline)
+        prepare.assert_not_called()
+        self.assertEqual(got.get("state"), "unavailable")
+        self.assertEqual(got.get("cause"), "queued")
+        # l'attente est bornée par le mur du gel, pas par les 900 s de la file
+        self.assertLessEqual(seen["bound"], 500.0)
+        self.assertLessEqual(now[0] - 1000.0, calls.FREEZE_BUDGET_S)
+        self.assertLess(now[0] - 1000.0, 600.0)   # FREEZE_TIMEOUT du compositeur
 
 
 if __name__ == "__main__":
