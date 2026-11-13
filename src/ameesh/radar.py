@@ -1582,9 +1582,10 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     preuve API fraîche, aucun remplacement et aucun vert d'intégration.
     `ci_green` reste un prédicat pur ; les lecteurs lui passent ce rollup.
 
-    #6960 : un run annulé dont tous les checks du portier ont conclu sans
-    échec est admis même sans check CANCELLED — l'annulation demandée par
-    `ameesh ci run` (#2876) peut être traitée après la fin des jobs.
+    #6960 : un run annulé dont tous les checks du portier ont conclu sur
+    l'une des conclusions admises (SUCCESS, SKIPPED, NEUTRAL) est admis même
+    sans check CANCELLED — l'annulation demandée par `ameesh ci run` (#2876)
+    peut être traitée après la fin des jobs.
     """
     from datetime import datetime
     from urllib.parse import urlencode
@@ -1710,11 +1711,14 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     # l'annulation est traitée après la fin de ses jobs, le run conclut
     # « cancelled » sans qu'aucun check ne soit CANCELLED (couverture
     # SUCCESS, suite SKIPPED). Un run ainsi terminé, dont tous les checks du
-    # portier ont conclu sans échec, est le même remplacement : la preuve de
-    # validation reste le run PR vert de la même tête, fini après.
+    # portier ont conclu sur l'une des conclusions admises (SUCCESS,
+    # SKIPPED, NEUTRAL), est le même remplacement : la preuve de validation
+    # reste le run PR vert de la même tête, fini après. Toute autre
+    # conclusion (TIMED_OUT, STARTUP_FAILURE, …) n'établit aucune preuve et
+    # bloque (#6982).
     if not any(c.get("conclusion") == "CANCELLED" for c in own) and any(
             str(c.get("status") or "").upper() != "COMPLETED"
-            or str(c.get("conclusion") or "").upper() == "FAILURE"
+            or str(c.get("conclusion") or "").upper() not in CI_OK
             for c in packet):
         return blocked()
     ends = [finished(c) for c in all_packet]
