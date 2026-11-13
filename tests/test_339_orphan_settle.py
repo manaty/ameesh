@@ -7,13 +7,14 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import unittest
 import uuid
 from unittest import mock
 
-from ameesh import containers, exploitation, platform, resources, runner as runner_mod, storage
+from ameesh import containers, db as db_mod, exploitation, platform, resources, runner as runner_mod, storage
 from ameesh.runner import Runner
 
 from .support import PgTestCase
@@ -45,8 +46,9 @@ class SettleDeadTurnsTest(PgTestCase):
                             (age_s, age_s, turn))
         return turn
 
-    def _review(self, runtime=None, uptime=86400.0, scan=None, engines=None) -> list:
-        runner = Runner(self.cfg, self.db, once=True)
+    def _review(self, runtime=None, uptime=86400.0, scan=None, engines=None,
+                runner=None) -> list:
+        runner = runner or Runner(self.cfg, self.db, once=True)
         if engines is None:
             engines = ([runtime] if runtime is not None else [], [])
         if scan is None:
@@ -99,6 +101,59 @@ class SettleDeadTurnsTest(PgTestCase):
         self.assertIn(sans, soldes)
         self.assertNotIn(avec, soldes)
         self.assertEqual(self.turns.get(avec)["status"], "orphan")
+
+    def test_failed_close_retried_with_its_verdict_and_alert_cleared(self):
+        turn = self._row('retry', pgid=self.mort,
+                         age_s=2 * exploitation.ORPHAN_GRACE_S)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = runner_mod.AgentWorker.__new__(runner_mod.AgentWorker)
+        threading.Thread.__init__(worker)
+        worker.runner, worker.db, worker.name = runner, self.db, 'a1'
+        close = self.turns.close_turn
+        attempts = []
+
+        def flaky(ident, **kwargs):
+            attempts.append((ident, kwargs))
+            if len(attempts) == 1:
+                raise db_mod.Unavailable('database is shutting down')
+            return close(ident, **kwargs)
+
+        store = mock.Mock(turn_resources=self.turns)
+        with mock.patch('ameesh.runner.storage.of', return_value=store), \
+                mock.patch.object(self.turns, 'close_turn', side_effect=flaky), \
+                mock.patch.object(runner, 'container_runtime', return_value=None), \
+                mock.patch('ameesh.turn_processes.group_running', return_value=False), \
+                mock.patch.object(runner_mod.time, 'monotonic', return_value=100):
+            worker._release_resource(turn, self.mort)
+            self.assertEqual(self.turns.get(turn)['status'], 'running')
+            self.assertEqual(runner.retry_resource_closes(), 0)  # backoff
+        self.assertIn(turn, [a['turn'] for a in exploitation.alerts(self.cfg, self.db)
+                             if a['type'] == 'orphan_resource'])
+        self.assertEqual(self._review(runner=runner), [])  # queued verdict owns the row
+        with mock.patch.object(runner_mod.time, 'monotonic', return_value=102):
+            self.assertEqual(runner.retry_resource_closes(), 1)
+        # The real driver settles the row even though the first write failed.
+        self.assertEqual(self.turns.get(turn)['status'], 'done')
+        self.assertFalse(runner._resource_closes)
+        self.assertEqual(attempts, [(turn, dict(orphan=False, containers=None))])
+        self.assertNotIn(turn, [a['turn'] for a in exploitation.alerts(self.cfg, self.db)
+                               if a['type'] == 'orphan_resource'])
+
+    def test_local_live_or_unreadable_tracking_never_settles(self):
+        turn = self._row('tracked', pgid=self.mort, status='orphan')
+        with mock.patch.object(Runner, '_live_turn_ids', return_value={turn}):
+            self.assertEqual(self._review(), [])
+        with mock.patch.object(Runner, '_live_turn_ids', return_value=None):
+            self.assertEqual(self._review(), [])
+        self.assertEqual(self.turns.get(turn)['status'], 'orphan')
+
+    def test_populated_or_unreadable_cgroup_keeps_the_row(self):
+        turn = self._row('cgroup', pgid=self.mort, status='orphan')
+        self.turns.attach_cgroup(turn, '/unit/turn-test')
+        with mock.patch('ameesh.platform.turn_cgroup.gone_or_empty', return_value=False):
+            self.assertEqual(self._review(), [])
+        with mock.patch('ameesh.platform.turn_cgroup.gone_or_empty', return_value=True):
+            self.assertEqual(self._review(), [turn])
 
     def test_silent_engine_settles_nothing(self):
         turn = self._row("me", pgid=self.mort, status="orphan")

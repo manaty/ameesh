@@ -2,6 +2,7 @@
 """#1266: unreadable processes are compared with the whole turn interval."""
 from __future__ import annotations
 
+import threading
 import unittest
 from unittest import mock
 
@@ -23,6 +24,9 @@ class UnreadableTurnWindowTest(unittest.TestCase):
         self.runner = Runner.__new__(Runner)
         self.runner.host, self.runner.cfg, self.runner.db = "test-host", mock.Mock(), mock.Mock()
         self.runner._live_review_after = 0
+        self.runner._live_turn_ids = lambda: set()
+        self.runner._resource_close_lock = threading.Lock()
+        self.runner._resource_closes = {}
         self.runner._boot_settle_ready = mock.Mock(return_value=True)
         self.runner._running_containers = mock.Mock(return_value={})
         self.turns = mock.Mock()

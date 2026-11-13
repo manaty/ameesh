@@ -484,6 +484,12 @@ python3 deploy/mise-a-jour/bascule.py activer \
   --venv ~/.local/share/ameesh/venv --version <sha7> [--precedent <sha7>]
 ```
 
+Sous le compte de l'exécutant de staging, `activer` et `retour` réécrivent
+aussi les empreintes `expected_sha256` de
+`~/.config/ameesh/staging-executor.json` dans le même geste (#7212, voir
+« Venv de l'exécutant ») ; `--staging-config` nomme un autre fichier. Sur les
+autres comptes (runners, poste, VM) aucun fichier de ce nom n'est touché.
+
 `preparer` crée le venv avec l'invite fixe `ameesh` (N2), installe depuis le
 wheelhouse local sans index (`--no-index`, `--require-hashes`,
 `--only-binary=:all:`, `--no-compile`, `PYTHONDONTWRITEBYTECODE=1`), écrit le
@@ -1023,6 +1029,25 @@ qui le tient à jour (#7164, ci-dessous). La qualification lit la version
 réellement lancée (`venv-courant` et `MainPID`), jamais celle qu'on croit
 installée.
 
+**Chaque bascule réépingle l'exécutant (#7212).** `activer` et `retour`
+réécrivent, dans la configuration privée du compte
+(`~/.config/ameesh/staging-executor.json`, ou le fichier nommé par
+`--staging-config`), les seules entrées `expected_sha256` qui nomment le venv
+changé : un chemin `venv-<version>` passe au venv vivant, un chemin stable
+`venv-courant/…` garde sa racine. La clé suit le chemin réellement lancé,
+version Python comprise (`lib/python3.12` → `lib/python3.13`), et l'empreinte
+est recalculée avec la même règle que l'exécutant (arbre du paquet,
+`__pycache__` exclu). Les autres entrées (sonde de quiescence, scripts) ne
+bougent pas. Le calcul et le contrôle se font **avant toute mutation**
+(adoption, rename, lanceurs) ; un refus (entrée sans correspondance dans le
+nouveau venv, JSON illisible, fichier d'un autre compte) laisse la bascule et
+la configuration intactes. Un échec d'écriture ramène le lien au venv
+précédent sans avoir retiré les lanceurs de la version quittée : la bascule et
+son épingle sont un seul geste. La mise à jour automatique #7164
+en hérite ; une bascule manuelle du venv de l'exécutant doit donc se faire
+avec le `bascule.py` du commit posé, sous le compte (c'est ce qui manquait au
+geste du 13/11 01:1xZ, qui a laissé l'épingle sur `venv-97285a0`).
+
 **Mise à jour du venv par l'exécutant (#7164).** Sans elle, un correctif de
 l'exécutant (#7053) restait sans effet : rien ne déclenchait ni ne signalait
 le geste. Le bloc facultatif `venv_update` de sa configuration l'active :
@@ -1055,9 +1080,11 @@ scellée (#5711) et jamais l'index :
    la passe suivante le prend sans autre geste ;
 3. `bascule.py preparer` avec les quatre options verrouillées et `activer
    --precedent <version vivante>`, pris comme les outils de l'étape 2 dans
-   l'arbre du commit déployé ;
+   l'arbre du commit déployé ; `activer` réépingle `expected_sha256` sur le
+   nouveau venv dans le même geste (#7212) ;
 4. lance `venv-courant/bin/python -I -m ameesh.staging_executor --help` :
-   un échec est un `retour` (`rolled back`) ; un succès fait de ce paquet
+   un échec est un `retour` (`rolled back`, qui réépingle sur le venv
+   précédent) ; un succès fait de ce paquet
    `work/paquet-courant` et retire les plus anciens.
 
 Le processus en cours garde son venv ; la minuterie suivante démarre le
@@ -1177,7 +1204,12 @@ entrée non fiable :
   refus `fingerprint: …`, sans aucun geste. La clé facultative
   `expected_sha256` de `staging-executor.json` (chemin absolu → SHA256)
   fait refuser toute empreinte différente, ou un chemin déclaré que la
-  séquence ne lance pas ; absente, on consigne sans refuser.
+  séquence ne lance pas ; absente, on consigne sans refuser. Cette épingle
+  suit le venv vivant (#7212) : une bascule de l'exécutant la réécrit dans
+  le même geste (voir « Venv de l'exécutant »), un chemin stable
+  `venv-courant/…` est admis et garde son chemin, l'empreinte étant
+  recalculée. Le réépinglage ne couvre que le changement de venv : un octet
+  modifié dans le venv courant reste refusé.
 
 Le programme `quiescence_probe` doit prouver l'arrêt de l'ancien exécutant
 et de ses opérations distantes, y compris les unités transitoires du poste.

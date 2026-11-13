@@ -201,6 +201,20 @@ class CheminsTest(FausseMontureTest):
 
 
 class FauxCgroupTest(FausseMontureTest):
+    def test_resource_settlement_requires_gone_or_readably_empty_cgroup(self):
+        path = '/runner/turn-settle'
+        self.assertTrue(turn_cgroup.gone_or_empty(path, root_dir=self.base))
+        folder = os.path.join(self.base, path.lstrip('/'))
+        os.makedirs(folder)
+        # An existing directory with unreadable/missing events is unknown.
+        self.assertFalse(turn_cgroup.gone_or_empty(path, root_dir=self.base))
+        for populated, expected in (('1', False), ('0', True)):
+            with open(os.path.join(folder, 'cgroup.events'), 'w') as fh:
+                fh.write('populated %s\n' % populated)
+            self.assertIs(turn_cgroup.gone_or_empty(path, root_dir=self.base), expected)
+        self.assertFalse(turn_cgroup.gone_or_empty('/../escape', root_dir=self.base))
+        self.assertFalse(turn_cgroup.gone_or_empty(path, root_dir=folder + '/missing'))
+
     """A.5–A.8 : `usable`, `create`/`populated`/`remove`/`orphans`, `kill`,
     `memory_peak` — tout contre la fausse monture."""
 
