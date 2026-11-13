@@ -4110,6 +4110,9 @@ def designated_prefix(worktree: Path, composition: Composition,
                 "retrait #3801 gardé (geste antérieur)"
                 % (group[0].lot, group_why))
             continue
+        # `found` est indexé par numéro de lot, pas par position (#7239 B) :
+        # comparer les positions, garder les lots dans les retraits et les
+        # mentions.
         by_test = {_failure_name(failure): lot
                    for lot, failures in found.items() for failure in failures}
         flaky_names = {_failure_name(failure) for failure in group_flaky}
@@ -4118,9 +4121,10 @@ def designated_prefix(worktree: Path, composition: Composition,
             keep: list[str] = []
             for test in removal.tests:
                 lot = by_test.get(test)
-                if lot == position:
+                at = positions.get(lot) if lot is not None else None
+                if at == position:
                     keep.append(test)
-                elif lot is not None and lot > position:
+                elif at is not None and at > position:
                     later_by_lot.setdefault(lot, []).append(test)
                 elif test in flaky_names:
                     flaky.append({"test": test})
@@ -4134,7 +4138,8 @@ def designated_prefix(worktree: Path, composition: Composition,
                     proof="3801"))
             for test in removal.tests:
                 lot = by_test.get(test)
-                if lot is not None and lot > position:
+                at = positions.get(lot) if lot is not None else None
+                if at is not None and at > position:
                     log("tests ciblés : #%d désignée (#3801) mais %s rouge au "
                         "préfixe de #%d, vert au sien — unité innocente, "
                         "retrait de #%d à sa place"
@@ -4144,11 +4149,12 @@ def designated_prefix(worktree: Path, composition: Composition,
                         "tous les préfixes depuis son unité (instable) — "
                         "consigné non concluant, sans retrait"
                         % (removal.lot, test))
+        designated_lot = composition.units[position - 1].lot
         for lot, tests in later_by_lot.items():
             later.append(Removal(
                 lot=lot, tests=tests, attributed=True, proof="prefixes",
-                evidence=["préfixe base+u1…u%d (rouge à #%d, vert au préfixe "
-                          "de #%d)" % (lot, lot, position)]))
+                evidence=["préfixe base+u%d (rouge à #%d, vert au préfixe "
+                          "de #%d)" % (positions[lot], lot, designated_lot)]))
     if flaky:
         names = sorted({_failure_name(failure) for failure in flaky
                         if _failure_name(failure)})

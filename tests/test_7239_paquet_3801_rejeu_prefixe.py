@@ -244,6 +244,81 @@ class DesignatedPrefixTest(StackCase):
         self.assertEqual(flaky, [])
 
 
+class RealIdsTest(StackCase):
+    """B #40518/#40519 : les lots ne sont pas des positions (7066/7108/7229)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.real = paquet_auto.Composition(
+            units=[paquet_auto.Unit(7066, "a" * 40, self.unit_a),
+                   paquet_auto.Unit(7108, "b" * 40, self.unit_b),
+                   paquet_auto.Unit(7229, "c" * 40, self.unit_c)],
+            discarded=[], head=self.unit_c)
+
+    def removal(self, lot: int, tests=(TARGET,)) -> "paquet_auto.Removal":
+        return paquet_auto.Removal(
+            lot=lot, tests=list(tests), attributed=True, proof="3801",
+            evidence=["test tests/test_own_a.py"])
+
+    def run_designated(self, removals, prefix, log=None):
+        return paquet_auto.designated_prefix(
+            self.repo, self.real, removals, timeout=5, prefix=prefix,
+            log=log or (lambda _line: None))
+
+    def test_rouge_au_prefixe_de_l_unite_en_tete_confirme(self) -> None:
+        # Reproduction de la revue : 7066 est en position 1 ; sans la
+        # comparaison par position, 7066 > 1 la faisait passer pour une unité
+        # suivante (preuve prefixes, trace « innocente »).
+        prefix = FakePrefix({TARGET: 1})
+        removals, flaky, why = self.run_designated([self.removal(7066)], prefix)
+        self.assertEqual((flaky, why), ([], ""))
+        self.assertEqual([removal.lot for removal in removals], [7066])
+        self.assertEqual(removals[0].proof, "3801")
+        self.assertEqual(prefix.calls, [(1, [TARGET])])
+
+    def test_rouge_au_prefixe_confirme_avec_vrais_numeros(self) -> None:
+        # 7108 est en position 2 : sans la comparaison par position, 7108 > 2
+        # le faisait passer pour une unité suivante (preuve prefixes).
+        prefix = FakePrefix({TARGET: 2})
+        removals, flaky, why = self.run_designated([self.removal(7108)], prefix)
+        self.assertEqual((flaky, why), ([], ""))
+        self.assertEqual([removal.lot for removal in removals], [7108])
+        self.assertEqual(removals[0].proof, "3801")
+        self.assertEqual(prefix.calls, [(2, [TARGET])])
+
+    def test_unite_innocente_avec_vrais_numeros(self) -> None:
+        lines: list[str] = []
+        prefix = FakePrefix({TARGET: 2})
+        removals, flaky, why = self.run_designated(
+            [self.removal(7066)], prefix, log=lines.append)
+        self.assertEqual((flaky, why), ([], ""))
+        self.assertEqual([removal.lot for removal in removals], [7108])
+        self.assertEqual(removals[0].proof, "prefixes")
+        self.assertIn("base+u2", removals[0].evidence[0])
+        self.assertIn("#7108", removals[0].evidence[0])
+        self.assertIn("innocente", "\n".join(lines))
+
+    def test_earlier_red_disculpe_encore_la_seconde_unite(self) -> None:
+        # Les deux unités sont confirmées #3801 ; le rouge de 7108 est déjà
+        # rouge au préfixe de 7066 (retirée) : earlier_red doit la disculper.
+        other = "tests.test_own_a.T.test_other"
+        prefix = FakePrefix({TARGET: 1, other: 2})
+        removals, _flaky, why = self.run_designated(
+            [self.removal(7066), self.removal(7108, tests=[other])], prefix)
+        self.assertEqual(why, "")
+        self.assertEqual([removal.lot for removal in removals], [7066, 7108])
+        self.assertEqual([removal.proof for removal in removals],
+                         ["3801", "3801"])
+
+        def replay(_worktree, label, _names, *, timeout):
+            return _red(label, ["tests.test_own_a"], test=other)
+
+        innocent = paquet_auto.earlier_red(
+            self.repo, self.real, removals, timeout=5, replay=replay,
+            log=lambda _line: None)
+        self.assertEqual(innocent, {7108: 7066})
+
+
 class PrefixStartTest(StackCase):
     """Le vrai `prefix_failures(start=…)` ne rejoue pas avant l'unité."""
 
@@ -319,7 +394,7 @@ class CheckLocalTestsTest(StackCase):
         self.assertEqual(faulty, [2])
         self.assertEqual([removal.lot for removal in removals], [2])
         self.assertEqual(removals[0].proof, "prefixes")
-        self.assertIn("préfixe base+u1", removals[0].evidence[0])
+        self.assertIn("préfixe base+u2", removals[0].evidence[0])
         self.assertNotIn(1, faulty)
 
     def test_rouge_sous_charge_vert_au_rejeu_est_instable(self) -> None:
