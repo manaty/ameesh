@@ -40,6 +40,21 @@ class ExerciceGrappeTest(unittest.TestCase):
         self.assertEqual(set(cible.actions), set(exercer.GrappeCible.ACTIONS))
         self.assertEqual(cible.table_jalon, "public.ep86_jalon")
 
+    def test_limites_du_rapport_correspondent_a_la_cible(self):
+        exercer = _charger_exercer()
+        for cible in ("banc", "grappe"):
+            with self.subTest(cible=cible):
+                rendu = exercer.rendre_markdown({"cible": cible})
+                limites = rendu.split("## Limites", 1)[1].split("## Reproduction", 1)[0]
+                self.assertIn("La perte de deux nœuds", limites)
+                if cible == "banc":
+                    self.assertIn("Le banc est local et jetable", limites)
+                    self.assertIn("Le poste client du banc", limites)
+                else:
+                    self.assertIn("la grappe réelle", limites)
+                    self.assertNotIn("du banc", limites)
+                    self.assertNotIn("local et jetable", limites)
+
     def test_meme_topologie_que_patroni(self):
         topo = json.loads(TOPOLOGIE.read_text(encoding="utf-8"))
         attendu = {(n["nom"], n["adresse"], n["nofailover"]) for n in topo["noeuds"]}

@@ -477,7 +477,7 @@ last resort. Each account takes these optional settings in the host's
 
 | setting | meaning |
 |---|---|
-| `priority` [default account 100, others 50] | rank in the failover order, lower first; the pace (L117) only breaks ties |
+| `priority` [default account 100, others 50] | final tie-breaker, lower first, after freshness, reset loss and pace (`accounts._rank_key`, #1580); `choose()` keeps a healthy session account first (0034 §4). This is not account pinning |
 | `cap` [0.50 for the default account, none otherwise] | fixed cap on **every** window: above it, the account is ineligible |
 | `overage` [`auto`] | may the account be billed beyond its plan? `auto` reads it from the harness (Claude `overageStatus`, Codex `credits.has_credits`), `allowed` or `none` declare it |
 | `overage_cap` [0.80] | fixed cap on every window of an account that may be billed beyond its plan |
@@ -489,12 +489,16 @@ last resort. Each account takes these optional settings in the host's
 | `pace_ceiling_end_hours` [6] | hours before `resets_at` where `pace_ceiling_end` applies; declared alone (without `pace_ceiling_end`), it is a configuration error |
 
 A window is held to the lowest of: its pace cap (0019, or `short_window_cap`
-on the short window), `cap`, and `overage_cap` when the account may be billed.
+on the short window), `cap`, and `overage_cap` when a personal account may be
+billed. An organization account instead has a hard 95 % cap on every window,
+replacing `overage_cap`, with no implicit default-account 50 % cap and no
+10-point reserve; an explicit `cap` may tighten that limit.
 An account **in overage** (Claude `isUsingOverage`, Codex a window at 100 %
 with credits) is never chosen, until the windows that ran out have reset (a
 spent window with no reset date keeps it out). The caps apply to session
-continuity too: a session on the primary leaves it once the primary is above
-50 % of a window. A manual force posted while a worker switches accounts is
+continuity too: a session on the personal primary leaves it once the primary
+is above its implicit 50 % cap on a window (except for critical agents,
+below). A manual force posted while a worker switches accounts is
 evaluated the same way: a forced account past its caps is not launched.
 A forced account at its threshold (pace, caps or overage) does not hold the
 agents while another healthy account is under its own: the force is lifted
@@ -1020,8 +1024,8 @@ change.
 **Reserve for the critical agents** (L242b (2)). The other agents stop
 earlier, so that the margin left is for the critical ones:
 
-* on a plan, a non-critical agent stops 10 points below the pace cap
-  (`accounts.RESERVE`): `max(min(80 %, elapsed × m), 10 %)` — the pace cap
+* on a personal plan (`scope=personal`), a non-critical agent stops 10 points
+  below the pace cap (`accounts.RESERVE`): `max(min(80 %, elapsed × m), 10 %)` — the pace cap
   `min(90 %, elapsed × m + 10)` minus the reserve, floored at the 10-point
   margin. The reserve never blocks the start of a window (#777): while
   `elapsed × m` is at most the 10-point margin, the threshold is the margin,
@@ -1030,10 +1034,16 @@ earlier, so that the margin left is for the critical ones:
   cap is 80 % (90 % − 10), not more (mesh-design, 2026-10-12; #1028). The
   short window cap, when set, is lowered the same way, and never exceeds that
   threshold for a non-critical agent. The fixed caps (50 % of the primary,
-  `cap`, `overage_cap`) are not: they hold for everyone. The reason then says
+  `cap`, `overage_cap`) are not lowered by the reserve; the implicit primary
+  cap has the critical-agent exception described above. The reason then says
   "10 points kept for critical agents". This holds with or without declared
   accounts. It also holds on a host with no critical agent: the reserve is
   then simply not used;
+* on an organization plan (`scope=organization`), no 10-point reserve is
+  subtracted, even for a non-critical agent. The pace cap still applies,
+  with a hard 95 % cap on every window for all agents (also when paid overage
+  is reported). It replaces `overage_cap`; the implicit default-account
+  50 % cap does not apply, while an explicit `cap` still tightens the limit;
 * on pay-per-token, a non-critical agent stops at `noncritical_hourly_share`
   of the mesh hourly cap. The setting is in the host configuration
   (`AMEESH_NONCRITICAL_HOURLY_SHARE`; between 0 and 1; default 0.75, a
