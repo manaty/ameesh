@@ -1609,6 +1609,10 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if row.get("held"):
             continue                    # la retenue active porte already sa cause
         state = state_by_lot.get(int(row["lot"]))
+        # #7233 : an old freeze on a lot returned to intake does not make
+        # its dependency wait a review wait. QA lots still need their reviews.
+        if state == "intake" and row.get("blocking_dependencies"):
+            continue
         reviewers = row["pending_reviewers"]
         if row.get("review_family_paused"):
             pauses = row["review_family_paused"]
@@ -1677,6 +1681,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 and now < float(window["observation"]["due_ts"]))
 
     for row in blocked_reviews:
+        if (state_by_lot.get(int(row["lot"])) == "intake"
+                and blocked_by.get(int(row["lot"]))):
+            continue
         # #7090 : une correction due sous une fenêtre d'observation non échue
         # est dans `window_waits` (attente voulue et datée) ; elle redevient
         # une attente `blocking_review` à l'échéance, sans retour au backlog.

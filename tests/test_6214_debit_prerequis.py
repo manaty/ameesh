@@ -77,6 +77,33 @@ def waits_by_lot(report):
 
 
 class DebitPrerequisTest(unittest.TestCase):
+    def test_intake_dependency_with_old_freeze_is_not_a_review_wait(self):
+        for state, blocking, expected in (
+                ("intake", True, False), ("intake", False, True),
+                ("qa", True, True)):
+            with self.subTest(state=state, blocking=blocking):
+                report = run(
+                    items=[item(7034, assignee=None), item(7107)],
+                    milestones=[frozen(7034, 100, T - 29 * H)],
+                    events=[event(7034, 101, T - 28 * H,
+                                  "returned for prerequisite", state=state)],
+                    dependencies={7034: [edge(7034, 7107, blocking=blocking)]})
+                row = next(r for r in report["qa"] if r["lot"] == 7034)
+                if blocking:
+                    self.assertEqual(row["blocking_dependencies"], [7107])
+                self.assertEqual(any(r["lot"] == 7034 for r in
+                                     report["slow_waits"]), expected)
+
+    def test_blocked_review_on_intake_keeps_dependency_as_wait_cause(self):
+        report = run(
+            items=[item(7034, assignee=None), item(7107)],
+            milestones=[frozen(7034, 100, T - 29 * H),
+                        verdict(7034, 101, T - 28 * H, kind="blocked")],
+            events=[event(7034, 102, T - 27 * H,
+                          "returned for prerequisite", state="intake")],
+            dependencies={7034: [edge(7034, 7107)]})
+        self.assertNotIn(7034, [r["lot"] for r in report["slow_waits"]])
+
     def test_prerequis_ouvert_pas_de_qa_merge_ni_de_sortie_2(self):
         # #659, relu depuis 4 h, dépend de #6209, relu il y a 1 h : le lot ne
         # peut pas entrer seul dans un paquet. Son attente est celle de #6209,
