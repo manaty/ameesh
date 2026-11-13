@@ -104,6 +104,98 @@ btrfs. Other builders require a separate operator inventory.
 Sources: [Docker volume lifecycle](https://docs.docker.com/engine/storage/volumes/),
 [BuildKit cache accounting](https://docs.docker.com/reference/cli/docker/buildx/du/).
 
+## Agent VM BuildKit cache policy (#7245)
+
+For agent VMs AG1–AG3, the proposed Docker rootless default-builder retention
+is **10GB** (decimal bytes, about 9.31 GiB), with BuildKit GC enabled. The
+reviewable fragment is
+[`docker-buildkit-gc.json`](../deploy/serveur/docker-buildkit-gc.json).
+It is an input to an operator merge, not a complete replacement for an existing
+Docker configuration. The server installer does not apply it automatically.
+Housekeeping continues to observe build cache; this proposal adds no prune
+command to housekeeping and changes none of its volume/image retention rules.
+
+The scope is the Engine's **docker driver**. Docker rootless normally reads
+`~/.config/docker/daemon.json` (under `$XDG_CONFIG_HOME/docker` when configured).
+A daemon started with `--config-file` must use that actual file instead.
+A `docker-container`, Kubernetes or remote Buildx builder has its own BuildKit
+configuration: this fragment does not configure it. Verify the builder used by
+the consuming job, including its explicit `--builder`, `BUILDX_BUILDER` or
+`DOCKER_BUILDKIT=0` overrides; a CLI's selected builder alone is insufficient.
+
+`defaultKeepStorage` derives the default GC policies. GC periodically removes
+eligible unused cache, first disposable/old records and then records above the
+retention target. This is **not a filesystem quota**: active cache, newly
+exported images, build contexts, concurrent builders and other host activity
+can exceed it. Shared layer accounting also prevents interpreting logical cache
+size as recoverable physical bytes. A 10GB target alone cannot guarantee that
+an arbitrary build stays above the host's free-space alert threshold.
+
+### Operator application proposal (not executed by this lot's author)
+
+The bureau applies the reviewed configuration separately on each VM after the
+required approval for an operation that enables cache deletion. Do not prune,
+restart Docker, or change a live host as part of a documentation check.
+
+1. Record the host, Engine/Buildx versions, user service command and effective
+   configuration path, rootless socket and storage filesystem. Verify
+   `docker info` reports rootless and `docker buildx inspect` reports the
+   consuming builder's driver as `docker`. Record the host's configured
+   free-space alert threshold and its separate hard pause floor; do not
+   substitute the historical 2 GiB pause floor for the alert threshold.
+2. Read the existing configuration as the daemon user. Back it up, preserving
+   its permissions, outside the product checkout. Prepare a candidate by
+   merging only `builder.gc.enabled=true` and
+   `builder.gc.defaultKeepStorage="10GB"`; preserve all other keys. If an
+   explicit `builder.gc.policy` exists, stop this application and have the
+   operator reconcile it: the default target does not override custom rules.
+   Likewise, an unexpected type in `builder` or `gc` is an error, not grounds
+   to replace that section. Treat a missing configuration as an empty object.
+3. Validate the candidate with the **installed Engine binary**:
+   `dockerd --validate --config-file <candidate>`. JSON parsing alone does not
+   validate Engine support. Keep the original configuration in place if this
+   fails. Stage the validated candidate beside the real file, owned by the
+   daemon user with mode 0600, and atomically rename it into place.
+4. Choose an idle Docker window with the consuming jobs' operator before
+   activating it. Restart the **user** `docker.service`, never the system
+   daemon, through the bureau's approved operation. Restarting can interrupt
+   running containers; do not infer live-restore support. Verify the actual
+   service, rootless socket, daemon health, active jobs and effective file
+   again after restart. A daemon failure calls for restoring the backup and
+   restarting the same user service through that operator window.
+5. Run the acceptance below on that VM before expanding to the others. Record
+   the approved application and its measurements in the lot, not in this
+   document. Restoring the previous file reverses the configuration; it cannot
+   recover cache already reclaimed by GC (which must be rebuilt).
+
+### Acceptance on each VM
+
+Use an operator-approved, bounded representative build that generates more
+than 10GB of default-builder cache cumulatively, with adequate initial headroom.
+Do not allocate dummy data until a live host reaches its alert threshold.
+Record the exact job, builder, Engine version, configuration and initial cache
+inventory. Sample physical free bytes on the Docker data filesystem throughout
+all build steps and exports, including GC activity, and keep the minimum. Use
+an explicit observation interval (for example 5 seconds), not just before/after
+`df` readings. This is sampled evidence, not proof of every intervening instant.
+Observe GC using the installed version's builder inventory and daemon logs;
+do not invoke a manual prune to make the test pass. Account for shared/in-use
+cache separately, and allow the periodic GC to settle before the final reading.
+
+Acceptance requires a successful build, observed automatic reclamation of
+eligible excess cache, and a sampled minimum **above the configured alert
+threshold**, with the operator's headroom margin documented. Record the
+maximum cache, minimum free bytes, elapsed observation period, and final
+reclaimable/in-use cache. Repeat for AG1, AG2 and AG3; a VM not measured remains
+unqualified. If the driver differs, GC is not observed, cache remains in use,
+or physical free space crosses the threshold, report the unmet condition;
+changing the target alone is not a proven fix for an oversized active build.
+The next mitigation needs workload/storage isolation or admission/headroom
+control, separately scoped and reviewed.
+
+Sources: [Docker BuildKit GC and driver-specific configuration](https://docs.docker.com/build/cache/garbage-collection/),
+[rootless daemon paths and user service](https://docs.docker.com/engine/security/rootless/tips/).
+
 ## Incident evidence, 12 October 2026
 
 The initial report recorded 5,092 Docker volumes and about 414.7 GB logically
