@@ -67,6 +67,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,12 @@ HOST_EXTRAS = "psycopg,crypto,contrats"
 #: pyproject de `--src` les déclare ; illisible, la règle reste stricte.
 EXTRAS_SELON_SOURCE = ("contrats",)
 CURRENT = "venv-courant"         # lien : version vivante
+#: #7212 : la configuration privée de l'exécutant de staging sous son home ;
+#: ses empreintes `expected_sha256` suivent le venv que la bascule change.
+STAGING_CONFIG = os.path.join(".config", "ameesh", "staging-executor.json")
+#: #7212 : un chemin épinglé peut nommer un venv versionné, le venv stable ou
+#: le lien vivant ; seuls ceux du venv changé sont réécrits.
+_VENV_PIN = re.compile(r"^venv(?:-[0-9a-z.]+)?$")
 REPORT = "venv.precedent"        # fichier : version précédente enregistrée
 LAUNCHERS = ".bascule-lanceurs"  # marqueur : <venv> porte les lanceurs
 SHEBANG_MAX_LINE = 8192          # borne en octets, même pour un script malformé
@@ -225,6 +232,179 @@ def _read_report(venv):
 
 def _write_report(venv, name):
     _write(_report_path(venv), name + "\n", mode=0o644)
+
+
+# --------------------------------------------------------------------------
+# #7212 : les empreintes attendues de l'exécutant suivent le venv vivant
+# --------------------------------------------------------------------------
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_tree(root):
+    """Même empreinte que `staging_executor._tree_sha256` (#5665) : chaque
+    fichier par chemin relatif et SHA-256, triés, caches `__pycache__` exclus."""
+    lines = []
+
+    def fail(exc):
+        raise exc
+    for top, dirs, files in os.walk(root, onerror=fail):
+        dirs[:] = sorted(name for name in dirs if name != "__pycache__")
+        for name in sorted(files):
+            path = os.path.join(top, name)
+            lines.append("%s\0%s\n" % (os.path.relpath(path, root),
+                                       _sha256_file(path)))
+    return hashlib.sha256("".join(sorted(lines)).encode("utf-8")).hexdigest()
+
+
+def _pin_digest(path):
+    return _sha256_tree(path) if os.path.isdir(path) else _sha256_file(path)
+
+
+def _staging_config(explicit):
+    """#7212 : la configuration privée à réépingler, ou None.
+
+    Explicite (`--staging-config`) ou, par défaut, celle du compte qui exécute
+    la bascule : un fichier régulier qui lui appartient. Sous un autre compte
+    (runners, root), rien n'est touché sans option explicite."""
+    if explicit:
+        path = os.path.abspath(explicit)
+        if not os.path.isfile(path):
+            _die("configuration de staging introuvable : %s" % path)
+        return path
+    path = os.path.join(os.path.expanduser("~"), STAGING_CONFIG)
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        return None
+    return path
+
+
+def _venv_pin(key, live):
+    """#7212 : (nouvelle clé, chemin à hacher) d'une épingle de venv, sinon None.
+
+    Seuls les chemins sous un venv voisin du venv changé sont concernés :
+    `venv-<version>` et le venv stable sont réécrits vers `live`, le lien
+    `venv-courant` garde son chemin stable. Le parent doit être celui du venv
+    changé : une épingle d'un autre compte reste intacte."""
+    base = os.path.dirname(live)
+    parts = os.path.abspath(key).split(os.sep)
+    for index, name in enumerate(parts):
+        if not _VENV_PIN.fullmatch(name):
+            continue
+        root = os.sep.join(parts[:index + 1]) or os.sep
+        if os.path.dirname(root) != base:
+            continue
+        suffix = os.path.join(*parts[index + 1:]) if parts[index + 1:] else ""
+        if not suffix or suffix.startswith(os.pardir):
+            return None
+        if name == CURRENT:
+            return key, os.path.join(live, suffix)
+        return os.path.join(live, suffix), os.path.join(live, suffix)
+    return None
+
+
+def _live_counterpart(live, suffix):
+    """Le suffixe dans `live`, avec la version Python vivante si elle a changé
+    (`lib/python3.12` → `lib/python3.13`)."""
+    candidate = os.path.join(live, suffix)
+    if os.path.exists(candidate):
+        return candidate
+    parts = suffix.split(os.sep)
+    if (len(parts) >= 2 and parts[0] == "lib"
+            and re.fullmatch(r"python3\.\d+", parts[1])):
+        try:
+            versions = sorted(name for name in os.listdir(os.path.join(live, "lib"))
+                              if re.fullmatch(r"python3\.\d+", name))
+        except OSError:
+            versions = []
+        if len(versions) == 1:
+            alternate = os.path.join(live, "lib", versions[0], *parts[2:])
+            if os.path.exists(alternate):
+                return alternate
+    return None
+
+
+def _repin_staging_config(path, live):
+    """#7212 : (nouveaux octets, anciens octets, changements) de la config.
+
+    Une épingle de venv qui ne trouve pas son chemin dans le venv vivant est
+    un refus : la configuration reste intacte. Les autres entrées (sonde,
+    scripts, ...) ne bougent pas."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            original = handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError("illisible (%s)" % (
+            getattr(exc, "strerror", None) or exc)) from None
+    try:
+        data = json.loads(original)
+    except ValueError as exc:
+        raise ValueError("JSON invalide (%s)" % exc) from None
+    if not isinstance(data, dict):
+        raise ValueError("la configuration doit être un objet JSON")
+    expected = data.get("expected_sha256")
+    if expected is None:
+        return None, original, []
+    if not isinstance(expected, dict) or not all(
+            isinstance(key, str) and isinstance(digest, str)
+            for key, digest in expected.items()):
+        raise ValueError("expected_sha256 doit associer des chemins à des empreintes")
+    changes = []
+    for key in list(expected):
+        target = _venv_pin(key, live)
+        if target is None:
+            continue
+        new_key, path_in_live = target
+        suffix = os.path.relpath(path_in_live, live)
+        path_in_live = _live_counterpart(live, suffix)
+        if path_in_live is None:
+            raise ValueError("%s n'a pas de correspondance dans %s" % (key, live))
+        try:
+            digest = _pin_digest(path_in_live)
+        except OSError as exc:
+            raise ValueError("%s illisible (%s)" % (
+                path_in_live, getattr(exc, "strerror", None) or exc)) from None
+        if new_key != key:
+            del expected[key]
+            expected[new_key] = digest
+            changes.append({"from": key, "to": new_key, "sha256": digest})
+        elif expected[key] != digest:
+            expected[key] = digest
+            changes.append({"path": key, "sha256": digest})
+    if not changes:
+        return None, original, []
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    return payload.encode("utf-8"), original, changes
+
+
+def _pins_for(explicit, live):
+    """#7212 : les octets réépinglés AVANT tout changement, ou (None, None, []).
+
+    Un refus laisse la bascule intacte : rien n'est écrit, rien n'est pointé."""
+    path = _staging_config(explicit)
+    if path is None:
+        return None, None, []
+    try:
+        payload, _original, changes = _repin_staging_config(path, live)
+    except (OSError, ValueError) as exc:
+        _die("réépinglage de %s : %s" % (path, exc))
+    return path, payload, changes
+
+
+def _write_pins(path, payload):
+    """Écrit la configuration réépinglée en une fois, sans changer son mode."""
+    if payload is None:
+        return
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    _write_bytes(path, payload, mode=mode)
 
 
 # --------------------------------------------------------------------------
@@ -1399,6 +1579,7 @@ def activer(args):
         _die("venv-%s n'est pas préparé (lancer « preparer »)" % version)
     vivante = _live_target(venv)
     precedent = vivante
+    restore = vivante
     if vivante is None:
         # première conversion : le venv réel ne bouge pas, son lib devient la
         # version précédente ; on pointe d'abord dessus (aucune fenêtre sans
@@ -1410,20 +1591,40 @@ def activer(args):
             print("bascule: adoption du venv réel comme venv-%s (sans pip)" % nom)
             _adopter(venv, nom)
         precedent = None if nom == version else nom
+        restore = nom
         _pointer(venv, nom)
     try:
         scripts = _installer_lanceurs(venv, version)
     except OSError as exc:
         _die(str(exc))
+    config, pins, changes = _pins_for(getattr(args, "staging_config", None), cible)
     if _live_target(venv) == version:
         _retirer_lanceurs(venv, scripts)
         print("bascule: venv-%s déjà actif" % version)
+        if pins is not None:
+            try:
+                _write_pins(config, pins)
+            except OSError as exc:
+                _die("réépinglage de %s impossible (%s)" % (config, exc))
+            print("bascule: %d empreinte(s) réépinglée(s) sur venv-%s"
+                  % (len(changes), version))
         _menager_apres_bascule(venv)
         return 0
     if precedent and precedent != version:
         _write_report(venv, precedent)
     _pointer(venv, version)
     _retirer_lanceurs(venv, scripts)
+    if pins is not None:
+        try:
+            _write_pins(config, pins)
+        except OSError as exc:
+            # La bascule et son épingle sont un seul geste : sans épingle
+            # valide, on revient au venv dont la configuration répond.
+            _pointer(venv, restore)
+            _die("réépinglage de %s impossible (%s) : bascule annulée"
+                 % (config, exc))
+        print("bascule: %d empreinte(s) réépinglée(s) sur venv-%s"
+              % (len(changes), version))
     print("bascule: venv-%s actif%s" % (version, "" if not precedent else " (avant : %s)" % precedent))
     _menager_apres_bascule(venv)
     return 0
@@ -1444,8 +1645,16 @@ def retour(args):
     cible = _version_dir(venv, precedent)
     if not os.path.isfile(os.path.join(cible, MARKER)):
         _die("version précédente venv-%s absente ou incomplète" % precedent)
+    config, pins, changes = _pins_for(getattr(args, "staging_config", None), cible)
     if vivante == precedent:
         print("bascule: déjà sur venv-%s (retour idempotent)" % precedent)
+        if pins is not None:
+            try:
+                _write_pins(config, pins)
+            except OSError as exc:
+                _die("réépinglage de %s impossible (%s)" % (config, exc))
+            print("bascule: %d empreinte(s) réépinglée(s) sur venv-%s"
+                  % (len(changes), precedent))
         return 0
     if not os.path.isfile(os.path.join(venv, LAUNCHERS)):
         _die("lanceurs absents de %s : activer une version d'abord" % venv)
@@ -1461,6 +1670,16 @@ def retour(args):
               file=sys.stderr)
     else:
         _retirer_lanceurs(venv, scripts)
+    if pins is not None:
+        try:
+            _write_pins(config, pins)
+        except OSError as exc:
+            if vivante:
+                _pointer(venv, vivante)
+            _die("réépinglage de %s impossible (%s) : retour annulé"
+                 % (config, exc))
+        print("bascule: %d empreinte(s) réépinglée(s) sur venv-%s"
+              % (len(changes), precedent))
     print("bascule: retour sur venv-%s (sans pip)" % precedent)
     return 0
 
@@ -1526,9 +1745,17 @@ def main(argv=None):
     p.add_argument("--precedent", default=None,
                    help="nom de la version quittée lors de la première conversion "
                         "(défaut : « precedent »)")
+    p.add_argument("--staging-config", default=None,
+                   help="#7212 : configuration de l'exécutant de staging dont les "
+                        "empreintes expected_sha256 suivent le venv basculé "
+                        "(défaut : ~/.config/ameesh/staging-executor.json du compte)")
     p.set_defaults(func=activer)
     p = sub.add_parser("retour", help="bascule en arrière, sans pip")
     p.add_argument("--venv", required=True)
+    p.add_argument("--staging-config", default=None,
+                   help="#7212 : configuration de l'exécutant de staging dont les "
+                        "empreintes expected_sha256 suivent le venv basculé "
+                        "(défaut : ~/.config/ameesh/staging-executor.json du compte)")
     p.set_defaults(func=retour)
     p = sub.add_parser("menage",
                        help="retirer les anciens venv-<version> et instantanés "
