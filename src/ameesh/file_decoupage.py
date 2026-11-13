@@ -812,7 +812,7 @@ def owed_work(db, names, lots, *, cfg=None, now: float | None = None) -> tuple:
     if not wanted:
         return out, None
     try:
-        for row in activation.due_fixes(db) or ():
+        for row in activation.actionable_fixes(db, cfg=cfg, now=now) or ():
             name = wanted.get(str(row.get("name") or "").strip().lower())
             if name and name not in out:
                 out[name] = "fix owed on #%s" % row.get("lot")
