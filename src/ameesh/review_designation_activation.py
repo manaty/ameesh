@@ -406,9 +406,11 @@ def _candidate_paths(db, cfg, item: Mapping) -> list[str]:
             row = {}
         candidates.append(str(row.get("cwd") or ""))
     try:
-        candidates.append(lot_class.repository(cfg, dict(item or {})) or "")
+        # #6984 : le dépôt du projet, puis les clones que l'hôte déclare pour
+        # lui (`packet_watch`, `release`) — pc-smichea n'a pas de bloc `radar`.
+        candidates.extend(lot_class.declared_repo_paths(cfg, dict(item or {})))
     except Exception:  # noqa: BLE001 - no radar settings: next hint
-        candidates.append("")
+        pass
     try:
         candidates.append(os.getcwd())
     except OSError:
@@ -580,7 +582,9 @@ def _fetch_from_local_clone(paths: Sequence[str], slug: str, frozen_sha: str,
         path = os.path.expanduser(str(path or "").strip())
         if not path or not os.path.isdir(path):
             continue
-        repo = canon_mod.git_toplevel(path)
+        # #6984 : un miroir bare n'a pas d'arbre de travail ; `git_toplevel`
+        # le saute et le fetch dans ce miroir ne servait donc à rien.
+        repo = canon_mod.git_repository(path)
         if not repo or repo in seen or not _origin_matches(repo, slug):
             continue
         seen.add(repo)
@@ -640,11 +644,15 @@ def companion_repository(db, cfg, item: Mapping, sha: str, own: str) -> str:
 
 
 def _repo_holding(path: str, frozen_sha: str, seen: set) -> str:
-    """The git top level of `path` when it holds the exact frozen commit."""
+    """The repository of `path` when it holds the exact frozen commit.
+
+    #6984 : `git_repository` accepts a bare mirror too (no working tree to walk
+    up from); the exact commit id still decides.
+    """
     path = os.path.expanduser(str(path or "").strip())
     if not path or not os.path.isdir(path):
         return ""
-    repo = canon_mod.git_toplevel(path)
+    repo = canon_mod.git_repository(path)
     if not repo or repo in seen:
         return ""
     seen.add(repo)
@@ -4155,6 +4163,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     live = _live_column(item)
     completion = None
     waiting = False
+    effective = None
     reported: list = []
     if not force:
         effective = _effective_mark(db, int(lot), int(freeze.get("id") or 0),
@@ -4212,6 +4221,41 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 return {"state": "unavailable", "reviewers": [],
                         "freeze": freeze,
                         "why": "review floor completion: %s" % inputs.why}
+            if waiting and effective is not None:
+                # #6984 : une attente enregistrée est une désignation valide.
+                # Un hôte qui ne peut pas lire la tête gelée (miroir bare
+                # absent, dépôt non déclaré) ne la dégrade pas en
+                # « unavailable » et ne vide pas la colonne : c'est la
+                # reprise depuis un dépôt qui tient la tête qui peut la
+                # compléter. Sans cette garde, la passe de reprise d'un hôte
+                # aveugle effaçait les sièges déjà pourvus sur #6969/#6970.
+                # Le gel rejoué doit être **le dernier** : une reprise d'un
+                # gel périmé rend `stale` et ne présente pas sa marque comme
+                # la désignation courante (B des relectures : le test de
+                # reprise périmée de #2447).
+                with db.transaction() as tx:
+                    if not _lock_current_freeze(tx, int(lot), freeze):
+                        return _stale(freeze)
+                shape = dict(effective[2])
+                live = _live_column(item)
+                seats = [dict(row) for row in shape.get("reviewers") or ()
+                         if live is None
+                         or str((row or {}).get("name") or "").strip() in live]
+                if shape.get("reviewers") and not seats:
+                    # #3557 : la marque d'attente nommait des sièges, mais
+                    # aucun n'est plus vivant (retiré à la main). Ce n'est plus
+                    # une désignation du gel : une reprise qui ne peut pas lire
+                    # ses entrées le dit, sans réécrire la colonne depuis la
+                    # marque.
+                    return {"state": "unavailable", "reviewers": [],
+                            "freeze": freeze,
+                            "why": "recorded waiting designation has no live seat: %s"
+                                   % inputs.why}
+                shape.update({"state": rd.WAITING, "reviewers": seats,
+                              "freeze": freeze,
+                              "why": "recorded waiting designation kept: %s"
+                                     % inputs.why})
+                return shape
             if manual:
                 with db.transaction() as tx:
                     if not _lock_current_freeze(tx, int(lot), freeze):
