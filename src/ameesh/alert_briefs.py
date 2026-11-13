@@ -578,6 +578,12 @@ def _packet_ci_text(ci: dict) -> str:
     return " (its CI is not readable here)"
 
 
+#: #7205 : la fin du brief SLO d'un lot prêt qui attend son véhicule. Le 13/11,
+#: cinq accusés `hold: …` du pilote ont écarté cinq lots validés de h-06.
+READY_HOLD_HINT = ("; acknowledge with a plain note, never `hold: …` — a pilot's "
+                   "hold is read by scripts/paquet-candidats.py as `pilot-hold` and "
+                   "drops the lot from the next package (#7205)")
+
 def _slo_breach(alert: dict, *, level: int | None = None) -> str:
     """#789 tranche 2 (canon §9) : une étape interne du lot a dépassé son
     délai ; le texte dit l'étape, le retard, et le geste du niveau atteint
@@ -748,6 +754,13 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
             move = ("pilot: the %s is frozen with its review verdict acquired and waits "
                     "for its merge vehicle/package — the composer/pilot carries it; do not "
                     "reassign or nudge its holder, include it in the next package" % v.noun)
+        if (not canon and not (cause and (cause.get("unknown")
+                                          or (cause.get("code")
+                                              and cause.get("owner") == "author")))):
+            # #7205 : le lot est prêt et attend son véhicule. Un accusé
+            # `hold: …` du pilote est une retenue que `paquet-candidats` lit
+            # (`pilot-hold`) : le lot sortirait du paquet que ce brief demande.
+            move += READY_HOLD_HINT
     elif decision is not None:
         decider = waiting.get("owner") or "its decider"
         due = waiting.get("due_ts")

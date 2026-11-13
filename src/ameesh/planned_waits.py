@@ -183,6 +183,26 @@ def is_hold_note(text) -> bool:
     return bool(_HOLD.match(str(text or "").strip()))
 
 
+def ready_hold_warning(db, item_id: int, text: str) -> str:
+    """#7205 : l'avertissement d'un `hold: …` posé sur un lot validé.
+
+    Le lot est relu et n'attend que son paquet. Écrite par un pilote, la note
+    est une retenue que `scripts/paquet-candidats.py` lit (`pilot-hold`) : le
+    lot sort du paquet suivant jusqu'à `unhold: <raison>`. Le 13/11, les
+    accusés d'alertes SLO ainsi écrits ont écarté cinq lots validés de h-06.
+    La note est écrite ; la CLI dit l'effet. Chaîne vide sinon."""
+    if not is_hold_note(text):
+        return ""
+    from . import work
+    item = work.get(db, item_id) or {}
+    if item.get("state") != "validated":
+        return ""
+    return ("lot %s is validated: a pilot's \"hold: …\" is read by "
+            "scripts/paquet-candidats.py as `pilot-hold` and drops the lot from the "
+            "next package until \"unhold: <reason>\". To acknowledge an alert, "
+            "write a plain note (#7205)" % item_id)
+
+
 def is_lift_note(text) -> bool:
     """#1664 : la note qui lève explicitement une retenue (`unhold:`,
     `hold lifted:`/`released:`/`cleared:`)."""
