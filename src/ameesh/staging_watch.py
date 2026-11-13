@@ -916,9 +916,12 @@ def canon_alerts(db, *, now: float, cfg) -> list[dict]:
 #: it, its outcome never came and the alert speaks.
 EXECUTOR_REFRESH_S = 7200.0
 
+#: #7259: the source an alert names when no later tick reports the version.
+PASS_SOURCE = "its last completed pass"
+
 
 def executor_version_findings(records, *, now: float, attested=(),
-                              descends=None) -> list[dict]:
+                              descends=None, ticks=None) -> list[dict]:
     """#7164: one alert per executor key whose own venv lags staging.
 
     `records`: (key, row) pairs, the newest `completed` executor record per
@@ -927,7 +930,13 @@ def executor_version_findings(records, *, now: float, attested=(),
     the one the next timer pass starts) must be the deployed commit, and not
     older than a staging attested afterwards by another path. A record
     without the field comes from an executor older than #7164: it alerts
-    too, since nothing else would ever update it."""
+    too, since nothing else would ever update it.
+
+    #7259: `ticks` maps (key, host) to the newest `staging.executor` event of
+    that executor on that host. Published after the pass (a higher id), its
+    `executor_venv` is the version actually launched, read instead of the
+    pass's: an install made after the last completed pass is not stale. The
+    alert names the source it read."""
     newest = None
     for row in attested or ():
         sha = (row.get("data") or {}).get("sha")
@@ -940,9 +949,21 @@ def executor_version_findings(records, *, now: float, attested=(),
         sha = str(data.get("sha") or "")
         version = data.get("executor_venv")
         live = str(version.get("live") or "") if isinstance(version, dict) else ""
+        source = PASS_SOURCE
+        tick = (ticks or {}).get((key, data.get("host")))
+        if tick and int(tick.get("id") or 0) > int(row.get("id") or 0):
+            launched = (tick.get("data") or {}).get("executor_venv")
+            launched = (str(launched.get("running") or launched.get("live") or "")
+                        if isinstance(launched, dict) else "")
+            if launched:
+                live = launched
+                source = "the tick of %s at %s" % (data.get("host"), time.strftime(
+                    "%Y-%m-%d %H:%MZ", time.gmtime(float(tick.get("ts") or 0))))
         refresh = data.get("venv_refresh")
         target = sha
-        running = (isinstance(refresh, dict) and refresh.get("state") == "running")
+        running = (isinstance(refresh, dict) and refresh.get("state") == "running"
+                   and not (source != PASS_SOURCE and live
+                            and sha.startswith(live)))
         started = refresh.get("started") if running else None
         if running and isinstance(started, (int, float)) and (
                 now - started < EXECUTOR_REFRESH_S):
@@ -951,11 +972,13 @@ def executor_version_findings(records, *, now: float, attested=(),
             cause = ("the venv refresh of its last completed pass (%s) never "
                      "recorded its outcome" % sha[:12])
         elif not live:
-            cause = ("its version is not recorded (executor older than #7164, "
-                     "or venv unreadable)")
+            cause = ("its version is not recorded, neither by its last "
+                     "completed pass nor by a later tick (executor older than "
+                     "#7164, or venv unreadable)")
         elif not sha.startswith(live):
-            cause = ("its last completed pass deployed %s but left it on venv-%s"
-                     % (sha[:12], live))
+            cause = ("its last completed pass deployed %s but %s runs venv-%s"
+                     % (sha[:12], "it" if source == PASS_SOURCE
+                        else source, live))
             if isinstance(refresh, dict):
                 cause += " (venv refresh %s%s%s)" % (
                     refresh.get("state") or "?",
@@ -973,6 +996,8 @@ def executor_version_findings(records, *, now: float, attested=(),
                      % (target[:12], live))
         else:
             continue
+        if live:
+            cause += "; version read from %s" % source
         out.append(dict(
             schema="ameesh-alert/1", type="staging_executor_stale", agent=None,
             since=None, value=None, threshold=None, reason=key,
@@ -1002,6 +1027,20 @@ def executor_versions(db) -> list[tuple[str, dict]]:
     return out
 
 
+def executor_ticks(db) -> dict:
+    """#7259: the newest `staging.executor` event per (key, host)."""
+    from . import staging_executor
+    out = {}
+    for row in storage.of(db).events.latest_type(
+            staging_executor.SEQUENCE_EVENT, 60, LIMIT):
+        data = row.get("data")
+        if isinstance(data, dict) and data.get("host"):
+            pair = (data.get("key") or "", data["host"])
+            if int(row.get("id") or 0) > int((out.get(pair) or {}).get("id") or 0):
+                out[pair] = row
+    return out
+
+
 def executor_alerts(db, *, now: float, cfg) -> list[dict]:
     """#7164: `executor_version_findings` over the shared log."""
     from . import release_cutoff
@@ -1009,7 +1048,7 @@ def executor_alerts(db, *, now: float, cfg) -> list[dict]:
         release_cutoff.STAGING_EVENT, 60, LIMIT)
     return executor_version_findings(
         executor_versions(db), now=now, attested=attested,
-        descends=git_descends(ancestry_repos(cfg)))
+        descends=git_descends(ancestry_repos(cfg)), ticks=executor_ticks(db))
 
 
 def alerts(db, *, now: float, cfg=None) -> list[dict]:

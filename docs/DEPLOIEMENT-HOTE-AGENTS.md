@@ -1099,7 +1099,12 @@ de ce processus, et `live`, celle du lien). Chaque passe porte aussi
 passe `completed` d'un exécutant laisse `live` sur un autre commit que celui
 déployé, quand un staging attesté depuis par une autre voie en descend, ou
 quand le champ manque (exécutant antérieur à #7164 : la première pose qui
-porte #7164 reste le geste opérateur ci-dessus).
+porte #7164 reste le geste opérateur ci-dessus). Chaque tick publie aussi la
+version qu'il exécute dans `staging.executor` (#7259, aussitôt qu'elle
+change) : publiée après la dernière passe sur le même hôte, c'est elle que
+l'alerte lit, si bien qu'une pose faite après cette passe ne déclenche plus de
+fausse alerte ; le texte de l'alerte nomme la source lue (tick ou passe), et
+« not recorded » ne reste que sans aucune lecture.
 
 **Garde de démarrage du staging (#6806).** Le service de l'exécutant élu
 n'est admis que si son contexte et son environnement public sont ceux de
