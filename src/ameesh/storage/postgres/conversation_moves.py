@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import json
 
-from ..conversation_moves import (AFTER_SWITCH, BEFORE_SWITCH, OPEN, PLAN_TTL_S,
-                                  ConversationMoves as Contract)
+from ..conversation_moves import (AFTER_SWITCH, BEFORE_SWITCH, HANDOVER_TTL_S,
+                                  OPEN, PLAN_TTL_S, ConversationMoves as Contract)
 
 _COLUMNS = """move_id::text AS move_id, agent, epoch_source, state, reason,
               requested_by, source_host, source_cwd, source_owner,
@@ -35,6 +35,13 @@ FAILED_AFTER_LAUNCH = (
     "(%s): part of that turn may have run. Your own session resumes here; read "
     "the shared conversation journal and the lot state before acting.")
 
+#: #7052: the source's in-progress instruction when its host vanished mid-turn.
+#: The claim replays `current_prompt` once on the target; the notice opens it.
+INTERRUPTED_TURN = (
+    "The previous turn on host %s was interrupted (the host went away) and may "
+    "have partially run. Its instruction is replayed once: read the shared "
+    "conversation journal and the lot state before acting.")
+
 
 def _row(rows):
     if not rows:
@@ -57,6 +64,7 @@ class ConversationMoves(Contract):
             return None, None
         registry = tx.query(
             """SELECT name, host, cwd, mode, status, lease_owner, lease_epoch, session_id,
+                      current_prompt,
                       (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
                        AND lease_expires_at > clock_timestamp()) AS lease_live
                  FROM agent_registry WHERE name = %s FOR UPDATE""", (rows[0]["agent"],))
@@ -86,6 +94,22 @@ class ConversationMoves(Contract):
                 " error = 'expired before the switch', updated_at = clock_timestamp()"
                 " WHERE agent = %s AND state IN " + _BEFORE_SQL + " AND updated_at <="
                 " clock_timestamp() - make_interval(secs => %s)", (agent, PLAN_TTL_S))
+            # #7052 : une bascule d'avatar que personne n'a réclamée (cible et
+            # source disparues) ne bloque pas indéfiniment le prochain plan :
+            # au-delà de HANDOVER_TTL_S, une nouvelle tentative peut s'ouvrir.
+            # Un détenteur VIVANT n'est jamais périmé : son premier tour peut
+            # durer (`rehydrating`), la tentative lui appartient.
+            tx.execute(
+                "UPDATE conversation_moves SET state = 'failed', failed_at = clock_timestamp(),"
+                " error = 'handover expired before the target claimed',"
+                " updated_at = clock_timestamp()"
+                " WHERE agent = %s AND reason = 'preference' AND state IN "
+                + _AFTER_SQL + " AND switched_at <= clock_timestamp()"
+                " - make_interval(secs => %s)"
+                " AND NOT EXISTS (SELECT 1 FROM agent_registry r"
+                "                  WHERE r.name = %s AND r.lease_owner IS NOT NULL"
+                "                    AND r.lease_expires_at > clock_timestamp())",
+                (agent, HANDOVER_TTL_S, agent))
             # ON CONFLICT without a target: the (agent, epoch_source) key AND the
             # one-open-attempt index both reread instead of raising
             created = tx.query(
@@ -140,6 +164,30 @@ class ConversationMoves(Contract):
                              + " ORDER BY created_at, move_id", (host,))
         return [_row([r]) for r in rows]
 
+    def open_handover(self, agent):
+        """#7052: the newest post-switch attempt of this `preference` role.
+
+        A target that claimed holds a live lease: the attempt is serving and
+        must not be reclaimed, so it is excluded here (the same registry row
+        the switch locked, without the lock: this is only read).
+        """
+        return _row(self.db.query(
+            """SELECT m.move_id::text AS move_id, m.agent, m.source_host,
+                      m.target_host, m.state,
+                      extract(epoch FROM m.switched_at)::float8 AS switched_ts,
+                      extract(epoch FROM clock_timestamp())::float8 AS now_ts
+                 FROM conversation_moves m
+                WHERE m.agent = %s
+                  AND m.reason = 'preference'
+                  AND m.state IN ('switched', 'recovered', 'rehydrating')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_registry r
+                       WHERE r.name = m.agent
+                         AND r.lease_owner IS NOT NULL
+                         AND r.lease_expires_at > clock_timestamp())
+                ORDER BY m.switched_at DESC NULLS LAST, m.created_at DESC
+                LIMIT 1""", (agent,)))
+
     def prepare(self, move_id, *, target_host, target_cwd, checks):
         if any(not isinstance(v, bool) for v in checks.values()):
             raise ValueError("conversation move checks are booleans only")
@@ -182,18 +230,27 @@ class ConversationMoves(Contract):
                 state = "switched"
             else:
                 state = "recovered" if owner else "switched"
+            # #7052 : le tour en cours sur l'hôte disparu est rejoué une fois
+            # sur la cible ; la consigne humaine garde son identité
+            # (`pending_prompt_id`), la mention ouvre le texte rejoué.
+            notice = (INTERRUPTED_TURN % move["source_host"]
+                      if state == "recovered" and r.get("current_prompt") else None)
             moved = tx.query(
                 """UPDATE agent_registry
                       SET lease_owner = NULL, lease_expires_at = NULL,
                           lease_epoch = lease_epoch + 1,
                           host = %s, cwd = coalesce(%s, cwd),
+                          current_prompt = CASE WHEN %s::text IS NULL
+                                                THEN current_prompt
+                                                ELSE %s::text || E'\\n\\n'
+                                                     || current_prompt END,
                           status = CASE WHEN status IN ('running', 'dead') THEN 'idle'
                                         ELSE status END,
                           updated_at = now()
                     WHERE name = %s AND host = %s AND lease_epoch = %s
                 RETURNING lease_epoch""",
-                (move["target_host"], move["target_cwd"], move["agent"],
-                 move["source_host"], r["lease_epoch"]))
+                (move["target_host"], move["target_cwd"], notice, notice,
+                 move["agent"], move["source_host"], r["lease_epoch"]))
             if not moved:
                 return None
             return self._set(tx, move_id, "state = %s, switched_at = clock_timestamp()",

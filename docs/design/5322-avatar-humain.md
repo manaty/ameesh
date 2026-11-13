@@ -524,6 +524,26 @@ l'ancien détenteur sont réutilisés ; seul le **classement** change
 (préférence au lieu de disponibilité) et le brief devient le segment de
 conversation (§2.3), avec la session provisoire.
 
+**Implémenté par B2 (#7052).** Le retour ne touche jamais le bail directement :
+l'hôte préféré, rang 0 après `PREFERENCE_DWELL_S` (120 s) de présence sans
+trou, planifie un `conversation_moves` (`reason = 'preference'`, A2 #7050)
+vers lui ; la libération se fait à la frontière du tour source (`switch`), le
+plan étant relu de la base, donc un redémarrage de l'exécuteur ne perd ni le
+dwell (marque mémoire, remise à zéro si le détenteur redevient absent) ni le
+holdoff. Le holdoff (`PREFERENCE_HOLDOFF_S`, 120 s + délai de rang) se calcule
+sur `switched_at` : l'ancien détenteur ne claim pas avant, puis ferme la
+tentative que le poste n'a pas réclamée (`reclaim` → `fail`) et reprend **sa**
+conversation localement, session comprise, au lieu d'une relève croisée par
+brief. Un troisième candidat attend que la cible désignée claim. L'avatar
+renouvelle un bail court (`PREFERENCE_LEASE_TTL_S`, 120 s, plafonné par le
+`lease_ttl` de l'hôte) : un poste qui disparaît libère la conversation en deux
+minutes, et la récupération (`recovered`) rejoue une fois la consigne
+interrompue (`current_prompt`, même `pending_prompt_id`) en tête de la file.
+Aucun `election_brief` n'est construit tant qu'un déplacement porte la
+conversation ; une bascule que personne ne réclame (cible et source
+disparues) est périmée après `HANDOVER_TTL_S` (300 s) pour qu'un nouveau plan
+aboutisse. Le bail et l'epoch restent les seuls arbitres.
+
 ### 3.3 Ce qui n'est pas `election`
 
 `releve: election` reste pour les rôles de gouvernance : disponibilité sur

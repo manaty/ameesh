@@ -103,6 +103,22 @@ MATCH_S = 180.0
 #: the old holder waits this long, after a planned release, before reclaiming
 #: (the challenger is rank 0 and may have crashed: the role must not stay free)
 HANDOVER_RECLAIM_MARGIN_S = 60.0
+#: #7052 (5322 §3.2, avatar B2): a candidate of better rank must stay present
+#: this long, without a gap, before the holder releases the lease. A
+#: workstation that flaps (sleep, network) does not take the conversation for
+#: one fresh reading.
+PREFERENCE_DWELL_S = 120.0
+#: #7052: after releasing to a preferred host, the old holder claims nothing
+#: before this margin plus its rank delay: a preferred host that dies right
+#: after the switch must not make the role flap back at once. The margin is
+#: re-read from the open `conversation_moves` attempt, so it survives a
+#: runner restart (nothing to keep in memory).
+PREFERENCE_HOLDOFF_S = 120.0
+#: #7052: lease TTL of an avatar (`releve: preference`), shorter than the
+#: 300 s default: a workstation that disappears frees the conversation for
+#: the next candidate in two minutes, not five. The host's own `lease_ttl`
+#: still wins when it is smaller.
+PREFERENCE_LEASE_TTL_S = 120.0
 #: #4086/#4253: an executor that stops while holding an elected role reserves
 #: it to its own host this long: the restarted executor reclaims first and
 #: keeps the session; a host that does not come back leaves the role to the
@@ -946,6 +962,14 @@ def claim_wait(db, role: Mapping, host: str, free_since: float, *,
     Returns `(allowed, reason, standing)`. An unready or unpublished host is
     refused — the CAS would refuse it anyway (EP1 placement/canon), but the
     rank delay must not let it take the slot of a ready candidate.
+
+    #7052: a `preference` host that released the lease to a preferred host
+    waits `PREFERENCE_HOLDOFF_S` plus its rank delay before claiming again
+    (`preference holdoff`). Once that margin is over and the preferred host
+    still has not claimed, the answer is `preference reclaim`: the caller
+    closes the abandoned attempt (`conversation_move.reclaim`) and claims
+    locally, keeping the source session, instead of taking the row across
+    hosts with an election brief.
     """
     now = time.monotonic() if now is None else float(now)
     ranked = candidacy(db, role["name"])
@@ -967,7 +991,97 @@ def claim_wait(db, role: Mapping, host: str, free_since: float, *,
     if now < ready_at:
         return (False, "rank %d: waits %ds" % (mine["rank"], int(ready_at - now) + 1),
                 mine)
+    # #7052: the conversation handed to a preferred host is not taken back
+    # before the holdoff; after it, an attempt the preferred host never
+    # claimed is closed by the caller, locally. Another candidate waits for
+    # the designated target: only it claims without a brief (its session is
+    # rehydrated by the move, not reset).
+    if (role.get("releve") or "") == "preference":
+        from . import conversation_move
+        handed = conversation_move.handover(
+            db, role["name"], holdoff_s=PREFERENCE_HOLDOFF_S + delay)
+        if handed is not None:
+            target = handed["target_host"]
+            if handed["source_host"] == host:
+                left = float(handed.get("left_s") or 0.0)
+                if left > 0:
+                    return (False, "preference holdoff: waits %ds for %s"
+                            % (int(left) + 1, target), mine)
+                return (False, "preference reclaim: %s did not claim; closing "
+                        "the attempt" % target, mine)
+            if target != host:
+                return (False, "preference: conversation handed to %s; waits "
+                        "for it to claim" % target, mine)
     return True, "", mine
+
+
+def preference_return(db, role: Mapping, host: str, *, seen_since: float | None = None,
+                      now: float | None = None) -> dict | None:
+    """#7052 (5322 §3.2): this preferred host's return, at the next boundary.
+
+    `role` is the fresh registry row; `host` the candidate that could take the
+    lease back; `seen_since` the monotonic instant this host first saw itself
+    present and best (`None`: not yet). Returns:
+
+    * `None` — nothing to do: not a `preference` role, not ready, not the best
+      present candidate, or already the holder;
+    * `{"state": "holdoff"}` — this host just released the lease to another
+      host and must let it claim (`PREFERENCE_HOLDOFF_S` + rank delay);
+    * `{"state": "dwell", "remaining_s": ...}` — the holder is present and
+      this host has not stayed present `PREFERENCE_DWELL_S` yet;
+    * `{"state": "plan", "recovery": bool, ...}` — plan a conversation move
+      to this host. `recovery` is true when the holder is absent (no fresh
+      presence) or its lease expired: the short avatar TTL frees the
+      conversation and the move rehydrates it from the journal.
+
+    The lease itself is never touched here: the move's `switch` releases it at
+    the source's turn boundary, and the claim CAS stays the only arbiter.
+    """
+    if (role.get("releve") or "") != "preference":
+        return None
+    if (role.get("mode") or "execute") != "execute" or role.get("status") == "stopped":
+        return None
+    name = str(role.get("name") or "")
+    holder = str(role.get("host") or "")
+    if not name or holder == host:
+        return None
+    now_mono = time.monotonic() if now is None else float(now)
+    ranked = candidacy(db, name)
+    mine = next((item for item in ranked if item["host"] == host), None)
+    if mine is None or not mine["ready"] or mine["rank"] != 0:
+        return None
+    delay = float(mine.get("delay_s") or 0.0)
+    # a host that just released to a preferred one waits its holdoff: it must
+    # not plan a recovery that would undo the handover it just made
+    from . import conversation_move
+    release = conversation_move.release_wait(
+        db, name, host, holdoff_s=PREFERENCE_HOLDOFF_S + delay)
+    if release is not None:
+        return {"state": "holdoff",
+                "remaining_s": max(0.0, float(release.get("left_s") or 0.0)),
+                "holder": holder, "release": release}
+    other = next((item for item in ranked if item["host"] == holder), None)
+    if _lease_live(db, role) and other is not None and other["ready"]:
+        if seen_since is None:
+            return {"state": "dwell", "remaining_s": PREFERENCE_DWELL_S,
+                    "holder": holder, "delay_s": delay}
+        elapsed = now_mono - float(seen_since)
+        if elapsed < PREFERENCE_DWELL_S:
+            return {"state": "dwell", "remaining_s": PREFERENCE_DWELL_S - elapsed,
+                    "holder": holder, "delay_s": delay}
+        return {"state": "plan", "recovery": False, "holder": holder,
+                "dwell_s": elapsed, "delay_s": delay}
+    # the holder is absent (no fresh presence) or its lease expired: the
+    # conversation is recovered at once, the short TTL bounding the wait
+    return {"state": "plan", "recovery": True, "holder": holder,
+            "dwell_s": 0.0, "delay_s": delay}
+
+
+def _lease_live(db, role: Mapping) -> bool:
+    """Is the role's lease still running, on the database clock?"""
+    if not role.get("lease_owner") or role.get("lease_expires_ts") is None:
+        return False
+    return float(role["lease_expires_ts"]) > pg.now_ts(db)
 
 
 def _nearest(rows: Sequence[Mapping], ts: float) -> Mapping | None:

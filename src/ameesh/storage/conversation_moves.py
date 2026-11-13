@@ -21,6 +21,11 @@ AFTER_SWITCH = ("switched", "recovered", "rehydrating")
 #: a planned or prepared attempt older than this no longer holds the source
 #: back (compiled, seconds): a target that never prepares cannot stop the agent
 PLAN_TTL_S = 900
+#: #7052: a switched/recovered attempt no target claimed within this no longer
+#: blocks a new plan (compiled, seconds). The source closes its attempt after
+#: its holdoff; this is the last resort when both hosts are gone, so the next
+#: present candidate can plan a recovery instead of waiting forever.
+HANDOVER_TTL_S = 300
 
 
 class ConversationMoves(abc.ABC):
@@ -58,6 +63,17 @@ class ConversationMoves(abc.ABC):
     @abc.abstractmethod
     def for_target(self, host: str) -> list[dict]:
         """Open attempts whose target is `host`, oldest first."""
+
+    @abc.abstractmethod
+    def open_handover(self, agent: str) -> dict | None:
+        """#7052: the newest post-switch attempt of a `preference` role whose
+        target has not claimed yet (no live lease).
+
+        States `switched`, `recovered` and `rehydrating`. Carries `source_host`
+        and `target_host`, plus `switched_ts` and `now_ts` on the database
+        clock, so the caller computes the holdoff. This is how a candidate
+        tells "the conversation was handed to that host, let it claim" from
+        "the row is simply free"."""
 
     @abc.abstractmethod
     def prepare(self, move_id: str, *, target_host: str, target_cwd: str,

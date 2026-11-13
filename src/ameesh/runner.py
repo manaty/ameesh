@@ -674,6 +674,22 @@ def _move_unsupported(worker) -> bool:
             or storage.is_remote(getattr(worker, "db", None)))
 
 
+def preference_lease_ttl(agent, host_ttl) -> float:
+    """#7052: the lease TTL of an avatar (`releve: preference`).
+
+    A workstation that disappears must free its conversation in two minutes
+    (`election.PREFERENCE_LEASE_TTL_S`), not five: the next candidate then
+    recovers it with the short move. The host's own `lease_ttl` still wins
+    when it is smaller; every other role keeps it unchanged.
+    """
+    ttl = float(host_ttl or 0.0)
+    if (agent or {}).get("releve") != "preference":
+        return ttl
+    from . import election
+    short = float(election.PREFERENCE_LEASE_TTL_S)
+    return min(ttl, short) if ttl > 0 else short
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -1253,6 +1269,19 @@ class AgentWorker(threading.Thread):
             log("[%s] thread unavailable: %s" % (self.name, exc))
 
     # -- bail --------------------------------------------------------------
+    @property
+    def lease_ttl(self) -> float:
+        """#7052: TTL of this worker's lease.
+
+        Short for a `releve: preference` avatar, so a workstation that goes
+        away frees the conversation for the next candidate in two minutes;
+        the runner's configured TTL for every other role (and when it is
+        smaller than the avatar bound). Read at each use, like the runner's
+        own reloadable `lease_ttl`.
+        """
+        return preference_lease_ttl(getattr(self, "agent", None),
+                                    getattr(self.runner, "lease_ttl", 0.0))
+
     def deadline_passed(self) -> bool:
         """L'échéance du bail est-elle déjà atteinte (ou inconnue) ?"""
         return (self.lease_deadline > 0
@@ -1266,7 +1295,7 @@ class AgentWorker(threading.Thread):
         déjà avoir réclamé l'agent (verdict codex3 B5a).
         """
         if self.lease_deadline <= 0:
-            return max(3.0, self.runner.lease_ttl / 3.0)
+            return max(3.0, self.lease_ttl / 3.0)
         # Temps restant exact, sans plancher : un appel entamé 20 ms avant
         # l'échéance ne doit pas survivre 50 ms de plus (verdict codex3 B5a).
         return max(0.0, self.lease_deadline - _clock_of(self).time())
@@ -1291,7 +1320,7 @@ class AgentWorker(threading.Thread):
                     migrations.require_compatible_writer(renew_db)
                     result["expires"] = registry.renew(
                         renew_db, self.name, self.runner.runner_id, self.epoch,
-                        self.runner.lease_ttl)
+                        self.lease_ttl)
             except Exception as exc:  # DbError, mais aussi tout imprévu
                 result["error"] = exc
             if result.get("expires") is not None or "error" in result:
@@ -1397,7 +1426,7 @@ class AgentWorker(threading.Thread):
         lost = getattr(self, "lease_lost", None)
         if lost is not None and lost.is_set():
             return False
-        ttl = float(getattr(self.runner, "lease_ttl", 0) or 0)
+        ttl = float(self.lease_ttl or 0)
         if ttl > 0 and self.lease_deadline > 0:
             reste = self.lease_deadline - _clock_of(self).time()
             if reste > ttl / 2.0:
@@ -1405,7 +1434,7 @@ class AgentWorker(threading.Thread):
         return self.renew()
 
     def _held_until(self) -> float:
-        return _clock_of(self).monotonic() + float(self.runner.lease_ttl)
+        return _clock_of(self).monotonic() + float(self.lease_ttl)
 
     def release_lease(self) -> bool:
         """Rend le bail ; False quand la base ne l'a pas pris (DbError) : le
@@ -1783,7 +1812,7 @@ class AgentWorker(threading.Thread):
         dernier essai utile était perdu. Le plancher de 50 ms évite le
         martèlement quand la marge s'épuise.
         """
-        pas = (self.runner.lease_ttl / 3.0) if self.runner.lease_ttl > 0 else 3.0
+        pas = (self.lease_ttl / 3.0) if self.lease_ttl > 0 else 3.0
         if getattr(self, "renew_failures", 0):
             # Un échec ne repousse pas le bail : la tranche nulle ne doit pas
             # marteler la base. Réessayer au délai court de L72, sans jamais
@@ -1917,7 +1946,7 @@ class AgentWorker(threading.Thread):
             rendu = registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
         except Exception as exc:  # base figée elle aussi : l'échéance le rendra
             log_async("[%s] preparation abandoned: lease not released (%s), "
-                      "it expires within %ds" % (self.name, exc, self.runner.lease_ttl))
+                      "it expires within %ds" % (self.name, exc, self.lease_ttl))
             return
         if not rendu:
             log_async("[%s] preparation abandoned: lease already gone (epoch %d)"
@@ -1929,7 +1958,7 @@ class AgentWorker(threading.Thread):
         # 3 s faisait dormir un bail de 3 s jusqu'à l'échéance même : le
         # watchdog tuait alors un harnais pas encore publié sous charge CI
         # (run 39133881211). Le plancher ne sert plus qu'à éviter un pas nul.
-        interval = max(0.05, self.runner.lease_ttl / 3.0)
+        interval = max(0.05, self.lease_ttl / 3.0)
         # L72 : après un échec, nouvel essai rapide (2 s, 4 s… jusqu'à
         # l'intervalle normal) — une base revenue doit prolonger le bail avant
         # son échéance, pas un tiers de bail plus tard. Pour un bail court, la
@@ -11293,7 +11322,7 @@ class AgentWorker(threading.Thread):
                     self._resident_between_turns()  # L76 : mort, sommeil
                     admission_lock.reset()  # #4602 : la passe prioritaire est finie
                     self.wake.wait(timeout=self.wait_timeout(self._until_due(
-                        min(self._idle_poll(), max(1.0, self.runner.lease_ttl / 3.0)))))
+                        min(self._idle_poll(), max(1.0, self.lease_ttl / 3.0)))))
                     self.wake.clear()
                     continue
                 try:
@@ -11514,6 +11543,17 @@ class Runner:
         #: l'exécuteur (N de la relecture #3011, panier #3099).
         self._handover_loaded = False
         self._handover_retry_at = 0.0
+        #: #7052 : `{rôle: instant monotone}` — premier moment où cet hôte,
+        #: rang 0 d'un avatar, a vu le détenteur présent et vivant ; le dwell
+        #: de retour se compte de là, et une absence le remet à zéro.
+        self._preference_seen_since: dict[str, float] = {}
+        #: #7052 : `{rôle: échéance monotone}` — après un plan ou un reclaim
+        #: d'avatar qui n'a pas abouti, ne pas réessayer à chaque passe.
+        self._preference_plan_next: dict[str, float] = {}
+        #: #7052 : cadence de la passe de retour, et dernier diagnostic (même
+        #: règle que `_role_error` : une panne ne casse pas l'exécuteur).
+        self._preference_next = 0.0
+        self._preference_error: str | None = None
         self._handover_error: str | None = None
         # #1467: explicit qualified passages only; no live policy selected here.
         self.train_passages = tuple(train_passages)
@@ -11953,6 +11993,15 @@ class Runner:
         """
         if not canon_mod.cross_host(agent.get("releve")):
             return None
+        if (agent.get("releve") or "") == "preference":
+            # #7052 : tant qu'un déplacement porte la conversation, l'avatar ne
+            # se relève pas par brief — sa session suit par `conversation_moves`
+            # (rehydratation, A2 #7050) et un brief la remettrait à zéro. Sans
+            # déplacement ouvert (source disparue avant tout plan), le brief
+            # reste le dernier recours de reprise, comme pour un rôle élu.
+            from . import conversation_move
+            if conversation_move.holds(self.db, agent["name"]):
+                return None
         previous = agent.get("previous_host")
         if not previous or previous == self.host:
             return None
@@ -11973,6 +12022,89 @@ class Runner:
                       % agent.get("name"))
             return ""
         return brief
+
+    def preference_return_pass(self) -> list:
+        """#7052 (5322 §3.2, avatar B2) : ramène la conversation sur son hôte
+        préféré, au prochain tour, sans jamais changer d'hôte par un brief.
+
+        Pour chaque avatar (`releve: preference`) dont cet hôte est candidat :
+        rang 0 et détenteur présent pendant `PREFERENCE_DWELL_S` → planifie un
+        `conversation_moves` vers cet hôte ; détenteur absent (relevé non
+        frais) ou bail échu → planifie aussitôt une récupération (`recovered`,
+        rejeu du tour interrompu). Le bail reste l'arbitre : ce n'est qu'un
+        plan, la bascule se fait à la frontière du tour source (`advance`),
+        dans la même passe si possible. Une panne ne casse pas l'exécuteur.
+        """
+        if self.dry_run or getattr(self, "mediated", False) or _admits_nobody(self):
+            return []
+        now = self.clock.monotonic()
+        check_s = float(getattr(self, "PREFERENCE_RETURN_CHECK_S", 20.0))
+        if self._preference_next and now < self._preference_next:
+            return []
+        self._preference_next = now + check_s
+        from . import conversation_move, election
+        from . import role_standings_pg as standings
+        try:
+            roles = standings.elected_roles(self.db, self.host, releves=("preference",))
+        except Exception as exc:  # idem : une lecture de rôle ne fait pas tomber l'hôte
+            message = "preference standings unreadable (%s)" % db_mod.brief(exc)
+            if message != self._preference_error:
+                log_async(message)
+            self._preference_error = message
+            return []
+        planned = []
+        for row in roles:
+            name = str(row.get("name") or "")
+            if not name or (self.agents_filter is not None
+                            and name not in self.agents_filter):
+                continue
+            agent = registry.get(self.db, name)
+            if agent is None:
+                continue
+            try:
+                verdict = election.preference_return(
+                    self.db, agent, self.host,
+                    seen_since=self._preference_seen_since.get(name), now=now)
+                if verdict is None:
+                    self._preference_seen_since.pop(name, None)
+                    continue
+                state = verdict.get("state")
+                if state == "dwell":
+                    self._preference_seen_since.setdefault(name, now)
+                    continue
+                if state != "plan":
+                    # holdoff : cet hôte a rendu la conversation, il la laisse
+                    self._preference_seen_since.pop(name, None)
+                    continue
+                if now < self._preference_plan_next.get(name, 0.0):
+                    continue
+                # Pas de pré-contrôle `holds` : une bascule que personne n'a
+                # réclamée doit pouvoir être périmée par `plan` (sous le verrou
+                # du registre, `HANDOVER_TTL_S`). Un déplacement frais vers un
+                # autre hôte est rendu tel quel et on n'insiste pas.
+                move = conversation_move.plan(
+                    self.db, name, self.host, requested_by=self.runner_id,
+                    reason="preference")
+                if move is None or move.get("target_host") != self.host:
+                    # un autre déplacement est déjà ouvert : ne pas insister
+                    self._preference_plan_next[name] = now + check_s
+                    continue
+                self._preference_seen_since.pop(name, None)
+                self._preference_plan_next.pop(name, None)
+                planned.append(name)
+                if move.get("created"):
+                    log_async(
+                        "[%s] preference return: move planned from %s%s"
+                        % (name, verdict.get("holder") or "?",
+                           " (recovery: holder absent)" if verdict.get("recovery")
+                           else " (dwell %ds)" % int(verdict.get("dwell_s") or 0)))
+            except Exception as exc:  # noqa: BLE001 - un avatar ne bloque pas l'hôte
+                message = "preference return for %s unreadable (%s)" % (
+                    name, db_mod.brief(exc))
+                if message != self._preference_error:
+                    log_async(message)
+                self._preference_error = message
+        return planned
 
     def advance_conversation_moves(self) -> list:
         """#7050 (5322 §2.3) : prépare (harnais, binaire, compte, dossier,
@@ -12009,6 +12141,10 @@ class Runner:
     ROLE_EVAL_INTERVAL_S = 60.0
     #: l'hystérésis lit une heure ; l'historique garde deux jours
     ROLE_PRUNE_EVERY_S = 6 * 3600.0
+    #: #7052 : fréquence de la passe de retour d'un avatar (`preference`) vers
+    #: son hôte préféré ; le dwell de 120 s se lit sur des marques en mémoire,
+    #: une lecture par 20 s suffit à le constater sans marteler la base.
+    PREFERENCE_RETURN_CHECK_S = 20.0
 
     @migrations.writer_tick
     def role_evaluation_once(self) -> int | None:
@@ -12219,6 +12355,27 @@ class Runner:
                     and self._republish_reserved(name, now)):
                 verdict = election.claim_wait(self.db, agent, self.host, since,
                                               now=now)
+            if (not verdict[0] and (agent.get("releve") or "") == "preference"
+                    and verdict[1].startswith("preference reclaim:")):
+                # #7052 : l'hôte préféré n'a pas réclamé dans la marge. Cet
+                # hôte ferme la tentative et reprend SA conversation, avec sa
+                # session, au lieu d'une relève croisée par brief.
+                from . import conversation_move
+                if now >= self._preference_plan_next.get(name, 0.0):
+                    delay = float((verdict[2] or {}).get("delay_s") or 0.0)
+                    closed = conversation_move.reclaim(
+                        self.db, name, self.host,
+                        holdoff_s=election.PREFERENCE_HOLDOFF_S + delay)
+                    if closed is not None:
+                        self._preference_plan_next.pop(name, None)
+                        log_async(
+                            "[%s] preference reclaim: %s did not claim; the "
+                            "conversation returns to %s" % (
+                                name, closed.get("target_host") or "?", self.host))
+                        verdict = election.claim_wait(self.db, agent, self.host,
+                                                      since, now=now)
+                    else:
+                        self._preference_plan_next[name] = now + 5.0
             return verdict
         except Exception as exc:  # idem : fail closed, jamais un tour sans rang
             message = "role standings unreadable (%s)" % db_mod.brief(exc)
@@ -12759,8 +12916,11 @@ class Runner:
         # #7050 : les déplacements de conversation vers cet hôte avancent
         # (préparation, bascule) avant la réclamation : un agent basculé est
         # réclamé dans la même passe. Une panne n'arrête pas l'exécuteur.
+        # #7052 : le retour d'un avatar (`preference`) se planifie juste avant,
+        # pour être basculé et réclamé dans la même passe s'il est possible.
         if not getattr(self, "mediated", False) and not self.dry_run \
                 and not _admits_nobody(self):
+            self.preference_return_pass()
             self.advance_conversation_moves()
         # #3925 : une liste d'admission vide n'admet personne (`claimable`
         # lit une liste vide comme « tous »)
@@ -12817,9 +12977,12 @@ class Runner:
                 if election_brief == "":
                     self._release_slot(agent["name"])
                     continue
-                lease = registry.claim(self.db, agent["name"], self.runner_id,
-                                       self.lease_ttl, host=self.host,
-                                       election_brief=election_brief or None)
+                # #7052 : un avatar (`releve: preference`) prend un bail court,
+                # pour que son hôte disparu libère la conversation en 2 min.
+                lease = registry.claim(
+                    self.db, agent["name"], self.runner_id,
+                    preference_lease_ttl(agent, self.lease_ttl), host=self.host,
+                    election_brief=election_brief or None)
                 if not lease:
                     self._release_slot(agent["name"])
                     # #6134 : même identifiant, tour encore en cours — la
