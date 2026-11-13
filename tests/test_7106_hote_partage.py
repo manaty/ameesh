@@ -12,11 +12,16 @@ B (même si son filtre d'agents était modifié) ; le runner de A le prend.
 from __future__ import annotations
 
 import dataclasses
+import io
 import os
+import types
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
-from ameesh import canon, election, persona_memory, placement, registry, storage, tenancy
+from ameesh import (canon, config, db as db_mod, election, identity,
+                    persona_memory, placement, registry, storage, sous_utilisation,
+                    tenancy)
 
 from . import test_canon
 from .test_canon import codes, write
@@ -214,15 +219,41 @@ class SharedClaimTest(test_canon._CanonDbCase):
 
     def test_enregistrement_exige_le_tenant_du_canon(self):
         with self.assertRaises(tenancy.TenancyError) as caught:
-            tenancy.register(self.db, "atelier", ALICE, actor="human:alice", uid=3001)
+            tenancy.register(self.db, "atelier", ALICE, actor="human:alice",
+                             local_host="atelier", uid=3001)
         self.assertEqual(caught.exception.code, "tenant-not-declared")
         with self.assertRaises(tenancy.TenancyError) as caught:
             tenancy.register(self.db, "banc", ALICE, actor="human:alice",
-                             user="ameesh-utilisateur-absent-7106")
+                             local_host="banc", user="ameesh-utilisateur-absent-7106")
         self.assertEqual(caught.exception.code, "tenant-user-missing")
-        row = tenancy.register(self.db, "banc", ALICE, actor="human:alice", uid=3001)
+        row = tenancy.register(self.db, "banc", ALICE, actor="human:alice",
+                               local_host="banc", uid=3001)
         self.assertEqual((row["uid"], row["runner_id"], row["unix_user"]),
                          (3001, "banc/alice", "ameesh-alice"))
+
+    def test_enregistrement_refuse_l_uid_d_un_autre_hote(self):
+        # N1 (#7200) : le passwd de l'appelant n'est pas celui de la cible
+        before = storage.of(self.db).tenancy.bindings("banc")
+        with mock.patch.object(tenancy.pwd, "getpwnam") as lookup:
+            with self.assertRaises(tenancy.TenancyError) as caught:
+                tenancy.register(self.db, "banc", ALICE, actor="human:alice",
+                                 local_host="atelier")
+        self.assertEqual(caught.exception.code, "tenant-uid-unverified")
+        self.assertIn("run the registration on banc", str(caught.exception))
+        lookup.assert_not_called()
+        # aucune liaison écrite : les deux du banc de test restent seules
+        self.assertEqual([(r["tenant"], r["uid"]) for r in
+                          storage.of(self.db).tenancy.bindings("banc")],
+                         [(r["tenant"], r["uid"]) for r in before])
+
+    def test_enregistrement_lit_l_uid_sur_l_hote_cible(self):
+        # N1 (#7200) : sur la cible, l'UID vient bien du système, jamais saisi
+        with mock.patch.object(tenancy.pwd, "getpwnam",
+                               return_value=types.SimpleNamespace(pw_uid=2001)) as lookup:
+            row = tenancy.register(self.db, "banc", ALICE, actor="human:alice",
+                                   local_host="banc")
+        lookup.assert_called_once_with("ameesh-alice")
+        self.assertEqual((row["uid"], row["unix_user"]), (2001, "ameesh-alice"))
 
     # -- présence --------------------------------------------------------------
     def test_battement_sous_liaison_seulement(self):
@@ -329,6 +360,78 @@ class ProvisioningTest(unittest.TestCase):
                               else runner_mod.Runner.resource_once(fake))
         beat.assert_called_once()
         collect.assert_not_called()
+
+
+class TenantAuthorityTest(unittest.TestCase):
+    """N2 (#7200) : liaison de tenant = humain ou bureau, jamais un agent.
+
+    `work.corrector` accepte les orchestrateurs et les agents de conception ;
+    le geste d'infrastructure du design 5322 §3.4 est réservé au bureau, d'où
+    la garde propre `tenancy.operator` (`BUREAU_ROLES`).
+    """
+
+    def test_un_agent_de_conception_est_refuse(self):
+        binding = identity.Binding(name="mty-amh-impl-04", source="session", ok=True)
+        with mock.patch.object(identity, "resolve_binding", return_value=binding), \
+                mock.patch.object(sous_utilisation, "role_orchestrators",
+                                  return_value=set()):
+            with self.assertRaises(tenancy.TenancyError) as caught:
+                tenancy.operator(None, None)
+        self.assertEqual(caught.exception.code, "tenant-bureau-only")
+        self.assertIn("neither a human nor the bureau", str(caught.exception))
+
+    def test_le_bureau_est_accepte(self):
+        binding = identity.Binding(name="bureau", source="session", ok=True)
+        with mock.patch.object(identity, "resolve_binding", return_value=binding), \
+                mock.patch.object(sous_utilisation, "role_orchestrators",
+                                  return_value={"bureau"}) as roles:
+            self.assertEqual(tenancy.operator(None, None), "bureau")
+        self.assertEqual(roles.call_args.args[1], tenancy.BUREAU_ROLES)
+
+    def test_un_humain_reste_accepte(self):
+        binding = identity.Binding(reason="unbound", source="none")
+        with mock.patch.object(identity, "resolve_binding", return_value=binding), \
+                mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": ""}, clear=False):
+            self.assertEqual(tenancy.operator(None, None, "human:alice"),
+                             "human:alice")
+
+    def test_un_agent_ne_signs_pas_pour_un_autre(self):
+        binding = identity.Binding(name="mty-amh-impl-04", source="session", ok=True)
+        with mock.patch.object(identity, "resolve_binding", return_value=binding):
+            with self.assertRaises(tenancy.TenancyError) as caught:
+                tenancy.operator(None, None, "bureau")
+        self.assertEqual(caught.exception.code, "tenant-actor-mismatch")
+
+    def test_main_passe_l_hote_local_au_register(self):
+        cfg = config.Config(host="banc", tenant="")
+        fake_db = mock.Mock()
+        with mock.patch.object(config, "load", return_value=cfg), \
+                mock.patch.object(db_mod, "connect", return_value=fake_db), \
+                mock.patch.object(tenancy, "register", return_value={"uid": 1}) as register, \
+                mock.patch.object(tenancy, "operator", return_value="bureau") as actor:
+            self.assertEqual(tenancy.main(["add", ALICE, "--register",
+                                           "--actor", "bureau"]), 0)
+        actor.assert_called_once_with(cfg, fake_db, "bureau")
+        self.assertEqual(register.call_args.kwargs["local_host"], "banc")
+        fake_db.close.assert_called_once()
+
+    def test_main_refuse_un_enregistrement_hors_de_l_hote_cible(self):
+        cfg = config.Config(host="poste", tenant="")
+        fake_db = mock.Mock()
+        out = io.StringIO()
+        with mock.patch.object(config, "load", return_value=cfg), \
+                mock.patch.object(db_mod, "connect", return_value=fake_db), \
+                mock.patch.object(tenancy, "operator", return_value="human:alice"), \
+                mock.patch.object(tenancy, "host_policy",
+                                  return_value={"shared": True,
+                                                "tenants": [ALICE]}), \
+                mock.patch.object(tenancy.pwd, "getpwnam") as lookup, \
+                redirect_stdout(out):
+            self.assertEqual(tenancy.main(["add", ALICE, "--host", "banc",
+                                           "--register", "--actor", "human:alice"]), 1)
+        self.assertIn("tenant-uid-unverified", out.getvalue())
+        lookup.assert_not_called()
+        fake_db.close.assert_called_once()
 
 
 if __name__ == "__main__":

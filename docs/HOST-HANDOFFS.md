@@ -578,22 +578,28 @@ the leases of its own agents.
 
 The guard is in the database (`ameesh_tenant_claim_ok`, migration 0575):
 `canon sync` writes the host policy in `host_tenancy`; the supervisor writes
-the tenant binding (system user, UID read from the system, runner id) in
-`host_tenants`. On a shared host a claim (or an `attach`) succeeds only for
-the runner bound to the agent's `responsible` (or `attach:<its user>@<host>`),
-whatever the runner's agent filter says. For `releve: preference`, a shared
+the tenant binding (system user, UID read from the target host's passwd,
+runner id) in `host_tenants`. On a shared host a claim (or an `attach`)
+succeeds only for the runner bound to the agent's `responsible` (or
+`attach:<its user>@<host>`), whatever the runner's agent filter says. For `releve: preference`, a shared
 candidate is present only with a fresh beat of the tenant's runner.
 `require_isolation` (persona memory) compares verified UIDs: two tenants are
 isolated; the same tenant, an unknown UID or a process under another UID is
 refused.
 
-Provisioning is a bureau gesture, never an agent:
+Provisioning is a bureau or human gesture, never an agent:
 
     ameesh host tenant add human:alice --host banc          # prints the plan
     # (run the plan as root, install the organization keys as the tenant)
+    # then ON the shared host (the UID is read from its passwd):
     ameesh host tenant add human:alice --host banc --register --actor human:<id>
     ameesh host tenant list [--host banc] [--json]
     ameesh host tenant remove human:alice --host banc --actor human:<id>
+
+`--register` is refused when `--host` is not the local host: a same-named user
+of the caller's machine would otherwise bind a false UID. `--actor` names a
+human (`human:<id>`) or `bureau`; a design or orchestrator agent is refused,
+and a bound session acts only as itself.
 
 `remove` is refused while an agent of the tenant is still on the host
 (lease, turn or row not moved). Honest limit: a tenant runner still holds the
