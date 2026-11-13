@@ -222,6 +222,53 @@ class SelectionHelperTest(unittest.TestCase):
         self.assertEqual(unit["coverage"]["unmapped_blocks"],
                          ["src/pkg/autre.py:autre"])
 
+    def test_7211_tete_de_lot_fusionnee_avec_la_cible_lit_l_unite(self) -> None:
+        # #7211 : une tête de lot qui a fusionné la cible est une fusion sans
+        # trailer `ameesh-work:`. `sha^1..sha` ne voit que le delta de la
+        # cible (bloc `chaude`) et perd le bloc de l'unité (`froide`) ; une
+        # fusion ordinaire se lit depuis `merge-base(base, unit)`, ici la
+        # cible, donc le delta de l'unité seule.
+        self.card(self.base)
+        self.git("checkout", "-q", "-b", "lot")
+        self.write("src/pkg/mod.py", SOURCE_V1.replace("return 2", "return 20"))
+        self.commit("unité : bloc froide")
+        self.git("checkout", "-q", "main")
+        self.write("src/pkg/mod.py", SOURCE_V1.replace("return 1", "return 10"))
+        self.base = self.commit("cible : bloc chaude")
+        self.git("checkout", "-q", "lot")
+        self.git("merge", "--no-ff", "--no-edit", "main")
+        report = self.select(self.git("rev-parse", "HEAD"), budget=200)
+        (unit,) = report["units"]
+        modules = [row["module"] for row in unit["added"]]
+        self.assertIn("tests.test_froid", modules)
+        self.assertNotIn("tests.test_chaud_rapide", modules)
+
+    def test_7211_composition_reconnue_lit_le_premier_parent(self) -> None:
+        # #7211 : une vraie composition (message avec `ameesh-work:`) garde
+        # son premier parent, la composition précédente. Sans cette lecture,
+        # l'unité 2 lirait aussi le delta de l'unité 1 depuis la base commune.
+        self.card(self.base)
+        self.git("checkout", "-q", "-b", "unite-1")
+        self.write("src/pkg/mod.py", SOURCE_V1.replace("return 1", "return 10"))
+        self.commit("unité 1 : bloc chaude")
+        self.git("checkout", "-q", "main")
+        self.write("README", "cible\n")
+        self.base = self.commit("cible avancée")
+        self.git("checkout", "-q", "-b", "paquet", "main")
+        self.git("merge", "--no-ff", "-m",
+                 "composition : #1\n\nameesh-work: 1", "unite-1")
+        self.git("checkout", "-q", "-b", "unite-2", "main")
+        self.write("src/pkg/mod.py", SOURCE_V1.replace("return 2", "return 20"))
+        self.commit("unité 2 : bloc froide")
+        self.git("checkout", "-q", "paquet")
+        self.git("merge", "--no-ff", "-m",
+                 "composition : #2\n\nameesh-work: 2", "unite-2")
+        report = self.select(self.git("rev-parse", "HEAD"), budget=200)
+        (unit,) = report["units"]
+        modules = [row["module"] for row in unit["added"]]
+        self.assertIn("tests.test_froid", modules)
+        self.assertNotIn("tests.test_chaud_rapide", modules)
+
     def test_4814_support_partage_borne_par_le_budget(self) -> None:
         # #4814 : `tests/support.py` importé par ~545 modules faisait de la
         # série de l'unité la suite entière ; le support entre au budget, le
