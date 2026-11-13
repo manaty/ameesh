@@ -189,6 +189,37 @@ class ChildrenPlacementTest(test_canon._CanonDbCase):
         self.assertIn("changed during creation", str(ctx.exception))
         self.assertIsNone(self.row("enfant2"))
 
+    def test_parent_deplace_sur_l_hote_choisi_entre_evaluation_et_insertion_refuse(self):
+        original = avatar_children.place_child
+
+        def raced(*args, **kwargs):
+            placement = original(*args, **kwargs)
+            self.db.execute(
+                "UPDATE agent_registry SET host = 'enfants' WHERE name = 'avatar'")
+            return placement
+
+        with mock.patch.object(avatar_children, "place_child", side_effect=raced):
+            with self.assertRaises(canon_sync.SpawnError) as ctx:
+                self.spawn("enfant2")
+        self.assertIn("changed during creation", str(ctx.exception))
+        self.assertIsNone(self.row("enfant2"))
+
+    def test_responsable_change_entre_evaluation_et_insertion_refuse(self):
+        original = avatar_children.place_child
+
+        def raced(*args, **kwargs):
+            placement = original(*args, **kwargs)
+            self.db.execute(
+                "UPDATE agent_registry SET responsible = 'human:bob' "
+                "WHERE name = 'avatar'")
+            return placement
+
+        with mock.patch.object(avatar_children, "place_child", side_effect=raced):
+            with self.assertRaises(canon_sync.SpawnError) as ctx:
+                self.spawn("enfant2")
+        self.assertIn("changed during creation", str(ctx.exception))
+        self.assertIsNone(self.row("enfant2"))
+
     # -- lignée incomplète : refus, jamais de repli ------------------------
     def test_lignee_avec_ancetre_absent_refuse(self):
         self.spawn()

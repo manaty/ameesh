@@ -797,7 +797,8 @@ class Ephemerals(interface.Ephemerals):
 
     def create(self, name, creator, *, cwd, ttl_seconds, host=None,
                admitted_hosts=None, credential_mode=None,
-               placement=None, evaluated_profile=None) -> dict | None:
+               placement=None, evaluated_profile=None,
+               evaluated_identity=None) -> dict | None:
         """Insertion atomique (INSERT … SELECT sur la ligne du créateur).
 
         Sans `host` : comportement R14, le responsable, l'hôte, le dossier et
@@ -813,7 +814,11 @@ class Ephemerals(interface.Ephemerals):
         `evaluated_profile` (`{harness, provider, model}`) est joint à
         l'INSERT : le harnais, le fournisseur et le modèle copiés du créateur
         doivent être ceux que le verdict a jugés, sinon aucune ligne n'est
-        écrite (le profil inséré ne serait pas le profil évalué)."""
+        écrite (le profil inséré ne serait pas le profil évalué).
+        `evaluated_identity` (`{host, responsible, created_by, lineage}`)
+        ferme la course de la fenêtre choix → INSERT : un parent déplacé, un
+        responsable changé, un `created_by` modifié ou un ancêtre revenu sur
+        l'hôte d'arrivée n'écrit rien."""
         placed = host is not None
         if placed and placement is None:
             raise ValueError("Ephemerals.create: a placement verdict is required with host")
@@ -821,6 +826,8 @@ class Ephemerals(interface.Ephemerals):
             raise ValueError("Ephemerals.create: admitted_hosts is required with host")
         if placed and not evaluated_profile:
             raise ValueError("Ephemerals.create: evaluated_profile is required with host")
+        if placed and not evaluated_identity:
+            raise ValueError("Ephemerals.create: evaluated_identity is required with host")
         # Ordre des paramètres = ordre des `%s` dans le SQL : verrou, nom,
         # hôte/dossier/mode, les deux durées (leur CASE précède created_by),
         # puis la partie placée (admission, verdict, profil), le créateur,
@@ -839,7 +846,13 @@ class Ephemerals(interface.Ephemerals):
             profile_guard = (
                 "\n               AND c.harness IS NOT DISTINCT FROM %s"
                 "\n               AND c.provider IS NOT DISTINCT FROM %s"
-                "\n               AND c.model IS NOT DISTINCT FROM %s")
+                "\n               AND c.model IS NOT DISTINCT FROM %s"
+                "\n               AND c.host IS NOT DISTINCT FROM %s"
+                "\n               AND c.responsible IS NOT DISTINCT FROM %s"
+                "\n               AND c.created_by IS NOT DISTINCT FROM %s"
+                "\n               AND NOT EXISTS (SELECT 1 FROM agent_registry a"
+                "\n                                WHERE a.name = ANY(%s::text[])"
+                "\n                                  AND a.host = %s)")
             params.extend([host, cwd, credential_mode])
             params.extend([ttl_seconds, ttl_seconds])
             params.extend(admitted_hosts)
@@ -869,7 +882,11 @@ class Ephemerals(interface.Ephemerals):
         if placed:
             params.extend([evaluated_profile.get("harness"),
                            evaluated_profile.get("provider"),
-                           evaluated_profile.get("model")])
+                           evaluated_profile.get("model"),
+                           evaluated_identity.get("host"),
+                           evaluated_identity.get("responsible"),
+                           evaluated_identity.get("created_by"),
+                           evaluated_identity.get("lineage") or [], host])
         created = self.db.query(
             """
             __LOCK__

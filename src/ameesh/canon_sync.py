@@ -2939,6 +2939,7 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
             host=placement.host, admitted_hosts=[placement.host],
             credential_mode=placement.credential_mode,
             evaluated_profile=placement.evaluated_profile,
+            evaluated_identity=placement.evaluated_identity,
             placement={"ok": placement.verdict.ok,
                        "diagnostic": placement.verdict.diagnostic,
                        "ref": placement.verdict.ref})

@@ -87,6 +87,10 @@ class ChildPlacement:
     #: `Ephemerals.create` copie du parent, et que l'INSERT doit vérifier
     #: égaux aux valeurs évaluées ci-dessus (`evaluated_profile`).
     evaluated_profile: dict
+    #: identité de lignée au moment du choix : hôte, responsable, `created_by`
+    #: du parent et noms de la lignée. L'INSERT les re-vérifie pour qu'un
+    #: déplacement ou un changement de tenant dans la fenêtre refuse l'écriture.
+    evaluated_identity: dict
 
     def describe(self) -> dict:
         return {"host": self.host, "cwd": self.cwd, "tenant": self.tenant,
@@ -339,6 +343,11 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
     evaluated = {"harness": getattr(root_card, "harness", None),
                  "provider": getattr(root_card, "provider", None),
                  "model": getattr(root_card, "model", None)}
+    identity = {"host": parent.get("host"),
+                "responsible": parent.get("responsible"),
+                "created_by": parent.get("created_by"),
+                "lineage": [row.get("name") for row in lineage_rows
+                            if row.get("name")]}
     actual = {key: parent.get(key) for key in evaluated}
     if actual != evaluated:
         raise PlacementError(SPAWN_PROFILE_DIVERGED, (
@@ -373,6 +382,7 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
                 host=host, cwd=workdir, credential_mode=verdict.credential_mode,
                 tenant=tenant, unix_user=str(binding["unix_user"]),
                 uid=int(binding["uid"]), runner_id=str(binding["runner_id"]),
-                verdict=verdict, evaluated_profile=dict(evaluated))
+                verdict=verdict, evaluated_profile=dict(evaluated),
+                evaluated_identity=dict(identity))
         reasons.append((host, why))
     raise _failure(root_card, policy, admitted, excluded, reasons)
