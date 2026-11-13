@@ -51,6 +51,8 @@ from . import sous_utilisation, vocab, work_lifecycle as lifecycle
 BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
                  # #5727 : le pilote fait poser une copie du canon à jour
                  "staging_canon_stale",
+                 # #7164 : le pilote fait poser le venv de l'exécuteur
+                 "staging_executor_stale",
                  "host_idle_reserved", "baseline_oversized", "host_release_failed",
                  "host_release_overdue", "host_release_no_runs",
                  "host_release_canon_unreadable",
@@ -1395,7 +1397,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     else:
         extra: dict[str, str] = {}
         no_reviewer = False
-        if kind in ("staging_interrupted", "staging_canon_stale"):
+        if kind in ("staging_interrupted", "staging_canon_stale",
+                    "staging_executor_stale"):
             text = alert["detail"]
             teams = set()
         elif kind == "stale_lot":

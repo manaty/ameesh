@@ -1017,11 +1017,56 @@ venv. Sous un compte dédié, `%h` n'est plus `/home/ameesh` : `vm.sh` ne
 touche pas ce venv, et le compte dédié ne doit jamais exécuter celui des
 runners (les tours d'agents peuvent l'écrire, ce qui contournerait
 l'isolement de la clé). Il garde son propre venv, même disposition, préparé
-depuis son clone dédié (`bascule.py preparer` puis `activer`) ; sa mise à
-jour est une étape à part, posée avec les accès. Tant qu'elle manque,
-l'exécutant reste sur sa version : la qualification lit la version
+depuis son clone dédié (`bascule.py preparer` puis `activer`). Sa première
+pose est un geste opérateur, posé avec les accès ; ensuite, c'est l'exécutant
+qui le tient à jour (#7164, ci-dessous). La qualification lit la version
 réellement lancée (`venv-courant` et `MainPID`), jamais celle qu'on croit
 installée.
+
+**Mise à jour du venv par l'exécutant (#7164).** Sans elle, un correctif de
+l'exécutant (#7053) restait sans effet : rien ne déclenchait ni ne signalait
+le geste. Le bloc facultatif `venv_update` de sa configuration l'active :
+
+```json
+"venv_update": {
+  "venv": "/home/ameesh-staging/.local/share/ameesh/venv",
+  "package": "/home/ameesh-staging/staging/packages/L2-review-<sha>-<date>",
+  "work": "/home/ameesh-staging/staging/venv-auto",
+  "python": "/usr/bin/python3"
+}
+```
+
+`package` est le paquet opérateur scellé de la dernière pose manuelle
+(`requirements-staging.lock` et `wheelhouse/`) ; `work` est un dossier du
+compte (`0755` au plus). Après chaque passe `completed`, une fois
+l'enregistrement terminal écrit et dans le même bail, l'exécutant, sur la voie
+scellée (#5711) et jamais l'index :
+
+1. ne fait rien si `venv-courant` nomme déjà le commit déployé (`current`), et
+   refuse si la version vivante n'en est pas un ancêtre (avance seulement) ;
+2. dérive le paquet du commit (`venv-staging.py deriver`) : roues et
+   épinglages du dernier paquet posé (`work/paquet-courant`, sinon `package`)
+   repris tels quels, seule la roue `ameesh` reconstruite hors réseau depuis
+   le commit avec le setuptools verrouillé ; une dépendance nouvelle ou
+   changée fait échouer l'installation `--require-hashes` qui suit : le paquet
+   est alors à refaire à la main ;
+3. produit le manifeste scellé (`produire --scelle`), puis `bascule.py
+   preparer` avec les quatre options verrouillées et `activer --precedent
+   <version vivante>`, tous trois pris dans l'arbre du commit déployé ;
+4. lance `venv-courant/bin/python -I -m ameesh.staging_executor --help` :
+   un échec est un `retour` (`rolled back`) ; un succès fait de ce paquet
+   `work/paquet-courant` et retire les plus anciens.
+
+Le processus en cours garde son venv ; la minuterie suivante démarre le
+nouveau. Le résultat va dans un second enregistrement de la passe :
+`venv_refresh` (`installed`, `current`, `unconfigured`, `rolled back`, ou
+`refused` avec l'étape et sa raison) et `executor_venv` (`running`, la version
+de ce processus, et `live`, celle du lien). Chaque passe porte aussi
+`executor_venv` dès sa prise. `staging_executor_stale` part quand la dernière
+passe `completed` d'un exécutant laisse `live` sur un autre commit que celui
+déployé, quand un staging attesté depuis par une autre voie en descend, ou
+quand le champ manque (exécutant antérieur à #7164 : la première pose qui
+porte #7164 reste le geste opérateur ci-dessus).
 
 **Garde de démarrage du staging (#6806).** Le service de l'exécutant élu
 n'est admis que si son contexte et son environnement public sont ceux de

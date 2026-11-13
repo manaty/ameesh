@@ -900,6 +900,92 @@ def canon_alerts(db, *, now: float, cfg) -> list[dict]:
                                 first_ahead=_first_ahead(repo), now=now)
 
 
+def executor_version_findings(records, *, attested=(), descends=None) -> list[dict]:
+    """#7164: one alert per executor key whose own venv lags staging.
+
+    `records`: (key, row) pairs, the newest `completed` executor record per
+    key with its event id. The executor's venv is only ever updated by its
+    own completed pass (`venv_refresh`); its version (`executor_venv.live`,
+    the one the next timer pass starts) must be the deployed commit, and not
+    older than a staging attested afterwards by another path. A record
+    without the field comes from an executor older than #7164: it alerts
+    too, since nothing else would ever update it."""
+    newest = None
+    for row in attested or ():
+        sha = (row.get("data") or {}).get("sha")
+        if isinstance(sha, str) and len(sha) == 40 and (
+                newest is None or int(row.get("id") or 0) > newest[0]):
+            newest = (int(row.get("id") or 0), sha)
+    out = []
+    for key, row in records:
+        data = row.get("data") or {}
+        sha = str(data.get("sha") or "")
+        version = data.get("executor_venv")
+        live = str(version.get("live") or "") if isinstance(version, dict) else ""
+        refresh = data.get("venv_refresh")
+        target = sha
+        if not live:
+            cause = ("its version is not recorded (executor older than #7164, "
+                     "or venv unreadable)")
+        elif not sha.startswith(live):
+            cause = ("its last completed pass deployed %s but left it on venv-%s"
+                     % (sha[:12], live))
+            if isinstance(refresh, dict):
+                cause += " (venv refresh %s%s%s)" % (
+                    refresh.get("state") or "?",
+                    " at %s" % refresh["step"] if refresh.get("step") else "",
+                    ": %s" % str(refresh["reason"])[:200]
+                    if refresh.get("reason") else "")
+            else:
+                cause += " (no venv refresh recorded)"
+        elif (newest and newest[0] > int(row.get("id") or 0)
+              and not newest[1].startswith(live) and descends is not None
+              and descends(sha, newest[1])):
+            target = newest[1]
+            cause = ("staging %s was attested after its last pass, by another "
+                     "path; venv-%s stays until its next completed pass"
+                     % (target[:12], live))
+        else:
+            continue
+        out.append(dict(
+            schema="ameesh-alert/1", type="staging_executor_stale", agent=None,
+            since=None, value=None, threshold=None, reason=key,
+            executor_venv=live, sha=target, urgent=False,
+            orchestrators=[data["notify"]] if data.get("notify") else [],
+            detail=("Staging executor %s runs an old version: %s. Fixes to "
+                    "the executor stay inactive until its venv moves; see "
+                    "\"Venv de l'exécutant\" in DEPLOIEMENT-HOTE-AGENTS.md."
+                    % (key, cause))))
+    return out
+
+
+def executor_versions(db) -> list[tuple[str, dict]]:
+    """#7164: the newest completed executor record per request key."""
+    events = storage.of(db).events
+    out = []
+    for row in events.latest_type("staging.request", 60, LIMIT):
+        key = row.get("object")
+        if not key:
+            continue
+        for item in events.recent_type("staging.request", 60, CANON_HISTORY,
+                                       object=key):
+            data = item.get("data")
+            if isinstance(data, dict) and data.get("state") == "completed":
+                out.append((key.split(":", 1)[-1], item))
+                break
+    return out
+
+
+def executor_alerts(db, *, cfg) -> list[dict]:
+    """#7164: `executor_version_findings` over the shared log."""
+    from . import release_cutoff
+    attested = storage.of(db).events.latest_type(
+        release_cutoff.STAGING_EVENT, 60, LIMIT)
+    return executor_version_findings(
+        executor_versions(db), attested=attested,
+        descends=git_descends(ancestry_repos(cfg)))
+
+
 def alerts(db, *, now: float, cfg=None) -> list[dict]:
     # Do not swallow a read failure: the caller must keep the alert family
     # unreadable instead of resolving an existing alert through absence.
