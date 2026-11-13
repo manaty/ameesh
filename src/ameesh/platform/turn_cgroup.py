@@ -232,6 +232,22 @@ def populated(path: str, *, root_dir: str = CGROUP_ROOT) -> bool | None:
     return None
 
 
+def gone_or_empty(path: str, *, root_dir: str = CGROUP_ROOT) -> bool:
+    """Read-only proof for resource settlement; unreadable is never empty."""
+    target = _target(path, root_dir)
+    if target is None:
+        return False
+    try:
+        if not Path(root_dir).is_dir():
+            return False
+        target.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return populated(path, root_dir=root_dir) is False
+
+
 def memory_peak(path: str, *, root_dir: str = CGROUP_ROOT) -> int | None:
     """Le pic mémoire du cgroup en octets (`memory.peak`, sinon
     `memory.current`), None si aucun des deux n'est lisible."""
