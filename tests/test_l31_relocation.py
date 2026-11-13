@@ -439,12 +439,14 @@ class OperatorMoveTest(_MoveCase):
             self._move()
         self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
 
-    def test_refuse_un_agent_preference(self):
-        # #7048 : `agent move` d'un agent `preference` est le sous-lot B4
+    def test_preference_passe_au_preflight_b4(self):
+        # #7108 (B4) : un agent `preference` n'est plus refusé en bloc ; il
+        # suit le préflight d'avatar (ici la cible banc n'est pas présente :
+        # aucun relevé, aucun verdict de placement, aucun canon synchronisé).
         self._prepare()
         self.db.execute("UPDATE agent_registry SET releve = 'preference', "
                         "candidats = ARRAY['atelier', 'banc'] WHERE name = 'ouvrier'")
-        with self.assertRaisesRegex(relocation.MoveError, "releve: preference"):
+        with self.assertRaisesRegex(relocation.MoveError, "move-presence: banc"):
             self._move()
         self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
 

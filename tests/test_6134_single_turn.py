@@ -29,6 +29,7 @@ from ameesh import registry, storage, work
 from ameesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase
+from .test_3219_lift_own_hold import bound
 
 _FORCE = "test: two lots for one agent (#6134)"
 
@@ -104,6 +105,31 @@ class WakeAfterLiftTest(_Base):
     def _notes(self, lot: int) -> list[str]:
         return [str(event.get("note") or "") for event in work.events(self.db, lot)]
 
+    def test_unassigned_hold_wake_is_cancelled_immediately_even_overdue(self):
+        for due in (1790000000.0, 4102444800.0):
+            with self.subTest(due=due):
+                lot = work.add(self.db, title="unassigned wait")["id"]
+                work.note(self.db, lot, "hold: prerequisite", actor="human:owner",
+                          wake_ts=due)
+                work.note(self.db, lot, "unhold: prerequisite available",
+                          actor="human:owner")
+                self.assertIsNone(work.get(self.db, lot)["wake_ts"])
+                self.assertEqual(sum(n.startswith("wake: cancelled")
+                                     for n in self._notes(lot)), 1)
+
+    def test_lifting_another_authors_hold_keeps_the_armed_hold(self):
+        self.register("holder", "claude", cwd=self._cwd("holder"))
+        self.register("other", "claude", cwd=self._cwd("other"))
+        lot = work.add(self.db, title="two holds")["id"]
+        due = 1790000000.0
+        work.note(self.db, lot, "hold: appointment", actor="holder", wake_ts=due)
+        work.note(self.db, lot, "hold: separate wait", actor="other")
+        with bound("other"):
+            work.note(self.db, lot, "unhold: separate wait finished", actor="other")
+        self.assertEqual(work.get(self.db, lot)["wake_ts"], due)
+        self.assertFalse(any(n.startswith("wake: cancelled")
+                             for n in self._notes(lot)))
+
     def test_a_wake_armed_by_a_lifted_hold_is_cancelled(self):
         worker = self._worker("w1")
         try:
@@ -146,7 +172,7 @@ class WakeAfterLiftTest(_Base):
             lot = self._lot(worker)
             old = time.time() - 1
             work.note(self.db, lot, "hold: attendre", actor="w4", wake_ts=old)
-            work.note(self.db, lot, "unhold: lever", actor="human:owner")
+            storage.of(self.db).work.note(lot, "build", "unhold: lever", actor="human:owner")
             reason, arm_id = worker._wake_abandoned_by_lift(lot)
             self.assertTrue(reason)
             self.assertIsNotNone(arm_id)
@@ -177,7 +203,7 @@ class WakeAfterLiftTest(_Base):
             old = time.time() - 1
             work.note(self.db, lot, "hold: attendre le paquet 452", actor="w5",
                       wake_ts=old)
-            work.note(self.db, lot, "unhold: le paquet 452 est fusionné",
+            storage.of(self.db).work.note(lot, "build", "unhold: le paquet 452 est fusionné",
                       actor="human:owner")
             self.assertIsNotNone(
                 storage.of(self.db).lot_sessions.claim_wake(
@@ -204,7 +230,7 @@ class WakeAfterLiftTest(_Base):
             lot = self._lot(worker)
             old = time.time() - 1
             work.note(self.db, lot, "hold: attendre", actor="w6", wake_ts=old)
-            work.note(self.db, lot, "unhold: lever", actor="human:owner")
+            storage.of(self.db).work.note(lot, "build", "unhold: lever", actor="human:owner")
             reason, arm_id = worker._wake_abandoned_by_lift(lot)
             self.assertTrue(reason)
             self.assertIsNotNone(

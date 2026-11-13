@@ -19,6 +19,10 @@ La garde est en base (`ameesh_tenant_claim_ok`, migration 0575) : le runner
 lié au tenant `responsible` de l'agent, et lui seul, prend le bail ; le
 filtre de ce module n'est qu'une optimisation et un diagnostic.
 
+Le provisionnement est un geste du bureau ou d'un humain, jamais d'un agent
+(§3.4) ; `add --register` se lance sur l'hôte cible, dont le passwd donne
+l'UID du tenant.
+
 Limite honnête (§3.4) : l'identité de l'exécuteur reste celle de sa
 configuration ; l'isolation SQL par rôle est un travail distinct (0033/L155).
 """
@@ -40,6 +44,9 @@ TENANT_RE = re.compile(r"^human:[A-Za-z0-9][A-Za-z0-9._@-]*$")
 TENANT_UNIT = "ameesh-runner-tenant@%s.service"
 #: préfixe de l'utilisateur système d'un tenant
 USER_PREFIX = "ameesh-"
+#: rôle du bureau dans le canon (§10) : avec les humains, le seul à écrire une
+#: liaison de tenant (design 5322 §3.4 : « bureau, jamais un agent »)
+BUREAU_ROLES = ("bureau",)
 
 
 class TenancyError(ValueError):
@@ -104,18 +111,37 @@ def admits(cfg, policy: Mapping, agent: Mapping) -> bool:
     return bool(tenant) and canon_mod.tenant_key(agent.get("responsible")) == tenant
 
 
+def published_profiles(cfg) -> list[str]:
+    """#7108 : profils de compte que CE runner peut offrir, `harnais/compte`.
+
+    Le runner d'un tenant lit sa propre configuration (`accounts`), sous son
+    home 0700 : le superviseur ne peut pas la lire. Seuls des noms passent au
+    battement, jamais un chemin ni un secret. Une configuration illisible ne
+    publie rien (fail closed : le déplacement vers ce tenant est refusé)."""
+    from . import accounts as accounts_mod
+    try:
+        declared = accounts_mod.parse(getattr(cfg, "accounts", None) or {})
+    except accounts_mod.AccountError:
+        return []
+    out = {"%s/%s" % (harness, profile.name)
+           for harness, profiles in declared.items() for profile in profiles}
+    return sorted(out)
+
+
 def beat(cfg, db, *, version: str | None = None) -> bool:
     """Battement du runner d'un tenant (`runner_presence`) ; faux sans tenant
     configuré ou sans liaison qui nomme ce runner (le superviseur n'a pas
-    encore enregistré le tenant, ou l'identifiant diffère)."""
+    encore enregistré le tenant, ou l'identifiant diffère). Le battement
+    publie les profils de compte (#7108) avec la présence."""
     tenant = runner_tenant(cfg)
     if not tenant:
         return False
     if version is None:
         from . import version as package_version
         version = package_version()
-    return storage.of(db).tenancy.beat(cfg.host, tenant, cfg.runner, uid=os.getuid(),
-                                       version=str(version or "") or None)
+    return storage.of(db).tenancy.beat(
+        cfg.host, tenant, cfg.runner, uid=os.getuid(),
+        version=str(version or "") or None, profiles=published_profiles(cfg))
 
 
 def presence_reason(db, role: Mapping, host: str, *, now: float,
@@ -219,14 +245,18 @@ def add_plan(host: str, tenant: str) -> list[list[str]]:
     ]
 
 
-def register(db, host: str, tenant: str, *, actor: str,
+def register(db, host: str, tenant: str, *, actor: str, local_host: str,
              uid: int | None = None, user: str | None = None) -> dict:
     """Liaison tenant → utilisateur système, UID et runner (`host_tenants`).
 
     Refusée si le canon ne déclare pas l'hôte partagé avec ce tenant
     (`tenant-not-declared`) ou si l'utilisateur système n'existe pas
-    (`tenant-user-missing`) : l'UID enregistré est celui que le système
-    rend, jamais une valeur saisie."""
+    (`tenant-user-missing`) : l'UID enregistré est celui que le système de
+    l'hôte cible rend, jamais une valeur saisie. `local_host` est l'hôte de
+    l'appelant (`cfg.host`) : quand il diffère de `host`, le passwd local
+    n'est pas celui de la cible, donc l'UID ne peut pas être lu et la
+    liaison est refusée (`tenant-uid-unverified`) sauf `uid` fourni, lu sur
+    la cible par l'appelant."""
     tenant = check_tenant(tenant)
     policy = host_policy(db, host)
     if not policy.get("shared") or tenant not in policy.get("tenants", []):
@@ -236,6 +266,12 @@ def register(db, host: str, tenant: str, *, actor: str,
                            % (host, tenant))
     user = user or unix_user(tenant)
     if uid is None:
+        if host != local_host:
+            raise TenancyError("tenant-uid-unverified",
+                               "host %s is not this host (%s): the tenant UID is "
+                               "read from the target host's passwd, never from the "
+                               "caller's; run the registration on %s"
+                               % (host, local_host, host))
         try:
             uid = pwd.getpwnam(user).pw_uid
         except KeyError:
@@ -272,8 +308,8 @@ def shell_plan(host: str, tenant: str) -> str:
     lines.append("# %s: the tenant's configuration (database, no secret in this plan),"
                  " installed by the bureau like the organization keys"
                  % ("/home/%s/.config/ameesh/config.json" % user))
-    lines.append("# then (as the host supervisor): ameesh host tenant add %s --host %s"
-                 " --register --actor <human:id of the registrant>"
+    lines.append("# then, on the target host (as the host supervisor): ameesh host tenant"
+                 " add %s --host %s --register --actor <human:<id>|bureau>"
                  % (shlex.quote(check_tenant(tenant)), shlex.quote(host)))
     return "\n".join(lines)
 
@@ -291,6 +327,57 @@ def describe(rows: list[Mapping[str, Any]]) -> list[str]:
     return out
 
 
+def operator(cfg, db, explicit: str | None = None) -> str:
+    """Qui écrit ou retire une liaison de tenant : un humain ou le bureau.
+
+    La conception réserve ce geste d'infrastructure au bureau, « jamais un
+    agent » (5322 §3.4) ; `work.corrector` est plus large (orchestrateurs et
+    agents de conception) et ne convient donc pas ici. Une session liée agit
+    en son nom seul ; un terminal humain dit qui il est (`--actor`)."""
+    from . import agent_names, canon, identity, sous_utilisation, work
+
+    text = (explicit or "").strip()
+    text = agent_names.resolve(text, db=db, operation="tenancy.operator")
+    binding = identity.resolve_binding(cfg, db)
+    # A rejected runner/session identity must never fall back to the human
+    # terminal path, including a malformed AGENT_MAIL_NAME (no returned name).
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise TenancyError("tenant-identity-invalid",
+                           "invalid session identity (%s)"
+                           % (binding.reason or "unbound identity"))
+    if binding.name:
+        if text and text != binding.name:
+            raise TenancyError("tenant-actor-mismatch",
+                               "this session belongs to %s, it does not act on "
+                               "behalf of %s" % (binding.name, text))
+        name = binding.name
+    else:
+        if not text:
+            raise TenancyError("tenant-actor-missing",
+                               "say who does it (--actor human:<id> or --actor bureau)")
+        name = text
+    if name.startswith(work.HUMAN_PREFIX):
+        return name
+    human = work.known_human(db, name, cfg)
+    if human:
+        return human
+    try:
+        # Le rôle de la fiche Agent, pas la liste d'alerte
+        # (`AMEESH_ALERT_ORCHESTRATORS` nomme des orchestrateurs, jamais le
+        # bureau) : un agent ne signe pas une liaison de tenant.
+        canons = canon.load_configured(cfg) if cfg is not None else []
+        if name in sous_utilisation.role_orchestrators(canons, BUREAU_ROLES):
+            return name
+    except Exception as exc:  # noqa: BLE001 - autorité illisible : refus
+        raise TenancyError("tenant-authority-unreadable",
+                           "cannot read the bureau role of %s: %s" % (name, exc)) from exc
+    raise TenancyError("tenant-bureau-only",
+                       "%s is neither a human nor the bureau: a tenant binding is "
+                       "an infrastructure gesture, \"bureau, jamais un agent\" "
+                       "(design 5322 §3.4)" % name)
+
+
 # --------------------------------------------------------------------------
 # `ameesh host tenant add|list|remove`
 # --------------------------------------------------------------------------
@@ -300,8 +387,9 @@ def main(argv=None) -> int:
 
     `add` sans `--register` imprime le plan système (utilisateur, home 0700,
     linger, dossier de comptes, unité) et n'exécute rien ; `--register`
-    écrit la liaison en base, une fois l'utilisateur créé. `remove` est
-    refusé tant qu'un agent du tenant reste sur l'hôte."""
+    écrit la liaison en base, une fois l'utilisateur créé, et se lance sur
+    l'hôte cible (l'UID est lu dans son passwd, pas celui de l'appelant).
+    `remove` est refusé tant qu'un agent du tenant reste sur l'hôte."""
     import argparse
     import json
 
@@ -316,14 +404,16 @@ def main(argv=None) -> int:
     add.add_argument("--host", help="shared host (default: this host)")
     add.add_argument("--register", action="store_true",
                      help="write the binding (system user, UID, runner) in the database")
-    add.add_argument("--actor", help="who registers (human:<id>) from an unbound terminal")
+    add.add_argument("--actor",
+                     help="who registers (human:<id> or bureau) from an unbound terminal")
     listing = commands.add_parser("list", help="tenants and runner presence")
     listing.add_argument("--host")
     listing.add_argument("--json", action="store_true")
     drop = commands.add_parser("remove", help="remove a tenant binding (no agent left)")
     drop.add_argument("tenant")
     drop.add_argument("--host")
-    drop.add_argument("--actor", help="who removes (human:<id>) from an unbound terminal")
+    drop.add_argument("--actor",
+                      help="who removes (human:<id> or bureau) from an unbound terminal")
     args = parser.parse_args(argv)
     cfg = config.load()
     host = args.host or cfg.host
@@ -348,10 +438,9 @@ def main(argv=None) -> int:
                                "a tenant runner configuration (%s) cannot write "
                                "tenant bindings: the host supervisor does"
                                % runner_tenant(cfg))
-        actor = work.corrector(cfg, db, args.actor, what="tenant registration",
-                               history=False)
+        actor = operator(cfg, db, args.actor)
         if args.command == "add":
-            result = register(db, host, args.tenant, actor=actor)
+            result = register(db, host, args.tenant, actor=actor, local_host=cfg.host)
         else:
             result = remove(db, host, args.tenant)
         print(json.dumps(result, ensure_ascii=False))

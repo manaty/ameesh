@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 
 from ..conversation_moves import (AFTER_SWITCH, BEFORE_SWITCH, HANDOVER_TTL_S,
-                                  OPEN, PLAN_TTL_S, ConversationMoves as Contract)
+                                  OPEN, PLAN_TTL_S, RecheckRefused,
+                                  ConversationMoves as Contract)
 
 _COLUMNS = """move_id::text AS move_id, agent, epoch_source, state, reason,
               requested_by, source_host, source_cwd, source_owner,
@@ -111,8 +112,8 @@ class ConversationMoves(Contract):
                 "UPDATE conversation_moves SET state = 'failed', failed_at = clock_timestamp(),"
                 " error = 'handover expired before the target claimed',"
                 " updated_at = clock_timestamp()"
-                " WHERE agent = %s AND reason = 'preference' AND state IN "
-                + _AFTER_SQL + " AND switched_at <= clock_timestamp()"
+                " WHERE agent = %s AND reason IN ('preference', 'manual')"
+                " AND state IN " + _AFTER_SQL + " AND switched_at <= clock_timestamp()"
                 " - make_interval(secs => %s)"
                 " AND NOT EXISTS (SELECT 1 FROM agent_registry r"
                 "                  WHERE r.name = %s AND r.lease_owner IS NOT NULL"
@@ -186,7 +187,7 @@ class ConversationMoves(Contract):
                       extract(epoch FROM clock_timestamp())::float8 AS now_ts
                  FROM conversation_moves m
                 WHERE m.agent = %s
-                  AND m.reason = 'preference'
+                  AND m.reason IN ('preference', 'manual')
                   AND m.state IN ('switched', 'recovered', 'rehydrating')
                   AND NOT EXISTS (
                       SELECT 1 FROM agent_registry r
@@ -195,6 +196,129 @@ class ConversationMoves(Contract):
                          AND r.lease_expires_at > clock_timestamp())
                 ORDER BY m.switched_at DESC NULLS LAST, m.created_at DESC
                 LIMIT 1""", (agent,)))
+
+    def manual(self, move_id, agent, target_host, target_cwd, *, actor,
+               source_host, recheck=None):
+        """#7108: manual move of a `preference` agent, one transaction.
+
+        The registry row is locked first; every guard is rechecked inside the
+        write (the caller's preflight is only a courtesy), the attempt opens
+        directly `switched` — `recovered` when the source lease is not live,
+        its interrupted instruction replayed once — with reason `manual`, and
+        the registry row moves to the target in the same transaction: source
+        lease released (epoch + 1), native session kept provisional until the
+        target's first turn. `source_host` is the host the caller saw: a row
+        that moved meanwhile is left untouched. `recheck(locked_row)` runs
+        after the row lock and before any write; a non-empty reason raises
+        `RecheckRefused` with nothing written. No session or credential file
+        is read, copied or written here.
+        """
+        if not agent or not target_host or not actor or not source_host:
+            raise ValueError("manual move requires agent, source host, target "
+                             "and actor")
+        if not target_cwd:
+            return None
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """SELECT name, host, cwd, mode, coalesce(releve, 'hote') AS releve,
+                          status, lease_owner, lease_epoch, session_id,
+                          current_prompt, admitted_hosts, canon_ref,
+                          responsible, harness, canon,
+                          (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
+                           AND lease_expires_at > clock_timestamp()) AS lease_live
+                     FROM agent_registry WHERE name = %s FOR UPDATE""", (agent,))
+            if not rows:
+                return None
+            r = rows[0]
+            if (r["mode"] != "execute" or r["releve"] != "preference"
+                    or r["host"] != source_host or r["host"] == target_host
+                    or target_host not in (r["admitted_hosts"] or ())):
+                return None
+            # a live turn or an interactive attach never moves; a stale
+            # `status = running` without a live lease is a dead host's mark:
+            # the attempt opens `recovered` and replays the instruction once.
+            if r["lease_live"] and (r["status"] == "running"
+                                    or (r["lease_owner"] or "").startswith("attach:")):
+                return None
+            if tx.query("SELECT 1 FROM host_holds WHERE host = %s"
+                        " AND until > clock_timestamp() LIMIT 1", (target_host,)):
+                return None
+            if tx.query("SELECT 1 FROM host_handoffs WHERE agent = %s"
+                        " AND state NOT IN ('verified', 'cancelled') LIMIT 1", (agent,)):
+                return None
+            if tx.query("SELECT 1 FROM conversation_moves WHERE agent = %s"
+                        " AND state IN " + _OPEN_SQL + " LIMIT 1", (agent,)):
+                return None
+            # #7108 (B #40410) : la cible est revalidée sur la ligne FRAÎCHE,
+            # sous le verrou et avant tout effet — le préflight hors
+            # transaction peut avoir vu un battement/profil/placement périmé.
+            if recheck is not None:
+                reason = recheck(dict(r))
+                if reason:
+                    raise RecheckRefused(reason)
+            state = ("switched" if r["lease_live"] or not r["lease_owner"]
+                     else "recovered")
+            notice = (INTERRUPTED_TURN % r["host"]
+                      if state == "recovered" and r.get("current_prompt") else None)
+            inserted = tx.query(
+                """INSERT INTO conversation_moves
+                       (move_id, agent, epoch_source, state, reason, requested_by,
+                        source_host, source_cwd, source_owner, source_session,
+                        target_host, target_cwd, switched_at)
+                   VALUES (%s::uuid, %s, %s, %s, 'manual', %s,
+                           %s, %s, %s, %s, %s, %s, clock_timestamp())
+                   RETURNING move_id::text AS move_id""",
+                (move_id, agent, int(r["lease_epoch"]), state, actor, r["host"],
+                 r["cwd"], r["lease_owner"], r["session_id"], target_host,
+                 target_cwd))
+            if not inserted:
+                return None
+            moved = tx.query(
+                """UPDATE agent_registry AS r
+                      SET host = %s, cwd = %s,
+                          lease_owner = NULL, lease_expires_at = NULL,
+                          lease_epoch = r.lease_epoch + 1,
+                          current_prompt = CASE WHEN %s::text IS NULL
+                                                THEN current_prompt
+                                                ELSE %s::text || E'\\n\\n'
+                                                     || current_prompt END,
+                          placement_ok = NULL,
+                          placement_diagnostic = %s::text,
+                          placement_ref = (SELECT c.placement_ref
+                                             FROM agent_candidates c
+                                            WHERE c.name = r.name AND c.host = %s
+                                              AND c.canon = coalesce(r.canon, '')),
+                          placement_profile = NULL,
+                          status = CASE WHEN r.status IN ('running', 'dead')
+                                        THEN 'idle' ELSE r.status END,
+                          updated_at = now()
+                    WHERE r.name = %s AND r.host = %s AND r.lease_epoch = %s
+                      AND coalesce(r.releve, 'hote') = 'preference'
+                      AND NOT ameesh_handoff_fenced(r.name)
+                      AND NOT EXISTS (SELECT 1 FROM host_holds hh
+                                       WHERE hh.host = %s
+                                         AND hh.until > clock_timestamp())
+                    RETURNING r.name, r.host, r.lease_epoch, r.session_id,
+                              %s::text AS previous_lease_owner,
+                              %s::bigint AS previous_lease_epoch""",
+                (target_host, target_cwd, notice, notice,
+                 "moved to %s (manual preference move; placement to re-evaluate)"
+                 % target_host, target_host, agent, r["host"],
+                 int(r["lease_epoch"]), target_host, r["lease_owner"],
+                 int(r["lease_epoch"])))
+            if not moved:
+                # leave no orphan attempt if the registry write lost the race,
+                # whether this call owns the transaction or runs inside one
+                tx.execute("DELETE FROM conversation_moves"
+                           " WHERE move_id = %s::uuid", (move_id,))
+                return None
+            row = dict(moved[0])
+            row["move_id"] = inserted[0]["move_id"]
+            row["source_host"] = r["host"]
+            row["target_host"] = target_host
+            row["target_cwd"] = target_cwd
+            row["state"] = state
+            return row
 
     def prepare(self, move_id, *, target_host, target_cwd, checks):
         if any(not isinstance(v, bool) for v in checks.values()):

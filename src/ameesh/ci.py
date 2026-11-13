@@ -277,6 +277,16 @@ GUARD_PER_PAGE = 100
 #: (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre d'appels
 #: réellement consommés est journalisé dans `ci_guard_scan`.
 GUARD_SCAN_MAX_CALLS = len(LIVE_STATUSES) + GUARD_SCAN_MAX_RUNS + 1
+#: #7148 (revue B de l'auditeur sur #7015) : la retenue d'un job par sa
+#: propre exécution (`strategy.max-parallel` au plafond, `needs`) n'est pas
+#: éternelle. Elle ne vaut que tant que l'exécution **progresse** : un job de
+#: la même exécution a démarré ou fini il y a moins de **deux SLO de file**
+#: (`exploitation.CI_QUEUE_SLO_S`, 15 min : 30 min). Passé ce silence, le job
+#: réintègre la file publiée même si des runners libres portent ses labels :
+#: un dispatch GitHub gelé ne reste pas muet indéfiniment. L'âge du job ne
+#: borne rien : une matrice au plafond crée toutes ses parts au départ et les
+#: laisse en file sous le `created_at` du run (cas `carte.yml` du 12/11).
+GUARD_QUEUE_HELD_S = 1800.0
 
 
 class _GuardBudget(RuntimeError):
@@ -1043,11 +1053,16 @@ def _guard_snapshot(run_id, attempt, status, jobs) -> dict:
     de la même exécution tourne déjà — une matrice `strategy.max-parallel`
     au plafond retient alors ses parts en file sans manquer de capacité.
 
+    #7148 : `progress` est le dernier instant où un job de l'exécution a
+    démarré ou fini (maximum de `started_at` et `completed_at`) ; la retenue
+    par l'exécution ne vaut que tant que ce progrès est récent.
+
     Rien n'est déduit d'un job `cancelled` : l'orphelin d'une exécution
     annulée compte comme un job en file (#876 le traite à la source)."""
     queued: list[dict] = []
     holding: dict[str, str] = {}
     active = False
+    progress = None
     for job in jobs:
         job_status = str(job.get("status") or "")
         if job_status == "queued":
@@ -1058,12 +1073,39 @@ def _guard_snapshot(run_id, attempt, status, jobs) -> dict:
             active = True
             if job.get("runner_name"):
                 holding.setdefault(str(job["runner_name"]), str(job.get("name") or ""))
+        for key in ("started_at", "completed_at"):
+            at = _iso_ts(job.get(key))
+            if at is not None and (progress is None or at > progress):
+                progress = at
     oldest = (min(queued, key=lambda q: (q["created_at"], q["id"]))
               if queued else None)
     return {"run_id": int(run_id), "attempt": int(attempt), "status": status,
             "queued": len(queued), "oldest_id": oldest["id"] if oldest else None,
             "oldest_at": oldest["created_at"] if oldest else None,
-            "runners": holding, "active": active, "queued_jobs": queued}
+            "runners": holding, "active": active, "queued_jobs": queued,
+            "progress": progress}
+
+
+def _held_by_own_run(job, free, now) -> bool:
+    """#7015/#7148 : le job en file est retenu par sa propre exécution, pas
+    par la capacité — un job de la même exécution tourne déjà et un runner
+    `online` libre porte **tous** ses labels.
+
+    #7148 (B de l'auditeur) : la retenue est bornée par le **progrès de
+    l'exécution**, pas par l'âge du job — une matrice au plafond garde ses
+    parts en file sous le `created_at` du run. Elle ne vaut que si un job de
+    la même exécution a démarré ou fini il y a moins de `GUARD_QUEUE_HELD_S`
+    (deux SLO de file) ; passé ce silence, le job réintègre la file pour
+    qu'un dispatch GitHub gelé finisse par alerter. Sans progrès lisible,
+    aucun progrès n'est prouvé : le job compte."""
+    if not job.get("run_active") or not job.get("labels"):
+        return False
+    if not any(job["labels"] <= labels for labels in free):
+        return False
+    progress = job.get("run_progress")
+    if progress is None:
+        return False
+    return now - float(progress) < GUARD_QUEUE_HELD_S
 
 
 class Watcher:
@@ -2068,7 +2110,11 @@ class Watcher:
         pas la capacité — si son exécution tourne déjà, c'est elle qui le
         retient (matrice `strategy.max-parallel` au plafond, `needs`) ; il ne
         compte donc pas dans `ci_queue_state`, et l'alerte de saturation ne le
-        voit pas. Un job sans labels connus reste compté.
+        voit pas. #7148 : cette retenue est bornée par le progrès de
+        l'exécution — un job de la même exécution démarré ou fini dans les deux
+        derniers SLO de file ; passé ce silence (plafond non lu), le job
+        réintègre la file pour qu'un dispatch gelé finisse par alerter. Un job
+        sans labels connus reste compté.
 
         Le relevé est borné (revue N/P2 2328 ; arbitrage A du pilote, 14/10) :
         la fenêtre de 600 s est écrite dans la base avant le premier appel
@@ -2172,7 +2218,8 @@ class Watcher:
                         oldest_at=snap["oldest_at"], runners=snap["runners"])
                     covered += 1
                     for job in snap.get("queued_jobs") or ():
-                        queued_jobs.append(dict(job, run_active=bool(snap.get("active"))))
+                        queued_jobs.append(dict(job, run_active=bool(snap.get("active")),
+                                                run_progress=snap.get("progress")))
                     holding.update(snap.get("runners") or {})
                 if reason is None:
                     data = api("repos/%s/actions/runners?per_page=%d"
@@ -2188,15 +2235,17 @@ class Watcher:
                         # alors que par une limite de son run (matrice au
                         # plafond `max-parallel`, `needs`). Le plafond n'est pas
                         # lu : un runner libre prouve qu'il ne manque pas de
-                        # capacité. Un job sans labels connus reste compté : on
-                        # ne peut pas prouver qu'un runner pourrait le prendre.
+                        # capacité. #7148 : cette retenue est bornée par le
+                        # progrès de l'exécution (un job démarré ou fini dans
+                        # les deux derniers SLO de file) ; passé ce silence, le
+                        # job réintègre la file (un dispatch gelé ne reste pas
+                        # muet). Un job sans labels connus reste compté : on ne
+                        # peut pas prouver qu'un runner pourrait le prendre.
                         free = [_label_set(r.get("labels")) for r in runners
                                 if (r.get("status") or "online") == "online"
                                 and not r.get("busy")]
                         waiting = [job for job in queued_jobs
-                                   if not (job["run_active"] and job["labels"]
-                                           and any(job["labels"] <= labels
-                                                   for labels in free))]
+                                   if not _held_by_own_run(job, free, now)]
                         if waiting:
                             oldest = min(waiting, key=lambda j: (
                                 str(j.get("created_at") or ""), int(j.get("id") or 0)))

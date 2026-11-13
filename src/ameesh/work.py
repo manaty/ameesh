@@ -5389,6 +5389,39 @@ def _note_wake_at(text: str) -> float | None:
         raise WorkError("wake_at= in the note: %s" % exc) from exc
 
 
+def _cancel_lifted_hold_wake(db, item_id, row, actor, cfg):
+    """#7233: cancel a hold's abandoned appointment under the lot lock.
+
+    No runner/assignee is needed, including after the deadline. An explicit
+    schedule and another author's active hold keep their appointment.
+    """
+    from . import planned_waits
+    due = row.get("wake_ts")
+    if due is None:
+        return
+    port = storage.of(db).work
+    arm = None
+    for event in port.events(item_id, 200):
+        text = str(event.get("note") or "").strip()
+        if text.startswith(("wake: scheduled wake delivered", "wake: cancelled")):
+            return
+        if "[réveil programmé:" in text.lower() or (
+                text.startswith("wake: ") and "(due " in text):
+            arm = event
+            break
+    if arm is None or not planned_waits.is_hold_note(arm.get("note")):
+        return
+    holds = planned_waits.active_holds(
+        db, storage.of(db).progress.lot_hold_events(
+            [item_id], planned_waits.HOLD_NOTE_PATTERNS), cfg=cfg)
+    if str(arm.get("actor") or "") in holds.get(item_id, {}):
+        return
+    # The enclosing row lock serializes both rearming and delivery claims.
+    port.schedule_wake(item_id, None, actor=actor, expect=due, arm_id=arm["id"],
+                       text="wake: cancelled (hold lifted; was due %s)"
+                            % _wake_moment(float(due)))
+
+
 def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False,
          wake_ts: float | None = None) -> bool:
     item = get(db, item_id)
@@ -5462,6 +5495,8 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
                     raise WorkError("lot %s not found" % item_id)
                 actor = check_wait_note(cfg, tx, actor, note_text, item_id=item_id)
                 storage.of(tx).work.note(item_id, row["state"], text, actor, **options)
+                if planned_waits.is_lift_note(note_text):
+                    _cancel_lifted_hold_wake(tx, item_id, row, actor, cfg)
         else:
             actor = check_wait_note(cfg, db, actor, note_text, item_id=item_id)
             storage.of(db).work.note(item_id, item["state"], text, actor, **options)

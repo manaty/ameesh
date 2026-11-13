@@ -240,6 +240,8 @@ FERMEES = {
     # aucun rôle superviseur ne la lit, aucun GRANT modifié.
     "account_pauses": {"harness", "account", "until_ts", "observed_at", "reason",
                        "source", "created_at", "updated_at"},
+    "account_turn_exceptions": {"decision_id", "agent", "harness", "account",
+                                "registered_at", "consumed_at", "consumed_host"},
     # #1922 (0452) : registre Process des workflows (révision/étape, reçus d'étape) —
     # fermé tant que le contrat des rôles superviseur ne le classe pas (paquet du 16/10)
     "work_items": {"workflow_ref", "workflow_stage", "workflow_version"},
@@ -418,6 +420,12 @@ FERMEES = {
                                    "adjudicator_family", "judged_families",
                                    "independent", "review_room", "note",
                                    "created_at"},
+    # #7108 (0576) : profils de compte publiés par le runner du tenant (noms
+    # `harnais/compte`, jamais un chemin ni un secret), lus par le préflight
+    # du déplacement manuel d'avatar ; données de compte, pas un état de
+    # supervision : colonne fermée aux deux rôles superviseur, aucun GRANT
+    # modifié.
+    "runner_presence": {"profiles"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

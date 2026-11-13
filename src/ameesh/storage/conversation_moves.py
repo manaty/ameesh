@@ -9,6 +9,7 @@ epoch) stays the only arbiter, and `agent_registry.session_id` changes only at
 from __future__ import annotations
 
 import abc
+from typing import Callable, Mapping
 
 #: states of an attempt; `OPEN` ones block a second attempt for the agent
 STATES = ("planned", "prepared", "switched", "recovered", "rehydrating",
@@ -26,6 +27,12 @@ PLAN_TTL_S = 900
 #: its holdoff; this is the last resort when both hosts are gone, so the next
 #: present candidate can plan a recovery instead of waiting forever.
 HANDOVER_TTL_S = 300
+
+
+#: #7108: a caller's in-transaction recheck refused the manual move before any
+#: write. The message is that refusal (actionable), never a generic retry.
+class RecheckRefused(RuntimeError):
+    """The recheck read fresh state under the registry lock and refused."""
 
 
 class ConversationMoves(abc.ABC):
@@ -66,14 +73,43 @@ class ConversationMoves(abc.ABC):
 
     @abc.abstractmethod
     def open_handover(self, agent: str) -> dict | None:
-        """#7052: the newest post-switch attempt of a `preference` role whose
-        target has not claimed yet (no live lease).
+        """#7052/#7108: the newest post-switch attempt of a `preference` role
+        whose target has not claimed yet (no live lease).
 
-        States `switched`, `recovered` and `rehydrating`. Carries `source_host`
-        and `target_host`, plus `switched_ts` and `now_ts` on the database
-        clock, so the caller computes the holdoff. This is how a candidate
-        tells "the conversation was handed to that host, let it claim" from
-        "the row is simply free"."""
+        States `switched`, `recovered` and `rehydrating`; reasons `preference`
+        (B2 return) and `manual` (B4 operator move). Carries `source_host` and
+        `target_host`, plus `switched_ts` and `now_ts` on the database clock,
+        so the caller computes the holdoff. This is how a candidate tells "the
+        conversation was handed to that host, let it claim" from "the row is
+        simply free"."""
+
+    @abc.abstractmethod
+    def manual(self, move_id: str, agent: str, target_host: str,
+               target_cwd: str, *, actor: str, source_host: str,
+               recheck: Callable[[Mapping], str | None] | None = None,
+               ) -> dict | None:
+        """#7108: one transaction for a manual move of a `preference` agent.
+
+        Locks the registry row, rechecks the guards (still on `source_host`,
+        the host the caller saw, `preference` and `execute`, no live turn or
+        attach, no open host handoff, no open conversation attempt, target
+        still admitted and not held), opens the attempt directly in `switched`
+        (reason `manual`, source fields copied, `switched_at` now) — or in
+        `recovered` when the source lease is no longer live, replaying its
+        interrupted instruction once — and moves the registry row to
+        `target_host` / `target_cwd` in the same write: the source lease is
+        released (epoch + 1), the native session stays provisional until the
+        target's first turn. No credential or session file is read, copied or
+        written.
+
+        `recheck(locked_row)` runs under that same lock, before any write,
+        with the freshly locked registry row (tenant, presence, account
+        profile, harness, placement can all have changed since the caller's
+        preflight); a non-empty reason raises `RecheckRefused` before any
+        effect. Returns the moved row (`previous_lease_owner`,
+        `previous_lease_epoch`, `move_id`, `source_host`, `target_host`,
+        `target_cwd`, `state`), or None when a guard changed since the
+        caller's preflight."""
 
     @abc.abstractmethod
     def prepare(self, move_id: str, *, target_host: str, target_cwd: str,

@@ -90,6 +90,9 @@ CASCADED = (
 # Evidence, authority and unrelated names: never rewritten. Executor
 # allowlists (jsonb) are granted authority, read through the alias.
 KEPT = (
+    # #7066: the spelling is bound by the owner's signature. A renamed agent
+    # needs a fresh decision; rewriting this index must not widen authority.
+    "account_turn_exceptions.agent",
     # #6881 (0567): the agent a limited login may act for, granted by the
     # administrator (role-bureau.sql) — a rename does not move it; the guard
     # refuses until the role is reinstalled under the new name (fails closed).

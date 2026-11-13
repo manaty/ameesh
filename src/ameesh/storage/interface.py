@@ -1249,6 +1249,26 @@ class Accounts(Domain):
     ne passent jamais par ce domaine, qui ne voit que des NOMS de comptes."""
 
     @abc.abstractmethod
+    def register_exception(self, decision_id: int, agent: str, harness: str, account: str):
+        """Index a signed token once; a consumed token cannot be re-armed."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def pending_exceptions(self, agent: str, harness: str) -> list:
+        """Read unconsumed decision ids indexed for this named agent."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def lock_exception(self, decision_id: int) -> bool:
+        """Lock an unconsumed token in the caller's turn-start transaction."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def consume_exception(self, decision_id: int, host: str):
+        """Record consumption in the same transaction as turn start."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def active(self, host: str, harness: str) -> dict | None:
         """La ligne `account_active` (account, forced, forced_until,
         updated_at), ou None. `forced_until` (epoch, #3755) est l'échéance du
@@ -4864,17 +4884,21 @@ class Tenancy(Domain):
 
     @abc.abstractmethod
     def bindings(self, host: str | None = None) -> list[dict]:
-        """Liaisons (avec la présence de leur runner : `seen_ts`, `version`)."""
+        """Liaisons (avec la présence de leur runner : `seen_ts`, `version`,
+        `profiles`)."""
 
     @abc.abstractmethod
     def beat(self, host: str, tenant: str, runner_id: str, *, uid: int | None,
-             version: str | None) -> bool:
-        """Battement du runner d'un tenant ; faux sans liaison qui le nomme."""
+             version: str | None, profiles: Sequence[str] = ()) -> bool:
+        """Battement du runner d'un tenant ; faux sans liaison qui le nomme.
+
+        #7108 : `profiles` publie les profils de compte `harnais/compte` que
+        ce runner peut offrir (noms seulement, jamais un chemin ni un secret)."""
 
     @abc.abstractmethod
     def presence(self, host: str, tenant: str) -> dict | None:
         """Dernier battement du tenant sur l'hôte (`seen_ts`, `now_ts`,
-        `runner_id`), ou None."""
+        `runner_id`, `profiles`), ou None."""
 
 
 # --------------------------------------------------------------------------

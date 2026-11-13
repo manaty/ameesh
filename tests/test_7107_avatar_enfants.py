@@ -70,8 +70,11 @@ class ChildrenPlacementTest(test_canon._CanonDbCase):
         write(self.root, "agents/avatar.md", avatar_card())
         self.write_placement(["atelier", "enfants"])
         self.sync_both()
+        # #7200 : liaison écrite depuis atelier pour l'hôte enfants ; l'UID
+        # 52001 est celui que le passwd de la cible rend (jamais celui de
+        # l'appelant), il est donc fourni explicitement.
         self.binding = tenancy.register(
-            self.db, "enfants", ALICE, actor=ALICE,
+            self.db, "enfants", ALICE, actor=ALICE, local_host="atelier",
             uid=52001, user="ameesh-alice")
 
     # -- fixtures ---------------------------------------------------------
