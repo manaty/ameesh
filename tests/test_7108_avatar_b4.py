@@ -270,6 +270,30 @@ class PreflightTest(_AvatarCase):
         self.assertIsNone(storage.of(self.db).conversation_moves.open_for(AVATAR))
         self.assertEqual(self.moved_events(), events)
 
+    def test_previous_writer_heartbeat_without_profiles_is_refused(self):
+        # CONTRIBUTING.md « Compatibilité N-1 » (#5690) : a tenant runner still
+        # on N-1 writes its heartbeat without the new `profiles` column. The
+        # new reader must hold (empty list, not NULL) and the move must be
+        # refused `move-account-missing` before any effect.
+        self.db.execute(
+            "DELETE FROM runner_presence WHERE host = %s AND tenant = %s",
+            (BANC, ALICE))
+        self.previous_write(
+            "INSERT INTO runner_presence"
+            " (host, tenant, runner_id, uid, version, seen_at)"
+            " SELECT t.host, t.tenant, t.runner_id, %s, %s, clock_timestamp()"
+            " FROM host_tenants t"
+            " WHERE t.host = %s AND t.tenant = %s AND t.runner_id = %s"
+            " ON CONFLICT (host, tenant) DO UPDATE"
+            " SET runner_id = excluded.runner_id, uid = excluded.uid,"
+            " version = excluded.version, seen_at = excluded.seen_at"
+            " RETURNING tenant",
+            (2001, "1.51.0", BANC, ALICE, "%s/alice" % BANC),
+            added=("profiles",))
+        presence = storage.of(self.db).tenancy.presence(BANC, ALICE)
+        self.assertEqual(presence["profiles"], [])
+        self.refused("move-account-missing")
+
     def test_harness_missing_refused_before_effect(self):
         self.db.execute(
             "UPDATE agent_candidates SET placement_ok = false,"
