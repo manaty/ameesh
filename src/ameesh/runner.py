@@ -9435,6 +9435,15 @@ class AgentWorker(threading.Thread):
         spawn_context_path = ""
         profile_path = ""
         if self.agent.get("created_by"):
+            # B 40603 : la tâche de nettoyage locale est écrite AVANT les
+            # fichiers privés ; un runner tué les laisse derrière lui et le
+            # prochain tour de cet hôte l'exécute (`sweep_local`).
+            try:
+                child_reports.begin_turn(self.cfg, self.name)
+            except OSError as exc:
+                self.fail_turn("spawn policy unavailable",
+                               "cleanup task not recorded: %s" % exc)
+                return False
             try:
                 spawn_profile = storage.of(self.db).ephemerals.profile(self.name)
                 # B 40580 : le contexte est indépendant du profil. Un
@@ -10958,15 +10967,21 @@ class AgentWorker(threading.Thread):
         return ok
 
     def _sweep_child_reports(self) -> None:
-        """Rapports finaux des enfants échus et purge de leur contexte.
+        """Rapports finaux des enfants échus, purge de leur contexte, et
+        exécution des nettoyages locaux laissés par un tour mort.
 
         Best effort : le tour de l'agent ne dépend jamais d'un rapport
-        d'enfant. B 40580 : appelé au début du tour et à la clôture.
+        d'enfant. B 40580 : appelé au début du tour et à la clôture ;
+        B 40603 : le nettoyage local est durable sur cet hôte.
         """
         try:
             child_reports.sweep_expired(self.db, self.cfg, self.name, warn=log_async)
         except Exception as exc:  # noqa: BLE001 — rapport non bloquant
             log_async("[%s] child report sweep skipped (%s)" % (self.name, exc))
+        try:
+            child_reports.sweep_local(self.cfg, warn=log_async)
+        except Exception as exc:  # noqa: BLE001 — le tour continue
+            log_async("[%s] child cleanup sweep skipped (%s)" % (self.name, exc))
 
     def _turn_closed(self, raison: str, duration: float) -> None:
         """Après un tour clos par un plafond (L105) : la suite au tour suivant,

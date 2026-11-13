@@ -22,11 +22,14 @@ expires. `child report` is the explicit CLI for the child itself.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
 
 from . import conversation, db as db_mod, mail, registry, spawn, storage
+from .platform import host as host_platform
+from .platform import process as process_platform
 
 KINDS = ("progress", "question", "final")
 STATUSES = ("completed", "failed", "expired")
@@ -214,8 +217,108 @@ def sweep_expired(db, cfg, parent: str, *, warn=None) -> list[dict]:
     return done
 
 
+#: Host-local spool of the cleanup tasks a turn still owes: one marker per
+#: child, written before its private files and removed with them.
+CLEANUP_DIR = "spawn-cleanup"
+CLEANUP_SUFFIX = ".json"
+
+
+def cleanup_path(cfg, child: str) -> str:
+    """The durable cleanup marker of one child on THIS host."""
+    name = child.encode("utf-8").hex() + CLEANUP_SUFFIX
+    return os.path.join(cfg.state_dir, CLEANUP_DIR, name)
+
+
+def _writer_alive(marker: dict) -> bool:
+    """True when the marker's writer is still the same live process.
+
+    `boot_id` + start time, read through the platform layer (L63): a PID
+    alone may be reused, and a reboot makes every recorded start stale.
+    """
+    try:
+        pid = int(marker.get("pid"))
+        start = float(marker.get("start"))
+    except (TypeError, ValueError):
+        return False
+    boot = marker.get("boot")
+    if pid <= 0 or not isinstance(boot, str):
+        return False
+    try:
+        if boot != host_platform.boot_id():
+            return False
+        return process_platform.same_start(start, process_platform.start_time(pid))
+    except Exception:  # noqa: BLE001 — an unreadable identity is not "alive"
+        return False
+
+
+def begin_turn(cfg, child: str) -> None:
+    """Record the local cleanup task BEFORE the private files are written.
+
+    B 40603 : a runner killed between `write_context` and `turn_end` (SIGKILL,
+    crash, host loss) leaves the files behind, and the parent's sweep runs on
+    ANOTHER host: it cannot remove them. The marker survives on the child's
+    host and `sweep_local` executes the task at the next turn there, so it is
+    kept until it runs, independent of a normal end of turn.
+    """
+    try:
+        start = process_platform.start_time(os.getpid())
+        boot = host_platform.boot_id()
+    except Exception as exc:  # noqa: BLE001 — never write a task we cannot check
+        raise OSError("process identity unavailable: %s" % exc) from None
+    if start is None or boot is None:
+        raise OSError("process identity unavailable: cleanup cannot be guaranteed")
+    marker = json.dumps({"child": child, "pid": os.getpid(),
+                         "boot": boot, "start": start})
+    spawn.write_private(cleanup_path(cfg, child), marker + "\n")
+
+
+def sweep_local(cfg, *, warn=None) -> list[str]:
+    """Execute the cleanup tasks left by dead turns on THIS host.
+
+    A marker whose writer is still the same live process is an in-flight
+    turn: its files are left alone. An unreadable marker proves nobody can
+    still be using the files, so privacy wins and they are removed.
+    """
+    directory = os.path.join(cfg.state_dir, CLEANUP_DIR)
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        if warn is not None:
+            warn("child cleanup: spool unreadable (%s)" % exc)
+        return []
+    done = []
+    for name in names:
+        if not name.endswith(CLEANUP_SUFFIX):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            child = bytes.fromhex(name[:-len(CLEANUP_SUFFIX)]).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                marker = json.load(handle)
+        except (OSError, ValueError):
+            marker = {}
+        if _writer_alive(marker):
+            continue
+        _remove_child_state(cfg, child)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        done.append(child)
+    return done
+
+
 def _remove_child_state(cfg, child: str) -> None:
-    """Remove the child's private policy/context files, best effort."""
+    """Remove the child's private policy/context files and its cleanup task."""
     directory = cfg.agent_dir(child)
     for name in (spawn.CONTEXT_FILE, spawn.PROFILE_FILE, spawn.MCP_FILE):
         try:
@@ -224,6 +327,10 @@ def _remove_child_state(cfg, child: str) -> None:
             pass
         except OSError:
             pass
+    try:
+        os.unlink(cleanup_path(cfg, child))
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------

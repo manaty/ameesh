@@ -301,7 +301,7 @@ def read_context(path: str) -> tuple[str, str]:
     return text, hashlib.sha256(raw).hexdigest()
 
 
-def _write_private(path: str, text: str) -> str:
+def write_private(path: str, text: str) -> str:
     """Atomically write one `0600` file under a `0700` directory."""
     directory = os.path.dirname(path)
     os.makedirs(directory, mode=DIR_MODE, exist_ok=True)
@@ -363,7 +363,7 @@ def write_profile(state_dir: str, profile: Mapping, cwd: str | None) -> tuple[st
             servers[name] = stored[name]
     mcp_path = ""
     if block.mcp:
-        mcp_path = _write_private(
+        mcp_path = write_private(
             os.path.join(state_dir, MCP_FILE),
             json.dumps({"mcpServers": servers}, ensure_ascii=False,
                        sort_keys=True, indent=1) + "\n")
@@ -376,7 +376,7 @@ def write_profile(state_dir: str, profile: Mapping, cwd: str | None) -> tuple[st
         "mcp": mcp,
         "mcp_config": mcp_path or None,
     }
-    path = _write_private(
+    path = write_private(
         os.path.join(state_dir, PROFILE_FILE),
         json.dumps(document, ensure_ascii=False, sort_keys=True, indent=1) + "\n")
     return path, mcp_path
@@ -420,4 +420,4 @@ def write_context(state_dir: str, text: str, *, digest: str | None = None) -> st
         raise SpawnToolsError(
             "spawn-context-digest",
             "the stored spawn context does not match its recorded digest")
-    return _write_private(target, text)
+    return write_private(target, text)

@@ -318,6 +318,52 @@ class ChildReportTest(_CanonDbCase):
         self.assertIsNotNone(storage.of(self.db).ephemerals.profile("aide5"))
         self.assertIsNotNone(storage.of(self.db).ephemerals.context("aide5"))
 
+    def test_a_dead_turns_private_files_are_swept_locally(self):
+        # B 40603 : un runner tué entre l'écriture et `turn_end` laisse un
+        # marqueur durable sur SON hôte ; un tour ultérieur y exécute le
+        # nettoyage, sans dépendre de la base ni du balayage du parent.
+        text = "turn context\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        canon_sync.spawn(self.db, "aide6", "orchestre", 3600, canon=self.load(),
+                         tools=["git"], context=(text, digest))
+        directory = self.cfg.agent_dir("aide6")
+        child_reports.begin_turn(self.cfg, "aide6")
+        spawn.write_profile(directory, storage.of(self.db).ephemerals.profile("aide6"),
+                            self.cwd)
+        spawn.write_context(directory, text)
+        # Le processus du tour est mort : son identité ne résout plus.
+        marker = child_reports.cleanup_path(self.cfg, "aide6")
+        with open(marker, "w", encoding="utf-8") as handle:
+            json.dump({"child": "aide6", "pid": 0, "boot": "gone", "start": 0.0}, handle)
+        self.assertEqual(child_reports.sweep_local(self.cfg), ["aide6"])
+        for filename in (spawn.PROFILE_FILE, spawn.MCP_FILE, spawn.CONTEXT_FILE):
+            self.assertFalse(os.path.exists(os.path.join(directory, filename)),
+                             filename)
+        self.assertFalse(os.path.exists(marker))
+        # La base garde le contexte : le tour suivant le réécrirait.
+
+    def test_a_live_turn_keeps_its_private_files(self):
+        # Un balayage concurrent ne touche pas un tour en cours (même hôte).
+        text = "turn context\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        canon_sync.spawn(self.db, "aide7", "orchestre", 3600, canon=self.load(),
+                         tools=["git"], context=(text, digest))
+        directory = self.cfg.agent_dir("aide7")
+        child_reports.begin_turn(self.cfg, "aide7")
+        spawn.write_profile(directory, storage.of(self.db).ephemerals.profile("aide7"),
+                            self.cwd)
+        spawn.write_context(directory, text)
+        self.assertEqual(child_reports.sweep_local(self.cfg), [])
+        for filename in (spawn.PROFILE_FILE, spawn.MCP_FILE, spawn.CONTEXT_FILE):
+            self.assertTrue(os.path.exists(os.path.join(directory, filename)),
+                            filename)
+        child_reports.turn_end(self.db, self.cfg, "aide7", final="progress",
+                               status="completed")
+        for filename in (spawn.PROFILE_FILE, spawn.MCP_FILE, spawn.CONTEXT_FILE):
+            self.assertFalse(os.path.exists(os.path.join(directory, filename)),
+                             filename)
+        self.assertFalse(os.path.exists(child_reports.cleanup_path(self.cfg, "aide7")))
+
     def test_a_final_report_purges_the_context_even_before_expiry(self):
         text = "private context\n"
         digest = hashlib.sha256(text.encode()).hexdigest()
@@ -414,14 +460,17 @@ class SpawnRunnerTest(PgTestCase):
         report_out = os.path.join(self.tmp, "child-report.txt")
         state = self.cfg.agent_dir(name)
         modes_out = os.path.join(self.tmp, "private-modes.txt")
+        markers_out = os.path.join(self.tmp, "cleanup-markers.txt")
+        cleanup_dir = os.path.join(self.cfg.state_dir, child_reports.CLEANUP_DIR)
         private = " ".join(shlex.quote(os.path.join(state, filename))
                            for filename in (spawn.PROFILE_FILE, spawn.MCP_FILE,
                                             spawn.CONTEXT_FILE))
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
                "AMEESH_TEST_RUN": 'cp "$AMEESH_TURN_CONTEXT" %s; stat -c "%%a %%n" %s'
-                                  ' > %s; %s -m ameesh child'
+                                  ' > %s; ls %s > %s 2>/dev/null; %s -m ameesh child'
                                   ' report --kind progress --text "explicit report" > %s 2>&1'
                                   % (shlex.quote(capture), private, shlex.quote(modes_out),
+                                     shlex.quote(cleanup_dir), shlex.quote(markers_out),
                                      shlex.quote(sys.executable),
                                      shlex.quote(report_out)),
                "PYTHONPATH": os.path.join(REPO, "src")}
@@ -459,6 +508,14 @@ class SpawnRunnerTest(PgTestCase):
             path = os.path.join(state, filename)
             self.assertEqual(modes.get(path), "600", path)
             self.assertFalse(os.path.exists(path), path)
+        # La tâche de nettoyage durable existait pendant le tour (B 40603) et
+        # le tour normal l'a exécutée puis retirée.
+        with open(markers_out, encoding="utf-8") as handle:
+            markers = [line.strip() for line in handle if line.strip()]
+        self.assertEqual(len(markers), 1, markers)
+        self.assertTrue(markers[0].endswith(child_reports.CLEANUP_SUFFIX))
+        self.assertEqual(os.listdir(cleanup_dir), [])
+        self.assertEqual(child_reports.sweep_local(self.cfg), [])
         # The child's final report reaches the parent, and the expiry sweep
         # purges the private context.
         self.db.execute("UPDATE agent_registry SET ephemeral_expires_at ="
