@@ -122,6 +122,16 @@ class ExhaustedNoteTest(unittest.TestCase):
         self.assertFalse(fd.exhausted([{"note": "la roadmap: épuisée ameesh"}], "ameesh"))
 
 
+class BodyTest(unittest.TestCase):
+    def test_the_roadmap_source_is_the_project_plan_in_the_canon(self):
+        # #7177 : docs/ROADMAP.md n'existe dans aucun dépôt ; la source est le
+        # plan du canon, propre au projet du lot
+        item = fd.Measure("nexlink", wakeable=["a", "b"], idle=["a"])
+        body = fd.body_of("nexlink", item, 0.0, 1800.0, [])
+        self.assertIn("`plan/nexlink/`", body)
+        self.assertNotIn("ROADMAP.md", body)
+
+
 class MechanicsBlockTest(unittest.TestCase):
     BASE = MECHANICS
 
