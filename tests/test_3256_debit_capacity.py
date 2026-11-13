@@ -125,11 +125,12 @@ class TriggerTest(unittest.TestCase):
         self.assertEqual(cap["projects"][0]["idle_agent_hours"], 0.0)
         self.assertEqual(cap["projects"][0]["roadmap_exhausted"]["lot"], 90)
 
-    def test_a_startable_lot_reopens_an_exhausted_roadmap(self):
+    def test_a_startable_lot_keeps_the_exhaustion_note(self):
         notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - H}]
         cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[split_lot()],
                       startable=[{"id": 12, "app": "ameesh"}])
-        self.assertIsNone(cap["projects"][0]["roadmap_exhausted"])
+        self.assertEqual(cap["projects"][0]["roadmap_exhausted"]["lot"], 90)
+        self.assertEqual(cap["projects"][0]["idle_agent_hours"], 0.0)
         self.assertEqual(len(cap["alerts"]), 1)
 
     def test_a_reopening_note_after_the_exhaustion_reopens(self):

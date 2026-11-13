@@ -143,6 +143,16 @@ comme avant.
 
 ### 3.1 La mesure
 
+Dans cette projection, le sommeil automatique de découpage reste une capacité
+mobilisable : sa pose ou sa levée ne change pas le dénominateur. Les pauses
+humaines et budgétaires, hôtes fermés et runners absents restent exclus.
+Une note d'épuisement reste visible tant qu'une note de réouverture ne l'annule
+pas. Un lot ponctuel démarrable permet une relance sans effacer cette note ;
+les heures de repos correspondantes sont bornées par sa date de création dans
+la fenêtre (date inconnue : aucune heure imputée). Cette borne ne prétend pas
+reconstituer les changements historiques de démarrabilité du lot.
+(Source : diagnostic mesh-design du 13/11/2026, lot #7249, manaty/ameesh#5469.)
+
 `ameesh debit` gagne une section `capacity`, par projet et pour le mesh :
 
 - `idle_agent_hours` sur la fenêtre du débit, et la part au repos des agents

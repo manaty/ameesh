@@ -2224,6 +2224,20 @@ def _idle_gaps(spans: list[tuple[float, float]], start: float, end: float,
     return total
 
 
+def _capacity_agents(agents) -> list[dict]:
+    """#7249: project roadmap sleep without mutating the registry rows."""
+    from . import file_decoupage
+    rows = [dict(row) for row in agents or ()]
+    # #7249 : le sommeil de découpage est une capacité mobilisable, pas
+    # une pause humaine/budget. Neutraliser seulement ce drapeau dans cette
+    # projection : les transitions sleep/wake ne changent pas le dénominateur.
+    for row in rows:
+        if (row.get("operator_paused")
+                and file_decoupage.is_sleep_reason(row.get("operator_pause_reason"))):
+            row["operator_paused"] = False
+    return rows
+
+
 def capacity(*, agents: Iterable[Mapping[str, Any]],
              turns: Iterable[Mapping[str, Any]] = (),
              startable: Iterable[Mapping[str, Any]] = (),
@@ -2307,7 +2321,7 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
                                      open_lots).items():
         held.setdefault(name, why)
     min_gap = float(repos_s) if repos_s is not None else 0.0
-    rows = [dict(row) for row in agents or ()]
+    rows = _capacity_agents(agents)
     spans = _busy_spans(turns, start, now)
     last_lot_turn = {name: values[-1][1] for name, values in spans.items()}
 
@@ -2373,16 +2387,16 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         current = decoupage.get(project)
         if current is None or (created or 0.0) > (current.get("created_ts") or 0.0):
             decoupage[project] = entry
-    for project in list(exhausted):
-        # #6215 : un lot démarrable de l'instant rouvre la route, comme le
-        # sommeil (`run`: `if item.startable`). Un lot **retenu par la garde
-        # d'empreinte** ne la rouvre plus : `split_startable` ne le compte pas
-        # démarrable (#4717) et le sommeil endort donc les agents — les deux
-        # lecteurs suivent la même règle. Le projet ne se tait pas pour
-        # autant : l'alerte de capacité continue de nommer l'attente
-        # d'empreinte (#4561), sous la ligne « feuille de route épuisée ».
-        if startable_by.get(project):
-            del exhausted[project]
+    # La note reste l'autorité de l'épuisement. Un lot ponctuel donne du
+    # travail sans réécrire cette note, ni facturer les heures de sommeil
+    # précédant sa création. Sans date connue, aucune heure n'est inventée.
+    available_since: dict[str, float] = {}
+    for lot in startable:
+        project = projects_mod.lot_project(lot) or ""
+        at = _epoch(lot.get("created_ts"))
+        if project in exhausted:
+            since = max(start, float(at) if at is not None else now)
+            available_since[project] = min(available_since.get(project, now), since)
 
     by_project: dict[str, list[dict]] = {}
     primary: dict[str, str] = {}
@@ -2399,8 +2413,11 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         # agents au repos en comptent (ni lot actionnable, ni pause budget,
         # ni famille exclue) : les trous d'un agent occupé ne sont pas de la
         # capacité disponible (#5043)
-        seconds = sum(_idle_gaps(spans.get(name, []), start, now, min_gap)
-                      for name in idle if primary.get(name) not in exhausted)
+        seconds = sum(_idle_gaps(
+            spans.get(name, []),
+            available_since.get(primary.get(name), now)
+            if primary.get(name) in exhausted else start, now, min_gap)
+            for name in idle)
         share = (len(idle) / len(names)) if names else 0.0
         return {"wakeable": len(names), "idle": len(idle), "idle_agents": idle,
                 "idle_share": round(share, 4),
@@ -2423,7 +2440,7 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         fresh = entry["decoupage"] is not None and (
             entry["decoupage"].get("age_s") or 0.0) < file_decoupage.FALLBACK_S
         # #6215 : une route épuisée ne tait un projet que si rien n'y attend.
-        # Un lot démarrable (qui a rouvert la route) ou un lot retenu par la
+        # Un lot démarrable ponctuel ou un lot retenu par la
         # garde d'empreinte est du travail réel : l'alerte le nomme et porte
         # son geste (#4561).
         pending = entry["startable_lots"] or entry["footprint_lots"]
@@ -3092,7 +3109,7 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
     # la tenue de budget ne se lit que pour les agents au repos (comme
     # `idle_capacity`) : un agent occupé n'entre pas dans la part au repos
     idle = sous_utilisation.idle_agents(
-        [row for row in listing if not row.get("retired_ts")], now, 0.0,
+        [row for row in _capacity_agents(listing) if not row.get("retired_ts")], now, 0.0,
         waiting_free=True, actionable_idle=True)
     held = attempt("budget holds", lambda: budget_holds(idle), {})
     # #5867 : un agent dont l'hôte ne peut pas ouvrir de tour (drainage, hôte
