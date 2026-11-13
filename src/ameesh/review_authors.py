@@ -4150,6 +4150,44 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
         return None
 
 
+def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> str:
+    """Le SHA complet d'un commit cité **abrégé**, résolu par la forge (#7252).
+
+    Le correctif d'un relecteur retiré par un push forcé n'est plus dans la
+    branche : un hôte qui n'a pas fetché entre le correctif et la réécriture ne
+    l'a pas localement, et `git fetch` d'un SHA abrégé (`5e2c911418d2`) ne le
+    résout pas. L'API de la forge du clone résout l'abrégé, y compris un objet
+    devenu pendant (`repos/<slug>/commits/<token>`), et rend le SHA complet ;
+    `_forge_fetch` rapatrie ensuite l'objet exact pour les contrôles de
+    topologie. Rend `""` sans forge, sur réponse illisible ou sur échéance :
+    un doute, jamais une exclusion silencieuse.
+    """
+    token = str(token or "").strip()
+    if not repo or not token:
+        return ""
+    slug = _repository_slug(repo)
+    if not slug:
+        return ""
+    bound = plan_git.FETCH_TIMEOUT if timeout is None else min(
+        float(timeout), plan_git.FETCH_TIMEOUT)
+    sweep = active_sweep()
+    if sweep is not None:
+        sweep.check("forge cited commit")
+        bound = min(bound, sweep.deadline.remaining())
+    if bound <= 0:
+        return ""
+    try:
+        from . import plan_github
+
+        client = plan_github.client(timeout=bound, caller="review-authors")
+        data = client.get("repos/%s/commits/%s" % (slug, token))
+    except Exception:  # noqa: BLE001 - forge injoignable ou muette : doute
+        return ""
+    full = str((data or {}).get("sha") or "").strip().lower() \
+        if isinstance(data, Mapping) else ""
+    return full if re.fullmatch(r"[0-9a-f]{40}", full) else ""
+
+
 def _forge_serves(repo: str, sha: str, *, timeout: Optional[float] = None):
     """La forge du clone sert-elle le commit exact `sha` ? (#6934, B/P2 cx2)
 
@@ -4231,7 +4269,8 @@ def _fetch_refused(stderr) -> bool:
     return any(marker in low for marker in _FETCH_REFUSAL_MARKERS)
 
 
-def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list[str]:
+def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "",
+                           *, commits: Sequence[str] = ()) -> list[str]:
     """Rapatrie, **hors transaction**, les objets des gels antérieurs (#3836).
 
     La désignation d'un gel lit les gels antérieurs du lot pour savoir quels
@@ -4247,6 +4286,13 @@ def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list
     gel ne peut plus bloquer le mesh sur le réseau. Un objet que la forge ne
     sert pas reste absent ; la lecture du gel le traite comme avant (un gel
     remplacé est ignoré, un autre rend la désignation en attente).
+
+    #7252 : `commits` est la plage que la lecture du gel lira. Elle prépare
+    aussi les commits **cités** par la réécriture de l'auteur sur cette plage
+    (résolution de l'abrégé par la forge, rapatriement de l'objet exact) : la
+    lecture `fetch=False` de la transaction les trouve alors dans le clone et
+    exclut le correcteur qu'ils nomment, au lieu de tracer un doute « non
+    préparé ». Une plage vide ne prépare aucune citation.
 
     Rend les SHA effectivement rapatriés. Jamais d'exception : une forge
     injoignable est une absence, pas une erreur du gel.
@@ -4290,8 +4336,14 @@ def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list
     # #6934 : la lecture du gel (`fetch=False`) ne sait dire « jamais poussé »
     # que par le refus mémorisé (`fetch_cache`) et les têtes locales : le même
     # balayage des correctifs retirés, ici avec la forge, les prépare.
+    # #7252 : avec la plage gelée, il prépare aussi les commits **cités** par
+    # la réécriture de l'auteur (résolution de l'abrégé, rapatriement exact) ;
+    # la lecture de la transaction les lira localement, sans réseau.
     try:
-        _rewritten_after_freeze(db, item, None, repo, head=current, fetch=True)
+        _rewritten_after_freeze(
+            db, item, None, repo, head=current, fetch=True,
+            commits=tuple(str(sha).strip().lower() for sha in commits or ()
+                          if str(sha or "").strip()))
     except Exception:  # noqa: BLE001 - au mieux : la lecture du gel doute
         pass
     return fetched
@@ -5006,6 +5058,12 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     return authors, unknown, [correctors[name] for name in sorted(correctors)]
 
 
+#: #7252 : une citation de commit retiré dans le message de réécriture de
+#: l'auteur (7 à 40 caractères hexadécimaux). Un identifiant de B (`#40556`)
+#: n'a pas cette longueur et un jeton non-commit est écarté par la résolution.
+_CITED_COMMIT = re.compile(
+    r"(?<![0-9a-fA-F])[0-9a-fA-F]{7,40}(?![0-9a-fA-F])")
+
 #: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
 #: Le relecteur corrige dans son tour : 6 h avant l'avis couvrent un tour
 #: long, 2 h après couvrent la poussée qui suit l'avis. La fenêtre est lue
@@ -5020,7 +5078,10 @@ REWRITTEN_SCAN_BUDGET_S = 60.0
 def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                             repo: str, *, head: str = "", strict: bool = False,
                             fetch: bool = True, recover=None,
-                            unattached: Optional[list] = None) -> dict[str, dict]:
+                            unattached: Optional[list] = None,
+                            commits: Sequence[str] = (),
+                            provider=None,
+                            reference_author: str = "") -> dict[str, dict]:
     """Les correctifs de relecteur **retirés** après leur gel (#4457).
 
     Un relecteur désigné corrige lui-même au premier tour (canon §2) : son
@@ -5082,6 +5143,22 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     tête gelée relue et de la tête lue (`_touches_only_files_absent_from`)
     n'exclut pas son acteur. Les deux preuves sont requises : un correctif
     réécrit sous un autre chemin reste exclu.
+
+    #7252 : le reçu exact peut manquer — correctif poussé hors du hook, agent
+    de gouvernance sans tour lié. Le commit de réécriture de l'auteur cite
+    alors le commit retiré par son SHA. La citation est lue dans la plage
+    gelée (`commits`) : le commit cité doit exister (dans le clone, sinon
+    résolu par la forge à partir de l'abrégé et rapatrié par son SHA exact),
+    descendre d'un gel antérieur du lot, ne plus être ancêtre de la tête,
+    avoir été écrit par un relecteur désigné de ce gel et avoir été publié.
+    Son acteur reste exclu par son nom, sa famille redevient éligible (§2) ;
+    `cited` nomme le commit qui le cite. Une citation d'un commit encore dans
+    la tête, d'un ancêtre ou d'un commit étranger au lot ne prouve rien et
+    n'exclut personne ; une forge muette est un doute tracé (`unattached`).
+    Avec `fetch=False` (lecture de la transaction du gel, #3836), la forge
+    n'est **jamais** interrogée : une citation absente localement est un doute
+    `not-prefetched`, dit au gel ; `prefetch_prior_freezes` l'a préparée hors
+    transaction, sur cette même plage.
     """
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
@@ -5192,7 +5269,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     verdicts = [row for row in rows
                 if row.get("kind") == "verdict"
                 and str(row.get("sha") or "").strip()]
-    author = str(item.get("assignee") or "").strip().casefold()
+    author = str(reference_author or item.get("assignee") or "").strip().casefold()
     # nominalement : acteur -> [(gel, tête, instant du verdict)] des têtes lues
     wanted: dict[str, list] = {}
     for freeze in freezes:
@@ -5212,8 +5289,6 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             stamp = float(verdict.get("at_ts") or freeze.get("at_ts") or 0.0)
             wanted.setdefault(key, []).append((freeze_id, sha, stamp, actor))
     check()
-    if not wanted:
-        return {}
     out: dict[str, dict] = {}
     #: #4679 : acteur -> reçu dont l'objet est introuvable. Ce n'est pas une
     #: absence : la topologie manque, le correcteur peut être l'auteur du
@@ -5339,6 +5414,204 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             unattached.extend(ignored[key] for key in sorted(ignored))
         return result
 
+    def cited_rewrites() -> dict[str, dict]:
+        """#7252 : les correctifs retirés que la réécriture de l'auteur cite.
+
+        Le reçu exact est la preuve préférée (#4457), mais il peut manquer :
+        un relecteur de gouvernance pousse son correctif hors du hook. Le
+        commit de réécriture de l'auteur cite alors le commit retiré
+        (`5e2c911418d2`, cas #7248). La citation n'est lue que dans la plage
+        gelée (`commits`) et seulement quand le commit qui cite a été écrit
+        par l'auteur de référence : un relecteur qui cite un autre commit ne
+        fait pas de son auteur un correcteur de cette tête.
+
+        Le commit cité doit ensuite exister — dans le clone, ou résolu par la
+        forge quand un push forcé l'a fait disparaître (`_forge_commit`, puis
+        `_forge_fetch` de l'objet exact) —, descendre d'un gel antérieur du
+        lot, ne plus être ancêtre de la tête, avoir été écrit par un relecteur
+        désigné de ce gel (reçu exact, committer ou auteur Git) et avoir été
+        publié. Son acteur est exclu par son nom, sans famille (#4457, §2) ;
+        `cited` nomme le commit qui le cite. Une citation d'un commit encore
+        dans la tête, d'un ancêtre ou d'un commit étranger au lot ne prouve
+        rien : elle n'exclut personne. Une forge muette sur un commit absent
+        localement est un doute tracé, jamais une exclusion. `fetch=False`
+        (#3836) interdit toute interrogation de la forge : l'objet absent
+        localement est un doute `not-prefetched`, à préparer hors transaction.
+        """
+        if not commits or not author:
+            return {}
+        range_commits = list(dict.fromkeys(
+            str(sha).strip() for sha in commits if str(sha or "").strip()))
+        if not range_commits:
+            return {}
+        check()
+        # Une seule lecture : l'identité (committer, auteur Git) et le corps
+        # de chaque commit de la plage. Un `git show` par commit citant
+        # coûterait deux processus par commit sur un hôte chargé, hors budget.
+        text = _read_out(
+            repo, "log", "--no-walk",
+            "--format=%H%x1f%ce%x1f%ct%x1f%ae%x1f%at%x1f%B%x1e",
+            *range_commits)
+        if text is None:
+            return {}
+        check()
+
+        def identity_actor(email: str, raw_stamp: str, *,
+                           registered: bool) -> str:
+            """L'acteur d'une identité, comme `commit_actor`/`commit_author`."""
+            try:
+                stamp = float(raw_stamp)
+            except ValueError:
+                return ""
+            actor = _agent_of_email(db, email.strip().lower(), stamp)
+            if registered and (not actor or not _registered(db, actor)):
+                return ""
+            return actor
+
+        cited: dict[str, str] = {}
+        for record in str(text).split("\x1e"):
+            fields = record.strip("\n").split("\x1f", 5)
+            if len(fields) != 6:
+                continue
+            citing, c_email, c_stamp, a_email, a_stamp, body = fields
+            citing = citing.strip()
+            if not citing or not body:
+                continue
+            tokens = _CITED_COMMIT.findall(body)
+            if not tokens:
+                continue
+            check()
+            actors = {identity_actor(c_email, c_stamp, registered=False),
+                      identity_actor(a_email, a_stamp, registered=True)}
+            if author not in {actor.casefold() for actor in actors if actor}:
+                continue
+            for token in tokens:
+                cited.setdefault(token.lower(), citing)
+        if not cited:
+            return {}
+        check()
+        present = _present_commits(repo, sorted(cited), timeout=remaining())
+        check()
+        found: dict[str, dict] = {}
+
+        def cite_doubt(token: str, citing: str, *,
+                       reason: str = "forge-unreadable") -> None:
+            """#7252 B/P2 auditeur : une citation non concluante se dit au gel."""
+            if unattached is not None:
+                ignored.setdefault(("", "cited:" + token), {
+                    "name": "", "sha": token,
+                    "reason": reason, "cited": citing})
+
+        for token, citing in sorted(cited.items()):
+            check()
+            full = (_read_local_commit(repo, token) if present is None
+                    else present.get(token))
+            if not full:
+                # #7252 B/P2 auditeur : le commit réécrit a disparu du clone
+                # (push forcé). La forge le résout par l'abrégé, puis sert
+                # l'objet exact pour les contrôles de topologie. Forge muette :
+                # un doute est tracé, jamais une exclusion silencieuse.
+                # #3836 : la lecture du gel (`fetch=False`) ne touche jamais au
+                # réseau ; ses citations sont préparées hors transaction
+                # (`prefetch_prior_freezes`). Un objet encore absent reste un
+                # doute tracé, sans fetch sous les verrous du gel.
+                if not fetch:
+                    cite_doubt(token, citing, reason="not-prefetched")
+                    continue
+                resolved = _forge_commit(repo, token, timeout=remaining())
+                if not resolved:
+                    cite_doubt(token, citing)
+                    continue
+                check()
+                if _forge_fetch(repo, resolved, timeout=remaining()) is not True:
+                    cite_doubt(token, citing)
+                    continue
+                full = _read_local_commit(repo, resolved) or ""
+                if not full:
+                    cite_doubt(token, citing)
+                    continue
+            if plan_git.same_commit(full, head_sha):
+                continue
+            if _is_ancestor(repo, full, head_sha) is True:
+                continue                # encore dans la tête : la plage le lit
+            prior = None
+            for freeze in reversed(freezes):
+                freeze_id = int(freeze.get("id") or 0)
+                if current_id and freeze_id >= current_id:
+                    continue
+                freeze_sha = str(freeze.get("sha") or "").strip().lower()
+                if not freeze_sha or plan_git.same_commit(freeze_sha, head_sha):
+                    continue
+                if _is_ancestor(repo, freeze_sha, full) is True:
+                    prior = freeze
+                    break
+            if prior is None:
+                continue                # étranger à cette tête
+            check()
+            freeze_id = int(prior.get("id") or 0)
+            freeze_sha = str(prior.get("sha") or "").strip().lower()
+            try:
+                receipt = _commit_receipt(provider, db, full, strict=strict)
+            except review_provenance.ProvenanceError:
+                if strict:
+                    raise
+                receipt = None
+            actors: set[str] = set()
+            if receipt:
+                actor = str(receipt.get("actor") or "").strip()
+                if actor:
+                    actors.add(actor)
+            for actor, _stamp in (commit_actor(repo, full, db),
+                                  commit_author(repo, full, db)):
+                if actor:
+                    actors.add(actor)
+            reviewers = designated_reviewers(db, item, prior, author)
+            candidates = sorted((actor for actor in actors
+                                 if actor in reviewers
+                                 and actor.casefold() != author),
+                                key=str.casefold)
+            if not candidates:
+                continue
+            is_published = any(published(actor, freeze_id, freeze_sha, full)
+                               for actor in candidates)
+            if not is_published:
+                if unattached is not None:
+                    for actor in candidates:
+                        ignored.setdefault((actor.casefold(), full), {
+                            "name": actor, "sha": full, "freeze": freeze_id,
+                            "reason": "never-pushed", "cited": citing})
+                continue
+            other_lot = stacked_lot(receipt, full) if receipt else 0
+            for actor in candidates:
+                if (_on_own_review_branch(repo, actor, lot, full)
+                        and _touches_only_files_absent_from(
+                            repo, full, (freeze_sha, head_sha))):
+                    continue            # note de relecture, pas un correctif
+                row = {"name": actor, "family": "", "families": [],
+                       "rewritten": full, "freeze": freeze_id,
+                       "cited": citing}
+                if other_lot:
+                    row["stacked_lot"] = other_lot
+                    row["stacked_unread"] = unread_stacks.get(full, 0)
+                found.setdefault(actor.casefold(), row)
+        check()
+        return found
+
+    cited = cited_rewrites()
+    check()
+
+    def merge_cited(result: dict) -> dict:
+        """#7252 : une citation complète un doute, jamais une preuve exacte."""
+        for name, row in cited.items():
+            existing = result.get(name)
+            if existing is None or (existing.get("unresolved")
+                                    and not existing.get("rewritten")):
+                result[name] = row
+        return result
+
+    if not wanted:
+        return finish(merge_cited({}))
+
     for key in sorted(wanted):
         for freeze_id, freeze_sha, verdict_at, actor in wanted[key]:
             since = max(0.0, verdict_at - REWRITTEN_BEFORE_S)
@@ -5359,7 +5632,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 check()
                 for name, row in (*doubt.items(), *stacked.items()):
                     out.setdefault(name, row)
-                return finish(out)
+                return finish(merge_cited(out))
             # #4457 (gel #25249) : une seule sonde `cat-file --batch-check`
             # pour tous les reçus, au lieu d'un processus git par SHA ; les
             # 500 reçus du témoin passent de ~40 s à moins d'une seconde.
@@ -5492,7 +5765,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     # le doute ne complète que les acteurs sans preuve.
     for name, row in (*doubt.items(), *stacked.items()):
         out.setdefault(name, row)
-    return finish(out)
+    return finish(merge_cited(out))
 
 
 def reading(db, item: Mapping, milestone: Optional[Mapping],
@@ -5570,6 +5843,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     lot** (`work_item_id` ou tour) : un reçu sans rattachement ne prouve rien
     ici, `doubts_out` reçoit sa trace (`{name, sha, freeze}`) pour que le gel
     le dise, sans exclure son acteur (#4679 B/P2 auditeur).
+    #7252 : quand le reçu exact manque (correctif poussé hors du hook), la
+    citation du commit retiré dans le message de réécriture de l'auteur le
+    retrouve ; l'acteur reste dans `correctors` avec une famille vide et
+    `cited` nomme le commit qui le cite. La citation ne vaut que pour un
+    commit qui existe (dans le clone, sinon résolu par la forge depuis
+    l'abrégé puis rapatrié), descend d'un gel antérieur, n'est plus ancêtre de
+    la tête et dont l'acteur était relecteur désigné de ce gel. Une forge
+    muette sur un commit absent localement est un doute (`doubts_out`).
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
@@ -5641,8 +5922,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
 
     `fetch=False` (#3836) ne rapatrie rien : c'est la lecture d'une
     transaction de gel, qui ne doit jamais attendre le réseau en tenant ses
-    verrous. Les objets des gels antérieurs se préparent hors transaction par
-    `prefetch_prior_freezes`.
+    verrous. Les objets des gels antérieurs **et les commits cités** (#7252)
+    se préparent hors transaction par `prefetch_prior_freezes`, sur la même
+    plage ; un objet encore absent est un doute tracé, jamais un fetch.
     """
     item = dict(item or {})
     packet = bool(packet_composer(item))
@@ -5936,7 +6218,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     unattached: list = []
     for row in _rewritten_after_freeze(
             db, item, milestone, repo, head=head, strict=strict,
-            fetch=fetch, recover=recover,
+            fetch=fetch, recover=recover, commits=commits, provider=provider,
+            reference_author=author_name,
             unattached=(unattached if doubts_out is not None else None)).values():
         key = str(row.get("name") or "").strip().lower()
         if not key or key in corrector_rows:
@@ -5944,6 +6227,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         corrector_rows[key] = {"name": row["name"], "family": "",
                                "proven": set(), "test_only": False,
                                "rewritten": str(row.get("rewritten") or ""),
+                               "cited": str(row.get("cited") or ""),
                                "unresolved": str(row.get("unresolved") or ""),
                                "stacked_lot": int(row.get("stacked_lot") or 0),
                                "stacked_unread": int(row.get("stacked_unread") or 0),
@@ -5959,6 +6243,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             entry["test_only"] = True
         if row.get("rewritten"):
             entry["rewritten"] = row["rewritten"]
+            if row.get("cited"):
+                entry["cited"] = row["cited"]
             if row.get("stacked_lot"):
                 entry["stacked_lot"] = int(row["stacked_lot"])
             if row.get("stacked_unread"):
