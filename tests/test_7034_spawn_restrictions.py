@@ -425,6 +425,38 @@ class ChildReportTest(_CanonDbCase):
                              filename)
         self.assertFalse(os.path.exists(child_reports.cleanup_path(self.cfg, "aide9")))
 
+    def test_a_failed_orphan_rewrite_keeps_the_original_task(self):
+        # B 40630 : si unlink échoue ET que la réécriture orpheline échoue,
+        # le marqueur d'origine reste : la tâche n'est jamais perdue avec le
+        # contexte encore présent.
+        text = "turn context\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        canon_sync.spawn(self.db, "aide10", "orchestre", 3600, canon=self.load(),
+                         tools=["git"], context=(text, digest))
+        directory = self.cfg.agent_dir("aide10")
+        child_reports.begin_turn(self.cfg, "aide10")
+        spawn.write_profile(directory, storage.of(self.db).ephemerals.profile("aide10"),
+                            self.cwd)
+        spawn.write_context(directory, text)
+        marker = child_reports.cleanup_path(self.cfg, "aide10")
+        real_unlink = os.unlink
+
+        def refuse_context(path):
+            if str(path).endswith(spawn.CONTEXT_FILE):
+                raise PermissionError(path)
+            return real_unlink(path)
+
+        from unittest import mock
+        with mock.patch("ameesh.child_reports.os.unlink", side_effect=refuse_context), \
+                mock.patch.object(spawn, "write_private", side_effect=OSError("boom")):
+            self.assertFalse(child_reports.remove_state(self.cfg, "aide10"))
+        self.assertTrue(os.path.exists(marker))
+        self.assertTrue(os.path.exists(os.path.join(directory, spawn.CONTEXT_FILE)))
+        # Rétabli : le tour suivant reprend la tâche conservée.
+        self.assertTrue(child_reports.remove_state(self.cfg, "aide10"))
+        self.assertFalse(os.path.exists(os.path.join(directory, spawn.CONTEXT_FILE)))
+        self.assertFalse(os.path.exists(marker))
+
     def test_a_final_report_purges_the_context_even_before_expiry(self):
         text = "private context\n"
         digest = hashlib.sha256(text.encode()).hexdigest()

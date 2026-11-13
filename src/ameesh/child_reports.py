@@ -386,11 +386,15 @@ def _remove_child_state(cfg, child: str) -> bool:
     """
     clean = _remove_named(cfg.agent_dir(child),
                           (spawn.CONTEXT_FILE, spawn.PROFILE_FILE, spawn.MCP_FILE))
-    marker = cleanup_path(cfg, child)
-    clean = _remove_named(os.path.dirname(marker), (os.path.basename(marker),)) and clean
     if not clean:
+        # B 40630 : le marqueur existant est REMPLACÉ atomiquement par sa
+        # version orpheline, jamais retiré d'abord : si la réécriture échoue
+        # (ou si le processus meurt entre les deux), la tâche d'origine reste
+        # au lieu de disparaître avec le contexte encore présent.
         _mark_orphan(cfg, child)
         return False
+    marker = cleanup_path(cfg, child)
+    _remove_named(os.path.dirname(marker), (os.path.basename(marker),))
     return True
 
 
