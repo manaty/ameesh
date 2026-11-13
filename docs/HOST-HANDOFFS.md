@@ -524,12 +524,38 @@ availability, and wait the usual rank delay. A present workstation (rank 0)
 claims at once and the cloud waits 20 s; with the workstation absent, the
 cloud is rank 0 and claims the free lease at once. The availability
 hysteresis and the planned handover stay `election`-only: the return to the
-preferred host while the cloud holds the lease is sub-lot B2.
+preferred host while the cloud holds the lease is sub-lot B2 (next section).
 `ameesh role status` lists these roles with the elected ones (#7059): the
 header says `releve: preference` and each candidate line carries its
 `(pref N)`; `--json` has `releve` and `preference_rank`. The merge guard of
 `ameesh doctor` (#6832) stays `election`-only: an avatar's candidate host
 does not merge on behalf of the mesh.
+
+## Return to the preferred host (#7052, avatar B2)
+
+The return is a conversation move (A2, #7050), never a cross-host claim with
+an election briefing: the avatar's session is rehydrated from the journal on
+the target instead of being reset. On each pass, the preferred host that is
+rank 0 plans the move once it has seen the holder present and live for
+`PREFERENCE_DWELL_S` (120 s, no gap); an absent holder (stale standing) or an
+expired lease plans a recovery at once. The source releases at its next turn
+boundary (`switch`, epoch + 1, lease cleared) and the target claims in the
+same pass, without a brief.
+
+After releasing, the old holder claims nothing before `PREFERENCE_HOLDOFF_S`
+(120 s plus its rank delay), read from the move's `switched_at` on the
+database clock so it survives a runner restart. If the preferred host still
+has not claimed after that margin, the old holder closes the attempt
+(`reclaim`) and resumes its own conversation locally, with its session; the
+role never stays free. While a handover is open, another candidate than the
+designated target waits, and no `election_brief` is built; a handover nobody
+claims (both hosts gone) is superseded after `HANDOVER_TTL_S` (300 s) so the
+next present candidate can plan again. An avatar holds a short lease
+(`PREFERENCE_LEASE_TTL_S`, 120 s, capped by the host's own `lease_ttl`): a
+workstation that disappears frees its conversation in two minutes. The
+interrupted instruction is replayed once at the target's claim (same
+`pending_prompt_id`), prefixed with the interruption notice; the lease CAS and
+the epoch remain the only arbiters, so two holders never serve a turn.
 
 ## Standby executors and the election briefing (L165/EP3)
 
