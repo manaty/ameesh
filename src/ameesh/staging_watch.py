@@ -810,6 +810,9 @@ def canon_drift_findings(records, *, head: str, first_ahead, now: float) -> list
         refused = (str(refresh.get("reason") or "refused")
                    if isinstance(refresh, dict) and refresh.get("state") == "refused"
                    else "")
+        # #7164 (pilot, 13/11 01:17): a pinned `canon_ref` is never moved by
+        # a pass; the alert names the pin and the operator bump instead.
+        pinned = isinstance(refresh, dict) and refresh.get("state") == "pinned"
         # A refusal alerts even when the agents' clone cannot date the drift
         # (the executor's commit unknown to it, e.g. after rewritten history).
         if not refused and (since is None or now - since < CANON_DRIFT_S):
@@ -819,11 +822,19 @@ def canon_drift_findings(records, *, head: str, first_ahead, now: float) -> list
         detail += ("ahead for %.1f d (threshold 1 d). " % ((now - since) / 86400.0)
                    if since is not None else "drift not datable from the agents' clone. ")
         detail += "Host fiches and rules read by staging may be stale. "
-        detail += ("The automatic refresh of its last completed pass was refused "
-                   "(%s): copy kept; fix the cause, or see the operator gesture "
-                   "in DEPLOIEMENT-HOTE-AGENTS.md." % refused[:200] if refused else
-                   "Its next completed pass refreshes the copy (#7053); without one, "
-                   "see the operator gesture in DEPLOIEMENT-HOTE-AGENTS.md.")
+        if refused:
+            detail += ("The automatic refresh of its last completed pass was refused "
+                       "(%s): copy kept; fix the cause, or see the operator gesture "
+                       "in DEPLOIEMENT-HOTE-AGENTS.md." % refused[:200])
+        elif pinned:
+            detail += ("Its canon_ref is pinned (%s): no pass moves it; advance "
+                       "the pin by the operator bump in DEPLOIEMENT-HOTE-AGENTS.md "
+                       "(\"canon_ref épinglé\")."
+                       % str(refresh.get("ref") or ref)[:40])
+        else:
+            detail += ("Its next completed pass refreshes the copy (#7053); "
+                       "without one, see the operator gesture in "
+                       "DEPLOIEMENT-HOTE-AGENTS.md.")
         out.append(dict(schema="ameesh-alert/1", type="staging_canon_stale",
                         agent=None, since=since,
                         value=now - since if since is not None else None,
@@ -900,7 +911,14 @@ def canon_alerts(db, *, now: float, cfg) -> list[dict]:
                                 first_ahead=_first_ahead(repo), now=now)
 
 
-def executor_version_findings(records, *, attested=(), descends=None) -> list[dict]:
+#: #7164 review B2: a venv refresh marked under way in the terminal record
+#: (`venv_refresh.state == "running"`) keeps the alert quiet this long; past
+#: it, its outcome never came and the alert speaks.
+EXECUTOR_REFRESH_S = 7200.0
+
+
+def executor_version_findings(records, *, now: float, attested=(),
+                              descends=None) -> list[dict]:
     """#7164: one alert per executor key whose own venv lags staging.
 
     `records`: (key, row) pairs, the newest `completed` executor record per
@@ -924,7 +942,15 @@ def executor_version_findings(records, *, attested=(), descends=None) -> list[di
         live = str(version.get("live") or "") if isinstance(version, dict) else ""
         refresh = data.get("venv_refresh")
         target = sha
-        if not live:
+        running = (isinstance(refresh, dict) and refresh.get("state") == "running")
+        started = refresh.get("started") if running else None
+        if running and isinstance(started, (int, float)) and (
+                now - started < EXECUTOR_REFRESH_S):
+            continue
+        if running:
+            cause = ("the venv refresh of its last completed pass (%s) never "
+                     "recorded its outcome" % sha[:12])
+        elif not live:
             cause = ("its version is not recorded (executor older than #7164, "
                      "or venv unreadable)")
         elif not sha.startswith(live):
@@ -976,13 +1002,13 @@ def executor_versions(db) -> list[tuple[str, dict]]:
     return out
 
 
-def executor_alerts(db, *, cfg) -> list[dict]:
+def executor_alerts(db, *, now: float, cfg) -> list[dict]:
     """#7164: `executor_version_findings` over the shared log."""
     from . import release_cutoff
     attested = storage.of(db).events.latest_type(
         release_cutoff.STAGING_EVENT, 60, LIMIT)
     return executor_version_findings(
-        executor_versions(db), attested=attested,
+        executor_versions(db), now=now, attested=attested,
         descends=git_descends(ancestry_repos(cfg)))
 
 

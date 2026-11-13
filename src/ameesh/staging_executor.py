@@ -833,6 +833,8 @@ VENV_WHEELHOUSE = "wheelhouse"
 VENV_MANIFEST = "manifeste.json"
 #: #7164: each step builds at most a venv offline; generous but bounded.
 VENV_STEP_TIMEOUT_S = 900
+#: #7164 review B2: the state of a refresh under way in the terminal record.
+VENV_REFRESH_RUNNING = "running"
 
 
 def _venv_path(options) -> str:
@@ -921,26 +923,45 @@ def _refresh_venv(options, repo: str, tree: str, sha: str) -> dict:
                 "reason": "not a fast-forward from venv-" + live}
     tools = os.path.join(tree, "deploy", "mise-a-jour")
     current = os.path.join(work, VENV_PACKAGE_CURRENT)
-    base = os.path.realpath(current) if os.path.isdir(current) else update["package"]
     package = os.path.join(work, "paquet-" + version)
     lock = os.path.join(package, VENV_LOCK)
     wheelhouse = os.path.join(package, VENV_WHEELHOUSE)
     manifest = os.path.join(package, VENV_MANIFEST)
-    if os.path.lexists(package) and os.path.realpath(package) != base:
-        shutil.rmtree(package, ignore_errors=True)
-    steps = []
-    if not os.path.isdir(package):
-        steps.append(("derive", [
-            python, "-I", os.path.join(tools, "venv-staging.py"), "deriver",
-            "--clone", repo, "--sha", sha,
-            "--lock", os.path.join(base, VENV_LOCK),
-            "--wheelhouse", os.path.join(base, VENV_WHEELHOUSE),
-            "--python", python, "--output", package]))
-    steps += [
-        ("manifest", [python, "-I", os.path.join(tools, "venv-staging.py"),
-                      "produire", "--clone", repo, "--sha", sha,
-                      "--lock", lock, "--wheelhouse", wheelhouse,
-                      "--python", python, "--scelle", "--output", manifest]),
+    # The last installed package first; the operator package next, so a
+    # package redone by hand after a dependency change (the derivation of
+    # the last one then fails) is taken without removing anything.
+    bases = [os.path.realpath(current)] if os.path.isdir(current) else []
+    if update["package"] not in bases:
+        bases.append(update["package"])
+    failure = None
+    for base in bases:
+        if os.path.lexists(package) and os.path.realpath(package) != base:
+            shutil.rmtree(package, ignore_errors=True)
+        steps = []
+        if not os.path.isdir(package):
+            steps.append(("derive", [
+                python, "-I", os.path.join(tools, "venv-staging.py"), "deriver",
+                "--clone", repo, "--sha", sha,
+                "--lock", os.path.join(base, VENV_LOCK),
+                "--wheelhouse", os.path.join(base, VENV_WHEELHOUSE),
+                "--python", python, "--output", package]))
+        steps.append(("manifest", [
+            python, "-I", os.path.join(tools, "venv-staging.py"), "produire",
+            "--clone", repo, "--sha", sha, "--lock", lock,
+            "--wheelhouse", wheelhouse, "--python", python, "--scelle",
+            "--output", manifest]))
+        failure = None
+        for step, argv in steps:
+            error = _venv_step(argv)
+            if error:
+                failure = {"state": "refused", "from": live, "to": version,
+                           "step": step, "reason": error}
+                break
+        if failure is None:
+            break
+    if failure is not None:
+        return failure
+    steps = [
         ("prepare", [python, "-I", os.path.join(tools, "bascule.py"),
                      "preparer", "--venv", venv, "--src", tree,
                      "--version", version, "--python", python,
@@ -1610,6 +1631,12 @@ def tick(db, cfg, options) -> dict:
             if result["state"] == "completed":
                 result["canon_refresh"] = refresh_canon(cfg)
                 result["canon_ref"] = canon_commit(cfg)
+                # #7164 review B2: the venv refresh below takes minutes; the
+                # terminal record says it is under way, so the alerts pass
+                # does not read the old version as a missed update meanwhile.
+                if options.get("venv_update"):
+                    result["venv_refresh"] = {"state": VENV_REFRESH_RUNNING,
+                                              "started": time.time()}
             _record(db, options["key"], result, lease=lease)
             # #7164: the executor's venv follows the deployed commit, from
             # the same tree, after the terminal record (the build may take

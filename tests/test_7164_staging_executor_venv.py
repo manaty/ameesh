@@ -76,7 +76,10 @@ class Hote(unittest.TestCase):
             link = os.path.join(self.share, staging_executor.BASCULE_CURRENT)
             os.unlink(link)
             os.symlink("venv-" + self.old[:7], link)
-        return self.failing.get(name)
+        error = self.failing.get(name)
+        if isinstance(error, list):
+            return error.pop(0) if error else None
+        return error
 
     def refresh(self, sha=None):
         with mock.patch.object(staging_executor, "_venv_step", side_effect=self.step):
@@ -153,6 +156,25 @@ class RefreshTest(Hote):
         self.assertEqual(self.live(), self.old[:7])
         self.assertFalse(os.path.lexists(os.path.join(self.work, "paquet-courant")))
 
+    def test_dependency_change_takes_the_operator_package_again(self):
+        """Relecture N3 : un paquet refait à la main est repris sans geste."""
+        self.refresh()
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "deps")
+        later = _git(self.repo, "rev-parse", "HEAD")
+        self.steps.clear()
+        # From the last installed package, the install refuses the new
+        # dependency; from the operator package (redone), it passes.
+        self.failing["produire"] = ["venv-staging: roue absente du lock : new-dep"]
+        self.assertEqual(self.refresh(later)["state"], "installed")
+        self.assertEqual(self.names(), ["deriver", "produire", "deriver", "produire",
+                                        "preparer", "activer", "launch"])
+        first, second = self.steps[0], self.steps[2]
+        self.assertEqual(first[first.index("--lock") + 1], os.path.join(
+            os.path.realpath(os.path.join(self.work, "paquet-" + self.new[:7])),
+            "requirements-staging.lock"))
+        self.assertEqual(second[second.index("--lock") + 1],
+                         os.path.join(self.package, "requirements-staging.lock"))
+
     def test_launch_failure_returns_to_the_previous_venv(self):
         self.failing["launch"] = "ModuleNotFoundError: No module named 'ameesh'"
         result = self.refresh()
@@ -199,6 +221,8 @@ class CompletedPassTest(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         case.foreign, case.attested = [], []
         case.cfg.canon, case.cfg.canon_ref = "", ""
+        case.options["venv_update"] = dict(venv="/v", package="/p", work="/w",
+                                           python="/usr/bin/python3")
         records = []
         original = case.record
 
@@ -224,7 +248,9 @@ class CompletedPassTest(unittest.TestCase):
         self.assertEqual(refresh.call_args.args[2:], ("tree", "a" * 40))
         terminal, final = records[-2:]
         self.assertEqual((terminal["state"], final["state"]), ("completed", "completed"))
-        self.assertNotIn("venv_refresh", terminal)
+        # Review B2: the terminal record says the refresh is under way.
+        self.assertEqual(terminal["venv_refresh"]["state"], "running")
+        self.assertIsInstance(terminal["venv_refresh"]["started"], float)
         self.assertEqual(final["venv_refresh"]["state"], "installed")
         self.assertEqual(final["executor_venv"]["live"], "aaaaaaa")
         # The version is carried from the take of the request on.
@@ -242,11 +268,24 @@ class AlertTest(unittest.TestCase):
     SHA = "a" * 40
     LATER = "b" * 40
 
-    def findings(self, data, *, attested=(), descends=lambda a, d: True, ident=5):
+    NOW = 1_800_000_000.0
+
+    def findings(self, data, *, attested=(), descends=lambda a, d: True, ident=5,
+                 now=None):
         return staging_watch.executor_version_findings(
             [("mesh", dict(id=ident, data=dict(dict(
                 state="completed", sha=self.SHA, notify="mesh-design"), **data)))],
+            now=self.NOW if now is None else now,
             attested=attested, descends=descends)
+
+    def test_refresh_under_way_is_quiet_until_its_bound(self):
+        """Relecture B2 : pas de fausse alerte pendant la mise à jour."""
+        data = dict(executor_venv=dict(running="1111111", live="1111111"),
+                    venv_refresh=dict(state="running", started=self.NOW))
+        self.assertEqual(self.findings(data, now=self.NOW + 600), [])
+        alert, = self.findings(
+            data, now=self.NOW + staging_watch.EXECUTOR_REFRESH_S + 1)
+        self.assertIn("never recorded its outcome", alert["detail"])
 
     def test_executor_on_the_deployed_commit_is_silent(self):
         self.assertEqual(self.findings(dict(executor_venv=dict(
@@ -294,6 +333,21 @@ class AlertTest(unittest.TestCase):
         self.assertIn("staging_executor_stale", exploitation.ALERT_TYPES)
         self.assertIn("staging_executor_stale", alert_briefs.BRIEFED_TYPES)
         self.assertIn("staging_executor_stale", notify.TYPE_LABELS)
+
+
+class PinnedCanonTest(unittest.TestCase):
+    """Pilote 13/11 01:17 : un canon_ref épinglé ne promet plus de passe."""
+
+    def test_pinned_ref_names_the_pin_and_the_bump(self):
+        data = dict(canon_ref="a" * 40, canon_refresh=dict(state="pinned",
+                                                           ref="a" * 40))
+        alert, = staging_watch.canon_drift_findings(
+            [("mesh", data)], head="b" * 40,
+            first_ahead=lambda ref, head: 1_800_000_000.0,
+            now=1_800_000_000.0 + 2 * 86400)
+        self.assertIn("pinned", alert["detail"])
+        self.assertIn("operator bump", alert["detail"])
+        self.assertNotIn("next completed pass", alert["detail"])
 
 
 class DeriverTest(unittest.TestCase):

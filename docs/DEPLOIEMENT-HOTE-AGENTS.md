@@ -1045,20 +1045,26 @@ scellée (#5711) et jamais l'index :
 1. ne fait rien si `venv-courant` nomme déjà le commit déployé (`current`), et
    refuse si la version vivante n'en est pas un ancêtre (avance seulement) ;
 2. dérive le paquet du commit (`venv-staging.py deriver`) : roues et
-   épinglages du dernier paquet posé (`work/paquet-courant`, sinon `package`)
-   repris tels quels, seule la roue `ameesh` reconstruite hors réseau depuis
-   le commit avec le setuptools verrouillé ; une dépendance nouvelle ou
-   changée fait échouer l'installation `--require-hashes` qui suit : le paquet
-   est alors à refaire à la main ;
-3. produit le manifeste scellé (`produire --scelle`), puis `bascule.py
-   preparer` avec les quatre options verrouillées et `activer --precedent
-   <version vivante>`, tous trois pris dans l'arbre du commit déployé ;
+   épinglages du dernier paquet posé (`work/paquet-courant`) repris tels
+   quels, seule la roue `ameesh` reconstruite hors réseau depuis le commit
+   avec le setuptools verrouillé, puis produit son manifeste scellé
+   (`produire --scelle`). Une dépendance nouvelle ou changée fait échouer
+   l'installation `--require-hashes` de cette production : la dérivation est
+   alors reprise depuis le paquet opérateur `package`. Après un tel
+   changement, l'opérateur refait donc ce paquet à la main au même chemin, et
+   la passe suivante le prend sans autre geste ;
+3. `bascule.py preparer` avec les quatre options verrouillées et `activer
+   --precedent <version vivante>`, pris comme les outils de l'étape 2 dans
+   l'arbre du commit déployé ;
 4. lance `venv-courant/bin/python -I -m ameesh.staging_executor --help` :
    un échec est un `retour` (`rolled back`) ; un succès fait de ce paquet
    `work/paquet-courant` et retire les plus anciens.
 
 Le processus en cours garde son venv ; la minuterie suivante démarre le
-nouveau. Le résultat va dans un second enregistrement de la passe :
+nouveau. L'enregistrement terminal de la passe porte `venv_refresh` =
+`running` (avec son heure) : l'alerte ne lit pas l'ancienne version comme
+une mise à jour manquée pendant ce travail, sauf s'il dure plus de deux
+heures sans résultat. Le résultat va dans un second enregistrement :
 `venv_refresh` (`installed`, `current`, `unconfigured`, `rolled back`, ou
 `refused` avec l'étape et sa raison) et `executor_venv` (`running`, la version
 de ce processus, et `live`, celle du lien). Chaque passe porte aussi
@@ -1259,6 +1265,35 @@ Le sous-shell s'arrête à la première commande en échec (`set -e`) : le
 erreurs du registre de l'hôte le font aussi échouer), et seulement si
 `origin/main` n'a pas bougé entre-temps. L'alerte se tait à la prochaine
 passe qui traite une demande (son enregistrement porte le nouveau commit).
+
+**`canon_ref` épinglé (#7164).** L'installation des candidats AG1 et AG2
+épingle `canon_ref` sur un SHA dans `~/.config/ameesh/config.json`, et le
+compte n'a aucun accès à `manaty/home` (décision du pilote du 13/11 :
+l'épinglage reste, sans nouvelle clé). Aucune passe ne déplace alors la copie :
+`canon_refresh` vaut `pinned`, et `staging_canon_stale`, passé le seuil d'un
+jour, nomme l'épinglage et renvoie à ce geste, jamais à « la prochaine passe ».
+Le geste de montée, sur le candidat élu puis l'autre, hors de toute séquence
+(minuterie arrêtée pendant le geste, relancée après) :
+
+1. `S` = SHA de `main` de `manaty/home`, lu à la forge avec l'accès de
+   l'opérateur (`gh api repos/manaty/home/commits/main --jq .sha`) ;
+2. un bundle contenant `S`, tiré d'un clone frais de la forge (jamais de la
+   copie des agents), `git bundle verify` ; posé `0600` chez le compte ;
+3. dans la copie du compte : `fetch` du bundle vers
+   `refs/ameesh/staging-canon-candidate`, `rev-parse` = `S`,
+   `merge-base --is-ancestor <ancien pin> S`, `ameesh canon check --canon
+   <copie> --ref S` (venv de l'exécutant) code 0, puis
+   `update-ref refs/remotes/origin/main S <ancien>` ;
+4. `config.json` : `canon_ref` passe de l'ancien pin à `S` (copie de
+   l'ancien fichier gardée), puis relu.
+
+Le SHA fait foi, pas le transport : seule la comparaison avec la forge compte.
+La passe `completed` suivante porte `canon_ref` = `S` (`canon_refresh` =
+`pinned`) et l'alerte se tait. Le rafraîchissement automatique de #7053
+demande au contraire une clé de déploiement en lecture seule sur
+`manaty/home` pour ce compte (nouveau secret : deux familles de relecture,
+créée par le bureau) et `canon_ref` remis à `origin/main` ; tant qu'elle
+n'est pas décidée, l'épinglage et ce geste restent la règle.
 
 Une fois la configuration et les accès approuvés, l'opérateur active les
 services sur les candidats et soumet un SHA complet :
