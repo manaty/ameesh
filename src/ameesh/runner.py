@@ -11978,8 +11978,10 @@ class Runner:
                     continue
                 if now < self._preference_plan_next.get(name, 0.0):
                     continue
-                if conversation_move.holds(self.db, name):
-                    continue
+                # Pas de pré-contrôle `holds` : une bascule que personne n'a
+                # réclamée doit pouvoir être périmée par `plan` (sous le verrou
+                # du registre, `HANDOVER_TTL_S`). Un déplacement frais vers un
+                # autre hôte est rendu tel quel et on n'insiste pas.
                 move = conversation_move.plan(
                     self.db, name, self.host, requested_by=self.runner_id,
                     reason="preference")

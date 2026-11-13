@@ -52,10 +52,11 @@ class Base(_RoleCase):
     def row(self) -> dict:
         return registry.get(self.db, "pilote")
 
-    def runner(self) -> SimpleNamespace:
+    def runner(self, host: str | None = None) -> SimpleNamespace:
         from ameesh.runner import Runner
+        host = host or self.POSTE
         runner = SimpleNamespace(
-            db=self.db, host=self.POSTE, runner_id="runner-poste",
+            db=self.db, host=host, runner_id="runner-%s" % host,
             dry_run=False, mediated=False, agents_filter=None,
             clock=SimpleNamespace(monotonic=time.monotonic),
             _preference_next=0.0, _preference_seen_since={},
@@ -231,17 +232,23 @@ class ReturnTest(Base):
         self.assertIsNone(Runner.election_brief_for(runner, agent))
 
     def test_a_handover_nobody_claimed_is_superseded(self):
+        # the reviewer's case (B/P2 #40199): after A→B, both A and B are gone
+        # and C alone is ready. The runner's real path must stale the handover
+        # (not skip `plan` on `holds`) and C must take the conversation.
         from ameesh.storage.conversation_moves import HANDOVER_TTL_S
         self.hold(self.CLOUD)
         first = M.plan(self.db, "pilote", self.POSTE,
                        requested_by="runner-poste", reason="preference")
         M.advance(self.db, self.POSTE, probes=ready,
                   cwd_for=lambda m: "/tgt/pilote")
-        # both the source and the designated target are gone: nothing claims
+        self.db.execute(
+            "UPDATE role_standings SET evaluated_at = clock_timestamp()"
+            " - interval '1 hour' WHERE name = 'pilote' AND host = ANY(%s)",
+            ([self.CLOUD, self.POSTE],))
         self.backdate(HANDOVER_TTL_S + 60.0)
-        second = M.plan(self.db, "pilote", self.THIRD,
-                        requested_by="runner-troisieme", reason="preference")
-        self.assertTrue(second["created"])
+        runner = self.runner(self.THIRD)
+        self.assertEqual(runner.preference_return_pass(), ["pilote"])
+        second = self.open_move()
         self.assertEqual((second["target_host"], second["source_host"]),
                          (self.THIRD, self.POSTE))
         self.assertEqual(self.attempt(first["move_id"])["state"], "failed")
