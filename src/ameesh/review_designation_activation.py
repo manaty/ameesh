@@ -1397,6 +1397,31 @@ def due_fixes(db, agent: Optional[str] = None) -> list:
     return [row for row in fixes if row["name"].lower() == wanted]
 
 
+def actionable_fixes(db, agent: Optional[str] = None, *, cfg=None,
+                     now: float | None = None) -> list:
+    """#7069: fixes that may wake their debtor now; parked debts stay owed.
+
+    Only a blocked lot with a live pilot hold is parked. Reuse the intake
+    hold reader and its scheduled-wake rule. Unreadable holds raise.
+    """
+    from . import backlog
+    rows = due_fixes(db, agent)
+    parked = [{"id": row["lot"]} for row in rows
+              if row.get("state") == "blocked"]
+    holds = backlog._take_holds(db, parked, cfg=cfg)
+    out = []
+    for row in rows:
+        hold = holds.get(row["lot"])
+        if row.get("state") == "blocked" and hold:
+            item = storage.of(db).work.get(int(row["lot"]))
+            if item is None:
+                raise RuntimeError("parked fix lot #%s unreadable" % row["lot"])
+            if item.get("state") == "blocked" and backlog._hold_blocks(item, hold, now):
+                continue
+        out.append(row)
+    return out
+
+
 def owed_work(db) -> tuple[list, list]:
     """`(pending, fixes)` of `_owed_read`, both halves in **one** read (#3333).
 

@@ -712,13 +712,14 @@ def fixes_owed_lines(db, name: str, *, now: float | None = None) -> list[str]:
     La lecture est `review_designation_activation.due_fixes`, l'autre moitié du
     calcul unique des avis dus (#3033) : un lot ouvert dont le dernier gel porte
     un verdict `blocked` non annulé, sans gel plus récent, dont l'agent est
-    l'assigné. C'est le travail qui passe avant tout autre : le blocage d'un
+    l'assigné. Un lot blocked sous hold de pilote actif reste dû, mais ne
+    relance pas son porteur (#7069). C'est le travail qui passe avant tout autre : le blocage d'un
     relecteur n'expire pas parce que son auteur travaille ailleurs. Une lecture
     illisible le dit, elle ne rend jamais une liste vide."""
     from . import review_designation_activation as activation
     from .sous_utilisation import _duration
     try:
-        rows = activation.due_fixes(db, name)
+        rows = activation.actionable_fixes(db, name, now=now)
     except Exception as exc:  # noqa: BLE001 - illisible : dit, jamais « rien dû »
         return ["(fixes owed unreadable: %s)" % fil.excerpt(str(exc), 120)]
     if not rows:
