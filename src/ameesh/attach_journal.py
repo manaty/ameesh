@@ -24,7 +24,7 @@ import os
 import sys
 import time
 
-from . import conversation, db as db_mod
+from . import conversation, db as db_mod, fil, registry
 
 ENV = "AMEESH_ATTACH"
 STATE_FILE = "attach-conversation.json"
@@ -139,7 +139,9 @@ def capture(cfg, db, binding, event: str, data: dict) -> dict | None:
             return None
     name = binding.name
     turn, seq = next_ids(cfg, name, session, event)
-    log = conversation.Log(db, cfg, agent=name)
+    # B1 (relecture cx2) : le fil de la persona, jamais celui de l'opérateur
+    project = fil.project_for(cfg, fil.agent_project(registry.get(db, name)))
+    log = conversation.Log(db, cfg, agent=name, project=project)
     event_id = "attach:%s:%s:%d" % (session, turn, seq)
     turn_ref = "attach:%s" % turn
     if event == "UserPromptSubmit":

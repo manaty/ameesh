@@ -55,9 +55,11 @@ class AttachJournalTest(PgTestCase):
                              " thread_entry FROM conversation_log"
                              " WHERE agent = 'avatar' ORDER BY seq")
 
-    def _hook(self, event, owner, epoch, *, attach="1", **payload):
+    def _hook(self, event, owner, epoch, *, attach="1", project=None, **payload):
         env = self.env(AGENT_MAIL_NAME="avatar", AMEESH_RUNNER_ID=owner,
                        AMEESH_LEASE_EPOCH=str(epoch), AMEESH_ATTACH=attach)
+        if project:
+            env["AMEESH_PROJECT"] = project
         proc = self.cli("hook", "claude", env=env, stdin=json.dumps(
             dict(payload, hook_event_name=event, session_id=SID, cwd=self.tmp)))
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -87,6 +89,37 @@ class AttachJournalTest(PgTestCase):
         last = self._entries()[-1]
         self.assertEqual((last["text"], last["event_id"]),
                          ("Et la selle aussi.", "attach:%s:%s:3" % (SID, turn)))
+
+    def test_persona_project_not_operator_project(self):
+        # B1 (relecture cx2 sur a2a35c6ed) : journal et copies R12 dans le
+        # projet de la persona, jamais dans celui de l'opérateur de l'attach
+        registry.upsert(self.db, "avatar", chantier="persona-proj", harness="claude",
+                        host=self.cfg.host, cwd=self.tmp, session_id=SID)
+        epoch = registry.attach_claim(self.db, "avatar", OWNER, 300)["lease_epoch"]
+        self._hook("UserPromptSubmit", OWNER, epoch, project="operator-proj",
+                   prompt="PROMPT-PRIVE-7047")
+        self._hook("Stop", OWNER, epoch, project="operator-proj",
+                   last_assistant_message="REPONSE-PRIVEE-7047")
+        rows = self.db.query("SELECT project, thread_entry FROM conversation_log"
+                             " WHERE agent = 'avatar' ORDER BY seq")
+        self.assertEqual([r["project"] for r in rows], ["persona-proj"] * 2)
+        self.assertTrue(all(r["thread_entry"] for r in rows))
+        copies = {}
+        for root, _dirs, files in os.walk(self.tmp):
+            for f in files:
+                path = os.path.join(root, f)
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        body = fh.read()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                for mark in ("PROMPT-PRIVE-7047", "REPONSE-PRIVEE-7047"):
+                    if mark in body:
+                        copies.setdefault(mark, []).append(os.path.relpath(path, self.tmp))
+        self.assertEqual(set(copies), {"PROMPT-PRIVE-7047", "REPONSE-PRIVEE-7047"})
+        for paths in copies.values():
+            self.assertTrue(all("persona-proj" in p for p in paths), paths)
+            self.assertFalse(any("operator-proj" in p for p in paths), paths)
 
     def test_driven_turn_abstains_no_duplicate(self):
         epoch = registry.claim(self.db, "avatar", "runner-x", ttl_seconds=300,
