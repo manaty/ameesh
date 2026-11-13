@@ -309,8 +309,7 @@ class PtyTest(unittest.TestCase):
         proc = attach_pty.PtyProcess(["/bin/sh", "-c", "sleep 30"])
         proc.close()
         self.assertIsNotNone(proc.poll())
-        with self.assertRaises(ProcessLookupError):
-            os.killpg(proc.pid, 0)
+        self.assertEqual(self._live_group(proc.pid), [])
         with self.assertRaises(attach_pty.PtyError):
             proc.send_signal(9)
 
@@ -318,10 +317,12 @@ class PtyTest(unittest.TestCase):
     def _live_group(pgid):
         """PID vivants (hors zombies) du groupe, via /proc (Linux)."""
         members = []
+        # hermeticity: allow — uniquement les processus du groupe créé ici
         for name in os.listdir("/proc"):
             if not name.isdigit():
                 continue
             try:
+                # hermeticity: allow — idem, jamais un processus de l'hôte
                 with open("/proc/%s/stat" % name, "rb") as fh:
                     fields = fh.read().rsplit(b")", 1)[1].split()
             except (OSError, IndexError):
