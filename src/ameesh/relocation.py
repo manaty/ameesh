@@ -312,9 +312,24 @@ def move_preference(cfg, db, name: str, target: str, *, actor: str = "",
     diagnostic = "moved from %s to %s by operator%s: conversation follows" % (
         source, target, " (%s)" % actor if actor else "")
     with db.transaction() as tx:
-        moved = conversation_move.manual(
-            tx, name, target, target_cwd, actor=actor, source_host=source,
-            move_id=move_id)
+        def recheck(locked: dict) -> str:
+            # #7108 (B #40410) : le préflight hors transaction peut avoir lu
+            # un battement, un profil ou un placement périmés. Revalide la
+            # cible sur la ligne FRAÎCHE, sous le verrou de l'écriture, avant
+            # tout effet : tenant lié, présence, profil de compte/harnais.
+            for guard in (_preference_tenant_refusal, _preference_presence_refusal,
+                          _preference_account_refusal):
+                reason = guard(tx, locked, target)
+                if reason:
+                    return reason
+            return ""
+
+        try:
+            moved = conversation_move.manual(
+                tx, name, target, target_cwd, actor=actor, source_host=source,
+                recheck=recheck, move_id=move_id)
+        except conversation_move.RecheckRefused as exc:
+            raise MoveError(str(exc)) from exc
         if moved is None:
             raise MoveError(
                 "%s was not moved: its state changed during the preflight (host, "

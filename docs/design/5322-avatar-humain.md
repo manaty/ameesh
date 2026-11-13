@@ -642,17 +642,21 @@ et les profils de compte `harnais/compte` que son runner publie dans
 `runner_presence.profiles` (migration 0576 ; des noms seulement, jamais un
 chemin ni un secret) — l'absence de profil pour le harnais est refusée
 `move-account-missing` avant toute écriture. Une seule transaction verrouille
-la ligne de registre, revérifie les gardes, ouvre la tentative
-`conversation_moves` (raison `manual`, source copiée, dossier de travail de la
-cible venu de son `canon sync`) directement en `switched`, ou en `recovered`
-quand le bail source n'est plus vivant (hôte disparu : le tour interrompu est
-rejoué une fois, comme en B2) ; elle passe la ligne sur la cible, révoque le
-bail source (époque + 1) et écrit `agent.moved` ; la session native reste
-provisoire jusqu'au premier tour de la cible, qui reconstruit le segment
-depuis le journal. Un `--keep-session` est refusé (rien de natif ne traverse).
-Le holdoff de B2 (`claim_wait`/`open_handover`) vaut aussi pour ce
-déplacement : la source ne reprend pas l'avatar pendant que la cible claim, et
-le récupère après `HANDOVER_TTL_S` si personne ne l'a fait.
+la ligne de registre, revérifie les gardes et **revalide la cible sur la ligne
+fraîche sous ce verrou** (tenant lié, présence, profil/harnais, placement),
+avant tout effet : un battement ou un `canon sync` qui change entre le
+préflight et l'écriture est refusé, jamais contourné (B #40410). Elle ouvre
+ensuite la tentative `conversation_moves` (raison `manual`, source copiée,
+dossier de travail de la cible venu de son `canon sync`) directement en
+`switched`, ou en `recovered` quand le bail source n'est plus vivant (hôte
+disparu : le tour interrompu est rejoué une fois, comme en B2) ; elle passe la
+ligne sur la cible, révoque le bail source (époque + 1) et écrit
+`agent.moved` ; la session native reste provisoire jusqu'au premier tour de la
+cible, qui reconstruit le segment depuis le journal. Un `--keep-session` est
+refusé (rien de natif ne traverse). Le holdoff de B2
+(`claim_wait`/`open_handover`) vaut aussi pour ce déplacement : la source ne
+reprend pas l'avatar pendant que la cible claim, et le récupère après
+`HANDOVER_TTL_S` si personne ne l'a fait.
 
 ### 3.6 Placement des enfants
 

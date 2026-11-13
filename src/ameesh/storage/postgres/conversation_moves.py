@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 
 from ..conversation_moves import (AFTER_SWITCH, BEFORE_SWITCH, HANDOVER_TTL_S,
-                                  OPEN, PLAN_TTL_S, ConversationMoves as Contract)
+                                  OPEN, PLAN_TTL_S, RecheckRefused,
+                                  ConversationMoves as Contract)
 
 _COLUMNS = """move_id::text AS move_id, agent, epoch_source, state, reason,
               requested_by, source_host, source_cwd, source_owner,
@@ -197,7 +198,7 @@ class ConversationMoves(Contract):
                 LIMIT 1""", (agent,)))
 
     def manual(self, move_id, agent, target_host, target_cwd, *, actor,
-               source_host):
+               source_host, recheck=None):
         """#7108: manual move of a `preference` agent, one transaction.
 
         The registry row is locked first; every guard is rechecked inside the
@@ -207,7 +208,9 @@ class ConversationMoves(Contract):
         the registry row moves to the target in the same transaction: source
         lease released (epoch + 1), native session kept provisional until the
         target's first turn. `source_host` is the host the caller saw: a row
-        that moved meanwhile is left untouched. No session or credential file
+        that moved meanwhile is left untouched. `recheck(locked_row)` runs
+        after the row lock and before any write; a non-empty reason raises
+        `RecheckRefused` with nothing written. No session or credential file
         is read, copied or written here.
         """
         if not agent or not target_host or not actor or not source_host:
@@ -220,6 +223,7 @@ class ConversationMoves(Contract):
                 """SELECT name, host, cwd, mode, coalesce(releve, 'hote') AS releve,
                           status, lease_owner, lease_epoch, session_id,
                           current_prompt, admitted_hosts, canon_ref,
+                          responsible, harness, canon,
                           (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
                            AND lease_expires_at > clock_timestamp()) AS lease_live
                      FROM agent_registry WHERE name = %s FOR UPDATE""", (agent,))
@@ -245,6 +249,13 @@ class ConversationMoves(Contract):
             if tx.query("SELECT 1 FROM conversation_moves WHERE agent = %s"
                         " AND state IN " + _OPEN_SQL + " LIMIT 1", (agent,)):
                 return None
+            # #7108 (B #40410) : la cible est revalidée sur la ligne FRAÎCHE,
+            # sous le verrou et avant tout effet — le préflight hors
+            # transaction peut avoir vu un battement/profil/placement périmé.
+            if recheck is not None:
+                reason = recheck(dict(r))
+                if reason:
+                    raise RecheckRefused(reason)
             state = ("switched" if r["lease_live"] or not r["lease_owner"]
                      else "recovered")
             notice = (INTERRUPTED_TURN % r["host"]

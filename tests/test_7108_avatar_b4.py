@@ -246,6 +246,30 @@ class PreflightTest(_AvatarCase):
             (BANC, ALICE))
         self.refused("move-account-missing")
 
+    def test_account_profile_lost_between_preflight_and_lock_is_refused(self):
+        # B #40410: the tenant runner's next heartbeat publishes no profile
+        # after the caller's preflight and before the write's locked recheck.
+        # The fresh row must be revalidated under the lock, before any effect.
+        before = self.row(AVATAR)
+        events = self.moved_events()
+        original = conversation_move.manual
+
+        def lose_profile(db, agent, target_host, target_cwd, **kwargs):
+            db.execute(
+                "UPDATE runner_presence SET profiles = '{}'"
+                " WHERE host = %s AND tenant = %s", (BANC, ALICE))
+            return original(db, agent, target_host, target_cwd, **kwargs)
+
+        with mock.patch.object(conversation_move, "manual",
+                               side_effect=lose_profile):
+            with self.assertRaisesRegex(relocation.MoveError,
+                                        "move-account-missing"):
+                relocation.move_manual(self.cfg, self.db, AVATAR, BANC,
+                                       actor=ALICE)
+        self.assertEqual(self.row(AVATAR), before)
+        self.assertIsNone(storage.of(self.db).conversation_moves.open_for(AVATAR))
+        self.assertEqual(self.moved_events(), events)
+
     def test_harness_missing_refused_before_effect(self):
         self.db.execute(
             "UPDATE agent_candidates SET placement_ok = false,"
