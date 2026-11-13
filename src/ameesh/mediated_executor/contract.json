@@ -4825,9 +4825,16 @@
     "source_mail"
    ],
    "ephemerals": [
+    "context",
     "create",
     "creator",
-    "exists"
+    "exists",
+    "expired_children",
+    "next_report_seq",
+    "profile",
+    "purge_context",
+    "report",
+    "set_report"
    ],
    "events": [
     "after",

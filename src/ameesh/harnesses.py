@@ -70,10 +70,14 @@ AUTH_TYPES = ("agent", "terminal")
 #: clés connues sous `ameesh`
 AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "interactive",
                "interactive_permission", "session", "stream", "env", "model", "effort", "tier", "compact", "hooks",
-               "cost", "permissions", "acp", "accounts", "install", "resident", "backup", "refusal")
+               "cost", "permissions", "acp", "accounts", "install", "resident", "backup", "refusal",
+               "spawn")
 #: #5529 : contrat de preuve de refus avant tout appel fournisseur
 REFUSAL_SCHEMAS = ("ameesh-refusal/1",)
 REFUSAL_KEYS = ("schema", "exit_code")
+#: #7034 : contrat d'application des outils/MCP restreints d'un enfant
+SPAWN_CONTRACTS = ("ameesh-spawn-tools/1",)
+SPAWN_KEYS = ("contract", "tools", "mcp")
 #: known keys of `ameesh.interactive_permission` (L223: permission mode of an
 #: interactive session, `ameesh attach` and `ameesh chat`); `modes` maps a mode
 #: to fixed arguments for a harness whose flag carries no `{mode}` (L685: codex
@@ -937,6 +941,62 @@ def validate(document: Any, *, path: str = "") -> list[Finding]:
                                             path))
     findings.extend(_check_resident(ameesh.get("resident"), protocol, path))
     findings.extend(_check_refusal(ameesh.get("refusal"), path))
+    findings.extend(_check_spawn(ameesh.get("spawn"), path))
+    return findings
+
+
+def _check_spawn(value: Any, path: str) -> list[Finding]:
+    """`ameesh.spawn` (#7034): how the harness applies a child's tool policy.
+
+    A descriptor that declares no block simply cannot host a restricted child.
+    The block names the contract, the argument template for the tool list and
+    the argument/config template for the MCP server list. `mcp.source` is a
+    project-relative file (`.mcp.json` for Claude), never an absolute path.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, dict):
+        return [Finding("harness-spawn-invalid", ERROR,
+                        "`ameesh.spawn`: object expected", path)]
+    findings = []
+    for key in value:
+        if key not in SPAWN_KEYS:
+            findings.append(Finding("harness-key-unknown", WARNING,
+                                    "`ameesh.spawn.%s`: unknown key (ignored)" % key, path))
+    if value.get("contract") not in SPAWN_CONTRACTS:
+        findings.append(Finding("harness-spawn-invalid", ERROR,
+                                "`ameesh.spawn.contract`: %s expected"
+                                % " | ".join(SPAWN_CONTRACTS), path))
+    for key in ("tools", "mcp"):
+        block = value.get(key)
+        if block is None:
+            continue
+        if not isinstance(block, dict):
+            findings.append(Finding("harness-spawn-invalid", ERROR,
+                                    "`ameesh.spawn.%s`: object expected" % key, path))
+            continue
+        for inner in block:
+            if inner not in ("flag", "source"):
+                findings.append(Finding("harness-key-unknown", WARNING,
+                                        "`ameesh.spawn.%s.%s`: unknown key (ignored)"
+                                        % (key, inner), path))
+        flag = block.get("flag")
+        if flag is not None and _strings(flag) is None:
+            findings.append(Finding("harness-spawn-invalid", ERROR,
+                                    "`ameesh.spawn.%s.flag`: list of strings expected" % key,
+                                    path))
+        if key == "mcp":
+            if block.get("flag") and "{path}" not in "\n".join(_strings(block.get("flag")) or ()):
+                findings.append(Finding("harness-spawn-invalid", ERROR,
+                                        "`ameesh.spawn.mcp.flag`: a `{path}` placeholder is "
+                                        "required", path))
+            source = block.get("source")
+            if source is not None:
+                if not isinstance(source, str) or not source or os.path.isabs(source) \
+                        or ".." in source.split("/"):
+                    findings.append(Finding("harness-spawn-invalid", ERROR,
+                                            "`ameesh.spawn.mcp.source`: a project-relative "
+                                            "file expected", path))
     return findings
 
 

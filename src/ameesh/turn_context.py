@@ -186,12 +186,15 @@ def build(*, turn_id: str, agent: str, host: str, kind: str, started_ts: float,
           budget_usd: float | None, spent_usd: float | None,
           spend_key: str | None, marker: dict | None,
           reservation: dict | None, generated_ts: float | None = None,
-          conversation: dict | None = None) -> dict:
+          conversation: dict | None = None,
+          spawn: dict | None = None,
+          spawn_context: dict | None = None) -> dict:
     """Build and validate the ``ameesh-turn-context/1`` document.
 
     `conversation` (#7050, additive): the conversation move this turn
     rehydrates — ids, bounds, digest and the path of the ``0600`` segment
-    file, never the segment text."""
+    file, never the segment text. `spawn`/`spawn_context` (#7034) carry the
+    restricted child's policy paths and bounds, never a secret."""
     document = {
         "schema": SCHEMA,
         "generated_ts": time.time() if generated_ts is None else float(generated_ts),
@@ -226,6 +229,10 @@ def build(*, turn_id: str, agent: str, host: str, kind: str, started_ts: float,
     }
     if conversation is not None:
         document["conversation"] = {key: conversation.get(key) for key in CONVERSATION_KEYS}
+    if spawn is not None:
+        document["spawn"] = dict(spawn)
+    if spawn_context is not None:
+        document["spawn_context"] = dict(spawn_context)
     validate(document)
     return document
 
@@ -292,6 +299,11 @@ def validate(document: Any) -> None:
         _text(reservation.get("state"), "accounting.reservation.state")
     if "conversation" in document:
         _conversation_validate(document["conversation"])
+    # #7034 : champs additifs, présents seulement pour un enfant restreint.
+    if document.get("spawn") is not None:
+        _spawn_validate(document["spawn"])
+    if document.get("spawn_context") is not None:
+        _spawn_context_validate(document["spawn_context"])
 
 
 def _conversation_validate(value: Any) -> None:
@@ -307,6 +319,30 @@ def _conversation_validate(value: Any) -> None:
     _text(move.get("source_host"), "conversation.source_host")
     _text(move.get("source_session"), "conversation.source_session", nullable=True)
     _text(move.get("file"), "conversation.file")
+
+
+def _spawn_validate(value: Any) -> None:
+    value = _object(value, "spawn")
+    _text(value.get("path"), "spawn.path")
+    _text(value.get("parent"), "spawn.parent")
+    _text(value.get("digest"), "spawn.digest", nullable=True)
+    for key in ("tools", "mcp"):
+        items = value.get(key)
+        if not isinstance(items, list):
+            raise ContextError("spawn.%s must be a list" % key)
+        for index, item in enumerate(items):
+            _text(item, "spawn.%s[%d]" % (key, index))
+
+
+def _spawn_context_validate(value: Any) -> None:
+    value = _object(value, "spawn_context")
+    _text(value.get("path"), "spawn_context.path", nullable=True)
+    digest = _text(value.get("digest"), "spawn_context.digest")
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ContextError("spawn_context.digest must be a SHA-256 hex digest")
+    size = value.get("bytes")
+    if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= 16384:
+        raise ContextError("spawn_context.bytes must be an integer from 0 to 16384")
 
 
 def _request_validate(row: Any, index: int) -> None:

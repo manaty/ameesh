@@ -71,6 +71,8 @@ from . import rate_limit as rate_limit_mod
 from . import account_window
 from . import provider_credits
 from . import persona_memory as memory_mod
+from . import spawn as spawn_policy
+from . import child_reports
 from . import train_events
 from . import migrations
 from . import turn_context
@@ -8089,6 +8091,15 @@ class AgentWorker(threading.Thread):
             if spec.get("scheduled_wake"):
                 self._forget_wake_claim()
             self._settle_runner_retry(spec)
+            if (getattr(self, "agent", None) or {}).get("created_by"):
+                # B 40615 : toute sortie du tour (préparation refusée, échec
+                # avant le Recorder, exception) exécute le nettoyage. Le
+                # marqueur ne survit donc qu'à une mort du processus, cas que
+                # `sweep_local` couvre : vivant ⇔ tour réellement en cours.
+                try:
+                    child_reports.remove_state(self.cfg, self.name)
+                except Exception as exc:  # noqa: BLE001 — jamais bloquant
+                    log_async("[%s] child state not removed (%s)" % (self.name, exc))
 
     def _run_turn_or_defer(self, spec: dict) -> bool | None:
         """Exclude attach for the whole turn and life of its resident.
@@ -8122,6 +8133,11 @@ class AgentWorker(threading.Thread):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             self._servir(())  # #2810 : le tour est reporté
             return None
+        # B 40580 : un enfant échu du parent laisse un rapport final et son
+        # contexte est purgé au début de CHAQUE tour du parent, pas seulement
+        # quand un plafond clôt un tour : un enfant mort sans tour final ne
+        # doit pas attendre un plafond qui peut ne jamais venir.
+        self._sweep_child_reports()
         self._session_turn_depth = getattr(self, "_session_turn_depth", 0) + 1
         # #2096 : le RSS avant le tour, pour ne rendre les arènes au noyau que
         # si le tour a fait croître le processus (voir `_release_turn_memory`).
@@ -8424,9 +8440,17 @@ class AgentWorker(threading.Thread):
             try:
                 entry = conversation.Log(self.db, cfg, agent=self.name,
                                          lot=row.get("lot_id"))
-                entry.append("human_message", text=row.get("body") or "",
-                             author=author, event_id="mail:%d" % int(mid),
-                             meta={"messages": [int(mid)]})
+                written = entry.append("human_message", text=row.get("body") or "",
+                                       author=author, event_id="mail:%d" % int(mid),
+                                       meta={"messages": [int(mid)]})
+                if self.agent.get("created_by"):
+                    try:
+                        child_reports.copy_human(
+                            self.db, cfg, self.name, author=author,
+                            body=row.get("body") or "",
+                            source_seq=int(written.get("seq") or 0))
+                    except Exception as exc:  # noqa: BLE001 — copie non bloquante
+                        log("[%s] child human copy skipped (%s)" % (self.name, exc))
                 first = first or entry
             except Exception as exc:  # le tour part quand même, la trace est signalée
                 log("[%s] conversation journal: human message #%s not recorded (%s)"
@@ -8604,6 +8628,14 @@ class AgentWorker(threading.Thread):
         from . import resident_runner
         if not resident_runner.enabled(self._state_read(resident_runner.SETTING)):
             return "resident=off"
+        if self.agent.get("created_by"):
+            # #7034 (B de revue 39559) : la politique d'outils/MCP d'un enfant
+            # n'est appliquée qu'à l'argv du tour par événement. Un processus
+            # résident tourne avec `--dangerously-skip-permissions` et sans
+            # `--tools`/`--mcp-config` : l'y laisser servir un tour élargirait
+            # l'enfant à tous les outils et tous les MCP, exactement ce que le
+            # lot interdit. Fail closed, quel que soit le réglage `resident`.
+            return "spawned child (#7034): policy applied per turn only"
         if self.runner.once:
             return "one turn only (--once)"
         if getattr(self.runner, "mediated", False):
@@ -9400,9 +9432,82 @@ class AgentWorker(threading.Thread):
             "effort_requested": effort_passe or None,
             **context_profile.account_identity(compte_publie),
         }
+        # #7034 : la politique d'outils/MCP d'un enfant restreint est appliquée
+        # par le runner à CHAQUE tour, avant le lancement. Le profil et le
+        # contexte sont lus en base ; un harnais qui ne prouve plus leur
+        # application refuse le tour (fail closed).
+        spawn_profile = None
+        spawn_context_row = None
+        spawn_args: list[str] = []
+        spawn_document = None
+        spawn_context_document = None
+        spawn_context_path = ""
+        profile_path = ""
+        if self.agent.get("created_by"):
+            # B 40603 : la tâche de nettoyage locale est écrite AVANT les
+            # fichiers privés ; un runner tué les laisse derrière lui et le
+            # prochain tour de cet hôte l'exécute (`sweep_local`).
+            try:
+                child_reports.begin_turn(self.cfg, self.name)
+            except OSError as exc:
+                self.fail_turn("spawn policy unavailable",
+                               "cleanup task not recorded: %s" % exc)
+                return False
+            try:
+                spawn_profile = storage.of(self.db).ephemerals.profile(self.name)
+                # B 40580 : le contexte est indépendant du profil. Un
+                # `spawn --context` seul n'écrit pas de `spawn_profiles` ;
+                # le lier au profil le perdrait silencieusement.
+                spawn_context_row = storage.of(self.db).ephemerals.context(self.name)
+            except db_mod.DbError as exc:
+                self.fail_turn("spawn policy unavailable",
+                               "spawn profile/context not read: %s" % exc)
+                return False
+        if spawn_profile is not None:
+            try:
+                profile_path, _mcp_path = spawn_policy.write_profile(
+                    self.state_dir, spawn_profile, cwd)
+                spawn_args = spawn_policy.argv(spawn_profile, profile_path)
+                spawn_document = {
+                    "path": profile_path,
+                    "parent": spawn_profile.get("parent"),
+                    "tools": list(spawn_profile.get("tools") or ()),
+                    "mcp": list(spawn_profile.get("mcp") or ()),
+                    "digest": spawn_profile.get("config_digest"),
+                }
+            except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+                self.fail_turn("spawn policy unavailable",
+                               "spawn policy not applied: %s" % exc)
+                return False
+        if spawn_context_row is not None:
+            try:
+                context_path = spawn_policy.write_context(
+                    self.state_dir, spawn_context_row.get("text") or "",
+                    digest=spawn_context_row.get("digest"))
+                spawn_context_path = context_path
+                if context_path and not session:
+                    # §4.3 : le CONTENU ne passe jamais par argv ; le
+                    # premier tour ne porte que le chemin privé à lire.
+                    resume += ("\n\nSPAWN CONTEXT: before starting, read the file %s "
+                               "(SHA-256 %s). It is your bounded context from the "
+                               "parent.\n" % (context_path, spawn_context_row.get("digest")))
+                spawn_context_document = {
+                    "path": context_path or None,
+                    "digest": spawn_context_row.get("digest"),
+                    "bytes": spawn_context_row.get("bytes"),
+                }
+            except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+                self.fail_turn("spawn context unavailable",
+                               "spawn context not delivered: %s" % exc)
+                return False
+        if self.agent.get("created_by") and not session:
+            try:
+                child_reports.started(self.db, self.cfg, self.name)
+            except Exception as exc:  # noqa: BLE001 — le tour de l'enfant continue
+                log_async("[%s] child started report skipped (%s)" % (self.name, exc))
         argv = adapter.command(resume + spec["prompt"], session,
                                model=model or None, effort=effort or None, patch=patch,
-                               tier=tier or None, compact=compact)
+                               tier=tier or None, compact=compact, spawn=spawn_args)
         label = {"prompt": "consigne", "mail": "messages", "event": "événements",
                  "urgent": "prioritaire", "idle": "reprise",
                  "suite": "suite"}[spec["kind"]]
@@ -9560,6 +9665,13 @@ class AgentWorker(threading.Thread):
             # L105 : borne du courrier remis par le hook pendant ce tour
             "AMEESH_TURN_MAIL_MAX": str(self.turn_mail_max()),
         }
+        # #7034 : un enfant restreint reçoit le chemin privé de sa politique
+        # (0600 sous son état) ; le harnais y lit ses outils/MCP autorisés.
+        if spawn_profile is not None and profile_path:
+            identite["AMEESH_SPAWN_PROFILE"] = profile_path
+            identite["AMEESH_SPAWN_CHILD"] = str(spawn_profile.get("parent") or "")
+        if spawn_context_path:
+            identite["AMEESH_SPAWN_CONTEXT"] = spawn_context_path
         # #834 : l'identité git de la session — auteur ET committer — vient du
         # nom d'agent du bail, jamais de la configuration du dépôt (partagée
         # par tous les worktrees : un `user.name` écrit par un agent valait
@@ -9747,7 +9859,8 @@ class AgentWorker(threading.Thread):
                 spend_key=spend_key, marker=marqueur,
                 reservation=reservation,
                 conversation=(self._move_turn.context
-                              if self._move_turn is not None else None))
+                              if self._move_turn is not None else None),
+                spawn=spawn_document, spawn_context=spawn_context_document)
             turn_context.write(self.state_dir, document,
                                secrets=turn_context.environment_secrets())
         except (OSError, turn_context.ContextError, db_mod.DbError) as exc:
@@ -10363,13 +10476,24 @@ class AgentWorker(threading.Thread):
             if conversation_recorder is not None:
                 interrupted = (self.lease_lost.is_set() or self.preempting.is_set()
                                or self.restarting.is_set() or clos)
+                statut = "interrupted" if interrupted else (
+                    "failed" if result_code or error or sys.exc_info()[0] else "completed")
                 conversation_recorder.finish(
                     final=conversation_recorder.final_text or "",
-                    status="interrupted" if interrupted else (
-                        "failed" if result_code or error or sys.exc_info()[0] else "completed"),
+                    status=statut,
                     cost=cost, usage=conversation_usage,
                     duration_s=max(0, time.time() - started))
                 conversation_recorder.close()
+                if self.agent.get("created_by"):
+                    try:
+                        child_reports.turn_end(
+                            self.db, self.cfg, self.name,
+                            final=self.last_final or conversation_recorder.final_text or "",
+                            status=("failed" if statut in ("failed", "interrupted")
+                                    else "completed"))
+                    except Exception as exc:  # noqa: BLE001 — le tour continue
+                        log_async("[%s] child progress report skipped (%s)"
+                                  % (self.name, exc))
 
         duration = time.time() - started
         # CTX-02b : clôture de l'observation du tour. Elle est publiée avec la
@@ -10851,10 +10975,33 @@ class AgentWorker(threading.Thread):
         self.runner.wake_all.set()
         return ok
 
+    def _sweep_child_reports(self) -> None:
+        """Rapports finaux des enfants échus, purge de leur contexte, et
+        exécution des nettoyages locaux laissés par un tour mort.
+
+        Best effort : le tour de l'agent ne dépend jamais d'un rapport
+        d'enfant. B 40580 : appelé au début du tour et à la clôture ;
+        B 40603 : le nettoyage local est durable sur cet hôte.
+        """
+        try:
+            child_reports.sweep_expired(self.db, self.cfg, self.name, warn=log_async)
+        except Exception as exc:  # noqa: BLE001 — rapport non bloquant
+            log_async("[%s] child report sweep skipped (%s)" % (self.name, exc))
+        try:
+            child_reports.sweep_local(self.cfg, warn=log_async)
+        except Exception as exc:  # noqa: BLE001 — le tour continue
+            log_async("[%s] child cleanup sweep skipped (%s)" % (self.name, exc))
+
     def _turn_closed(self, raison: str, duration: float) -> None:
         """Après un tour clos par un plafond (L105) : la suite au tour suivant,
         et, pour le plafond de contexte, la rotation avec résumé de reprise
         avant lui. Journalisé, et noté dans le fil."""
+        # #7034 : un enfant échu du parent laisse un rapport final, jamais un
+        # silence. Best effort : le tour du parent ne l'attend pas. Le
+        # balayage tourne aussi au début du tour (B 40580) ; celui-ci est la
+        # seconde chance d'un tour clos par un plafond.
+        self._sweep_child_reports()
+
         self.last_turn_closed = raison
         self.suite = raison
         contexte = raison.startswith("context cap")
@@ -16870,6 +17017,16 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
               file=sys.stderr)
     if (agent.get("host") or "") != cfg.host:
         print("agent %s pinned to %s, not to %s" % (name, agent.get("host") or "?", cfg.host),
+              file=sys.stderr)
+        return 1
+    # #7034 (N1 de la revue 39559) : la session interactive ne reçoit ni
+    # `--tools` ni `--mcp-config` ; attach à un enfant restreint serait une
+    # session avec tous les outils et tous les MCP. Refus explicite, jamais un
+    # élargissement silencieux : le parent reste attachable, et les rapports
+    # de l'enfant disent ce qu'il a fait.
+    if storage.of(db).ephemerals.profile(name) is not None:
+        print("agent %s is a restricted child (#7034): its tool/MCP policy is not "
+              "applied to an interactive session; attach the parent instead" % name,
               file=sys.stderr)
         return 1
     try:
