@@ -855,6 +855,24 @@ class SequenceConfigTest(unittest.TestCase):
         self.assertTrue(events.record.call_args.args[3]["ready"])
 
 
+    def test_a_changed_executor_version_is_published_at_once(self):
+        """#7259: the tick carries the version it runs."""
+        events = mock.Mock()
+        events.recent_type.return_value = [dict(data={
+            "ready": True, "executor_venv": {"running": "1", "live": "1"}},
+            ts=time.time())]
+        store = types.SimpleNamespace(events=events)
+        with mock.patch.object(executor.storage, "of", return_value=store), \
+             mock.patch.object(executor, "executor_venv",
+                               return_value={"running": "2", "live": "2"}):
+            executor.publish_sequence_readiness(
+                object(), types.SimpleNamespace(host="host-a"),
+                {"role": "mesh-design", "key": "mesh"}, None, {})
+        events.record.assert_called_once()
+        self.assertEqual(events.record.call_args.args[3]["executor_venv"],
+                         {"running": "2", "live": "2"})
+
+
 class GuardedStopTest(unittest.TestCase):
     """#5450: a monitored stop kills the group, not the lease."""
 
