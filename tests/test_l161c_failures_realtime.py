@@ -508,12 +508,15 @@ def iso(t: float) -> str:
     return datetime.fromtimestamp(float(t), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def runner_view(runner_id, name, *, busy=True, status="online"):
-    return {"id": runner_id, "name": name, "status": status, "busy": busy}
+def runner_view(runner_id, name, *, busy=True, status="online", labels=None):
+    view = {"id": runner_id, "name": name, "status": status, "busy": busy}
+    if labels is not None:
+        view["labels"] = [{"name": label} for label in labels]
+    return view
 
 
 def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=None,
-             conclusion=None):
+             conclusion=None, labels=None):
     job = {"name": name, "status": status, "runner_name": runner}
     if conclusion is not None:
         job["conclusion"] = conclusion
@@ -521,6 +524,8 @@ def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=N
         job["id"] = job_id
     if created_at is not None:
         job["created_at"] = created_at
+    if labels is not None:
+        job["labels"] = list(labels)
     return job
 
 
@@ -2967,6 +2972,114 @@ class WatcherTest(PgTestCase):
         # le job en cours tient son runner : pas de panne signalée à tort
         self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
                           if a["type"] == "ci_runner_stuck"], [])
+
+    def test_garde_file_ne_compte_pas_une_matrice_au_plafond(self):
+        """#7015 : cinq parts `mesure psql` en file parce que `carte.yml` borne
+        sa matrice à 8 (`strategy.max-parallel`), 8 parts déjà en cours et 7
+        runners `ameesh-ci` libres : la capacité existe, ce n'est pas une
+        saturation (alerte du 12/11 02:05Z, run carte 43131365562)."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        labels = ["self-hosted", "linux", "ameesh-ci"]
+        self.api.runners = [
+            runner_view(21 + i, "ameesh-ci-%d" % (i + 1), busy=i < 8, labels=labels)
+            for i in range(15)]
+        run = run_view(912, "d1" * 20, "main", workflow="carte.yml")
+        run.update({"status": "in_progress", "created_at": iso(horloge.t - 4200)})
+        self.api.live = [run]
+        self.api.jobs[912] = [
+            job_view("mesure psycopg %d/12" % (i + 1),
+                     runner="ameesh-ci-%d" % (i + 1), job_id=9120 + i, labels=labels)
+            for i in range(8)]
+        self.api.jobs[912].extend(
+            job_view("mesure psql %d/9" % (i + 1), status="queued", job_id=9130 + i,
+                     created_at=iso(horloge.t - 3720 + i), labels=labels)
+            for i in range(5))
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(int(row["queued"]), 0)
+        self.assertIsNone(row["oldest_ts"])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_queue_saturated"], [])
+        # les 8 runners occupés tiennent bien leurs jobs : pas de panne à tort
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_runner_stuck"], [])
+
+    def test_garde_file_alerte_quand_aucun_runner_libre(self):
+        """#7015 (cas inverse) : la même matrice au plafond, mais les 8 runners
+        en ligne sont occupés et les 7 autres hors ligne : la file attend la
+        capacité et alerte, même si la matrice est à son plafond."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        labels = ["self-hosted", "linux", "ameesh-ci"]
+        self.api.runners = [
+            runner_view(21 + i, "ameesh-ci-%d" % (i + 1), busy=i < 8,
+                        status="online" if i < 8 else "offline", labels=labels)
+            for i in range(15)]
+        run = run_view(912, "d1" * 20, "main", workflow="carte.yml")
+        run.update({"status": "in_progress", "created_at": iso(horloge.t - 4200)})
+        self.api.live = [run]
+        self.api.jobs[912] = [
+            job_view("mesure psycopg %d/12" % (i + 1),
+                     runner="ameesh-ci-%d" % (i + 1), job_id=9120 + i, labels=labels)
+            for i in range(8)]
+        self.api.jobs[912].extend(
+            job_view("mesure psql %d/9" % (i + 1), status="queued", job_id=9130 + i,
+                     created_at=iso(horloge.t - 3720 + i), labels=labels)
+            for i in range(5))
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (5, 9130))
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(int(alerte["value"]), 5)
+        self.assertIn("62 min", alerte["detail"])
+        self.assertIn("waiting for a free runner", alerte["detail"])
+
+    def test_garde_file_ne_prend_pas_un_runner_d_un_autre_label(self):
+        """#7015 : un runner libre ne compte que s'il porte **tous** les labels
+        du job ; un runner linux libre ne prend pas une part macOS en file."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        linux = ["self-hosted", "linux", "ameesh-ci"]
+        macos = ["self-hosted", "macos"]
+        self.api.runners = [
+            runner_view(21, "ameesh-ci-1-1", busy=True, labels=linux),
+            runner_view(22, "ameesh-ci-1-2", busy=False, labels=linux)]
+        run = run_view(913, "d2" * 20, "main")
+        run.update({"status": "in_progress", "created_at": iso(horloge.t - 4200)})
+        self.api.live = [run]
+        self.api.jobs[913] = [
+            job_view("tests 1/2", runner="ameesh-ci-1-1", job_id=9131, labels=linux),
+            job_view("tests 2/2", status="queued", job_id=9132,
+                     created_at=iso(horloge.t - 3720), labels=macos)]
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9132))
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(int(alerte["value"]), 1)
+
+    def test_garde_file_compte_une_execution_dont_aucun_job_ne_tourne(self):
+        """#7015 : un runner libre ne disculpe pas une exécution dont aucun job
+        ne tourne : la matrice n'est pas au plafond, la file attend vraiment.
+        La retenue par la propre exécution suppose un job `in_progress` de la
+        même exécution."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        labels = ["self-hosted", "linux", "ameesh-ci"]
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False, labels=labels)]
+        run = run_view(914, "d3" * 20, "main")
+        run.update({"status": "queued", "created_at": iso(horloge.t - 3800)})
+        self.api.queued = [run]
+        self.api.jobs[914] = [job_view("tests 1/2", status="queued", job_id=9141,
+                                       created_at=iso(horloge.t - 3720), labels=labels)]
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9141))
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(int(alerte["value"]), 1)
 
     def test_garde_file_ne_vieillit_pas_une_reprise(self):
         """#845 : une re-exécution garde le `created_at` de son run ; la date

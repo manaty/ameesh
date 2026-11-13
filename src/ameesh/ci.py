@@ -1020,25 +1020,50 @@ def landed_commits(repo: str, head_sha: str, api=None, *, max_lots: int = 12) ->
     return out
 
 
+def _label_set(values) -> set[str]:
+    """#7015 : les labels d'un job ou d'un runner, sans casse (GitHub compare
+    les labels ainsi). Les entrées vides sont ignorées ; un label absent ne
+    prouve rien et ne fait donc jamais correspondre un runner."""
+    out: set[str] = set()
+    for value in values or ():
+        name = value.get("name") if isinstance(value, dict) else value
+        if name is None:
+            continue
+        name = str(name).strip().casefold()
+        if name:
+            out.add(name)
+    return out
+
+
 def _guard_snapshot(run_id, attempt, status, jobs) -> dict:
     """#845 : le relevé d'une exécution — jobs `queued` (compte et plus
     vieux) et runners qui tiennent un job `in_progress` (`{nom: job}`).
 
+    #7015 : chaque job en file garde ses `labels`, et `active` dit qu'un job
+    de la même exécution tourne déjà — une matrice `strategy.max-parallel`
+    au plafond retient alors ses parts en file sans manquer de capacité.
+
     Rien n'est déduit d'un job `cancelled` : l'orphelin d'une exécution
     annulée compte comme un job en file (#876 le traite à la source)."""
-    queued: list[tuple[str, int]] = []
+    queued: list[dict] = []
     holding: dict[str, str] = {}
+    active = False
     for job in jobs:
         job_status = str(job.get("status") or "")
         if job_status == "queued":
             created = str(job.get("created_at") or job.get("started_at") or "")
-            queued.append((created, int(job.get("id") or 0)))
-        elif job_status == "in_progress" and job.get("runner_name"):
-            holding.setdefault(str(job["runner_name"]), str(job.get("name") or ""))
-    oldest = min(queued, key=lambda q: (q[0], q[1])) if queued else None
+            queued.append({"id": int(job.get("id") or 0), "created_at": created,
+                           "labels": _label_set(job.get("labels"))})
+        elif job_status == "in_progress":
+            active = True
+            if job.get("runner_name"):
+                holding.setdefault(str(job["runner_name"]), str(job.get("name") or ""))
+    oldest = (min(queued, key=lambda q: (q["created_at"], q["id"]))
+              if queued else None)
     return {"run_id": int(run_id), "attempt": int(attempt), "status": status,
-            "queued": len(queued), "oldest_id": oldest[1] if oldest else None,
-            "oldest_at": oldest[0] if oldest else None, "runners": holding}
+            "queued": len(queued), "oldest_id": oldest["id"] if oldest else None,
+            "oldest_at": oldest["created_at"] if oldest else None,
+            "runners": holding, "active": active, "queued_jobs": queued}
 
 
 class Watcher:
@@ -2034,11 +2059,16 @@ class Watcher:
     def _guard(self, db, repo: str) -> None:
         """#845 : l'état des runners et de la file, relevé par l'API (sans SSH).
 
-        La file est l'âge du plus vieux **job** encore `queued`, toutes
-        exécutions non conclues : un run reste `queued` tant qu'un de ses jobs
-        attend, et son `created_at` ne date pas ses jobs (une re-exécution
-        garde la date du run, un run `in_progress` peut encore porter un job en
-        file).
+        La file est l'âge du plus vieux **job** encore `queued` qu'aucun
+        runner libre ne peut prendre, toutes exécutions non conclues : un run
+        reste `queued` tant qu'un de ses jobs attend, et son `created_at` ne
+        date pas ses jobs (une re-exécution garde la date du run, un run
+        `in_progress` peut encore porter un job en file). #7015 : un job dont
+        les labels sont couverts par un runner `online` non occupé n'attend
+        pas la capacité — si son exécution tourne déjà, c'est elle qui le
+        retient (matrice `strategy.max-parallel` au plafond, `needs`) ; il ne
+        compte donc pas dans `ci_queue_state`, et l'alerte de saturation ne le
+        voit pas. Un job sans labels connus reste compté.
 
         Le relevé est borné (revue N/P2 2328 ; arbitrage A du pilote, 14/10) :
         la fenêtre de 600 s est écrite dans la base avant le premier appel
@@ -2123,8 +2153,7 @@ class Watcher:
                 # né après une annulation de part : aucune inférence ne les
                 # sépare sans masquer une file réelle. Les orphelins se traitent
                 # à la source (`always() && !cancelled()` sur l'agrégat, #876).
-                queued: list[tuple[str, int]] = []
-                queued_total = 0
+                queued_jobs: list[dict] = []
                 holding: dict[str, str] = {}
                 for run_id in sorted(not_done):
                     run = not_done[run_id]
@@ -2142,10 +2171,8 @@ class Watcher:
                         queued=int(snap["queued"]), oldest_id=snap["oldest_id"],
                         oldest_at=snap["oldest_at"], runners=snap["runners"])
                     covered += 1
-                    queued_total += int(snap.get("queued") or 0)
-                    if int(snap.get("queued") or 0):
-                        queued.append((str(snap.get("oldest_at") or ""),
-                                       int(snap.get("oldest_id") or 0)))
+                    for job in snap.get("queued_jobs") or ():
+                        queued_jobs.append(dict(job, run_active=bool(snap.get("active"))))
                     holding.update(snap.get("runners") or {})
                 if reason is None:
                     data = api("repos/%s/actions/runners?per_page=%d"
@@ -2154,11 +2181,28 @@ class Watcher:
                     if int(data.get("total_count") or 0) > len(runners):
                         reason = "runner_truncated"
                     else:
-                        if queued:
-                            created, job_id = min(queued, key=lambda q: (q[0], q[1]))
-                            st.ci.observe_queue(repo, oldest_id=job_id,
-                                                oldest_at=created or None,
-                                                queued=queued_total)
+                        # #7015 : la file qui compte est celle de la capacité —
+                        # un job qu'un runner libre portant ses labels pourrait
+                        # prendre n'est pas une attente de runner quand sa
+                        # propre exécution tourne déjà : GitHub ne le retient
+                        # alors que par une limite de son run (matrice au
+                        # plafond `max-parallel`, `needs`). Le plafond n'est pas
+                        # lu : un runner libre prouve qu'il ne manque pas de
+                        # capacité. Un job sans labels connus reste compté : on
+                        # ne peut pas prouver qu'un runner pourrait le prendre.
+                        free = [_label_set(r.get("labels")) for r in runners
+                                if (r.get("status") or "online") == "online"
+                                and not r.get("busy")]
+                        waiting = [job for job in queued_jobs
+                                   if not (job["run_active"] and job["labels"]
+                                           and any(job["labels"] <= labels
+                                                   for labels in free))]
+                        if waiting:
+                            oldest = min(waiting, key=lambda j: (
+                                str(j.get("created_at") or ""), int(j.get("id") or 0)))
+                            st.ci.observe_queue(repo, oldest_id=oldest["id"],
+                                                oldest_at=oldest["created_at"] or None,
+                                                queued=len(waiting))
                         else:
                             st.ci.observe_queue(repo, oldest_id=None, oldest_at=None,
                                                 queued=0)
