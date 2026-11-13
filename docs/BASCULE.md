@@ -1833,9 +1833,27 @@ Then measure the client side once, as its **own** leader loss (another
 30–60 s, same window rules): `verifier-clients.py` kills the leader itself
 through `--tuer` (README Patroni, “Preuve côté client”), so it is not
 combined with an `exercer.py` run. `--tuer` is the cluster file's
-`perte_noeud` command run over SSH on the current leader; bring that node
-back afterwards with `retour_noeud`. Pass: listener resubscribed, sweep
-delivered, RPO 0 on confirmed commits.
+`perte_noeud` command, run over SSH on the **leader of the moment** — the
+`Leader` line of `patronictl list`, which after `perte-primaire` is
+`ameesh-agents-2`, not the node of the README example. The script splits
+the value with `shlex.split` and runs it **without a shell**: the inner
+single quotes below keep the two commands as one argument to `ssh`, whose
+login shell interprets the `;`, and the outer double quotes let `$LEADER`
+expand locally. A bare `--tuer ssh … cmd1; cmd2` would run `cmd2` on the
+workstation.
+
+```bash
+LEADER=ameesh-agents-1   # example; read the Leader line of patronictl list
+~/.local/share/ameesh/venv/bin/python deploy/serveur/patroni/verifier-clients.py \
+  --dsn 'postgresql://ameesh@10.78.0.11,10.78.0.12,10.78.0.10:5432/ameesh?sslmode=require' \
+  --tuer "ssh -o BatchMode=yes -o ConnectTimeout=5 $LEADER 'sudo -n systemctl kill --signal=SIGKILL patroni.service etcd.service; sudo -n systemctl stop patroni.service etcd.service'" \
+  --geste-reel --rapport "$TMPDIR/ep86-clients.json"
+```
+
+Bring the killed node back afterwards with `retour_noeud` (`sudo -n
+systemctl start etcd.service patroni.service` over the same SSH alias, on
+`$LEADER`, which is no longer the leader). Pass: listener resubscribed,
+sweep delivered, RPO 0 on confirmed commits.
 
 **4. Clean-up and report.** After the last scenario: `patronictl list` back
 to the start state (`patronictl switchover --candidate ameesh-agents-1` if
