@@ -2193,8 +2193,9 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
 
     * `agents` : le relevé des agents (`operations.listing`) ; un agent
       **réveillable** l'est au sens de #4273 (`file_decoupage.wakeable` :
-      exécution, ni éphémère, ni chat, ni arrêté, ni en pause, ni critique ni
-      relecteur — `critical_verdict` sur `canons`, `configured`), et en
+      exécution, ni éphémère, ni chat, ni arrêté, ni en pause, ni critique
+      (`critical_verdict` sur `canons`, `configured`), ni relecteur de rôle
+      (`review_designation.reviewer_role`, #7174)), et en
       plus ni retiré (`retired_ts`), ni sans exécuteur vivant
       (`_awake_runner`), ni tenu par son budget (`held`), ni d'une famille
       exclue des prises (`excluded_families`, #5005 : cette capacité-là est
