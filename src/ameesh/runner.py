@@ -11143,6 +11143,35 @@ def _admits_nobody(runner) -> bool:
     return flt is not None and not flt
 
 
+def _tenant_runner(runner) -> bool:
+    """#7106 : cet exécuteur est le runner d'un tenant d'hôte partagé ;
+    l'état machine (canon, relevés, cycle de vie, ménage) est alors au
+    superviseur d'hôte. Fonction et `getattr`, comme `_admits_nobody` : les
+    doublures des tests n'ont pas toujours de configuration."""
+    from . import tenancy
+    cfg = getattr(runner, "cfg", None)
+    tenant = getattr(cfg, "tenant", "") if cfg is not None else ""
+    return isinstance(tenant, str) and bool(tenancy.runner_tenant(cfg))
+
+
+def _tenant_candidates(runner, candidates: list[dict]) -> list[dict]:
+    """#7106 : les agents réclamables que CET exécuteur peut prendre sur un
+    hôte partagé (`tenancy.admits`) ; hôte non partagé : inchangé. Une
+    politique illisible ne filtre pas : la garde reste la base."""
+    if not candidates or getattr(runner, "mediated", False):
+        return candidates  # un appareil médié n'est jamais un hôte partagé
+    from . import tenancy
+    try:
+        policy = tenancy.host_policy(runner.db, runner.host)
+    except db_mod.Unavailable:
+        raise
+    except db_mod.DbError:
+        return candidates
+    if not isinstance(policy, dict) or policy.get("shared") is not True:
+        return candidates
+    return [agent for agent in candidates if tenancy.admits(runner.cfg, policy, agent)]
+
+
 class Runner:
     def __init__(
         self,
@@ -12473,7 +12502,7 @@ class Runner:
                       else registry.claimable(self.db, self.host, self.agents_filter))
         # #7106 : sur un hôte partagé, un runner de tenant ne tente que ses
         # agents, le superviseur aucun (la base refuserait le CAS)
-        candidates = self._tenant_candidates(candidates)
+        candidates = _tenant_candidates(self, candidates)
         # #5601 : avec des réservations, admission par classe puis par date du
         # prochain lot ; sans réservation, l'ordre du registre reste intact
         candidates = self._admission_order(candidates)
@@ -13598,7 +13627,7 @@ class Runner:
         if getattr(self, "mediated", False):
             self._gate_settled.set()
             return  # canon sync is server-side for mediated devices
-        if self._tenant_runner():
+        if _tenant_runner(self):
             # #7106 : le canon de l'hôte partagé est synchronisé par son
             # superviseur ; le runner d'un tenant lit l'état en base
             self._gate_settled.set()
@@ -13681,30 +13710,6 @@ class Runner:
                     return
 
         threading.Thread(target=boucle, daemon=True, name="solde").start()
-
-    def _tenant_runner(self) -> bool:
-        """#7106 : cet exécuteur est le runner d'un tenant d'hôte partagé ;
-        l'état machine (canon, relevés, cycle de vie, ménage) est alors au
-        superviseur d'hôte. `getattr` : les doublures des tests n'ont pas
-        toujours de configuration."""
-        from . import tenancy
-        cfg = getattr(self, "cfg", None)
-        return bool(cfg is not None and tenancy.runner_tenant(cfg))
-
-    def _tenant_candidates(self, candidates: list[dict]) -> list[dict]:
-        """#7106 : les agents réclamables que CET exécuteur peut prendre sur un
-        hôte partagé (`tenancy.admits`) ; hôte non partagé : inchangé. Une
-        politique illisible ne filtre pas : la garde reste la base."""
-        if not candidates or getattr(self, "mediated", False):
-            return candidates  # un appareil médié n'est jamais un hôte partagé
-        from . import tenancy
-        try:
-            policy = tenancy.host_policy(self.db, self.host)
-        except db_mod.Unavailable:
-            raise
-        except db_mod.DbError:
-            return candidates
-        return [agent for agent in candidates if tenancy.admits(self.cfg, policy, agent)]
 
     # -- ressources de l'hôte (L31, 0028) -----------------------------------
     @migrations.writer_tick(on_admission_error=_background_admission_error)
@@ -13854,7 +13859,7 @@ class Runner:
 
         #7106 : le cycle de vie d'un hôte partagé est au superviseur.
         """
-        if self._tenant_runner():
+        if _tenant_runner(self):
             return
         if getattr(self, "mediated", False):
             return
@@ -14579,7 +14584,7 @@ class Runner:
             self._start_thread_expiry_notice()
         if interval <= 0 or self.once or getattr(self, "mediated", False):
             return  # exécuteur médié : pas de base, pas de ménage local (contrat 1.1)
-        if self._tenant_runner():
+        if _tenant_runner(self):
             return  # #7106 : le ménage de l'hôte partagé est au superviseur
 
         def boucle() -> None:
