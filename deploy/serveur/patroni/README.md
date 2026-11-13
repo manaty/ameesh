@@ -476,12 +476,15 @@ etcdctl --endpoints https://10.78.0.11:2379 \
 etcdctl ... member remove <ID>
 ```
 
-Sur le nœud neuf : générer son matériel TLS (même CA), vider son
-`/var/lib/etcd/ameesh`, passer temporairement `initial-cluster-state` à
-`existing` dans son `etcd.yml` avec `initial-cluster` à la liste des trois
-membres (le nouveau nom et la même adresse), démarrer etcd, puis
-`member add` si nécessaire. Vérifier `endpoint health --cluster` à chaque
-étape : le quorum ne doit jamais descendre sous 2.
+Puis, depuis un membre sain, annoncer le nœud neuf **avant** de le
+démarrer (`etcdctl ... member add <nom> --peer-urls=https://<adresse>:2380`) ;
+sur le nœud neuf : matériel TLS sauvegardé (même AC ; `generer-tls.sh` en
+créerait une nouvelle), `/var/lib/etcd/ameesh` vide, `etcd.yml` avec
+`initial-cluster-state: existing` et l'`initial-cluster` donné par
+`member add`, puis démarrer etcd. Exemple complet et retour arrière :
+`docs/EXPLOITATION.md`, « Remplacement d'un membre etcd ». Vérifier
+`endpoint health --cluster` à chaque étape : le quorum ne doit jamais
+descendre sous 2.
 
 ### Perte du DCS (etcd)
 
@@ -493,11 +496,12 @@ membres etcd, puis `patronictl list`. Ne pas couper `failsafe_mode` pour
 ### Disque plein
 
 `db_disk_low` et `host_disk_soon_full` se complètent. Sur le primaire :
-purger les WAL archivés (`pg_archivecleanup` seulement après vérification de
-l'archive), les sauvegardes locales selon la rétention, puis
-`VACUUM (VERBOSE, ANALYZE)` si les tables mortes sont la cause. Un slot de
-réplication non consommé peut remplir le disque : `pg_replication_slots`.
-Ne jamais supprimer un WAL non archivé.
+rétablir l'archivage s'il est en retard (PostgreSQL recycle alors `pg_wal`
+seul), traiter un slot de réplication non consommé
+(`pg_replication_slots`), puis `VACUUM (VERBOSE, ANALYZE)` si les tables
+mortes sont la cause. Pas de `pg_archivecleanup` : l'archive est le dépôt
+pgBackRest, purgé par `pgbackrest expire`. Ne jamais supprimer un WAL à la
+main. Détail : `docs/EXPLOITATION.md`, « Disque plein ».
 
 ### Suspicion de split brain
 

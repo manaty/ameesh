@@ -1,0 +1,22 @@
+{
+  "grappe": "ameesh",
+  "commentaire": "EP8.6 (#6863) : commandes relues pour exercer.py --cible grappe --geste-reel. Chaque nom de nœud est un alias SSH de l'exploitant vers l'adresse PUBLIQUE du nœud (jamais 10.78.0.0/24, que la coupure réseau ferme), compte root ou sudo sans mot de passe. Le poste est observé, pas éteint : voir docs/BASCULE.md, « Real cutover and exercise (EP8.6) ».",
+  "pc": {"hote": "manaty-mesh-1"},
+  "noeuds": [
+    {"nom": "ameesh-agents-1", "adresse": "10.78.0.11", "nofailover": false},
+    {"nom": "ameesh-agents-2", "adresse": "10.78.0.12", "nofailover": false},
+    {"nom": "manaty-mesh-1", "adresse": "10.78.0.10", "nofailover": true}
+  ],
+  "actions": {
+    "perte_noeud": "sudo -n systemctl kill --signal=SIGKILL patroni.service etcd.service; sudo -n systemctl stop patroni.service etcd.service",
+    "retour_noeud": "sudo -n systemctl start etcd.service patroni.service",
+    "coupure_reseau": "sudo -n systemd-run --unit=ep86-retablir --on-active=600 /bin/sh -c 'iptables -D INPUT -s 10.78.0.0/24 -m comment --comment ep86 -j DROP; iptables -D OUTPUT -d 10.78.0.0/24 -m comment --comment ep86 -j DROP' && sudo -n iptables -I INPUT 1 -s 10.78.0.0/24 -m comment --comment ep86 -j DROP && sudo -n iptables -I OUTPUT 1 -d 10.78.0.0/24 -m comment --comment ep86 -j DROP",
+    "retablissement_reseau": "sudo -n iptables -D INPUT -s 10.78.0.0/24 -m comment --comment ep86 -j DROP; sudo -n iptables -D OUTPUT -d 10.78.0.0/24 -m comment --comment ep86 -j DROP; sudo -n systemctl stop ep86-retablir.timer 2>/dev/null; ! sudo -n iptables -S | grep -q ep86",
+    "arret_pc": "! ping -c 3 -W 2 10.77.0.2",
+    "demarrage_pc": "true"
+  },
+  "table_jalon": "public.ep86_jalon",
+  "creer_table_jalon": true,
+  "ssh": ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"],
+  "sudo": "sudo -n"
+}

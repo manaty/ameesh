@@ -46,8 +46,10 @@ lignes SQL et le JSON Patroni sont des faux.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import re
+import ssl
 import sys
 import time
 import urllib.parse
@@ -166,10 +168,17 @@ def _as_seconds(value):
         return None
 
 
-def _json(base_url: str, path: str, *, timeout: float = PATRONI_TIMEOUT_S):
+def _json(base_url: str, path: str, *, timeout: float = PATRONI_TIMEOUT_S,
+          cafile: str = ""):
     url = base_url.rstrip("/") + path
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with _OPENER.open(request, timeout=timeout) as response:
+    opener = _OPENER
+    if cafile:
+        # #6863 : l'AC privée de la grappe, pour cette lecture seulement.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=cafile)))
+    with opener.open(request, timeout=timeout) as response:
         payload = response.read(1_000_000)
     data = json.loads(payload.decode("utf-8"))
     if not isinstance(data, dict):
@@ -188,6 +197,9 @@ def patroni(cfg, *, reader=_json) -> dict | None:
     url = str(getattr(cfg, "patroni_url", "") or "").strip()
     if not url:
         return None
+    cafile = str(getattr(cfg, "patroni_ca", "") or "").strip()
+    if cafile and reader is _json:
+        reader = functools.partial(_json, cafile=cafile)
     out = {"url": mask_url(url), "local": None, "members": [], "error": None,
            "errors": {"local": None, "cluster": None},
            "name": None, "scope": None, "version": None, "paused": None}
