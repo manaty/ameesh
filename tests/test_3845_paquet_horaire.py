@@ -733,6 +733,37 @@ class FollowTest(Base):
         self.assertIn("--package-exclusion", move[0])
         self.assertEqual(self.shell.ran("work", "move", "3807"), [])
 
+    def test_red_of_old_source_preserves_a_new_freeze_and_its_state(self):
+        self.open_carrier()
+        unit = {"id": 3801, "assignee": "mty-amh-impl-02", "state": "validated",
+                "freeze": {"declared": {"sha": HEAD2}}}
+        self.shell.items[3801] = unit
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        ph.tick(self.ctx)
+        self.assertEqual(self.shell.ran("work", "move", "3801"), [])
+        self.assertEqual(unit["state"], "validated")
+        self.assertEqual(ph.frozen_sha(unit), HEAD2)
+        self.assertFalse([body for to, body in self.shell.mails
+                          if to == "mty-amh-impl-02"])
+        self.assertTrue(any("gel courant=%s conservé" % HEAD2 in note
+                            for note in ph.marks(unit)))
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
+        self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
+        self.assertEqual(auto[auto.index("--keep-composition") + 1], HEAD)
+
+    def test_unchanged_source_still_needs_correction(self):
+        self.shell.items[3801] = {"id": 3801, "state": "qa",
+            "freeze": {"declared": {"sha": "035249f490d2" + "0" * 28}}}
+        self.assertTrue(ph.exclude(self.ctx, 3801, 4000, "h-test", "77", [],
+                                   source="035249f490d2"))
+        self.assertEqual(len(self.shell.ran("work", "move", "3801", "build")), 1)
+
+    def test_no_current_freeze_does_not_hide_the_due_correction(self):
+        self.shell.items[3801] = {"id": 3801, "state": "qa"}
+        self.assertTrue(ph.exclude(self.ctx, 3801, 4000, "h-test", "77", [],
+                                   source="035249f490d2"))
+        self.assertEqual(len(self.shell.ran("work", "move", "3801", "build")), 1)
+
     def test_transition_refusee_laisse_la_trace_en_note(self):
         self.open_carrier()
         self.shell.items[3801] = {"id": 3801, "assignee": "mty-amh-impl-02"}
