@@ -1818,7 +1818,18 @@ def build(*, items: Iterable[Mapping[str, Any]],
     #: geste au bureau ; ce n'est pas une attente d'agent (#3498).
     external_lots = set(external_by_lot)
     for row in wakes_out:
-        if row.get("overdue") and int(row["lot"]) not in external_lots:
+        ident = int(row["lot"])
+        # #7241 : le gel répond à l'ancien réveil sans annuler sa livraison.
+        # Un réveil réarmé après le gel reste actionnable.
+        freeze = _latest_freeze(milestones_by_lot.get(ident, []))
+        wake = wake_state(events_by_lot.get(ident, []))
+        answered = bool(
+            freeze and wake and freeze.get("at_ts") is not None
+            and float(freeze["at_ts"]) >= float(row["due_ts"])
+            and float(freeze["at_ts"]) >= float(wake.get("since") or 0.0))
+        reserved = bool(str(by_id[ident].get("external_executor") or "").strip())
+        if (row.get("overdue") and ident not in external_lots
+                and not reserved and not answered):
             add_wait("wake_overdue", row, row["due_ts"],
                      row.get("assignee") or "?",
                      GESTURES["wake_overdue"], level=1,
