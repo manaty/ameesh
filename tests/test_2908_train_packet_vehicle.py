@@ -21,6 +21,8 @@ class InventoryPacketVehicleTest(unittest.TestCase):
         self.project = types.SimpleNamespace(name="ameesh", repo="/unused", target="main")
         self.ops = mock.Mock()
         self.ops.milestones.return_value = [dict(id=1, kind="frozen", sha=HEAD)]
+        # #6993 : no recorded packet membership in this fixture.
+        self.ops.packet_members.return_value = []
         self.reader = mock.Mock(side_effect=lambda marks, waived: dict(
             sha=HEAD, origin="frozen", declared=marks[0], verdict=None, notes=[], causes=[]))
         patch = mock.patch.object(storage, "of", return_value=types.SimpleNamespace(
