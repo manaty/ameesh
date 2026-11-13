@@ -364,6 +364,37 @@ class ChildReportTest(_CanonDbCase):
                              filename)
         self.assertFalse(os.path.exists(child_reports.cleanup_path(self.cfg, "aide7")))
 
+    def test_a_failed_cleanup_keeps_the_task_for_retry(self):
+        # B 40616 : un unlink transitoire ne doit pas effacer la tâche ; le
+        # marqueur est marqué orphelin et le balayage suivant réessaie.
+        text = "turn context\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        canon_sync.spawn(self.db, "aide8", "orchestre", 3600, canon=self.load(),
+                         tools=["git"], context=(text, digest))
+        directory = self.cfg.agent_dir("aide8")
+        child_reports.begin_turn(self.cfg, "aide8")
+        spawn.write_profile(directory, storage.of(self.db).ephemerals.profile("aide8"),
+                            self.cwd)
+        spawn.write_context(directory, text)
+        marker = child_reports.cleanup_path(self.cfg, "aide8")
+        real_unlink = os.unlink
+
+        def refuse_context(path):
+            if str(path).endswith(spawn.CONTEXT_FILE):
+                raise PermissionError(path)
+            return real_unlink(path)
+
+        from unittest import mock
+        with mock.patch("ameesh.child_reports.os.unlink", side_effect=refuse_context):
+            self.assertFalse(child_reports.remove_state(self.cfg, "aide8"))
+        self.assertTrue(os.path.exists(os.path.join(directory, spawn.CONTEXT_FILE)))
+        with open(marker, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["pid"], 0)
+        # Rétabli : la tâche conservée s'exécute au balayage suivant.
+        self.assertEqual(child_reports.sweep_local(self.cfg), ["aide8"])
+        self.assertFalse(os.path.exists(os.path.join(directory, spawn.CONTEXT_FILE)))
+        self.assertFalse(os.path.exists(marker))
+
     def test_a_final_report_purges_the_context_even_before_expiry(self):
         text = "private context\n"
         digest = hashlib.sha256(text.encode()).hexdigest()
@@ -525,6 +556,50 @@ class SpawnRunnerTest(PgTestCase):
         self.assertTrue(self.db.query(
             "SELECT 1 AS x FROM conversation_log WHERE agent = %s"
             " AND event_id = %s", (parent, "child:%s:final" % name)))
+
+
+    def test_a_turn_refused_after_writing_the_files_leaves_nothing(self):
+        # B 40615 : un refus APRÈS `begin_turn` et l'écriture des fichiers
+        # (ici `write_context` échoue) sort sans `turn_end` ; le `finally` du
+        # tour exécute le nettoyage, le marqueur ne reste pas « vivant ».
+        from unittest import mock
+        from ameesh import mail, registry, runner as runner_mod
+        from ameesh.runner import AgentWorker, Runner
+
+        name, parent = "child-early", "parent-early"
+        cwd = os.path.join(self.tmp, "work", name)
+        os.makedirs(cwd, exist_ok=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        self.register(name, "claude", cwd=cwd)
+        self.register(parent, "claude", cwd=cwd)
+        self.db.execute(
+            "UPDATE agent_registry SET ephemeral = true, created_by = %s,"
+            " ephemeral_expires_at = now() + interval '1 hour' WHERE name = %s",
+            (parent, name))
+        text = "mission context for the child\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        self.db.execute(
+            "INSERT INTO spawn_profiles (child, parent, harness, tools, mcp, config_digest)"
+            " VALUES (%s, %s, 'claude', ARRAY['git'], ARRAY[]::text[], %s)",
+            (name, parent, spawn.policy_digest(["git"], [])))
+        self.db.execute(
+            "INSERT INTO spawn_contexts (child, parent, digest, bytes, text)"
+            " VALUES (%s, %s, %s, %s, %s)", (name, parent, digest, len(text.encode()), text))
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        mail.send(self.db, parent, name, "travail", kind="request")
+        spec = worker.pick()
+        self.assertIsNotNone(spec)
+        with mock.patch.object(runner_mod.spawn_policy, "write_context",
+                               side_effect=OSError("synthetic write failure")):
+            self.assertFalse(worker.run_turn(spec))
+        state = self.cfg.agent_dir(name)
+        for filename in (spawn.PROFILE_FILE, spawn.MCP_FILE, spawn.CONTEXT_FILE):
+            self.assertFalse(os.path.exists(os.path.join(state, filename)), filename)
+        self.assertFalse(os.path.exists(child_reports.cleanup_path(self.cfg, name)))
+        self.assertEqual(child_reports.sweep_local(self.cfg), [])
 
 
 class RestrictedNeverResidentTest(PgTestCase):

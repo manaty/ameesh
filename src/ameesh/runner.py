@@ -8091,6 +8091,15 @@ class AgentWorker(threading.Thread):
             if spec.get("scheduled_wake"):
                 self._forget_wake_claim()
             self._settle_runner_retry(spec)
+            if (self.agent or {}).get("created_by"):
+                # B 40615 : toute sortie du tour (préparation refusée, échec
+                # avant le Recorder, exception) exécute le nettoyage. Le
+                # marqueur ne survit donc qu'à une mort du processus, cas que
+                # `sweep_local` couvre : vivant ⇔ tour réellement en cours.
+                try:
+                    child_reports.remove_state(self.cfg, self.name)
+                except Exception as exc:  # noqa: BLE001 — jamais bloquant
+                    log_async("[%s] child state not removed (%s)" % (self.name, exc))
 
     def _run_turn_or_defer(self, spec: dict) -> bool | None:
         """Exclude attach for the whole turn and life of its resident.

@@ -308,29 +308,68 @@ def sweep_local(cfg, *, warn=None) -> list[str]:
             marker = {}
         if _writer_alive(marker):
             continue
-        _remove_child_state(cfg, child)
+        # B 40616 : la tâche n'est retirée qu'après suppression CONFIRMÉE de
+        # tous les fichiers ; une erreur transitoire la laisse en place pour
+        # la reprise, et `_remove_child_state` la marque orpheline (PID 0)
+        # pour qu'un tour vivant ne la fasse plus passer pour en cours.
+        if not _remove_child_state(cfg, child):
+            if warn is not None:
+                warn("child cleanup: %s kept for retry" % child)
+            continue
         try:
             os.unlink(path)
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError:
+            if warn is not None:
+                warn("child cleanup: marker of %s kept for retry" % child)
+            continue
         done.append(child)
     return done
 
 
-def _remove_child_state(cfg, child: str) -> None:
-    """Remove the child's private policy/context files and its cleanup task."""
+def remove_state(cfg, child: str) -> bool:
+    """Best-effort immediate cleanup; True when every file is confirmed gone."""
+    return _remove_child_state(cfg, child)
+
+
+def _mark_orphan(cfg, child: str) -> None:
+    """Keep the task, but no longer as an in-flight turn (B 40616)."""
+    try:
+        spawn.write_private(cleanup_path(cfg, child),
+                            json.dumps({"child": child, "pid": 0}) + "\n")
+    except OSError:
+        pass
+
+
+def _remove_child_state(cfg, child: str) -> bool:
+    """Remove the private files and the cleanup task.
+
+    True only when every unlink is confirmed (missing counts as gone). On any
+    failure the marker is kept — and marked orphan so any sweep retries it —
+    instead of announcing a cleanup that did not happen (B 40616).
+    """
     directory = cfg.agent_dir(child)
+    clean = True
     for name in (spawn.CONTEXT_FILE, spawn.PROFILE_FILE, spawn.MCP_FILE):
         try:
             os.unlink(os.path.join(directory, name))
         except FileNotFoundError:
             pass
         except OSError:
-            pass
+            clean = False
+    if not clean:
+        _mark_orphan(cfg, child)
+        return False
     try:
         os.unlink(cleanup_path(cfg, child))
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError:
+        # The files are gone: no privacy leak remains. The stale marker is
+        # harmless and a dead writer's next sweep removes it.
+        pass
+    return True
 
 
 # --------------------------------------------------------------------------
