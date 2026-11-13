@@ -155,6 +155,19 @@ class MoveTest(Base):
                                            epoch=lease["lease_epoch"], **ok)["state"],
                          "verified")
 
+    def test_plan_through_an_alias_rereads_the_open_attempt(self):
+        # #7093 (relecture dev3) : un plan nommé par un alias résout le nom
+        # primaire comme le déclencheur d'écriture ; sinon il ne relit ni la
+        # ligne de registre ni la tentative ouverte.
+        self.db.execute("UPDATE agent_registry SET aliases = ARRAY['avatar-old']"
+                        " WHERE name = 'avatar'")
+        first = M.plan(self.db, "avatar-old", "target", requested_by="human:alice")
+        self.assertIsNotNone(first)
+        self.assertEqual(first["agent"], "avatar")
+        again = M.plan(self.db, "avatar-old", "target", requested_by="human:alice")
+        self.assertEqual(again["move_id"], first["move_id"])
+        self.assertFalse(again["created"])
+
     def test_prepare_failure_source_keeps_serving(self):
         move = self.plan()
         steps = M.advance(self.db, "target", cwd_for=lambda m: "/tgt",
@@ -249,6 +262,31 @@ class MoveTest(Base):
         self.db.execute("UPDATE conversation_moves SET updated_at = now() - interval '1 hour'")
         self.assertEqual(self.begin(), "started")
         self.assertEqual(self.advance(), [(move["move_id"], "failed")])
+
+    def test_long_source_turn_delays_the_switch_without_failing_it(self):
+        # #7093 (relecture dev3) : au-delà de PLAN_TTL_S une tentative déjà
+        # préparée attend la fin du tour source ; elle n'est pas abandonnée
+        # (design 5322 §2.6 : un tour long retarde, il ne tue pas).
+        move = self.plan()
+        self.db.execute("UPDATE agent_registry SET status = 'running' WHERE name = 'avatar'")
+        self.assertEqual(self.advance(), [(move["move_id"], "prepared"),
+                                          (move["move_id"], "waiting")])
+        self.db.execute("UPDATE conversation_moves SET updated_at = now() - interval '1 hour'")
+        self.db.execute("UPDATE agent_registry SET status = 'idle' WHERE name = 'avatar'")
+        self.assertEqual(self.advance(), [(move["move_id"], "switched")])
+        self.assertEqual(self.row()["host"], "target")
+
+    def test_late_failure_guard_does_not_undo_a_switch(self):
+        # #7093 (relecture dev3) : la passe cible ne défait pas une tentative
+        # qu'une autre passe vient de préparer ou de basculer — `fail` limité
+        # à `planned` n'agit pas.
+        move = self.plan()
+        self.advance()  # prepared then switched in the same pass
+        self.assertEqual(self.moves.get(move["move_id"])["state"], "switched")
+        self.assertIsNone(self.moves.fail(move["move_id"], error="prepare: expired",
+                                          only=("planned",)))
+        self.assertEqual(self.moves.get(move["move_id"])["state"], "switched")
+        self.assertEqual(self.row()["host"], "target")
 
     def test_stale_plan_holds_nothing_and_can_be_planned_again(self):
         # B (relecture 3) : au-delà de PLAN_TTL_S, la tentative ne retient
@@ -508,6 +546,22 @@ class WorkerTest(Base):
                          "switch: source session changed since the plan")
         row = self.row()
         self.assertEqual((row["host"], row["session_id"]), ("source", "sess-other"))
+
+    def test_switch_refused_when_the_source_lease_changed_since_the_plan(self):
+        # #7093 (relecture 1/2) : même nom de détenteur, mais un bail rendu et
+        # repris depuis le plan — ce n'est plus le bail que le plan a vu.
+        move = self.plan()
+        self.assertTrue(registry.release(self.db, "avatar", "runner-src", self.epoch))
+        again = registry.claim(self.db, "avatar", "runner-src", ttl_seconds=300,
+                               host="source")
+        self.assertGreater(again["lease_epoch"], self.epoch)
+        steps = self.advance()
+        self.assertIn((move["move_id"], "failed"), steps)
+        self.assertEqual(self.moves.get(move["move_id"])["error"],
+                         "switch: source lease changed since the plan")
+        row = self.row()
+        self.assertEqual((row["host"], row["session_id"], row["lease_owner"]),
+                         ("source", "sess-source", "runner-src"))
 
     def test_runner_pass_prepares_and_switches(self):
         from types import SimpleNamespace

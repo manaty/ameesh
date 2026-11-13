@@ -72,6 +72,14 @@ class ConversationMoves(Contract):
 
     def plan(self, *, move_id, agent, target_host, reason, requested_by):
         with self.db.transaction() as tx:
+            # #7093 (relecture dev3) : un alias se résout comme à l'écriture
+            # (déclencheur ameesh_agent_spelling) ; sans cela, un plan nommé
+            # par un alias ne relisait ni la ligne de registre ni la tentative
+            # ouverte, et ouvrait une seconde ligne sous un autre nom.
+            resolved = tx.query(
+                "SELECT coalesce(ameesh_agent_primary_locked(%s), %s) AS name",
+                (agent, agent))
+            agent = resolved[0]["name"] if resolved else agent
             rows = tx.query(
                 """SELECT name, host, cwd, mode, lease_owner, lease_epoch, session_id
                      FROM agent_registry WHERE name = %s FOR UPDATE""", (agent,))
@@ -162,10 +170,20 @@ class ConversationMoves(Contract):
                 return None
             if move["state"] in ("switched", "recovered"):
                 return move
-            if move["state"] != "prepared" or move["stale"]:
+            # #7093 (relecture dev3) : un tour source plus long que
+            # PLAN_TTL_S retarde la bascule, il ne l'abandonne pas — le
+            # `stale` ne vaut que pour une tentative encore `planned`.
+            if move["state"] != "prepared":
                 return None
             if r["mode"] != "execute" or r["host"] != move["source_host"]:
                 return None
+            if int(r["lease_epoch"]) != int(move["epoch_source"]):
+                # #7093 (relecture 1/2) : le bail a été rendu et repris depuis
+                # le plan ; le détenteur est peut-être le même nom, mais ce
+                # n'est plus le bail que le plan a vu.
+                return self._set(tx, move_id,
+                                 "state = 'failed', error = %s, failed_at = clock_timestamp()",
+                                 ("switch: source lease changed since the plan",))
             if (r["session_id"] or None) != (move["source_session"] or None):
                 # B4 : la session native a changé depuis le plan (rotation,
                 # bascule de lot) — l'échec ne pourrait plus la rendre
@@ -255,11 +273,15 @@ class ConversationMoves(Contract):
                              " source_cache = 'stale-cache', verified_at = clock_timestamp()",
                              (session,))
 
-    def fail(self, move_id, *, error, owner=None, epoch=None):
+    def fail(self, move_id, *, error, owner=None, epoch=None, only=None):
         error = (error or "failed")[:2000]
         with self.db.transaction() as tx:
             move, r = self._locked(tx, move_id)
             if move is None or move["state"] not in OPEN:
+                return None
+            if only is not None and move["state"] not in only:
+                # #7093 (relecture dev3) : la passe cible ne défait pas une
+                # tentative qu'une autre passe vient de préparer ou de basculer.
                 return None
             if move["state"] in BEFORE_SWITCH or r is None:
                 return self._set(tx, move_id, "state = 'failed', error = %s,"

@@ -82,8 +82,10 @@ def advance(db, host: str, *, probes: Callable[[dict], Mapping[str, bool]],
     pairs: `prepared`, `switched`, `recovered`, `failed`, `waiting`.
     `agents`, if given, limits the pass to those agents (the runner's
     admission list).
-    A prepared attempt waits while the source turn runs; an attempt older
-    than `PLAN_TTL_S` before its switch is failed (the source serves again).
+    A prepared attempt waits while the source turn runs; a planned attempt
+    older than `PLAN_TTL_S` is failed (the source serves again), but a
+    prepared one is never abandoned by that delay: its switch waits for the
+    end of the source turn (design 5322 §2.6).
     """
     moves = _moves(db)
     done: list[tuple[str, str]] = []
@@ -103,12 +105,15 @@ def advance(db, host: str, *, probes: Callable[[dict], Mapping[str, bool]],
                 missing = [c for c in CHECKS if verdicts.get(c) is not True]
                 error = "prepare: not ready: %s" % ", ".join(missing) if missing else ""
             if error or not cwd:
-                moves.fail(ident, error=error or "prepare: no folder")
+                moves.fail(ident, error=error or "prepare: no folder", only=("planned",))
                 done.append((ident, "failed"))
                 continue
             checks = {c: bool(verdicts.get(c)) for c in CHECKS}
             if moves.prepare(ident, target_host=host, target_cwd=cwd, checks=checks) is None:
-                if moves.fail(ident, error="prepare: expired or source moved") is not None:
+                # #7093 (relecture dev3) : une autre passe a pu préparer ou
+                # basculer la ligne entre la lecture et ici — ne pas la défaire.
+                if moves.fail(ident, error="prepare: expired or source moved",
+                              only=("planned",)) is not None:
                     done.append((ident, "failed"))
                 continue
             move = moves.get(ident) or move
@@ -117,11 +122,6 @@ def advance(db, host: str, *, probes: Callable[[dict], Mapping[str, bool]],
             switched = moves.switch(ident, target_host=host)
             if switched is not None:
                 done.append((ident, switched["state"]))
-                continue
-            fresh = moves.get(ident) or {}
-            if fresh.get("state") == "prepared" and fresh.get("stale"):
-                moves.fail(ident, error="switch: expired before the source turn ended")
-                done.append((ident, "failed"))
             else:
                 done.append((ident, "waiting"))
     return done
