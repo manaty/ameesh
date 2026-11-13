@@ -320,8 +320,22 @@ def reconcile(readings, now, *, truncated=False, plan=None, unread_before=None):
             and now - unread_before >= SHORT_WINDOW_S
         at_rest = newest is not None and now - newest >= SHORT_WINDOW_S \
             and unread_at_rest
+        # #7196: the retained short's known reset is a tighter proof than a
+        # whole short window of silence. Every turn publishes a reading; when
+        # no observation read and no unread journal is later than that reset,
+        # no turn has run since it, so the next short window is untouched
+        # (0 %). Without it the account stayed refused up to 5 h after its
+        # reset — paused, it could never produce the live short that lifts
+        # the refusal. A reading or an unread journal after the reset keeps
+        # the #2843 refusal; other hosts come in through the shared history
+        # (#5466) and the shared pause (#6961), after this reading.
+        last_reset = max((float(g.resets_at) for g in short_windows
+                          if g.resets_at), default=None)
+        idle_since_reset = last_reset is not None and newest is not None \
+            and newest < last_reset and unread_before is not None \
+            and unread_before < last_reset
         if sample_plans != {"pro"} and not short_live \
-                and not (short_windows and at_rest):
+                and not (short_windows and (at_rest or idle_since_reset)):
             missing.append("short window")
         if not any(g.window_s > 5 * 3600 for g, _limits in windows.values()):
             missing.append("weekly window")
