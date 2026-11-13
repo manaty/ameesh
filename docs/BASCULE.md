@@ -1535,7 +1535,7 @@ enrolled).
 
 ---
 
-## PostgreSQL cluster — planned switchover, minor upgrades and restore (EP8)
+## PostgreSQL cluster — planned switchover, minor upgrades, restore and real exercise (EP8)
 
 The mesh database is a three-node PostgreSQL 17 cluster under etcd 3.5 and
 Patroni 4.x (study
@@ -1761,6 +1761,100 @@ versions validated in the Patroni README; the pilot confirms the package
 source before the gesture. No preparation lot pins a PostgreSQL minor version
 or a rollback to the previous package: keep the previous `.deb` or binary on
 the node until the cluster is green.
+
+### Real cutover and exercise (EP8.6, #6863)
+
+Owner decision #207987 a: a planned database restart of 30 to 60 s, run by
+the pilot or the bureau, owner informed. This is a staging operation (canon
+§14): the **bureau** executes as root, the **pilot** announces the window,
+the lot's author checks the outputs. No agent runs these gestures.
+
+**Prerequisite**: #6959 done — `patronictl list` shows `ameesh-agents-1`
+`Leader`, `ameesh-agents-2` `Sync Standby`, `manaty-mesh-1` `Replica`
+(async), and `adopter.sh grappe` passes. Without it, stop here: the
+exercise needs Patroni.
+
+**1. The mesh moves onto the cluster** (clients, no database gesture). In
+the §14 order — VMs first, `pc-smichea` last if it is online — apply the
+EP8.5 client steps of [`EXPLOITATION.md`](EXPLOITATION.md), “DSN
+multi-hôtes”:
+
+| Client | Change | Check |
+|---|---|---|
+| `ameesh-agents-3`, `-1`, `-2` (PgBouncer) | `.pgpass` (three lines), `amont.dsn`, `server_fast_close = 1`, `pgbouncer-host.py install-amont` | `systemctl --user list-timers ameesh-pgbouncer-amont.timer`, `amont --dry-run` names the leader |
+| each node (agent account) | `patroni_url` = `https://<own private address>:8008` and `patroni_ca` = `/etc/ameesh/tls/ca.crt` (must be readable by `ameesh`) in `config.json` | `ameesh db status` shows a `patroni` line without error, verdict `OK` |
+| `manaty-mesh-1` (daily dump) | three-host DSN in `config.json` | next `ameesh-sauvegarde.service` run green |
+| BG (`bureau-goal`, native adapter) | unchanged until its own lot: it reaches the hub address only (WireGuard filter, `hotes/manaty-mesh-1.md`) and follows the leader only while the hub is primary | — |
+| `pc-smichea` | three-host DSN through the hub relay (`RESEAU-PRIVE.md`) | on its return, not before |
+
+After each host: `ameesh doctor` green, a test mail delivered
+(`agent-mail send <self> --info`). Rollback per host: `systemctl --user
+disable --now ameesh-pgbouncer-amont.timer`, `pgbouncer.ini.avant-amont`
+back in place, HUP; `config.json` from its copy.
+
+**2. Read-only rehearsal** from the operator's workstation, with
+[`deploy/serveur/patroni/exercice-grappe.json`](../deploy/serveur/patroni/exercice-grappe.json)
+(reviewed commands; each node name is an SSH alias of the operator to the
+node's **public** address, root or passwordless `sudo` — never
+`10.78.0.0/24`, which the network cut closes):
+
+```bash
+python3 deploy/serveur/patroni/banc/exercer.py --cible grappe \
+  --grappe-config deploy/serveur/patroni/exercice-grappe.json --lecture-seule
+```
+
+It must reach the three nodes and the etcd quorum. For the “PC off”
+calibration, with `pc-smichea` **on**, `ssh manaty-mesh-1 ping -c 3 -W 2
+10.77.0.2` must answer: otherwise the check of step 3 proves nothing and
+that scenario is played by observation only (`ameesh host status
+pc-smichea`, written in the report).
+
+**3. Exercise**, one scenario at a time, `--scenarios <name>`, each in its
+announced window, `ameesh db status` and `patronictl list` before and
+after. The jalon table `public.ep86_jalon` is created on
+`ameesh-agents-1` in the `postgres` database (not `ameesh`): run the first
+scenario while `ameesh-agents-1` is leader.
+
+```bash
+python3 deploy/serveur/patroni/banc/exercer.py --cible grappe --geste-reel \
+  --grappe-config deploy/serveur/patroni/exercice-grappe.json \
+  --scenarios perte-primaire --rapport "$TMPDIR/ep86-perte-primaire"
+```
+
+| Scenario | Gesture (from the cluster file) | Pass | Mesh impact |
+|---|---|---|---|
+| `perte-primaire` | `SIGKILL` of `patroni` and `etcd` on the leader (PostgreSQL dies with the unit's cgroup), then `stop` so that `Restart=on-failure` does not bring it back | new leader < 60 s (target), < 300 s (requirement); RPO 0; never two primaries; the old leader rejoins (`pg_rewind`) after `retour_noeud` | 30–60 s of reconnection |
+| `coupure-reseau` | DROP of `10.78.0.0/24` in and out on the leader, with a `systemd-run` timer that removes the rules after 600 s **set first** | same, plus the old leader demoted while cut | same |
+| `pc-eteint` | none: the PC is off (owner) and the hub's `ping` proves it | leader and etcd quorum unchanged | none |
+| `deux-noeuds` | loss of the leader and the sync standby; the hub (`nofailover`) survives | the hub does **not** promote (1 etcd voter of 3), no write without quorum, jalon present after both return — the study's documented limit | **writes stop for the whole scenario**: separate window, owner told the duration beforehand |
+
+Also measure the client side once, on `perte-primaire`:
+`verifier-clients.py` with `--tuer` (README Patroni, “Preuve côté client”):
+listener resubscribed, sweep delivered, RPO 0 on confirmed commits.
+
+**4. Clean-up and report.** After the last scenario: `patronictl list` back
+to the start state (`patronictl switchover --candidate ameesh-agents-1` if
+needed, “Planned switchover”), `DROP TABLE public.ep86_jalon` in the
+`postgres` database on the leader, `ameesh doctor` and `ameesh alerts` on
+the four hosts. The `rapport.json` and `rapport.md` of each scenario, the
+`verifier-clients.py` JSON and the before/after outputs go to lot #6863;
+`limite` is accepted only for `deux-noeuds`, `blocked` anywhere fails the
+lot.
+
+**5. Canon host cards** (`manaty/home`, reviewed PR, after step 4): the
+cards of `ameesh-agents-1`, `ameesh-agents-2` and `manaty-mesh-1` state the
+node's role in the cluster (Patroni leader candidate or `nofailover`
+voter), PostgreSQL 17, etcd 3.5.17 and Patroni versions read on the node,
+and the rollback (`retour-arriere.sh`). `manaty-mesh-1` stops being “the
+host that carries only the mesh database”; `ameesh-agents-1`'s
+“no PostgreSQL server installed” (#6291) is replaced. `federation.yaml`
+names no database address: unchanged.
+
+**Rollback** at any step: a failed scenario stops the exercise; bring the
+lost node back (`retour_noeud`, `retablissement_reseau`), then
+“Planned switchover” to `ameesh-agents-1`. Leaving Patroni altogether is
+`retour-arriere.sh` (README Patroni, “Retour arrière scripté”); the client
+rollback is step 1's.
 
 ---
 
