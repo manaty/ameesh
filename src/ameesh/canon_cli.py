@@ -949,6 +949,15 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
               row["name"], row["created_by"], row["responsible"],
               _join(row.get("capabilities")), row.get("host") or "—",
               time.strftime("%Y-%m-%d %H:%M", time.localtime(row["ephemeral_expires_ts"]))))
+    placed = row.get("placement")
+    if placed:
+        # #7107 (avatar B5) : le placement propre, pas seulement l'hôte — le
+        # runner et l'UID du tenant sont la preuve que l'enfant n'est pas sur
+        # ceux du parent.
+        print("own placement: host %s, tenant %s (uid %s, runner %s), workdir %s"
+              % (placed.get("host") or "—", placed.get("tenant") or "—",
+                 placed.get("uid") if placed.get("uid") is not None else "—",
+                 placed.get("runner") or "—", placed.get("cwd") or "—"))
     if row.get("placement_ok") is False:
         print("placement refused (not claimable): %s"
               % (row.get("placement_diagnostic") or "?"))

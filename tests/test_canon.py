@@ -1545,8 +1545,10 @@ class CanonCliTest(_CanonDbCase):
 
     def test_spawn(self):
         self.sync()
+        # #7107 : spawn lit le canon (placement des enfants d'un avatar), le
+        # banc doit donc le rendre lisible comme le fait un hôte équipé.
         proc = self.mesh("agent", "spawn", "aide", "--by", "orchestre", "--ttl", "1h",
-                         "--prompt", "premier tour")
+                         "--prompt", "premier tour", env=self.cli_env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("responsible human:alice", proc.stdout)
         self.assertEqual(self.row("aide")["pending_prompt"], "premier tour")
@@ -1559,7 +1561,7 @@ class CanonCliTest(_CanonDbCase):
         self.assertIn("refus", proc.stderr)
         self.assertIsNone(self.row("aide3"))
         proc = self.mesh("agent", "spawn", "aide3", "--by", "relecteur", "--ttl", "1h",
-                         env=self.env(AGENT_MAIL_NAME="relecteur"))
+                         env=self.cli_env(AGENT_MAIL_NAME="relecteur"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 

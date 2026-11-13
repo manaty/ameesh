@@ -794,20 +794,75 @@ class Ephemerals(interface.Ephemerals):
         )
         return rows[0] if rows else None
 
-    def create(self, name, creator, *, cwd, ttl_seconds) -> dict | None:
-        """Insertion atomique (INSERT … SELECT sur la ligne du créateur) : le
-        responsable copié est celui du créateur au moment de la création ; un
-        verdict de placement admis n'est hérité que si le profil du créateur
-        est encore le profil évalué."""
+    def create(self, name, creator, *, cwd, ttl_seconds, host=None,
+               admitted_hosts=None, credential_mode=None,
+               placement=None) -> dict | None:
+        """Insertion atomique (INSERT … SELECT sur la ligne du créateur).
+
+        Sans `host` : comportement R14, le responsable, l'hôte, le dossier et
+        le verdict de placement sont recopiés du créateur (un verdict admis
+        n'est hérité que si le profil du créateur est encore le profil évalué).
+
+        Avec `host` (#7107, avatar B5) : l'enfant est placé sur cet hôte, avec
+        ses seuls `admitted_hosts`, son mode d'identifiants et le verdict
+        `placement` évalué pour cet hôte ; `placement_profile` est calculé sur
+        la ligne écrite (hôte, harnais, fournisseur, modèle, mode), jamais
+        recopié du créateur. `cwd=None` ne reprend pas le dossier du créateur :
+        un enfant sans dossier sur son hôte n'hérite pas de celui du parent."""
+        placed = host is not None
+        if placed and placement is None:
+            raise ValueError("Ephemerals.create: a placement verdict is required with host")
+        if placed and not admitted_hosts:
+            raise ValueError("Ephemerals.create: admitted_hosts is required with host")
+        # Ordre des paramètres = ordre des `%s` dans le SQL : verrou, nom,
+        # hôte/dossier/mode, les deux durées (leur CASE précède created_by),
+        # puis la partie placée (admission, verdict, profil), le créateur.
+        params: list = [name_lock_key(name), name]
+        if placed:
+            host_expr, cwd_expr = "%s", "%s"
+            mode_expr = "%s"
+            admitted_expr = "ARRAY[%s]::text[]" % ", ".join(["%s"] * len(admitted_hosts))
+            ok_expr = "%s::boolean"
+            diagnostic_expr = "%s"
+            ref_expr = "%s"
+            profile_expr = ("ameesh_placement_profile(%s::text, c.harness, c.provider, "
+                            "c.model, %s::text)")
+            params.extend([host, cwd, credential_mode])
+            params.extend([ttl_seconds, ttl_seconds])
+            params.extend(admitted_hosts)
+            params.extend([bool(placement.get("ok")),
+                           placement.get("diagnostic") or "", placement.get("ref")])
+            params.extend([host, credential_mode])
+        else:
+            host_expr = "c.host"
+            cwd_expr = "coalesce(%s, c.cwd)"
+            mode_expr = "c.credential_mode"
+            admitted_expr = "NULL"
+            ok_expr = ("CASE WHEN c.placement_ok AND c.placement_profile "
+                       "IS DISTINCT FROM __NOW__ THEN false ELSE c.placement_ok END")
+            diagnostic_expr = (
+                "CASE WHEN c.placement_ok AND c.placement_profile "
+                "IS DISTINCT FROM __NOW__ "
+                "THEN 'profile of ' || c.name || ' diverged since the placement was "
+                "evaluated (evaluated: ' || coalesce(c.placement_profile, 'none') "
+                "|| '; current: ' || __NOW__ || '): placement not inherited, "
+                "re-evaluate with \"ameesh canon sync\"' "
+                "ELSE c.placement_diagnostic END")
+            ref_expr = "c.placement_ref"
+            profile_expr = "c.placement_profile"
+            params.append(cwd)
+            params.extend([ttl_seconds, ttl_seconds])
+        params.append(creator)
         created = self.db.query(
             """
             __LOCK__
             INSERT INTO agent_registry
                 (name, chantier, harness, host, cwd, model, responsible, team, projects, provider,
                  credential_mode, capabilities, ephemeral, ephemeral_expires_at, created_by,
+                 admitted_hosts,
                  placement_ok, placement_diagnostic, placement_ref, placement_profile, canon)
-            SELECT %s, c.chantier, c.harness, c.host, coalesce(%s, c.cwd), c.model,
-                   c.responsible, c.team, c.projects, c.provider, c.credential_mode,
+            SELECT %s, c.chantier, c.harness, __HOST__, __CWD__, c.model,
+                   c.responsible, c.team, c.projects, c.provider, __MODE__,
                    ARRAY(SELECT x FROM unnest(ARRAY['read', 'propose']::text[]) AS x
                           WHERE c.capabilities IS NULL OR x = ANY(c.capabilities)),
                    true,
@@ -815,18 +870,8 @@ class Ephemerals(interface.Ephemerals):
                         THEN least(now() + make_interval(secs => %s), c.ephemeral_expires_at)
                         ELSE now() + make_interval(secs => %s) END,
                    c.name,
-                   -- C4 : le profil de l'éphémère est celui du créateur (colonnes
-                   -- recopiées ci-dessus) ; un verdict admis n'est hérité que s'il
-                   -- a jugé ce profil
-                   CASE WHEN c.placement_ok AND c.placement_profile IS DISTINCT FROM __NOW__
-                        THEN false ELSE c.placement_ok END,
-                   CASE WHEN c.placement_ok AND c.placement_profile IS DISTINCT FROM __NOW__
-                        THEN 'profile of ' || c.name || ' diverged since the placement was '
-                             || 'evaluated (evaluated: ' || coalesce(c.placement_profile, 'none')
-                             || '; current: ' || __NOW__ || '): placement not inherited, '
-                             || 're-evaluate with "ameesh canon sync"'
-                        ELSE c.placement_diagnostic END,
-                   c.placement_ref, c.placement_profile,
+                   __ADMITTED__,
+                   __OK__, __DIAGNOSTIC__, __REF__, __PROFILE__,
                    -- L42 (0031) : l'éphémère appartient au canon de son créateur
                    c.canon
               FROM agent_registry c
@@ -836,11 +881,23 @@ class Ephemerals(interface.Ephemerals):
                AND c.status <> 'stopped'
                AND (NOT c.ephemeral OR c.ephemeral_expires_at > now())
             ON CONFLICT (name) DO NOTHING
-            RETURNING name, responsible, host, harness, capabilities, created_by,
+            RETURNING name, responsible, host, cwd, harness, capabilities, created_by,
                       placement_ok, placement_diagnostic,
                       extract(epoch from ephemeral_expires_at)::float8 AS ephemeral_expires_ts
-            """.replace("__LOCK__", NAME_LOCK_CTE).replace("__NOW__", profile_sql("c")),
-            (name_lock_key(name), name, cwd, ttl_seconds, ttl_seconds, creator),
+            """
+            .replace("__LOCK__", NAME_LOCK_CTE)
+            .replace("__HOST__", host_expr)
+            .replace("__CWD__", cwd_expr)
+            .replace("__MODE__", mode_expr)
+            .replace("__OK__", ok_expr)
+            .replace("__DIAGNOSTIC__", diagnostic_expr)
+            .replace("__REF__", ref_expr)
+            .replace("__PROFILE__", profile_expr)
+            .replace("__ADMITTED__", admitted_expr)
+            # après l'insertion des expressions : __NOW__ vit dans __OK__ et
+            # __DIAGNOSTIC__ (héritage du créateur), pas dans le SQL nu
+            .replace("__NOW__", profile_sql("c")),
+            tuple(params),
         )
         return created[0] if created else None
 
