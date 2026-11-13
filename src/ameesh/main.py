@@ -21,8 +21,6 @@
   ameesh agent spawn <name> --by <creator> --ttl <duration>
         [--tool T] [--mcp M] [--context F]   ephemeral child, restricted
         to a subset of the parent's tools/MCP, with a bounded context;
-  ameesh child report --kind progress|question|final [--body-file F|--text T]
-        the child's report to its parent (journal + mail);
   ameesh alerts [--follow] [--json]     operational alerts (one object per line);
   ameesh approvals            list signed approvals;
   ameesh approve              sign an approval;
@@ -53,6 +51,8 @@
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
         session (L123);
+  ameesh child report --kind progress|question|final [--body-file F|--text T]
+        the child's report to its parent (journal + mail);
   ameesh ci status <lot> [--limit N] [--json]
         latest CI runs and failing tests of a {work};
   ameesh conflicts [--all] [--json]     conflict radar between {works} (L160b);

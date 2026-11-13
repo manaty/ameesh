@@ -426,6 +426,14 @@ FERMEES = {
     # supervision : colonne fermée aux deux rôles superviseur, aucun GRANT
     # modifié.
     "runner_presence": {"profiles"},
+    # #7034 (0571) : état privé d'un enfant restreint (politique d'outils et
+    # de MCP, contexte borné, état des rapports) ; rien à superviser ici, le
+    # rôle de base n'en lit aucune colonne, aucun GRANT ajouté.
+    "spawn_profiles": {"child", "parent", "harness", "tools", "mcp",
+                       "mcp_servers", "config_digest", "created_at"},
+    "spawn_contexts": {"child", "parent", "digest", "bytes", "text", "created_at"},
+    "spawn_reports": {"child", "seq", "started_at", "final_at", "final_status",
+                      "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

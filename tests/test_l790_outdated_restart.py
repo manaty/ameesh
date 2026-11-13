@@ -210,7 +210,7 @@ class SelectedTurnRefusedTest(unittest.TestCase):
         state_dir = tempfile.TemporaryDirectory()
         self.addCleanup(state_dir.cleanup)
         worker = types.SimpleNamespace(
-            runner=runner, db=object(), name="perime", epoch=1, fast_failure=True,
+            runner=runner, db=object(), name="perime", epoch=1, fast_failure=True, agent=None,
             _attach_pending=lambda: False, _session_lock=mock.Mock(),
             resident=object(), state_dir=state_dir.name,
             # #2810 : l'enveloppe efface les messages servis à la fin du tour.
@@ -221,6 +221,9 @@ class SelectedTurnRefusedTest(unittest.TestCase):
             # la doublure n'a pas de document, le rappel est inerte.
             _release_turn_memory=lambda *a, **k: None,
             _purge_turn_context=lambda: None,
+            # B 40580/#7034 : l'enveloppe balaie les rapports d'enfants avant
+            # le tour ; la doublure n'a pas d'enfants, le rappel est inerte.
+            _sweep_child_reports=lambda: None,
             # #6487 : l'enveloppe clôt l'entrée de relance A11 dans son
             # `finally` ; ce tour-ci n'en porte pas (`_retry_key` absent), le
             # journal de relance est couvert par test_6487_runner_retry_journal.
