@@ -377,10 +377,14 @@ class ChildReportTest(_CanonDbCase):
                             self.cwd)
         spawn.write_context(directory, text)
         marker = child_reports.cleanup_path(self.cfg, "aide8")
+        temporary = os.path.join(directory, spawn.CONTEXT_FILE + ".999999.tmp")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(text)
         real_unlink = os.unlink
 
         def refuse_context(path):
-            if str(path).endswith(spawn.CONTEXT_FILE):
+            path = str(path)
+            if path.endswith(spawn.CONTEXT_FILE) or path.endswith(".tmp"):
                 raise PermissionError(path)
             return real_unlink(path)
 
@@ -388,12 +392,38 @@ class ChildReportTest(_CanonDbCase):
         with mock.patch("ameesh.child_reports.os.unlink", side_effect=refuse_context):
             self.assertFalse(child_reports.remove_state(self.cfg, "aide8"))
         self.assertTrue(os.path.exists(os.path.join(directory, spawn.CONTEXT_FILE)))
+        self.assertTrue(os.path.exists(temporary))
         with open(marker, encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["pid"], 0)
         # Rétabli : la tâche conservée s'exécute au balayage suivant.
         self.assertEqual(child_reports.sweep_local(self.cfg), ["aide8"])
         self.assertFalse(os.path.exists(os.path.join(directory, spawn.CONTEXT_FILE)))
+        self.assertFalse(os.path.exists(temporary))
         self.assertFalse(os.path.exists(marker))
+
+    def test_private_temporaries_of_a_dead_write_are_removed(self):
+        # B 40621 : `write_private` tué entre l'écriture et `os.replace`
+        # laisse `<fichier>.<pid>.tmp` avec le texte privé.
+        text = "turn context\n"
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        canon_sync.spawn(self.db, "aide9", "orchestre", 3600, canon=self.load(),
+                         tools=["git"], context=(text, digest))
+        directory = self.cfg.agent_dir("aide9")
+        child_reports.begin_turn(self.cfg, "aide9")
+        spawn.write_profile(directory, storage.of(self.db).ephemerals.profile("aide9"),
+                            self.cwd)
+        spawn.write_context(directory, text)
+        temporaries = [spawn.CONTEXT_FILE + ".123456.tmp",
+                       spawn.MCP_FILE + ".123456.tmp"]
+        for filename in temporaries:
+            with open(os.path.join(directory, filename), "w", encoding="utf-8") as handle:
+                handle.write(text)
+        self.assertTrue(child_reports.remove_state(self.cfg, "aide9"))
+        for filename in temporaries + [spawn.CONTEXT_FILE, spawn.PROFILE_FILE,
+                                       spawn.MCP_FILE]:
+            self.assertFalse(os.path.exists(os.path.join(directory, filename)),
+                             filename)
+        self.assertFalse(os.path.exists(child_reports.cleanup_path(self.cfg, "aide9")))
 
     def test_a_final_report_purges_the_context_even_before_expiry(self):
         text = "private context\n"

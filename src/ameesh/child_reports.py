@@ -342,33 +342,55 @@ def _mark_orphan(cfg, child: str) -> None:
         pass
 
 
-def _remove_child_state(cfg, child: str) -> bool:
-    """Remove the private files and the cleanup task.
-
-    True only when every unlink is confirmed (missing counts as gone). On any
-    failure the marker is kept — and marked orphan so any sweep retries it —
-    instead of announcing a cleanup that did not happen (B 40616).
-    """
-    directory = cfg.agent_dir(child)
-    clean = True
-    for name in (spawn.CONTEXT_FILE, spawn.PROFILE_FILE, spawn.MCP_FILE):
-        try:
-            os.unlink(os.path.join(directory, name))
-        except FileNotFoundError:
-            pass
-        except OSError:
-            clean = False
-    if not clean:
-        _mark_orphan(cfg, child)
-        return False
+def _unlink(directory: str, name: str) -> bool:
     try:
-        os.unlink(cleanup_path(cfg, child))
+        os.unlink(os.path.join(directory, name))
     except FileNotFoundError:
         pass
     except OSError:
-        # The files are gone: no privacy leak remains. The stale marker is
-        # harmless and a dead writer's next sweep removes it.
-        pass
+        return False
+    return True
+
+
+def _remove_named(directory: str, names: tuple[str, ...]) -> bool:
+    """Remove `names` and their private `.<pid>.tmp` leftovers (B 40621).
+
+    `spawn.write_private` writes `<name>.<pid>.tmp` then replaces it; a
+    process killed in between leaves the temporary holding the private text.
+    The agent directory is private (0700), but the text must still go.
+    """
+    clean = True
+    try:
+        entries = os.listdir(directory)
+    except FileNotFoundError:
+        entries = []
+    except OSError:
+        return False
+    for name in names:
+        if not _unlink(directory, name):
+            clean = False
+        prefix = name + "."
+        for entry in entries:
+            if entry.startswith(prefix) and entry.endswith(".tmp") \
+                    and not _unlink(directory, entry):
+                clean = False
+    return clean
+
+
+def _remove_child_state(cfg, child: str) -> bool:
+    """Remove the private files, their temporaries and the cleanup task.
+
+    True only when every unlink is confirmed (missing counts as gone). On any
+    failure the marker is kept — and marked orphan so any sweep retries it —
+    instead of announcing a cleanup that did not happen (B 40616, B 40621).
+    """
+    clean = _remove_named(cfg.agent_dir(child),
+                          (spawn.CONTEXT_FILE, spawn.PROFILE_FILE, spawn.MCP_FILE))
+    marker = cleanup_path(cfg, child)
+    clean = _remove_named(os.path.dirname(marker), (os.path.basename(marker),)) and clean
+    if not clean:
+        _mark_orphan(cfg, child)
+        return False
     return True
 
 
