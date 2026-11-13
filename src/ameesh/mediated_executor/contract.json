@@ -4623,14 +4623,18 @@
     "start"
    ],
    "accounts": [
+    "consume_exception",
     "declared",
     "force_switch",
     "hold",
     "holds",
     "identities",
     "init_active",
+    "lock_exception",
+    "pending_exceptions",
     "placement_state",
     "publish_identity",
+    "register_exception",
     "release",
     "set_auto",
     "switch",

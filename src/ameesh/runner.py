@@ -2827,9 +2827,13 @@ class AgentWorker(threading.Thread):
         except (accounts_mod.AccountError, OSError) as exc:
             log_async("[%s] account ceiling check skipped (%s)"
                       % (self.name, " ".join(str(exc).split())[:160]))
+            if getattr(self, "_account_exception_live", None) is not None:
+                return "signed account exception quota observation unavailable"
             return None
         profile = accounts_mod.by_name(items, compte.name)
         if profile is None:
+            if getattr(self, "_account_exception_live", None) is not None:
+                return "signed account exception profile unavailable"
             return None
         try:
             limites = self.runner.budget_limits(self.db)
@@ -2844,13 +2848,20 @@ class AgentWorker(threading.Thread):
         except Exception as exc:  # noqa: BLE001 — observation seule
             log_async("[%s] account ceiling check skipped (%s)"
                       % (self.name, " ".join(str(exc).split())[:160]))
+            if getattr(self, "_account_exception_live", None) is not None:
+                return "signed account exception quota observation unavailable"
             return None
         # #6961 (l242b) : `hard_all` — un plafond qui vaut aussi pour un agent
         # critique. Le plafond implicite de 50 % d'un non-critique ne clôt pas
         # le tour en vol et ne se publie pas en pause partagée : elle
         # écarterait un critique autorisé au-delà (défaut l242b).
+        exception_live = getattr(self, "_account_exception_live", None) is not None
+        exception_reason = None
+        if exception_live:
+            from . import account_exception
+            exception_reason = account_exception.ceiling_reason(self, profile, ev, now=now)
         if not ev.hard_all or ev.until is None or float(ev.until) <= now:
-            return None
+            return exception_reason
         raison = "account hard cap: %s (%s)" % (profile.name, ev.reason)
         try:
             storage.of(self.db).accounts.publish_account_pause(
@@ -2861,6 +2872,10 @@ class AgentWorker(threading.Thread):
         except Exception as exc:  # noqa: BLE001 — la clôture locale reste due
             log_async("[%s] shared account pause not published (%s)"
                       % (self.name, " ".join(str(exc).split())[:160]))
+        if exception_live:
+            if exception_reason is None:
+                return None
+            raison = exception_reason
         log_async("[%s] %s: turn closed at the next safe point"
                   % (self.name, raison))
         return raison
@@ -9414,9 +9429,18 @@ class AgentWorker(threading.Thread):
 
         def begin(tx):
             nonlocal begin_reason
-            begin_reason = registry.begin_turn_diagnosed(
-                tx, self.name, self.runner.runner_id, self.epoch, marqueurs)
-            return begin_reason == "started"
+            from . import account_exception
+
+            def open_turn(connection):
+                nonlocal begin_reason
+                begin_reason = registry.begin_turn_diagnosed(
+                    connection, self.name, self.runner.runner_id, self.epoch, marqueurs)
+                return begin_reason == "started"
+
+            admitted = account_exception.begin(self, compte, open_turn, db=tx)
+            if not admitted and begin_reason == "unknown":
+                begin_reason = "account exception no longer valid"
+            return admitted
 
         admission = account_window.claim_start(
             self.db, harness, getattr(compte, "name", None), self.cfg.host,

@@ -39,6 +39,32 @@ def _verrou_placement(tx, host, harness) -> None:
 
 
 class Accounts(interface.Accounts):
+    def register_exception(self, decision_id, agent, harness, account):
+        self.db.execute(
+            "with added as ("
+            " insert into account_turn_exceptions(decision_id, agent, harness, account)"
+            " values (%s, %s, %s, %s) on conflict (decision_id) do nothing returning agent)"
+            " select pg_notify('ameesh_budget',"
+            " json_build_object('scope', 'agent:' || agent)::text) from added",
+            (int(decision_id), agent, harness, account))
+
+    def pending_exceptions(self, agent, harness):
+        return self.db.query(
+            "select decision_id from account_turn_exceptions"
+            " where agent = %s and harness = %s and consumed_at is null"
+            " order by decision_id", (agent, harness))
+
+    def lock_exception(self, decision_id):
+        return bool(self.db.query(
+            "select decision_id from account_turn_exceptions"
+            " where decision_id = %s and consumed_at is null for update",
+            (int(decision_id),)))
+
+    def consume_exception(self, decision_id, host):
+        self.db.execute(
+            "update account_turn_exceptions set consumed_at = clock_timestamp(),"
+            " consumed_host = %s where decision_id = %s and consumed_at is null",
+            (host, int(decision_id)))
 
     def active(self, host, harness) -> dict | None:
         rows = self.db.query(_ACTIVE, (host, harness))

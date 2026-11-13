@@ -87,6 +87,8 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None,
     budget) : une simulation, un affichage ou un test ne sonde pas le réseau.
     """
     harness = own_harness(worker)        # L242b (3) : toujours le sien d'abord
+    worker._account_exception = None
+    worker._account_exception_live = None
     try:
         items = accounts.profiles(worker.cfg, harness)
     except accounts.AccountError as exc:
@@ -123,6 +125,15 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None,
                 if pause else None)
     if choice.switched:
         journal(worker, harness, choice.switched)
+    if choice.profile is None:
+        from . import account_exception
+        exception = account_exception.preview(worker, items, book, margin=bool(margin))
+        if exception is not None:
+            profile, decision_id = exception
+            worker._account_exception = decision_id
+            worker._account_exception_margin = bool(margin)
+            choice = accounts.Choice(profile, profile, per_agent=True,
+                                      why="signed one-turn exception, decision #%d" % decision_id)
     if choice.profile is None:
         # garde de budget désactivée (`pause=False`) : `accounts.choose` a déjà
         # levé le rythme ; il ne reste que des comptes en overage ou au-dessus

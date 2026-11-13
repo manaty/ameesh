@@ -240,6 +240,8 @@ FERMEES = {
     # aucun rôle superviseur ne la lit, aucun GRANT modifié.
     "account_pauses": {"harness", "account", "until_ts", "observed_at", "reason",
                        "source", "created_at", "updated_at"},
+    "account_turn_exceptions": {"decision_id", "agent", "harness", "account",
+                                "registered_at", "consumed_at", "consumed_host"},
     # #1922 (0452) : registre Process des workflows (révision/étape, reçus d'étape) —
     # fermé tant que le contrat des rôles superviseur ne le classe pas (paquet du 16/10)
     "work_items": {"workflow_ref", "workflow_stage", "workflow_version"},
