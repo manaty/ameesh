@@ -405,8 +405,8 @@ def body_of(project: str, item: Measure, since_ts: float, now: float,
     if losses:
         lines.append("Quota perdu au reset si rien ne change : %s." % "; ".join(losses))
     lines += [
-        "Feuille de route : la source déclarée du projet (docs/ROADMAP.md, décisions "
-        "owner `ameesh decide`).",
+        "Feuille de route : le plan du projet dans le canon (fiches WorkPackage "
+        "sous `plan/%s/`) et les décisions owner (`ameesh decide`)." % project,
         "",
         "Attendu du pilote : des lots démarrables, d'au plus une journée chacun et de "
         "classe conforme au §1 du canon, pour %d agent(s) ; ce lot se ferme quand la "
