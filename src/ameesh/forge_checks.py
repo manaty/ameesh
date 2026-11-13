@@ -400,11 +400,12 @@ def doctor_lines(cfg, db, *, gh=None) -> tuple:
     droits, une lecture passagère ou un `gh` sans jeton restent des
     non-concluants : ils n'affaiblissent aucune source, ils ne bloquent pas
     (§3). Hors candidat d'un rôle élu, rien n'est vérifié : cet hôte ne
-    fusionne pas au nom du mesh."""
+    fusionne pas au nom du mesh. #7059 : un rôle `releve: preference` (avatar)
+    n'en est pas un, ses hôtes candidats ne sont pas tenus à cette garde."""
     from . import role_standings_pg
     lines: list = []
     try:
-        roles = role_standings_pg.elected_roles(db, cfg.host)
+        roles = role_standings_pg.election_roles(db, cfg.host)
     except Exception as exc:  # noqa: BLE001 - une lecture ne casse pas le doctor
         return False, ["not checked (elected roles unreadable: %s)" % _one_line(exc)]
     if not roles:

@@ -431,8 +431,12 @@ doublon ; le tri n'est appliqué qu'à l'affichage et aux diagnostics. La
 colonne `agent_registry.admitted_hosts` garde cet ordre ; un nouveau champ
 `preference_rank` (ou l'index dans la liste) est écrit dans
 `agent_candidates` pour chaque hôte candidat. `releve: preference` exige que
-tous les hôtes de la liste soient des candidats évalués ; un hôte non admis
-est une erreur `agent-preference-host-not-admitted`.
+tous les hôtes de la liste soient des candidats évalués. Les candidats étant
+les hôtes du Placement eux-mêmes, aucun ne peut être « non admis » ; un hôte
+du Placement que sa politique refuse donne l'erreur
+`placement-policy-violation` portant `candidate=<agent>` (ERROR, fermeture
+sûre de ce seul candidat, comme pour `election`) — tel que livré par #7048,
+aligné par #7059 ; il n'y a pas de code `agent-preference-host-not-admitted`.
 
 **Présence.** Un hôte est **présent** pour un agent si, au moment du claim :
 

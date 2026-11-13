@@ -525,6 +525,11 @@ claims at once and the cloud waits 20 s; with the workstation absent, the
 cloud is rank 0 and claims the free lease at once. The availability
 hysteresis and the planned handover stay `election`-only: the return to the
 preferred host while the cloud holds the lease is sub-lot B2.
+`ameesh role status` lists these roles with the elected ones (#7059): the
+header says `releve: preference` and each candidate line carries its
+`(pref N)`; `--json` has `releve` and `preference_rank`. The merge guard of
+`ameesh doctor` (#6832) stays `election`-only: an avatar's candidate host
+does not merge on behalf of the mesh.
 
 ## Standby executors and the election briefing (L165/EP3)
 
