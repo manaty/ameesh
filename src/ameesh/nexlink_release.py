@@ -879,63 +879,35 @@ def _handoff_delivered(delivery, recipient) -> bool:
     return bool(recipient and isinstance(delivery, dict) and delivery.get(recipient))
 
 
-def staging_migration_preflight(project, pending, required, db=None):
-    """#7364: refuse unsafe SQL before issuing any staging instruction."""
+def staging_migration_preflight(project, pending, required):
+    """Advisory only: the Git delta is not the applicator's pending inventory.
+
+    No staging or ameesh proof-store access is made from this handoff reader.
+    The applicator uses `ameesh staging-migrations` for the blocking check.
+    """
     from . import staging_migrations as sm
     if not required:
         return []
-
-    def read_file(path):
-        return subprocess.run(["git", "-C", project.repo, "show",
-                               pending["sha"] + ":" + path], capture_output=True,
-                              check=True, timeout=30).stdout
-
-    def read_notes(lot):
-        from . import work
-        if db is None:
-            return []
-        carrier = work.get(db, lot)
-        if not carrier or carrier.get("app") != project.name:
-            return []
-        return [row.get("note", "") for row in
-                work.events_noted(db, lot, sm.NOTE_PREFIX)]
-
-    def signed_decision(identifier, text):
-        from . import decisions
-        if db is None:
-            return False
-        view = decisions.get(db, identifier)
-        scoped = "project:%s %s" % (rc.github_slug(project), text)
-        if (not view or view.get("state") != "answered"
-                or scoped not in ((view.get("answer") or {}).get("text") or "").splitlines()):
-            return False
-        try:
-            decisions.require_current(db, view)
-            return decisions.verify_proof(db, view)[0]
-        except decisions.DecisionError:
-            return False
-
     try:
-        policy = sm.load_policy(read_file(sm.POLICY_PATH).decode("utf-8"))
+        tree = sm.GitTree(project.repo, pending["sha"])
+        policy = tree.policy()
         found = {}
         for rows in required.values():
             for row in rows:
                 path = "supabase/migrations/" + row["name"] + ".sql"
                 if path in found:
                     continue
-                data = read_file(path)
-                if hashlib.sha256(data).hexdigest() != row["checksum"]:
-                    raise sm.Refused(path + ": frozen migration checksum differs")
-                result = sm.check(path, data, policy, read_file=read_file,
-                                  read_notes=read_notes, signed_decision=signed_decision)
+                result = sm.classify(tree.read(path).decode("utf-8"), policy)
                 found[path] = dict(path=path, checksum=row["checksum"],
-                                   classification=result.kind, reasons=list(result.reasons))
+                                   classification=result.kind, reasons=list(result.reasons),
+                                   warning=("" if result.kind == "additive" else
+                                            "applicator must verify declaration/proof if pending"))
         return list(found.values())
-    except (sm.Refused, UnicodeError, subprocess.CalledProcessError) as exc:
-        raise rc.ReleaseError("staging migration preflight refused: %s" % exc) from exc
+    except (sm.Refused, UnicodeError) as exc:
+        return [dict(classification="unknown", warning=str(exc))]
 
 
-def handoff_preflight(project, pending, db=None):
+def handoff_preflight(project, pending):
     """B1 dev3: every check that can refuse a handoff, run before the tag.
 
     The frozen staging workflows (closed list, deploy jobs) and the delta's
@@ -943,7 +915,7 @@ def handoff_preflight(project, pending, db=None):
     for workflow in STAGING_WORKFLOWS:
         staging_jobs(project, pending["sha"], workflow)
     required = migration_requirements(project, pending["sha"], pending["main"])
-    classified = staging_migration_preflight(project, pending, required, db)
+    classified = staging_migration_preflight(project, pending, required)
     return {"migration_safety": classified,
             "migrations": [{"target": target, "version": row["version"],
                             "name": row["name"], "checksum": row["checksum"]}
@@ -1043,6 +1015,12 @@ def _handoff_open(cfg, db, project, pending, now, save):
            ", ".join("%s %s" % (row["target"], row["name"]) for row in rows) or "aucune",
            ", ".join(STAGING_WORKFLOWS), pending["version"], project.staging_handoff,
            command, when.strftime("%d/%m %H:%MZ")))
+    warnings = ["%s: %s %s" % (row.get("path", "migration inventory"),
+                                   row.get("classification", "unknown"), row["warning"])
+                for row in pending["handoff_preflight"].get("migration_safety", [])
+                if row.get("warning")]
+    if warnings:
+        instructions += "\nSQL advisory (Git delta, not pending inventory):\n" + "\n".join(warnings)
     # #6039 N5: `reported` is durable after the bureau's delivery, not before:
     # a crash or a caught mail failure between this save and `_announce` is
     # retried by the next tick (`_handoff_reannounce`), without waiting for
@@ -1455,10 +1433,10 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 active += 1
         if not ready:
             return dict(pending, result="waiting-ci")
-        if (not pending["empty"]
+        if (not pending["empty"] and project.staging_handoff
                 and "migration_safety" not in pending.get("handoff_preflight", {})):
             try:
-                pending["handoff_preflight"] = handoff_preflight(project, pending, db)
+                pending["handoff_preflight"] = handoff_preflight(project, pending)
             except rc.TransientReleaseError:
                 # #6039 N9: a git timeout or a transient read keeps the
                 # pending for the next tick; it must not close the cutoff in

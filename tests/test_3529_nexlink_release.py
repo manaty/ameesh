@@ -91,17 +91,17 @@ class GitTests(unittest.TestCase):
         required = nx.migration_requirements(self.project, sha, self.base)
         # An additive working copy cannot hide the frozen relaxation.
         (self.repo / name).write_text("CREATE TABLE innocent (id int);")
-        with self.assertRaisesRegex(rc.ReleaseError, "796_relax.*relaxation"):
-            nx.staging_migration_preflight(self.project, pending, required)
-        # An absent policy refuses even otherwise additive SQL.
-        sha = self.commit("supabase/migrations/798_new.sql", "CREATE TABLE x (id int);")
+        report = nx.staging_migration_preflight(self.project, pending, required)
+        self.assertEqual(report[0]["classification"], "relaxation")
+        self.assertIn("applicator", report[0]["warning"])
+        # No project policy is needed for additive defaults.
+        self.commit("supabase/migrations/798_new.sql", "CREATE TABLE x (id int);")
         self.git("rm", ".ameesh/staging-migrations.json")
         self.git("commit", "-qm", "remove policy")
-        sha = self.git("rev-parse", "HEAD").strip()
-        pending["sha"] = sha
-        with self.assertRaisesRegex(rc.ReleaseError, "preflight refused"):
-            nx.staging_migration_preflight(self.project, pending,
-                                           nx.migration_requirements(self.project, sha, self.base))
+        pending["sha"] = self.git("rev-parse", "HEAD").strip()
+        report = nx.staging_migration_preflight(self.project, pending,
+                    nx.migration_requirements(self.project, pending["sha"], self.base))
+        self.assertTrue(all(row["classification"] == "additive" for row in report))
 
     def test_migration_checksum_and_ledger_gate(self):
         sha = self.commit("supabase/migrations/540_expiry.sql", "select 1;\n")
@@ -267,22 +267,6 @@ class PipelineTests(unittest.TestCase):
         patcher = mock.patch.object(nx, "release_tags", return_value={})
         patcher.start()
         self.addCleanup(patcher.stop)
-
-        patcher = mock.patch.object(nx, "handoff_preflight",
-                                    return_value={"migrations": [], "migration_safety": []})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_non_handoff_staging_also_refuses_before_tag_or_dispatch(self):
-        with mock.patch.object(nx, "handoff_preflight",
-                               side_effect=rc.ReleaseError("unsafe migration")), \
-                mock.patch.object(nx, "drop_abandoned"), \
-                mock.patch.object(nx, "workflow_step", return_value=True) as dispatch, \
-                mock.patch.object(nx, "publish") as publish:
-            with self.assertRaisesRegex(rc.ReleaseError, "unsafe migration"):
-                rc.execute(self.cfg, None, self.project, now=100000)
-            publish.assert_not_called()
-            self.assertTrue(all(not call.kwargs["staging"] for call in dispatch.call_args_list))
 
     def test_resume_frozen_cutoff_outside_window_without_new_snapshot(self):
         with mock.patch.object(nx, "snapshot") as snapshot, \

@@ -622,8 +622,6 @@ class HandoffPipelineTests(unittest.TestCase):
         import subprocess as sp
         staging, migrations = "staging_jobs", "migration_requirements"
         for target, error, expected in (
-                ("staging_migration_preflight", rc.ReleaseError("unsafe migration 796"),
-                 "unsafe migration 796"),
                 (staging, rc.ReleaseError("Deployment environment must be literal staging"),
                  "literal staging"),
                 (staging, sp.CalledProcessError(128, ["git", "show", "x:.github/workflows/deploy-api.yml"]),
@@ -649,18 +647,17 @@ class HandoffPipelineTests(unittest.TestCase):
                 self.assertIn("refusée avant le tag", self.sent[-1][0])
                 self.assertIn("--force", self.sent[-1][0])
 
-    def test_historical_preflight_without_safety_cannot_bypass_new_gate(self):
+    def test_historical_preflight_gains_advisory_without_blocking_handoff(self):
         self.pending["handoff_preflight"] = {"migrations": []}
         rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {
             "nexlink": {"pending_nexlink": self.pending}}})
-        with mock.patch.object(nx, "staging_migration_preflight",
-                               side_effect=rc.ReleaseError("unsafe cached migration")), \
-                mock.patch.object(nx, "drop_abandoned"), \
-                mock.patch.object(nx, "workflow_step", return_value=True), \
-                mock.patch.object(nx, "publish") as publish:
-            with self.assertRaisesRegex(rc.ReleaseError, "unsafe cached migration"):
-                self.run_tick(1000)
-            publish.assert_not_called()
+        warnings = [{"path": "796.sql", "classification": "unknown",
+                     "warning": "check explicit applicator inventory"}]
+        with mock.patch.object(nx, "staging_migration_preflight", return_value=warnings) as advisory:
+            self.assertEqual(self.handed_over()["result"], "waiting-attestation")
+        advisory.assert_called_once()
+        self.assertIn("796.sql", self.sent[-1][0])
+        self.assertIn("SQL advisory", self.sent[-1][0])
 
     def test_preflight_refusal_is_not_reported_twice(self):
         """#6039 N8: `_report_error` must not claim a closed pending is kept."""

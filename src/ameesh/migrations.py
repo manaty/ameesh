@@ -566,7 +566,7 @@ def non_additive(migration: Migration) -> list[str]:
     return reasons
 
 
-def _lex(sql: str) -> tuple[list[str], str, bool, str]:
+def _lex(sql: str, *, dollar_handler=None, allow_inline_comments=False) -> tuple[list[str], str, bool, str]:
     """(chaînes, texte sans commentaires ni chaînes, lecture sûre, source sans
     documentation), en une seule passe : le délimiteur d'une chaîne ne se lit
     jamais dans un commentaire, ni l'inverse. Un identifiant cité devient un
@@ -576,13 +576,17 @@ def _lex(sql: str) -> tuple[list[str], str, bool, str]:
     (il finit au LF ou au CR seul, comme PostgreSQL). #6153 : le littéral
     '…' d'un COMMENT ON … IS hors chaîne est de la documentation, jamais
     exécutée : il n'est ni dans les chaînes ni dans la source rendue ; un
-    littéral $$ y reste une chaîne, par prudence."""
+    littéral $$ y reste une chaîne, par prudence. Le lecteur staging peut
+    remplacer les corps dollar par des jetons via `dollar_handler` et admettre
+    les commentaires internes (toujours remplacés par un espace) ; les
+    appelants historiques conservent exactement leurs valeurs par défaut."""
     strings, code, at, size, sure = [], [], 0, len(sql), True
     prose = []
     while at < size:
         two = sql[at:at + 2]
         dollar = _DOLLAR_TAG.match(sql, at) if sql[at] == "$" else None
-        if two == "/*" and "".join(code).rsplit(";", 1)[-1].strip():
+        if (not allow_inline_comments and two == "/*"
+                and "".join(code).rsplit(";", 1)[-1].strip()):
             sure = False
         if two == "--":
             end = sql.find("\n", at)
@@ -623,6 +627,8 @@ def _lex(sql: str) -> tuple[list[str], str, bool, str]:
                 code.append('"_"')
             elif not dollar and _COMMENT_IS.search("".join(code).rsplit(";", 1)[-1]):
                 prose.append((at, end)), code.append(" ")
+            elif dollar and dollar_handler is not None and closing >= 0:
+                code.append(dollar_handler(sql[at:end]))
             else:
                 strings.append(sql[at:end]), code.append(" ")
             at = end
