@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=ameesh CI: detect and recover failed runner services (#7319)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ameesh-ci-runner-recover
+TimeoutStartSec=90
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ameesh-ci-runner-recover
+SyslogLevelPrefix=yes

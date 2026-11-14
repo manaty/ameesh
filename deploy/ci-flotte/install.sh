@@ -18,6 +18,9 @@
 #       host before a planned stop
 #   /etc/systemd/system/ameesh-ci-runner-drain.{service,timer}
 #                                                   the pass, every 5 min
+#   /usr/local/sbin/ameesh-ci-runner-recover and its service/timer:
+#       recover failed services every minute, under the drain lock (#7319);
+#       inactive (deliberately stopped) and active runners are left alone
 #
 #   sudo deploy/ci-flotte/install.sh --dry-run --install
 #   sudo deploy/ci-flotte/install.sh --install
@@ -38,6 +41,9 @@ TOOL=/usr/local/sbin/ameesh-ci-runner-drain
 UNITS=/etc/systemd/system
 SERVICE=ameesh-ci-runner-drain.service
 TIMER=ameesh-ci-runner-drain.timer
+RECOVER_SERVICE=ameesh-ci-runner-recover.service
+RECOVER_TIMER=ameesh-ci-runner-recover.timer
+RECOVER_TOOL=/usr/local/sbin/ameesh-ci-runner-recover
 DRY=0
 MODE=""
 
@@ -72,7 +78,9 @@ place() {  # place SRC DEST MODE
 check() {
   local ko=0
   for pair in "needrestart-ameesh-ci.conf:$CONF" "ci-runner-drain.py:$TOOL" \
-      "$SERVICE:$UNITS/$SERVICE" "$TIMER:$UNITS/$TIMER"; do
+      "$SERVICE:$UNITS/$SERVICE" "$TIMER:$UNITS/$TIMER" \
+      "ci-runner-recover.py:$RECOVER_TOOL" \
+      "$RECOVER_SERVICE:$UNITS/$RECOVER_SERVICE" "$RECOVER_TIMER:$UNITS/$RECOVER_TIMER"; do
     local src=$HERE/${pair%%:*} dest=$R${pair#*:}
     if [ ! -f "$dest" ]; then echo "KO missing: $dest"; ko=1
     elif ! cmp -s "$src" "$dest"; then echo "KO differs from the checkout: $dest"; ko=1
@@ -81,6 +89,8 @@ check() {
   if [ -z "$R" ]; then
     if systemctl is-active --quiet "$TIMER"; then echo "OK $TIMER active"
     else echo "KO $TIMER not active"; ko=1; fi
+    if systemctl is-active --quiet "$RECOVER_TIMER"; then echo "OK $RECOVER_TIMER active"
+    else echo "KO $RECOVER_TIMER not active"; ko=1; fi
     # the proof that counts: needrestart, in its own words, defers the runners
     if command -v needrestart >/dev/null && \
         perl -e 'our %nrconf; do $ARGV[0]; my @d = grep { "actions.runner.x.service" =~ /$_/ && !$nrconf{override_rc}{$_} } keys %{$nrconf{override_rc}}; exit(@d ? 0 : 1)' \
@@ -99,9 +109,12 @@ case "$MODE" in
     place "$HERE/ci-runner-drain.py" "$TOOL" 0755
     place "$HERE/$SERVICE" "$UNITS/$SERVICE" 0644
     place "$HERE/$TIMER" "$UNITS/$TIMER" 0644
+    place "$HERE/ci-runner-recover.py" "$RECOVER_TOOL" 0755
+    place "$HERE/$RECOVER_SERVICE" "$UNITS/$RECOVER_SERVICE" 0644
+    place "$HERE/$RECOVER_TIMER" "$UNITS/$RECOVER_TIMER" 0644
     if [ -z "$R" ]; then
       run systemctl daemon-reload
-      run systemctl enable --now "$TIMER"
+      run systemctl enable --now "$TIMER" "$RECOVER_TIMER"
     fi
     [ "$DRY" = 1 ] || check
     ;;
@@ -110,9 +123,10 @@ case "$MODE" in
     ;;
   remove)
     if [ -z "$R" ]; then
-      run systemctl disable --now "$TIMER"
+      run systemctl disable --now "$TIMER" "$RECOVER_TIMER"
     fi
-    run rm -f "$R$CONF" "$R$TOOL" "$R$UNITS/$SERVICE" "$R$UNITS/$TIMER"
+    run rm -f "$R$CONF" "$R$TOOL" "$R$UNITS/$SERVICE" "$R$UNITS/$TIMER" \
+      "$R$RECOVER_TOOL" "$R$UNITS/$RECOVER_SERVICE" "$R$UNITS/$RECOVER_TIMER"
     if [ -z "$R" ]; then run systemctl daemon-reload; fi
     ;;
 esac

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=ameesh CI: check runner services every minute (#7319)
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target
