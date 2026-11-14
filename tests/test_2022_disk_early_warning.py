@@ -90,6 +90,16 @@ class WarningsTest(unittest.TestCase):
     def test_under_the_pause_floor_is_critical(self):
         found = resources.disk_warnings(reading(GIB), self.limits)
         self.assertTrue(found[0]["critical"])
+        self.assertEqual(found[0]["floor_eta_s"], 0.0)
+
+    def test_measured_floor_breach_overrides_smoothed_trend(self):
+        history = series(26 * GIB, GIB, 6)
+        current = reading(GIB)
+        points = resources._volume_series(history, "/") + [(current["sampled_ts"], GIB)]
+        self.assertGreater(resources.disk_floor_eta(points, 2 * GIB), 0)
+        warning = resources.disk_warnings(current, self.limits, history)[0]
+        self.assertEqual(warning["floor_eta_s"], 0.0)
+        self.assertTrue(warning["floor_crossed"])
 
     def test_trend_reaches_the_floor_within_a_day(self):
         # 200 GiB free, losing 10 GiB an hour: the 2 GiB floor in ~20 h,
@@ -162,6 +172,25 @@ class AlertTest(unittest.TestCase):
         self.assertTrue(critical["urgent"])
         self.assertEqual(critical["reason"], "critique")
         self.assertEqual(exploitation.alert_key(warning), exploitation.alert_key(critical))
+
+    def test_floor_crossed_has_no_future_deadline(self):
+        for history in ((), series(26 * GIB, GIB, 6)):
+            with self.subTest(history=bool(history)):
+                alert = self.alerts(reading(GIB), history)[0]
+                self.assertEqual(alert["floor_eta_s"], 0)
+                self.assertIn("floor crossed", alert["detail"])
+                self.assertNotIn("floor in", alert["detail"])
+                self.assertNotIn("before the", alert["detail"])
+
+    def test_cleanup_advice_targets_the_alerted_volume(self):
+        current = reading(GIB, path="/home/development")
+        current["volumes"].append({
+            "path": "/", "paths": ["/", "/var/lib/docker"],
+            "disk_free_bytes": 100 * GIB, "disk_total_bytes": 500 * GIB})
+        alert = self.alerts(current)[0]
+        self.assertEqual(alert["paths"], ["/home/development"])
+        self.assertIn("space on the listed volumes", alert["detail"])
+        self.assertNotIn("docker", alert["detail"])
 
     def test_history_unreadable_keeps_the_thresholds(self):
         store = mock.MagicMock()

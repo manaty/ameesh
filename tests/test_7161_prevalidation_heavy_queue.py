@@ -8,6 +8,7 @@ le délai, la prévalidation est rendue « en file » et le gel reste écrit.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 import threading
@@ -61,25 +62,38 @@ class QueueTest(unittest.TestCase):
         poll.start()
         self.addCleanup(poll.stop)
 
-    def release_later(self, held, delay=0.4):
-        def later():
-            time.sleep(delay)
+    @contextlib.contextmanager
+    def occupied_queue(self, cfg):
+        """Le vrai verrou se libère au premier poll, après 0,4 s simulée."""
+        now = [100.0]
+        clock = lambda: now[0]
+        acquire = heavy.acquire
+        held = acquire(cfg, command="suite")
+        self.addCleanup(held[1].close)
+        polls = []
+
+        def release_on_wait(seconds):
+            polls.append(seconds)
+            now[0] += 0.4
             heavy.release(held[1])
-        thread = threading.Thread(target=later)
-        thread.start()
-        self.addCleanup(thread.join)
+
+        def queued_acquire(*args, **kwargs):
+            return acquire(*args, **kwargs, clock=clock, sleep=release_on_wait)
+
+        with mock.patch.object(heavy, "acquire", side_effect=queued_acquire):
+            yield clock
+        self.assertEqual(len(polls), 1, "le créneau occupé impose un passage en file")
 
     def test_the_queue_wait_is_paused_from_the_deadline(self):
         """Le temps passé à attendre un créneau ne consomme pas le budget."""
         one = SimpleNamespace(state_dir=self.cfg.state_dir, max_heavy_suites=1)
-        held = heavy.acquire(one, command="suite")
-        self.release_later(held)
-        deadline = Deadline(5.0, wall=time.monotonic() + 60.0)
-        with calls.heavy_queue(one, "prévalidation #7161", say=lambda text: None,
-                               deadline=deadline) as waited:
-            self.assertGreaterEqual(waited, 0.3)
-        # sans la pause, il ne resterait que ~4,6 s à l'échéance
-        self.assertGreater(deadline.remaining(), 4.5)
+        with self.occupied_queue(one) as clock:
+            deadline = Deadline(5.0, clock=clock, wall=clock() + 60.0)
+            with calls.heavy_queue(one, "prévalidation #7161", say=lambda text: None,
+                                   deadline=deadline) as waited:
+                self.assertAlmostEqual(waited, 0.4)
+            # Sans la pause, il ne resterait que 4,6 s à l'échéance.
+            self.assertAlmostEqual(deadline.remaining(), 5.0)
 
     def test_without_a_slot_within_the_bound_the_state_is_queued(self):
         """Aucun créneau dans le délai : « en file », jamais run-incomplete."""
@@ -153,9 +167,8 @@ class QueueTest(unittest.TestCase):
             seen["remaining"] = kwargs["deadline"].remaining()
             return green()
 
-        held = heavy.acquire(cfg, command="suite")
-        self.release_later(held)
-        with mock.patch.object(calls, "parameters", return_value=params), \
+        with self.occupied_queue(cfg) as clock, \
+                mock.patch.object(calls, "parameters", return_value=params), \
                 mock.patch.object(calls, "tooling"), \
                 mock.patch.object(calls, "map_for", return_value=("", "")), \
                 mock.patch.object(calls, "prepare", return_value=FakePrepared()), \
@@ -163,10 +176,10 @@ class QueueTest(unittest.TestCase):
                 mock.patch.object(calls, "_run_hosts", side_effect=fake_run_hosts):
             report = calls.run(cfg, None, 7161, repo="/repo", head="a" * 40,
                                base="b" * 40, project="ameesh", record=False,
-                               deadline=Deadline(1.5, wall=time.monotonic() + 60.0))
+                               deadline=Deadline(1.5, clock=clock, wall=clock() + 60.0))
         self.assertTrue(report.get("ok"))
-        self.assertGreaterEqual(report.get("queue_wait_s", 0), 0.3,
-                                "la preuve dit que la prévalidation a attendu")
+        self.assertAlmostEqual(report.get("queue_wait_s", 0), 0.4,
+                               msg="la preuve dit que la prévalidation a attendu")
         # sans la pause, l'échéance n'aurait plus que ~1,1 s au run
         self.assertGreater(seen["remaining"], 1.3)
 

@@ -11,8 +11,13 @@ contient plus de processus. Un listener tué peut laisser un Worker vivant
 journalisée. Les services actifs, en transition, ou arrêtés volontairement
 (`inactive`) ne sont pas démarrés. Un job systemd déjà en attente interdit
 la reprise ; `--job-mode=fail` ne remplace pas un arrêt en attente. Pour une
-maintenance, arrêter le timer de récupération avant de manipuler les unités,
-puis le réactiver en fin de maintenance.
+maintenance, arrêter le timer et le service de récupération avant de manipuler
+les unités ou de lancer `ameesh-ci-runner-drain --all --stop --wait 3600` :
+`sudo systemctl stop ameesh-ci-runner-recover.timer ameesh-ci-runner-recover.service`.
+Arrêter aussi le service empêche une reprise déjà lancée de continuer. Réactiver
+ensuite le timer avec `sudo systemctl start ameesh-ci-runner-recover.timer`,
+y compris si la maintenance est annulée. Après un reboot, le timer activé au
+démarrage reprend automatiquement.
 
 Le verrou `/run/lock/ameesh-ci-runner-drain.lock` est partagé avec le drain.
 La récupération ne peut donc pas se glisser entre son `cgroup.kill` et son

@@ -2011,8 +2011,9 @@ def disk_warnings(reading: dict, limits: dict, history=()) -> list[dict]:
     `used` (share, None without a total), `reasons` (`used`: share at or
     over `warn_disk_used`; `free`: under `warn_disk_free`; `trend`: the floor
     reached within `DISK_TREND_HORIZON_S` by the fit of `history`, the
-    readings of the last `DISK_TREND_WINDOW_S`), `floor_eta_s` (None without
-    a trend) and `critical` (floor already crossed, or reached within
+    readings of the last `DISK_TREND_WINDOW_S`), `floor_eta_s` (zero below the
+    measured floor, otherwise None without a trend), `floor_crossed` and
+    `critical` (floor already crossed, or reached within
     `DISK_TREND_CRITICAL_S`). A warning, never a breach: `pressure` ignores
     it. A volume without a reading is skipped: nothing is guessed."""
     floor = limits.get("min_disk_free") or 0
@@ -2037,7 +2038,10 @@ def disk_warnings(reading: dict, limits: dict, history=()) -> list[dict]:
         series = _volume_series(history, vol.get("path"))
         if reading.get("sampled_ts") is not None:
             series.append((reading["sampled_ts"], free))
-        eta = disk_floor_eta(series, floor)
+        # The measured floor breach takes precedence over a smoothed trend
+        # (and does not require enough history for a fit).
+        crossed = free < floor
+        eta = 0.0 if crossed else disk_floor_eta(series, floor)
         if eta is not None and eta <= DISK_TREND_HORIZON_S:
             reasons.append("trend")
         else:
@@ -2045,7 +2049,7 @@ def disk_warnings(reading: dict, limits: dict, history=()) -> list[dict]:
         if not reasons:
             continue
         out.append({"path": vol.get("path"), "free": free, "total": total, "used": used,
-                    "reasons": reasons, "floor_eta_s": eta,
+                    "reasons": reasons, "floor_eta_s": eta, "floor_crossed": crossed,
                     "critical": free < floor or (eta is not None
                                                  and eta <= DISK_TREND_CRITICAL_S)})
     out.sort(key=lambda w: (not w["critical"], w["floor_eta_s"] is None,
