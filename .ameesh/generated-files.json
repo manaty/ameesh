@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "files": {
+    "ui/src/api/schema.d.ts": {
+      "check": ["node", "ui/scripts/gen-api.mjs", "--check"],
+      "runtime": "ui/node_modules",
+      "locks": ["ui/package.json", "ui/package-lock.json"]
+    },
+    "docs/api/openapi-v1.json": {
+      "check": ["python3", "-c", "from pathlib import Path; from ameesh.serve import dump_openapi; import sys; sys.exit(0 if Path('docs/api/openapi-v1.json').read_text(encoding='utf-8') == dump_openapi() else 1)"]
+    }
+  }
+}
