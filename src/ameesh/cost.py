@@ -1311,7 +1311,9 @@ class CostBook:
         y est vite périmée alors qu'un autre état (ou hôte) a publié plus frais
         pour le même compte. Fenêtre par fenêtre, l'historique l'emporte quand
         son instant de production est STRICTEMENT plus récent que celui de la
-        mesure locale ; une mesure non datée ne remplace jamais une mesure
+        mesure locale. À cinq minutes près, dans la même fenêtre, une lecture
+        directe prime sur le widget (#7333), dont l’horloge peut avancer ;
+        une mesure non datée ne remplace jamais une mesure
         datée. Lecture seule, jamais fatale : sans base, en panne, ou sans
         relevé daté, la lecture locale est rendue.
 
@@ -1341,8 +1343,16 @@ class CostBook:
         merged, changed = [], False
         for gauge in gauges:
             row = known.get(gauge.key)
-            if row is not None and (gauge.produced_at is None
-                                    or float(row["produced_ts"]) > float(gauge.produced_at)):
+            use_history = row is not None and (gauge.produced_at is None
+                                               or float(row["produced_ts"]) > float(gauge.produced_at))
+            if (row is not None and gauge.produced_at is not None
+                    and gauge.resets_at is not None and row.get("resets_at_ts") is not None
+                    and abs(float(row["produced_ts"]) - gauge.produced_at) <= GAUGE_CLOCK_JITTER_S
+                    and abs(float(row["resets_at_ts"]) - gauge.resets_at) <= GAUGE_CLOCK_JITTER_S
+                    and bool(gauge.source) and bool(row.get("source"))
+                    and (gauge.source == "widget") != (row["source"] == "widget")):
+                use_history = gauge.source == "widget"
+            if use_history:
                 produced = float(row["produced_ts"])
                 merged.append(Gauge("claude", gauge.key, float(row["used"]),
                                     row.get("resets_at_ts"), float(row["window_s"]),
@@ -3447,6 +3457,9 @@ GAUGE_TIME_TOLERANCE_S = 1.0
 #: Codex (5 h) en reste très au-delà, si bien qu'un vrai changement de fenêtre
 #: (échéance plus tardive de plusieurs heures) gagne toujours.
 CODEX_WINDOW_JITTER_S = 300.0
+
+#: #7333 : à cinq minutes près, le widget ne prime pas sur la lecture directe.
+GAUGE_CLOCK_JITTER_S = 300.0
 
 
 def _marker_ts(event: dict) -> float | None:
