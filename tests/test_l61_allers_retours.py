@@ -38,7 +38,9 @@ BORNES = {
     "projects": 2,
     #: L521 : 34 allers-retours avant, un `;` dans un commentaire SQL
     #: désactivait le pipeline de tout le lot
-    "alerts": 6,
+    #: #7357 : un échange de dépendance résout le schéma avant de construire
+    #: les lectures d'activité ; pas de repli JSON coûteux sur schéma courant.
+    "alerts": 7,
 }
 
 
