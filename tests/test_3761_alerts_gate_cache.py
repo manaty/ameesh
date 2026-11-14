@@ -264,6 +264,7 @@ class GateCacheWiringTest(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertTrue(entered, "les canons doivent être lus dans la fenêtre")
         self.assertIs(observed.call_args.kwargs["gate_cache"], state["gates"])
+        self.assertTrue(observed.call_args.kwargs["refresh_gates"])
 
 
 class StateSchemaTest(unittest.TestCase):

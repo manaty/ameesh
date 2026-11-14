@@ -1854,3 +1854,58 @@ class AttributionRendueTest(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GateObservationRenewalTest(_Base):
+    """#7350 B1: the producer refills observations; the CLI never does."""
+
+    def test_notifier_fills_and_renews_expired_gate_cli_only_observes(self):
+        from ameesh import plan_git
+        self.qa(verdict_s=50 * 60)
+        head, base = "a" * 40, "b" * 40
+        self.db.execute("UPDATE work_item_milestones SET sha = %s "
+                        "WHERE work_item_id = %s", (head, self.lot["id"]))
+        state = notify.empty_state()
+        notifier = notify.Notifier(
+            self.cfg, notify.parse_config({}), state, dry_run=True,
+            clock=lambda: self.now, only=frozenset({"alerts"}),
+            log=lambda _message: None)
+        klass = {"class": "sensitive", "frozen_sha": head,
+                 "repo": "/fixture", "files": [{"path": "src/ameesh/db.py"}]}
+        args = exploitation.build_parser().parse_args(["alerts", "--json"])
+        with mock.patch.object(lot_class, "repo_for_freeze", return_value=("/fixture", head)), \
+                mock.patch.object(lot_class, "default_base", return_value="origin/main"), \
+                mock.patch.object(merge_queue, "_class_base", return_value="origin/main"), \
+                mock.patch.object(plan_git, "_commit", return_value=base), \
+                mock.patch.object(lot_class, "of_lot", return_value=klass), \
+                mock.patch.object(merge_queue.time, "time", side_effect=lambda: self.now), \
+                mock.patch.object(merge_queue, "review_gate", return_value={"ok": False}) as full:
+            notifier.run_pass(self.db, thresholds=_seuils(orchestrators_declared=["orch"]))
+            key = str(self.lot["id"])
+            self.assertIn(key, state["gates"])
+            self.assertFalse(state["gates"][key]["ok"])
+            first = state["gates"][key]["at"]
+            self.assertEqual(full.call_count, 1)
+            notifier.run_pass(self.db, thresholds=_seuils(orchestrators_declared=["orch"]))
+            self.assertEqual(full.call_count, 1, "fresh observations are reused")
+            self.now += merge_queue.GATE_CACHE_TTL_S + 1
+            notifier.run_pass(self.db, thresholds=_seuils(orchestrators_declared=["orch"]))
+            self.assertEqual(full.call_count, 2, "the producer must refill after TTL")
+            self.assertGreater(state["gates"][key]["at"], first)
+            self.assertEqual(self.slo(gate_cache=state["gates"]), [])
+            before = dict(state["gates"][key])
+            with mock.patch.object(exploitation.db_mod, "connect", return_value=self.db), \
+                    mock.patch.object(self.db, "close"), \
+                    mock.patch.object(notify, "load_shared_state", return_value=state), \
+                    mock.patch.object(notify, "save_shared_state") as save, \
+                    mock.patch("sys.stdout"):
+                self.assertEqual(exploitation.cmd_alerts(self.cfg, args), 0)
+                self.assertEqual(full.call_count, 2)
+                self.assertEqual(state["gates"][key], before)
+                # The same holds for an expired observation in the CLI:
+                # only the lease holder may renew it later.
+                self.now += merge_queue.GATE_CACHE_TTL_S + 1
+                self.assertEqual(exploitation.cmd_alerts(self.cfg, args), 0)
+                self.assertEqual(full.call_count, 2)
+                self.assertEqual(state["gates"][key], before)
+                save.assert_not_called()

@@ -2567,7 +2567,7 @@ class Notifier:
                 current = exploitation.alerts(
                     self.cfg, db, now=now, local_pool=False,
                     unreadable=unreadable, gate_cache=gate_cache,
-                    record_footprint=not self.dry_run, **thresholds)
+                    record_footprint=not self.dry_run, refresh_gates=True, **thresholds)
         # #3913 B1 : la lecture/le calcul a pu durer plus que le bail. Avant
         # la première écriture (les accusés) et la première poussée, on
         # reprend le verdict : un détenteur périmé se tait, même si son
