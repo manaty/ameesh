@@ -107,6 +107,7 @@ import difflib
 import os
 import re
 import tempfile
+import time
 
 from typing import Mapping, Optional, Sequence
 
@@ -843,6 +844,60 @@ def _same_patch_receipts(db, item: Mapping, repo: str, sha: str, *,
     return found
 
 
+def _legacy_address(repo: str, sha: str, field: str) -> bool:
+    """#7324 : l'adresse `%ae`/`%ce` est-elle l'ancienne `@ameesh.local` ?
+
+    Ces commits d'avant la convention (#3111) n'ont qu'un journal des tours
+    grossier : l'absence d'un tour proche n'y prouve rien."""
+    text = _read_out(repo, "show", "-s", "--format=" + field, sha)
+    return str(text or "").strip().lower().endswith("@ameesh.local")
+
+
+def _turn_absent(db, actor: str, stamp: float, *, strict: bool = False) -> bool:
+    """#7324 : le journal des tours **contredit**-il le commit de `actor` ?
+
+    Le repli du committer (#2721) lit la famille au journal des tours, mais
+    `_turns_harness` retombe sur le dernier tour antérieur, si ancien soit-il :
+    un commit dont l'adresse Git nomme un agent qui ne tournait pas à cet
+    instant héritait de sa famille. Constat nexlink #7272 (14/11 03:4xZ) :
+    deepseek4 a réécrit sept commits sous l'identité `claude1@ameesh.invalid`
+    pendant la pause de claude1 ; la lecture n'a vu que la famille claude.
+
+    Vrai seulement sur une preuve : l'agent a déjà un tour au journal, aucun
+    tour ne s'est fini à moins de `FREEZE_TURN_WINDOW_S` du commit (avant ou
+    après), et aucun tour n'est en cours qui puisse le contenir. Une
+    réécriture dans la demi-heure d'un tour de l'agent n'est donc pas vue :
+    la borne préfère ne jamais fermer la porte à tort. Un agent sans aucune ligne
+    garde la lecture d'avant (pas de preuve contraire) ; un journal illisible
+    n'est pas une preuve (`strict` laisse passer `JournalUnreadable`)."""
+    if db is None or not actor or not stamp:
+        return False
+    window = review_lot.FREEZE_TURN_WINDOW_S
+    try:
+        ledger = storage.of(db).turn_costs
+        after = ledger.first_after(actor, float(stamp))
+        if after is not None and 0 <= (float(after.get("recorded_ts") or 0)
+                                       - float(stamp)) <= window:
+            return False
+        before = ledger.last_before(actor, float(stamp))
+        if before is None and after is None:
+            return False
+        if before is not None and 0 <= (float(stamp) - float(
+                before.get("recorded_ts") or 0)) <= window:
+            # Un tour fini juste avant reste plausible (horloges, seconde de
+            # `%ct`) : seul un trou d'une fenêtre entière est une preuve.
+            return False
+        if after is None and time.time() - float(stamp) <= window \
+                and registry.turn_in_progress(db, actor):
+            return False
+    except Exception as exc:  # noqa: BLE001 - journal illisible : pas de preuve
+        if strict:
+            raise JournalUnreadable("turn journal unreadable for %s: %s"
+                                    % (actor, exc)) from exc
+        return False
+    return True
+
+
 def _unreceived_role(actor: str, author_name: str, reviewers) -> str:
     """Le rôle d'un acteur dans la lecture : référence, relecteur ou tiers."""
     if author_name and str(actor).casefold() == str(author_name).strip().casefold():
@@ -906,8 +961,13 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
             and git_author.casefold() != committer.casefold()
             and agent_made):
         rows, unknown = [], []
-        for actor, stamp in ((committer, committer_stamp),
-                             (git_author, author_stamp)):
+        for actor, stamp, field in ((committer, committer_stamp, "%ce"),
+                                    (git_author, author_stamp, "%ae")):
+            if (not _legacy_address(repo, sha, field)
+                    and _turn_absent(db, actor, stamp, strict=strict_journal)):
+                # #7324 : l'adresse nomme un agent qui ne tournait pas : le
+                # commit vient d'ailleurs, sa provenance reste inconnue.
+                return [], [sha[:12]]
             role = _unreceived_role(actor, author_name, reviewers)
             proven = actor_family(db, actor, stamp, families,
                                   strict=strict_journal)
@@ -927,6 +987,10 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
         return [], [sha[:12]]
     role = _unreceived_role(actor, author_name, reviewers)
     if role != "reference" and not _registered(db, actor):
+        return [], [sha[:12]]
+    if (not _legacy_address(repo, sha, "%ce")
+            and _turn_absent(db, actor, stamp, strict=strict_journal)):
+        # #7324 : ni l'assigné ni un autre ne prouvent ce commit par un tour.
         return [], [sha[:12]]
     proven = actor_family(db, actor, stamp, families,
                           strict=strict_journal)
