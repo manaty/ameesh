@@ -307,6 +307,24 @@ class HoldsAndWakesTest(unittest.TestCase):
         self.assertTrue(all(row["kind"] == "hold_undeployed"
                             for row in report["slow_waits"]))
 
+    def test_hold_ipv4_reste_une_attente_externe_7316(self):
+        for address in ("51.158.121.89", "51.15.141.186"):
+            with self.subTest(address=address):
+                report = run(
+                    items=[item(6800, assignee="codex1", app="nexlink")],
+                    events=[event(6800, 1, T - 3 * H,
+                                  "hold: attente bureau sur " + address)])
+                self.assertEqual(report["undeployed_holds"], [])
+                self.assertEqual(report["totals"]["holds"], 1)
+
+    def test_hold_ipv4_et_versions_conserve_la_cible_7316(self):
+        report = run(
+            items=[item(1)],
+            events=[event(1, 1, T - 3 * H,
+                          "hold: sur 51.158.121.89, attend 1.20.0 → 1.21.0")])
+        self.assertEqual([row["version"] for row in report["undeployed_holds"]],
+                         ["1.21.0"])
+
     def test_hold_sur_une_version_installee_ne_signale_pas(self):
         report = run(
             items=[item(1)],
