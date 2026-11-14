@@ -109,7 +109,9 @@ class WidgetNonMentionneTest(unittest.TestCase):
         gauges = widget_usage.read(_profil(self.compte, "secondaire"),
                                    now=self.now, directory=self.dossier)
         self.assertIsNotNone(gauges)
-        self.assertTrue(all(g.produced_at is None and g.source == widget_usage.SOURCE
+        # #7329 : le widget publie sa propre date comme instant de production
+        # (jamais l'heure d'insertion) ; la mention « non daté » reste absente.
+        self.assertTrue(all(g.produced_at == g.read_at and g.source == widget_usage.SOURCE
                             for g in gauges))
         ligne = {"harness": "claude", "account": "secondaire", "forced": False,
                  "active": False, "ok": True, "problems": [], "reason": "",
