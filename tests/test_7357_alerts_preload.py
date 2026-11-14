@@ -89,6 +89,34 @@ class SchemaPreloadTest(unittest.TestCase):
                 # The schema count travels before the query it determines.
                 self.assertEqual(len(base.echanges), 2)
 
+    def test_module_reads_keep_old_schema_fallback(self):
+        from ameesh.modules.storage import ModuleStore
+        from ameesh.storage.postgres import work
+
+        class Base(_FausseBase):
+            def _lignes(self, sql, params):
+                if 'information_schema.columns' in sql:
+                    return [{"n": self.column_count}]
+                return []
+
+        for current in (True, False):
+            with self.subTest(current=current):
+                base = Base()
+                base.column_count = len(work._OPTIONAL_ITEM_COLUMNS) - (not current)
+
+                def read(db):
+                    modules = ModuleStore(db)
+                    modules.audit_evidence('acme', 'it', ['bug'], 'subject', 'proof')
+                    modules.audit_qa('acme', 'it', ['bug'], 'subject', 'qa', ['merged'])
+
+                db_mod.batched(base, read)
+                queries = [sql for trip in base.echanges for sql in trip
+                           if 'AS declaration_id' in sql]
+                self.assertEqual(len(queries), 2)
+                for sql in queries:
+                    self.assertEqual("to_jsonb(w)->>'legacy_state'" in sql, not current)
+                    self.assertEqual('w.legacy_state' in sql, current)
+
     def test_known_empty_prerequisite_is_read_once(self):
         base = _FausseBase()
         # This base returns [] for an explicit absent-schema probe.

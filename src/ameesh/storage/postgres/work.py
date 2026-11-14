@@ -183,6 +183,12 @@ def has_current_item_columns(db) -> bool:
     return current
 
 
+def legacy_state_column(db, alias: str) -> str:
+    """Read the delivery phase without serialising a current work_items row."""
+    return (f"{alias}.legacy_state" if has_current_item_columns(db)
+            else f"to_jsonb({alias})->>'legacy_state'")
+
+
 def item_columns(db, ref: str | None = None, migrations: str | None = None) -> str:
     """Les colonnes d'un lot ; `reviewer` quand 0421 est appliquée, `''` sinon
     (les lectures d'avant la migration ne cassent pas, #705).
