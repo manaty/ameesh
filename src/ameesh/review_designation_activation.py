@@ -1002,7 +1002,7 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
     if unknown:
         # #3835 : nommer le gel antérieur et le lot qui portent l'inconnu.
         raise ActivationError(
-            review_authors.unknown_refusal(unknown, head_sha=head))
+            review_authors.unknown_refusal(unknown, head_sha=head, repo=repo))
     return correctors
 
 

@@ -517,12 +517,14 @@ class FreezeDeadlineWiringTest(unittest.TestCase):
         args = mesh_cli.build_parser().parse_args([
             "work", "milestone", "4073", "frozen", "--sha", "a" * 40,
             "--actor", "author"])
-        row = {"kind": "frozen", "sha": "a" * 40, "note": "", "verdict": None}
+        row = {"id": 1, "kind": "frozen", "sha": "a" * 40,
+               "note": "", "verdict": None}
         with mock.patch.object(mesh_cli, "_open", return_value=mock.Mock()), \
                 mock.patch.object(mesh_cli, "_work_actor"), \
                 mock.patch.object(mesh_cli.work, "get", return_value={"id": 4073}), \
                 mock.patch.object(mesh_cli.work, "freeze_head", return_value="a" * 40), \
                 mock.patch.object(mesh_cli.work, "milestone", return_value=row), \
+                mock.patch("ameesh.freeze_gate.milestones", return_value=[row]), \
                 mock.patch("ameesh.verdict_carry.carry",
                            return_value={"result": "idle"}), \
                 mock.patch.object(prevalidation_calls, "freeze_deadline",
