@@ -2112,12 +2112,9 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
         return "#%d : composition en cours (%s)" % (carrier, holder)
     run_id = str(run.get("run_id") or "?")
     removed = ", ".join("#%d" % lot for lot in verdict.lots)
-    sources = {lot: unit.source
-               for unit in composition_units(manifest_at(ctx, item, frozen_sha(item)))
-               for lot in unit.lots}
     for lot in verdict.lots:
         if not exclude(ctx, lot, carrier, name, run_id, verdict.tests,
-                       source=sources.get(lot, "")):
+                       packet_frozen_at=frozen_ts(item)):
             continue
         try:
             author = str(show(ctx, lot).get("assignee") or "")
@@ -2142,7 +2139,7 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
 
 
 def exclude(ctx: Context, lot: int, carrier: int, name: str, run_id: str,
-            tests: list[str], *, source: str = "") -> bool:
+            tests: list[str], *, packet_frozen_at: float = 0) -> bool:
     """#4028 : le lot retiré pour un test négatif porte sa propre trace et
     repasse en `build` : il attend le correctif de son assigné, et un nouveau
     gel le ramène en qa (puis au paquet). Sans cela il restait en qa, gelé avec
@@ -2150,17 +2147,22 @@ def exclude(ctx: Context, lot: int, carrier: int, name: str, run_id: str,
     paquet suivant. #4043 : le retrait n'est pas une boucle d'auteur
     (`--package-exclusion` : `loops` inchangé, jamais refusé à la limite). Une
     transition refusée (lot déjà sorti de qa) laisse la trace seule, en note.
-    #7271 : un autre gel courant n'est pas la source testée : son état est
-    conservé, sans demander de correction à son auteur (retour False)."""
-    source = source.strip().lower()
-    if re.fullmatch(r"[0-9a-f]{12,40}", source):
-        current = frozen_sha(show(ctx, lot))
-        if (re.fullmatch(r"[0-9a-f]{40}", current)
-                and not current.startswith(source) and not source.startswith(current)):
-            trace = ("%s%s porteur=#%d run=%s tests=%s : source retirée=%s ; "
-                     "gel courant=%s conservé, aucun regel demandé"
+    #7271 : seul un gel déclaré après celui du paquet prouve une reprise
+    postérieure à sa composition. Une remise ou résolution peut avoir une
+    source différente du gel du lot sans que celui-ci ait changé."""
+    if packet_frozen_at > 0:
+        try:
+            current_item = show(ctx, lot)
+        except HoraireError as exc:
+            ctx.say("gel courant de #%d illisible : %s" % (lot, exc))
+            current_item = {}
+        current = frozen_sha(current_item)
+        if current and frozen_ts(current_item) > packet_frozen_at:
+            trace = ("%s%s porteur=#%d run=%s tests=%s : "
+                     "gel courant=%s conservé (postérieur au gel du paquet), "
+                     "aucun regel demandé"
                      % (MARK_EXCLUDED, name, carrier, run_id,
-                        ",".join(tests) or "?", source, current))
+                        ",".join(tests) or "?", current))
             if ctx.dry_run:
                 ctx.say("[essai] #%d état conservé : %s" % (lot, trace))
             else:

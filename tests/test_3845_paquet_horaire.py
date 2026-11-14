@@ -734,9 +734,10 @@ class FollowTest(Base):
         self.assertEqual(self.shell.ran("work", "move", "3807"), [])
 
     def test_red_of_old_source_preserves_a_new_freeze_and_its_state(self):
-        self.open_carrier()
+        item = self.open_carrier()
+        item["freeze"]["declared"]["at_ts"] = NOW - 600
         unit = {"id": 3801, "assignee": "mty-amh-impl-02", "state": "validated",
-                "freeze": {"declared": {"sha": HEAD2}}}
+                "freeze": {"declared": {"sha": HEAD2, "at_ts": NOW - 100}}}
         self.shell.items[3801] = unit
         self.shell.ci[4000] = {"runs": [red_run()]}
         ph.tick(self.ctx)
@@ -751,17 +752,54 @@ class FollowTest(Base):
         self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
         self.assertEqual(auto[auto.index("--keep-composition") + 1], HEAD)
 
-    def test_unchanged_source_still_needs_correction(self):
+    def test_freeze_without_timestamp_still_needs_correction(self):
         self.shell.items[3801] = {"id": 3801, "state": "qa",
             "freeze": {"declared": {"sha": "035249f490d2" + "0" * 28}}}
         self.assertTrue(ph.exclude(self.ctx, 3801, 4000, "h-test", "77", [],
-                                   source="035249f490d2"))
+                                   packet_frozen_at=NOW - 600))
         self.assertEqual(len(self.shell.ran("work", "move", "3801", "build")), 1)
 
     def test_no_current_freeze_does_not_hide_the_due_correction(self):
         self.shell.items[3801] = {"id": 3801, "state": "qa"}
         self.assertTrue(ph.exclude(self.ctx, 3801, 4000, "h-test", "77", [],
-                                   source="035249f490d2"))
+                                   packet_frozen_at=NOW - 600))
+        self.assertEqual(len(self.shell.ran("work", "move", "3801", "build")), 1)
+
+    def test_remise_source_different_from_covered_freeze_still_needs_correction(self):
+        item = self.open_carrier()
+        item["freeze"]["declared"]["at_ts"] = NOW - 600
+        self.shell.items[3801] = {"id": 3801, "state": "validated",
+            "assignee": "author", "freeze": {"declared": {
+                "sha": HEAD2, "at_ts": NOW - 1200}}}
+        # The manifest carries the remise SHA, whereas the lot stays frozen
+        # on its covered branch head (HEAD2); no new freeze took place.
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        ph.tick(self.ctx)
+        self.assertEqual(len(self.shell.ran("work", "move", "3801", "build")), 1)
+        self.assertTrue([body for to, body in self.shell.mails if to == "author"])
+
+    def test_resolution_unit_does_not_preserve_unchanged_member_freezes(self):
+        self.manifest = RESOLVED
+        item = self.open_carrier()
+        item["freeze"]["declared"]["at_ts"] = NOW - 600
+        for lot in (3779, 3755):
+            self.shell.items[lot] = {"id": lot, "state": "validated",
+                "assignee": "author", "freeze": {"declared": {
+                    "sha": HEAD2, "at_ts": NOW - 1200}}}
+        ph.recompose(self.ctx, item, red_run(),
+                     ph.Verdict(True, [3779, 3755], ["tests.test_x.T.test_a"], ""))
+        for lot in (3779, 3755):
+            self.assertEqual(len(self.shell.ran("work", "move", str(lot), "build")), 1)
+
+    def test_missing_packet_freeze_time_does_not_prove_a_new_freeze(self):
+        self.shell.items[3801] = {"id": 3801, "state": "qa",
+            "freeze": {"declared": {"sha": HEAD2, "at_ts": NOW}}}
+        self.assertTrue(ph.exclude(self.ctx, 3801, 4000, "h-test", "77", []))
+        self.assertEqual(len(self.shell.ran("work", "move", "3801", "build")), 1)
+
+    def test_unreadable_current_freeze_does_not_abort_exclusion(self):
+        self.assertTrue(ph.exclude(self.ctx, 3801, 4000, "h-test", "77", [],
+                                   packet_frozen_at=NOW - 600))
         self.assertEqual(len(self.shell.ran("work", "move", "3801", "build")), 1)
 
     def test_transition_refusee_laisse_la_trace_en_note(self):
