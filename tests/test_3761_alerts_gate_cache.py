@@ -47,7 +47,7 @@ class GateCacheTest(unittest.TestCase):
         self.klass = {"class": "normal", "files": [{"path": "src/ameesh/x.py"}]}
 
     def _call(self, cache, *, marks=None, now=1000.0, target="origin/main",
-              base_sha=BASE):
+              base_sha=BASE, cache_only=False):
         with mock.patch.object(plan_git, "latest_freeze",
                                return_value={"sha": HEAD}), \
                 mock.patch.object(lot_class, "repo_for_freeze",
@@ -64,8 +64,36 @@ class GateCacheTest(unittest.TestCase):
                                   return_value={"ok": True}) as gate:
             out = merge_queue.review_gate_for_item(
                 self.db, self.cfg, self.item, marks or _marks(),
-                gate_cache=cache, now=now)
+                gate_cache=cache, now=now, cache_only=cache_only)
         return out, gate
+
+    def test_observation_never_recomputes_a_missing_or_stale_gate(self):
+        for cache in (None, {}, {"3761": {"key": "old", "ok": True, "at": 0}},
+                      {"3761": {"key": "old", "ok": True, "at": 1000}}):
+            with self.subTest(cache=cache):
+                out, gate = self._call(cache, cache_only=True)
+                self.assertIsNone(out)
+                gate.assert_not_called()
+
+    def test_observation_keeps_both_cached_decisions(self):
+        for ok in (True, False):
+            cache = {}
+            self._call(cache)
+            cache["3761"]["ok"] = ok
+            out, gate = self._call(cache, cache_only=True)
+            self.assertEqual(out, {"ok": ok, "cached": True})
+            gate.assert_not_called()
+            out, gate = self._call(cache, cache_only=True, marks=_marks([
+                {"id": 11, "kind": "verdict", "sha": HEAD, "actor": "r",
+                 "verdict": "blocked", "at_ts": 2.0}]))
+            self.assertIsNone(out)
+            gate.assert_not_called()
+
+    def test_observation_without_cache_does_not_even_probe_git(self):
+        with mock.patch.object(lot_class, "repo_for_freeze") as probe:
+            self.assertIsNone(merge_queue.review_gate_for_item(
+                self.db, self.cfg, self.item, _marks(), cache_only=True))
+            probe.assert_not_called()
 
     def test_a_fresh_signature_returns_without_reading_git(self):
         cache: dict = {}
@@ -236,6 +264,7 @@ class GateCacheWiringTest(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertTrue(entered, "les canons doivent être lus dans la fenêtre")
         self.assertIs(observed.call_args.kwargs["gate_cache"], state["gates"])
+        self.assertTrue(observed.call_args.kwargs["refresh_gates"])
 
 
 class StateSchemaTest(unittest.TestCase):
