@@ -2,6 +2,7 @@
 """#7320: cgroup removal after kill must not strand a failed runner."""
 import builtins
 import errno
+import itertools
 import os
 import subprocess
 import unittest
@@ -49,6 +50,7 @@ class RemovedCgroupTest(unittest.TestCase):
         def open_(path, *args, **kwargs):
             if str(path).endswith('/cgroup.kill'):
                 self.fixture.alive = False
+                (self.fixture.group / 'cgroup.events').write_text('frozen 1\npopulated 0\n')
                 raise OSError(errno.ENODEV, 'removed')
             return real_open(path, *args, **kwargs)
 
@@ -56,6 +58,24 @@ class RemovedCgroupTest(unittest.TestCase):
         with mock.patch.object(drain.os, 'open', side_effect=open_):
             self.assertTrue(self.host.act_if_idle('restart', R1))
         self.assertEqual(self.fixture.events, ['freeze', 'thaw', 'restart'])
+
+    def test_enodev_open_with_populated_cgroup_refuses_restart(self):
+        real_open = os.open
+
+        def open_(path, *args, **kwargs):
+            if str(path).endswith('/cgroup.kill'):
+                raise OSError(errno.ENODEV, 'kill unavailable')
+            return real_open(path, *args, **kwargs)
+
+        self.host._kill_frozen = lambda group: drain.Host._kill_frozen(self.host, group)
+        self.host.act = mock.Mock()
+        with mock.patch.object(drain.os, 'open', side_effect=open_), \
+             mock.patch.object(drain.time, 'monotonic', side_effect=itertools.count(0, 6)):
+            with self.assertRaisesRegex(OSError, R1 + '.*populated=0'):
+                self.host.act_if_idle('restart', R1)
+        self.host.act.assert_not_called()
+        self.assertTrue(self.fixture.alive)
+        self.assertEqual(self.fixture.events, ['freeze', 'thaw'])
 
     def test_removal_during_kill_write_or_close_checks_empty(self):
         for phase in ('write', 'close'):

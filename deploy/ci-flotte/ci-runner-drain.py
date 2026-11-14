@@ -238,7 +238,9 @@ class Host:
             kill_fd = os.open(group + "/cgroup.kill", os.O_WRONLY)
         except OSError as exc:
             if exc.errno == errno.ENODEV:
-                return  # The cgroup has already been removed.
+                # Even an unavailable kill interface is not proof of emptiness.
+                self._wait_event(group, "populated", "0", removed_ok=True)
+                return
             raise
         try:
             with os.fdopen(kill_fd, "w") as f:
