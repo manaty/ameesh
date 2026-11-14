@@ -538,14 +538,16 @@ class Context:
         self.must("work", "note", str(lot), "-", "--actor", self.actor,
                   input_text=text, what="note au porteur #%d" % lot)
 
-    def mail(self, to: str, lot: int, body: str) -> None:
+    def mail(self, to: str, lot: int, body: str, *, info: bool = False) -> None:
         if self.dry_run:
             self.say("[essai] courrier à %s (#%d) : %s" % (to, lot, body.splitlines()[0]))
             return
         # #3845 : `ameesh role run` retire AGENT_MAIL_NAME ; l'expéditeur est
         # l'acteur (le rôle), nommé explicitement.
-        result = self.shell.run(["agent-mail", "send", to, "-", "--lot", str(lot),
-                                 "--from", self.actor], input_text=body, timeout=120)
+        cmd = ["agent-mail", "send", to, "-", "--lot", str(lot), "--from", self.actor]
+        if info:
+            cmd.append("--info")
+        result = self.shell.run(cmd, input_text=body, timeout=120)
         if result.returncode != 0:
             # Un courrier perdu ne défait pas le geste : il est dit au journal.
             self.say("courrier à %s non envoyé : %s" % (to, auto._tail(result.text, 5)))
@@ -841,7 +843,7 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
     """
     cmd = [ctx.python, str(SCRIPT_DIR / "paquet-auto.py"), "--repo", str(ctx.repo),
            "--target", ctx.target, "--name", name, "--carrier", str(carrier),
-           "--pilot", ctx.pilot, "--from", ctx.actor,
+           "--pilot", ctx.pilot, "--from", ctx.actor, "--report-info",
            # #5084 : la pause posée après le départ du tic est relue avant de pousser
            "--pause-project", ctx.project]
     cmd += ["--contract-publication", publication_mode(ctx)]
@@ -1953,6 +1955,7 @@ def publish(ctx: Context, item: dict) -> str:
     lines += ["- %s %s%s" % (", ".join("#%d" % lot for lot in unit.lots), unit.source[:12],
                              " (résolution)" if unit.resolution else "")
               for unit in units]
+    needs_action = bool(resolutions)
     if resolutions:
         lines.append("Résolution(s) présente(s) : « verdict non requis » reste au "
                      "pilote (#1979) ; la fusion automatique attend ce geste.")
@@ -1961,14 +1964,16 @@ def publish(ctx: Context, item: dict) -> str:
     elif waived(item):
         lines.append("Fusions propres seulement : « verdict non requis » déjà posé (§2).")
     elif not ctx.dry_run:
-        lines.append(waive(ctx, item, sha))
+        waiver = waive(ctx, item, sha)
+        lines.append(waiver)
+        needs_action = "laissé au pilote" in waiver
     if not ctx.dry_run:
         ctx.must("ci", "run", str(carrier), "--full", "--sha", sha, "--avis", "0",
                  "--reason", "paquet horaire automatique (#3845)",
                  what="ci-full #%d" % carrier)
     ctx.note(carrier, MARK_CI + sha)
     lines.append("ci-full demandée sur %s ; fusion automatique à la CI verte." % sha[:12])
-    ctx.mail(ctx.pilot, carrier, "\n".join(lines))
+    ctx.mail(ctx.pilot, carrier, "\n".join(lines), info=not needs_action)
     return "#%d : ci-full demandée sur %s" % (carrier, sha[:12])
 
 
