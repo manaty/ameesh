@@ -295,7 +295,9 @@ class AlertesTest(PgTestCase):
                           alert["decisions"], alert["overdue"], alert["reason"]),
                          (ALICE, ALICE, HOST, [view["id"]], [view["id"]],
                           "notifier_stale"))
-        self.assertAlmostEqual(alert["since"], now - 3600, places=3)
+        # #7354 : `since` passe par la base (µs) puis est arrondi au ms
+        # (exploitation._alert) ; l'écart peut dépasser 0,0005 d'un demi-µs.
+        self.assertAlmostEqual(alert["since"], now - 3600, delta=0.001)
         self.assertIsNone(alert.get("host"))
         self.assertIn("last heartbeat from host pc-smichea", alert["detail"])
         self.assertIn("nothing is pushed to human:alice", alert["detail"])
