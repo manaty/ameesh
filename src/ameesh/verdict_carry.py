@@ -1211,7 +1211,8 @@ def generated_adapted(repo: str, reviewed: str, frozen: str, *,
         if manifest["version"] != 1 or not isinstance(files, dict) or not files:
             raise ValueError("invalid declaration")
         for path, rule in files.items():
-            if (not _generated_path(path) or not isinstance(rule, dict)
+            if (not _generated_path(path) or path == GENERATED_FILES
+                    or not isinstance(rule, dict)
                     or not isinstance(rule.get("check"), list) or not rule["check"]
                     or not all(isinstance(arg, str) and arg for arg in rule["check"])):
                 raise ValueError("invalid rule")
@@ -1270,7 +1271,16 @@ def generated_adapted(repo: str, reviewed: str, frozen: str, *,
                        "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
                        "PYTHONPATH": str(Path(tree) / "src"),
                        "PYTHONNOUSERSITE": "1"}
-                result = subprocess.run(rule["check"], cwd=tree,
+                command = list(rule["check"])
+                if "/" not in command[0]:
+                    # The host runtime is trusted, including tools outside the
+                    # system PATH. Resolve only the executable; do not pass the
+                    # host PATH or injection variables into the checker.
+                    executable = shutil.which(command[0])
+                    if executable is None:
+                        return False, "generated executable unavailable for " + path
+                    command[0] = str(Path(executable).resolve())
+                result = subprocess.run(command, cwd=tree,
                                         env=env,
                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.DEVNULL, timeout=GENERATED_CHECK_TIMEOUT)

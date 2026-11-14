@@ -214,3 +214,38 @@ class GeneratedCarryTest(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertEqual(set(seen[0]), {"PATH", "HOME", "TMPDIR", "LANG",
                                       "LC_ALL", "PYTHONPATH", "PYTHONNOUSERSITE"})
+
+    @unittest.skipUnless(shutil.which("node"), "node unavailable")
+    def test_manifest_node_command_resolves_outside_system_path(self):
+        manifest = json.loads((Path(__file__).resolve().parents[1] /
+                               verdict_carry.GENERATED_FILES).read_text())
+        self.rule = {"check": manifest["files"]["ui/src/api/schema.d.ts"]["check"]}
+        self.write("ui/scripts/gen-api.mjs", "import fs from 'node:fs';\n"
+                   "if (!process.argv.includes('--check')) process.exit(2);\n"
+                   "process.exit(fs.readFileSync('generated.txt', 'utf8') === "
+                   "fs.readFileSync('source.txt', 'utf8') ? 0 : 1);\n")
+        self.declare()
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        self.write("generated.txt", "reviewed\n")
+        frozen = self.commit()
+        tools = Path(self.tmp.name) / "host-tools"
+        tools.mkdir()
+        (tools / "node").symlink_to(shutil.which("node"))
+        with mock.patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.defpath,
+                "NODE_OPTIONS": "--this-must-not-reach-node"}):
+            ok, why, adaptation = self.check(frozen)
+        self.assertTrue(ok, why)
+        self.assertTrue(adaptation)
+
+    def test_manifest_cannot_declare_itself_as_generated(self):
+        self.write(verdict_carry.GENERATED_FILES, json.dumps({"version": 1,
+            "files": {verdict_carry.GENERATED_FILES:
+                      {"check": [sys.executable, "-c", "pass"]}}}))
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        with (Path(self.root) / verdict_carry.GENERATED_FILES).open("a") as stream:
+            stream.write("\n")
+        ok, why, _ = self.check(self.commit())
+        self.assertFalse(ok)
+        self.assertIn("declaration absent or invalid", why)

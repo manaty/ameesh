@@ -8,7 +8,8 @@ de la cible, jamais depuis le checkout courant ou la branche candidate.
 La nouvelle tête descend de la tête relue par des commits linéaires limités
 à ces sorties. Les sources, générateurs, déclarations et autres fichiers
 restent identiques à ceux relus ; une modification de code, même rétablie
-ensuite, refuse le report. Les sorties sont des fichiers ordinaires.
+ensuite, refuse le report. Le manifeste ne peut pas se déclarer comme sortie.
+Les sorties sont des fichiers ordinaires.
 
 Chaque commande `check` déclarée est exécutée sans shell sur un checkout
 jetable de la tête gelée. Elle doit sortir en zéro sans retoucher sa sortie.
@@ -23,7 +24,12 @@ système, HOME et TMPDIR jetables, locale C.UTF-8, PYTHONPATH vers les sources
 gelées et PYTHONNOUSERSITE=1. Aucune autre variable de l’hôte n’est héritée
 (notamment NODE_OPTIONS, NODE_PATH, PYTHONHOME et LD_PRELOAD).
 
-La preuve fait encore confiance aux exécutables système et aux octets des
+Un exécutable nommé sans chemin est résolu avec le PATH de l’hôte, puis
+lancé par son chemin absolu dans cet environnement fermé. Cela permet par
+exemple le Node installé hors du PATH système, sans transmettre le PATH de
+l’hôte au contrôle.
+
+La preuve fait encore confiance aux exécutables locaux et aux octets des
 dépendances locales : comparer les locks ne certifie pas ces octets. Elle
 suppose un hôte et un runtime locaux de confiance ; ce n’est pas une exécution
 distante attestée ni un bac à sable contre un runtime compromis. Tous les
