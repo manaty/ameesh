@@ -1058,10 +1058,10 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
             % ", ".join(declared))
     tooling(repo, head, params, deadline=deadline)
     carte, cleanup = map_for(repo_slug, repo, explicit=map_path, deadline=deadline)
-    if deadline is not None and deadline.expired():
-        raise _timeout_error(deadline, "avant la file heavy")
     prepared = None
     try:
+        if deadline is not None and deadline.expired():
+            raise _timeout_error(deadline, "avant la file heavy")
         #: #7161 : le plan, le snapshot et le run invité passent par la file
         #: des suites lourdes de l'hôte (`ameesh heavy`, L131). L'attente d'un
         #: créneau est suspendue de l'échéance : elle n'est jamais un

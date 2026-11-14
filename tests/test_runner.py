@@ -1191,7 +1191,11 @@ class RunnerTest(PgTestCase):
         # résolution du harnais et le pick dépassaient 3 s et le veilleur tuait
         # avant le tour. La cadence courte est couverte par les témoins à
         # horloge simulée ; ce témoin de bout en bout vérifie la restauration.
-        env = self.env(AMEESH_TEST_SLEEP="300", AMEESH_LEASE_TTL="20",
+        # #7296 : démarrage et arrêt ont chacun une borne de 120 s, mise
+        # à l'échelle par wait_for. Le harnais doit dormir au-delà des deux
+        # bornes cumulées, même sous psql : sa fin naturelle ne prouve pas
+        # que le runner l'a arrêté à la perte du bail.
+        env = self.env(AMEESH_TEST_SLEEP=str(scaled(300)), AMEESH_LEASE_TTL="20",
                        AMEESH_HOST_GATE="file", AMEESH_HOST_GATE_PATH=gate_state,
                        AMEESH_HOST_GATE_ACK=os.path.join(self.tmp, "gate-ack", "ack.json"),
                        AMEESH_HOST_GATE_FALLBACK="available")
@@ -1207,26 +1211,28 @@ class RunnerTest(PgTestCase):
             if proc.poll() is None:
                 proc.terminate()
             try:
-                proc.wait(timeout=30)
+                proc.wait(timeout=scaled(30))
             except subprocess.TimeoutExpired:
                 proc.kill()
-                proc.wait(timeout=5)
-            lecteur.join(timeout=5)
+                proc.wait(timeout=scaled(5))
+            lecteur.join(timeout=scaled(5))
             if proc.stdout is not None:
                 proc.stdout.close()
 
         try:
-            self.wait_for(lambda: len(self.turns()) == 1, timeout=60)
+            self.wait_for(lambda: proc.poll() is not None or len(self.turns()) == 1,
+                          timeout=120)
+            self.assertIsNone(proc.poll(), "exécuteur sorti avant le démarrage du tour")
             self.db.execute(
                 "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
                 "WHERE name = 'perdu'")
-            # Le harnais dort 300 s : un arrêt manqué à la perte du bail laisse
+            # Le harnais dort plus de 240 s : un arrêt manqué à la perte du bail laisse
             # l'exécuteur vivant au-delà de cette borne. `--once` sort juste
             # après le tour : sa sortie est le repère stable (rien ne vient
             # reprendre la consigne restaurée). Sous charge CI, le battement
             # peut tarder : 120 s, et la sortie nomme la cause.
             self.wait_for(lambda: proc.poll() is not None, timeout=120)
-            proc.wait(timeout=30)
+            proc.wait(timeout=scaled(30))
         except AssertionError as exc:
             arreter()
             self.fail("%s\nsortie de l'exécuteur :\n%s"
