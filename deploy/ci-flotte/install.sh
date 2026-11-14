@@ -28,7 +28,12 @@
 #   sudo deploy/ci-flotte/install.sh --remove
 #
 # Planned stop of a CI VM (reboot, resize, image): drain first, never cut:
+#   sudo systemctl stop ameesh-ci-runner-recover.timer ameesh-ci-runner-recover.service
 #   sudo ameesh-ci-runner-drain --all --stop --wait 3600 && sudo systemctl reboot
+# Stop both recovery units before draining: no recovery may remain running
+# when the drain snapshots active runners. If maintenance is cancelled or
+# finishes without reboot, start ameesh-ci-runner-recover.timer again; an
+# enabled timer resumes automatically after reboot. See recovery.md.
 #
 # Test seam (dry runs and --check only): CI_FLOTTE_TEST_ROOT prefixes every
 # path written or read.

@@ -10,6 +10,13 @@ Le bureau applique depuis le checkout fusionné, sur **chaque** VM CI
    redémarrer les runners entre deux jobs avec ce drain : il ne coupe pas un
    job accepté avant le lancement du Worker. **Ne jamais utiliser l’ancien
    drain f40978b, suspendu.**
+   Avant le drain, arrêter le timer **et le service** de récupération :
+   `sudo systemctl stop ameesh-ci-runner-recover.timer ameesh-ci-runner-recover.service`.
+   Le verrou du drain protège chaque geste, pas toute la maintenance : une
+   reprise ne doit pas ajouter un runner après la photographie des unités à
+   drainer. En fin de maintenance, ou si elle est annulée, réactiver le timer
+   avec `sudo systemctl start ameesh-ci-runner-recover.timer` ; après un reboot,
+   le timer activé au démarrage reprend automatiquement. Voir [recovery.md](recovery.md).
 4. Au premier job, vérifier dans les diagnostics Worker la mention
    `Found action archive` et le chemin du cache. `--check` et `systemctl show`
    ne prouvent que les fichiers et la configuration chargée ; le journal du
