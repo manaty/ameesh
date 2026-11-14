@@ -47,6 +47,11 @@ COMMAND = ["/bin/sh", "-c", 'while IFS= read -r line; do printf "echo:%s\\n" "$l
 #: psycopg ou des unités voisines, 5 s ne suffisent pas. La condition reste un
 #: événement ou une trame attendue ; la borne n'est qu'un garde-fou.
 LOCAL_IO_TIMEOUT = 30.0
+#: budget des sessions ouvertes par les tests : très au-dessus de la borne
+#: d'E/S du poste, pour qu'une part lente ne ferme jamais une session en cours
+#: de test (le relais rendait `max_duration` avant la réponse, #7325). Les
+#: bornes de production du relais et de l'hôte restent leurs défauts.
+SESSION_BUDGET = 10 * LOCAL_IO_TIMEOUT
 
 
 class _ObservedConnector(attach_host.HostConnector):
@@ -460,8 +465,8 @@ class RelayTest(unittest.TestCase):
         config = dict(listen_host="127.0.0.1", listen_port=0,
                       hosts={HOST: TOKEN}, plaintext_loopback=True,
                       grant_checker=self._check_grant,
-                      pair_timeout=0.3, idle_timeout=10.0,
-                      max_session_seconds=10.0, max_sessions=8,
+                      pair_timeout=0.3, idle_timeout=SESSION_BUDGET,
+                      max_session_seconds=SESSION_BUDGET, max_sessions=8,
                       max_sessions_per_host=4, max_sessions_per_ip=8)
         config.update(overrides)
         self.relay = attach_relay.RelayServer(attach_relay.RelayConfig(**config),
@@ -473,7 +478,8 @@ class RelayTest(unittest.TestCase):
         config = dict(relay_host="127.0.0.1", relay_port=self.relay.port, token=TOKEN,
                       host=HOST, agents=(AGENT,), plaintext_loopback=True,
                       command=COMMAND, host_signing_key=HOST_SIGNING_KEY,
-                      max_sessions=4, max_session_seconds=10.0, keepalive=1.0)
+                      max_sessions=4, max_session_seconds=SESSION_BUDGET,
+                      request_timeout=SESSION_BUDGET, keepalive=1.0)
         config.update(overrides)
         self.connector = _ObservedConnector(
             attach_host.HostConfig(**config), self.verifier, logger=self.logger)
@@ -713,6 +719,21 @@ class RelayTest(unittest.TestCase):
             attach_relay.RelayConfig(hosts={HOST: TOKEN}, listen_host="10.0.0.1",
                                      mesh_cidrs=("10.0.0.0/8",), plaintext_loopback=True)
 
+    def test_budget_de_session_au_dessus_de_la_borne_du_poste(self):
+        # #7325 : sous charge, une part lente met plus que l'ancien budget de
+        # 10 s entre l'appairage et la réponse ; le relais fermait alors la
+        # session (`max_duration`) avant que le poste ne rende son verdict.
+        # Le budget des tests doit rester au-dessus de leur propre borne d'E/S.
+        self.assertGreater(SESSION_BUDGET, LOCAL_IO_TIMEOUT)
+        relay = self.start()
+        self.host()
+        self.assertGreater(relay.config.idle_timeout, LOCAL_IO_TIMEOUT)
+        self.assertGreater(relay.config.max_session_seconds, LOCAL_IO_TIMEOUT)
+        self.assertGreater(self.connector.config.max_session_seconds,
+                           LOCAL_IO_TIMEOUT)
+        self.assertGreater(self.connector.config.request_timeout,
+                           LOCAL_IO_TIMEOUT)
+
 
 class TlsTest(unittest.TestCase):
     def setUp(self):
@@ -753,15 +774,16 @@ class TlsTest(unittest.TestCase):
         relay = attach_relay.RelayServer(attach_relay.RelayConfig(
             listen_host="127.0.0.1", listen_port=0, hosts={HOST: TOKEN},
             grant_checker=lambda document, expected: (True, "", ""),
-            tls_context=self.server_ctx, pair_timeout=0.3, idle_timeout=10.0,
-            max_session_seconds=10.0))
+            tls_context=self.server_ctx, pair_timeout=0.3,
+            idle_timeout=SESSION_BUDGET, max_session_seconds=SESSION_BUDGET))
         relay.start()
         self.addCleanup(relay.stop)
         verifier = FakeVerifier()
         connector = _ObservedConnector(attach_host.HostConfig(
             relay_host="127.0.0.1", relay_port=relay.port, token=TOKEN, host=HOST,
             agents=(AGENT,), tls_context=self.client_ctx, command=COMMAND,
-            host_signing_key=HOST_SIGNING_KEY), verifier)
+            host_signing_key=HOST_SIGNING_KEY, max_session_seconds=SESSION_BUDGET,
+            request_timeout=SESSION_BUDGET), verifier)
         thread = threading.Thread(target=connector.run_forever, daemon=True)
         thread.start()
         self.addCleanup(connector.stop)
