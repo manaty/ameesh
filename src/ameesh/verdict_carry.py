@@ -51,6 +51,13 @@ tests seuls n'en profite pas : ses tests sont son contenu. **Seul un avis
 favorable se reporte ainsi** : une adaptation peut répondre au blocage, son
 auteur juge donc la nouvelle tête, redésigné normalement.
 
+**Sorties générées (#7323)** — une liste fermée versionnée sur la cible
+(`.ameesh/generated-files.json`) nomme les sorties et leurs contrôles.
+Un delta linéaire limité à ces sorties conserve les avis favorables si chaque
+contrôle réussit sur un checkout jetable de la tête gelée. Les sources et les
+générateurs restent relus ; contrôle rouge ou non concluant, code mêlé,
+changement transitoire ou mode spécial : refus. Voir `docs/VERDICTS-GENERES.md`.
+
 **Renumérotation (#7000)** — constat nexlink #6953 : le pilote échange deux
 réservations, l'auteur renomme sa migration 784 en 783 et retouche les renvois
 au numéro. C'est une troisième adaptation ; l'invariant prouvé, pour la
@@ -131,10 +138,13 @@ import json
 import os
 import re
 import shutil
+import stat
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, replace
 from typing import Mapping, Optional
+from pathlib import Path, PurePosixPath
 
 from . import merge_queue, plan_git, storage, work
 
@@ -1171,8 +1181,147 @@ def adapted(repo: str, reviewed: str, frozen: str, tip: str, *,
                   % (merge["tests"], merge["hunks"], why))
 
 
+# #7323: the declaration is read from the integrated target, never the caller's
+# checkout or an unreviewed candidate. Inputs and checkers stay unchanged R→F.
+GENERATED_FILES = ".ameesh/generated-files.json"
+GENERATED_CHECK_TIMEOUT = 60
+
+
+def _generated_path(value) -> bool:
+    return (isinstance(value, str) and bool(value) and "\\" not in value
+            and not PurePosixPath(value).is_absolute()
+            and all(part not in ("", ".", "..", ".git") for part in value.split("/")))
+
+
+def _trusted_generated_executable(command: str) -> str | None:
+    """Resolve only through root-controlled paths, including symlink parents.
+
+    Inspect the lookup path as well as the resolved target: an author-owned
+    alias to /usr/bin/true must not be accepted as a trusted 'node'.
+    """
+    if "/" in command:
+        candidates = [Path(command)] if Path(command).is_absolute() else []
+    else:
+        candidates = [Path(directory) / command
+                      for directory in os.get_exec_path() if Path(directory).is_absolute()]
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            for path in (candidate, *candidate.parents, resolved, *resolved.parents):
+                info = path.lstat()
+                if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode)
+                                        and info.st_mode & 0o022):
+                    break
+            else:
+                if resolved.is_file() and os.access(resolved, os.X_OK):
+                    return str(resolved)
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
+def generated_adapted(repo: str, reviewed: str, frozen: str, *,
+                      declaration_ref: str | None = None, runtime_repo: str | None = None) -> tuple:
+    """Only declared generated outputs, unchanged inputs, successful frozen check.
+
+    This deliberately requires descent from R and checks every intervening
+    commit. Mixed code, transient code edits, merges, modes and declarations
+    changed in the same delta cannot acquire inherited opinions.
+    """
+    if not _complete_history(repo):
+        return False, "generated proof requires complete history"
+    if plan_git._git(repo, "merge-base", "--is-ancestor", reviewed, frozen).returncode:
+        return False, "generated proof requires descent from the reviewed head"
+    raw = plan_git._out(repo, "show", (declaration_ref or reviewed) + ":" + GENERATED_FILES)
+    try:
+        manifest = json.loads(raw or "null")
+        files = manifest["files"]
+        if manifest["version"] != 1 or not isinstance(files, dict) or not files:
+            raise ValueError("invalid declaration")
+        for path, rule in files.items():
+            if (not _generated_path(path) or path == GENERATED_FILES
+                    or not isinstance(rule, dict)
+                    or not isinstance(rule.get("check"), list) or not rule["check"]
+                    or not all(isinstance(arg, str) and arg for arg in rule["check"])):
+                raise ValueError("invalid rule")
+            if "runtime" in rule and (not _generated_path(rule["runtime"])
+                    or not isinstance(rule.get("locks"), list) or not rule["locks"]
+                    or not all(_generated_path(lock) for lock in rule["locks"])):
+                raise ValueError("invalid runtime declaration")
+    except (ValueError, TypeError, KeyError):
+        return False, "generated declaration absent or invalid on trusted head"
+    runtime_repo = runtime_repo or repo
+    changed = _name_status(repo, reviewed, frozen)
+    if not changed or any(path not in files or status not in ("A", "M")
+                          for path, status in changed.items()):
+        return False, "delta is not limited to declared generated files"
+    commits = _lines_of(repo, "rev-list", "--reverse", reviewed + ".." + frozen)
+    if not commits or len(commits) > MAX_NEW_COMMITS:
+        return False, "generated history unavailable or too large"
+    for commit in commits:
+        parents = _lines_of(repo, "rev-list", "--parents", "-n", "1", commit)
+        if not parents or len(parents) != 2:
+            return False, "generated history must be linear"
+        delta = _name_status(repo, parents[1], commit)
+        if delta is None or any(path not in files or status not in ("A", "M")
+                                for path, status in delta.items()):
+            return False, "generated history contains another change"
+    for path in files:
+        before = plan_git._out(repo, "ls-tree", reviewed, "--", path)
+        after = plan_git._out(repo, "ls-tree", frozen, "--", path)
+        if (not after or after.split()[0] != "100644"
+                or (before and before.split()[0] != "100644")):
+            return False, "generated output must be a regular non-executable file"
+    try:
+        with tempfile.TemporaryDirectory(prefix="ameesh-generated-") as tmp:
+            tree = str(Path(tmp) / "tree")
+            if plan_git._git(repo, "clone", "--shared", "--no-checkout", "--", repo, tree).returncode:
+                return False, "generated check checkout unavailable"
+            if plan_git._git(tree, "checkout", "--detach", frozen).returncode:
+                return False, "generated check checkout unavailable"
+            for path in sorted(files):
+                rule = files[path]
+                runtime = rule.get("runtime")
+                if runtime and not (Path(tree) / runtime).exists():
+                    # Reuse installed tools only with exactly the frozen lock
+                    # and package declaration. Missing tools are inconclusive.
+                    for lock in rule["locks"]:
+                        blob = plan_git._git(repo, "show", frozen + ":" + lock)
+                        if blob.returncode or (Path(runtime_repo) / lock).read_bytes() != blob.stdout:
+                            return False, "generated runtime lock differs from frozen head"
+                    source = Path(runtime_repo) / runtime
+                    if not source.is_dir():
+                        return False, "generated runtime unavailable"
+                    (Path(tree) / runtime).symlink_to(source.resolve(), target_is_directory=True)
+                # Isolate ambient configuration, while trusting the host's
+                # executables and installed runtime bytes (not a sandbox).
+                env = {"PATH": os.defpath, "HOME": tmp, "TMPDIR": tmp,
+                       "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                       "PYTHONPATH": str(Path(tree) / "src"),
+                       "PYTHONNOUSERSITE": "1"}
+                command = list(rule["check"])
+                executable = _trusted_generated_executable(command[0])
+                if executable is None:
+                    return False, "trusted generated executable unavailable for " + path
+                command[0] = executable
+                result = subprocess.run(command, cwd=tree,
+                                        env=env,
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, timeout=GENERATED_CHECK_TIMEOUT)
+                if result.returncode:
+                    return False, "generated check failed or inconclusive for " + path
+                # A checker must validate the committed bytes, not fix them.
+                blob = plan_git._git(repo, "show", frozen + ":" + path)
+                if blob.returncode or (Path(tree) / path).read_bytes() != blob.stdout:
+                    return False, "generated check modified its output"
+    except (OSError, subprocess.SubprocessError):
+        return False, "generated check unavailable or timed out"
+    return True, "generated adaptation: frozen generation checks passed for " + ", ".join(sorted(changed))
+
+
 def _carriable(repo: str, reviewed: str, frozen: str, tip: str, *,
-               renumber: Renumbering | None = None) -> tuple:
+               renumber: Renumbering | None = None, runtime_repo: str | None = None,
+               allow_generated: bool = True) -> tuple:
     """`(oui, raison, adaptation)` : réalignement (tout verdict se reporte) ou, à
     défaut, adaptation (l'avis favorable seul se reporte, #5042, #7000)."""
     ok, why = realigned(repo, reviewed, frozen, tip)
@@ -1181,7 +1330,13 @@ def _carriable(repo: str, reviewed: str, frozen: str, tip: str, *,
     fits, how = adapted(repo, reviewed, frozen, tip, renumber=renumber)
     if fits:
         return True, how, True
-    return False, "%s; not an adaptation either: %s" % (why, how), False
+    if not allow_generated:
+        return False, NOT_OK_ADAPTATION, False
+    generated, proof = generated_adapted(repo, reviewed, frozen, declaration_ref=tip,
+                                          runtime_repo=runtime_repo)
+    if generated:
+        return True, proof, True
+    return False, "%s; not an adaptation either: %s; generated check #7323: %s" % (why, how, proof), False
 
 
 def _outcomes(db, lots) -> dict:
@@ -1210,6 +1365,12 @@ def _decided(notes, reviewed: str, frozen: str) -> bool:
     se comparent au préfixe (N1 qa-01) : un verdict qui cite un SHA abrégé
     retrouve l'issue écrite avec le SHA résolu, sans nouveau calcul."""
     for note in notes or ():
+        # Old refusals of generated files never ran this new proof. Revisit
+        # those once on the same freeze, preserving acquired verdicts.
+        if (str(note).startswith(NOT_CARRIED)
+                and "differs outside a test or a conflict" in note
+                and "generated check #7323:" not in note):
+            continue
         for left, right in _ARROW_RE.findall(note):
             if _same(left, reviewed) and _same(right, frozen):
                 return True
@@ -1402,7 +1563,7 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
         renumber = renumbering_of(cfg, row, repo)
     except Exception:  # noqa: BLE001 - réservation illisible : aucune renumérotation
         renumber = None
-    verdicts: dict = {}          # tête relue complète -> (oui, raison)
+    verdicts: dict = {}          # (tête relue, contrôle autorisé) -> preuve
     plan: list = []              # (relecteur, verdict reporté)
     refused: list = []           # (tête relue, raison)
     superseded: list = []        # (tête relue, raison), hors du gel précédent
@@ -1416,9 +1577,14 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
             out["detail"] = "reviewed head %s is not a commit of %s" % (
                 _norm(mark.get("sha"))[:12], where)
             continue                  # objet absent : rien de prouvé, retenté
-        if reviewed not in verdicts:
-            verdicts[reviewed] = _carriable(where, reviewed, frozen, tip, renumber=renumber)
-        ok, why, adaptation = verdicts[reviewed]
+        allow_generated = ((mark.get("verdict") or "ok") == "ok"
+                           and not _stale(mark, previous))
+        proof_key = (reviewed, allow_generated)
+        if proof_key not in verdicts:
+            verdicts[proof_key] = _carriable(
+                where, reviewed, frozen, tip, renumber=renumber,
+                runtime_repo=repo, allow_generated=allow_generated)
+        ok, why, adaptation = verdicts[proof_key]
         if ok and adaptation and (mark.get("verdict") or "ok") != "ok":
             ok, why = False, NOT_OK_ADAPTATION
         if ok:

@@ -1,0 +1,315 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#7323: generated-only deltas carry only after frozen generation checks."""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+import unittest
+from unittest import mock
+import subprocess
+
+from ameesh import verdict_carry
+from .test_2442_verdict_carry import _git
+
+
+CHECK_PYTHON = verdict_carry._trusted_generated_executable("python3")
+CHECK_NODE = verdict_carry._trusted_generated_executable("node")
+
+
+class GeneratedCarryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="7323-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        _git(self.root, "init", "-q", "-b", "main")
+        self.write("source.txt", "base\n")
+        self.write("generated.txt", "base\n")
+        self.write("check.py", "from pathlib import Path\nimport sys\n"
+                   "sys.exit(0 if Path('generated.txt').read_bytes() == "
+                   "Path('source.txt').read_bytes() else 1)\n")
+        self.rule = {"check": [CHECK_PYTHON, "check.py"]}
+        self.declare()
+        self.tip = self.commit()
+        self.write("source.txt", "reviewed\n")
+        self.reviewed = self.commit()
+
+    def write(self, path, text):
+        full = Path(self.root) / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(text, encoding="utf-8")
+
+    def declare(self):
+        self.write(verdict_carry.GENERATED_FILES, json.dumps({
+            "version": 1, "files": {"generated.txt": self.rule}}))
+
+    def commit(self):
+        _git(self.root, "add", ".")
+        _git(self.root, "commit", "-q", "-m", "fixture")
+        return _git(self.root, "rev-parse", "HEAD")
+
+    def check(self, frozen):
+        return verdict_carry._carriable(self.root, self.reviewed, frozen, self.tip)
+
+    def test_generated_only_green_check_carries_as_adaptation(self):
+        self.write("generated.txt", "reviewed\n")
+        ok, why, adaptation = self.check(self.commit())
+        self.assertTrue(ok, why)
+        self.assertTrue(adaptation)
+        self.assertIn("frozen generation checks passed", why)
+
+    def test_ineligible_mark_never_runs_generated_proof(self):
+        self.write("generated.txt", "reviewed\n")
+        frozen = self.commit()
+        with mock.patch.object(verdict_carry, "generated_adapted") as generated:
+            ok, why, _ = verdict_carry._carriable(
+                self.root, self.reviewed, frozen, self.tip, allow_generated=False)
+        self.assertFalse(ok)
+        self.assertEqual(why, verdict_carry.NOT_OK_ADAPTATION)
+        generated.assert_not_called()
+
+    def test_plan_disables_execution_for_blocked_and_stale_marks(self):
+        marks = [
+            {"id": 1, "kind": "verdict", "actor": "blocked", "sha": "R", "verdict": "blocked"},
+            {"id": 2, "kind": "verdict", "actor": "stale", "sha": "R", "verdict": "ok"},
+            {"id": 3, "kind": "frozen", "sha": "previous"},
+            {"id": 4, "kind": "verdict", "actor": "current", "sha": "R", "verdict": "ok"},
+        ]
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            def patch(name, **kwargs):
+                return stack.enter_context(mock.patch(name, **kwargs))
+            patch("ameesh.work.get", return_value={"state": "qa"})
+            patch("ameesh.work.milestones", return_value=marks)
+            patch("ameesh.verdict_carry.pending", return_value={m["actor"]: m for m in marks if "actor" in m})
+            patch("ameesh.agent_review_hold.carried_reviewers", return_value=["blocked", "stale", "current"])
+            patch("ameesh.lot_class.default_base", return_value="main")
+            patch("ameesh.verdict_carry._repo_path", return_value=self.root)
+            patch("ameesh.merge_queue.pinned", side_effect=lambda repo, sha: sha)
+            patch("ameesh.verdict_carry.renumbering_of", return_value=None)
+            check = patch("ameesh.verdict_carry._carriable", return_value=(False, "refused", False))
+            verdict_carry._plan_for(None, None, 7323, {"detail": ""}, "F",
+                repo=self.root, clone=self.root, notes=[],
+                fetched={(self.root, "main"): ("tip", self.root)})
+        # Same reviewed head: an eligible proof must not be reused for a stale mark.
+        self.assertEqual([c.kwargs["allow_generated"] for c in check.call_args_list],
+                         [False, True])
+
+    def test_red_check_refuses(self):
+        self.write("generated.txt", "invented\n")
+        self.assertFalse(self.check(self.commit())[0])
+
+    def test_mixed_code_refuses(self):
+        self.write("generated.txt", "reviewed\n")
+        self.write("source.txt", "unreviewed\n")
+        self.assertFalse(self.check(self.commit())[0])
+
+    def test_unlisted_output_refuses(self):
+        self.write("generated.txt", "reviewed\n")
+        self.write("another.txt", "generated\n")
+        self.assertFalse(self.check(self.commit())[0])
+
+    def test_declaration_cannot_grant_itself_an_exemption(self):
+        self.rule["check"] = [CHECK_PYTHON, "-c", "pass"]
+        self.declare()
+        self.write("generated.txt", "invented\n")
+        self.assertFalse(self.check(self.commit())[0])
+
+    def test_dirty_checkout_is_not_the_proof(self):
+        self.write("generated.txt", "invented\n")
+        frozen = self.commit()
+        self.write("generated.txt", "reviewed\n")
+        self.assertFalse(self.check(frozen)[0])
+
+    def test_hidden_code_change_then_revert_refuses(self):
+        self.write("source.txt", "hidden\n")
+        self.commit()
+        self.write("source.txt", "reviewed\n")
+        self.write("generated.txt", "reviewed\n")
+        self.assertFalse(self.check(self.commit())[0])
+
+    def test_missing_command_and_timeout_are_inconclusive(self):
+        self.write("generated.txt", "reviewed\n")
+        frozen = self.commit()
+        original_run = subprocess.run
+        for exc in (FileNotFoundError(), subprocess.TimeoutExpired("checker", 60)):
+            def run(argv, *args, **kwargs):
+                if argv[0] == str(Path(CHECK_PYTHON).resolve()):
+                    raise exc
+                return original_run(argv, *args, **kwargs)
+            with self.subTest(exc=type(exc).__name__), mock.patch.object(
+                    verdict_carry.subprocess, "run", side_effect=run):
+                self.assertFalse(verdict_carry.generated_adapted(
+                    self.root, self.reviewed, frozen)[0])
+
+    def test_symlink_output_refuses(self):
+        (Path(self.root) / "generated.txt").unlink()
+        os.symlink("source.txt", Path(self.root) / "generated.txt")
+        self.assertFalse(self.check(self.commit())[0])
+
+    def test_checker_cannot_fix_a_stale_file_and_claim_success(self):
+        self.write("check.py", "from pathlib import Path\n"
+                   "Path('generated.txt').write_bytes(Path('source.txt').read_bytes())\n")
+        self.reviewed = self.commit()
+        self.write("generated.txt", "invented\n")
+        self.assertFalse(self.check(self.commit())[0])
+
+    def test_old_generated_refusal_is_retried_on_the_same_freeze(self):
+        old = (verdict_carry.NOT_CARRIED + " " + self.reviewed[:12] + " → "
+               + self.tip[:12] + ": generated.txt differs outside a test or a conflict")
+        self.assertFalse(verdict_carry._decided([old], self.reviewed, self.tip))
+        current = old + "; generated check #7323: failed"
+        self.assertTrue(verdict_carry._decided([current], self.reviewed, self.tip))
+
+    def test_manifest_absent_from_trusted_target_refuses(self):
+        _git(self.root, "rm", verdict_carry.GENERATED_FILES)
+        self.tip = self.commit()
+        self.write("generated.txt", "reviewed\n")
+        self.assertFalse(self.check(self.commit())[0])
+
+    def runtime_fixture(self):
+        self.rule.update(runtime="tools", locks=["lock.txt"])
+        self.declare()
+        self.write(".gitignore", "tools/\n")
+        self.write("lock.txt", "locked\n")
+        self.write("check.py", "from pathlib import Path\nimport sys\n"
+                   "sys.exit(0 if Path('tools/marker').read_text() == 'installed' "
+                   "and Path('generated.txt').read_bytes() == "
+                   "Path('source.txt').read_bytes() else 1)\n")
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        self.write("generated.txt", "reviewed\n")
+        return self.commit()
+
+    def test_runtime_is_reused_when_locks_match(self):
+        frozen = self.runtime_fixture()
+        self.write("tools/marker", "installed")
+        ok, why, adaptation = self.check(frozen)
+        self.assertTrue(ok, why)
+        self.assertTrue(adaptation)
+
+    def test_missing_runtime_is_inconclusive(self):
+        frozen = self.runtime_fixture()
+        ok, why, _ = self.check(frozen)
+        self.assertFalse(ok)
+        self.assertIn("runtime unavailable", why)
+
+    def test_runtime_with_different_lock_is_refused(self):
+        frozen = self.runtime_fixture()
+        self.write("tools/marker", "installed")
+        self.write("lock.txt", "different\n")
+        ok, why, _ = self.check(frozen)
+        self.assertFalse(ok)
+        self.assertIn("runtime lock differs", why)
+
+    def test_unchanged_downstream_output_must_pass_its_check(self):
+        self.write("downstream.txt", "base\n")
+        self.write(verdict_carry.GENERATED_FILES, json.dumps({
+            "version": 1, "files": {
+                "generated.txt": self.rule,
+                "downstream.txt": {"check": [CHECK_PYTHON, "-c",
+                    "from pathlib import Path; import sys; "
+                    "sys.exit(Path('downstream.txt').read_bytes() != "
+                    "Path('generated.txt').read_bytes())"]}}}))
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        self.write("generated.txt", "reviewed\n")
+        ok, why, _ = self.check(self.commit())
+        self.assertFalse(ok)
+        self.assertIn("check failed or inconclusive for downstream.txt", why)
+
+    @unittest.skipUnless(CHECK_NODE, "trusted node unavailable")
+    def test_node_options_cannot_forge_success(self):
+        self.rule = {"check": [CHECK_NODE, "check.js"]}
+        self.write("check.js", "process.exit(1);\n")
+        self.declare()
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        self.write("generated.txt", "reviewed\n")
+        frozen = self.commit()
+        self.write("preload.js", "process.exit(0);\n")
+        with mock.patch.dict(os.environ, {
+                "NODE_OPTIONS": "--require " + str(Path(self.root) / "preload.js")}):
+            ok, why, _ = self.check(frozen)
+        self.assertFalse(ok)
+        self.assertIn("check failed", why)
+
+    def test_check_environment_is_closed(self):
+        self.write("generated.txt", "reviewed\n")
+        frozen = self.commit()
+        original_run = subprocess.run
+        seen = []
+
+        def run(argv, *args, **kwargs):
+            if argv[0] == str(Path(CHECK_PYTHON).resolve()):
+                seen.append(kwargs["env"])
+            return original_run(argv, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"NODE_PATH": "injected",
+                "PYTHONHOME": "injected"}), mock.patch.object(
+                    verdict_carry.subprocess, "run", side_effect=run):
+            self.assertTrue(self.check(frozen)[0])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(set(seen[0]), {"PATH", "HOME", "TMPDIR", "LANG",
+                                      "LC_ALL", "PYTHONPATH", "PYTHONNOUSERSITE"})
+
+    @unittest.skipUnless(CHECK_NODE, "trusted node unavailable")
+    def test_manifest_node_command_resolves_outside_system_path(self):
+        manifest = json.loads((Path(__file__).resolve().parents[1] /
+                               verdict_carry.GENERATED_FILES).read_text())
+        self.rule = {"check": manifest["files"]["ui/src/api/schema.d.ts"]["check"]}
+        self.write("ui/scripts/gen-api.mjs", "import fs from 'node:fs';\n"
+                   "if (!process.argv.includes('--check')) process.exit(2);\n"
+                   "process.exit(fs.readFileSync('generated.txt', 'utf8') === "
+                   "fs.readFileSync('source.txt', 'utf8') ? 0 : 1);\n")
+        self.declare()
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        self.write("generated.txt", "reviewed\n")
+        frozen = self.commit()
+        tools = Path(CHECK_NODE).parent
+        with mock.patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.defpath,
+                "NODE_OPTIONS": "--this-must-not-reach-node"}):
+            ok, why, adaptation = self.check(frozen)
+        self.assertTrue(ok, why)
+        self.assertTrue(adaptation)
+
+    def test_manifest_cannot_declare_itself_as_generated(self):
+        self.write(verdict_carry.GENERATED_FILES, json.dumps({"version": 1,
+            "files": {verdict_carry.GENERATED_FILES:
+                      {"check": [CHECK_PYTHON, "-c", "pass"]}}}))
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        with (Path(self.root) / verdict_carry.GENERATED_FILES).open("a") as stream:
+            stream.write("\n")
+        ok, why, _ = self.check(self.commit())
+        self.assertFalse(ok)
+        self.assertIn("declaration absent or invalid", why)
+
+    def test_fake_node_in_author_path_cannot_forge_success(self):
+        self.rule = {"check": ["node", "check.js"]}
+        self.write("check.js", "process.exit(1);\n")
+        self.declare()
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        self.write("generated.txt", "invented\n")
+        frozen = self.commit()
+        self.write("host-tools/node", "#!/bin/sh\nexit 0\n")
+        fake = Path(self.root) / "host-tools/node"
+        fake.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(fake.parent) + os.pathsep +
+                                         os.environ.get("PATH", os.defpath)}):
+            self.assertFalse(self.check(frozen)[0])
+        # A user-controlled alias to a trusted executable is unsafe too.
+        fake.unlink()
+        fake.symlink_to(shutil.which("true"))
+        with mock.patch.dict(os.environ, {"PATH": str(fake.parent)}):
+            self.assertIsNone(verdict_carry._trusted_generated_executable("node"))
+
+    def test_absolute_author_executable_is_not_trusted(self):
+        self.write("fake-check", "#!/bin/sh\nexit 0\n")
+        fake = Path(self.root) / "fake-check"
+        fake.chmod(0o755)
+        self.assertIsNone(verdict_carry._trusted_generated_executable(str(fake)))
