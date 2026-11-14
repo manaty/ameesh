@@ -39,7 +39,9 @@ def load_policy(text):
             if not isinstance(entries, list) or not entries:
                 raise ValueError("empty rules: " + kind)
             for entry in entries:
-                if set(entry) != {"pattern", "reason"} or not entry["reason"]:
+                if (not isinstance(entry, dict) or set(entry) != {"pattern", "reason"}
+                        or not isinstance(entry["reason"], str) or not entry["reason"].strip()
+                        or not isinstance(entry["pattern"], str) or not entry["pattern"]):
                     raise ValueError("rule needs pattern and reason")
                 re.compile(entry["pattern"], re.I | re.S)
         if not isinstance(policy.get("declarations", {}), dict):

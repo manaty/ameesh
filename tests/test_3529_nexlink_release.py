@@ -268,6 +268,22 @@ class PipelineTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        patcher = mock.patch.object(nx, "handoff_preflight",
+                                    return_value={"migrations": [], "migration_safety": []})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_non_handoff_staging_also_refuses_before_tag_or_dispatch(self):
+        with mock.patch.object(nx, "handoff_preflight",
+                               side_effect=rc.ReleaseError("unsafe migration")), \
+                mock.patch.object(nx, "drop_abandoned"), \
+                mock.patch.object(nx, "workflow_step", return_value=True) as dispatch, \
+                mock.patch.object(nx, "publish") as publish:
+            with self.assertRaisesRegex(rc.ReleaseError, "unsafe migration"):
+                rc.execute(self.cfg, None, self.project, now=100000)
+            publish.assert_not_called()
+            self.assertTrue(all(not call.kwargs["staging"] for call in dispatch.call_args_list))
+
     def test_resume_frozen_cutoff_outside_window_without_new_snapshot(self):
         with mock.patch.object(nx, "snapshot") as snapshot, \
                 mock.patch.object(nx, "workflow_step", return_value=False):

@@ -1455,7 +1455,7 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 active += 1
         if not ready:
             return dict(pending, result="waiting-ci")
-        if (not pending["empty"] and project.staging_handoff
+        if (not pending["empty"]
                 and "migration_safety" not in pending.get("handoff_preflight", {})):
             try:
                 pending["handoff_preflight"] = handoff_preflight(project, pending, db)

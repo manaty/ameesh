@@ -1,6 +1,6 @@
 # Staging migration preflight
 
-Before a Nexlink staging handoff publishes its release tag, the release
+Before a Nexlink staging release publishes its release tag, the release
 controller reads `.ameesh/staging-migrations.json` from the frozen candidate.
 If the candidate has migrations, an absent or unreadable policy refuses the
 handoff. No SQL is executed by this check.
@@ -52,5 +52,6 @@ this declaration mechanism.
 
 The returned handoff manifest records the classification and reasons under
 `migration_safety`. A preflight saved by an older controller without that field
-must run the check before publishing. This gate covers the controller's
-staging handoff; it cannot prevent SQL applied manually outside that flow.
+must run the check before publishing. This gate covers both the controller's
+staging handoff and its direct staging workflow path; it cannot prevent SQL
+applied manually outside those flows.
