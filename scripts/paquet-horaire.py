@@ -2113,6 +2113,9 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
     run_id = str(run.get("run_id") or "?")
     removed = ", ".join("#%d" % lot for lot in verdict.lots)
     for lot in verdict.lots:
+        if not exclude(ctx, lot, carrier, name, run_id, verdict.tests,
+                       packet_frozen_at=frozen_ts(item)):
+            continue
         try:
             author = str(show(ctx, lot).get("assignee") or "")
         except HoraireError:
@@ -2126,7 +2129,6 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
                      "suivante. %s"
                      % (lot, name, run_id, frozen_sha(item)[:12], ", ".join(verdict.tests),
                         run.get("url") or ""))
-        exclude(ctx, lot, carrier, name, run_id, verdict.tests)
     ctx.mail(ctx.pilot, carrier,
              "#%d %s : ci-full rouge (run %s), retrait de %s (%s) ; recomposition."
              % (carrier, name, run_id, removed, ", ".join(verdict.tests)))
@@ -2137,30 +2139,52 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
 
 
 def exclude(ctx: Context, lot: int, carrier: int, name: str, run_id: str,
-            tests: list[str]) -> None:
+            tests: list[str], *, packet_frozen_at: float = 0) -> bool:
     """#4028 : le lot retiré pour un test négatif porte sa propre trace et
     repasse en `build` : il attend le correctif de son assigné, et un nouveau
     gel le ramène en qa (puis au paquet). Sans cela il restait en qa, gelé avec
     son GO, et l'attente « merge » faisait réclamer au bureau son inclusion au
     paquet suivant. #4043 : le retrait n'est pas une boucle d'auteur
     (`--package-exclusion` : `loops` inchangé, jamais refusé à la limite). Une
-    transition refusée (lot déjà sorti de qa) laisse la trace seule, en note."""
+    transition refusée (lot déjà sorti de qa) laisse la trace seule, en note.
+    #7271 : seul un gel déclaré après celui du paquet prouve une reprise
+    postérieure à sa composition. Une remise ou résolution peut avoir une
+    source différente du gel du lot sans que celui-ci ait changé."""
+    if packet_frozen_at > 0:
+        try:
+            current_item = show(ctx, lot)
+        except HoraireError as exc:
+            ctx.say("gel courant de #%d illisible : %s" % (lot, exc))
+            current_item = {}
+        current = frozen_sha(current_item)
+        if current and frozen_ts(current_item) > packet_frozen_at:
+            trace = ("%s%s porteur=#%d run=%s tests=%s : "
+                     "gel courant=%s conservé (postérieur au gel du paquet), "
+                     "aucun regel demandé"
+                     % (MARK_EXCLUDED, name, carrier, run_id,
+                        ",".join(tests) or "?", current))
+            if ctx.dry_run:
+                ctx.say("[essai] #%d état conservé : %s" % (lot, trace))
+            else:
+                ctx.note(lot, trace)
+            return False
     trace = "%s%s porteur=#%d run=%s tests=%s : correctif dû par l'assigné, " \
             "regel pour revenir au paquet" % (MARK_EXCLUDED, name, carrier, run_id,
                                               ",".join(tests) or "?")
     if ctx.dry_run:
         ctx.say("[essai] #%d → build : %s" % (lot, trace))
-        return
+        return True
     # #7091 : la liste des tests n'est pas bornée, la note passe par stdin.
     moved = ctx.ameesh("work", "move", str(lot), "build", "--package-exclusion",
                        "--note", "-", "--actor", ctx.actor, input_text=trace)
     if moved.returncode == 0:
-        return
+        return True
     ctx.say("#%d non repassé en build : %s" % (lot, auto._tail(moved.text, 5)))
     try:
         ctx.note(lot, trace)
     except HoraireError as exc:
         ctx.say("trace d'exclusion de #%d non écrite : %s" % (lot, exc))
+    return True
 
 
 def check_fresh(ctx: Context) -> None:
