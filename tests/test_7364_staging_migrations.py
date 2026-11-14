@@ -153,6 +153,32 @@ class GitInventoryTests(unittest.TestCase):
         self.assertTrue(self.run_inventory(['sql/1.sql'],lambda *args:calls.append(args) or True)['allowed'])
         self.assertEqual(calls,[(42,17,'approve')])
 
+    def test_doubt_requires_signed_owner_agreement_not_a_restore_declaration(self):
+        for data in (b"DO $$ BEGIN EXECUTE 'DROP TABLE ' || 'x'; END $$;",
+                     b"DO $$ BEGIN CREATE TABLE x (id int); $$;", b"\xff"):
+            with self.subTest(data=data):
+                path = 'sql/unknown.sql'
+                (self.repo / 'sql').mkdir(exist_ok=True)
+                (self.repo / path).write_bytes(data)
+                self.put('rollback/unknown_restore.sql', '-- restore')
+                entry = {'checksum':hashlib.sha256(data).hexdigest(), 'lot':17,
+                         'restore':'rollback/unknown_restore.sql'}
+                self.policy({path:entry})
+                report = self.run_inventory([path])
+                self.assertFalse(report['allowed'])
+                self.assertIn('unknown', report['files'][0]['reason'])
+                entry.update(decision=42, approval_option='approve')
+                self.policy({path:entry})
+                self.assertFalse(self.run_inventory([path])['allowed'])
+                calls = []
+                report = self.run_inventory([path], lambda *args:calls.append(args) or True)
+                self.assertTrue(report['allowed'])
+                self.assertEqual(report['files'][0]['classification'], 'unknown')
+                self.assertEqual(calls, [(42,17,'approve')])
+                entry['checksum'] = '0' * 64
+                self.policy({path:entry})
+                self.assertFalse(self.run_inventory([path], lambda *args:True)['allowed'])
+
     def test_cli_explicit_inventory_exit_codes_and_no_credential_for_additive(self):
         self.put('sql/1.sql','CREATE TABLE x (id int);')
         self.put('sql/2.sql','DROP TABLE x;')

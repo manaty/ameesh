@@ -207,13 +207,11 @@ def check(path, data, policy, *, read_file, signed_decision):
     """The frozen policy entry itself is the reviewed migration declaration."""
     try:
         result = classify(data.decode("utf-8"), policy)
-    except UnicodeError as exc:
-        raise Refused("%s: SQL is not UTF-8" % path) from exc
+    except UnicodeError:
+        result = Classification("unknown", ("SQL is not UTF-8",))
     if result.kind == "additive":
         return result
     reason = "%s: %s (%s)" % (path, result.kind, "; ".join(result.reasons))
-    if result.kind == "unknown":
-        raise Refused(reason)
     checksum = hashlib.sha256(data).hexdigest()
     declaration = policy.get("declarations", {}).get(path, {})
     if not isinstance(declaration, dict) or declaration.get("checksum") != checksum:
@@ -221,7 +219,7 @@ def check(path, data, policy, *, read_file, signed_decision):
     lot = declaration.get("lot")
     if type(lot) is not int or lot <= 0:
         raise Refused(reason + "; carrier lot required")
-    if result.kind == "destructive":
+    if result.kind in ("destructive", "unknown"):
         identifier, option = declaration.get("decision"), declaration.get("approval_option")
         if (type(identifier) is not int or identifier <= 0 or not isinstance(option, str) or not option
                 or not signed_decision(identifier, lot, option)):
