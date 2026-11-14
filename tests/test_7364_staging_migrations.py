@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import hashlib
 import json
+import types
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -99,6 +100,57 @@ class StagingMigrationsTest(unittest.TestCase):
                 mock.patch.object(nx.subprocess, "run", side_effect=nx.subprocess.CalledProcessError(128, "git")):
             with self.assertRaisesRegex(rc.ReleaseError, "preflight refused"):
                 nx.handoff_preflight(mock.Mock(), {"sha": "a" * 40, "main": "b" * 40})
+
+    def adapter(self, sql, declaration):
+        path = "supabase/migrations/796_example.sql"
+        digest = hashlib.sha256(sql.encode()).hexdigest()
+        self.policy["declarations"][path] = dict(checksum=digest, **declaration)
+        files = {sm.POLICY_PATH: json.dumps(self.policy).encode(), path: sql.encode(),
+                 "rollback/796_restore.sql": b"-- restore"}
+        reader = mock.patch.object(nx.subprocess, "run", side_effect=lambda cmd, **kw:
+                                   types.SimpleNamespace(stdout=files[cmd[-1].split(":", 1)[1]]))
+        reader.start()
+        self.addCleanup(reader.stop)
+        return (types.SimpleNamespace(repo="unused", name="project"),
+                {"sha": "a" * 40, "main": "b" * 40},
+                {"hub": [{"name": "796_example", "checksum": digest}]},
+                sm.declaration_text(path, digest))
+
+    def test_adapter_reverifies_signed_owner_proof_and_scope(self):
+        from ameesh import decisions
+        project, pending, required, text = self.adapter("DROP TABLE messages;", {"decision": 42})
+        view = {"state": "answered", "answer": {"text": "project:owner/repo allow-" + text}}
+        with mock.patch.object(rc, "github_slug", return_value="owner/repo"), \
+                mock.patch.object(decisions, "get", return_value=view), \
+                mock.patch.object(decisions, "require_current") as current, \
+                mock.patch.object(decisions, "verify_proof", return_value=(False, "unsigned")) as verify:
+            with self.assertRaisesRegex(rc.ReleaseError, "signed owner"):
+                nx.staging_migration_preflight(project, pending, required, object())
+            current.assert_called_once()
+            verify.assert_called_once()
+            verify.return_value = (True, "verified")
+            self.assertEqual(nx.staging_migration_preflight(project, pending, required, object())[0]
+                             ["classification"], "destructive")
+            current.side_effect = decisions.DecisionError("superseded")
+            with self.assertRaisesRegex(rc.ReleaseError, "signed owner"):
+                nx.staging_migration_preflight(project, pending, required, object())
+            current.side_effect = None
+            view["answer"]["text"] = "project:another/repo allow-" + text
+            with self.assertRaisesRegex(rc.ReleaseError, "signed owner"):
+                nx.staging_migration_preflight(project, pending, required, object())
+
+    def test_adapter_requires_carrier_lot_from_the_release_project(self):
+        from ameesh import work
+        project, pending, required, text = self.adapter(
+            "ALTER TABLE messages DROP CONSTRAINT fk;",
+            {"lot": 7266, "restore": "rollback/796_restore.sql"})
+        with mock.patch.object(work, "get", return_value={"app": "another"}) as carrier, \
+                mock.patch.object(work, "events_noted", return_value=[{"note": text}]):
+            with self.assertRaisesRegex(rc.ReleaseError, "carrier lot"):
+                nx.staging_migration_preflight(project, pending, required, object())
+            carrier.return_value = {"app": "project"}
+            self.assertEqual(nx.staging_migration_preflight(project, pending, required, object())[0]
+                             ["classification"], "relaxation")
 
 
 if __name__ == "__main__":
