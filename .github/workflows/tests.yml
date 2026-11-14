@@ -730,6 +730,13 @@ jobs:
           # pour un job à la fois ; setup-python (restauration de son cache
           # pip) et pip lisent PIP_CACHE_DIR.
           echo "PIP_CACHE_DIR=$RUNNER_WORKSPACE/../pip-cache" >> "$GITHUB_ENV"
+          # #7380 : setup-python enregistre le cache pip dans son post-job.
+          # Une part dont le venv vient du cache (actions/cache) n'appelle
+          # jamais pip : le dossier manquerait et le post-job conclurait la
+          # part en rouge sans test en échec (« Cache folder path ... doesn't
+          # exist on disk », run 43603076812, 6 parts psycopg). On le crée ici,
+          # avant setup-python.
+          mkdir -p "$RUNNER_WORKSPACE/../pip-cache"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - *disque_rapport
       # #3581 : le témoin du pont JS (#3529) appelle `node`, absent du PATH de

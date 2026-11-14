@@ -234,6 +234,12 @@ class WorkflowTest(unittest.TestCase):
 
     def test_cache_pip_par_runner(self):
         self.assertIn('echo "PIP_CACHE_DIR=$RUNNER_WORKSPACE/../pip-cache"', WORKFLOW)
+        # Le dossier doit exister avant setup-python : son post-job sauvegarde
+        # ce chemin et rougit la part quand il manque (run 43603076812, parts
+        # dont le venv vient du cache et qui n'appellent donc jamais pip).
+        self.assertIn('mkdir -p "$RUNNER_WORKSPACE/../pip-cache"', WORKFLOW)
+        self.assertLess(WORKFLOW.index('mkdir -p "$RUNNER_WORKSPACE/../pip-cache"'),
+                        WORKFLOW.index("cache: pip"))
         self.assertNotIn("PIP_CACHE_DIR=/home/runner/.cache/pip", WORKFLOW)
         self.assertNotIn("PIP_CACHE_DIR=$HOME/.cache/pip", WORKFLOW)
         self.assertLess(WORKFLOW.index("PIP_CACHE_DIR=$RUNNER_WORKSPACE"),
