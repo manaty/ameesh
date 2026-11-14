@@ -16,6 +16,7 @@ from .test_2442_verdict_carry import _git
 
 
 CHECK_PYTHON = verdict_carry._trusted_generated_executable("python3")
+CHECK_NODE = verdict_carry._trusted_generated_executable("node")
 
 
 class GeneratedCarryTest(unittest.TestCase):
@@ -182,9 +183,9 @@ class GeneratedCarryTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("check failed or inconclusive for downstream.txt", why)
 
-    @unittest.skipUnless(shutil.which("node"), "node unavailable")
+    @unittest.skipUnless(CHECK_NODE, "trusted node unavailable")
     def test_node_options_cannot_forge_success(self):
-        self.rule = {"check": [shutil.which("node"), "check.js"]}
+        self.rule = {"check": [CHECK_NODE, "check.js"]}
         self.write("check.js", "process.exit(1);\n")
         self.declare()
         self.reviewed = self.commit()
@@ -217,7 +218,7 @@ class GeneratedCarryTest(unittest.TestCase):
         self.assertEqual(set(seen[0]), {"PATH", "HOME", "TMPDIR", "LANG",
                                       "LC_ALL", "PYTHONPATH", "PYTHONNOUSERSITE"})
 
-    @unittest.skipUnless(shutil.which("node"), "node unavailable")
+    @unittest.skipUnless(CHECK_NODE, "trusted node unavailable")
     def test_manifest_node_command_resolves_outside_system_path(self):
         manifest = json.loads((Path(__file__).resolve().parents[1] /
                                verdict_carry.GENERATED_FILES).read_text())
@@ -231,7 +232,7 @@ class GeneratedCarryTest(unittest.TestCase):
         self.tip = self.reviewed
         self.write("generated.txt", "reviewed\n")
         frozen = self.commit()
-        tools = Path(shutil.which("node")).parent
+        tools = Path(CHECK_NODE).parent
         with mock.patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.defpath,
                 "NODE_OPTIONS": "--this-must-not-reach-node"}):
             ok, why, adaptation = self.check(frozen)
