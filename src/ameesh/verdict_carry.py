@@ -1320,7 +1320,8 @@ def generated_adapted(repo: str, reviewed: str, frozen: str, *,
 
 
 def _carriable(repo: str, reviewed: str, frozen: str, tip: str, *,
-               renumber: Renumbering | None = None, runtime_repo: str | None = None) -> tuple:
+               renumber: Renumbering | None = None, runtime_repo: str | None = None,
+               allow_generated: bool = True) -> tuple:
     """`(oui, raison, adaptation)` : réalignement (tout verdict se reporte) ou, à
     défaut, adaptation (l'avis favorable seul se reporte, #5042, #7000)."""
     ok, why = realigned(repo, reviewed, frozen, tip)
@@ -1329,6 +1330,8 @@ def _carriable(repo: str, reviewed: str, frozen: str, tip: str, *,
     fits, how = adapted(repo, reviewed, frozen, tip, renumber=renumber)
     if fits:
         return True, how, True
+    if not allow_generated:
+        return False, NOT_OK_ADAPTATION, False
     generated, proof = generated_adapted(repo, reviewed, frozen, declaration_ref=tip,
                                           runtime_repo=runtime_repo)
     if generated:
@@ -1560,7 +1563,7 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
         renumber = renumbering_of(cfg, row, repo)
     except Exception:  # noqa: BLE001 - réservation illisible : aucune renumérotation
         renumber = None
-    verdicts: dict = {}          # tête relue complète -> (oui, raison)
+    verdicts: dict = {}          # (tête relue, contrôle autorisé) -> preuve
     plan: list = []              # (relecteur, verdict reporté)
     refused: list = []           # (tête relue, raison)
     superseded: list = []        # (tête relue, raison), hors du gel précédent
@@ -1574,10 +1577,14 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
             out["detail"] = "reviewed head %s is not a commit of %s" % (
                 _norm(mark.get("sha"))[:12], where)
             continue                  # objet absent : rien de prouvé, retenté
-        if reviewed not in verdicts:
-            verdicts[reviewed] = _carriable(where, reviewed, frozen, tip, renumber=renumber,
-                                               runtime_repo=repo)
-        ok, why, adaptation = verdicts[reviewed]
+        allow_generated = ((mark.get("verdict") or "ok") == "ok"
+                           and not _stale(mark, previous))
+        proof_key = (reviewed, allow_generated)
+        if proof_key not in verdicts:
+            verdicts[proof_key] = _carriable(
+                where, reviewed, frozen, tip, renumber=renumber,
+                runtime_repo=repo, allow_generated=allow_generated)
+        ok, why, adaptation = verdicts[proof_key]
         if ok and adaptation and (mark.get("verdict") or "ok") != "ok":
             ok, why = False, NOT_OK_ADAPTATION
         if ok:

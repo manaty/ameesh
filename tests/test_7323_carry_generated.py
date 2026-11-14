@@ -60,6 +60,43 @@ class GeneratedCarryTest(unittest.TestCase):
         self.assertTrue(adaptation)
         self.assertIn("frozen generation checks passed", why)
 
+    def test_ineligible_mark_never_runs_generated_proof(self):
+        self.write("generated.txt", "reviewed\n")
+        frozen = self.commit()
+        with mock.patch.object(verdict_carry, "generated_adapted") as generated:
+            ok, why, _ = verdict_carry._carriable(
+                self.root, self.reviewed, frozen, self.tip, allow_generated=False)
+        self.assertFalse(ok)
+        self.assertEqual(why, verdict_carry.NOT_OK_ADAPTATION)
+        generated.assert_not_called()
+
+    def test_plan_disables_execution_for_blocked_and_stale_marks(self):
+        marks = [
+            {"id": 1, "kind": "verdict", "actor": "blocked", "sha": "R", "verdict": "blocked"},
+            {"id": 2, "kind": "verdict", "actor": "stale", "sha": "R", "verdict": "ok"},
+            {"id": 3, "kind": "frozen", "sha": "previous"},
+            {"id": 4, "kind": "verdict", "actor": "current", "sha": "R", "verdict": "ok"},
+        ]
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            def patch(name, **kwargs):
+                return stack.enter_context(mock.patch(name, **kwargs))
+            patch("ameesh.work.get", return_value={"state": "qa"})
+            patch("ameesh.work.milestones", return_value=marks)
+            patch("ameesh.verdict_carry.pending", return_value={m["actor"]: m for m in marks if "actor" in m})
+            patch("ameesh.agent_review_hold.carried_reviewers", return_value=["blocked", "stale", "current"])
+            patch("ameesh.lot_class.default_base", return_value="main")
+            patch("ameesh.verdict_carry._repo_path", return_value=self.root)
+            patch("ameesh.merge_queue.pinned", side_effect=lambda repo, sha: sha)
+            patch("ameesh.verdict_carry.renumbering_of", return_value=None)
+            check = patch("ameesh.verdict_carry._carriable", return_value=(False, "refused", False))
+            verdict_carry._plan_for(None, None, 7323, {"detail": ""}, "F",
+                repo=self.root, clone=self.root, notes=[],
+                fetched={(self.root, "main"): ("tip", self.root)})
+        # Same reviewed head: an eligible proof must not be reused for a stale mark.
+        self.assertEqual([c.kwargs["allow_generated"] for c in check.call_args_list],
+                         [False, True])
+
     def test_red_check_refuses(self):
         self.write("generated.txt", "invented\n")
         self.assertFalse(self.check(self.commit())[0])
