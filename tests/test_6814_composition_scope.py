@@ -2,7 +2,7 @@
 """#6814 — la composition d'un agent vit hors du cgroup de son exécuteur.
 
 Le banc n'appelle pas systemd : il vérifie la décision (cgroup d'un runner ou
-non), l'environnement et le journal du scope (le bail du tour tombe, le nom de
+non), l'environnement et le journal du scope (le bail du tour reste vérifiable, le nom de
 l'agent reste, le lot suit le porteur, les sorties ne passent plus par le tube
 du tour), la ligne `systemd-run --scope` et la session neuve du scope (B/P1
 impl-11 : `killpg` du groupe du tour ne doit pas l'atteindre), sans jamais
@@ -107,12 +107,12 @@ class ScopeEnvironment(unittest.TestCase):
         self.environ.start()
         self.addCleanup(self.environ.stop)
 
-    def test_bail_du_tour_tombe_et_l_agent_reste(self) -> None:
+    def test_bail_du_tour_et_agent_restent(self) -> None:
         env = paquet_auto.scope_environment(carrier=6810)
         self.assertEqual(env[paquet_auto.SCOPED_ENV], "1")
         for variable in ("AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
                          "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH"):
-            self.assertNotIn(variable, env)
+            self.assertEqual(env[variable], self.turn[variable])
         self.assertEqual(env["AGENT_MAIL_NAME"], "mty-amh-impl-01")
         self.assertEqual(env["AMEESH_DSN"], self.turn["AMEESH_DSN"])
         self.assertEqual(env["AMEESH_CONFIG"], self.turn["AMEESH_CONFIG"])
@@ -264,7 +264,7 @@ class MaybeScope(unittest.TestCase):
         env = kwargs["env"]
         self.assertEqual(env[paquet_auto.SCOPED_ENV], "1")
         for variable in ("AMEESH_RUNNER_ID", "AMEESH_LEASE_EPOCH"):
-            self.assertNotIn(variable, env)
+            self.assertEqual(env[variable], os.environ[variable])
         self.assertEqual(env["AMEESH_LOT"], "42")
         log = pathlib.Path(env[paquet_auto.SCOPE_LOG_ENV])
         self.assertEqual(log.parent, self.root / "logs")
