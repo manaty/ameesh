@@ -26,9 +26,10 @@ from .test_2447_review_designation_activation import _Repo
 
 FAMILIES = ("claude", "codex", "deepseek")
 AUTHOR = "impl7324"                    # claude, l'assigné en pause
+FORGER = "dsk7324"                     # deepseek, l'exécutant réel
 
 
-class ForgedReferenceTest(PgTestCase):
+class _Range(PgTestCase):
 
     def setUp(self):
         super().setUp()
@@ -58,6 +59,10 @@ class ForgedReferenceTest(PgTestCase):
             self.repo.root, FAMILIES, strict=True, base=self.base,
             head=self.head, target=self.base)
 
+
+
+class ForgedReferenceTest(_Range):
+
     def test_a_commit_outside_any_turn_of_the_assignee_is_unknown(self):
         # Le dernier tour de l'assigné s'est fini trois heures avant.
         self.turn(self.stamp - 3 * 3600)
@@ -84,6 +89,71 @@ class ForgedReferenceTest(PgTestCase):
 
     def test_an_agent_without_any_turn_keeps_the_previous_reading(self):
         self.assertFalse(review_authors._turn_absent(self.db, AUTHOR, self.stamp))
+
+
+class FreezerReceiptTest(_Range):
+    """Témoin (b) du lot : commits au nom de X, gel prouvé de Y → {X, Y}.
+
+    X est en tour au même instant (tours simultanés, date recopiée) : la
+    garde du journal ne voit rien, seul le reçu du gel prouve Y."""
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, FORGER, harness="deepseek", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.turn(self.stamp + 60)     # X tournait vraiment à cet instant
+
+    def freeze_by(self, actor, harness):
+        ops = __import__("ameesh.storage", fromlist=["of"]).of(self.db).work
+        row = ops.add_milestone(self.lot, "frozen", sha=self.head, actor=actor,
+                                verdict=None, note="")
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, 's', 't', %s, %s)",
+            ("milestone:%d" % int(row["id"]), self.head, actor, harness, self.lot))
+        return dict(row)
+
+    def read_at(self, milestone):
+        return review_authors.reading(
+            self.db, work.get(self.db, self.lot), milestone, [self.head],
+            self.repo.root, FAMILIES, strict=True, base=self.base,
+            head=self.head, target=self.base)
+
+    def families(self, authors):
+        out = {}
+        for row in authors:
+            out[row["name"]] = set(row.get("families") or [row["family"]])
+        return out
+
+    def test_a_freeze_by_another_family_makes_it_an_author(self):
+        authors, unknown, _ = self.read_at(self.freeze_by(FORGER, "deepseek"))
+        self.assertEqual(unknown, [])
+        found = self.families(authors)
+        self.assertEqual(found.get(FORGER), {"deepseek"}, authors)
+        self.assertIn(AUTHOR, found)
+
+    def test_a_freeze_by_the_assignee_adds_nobody(self):
+        authors, unknown, _ = self.read_at(self.freeze_by(AUTHOR, "claude"))
+        self.assertEqual(unknown, [])
+        self.assertEqual(set(self.families(authors)), {AUTHOR})
+
+    def test_the_pre_insert_proof_counts_as_the_freeze_receipt(self):
+        authors, _unknown, _ = review_authors.reading(
+            self.db, work.get(self.db, self.lot), None, [self.head],
+            self.repo.root, FAMILIES, strict=True, base=self.base,
+            head=self.head, target=self.base,
+            milestone_proof={"actor": FORGER, "harness": "deepseek"})
+        self.assertEqual(self.families(authors).get(FORGER), {"deepseek"})
+
+    def test_an_exact_commit_receipt_does_not_add_the_freezer(self):
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, 's', 't', 'claude', %s)",
+            ("commit:" + self.head, self.head, AUTHOR, self.lot))
+        authors, _unknown, _ = self.read_at(self.freeze_by(FORGER, "deepseek"))
+        self.assertNotIn(FORGER, self.families(authors))
 
 
 class RefusalWordingTest(PgTestCase):
