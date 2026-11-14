@@ -595,7 +595,11 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
     from . import host_idle
     # #4148: show the durable release state next to the read-only footprint.
     controls = {row["host"]: row for row in storage.of(db).host_lifecycle.listing()}
-    footprints = host_idle.snapshot(cfg, db, canons, latest_by_host, controls=controls)
+    # #7327 : le filtre `only` s'applique AVANT le snapshot — sinon une vue
+    # d'un seul hôte paie l'activité de toute la flotte (et expirait sur le
+    # poste). Les autres hôtes ne sont ni projetés ni lus.
+    footprints = host_idle.snapshot(cfg, db, canons, latest_by_host, controls=controls,
+                                    hosts=[only] if only else None)
     # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
     # worktrees suivis)
     hk = storage.of(db).housekeeping

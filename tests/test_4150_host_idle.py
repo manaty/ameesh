@@ -123,16 +123,18 @@ class HostIdleTest(unittest.TestCase):
     def test_snapshot_reads_only_and_failure_is_conservative(self):
         store = mock.MagicMock()
         store.operations.listing.return_value = [self.agent()]
-        store.work.items.return_value = []
+        store.work.activity.return_value = {
+            'worker': {'total': 0, 'latest_updated_ts': None, 'open': []}}
         store.hosts.since.return_value = [self.reading(sampled_ts=t)
                                            for t in range(7600, NOW + 1, 60)]
         cfg = config.Config(resource_interval=60)
         with mock.patch.object(storage, 'of', return_value=store), \
                 mock.patch('ameesh.host_lifecycle.critical_names', return_value=set()):
             self.assertEqual(host_idle.snapshot(cfg, 'db', [], {'vm': self.reading()}, now=NOW)['vm']['state'], 'idle')
-            # A reading that can still prove idle keeps the full lot read and
-            # the quiet history: both can shorten the interval (VM witness).
-            store.work.items.assert_called_once_with(state=None, assignee='worker', limit=1000)
+            # A reading that can still prove idle keeps the bounded activity
+            # read and the quiet history: both can shorten the interval.
+            store.work.activity.assert_called_once_with(['worker'], limit=1000)
+            store.work.items.assert_not_called()
             self.assertEqual([call.args[0] for call in store.hosts.since.call_args_list], ['vm'])
             store.operations.listing.side_effect = RuntimeError('unavailable')
             out = host_idle.snapshot(cfg, 'db', [], {'vm': self.reading()}, now=NOW)['vm']
@@ -143,7 +145,8 @@ class HostIdleTest(unittest.TestCase):
     def test_snapshot_skips_lot_reads_where_the_reading_is_busy(self):
         store = mock.MagicMock()
         store.operations.listing.return_value = [self.agent(), self.agent(name='other', host='busy')]
-        store.work.items.return_value = []
+        store.work.activity.return_value = {
+            'worker': {'total': 0, 'latest_updated_ts': None, 'open': []}}
         store.hosts.since.return_value = [self.reading(sampled_ts=t)
                                            for t in range(7600, NOW + 1, 60)]
         cfg = config.Config(resource_interval=60)
@@ -154,8 +157,8 @@ class HostIdleTest(unittest.TestCase):
                                      now=NOW)
         self.assertEqual(out['vm']['state'], 'idle')
         self.assertEqual(out['busy']['state'], 'busy')
-        self.assertEqual([call.kwargs['assignee'] for call in store.work.items.call_args_list],
-                         ['worker'])
+        store.work.activity.assert_called_once_with(['worker'], limit=1000)
+        store.work.items.assert_not_called()
         # The busy host cannot be idle whatever its history says: no read.
         self.assertEqual([call.args[0] for call in store.hosts.since.call_args_list], ['vm'])
 
@@ -182,6 +185,7 @@ class HostIdleTest(unittest.TestCase):
         self.assertEqual(out['leases'], 0)
         self.assertNotIn('agent/lot activity unreadable', out['unknown'])
         store.work.items.assert_not_called()
+        store.work.activity.assert_not_called()
         store.work.get.assert_called_once_with(42)
         store.progress.lot_hold_events.assert_called_once()
 

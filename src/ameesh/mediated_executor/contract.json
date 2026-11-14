@@ -5041,6 +5041,7 @@
     "notify"
    ],
    "work": [
+    "activity",
     "add",
     "add_milestone",
     "adopt_workflow",

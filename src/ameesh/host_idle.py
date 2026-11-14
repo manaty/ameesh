@@ -56,13 +56,18 @@ def runs_interface(cfg, canons, host):
 
 def project(reading, history, agents, lots, *, now, idle_after_s=1800,
             fresh_within=180, capacity='burst', cost_eur_h=None, holds=None,
-            runs_declared=None, cost=None):
+            runs_declared=None, cost=None, latest_ts=None):
     """Pure projection. None inputs mean unreadable sources, never empty ones.
 
     `runs_declared` (#5905) is the `(interface, origin)` of `runs_interface`;
     without it the run count stays the undeclared placeholder. `cost` (#5912):
     the card's cost per state (`cost_states`); it replaces `cost_eur_h`, the
-    cost of the running host."""
+    cost of the running host.
+
+    `lots` may be the reduced open-lot projection of `work.activity` (#7327);
+    `latest_ts` then carries the latest `updated_at` over every lot, closed
+    ones included, so the quiet interval is bounded exactly as with the full
+    per-agent lists."""
     out = resources.footprint(reading)
     interface, origin = runs_declared or (None, None)
     if interface in RUNS_INTERFACES:
@@ -145,6 +150,11 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
         wake = resources.finite_float(lot.get('wake_ts'))
         if lot.get('state') not in DONE and wake is not None and wake < now + idle_after_s:
             busy = True
+    # Closed lots are absent from the reduced projection: their latest update
+    # is carried separately, or a close would not reset the quiet interval.
+    latest = resources.finite_float(latest_ts)
+    if latest is not None:
+        since = max(since, latest)
     if busy or unknown:
         return out
     # Walk backwards only through the uninterrupted, quiet suffix. Do not
@@ -307,7 +317,7 @@ def _complete_canons(cfg, canons):
 
 
 def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None,
-             guards=False, history_s=None):
+             guards=False, history_s=None, hosts=None):
     """Read all common sources once, then project each host. No mutations.
 
     `history_s` extends the quiet evidence window for adapter hysteresis; it
@@ -321,33 +331,54 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None
     `guards` (#5914): always read the elected leaders and reserves, even when
     explicit `capacity: baseline` cards fill the baseline. The automatic
     drain needs `baseline_guard` for its one host whatever the other cards say.
+
+    `hosts` (#7327): project only these hosts. Their readings are the only
+    ones that can prove idle, so only their agents' lots are read; a caller
+    that shows one host no longer pays the whole fleet's activity. The
+    capacity/baseline election still reads every configured host name (it is
+    cheap and keeps the projection identical for the requested hosts).
     """
     from . import canon as canon_mod
     from . import planned_waits
     now = time.time() if now is None else now
     idle_s = max(1.0, float(cfg.idle_after_s))
     fresh = staleness_s(cfg.resource_interval)
-    names = set(readings) | {h.title for c in canons for h in c.hosts}
+    known = readings
+    if hosts is not None:
+        wanted = {str(host) for host in hosts}
+        readings = {host: reading for host, reading in readings.items()
+                    if host in wanted}
+    names = set(known) | {h.title for c in canons for h in c.hosts}
     protected = set()
     agents = lots = None
+    latest = {}
     holds = {}
     candidates = {host for host, reading in readings.items()
                   if _can_prove_idle(reading, now=now, fresh_within=fresh)}
     try:
         agents = storage.of(db).operations.listing() if listing is None else listing
-        # Bounded per-agent read includes closed lots: closing work also
-        # resets the quiet interval. Truncation cannot prove an idle host.
+        # One aggregate read for every agent whose host can still prove idle
+        # (#7327): the per-agent `items` read cost seconds per agent on the
+        # live mesh, and the workstation timed out on a one-host view. The
+        # aggregate still includes closed lots through `latest_updated_ts`:
+        # closing work resets the quiet interval, and a truncated list cannot
+        # prove an idle host.
         # A host whose own reading already excludes rest only needs the
         # session lot, for the lease count and the hold filter: its full
         # per-agent lists cost seconds per view and cannot change the verdict
         # (#4178, taking back 9b11d526b after its revert b207dbce5).
+        wanted_agents = [agent['name'] for agent in agents
+                         if agent.get('host') in candidates]
+        activity = (storage.of(db).work.activity(wanted_agents, limit=1000)
+                    if wanted_agents else {})
         lots = {}
         for agent in agents:
             if agent.get('host') not in candidates:
                 lots[agent['name']] = []
                 continue
-            rows = storage.of(db).work.items(state=None, assignee=agent['name'], limit=1000)
-            lots[agent['name']] = rows if len(rows) < 1000 else None
+            row = activity.get(agent['name']) or {}
+            lots[agent['name']] = row.get('open')
+            latest[agent['name']] = row.get('latest_updated_ts')
         by_id = {int(lot['id']): lot for rows in lots.values() if rows is not None
                  for lot in rows}
         for agent in agents:
@@ -408,12 +439,18 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None
         members = ([a for a in agents if a.get('host') == host]
                    if agents is not None else None)
         host_lots = [] if members is not None else None
+        latest_ts = None
         for agent in members or []:
             rows = lots.get(agent['name'])
             if rows is None:
                 host_lots = None
                 break
             host_lots.extend(rows)
+            # Closed lots are not in `open`; their last update still bounds
+            # the quiet interval, as the full per-agent list did before.
+            stamp = resources.finite_float(latest.get(agent['name']))
+            if stamp is not None:
+                latest_ts = stamp if latest_ts is None else max(latest_ts, stamp)
         if host_lots is not None:
             present = {lot['id'] for lot in host_lots}
             for agent in members or []:
@@ -432,6 +469,7 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None
         out[host] = project(reading, history, members, host_lots, now=now,
                             idle_after_s=idle_s, fresh_within=fresh,
                             capacity=capacity[host], cost=costs.get(host), holds=holds,
+                            latest_ts=latest_ts,
                             runs_declared=runs_interface(cfg, canons, host))
         out[host]["baseline_guard"] = host in protected
         control = (controls or {}).get(host) if isinstance(controls, dict) else None
