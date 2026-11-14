@@ -204,6 +204,9 @@ ameesh attach avatar-alice --host ameesh-agents-1 \
 - **Copie enfant** : si l'agent attaché est un enfant, chaque message humain
   est recopié au journal du parent (design §4.2), seulement si parent et
   enfant partagent le même `responsible`, avec `meta={child, copied_from}`.
+- **Bornes** : `--max` du poste est porté par la trame `REQ` jusqu'à l'argv
+  du wrapper de l'hôte (et reste borné par la session du relais) ; un
+  `SIGWINCH` relit la taille réelle du terminal avant chaque `WINSIZE`.
 - **Coupure** : le wrapper installe SIGTERM/SIGHUP/SIGINT, arrête le groupe
   du harnais et rend le bail dans `finally` ; l'événement `agent.attach`
   (accepté ou refusé) ne porte ni reçu, ni nonce, ni signature.

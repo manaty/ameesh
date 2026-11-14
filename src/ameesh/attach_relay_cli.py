@@ -198,8 +198,13 @@ def _host_attach_command(request) -> list:
     service tourne dans le même environnement que la CLI. L'agent vient de
     la trame appariée (déjà liée au grant), jamais d'un texte libre.
     """
-    return [sys.executable, "-m", "ameesh", "attach", "--host-attach",
+    argv = [sys.executable, "-m", "ameesh", "attach", "--host-attach",
             request.agent]
+    # B1 (relecture cx2) : la borne demandée par le poste arrive jusqu'au
+    # wrapper ; sinon un `--max 30s` distant resterait au défaut de 2 h.
+    if request.max_seconds:
+        argv += ["--max", "%ds" % int(request.max_seconds)]
+    return argv
 
 
 def cmd_host(args) -> int:

@@ -86,6 +86,9 @@ class AttachRequest:
     #: #7121 : le poste demande l'attente de fin de tour (`--wait`) avant le
     #: bail ; sans ce drapeau, un tour en cours refuse l'attach.
     wait: bool = False
+    #: #7121 (B1 relecture) : borne demandée par le poste (`--max`), en
+    #: secondes ; 0 = défaut du wrapper. Portée jusqu'à l'argv du wrapper.
+    max_seconds: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -488,6 +491,7 @@ class HostSession:
         wait = data.get("wait", False)
         if not isinstance(wait, bool):
             raise ValueError("wait: boolean expected")
+        max_seconds = _bounded_int(data.get("max", 0), "max", 0, 86400)
         if not hmac.compare_digest(transcript_hash, self.channel.transcript_hash):
             raise ValueError("transcript_hash: differs from this session")
         device_key = data.get("device_key")
@@ -508,7 +512,7 @@ class HostSession:
                              device_signature=raw_signature,
                              transcript_hash=transcript_hash, device_key=device_key,
                              rows=rows, cols=cols, xpix=xpix, ypix=ypix, term=term,
-                             wait=wait)
+                             wait=wait, max_seconds=max_seconds)
 
     def _refuse(self, code: str, reason: str) -> None:
         self.refusal = code or "refused"

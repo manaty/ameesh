@@ -95,6 +95,9 @@ class StationConfig:
     ca_file: str | None = None
     insecure_tls: bool = False
     connect_timeout: float = 10.0
+    #: #7121 (B1 relecture) : borne demandée par le poste (`--max`), portée par
+    #: la trame REQ jusqu'au wrapper de l'hôte.
+    max_seconds: float = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -466,7 +469,8 @@ class Session:
             device_signature=receipts.b64u_encode(signature),
             transcript_hash=receipts.b64u_encode(transcript_hash),
             device_key=cfg.device.credential_id, rows=cfg.rows, cols=cfg.cols,
-            xpix=cfg.xpix, ypix=cfg.ypix, term=cfg.term, wait=bool(cfg.wait))
+            xpix=cfg.xpix, ypix=cfg.ypix, term=cfg.term, wait=bool(cfg.wait),
+            max=int(cfg.max_seconds) if cfg.max_seconds else 0)
         self._send(transport.REQ, self.channel.seal(transport.REQ, payload))
         deadline = time.monotonic() + CONTROL_TIMEOUT
         while True:
@@ -526,6 +530,12 @@ class Session:
         while not stop.is_set():
             if resize.is_set():
                 resize.clear()
+                # B2 (relecture cx2) : un SIGWINCH peut en cacher un autre ;
+                # relire la taille réelle, jamais la valeur du démarrage.
+                size = _read_terminal_size(stdout_fd)
+                if size is not None:
+                    (self.config.rows, self.config.cols,
+                     self.config.xpix, self.config.ypix) = size
                 self._send(transport.WINSIZE, channel.seal(
                     transport.WINSIZE, struct.pack(
                         ">HHHH", self.config.rows, self.config.cols,
@@ -602,12 +612,18 @@ def _relay_error(frame: transport.Frame) -> tuple[str, str]:
     return str(data.get("code") or "relay"), str(data.get("message") or "")
 
 
-def _terminal_size() -> tuple[int, int, int, int]:
+def _read_terminal_size(fd: int) -> tuple[int, int, int, int] | None:
+    """Taille réelle du terminal, ou None si `fd` n'en est pas un (tube)."""
     try:
-        size = os.get_terminal_size(sys.stdout.fileno())
-        return max(1, size.lines), max(1, size.columns), 0, 0
+        size = os.get_terminal_size(fd)
     except OSError:
-        return 24, 80, 0, 0
+        return None
+    return max(1, size.lines), max(1, size.columns), 0, 0
+
+
+def _terminal_size(fd: int | None = None) -> tuple[int, int, int, int]:
+    fd = sys.stdout.fileno() if fd is None else fd
+    return _read_terminal_size(fd) or (24, 80, 0, 0)
 
 
 def run_session(config: StationConfig, *, stdin_fd: int | None = None,
@@ -616,7 +632,7 @@ def run_session(config: StationConfig, *, stdin_fd: int | None = None,
     import threading
     stdin_fd = sys.stdin.fileno() if stdin_fd is None else stdin_fd
     stdout_fd = sys.stdout.fileno() if stdout_fd is None else stdout_fd
-    rows, cols, xpix, ypix = _terminal_size()
+    rows, cols, xpix, ypix = _terminal_size(stdout_fd)
     if not config.rows:
         config.rows, config.cols, config.xpix, config.ypix = rows, cols, xpix, ypix
     stop, resize = threading.Event(), threading.Event()
@@ -750,7 +766,8 @@ def main(cfg, args) -> int:
         plaintext_loopback=bool(getattr(args, "plaintext_loopback", False)),
         ca_file=getattr(args, "ca_file", None),
         insecure_tls=bool(getattr(args, "insecure_tls", False)),
-        connect_timeout=float(getattr(args, "connect_timeout", 10.0)))
+        connect_timeout=float(getattr(args, "connect_timeout", 10.0)),
+        max_seconds=float(getattr(args, "max", 0.0) or 0.0))
     return run_session(config)
 
 

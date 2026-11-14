@@ -16,6 +16,7 @@ import logging
 import os
 import select
 import signal
+import struct
 import threading
 import time
 import unittest
@@ -41,12 +42,15 @@ ATT = "att_" + "a" * 26
 
 
 class RelayHostCliTest(unittest.TestCase):
-    def test_host_attach_command_uses_the_paired_agent(self):
+    def test_host_attach_command_uses_the_paired_agent_and_max(self):
         from types import SimpleNamespace
         from ameesh import attach_relay_cli
-        argv = attach_relay_cli._host_attach_command(SimpleNamespace(agent=AGENT))
+        argv = attach_relay_cli._host_attach_command(
+            SimpleNamespace(agent=AGENT, max_seconds=30))
         self.assertIn("--host-attach", argv)
-        self.assertEqual(argv[-1], AGENT)
+        self.assertIn("30s", argv)
+        self.assertEqual(argv[argv.index("--max") + 1], "30s")
+        self.assertEqual(argv[argv.index("--host-attach") + 1], AGENT)
 
     def test_command_and_host_attach_are_exclusive(self):
         from types import SimpleNamespace
@@ -87,6 +91,7 @@ class StationSessionTest(unittest.TestCase):
             self.relay.stop()
 
     def _start(self):
+        self.verifier = FakeVerifier()
         self.relay = attach_relay.RelayServer(attach_relay.RelayConfig(
             listen_host="127.0.0.1", listen_port=0, hosts={HOST: TOKEN},
             plaintext_loopback=True,
@@ -99,7 +104,7 @@ class StationSessionTest(unittest.TestCase):
             relay_host="127.0.0.1", relay_port=self.relay.port, token=TOKEN,
             host=HOST, agents=(AGENT,), plaintext_loopback=True, command=COMMAND,
             host_signing_key=HOST_SIGNING_KEY, max_sessions=4,
-            max_session_seconds=10.0, keepalive=1.0), FakeVerifier(),
+            max_session_seconds=10.0, keepalive=1.0), self.verifier,
             logger=self.logger)
         self.thread = threading.Thread(target=self.connector.run_forever, daemon=True)
         self.thread.start()
@@ -112,7 +117,8 @@ class StationSessionTest(unittest.TestCase):
             agent=AGENT, host=HOST, tenant="",
             relay="http://127.0.0.1:%d" % self.relay.port, receipt=receipt,
             device=_StationSigner(device), host_key=HOST_PUBLIC_KEY,
-            wait=True, rows=24, cols=80, term="xterm", plaintext_loopback=True)
+            wait=True, rows=24, cols=80, term="xterm", plaintext_loopback=True,
+            max_seconds=30)
         stdin_r, stdin_w = os.pipe()
         stdout_r, stdout_w = os.pipe()
         self.addCleanup(os.close, stdin_r)
@@ -131,6 +137,7 @@ class StationSessionTest(unittest.TestCase):
                 if ready:
                     output.extend(os.read(stdout_r, 4096))
             self.assertIn(b"echo:bonjour 7121", output)
+            self.assertEqual(self.verifier.requests[0].max_seconds, 30)
             os.close(stdin_w)
             stdin_w = None
             worker.join(10.0)
@@ -141,6 +148,62 @@ class StationSessionTest(unittest.TestCase):
                 os.close(stdin_w)
             os.close(stdout_w)
             worker.join(5.0)
+
+class _FakeChannel:
+    ready = True
+    closed = False
+
+    def seal(self, ftype, payload=b""):
+        return payload
+
+    def ack_frame(self):
+        return None
+
+    def close_frame(self, code="normal", message=""):
+        return 0, b""
+
+
+class _FakeSocket:
+    def __init__(self):
+        self.frames = []
+
+    def sendall(self, data):
+        self.frames.append(bytes(data))
+
+    def close(self):
+        pass
+
+
+class PumpResizeTest(unittest.TestCase):
+    def test_two_successive_resizes_send_the_new_size(self):
+        config = D.StationConfig(
+            agent=AGENT, host=HOST, tenant="", relay="http://127.0.0.1:1",
+            receipt={"request": {"attach_id": ATT}}, device=None, host_key=b"",
+            rows=24, cols=80)
+        session = D.Session(config)
+        session.sock = _FakeSocket()
+        session.channel = _FakeChannel()
+        session.session = b"\x00" * 16
+        stop, resize = threading.Event(), threading.Event()
+        resize.set()
+        sizes = [(40, 120, 0, 0), (50, 132, 0, 0)]
+        rounds = {"n": 0}
+
+        def fake_select(_read, _write, _error, _timeout):
+            rounds["n"] += 1
+            if rounds["n"] == 1:
+                resize.set()
+            elif rounds["n"] >= 2:
+                stop.set()
+            return [], [], []
+
+        with mock.patch.object(D, "_read_terminal_size", side_effect=sizes), \
+                mock.patch.object(D.select, "select", side_effect=fake_select):
+            self.assertEqual(session.pump(stdin_fd=None, stdout_fd=1,
+                                          stop=stop, resize=resize), 0)
+        sent = b"".join(session.sock.frames)
+        self.assertIn(struct.pack(">HHHH", 40, 120, 0, 0), sent)
+        self.assertIn(struct.pack(">HHHH", 50, 132, 0, 0), sent)
 
 class RemoteOwnerTest(unittest.TestCase):
     def test_owner_shape_and_tenant(self):
