@@ -38,7 +38,10 @@ if os.environ.get('FAKE_STALL_SSH') \
     # permet au banc de tuer le dernier détenteur des tuyaux quand le client
     # est tué avant lui.
     if os.environ.get('FAKE_STALL_PID'):
-        Path(os.environ['FAKE_STALL_PID']).write_text(str(os.getpid()))
+        pid_file = Path(os.environ['FAKE_STALL_PID'])
+        pid_tmp = pid_file.with_suffix('.tmp')
+        pid_tmp.write_text(str(os.getpid()))
+        os.replace(pid_tmp, pid_file)
     # Le témoin n'est posé qu'une fois les gestionnaires installés : le banc
     # peut alors envoyer le signal sans course.
     if os.environ.get('FAKE_STALL_STARTED'):
@@ -1177,7 +1180,11 @@ class AgentHostTest(unittest.TestCase):
             'subprocess.Popen(\n'
             '    [sys.executable, "-c",\n'
             '     "import os, signal, sys; from pathlib import Path; "\n'
-            '     "Path(sys.argv[1]).write_text(str(os.getpid())); "\n'
+            # Publish only a complete PID: existence is the readiness signal.
+            '     "pid_file = Path(sys.argv[1]); "\n'
+            '     "pid_tmp = pid_file.with_suffix(\'.tmp\'); "\n'
+            '     "pid_tmp.write_text(str(os.getpid())); "\n'
+            '     "os.replace(pid_tmp, pid_file); "\n'
             '     "signal.pause()", sys.argv[1]],\n'
             '    start_new_session=True)\n'
             'time.sleep(60)\n')
