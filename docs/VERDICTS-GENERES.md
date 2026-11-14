@@ -18,7 +18,16 @@ par contrôle est de 60 secondes. Aucun paquet n’est installé automatiquement
 Un `runtime` facultatif permet de réutiliser les outils locaux installés ;
 les fichiers `locks` déclarés doivent être identiques aux blobs gelés.
 Le clone radar reçoit ce runtime depuis le dépôt local d’origine, pas depuis
-son propre checkout. Les variables de transport et secrets sont filtrées.
+son propre checkout. L’environnement est construit par liste fermée : PATH
+système, HOME et TMPDIR jetables, locale C.UTF-8, PYTHONPATH vers les sources
+gelées et PYTHONNOUSERSITE=1. Aucune autre variable de l’hôte n’est héritée
+(notamment NODE_OPTIONS, NODE_PATH, PYTHONHOME et LD_PRELOAD).
+
+La preuve fait encore confiance aux exécutables système et aux octets des
+dépendances locales : comparer les locks ne certifie pas ces octets. Elle
+suppose un hôte et un runtime locaux de confiance ; ce n’est pas une exécution
+distante attestée ni un bac à sable contre un runtime compromis. Tous les
+contrôles déclarés, même ceux des sorties inchangées, doivent passer.
 
 Seuls les avis favorables sont reportés, comme pour les adaptations de tests.
 Les anciens refus « differs outside a test or a conflict » sont réexaminés

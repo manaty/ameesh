@@ -1237,7 +1237,7 @@ def generated_adapted(repo: str, reviewed: str, frozen: str, *,
         if delta is None or any(path not in files or status not in ("A", "M")
                                 for path, status in delta.items()):
             return False, "generated history contains another change"
-    for path in changed:
+    for path in files:
         before = plan_git._out(repo, "ls-tree", reviewed, "--", path)
         after = plan_git._out(repo, "ls-tree", frozen, "--", path)
         if (not after or after.split()[0] != "100644"
@@ -1250,7 +1250,7 @@ def generated_adapted(repo: str, reviewed: str, frozen: str, *,
                 return False, "generated check checkout unavailable"
             if plan_git._git(tree, "checkout", "--detach", frozen).returncode:
                 return False, "generated check checkout unavailable"
-            for path in sorted(changed):
+            for path in sorted(files):
                 rule = files[path]
                 runtime = rule.get("runtime")
                 if runtime and not (Path(tree) / runtime).exists():
@@ -1264,11 +1264,14 @@ def generated_adapted(repo: str, reviewed: str, frozen: str, *,
                     if not source.is_dir():
                         return False, "generated runtime unavailable"
                     (Path(tree) / runtime).symlink_to(source.resolve(), target_is_directory=True)
-                from .platform.child_environment import for_child
-                env = dict(os.environ, PYTHONPATH=str(Path(tree) / "src"),
-                           PYTHONNOUSERSITE="1")
+                # Isolate ambient configuration, while trusting the host's
+                # executables and installed runtime bytes (not a sandbox).
+                env = {"PATH": os.defpath, "HOME": tmp, "TMPDIR": tmp,
+                       "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                       "PYTHONPATH": str(Path(tree) / "src"),
+                       "PYTHONNOUSERSITE": "1"}
                 result = subprocess.run(rule["check"], cwd=tree,
-                                        env=for_child(rule["check"], env),
+                                        env=env,
                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.DEVNULL, timeout=GENERATED_CHECK_TIMEOUT)
                 if result.returncode:

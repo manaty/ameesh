@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -162,3 +163,54 @@ class GeneratedCarryTest(unittest.TestCase):
         ok, why, _ = self.check(frozen)
         self.assertFalse(ok)
         self.assertIn("runtime lock differs", why)
+
+    def test_unchanged_downstream_output_must_pass_its_check(self):
+        self.write("downstream.txt", "base\n")
+        self.write(verdict_carry.GENERATED_FILES, json.dumps({
+            "version": 1, "files": {
+                "generated.txt": self.rule,
+                "downstream.txt": {"check": [sys.executable, "-c",
+                    "from pathlib import Path; import sys; "
+                    "sys.exit(Path('downstream.txt').read_bytes() != "
+                    "Path('generated.txt').read_bytes())"]}}}))
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        self.write("generated.txt", "reviewed\n")
+        ok, why, _ = self.check(self.commit())
+        self.assertFalse(ok)
+        self.assertIn("check failed or inconclusive for downstream.txt", why)
+
+    @unittest.skipUnless(shutil.which("node"), "node unavailable")
+    def test_node_options_cannot_forge_success(self):
+        self.rule = {"check": [shutil.which("node"), "check.js"]}
+        self.write("check.js", "process.exit(1);\n")
+        self.declare()
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        self.write("generated.txt", "reviewed\n")
+        frozen = self.commit()
+        self.write("preload.js", "process.exit(0);\n")
+        with mock.patch.dict(os.environ, {
+                "NODE_OPTIONS": "--require " + str(Path(self.root) / "preload.js")}):
+            ok, why, _ = self.check(frozen)
+        self.assertFalse(ok)
+        self.assertIn("check failed", why)
+
+    def test_check_environment_is_closed(self):
+        self.write("generated.txt", "reviewed\n")
+        frozen = self.commit()
+        original_run = subprocess.run
+        seen = []
+
+        def run(argv, *args, **kwargs):
+            if argv[0] == sys.executable:
+                seen.append(kwargs["env"])
+            return original_run(argv, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"NODE_PATH": "injected",
+                "PYTHONHOME": "injected"}), mock.patch.object(
+                    verdict_carry.subprocess, "run", side_effect=run):
+            self.assertTrue(self.check(frozen)[0])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(set(seen[0]), {"PATH", "HOME", "TMPDIR", "LANG",
+                                      "LC_ALL", "PYTHONPATH", "PYTHONNOUSERSITE"})
