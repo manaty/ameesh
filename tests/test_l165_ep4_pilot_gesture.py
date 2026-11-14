@@ -156,6 +156,53 @@ class GestureFenceTest(PgTestCase):
         state = registry.get(self.db, self.name)
         self.assertGreater(float(state["lease_expires_ts"]), 0.0)
 
+    @contextlib.contextmanager
+    def composition_scope(self):
+        # #7318: real scope transformation, then the real packet guard. No
+        # systemd unit or external packet operation is started by this test.
+        from .test_6814_composition_scope import paquet_auto
+        with mock.patch.object(paquet_auto, "SCOPE_TMPDIR", str(self.tmp)):
+            env = paquet_auto.scope_environment(carrier=7318)
+        with mock.patch.dict(os.environ, env, clear=True):
+            yield
+
+    def test_scope_runner_bail_vivant_autorise(self):
+        with self.live(), self.composition_scope():
+            gate = pilot_gesture.gate(self.cfg, self.db, "packet", "scope #7318")
+            self.assertEqual((gate.agent, gate.epoch), (self.name, self.epoch))
+            self.assertGreater(gate.hold(self.db), 0)
+
+    def test_scope_role_bail_vivant_autorise(self):
+        with self.role_env(role=self.name, epoch=self.epoch, owner="runner-h1"), \
+                self.composition_scope():
+            gate = pilot_gesture.gate(self.cfg, self.db, "packet", "scope role #7318")
+            self.assertEqual((gate.agent, gate.epoch), (self.name, self.epoch))
+            self.assertGreater(gate.hold(self.db), 0)
+
+    def test_scope_epoque_perimee_refusee(self):
+        old = self.epoch
+        self.assertTrue(registry.release(self.db, self.name, "runner-h1", old))
+        self.assertIsNotNone(registry.claim(
+            self.db, self.name, "runner-h2", 600, host="h2", election_brief="scope"))
+        for role in (False, True):
+            env = (self.role_env(role=self.name, epoch=old, owner="runner-h1")
+                   if role else self.identity_env(
+                       name=self.name, runner="runner-h1", epoch=old))
+            with self.subTest(role=role), env, self.composition_scope():
+                with self.assertRaises(pilot_gesture.GestureRefused):
+                    pilot_gesture.gate(self.cfg, self.db, "packet", "scope stale #7318")
+
+    def test_scope_sans_liaison_refuse(self):
+        for runner, epoch in ((None, self.epoch), ("runner-h1", None), (None, None)):
+            with self.subTest(runner=runner, epoch=epoch), \
+                    self.identity_env(name=self.name, runner=runner, epoch=epoch), \
+                    self.composition_scope():
+                with self.assertRaises(pilot_gesture.GestureRefused):
+                    pilot_gesture.gate(self.cfg, self.db, "packet", "scope unbound #7318")
+        with self.role_env(role=self.name), self.composition_scope():
+            with self.assertRaises(pilot_gesture.GestureRefused):
+                pilot_gesture.gate(self.cfg, self.db, "packet", "scope role unbound #7318")
+
     def test_role_arrete_entre_la_garde_et_l_ecriture_refuse(self):
         with self.live():
             gate = pilot_gesture.gate(self.cfg, self.db, "merge", "stop #1")
