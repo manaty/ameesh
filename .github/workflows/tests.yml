@@ -718,7 +718,18 @@ jobs:
     steps:
       - &debut
         name: début du job (mesure du plafond, #899)
-        run: echo "AMEESH_JOB_DEBUT=$(date -u +%s)" >> "$GITHUB_ENV"
+        run: |
+          echo "AMEESH_JOB_DEBUT=$(date -u +%s)" >> "$GITHUB_ENV"
+          # #7380 : cache pip PAR RUNNER. /home/runner/.cache/pip est commun
+          # aux huit runners de l'hôte ; actions/setup-python y extrait un
+          # cache pip à chaque job (tar, non atomique) pendant que d'autres
+          # jobs lisent la même entrée : une roue peut être lue tronquée et pip
+          # refuse alors son empreinte (« THESE PACKAGES DO NOT MATCH THE
+          # HASHES », run 43599097259, ameesh-ci-1-8). Le cache du job est
+          # désormais sous le _work de CE runner, que le runner n'utilise que
+          # pour un job à la fois ; setup-python (restauration de son cache
+          # pip) et pip lisent PIP_CACHE_DIR.
+          echo "PIP_CACHE_DIR=$RUNNER_WORKSPACE/../pip-cache" >> "$GITHUB_ENV"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - *disque_rapport
       # #3581 : le témoin du pont JS (#3529) appelle `node`, absent du PATH de
@@ -804,7 +815,25 @@ jobs:
           else
             rm -rf .venv-ci
             python -m venv .venv-ci
-            .venv-ci/bin/pip install 'psycopg[binary]>=3.2' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10' 'pyyaml>=6'
+            paquets=('psycopg[binary]>=3.2' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10' 'pyyaml>=6')
+            journal="$RUNNER_TEMP/pip-dependances.log"
+            # #7380 : une entrée du cache pip peut être illisible (course de
+            # restauration entre les huit runners d'un hôte, supprimée par le
+            # PIP_CACHE_DIR par runner posé au début du job). pip vérifie
+            # l'empreinte de chaque roue : une entrée corrompue échoue, elle
+            # ne s'installe jamais. On purge alors le cache du runner et on
+            # rejoue SANS cache ; aucune option ne désactive les empreintes.
+            if .venv-ci/bin/pip install "${paquets[@]}" >"$journal" 2>&1; then
+              cat "$journal"
+            elif grep -q "DO NOT MATCH THE HASHES" "$journal"; then
+              cat "$journal"
+              echo "::warning::cache pip corrompu (#7380) : entrée invalidée, nouvelle tentative sans cache"
+              .venv-ci/bin/pip cache purge || true
+              .venv-ci/bin/pip install --no-cache-dir "${paquets[@]}"
+            else
+              cat "$journal"
+              exit 1
+            fi
             echo "reconstruit=1" >> "$GITHUB_OUTPUT"
           fi
       # #1293 : le venv reconstruit est sauvé sous la clé du run, que la
