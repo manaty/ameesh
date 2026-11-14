@@ -5,6 +5,12 @@ controller reads `.ameesh/staging-migrations.json` from the frozen candidate.
 If the candidate has migrations, an absent or unreadable policy refuses the
 handoff. No SQL is executed by this check.
 
+The controller inventories the Git delta from the release's `main` baseline.
+It does not read the live staging migration ledger in handoff mode. This is a
+conservative superset of pending SQL: a previously applied file can still
+require a declaration. Checking precisely the unapplied files requires the
+applicator's actual pending inventory; that integration remains to be agreed.
+
 Start with `deploy/staging-migrations-policy.example.json`, then review the
 policy in the project repository. Its `rules` contain regular expressions and
 reasons for `additive`, `relaxation`, and `destructive` statements. An entire
