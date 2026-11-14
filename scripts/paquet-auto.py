@@ -5354,8 +5354,10 @@ def merged_during_tests(args: argparse.Namespace, worktree: Path, head: str,
 
 
 def send_mail(recipient: str, lot: int, body: str,
-              sender: str | None = None) -> str:
+              sender: str | None = None, *, info: bool = False) -> str:
     cmd = ["agent-mail", "send", recipient, "-", "--lot", str(lot)]
+    if info:
+        cmd.append("--info")
     if sender:
         # #3845 : sous `ameesh role run`, AGENT_MAIL_NAME est retiré ; sans
         # --from, agent-mail refuse (« unbound sender »).
@@ -5567,7 +5569,7 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
 def mail_body(*, name: str, target: str, base_sha: str, carrier: int,
               head: str, branch: str, composition: Composition,
               tests: list[TestRun], inclusion_rc: int, pr_number: int | None,
-              pr_url: str) -> str:
+              pr_url: str, report_info: bool = False) -> str:
     units = ", ".join("#%d" % unit.lot for unit in composition.units) or "aucun"
     discarded = "; ".join(
         "#%d (%s)" % (item.lot, item.reason) for item in composition.discarded
@@ -5592,7 +5594,7 @@ Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branch
 - Inclusion : {inclusion}.
 - Gel : `ameesh work milestone` posé sur la tête dès la poussée, ci-full demandée (#4304) ; manifeste `{manifest}`.
 
-« Verdict non requis » reste ton geste ; aucune fusion sur {target}.
+{next_step}
 """.format(
         name=name, head=head, target=target, base=base_sha[:12],
         branch=branch, pr=pr, n=len(composition.units), units=units,
@@ -5601,6 +5603,9 @@ Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branch
         non_section=non_section,
         inclusion="vert" if inclusion_rc == 0 else "à lire",
         manifest=manifest_rel(name),
+        next_step=("Le composeur horaire poursuit la publication et traite les demandes "
+                   "de geste séparément." if report_info else
+                   "« Verdict non requis » reste ton geste ; aucune fusion sur %s." % target),
     )
 
 
@@ -6011,10 +6016,13 @@ def publish_tested(args: argparse.Namespace) -> int:
             "Paquet %s publié sans retester : tête `%s` sur %s `%s` (branche `%s`, %s)."
             % (args.name, head, args.target, base_sha[:12], branch, pr), "",
             units, "", origin, "",
-            "« Verdict non requis » et la ci-full restent tes gestes ; aucune "
-            "fusion sur %s." % args.target, ""])
+            ("Le composeur horaire poursuit la publication et signale séparément "
+             "les gestes nécessaires." if getattr(args, "report_info", False) else
+             "« Verdict non requis » et la ci-full restent tes gestes ; aucune "
+             "fusion sur %s." % args.target), ""])
         try:
-            send_mail(args.pilot, args.carrier, mail, getattr(args, "sender", None))
+            send_mail(args.pilot, args.carrier, mail, getattr(args, "sender", None),
+                      info=getattr(args, "report_info", False))
         except PaquetAutoError as error:
             print("courrier non envoyé : %s\n\n%s" % (error, mail), file=sys.stderr)
             raise
@@ -6594,9 +6602,10 @@ def compose_packet(args: argparse.Namespace) -> int:
                          carrier=args.carrier, head=head, branch=branch,
                          composition=composition, tests=runs,
                          inclusion_rc=inclusion_rc, pr_number=pr_number,
-                         pr_url=pr_url)
+                         pr_url=pr_url, report_info=getattr(args, "report_info", False))
         try:
-            send_mail(args.pilot, args.carrier, mail, getattr(args, "sender", None))
+            send_mail(args.pilot, args.carrier, mail, getattr(args, "sender", None),
+                      info=getattr(args, "report_info", False))
         except PaquetAutoError as error:
             print("courrier non envoyé : %s\n\n%s" % (error, mail),
                   file=sys.stderr)
@@ -6822,6 +6831,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--name", required=True, help="nom du paquet (h-AAAAMMJJ-NN)")
     parser.add_argument("--carrier", type=int, default=0,
                         help="lot porteur du paquet")
+    parser.add_argument("--report-info", action="store_true",
+                        help="compte rendu de succès sans réveil ; le composeur poursuit la publication")
     parser.add_argument("--pilot", default="mesh-design",
                         help="destinataire du courrier (défaut : mesh-design)")
     parser.add_argument("--from", dest="sender",
