@@ -91,7 +91,13 @@ auteurs, avec les mêmes exceptions du canon §2 :
   est alors auteur, sa famille exclue). #2721 :
   à la désignation, ce repli porte sa trace (`proof: turn-journal`,
   `fallback_commits`), et un committer distinct de la référence doit être au
-  registre.
+  registre ;
+* #7324 : ce repli ne lit qu'une identité Git, que celui qui réécrit choisit
+  (nexlink #7272 : sept commits signés au nom de l'assigné en pause). Quand la
+  plage en contient, l'acteur prouvé par le reçu exact du **gel** est auteur
+  lui aussi s'il n'est pas la référence ; sans famille prouvée, la tête reste
+  inconnue. Coût assumé : un pilote qui regèle une telle plage voit sa famille
+  exclue (le doute conserve).
 
 Le module ne devine jamais une famille depuis un nom Git seul : le committer
 et l'auteur Git doivent porter l'adresse d'agent (`<nom>@ameesh.invalid`),
@@ -107,7 +113,6 @@ import difflib
 import os
 import re
 import tempfile
-import time
 
 from typing import Mapping, Optional, Sequence
 
@@ -850,10 +855,13 @@ def _freeze_actor(db, milestone: Optional[Mapping],
     """#7324 : `(acteur, famille)` du reçu exact du gel, ou None sans reçu.
 
     `proof` est la preuve du tour courant quand la lecture précède l'INSERT
-    du jalon (#3948) ; sinon le reçu du jalon en base. Un jalon sans reçu ne
-    prouve rien : la lecture d'avant s'applique."""
-    receipt = dict(proof) if proof else None
-    if receipt is None:
+    du jalon (#3948), `{}` quand ce tour n'en a pas ; sinon le reçu du jalon
+    en base. Un jalon sans reçu ne prouve rien : la lecture d'avant s'applique."""
+    if proof is not None:
+        # #3948 : `{}` est le « pas de preuve » explicite d'un gel hors tour ;
+        # l'id du jalon n'est alors que provisoire et ne se relit pas.
+        receipt = dict(proof)
+    else:
         try:
             milestone_id = int((milestone or {}).get("id") or 0)
         except (TypeError, ValueError):
@@ -873,60 +881,6 @@ def _freeze_actor(db, milestone: Optional[Mapping],
     if not actor:
         return None
     return actor, _family(receipt.get("harness"), families)
-
-
-def _legacy_address(repo: str, sha: str, field: str) -> bool:
-    """#7324 : l'adresse `%ae`/`%ce` est-elle l'ancienne `@ameesh.local` ?
-
-    Ces commits d'avant la convention (#3111) n'ont qu'un journal des tours
-    grossier : l'absence d'un tour proche n'y prouve rien."""
-    text = _read_out(repo, "show", "-s", "--format=" + field, sha)
-    return str(text or "").strip().lower().endswith("@ameesh.local")
-
-
-def _turn_absent(db, actor: str, stamp: float, *, strict: bool = False) -> bool:
-    """#7324 : le journal des tours **contredit**-il le commit de `actor` ?
-
-    Le repli du committer (#2721) lit la famille au journal des tours, mais
-    `_turns_harness` retombe sur le dernier tour antérieur, si ancien soit-il :
-    un commit dont l'adresse Git nomme un agent qui ne tournait pas à cet
-    instant héritait de sa famille. Constat nexlink #7272 (14/11 03:4xZ) :
-    deepseek4 a réécrit sept commits sous l'identité `claude1@ameesh.invalid`
-    pendant la pause de claude1 ; la lecture n'a vu que la famille claude.
-
-    Vrai seulement sur une preuve : l'agent a déjà un tour au journal, aucun
-    tour ne s'est fini à moins de `FREEZE_TURN_WINDOW_S` du commit (avant ou
-    après), et aucun tour n'est en cours qui puisse le contenir. Une
-    réécriture dans la demi-heure d'un tour de l'agent n'est donc pas vue :
-    la borne préfère ne jamais fermer la porte à tort. Un agent sans aucune ligne
-    garde la lecture d'avant (pas de preuve contraire) ; un journal illisible
-    n'est pas une preuve (`strict` laisse passer `JournalUnreadable`)."""
-    if db is None or not actor or not stamp:
-        return False
-    window = review_lot.FREEZE_TURN_WINDOW_S
-    try:
-        ledger = storage.of(db).turn_costs
-        after = ledger.first_after(actor, float(stamp))
-        if after is not None and 0 <= (float(after.get("recorded_ts") or 0)
-                                       - float(stamp)) <= window:
-            return False
-        before = ledger.last_before(actor, float(stamp))
-        if before is None and after is None:
-            return False
-        if before is not None and 0 <= (float(stamp) - float(
-                before.get("recorded_ts") or 0)) <= window:
-            # Un tour fini juste avant reste plausible (horloges, seconde de
-            # `%ct`) : seul un trou d'une fenêtre entière est une preuve.
-            return False
-        if after is None and time.time() - float(stamp) <= window \
-                and registry.turn_in_progress(db, actor):
-            return False
-    except Exception as exc:  # noqa: BLE001 - journal illisible : pas de preuve
-        if strict:
-            raise JournalUnreadable("turn journal unreadable for %s: %s"
-                                    % (actor, exc)) from exc
-        return False
-    return True
 
 
 def _unreceived_role(actor: str, author_name: str, reviewers) -> str:
@@ -992,13 +946,8 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
             and git_author.casefold() != committer.casefold()
             and agent_made):
         rows, unknown = [], []
-        for actor, stamp, field in ((committer, committer_stamp, "%ce"),
-                                    (git_author, author_stamp, "%ae")):
-            if (not _legacy_address(repo, sha, field)
-                    and _turn_absent(db, actor, stamp, strict=strict_journal)):
-                # #7324 : l'adresse nomme un agent qui ne tournait pas : le
-                # commit vient d'ailleurs, sa provenance reste inconnue.
-                return [], [sha[:12]]
+        for actor, stamp in ((committer, committer_stamp),
+                             (git_author, author_stamp)):
             role = _unreceived_role(actor, author_name, reviewers)
             proven = actor_family(db, actor, stamp, families,
                                   strict=strict_journal)
@@ -1018,10 +967,6 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
         return [], [sha[:12]]
     role = _unreceived_role(actor, author_name, reviewers)
     if role != "reference" and not _registered(db, actor):
-        return [], [sha[:12]]
-    if (not _legacy_address(repo, sha, "%ce")
-            and _turn_absent(db, actor, stamp, strict=strict_journal)):
-        # #7324 : ni l'assigné ni un autre ne prouvent ce commit par un tour.
         return [], [sha[:12]]
     proven = actor_family(db, actor, stamp, families,
                           strict=strict_journal)
@@ -6197,9 +6142,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             if name and (not author_name
                          or name.casefold() != author_name.casefold()):
                 if family:
+                    # sa famille vient du reçu du gel, pas du repli #2721 :
+                    # aucune trace `proof: turn-journal` pour lui.
                     by_name.setdefault(name, set()).add(family)
-                    proofs.setdefault(name, set()).update(
-                        sha for values in list(proofs.values()) for sha in values)
                 else:
                     head_sha = str(head or (milestone or {}).get("sha") or "")
                     if head_sha[:12] and head_sha[:12] not in unknown:

@@ -17,7 +17,6 @@ Attendu :
 from __future__ import annotations
 
 import os
-import time
 
 from ameesh import freeze_families, registry, review_authors, work
 
@@ -61,34 +60,24 @@ class _Range(PgTestCase):
 
 
 
-class ForgedReferenceTest(_Range):
+class LongTurnTest(_Range):
+    """B 7bd2c991/75d35268 : un tour long ou en cours ne ferme rien.
 
-    def test_a_commit_outside_any_turn_of_the_assignee_is_unknown(self):
-        # Le dernier tour de l'assigné s'est fini trois heures avant.
-        self.turn(self.stamp - 3 * 3600)
-        _authors, unknown, _correctors = self.reading()
-        self.assertEqual(unknown, [self.head[:12]])
+    La garde par fenêtre de tours est retirée : seul le reçu du gel prouve un
+    autre acteur. Un commit de l'assigné loin de tout tour fini reste le sien."""
 
-    def test_a_commit_inside_a_turn_of_the_assignee_stays_his(self):
+    def test_a_commit_far_from_any_finished_turn_stays_the_assignee(self):
         self.turn(self.stamp - 3 * 3600)
-        self.turn(self.stamp + 60)
         authors, unknown, _correctors = self.reading()
         self.assertEqual(unknown, [])
-        self.assertEqual({row["name"]: row["family"] for row in authors},
-                         {AUTHOR: "claude"})
+        self.assertEqual({row["name"] for row in authors}, {AUTHOR})
 
-    def test_turn_absent_reads_a_turn_in_progress(self):
+    def test_a_turn_ending_forty_minutes_later_keeps_the_commit(self):
         self.turn(self.stamp - 3 * 3600)
-        self.assertTrue(review_authors._turn_absent(self.db, AUTHOR, self.stamp))
-        self.db.execute("UPDATE agent_registry SET status = 'running'"
-                        " WHERE name = %s", (AUTHOR,))
-        from unittest import mock
-        with mock.patch.object(registry, "turn_in_progress", return_value=True):
-            self.assertFalse(review_authors._turn_absent(
-                self.db, AUTHOR, time.time()))
-
-    def test_an_agent_without_any_turn_keeps_the_previous_reading(self):
-        self.assertFalse(review_authors._turn_absent(self.db, AUTHOR, self.stamp))
+        self.turn(self.stamp + 40 * 60)
+        authors, unknown, _correctors = self.reading()
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"] for row in authors}, {AUTHOR})
 
 
 class FreezerReceiptTest(_Range):
@@ -138,6 +127,24 @@ class FreezerReceiptTest(_Range):
         self.assertEqual(unknown, [])
         self.assertEqual(set(self.families(authors)), {AUTHOR})
 
+    def test_an_empty_pre_insert_proof_never_reads_a_provisional_milestone(self):
+        # #3948 : `{}` = gel hors tour ; l'id provisoire peut nommer le jalon
+        # d'un autre lot, il ne se relit pas.
+        other = self.freeze_by(FORGER, "deepseek")
+        authors, _unknown, _ = review_authors.reading(
+            self.db, work.get(self.db, self.lot), other, [self.head],
+            self.repo.root, FAMILIES, strict=True, base=self.base,
+            head=self.head, target=self.base, milestone_proof={})
+        self.assertNotIn(FORGER, self.families(authors))
+
+    def test_the_freezer_carries_no_turn_journal_trace(self):
+        authors, _unknown, _ = review_authors.reading(
+            self.db, work.get(self.db, self.lot), self.freeze_by(FORGER, "deepseek"),
+            [self.head], self.repo.root, FAMILIES, strict=True, base=self.base,
+            head=self.head, target=self.base, trace=True)
+        row = next(row for row in authors if row["name"] == FORGER)
+        self.assertNotIn("proof", row)
+
     def test_the_pre_insert_proof_counts_as_the_freeze_receipt(self):
         authors, _unknown, _ = review_authors.reading(
             self.db, work.get(self.db, self.lot), None, [self.head],
@@ -168,3 +175,13 @@ class RefusalWordingTest(PgTestCase):
         self.assertIn("must redo these commits", text)
         self.assertIn("forbidden", text)
         self.assertNotIn("Return these commits", text)
+
+    def test_an_empty_assignee_reads_once(self):
+        verdict = {"state": "short", "required": 2, "need": 2,
+                   "eligible": [], "forbidden": ["claude"],
+                   "families": ["claude", "codex"], "authors": [],
+                   "manual_seats": [], "unknown_authors": [],
+                   "assignee": "", "why": "x"}
+        text = freeze_families.message(None, verdict)
+        self.assertIn("The assignee (or", text)
+        self.assertNotIn("The the", text)

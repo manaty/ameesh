@@ -187,7 +187,7 @@ def message(inputs, verdict: Mapping | None = None) -> str:
     """
     verdict = dict(verdict or assess(inputs))
     assignee = str(verdict.get("assignee") or "").strip()
-    target = ("assignee %s" % assignee) if assignee else "the assignee"
+    target = ("assignee %s" % assignee) if assignee else "assignee"
     forbidden = set(verdict.get("forbidden") or ())
     declared = set(verdict.get("families") or ())
     authors = [row for row in verdict.get("authors") or ()
