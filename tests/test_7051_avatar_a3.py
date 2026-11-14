@@ -23,7 +23,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import (canon, conversation as C, conversation_move as M,
+from ameesh import (accounts, canon, conversation as C, conversation_move as M,
                     harnesses, registry, storage)
 
 from . import test_canon
@@ -182,6 +182,14 @@ class MoveProbeTest(test_canon._TmpMixin, unittest.TestCase):
         with open(self.binary, "w", encoding="utf-8") as fh:
             fh.write("#!/bin/sh\n")
         os.chmod(self.binary, 0o755)
+        # #7051 relecture cx2 : sans profil déclaré, le verdict `account` lit le
+        # HOME du runner (`~/.claude`) ; ce dossier existe sur les VM d'agents
+        # mais pas sur les runners CI. Le test fixe donc le foyer par défaut,
+        # comme il fixe déjà le binaire — le produit, lui, garde son repli.
+        self.home = self.make_tmp()
+        patcher = mock.patch.object(accounts, "default_home", return_value=self.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def probes(self, *, attach: bool, resident: bool) -> dict:
         return M.host_probes(
@@ -202,6 +210,16 @@ class MoveProbeTest(test_canon._TmpMixin, unittest.TestCase):
         verdicts = self.probes(attach=False, resident=True)
         self.assertFalse(verdicts["interactive"])
         self.assertTrue(verdicts["resident"])
+
+    def test_a_missing_default_home_is_not_an_account(self):
+        # Le pendant du test précédent : un foyer par défaut absent n'est pas
+        # un compte utilisable, et c'est la seule sonde qui manque.
+        missing = os.path.join(self.make_tmp(), "absent")
+        with mock.patch.object(accounts, "default_home", return_value=missing):
+            verdicts = self.probes(attach=True, resident=True)
+        self.assertFalse(verdicts["account"])
+        self.assertEqual([check for check in M.CHECKS if verdicts[check] is not True],
+                         ["account"])
 
 
 # --------------------------------------------------------------------------
