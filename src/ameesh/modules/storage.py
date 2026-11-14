@@ -9,15 +9,15 @@ from __future__ import annotations
 import json
 
 
-def _phase_state(alias: str) -> str:
+def _phase_state(db, alias: str) -> str:
     """#4621 : la phase de livraison, lue par les états de policy.
 
     Depuis 0518 le core `delivered` porte `merged` et `promoted` ; un constat
     doit nommer la phase (`merged`/`promoted`), comme les règles `require_qa`.
     `to_jsonb` garde la lecture compatible avec une base d'avant 0518.
     """
-    return "coalesce(to_jsonb(%s)->>'legacy_state', %s.state) AS state" % (
-        alias, alias)
+    from ..storage.postgres.work import legacy_state_column
+    return "coalesce(%s, %s.state) AS state" % (legacy_state_column(db, alias), alias)
 
 
 class ModuleStore:
@@ -115,7 +115,7 @@ class ModuleStore:
     def audit_evidence(self, project, module, types, subject_kind, evidence_kind):
         """Read current declarations and matching evidence in one snapshot."""
         return self.db.query(
-            "SELECT w.id, w.title, w.type, " + _phase_state("w") + ", w.assignee, "
+            "SELECT w.id, w.title, w.type, " + _phase_state(self.db, "w") + ", w.assignee, "
             "extract(epoch from w.created_at)::float8 AS created_ts, "
             "d.id AS declaration_id, d.subject, "
             "extract(epoch from d.at)::float8 AS declaration_ts, "
@@ -145,8 +145,9 @@ class ModuleStore:
         One snapshot: a lot whose current declaration has no matching `ok`
         evidence, or whose evidence is bound to an earlier declaration, is a
         deviation the module decides how to report."""
+        from ..storage.postgres.work import legacy_state_column
         return self.db.query(
-            "SELECT w.id, w.title, w.type, " + _phase_state("w") + ", w.assignee, "
+            "SELECT w.id, w.title, w.type, " + _phase_state(self.db, "w") + ", w.assignee, "
             "extract(epoch from w.created_at)::float8 AS created_ts, "
             "d.id AS declaration_id, d.subject, "
             "extract(epoch from d.at)::float8 AS declaration_ts, "
@@ -163,7 +164,7 @@ class ModuleStore:
             "WHERE p.project = %s AND p.module = %s "
             "AND w.type IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
             "AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(%s::jsonb) s(value) "
-            "WHERE s.value IN (w.state, to_jsonb(w)->>'legacy_state')) "
+            "WHERE s.value IN (w.state, " + legacy_state_column(self.db, "w") + ")) "
             "ORDER BY w.id",
             (subject_kind, evidence_kind, project, module,
              json.dumps(list(types)), json.dumps(list(states))))
