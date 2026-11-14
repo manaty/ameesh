@@ -40,11 +40,24 @@ class DeferredGuardTest(unittest.TestCase):
             name="ameesh", repo="/nowhere", target="main", remote="origin",
             report="human", github="manaty/ameesh")
 
-    def tick(self, rows, by_commit, *, pilots=("pilot",)):
+    def tick(self, rows, by_commit, *, pilots=("pilot",), pairs=()):
+        pairs = set(pairs)
+
+        def ancestry(repo, ancestor, descendant):
+            if ancestor == descendant:
+                return True
+            if (ancestor, descendant) in pairs:
+                return True
+            if (descendant, ancestor) in pairs:
+                return False
+            return None
+
         with mock.patch.object(release_cutoff, "stored_attestations",
                                return_value=rows), \
              mock.patch.object(release_cutoff, "_tags_by_commit",
                                return_value=by_commit), \
+             mock.patch.object(staging_deferred, "_is_ancestor",
+                               side_effect=ancestry), \
              mock.patch.object(staging_deferred, "_registry_rows", return_value=[]), \
              mock.patch("ameesh.alert_briefs.project_pilots",
                         return_value=list(pilots)), \
@@ -106,9 +119,52 @@ class DeferredGuardTest(unittest.TestCase):
         rows = [attestation(newer, hotes={h: {"actif": newer}
                                          for h in AGENTS + ("manaty-mesh-1",)}),
                 attestation(SHA, reportes={"manaty-mesh-1": {"raison": "deferred"}})]
-        report, send = self.tick(rows, {SHA: TAG})
+        report, send = self.tick(rows, {SHA: TAG}, pairs={(SHA, newer)})
         self.assertEqual(report["result"], "none")
         self.assertEqual(send.call_count, 0)
+
+    def test_an_old_commit_proof_does_not_lift_the_alert(self):
+        """A catch-up at an ancestor (old version, rollback) is still a lag."""
+        older = "f" * 40
+        rows = [attestation(older, hotes={h: {"actif": older}
+                                         for h in AGENTS + ("manaty-mesh-1",)}),
+                attestation(SHA, reportes={"manaty-mesh-1": {"raison": "deferred"}})]
+        report, send = self.tick(rows, {SHA: TAG}, pairs={(older, SHA)})
+        self.assertEqual(report["result"], "alerted")
+        self.assertEqual(send.call_count, 2)
+
+    def test_an_invalid_proof_does_not_lift_the_alert(self):
+        """A proof that does not name a commit is no proof at all."""
+        newer = "e" * 40
+        rows = [attestation(newer, hotes={"manaty-mesh-1": {"actif": "not-a-sha"}}),
+                attestation(SHA, reportes={"manaty-mesh-1": {"raison": "deferred"}})]
+        report, send = self.tick(rows, {SHA: TAG}, pairs={(SHA, newer)})
+        self.assertEqual(report["result"], "alerted")
+
+    def test_only_a_commit_names_a_proof(self):
+        with mock.patch.object(staging_deferred, "_is_ancestor") as ancestry:
+            for actif in ("", None, 42, "v1.54.0", "abc", "x" * 40):
+                self.assertFalse(staging_deferred._at_least(actif, SHA, "/nowhere"), actif)
+            ancestry.assert_not_called()
+
+    def test_unreadable_ancestry_does_not_lift_the_alert(self):
+        """git cannot answer: keep the alert (unreadable never proves)."""
+        newer = "e" * 40
+        rows = [attestation(newer, hotes={"manaty-mesh-1": {"actif": newer}}),
+                attestation(SHA, reportes={"manaty-mesh-1": {"raison": "deferred"}})]
+        report, send = self.tick(rows, {SHA: TAG}, pairs=())
+        self.assertEqual(report["result"], "alerted")
+        self.assertEqual(send.call_count, 2)
+
+    def test_a_later_report_outranks_an_older_proof(self):
+        """A regression after a proof is a new lag, not a catch-up."""
+        proof, later = "e" * 40, "f" * 40
+        rows = [attestation(later, reportes={"manaty-mesh-1": {"raison": "rollback"}}),
+                attestation(proof, hotes={"manaty-mesh-1": {"actif": proof}}),
+                attestation(SHA, reportes={"manaty-mesh-1": {"raison": "deferred"}})]
+        report, send = self.tick(rows, {SHA: TAG}, pairs={(SHA, proof)})
+        self.assertEqual(report["result"], "alerted")
+        self.assertEqual(send.call_count, 2)
 
     def test_unreadable_attestations_conclude_nothing(self):
         report, send = self.tick([], {})

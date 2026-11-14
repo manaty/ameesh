@@ -17,10 +17,16 @@ release. The gesture is declared after each cutoff instead of being forgotten.
 
 A workstation report is normal and is never alerted. No readable attestation,
 no tag, an unreadable state: nothing is concluded, no mail is sent.
+
+A later attestation lifts the alert only when its host proof is a commit: the
+host's active commit must be the tagged one or a descendant of it (a rollback
+or an old catch-up at an ancestor is still a lag, #7365 review).
 """
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 from pathlib import Path
 
 SCHEMA = "ameesh-staging-deferred/1"
@@ -86,17 +92,73 @@ def _deferred(data) -> dict:
     return out
 
 
-def _proved_since(rows, index, host) -> bool:
-    """A newer attestation proves the host: the report is caught up (#7365).
+#: a commit written by an attestation (full or abbreviated), never a ref name
+_SHA_RE = re.compile(r"\A[0-9a-f]{7,40}\Z")
 
-    This is the other outcome — the root path was given and `--absent`
-    removed. A report older than a proof is history, not a lag.
+
+def _commit(value) -> str | None:
+    """The commit an attestation field names, or None when it names none."""
+    return value if isinstance(value, str) and _SHA_RE.match(value) else None
+
+
+def _is_ancestor(repo: str, ancestor: str, descendant: str) -> bool | None:
+    """Whether `ancestor` is `descendant` or an ancestor of it.
+
+    None when git cannot answer (missing repository or commit): an unreadable
+    proof never lifts the alert (#7365 review).
+    """
+    if ancestor == descendant:
+        return True
+    try:
+        run = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor",
+                              ancestor, descendant],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if run.returncode == 0:
+        return True
+    if run.returncode == 1:
+        return False
+    return None
+
+
+def _at_least(actif, baseline, repo) -> bool:
+    """The host's active commit is the tagged one or a descendant of it."""
+    actif, baseline = _commit(actif), _commit(baseline)
+    if actif is None or baseline is None:
+        return False
+    return _is_ancestor(repo, baseline, actif) is True
+
+
+def _evidence(rows, index, host) -> dict | None:
+    """The newest evidence on `host` after the tagged attestation.
+
+    A later report (the host was still deferred) outranks an older proof: a
+    regression is not a catch-up. A row that does not name the host says
+    nothing and is skipped.
     """
     for data in rows[:index]:
         hotes = data.get("hotes") or {}
-        if isinstance(hotes, dict) and host in hotes:
-            return True
-    return False
+        preuve = hotes.get(host) if isinstance(hotes, dict) else None
+        if isinstance(preuve, dict):
+            return preuve
+        reportes = data.get("reportes") or {}
+        if isinstance(reportes, dict) and host in reportes:
+            return None
+    return None
+
+
+def _proved_since(rows, index, host, baseline, repo) -> bool:
+    """A newer attestation proves the host caught up (#7365).
+
+    This is the other outcome — the root path was given and `--absent`
+    removed. The proof must name the host's active commit, at the tagged
+    commit or after it: an old catch-up or a rollback at an ancestor leaves
+    the lag in place. A report older than a proof is history, not a lag.
+    """
+    preuve = _evidence(rows, index, host)
+    return preuve is not None and _at_least(preuve.get("actif"), baseline, repo)
 
 
 def _last_proof(rows, start, hosts, by_commit) -> dict:
@@ -163,8 +225,10 @@ def tick(cfg, db, project) -> dict:
     if chosen is None:
         return report
     index, tag, data = chosen
+    baseline = data.get("sha")
+    repo = getattr(project, "repo", "")
     deferred = {host: detail for host, detail in _deferred(data).items()
-                if not _proved_since(rows, index, host)}
+                if not _proved_since(rows, index, host, baseline, repo)}
     if not deferred:
         return report
     proofs = _last_proof(rows, index, deferred, by_commit)
