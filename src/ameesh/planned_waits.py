@@ -266,6 +266,11 @@ _EXTERNAL_HEAD = re.compile(
     r"(?P<who>bureau|owner|propri[eé]taire|externe)"
     r"\s*(?:[\)\]]\s*)?"
     r"(?P<tail>.*)", re.I | re.S)
+_EXTERNAL_COMMA_HEAD = re.compile(
+    r"^hold:\s*attente\s+(?P<who>bureau|owner|propri[eé]taire|externe)\s*,", re.I)
+_EXTERNAL_WRITE_HEAD = re.compile(
+    r"^hold:\s*attente\s+(?:owner|bureau)\b", re.I)
+_EXTERNAL_COMMA = re.compile(r"^\s*,\s*(?P<gesture>.+)$", re.S)
 _EXTERNAL_DUE = re.compile(
     r"\s*[\(\[]\s*(?:échéance|echeance|due|au\s+plus\s+tard|jusqu'au|avant\s+le)"
     r"\s*:?\s*(?P<date>[^\)\]]+?)\s*[\)\]]", re.I)
@@ -288,7 +293,9 @@ def external_hold(text) -> dict | None:
     après le séparateur, `due` la date déclarée (texte brut, pour
     `debit.parse_wake_due`) ou None. Une déclaration sans geste n'est pas une
     déclaration : le hold reste une attente ordinaire, et rien n'est deviné
-    depuis la prose (« attente du bureau depuis 3 h » ne déclare pas)."""
+    depuis la prose (« attente du bureau depuis 3 h » ne déclare pas).
+    #7309 : la virgule est acceptée seulement dans l’en-tête ancré
+    `hold: attente <exécutant>, <geste>`."""
     note = str(text or "").strip()
     match = _EXTERNAL_HEAD.search(note)
     if not match:
@@ -301,6 +308,9 @@ def external_hold(text) -> dict | None:
     if head_due:
         tail = tail[head_due.end():]
     separator = _EXTERNAL_SEP.match(tail) or _EXTERNAL_DASH.match(tail)
+    # #7309: a comma declares a wait only directly after the hold header.
+    if not separator and _EXTERNAL_COMMA_HEAD.match(note):
+        separator = _EXTERNAL_COMMA.match(tail)
     if not separator:
         return None
     gesture = _EXTERNAL_DUE.sub("", separator.group("gesture"))
@@ -311,6 +321,16 @@ def external_hold(text) -> dict | None:
     due = _EXTERNAL_DUE.search(note) or _EXTERNAL_WAKE.search(note)
     return {"executor": who, "gesture": gesture,
             "due": due.group("date").strip() if due else None}
+
+
+def external_hold_warning(text) -> str:
+    """#7309: warn when a leading external wait cannot be classified."""
+    note = str(text or "").strip()
+    if _EXTERNAL_WRITE_HEAD.match(note) and external_hold(note) is None:
+        return ('external wait not recognized; write "hold: attente owner : '
+                '<gesture>" (or bureau); use a colon, dash or comma followed '
+                'by the expected gesture')
+    return ""
 
 
 #: #4235 : une **fenêtre d'observation** est une attente voulue et **datée**,
