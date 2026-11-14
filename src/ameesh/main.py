@@ -26,8 +26,10 @@
   ameesh approve              sign an approval;
   ameesh approve-check [--url U] [--json]
         RP ID/origin agreement between ameesh-approve and this verifier;
-  ameesh attach <agent> [--wait] [--ttl S] [--max 2h]
+  ameesh attach <agent> [--wait] [--ttl S] [--max 2h] [distant options]
         bounded native access: sleep the resident, then return its lease (L82);
+        distant (pinned host): --relay URL --receipt FILE, device/host keys
+        in 0600 files; lease, wait, journal A0, reprise (#7121) ;
   ameesh attach-grant request <agent> --host H --device-key K [--tenant T] |
         who <agent> | audit [--agent A]   remote attach grant: 5 min WebAuthn
         grant bound to the station's device key, who may ask, journal (#7119);

@@ -24,7 +24,7 @@ import os
 import sys
 import time
 
-from . import conversation, db as db_mod, fil, registry
+from . import attach_session, child_reports, conversation, db as db_mod, fil, registry
 
 ENV = "AMEESH_ATTACH"
 STATE_FILE = "attach-conversation.json"
@@ -122,6 +122,38 @@ def final_answer(data: dict) -> str | None:
     return final_from_transcript(data.get("transcript_path"))
 
 
+def human_author(binding) -> str:
+    """The verified grant human (D3), else the attach lease's identity (A0).
+
+    A distant attach knows the human from its checked grant
+    (`AMEESH_ATTACH_HUMAN`, set by the host after verification); a local
+    attach keeps the lease suffix it always had. The grant human is the A0
+    author: two people never share a lease identity.
+    """
+    verified = attach_session.human_from_env()
+    if verified:
+        return verified
+    return "human:" + binding.runner_id[len("attach:"):]
+
+
+def _copy_to_parent(db, cfg, name: str, author: str, text: str, entry: dict) -> None:
+    """Design §4.2: a human message written to a child is copied to its parent.
+
+    Only a spawned child has a parent; `copy_human` enforces the same
+    `responsible` (never one human's private conversation to another's
+    avatar) and makes the copy idempotent by `source_seq`. A non-child is
+    left alone, as is an entry without a sequence.
+    """
+    if not (registry.get(db, name) or {}).get("ephemeral"):
+        return
+    try:
+        source_seq = int(entry.get("seq"))
+    except (AttributeError, TypeError, ValueError):
+        return
+    child_reports.copy_human(db, cfg, name, author=author, body=text,
+                             source_seq=source_seq)
+
+
 def capture(cfg, db, binding, event: str, data: dict) -> dict | None:
     """Record this hook's entry; returns it, or None when nothing is due."""
     if db is None or not wanted(event, binding):
@@ -145,7 +177,7 @@ def capture(cfg, db, binding, event: str, data: dict) -> dict | None:
     event_id = "attach:%s:%s:%d" % (session, turn, seq)
     turn_ref = "attach:%s" % turn
     if event == "UserPromptSubmit":
-        human = "human:" + binding.runner_id[len("attach:"):]
+        human = human_author(binding)
         entry = log.append("human_message", text, author=human, session=session,
                            turn=turn_ref, event_id=event_id)
     else:
@@ -153,6 +185,8 @@ def capture(cfg, db, binding, event: str, data: dict) -> dict | None:
                            event_id=event_id, meta={"status": "completed"},
                            thread_text=text if text.strip() else None)
     log.drain_threads()
+    if event == "UserPromptSubmit":
+        _copy_to_parent(db, cfg, name, human, text, entry)
     return entry
 
 

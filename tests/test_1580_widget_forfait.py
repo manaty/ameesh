@@ -99,6 +99,9 @@ class WidgetUsageTest(unittest.TestCase):
         # #1789/N2: the reading exposes its date, like the log gauges
         for gauge in gauges:
             self.assertAlmostEqual(gauge.read_at, self.now - 60, places=2)
+            # #7329 : sa date est aussi son instant de production, publié dans
+            # l'historique partagé — jamais l'heure d'insertion.
+            self.assertAlmostEqual(gauge.produced_at, self.now - 60, places=2)
 
     def test_mtime_fallback_also_carries_the_date(self):
         """#1789/N2: without `updatedAt`, the reading's date comes from the
@@ -111,6 +114,7 @@ class WidgetUsageTest(unittest.TestCase):
                                    now=self.now, directory=self.dossier)
         self.assertIsNotNone(gauges)
         self.assertAlmostEqual(gauges[0].read_at, stamp, places=2)
+        self.assertAlmostEqual(gauges[0].produced_at, stamp, places=2)
 
     def test_bucket_title_with_parenthesis(self):
         """#1789/N4: "Fable Weekly (7-day)" gives the scope "fable", not

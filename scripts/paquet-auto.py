@@ -6636,15 +6636,11 @@ RUNNER_CGROUP_RE = re.compile(
     r"/ameesh-runner(?:-agent)?@[^/]*\.service(?:/|$)")
 #: Posé dans le scope : une seconde exécution ne se ré-enveloppe pas.
 SCOPED_ENV = "AMEESH_PAQUET_AUTO_SCOPED"
-#: Variables du tour et de son bail, retirées du scope. Le nom de l'agent
-#: reste (`AGENT_MAIL_NAME`, identité explicite) : après le redémarrage,
-#: l'exécuteur reprend un bail neuf et une identité liée à l'ancienne époque
-#: serait refusée (« unbound sender ») au milieu de la composition.
-TURN_VARIABLES = (
-    "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
-    "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
-    "AMEESH_LOT",
-)
+#: Seul le lot change de sujet dans le scope. #7318 : conserver le runner,
+#: l'époque et l'enveloppe de rôle ; sortir du cgroup ne donne pas un nouveau
+#: bail. Les gardes continuent de vérifier ces preuves contre le bail vivant
+#: et refusent une session périmée ou non liée, même après un redémarrage.
+TURN_VARIABLES = ("AMEESH_LOT",)
 #: Dossier stable des worktrees, celui du tic (`CacheDirectory`) : le TMPDIR
 #: d'un tour peut être vidé à une rotation de session pendant la composition.
 SCOPE_TMPDIR = ".cache/ameesh/paquet-auto"
@@ -6687,9 +6683,9 @@ def scope_environment(carrier: int = 0, *, log: Path | None = None) -> dict:
     """#6814 : l'environnement de la composition dans son scope.
 
     Le scope hérite du tour (DSN, `AGENT_MAIL_NAME`, `AMEESH_CONFIG`, caches),
-    mais pas de son bail : l'agent reste nommé, en identité explicite, et le
-    courrier de fin part encore après le redémarrage. `AMEESH_LOT` suit le
-    porteur (#6810), jamais le lot que l'agent avait au moment du lancement.
+    avec les preuves de son bail : la garde du pilote les vérifie encore
+    dans le scope, sans transformer une session liée en identité explicite.
+    `AMEESH_LOT` suit le porteur (#6810), jamais le lot que l'agent avait au moment du lancement.
     """
     env = dict(os.environ)
     env[SCOPED_ENV] = "1"

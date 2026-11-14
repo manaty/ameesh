@@ -16709,7 +16709,7 @@ def attach_owner(host: str) -> str:
 
 
 def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
-                harness: str = "") -> dict:
+                harness: str = "", human: str = "") -> dict:
     """L'identité que le harnais interactif transmet à ses hooks."""
     env = os.environ.copy()
     venv_guard.scrub(env, venv_guard.shim_dir(cfg))  # #2763 : comme un tour
@@ -16726,6 +16726,14 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
         # #7047 (A0) : les hooks écrivent l'échange au journal de conversation
         "AMEESH_ATTACH": "1",
     })
+    if human:
+        # #7121 (D3) : l'humain du grant, pas l'utilisateur système de l'hôte ;
+        # lu par le hook A0 pour l'auteur et la copie enfant.
+        env["AMEESH_ATTACH_HUMAN"] = human
+    else:
+        # Un attach local ne doit jamais hériter de l'humain d'un attach
+        # distant depuis lequel il aurait été lancé (A0 : auteur vérifié).
+        env.pop("AMEESH_ATTACH_HUMAN", None)
     # #834 : la session attachée porte la même identité git qu'un tour.
     env.update(identity.git_identity(name))
     if harness:
@@ -16962,7 +16970,16 @@ def _attach_permission_mode(cfg: Config, name: str, harness: str,
 
 
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
-               ttl: float | None = None, max_seconds: float | None = None) -> int:
+               ttl: float | None = None, max_seconds: float | None = None,
+               owner: str | None = None, human: str = "", attach_id: str = "",
+               tenant: str = "", device: str = "", remote: bool = False) -> int:
+    """Attach natif, ou distant quand `remote` (bail, attente, reprise, A0).
+
+    `owner` est l'identité du bail (`attach:…`) : par défaut celle de
+    l'utilisateur local ; en distant, l'hôte du grant la fournit
+    (`attach:<tenant>:<appareil>`, §5.4). `human` est l'humain vérifié du
+    grant ; il ne sert qu'au journal (A0), jamais à élargir un droit.
+    """
     from contextlib import ExitStack
     from . import attach as attach_mod
     from .platform import session_lock
@@ -16971,25 +16988,52 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         return 1
     max_seconds = attach_mod.DEFAULT_MAX if max_seconds is None else max_seconds
     attach_mod.Deadline(max_seconds)  # validate before taking a lock or lease
-    with ExitStack() as locks:
-        # The runner's requested() probe briefly holds this same lock. Give
-        # that probe time to finish before declaring a duplicate session.
-        for _ in range(10):
-            request = session_lock.try_lock(cfg.agent_dir(name), "attach-request")
-            if request is not None:
-                break
-            time.sleep(0.01)
-        if request is None:
-            print("agent %s already has an attach request/session: close it first" % name,
-                  file=sys.stderr)
-            return 3
-        locks.enter_context(request)
-        return _run_attach(cfg, db, name, wait=wait, ttl=ttl,
-                           max_seconds=max_seconds, locks=locks)
+    #: #7121 : une coupure du relais ferme le PTY (SIGTERM/SIGHUP). Le wrapper
+    #: doit rendre le bail et arrêter le harnais avant d'être tué : ces
+    #: signaux posent l'arrêt, la boucle coupe le groupe et le `finally`
+    #: rend le bail. Jamais installé hors du fil principal (tests, workers).
+    stop_event = threading.Event()
+    previous_signals: dict = {}
+    if remote and threading.current_thread() is threading.main_thread():
+        def _stop_attach(_signum, _frame):
+            stop_event.set()
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            try:
+                previous_signals[signum] = signal.signal(signum, _stop_attach)
+            except (ValueError, OSError):
+                pass
+    try:
+        with ExitStack() as locks:
+            # The runner's requested() probe briefly holds this same lock. Give
+            # that probe time to finish before declaring a duplicate session.
+            for _ in range(10):
+                request = session_lock.try_lock(cfg.agent_dir(name), "attach-request")
+                if request is not None:
+                    break
+                time.sleep(0.01)
+            if request is None:
+                print("agent %s already has an attach request/session: close it first" % name,
+                      file=sys.stderr)
+                return 3
+            locks.enter_context(request)
+            return _run_attach(cfg, db, name, wait=wait, ttl=ttl,
+                               max_seconds=max_seconds, locks=locks,
+                               owner=owner, human=human, attach_id=attach_id,
+                               tenant=tenant, device=device, remote=remote,
+                               stop_event=stop_event)
+    finally:
+        for signum, handler in previous_signals.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                pass
 
 
 def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
-                ttl: float | None, max_seconds: float, locks) -> int:
+                ttl: float | None, max_seconds: float, locks,
+                owner: str | None = None, human: str = "", attach_id: str = "",
+                tenant: str = "", device: str = "", remote: bool = False,
+                stop_event: threading.Event | None = None) -> int:
     """`ameesh attach <agent>` : bail interactif sur la même session (C9).
 
     Le bail est pris même s'il est déjà détenu par un exécuteur **sans tour en
@@ -16998,18 +17042,43 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     cours n'est jamais interrompu : refus, ou attente avec `--wait`. Le bail est
     renouvelé tant que la session vit, le harnais est arrêté si le bail est
     perdu, et le bail est rendu à la sortie.
+
+    #7121 (D3) : en distant, l'hôte du grant fournit `owner` (TTL court,
+    attente bornée par `--max`), le journal reçoit `agent.attach` et l'humain
+    vérifié, et la dernière page du journal est imprimée avant le harnais.
     """
     from . import attach as attach_mod
+    from . import attach_session as attach_session_mod
     from .platform import session_lock
     from .agent_names import resolve
+    stop_event = stop_event or threading.Event()
+    started = time.monotonic()
+    if owner:
+        if not attach_session_mod.OWNER_RE.fullmatch(owner):
+            print("attach: invalid lease owner", file=sys.stderr)
+            return 1
+        lease_owner = owner
+    else:
+        lease_owner = attach_owner(cfg.host)
+    if human and not attach_session_mod.HUMAN_RE.fullmatch(human):
+        print("attach: invalid grant human", file=sys.stderr)
+        return 1
     name = resolve(name, db=db, operation="lease.attach")
+
+    def refuse(code: str, message: str, status: int = 1) -> int:
+        print(message, file=sys.stderr)
+        if remote:
+            attach_session_mod.record_event(
+                db, name, outcome="refused", code=code, reason=message,
+                owner=lease_owner, host=cfg.host, tenant=tenant, device=device,
+                human=human, attach_id=attach_id)
+        return status
+
     agent = registry.get(db, name)
     if agent is None:
-        print("unknown agent: %s" % name, file=sys.stderr)
-        return 1
+        return refuse("unknown_agent", "unknown agent: %s" % name)
     if agent.get("status") == "stopped":
-        print("agent %s stopped: nothing to attach" % name, file=sys.stderr)
-        return 1
+        return refuse("agent_stopped", "agent %s stopped: nothing to attach" % name)
     from . import budget as budget_pause
     texte = agent.get("status_text") or ""
     if agent.get("status") == "blocked" and texte.startswith(budget_pause.PAUSE_PREFIX):
@@ -17018,19 +17087,19 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         print("agent %s in budget %s" % (name, texte[len(budget_pause.PAUSE_PREFIX):]),
               file=sys.stderr)
     if (agent.get("host") or "") != cfg.host:
-        print("agent %s pinned to %s, not to %s" % (name, agent.get("host") or "?", cfg.host),
-              file=sys.stderr)
-        return 1
+        return refuse("pinned_elsewhere",
+                      "agent %s pinned to %s, not to %s"
+                      % (name, agent.get("host") or "?", cfg.host))
     # #7034 (N1 de la revue 39559) : la session interactive ne reçoit ni
     # `--tools` ni `--mcp-config` ; attach à un enfant restreint serait une
     # session avec tous les outils et tous les MCP. Refus explicite, jamais un
     # élargissement silencieux : le parent reste attachable, et les rapports
     # de l'enfant disent ce qu'il a fait.
     if storage.of(db).ephemerals.profile(name) is not None:
-        print("agent %s is a restricted child (#7034): its tool/MCP policy is not "
-              "applied to an interactive session; attach the parent instead" % name,
-              file=sys.stderr)
-        return 1
+        return refuse("restricted_child",
+                      "agent %s is a restricted child (#7034): its tool/MCP policy "
+                      "is not applied to an interactive session; attach the parent "
+                      "instead" % name)
     try:
         # #4293 : le binaire du canari suit l'agent en session interactive
         # aussi ; #4488 : seulement s'il est déclaré sur cet hôte.
@@ -17043,15 +17112,18 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         # doit refuser d'emblée, sans toucher au bail ni à la session.
         adapter.require_interactive()
     except adapters.HarnessMissing as exc:
-        print("attach: %s" % exc, file=sys.stderr)
-        return 1
+        return refuse("harness_missing", "attach: %s" % exc)
     # L30 : la session interactive prend le compte actif du harnais ; un profil
     # inutilisable est refusé AVANT de prendre le bail.
     ok, compte = account_turn.attach_profile(cfg, db, agent.get("harness") or "")
     if not ok:
-        return 1
-    owner = attach_owner(cfg.host)
-    ttl = max(5.0, ttl or cfg.lease_ttl)
+        return refuse("account_unavailable", "attach: no usable account for %s" % name)
+    if ttl is None:
+        # §5.4 : le bail distant est court (coupure du poste) ; le local garde
+        # le TTL de l'exécuteur.
+        ttl = attach_session_mod.REMOTE_LEASE_TTL if remote else cfg.lease_ttl
+    ttl = max(5.0, float(ttl))
+    wait_end = started + max_seconds
     registry.reap(db, cfg.host)
     # #1686 N1 : le budget de passation court à partir du **premier conflit de
     # verrou**, pas depuis l'entrée dans l'attente du tour : un `--wait` plus
@@ -17060,17 +17132,23 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     handoff_end = None
     session_guard = None
     while True:
+        if stop_event.is_set():
+            return refuse("detached", "attach: stopped before the session started", 3)
+        if remote and time.monotonic() >= wait_end:
+            return refuse("wait_timeout",
+                          "a turn is still in progress for %s after %ds; attach "
+                          "refused" % (name, int(max_seconds)), 3)
         current = registry.get(db, name) or {}
         if ((current.get("lease_owner") or "").startswith("attach:")
                 and float(current.get("lease_expires_ts") or 0) > time.time()):
-            print("agent %s already has an attached session: close it first" % name,
-                  file=sys.stderr)
-            return 3
+            return refuse("already_attached",
+                          "agent %s already has an attached session: close it first"
+                          % name, 3)
         if registry.turn_in_progress(db, name):
             if not wait:
-                print("a turn is in progress for %s (rerun with --wait to wait)"
-                      % name, file=sys.stderr)
-                return 3
+                return refuse("turn_in_progress",
+                              "a turn is in progress for %s (rerun with --wait to wait)"
+                              % name, 3)
             print("turn in progress for %s: waiting…" % name, file=sys.stderr, flush=True)
             time.sleep(2.0)
             continue
@@ -17080,9 +17158,9 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                 if handoff_end is None:
                     handoff_end = time.monotonic() + attach_mod.HANDOFF_TIMEOUT
                 if time.monotonic() >= handoff_end:
-                    print("agent %s: resident did not hand back its session; attach refused"
-                          % name, file=sys.stderr)
-                    return 3
+                    return refuse("handoff_timeout",
+                                  "agent %s: resident did not hand back its session; "
+                                  "attach refused" % name, 3)
                 time.sleep(0.1)
                 continue
             locks.enter_context(session_guard)
@@ -17093,22 +17171,23 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                 and agent_incarnation(finished) == agent_incarnation(agent)):
             agent = dict(agent, session_id=finished.get("session_id"),
                          pending_prompt=finished.get("pending_prompt"))
-        lease = registry.attach_claim(db, name, owner, ttl)
+        lease = registry.attach_claim(db, name, lease_owner, ttl)
         if lease:
             break
         from . import host_holds
         hold = host_holds.live(db).get(agent.get("host") or "")
         if hold:
             # #254 : un hôte en pause ne prend aucun bail, interactif compris
-            print("agent %s not claimable: host %s on hold until %s (%s); lift it: "
-                  "ameesh hosts %s --release" % (
-                      name, hold["host"],
-                      time.strftime("%Y-%m-%d %H:%M", time.localtime(float(hold["until_ts"]))),
-                      hold["reason"], hold["host"]), file=sys.stderr)
-            return 1
-        print("agent %s not claimable (owner unresolved, ephemeral expired, or status)"
-              % name, file=sys.stderr)
-        return 1
+            return refuse("host_hold",
+                          "agent %s not claimable: host %s on hold until %s (%s); lift it: "
+                          "ameesh hosts %s --release" % (
+                              name, hold["host"],
+                              time.strftime("%Y-%m-%d %H:%M",
+                                            time.localtime(float(hold["until_ts"]))),
+                              hold["reason"], hold["host"]))
+        return refuse("not_claimable",
+                      "agent %s not claimable (owner unresolved, ephemeral expired, "
+                      "or status)" % name)
     epoch = int(lease["lease_epoch"])
     log_async("[%s] attach lease taken (epoch %d)" % (name, epoch))
     # L719 : le mode de permission est vérifié contre la registration
@@ -17137,7 +17216,7 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         interval = max(3.0, ttl / 3.0)
         while not stop.wait(interval):
             try:
-                expires = registry.renew(db, name, owner, epoch, ttl)
+                expires = registry.renew(db, name, lease_owner, epoch, ttl)
             except db_mod.DbError as exc:
                 log_async("[%s] attach: renewal failed (%s)" % (name, exc))
                 continue
@@ -17216,7 +17295,8 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
             agent.get("session_id"),
             permission_mode=_attach_permission_mode(
                 cfg, name, harness_revendique, mode_incarnation))
-        env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
+        env = _attach_env(cfg, name, lease_owner, epoch,
+                          agent.get("harness") or "", human=human)
         env.update(adapter.env())
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         env.update(_attach_tmp_env(cfg, name, env, holds))
@@ -17224,11 +17304,20 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         if cwd and not os.path.isdir(cwd):
             cwd = None
         if not account_turn.apply_env_attach(env, compte, cfg):
-            return 1  # le `finally` rend le bail
+            return refuse("account_unavailable",
+                          "attach: no usable account for %s" % name)  # `finally` rend le bail
         if limit.expired():
-            return 124
-        if perdu.is_set():
-            return 1
+            return refuse("max_duration", "attach: maximum duration reached", 124)
+        if perdu.is_set() or stop_event.is_set():
+            return refuse("detached", "attach: lease or session lost before the harness", 1)
+        if remote:
+            # #7121 §5.5 : le poste n'a pas de credential base ; l'hôte imprime
+            # la dernière page du journal (A1) dans le PTY, avant le harnais.
+            attach_session_mod.print_history(cfg, db, name)
+            attach_session_mod.record_event(
+                db, name, outcome="accepted", owner=lease_owner, host=cfg.host,
+                tenant=tenant, device=device, human=human, attach_id=attach_id,
+                epoch=epoch, session=(agent.get("session_id") or ""))
         log_async("[%s] interactive session: %s" % (name, " ".join(argv)))
         from . import alert_briefs, auditor as auditor_mod, canon as canon_mod
         from .platform import child_environment
@@ -17249,11 +17338,19 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         if etat["deadline"] > 0 and time.time() >= etat["deadline"]:
             perdu.set()
         while proc.poll() is None:
-            if perdu.is_set():
-                stop_group_now(proc, "lease lost (attach)", name=name)
+            if perdu.is_set() or stop_event.is_set():
+                # `perdu` : le bail/session est perdu (échec) ; `stop_event` :
+                # coupure du relais ou arrêt demandé (fermeture propre).
+                stop_group_now(proc, "lease lost (attach)" if perdu.is_set()
+                               else "attach stopped", name=name)
                 break
             time.sleep(0.2)
         code = proc.wait()
+        if stop_event.is_set() and not perdu.is_set():
+            # Coupure du relais ou SIGTERM de l'hôte : la session se ferme
+            # proprement (bail rendu), un code négatif de groupe tué n'est pas
+            # une erreur de l'attach.
+            code = 0
         if expired.is_set():
             code = 124
     except KeyboardInterrupt:
@@ -17270,7 +17367,7 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
             if worker.ident is not None:    # started (L223)
                 worker.join(timeout=5)
         try:
-            registry.release(db, name, owner, epoch)
+            registry.release(db, name, lease_owner, epoch)
         except db_mod.DbError:
             pass
         log_async("[%s] attach lease returned" % name)
@@ -17290,27 +17387,91 @@ def _refuses_incompatible_schema(entry):
     return checked
 
 
+def _attach_distant_main(cfg, parsed) -> int:
+    """`ameesh attach` distant : le poste, ou un refus nommé (jamais une trace)."""
+    from . import attach_distant
+    try:
+        return attach_distant.main(cfg, parsed)
+    except attach_distant.StationError as exc:
+        print("ameesh attach: refused [%s]: %s" % (exc.code, exc), file=sys.stderr)
+        return 1
+
+
+def _attach_host_main(cfg, parsed) -> int:
+    """Côté hôte d'un attach distant, lancé par `attach-relay host --host-attach`.
+
+    L'hôte a déjà vérifié ET consommé le grant (D1) ; il ne transmet que
+    l'identité de routage et l'humain vérifié par l'environnement, jamais le
+    reçu ni la signature. Le wrapper prend le bail court, attend le tour,
+    imprime le journal (A0/A1), lance le harnais sur la session existante et
+    rend le bail à la sortie ou à la coupure.
+    """
+    from . import attach_session as attach_session_mod
+    try:
+        metadata = attach_session_mod.metadata_from_env()
+        owner = attach_session_mod.remote_owner(metadata["tenant"], metadata["device"])
+    except attach_session_mod.SessionError as exc:
+        print("ameesh attach: %s" % exc, file=sys.stderr)
+        return 1
+    try:
+        db = db_mod.connect(cfg)
+    except db_mod.Unavailable as exc:
+        print("ameesh attach: database unreachable: %s" % exc, file=sys.stderr)
+        return 1
+    code = 1
+    try:
+        try:
+            db_mod.require_schema(db)
+        except db_mod.SchemaMissing as exc:
+            print("ameesh attach: %s" % exc, file=sys.stderr)
+            return 1
+        code = run_attach(
+            cfg, db, parsed.agent, wait=attach_session_mod.wait_from_env(),
+            ttl=attach_session_mod.REMOTE_LEASE_TTL, max_seconds=parsed.max,
+            owner=owner, human=metadata["human"], attach_id=metadata["attach_id"],
+            tenant=metadata["tenant"], device=metadata["device"], remote=True)
+        return code
+    finally:
+        try:
+            db.close()
+        finally:
+            _sortie_sure(code)
+
+
 @_refuses_incompatible_schema
 def attach_main(argv: list[str] | None = None) -> int:
     from . import attach as attach_mod
+    from . import attach_distant
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(
         prog="ameesh attach",
-        description="Put the resident to sleep for bounded native access, then return its lease (L82).")
+        description="Put the resident to sleep for bounded native access, then return "
+                    "its lease (L82). An agent pinned to another host is reached through "
+                    "the attach relay (D3, #7121).")
     parser.add_argument("agent")
     parser.add_argument("--wait", action="store_true",
                         help="wait for a turn in progress to end before taking the lease")
     parser.add_argument("--ttl", type=float, default=None, help="lease duration in seconds")
     parser.add_argument("--max", type=attach_mod.duration, default=attach_mod.DEFAULT_MAX,
                         help="maximum interactive duration (default: 2h; e.g. 30m, 4h)")
+    parser.add_argument("--host-attach", action="store_true", help=argparse.SUPPRESS)
+    attach_distant.add_arguments(parser)
     parsed = parser.parse_args(argv)
     if not _harden_executor_environment():
         return 1
     cfg = load_config()
     adapters.configure(cfg)  # L106 : `harness_bins` de l'hôte
+    if parsed.host_attach:
+        return _attach_host_main(cfg, parsed)
+    explicit_remote = bool(parsed.relay or parsed.grant or parsed.receipt
+                           or parsed.device_key_file or parsed.host)
     try:
         db = db_mod.connect(cfg)
     except db_mod.Unavailable as exc:
+        if explicit_remote:
+            # poste sans credential base (conception §5.3) : le transport et le
+            # reçu suffisent, l'hôte est donné ou résolu ailleurs.
+            return _attach_distant_main(cfg, parsed)
         print("ameesh attach: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     code = 1  # reste 1 si une exception traverse : le repli sort alors en échec
@@ -17320,9 +17481,21 @@ def attach_main(argv: list[str] | None = None) -> int:
         except db_mod.SchemaMissing as exc:
             print("ameesh attach: %s" % exc, file=sys.stderr)
             return 1
-        code = run_attach(cfg, db, parsed.agent, wait=parsed.wait, ttl=parsed.ttl,
-                          max_seconds=parsed.max)
-        return code
+        if explicit_remote:
+            code = _attach_distant_main(cfg, parsed)
+            return code
+        row = registry.get(db, parsed.agent) or {}
+        if (row.get("host") or "") == cfg.host:
+            code = run_attach(cfg, db, parsed.agent, wait=parsed.wait, ttl=parsed.ttl,
+                              max_seconds=parsed.max)
+            return code
+        if not row:
+            print("unknown agent: %s" % parsed.agent, file=sys.stderr)
+            return 1
+        print("agent %s pinned to %s, not to %s: distant attach needs --relay URL "
+              "(or AMEESH_ATTACH_RELAY) and --device-key-file"
+              % (parsed.agent, row.get("host") or "?", cfg.host), file=sys.stderr)
+        return 1
     finally:
         try:
             db.close()
