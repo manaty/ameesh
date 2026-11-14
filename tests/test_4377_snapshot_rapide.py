@@ -24,6 +24,9 @@ class SnapshotScopeTest(unittest.TestCase):
     def _store(self, agents):
         store = mock.MagicMock()
         store.operations.listing.return_value = agents
+        store.work.activity.side_effect = lambda names, limit=1000: {
+            name: {'total': 0, 'latest_updated_ts': None, 'open': []}
+            for name in names}
         store.work.items.return_value = []
         store.work.get.side_effect = lambda ident: dict(
             id=ident, state='build', assignee='x', updated_ts=7000)

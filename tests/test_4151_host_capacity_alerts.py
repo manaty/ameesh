@@ -73,7 +73,9 @@ class CapacityAlertsTest(unittest.TestCase):
 
     def test_full_baseline_still_protects_elected_burst_leader(self):
         store = mock.MagicMock()
-        store.work.items.return_value = []
+        store.work.activity.side_effect = lambda names, limit=1000: {
+            name: {'total': 0, 'latest_updated_ts': None, 'open': []}
+            for name in names}
         reading = dict(sampled_ts=NOW, turns_in_progress=0, cpu_count=8,
                        mem_total_bytes=16000, mem_available_bytes=12000,
                        app_cpu=0.25, cgroup={'container': False, 'limits_readable': True})
@@ -103,7 +105,9 @@ class CapacityAlertsTest(unittest.TestCase):
         # baseline_oversized cannot fire, so the 30 s alert pass must not pay
         # the leader/reserve election.
         store = mock.MagicMock()
-        store.work.items.return_value = []
+        store.work.activity.side_effect = lambda names, limit=1000: {
+            name: {'total': 0, 'latest_updated_ts': None, 'open': []}
+            for name in names}
         store.hosts.since.return_value = [dict(self.reading(), sampled_ts=t)
                                          for t in range(7600, NOW + 1, 60)]
         listing = [dict(name=h, host=h, status='idle', lease_live=True,
