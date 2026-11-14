@@ -81,6 +81,28 @@ class GitTests(unittest.TestCase):
             nx.merge_candidate(self.project, develop, main)
         self.assertEqual(len(self.git("worktree", "list", "--porcelain").split("worktree ")) - 1, 1)
 
+    def test_staging_safety_reads_frozen_policy_and_sql(self):
+        policy = (Path(__file__).parents[1] / "deploy" /
+                  "staging-migrations-policy.example.json").read_text()
+        self.commit(".ameesh/staging-migrations.json", policy)
+        name = "supabase/migrations/796_relax.sql"
+        sha = self.commit(name, "ALTER TABLE public.commands DROP CONSTRAINT fk;")
+        pending = {"sha": sha, "main": self.base}
+        required = nx.migration_requirements(self.project, sha, self.base)
+        # An additive working copy cannot hide the frozen relaxation.
+        (self.repo / name).write_text("CREATE TABLE innocent (id int);")
+        with self.assertRaisesRegex(rc.ReleaseError, "796_relax.*relaxation"):
+            nx.staging_migration_preflight(self.project, pending, required)
+        # An absent policy refuses even otherwise additive SQL.
+        sha = self.commit("supabase/migrations/798_new.sql", "CREATE TABLE x (id int);")
+        self.git("rm", ".ameesh/staging-migrations.json")
+        self.git("commit", "-qm", "remove policy")
+        sha = self.git("rev-parse", "HEAD").strip()
+        pending["sha"] = sha
+        with self.assertRaisesRegex(rc.ReleaseError, "preflight refused"):
+            nx.staging_migration_preflight(self.project, pending,
+                                           nx.migration_requirements(self.project, sha, self.base))
+
     def test_migration_checksum_and_ledger_gate(self):
         sha = self.commit("supabase/migrations/540_expiry.sql", "select 1;\n")
         required = nx.migration_requirements(self.project, sha, self.base)["hub"][0]

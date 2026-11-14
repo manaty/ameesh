@@ -332,6 +332,7 @@ class HandoffPipelineTests(unittest.TestCase):
                    mock.patch.object(nx, "release_tags", return_value={}),
                    mock.patch.object(nx, "open_handoff_lot", return_value=77),
                    mock.patch.object(nx, "staging_jobs", return_value=["deploy"]),
+                   mock.patch.object(nx, "staging_migration_preflight", return_value=[]),
                    mock.patch.object(work, "events_noted",
                                      side_effect=lambda db, lot, prefix: list(self.notes)),
                    mock.patch.object(nx, "migration_requirements", return_value={
