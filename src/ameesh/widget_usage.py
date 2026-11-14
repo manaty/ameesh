@@ -38,8 +38,11 @@ from .cost import Gauge, Gauges, KNOWN_WINDOWS
 #: The only schema this reader can read (`schemaVersion`).
 SCHEMA_VERSION = 1
 #: #1272: the `Gauge.source` of a widget reading. The widget dates its own
-#: reading (`updatedAt`, freshness checked here) but publishes no turn marker,
-#: so `produced_at` stays None (#1132); the display must not call it undated.
+#: reading (`updatedAt`, freshness checked here) but publishes no turn marker:
+#: #7329 publishes that date as `produced_at` — the reading's own instant,
+#: never the insertion time — so the shared history can carry it to another
+#: host without it ever beating a newer direct reading. The display must not
+#: call it undated.
 SOURCE = "widget"
 #: The snapshot directory, on the host where the widget runs (pc-smichea).
 DEFAULT_DIR = "~/.local/state/omarchy/agents/usage"
@@ -177,7 +180,8 @@ def read(profile, *, now: float | None = None, directory=None,
             key = "%s@%s" % (key, scope)
         gauges.append(Gauge("claude", key, _fraction(item.get("percent")),
                             _iso_epoch(item.get("resetsAt")), window,
-                            read_at=stamp, source=SOURCE, scope=scope))
+                            read_at=stamp, produced_at=stamp,
+                            source=SOURCE, scope=scope))
     if not gauges:
         return None
     if now - stamp > min(g.window_s for g in gauges):

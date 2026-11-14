@@ -374,7 +374,11 @@ longue (#1561) ; sinon les journaux restent la source, et un hôte sans widget
 ne change rien. Un seau de modèle (`title`, ex. « Fable Weekly ») ne compte
 que pour une session **de ce modèle** ; un modèle inconnu l'ignore, et
 `accounts list` les montre tous (la ligne d'état peut donc être retenue par un
-seau de modèle).
+seau de modèle). Le relevé du widget porte sa propre date (`updatedAt`, repli :
+date du fichier) comme instant de production dans l'historique partagé
+(#7329) : un hôte sans widget reprend donc le relevé frais du poste qui en a
+un, et une lecture directe plus récente le bat encore — c'est la date de la
+lecture qui est publiée, jamais l'heure d'insertion.
 
 Un relevé ne date pas de son écriture : un `rate_limit_event` ne porte aucun
 instant, et le dater au `mtime` du journal faisait passer la dernière mesure
