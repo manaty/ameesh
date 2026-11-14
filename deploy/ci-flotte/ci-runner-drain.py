@@ -218,8 +218,8 @@ class Host:
             try:
                 with open(group + "/cgroup.events") as f:
                     events = dict(line.split() for line in f)
-            except FileNotFoundError:
-                if removed_ok:
+            except OSError as exc:
+                if removed_ok and exc.errno in (errno.ENOENT, errno.ENODEV):
                     return
                 raise
             if events.get(key) == value:
@@ -234,8 +234,19 @@ class Host:
             f.write(value)
 
     def _kill_frozen(self, group):
-        with os.fdopen(os.open(group + "/cgroup.kill", os.O_WRONLY), "w") as f:
-            f.write("1")
+        try:
+            kill_fd = os.open(group + "/cgroup.kill", os.O_WRONLY)
+        except OSError as exc:
+            if exc.errno == errno.ENODEV:
+                return  # The cgroup has already been removed.
+            raise
+        try:
+            with os.fdopen(kill_fd, "w") as f:
+                f.write("1")
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ENODEV):
+                raise
+            # A removal during write/close is checked like a normal kill.
         # SIGKILL is asynchronous, even for frozen tasks. Do not let systemd
         # thaw any survivor. A removed cgroup is also empty (Restart=no).
         self._wait_event(group, "populated", "0", removed_ok=True)
@@ -261,21 +272,40 @@ class Host:
             with open(group + "/cgroup.freeze") as f:
                 if f.read().strip() != "0":
                     raise OSError("runner cgroup is already frozen: " + unit)
+            kill_attempted = False
+            action_attempted = False
             try:
-                # Use the kernel freezer: systemctl freeze retains a frozen
-                # unit state after SIGKILL and can then refuse its restart.
-                self._set_freezer(group, "1")
-                self._wait_event(group, "frozen", "1")
-                if busy(self, unit):
-                    return False
-                self._kill_frozen(group)
-            finally:
                 try:
-                    self._set_freezer(group, "0")
-                except OSError as exc:
-                    if exc.errno not in (errno.ENOENT, errno.ENODEV):
-                        raise
-            self.act(verb, unit)
+                    # Use the kernel freezer: systemctl freeze retains a frozen
+                    # unit state after SIGKILL and can then refuse its restart.
+                    self._set_freezer(group, "1")
+                    self._wait_event(group, "frozen", "1")
+                    if busy(self, unit):
+                        return False
+                    kill_attempted = True
+                    self._kill_frozen(group)
+                finally:
+                    try:
+                        self._set_freezer(group, "0")
+                    except OSError as exc:
+                        if exc.errno not in (errno.ENOENT, errno.ENODEV):
+                            raise
+                action_attempted = True
+                self.act(verb, unit)
+            except (OSError, subprocess.SubprocessError) as exc:
+                if not kill_attempted:
+                    raise
+                recovery = "action failed"
+                if not action_attempted:
+                    try:
+                        # An error after kill must not strand an empty unit.
+                        # Never resume a survivor merely to complete a restart.
+                        self._wait_event(group, "populated", "0", removed_ok=True)
+                        self.act(verb, unit)
+                        recovery = verb + " completed after drain error"
+                    except (OSError, subprocess.SubprocessError) as recovery_exc:
+                        recovery = "recovery refused or failed: %s" % recovery_exc
+                raise OSError("%s: %s; %s" % (unit, exc, recovery)) from exc
             return True
 
 
