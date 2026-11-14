@@ -19,7 +19,7 @@
         "reason": "new index"
       },
       {
-        "pattern": "alter table [\\w.\\\"]+ add column (?:if not exists )?[\\w\\\"]+ [^;]+",
+        "pattern": "alter table [\\w.\\\"]+ add column (?:if not exists )?[\\w\\\"]+ [\\w.]+(?:\\[\\])?(?: null)?",
         "reason": "new column"
       },
       {
@@ -29,7 +29,7 @@
     ],
     "relaxation": [
       {
-        "pattern": "alter table [^;]*\\bdrop constraint (?:if exists )?[\\w\\\"]+",
+        "pattern": "alter table [\\w.\\\"]+ drop constraint (?:if exists )?[\\w\\\"]+",
         "reason": "constraint removed"
       },
       {

@@ -45,10 +45,11 @@ class StagingMigrationsTest(unittest.TestCase):
             self.check(sql + "\n", read_notes=lambda lot: [text])
 
     def test_multiple_alter_actions_cannot_hide_a_constraint_drop(self):
-        sql = "ALTER TABLE messages ADD COLUMN v int, DROP CONSTRAINT fk;"
-        self.assertEqual(sm.classify(sql, self.policy).kind, "relaxation")
-        with self.assertRaises(sm.Refused):
-            self.check(sql)
+        for action in ("DROP CONSTRAINT fk", "DISABLE TRIGGER ALL"):
+            sql = "ALTER TABLE messages ADD COLUMN v int, " + action + ";"
+            self.assertEqual(sm.classify(sql, self.policy).kind, "unknown")
+            with self.assertRaises(sm.Refused):
+                self.check(sql)
 
     def test_destructive_requires_explicit_signed_authorization(self):
         for sql in ("DROP TABLE messages;", "ALTER TABLE messages DROP COLUMN body;",
