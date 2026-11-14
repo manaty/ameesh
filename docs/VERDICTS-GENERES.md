@@ -24,10 +24,15 @@ système, HOME et TMPDIR jetables, locale C.UTF-8, PYTHONPATH vers les sources
 gelées et PYTHONNOUSERSITE=1. Aucune autre variable de l’hôte n’est héritée
 (notamment NODE_OPTIONS, NODE_PATH, PYTHONHOME et LD_PRELOAD).
 
-Un exécutable nommé sans chemin est résolu avec le PATH de l’hôte, puis
-lancé par son chemin absolu dans cet environnement fermé. Cela permet par
-exemple le Node installé hors du PATH système, sans transmettre le PATH de
-l’hôte au contrôle.
+Le PATH de l’hôte fournit des répertoires candidats, mais seuls les chemins
+contrôlés par root sont admissibles : exécutable, répertoire de recherche,
+cibles des liens et tous leurs parents doivent appartenir à root, sans
+écriture groupe/autres (les permissions des liens eux-mêmes sont ignorées).
+Les chemins absolus subissent les mêmes contrôles ; les exécutables relatifs
+avec barre oblique sont refusés. Un alias dans un répertoire auteur, même
+vers un binaire root, est refusé. Le contrôle reçoit le chemin absolu résolu,
+sans le PATH de l’hôte. Cela accepte le Node administré hors du PATH système
+sans accepter un faux Node placé dans un répertoire de l’auteur.
 
 La preuve fait encore confiance aux exécutables locaux et aux octets des
 dépendances locales : comparer les locks ne certifie pas ces octets. Elle

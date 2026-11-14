@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import sys
 import shutil
 import tempfile
 import unittest
@@ -14,6 +13,9 @@ import subprocess
 
 from ameesh import verdict_carry
 from .test_2442_verdict_carry import _git
+
+
+CHECK_PYTHON = verdict_carry._trusted_generated_executable("python3")
 
 
 class GeneratedCarryTest(unittest.TestCase):
@@ -27,7 +29,7 @@ class GeneratedCarryTest(unittest.TestCase):
         self.write("check.py", "from pathlib import Path\nimport sys\n"
                    "sys.exit(0 if Path('generated.txt').read_bytes() == "
                    "Path('source.txt').read_bytes() else 1)\n")
-        self.rule = {"check": [sys.executable, "check.py"]}
+        self.rule = {"check": [CHECK_PYTHON, "check.py"]}
         self.declare()
         self.tip = self.commit()
         self.write("source.txt", "reviewed\n")
@@ -72,7 +74,7 @@ class GeneratedCarryTest(unittest.TestCase):
         self.assertFalse(self.check(self.commit())[0])
 
     def test_declaration_cannot_grant_itself_an_exemption(self):
-        self.rule["check"] = [sys.executable, "-c", "pass"]
+        self.rule["check"] = [CHECK_PYTHON, "-c", "pass"]
         self.declare()
         self.write("generated.txt", "invented\n")
         self.assertFalse(self.check(self.commit())[0])
@@ -96,7 +98,7 @@ class GeneratedCarryTest(unittest.TestCase):
         original_run = subprocess.run
         for exc in (FileNotFoundError(), subprocess.TimeoutExpired("checker", 60)):
             def run(argv, *args, **kwargs):
-                if argv[0] == sys.executable:
+                if argv[0] == str(Path(CHECK_PYTHON).resolve()):
                     raise exc
                 return original_run(argv, *args, **kwargs)
             with self.subTest(exc=type(exc).__name__), mock.patch.object(
@@ -169,7 +171,7 @@ class GeneratedCarryTest(unittest.TestCase):
         self.write(verdict_carry.GENERATED_FILES, json.dumps({
             "version": 1, "files": {
                 "generated.txt": self.rule,
-                "downstream.txt": {"check": [sys.executable, "-c",
+                "downstream.txt": {"check": [CHECK_PYTHON, "-c",
                     "from pathlib import Path; import sys; "
                     "sys.exit(Path('downstream.txt').read_bytes() != "
                     "Path('generated.txt').read_bytes())"]}}}))
@@ -203,7 +205,7 @@ class GeneratedCarryTest(unittest.TestCase):
         seen = []
 
         def run(argv, *args, **kwargs):
-            if argv[0] == sys.executable:
+            if argv[0] == str(Path(CHECK_PYTHON).resolve()):
                 seen.append(kwargs["env"])
             return original_run(argv, *args, **kwargs)
 
@@ -229,9 +231,7 @@ class GeneratedCarryTest(unittest.TestCase):
         self.tip = self.reviewed
         self.write("generated.txt", "reviewed\n")
         frozen = self.commit()
-        tools = Path(self.tmp.name) / "host-tools"
-        tools.mkdir()
-        (tools / "node").symlink_to(shutil.which("node"))
+        tools = Path(shutil.which("node")).parent
         with mock.patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.defpath,
                 "NODE_OPTIONS": "--this-must-not-reach-node"}):
             ok, why, adaptation = self.check(frozen)
@@ -241,7 +241,7 @@ class GeneratedCarryTest(unittest.TestCase):
     def test_manifest_cannot_declare_itself_as_generated(self):
         self.write(verdict_carry.GENERATED_FILES, json.dumps({"version": 1,
             "files": {verdict_carry.GENERATED_FILES:
-                      {"check": [sys.executable, "-c", "pass"]}}}))
+                      {"check": [CHECK_PYTHON, "-c", "pass"]}}}))
         self.reviewed = self.commit()
         self.tip = self.reviewed
         with (Path(self.root) / verdict_carry.GENERATED_FILES).open("a") as stream:
@@ -249,3 +249,29 @@ class GeneratedCarryTest(unittest.TestCase):
         ok, why, _ = self.check(self.commit())
         self.assertFalse(ok)
         self.assertIn("declaration absent or invalid", why)
+
+    def test_fake_node_in_author_path_cannot_forge_success(self):
+        self.rule = {"check": ["node", "check.js"]}
+        self.write("check.js", "process.exit(1);\n")
+        self.declare()
+        self.reviewed = self.commit()
+        self.tip = self.reviewed
+        self.write("generated.txt", "invented\n")
+        frozen = self.commit()
+        self.write("host-tools/node", "#!/bin/sh\nexit 0\n")
+        fake = Path(self.root) / "host-tools/node"
+        fake.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(fake.parent) + os.pathsep +
+                                         os.environ.get("PATH", os.defpath)}):
+            self.assertFalse(self.check(frozen)[0])
+        # A user-controlled alias to a trusted executable is unsafe too.
+        fake.unlink()
+        fake.symlink_to(shutil.which("true"))
+        with mock.patch.dict(os.environ, {"PATH": str(fake.parent)}):
+            self.assertIsNone(verdict_carry._trusted_generated_executable("node"))
+
+    def test_absolute_author_executable_is_not_trusted(self):
+        self.write("fake-check", "#!/bin/sh\nexit 0\n")
+        fake = Path(self.root) / "fake-check"
+        fake.chmod(0o755)
+        self.assertIsNone(verdict_carry._trusted_generated_executable(str(fake)))

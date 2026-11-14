@@ -138,6 +138,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -1192,6 +1193,33 @@ def _generated_path(value) -> bool:
             and all(part not in ("", ".", "..", ".git") for part in value.split("/")))
 
 
+def _trusted_generated_executable(command: str) -> str | None:
+    """Resolve only through root-controlled paths, including symlink parents.
+
+    Inspect the lookup path as well as the resolved target: an author-owned
+    alias to /usr/bin/true must not be accepted as a trusted 'node'.
+    """
+    if "/" in command:
+        candidates = [Path(command)] if Path(command).is_absolute() else []
+    else:
+        candidates = [Path(directory) / command
+                      for directory in os.get_exec_path() if Path(directory).is_absolute()]
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            for path in (candidate, *candidate.parents, resolved, *resolved.parents):
+                info = path.lstat()
+                if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode)
+                                        and info.st_mode & 0o022):
+                    break
+            else:
+                if resolved.is_file() and os.access(resolved, os.X_OK):
+                    return str(resolved)
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
 def generated_adapted(repo: str, reviewed: str, frozen: str, *,
                       declaration_ref: str | None = None, runtime_repo: str | None = None) -> tuple:
     """Only declared generated outputs, unchanged inputs, successful frozen check.
@@ -1272,14 +1300,10 @@ def generated_adapted(repo: str, reviewed: str, frozen: str, *,
                        "PYTHONPATH": str(Path(tree) / "src"),
                        "PYTHONNOUSERSITE": "1"}
                 command = list(rule["check"])
-                if "/" not in command[0]:
-                    # The host runtime is trusted, including tools outside the
-                    # system PATH. Resolve only the executable; do not pass the
-                    # host PATH or injection variables into the checker.
-                    executable = shutil.which(command[0])
-                    if executable is None:
-                        return False, "generated executable unavailable for " + path
-                    command[0] = str(Path(executable).resolve())
+                executable = _trusted_generated_executable(command[0])
+                if executable is None:
+                    return False, "trusted generated executable unavailable for " + path
+                command[0] = executable
                 result = subprocess.run(command, cwd=tree,
                                         env=env,
                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
