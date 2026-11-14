@@ -20,7 +20,7 @@ import random
 import time
 
 from ... import packet_head
-from ...db import DbError, in_transaction, is_unique_violation
+from ...db import DbError, in_transaction, is_unique_violation, prerequisite_query
 from ...slo import VEHICLE_EXIT_MARK
 from .. import interface
 from . import catalog as _catalog
@@ -170,7 +170,7 @@ def has_current_item_columns(db) -> bool:
     appliquée pendant qu'une connexion vit est donc vue à la lecture suivante."""
     if getattr(db, "_has_current_item_columns", False):
         return True
-    found = db.query(
+    found = prerequisite_query(db,
         "SELECT count(*) AS n FROM information_schema.columns"
         " WHERE table_schema = current_schema() AND table_name = 'work_items'"
         " AND column_name IN (%s)" % ", ".join("'%s'" % c for c in _OPTIONAL_ITEM_COLUMNS))

@@ -1762,6 +1762,8 @@ def open_db(cfg: Config) -> PsqlDriver | PsycopgDriver:
 #    à la base. Le résultat est donc toujours celui d'une vraie exécution —
 #    au pire, une requête imprévue coûte son aller-retour, comme avant.
 #
+# Une sonde de schéma explicitement marquée `prerequisite_query` est résolue
+# avant la découverte de ses dépendants ; elle ne simule pas un schéma absent.
 # Seules les lectures pures sont regroupées (SELECT/WITH sans DML, sans verrou,
 # sans fonction à effet) ; une écriture ou une transaction arrête la passe à
 # blanc, et, dans la vraie passe, coupe le cache (lecture de ses écritures).
@@ -1905,7 +1907,11 @@ class _Answers:
 
 
 class _Recorder:
-    """La connexion vue par une passe à blanc : aucune requête n'est envoyée."""
+    """La vue à blanc : les requêtes ordinaires sont seulement enregistrées.
+
+    `prerequisite_query` peut résoudre une sonde de schéma explicitement
+    marquée et les lectures déjà enregistrées avant de poursuivre.
+    """
 
     def __init__(self, db, answers: _Answers):
         self._db = db
@@ -2019,17 +2025,42 @@ class _Replay:
 def is_dry_pass(db) -> bool:
     """La connexion est-elle une passe à blanc de `batched` ?
 
-    Une passe à blanc n'envoie aucune requête : un appelant qui lit autre
-    chose que la base (une sonde réseau, #2582) doit attendre la vraie passe,
+    Une passe à blanc découvre les lectures de base : un appelant qui lit
+    autre chose (une sonde réseau, #2582) doit attendre la vraie passe,
     sinon la sonde est refaite à chaque niveau de préchargement."""
     return isinstance(db, _Recorder)
+
+
+def prerequisite_query(db, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+    """Read a schema prerequisite before discovering its dependent queries.
+
+    An ordinary dry-pass miss returns []; for a schema probe that would
+    invent an old schema and preload its expensive fallback queries. Resolve
+    this explicit prerequisite immediately and retain its actual answer in
+    the preload window. Ordinary queries still make no I/O in the dry pass.
+    """
+    if isinstance(db, _Recorder):
+        params = tuple(params or ())
+        rows = db._answers.get(sql, params)
+        if rows is None:
+            if not pure_read(sql):
+                raise _Abort("prerequisite must be a pure read")
+            db.query(sql, params)  # record the prerequisite with pending reads
+            _fill_answers(db._db, db._answers, db.misses)
+            db.misses.clear()
+            rows = db._answers.get(sql, params)
+            return rows if rows is not None else []
+        return rows
+    return db.query(sql, params)
 
 
 def batched(db, fn, *, levels: int = 4):
     """Exécute `fn(db)` en regroupant ses lectures (voir plus haut).
 
-    `levels` borne le nombre d'allers-retours de préchargement (une requête
-    qui dépend d'une autre en demande un de plus). Rend la valeur de `fn`.
+    `levels` borne les passes ordinaires de préchargement (une requête qui
+    dépend d'une autre demande une passe de plus). Une sonde explicitement
+    marquée `prerequisite_query` résout ses dépendances avant de continuer
+    la passe. Rend la valeur de `fn`.
     """
     if isinstance(db, (_Recorder, _Replay)) or not hasattr(db, "query_batch"):
         return fn(db)
@@ -2072,6 +2103,35 @@ def _requery_faulty(db, items: list[tuple[str, tuple]]) -> list:
     return results
 
 
+def _fill_answers(db, answers: _Answers, items: list[tuple]) -> None:
+    try:
+        results = db.query_batch(items)
+    except Unavailable:
+        raise
+    except SchemaMissing:
+        # `SchemaMissing` recouvre deux cas (L521) : la sonde dit que la
+        # base n'est pas migrée — à dire tout de suite —, ou une lecture
+        # optionnelle référence une table d'une migration absente. Le
+        # pilote psql rend la seconde en `DbError`, psycopg en
+        # `SchemaMissing` : sans cette distinction, `work show` échouait
+        # sous psycopg au lieu de rendre « resolutions: unavailable »
+        # (L160d). La lecture fautive est écartée ; la vraie passe la
+        # redemandera à l'appelant, qui sait quoi en faire.
+        if not _schema_migrated(db):
+            raise
+        results = _requery_faulty(db, items)
+    except DbError:
+        # une requête de la passe à blanc est invalide (bâtie sur une
+        # réponse vide) : le lot échoue en entier. Repli : une à une, les
+        # fautives écartées — la vraie passe fera les bonnes.
+        results = _requery_faulty(db, items)
+    for (sql, params), rows in zip(items, results):
+        if rows is None:
+            answers.refused.append((sql, params))
+        else:
+            answers.put(sql, params, rows)
+
+
 def _preload(db, fn, levels: int) -> _Answers:
     answers = _Answers()
     for _level in range(levels):
@@ -2082,32 +2142,7 @@ def _preload(db, fn, levels: int) -> _Answers:
             pass  # réponses vides ou écriture : on garde ce qui a été noté
         if not recorder.misses:
             break
-        try:
-            results = db.query_batch(recorder.misses)
-        except Unavailable:
-            raise
-        except SchemaMissing:
-            # `SchemaMissing` recouvre deux cas (L521) : la sonde dit que la
-            # base n'est pas migrée — à dire tout de suite —, ou une lecture
-            # optionnelle référence une table d'une migration absente. Le
-            # pilote psql rend la seconde en `DbError`, psycopg en
-            # `SchemaMissing` : sans cette distinction, `work show` échouait
-            # sous psycopg au lieu de rendre « resolutions: unavailable »
-            # (L160d). La lecture fautive est écartée ; la vraie passe la
-            # redemandera à l'appelant, qui sait quoi en faire.
-            if not _schema_migrated(db):
-                raise
-            results = _requery_faulty(db, recorder.misses)
-        except DbError:
-            # une requête de la passe à blanc est invalide (bâtie sur une
-            # réponse vide) : le lot échoue en entier. Repli : une à une, les
-            # fautives écartées — la vraie passe fera les bonnes.
-            results = _requery_faulty(db, recorder.misses)
-        for (sql, params), rows in zip(recorder.misses, results):
-            if rows is None:
-                answers.refused.append((sql, params))
-            else:
-                answers.put(sql, params, rows)
+        _fill_answers(db, answers, recorder.misses)
     return answers
 
 

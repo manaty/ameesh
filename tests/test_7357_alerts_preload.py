@@ -65,3 +65,35 @@ class AlertOrderingTest(PgTestCase):
         # The probe travels in a batch and is replayed from that answer. A
         # preceding transaction would abort the dry pass and force a query.
         self.assertEqual(reads, [])
+
+
+class SchemaPreloadTest(unittest.TestCase):
+    def test_schema_probe_does_not_speculate_about_missing_columns(self):
+        from ameesh.storage.postgres import operations, work
+
+        class Base(_FausseBase):
+            def _lignes(self, sql, params):
+                if 'information_schema.columns' in sql:
+                    return [{"n": self.column_count}]
+                return []
+
+        for current in (True, False):
+            with self.subTest(current=current):
+                base = Base()
+                base.column_count = len(work._OPTIONAL_ITEM_COLUMNS) - (not current)
+                db_mod.batched(base, lambda db: operations.Operations(db).open_lots_activity(5))
+                activity = [sql for trip in base.echanges for sql in trip
+                            if 'last_activity_ts ASC' in sql]
+                self.assertEqual(len(activity), 1)
+                self.assertEqual('to_jsonb(w)' in activity[0], not current)
+                # The schema count travels before the query it determines.
+                self.assertEqual(len(base.echanges), 2)
+
+    def test_known_empty_prerequisite_is_read_once(self):
+        base = _FausseBase()
+        # This base returns [] for an explicit absent-schema probe.
+        with mock.patch.object(base, '_lignes', return_value=[]):
+            result = db_mod.batched(base, lambda db: db_mod.prerequisite_query(
+                db, 'SELECT absent FROM schema_probe'))
+        self.assertEqual(result, [])
+        self.assertEqual(len(base.echanges), 1)
