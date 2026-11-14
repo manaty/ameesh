@@ -1618,16 +1618,25 @@ def rendre_markdown(rapport: dict) -> str:
             lignes.append("- %s" % note)
         lignes.append("")
 
+    lignes += ["## Limites", ""]
+    if rapport.get("cible") == "banc":
+        lignes += [
+            "- Le banc est local et jetable : il prouve le comportement de Patroni, etcd et "
+            "PostgreSQL 17 avec les gabarits de #6870, pas la latence réelle des VM ni le "
+            "réseau privé d'EP8.2.",
+            "- Le poste client du banc n'est pas le poste de l'owner : le scénario « PC éteint » "
+            "vérifie qu'un client qui disparaît n'affecte pas la grappe.",
+        ]
+    else:
+        lignes += [
+            "- L'exercice décrit la grappe réelle et les conditions observées pendant cette "
+            "exécution ; il ne garantit pas les délais sous d'autres charges ou incidents.",
+            "- Le scénario « PC éteint » observe l'indisponibilité du poste de l'owner ; "
+            "l'exercice ne commande ni son arrêt ni son redémarrage.",
+        ]
     lignes += [
-        "## Limites",
-        "",
-        "- Le banc est local et jetable : il prouve le comportement de Patroni, etcd et "
-        "PostgreSQL 17 avec les gabarits de #6870, pas la latence réelle des VM ni le "
-        "réseau privé d'EP8.2.",
         "- La perte de deux nœuds n'est pas survivable par conception (1 votant etcd sur 3) ; "
         "le scénario vérifie l'absence de split brain et le retour, pas la disponibilité.",
-        "- Le poste client du banc n'est pas le poste de l'owner : le scénario « PC éteint » "
-        "vérifie qu'un client qui disparaît n'affecte pas la grappe.",
         "",
         "## Reproduction",
         "",

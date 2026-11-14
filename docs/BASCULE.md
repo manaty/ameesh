@@ -1767,7 +1767,8 @@ the node until the cluster is green.
 Owner decision #207987 a: a planned database restart of 30 to 60 s, run by
 the pilot or the bureau, owner informed. This is a staging operation (canon
 §14): the **bureau** executes as root, the **pilot** announces the window,
-the lot's author checks the outputs. No agent runs these gestures.
+the lot's author checks the outputs. Agents of the authoring mesh do not run
+these gestures; the bureau executes them.
 
 **Prerequisite**: #6959 done — `patronictl list` shows `ameesh-agents-1`
 `Leader`, `ameesh-agents-2` `Sync Standby`, `manaty-mesh-1` `Replica`

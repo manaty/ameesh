@@ -98,6 +98,21 @@ an unavailable writer reports an error without stopping the agent. The
 ordinary runner also uses this sink for one-turn-per-event harnesses.
 Its original `events.jsonl` trace remains available if the database fails.
 
+An interactive `ameesh attach` has no Recorder (#7047, design 5322 §2.2).
+`_attach_env` sets `AMEESH_ATTACH=1`, and the agent-mail hook
+(`attach_journal`) records the human prompt (`UserPromptSubmit`, author
+`human:<user>@<host>` of the attach) and the final answer (`Stop`:
+`last_assistant_message`, otherwise the assistant text after the last user
+entry of the transcript, subagents excluded) as `human_message` and
+`turn_end`, both with an R12 copy. Event ids are
+`attach:<session>:<turn>:<seq>`: `<turn>` is the prompt's millisecond
+timestamp (a lost local state never reuses an id), `<seq>` counts the turn's
+entries (a `Stop` that delivers mail continues the turn). The hook writes
+only under the attach's own live lease (`attach:…` owner): a driven turn,
+even with an inherited `AMEESH_ATTACH`, keeps its Recorder alone. A database
+failure is reported on stderr; the turn and mail delivery go on. Harnesses
+without hooks (ACP) do not record attach exchanges.
+
 ## Readable thread and retention
 
 Every human message and final answer has a durable R12 outbox in its log

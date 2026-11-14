@@ -16723,6 +16723,8 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
         "AMEESH_HOST": cfg.host, "AGENT_MESH_HOST": cfg.host,
         "AMEESH_RUNNER_ID": owner, "AGENT_MESH_RUNNER_ID": owner,
         "AMEESH_LEASE_EPOCH": str(epoch), "AGENT_MESH_LEASE_EPOCH": str(epoch),
+        # #7047 (A0) : les hooks écrivent l'échange au journal de conversation
+        "AMEESH_ATTACH": "1",
     })
     # #834 : la session attachée porte la même identité git qu'un tour.
     env.update(identity.git_identity(name))

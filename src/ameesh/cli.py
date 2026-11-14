@@ -1634,6 +1634,11 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # Only the agent's own harness may register sessions or deliver mail.
         _foreign_hook_refused(cfg, bk, name, tool, attendu, data.get("session_id"))
         return 0
+    if bk.kind == "pg":
+        # #7047 (A0) : une session attach n'a pas de Recorder ; le prompt et
+        # la réponse finale vont au journal par ce hook, jamais bloquant
+        from . import attach_journal
+        attach_journal.capture_quietly(cfg, bk.db, binding, event, data)
     if binding.source == "session" and binding.ok:
         # #1604 : l'identité de CETTE session est notée localement pour que les
         # hooks rapides (PostToolUse) n'aient pas à rouvrir la base ; le

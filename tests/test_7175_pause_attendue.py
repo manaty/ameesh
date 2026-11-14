@@ -17,7 +17,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import alert_briefs, exploitation, mail, notify, registry, storage
+from ameesh import alert_briefs, budget, exploitation, mail, notify, registry, storage
 
 from .support import PgTestCase
 
@@ -61,6 +61,18 @@ class AlertTest(PgTestCase):
         self.assertIn("nothing to do", alerte["detail"])
         self.assertIn("Expected action: none", alert_briefs._budget_pause_long(alerte))
 
+    def test_critical_overage_still_requests_action(self):
+        now = 1800000000.0
+        self._gauge(now, 3 * 3600)
+        self._pause(budget.PAUSE_PREFIX + budget.CRITICAL_MARK
+                    + OVERAGE[len(budget.PAUSE_PREFIX):])
+        self.db.execute("UPDATE agent_registry SET status_since = to_timestamp(%s)"
+                        " WHERE name = 'ouvrier'", (now - 7200,))
+        (alerte,) = self._alertes(now)
+        self.assertNotIn("waits_reset", alerte)
+        self.assertNotIn("nothing to do", alerte["detail"])
+        self.assertIn("check the caps", alerte["detail"])
+
     def test_key_survives_status_flicker(self):
         now = time.time()
         self._gauge(now, 3 * 3600)
@@ -86,6 +98,55 @@ class AlertTest(PgTestCase):
                     "seen on this host — primaire: codex plan: in overage")
         (alerte,) = self._alertes(now)
         self.assertNotIn("waits_reset", alerte)
+
+
+class ResetFallbackTest(unittest.TestCase):
+    """Échéances d'overage sans base : plusieurs fenêtres et plusieurs comptes."""
+    NOW = 1800000000.0
+
+    def deadline(self, gauges, reason=OVERAGE):
+        store = mock.Mock()
+        store.operations.gauge_latest.side_effect = lambda **kw: gauges[kw["account"]]
+        with mock.patch.object(storage, "of", return_value=store):
+            return exploitation._budget_pause_waits_reset(
+                object(), {"harness": "codex"}, reason, self.NOW)
+
+    def gauge(self, used, delay):
+        return {"used": used, "resets_at_ts": None if delay is None else self.NOW + delay}
+
+    def test_waits_for_last_exhausted_window_ignores_unspent(self):
+        self.assertEqual(self.deadline({"primaire": [
+            self.gauge(1.0, 3600), self.gauge(1.1, 10800), self.gauge(0.5, 60),
+        ]}), self.NOW + 10800)
+
+    def test_undated_exhausted_window_has_no_deadline(self):
+        self.assertIsNone(self.deadline({"primaire": [
+            self.gauge(1.0, 3600), self.gauge(1.0, None),
+        ]}))
+
+    def test_unspent_undated_window_does_not_hold_account(self):
+        self.assertEqual(self.deadline({"primaire": [
+            self.gauge(1.0, 3600), self.gauge(0.2, None),
+        ]}), self.NOW + 3600)
+
+    def test_first_account_released_suffices(self):
+        reason = OVERAGE + "; secondaire: codex plan: in overage (billed beyond the plan)"
+        self.assertEqual(self.deadline({
+            "primaire": [self.gauge(1.0, 3600), self.gauge(1.0, 10800)],
+            "secondaire": [self.gauge(1.0, 7200)],
+        }, reason), self.NOW + 7200)
+
+    def test_expired_exhausted_window_does_not_hold_account(self):
+        self.assertEqual(self.deadline({"primaire": [
+            self.gauge(1.0, -3600), self.gauge(1.0, 7200),
+        ]}), self.NOW + 7200)
+
+    def test_no_exhausted_window_proves_no_deadline(self):
+        self.assertIsNone(self.deadline({"primaire": [self.gauge(0.2, 3600)]}))
+
+    def test_critical_pause_keeps_action_expected(self):
+        self.assertIsNone(self.deadline({"primaire": [self.gauge(1.0, 3600)]},
+                                       budget.CRITICAL_MARK + OVERAGE))
 
 
 class BriefOnceTest(unittest.TestCase):
