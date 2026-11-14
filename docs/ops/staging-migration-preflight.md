@@ -50,6 +50,28 @@ No extra note is required. The restore path must be a regular nonempty file in
 the same frozen tree, with a name ending in `_restore.sql`. This checks its
 presence; migration review and rollback tests establish its correctness.
 
+Every file creating a trigger (including constraint and replacement triggers)
+must also declare `rejects_previous_writes` as a JSON boolean and
+`previous_writes_justification` as a nonempty short explanation. Missing or
+invalid fields refuse application. For example:
+
+```json
+{
+  "checksum": "<SHA256 of the SQL bytes>",
+  "lot": 1234,
+  "rejects_previous_writes": false,
+  "previous_writes_justification": "The reviewed function only records writes",
+  "restore": "rollback/001_restore.sql"
+}
+```
+
+With `false`, the file remains a relaxation requiring its frozen restore
+(unless another statement requires owner agreement). The reviewer must check
+the called function's body against the assertion, for BEFORE and AFTER triggers.
+The classifier does not infer that body's behavior. With `true`, the same
+signed owner agreement as a destructive migration is required, using `decision`
+and `approval_option` attached to the carrier lot; a restore alone is insufficient.
+
 For a destructive or doubtful migration, the entry contains `checksum`, `lot`, `decision`
 (the integer decision ID), and `approval_option` (the key of the owner's
 agreement option). The command reads the ordinary ameesh decision proof

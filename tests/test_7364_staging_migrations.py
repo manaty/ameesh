@@ -73,8 +73,48 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaises(sm.Refused):
             sm.check('migration.sql', data, sm.load_policy(), read_file=lambda p:b'-- restore', signed_decision=lambda *a:False)
         policy = sm.load_policy()
-        policy['declarations']['migration.sql'] = {'checksum':hashlib.sha256(data).hexdigest(), 'lot':1, 'restore':'cleanup_restore.sql'}
+        policy['declarations']['migration.sql'] = {'checksum':hashlib.sha256(data).hexdigest(), 'lot':1, 'restore':'cleanup_restore.sql',
+            'rejects_previous_writes':False, 'previous_writes_justification':'Only cleans up deleted rows; function reviewed'}
         self.assertEqual(sm.check('migration.sql', data, policy, read_file=lambda p:b'DROP TRIGGER cleanup ON conversations;', signed_decision=lambda *a:False).kind, 'relaxation')
+
+    def test_trigger_previous_writes_declaration_and_owner_proof(self):
+        for timing in ('BEFORE', 'AFTER'):
+            for form in ('TRIGGER', 'CONSTRAINT TRIGGER', 'OR REPLACE TRIGGER'):
+                with self.subTest(timing=timing, form=form):
+                    data = (f'CREATE {form} guard {timing} INSERT ON x '
+                            'FOR EACH ROW EXECUTE FUNCTION guard_write();').encode()
+                    policy = sm.load_policy()
+                    entry = {'checksum':hashlib.sha256(data).hexdigest(), 'lot':17,
+                             'restore':'guard_restore.sql'}
+                    policy['declarations']['trigger.sql'] = entry
+                    def check(verifier=lambda *args:False, restore=b'DROP TRIGGER guard ON x;'):
+                        return sm.check('trigger.sql', data, policy,
+                                        read_file=lambda p:restore, signed_decision=verifier)
+                    with self.assertRaisesRegex(sm.Refused, 'boolean rejects_previous_writes'):
+                        check()
+                    for value in (None, 'false', 0, 1):
+                        entry['rejects_previous_writes'] = value
+                        entry['previous_writes_justification'] = 'Reviewed function'
+                        with self.assertRaisesRegex(sm.Refused, 'boolean rejects_previous_writes'):
+                            check()
+                    entry['rejects_previous_writes'] = False
+                    for justification in (None, '', '  ', True):
+                        entry['previous_writes_justification'] = justification
+                        with self.assertRaisesRegex(sm.Refused, 'justification'):
+                            check()
+                    entry['previous_writes_justification'] = 'Function only records writes'
+                    self.assertEqual(check().kind, 'relaxation')
+                    with self.assertRaisesRegex(sm.Refused, 'restore'):
+                        check(restore=b'')
+                    entry['rejects_previous_writes'] = True
+                    with self.assertRaisesRegex(sm.Refused, 'signed owner agreement'):
+                        check()
+                    entry.update(decision=42, approval_option='approve')
+                    with self.assertRaisesRegex(sm.Refused, 'signed owner agreement'):
+                        check()
+                    calls = []
+                    self.assertEqual(check(lambda *args:calls.append(args) or True).kind, 'relaxation')
+                    self.assertEqual(calls, [(42,17,'approve')])
 
     def test_worst_instruction_in_all_static_branches(self):
         sql = """DO $$ BEGIN IF to_regnamespace('graph') IS NULL THEN
@@ -181,6 +221,29 @@ class GitInventoryTests(unittest.TestCase):
         declarations[paths[0]]['checksum']='0'*64
         self.policy(declarations)
         self.assertFalse(self.run_inventory(paths)['allowed'])
+
+    def test_frozen_trigger_declaration_controls_owner_gate(self):
+        sql = """CREATE FUNCTION guard_write() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'write refused'; END $$;
+        DO $$ BEGIN IF to_regclass('x') IS NOT NULL THEN
+        CREATE TRIGGER guard BEFORE INSERT ON x FOR EACH ROW
+        EXECUTE FUNCTION guard_write(); END IF; END $$;"""
+        self.put('sql/trigger.sql', sql)
+        self.put('rollback/trigger_restore.sql', 'DROP TRIGGER guard ON x;')
+        entry = {'checksum':hashlib.sha256(sql.encode()).hexdigest(), 'lot':17,
+                 'restore':'rollback/trigger_restore.sql',
+                 'previous_writes_justification':'Function rejects writes incompatible with the new invariant'}
+        self.policy({'sql/trigger.sql':entry})
+        self.assertFalse(self.run_inventory(['sql/trigger.sql'])['allowed'])
+        entry['rejects_previous_writes'] = True
+        self.policy({'sql/trigger.sql':entry})
+        self.assertFalse(self.run_inventory(['sql/trigger.sql'])['allowed'])
+        entry.update(decision=42, approval_option='approve')
+        self.policy({'sql/trigger.sql':entry})
+        calls = []
+        self.assertTrue(self.run_inventory(['sql/trigger.sql'],
+            lambda *args:calls.append(args) or True)['allowed'])
+        self.assertEqual(calls, [(42,17,'approve')])
 
     def test_restore_must_be_regular_nonempty_and_in_frozen_tree(self):
         sql='ALTER TABLE x DROP CONSTRAINT fk;'
