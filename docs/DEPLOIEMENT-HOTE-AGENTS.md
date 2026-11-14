@@ -682,6 +682,31 @@ page sont à exécuter par le responsable du déploiement après revue et
 validation CI, une VM à la fois ; `controler` affiche le code installé, le
 clone et `previous-sha` avant les unités.
 
+**Serveur sans accès root : geste bureau après chaque coupure (#7365).** Un
+`--absent manaty-mesh-1=…` n’est pas un état permanent : le canon §14 exige
+qu’un hôte reporté soit rattrapé, et « la coupure suivante ne redescend jamais
+sous ce commit ». La séquence ne peut pas le faire elle-même : en mode serveur,
+`vm.sh` passe par `ssh root@$VM`, installe `/opt/ameesh` et écrit
+`/root/.cache/ameesh` ; le compte de staging n’a pas de chemin root vers le
+serveur. Le geste est donc celui du **bureau**, après chaque coupure, sous un
+droit root nommé par une décision owner (§10, comme #215688 pour #7152) :
+depuis le compte de staging, avec son `BASCULE_ENV` (`VM` = adresse du serveur,
+`PERSONAS_VM` vide), `deploy/mise-a-jour/vm.sh verifier`, `vm.sh installer
+<commit attesté>`, `vm.sh redemarrer`, `vm.sh controler` ; `vm.sh retour` en cas
+d’échec ; Postgres n’est jamais arrêté. Le commit visé est celui de l’attestation de staging de la release
+(les VM d’agents le prouvent), jamais la tête de `main` ni une branche.
+
+Deux gardes le déclarent. Le rapport de coupure nomme chaque hôte reporté, sa
+raison et le tag non déployé (`REPORTÉ (…) — non déployé au tag …`). Et la
+minuterie de release (`ameesh release tick`) envoie au bureau et au pilote,
+**une fois par release**, l’alerte de retard de version
+(`ameesh.staging_deferred`) : tag non déployé, hôte reporté, raison, dernière
+preuve de staging de cet hôte et geste exact ; elle ne retient ni ne défait
+aucune release. Un report du poste n’est jamais alerté (il se met à jour à son
+retour). Si un chemin root permanent est un jour donné au compte de staging,
+l’autre voie redevient possible : retirer `--absent` et laisser la séquence
+attester le serveur à chaque coupure.
+
 ## Minuteries de rôle de l’observation GitHub (#3327)
 
 L’observation GitHub (veille des tickets, relevé CI, projection des issues) est
