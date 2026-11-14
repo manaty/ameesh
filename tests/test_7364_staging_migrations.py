@@ -38,6 +38,19 @@ class ClassificationTests(unittest.TestCase):
             with self.subTest(suffix=suffix):
                 self.assertEqual(sm.classify("ALTER TABLE x ADD COLUMN y text " + suffix).kind, 'destructive')
 
+    def test_domain_column_default_stays_destructive(self):
+        # PostgreSQL accepts ADD COLUMN on an empty table, but the domain CHECK
+        # rejects a subsequent N-1 INSERT that omits y. No implicit domain cast
+        # may use the additive shortcut, including arrays and quoted domains.
+        for typename in ('c.d', 'c.d[]', 'custom_domain', '"d"', 'c."d"'):
+            with self.subTest(typename=typename):
+                sql = f"ALTER TABLE c.t ADD COLUMN y {typename} NOT NULL DEFAULT 'bad';"
+                self.assertEqual(sm.classify(sql).kind, 'destructive')
+                with self.assertRaises(sm.Refused):
+                    sm.check('domain.sql', sql.encode(), sm.load_policy(),
+                             read_file=lambda p:b'-- restore', signed_decision=lambda *a:False)
+        self.assertEqual(sm.classify("ALTER TABLE c.t ADD COLUMN y pg_catalog.text NOT NULL DEFAULT 'bad'").kind, 'additive')
+
     def test_constant_column_does_not_override_project_destructive_rules(self):
         policy = sm.load_policy(json.dumps({'schema':'ameesh-staging-migrations/1',
             'exceptions':{'destructive':[{'pattern':r'alter table protected .*', 'reason':'protected table'}]}}))

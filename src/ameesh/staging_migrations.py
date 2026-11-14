@@ -196,8 +196,11 @@ def classify(sql, policy=None):
         # Match the entire addition, keeping literal contents opaque. Extra
         # actions, constraints, NULL and computed defaults cannot pass here.
         constant = r"(?:'_'|true|false|[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?|array\s*\[\s*\])"
-        cast = r"(?:\s*::\s*(?:pg_catalog\.)?(?:text|varchar|bool|boolean|int|integer|int2|int4|int8|bigint|smallint|numeric|decimal|real|float4|float8|json|jsonb|uuid)(?:\[\])?)*"
-        column = r'alter table [\w.\"]+ add column (?:if not exists )?[\w\"]+ [\w.]+(?:\[\])?'
+        # A domain's implicit cast may reject this constant on an N-1 insert.
+        # Restrict both the column type and explicit casts to known built-ins.
+        builtin = r"(?:pg_catalog\.)?(?:text|varchar|bool|boolean|int|integer|int2|int4|int8|bigint|smallint|numeric|decimal|real|float4|float8|json|jsonb|uuid)"
+        cast = r"(?:\s*::\s*" + builtin + r"(?:\[\])?)*"
+        column = r'alter table [\w.\"]+ add column (?:if not exists )?[\w\"]+ ' + builtin + r"(?:\[\])?"
         constant_column = re.fullmatch(
             column + r"(?: not null default " + constant + cast
             + r"| default " + constant + cast + r" not null)", statement)

@@ -76,10 +76,13 @@ declaration is added to that file with the migration's lot. A project's gate is
 active only once its applicator integration is delivered. Manually executed
 SQL outside the applicator is outside this control.
 
-A new `ADD COLUMN ... NOT NULL` is additive only with a constant default:
+A new `ADD COLUMN ... NOT NULL` is additive only for a recognized built-in
+column type (optionally qualified by `pg_catalog`) with a constant default:
 a quoted literal, boolean, number or empty array (optionally with a built-in type cast from the recognized list).
 Absent defaults, NULL, function calls and computed expressions retain the
-destructive classification. This lets N-1 writers omit the new column: 0576
+destructive classification. Custom types and domains also remain destructive:
+a domain CHECK can reject the default on an N-1 insert even if adding the
+column to an empty table succeeds. This lets N-1 writers omit the new column: 0576
 (`profiles text[] not null default '{}'`) is additive.
 
 A new trigger is a relaxation requiring a declaration and frozen restore:
