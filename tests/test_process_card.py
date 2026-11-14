@@ -16,8 +16,10 @@ import json
 import os
 import tempfile
 import textwrap
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ameesh.process_card import (CheckResult, TYPE_ALIASES, artifact_document,
                                  check_page, encode_canon_workflow, main,
@@ -271,9 +273,29 @@ projection:
         self.assertEqual("ref-invalid", caught.exception.code)
 
 
+class _OwnThreadOutput(io.StringIO):
+    """Stdout capturé qui ignore les écritures des autres fils.
+
+    #7381 : `redirect_stdout` remplace `sys.stdout` pour tout le processus ;
+    le fil démon du journal asynchrone (`ameesh.runner.log_async`) ou un fil
+    resté vivant d'un test voisin peut y écrire pendant la capture. Une ligne
+    datée ou un « {} » n'est pas du JSON (« Extra data »). Seule la sortie du
+    fil de ce test est gardée, comme dans test_2022_fleet (#4736).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._writer = threading.current_thread()
+
+    def write(self, text):
+        if threading.current_thread() is not self._writer:
+            return len(text)
+        return super().write(text)
+
+
 class CliTest(PageCase):
     def run_main(self, argv):
-        out, err = io.StringIO(), io.StringIO()
+        out, err = _OwnThreadOutput(), _OwnThreadOutput()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = main(argv)
         return code, out.getvalue(), err.getvalue()
@@ -281,7 +303,7 @@ class CliTest(PageCase):
     def test_route_ameesh_process(self):
         from ameesh.main import main as ameesh_main
 
-        out, err = io.StringIO(), io.StringIO()
+        out, err = _OwnThreadOutput(), _OwnThreadOutput()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = isolated_entrypoint(ameesh_main, ["process", "check", str(EXAMPLE)])
         self.assertEqual(0, code, err.getvalue())
@@ -300,6 +322,42 @@ class CliTest(PageCase):
         self.assertEqual("process-workflow/1", payload["document"]["schema"])
         self.assertEqual("governance-tracking", payload["document"]["types"][4])
         self.assertEqual({"draft": "Draft"}, {"draft": payload["labels"]["draft"]})
+
+    def test_check_json_ignore_les_ecritures_des_autres_fils(self):
+        """#7381 : un « {} » écrit par un autre fil ne salit pas la capture.
+
+        Signature du run 43599097259 : « Extra data: line 1 column 3
+        (char 2) », soit « {} » devant le document. Le fil du journal
+        asynchrone de l'exécuteur est global au processus ; ce témoin le
+        reproduit sans course : l'écrivain ne rend la main qu'une fois son
+        « {} » écrit pendant la capture.
+        """
+        ecrit, fini = threading.Event(), threading.Event()
+
+        def ecrivain():
+            try:
+                if ecrit.wait(10):
+                    print("{}", end="", flush=True)
+            finally:
+                fini.set()
+
+        fil = threading.Thread(target=ecrivain, name="ecrivain-7381", daemon=True)
+        fil.start()
+        self.addCleanup(fil.join, 10)
+        vrai_check = check_page
+
+        def check(*args, **kwargs):
+            ecrit.set()
+            self.assertTrue(fini.wait(10), "l'écrivain n'a pas écrit")
+            return vrai_check(*args, **kwargs)
+
+        with mock.patch("ameesh.process_card.check_page", check):
+            code, out, err = self.run_main(["check", str(EXAMPLE), "--json"])
+        fil.join(10)
+        self.assertFalse(fil.is_alive(), "l'écrivain a survécu à son test")
+        self.assertEqual(0, code, err)
+        payload = json.loads(out)
+        self.assertEqual("process-workflow/1", payload["document"]["schema"])
 
     def test_carte_en_prose_sort_zero(self):
         with tempfile.TemporaryDirectory() as tmp:

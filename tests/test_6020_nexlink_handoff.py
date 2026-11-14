@@ -332,6 +332,7 @@ class HandoffPipelineTests(unittest.TestCase):
                    mock.patch.object(nx, "release_tags", return_value={}),
                    mock.patch.object(nx, "open_handoff_lot", return_value=77),
                    mock.patch.object(nx, "staging_jobs", return_value=["deploy"]),
+                   mock.patch.object(nx, "staging_migration_preflight", return_value=[]),
                    mock.patch.object(work, "events_noted",
                                      side_effect=lambda db, lot, prefix: list(self.notes)),
                    mock.patch.object(nx, "migration_requirements", return_value={
@@ -645,6 +646,18 @@ class HandoffPipelineTests(unittest.TestCase):
                 self.assertEqual(len(self.sent), before + 1)
                 self.assertIn("refusée avant le tag", self.sent[-1][0])
                 self.assertIn("--force", self.sent[-1][0])
+
+    def test_historical_preflight_gains_advisory_without_blocking_handoff(self):
+        self.pending["handoff_preflight"] = {"migrations": []}
+        rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {
+            "nexlink": {"pending_nexlink": self.pending}}})
+        warnings = [{"path": "796.sql", "classification": "unknown",
+                     "warning": "check explicit applicator inventory"}]
+        with mock.patch.object(nx, "staging_migration_preflight", return_value=warnings) as advisory:
+            self.assertEqual(self.handed_over()["result"], "waiting-attestation")
+        advisory.assert_called_once()
+        self.assertIn("796.sql", self.sent[-1][0])
+        self.assertIn("SQL advisory", self.sent[-1][0])
 
     def test_preflight_refusal_is_not_reported_twice(self):
         """#6039 N8: `_report_error` must not claim a closed pending is kept."""
