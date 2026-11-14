@@ -145,8 +145,6 @@
         re-delivers the pending mail of a stopped agent to a live agent;
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh migrate              apply schema migrations;
-  ameesh staging-migrations --repo DIR --sha SHA --project P --file PATH
-        read-only gate on the applicator's explicit pending SQL inventory;
   ameesh model-report [--json] [--project P] [--days N] [--at T] [--start T] [--end T]
         rapport d'évaluation des modèles en lecture seule (étude #6650, unité
         M1) : fenêtre UTC, cohortes d'intégration et de staging séparées,
@@ -251,6 +249,8 @@
         turn_mail_max=20|0 turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
+  ameesh staging-migrations --repo DIR --sha SHA --project P --file PATH
+        read-only gate on the applicator's explicit pending SQL inventory;
   ameesh turn current [--local] [--expect-turn ID] [--json]
         read the calling turn; reuse requires its captured turn id;
   ameesh turn observe (--turn ID | --request ID) [--json]
