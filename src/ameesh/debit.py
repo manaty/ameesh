@@ -114,7 +114,8 @@ _WAKE_DELIVERED = re.compile(r"scheduled wake delivered", re.I)
 _DUE = re.compile(r"\(due\s+([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}"
                   r"(?::[0-9]{2})?(?:\s+[A-Za-z][A-Za-z0-9_/+-]*)?)\)")
 _PROGRAMMED = re.compile(r"\[réveil programmé\s*:\s*([^\]]+)\]", re.I)
-_VERSION = re.compile(r"\b(\d+)\.(\d+)\.(\d+)\b")
+# #7316 : un triplet au sein d’une IPv4 ne désigne pas une version.
+_VERSION = re.compile(r"(?<![\d.])\b(\d+)\.(\d+)\.(\d+)\b(?!\.\d)")
 #: une retenue qui attend un déploiement (#3497) : « pas/non/jamais déployé »,
 #: le verbe (« reste à déployer main »), et le nom dans une formule d'attente
 #: (« attente du déploiement », « inerte jusqu'au déploiement ») ou de
