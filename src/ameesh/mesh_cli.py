@@ -3315,6 +3315,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 raise work.WorkError("--supersedes only applies to a freeze")
             # `--repo` vaut aussi pour un verdict (#2674) : il y résout
             # l'abréviation du SHA relu, et fait alors autorité.
+            if args.kind == "frozen":
+                print("freeze pending: static checks finished; milestone for %s "
+                      "is not recorded yet" % sha, flush=True)
             row = work.milestone(
                 db, args.id, args.kind, sha=sha, actor=args.actor or "",
                 verdict=args.verdict, note=note, outcome=outcome, repo=args.repo,
@@ -3323,7 +3326,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # toute désignation ; un regel d'adaptation de test ne dépose
                 # aucun courrier de relecture avant sa preuve.
                 defer_designation=(args.kind == "frozen"))
-            print(('milestone %s added to %s #%d%s') % (row["kind"], v.noun, args.id, " (%s)" % row["verdict"] if row.get("verdict") else ""))
+            if args.kind == "frozen":
+                from . import freeze_gate
+                row = freeze_gate.verify_recorded(
+                    db, args.id, row, sha, supersedes=args.supersedes)
+            print(('milestone %s added to %s #%d%s') % (row["kind"], v.noun, args.id, " (%s)" % row["verdict"] if row.get("verdict") else ""), flush=True)
             if row.get("verdict") == "blocked":
                 # #3416 : le relecteur désigné qui bloque corrige souvent
                 # lui-même ; prévenu ici, il sait que sa famille deviendrait

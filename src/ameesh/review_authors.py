@@ -4112,7 +4112,7 @@ def _access_detail(reason: str, repo: str) -> str:
     if reason:
         return ("accessibility not established: %s in %s"
                 % (reason, repo or "the repository"))
-    return ""
+    return "repository read: %s" % repo if repo else ""
 
 
 def prior_freeze_problem(lot: int, freeze_id: int, sha: str, detail: str, *,
@@ -4139,7 +4139,7 @@ def prior_freeze_problem(lot: int, freeze_id: int, sha: str, detail: str, *,
     return text
 
 
-def unknown_refusal(unknown: Sequence[str], *, head_sha: str = "") -> str:
+def unknown_refusal(unknown: Sequence[str], *, head_sha: str = "", repo: str = "") -> str:
     """Le refus actionnable d'inconnus de provenance (#3835).
 
     Chaque inconnu porté par un gel antérieur est nommé avec son gel, son SHA
@@ -4172,6 +4172,8 @@ def unknown_refusal(unknown: Sequence[str], *, head_sha: str = "") -> str:
         else:
             doubts.append(value)
     out = "author provenance unknown for frozen commit(s): " + ", ".join(names or ["?"])
+    if repo:
+        out += "; repository read: %s" % repo
     for frozen_lot, freeze_ids in sorted(unreachable.items()):
         unique = sorted({int(value) for value in freeze_ids})
         out += ("; no local ref contains prior freeze(s) %s of lot #%d: if no "

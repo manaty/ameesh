@@ -797,6 +797,29 @@ def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None,
     raise WorkError(_freeze_unresolved(text))
 
 
+def verify_recorded(db: Db, item_id: int, row: dict, sha: str, *, supersedes=()) -> dict:
+    """#7353: a CLI success requires the exact journalled freeze and marks."""
+    from .work import WorkError
+    expected_id = int(row.get("id") or 0)
+    try:
+        recorded = next((mark for mark in milestones(db, item_id, None)
+                         if int(mark.get("id") or 0) == expected_id), None)
+    except Exception as exc:  # journal unavailable: never announce success
+        raise WorkError("freeze not confirmed in journal for lot #%d: journal "
+                        "unreadable; inspect the lot before retrying" % item_id) from exc
+    required = {int(value) for value in supersedes or ()}
+    actual = {int(value) for value in FREEZE_SUPERSEDES_RE.findall(
+        str((recorded or {}).get("note") or ""))}
+    if (not expected_id or not recorded or recorded.get("kind") != "frozen"
+            or recorded.get("sha") != sha or not required.issubset(actual)):
+        raise WorkError(
+            "freeze not confirmed in journal for lot #%d at %s "
+            "(milestone #%d, expected supersedes %s); do not treat static "
+            "checks as a recorded freeze; inspect the lot before retrying"
+            % (item_id, sha[:12], expected_id, sorted(required)))
+    return recorded
+
+
 def milestone(
     db: Db,
     item_id: int,
