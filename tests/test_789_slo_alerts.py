@@ -1862,6 +1862,8 @@ class GateObservationRenewalTest(_Base):
     def test_notifier_fills_and_renews_expired_gate_cli_only_observes(self):
         from ameesh import plan_git
         self.qa(verdict_s=50 * 60)
+        # Cache timestamps round to milliseconds; keep this frozen clock exact.
+        self.now = float(int(self.now))
         head, base = "a" * 40, "b" * 40
         self.db.execute("UPDATE work_item_milestones SET sha = %s "
                         "WHERE work_item_id = %s", (head, self.lot["id"]))
