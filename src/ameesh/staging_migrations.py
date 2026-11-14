@@ -58,6 +58,7 @@ class Refused(ValueError):
 class Classification:
     kind: str
     reasons: tuple[str, ...]
+    creates_trigger: bool = False
 
 
 def load_policy(text=None):
@@ -180,6 +181,8 @@ def classify(sql, policy=None):
         code = _code(sql)
     except Refused as exc:
         return Classification("unknown", (str(exc),))
+    creates_trigger = bool(re.search(
+        r"(?:^|;)\s*create\s+(?:or\s+replace\s+)?(?:constraint\s+)?trigger\b", code))
     if not code.strip(" ;"):
         return Classification("unknown", ("no SQL statement",))
     rank = {"additive": 0, "relaxation": 1, "destructive": 2, "unknown": 3}
@@ -190,7 +193,7 @@ def classify(sql, policy=None):
         if not statement:
             continue
         if re.match(r"(?:execute|call|do)\b", statement):
-            return Classification("unknown", ("dynamic SQL not analysed",))
+            return Classification("unknown", ("dynamic SQL not analysed",), creates_trigger)
         if unconditional and _new_routine_revoke(statement, code):
             continue
         # Match the entire addition, keeping literal contents opaque. Extra
@@ -219,8 +222,8 @@ def classify(sql, policy=None):
                 reasons.extend(hits if category != "additive" else [])
                 break
         if found is None:
-            return Classification("unknown", ("statement outside SQL rules: " + statement[:120],))
-    return Classification(kind, tuple(dict.fromkeys(reasons)))
+            return Classification("unknown", ("statement outside SQL rules: " + statement[:120],), creates_trigger)
+    return Classification(kind, tuple(dict.fromkeys(reasons)), creates_trigger)
 
 
 def check(path, data, policy, *, read_file, signed_decision):
@@ -229,7 +232,7 @@ def check(path, data, policy, *, read_file, signed_decision):
         result = classify(data.decode("utf-8"), policy)
     except UnicodeError:
         result = Classification("unknown", ("SQL is not UTF-8",))
-    if result.kind == "additive":
+    if result.kind == "additive" and not result.creates_trigger:
         return result
     reason = "%s: %s (%s)" % (path, result.kind, "; ".join(result.reasons))
     checksum = hashlib.sha256(data).hexdigest()
@@ -239,7 +242,14 @@ def check(path, data, policy, *, read_file, signed_decision):
     lot = declaration.get("lot")
     if type(lot) is not int or lot <= 0:
         raise Refused(reason + "; carrier lot required")
-    if result.kind in ("destructive", "unknown"):
+    rejects_previous_writes = False
+    if result.creates_trigger:
+        rejects_previous_writes = declaration.get("rejects_previous_writes")
+        justification = declaration.get("previous_writes_justification")
+        if (type(rejects_previous_writes) is not bool
+                or not isinstance(justification, str) or not justification.strip()):
+            raise Refused(reason + "; trigger requires boolean rejects_previous_writes and previous_writes_justification")
+    if result.kind in ("destructive", "unknown") or rejects_previous_writes:
         identifier, option = declaration.get("decision"), declaration.get("approval_option")
         if (type(identifier) is not int or identifier <= 0 or not isinstance(option, str) or not option
                 or not signed_decision(identifier, lot, option)):
