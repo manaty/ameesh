@@ -24,6 +24,7 @@ from .support import PgTestCase
 from .test_2447_review_designation_activation import _ActivationFixture
 
 FAMILIES = ("claude", "codex", "deepseek")
+CORRECTION_TS = 1794614400  # 2026-11-14 00:00 UTC, after the first freeze.
 
 
 class RebasedCorrectorDoubtTest(_ActivationFixture, PgTestCase):
@@ -31,6 +32,11 @@ class RebasedCorrectorDoubtTest(_ActivationFixture, PgTestCase):
 
     def setUp(self):
         super().setUp()
+        # #7331: Git dates have whole-second precision, unlike milestone.at.
+        # Give corrections an explicit instant strictly after F1, regardless
+        # of how quickly the fixture runs or which second it starts in.
+        self.repo.dry.update(GIT_AUTHOR_DATE="%s +0000" % CORRECTION_TS,
+                             GIT_COMMITTER_DATE="%s +0000" % CORRECTION_TS)
         registry.upsert(self.db, "cx3", harness="codex", host=self.cfg.host,
                         cwd=self.repo.root, status="idle")
         self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
@@ -55,7 +61,10 @@ class RebasedCorrectorDoubtTest(_ActivationFixture, PgTestCase):
                        create_turn_lot=False):
         """F1, correctif de cx3 amendé avant push, réécriture par l'auteur."""
         head_a = self.frozen
-        self.freeze()                       # F1 désigne r1 (claude) et r2 (codex)
+        first, _out = self.freeze()          # F1 désigne r1 (claude) et r2 (codex)
+        self.db.execute(
+            "UPDATE work_item_milestones SET at = to_timestamp(%s) WHERE id = %s",
+            (CORRECTION_TS - 1, first["id"]))
         # Le correctif local de cx3, puis son amend avant le push : le commit
         # poussé n'a aucun reçu, et le commit local reste inconnu du clone lu.
         self.repo.write("src/ameesh/mail.py", "lot\ncx3 petit correctif\n")
