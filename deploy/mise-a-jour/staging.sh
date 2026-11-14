@@ -767,6 +767,9 @@ mkdir -p -- "$d"
 git -C "$depot" fetch -q origin
 git -C "$depot" archive "$R" src | tar -x -C "$d"
 cd "$d"
+# #7368 : contrôle bloquant de la liste réellement en attente (lecture seule),
+# puis dry-run additif ; un refus laisse la base intacte et ne relance rien.
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh.staging_migrations_preflight --repo "$depot" --sha "$R" --project ameesh
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --dry-run --additive-only
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --additive-only
 REMOTE
@@ -792,6 +795,9 @@ mkdir -p -- "$d"
 git -C "$depot" fetch -q origin
 git -C "$depot" archive "$R" src | tar -x -C "$d"
 cd "$d"
+# #7368 : le contrôle juge les migrations réellement en attente sur la base,
+# avant la sauvegarde comme avant l'application.
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh.staging_migrations_preflight --repo "$depot" --sha "$R" --project ameesh
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --dry-run --additive-only
 REMOTE
 }

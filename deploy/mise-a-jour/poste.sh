@@ -226,10 +226,11 @@ verifier() {
   ("$AMEESH" doctor || true) | tail -3
 }
 
-# #5692 : lecture seule des bases, depuis l'instantané de REF. Codes : 0 aucune
-# non additive ; 3 la base du mesh en attend (staging refusé AVANT sauvegarde) ;
-# 4 seule une base secondaire en attend (poste reportable d'emblée, le staging
-# des VM continue) ; 1 autre échec.
+# #5692/#7368 : lecture seule des bases, depuis l'instantané de REF. Codes : 0
+# rien à refuser ; 3 la base du mesh attend une migration non additive ou le
+# contrôle des migrations réellement en attente la refuse (staging refusé AVANT
+# sauvegarde) ; 4 seule une base secondaire est dans ce cas (poste reportable
+# d'emblée, le staging des VM continue) ; 1 autre échec.
 prevol() {
   local ref=${1:-HEAD} sha cible d code_mesh=0 code_reste=0
   sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}") \
@@ -238,6 +239,12 @@ prevol() {
   etape "migrations à venir (lecture seule) : $sha"
   dsn_part d "$CONFIG" dsn || return 1
   echo "mesh     : $d"
+  # #7368 : le contrôle bloquant juge la liste RÉELLE des migrations en attente
+  # sur cette base (lecture seule), avant le dry-run additif et la sauvegarde.
+  if ! verifier_migrations_controle "$cible" "$sha" "$CONFIG"; then
+    echo "poste : migrations en attente refusées par le contrôle sur la base du mesh : staging refuse avant toute sauvegarde" >&2
+    return 3
+  fi
   # Le fichier de l'hôte fait foi : un AMEESH_CONFIG ambiant (profil, banc)
   # ne doit pas faire sonder une autre base que celle que « migrer » servira.
   AMEESH_CONFIG="$CONFIG" ameesh_de "$cible" migrate --dry-run --additive-only \
@@ -248,6 +255,10 @@ prevol() {
       return 4
     fi
     echo "ancienne : $d"
+    if ! verifier_migrations_controle "$cible" "$sha" "$CONFIG_RESTE" "$CONFIG"; then
+      echo "poste : migrations en attente refusées par le contrôle sur l'ancienne base : poste reportable d'emblee, mise a jour a son retour" >&2
+      return 4
+    fi
     AMEESH_CONFIG="$CONFIG_RESTE" ameesh_de "$cible" migrate --dry-run --additive-only \
       || code_reste=$?
   fi
@@ -503,6 +514,21 @@ ameesh_de() {
   local cible=$1; shift
   PYTHONPATH="$cible/src" "$VENV/bin/python" -m ameesh "$@"
 }
+# #7368 : contrôle bloquant des migrations RÉELLEMENT en attente sur une base.
+# La liste vient de la base (lecture seule, code de l'instantané), le
+# classement des fichiers de l'arbre gelé ; un refus arrête la séquence avant
+# toute écriture et avant tout redémarrage d'exécuteur. Les preuves de décision
+# restent lues sur la base du mesh ($CONFIG), jamais sur une base secondaire.
+verifier_migrations_controle() {  # cible sha base [preuve]
+  local cible=$1 sha=$2 base=$3 preuve=${4:-$CONFIG}
+  if ! PYTHONPATH="$cible/src" "$VENV/bin/python" \
+       -m ameesh.staging_migrations_preflight \
+       --repo "$DEPOT" --sha "$sha" --project ameesh \
+       --config "$preuve" --pending-config "$base"; then
+    echo "contrôle des migrations en attente refusé sur la base $base (rien n'a été écrit)" >&2
+    return 1
+  fi
+}
 installe() { [ "$(readlink "$PARTAGE/src-current" 2>/dev/null)" = "$(basename "$1")" ]; }
 
 installer() {
@@ -580,6 +606,12 @@ migrer() {
   etape "base du mesh (une seule fois pour tout le mesh)"
   dsn_part d "$CONFIG" dsn || return
   echo "base : $d"
+  # #7368 : dernier contrôle avant toute écriture, sur la liste réellement en
+  # attente. Un refus laisse la base intacte et aucun exécuteur n'est relancé.
+  if ! verifier_migrations_controle "$cible" "$sha" "$CONFIG"; then
+    echo "migrations en attente refusées par le contrôle : aucune écriture, aucune installation" >&2
+    return 1
+  fi
   # #5692 : depuis que le dry-run rend le verdict du garde (code 3), le
   # message de refus doit sortir ici aussi — sinon `set -e` quitte le script
   # sans expliquer pourquoi.
@@ -595,6 +627,10 @@ migrer() {
     etape "ancienne base (ses exécuteurs prennent le même code)"
     dsn_part d "$CONFIG_RESTE" dsn || return
     echo "base : $d"
+    if ! verifier_migrations_controle "$cible" "$sha" "$CONFIG_RESTE" "$CONFIG"; then
+      echo "migrations en attente refusées par le contrôle sur l'ancienne base : aucune écriture" >&2
+      return 1
+    fi
     AMEESH_CONFIG="$CONFIG_RESTE" migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
   fi
   # #2357: after a failed compatibility probe the OLD code can no longer serve

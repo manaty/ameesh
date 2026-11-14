@@ -153,6 +153,10 @@ class MigrationPinningTest(unittest.TestCase):
             # installer's post-switch import control needs the real packages;
             # the fake venv has none, the sequencing is what matters here.
             'case "$2" in *"import psycopg"*) exit 0 ;; esac\n'
+            # #7368 : le contrôle des migrations en attente est un appel
+            # distinct de « migrate » ; ce banc suit l'ordonnancement de
+            # poste.sh, le classement SQL est couvert par test_7368.
+            'if [ "$1" = -m ] && [ "$2" = ameesh.staging_migrations_preflight ]; then exit 0; fi\n'
             'exec ' + shlex.quote(sys.executable) + ' "$@"\n')
         (venv / "python").chmod(0o755)
         config = Path(self.env["HOME"]) / ".config/ameesh/config.json"

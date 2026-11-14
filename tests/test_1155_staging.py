@@ -212,6 +212,15 @@ case "$*" in
     # `migrate --additive-only`) partagent ce canal ; une panne injectee vise
     # l'application, pas le dry-run.
     script=$(cat)
+    # #7368 : le controle des migrations en attente precede le dry-run dans les
+    # deux scripts ; un refus arrete la sequence au preflight.
+    if printf '%s\n' "$script" | grep -q -- '-m ameesh.staging_migrations_preflight' \
+       && grep -qx "ko=controle-migrations" "$FAKE_STATE/scenario" 2>/dev/null; then
+      grep -vx "ko=controle-migrations" "$FAKE_STATE/scenario" > "$FAKE_STATE/scenario.tmp" || true
+      mv "$FAKE_STATE/scenario.tmp" "$FAKE_STATE/scenario"
+      echo "controle des migrations refuse" >&2
+      exit 1
+    fi
     if printf '%s\n' "$script" | grep -q -- '-m ameesh migrate --additive-only$' \
        && grep -qx "ko=migration" "$FAKE_STATE/scenario" 2>/dev/null; then
       grep -vx "ko=migration" "$FAKE_STATE/scenario" > "$FAKE_STATE/scenario.tmp" || true
@@ -1318,6 +1327,26 @@ class StagingTest(unittest.TestCase):
         self.assertEqual((trace['hote'], trace['verdict']), ('ameesh-agents-3', 'ko'))
         self.assertIn('clone des migrations', trace['detail'])
 
+    def test_migration_preflight_refusal_stops_before_backup_and_install(self):
+        """#7368 : un refus du contrôle (migration destructive non déclarée)
+        arrête la séquence au préflight, avant la sauvegarde, sans migration
+        ni installation ni redémarrage."""
+        (self.state / 'scenario').write_text('ko=controle-migrations\n')
+        p = self.run_vm('--hotes', 'ameesh-agents-3')
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn('preflight en echec', p.stderr)
+        self.assertFalse([a for a in self.actions() if a[1] == 'installer'],
+                         self.actions())
+        self.assertFalse([l for l in self.calls() if l.startswith('sauvegarde-serveur ')])
+        self.assertFalse([l for l in self.calls() if 'action=migrer' in l])
+        migrations = [l for l in self.calls()
+                      if l.startswith('stub ') and 'bash -s -- %s' % self.sha in l]
+        self.assertEqual(len(migrations), 1, self.calls())
+        trace = next(t for t in self.traces() if t['etape'] == 'verifier'
+                     and t['hote'] == 'ameesh-agents-3')
+        self.assertEqual(trace['verdict'], 'ko')
+        self.assertIn('preflight des migrations', trace['detail'])
+
     def test_third_agent_failure_rolls_back_before_workstation(self):
         (self.state / 'scenario').write_text('ko=sante:ameesh-agents-3\n')
         p = self.run_staging()
@@ -1894,6 +1923,25 @@ class PosteMigrerTest(unittest.TestCase):
         self.assertEqual(p.returncode, 3, p.stderr + p.stdout)
         self.assertIn('migration non additive', p.stderr)
         self.assertIn('garde additive', p.stderr)
+
+    def test_gate_refusal_stops_before_any_migration(self):
+        """#7368 : un refus du contrôle des migrations réellement en attente
+        arrête `migrer` avant le dry-run et avant toute écriture."""
+        stub = self.venv / 'python'
+        stub.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "venv %s\\n" "$*" >> "${FAKE_LOG:?}"\n'
+            'case " $* " in *"staging_migrations_preflight"*) exit 1 ;; esac\n'
+            'exit 0\n')
+        stub.chmod(0o755)
+        p = self.run_poste('migrer', self.premier)
+        self.assertEqual(p.returncode, 1, p.stderr + p.stdout)
+        self.assertIn('contrôle des migrations en attente refusé', p.stderr)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual(len([l for l in lines if 'staging_migrations_preflight' in l]),
+                         1, lines)
+        self.assertFalse([l for l in lines if 'migrate --dry-run' in l
+                          or 'migrate --additive-only' in l], lines)
 
 
 class PaquetGitTest(unittest.TestCase):
