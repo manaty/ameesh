@@ -515,9 +515,13 @@ class RelayTest(unittest.TestCase):
         self.assertNotIn("signature", logs)
 
     def test_fermeture_pendant_la_verification_ne_laisse_pas_de_pty(self):
-        self.start()
-        self.host()
+        self.start(idle_timeout=LOCAL_IO_TIMEOUT * 2,
+                   max_session_seconds=LOCAL_IO_TIMEOUT * 3)
+        self.host(request_timeout=LOCAL_IO_TIMEOUT * 2,
+                  max_session_seconds=LOCAL_IO_TIMEOUT * 3)
         created = []
+        verification_closed = threading.Event()
+        pty_closed = threading.Event()
 
         class FakePty:
             def __init__(self, *args, **kwargs):
@@ -526,10 +530,11 @@ class RelayTest(unittest.TestCase):
 
             def close(self):
                 self.closed = True
+                pty_closed.set()
 
         def verify(_request):
-            session = next(iter(self.connector.sessions.values()))
             session.close("test", "closed during verification")
+            verification_closed.set()
             return attach_host.GrantResult(True, "ok", "granted", human="human:alice")
 
         self.verifier.result = verify
@@ -537,16 +542,28 @@ class RelayTest(unittest.TestCase):
         station = Station(self.relay.port, receipt, device)
         self.addCleanup(station.close)
         station.handshake()
+        session = self.connector.sessions[station.session]
         with mock.patch.object(attach_host.attach_pty, "PtyProcess", FakePty):
-            with self.assertRaises((AssertionError, TimeoutError)):
-                station.request(timeout=0.5)
-            # le spawn peut suivre la fermeture : il doit rester sous le mock
-            deadline = time.monotonic() + 2
-            while not created and time.monotonic() < deadline:
-                time.sleep(0.01)
-        self.assertEqual(len(created), 1, self.logs.getvalue())
-        self.assertTrue(created[0].closed)
-        self.assertEqual(self.connector.sessions, {})
+            try:
+                with self.assertRaises((AssertionError, TimeoutError)):
+                    # Pas de réponse OK attendue ; cette borne ne décide
+                    # pas si l'hôte a traité REQ (événements ci-dessous).
+                    station.request(timeout=0.5)
+                # La fermeture côté station peut précéder le retour du
+                # vérificateur : attendre les faits, pas le seul spawn.
+                self.assertTrue(verification_closed.wait(LOCAL_IO_TIMEOUT),
+                                self.logs.getvalue())
+                self.assertTrue(pty_closed.wait(LOCAL_IO_TIMEOUT),
+                                self.logs.getvalue())
+            finally:
+                # Garder le mock pendant la fin du traitement de REQ,
+                # y compris si la station expire ou une assertion échoue.
+                session.close("test", "test finished")
+                session.wait(LOCAL_IO_TIMEOUT)
+            self.assertFalse(session._thread.is_alive(), self.logs.getvalue())
+            self.assertEqual(len(created), 1, self.logs.getvalue())
+            self.assertTrue(created[0].closed)
+            self.assertEqual(self.connector.sessions, {})
 
     def test_refus_de_la_porte(self):
         self.start()
