@@ -134,7 +134,7 @@ class AlertsCacheTest(unittest.TestCase):
         cache = {'123': {'ok': False, 'key': 'signature', 'at': 1000}}
         self.assertIs(self.run_cli({'gates': cache}), cache)
 
-    def test_missing_or_unreadable_cache_keeps_the_complete_read(self):
+    def test_missing_or_unreadable_cache_does_not_hide_alerts(self):
         for state in (None, {}, {'gates': []}):
             with self.subTest(state=state):
                 self.assertEqual(self.run_cli(state), {'fixture': {'ok': True}})

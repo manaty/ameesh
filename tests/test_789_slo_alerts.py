@@ -437,9 +437,11 @@ class ReviewGateRepositoryTest(_Base):
         self.assertIsNotNone(gate, "le dépôt du gel doit être retrouvé")
         self.assertFalse(gate["ok"])
         self.assertEqual(gate["required"], 2)
+        cache = {}
         self.assertFalse(exploitation._review_gate_open(
-            self.cfg, self.db, row, marks, {"verdict_required": True}))
-        self.assertEqual(self.slo(), [])
+            self.cfg, self.db, row, marks, {"verdict_required": True},
+            gate_cache=cache))
+        self.assertEqual(self.slo(gate_cache=cache), [])
 
     def test_main_local_en_retard_ne_rajoute_pas_un_avis(self):
         """Un changement SQL déjà sur origin/main n'appartient plus au lot."""
@@ -1421,19 +1423,21 @@ class AttentePorteurTest(_Base):
 
     def test_premier_avis_ne_fait_pas_le_go(self):
         self.qa(verdict_s=50 * 60)
-        klass = {"class": "sensitive", "doubt": False, "frozen_sha": "a" * 40,
-                 "repo": None}
-        with mock.patch("ameesh.lot_class.of_lot", return_value=klass), \
-                mock.patch("ameesh.merge_queue.review_gate",
-                           return_value={"ok": False, "required": 2, "accepted": [1]}):
+        with mock.patch("ameesh.merge_queue.review_gate_for_item",
+                        return_value={"ok": False, "cached": True}) as gate:
             self.assertEqual(self.slo(), [])
-        with mock.patch("ameesh.lot_class.of_lot", return_value=klass), \
-                mock.patch("ameesh.merge_queue.review_gate",
-                           return_value={"ok": True, "required": 2,
-                                         "accepted": [1, 2]}):
+            self.assertTrue(gate.call_args.kwargs["cache_only"])
+        with mock.patch("ameesh.merge_queue.review_gate_for_item",
+                        return_value={"ok": True, "cached": True}):
             alerts = self.slo()
         self.assertEqual([(a["step"], a["targets"]) for a in alerts],
                          [("verdict_merge", ["pilot"])])
+
+    def test_gate_unknown_keeps_alert_without_recomputing_authors(self):
+        self.qa(verdict_s=50 * 60)
+        with mock.patch("ameesh.merge_queue.review_gate") as full_gate:
+            self.assertEqual(len(self.slo()), 1)
+            full_gate.assert_not_called()
 
     def test_classe_douteuse_ne_tait_pas_l_alerte(self):
         self.qa(verdict_s=50 * 60)

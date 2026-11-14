@@ -1829,6 +1829,7 @@ def _gate_cache_store(cache, lot, signature, ok, now: float) -> None:
 
 def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
                          overview=None, gate_cache=None,
+                         cache_only: bool = False,
                          now: float | None = None) -> dict | None:
     """La porte des avis du dernier gel d'un lot, lue comme la composition du
     paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
@@ -1845,12 +1846,27 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
     Seule `exploitation._slo_breaches` passe un cache : le feu, la file et le
     paquet l'appellent sans, donc une fusion ne lit jamais un verdict mémorisé.
 
+    `cache_only` (#7350) : une observation SLO ne reconstruit pas une porte.
+    Sans résultat frais de même signature, rend None. Aucun chemin de fusion
+    ne passe cette option ; l'inconnu conserve l'alerte, jamais un GO.
+
     Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
     introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
     jamais lire None comme une porte ouverte. Lecture seule."""
     from . import lot_class
 
     now = time.time() if now is None else float(now)
+    lot = int((item or {}).get("id") or 0)
+    entry = gate_cache.get(str(lot)) if isinstance(gate_cache, dict) else None
+    fresh = False
+    if isinstance(entry, dict) and isinstance(entry.get("ok"), bool):
+        try:
+            age = now - float(entry.get("at"))
+            fresh = 0.0 <= age <= GATE_CACHE_TTL_S
+        except (TypeError, ValueError):
+            pass
+    if cache_only and not fresh:
+        return None
     freeze = plan_git.latest_freeze(marks or ())
     frozen = str((freeze or {}).get("sha") or "").strip()
     repo, resolved = (lot_class.repo_for_freeze(db, cfg, item, frozen,
@@ -1868,20 +1884,13 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
         base_sha = plan_git._commit(repo, base) if base else None
     except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
         return None
-    lot = int((item or {}).get("id") or 0)
     signature = _gate_cache_signature(cfg, item, marks, repo, frozen, target,
                                       base, base_sha, klass) \
         if gate_cache is not None else None
-    if gate_cache is not None:
-        entry = gate_cache.get(str(lot))
-        if isinstance(entry, dict) and isinstance(entry.get("ok"), bool) \
-                and entry.get("key") == signature:
-            try:
-                age = now - float(entry.get("at"))
-            except (TypeError, ValueError):
-                age = None
-            if age is not None and 0.0 <= age <= GATE_CACHE_TTL_S:
-                return {"ok": bool(entry.get("ok")), "cached": True}
+    if fresh and entry.get("key") == signature:
+        return {"ok": bool(entry.get("ok")), "cached": True}
+    if cache_only:
+        return None
     # #4469 : sous une échéance de balayage (passe d'alertes), une lecture
     # dont un balayage a été refusé ne conclut pas : None, et rien en cache.
     from . import review_authors
