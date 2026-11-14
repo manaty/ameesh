@@ -2689,6 +2689,43 @@ class WorkItems(Domain):
         """Lots, du plus récemment modifié au plus ancien ; None sans limite."""
 
     @abc.abstractmethod
+    def activity(self, assignees: Sequence[str], *, limit: int = 1000) -> dict[str, dict]:
+        """L'activité des lots de plusieurs assignés, en une lecture bornée.
+
+        Rend, par assigné : ``latest_updated_ts`` (le plus récent
+        ``updated_at`` en epoch, ou None) et ``open`` (les lots non terminaux —
+        même prédicat que ``work_lifecycle.COMPLETED`` sur ``state`` — réduits
+        aux seuls champs utiles : ``id``, ``state``, ``assignee``,
+        ``planned_start``, ``wake_ts``, ``updated_ts``), ou None quand
+        ``limit`` lots ont été lus : une liste peut alors être tronquée, et une
+        lecture partielle ne prouve jamais qu'un hôte est au repos.
+        ``planned_start`` vaut None, comme ``items`` ne projette pas cette
+        colonne : l'appelant lit la même valeur qu'avant la réduction.
+
+        Un assigné sans lot a une entrée à zéro (``open`` vide, pas None).
+        Le corps par défaut lit ``items`` une fois par assigné (même résultat,
+        un aller-retour par agent) ; le pilote PostgreSQL l'agrège en une
+        requête pour tous les agents (#7327), sans charger leur historique.
+
+        Lecture pure, sans verrou. Destination : les vues d'occupation des
+        hôtes (``host_idle.snapshot``), jamais une décision d'écriture."""
+        out = {}
+        for name in dict.fromkeys(str(name) for name in assignees if name):
+            rows = self.items(state=None, assignee=name, limit=limit)
+            out[name] = {
+                "latest_updated_ts": max(
+                    (float(row["updated_ts"]) for row in rows
+                     if row.get("updated_ts") is not None), default=None),
+                "open": (None if len(rows) >= limit else [
+                    {key: row.get(key) for key in
+                     ("id", "state", "assignee", "planned_start", "wake_ts",
+                      "updated_ts")}
+                    for row in rows
+                    if row.get("state") not in lifecycle.COMPLETED]),
+            }
+        return out
+
+    @abc.abstractmethod
     def items_missing_ref(self, *, states: Sequence[str], ref_prefix: str,
                           limit: int, attempt_prefix: str = "",
                           retry_s: float = 0, terminal_prefix: str = "",

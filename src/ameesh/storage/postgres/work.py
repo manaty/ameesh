@@ -1036,6 +1036,55 @@ class WorkItems(interface.WorkItems):
         params.append(None if limit is None else int(limit))
         return self.db.query(sql, tuple(params))
 
+    def activity(self, assignees, *, limit=1000) -> dict[str, dict]:
+        """#7327 : l'activité des lots de tous ces agents en une requête.
+
+        Même résultat que la lecture par agent (`items`), mais un seul
+        aller-retour et sans charger l'historique : par assigné, le plus récent
+        `updated_at` et la projection minimale des lots non terminaux (voir
+        `interface.WorkItems.activity`). `open` vaut None quand `limit` lots
+        ont été lus : la liste serait tronquée.
+
+        Comme `items`, cette lecture exige le schéma courant (colonnes
+        `wake_at`/`legacy_state`) et n'utilise que des colonnes directes, sans
+        `to_jsonb(work_items)` : le corps du lot n'est jamais lu.
+        """
+        names = sorted({str(name) for name in assignees if name})
+        if not names:
+            return {}
+        limit = int(limit)
+        done = tuple(sorted(lifecycle.COMPLETED))
+        rows = self.db.query(
+            "SELECT assignee,"
+            " extract(epoch from max(updated_at))::float8 AS latest_updated_ts,"
+            " CASE WHEN count(*) < %d THEN coalesce(jsonb_agg("
+            "   jsonb_build_object("
+            "     'id', id, 'state', state, 'assignee', assignee,"
+            # `items` ne projette pas planned_start : la réduction doit porter
+            # la même valeur (None), sinon held_actions changerait de résultat.
+            "     'planned_start', NULL,"
+            "     'wake_ts', extract(epoch from wake_at)::float8,"
+            "     'updated_ts', extract(epoch from updated_at)::float8)"
+            "   ORDER BY updated_at DESC, id DESC) FILTER (WHERE state NOT IN (%s)), '[]'::jsonb)"
+            " END AS open"
+            " FROM work_items WHERE assignee = ANY(%%s::text[])"
+            " GROUP BY assignee"
+            % (limit, ", ".join(["%s"] * len(done))),
+            (*done, names))
+        found = {row["assignee"]: row for row in rows}
+        out = {}
+        for name in names:
+            row = found.get(name)
+            if row is None:
+                out[name] = {"latest_updated_ts": None, "open": []}
+                continue
+            latest = row["latest_updated_ts"]
+            out[name] = {
+                "latest_updated_ts": None if latest is None else float(latest),
+                "open": list(row["open"]) if row["open"] is not None else None,
+            }
+        return out
+
     def items_missing_ref(self, *, states, ref_prefix, limit,
                           attempt_prefix="", retry_s=0, terminal_prefix="",
                           max_attempts=0, since=None) -> list[dict]:
