@@ -567,7 +567,9 @@ class WorkerTest(Base):
         from types import SimpleNamespace
         from ameesh.runner import Runner
         move = self.plan()
-        adapter = SimpleNamespace(binary="/bin/sh", spec=SimpleNamespace(attach=["x"]))
+        adapter = SimpleNamespace(
+            binary="/bin/sh", spec=SimpleNamespace(attach=["x"]),
+            descriptor=SimpleNamespace(resident={"protocol": "x"}))
         runner = SimpleNamespace(cfg=self.cfg, db=self.db, host="target",
                                  agents_filter=["avatar"])
         self.db.execute("UPDATE conversation_moves SET source_cwd = %s", (self.tmp,))

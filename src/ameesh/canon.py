@@ -5401,7 +5401,10 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     # ceux des descripteurs connus (paquet + dossier de l'hôte). Un `harness`
     # inconnu est une ERREUR : l'agent ne serait réclamable nulle part, et le
     # silence ferait croire à un harnais supporté.
-    known_harnesses = set(harnesses.known_ids())
+    # #7051 (avatar A3) : un seul balayage des descripteurs pour la liste des
+    # harnais connus et la qualification d'avatar (`avatar-harness-unsupported`).
+    known_descriptors = harnesses.scan()[0]
+    known_harnesses = set(known_descriptors)
     known = None if known_projects is None else (
         set(known_projects) | {p.team for p in canon.packages if p.team})
     # #4803 : les projets que le canon déclare lui-même. `relit` ne peut nommer
@@ -5469,6 +5472,26 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 "`harness` %r of %s is absent from `harnesses` (%s)"
                 % (agent.harness, agent.title, ", ".join(agent.harnesses)),
                 f, agent=agent.title)
+        if "avatar" in (agent.fiche.data or {}):
+            # #7051 (avatar A3, design 5322 §1.1) : un avatar est attaché par
+            # un humain (mode interactif) ET piloté par l'exécuteur entre deux
+            # attaches (mode résident). Un harnais qui n'a pas les deux ne peut
+            # pas porter d'avatar : `avatar-harness-unsupported`. Le mode
+            # résident est vérifié ici, pas seulement l'interactif du
+            # déplacement (DeepSeek a l'ACP mais pas d'interactif ; un harnais
+            # ACP sans `ameesh.interactive` est refusé de même).
+            declared = list(dict.fromkeys(
+                ([agent.harness] if agent.harness else []) + list(agent.harnesses or [])))
+            for name in declared:
+                descriptor = known_descriptors.get(name)
+                if descriptor is None:
+                    continue  # `agent-harness-unknown` le dit déjà
+                problems = harnesses.avatar_problems(descriptor)
+                if problems:
+                    add("avatar-harness-unsupported", ERROR,
+                        "avatar %s: harness %s cannot back an avatar: %s"
+                        % (agent.title, name, "; ".join(problems)),
+                        f, agent=agent.title)
         # L243 (#435): one truth per card — `team`, when kept beside
         # `projects`, is its first project
         if agent.projects is not None:

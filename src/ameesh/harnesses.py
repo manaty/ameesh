@@ -1475,6 +1475,27 @@ def known_ids(host: str | None = None) -> list[str]:
     return sorted(scan(host=host)[0])
 
 
+def avatar_problems(descriptor: HarnessDescriptor) -> list[str]:
+    """#7051 (avatar A3, design 5322 §1.1): why this harness cannot back an avatar.
+
+    An avatar is attached by a human (`ameesh attach`, `ameesh chat`) and is
+    driven by the executor between those attaches: the harness must therefore
+    declare **both** an interactive command (`ameesh.interactive`; the empty
+    list is a legitimate command, `null` is the refusal) and a resident mode
+    (`ameesh.resident`, non-empty). Claude and Codex declare both; DeepSeek
+    declares the resident ACP mode but no interactive one, and an ACP harness
+    without `ameesh.interactive` is refused the same way — this is a
+    qualification of the descriptor, not a promise about a binary installed
+    on this host.
+    """
+    problems = []
+    if not descriptor.attach:
+        problems.append("no interactive session (`ameesh.interactive` is null)")
+    if not descriptor.resident:
+        problems.append("no resident mode (`ameesh.resident` is absent)")
+    return problems
+
+
 def paid_per_token(host: str | None = None) -> tuple[str, ...]:
     """Les harnais dont le descripteur déclare l'usage payé au jeton (0019 §2)."""
     return tuple(sorted(i for i, d in scan(host=host)[0].items() if d.paid_per_token))
