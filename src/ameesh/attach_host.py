@@ -83,6 +83,9 @@ class AttachRequest:
     xpix: int = 0
     ypix: int = 0
     term: str = ""
+    #: #7121 : le poste demande l'attente de fin de tour (`--wait`) avant le
+    #: bail ; sans ce drapeau, un tour en cours refuse l'attach.
+    wait: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -416,6 +419,17 @@ class HostSession:
         if request.term:
             env["TERM"] = request.term
         env.setdefault("AMEESH_ATTACH_REMOTE", "1")
+        # #7121 (D3) : le wrapper hôte reçoit l'identité VÉRIFIÉE du grant
+        # (jamais le reçu, le nonce ou la signature) ; il ne fait confiance
+        # qu'à ces champs pour le bail, l'humain du journal et l'attente.
+        env["AMEESH_ATTACH_HUMAN"] = result.human
+        env["AMEESH_ATTACH_TENANT"] = request.tenant
+        env["AMEESH_ATTACH_DEVICE"] = request.device_key
+        env["AMEESH_ATTACH_ID"] = request.attach_id
+        if request.wait:
+            env["AMEESH_ATTACH_WAIT"] = "1"
+        else:
+            env.pop("AMEESH_ATTACH_WAIT", None)
         try:
             pty = attach_pty.PtyProcess(argv, env=env, cwd=self.connector.config.cwd,
                                         rows=request.rows, cols=request.cols)
@@ -471,6 +485,9 @@ class HostSession:
                              % len(transcript_hash))
         if not self.channel.ready:
             raise ValueError("transcript_hash: the channel is not established")
+        wait = data.get("wait", False)
+        if not isinstance(wait, bool):
+            raise ValueError("wait: boolean expected")
         if not hmac.compare_digest(transcript_hash, self.channel.transcript_hash):
             raise ValueError("transcript_hash: differs from this session")
         device_key = data.get("device_key")
@@ -490,7 +507,8 @@ class HostSession:
                              attach_id=self.attach_id, receipt=parsed.document,
                              device_signature=raw_signature,
                              transcript_hash=transcript_hash, device_key=device_key,
-                             rows=rows, cols=cols, xpix=xpix, ypix=ypix, term=term)
+                             rows=rows, cols=cols, xpix=xpix, ypix=ypix, term=term,
+                             wait=wait)
 
     def _refuse(self, code: str, reason: str) -> None:
         self.refusal = code or "refused"

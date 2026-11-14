@@ -27,6 +27,10 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   agent.updated        another change of status, lease, mode or stop reason
   agent.moved          a manual move of a `releve: hote` agent to another
                        admitted host (#3299, written with the move)
+  agent.attach         a distant attach accepted or refused, with its lease
+                       identity, host, tenant, device, grant human and
+                       `attach_id` — never the receipt, nonce or signature
+                       (#7121, written by the host session)
   agent.retired        an agent taken out of the active registry, and
   agent.restored       brought back (#3460, written with the gesture)
   cost.recorded        a priced turn (turn_costs)
@@ -113,7 +117,7 @@ from . import storage
 CHANNEL = "ameesh_events"
 TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
          "turn.context", "agent.updated",
-         "agent.moved",
+         "agent.moved", "agent.attach",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
          "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request", "git.lock_removed",

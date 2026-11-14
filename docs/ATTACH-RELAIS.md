@@ -2,10 +2,10 @@
 
 Transport de l'attach distant : un **service de relais** apparie le poste
 d'un humain et la **connexion sortante** de l'hôte de l'agent, puis relaie
-des trames chiffrées de bout en bout autour d'un PTY. Ce lot livre le
+des trames chiffrées de bout en bout autour d'un PTY. D2 (#7120) livre le
 service, la connexion de l'hôte, le PTY, les trames, l'E2E, les quotas et
-les journaux. Il ne livre pas `ameesh attach` distant : le bail, l'attente
-de tour, la reprise et le journal A0 restent à D3 (#7121).
+les journaux ; D3 (#7121) branche la session d'attach elle-même : bail,
+attente de tour, reprise, journal A0, copie enfant et coupure.
 
 Conception : `docs/design/5322-avatar-humain.md` §5.3 et §6 (D2).
 Décision owner : **Q3 #213938, option a**, signée par `human:smichea` le
@@ -160,7 +160,7 @@ ExecStart=/usr/local/bin/ameesh attach-relay host --relay https://relay.interne:
   --host ameesh-agents-1 --token-file %h/.config/ameesh/attach-token \
   --host-key-file %h/.config/ameesh/attach-host-key \
   --ca-file %h/.config/ameesh/tls/ca.pem --agent avatar-alice \
-  --command 'ameesh runner attach --agent avatar-alice'
+  --host-attach
 Restart=on-failure
 RestartSec=2
 
@@ -172,6 +172,44 @@ En cas de coupure du relais, l'hôte retente avec un backoff borné ; les
 sessions en cours échouent proprement (`relay_lost`, PTY fermé) et ne sont
 pas rejouées. Le service s'arrête sur SIGTERM/SIGINT, ferme les sessions et
 libère le port.
+
+## Attach distant : session, bail, journal (D3, #7121)
+
+`--host-attach` remplace la commande statique par le wrapper d'attach de
+l'hôte (`ameesh attach --host-attach <agent>`). Le poste utilise la même
+commande `ameesh attach` que pour un agent local ; le chemin distant est
+choisi dès qu'une option distante est donnée (`--relay`, `--receipt`,
+`--grant`, `--device-key-file`, `--host`) ou que l'agent est épinglé sur un
+autre hôte.
+
+```sh
+# poste : reçu signé déjà écrit, clé d'appareil et clé d'hôte 0600
+ameesh attach avatar-alice --host ameesh-agents-1 \
+  --relay https://relay.interne:8790 --receipt ~/.config/ameesh/attach-receipt.json \
+  --device-key-file ~/.config/ameesh/device.key \
+  --host-key-file ~/.config/ameesh/attach-host.pub
+```
+
+- **Bail** : `attach:<tenant>:<appareil>` (conception §5.4), TTL court de
+  60 s renouvelé tous les 20 s ; une coupure le laisse expirer et le
+  résident reprend la session. Le bail local garde son TTL d'attach.
+- **Attente de tour** : `REQ` porte `wait` (option `--wait`) ; sans elle un
+  tour en cours est refusé (`turn_running`), avec elle l'hôte attend la fin
+  du tour, bornée par `--max`. Un tour en cours n'est jamais interrompu.
+- **Journal** : l'hôte imprime la dernière page du journal (A1) dans le PTY
+  avant le harnais ; les échanges de la session sont écrits par les hooks A0
+  (`UserPromptSubmit`/`Stop`) sous `AMEESH_ATTACH=1`, avec l'humain **vérifié
+  du grant** comme auteur (`AMEESH_ATTACH_HUMAN`), jamais un nom fourni par
+  le poste.
+- **Copie enfant** : si l'agent attaché est un enfant, chaque message humain
+  est recopié au journal du parent (design §4.2), seulement si parent et
+  enfant partagent le même `responsible`, avec `meta={child, copied_from}`.
+- **Coupure** : le wrapper installe SIGTERM/SIGHUP/SIGINT, arrête le groupe
+  du harnais et rend le bail dans `finally` ; l'événement `agent.attach`
+  (accepté ou refusé) ne porte ni reçu, ni nonce, ni signature.
+- **Refus nommés** : grant absent/expiré/rejoué, autre humain, appareil
+  différent, tour en cours sans `--wait`, agent inconnu — chacun journalisé,
+  code stable côté poste.
 
 ## Tests
 

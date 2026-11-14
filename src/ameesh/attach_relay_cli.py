@@ -4,7 +4,7 @@
   ameesh attach-relay serve --hosts-file F [--listen H:PORT] [--mesh-cidr C]…
        [--tls-cert F --tls-key F] [--plaintext-loopback] [quotas]
   ameesh attach-relay host --relay URL --host H --token-file F
-       --host-key-file F --agent A [--tenant T] --command "…" [—] [quotas]
+       --host-key-file F --agent A [--tenant T] (--host-attach | --command "…") [quotas]
 
 `serve` écoute le réseau du mesh (jamais une adresse publique) et apparie
 postes et hôtes, après avoir vérifié la signature du reçu (base + politique
@@ -14,10 +14,10 @@ d'hôte et la clé Ed25519 de l'hôte sont lus dans des fichiers 0600, jamais
 dans l'environnement. TLS est exigé hors boucle locale ; le mode
 `--plaintext-loopback` ne sert qu'aux tests locaux.
 
-Ce n'est pas encore `ameesh attach` distant (D3) : la commande interactive
-de l'hôte est fournie par l'opérateur (`--command`) et la station est le
-client de `attach_transport`. D3 branchera le bail, la session et le
-journal.
+#7121 (D3) : `--host-attach` branche la session d'attach complète —
+`ameesh attach --host-attach` sur l'hôte, bail `attach:<tenant>:<appareil>`,
+attente de tour, journal A0 et reprise. `--command` reste l'ancien mode
+(diagnostic, banc) : l'opérateur fournit lui-même la commande interactive.
 """
 from __future__ import annotations
 
@@ -191,19 +191,32 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def _host_attach_command(request) -> list:
+    """La commande d'une session distante : le wrapper d'attach de l'hôte.
+
+    `sys.executable -m ameesh` plutôt qu'un chemin d'installation : le
+    service tourne dans le même environnement que la CLI. L'agent vient de
+    la trame appariée (déjà liée au grant), jamais d'un texte libre.
+    """
+    return [sys.executable, "-m", "ameesh", "attach", "--host-attach",
+            request.agent]
+
+
 def cmd_host(args) -> int:
-    if not args.command:
-        print("attach-relay host: --command est requis (argv entre guillemets, "
-              "jamais passé à un shell)", file=sys.stderr)
+    if bool(args.command) == bool(args.host_attach):
+        print("attach-relay host: --command et --host-attach sont exclusifs "
+              "(l'un des deux est requis)", file=sys.stderr)
         return 2
-    try:
-        argv = shlex.split(args.command)
-    except ValueError as exc:
-        print("attach-relay host: --command illisible (%s)" % exc, file=sys.stderr)
-        return 2
-    if not argv:
-        print("attach-relay host: --command vide", file=sys.stderr)
-        return 2
+    argv = None
+    if not args.host_attach:
+        try:
+            argv = shlex.split(args.command)
+        except ValueError as exc:
+            print("attach-relay host: --command illisible (%s)" % exc, file=sys.stderr)
+            return 2
+        if not argv:
+            print("attach-relay host: --command vide", file=sys.stderr)
+            return 2
     try:
         relay_host, relay_port, context = attach_host.parse_relay_url(
             args.relay, plaintext_loopback=args.plaintext_loopback,
@@ -231,7 +244,8 @@ def cmd_host(args) -> int:
             relay_host=relay_host, relay_port=relay_port, token=token, host=host,
             tenant=args.tenant or "", agents=tuple(args.agent or ()),
             tls_context=context, plaintext_loopback=args.plaintext_loopback,
-            command=argv, cwd=args.cwd, max_sessions=args.max_sessions,
+            command=(_host_attach_command if args.host_attach else argv),
+            cwd=args.cwd, max_sessions=args.max_sessions,
             max_session_seconds=args.max_session, keepalive=args.keepalive,
             host_signing_key=host_signing_key)
     except attach_host.HostConfigError as exc:
@@ -307,8 +321,12 @@ def main(argv: list[str] | None = None) -> int:
     host.add_argument("--agent", action="append", default=[],
                       help="agent servi (exactement un : la commande statique est liée "
                            "à cet agent)")
-    host.add_argument("--command", required=True,
-                      help="argv interactif de l'hôte (harnais), entre guillemets")
+    host.add_argument("--host-attach", action="store_true",
+                      help="session d'attach complète (#7121) : bail, attente de "
+                           "tour, journal A0, reprise")
+    host.add_argument("--command", default=None,
+                      help="argv interactif de l'hôte (harnais), entre guillemets "
+                           "(mode diagnostic ; exclusif avec --host-attach)")
     host.add_argument("--cwd", default=None)
     host.add_argument("--ca-file", default=None, help="CA du certificat du relais")
     host.add_argument("--insecure-tls", action="store_true",
