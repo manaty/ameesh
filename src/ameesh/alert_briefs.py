@@ -3,6 +3,8 @@
 `ameesh notify` pousse ses alertes à l'humain responsable. Trois d'entre elles
 appellent un geste qu'un agent sait faire : `idle_capacity` (L118),
 `stale_lot` et `plan_underused`. Elles partent aussi, par courrier `event`,
+avec `info` pour capacité et sous-utilisation ordinaires (#7308) : lecture au
+tour suivant, sans réveil supplémentaire,
 
 * aux orchestrateurs (ceux de l'alerte, de l'équipe concernée quand elle est
   connue), qui répartissent le travail ;
@@ -1039,6 +1041,9 @@ def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
     pause budget sur le même compte (11/11 03:32-04:23Z : auditeur,
     mesh-design et orchestrateur se réveillaient l'un l'autre pour une pause
     qu'aucun ne pouvait lever) ; il la lit en `info`, sans l'urgence."""
+    # Les textes routés portent aussi une escalade de secours (#3036).
+    escalated = {name for name, body in names.items()
+                 if "Escalated from level " in body} if isinstance(names, dict) else set()
     names = [name for name in names if not name.startswith("thread:")]
     kind = alert.get("type")
     if kind == "critical_budget_pause":
@@ -1047,6 +1052,18 @@ def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
                 if account and _budget_paused_on(by_name.get(name), account)}
     if alert.get("urgent"):
         return {}
+    # #7308 : les constats sans geste immédiat restent lisibles au tour suivant.
+    waiting = alert.get("waiting") or {}
+    packet_wait = (slo_ordinary_l1(alert)
+                   and alert.get("lot_state") == "validated"
+                   and alert.get("step") == "verdict_merge"
+                   and (waiting.get("what") == "packet"
+                        or (waiting.get("what") == "merge" and not waiting.get("who")))
+                   and not waiting.get("canon")
+                   and not waiting.get("candidate")
+                   and not waiting.get("packet_missed"))
+    if not alert.get("critical") and (kind in ("idle_capacity", "plan_underused") or packet_wait):
+        return {name: {"info": True} for name in names if name not in escalated}
     if kind in ("operator_pause_long", "operator_pause_host") and automatic_sleep(alert):
         return {name: {"info": True} for name in names}
     if kind != "slo_breach" or len(names) < 2:

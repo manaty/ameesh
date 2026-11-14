@@ -2905,6 +2905,15 @@ class Watcher:
         # urgente) : passif, le dernier verdict réveille.
         if _same_lot(row, pending) and (status == "success" or row.get("urgent_message_id")):
             payload["info"] = True
+        # #7308 : un paquet armé poursuit sa fusion sans geste du pilote.
+        # Sans publication prouvée, le verdict reste actionnable. Le veilleur
+        # de paquets signale séparément une fusion qui reste bloquée.
+        if status == "success" and lot:
+            from . import packet_automerge
+            if packet_automerge.carrier(lot.get("branch")):
+                published = packet_automerge.publication(db, int(lot["id"]), row["head_sha"])
+                if published.get("armed") and published.get("requested"):
+                    payload["info"] = True
         # #795 N2 : le courrier du verdict et `verdict_message_id` restent
         # publiés dans la même transaction (un relevé intercalé ne voit jamais
         # l'un sans l'autre).

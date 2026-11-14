@@ -530,14 +530,14 @@ def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
             if not dry_run:
                 checked[name] = now
             results += _auto_merge(cfg, db, name, watch.app or name, gh=gh, dry_run=dry_run,
-                                   checkout=watch.repo)
+                                   checkout=watch.repo, watch=watch, state=state, now=now)
     if not dry_run:
         save_state(cfg, state)
     return results
 
 
 def _auto_merge(cfg, db, name: str, app: str, *, gh, dry_run: bool,
-                checkout: str = "") -> list[dict]:
+                checkout: str = "", watch=None, state=None, now=None) -> list[dict]:
     """#2813 : les fusions, désarmements et erreurs des porteurs publiés de `app`."""
     from . import packet_automerge
     try:
@@ -553,4 +553,89 @@ def _auto_merge(cfg, db, name: str, app: str, *, gh, dry_run: bool,
                         "error": "auto-merge of #%d: %s" % (row["lot"], row.get("error"))})
         elif row["result"] in ("disarmed", "would-disarm", "merged", "would-merge"):
             out.append(dict(row, project=name, result="auto-merge-" + row["result"]))
+    pending = [row["lot"] for row in rows if row["result"] == "pending"]
+    if db is not None and pending and watch is not None:
+        try:
+            out += held_after_green(db, watch, state, now=now, dry_run=dry_run,
+                                    gh=gh, lots=pending)
+        except Exception as exc:  # le rappel ne bloque pas les autres projets
+            out.append({"project": name, "result": "error",
+                        "error": "held-after-green: %s" % exc})
+    return out
+
+
+def held_after_green(db, watch: ProjectWatch, state: dict, *, now: float,
+                     dry_run: bool = False, gh=None, lots=()) -> list[dict]:
+    """#7308 : un réveil par tête armée bloquée après les premiers verts.
+
+    Le délai est la grâce configurée du veilleur. Une suite encore en file
+    ne produit pas de verdict : le premier vert terminé donne la borne.
+    Aucun changement de porte ; échec d'envoi = nouvel essai.
+    """
+    from . import packet_automerge
+    notified = state.setdefault("held_after_green", {})
+    out = []
+    for lot in lots:
+        marks = packet_automerge.marks(db, lot)
+        armed = packet_automerge.active(marks)
+        if not armed:
+            continue
+        key = "%s:%s:%s" % (watch.name, lot, armed["sha"])
+        if set(watch.notify).issubset(notified.get(key, ())):
+            continue
+        held = [m for m in marks if m["id"] > armed["id"]
+                and m["state"] == "held" and m["sha"] == armed["sha"]]
+        if not held:
+            continue
+        runs = [r for r in storage.of(db).ci.for_lot(lot, 50)
+                if r.get("head_sha") == armed["sha"]]
+        # Le dernier attempt de chaque workflow fait foi ; un rouge a déjà
+        # son courrier actionnable et n'appelle pas ce rappel de vert.
+        latest = {}
+        for run in sorted(runs, key=lambda r: (r.get("run_id") or 0,
+                                              r.get("run_attempt") or 1), reverse=True):
+            latest.setdefault(run.get("workflow") or "", run)
+        if any(r.get("status") == "failure" for r in latest.values()):
+            continue
+        green = [float(r["concluded_ts"]) for r in latest.values()
+                 if r.get("status") == "success" and r.get("concluded_ts") is not None]
+        if not green or any(r.get("status") == "running" for r in latest.values()):
+            # Un job sans runner peut laisser le run global en cours après
+            # la fin des autres jobs : aucun verdict global ne viendra alors.
+            # Relire les checks, sans changer la porte de fusion.
+            from . import land, radar
+            view = packet_automerge.pr_status(armed["repo"], armed["pr"],
+                                               gh=gh or land._gh)
+            if view.get("state") != "OPEN" or view.get("head") != armed["sha"]:
+                continue
+            checks = radar.latest_rollup(view.get("rollup") or ())
+            if not checks or not any(radar.check_result(c) == radar.CI_GREEN_RESULT
+                                     for c in checks):
+                continue
+            if any(radar.check_result(c) == radar.CI_NEGATIVE_RESULT
+                   or (radar.check_result(c) == radar.CI_WAITING_RESULT
+                       and str(c.get("status") or "").upper() != "QUEUED")
+                   for c in checks):
+                state.setdefault("held_green_observed", {}).pop(key, None)
+                continue
+            # Sans timestamp de fin exploitable, l'observation persistée est
+            # une borne conservatrice ; un job repris réinitialise ce délai.
+            observed = state.setdefault("held_green_observed", {})
+            green = [float(observed.setdefault(key, now))]
+        if now - max(green) < watch.grace_s:
+            continue
+        text = ("Paquet #%d : auto-merge held %.0f min après la fin des jobs verts "
+                "sur %s. Motif : %s. Lire la porte du paquet et traiter le blocage."
+                % (lot, (now - max(green)) / 60, armed["sha"][:12], held[-1]["why"]))
+        sent = list(notified.get(key, ()))
+        for recipient in watch.notify:
+            if recipient in sent:
+                continue
+            if not dry_run:
+                mail.send(db, work.SYSTEM_SENDER, recipient, text, kind="event",
+                          payload={"packet_merge_held": {"lot": lot, "sha": armed["sha"]}})
+                sent.append(recipient)
+                notified[key] = sent
+        out.append({"project": watch.name, "lot": lot, "result": "auto-merge-held",
+                    "body": text})
     return out
