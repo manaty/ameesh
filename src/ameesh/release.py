@@ -589,6 +589,16 @@ def _release_tick(cfg, args, declared) -> int:
                         print("staging-needed %s: %s" % (name, exc), file=sys.stderr)
                         report["staging_pending"] = {"result": "unreadable", "error": str(exc)}
                         status = 1
+                    # #7365 : un serveur reporté à chaque coupure est un
+                    # retard de version, pas un état ; la garde le déclare au
+                    # pilote et au bureau une fois par release.
+                    from . import staging_deferred
+                    try:
+                        report["staging_deferred"] = staging_deferred.tick(cfg, db, project)
+                    except Exception as exc:
+                        print("staging-deferred %s: %s" % (name, exc), file=sys.stderr)
+                        report["staging_deferred"] = {"result": "unreadable", "error": str(exc)}
+                        status = 1
             except release_cutoff.TransientReleaseError as exc:
                 print("%s: %s" % (name, exc), file=sys.stderr)
                 # #6014: a transient failure is still a cutoff not done; say

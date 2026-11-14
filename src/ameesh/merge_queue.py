@@ -686,7 +686,7 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     if unknown:
         # #3835 : nommer le gel antérieur et le lot qui portent l'inconnu, et
         # ne proposer `--supersedes` que pour un gel prouvé hors de toute ref.
-        raise ValueError(review_authors.unknown_refusal(unknown, head_sha=frozen))
+        raise ValueError(review_authors.unknown_refusal(unknown, head_sha=frozen, repo=repo))
     return authors, correctors
 
 
@@ -2385,7 +2385,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                     # SHA et son lot, et propose `--supersedes` quand il est
                     # prouvé hors de toute ref.
                     raise _ProvenanceError(
-                        review_authors.unknown_refusal([sha], head_sha=frozen))
+                        review_authors.unknown_refusal([sha], head_sha=frozen, repo=repo))
                 raise _ProvenanceError(
                     "historical author unreadable for the unknown %s" % sha)
             add(fallback)

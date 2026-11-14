@@ -2880,6 +2880,17 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
         for row in staging.get("summary") or []:
             lines.append("  - %s: %s %s%s" % (row["host"], row["step"], row["verdict"],
                                              " (retour effectué)" if row["rollback"] else ""))
+        # #7365 : un hôte reporté n'est pas un hôte déployé. Le rapport le
+        # nomme, avec sa raison et le tag manqué, pour que le geste de
+        # rattrapage soit déclaré à chaque coupure ; le poste, lui, se met à
+        # jour à son retour (droit root §10 pour un serveur sans accès root).
+        reportes = (staging.get("attestation") or {}).get("reportes") or {}
+        for host, detail in sorted(reportes.items()):
+            raison = " ".join(str((detail or {}).get("raison") or "absent").split())
+            suite = ("mise à jour à son retour" if host == STAGING_POSTE
+                     else "rattrapage requis, jamais en dessous (§14)")
+            lines.append("  - %s: REPORTÉ (%s) — non déployé au tag %s ; %s"
+                         % (host, raison, tag, suite))
         if staging.get("error"):
             lines.append("  erreur: %s" % staging["error"])
         if staging.get("attestation"):
