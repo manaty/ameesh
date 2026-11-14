@@ -141,6 +141,8 @@ class _Sweep:
         self.label = str(label or "")
         self.tripped = ""              # première étape refusée à l'échéance
         self.trips = 0                 # #4469 : refus comptés, lus par lecture
+        self.readers = {}
+        self.reader_stack = contextlib.ExitStack()
 
     def check(self, step: str) -> None:
         if self.deadline.expired():
@@ -168,6 +170,7 @@ def sweep_deadline(budget: float, label: str = ""):
         yield sweep
     finally:
         _SWEEP.reset(token)
+        sweep.reader_stack.close()
 
 
 def active_sweep():
@@ -1045,6 +1048,40 @@ def _read_bound(limit=None):
 @contextlib.contextmanager
 def _local_object_repo(repo):
     """Read shared objects from a repository with no promisor or remote."""
+    sweep = active_sweep()
+    if sweep is None:
+        with _new_local_object_repo(repo) as reader:
+            yield reader
+        return
+    # #7350: keep the isolated repository alive for this sweep. Recreating
+    # it on every read also invalidated canon's immutable-content cache.
+    # Repository replacement and changed info/attributes still get a new
+    # reader; failed initialization is never retained.
+    identity = canon._repository_identity(repo)
+    key = (os.path.realpath(repo), identity)
+    entry = sweep.readers.get(key) if identity is not None else None
+    if entry is not None:
+        reader, attributes, content = entry
+        if _reader_attributes(attributes) == content:
+            yield reader
+            return
+    scope = _new_local_object_repo(repo, metadata=True)
+    reader, attributes, content = sweep.reader_stack.enter_context(scope)
+    if identity is not None:
+        sweep.readers[key] = (reader, attributes, content)
+    yield reader
+
+
+def _reader_attributes(path):
+    try:
+        with open(path, "rb") as source:
+            return source.read()
+    except FileNotFoundError:
+        return None
+
+
+@contextlib.contextmanager
+def _new_local_object_repo(repo, *, metadata=False):
     objects = _read_out(repo, "rev-parse", "--git-path", "objects")
     if not objects:
         raise plan_git.MergeProbeError("local object directory unreadable")
@@ -1059,17 +1096,19 @@ def _local_object_repo(repo):
         # Preserve the reader's info/attributes semantics (grep_cache keys
         # include them), while leaving all remote/promisor configuration out.
         attributes = _read_out(repo, "rev-parse", "--git-path", "info/attributes")
+        content = None
         if attributes:
-            try:
-                with open(os.path.join(repo, attributes), "rb") as source:
-                    content = source.read()
-            except FileNotFoundError:
-                pass
-            else:
+            attributes = os.path.join(repo, attributes)
+            content = _reader_attributes(attributes)
+            if content is not None:
                 with open(os.path.join(gitdir, "info", "attributes"), "wb") as target:
                     target.write(content)
-        yield gitdir, {**plan_git.NO_LAZY_FETCH, "GIT_DIR": gitdir,
-                       "GIT_OBJECT_DIRECTORY": objects}
+        reader = (gitdir, {**plan_git.NO_LAZY_FETCH, "GIT_DIR": gitdir,
+                          "GIT_OBJECT_DIRECTORY": objects})
+        # An unreadable attribute path must not become a reusable snapshot.
+        if metadata and not attributes:
+            raise plan_git.MergeProbeError("local attributes path unreadable")
+        yield (reader, attributes, content) if metadata else reader
 
 
 def _read_git(repo, *args, **kwargs):
