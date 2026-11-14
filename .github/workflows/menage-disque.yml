@@ -18,12 +18,24 @@
 # runners d'une VM partagent le démon docker, le verrou du script évite deux
 # élagueurs simultanés sur le même hôte. `workflow_dispatch` : la même passe
 # à la main quand un disque approche du seuil.
+#
+# #7380 — le même passage vérifie le cache pip de l'hôte
+# (`scripts/ci-pip-cache.py`) et supprime les roues illisibles : le cache
+# partagé `/home/runner/.cache/pip` d'avant le correctif `PIP_CACHE_DIR` peut
+# garder une entrée corrompue qu'aucun job ne doit plus lire. L'entrée
+# `pip-cache` du dispatch lance cette seule vérification, sans le ménage
+# docker (qui retirerait `postgres:17` en pleine journée).
 name: menage disque runners
 
 on:
   schedule:
     - cron: "23 5 * * *"
   workflow_dispatch:
+    inputs:
+      pip-cache:
+        description: "cache pip seul (#7380) : diagnostic et purge, sans ménage docker"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -43,12 +55,20 @@ jobs:
         slot: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: cache pip des runners (#7380)
+        continue-on-error: true
+        run: |
+          python3 scripts/ci-pip-cache.py diagnostic
+          python3 scripts/ci-pip-cache.py purge
       - name: rapport complet avant ménage (#5325)
+        if: ${{ !inputs.pip-cache }}
         continue-on-error: true
         run: python3 scripts/ci-disque.py rapport --complet
       - name: ménage dédié (#5325)
+        if: ${{ !inputs.pip-cache }}
         continue-on-error: true
         run: python3 scripts/ci-disque.py menage --images-inutilisees
       - name: rapport après ménage (#5325)
+        if: ${{ !inputs.pip-cache }}
         continue-on-error: true
         run: python3 scripts/ci-disque.py rapport
