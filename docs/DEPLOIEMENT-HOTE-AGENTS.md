@@ -992,7 +992,13 @@ compte qui détient les accès de déploiement, avec une configuration privée
   "start_timeout_s": 300,
   "return_timeout_s": 1800,
   "service_timeout_s": 41400,
-  "quiescence_probe": ["/chemin/du/clone-dedie/deploy/mise-a-jour/quiescence-staging.sh"]
+  "quiescence_probe": ["/chemin/du/clone-dedie/deploy/mise-a-jour/quiescence-staging.sh"],
+  "venv_update": {
+    "venv": "/chemin/du/compte/.local/share/ameesh/venv",
+    "package": "/chemin/du/paquet-operateur-scelle",
+    "work": "/chemin/du/compte/staging/venv-auto",
+    "python": "/usr/bin/python3"
+  }
 }
 ```
 
@@ -1050,7 +1056,12 @@ geste du 13/11 01:1xZ, qui a laissé l'épingle sur `venv-97285a0`).
 
 **Mise à jour du venv par l'exécutant (#7164).** Sans elle, un correctif de
 l'exécutant (#7053) restait sans effet : rien ne déclenchait ni ne signalait
-le geste. Le bloc facultatif `venv_update` de sa configuration l'active :
+le geste. Le bloc `venv_update` de `~/.config/ameesh/staging-executor.json` est
+nécessaire pour activer cette mise à jour automatique, notamment sous un
+compte dédié. Lors de l’installation sur chaque candidat, renseigner les
+chemins absolus du venv de ce compte, de son paquet opérateur scellé et du
+dossier de travail ; vérifier que le paquet est présent et lisible par ce
+compte avant d’activer la minuterie :
 
 ```json
 "venv_update": {
@@ -1060,6 +1071,15 @@ le geste. Le bloc facultatif `venv_update` de sa configuration l'active :
   "python": "/usr/bin/python3"
 }
 ```
+
+Sans ce bloc, la configuration est acceptée, mais chaque passe rend
+`venv_refresh.state = unconfigured` : elle ne met pas le venv à jour. Sous
+un compte dédié, `vm.sh` ne le met pas à jour non plus. Dès que la version
+vivante reste en retard, l’alerte `staging_executor_stale` reste levée tant
+que le venv n’a pas rejoint la version attendue. Ajouter le bloc ne lance
+pas une mise à jour immédiate : celle-ci suit la prochaine passe
+`completed`. `bascule.py` réépingle les entrées `expected_sha256` existantes,
+mais ne crée jamais `venv_update` et ne devine pas le paquet opérateur.
 
 `package` est le paquet opérateur scellé de la dernière pose manuelle
 (`requirements-staging.lock` et `wheelhouse/`) ; `work` est un dossier du

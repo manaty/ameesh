@@ -11,8 +11,10 @@ attempt is a row of `conversation_moves`; this module drives it:
   finishes its turn in progress and opens no new one (`begin_turn` answers
   `conversation_move`); queued input stays queued;
 - **prepare** (`advance`, on the target host): harness, account, folder,
-  binary and interactive mode checked by the caller's probes, no model call;
-  a failed check fails the attempt and the source serves again, nothing moved;
+  binary, interactive and resident modes checked by the caller's probes
+  (#7051: the avatar is attached there and stays executor-driven), no model
+  call; a failed check fails the attempt and the source serves again, nothing
+  moved;
 - **switch** (`advance`): at the end of the source turn, the lease is released
   (epoch + 1) and the registry row moves to the target, its session kept —
   `recovered` when the source lease had expired (host gone);
@@ -44,8 +46,10 @@ from .storage.conversation_moves import RecheckRefused
 
 #: the segment, rendered for the harness, in the agent's state directory
 SEGMENT_FILENAME = "conversation-segment.md"
-#: what `prepare` checks on the target; each probe answers True or False
-CHECKS = ("harness", "binary", "account", "folder", "interactive")
+#: what `prepare` checks on the target; each probe answers True or False.
+#: #7051 (avatar A3, design 5322 §2.3): a target harness must also be resident
+#: — the avatar stays executor-driven there between the human's attaches.
+CHECKS = ("harness", "binary", "account", "folder", "interactive", "resident")
 #: `begin_turn` refusal while a move holds the source back
 BEGIN_REFUSAL = "conversation_move"
 REASONS = ("preference", "manual")
@@ -212,10 +216,11 @@ def host_probes(cfg, row: dict | None, *, adapter_for: Callable) -> dict[str, bo
     """The `CHECKS` verdicts of this host for the agent's registry `row`.
 
     No model call and no secret read: the harness descriptor resolves, its
-    binary is executable, it declares an interactive session, and an account
-    is usable (a declared profile without problem, else the harness's default
-    home exists). `adapter_for(harness, harness_bin)` raises when the host
-    cannot run the harness."""
+    binary is executable, it declares an interactive session and a resident
+    mode (#7051: an avatar is attached and stays executor-driven), and an
+    account is usable (a declared profile without problem, else the harness's
+    default home exists). `adapter_for(harness, harness_bin)` raises when the
+    host cannot run the harness."""
     from . import accounts
     harness = (row or {}).get("harness") or ""
     verdicts = dict.fromkeys(CHECKS, False)
@@ -228,6 +233,8 @@ def host_probes(cfg, row: dict | None, *, adapter_for: Callable) -> dict[str, bo
     binary = getattr(adapter, "binary", "") or ""
     verdicts["binary"] = bool(binary) and os.access(binary, os.X_OK)
     verdicts["interactive"] = bool(getattr(adapter.spec, "attach", False))
+    descriptor = getattr(adapter, "descriptor", None)
+    verdicts["resident"] = bool(getattr(descriptor, "resident", None))
     declared = accounts.profiles(cfg, harness)
     verdicts["account"] = (any(not accounts.check(p) for p in declared) if declared
                            else os.path.isdir(accounts.default_home(harness)))

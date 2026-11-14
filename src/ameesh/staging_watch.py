@@ -985,6 +985,11 @@ def executor_version_findings(records, *, now: float, attested=(),
                     " at %s" % refresh["step"] if refresh.get("step") else "",
                     ": %s" % str(refresh["reason"])[:200]
                     if refresh.get("reason") else "")
+                if refresh.get("state") == "unconfigured":
+                    cause += ("; configure the missing venv_update block in "
+                              "staging-executor.json with this account's venv, "
+                              "sealed operator package and work paths; refresh "
+                              "runs after the next completed pass")
             else:
                 cause += " (no venv refresh recorded)"
         elif (newest and newest[0] > int(row.get("id") or 0)
