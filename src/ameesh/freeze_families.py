@@ -180,11 +180,14 @@ def message(inputs, verdict: Mapping | None = None) -> str:
     Le message nomme l'assigné, chaque famille d'auteur prouvée et les commits
     que la lecture lui attribue (plage courante et gels antérieurs reportés).
     Il rappelle la phrase du §2 (« retour à l'auteur »). Aucun contournement
-    n'est proposé : la tête serait refusée par la porte de fusion.
+    n'est proposé : la tête serait refusée par la porte de fusion. #7324 :
+    « rendre les commits » a été lu comme « les signer au nom de l'assigné »
+    (nexlink #7272) ; le message dit que l'assigné les **refait** et que
+    réécrire l'identité Git est interdit.
     """
     verdict = dict(verdict or assess(inputs))
     assignee = str(verdict.get("assignee") or "").strip()
-    target = ("assignee %s" % assignee) if assignee else "the assignee"
+    target = ("assignee %s" % assignee) if assignee else "assignee"
     forbidden = set(verdict.get("forbidden") or ())
     declared = set(verdict.get("families") or ())
     authors = [row for row in verdict.get("authors") or ()
@@ -197,7 +200,10 @@ def message(inputs, verdict: Mapping | None = None) -> str:
            int(verdict.get("need") or 0),
            len(verdict.get("eligible") or ()),
            verdict.get("why") or "the head cannot be reviewed"),
-        "Return these commits to the %s, then freeze again:" % target,
+        "The %s (or an agent of their family) must redo these commits in "
+        "their own turn, then freeze again; rewriting the Git author or "
+        "committer does not change who wrote them and is forbidden (#7324):"
+        % target,
     ]
     shown = 0
     for row in authors:

@@ -91,7 +91,13 @@ auteurs, avec les mêmes exceptions du canon §2 :
   est alors auteur, sa famille exclue). #2721 :
   à la désignation, ce repli porte sa trace (`proof: turn-journal`,
   `fallback_commits`), et un committer distinct de la référence doit être au
-  registre.
+  registre ;
+* #7324 : ce repli ne lit qu'une identité Git, que celui qui réécrit choisit
+  (nexlink #7272 : sept commits signés au nom de l'assigné en pause). Quand la
+  plage en contient, l'acteur prouvé par le reçu exact du **gel** est auteur
+  lui aussi s'il n'est pas la référence ; sans famille prouvée, la tête reste
+  inconnue. Coût assumé : un pilote qui regèle une telle plage voit sa famille
+  exclue (le doute conserve).
 
 Le module ne devine jamais une famille depuis un nom Git seul : le committer
 et l'auteur Git doivent porter l'adresse d'agent (`<nom>@ameesh.invalid`),
@@ -841,6 +847,40 @@ def _same_patch_receipts(db, item: Mapping, repo: str, sha: str, *,
         seen.add(key)
         found.append(receipt)
     return found
+
+
+def _freeze_actor(db, milestone: Optional[Mapping],
+                  proof: Optional[Mapping], families, *, provider=None,
+                  strict: bool = False) -> Optional[tuple[str, str]]:
+    """#7324 : `(acteur, famille)` du reçu exact du gel, ou None sans reçu.
+
+    `proof` est la preuve du tour courant quand la lecture précède l'INSERT
+    du jalon (#3948), `{}` quand ce tour n'en a pas ; sinon le reçu du jalon
+    en base. Un jalon sans reçu ne prouve rien : la lecture d'avant s'applique."""
+    if proof is not None:
+        # #3948 : `{}` est le « pas de preuve » explicite d'un gel hors tour ;
+        # l'id du jalon n'est alors que provisoire et ne se relit pas.
+        receipt = dict(proof)
+    else:
+        try:
+            milestone_id = int((milestone or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            milestone_id = 0
+        if milestone_id <= 0:
+            return None
+        try:
+            receipt = _milestone_receipt(provider, db, milestone_id,
+                                         strict=strict)
+        except review_provenance.ProvenanceError:
+            if strict:
+                raise
+            return None
+    if not receipt:
+        return None
+    actor = str(receipt.get("actor") or "").strip()
+    if not actor:
+        return None
+    return actor, _family(receipt.get("harness"), families)
 
 
 def _unreceived_role(actor: str, author_name: str, reviewers) -> str:
@@ -6088,6 +6128,27 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             by_name.setdefault(actor, set()).add(proven)
             third_commits.setdefault(actor, []).append(sha)
             record_commit(actor, sha)
+    # #7324 : un commit sans reçu exact n'est attribué que par son identité
+    # Git, que celui qui la réécrit choisit (nexlink #7272 : deepseek4 a signé
+    # sept commits au nom de claude1). Le reçu exact du jalon de gel, lui, ne
+    # se réécrit pas : quand la plage a de tels commits et que l'acteur prouvé
+    # du gel n'est pas la référence, sa famille est auteur aussi. Sans famille
+    # prouvée pour cet acteur, la tête reste inconnue.
+    if proofs and not packet:
+        freezer = _freeze_actor(db, milestone, milestone_proof, families,
+                                provider=provider, strict=strict)
+        if freezer is not None:
+            name, family = freezer
+            if name and (not author_name
+                         or name.casefold() != author_name.casefold()):
+                if family:
+                    # sa famille vient du reçu du gel, pas du repli #2721 :
+                    # aucune trace `proof: turn-journal` pour lui.
+                    by_name.setdefault(name, set()).add(family)
+                else:
+                    head_sha = str(head or (milestone or {}).get("sha") or "")
+                    if head_sha[:12] and head_sha[:12] not in unknown:
+                        unknown.append(head_sha[:12])
     # #4179 : la famille d'un auteur tiers ne s'exclut que par le contenu qui
     # survit dans la tête (#3335/#3220). Un commit hérité d'un parent empilé
     # puis retiré (revert, annulation) n'est pas un contenu de cette tête : le
