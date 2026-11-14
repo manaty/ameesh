@@ -308,14 +308,13 @@ def inventory(tree, paths, *, signed_decision):
             "allowed": not refused, "files": rows}
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Read-only check of the applicator's explicit pending SQL inventory")
-    parser.add_argument("--repo", required=True)
-    parser.add_argument("--sha", required=True, help="full frozen commit SHA")
-    parser.add_argument("--project", required=True, help="ameesh project owning carrier lots")
-    parser.add_argument("--file", action="append", default=[], help="pending repository-relative SQL file (repeatable)")
-    parser.add_argument("--files-from", help="UTF-8 file with one pending path per line")
-    args = parser.parse_args(argv)
+def check_inventory(repo, sha, project, paths, *, cfg=None):
+    """Classify one explicit frozen inventory, opening the proof reader lazily.
+
+    `cfg` is the ordinary ameesh configuration used for signed decisions; it is
+    optional so a caller that already has one (the staging applicator, #7368)
+    does not reload the environment. No staging credential is read.
+    """
     connection = None
 
     def signed_decision(identifier, lot, option):
@@ -324,9 +323,25 @@ def main(argv=None):
         # No staging credential, SQL execution, or credential CLI option.
         from . import config, db
         if connection is None:
-            connection = db.connect(config.load(register_credentials=False), writer=False)
-        return decision_verifier(connection, args.project)(identifier, lot, option)
+            connection = db.connect(
+                cfg or config.load(register_credentials=False), writer=False)
+        return decision_verifier(connection, project)(identifier, lot, option)
 
+    try:
+        return inventory(GitTree(repo, sha), paths, signed_decision=signed_decision)
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Read-only check of the applicator's explicit pending SQL inventory")
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--sha", required=True, help="full frozen commit SHA")
+    parser.add_argument("--project", required=True, help="ameesh project owning carrier lots")
+    parser.add_argument("--file", action="append", default=[], help="pending repository-relative SQL file (repeatable)")
+    parser.add_argument("--files-from", help="UTF-8 file with one pending path per line")
+    args = parser.parse_args(argv)
     try:
         paths = list(args.file)
         if args.files_from:
@@ -334,15 +349,12 @@ def main(argv=None):
             paths.extend(line for line in Path(args.files_from).read_text(encoding="utf-8").splitlines() if line)
         if not paths and args.files_from is None:
             raise Refused("explicit pending inventory required (--file or --files-from)")
-        report = inventory(GitTree(args.repo, args.sha), paths, signed_decision=signed_decision)
+        report = check_inventory(args.repo, args.sha, args.project, paths)
         print(json.dumps(report, ensure_ascii=False))
         return 0 if report["allowed"] else 1
     except (Refused, OSError, UnicodeError, ValueError, migrations.DbError) as exc:
         print(json.dumps({"allowed": False, "reason": str(exc)}, ensure_ascii=False))
         return 1
-    finally:
-        if connection is not None:
-            connection.close()
 
 
 if __name__ == "__main__":

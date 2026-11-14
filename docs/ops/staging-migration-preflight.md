@@ -64,7 +64,14 @@ applied in staging. Its `migration_safety` report and handoff message warn about
 non-additive or doubtful files but do not block the release or read the live
 staging ledger. Only the explicit applicator inventory is a blocking check.
 
-Project application is separate: Nexlink's applicator integration is #7374;
-ameesh's staging integration is #7368. A project's gate is
-active only once that integration is delivered. Manually executed SQL outside
-the applicator is outside this control.
+Project application is separate: Nexlink's applicator integration is #7374.
+ameesh's staging sequence is integrated (#7368): before its migrations step,
+and again in the read-only preflight, it computes the migrations actually
+pending on the target database with `ameesh.staging_migrations_preflight`
+(read-only `schema_migrations` query, migrations directory of the frozen
+snapshot), then runs the gate on exactly those repository paths and stops
+the sequence on a refusal, before any SQL write and any executor restart. The
+repository now carries an empty `.ameesh/staging-migrations.json`; a project
+declaration is added to that file with the migration's lot. A project's gate is
+active only once its applicator integration is delivered. Manually executed
+SQL outside the applicator is outside this control.
