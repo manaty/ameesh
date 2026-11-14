@@ -94,6 +94,10 @@ BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
 NOTIFIER_EXCLUDED = ("notify_undeliverable",)
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
+#: #7307 : une pause d'allure de famille de relecture se lève puis se repose
+#: 10 à 25 min plus tard sur le même compte et la même fenêtre ; c'est le même
+#: épisode tant que l'absence continue reste sous ce seuil.
+FAMILY_PAUSE_GAP_S = 45 * 60.0
 #: #3057 : un bail rendu depuis moins de ce délai (redémarrage d'exécuteur,
 #: quelques secondes) n'est pas encore une perte : le brief attend, sans
 #: escalade ni copie au fil ; trois passes du notificateur (30 s)

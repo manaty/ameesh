@@ -3353,6 +3353,16 @@ class Notifier:
                  and not alert_briefs.sleep_unbriefed(a)
                  # #6642 : grâce de 5 min d'un SLO de niveau 1 ordinaire
                  and not alert_briefs.slo_grace_unbriefed(a)}
+        for key, alert in alive.items():
+            entry = sent.get(key)
+            if entry is not None and alert.get("type") == "review_family_paused":
+                # #7307 : la pause d'allure recalcule son échéance à chaque
+                # passe ; l'entrée suit la plus tardive, et le retour de
+                # l'alerte clôt l'absence en cours.
+                entry.pop("absent_since", None)
+                if alert.get("resume_ts") is not None:
+                    entry["resume_ts"] = max(float(alert["resume_ts"]),
+                                             float(entry.get("resume_ts") or 0))
         open_lots = None
         for key in list(sent):
             if key not in alive:
@@ -3371,6 +3381,14 @@ class Notifier:
                     # pause. L'épisode (compte, fenêtre) est le même : garder
                     # l'entrée jusqu'à l'échéance évite un brief par retour.
                     continue  # same budget episode, even if no lot waits for a pass
+                if entry.get("type") == "review_family_paused" \
+                        and entry.get("resume_ts") is not None \
+                        and now - entry.setdefault("absent_since", now) \
+                        < alert_briefs.FAMILY_PAUSE_GAP_S:
+                    # #7307 : échéance passée, la pause se repose d'ordinaire
+                    # 10 à 25 min après (même compte, même fenêtre) : un seul
+                    # brief tant que l'absence continue reste sous le seuil.
+                    continue
                 if entry.get("type") == "budget_pause_long" \
                         and entry.get("resume_ts") is not None and now < entry["resume_ts"]:
                     # #7175 : l'attente d'une remise à zéro, déjà dite ; le

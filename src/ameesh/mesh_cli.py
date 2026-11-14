@@ -3072,7 +3072,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # lève la retenue.
             # #7205 : un `hold:` sur un lot validé l'écarte du paquet suivant.
             from . import planned_waits
-            for warning in (work.hold_lift_warning(db, args.id, text),
+            for warning in (planned_waits.external_hold_warning(text),
+                            work.hold_lift_warning(db, args.id, text),
                             planned_waits.ready_hold_warning(db, args.id, text)):
                 if warning:
                     print("warning: %s" % warning, file=sys.stderr)

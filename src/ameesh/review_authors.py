@@ -981,6 +981,12 @@ MIN_CONTENT_LINE = 8
 #: traitement de la sortie. 384 garde le ciblé sous le point où il devient
 #: plus cher que la lecture complète.
 TREE_LINES_WHOLE_MAX = 384
+#: #7299 : au plus de lignes échantillonnées pour la preuve positive de survie
+#: (`_commit_survives`). Une seule ligne propre suffit ; les plus longues sont
+#: prises d'abord, car les en-têtes génériques existent dans tout l'arbre du
+#: parent. Le balayage ciblé de 32 motifs reste sous la seconde sur l'arbre
+#: mesuré de nexlink (2,75 M lignes), contre ~12 s pour l'arbre entier.
+SURVIVAL_SAMPLE_MAX = 32
 #: lignes de code génériques : leur présence ne prouve aucun contenu propre
 _TRIVIAL_LINES = frozenset((
     "pass", "return", "return true", "return false", "break", "continue",
@@ -3321,6 +3327,59 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
             # même fichier (réordre, réindentation) reste héritée si elle
             # existait déjà avant le commit.
             return bool(removed_from.get(row.strip(), set()) - {path})
+
+        # #7299 : preuve positive bornée avant le balayage d'héritage.
+        # Le balayage ci-dessous lit l'arbre du parent et celui de la base en
+        # entier (`git grep -G ^`) dès que le commit est gros ; l'entrée de
+        # cache dépasse alors `MAX_ENTRY_BYTES`, n'est jamais publiée et deux
+        # arbres ne tiennent pas dans le mémo du processus : chaque commit
+        # repayait des dizaines de secondes et l'essai suivant aussi (#7266 :
+        # plus de 300 s). On cherche donc d'abord une ligne **propre** sur un
+        # échantillon borné : présente dans la tête au chemin du diff (ou au
+        # chemin renommé du fichier), absente du parent et de la base de
+        # fusion, exactement comme `_inherited_lines`. Les lignes les plus
+        # longues passent d'abord : les en-têtes génériques (`end;`, imports)
+        # existent partout dans l'arbre du parent et ne prouvent rien.
+        #
+        # L'échantillon ne peut que **garder** un auteur : s'il ne trouve pas
+        # de ligne propre, la lecture complète ci-dessous conclut comme avant
+        # (le doute conserve l'auteur, canon §2).
+        parent_rev = str(sha) + "^"
+        candidates: list = []
+        by_path: dict = {}
+        for path, row in added:
+            by_path.setdefault(path, []).append(row)
+        for path, rows in by_path.items():
+            rows = [row for row in rows if not moved(path, row)]
+            if not rows:
+                continue
+            lines = _head_lines(repo, head, path, cache)
+            found = [row for row in rows
+                     if lines is not None and row.strip() in lines]
+            if not found:
+                target = _renamed_target(repo, head, sha, path, cache)
+                if target:
+                    lines = _head_lines(repo, head, target, cache)
+                    found = [row for row in rows
+                             if lines is not None and row.strip() in lines]
+            candidates.extend(row.strip() for row in found)
+        if candidates:
+            sample = []
+            for value in sorted(set(candidates), key=lambda line: (-len(line), line)):
+                if "\n" in value or "\x00" in value or "\ufffd" in value:
+                    continue
+                sample.append(value)
+                if len(sample) >= SURVIVAL_SAMPLE_MAX:
+                    break
+            inherited = set(_lines_in_tree(repo, parent_rev, sample))
+            if base:
+                key = ("merge-base", head, base)
+                if key not in cache:
+                    cache[key] = _read_out(repo, "merge-base", head, base) or ""
+                if cache[key]:
+                    inherited |= _lines_in_tree(repo, cache[key], sample)
+            if any(value not in inherited for value in sample):
+                return True
 
         inherited = _inherited_lines(
             repo, head, sha, base,
