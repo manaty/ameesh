@@ -1006,6 +1006,7 @@
               "turn.context",
               "agent.updated",
               "agent.moved",
+              "agent.attach",
               "cost.recorded",
               "thread.entry",
               "decision.created",
