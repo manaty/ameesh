@@ -26,6 +26,43 @@ class ClassificationTests(unittest.TestCase):
                     "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;"):
             self.assertEqual(sm.classify(sql).kind, 'relaxation')
 
+    def test_mandatory_column_requires_only_a_constant_default(self):
+        for default in ("'{}'", "'drop table x; --'", "true", "false", "0", "-1.25", "1e3", "ARRAY[]::text[]", "'{}'::text[]"):
+            for suffix in (f"NOT NULL DEFAULT {default}", f"DEFAULT {default} NOT NULL"):
+                with self.subTest(suffix=suffix):
+                    self.assertEqual(sm.classify("ALTER TABLE x ADD COLUMN y text[] " + suffix).kind, 'additive')
+        for suffix in ("NOT NULL", "NOT NULL DEFAULT NULL", "NOT NULL DEFAULT now()",
+                       "NOT NULL DEFAULT 1 + 2", "NOT NULL DEFAULT '{}' || '{}'",
+                       "NOT NULL DEFAULT fake_literal", "NOT NULL DEFAULT 'x'::custom_type", "NOT NULL DEFAULT 1 CHECK (false)",
+                       "NOT NULL DEFAULT 1, DROP COLUMN z"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(sm.classify("ALTER TABLE x ADD COLUMN y text " + suffix).kind, 'destructive')
+
+    def test_constant_column_does_not_override_project_destructive_rules(self):
+        policy = sm.load_policy(json.dumps({'schema':'ameesh-staging-migrations/1',
+            'exceptions':{'destructive':[{'pattern':r'alter table protected .*', 'reason':'protected table'}]}}))
+        self.assertEqual(sm.classify("ALTER TABLE protected ADD COLUMN y int NOT NULL DEFAULT 1", policy).kind, 'destructive')
+
+    def test_actual_migrations_and_new_trigger(self):
+        root = Path(__file__).resolve().parents[1]
+        for name, kind in (("0572_conversation_moves.sql", 'relaxation'),
+                           ("0575_shared_host_tenants.sql", 'relaxation'),
+                           ("0576_tenant_account_profiles.sql", 'additive')):
+            with self.subTest(name=name):
+                self.assertEqual(sm.classify((root/'src/ameesh/migrations'/name).read_text()).kind, kind)
+        path = FIXTURES/'799_c1_residual_hub_fks.sql'
+        meta = json.loads(path.with_suffix('.source.json').read_text())
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), meta['sha256'])
+        self.assertEqual(sm.classify(path.read_text()).kind, 'unknown')
+        trigger = "CREATE TRIGGER cleanup AFTER DELETE ON conversations FOR EACH ROW EXECUTE FUNCTION ops.cleanup();"
+        self.assertEqual(sm.classify(trigger).kind, 'relaxation')
+        data = trigger.encode()
+        with self.assertRaises(sm.Refused):
+            sm.check('migration.sql', data, sm.load_policy(), read_file=lambda p:b'-- restore', signed_decision=lambda *a:False)
+        policy = sm.load_policy()
+        policy['declarations']['migration.sql'] = {'checksum':hashlib.sha256(data).hexdigest(), 'lot':1, 'restore':'cleanup_restore.sql'}
+        self.assertEqual(sm.check('migration.sql', data, policy, read_file=lambda p:b'DROP TRIGGER cleanup ON conversations;', signed_decision=lambda *a:False).kind, 'relaxation')
+
     def test_worst_instruction_in_all_static_branches(self):
         sql = """DO $$ BEGIN IF to_regnamespace('graph') IS NULL THEN
         CREATE TABLE x (id int); ELSE DROP TABLE x; END IF; END $$;"""

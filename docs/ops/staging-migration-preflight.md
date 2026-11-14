@@ -75,3 +75,17 @@ repository now carries an empty `.ameesh/staging-migrations.json`; a project
 declaration is added to that file with the migration's lot. A project's gate is
 active only once its applicator integration is delivered. Manually executed
 SQL outside the applicator is outside this control.
+
+A new `ADD COLUMN ... NOT NULL` is additive only with a constant default:
+a quoted literal, boolean, number or empty array (optionally with a built-in type cast from the recognized list).
+Absent defaults, NULL, function calls and computed expressions retain the
+destructive classification. This lets N-1 writers omit the new column: 0576
+(`profiles text[] not null default '{}'`) is additive.
+
+A new trigger is a relaxation requiring a declaration and frozen restore:
+it can reject writes from N-1 code. Replacing and dropping triggers retain
+their existing classes. Migration 0572 therefore requires a declaration and
+restore. Migration 0575 also requires them because `CREATE OR REPLACE FUNCTION`
+is a relaxation, even alongside new tables. The complete 799 fixture remains
+doubtful because its outer DO contains an unsupported RAISE EXCEPTION;
+classifying its new trigger as relaxation does not authorize other statements.

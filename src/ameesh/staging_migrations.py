@@ -31,6 +31,7 @@ _DEFAULT_RULES = {
         {"pattern": r'grant\s+[^;]+', "reason": 'privilege added'},
     ],
     'relaxation': [
+        {"pattern": r'create (?:constraint )?trigger\s+[^;]+', "reason": 'new trigger may reject previous-version writes'},
         {"pattern": r'alter table [\w.\"]+ drop constraint (?:if exists )?[\w\"]+', "reason": 'constraint removed'},
         {"pattern": r'create or replace (?:function|procedure)\s+[^;]+', "reason": 'routine replaced'},
         {"pattern": r'create or replace (?:trigger|rule|view)\s+[^;]+', "reason": 'guard or view replaced'},
@@ -99,10 +100,14 @@ def _code(sql, *, procedural=False, depth=0):
         bodies.append(literal[len(tag):-len(tag)])
         return " __staging_body_%d__ " % (len(bodies) - 1)
 
-    _, code, sure, _ = migrations._lex(sql, dollar_handler=body_token, allow_inline_comments=True)
+    _, code, sure, _ = migrations._lex(sql, dollar_handler=body_token, allow_inline_comments=True,
+                                        string_handler=lambda literal: " '_' ")
     if not sure:
         raise Refused("SQL lexical analysis incomplete")
     code = re.sub(r"\s+", " ", code.lower()).strip()
+    code = ";".join(part if re.match(r"\s*alter table\b.*\badd column\b", part)
+                    else part.replace("'_'", " ")
+                    for part in code.split(";"))
     for i, body in enumerate(bodies):
         token = "__staging_body_%d__" % i
         pattern = r"\bdo\s+(?:language\s+plpgsql\s+)?" + token + r"(?:\s+language\s+plpgsql)?"
@@ -188,10 +193,22 @@ def classify(sql, policy=None):
             return Classification("unknown", ("dynamic SQL not analysed",))
         if unconditional and _new_routine_revoke(statement, code):
             continue
+        # Match the entire addition, keeping literal contents opaque. Extra
+        # actions, constraints, NULL and computed defaults cannot pass here.
+        constant = r"(?:'_'|true|false|[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?|array\s*\[\s*\])"
+        cast = r"(?:\s*::\s*(?:pg_catalog\.)?(?:text|varchar|bool|boolean|int|integer|int2|int4|int8|bigint|smallint|numeric|decimal|real|float4|float8|json|jsonb|uuid)(?:\[\])?)*"
+        column = r'alter table [\w.\"]+ add column (?:if not exists )?[\w\"]+ [\w.]+(?:\[\])?'
+        constant_column = re.fullmatch(
+            column + r"(?: not null default " + constant + cast
+            + r"| default " + constant + cast + r" not null)", statement)
         found = None
         for category in ("destructive", "relaxation", "additive"):
             hits = [entry["reason"] for entry in policy["rules"][category]
-                    if re.fullmatch(entry["pattern"], statement, re.I | re.S)]
+                    if re.fullmatch(entry["pattern"], statement, re.I | re.S)
+                    and not (constant_column and entry in _DEFAULT_RULES["destructive"]
+                             and entry["reason"] == "mandatory column")]
+            if category == "additive" and constant_column:
+                hits.append("constant default for new mandatory column")
             if hits:
                 found = category
                 if rank[category] > rank[kind]:

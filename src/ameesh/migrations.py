@@ -566,7 +566,7 @@ def non_additive(migration: Migration) -> list[str]:
     return reasons
 
 
-def _lex(sql: str, *, dollar_handler=None, allow_inline_comments=False) -> tuple[list[str], str, bool, str]:
+def _lex(sql: str, *, dollar_handler=None, string_handler=None, allow_inline_comments=False) -> tuple[list[str], str, bool, str]:
     """(chaînes, texte sans commentaires ni chaînes, lecture sûre, source sans
     documentation), en une seule passe : le délimiteur d'une chaîne ne se lit
     jamais dans un commentaire, ni l'inverse. Un identifiant cité devient un
@@ -578,7 +578,8 @@ def _lex(sql: str, *, dollar_handler=None, allow_inline_comments=False) -> tuple
     exécutée : il n'est ni dans les chaînes ni dans la source rendue ; un
     littéral $$ y reste une chaîne, par prudence. Le lecteur staging peut
     remplacer les corps dollar par des jetons via `dollar_handler` et admettre
-    les commentaires internes (toujours remplacés par un espace) ; les
+    les commentaires internes (toujours remplacés par un espace). Le rappel
+    `string_handler` remplace les littéraux simples par un jeton opaque ; les
     appelants historiques conservent exactement leurs valeurs par défaut."""
     strings, code, at, size, sure = [], [], 0, len(sql), True
     prose = []
@@ -630,7 +631,8 @@ def _lex(sql: str, *, dollar_handler=None, allow_inline_comments=False) -> tuple
             elif dollar and dollar_handler is not None and closing >= 0:
                 code.append(dollar_handler(sql[at:end]))
             else:
-                strings.append(sql[at:end]), code.append(" ")
+                strings.append(sql[at:end])
+                code.append(string_handler(sql[at:end]) if string_handler is not None else " ")
             at = end
         else:
             code.append(sql[at])

@@ -1,0 +1,6 @@
+{
+  "repository": "manaty/nexlink",
+  "commit": "810057643745ac401a101d5b202af9d5b4c0331a",
+  "path": "supabase/migrations/799_c1_residual_hub_fks.sql",
+  "sha256": "ec6b719922f606424f0a9023ffa61c08be0dbcb12a07b93054b0a6b7d1458fe2"
+}
