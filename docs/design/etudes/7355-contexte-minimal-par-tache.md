@@ -81,7 +81,9 @@ Ce que cette étude établit :
    et débordement des sorties d'outil, découpage en phases). **Aucune valeur
    propre à un client n'entre dans le cœur d'ameesh** : le schéma et les
    bornes sont à ameesh, les valeurs sont au propriétaire de la tâche.
-7. **Les profils proposés, chiffrés et à valider par les pilotes :**
+7. **Les profils proposés sont des hypothèses de départ, à confirmer par
+   pilote** (décision du pilote du 2026-11-14, message #219291) : aucun de ces
+   nombres n'est acquis, chaque pilote D–F le fixe sur sa propre mesure.
    - `verifier/bug_staging` : 3 k jetons fournis d'emblée, sortie d'outil
      plafonnée à 4 k caractères (débordement fichier), 15 étapes, budget de
      tour 600 k, session par vérification, pas de repo ni de skills ;
@@ -93,10 +95,11 @@ Ce que cette étude établit :
    - `concierge/chat` : 2 k fournis, 2 k/8 k d'outils, 5 étapes, budget 200 k.
 8. **Effet attendu, à mesurer et non à croire.** Le demandeur estime le
    vérificateur à ~0,3 M par vérification (pire cas ~0,5 M) contre 0,7–2,5 M
-   aujourd'hui ; notre profil fixe la cible à **≤ 40 % des jetons par vérification
-   réussie par rapport à la référence** et **aucune baisse du taux de succès**. Pour le
-   fixer, la cible est **≤ 50 % des 3,1 M actuels** ; pour le builder, la
-   cible sera fixée après les deux premiers pilotes, pas avant.
+   aujourd'hui ; le pilote se fixe comme **seuil de réussite ≤ 40 % des jetons
+   par vérification réussie par rapport à la référence**, avec **aucune baisse
+   du taux de succès**. C'est un seuil pour décider de généraliser, **pas un
+   plafond dur**. Pour le fixer, le seuil est **≤ 50 % des 3,1 M actuels** ;
+   pour le builder, il sera fixé après les deux premiers pilotes, pas avant.
 9. **Sur la hausse #1793 (2,5 M → 5 M) :** elle débloque les 40 vérifications
    coincées et permet de mesurer la nouvelle politique sur des cas réels ;
    elle ne corrige pas la croissance quadratique. Recommandation : la traiter
@@ -125,7 +128,7 @@ Ce que cette étude établit :
   d'application, bornes dures, publication, cycle de version, modes d'échec
   (§6) ;
 - le **plan de mesure continue et de rétention opt-in caviardée** (§7), et
-  le **découpage des pilotes** avec leurs critères de succès (§8).
+  le **découpage des pilotes** avec leurs seuils de réussite (§8).
 
 ### 2.2 Non livré (et pourquoi)
 
@@ -145,6 +148,9 @@ Ce que cette étude établit :
 - **Aucune action de production, aucun merge, aucun commentaire de release.**
   Le ticket miroir #5549 est commenté à chaque étape par la veille ; cette
   étude ne fusionne rien et ne déploie rien.
+- **Aucun lot A–G ouvert.** Les lots d'implémentation et les pilotes sont
+  décrits, pas créés : ils attendent la décision owner qui suivra la relecture
+  et la fusion de l'étude (décision du pilote du 2026-11-14, message #219291).
 
 ### 2.3 Ce qui existait déjà et n'est pas refait
 
@@ -492,11 +498,14 @@ d'implémentation proposé (§8.2).
 
 ## 5. Profil de contexte par type de tâche
 
-Les valeurs ci-dessous sont des **propositions**, pas des réglages actifs.
-Elles sont dérivées des mesures §3 et des cibles du demandeur ; chaque pilote
-les validera ou les corrigera. Les profils sont **génériques** : le type est
-un label opaque, les valeurs appartiennent au propriétaire de la tâche, et le
-cœur d'ameesh ne connaît aucun client (§7).
+Les valeurs ci-dessous sont des **hypothèses de départ, à confirmer par
+pilote** — pas des réglages actifs, pas des chiffres acquis. Elles sont
+dérivées des mesures §3 et des cibles du demandeur ; chaque pilote D–F les
+fixe sur sa propre mesure, les corrige ou revient en arrière. Aucun de ces
+nombres n'est validé hors pilote (décision du pilote du 2026-11-14, message
+#219291). Les profils sont **génériques** : le type est un label opaque, les
+valeurs appartiennent au propriétaire de la tâche, et le cœur d'ameesh ne
+connaît aucun client (§7).
 
 ### 5.1 `verifier/bug_staging`
 
@@ -629,7 +638,9 @@ Le message qui ouvre le tour peut porter :
 
 Un profil absent ou vide signifie **legacy** : aucun budget de tâche, aucun
 plafond d'outil, aucun budget d'étapes. C'est le comportement d'aujourd'hui,
-et il reste le défaut tant qu'aucune valeur n'a été posée.
+et il reste le défaut tant qu'aucune valeur n'a été posée. Les nombres de
+l'exemple ci-dessus sont ceux de l'hypothèse `verifier/bug_staging` (§5.1),
+**à confirmer par pilote** ; le schéma n'en impose aucun.
 
 ### 6.3 Schéma
 
@@ -686,7 +697,12 @@ point sûr. Tout ce qui est un **contenu** (brief, récupération, troncature)
 est appliqué par l'intégrateur, car lui seul connaît la tâche et ses outils.
 Le harnais garde son préambule et sa compaction native.
 
-### 6.5 Bornes dures et valeurs par défaut
+### 6.5 Bornes du schéma et valeurs de départ
+
+**Les nombres des profils (§5) sont des hypothèses de départ, pas des bornes
+dures** : ils ne sont ni validés ni appliqués avant leur pilote. Les bornes
+ci-dessous sont celles du **schéma** (refus au-delà), pas les valeurs
+recommandées.
 
 - **Aucune valeur de profil ne peut dépasser les bornes du tableau.** Un
   dépassement est refusé avant le premier appel, avec une raison ; le tour
@@ -857,7 +873,13 @@ Sur les tours échantillonnés, deux mesures :
 
 A et B peuvent se faire en parallèle ; C attend B ; D attend C. G est
 indépendant de C et peut être découpé plus tard, une fois le besoin de
-contenu confirmé. Le découpage exact et l'ordre sont à mesh-design.
+contenu confirmé. L'ordre **A → B → C → D–F** est validé par le pilote le
+2026-11-14 (message #219291) : la mesure commande le reste et A ne change
+aucun comportement. **Aucun lot A–G n'est ouvert avant la décision owner**
+qui suivra la relecture et la fusion de l'étude ; les options soumises sont
+a) A seul, b) A+B, c) rien pour l'instant. G (rétention opt-in) reste à
+part : lot sensible (vie privée), décision owner distincte, après les
+pilotes.
 
 ### 8.2 Lot A — compteurs
 
@@ -897,6 +919,11 @@ contenu confirmé. Le découpage exact et l'ordre sont à mesh-design.
 
 ### 8.5 Lots D–F — pilotes
 
+Les valeurs de §5 sont des **hypothèses de départ** : chaque pilote fixe son
+profil sur sa propre mesure avant de l'appliquer. Les seuils ci-dessous
+servent à décider s'il faut généraliser ; ce ne sont **pas des plafonds
+durs**.
+
 Chaque pilote :
 
 1. **pré-enregistre** la fenêtre de référence (mêmes types de tâche, même
@@ -911,7 +938,7 @@ Chaque pilote :
    mécanisme réversible) ;
 5. **publie** un commentaire sur #5549 et un bilan dans le lot.
 
-Critères de succès proposés :
+Seuils de réussite (pour décider de généraliser) :
 
 | type | taille | métrique principale | garde-fou |
 |---|---:|---|---|
@@ -1090,3 +1117,4 @@ for role in sorted({r["role"] for r in rows}):
 |---|---|---|
 | r1 | 2026-11-14 | création : mesure 7 jours, profil par type de tâche, contrat `ameesh-task-context/1`, plan de mesure et de rétention, découpage des pilotes |
 | r2 | 2026-11-14 | confrontation à l'étude #6427 (tours longs, croissance par pas constante), plafond par harnais #6677 et série par pas #6433 ; aucune valeur ni conclusion de mesure modifiée |
+| r3 | 2026-11-14 | consignes du pilote (#219291) : valeurs de profils marquées hypothèses de départ à confirmer par pilote, cibles = seuils de réussite pour généraliser et non plafonds durs, aucun lot A–G ouvert avant décision owner ; aucune mesure modifiée |
