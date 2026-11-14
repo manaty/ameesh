@@ -249,6 +249,8 @@
         turn_mail_max=20|0 turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
+  ameesh staging-migrations --repo DIR --sha SHA --project P --file PATH
+        read-only gate on the applicator's explicit pending SQL inventory;
   ameesh turn current [--local] [--expect-turn ID] [--json]
         read the calling turn; reuse requires its captured turn id;
   ameesh turn observe (--turn ID | --request ID) [--json]
@@ -393,6 +395,9 @@ def _dispatch(argv: list[str] | None) -> int:
         print(_doc())
         return 0
     command, rest = argv[0], argv[1:]
+    if command == "staging-migrations":
+        from . import staging_migrations
+        return staging_migrations.main(rest)
     from . import db as db_mod
     db_mod.set_command_application(command)  # #5976
     if command == "role" and rest[:1] == ["run"]:

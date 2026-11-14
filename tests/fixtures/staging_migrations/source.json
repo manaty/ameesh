@@ -1,0 +1,14 @@
+{
+  "repo": "manaty/nexlink",
+  "commit": "788f82adb4672a79d4351b59fa19367a9bfd3dd3",
+  "files": {
+    "796_c1_channel_commands_split.sql": {
+      "path": "supabase/migrations/796_c1_channel_commands_split.sql",
+      "sha256": "3d0996aa3d4f20fadd19a93f9388c5f6d96dfd8e526e7d83fdbaa48622577cb5"
+    },
+    "797_c1_media_keys_fk_hub.sql": {
+      "path": "supabase/migrations/797_c1_media_keys_fk_hub.sql",
+      "sha256": "6328b6f41fc6716a6eaf8fd9baea2256c3c252c5ffd75179727145fc0da8f645"
+    }
+  }
+}
