@@ -86,10 +86,23 @@ class NamedExceptionTest(DecisionBase):
         self.assertTrue(exceptions.begin(self.worker, self.profile, lambda tx: opened.append(tx) or True))
         self.assertEqual(len(opened), 1)
         self.assertEqual(self.consumed(identifier)["consumed_host"], self.cfg.host)
-        exceptions.register(self.db, identifier, now=self.now)
+        _, replay = exceptions.register(self.db, identifier, now=self.now)
+        self.assertEqual(replay, "already-consumed")
         self.assertIsNone(exceptions.preview(self.worker, self.items, self.book, now=self.now))
         self.assertTrue(account_turn.choose(self.worker, self.book))
         self.assertIsNone(self.worker._account_exception)
+
+    def test_registration_reports_armed_registered_and_consumed(self):
+        identifier = self.signed()
+        _, first = exceptions.register(self.db, identifier, now=self.now)
+        self.assertEqual(first, "registered")
+        _, again = exceptions.register(self.db, identifier, now=self.now)
+        self.assertEqual(again, "already-registered")
+        self.assertEqual(account_turn.choose(self.worker, self.book), "")
+        self.assertTrue(exceptions.begin(self.worker, self.profile, lambda tx: True))
+        _, spent = exceptions.register(self.db, identifier, now=self.now)
+        self.assertEqual(spent, "already-consumed")
+        self.assertIsNone(exceptions.preview(self.worker, self.items, self.book, now=self.now))
 
     def test_other_agent_and_other_account_do_not_benefit(self):
         self.prepare()
@@ -181,10 +194,26 @@ class NamedExceptionTest(DecisionBase):
         identifier = self.signed()
         accepted = self.mesh("accounts", "exception", str(identifier))
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
-        self.assertIn("one-turn exception", accepted.stdout)
+        self.assertIn("one-turn exception #%d registered" % identifier, accepted.stdout)
         refused = self.mesh("accounts", "exception", str(self.signed(signed=False)))
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertIn("signature rejected", refused.stderr)
+
+    def test_cli_reports_replays_without_rearming(self):
+        identifier = self.prepare()
+        again = self.mesh("accounts", "exception", str(identifier))
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("already registered", again.stdout)
+        self.assertIn("not re-armed", again.stdout)
+        still = exceptions.preview(self.worker, self.items, self.book, now=self.now)
+        self.assertIsNotNone(still)
+        self.assertEqual(still[1], identifier)
+        self.assertTrue(exceptions.begin(self.worker, self.profile, lambda tx: True))
+        spent = self.mesh("accounts", "exception", str(identifier))
+        self.assertEqual(spent.returncode, 0, spent.stderr)
+        self.assertIn("already consumed", spent.stdout)
+        self.assertIn("not re-armed", spent.stdout)
+        self.assertIsNone(exceptions.preview(self.worker, self.items, self.book, now=self.now))
 
     def test_profile_change_between_preview_and_start_refused(self):
         self.prepare()

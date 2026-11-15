@@ -40,13 +40,26 @@ def _verrou_placement(tx, host, harness) -> None:
 
 class Accounts(interface.Accounts):
     def register_exception(self, decision_id, agent, harness, account):
-        self.db.execute(
-            "with added as ("
-            " insert into account_turn_exceptions(decision_id, agent, harness, account)"
-            " values (%s, %s, %s, %s) on conflict (decision_id) do nothing returning agent)"
-            " select pg_notify('ameesh_budget',"
-            " json_build_object('scope', 'agent:' || agent)::text) from added",
+        # #7234: the INSERT alone cannot say whether it indexed anything; a
+        # replay on a consumed token stays a no-op, so the caller must be able
+        # to tell "armed" from "already registered" / "already consumed".
+        # A direct INSERT ... RETURNING keeps the data-modifying statement at
+        # the top level, which the psql driver's JSON wrapper requires.
+        rows = self.db.query(
+            "insert into account_turn_exceptions(decision_id, agent, harness, account)"
+            " values (%s, %s, %s, %s) on conflict (decision_id) do nothing"
+            " returning 'registered' as status,"
+            " pg_notify('ameesh_budget',"
+            " json_build_object('scope', 'agent:' || agent)::text) as notified",
             (int(decision_id), agent, harness, account))
+        if rows:
+            return rows[0]["status"]
+        rows = self.db.query(
+            "select case when consumed_at is not null then 'already-consumed'"
+            " else 'already-registered' end as status"
+            " from account_turn_exceptions where decision_id = %s",
+            (int(decision_id),))
+        return rows[0]["status"] if rows else "already-registered"
 
     def pending_exceptions(self, agent, harness):
         return self.db.query(
