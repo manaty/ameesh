@@ -968,6 +968,26 @@ change. The switch is also journaled in `account_switches` with type `agent`
 and the agent's name (lot #7439), so the host's switch history is complete;
 the shared `account_active` row still does not move.
 
+**Claude rotation waves (#7441).** After an effective switch, a persona stays
+on its account for at least two hours when only the pace threshold would
+rotate it. Actual saturation or a provider refusal bypasses this dwell for
+that persona. Absolute caps, overage, invalid credentials and shared account
+holds still apply. The dwell is measured from the last effective change,
+across hosts; a planned or withheld switch never restarts its clock.
+
+A critical persona needing a switch schedules the eligible critical personas
+in one database transaction, including personas running on other hosts. The
+wave has a shared identifier and monotonically increasing journal epochs.
+Each persona uses the latest proposal at its next turn boundary, after
+rechecking local profiles and all account guards. Planning never modifies a
+running session or its environment. An older proposal cannot be applied after
+a newer wave, and an applied epoch cannot run twice.
+
+`account_switches` distinguishes `planned` (proposal), `hysteresis` (withheld
+switch, once per effective switch/destination pair), and `agent` (effective
+application at the turn boundary). The shared `wave_id` and `wave_epoch`
+identify the wave in both proposals and effective applications. The shared `account_active` choice remains separate.
+
 **Fallback order for a critical agent at its threshold**:
 
 1. another plan account of the same harness with headroom (§ 4 order);

@@ -242,6 +242,102 @@ class Accounts(interface.Accounts):
             " kind, reason, agent) values (%s, %s, %s, %s, 'agent', %s, %s)",
             (host, harness, from_account, to_account, reason, agent))
 
+    def last_agent_switch(self, harness, agent):
+        rows = self.db.query(
+            "select id, from_account, to_account, extract(epoch from at)::float8 as at_ts"
+            " from account_switches where harness = %s and agent = %s"
+            " and kind in ('agent', 'bascule', 'retour', 'manuel', 'config')"
+            " and from_account is distinct from to_account order by id desc limit 1",
+            (harness, agent))
+        return rows[0] if rows else None
+
+    def pending_agent_plan(self, harness, agent):
+        rows = self.db.query(
+            "select p.id, p.from_account, p.to_account, p.reason, p.wave_id, p.wave_epoch"
+            " from account_switches p"
+            " where p.harness = %s and p.agent = %s and p.kind = 'planned'"
+            " and not exists (select 1 from account_switches s where s.harness = p.harness"
+            " and s.agent = p.agent and s.id > p.id"
+            " and s.kind in ('agent', 'bascule', 'retour', 'manuel', 'config'))"
+            " order by p.id desc limit 1", (harness, agent))
+        return rows[0] if rows else None
+
+    def plan_agent_wave(self, harness, proposals, *, wave):
+        with self.db.transaction() as tx:
+            tx.query("select pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':account-wave:' || %s, 0))", (harness,))
+            store = Accounts(tx)
+            ordered = sorted(proposals, key=lambda p: p['agent'])
+            pending_by_agent = {p['agent']: store.pending_agent_plan(harness, p['agent'])
+                                for p in ordered}
+            if any(int((pending_by_agent[p['agent']] or {}).get('id') or 0)
+                   != p.get('expected_plan', 0) for p in ordered):
+                return []
+            effective = {p['agent']: store.last_agent_switch(harness, p['agent'])
+                         for p in ordered}
+            if any(int((effective[p['agent']] or {}).get('id') or 0)
+                   != p.get('expected_switch', 0)
+                   or (effective[p['agent']]
+                       and effective[p['agent']]['to_account'] != p['from']) for p in ordered):
+                return []  # an effective switch invalidated the planning snapshot
+            if all(pending_by_agent[p['agent']]
+                   and pending_by_agent[p['agent']]['from_account'] == p['from']
+                   and pending_by_agent[p['agent']]['to_account'] == p['to'] for p in ordered):
+                return list(pending_by_agent.values())
+            result = []
+            epoch = None
+            for proposal in ordered:
+                rows = tx.query(
+                    "insert into account_switches (host, harness, agent, from_account,"
+                    " to_account, kind, reason, wave_id)"
+                    " values (%s, %s, %s, %s, %s, 'planned', %s, %s)"
+                    " returning id, from_account, to_account, reason, wave_id",
+                    (proposal['host'], harness, proposal['agent'], proposal['from'],
+                     proposal['to'], 'wave ' + wave + ': ' + proposal['reason'], wave))
+                epoch = epoch or rows[0]['id']
+                tx.execute('update account_switches set wave_epoch = %s where id = %s',
+                           (epoch, rows[0]['id']))
+                rows[0]['wave_epoch'] = epoch
+                result.extend(rows)
+            return result
+
+    def apply_agent_plan(self, host, harness, *, agent, from_account, to_account,
+                         reason, epoch):
+        with self.db.transaction() as tx:
+            tx.query("select pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':account-wave:' || %s, 0))", (harness,))
+            if epoch:
+                pending = Accounts(tx).pending_agent_plan(harness, agent)
+                if (not pending or pending['wave_epoch'] != epoch
+                        or pending['from_account'] != from_account
+                        or pending['to_account'] != to_account):
+                    return False
+                tx.execute(
+                    "insert into account_switches (host, harness, agent, from_account,"
+                    " to_account, kind, reason, wave_id, wave_epoch)"
+                    " values (%s, %s, %s, %s, %s, 'agent', %s, %s, %s)",
+                    (host, harness, agent, from_account, to_account, reason,
+                     pending['wave_id'], epoch))
+            else:
+                Accounts(tx).record_agent_switch(host, harness, agent=agent,
+                                                 from_account=from_account,
+                                                 to_account=to_account, reason=reason)
+            return True
+
+    def record_hysteresis(self, host, harness, *, agent, account, target, switch_id, reason):
+        with self.db.transaction() as tx:
+            tx.query("select pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':account-dwell:' || %s, 0))",
+                     (harness + '/' + agent,))
+            tx.execute(
+                "insert into account_switches (host, harness, agent, from_account,"
+                " to_account, kind, reason) select %s, %s, %s, %s, %s, 'hysteresis', %s"
+                " where not exists (select 1 from account_switches where harness = %s"
+                " and agent = %s and kind = 'hysteresis' and id > %s"
+                " and from_account = %s and to_account = %s)",
+                (host, harness, agent, account, target, reason, harness, agent,
+                 int(switch_id), account, target))
+
     def set_auto(self, host, harness, *, reason, expected=None,
                  expected_until=None) -> bool:
         with self.db.transaction() as tx:
