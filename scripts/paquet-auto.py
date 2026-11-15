@@ -1623,19 +1623,27 @@ def exclude_discards(requested: list[int], reasons: list[str],
     return discards
 
 
+def composition_text(repo: Path, head: str, name: str) -> str:
+    """#7477: exact receipt first, historical Git rendering on absence."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh import packet_snapshot
+    text = packet_snapshot.text(checkout=str(repo), head=head,
+        branch=package_branch(name),
+        fallback=lambda: _decode(git(repo, "show",
+            "%s:%s" % (head, manifest_rel(name)), check=False).stdout))
+    if not text:
+        raise InputError("composition illisible à la tête %s" % head)
+    return text
+
+
 def composition_specs(repo: Path, reference: str, name: str) -> list[tuple[list[int], str]]:
     """#4581 : la table `## Composition` du manifeste gelé à `reference`."""
     sha = rev(repo, reference)
     if sha is None:
         raise InputError("--keep-composition : référence %r introuvable" % reference)
     rel = manifest_rel(name)
-    show = git(repo, "show", "%s:%s" % (sha, rel), check=False)
-    if show.returncode != 0:
-        raise InputError(
-            "--keep-composition : manifeste %s illisible sur %s : %s"
-            % (rel, sha[:12], _tail(_decode(show.stderr))))
     try:
-        return parse_composition_table(_decode(show.stdout))
+        return parse_composition_table(composition_text(repo, sha, name))
     except InputError as error:
         raise InputError(
             "--keep-composition : %s illisible sur %s : %s"
@@ -3224,6 +3232,18 @@ def contract_attestation_context(worktree: Path, *, base: str, modules: list,
                  attestation_execution_inputs(cfg), driver=test_driver(worktree)),
              "database_schema": tree, "fixtures": {"tree": tree}, "exclusions": {}}
     lots = []
+    from ameesh import packet_snapshot
+    branch = _decode(git(worktree, "symbolic-ref", "--short", "-q", "HEAD",
+                         check=False, timeout=remaining()).stdout).strip()
+    head = rev(worktree, "HEAD")
+    receipt = (packet_snapshot.lookup(checkout=str(worktree), head=head, branch=branch)
+               if head and branch.startswith("integration/") else None)
+    if receipt:
+        for unit in receipt["payload"]["units"]:
+            lots.append({"id": str(unit["work_item_id"]),
+                         "sha": unit.get("source_sha") or unit["unit_sha"]})
+        remaining()
+        return scope, path, lots, max_age
     changed = git(worktree, "diff", "--name-only", base, "HEAD", "--", "reviews/",
                   timeout=remaining())
     for rel in sorted(_decode(changed.stdout).splitlines()):
@@ -5083,10 +5103,14 @@ def run_inclusion(worktree: Path, manifest: Path, head: str,
 
 
 def record_packet(worktree: Path, carrier: int, base_sha: str, head: str,
-                  branch: str, target: str, expect_pushed: str = "") -> str:
+                  branch: str, target: str, expect_pushed: str = "", claim=None) -> str:
     cmd = ["ameesh", "work", "packet", "record", str(carrier),
            "--repo", str(worktree), "--base", base_sha, "--head", head,
            "--branch", branch, "--target", target]
+    if claim is not None:
+        claim.require()
+        cmd += ["--composition-owner", claim.owner,
+                "--composition-epoch", str(claim.epoch)]
     if expect_pushed:
         # #4501 : la tête poussée que cette composition remplace (bail du
         # composeur) ; le refus d'une tête gelée étrangère vient de packet_link.
@@ -5713,12 +5737,7 @@ def replay(repo: Path, reference: str, name: str, base: str, *,
     if ref is None:
         raise InputError("référence %r introuvable" % reference)
     manifest_path = manifest_rel(name)
-    show = git(repo, "show", "%s:%s" % (ref, manifest_path), check=False)
-    if show.returncode != 0:
-        raise InputError(
-            "manifeste %s introuvable dans %s : %s"
-            % (manifest_path, ref[:12], _decode(show.stderr).strip()))
-    manifest_text = _decode(show.stdout)
+    manifest_text = composition_text(repo, ref, name)
     specs = parse_composition_table(manifest_text)
     base_sha = rev(repo, base)
     if base_sha is None:
@@ -5851,7 +5870,8 @@ def check_chain(repo: Path, head: str, base_sha: str, rel: str,
         raise ChainRefused("la tête %s n'est pas le seul commit du manifeste %s"
                            % (head[:12], rel))
     try:
-        specs = parse_composition_table(out(repo, "show", "%s:%s" % (head, rel)))
+        name = Path(rel).stem.removeprefix("integration-paquet-")
+        specs = parse_composition_table(composition_text(repo, head, name))
     except InputError as error:
         raise ChainRefused(str(error)) from error
     lines = out(repo, "rev-list", "--first-parent", "--parents", "--reverse",
@@ -6333,7 +6353,7 @@ def compose_packet(args: argparse.Namespace) -> int:
             if not args.no_packet_record:
                 print(record_packet(worktree, args.carrier, base_sha, head,
                                     branch, args.target,
-                                    expect_pushed=lease or ""), flush=True)
+                                    expect_pushed=lease or "", claim=claim), flush=True)
             _write_id_file(expected_file, [unit.lot for unit in composition.units])
             inclusion_rc, inclusion_output = run_inclusion(
                 worktree, worktree / rel, head, ready_out, expected_file)

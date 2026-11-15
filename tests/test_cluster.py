@@ -306,6 +306,11 @@ FERMEES = {
     "work_packet_members": {"package_id", "work_item_id", "package_branch",
                             "base_sha", "head_sha", "unit_sha", "source_sha",
                             "frozen_sha", "recorded_by", "recorded_at"},
+    # #7477 (0580): immutable composition receipts are internal to the
+    # composer/readers, closed to both external supervisor roles.
+    "work_packet_snapshots": {"id", "repository", "target", "package_id", "branch",
+                              "head_sha", "base_sha", "payload", "recorded_by",
+                              "lease_owner", "lease_epoch", "recorded_at"},
     # #3631 (0488) : agrégat des relevés d'hôte par tranche de 10 min, tenu
     # et lu par l'exécuteur (`lend_basis`), pas par le rôle superviseur ;
     # état de mesure interne, fermé aux deux rôles, aucun GRANT modifié.

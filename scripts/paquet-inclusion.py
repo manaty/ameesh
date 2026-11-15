@@ -248,8 +248,9 @@ def iter_tables(lines: list[str]):
         index += 1
 
 
-def parse_manifest(path: Path) -> Manifest:
-    text = path.read_text(encoding="utf-8")
+def parse_manifest(path: Path, *, text: str | None = None) -> Manifest:
+    if text is None:
+        text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
     manifest = Manifest(path=path)
     composed_found = False
@@ -684,13 +685,21 @@ def lot_verdict(entries: list[dict]) -> str:
 def run(args: argparse.Namespace) -> tuple[int, dict]:
     repo = Path(args.repo).resolve()
     manifest_path = Path(args.manifest).resolve()
-    if not manifest_path.is_file():
-        raise InputError(f"manifeste introuvable : {manifest_path}")
-    manifest = parse_manifest(manifest_path)
-
     head = rev_parse(repo, args.head)
     if head is None:
         raise InputError(f"tête introuvable : {args.head}")
+    receipt = None
+    if manifest_path.name.startswith("integration-"):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+        from ameesh import packet_snapshot
+        branch = "integration/" + manifest_path.stem.removeprefix("integration-")
+        receipt = packet_snapshot.lookup(checkout=str(repo), head=head, branch=branch)
+    if receipt:
+        manifest = parse_manifest(manifest_path, text=receipt["payload"]["manifest"])
+    else:
+        if not manifest_path.is_file():
+            raise InputError(f"manifeste introuvable : {manifest_path}")
+        manifest = parse_manifest(manifest_path)
 
     expected = collect_ids(args.expected, args.expected_file)
     if not expected and manifest.admissions:

@@ -631,7 +631,7 @@ class Passage:
             stamp = named.group(1) if named else _stamp_of(created, zone)
             parents = raw_parents.split()
             branch_head = parents[1] if len(parents) > 1 else sha
-            manifest_lots = _manifest_lots(clone, sha, tail)
+            manifest_lots = _manifest_lots(clone, sha, tail, receipt_head=branch_head)
             lots = manifest_lots
             if lots is None and len(parents) > 1:
                 # The numbered composer declares its units in the merge
@@ -774,13 +774,18 @@ def _first_parent_before(clone, head, cutoff):
         raise train.TrainError("unreadable packet commit date") from exc
 
 
-def _manifest_lots(clone, sha, tail):
+def _manifest_lots(clone, sha, tail, *, receipt_head=None):
     """The exact ``reviews/integration-<tail>.md`` lots, or None.
 
     No fallback to another packet's manifest: an inherited manifest would
     turn an unrelated branch into a false carrier (#2682 B2).
     """
     path = "reviews/integration-%s.md" % tail
+    from . import packet_snapshot
+    receipt = packet_snapshot.lookup(checkout=clone, head=receipt_head or sha,
+                                     branch="integration/" + tail)
+    if receipt:
+        return parse_manifest(receipt["payload"]["manifest"])
     manifest = resolutions._run(clone, "show", "%s:%s" % (sha, path))
     if manifest.returncode:
         return None

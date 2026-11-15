@@ -999,8 +999,16 @@ def packets_between(repo: str, since: str, target: str) -> tuple[list[Packet], l
             else:
                 pr, branch = int(match.group(1)), match.group(2)
             units = sorted({int(n) for n in _LOT_REF.findall(body)})
-            manifest = _manifest_for(repo, target, branch)
-            parsed = parse_manifest(_manifest_text(repo, target, manifest))
+            from . import packet_snapshot
+            # A merge's second parent is the carrier head actually delivered.
+            parent = _git(repo, "rev-parse", "--verify", sha + "^2")
+            carrier_head = parent.stdout.strip() if parent.returncode == 0 else ""
+            receipt = packet_snapshot.lookup(checkout=repo, head=carrier_head,
+                                             branch=branch) if carrier_head else None
+            manifest = ("packet-snapshot:%d" % receipt["id"] if receipt else
+                        _manifest_for(repo, sha, branch))
+            parsed = parse_manifest(receipt["payload"]["manifest"] if receipt else
+                                    _manifest_text(repo, sha, manifest))
             # The merge body may omit units; the manifest composition is the
             # complete list. Union, never prefer the shorter body (N1).
             units = sorted(set(units) | set(parsed["included"]))

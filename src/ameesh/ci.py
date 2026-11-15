@@ -3947,7 +3947,8 @@ def _manifest_name(head_ref: str) -> str:
     return "integration-%s.md" % head_ref[len("integration/"):].replace("/", "-")
 
 
-def _carrier_manifest(api, repo: str, head_ref: str, sha: str, base: str) -> str:
+def _carrier_manifest(api, repo: str, head_ref: str, sha: str, base: str, *,
+                      db=None, target=None, carrier=None) -> str:
     """Le manifeste de composition que publie le porteur à `sha`, ou "" (N1 #2240).
 
     Un porteur `integration/<nom>` publie `reviews/integration-<nom>.md` :
@@ -3958,6 +3959,11 @@ def _carrier_manifest(api, repo: str, head_ref: str, sha: str, base: str) -> str
     publier (R1 ameesh-dev1). Toute réponse illisible vaut « pas de manifeste » :
     le refus est nommé, jamais un zéro avis supposé.
     """
+    from . import packet_snapshot
+    receipt = packet_snapshot.lookup(db=db, repository=repo, head=sha, branch=head_ref,
+                                     target=target, package_id=carrier)
+    if receipt:
+        return "packet-snapshot:%d" % receipt["id"] if receipt["payload"]["units"] else ""
     name = _manifest_name(head_ref)
     at_head = _reviews_at(api, repo, sha)
     at_base = _reviews_at(api, repo, base)
@@ -4279,7 +4285,8 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                            "integration/** carrier head (source %r); review the head "
                            "and pass its required verdicts"
                            % (pr["number"], head_ref or "—"))
-        manifest = _carrier_manifest(api, name, head_ref, frozen_sha, pr["base"])
+        manifest = _carrier_manifest(api, name, head_ref, frozen_sha, pr["base"], db=db,
+                                     target=pr["base_ref"], carrier=item_id)
         if not manifest:
             raise GelError("pull request #%d: --avis 0 --full needs the carrier's own "
                            "manifest (reviews/%s) at %s, absent from the base; without "

@@ -4192,6 +4192,62 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(package_id), rows[0]["state"], note, actor)
             return WorkItems(tx).packet_members(package_ids=[int(package_id)])
 
+    def record_packet_snapshot(self, *, repository, target, package_id, branch,
+                               head_sha, base_sha, payload, actor, lease_key,
+                               lease_owner, lease_epoch) -> dict:
+        payload = json.loads(json.dumps(payload))
+        with self.db.transaction() as tx:
+            lease = tx.query(
+                "SELECT owner, epoch FROM merge_locks WHERE target = %s FOR SHARE",
+                (lease_key,))
+            if (not lease or lease[0]["owner"] != lease_owner
+                    or int(lease[0]["epoch"]) != int(lease_epoch)):
+                raise DbError("packet snapshot: composer lease changed")
+            live = tx.query(
+                "SELECT 1 FROM merge_locks WHERE target = %s"
+                " AND expires_at > clock_timestamp()", (lease_key,))
+            if not live:
+                raise DbError("packet snapshot: composer lease expired")
+            tx.execute(
+                "INSERT INTO work_packet_snapshots"
+                " (repository, target, package_id, branch, head_sha, base_sha,"
+                " payload, recorded_by, lease_owner, lease_epoch)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)"
+                " ON CONFLICT (repository, target, package_id, head_sha) DO NOTHING",
+                (repository, target, int(package_id), branch, head_sha, base_sha,
+                 json.dumps(payload), actor or "", lease_owner, int(lease_epoch)))
+            receipt = WorkItems(tx).packet_snapshots(
+                repository=repository, target=target, package_id=package_id,
+                head_sha=head_sha)[0]
+            if (receipt["branch"] != branch or receipt["base_sha"] != base_sha
+                    or receipt["payload"] != payload):
+                raise DbError("packet snapshot: immutable head already has different content")
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                            " AND expires_at > clock_timestamp()", (lease_key,)):
+                raise DbError("packet snapshot: composer lease expired during write")
+            return receipt
+
+    def packet_snapshots(self, *, repository, target=None, package_id=None,
+                         branch=None, head_sha=None) -> list[dict]:
+        # During additive rollout an older database has no new receipts.
+        # Query errors after the prerequisite are not treated as absence.
+        ready = prerequisite_query(self.db,
+            "SELECT to_regclass('work_packet_snapshots') IS NOT NULL AS ready")
+        if not ready or not ready[0]["ready"]:
+            return []
+        where, params = ["repository = %s"], [repository]
+        for column, value in (("target", target), ("package_id", package_id),
+                              ("branch", branch), ("head_sha", head_sha)):
+            if value is not None:
+                where.append(column + " = %s")
+                params.append(value)
+        return self.db.query(
+            "SELECT id, repository, target, package_id, branch, head_sha, base_sha,"
+            " payload, recorded_by, lease_owner, lease_epoch,"
+            " extract(epoch FROM recorded_at)::float8 AS recorded_ts"
+            " FROM work_packet_snapshots WHERE " + " AND ".join(where)
+            + " ORDER BY id", tuple(params))
+
     def packet_members(self, *, item_ids=None, package_ids=None) -> list[dict]:
         where, params = [], []
         if item_ids is not None:
