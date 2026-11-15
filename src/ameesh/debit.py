@@ -68,8 +68,9 @@ l'auteur ou du pilote (déclarer la dépendance, ou rebaser). #7435 : un lot
 relu déjà membre d'un **porteur de paquet non terminé à sa tête gelée** n'est
 pas non plus une attente `qa_merge` : le paquet est sa voie d'atterrissage
 (§11 bis/§12), le pilote n'a rien à relancer. Le rapport le classe
-`in_packet` (niveau 0, hors `slow_waits`) ; un porteur terminé, ou une
-composition sur une autre tête, laisse la ligne revenir.
+`in_packet` (niveau 0, hors `slow_waits`) ; un porteur terminé, en retenue
+(`blocked`, `waiting_human`, #7445) ou une composition sur une autre tête,
+laisse la ligne revenir.
 
 #3256 B : la section `capacity` (spec `docs/design/3256-debit-file.md` §3) —
 agents réveillables au repos, heures-agent au repos, lots démarrables, lot de
@@ -515,8 +516,12 @@ def _open_packet_member(row: Mapping[str, Any],
     #2443) : une recomposition remplace l'ensemble des unités, donc un lot
     retiré n'est plus membre. Un porteur terminé (`lifecycle.COMPLETED`) ne
     porte plus rien ; un état absent ne prouve pas un porteur ouvert et laisse
-    donc la ligne revenir. La tête comparée est celle du **gel courant** du
-    lot : un porteur composé avant un regel ne porte plus la tête examinée.
+    donc la ligne revenir. Un porteur en retenue (`blocked`, `waiting_human`,
+    #7445) est encore rendu ici, mais `build` ne le laisse pas masquer
+    l'attente du membre : son attente propre peut être invisible (un porteur
+    bloqué sans `hold:` n'a aucune ligne à lui). La tête comparée est celle du
+    **gel courant** du lot : un porteur composé avant un regel ne porte plus
+    la tête examinée.
     """
     from . import packet_head
     sha = str(row.get("frozen_sha") or row.get("sha") or "")
@@ -1200,11 +1205,17 @@ def build(*, items: Iterable[Mapping[str, Any]],
 
     `packets` (#3256 C, #7435) : les compositions de la fenêtre
     (`work_packet_members` et l'état du porteur). Un lot membre d'un porteur
-    **non terminé** (`package_state` hors `lifecycle.COMPLETED`) dont le
-    `frozen_sha` est sa tête gelée est classé `in_packet` (niveau 0) : ce
-    n'est pas une attente `qa_merge`. Un état de porteur absent ne prouve
-    rien et laisse la ligne ; un porteur terminé ou composé sur une autre
-    tête la laisse revenir."""
+    **non terminé** (`package_state` hors `lifecycle.COMPLETED`) et **hors
+    retenue** (`blocked`, `waiting_human`, #7445) dont le `frozen_sha` est sa
+    tête gelée est classé `in_packet` (niveau 0) : ce n'est pas une attente
+    `qa_merge`. Un porteur en retenue ne porte plus ses membres, dont la
+    ligne revient : son attente propre peut être invisible, et le membre ne
+    doit pas attendre en silence qu'il soit recomposé ou fermé. La ligne
+    redevient humaine quand le porteur est `waiting_human` (décision owner
+    ouverte, hors `--check`) ; un porteur `blocked` la laisse en attente
+    d'agent (pilote). Un état de porteur absent ne prouve rien et laisse la
+    ligne ; un porteur terminé ou composé sur une autre tête la laisse
+    revenir."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
     # la déclaration d'attente externe d'un hold.
@@ -1717,10 +1728,21 @@ def build(*, items: Iterable[Mapping[str, Any]],
             # `in_packet` de niveau 0 : visible sur la ligne `qa`, jamais une
             # attente lente ni une sortie 2. Un porteur terminé ou composé sur
             # une autre tête ne prouve rien et laisse la ligne revenir.
+            # #7445 : un porteur en retenue (`blocked`, `waiting_human`) ne
+            # porte plus son membre : sa ligne `qa_merge` revient, liée au
+            # porteur. Un porteur `waiting_human` est une attente humaine
+            # (décision owner ouverte), donc hors `--check` ; `blocked` est un
+            # geste d'agent (pilote) et reste une attente lente.
             member = _open_packet_member(row, packets_by_lot)
+            packet = None
             if member is not None:
-                row["in_packet"] = int(member["package_id"])
-                continue
+                carrier = str(member.get("package_state") or "")
+                if carrier not in lifecycle.WAITING:
+                    row["in_packet"] = int(member["package_id"])
+                    continue
+                packet = {"package_id": int(member["package_id"]),
+                          "state": carrier}
+                row["packet_wait"] = packet
             # #6423 : un réveil armé ou une fenêtre d'observation, non échus,
             # sont des attentes voulues et datées : le lot n'est pas encore
             # « en attente du paquet » et rien n'est actionnable avant
@@ -1733,9 +1755,18 @@ def build(*, items: Iterable[Mapping[str, Any]],
             if (window is not None
                     and now < float(window["observation"]["due_ts"])):
                 continue
-            add_wait("qa_merge", row, row["frozen_ts"], "paquet",
-                     GESTURES["qa_merge"], level=2, human=_human_wait(state),
-                     **dependents_of(row["lot"]))
+            extra = dependents_of(row["lot"])
+            who = "paquet"
+            if packet is not None:
+                who = "paquet #%d" % packet["package_id"]
+                extra.update({"packet": packet["package_id"],
+                              "packet_state": packet["state"]})
+            add_wait("qa_merge", row, row["frozen_ts"], who,
+                     GESTURES["qa_merge"], level=2,
+                     human=(_human_wait(state)
+                            or (packet is not None
+                                and packet["state"] == lifecycle.WAITING_HUMAN)),
+                     **extra)
     def window_open(lot) -> bool:
         """#4235 : la fenêtre d'observation du lot tient encore (non échue)."""
         window = window_by_lot.get(int(lot))
@@ -2764,7 +2795,8 @@ _CI_SQL = """
 #: `_ITEMS_SQL` : un lot fusionné en est exclu, et c'est justement un lot relu
 #: puis composé que la mesure doit compter (relecture auditeur du 28/10).
 #: #7435 : `package_state` dit si le porteur est encore ouvert ; la
-#: classification `in_packet` de `build` en dépend.
+#: classification `in_packet` de `build` en dépend. #7445 : une retenue
+#: (`blocked`, `waiting_human`) compte comme non porteuse.
 _PACKETS_SQL = """
     SELECT m.package_id, m.work_item_id, m.frozen_sha,
            p.state AS package_state,
