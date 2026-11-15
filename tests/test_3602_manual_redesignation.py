@@ -99,7 +99,8 @@ class ManualRedesignationTest(t2447._ActivationFixture, PgTestCase):
         self._new_head()
         _, again = self.freeze()
         self.assertEqual(again["state"], rd.DESIGNATED, again)
-        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+        # #7442: the still-live r2 seat has priority; both seats remain automatic.
+        self.assertCountEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
         self._new_head()
         self._families("deepseek")
         _, waiting = self.freeze()
