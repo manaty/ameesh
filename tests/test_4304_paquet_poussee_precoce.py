@@ -164,7 +164,7 @@ class Flux:
             mock.patch.object(paquet_auto, "check_local_tests", side_effect=tests),
             mock.patch.object(paquet_auto, "composition_table", return_value="## Composition\n"),
             mock.patch.object(paquet_auto, "build_manifest", side_effect=manifest),
-            mock.patch.object(paquet_auto, "write_manifest", side_effect=write),
+            mock.patch.object(paquet_auto, "write_composition", side_effect=write),
             mock.patch.object(paquet_auto, "run_inclusion",
                               side_effect=self.log("inclusion", (0, "ok"))),
             mock.patch.object(paquet_auto, "pull_request_state", side_effect=state),
