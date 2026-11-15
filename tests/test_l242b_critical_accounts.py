@@ -197,7 +197,8 @@ class ExecuteurTest(_L30Base):
             self.assertEqual(
                 [(b["from_account"], b["to_account"], b["kind"], b["agent"])
                  for b in self._bascules()],
-                [("primaire", "secondaire", "agent", "orch")])
+                [("primaire", "secondaire", "planned", "orch"),
+                 ("primaire", "secondaire", "agent", "orch")])
             self.assertIsNone(storage.of(self.db).accounts.active(self.cfg.host, "claude"))
             self.assertIn("for this critical agent only", self._fil())
             self.assertEqual(registry.get(self.db, "orch")["session_account"], "secondaire")

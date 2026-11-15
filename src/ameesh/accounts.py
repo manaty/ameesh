@@ -1882,6 +1882,7 @@ class Choice:
     #: L242b : choix propre à un agent critique — le dernier choix partagé
     #: (`account_active`) n'a pas bougé, aucun forçage n'a été levé
     per_agent: bool = False
+    retained: dict | None = None        #: #7441: attempted switch held by dwell
 
 
 #: #3969 : la raison d'un choix sans compte plaçable parce qu'un compte
@@ -2697,7 +2698,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
            paced: bool = True, critical: bool = False, margin: bool = False,
-           model: str = "", cfg=None, probe: bool = False) -> Choice:
+           model: str = "", cfg=None, probe: bool = False,
+           planned_account: str | None = None) -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     `session_account` : le compte sous lequel tourne la session en cours de
@@ -2763,6 +2765,10 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         from . import account_claims
         items = account_claims.mark_refused(cfg, items, db=db, now=now)
     store = storage.of(db).accounts
+    # #7441: effective persona switches only; pending waves and withheld
+    # switches never restart the two-hour clock. Simulation remains read-only.
+    last_switch = (store.last_agent_switch(harness, agent)
+                   if harness == 'claude' and agent else None)
     # L242b : un choix critique n'écrit jamais l'état partagé (#324 r1)
     readonly = simulate or critical
     row = store.active(host, harness) or (
@@ -2951,7 +2957,10 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # (les autres comptes ne sont alors pas relus : rien à choisir). Un compte
         # retenu ne l'est pas : c'est le PROCHAIN tour que ce choix décide, il ne
         # part pas sur un compte facturé au-delà du plan (R1 auditeur, B1).
-        own = by_name(items, session_account) if session_account else None
+        # Clearing a session does not erase the effective persona account.
+        origin_name = session_account or ((last_switch or {}).get('to_account')
+                                          if critical else None)
+        own = by_name(items, origin_name) if origin_name else None
         own_ev = ev(own) if own is not None else None
         # #7006 : un agent critique quitte son compte avant sa saturation. À
         # 100 %, `account_turn.summary_possible` refuse le tour de résumé (le
@@ -2964,8 +2973,32 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                     and own is not None and own in candidates
                     and own.name not in ecartes and own.name not in epuises)
                 else None)
+        # #7441: a pace threshold alone cannot rotate a persona within two
+        # hours. Absolute caps, invalid profiles, provider refusals, holds and
+        # actual saturation retain their existing priority.
+        dwell = (own is not None and last_switch
+                 and last_switch.get('to_account') == own.name
+                 and 0 <= now - float(last_switch['at_ts']) < 2 * 3600)
+        if (dwell and own in candidates and own.name not in ecartes
+                and own_ev.unpaced_ok and not own_ev.problems and placeable(own_ev, now)
+                and not any(g.used_at(now) >= 1 for g in own_ev.gauges)):
+            target = planned_account
+            if target is None and (not own_ev.ok or near is not None):
+                for profile in items:
+                    ev(profile)
+                alternatives = rank([p for p in candidates if p.name != own.name
+                                     and p.name not in ecartes], cache, now)
+                target = alternatives[0].name if alternatives else None
+            if target and target != own.name:
+                why = ('hysteresis: stay on %s for at least 2 h after switch #%s; '
+                       'pace threshold alone withholds %s' %
+                       (own.name, last_switch['id'], target))
+                return Choice(own, active, kept=True, why=why,
+                              retained={'account': own.name, 'target': target,
+                                        'switch_id': last_switch['id'], 'reason': why})
         if (own is not None and own in candidates and own.name not in ecartes
-                and own.name not in epuises and own_ev.ok and near is None):
+                and own.name not in epuises and own_ev.ok and near is None
+                and (not planned_account or planned_account == own.name)):
             return Choice(own, active, kept=True,
                           why="continuity: the session stays on %s, under its "
                               "threshold" % own.name)
@@ -3123,7 +3156,9 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 if refreshed:
                     return decide(retenus, conflits, sick, pauses)
             return Choice(None, active, reason=why)
-        target = ranked[0]
+        # A wave is only a preference among accounts passing every current
+        # guard. A missing or newly blocked destination never forces a turn.
+        target = next((p for p in ranked if p.name == planned_account), ranked[0])
         why = reason_of(ranked, cache, now)
         if sick:
             why = "skipped authentication failing accounts on %s: %s; %s" % (
@@ -3145,12 +3180,12 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         elif left is not None and not cache[left.name].ok:
             why = "%s at threshold (%s); %s" % (left.name, cache[left.name].reason, why)
         if critical:
-            # L242b : jamais le dernier choix partagé ; la bascule est celle de
-            # l'agent (depuis le compte de sa session, sinon le choix partagé)
-            origin = own if own is not None else active
+            # Keep the persona origin even when this host has no profile for
+            # it: a remote peer may have a different set of declared accounts.
+            origin = origin_name or active.name
             moved = None
-            if target.name != origin.name:
-                moved = {"from": origin.name, "to": target.name, "kind": "agent", "reason": why}
+            if target.name != origin:
+                moved = {"from": origin, "to": target.name, "kind": "agent", "reason": why}
             return Choice(target, active, switched=moved, why=why, per_agent=True)
         if target.name == active.name:
             # #1883 (R2 auditeur, B1) : rien n'est écrit ici — c'est le point de
@@ -3279,6 +3314,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 and choice.profile.name not in conflits_frais
                 and choice.profile.name not in _paused_names(pauses_frais, cache, now)
                 and choice.profile.name not in sick):
+            if choice.retained and not simulate:
+                store.record_hysteresis(host, harness, agent=agent, **choice.retained)
             return choice
         # reprise : la décision est rejouée sur l'état frais — forçage levé
         # pour un compte libre, continuité rompue, compte écarté du classement

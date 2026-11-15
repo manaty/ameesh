@@ -123,9 +123,30 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None,
         # sans état des comptes, on ne sait pas quel compte est sous le seuil
         return ("account state unavailable (%s)" % db_mod.explain(exc)
                 if pause else None)
-    if choice.switched:
+    if harness == 'claude' and is_critical(worker):
+        from . import account_rotation
+        try:
+            choice = account_rotation.coordinate(worker, items, book, choice,
+                                                   now=time.time(), pause=pause,
+                                                   margin=bool(margin))
+        except db_mod.Unavailable:
+            raise
+        except db_mod.DbError as exc:
+            return 'account wave unavailable (%s)' % db_mod.explain(exc)
+    elif choice.switched:
         if not journal(worker, harness, choice.switched):
             return "account state unavailable: switch not journalized"
+    if harness == 'claude':
+        # Selection also runs while idle. Every persona's effective change,
+        # including adoption of an already selected shared account, belongs
+        # at its next turn boundary and starts its own dwell clock there.
+        origin = session_account(worker, items)
+        pending = choice.switched if is_critical(worker) else None
+        if choice.profile is not None and origin and choice.profile.name != origin:
+            pending = dict(pending or {}, **{
+                'from': origin, 'to': choice.profile.name, 'kind': 'agent',
+                'reason': (pending or {}).get('reason') or choice.why or 'turn account change'})
+        worker._pending_claude_switch = pending
     if choice.profile is None:
         from . import account_exception
         exception = account_exception.preview(worker, items, book, margin=bool(margin))
@@ -327,24 +348,35 @@ def journal(worker, harness: str, switched: dict) -> bool:
     pas la bascule s'appliquer, pour que le prochain tour la rejoue.
     """
     if switched["kind"] == "agent":
-        cle = (switched["from"], switched["to"])
+        cle = (switched["from"], switched["to"], switched.get('epoch'))
         if getattr(worker, "_agent_switch_logged", None) == cle:
             return True
         db = getattr(worker, "db", None)
         if db is not None:
             try:
-                storage.of(db).accounts.record_agent_switch(
-                    worker.cfg.host, harness,
-                    from_account=switched["from"], to_account=switched["to"],
-                    reason=switched["reason"], agent=worker.name)
+                store = storage.of(db).accounts
+                if harness == 'claude':
+                    applied = store.apply_agent_plan(
+                        worker.cfg.host, harness, from_account=switched['from'],
+                        to_account=switched['to'], reason=switched['reason'],
+                        agent=worker.name, epoch=switched.get('epoch', 0))
+                    if not applied:
+                        return False  # a newer wave will be selected next turn
+                else:
+                    store.record_agent_switch(
+                        worker.cfg.host, harness,
+                        from_account=switched["from"], to_account=switched["to"],
+                        reason=switched["reason"], agent=worker.name)
             except db_mod.DbError as exc:
                 _log("[%s] account switch not journalized (%s)"
                      % (worker.name, db_mod.explain(exc)))
                 return False
         worker._agent_switch_logged = cle
-        texte = ("Account switch %s for this critical agent only: %s → %s (%s). The "
+        label = ('persona at the turn boundary' if harness == 'claude' and not is_critical(worker)
+                 else 'critical agent only')
+        texte = ("Account switch %s for this %s: %s → %s (%s). The "
                  "shared choice and any force stay as they are." % (
-                     harness, switched["from"], switched["to"], switched["reason"]))
+                     harness, label, switched["from"], switched["to"], switched["reason"]))
         _log("[%s] %s" % (worker.name, texte))
         worker._fil_note(texte, meta={"action": "compte", "type": "agent",
                                       "harnais": harness, "de": switched["from"],
@@ -411,6 +443,22 @@ def apply(worker, env: dict, compte) -> bool:
         _log("[%s] %s: turn not started" % (worker.name, exc))
         worker.fail_turn("account unusable", str(exc))
         return False
+    if not begin_switch(worker, compte):
+        registry.restore_prompt(worker.db, worker.name, worker.runner.runner_id, worker.epoch)
+        registry.set_status(worker.db, worker.name, 'queued',
+                            status_text='account wave changed; retry next turn')
+        return False
+    return True
+
+
+def begin_switch(worker, compte) -> bool:
+    """Commit the newest epoch with the validated turn environment, before setup."""
+    pending = getattr(worker, '_pending_claude_switch', None)
+    if compte is not None and compte.harness == 'claude' and pending and pending['to'] == compte.name:
+        if not journal(worker, 'claude', pending):
+            _log('[%s] account wave superseded or not journalized; retry next turn' % worker.name)
+            return False
+        worker._pending_claude_switch = None
     return True
 
 

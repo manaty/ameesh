@@ -1427,6 +1427,30 @@ class Accounts(Domain):
         """
         return None
 
+    def last_agent_switch(self, harness: str, agent: str) -> dict | None:
+        """#7441: last effective account change for this persona, across hosts."""
+        return None
+
+    def pending_agent_plan(self, harness: str, agent: str) -> dict | None:
+        """#7441: a wave proposal newer than the persona's effective switch."""
+        return None
+
+    def plan_agent_wave(self, harness: str, proposals: list[dict], *, wave: str) -> list:
+        """#7441: publish a whole wave atomically, without changing sessions."""
+        return []
+
+    def apply_agent_plan(self, host: str, harness: str, *, agent: str,
+                         from_account: str, to_account: str, reason: str, epoch: int) -> bool:
+        """Apply only the latest wave epoch at a turn boundary; stale = false."""
+        self.record_agent_switch(host, harness, agent=agent, from_account=from_account,
+                                 to_account=to_account, reason=reason)
+        return True
+
+    def record_hysteresis(self, host: str, harness: str, *, agent: str,
+                          account: str, target: str, switch_id: int, reason: str) -> None:
+        """#7441: journal a withheld switch once per switch/target pair."""
+        return None
+
     # -- #6961 : pause partagée par compte --------------------------------
     # Méthodes NON abstraites : le contrat de l'exécuteur médié (L107) ne
     # change pas, et un stockage qui ne les porte pas (doublure de test,
