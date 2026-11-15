@@ -2943,6 +2943,10 @@ class _ForcedPort:
     def latest_freeze(self, lot: int):
         return self.port.latest_freeze(lot)
 
+    def previous_review(self, lot: int, freeze_id: int):
+        reader = getattr(self.port, "previous_review", None)
+        return reader(lot, freeze_id) if callable(reader) else {}
+
     def recorded(self, lot: int, freeze_id: int):
         return None
 
@@ -3290,6 +3294,10 @@ class _TracedPort:
 
     def latest_freeze(self, lot: int):
         return self.port.latest_freeze(lot)
+
+    def previous_review(self, lot: int, freeze_id: int):
+        reader = getattr(self.port, "previous_review", None)
+        return reader(lot, freeze_id) if callable(reader) else {}
 
     def recorded(self, lot: int, freeze_id: int):
         return self.port.recorded(lot, freeze_id)

@@ -63,6 +63,25 @@ class StableJournalTest(PgTestCase):
         self.assertEqual(len(self.db.query('SELECT id FROM agent_mailbox'
                                          ' WHERE work_item_id = %s', (str(self.lot),))), 2)
 
+    def test_activation_selection_keeps_seat_through_both_port_wrappers(self):
+        self.first_review()
+        current = self.freeze(B, 'Correction ready for delta review.')
+        inputs = activation.Inputs(
+            item=self.item, freeze=current, repo='', base='c' * 40,
+            paths=['src/ameesh/thing.py'], commits=[],
+            policy=activation.Policy((), FAMILIES, 'sensitive', 1, '', '', ''),
+            authors=[{'name': 'author', 'family': 'codex'}],
+            unknown_authors=[], correctors=[], notify='pilot',
+            candidates=[rd.Candidate('old', 'claude', load=20),
+                        rd.Candidate('new', 'claude')])
+        out = activation._selection(inputs, pg.PgPort(self.db), force=True)
+        self.assertEqual(out['reviewers'], [{'name': 'old', 'family': 'claude'}])
+        rows = self.db.query('SELECT recipient, body FROM agent_mailbox'
+                             ' WHERE work_item_id = %s ORDER BY id', (str(self.lot),))
+        self.assertEqual([r['recipient'] for r in rows], ['old', 'old'])
+        self.assertIn('git diff %s..%s' % (A[:12], B[:12]), rows[-1]['body'])
+        self.assertIn('Correction ready for delta review.', rows[-1]['body'])
+
     def test_removed_seat_is_not_resurrected(self):
         self.first_review()
         self.db.execute("UPDATE work_items SET reviewers = '{}' WHERE id = %s", (self.lot,))
