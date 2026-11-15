@@ -533,6 +533,10 @@ class TurnUsage:
     price_fallback: str | None = None
     #: L225 : écritures de cache Claude du tour (None : harnais sans)
     cache_write_tokens: int | None = None
+    #: #7494 : cumul du fil Codex à la fin du tour, quand un tour interrompu
+    #: (clos avant `turn.completed`) a été mesuré au journal de session. Il
+    #: donne au tour suivant le repère que le flux n'a pas fourni.
+    cum_usage: list[int] | None = None
 
     def row(self) -> dict:
         return {
@@ -1831,6 +1835,33 @@ class CostBook:
         return float(value) if isinstance(value, (int, float)) \
             and not isinstance(value, bool) else None
 
+    def turn_ended_ts(self, turn_id: str | None) -> float | None:
+        """#7494 : fin réelle d'un tour, lue sur sa ligne de ressources.
+
+        Elle borne la fenêtre du journal Codex quand le flux n'a pas publié
+        `turn.completed` : une réparation tardive ne prend pas le tour suivant
+        du même fil pour celui-ci. None si la ligne ou la base manque (le
+        repli reste alors borné par `ended`, ou ne s'applique pas).
+        """
+        if not turn_id or self.db is None:
+            return None
+        try:
+            row = storage.of(self.db).turn_resources.get(turn_id)
+        except Exception:  # noqa: BLE001 — mesure seulement, jamais fatal
+            return None
+        if not isinstance(row, dict):
+            return None
+        # `get` rend `ended_ts` (epoch) ; une ligne brute porte `ended_at`.
+        value = row.get("ended_ts")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        value = row.get("ended_at")
+        if isinstance(value, _dt.datetime):
+            return value.timestamp()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return None
+
     def turn_marker(self, agent: str, start: int) -> dict | None:
         """Le dernier marqueur de tour (L71) avant la ligne `start`, ou None."""
         path = os.path.join(self.agent_dir(agent), "events.jsonl")
@@ -1947,12 +1978,21 @@ class CostBook:
         présenter comme mesuré.
 
         Rend ``{"usage", "reason", "turn_started", "peak_usage",
-        "peak_partial", "peak_reasons", "compaction"}``.
+        "peak_partial", "peak_reasons", "compaction", "usage_total",
+        "thread_total", "thread_before"}``. #7494 : `usage_total` est la somme
+        des `last_token_usage` du tour, `thread_total` le `total_token_usage`
+        de fin de tour et `thread_before` celui qui précède son
+        `task_started` ; ils servent au grand livre d'un tour clos avant
+        `turn.completed`.
         Aucune erreur de lecture n'est fatale : le motif est nommé.
         """
         empty = {"usage": None, "reason": None, "turn_started": None,
                  "peak_usage": None, "peak_partial": False,
-                 "peak_reasons": [], "compaction": None}
+                 "peak_reasons": [], "compaction": None,
+                 # #7494 : de quoi compter un tour clos avant `turn.completed`
+                 # (usage du tour et cumul du fil, entrée cache comprise).
+                 "usage_total": None, "thread_total": None,
+                 "thread_before": None}
         path = self.codex_rollout(thread)
         if not path:
             return dict(empty, reason=context_metrics.REASON_JOURNAL_MISSING)
@@ -1967,6 +2007,12 @@ class CostBook:
         saw_token_count = False
         task_seen = False
         task_start: float | None = None
+        #: #7494 : dernier cumul du fil du tour et cumul qui le précède ; le
+        #: premier `token_count` rencontré en remontant porte le total de fin
+        #: de tour, le dernier d'avant `task_started` le repère de départ.
+        turn_total: dict | None = None
+        thread_before: dict | None = None
+        before_boundary = False
         # Événements du tour, lus de la fin vers le début puis remis dans
         # l'ordre : `("usage", dict|None)` et `("compaction", None)`.
         events: list[tuple[str, dict | None]] = []
@@ -1985,6 +2031,18 @@ class CostBook:
                 continue
             top = event.get("type") if isinstance(event, dict) else None
             payload = event.get("payload") if isinstance(event, dict) else None
+            if before_boundary:
+                # #7494 : premier `token_count` avant le `task_started` du tour
+                # = cumul du fil au moment où le tour commence. Les items de
+                # compaction d'avant le tour ne lui sont pas attribués.
+                if isinstance(payload, dict) and payload.get("type") == "token_count":
+                    info = payload.get("info")
+                    total = info.get("total_token_usage") \
+                        if isinstance(info, dict) else None
+                    if isinstance(total, dict) and total:
+                        thread_before = total
+                    break
+                continue
             if top == "compacted":
                 # item de rollout écrit APRÈS une compaction réussie
                 events.append(("compaction", None))
@@ -2006,12 +2064,17 @@ class CostBook:
                                 stamp.replace("Z", "+00:00")).timestamp()
                         except ValueError:
                             task_start = None
-                break
+                before_boundary = True
+                continue
             if kind == "token_count":
                 saw_token_count = True
                 info = payload.get("info")
                 candidate = info.get("last_token_usage") \
                     if isinstance(info, dict) else None
+                total = info.get("total_token_usage") \
+                    if isinstance(info, dict) else None
+                if isinstance(total, dict) and total and turn_total is None:
+                    turn_total = total
                 events.append(("usage",
                                candidate if isinstance(candidate, dict)
                                else None))
@@ -2104,13 +2167,28 @@ class CostBook:
                 "reasons": list(dict.fromkeys(boundary_reasons)),
             }
 
+        # #7494 : somme des `last_token_usage` du tour — le minorant exact quand
+        # le cumul du fil ou son repère manque (appel illisible, journal
+        # tronqué). Utilisée seulement par le repli du grand livre.
+        usage_total: dict | None = None
+        if calls:
+            somme = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+            for call in calls:
+                for key in somme:
+                    somme[key] += _num(call, key)
+            if any(somme.values()):
+                usage_total = somme
+
         result = {"usage": usage, "reason": None,
                   "turn_started": task_start,
                   "peak_usage": peak_usage,
                   "peak_partial": peak_partial,
                   "peak_reasons": ([context_metrics.REASON_CALL_USAGE_UNKNOWN]
                                    if peak_partial and calls else []),
-                  "compaction": compaction}
+                  "compaction": compaction,
+                  "usage_total": usage_total,
+                  "thread_total": turn_total,
+                  "thread_before": thread_before}
         if usage is not None:
             return result
         if saw_token_count:
@@ -2211,7 +2289,9 @@ class CostBook:
         return None
 
     def turn_usage(self, agent: str, start: int = 0, session: str | None = None,
-                   model: str | None = None, ended: float | None = None) -> TurnUsage:
+                   model: str | None = None, ended: float | None = None,
+                   started: float | None = None,
+                   turn_id: str | None = None) -> TurnUsage:
         """Ce que le tour qui vient de finir a coûté, sans rien écrire.
 
         Le repère de cumul (dernier `total_cost_usd` Claude, dernier usage Codex)
@@ -2222,6 +2302,11 @@ class CostBook:
         #513 : un modèle à heures creuses (`PRICE_PERIODS`) est facturé à
         l'heure du tour, de son marqueur à `ended` (défaut : maintenant ; un
         compte rejoué plus tard n'en est que plus souvent en pointe).
+
+        #7494 : `started` (epoch) borne la fenêtre du journal Codex quand
+        `codex exec --json` n'a pas publié son `turn.completed` — tour clos par
+        le plafond de durée, arrêt ou erreur. Absent, il se lit sur le marqueur
+        du tour.
         """
         harness = self.tool_of(agent)
         # Le modèle **effectif du lancement** est passé par l'exécuteur ; le
@@ -2333,7 +2418,28 @@ class CostBook:
         if harness == "codex":
             completed = [e.get("usage") or {} for e in events if e.get("type") == "turn.completed"]
             if not completed:
-                return TurnUsage(agent, harness, modele, 0.0)
+                # #7494 : `codex exec --json` ne publie son usage qu'au
+                # `turn.completed`. Un tour clos par le plafond de durée (ou
+                # arrêté) avant cet événement était compté à zéro. Le journal
+                # de session du fil porte, pour chaque appel, le cumul du fil
+                # (`total_token_usage`) : borné à la fenêtre du tour, son delta
+                # est l'usage du tour et son total le repère du tour suivant.
+                # Sans journal ou hors fenêtre : zéro, comme avant (fail-closed,
+                # jamais l'usage d'un autre tour).
+                fenetre = started if started is not None else self.turn_started(agent, start)
+                fin = ended if ended is not None else self.turn_ended_ts(turn_id)
+                mesure = None
+                if session and fenetre is not None:
+                    mesure = self.codex_turn_last_call_usage(session, fenetre, fin)
+                delta, total_fil = _codex_journal_delta(mesure)
+                if delta is None:
+                    return TurnUsage(agent, harness, modele, 0.0)
+                uncached = max(delta[0] - delta[1], 0)
+                usd = (uncached * pin + delta[1] * pcache + delta[2] * pout) / 1e6
+                return TurnUsage(agent, harness, modele, usd,
+                                 input_tokens=delta[0], cached_input_tokens=delta[1],
+                                 output_tokens=delta[2], cum_usage=total_fil,
+                                 **(marque if any(delta) else {}))
             last = completed[-1]
             current = [int(last.get("input_tokens", 0)), int(last.get("cached_input_tokens", 0)),
                        int(last.get("output_tokens", 0))]
@@ -2440,7 +2546,8 @@ class CostBook:
         # **Résolue une fois**, sur tout le flux, puis transmise au calcul comme à
         # l'insertion : la ligne et le repère doivent porter la même session.
         session_id = session or self.session_of(agent)
-        usage = self.turn_usage(agent, start, session=session_id, model=model, ended=ended)
+        usage = self.turn_usage(agent, start, session=session_id, model=model,
+                                ended=ended, started=started_at, turn_id=turn_id)
         # L30 : le compte du tour est celui du dernier marqueur AVANT le tour.
         account = self.account_at(agent, start, usage.harness)
         cum_usd = cum_input = cum_cached = cum_out = None
@@ -2466,6 +2573,11 @@ class CostBook:
                     cum_input = int(last.get("input_tokens", 0))
                     cum_cached = int(last.get("cached_input_tokens", 0))
                     cum_out = int(last.get("output_tokens", 0))
+                elif usage.cum_usage is not None:
+                    # #7494 : tour interrompu avant `turn.completed`, mesuré au
+                    # journal de session. Le total du fil y est le repère du
+                    # tour suivant, comme l'aurait été celui du `turn.completed`.
+                    cum_input, cum_cached, cum_out = usage.cum_usage
         if resident is not None and usage.harness != "claude":
             # L80a : le coût USD cumulé d'une session résidente (ACP) est le
             # repère durable du tour suivant, y compris après un redémarrage
@@ -3282,6 +3394,50 @@ def _resident_inputs_event(events: Iterable[dict]) -> dict | None:
         if event.get("type") == RESIDENT_INPUTS_EVENT:
             found = event
     return found
+
+
+def _codex_journal_delta(mesure: dict | None,
+                         ) -> tuple[list[int] | None, list[int] | None]:
+    """#7494 : usage d'un tour Codex et cumul du fil, lus au journal de session.
+
+    `mesure` est le résultat de :meth:`CostBook.codex_turn_last_call_usage`,
+    borné à la fenêtre du tour. Le delta du `total_token_usage` (fin du tour
+    moins le relevé qui précède son `task_started`) est exact ; à défaut, la
+    somme des `last_token_usage` des appels du tour reste le seul minorant
+    disponible. Un delta négatif (fil remis à zéro) n'est jamais publié : on
+    retombe sur la somme des appels, sinon ``(None, None)`` — le tour reste à
+    zéro, comme avant.
+
+    Rend ``(delta, total_fil)`` : `delta` = `[entrée, cache, sortie]` du tour,
+    `total_fil` = cumul du fil à la fin du tour (repère du tour suivant), ou
+    None s'il n'est pas lisible.
+    """
+    if not isinstance(mesure, dict):
+        return None, None
+    if mesure.get("reason") == context_metrics.REASON_TURN_NOT_IN_JOURNAL:
+        # Le journal n'a pas le tour observé : jamais l'usage d'un autre.
+        return None, None
+    total = mesure.get("thread_total")
+    before = mesure.get("thread_before")
+    total_fil = None
+    if isinstance(total, dict) and total:
+        total_fil = [_num(total, "input_tokens"),
+                     _num(total, "cached_input_tokens"),
+                     _num(total, "output_tokens")]
+    if isinstance(total, dict) and isinstance(before, dict):
+        courant = [_num(total, "input_tokens"), _num(total, "cached_input_tokens"),
+                   _num(total, "output_tokens")]
+        precedent = [_num(before, "input_tokens"), _num(before, "cached_input_tokens"),
+                     _num(before, "output_tokens")]
+        if all(c >= p for c, p in zip(courant, precedent)):
+            return [c - p for c, p in zip(courant, precedent)], total_fil
+    somme = mesure.get("usage_total")
+    if isinstance(somme, dict):
+        delta = [_num(somme, "input_tokens"), _num(somme, "cached_input_tokens"),
+                 _num(somme, "output_tokens")]
+        if any(delta):
+            return delta, total_fil
+    return None, None
 
 
 def _resident_turn_usage(agent: str, harness: str, modele: str, event: dict,

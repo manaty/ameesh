@@ -138,6 +138,10 @@ def main() -> int:
     if os.environ.get("AMEESH_TEST_CODEX_MODEL"):
         demarrage["model"] = os.environ["AMEESH_TEST_CODEX_MODEL"]
     print(json.dumps(demarrage), flush=True)
+    # #7494 : harnais muet **après** l'annonce du fil, pour reproduire un tour
+    # clos par la borne de durée avant son `turn.completed`.
+    if os.environ.get("AMEESH_TEST_SLEEP_AFTER_START"):
+        time.sleep(float(os.environ["AMEESH_TEST_SLEEP_AFTER_START"]))
     # #3779 : un tour refusé par le fournisseur (429), comme le vrai CLI.
     failed = os.environ.get("AMEESH_TEST_TURN_FAILED")
     if failed:
