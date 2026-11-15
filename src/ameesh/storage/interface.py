@@ -1415,6 +1415,18 @@ class Accounts(Domain):
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
         """Les dernières bascules de l'hôte (toutes ou d'un harnais), récentes d'abord."""
 
+    def record_agent_switch(self, host: str, harness: str, *,
+                            from_account: str | None, to_account: str,
+                            reason: str, agent: str | None) -> None:
+        """#7439 : journalise la bascule propre d'un agent critique.
+
+        Une seule ligne `account_switches` (type `agent`) ; le choix partagé
+        `account_active` n'est jamais touché (L242b). Méthode NON abstraite,
+        comme la pause partagée : le contrat de l'exécuteur médié ne change
+        pas, et un stockage qui ne la porte pas garde la trace du fil.
+        """
+        return None
+
     # -- #6961 : pause partagée par compte --------------------------------
     # Méthodes NON abstraites : le contrat de l'exécuteur médié (L107) ne
     # change pas, et un stockage qui ne les porte pas (doublure de test,

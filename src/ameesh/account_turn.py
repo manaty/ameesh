@@ -26,7 +26,7 @@ import sys
 import time
 
 from . import accounts, adapters, auth_failure, cost as cost_mod, db as db_mod, registry
-from . import account_window
+from . import account_window, storage
 
 #: compte indisponible (configuration ou base) : le tour ne part pas
 INVALID = object()
@@ -124,7 +124,8 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None,
         return ("account state unavailable (%s)" % db_mod.explain(exc)
                 if pause else None)
     if choice.switched:
-        journal(worker, harness, choice.switched)
+        if not journal(worker, harness, choice.switched):
+            return "account state unavailable: switch not journalized"
     if choice.profile is None:
         from . import account_exception
         exception = account_exception.preview(worker, items, book, margin=bool(margin))
@@ -313,18 +314,33 @@ def log_choice(worker, harness: str, choice) -> None:
                                       choice.why or "only usable account"))
 
 
-def journal(worker, harness: str, switched: dict) -> None:
+def journal(worker, harness: str, switched: dict) -> bool:
     """Une bascule = une ligne de journal + une entrée dans le fil de l'équipe.
 
-    La ligne `account_switches` est déjà écrite (même transaction que le
-    changement de compte) ; ici, la trace lisible. L242b : la bascule propre
-    à un agent critique (`kind` `agent`) n'a pas de ligne en base ; sa trace
-    n'est écrite qu'une fois par changement.
+    La ligne `account_switches` est écrite ICI pour la bascule propre à un
+    agent critique (`kind` `agent`) : elle ne touche pas le choix partagé
+    (L242b), mais le fil seul ne suffisait pas à relire les changements de
+    compte (lot #7439). Une bascule partagée, elle, a déjà sa ligne :
+    `accounts.choose` l'écrit dans la même transaction que le changement.
+
+    Rend faux si la ligne n'a pas pu être écrite : l'appelant ne laisse alors
+    pas la bascule s'appliquer, pour que le prochain tour la rejoue.
     """
     if switched["kind"] == "agent":
         cle = (switched["from"], switched["to"])
         if getattr(worker, "_agent_switch_logged", None) == cle:
-            return
+            return True
+        db = getattr(worker, "db", None)
+        if db is not None:
+            try:
+                storage.of(db).accounts.record_agent_switch(
+                    worker.cfg.host, harness,
+                    from_account=switched["from"], to_account=switched["to"],
+                    reason=switched["reason"], agent=worker.name)
+            except db_mod.DbError as exc:
+                _log("[%s] account switch not journalized (%s)"
+                     % (worker.name, db_mod.explain(exc)))
+                return False
         worker._agent_switch_logged = cle
         texte = ("Account switch %s for this critical agent only: %s → %s (%s). The "
                  "shared choice and any force stay as they are." % (
@@ -333,7 +349,7 @@ def journal(worker, harness: str, switched: dict) -> None:
         worker._fil_note(texte, meta={"action": "compte", "type": "agent",
                                       "harnais": harness, "de": switched["from"],
                                       "vers": switched["to"]})
-        return
+        return True
     texte = ("Account switch %s: %s → %s (%s). New sessions go to "
              "account %s; a running session keeps its account while it is under "
              "its threshold (0034)." % (harness, switched["from"], switched["to"],
@@ -342,6 +358,7 @@ def journal(worker, harness: str, switched: dict) -> None:
     worker._fil_note(texte, meta={"action": "compte", "type": switched["kind"],
                                   "harnais": harness, "de": switched["from"],
                                   "vers": switched["to"]})
+    return True
 
 
 def for_turn(worker):

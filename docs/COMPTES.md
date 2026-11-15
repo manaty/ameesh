@@ -415,7 +415,9 @@ seven_day 35 % utilisé (rythme 45 %)`, ou `— continuité :
 la session reste sur primaire, sous son seuil`), une fois par changement de choix et non à
 chaque sondage. Chaque changement du dernier choix est journalisé en base
 (`account_switches`, type `bascule`, avec la même raison) et dans le fil de
-l'équipe de l'agent qui l'a déclenché. Les retenues jusqu'à la remise à zéro
+l'équipe de l'agent qui l'a déclenché ; un changement propre à un agent
+critique y entre aussi, type `agent`, sans déplacer le choix partagé
+(§ 7, L242b). Les retenues jusqu'à la remise à zéro
 (`account_holds`) et les « retours au primaire » de 0027 §3 ne sont plus
 posés : le choix par retard sur le rythme les remplace. Une
 session reprise sous l'autre compte, ou tournée avec résumé, est dite dans le
@@ -962,8 +964,9 @@ A switch is portable when the session moves within the same harness (Claude
 with a shared `projects/`, § 1). It is then made in the same session, before
 the turn and before any pause. The runner journal and the team thread say
 "Account switch claude for this critical agent only: A → B (…)", once per
-change. No `account_switches` row is written, since the shared choice did not
-change.
+change. The switch is also journaled in `account_switches` with type `agent`
+and the agent's name (lot #7439), so the host's switch history is complete;
+the shared `account_active` row still does not move.
 
 **Fallback order for a critical agent at its threshold**:
 
