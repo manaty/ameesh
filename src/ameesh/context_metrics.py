@@ -28,8 +28,9 @@ legacy de 150 000, ni n'écrit au grand livre ou en SQL. Les fonctions
 historiques d'``adapters`` (``usage_tokens``, ``reread_tokens``,
 ``context_tokens``) gardent exactement leurs valeurs ; elles prennent
 seulement leur lecture des champs dans :func:`usage_fields`, pour qu'une seule
-table de clés serve aux deux chemins. Ce module ne lit ni le prompt, ni le
-résultat d'un outil, ni un secret : seulement les dictionnaires d'usage.
+table de clés serve aux deux chemins. Les tailles textuelles sont réduites
+par les adaptateurs à des entiers ; aucun contenu de prompt ou de résultat
+n’est conservé par ce module.
 
 Absence et qualité (contrat §2.4) : une valeur absente vaut ``None`` avec une
 raison, jamais ``0``. Un ``0`` réel reste une mesure. Les qualités sont
@@ -55,6 +56,8 @@ un zéro de sortie n'est **pas** une mesure d'``O_last`` (contrat §2.2).
 """
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -144,6 +147,69 @@ _HARNESS_ALIASES = {
     "acp": "acp",
     "acp-json": "acp",
 }
+
+
+CONTENT_COUNT_KEYS = ("tool_calls", "tool_output_chars", "tool_output_max_chars",
+                      "tool_output_chars_by_tool", "assistant_chars", "steps",
+                      "context_first_chars")
+TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:/-]{0,127}$")
+MAX_TOOL_NAMES = 128
+
+
+def text_chars(content) -> int:
+    """Count textual model-facing blocks, never stringify metadata or images."""
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(len(block["text"]) for block in content
+                   if isinstance(block, Mapping) and block.get("type") == "text"
+                   and isinstance(block.get("text"), str))
+    return 0
+
+
+def stream_counts(harness: str, event: Mapping) -> dict:
+    """Reduce a raw event to sizes and tool identities; retain no content."""
+    kind = event.get("type")
+    counts = {}
+    if harness == "claude" and not event.get("parent_tool_use_id"):
+        message = event.get("message") or {}
+        blocks = message.get("content") or []
+        if kind == "assistant" and isinstance(blocks, list):
+            # Claude repeats usage/message ids across separately emitted blocks.
+            # Ephemeral fingerprints distinguish those blocks without retaining text.
+            counts["assistants"] = [
+                ((str(message["id"]), hashlib.sha256(b["text"].encode()).hexdigest())
+                 if message.get("id") else None, len(b["text"]))
+                for b in blocks if isinstance(b, Mapping) and b.get("type") == "text"
+                and isinstance(b.get("text"), str)]
+            counts["starts"] = [(b.get("id"), b.get("name")) for b in blocks
+                                if isinstance(b, Mapping) and b.get("type") == "tool_use"]
+        elif kind == "user" and isinstance(blocks, list):
+            counts["results"] = [(b.get("tool_use_id"), text_chars(b.get("content")))
+                                 for b in blocks if isinstance(b, Mapping)
+                                 and b.get("type") == "tool_result"]
+    elif harness == "codex" and kind == "item.completed":
+        item = event.get("item") or {}
+        counts["step"] = 1
+        if item.get("type") == "agent_message":
+            counts["assistants"] = [(item.get("id"), text_chars(item.get("text")))]
+        elif "aggregated_output" in item or "result" in item:
+            name = item.get("tool") or item.get("name") or item.get("type")
+            counts["starts"] = [(item.get("id"), name)]
+            result = item.get("aggregated_output", item.get("result"))
+            if isinstance(result, Mapping):
+                result = result.get("content")
+            counts["results"] = [(item.get("id"), text_chars(result))]
+    elif harness == "deepseek":
+        if kind == "status" and event.get("phase") == "step_end":
+            counts["step"] = 1
+        elif kind == "text":
+            counts["assistants"] = [(None, text_chars(event.get("text")))]
+        elif kind == "tool_call":
+            counts["starts"] = [(event.get("callId"), event.get("tool"))]
+        elif kind == "tool_result":
+            counts["results"] = [(event.get("callId"), text_chars(event.get("result")))]
+    return counts
 
 
 class ContextMetricsError(ValueError):
@@ -491,7 +557,8 @@ class TurnNormalizer:
                  session_reread_quality: str = MEASURED,
                  session_reread_reasons: Iterable[str] = (),
                  cumulative: Mapping | None = None,
-                 reread_source: str = "auto", max_calls: int = MAX_CALLS):
+                 reread_source: str = "auto", max_calls: int = MAX_CALLS,
+                 context_first_chars: int | None = None):
         if reread_source not in ("auto", "calls", "totals"):
             raise ContextMetricsError(
                 "reread_source must be auto, calls or totals")
@@ -533,6 +600,15 @@ class TurnNormalizer:
         self._journal_peak_reasons: tuple[str, ...] = ()
         self._journal_reason: str | None = None
         self._index: dict[tuple[bool, str], int] = {}
+        self._content_counts = dict.fromkeys(CONTENT_COUNT_KEYS, 0)
+        self._content_counts["tool_output_chars_by_tool"] = {}
+        self._content_counts["context_first_chars"] = context_first_chars
+        if self.harness not in ("claude", "codex", "deepseek"):
+            self._content_counts = dict.fromkeys(CONTENT_COUNT_KEYS)
+        self._tool_names = {}
+        self._result_ids = set()
+        self._assistant_sizes = {}
+        self._stream_steps = 0
         self._count = 0
         self._duplicates = 0
         self._replaced = 0
@@ -659,6 +735,7 @@ class TurnNormalizer:
         self._ensure_open()
         if not isinstance(parsed, Mapping):
             return self
+        self._observe_sizes(parsed.get("content_counts"))
         announced_model = parsed.get("model")
         if isinstance(announced_model, str) and announced_model.strip():
             self.model = announced_model.strip()
@@ -685,6 +762,37 @@ class TurnNormalizer:
                 and isinstance(parsed.get("usage"), Mapping):
             self.total(parsed["usage"])
         return self
+
+    def _observe_sizes(self, counts) -> None:
+        if not isinstance(counts, Mapping):
+            return
+        values = self._content_counts
+        self._stream_steps += counts.get("step", 0)
+        for identity, size in counts.get("assistants", ()):
+            previous = self._assistant_sizes.get(identity, 0) if identity else 0
+            values["assistant_chars"] += max(0, size - previous)
+            if identity and len(self._assistant_sizes) < self.max_calls:
+                self._assistant_sizes[identity] = max(size, previous)
+        for identity, name in counts.get("starts", ()):
+            if not identity or identity not in self._tool_names:
+                values["tool_calls"] += 1
+            if identity and len(self._tool_names) < self.max_calls:
+                self._tool_names[identity] = name if isinstance(name, str) \
+                    and TOOL_NAME_RE.fullmatch(name) else "unknown"
+        for identity, size in counts.get("results", ()):
+            if identity and identity in self._result_ids:
+                continue
+            if identity and len(self._result_ids) < self.max_calls:
+                self._result_ids.add(identity)
+            name = self._tool_names.get(identity, "unknown")
+            by_tool = values["tool_output_chars_by_tool"]
+            if name not in by_tool and len(by_tool) >= MAX_TOOL_NAMES:
+                name = "other"
+            by_tool[name] = by_tool.get(name, 0) + size
+            if not identity or identity not in self._tool_names:
+                values["tool_calls"] += 1
+            values["tool_output_chars"] += size
+            values["tool_output_max_chars"] = max(values["tool_output_max_chars"], size)
 
     # -- journal de session Codex (#5148) --------------------------------
     def journal_call(self, usage: Mapping | None, *,
@@ -848,6 +956,10 @@ class TurnNormalizer:
                 },
             },
             "counts": {
+                **self._content_counts,
+                "steps": (len(self._calls) if self.harness == "claude" else
+                          self._stream_steps if self.harness in ("codex", "deepseek")
+                          else None),
                 "calls": len(self._calls),
                 "subagent_calls": len(self._subcalls),
                 "journal_calls": 1 if self._journal_call is not None else 0,

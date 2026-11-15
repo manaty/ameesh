@@ -24,6 +24,8 @@ Le schéma est documenté dans ``docs/design/ctx-01-compteurs-contexte.md`` §8.
 """
 from __future__ import annotations
 
+from itertools import islice
+
 import argparse
 import json
 import math
@@ -83,7 +85,7 @@ LINE_KEYS = frozenset({
     "session_seq", "W", "auxiliary_models",
     "C_last", "C_peak", "O_last", "C_next_input", "C_next", "R_turn", "R_session",
     "R_session_base", "O", "S_hist", "cache_read_tokens", "cache_write_tokens",
-    "series", "decision", "policy", "legacy", "quality", "reasons", "source",
+    "counts", "series", "decision", "policy", "legacy", "quality", "reasons", "source",
 })
 REQUIRED_LINE_KEYS = frozenset({
     "schema", "turn_id", "agent", "harness", "model", "model_quality",
@@ -263,6 +265,36 @@ def _rank(value) -> int | None:
     """Le rang d'une croissance : deux appels au moins, un entier."""
     number = _number(value)
     return number if isinstance(number, int) and number >= 2 else None
+
+
+def _counts(raw) -> dict:
+    """Only numeric counters and bounded tool identifiers may leave an event."""
+    raw = raw if isinstance(raw, Mapping) else {}
+    result = {key: _count(raw.get(key)) for key in context_metrics.CONTENT_COUNT_KEYS
+              if key != "tool_output_chars_by_tool"}
+    tools = raw.get("tool_output_chars_by_tool")
+    result["tool_output_chars_by_tool"] = None
+    if isinstance(tools, Mapping):
+        result["tool_output_chars_by_tool"] = {
+            name: value for name, value in islice(tools.items(), context_metrics.MAX_TOOL_NAMES + 1)
+            if isinstance(name, str) and context_metrics.TOOL_NAME_RE.fullmatch(name)
+            and isinstance(value, int) and not isinstance(value, bool) and value >= 0}
+    return result
+
+
+def _validate_counts(raw) -> None:
+    mapping = _mapping(raw, "counts")
+    _extra(mapping, frozenset(context_metrics.CONTENT_COUNT_KEYS), "counts")
+    for key, value in mapping.items():
+        if key != "tool_output_chars_by_tool" and value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise CorpusError("counts.%s must be a non-negative integer or null" % key)
+    tools = mapping.get("tool_output_chars_by_tool")
+    if tools is not None and (not isinstance(tools, Mapping) or any(
+            isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in tools.values())):
+        raise CorpusError("counts tool sizes must be non-negative integers")
+    if dict(mapping) != _counts(mapping):
+        raise CorpusError("counts must contain only non-negative integer counters and tool sizes")
 
 
 def _series(raw) -> dict:
@@ -826,6 +858,7 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
         # plus forte croissance et son rang) ; optionnelle dans un événement
         # antérieur, alors dite `not_published`.
         "series": _series(context.get("series")),
+        "counts": _counts(context.get("counts")),
     }
     started, ended = result["started_ts"], result["ended_ts"]
     if isinstance(started, (int, float)) and isinstance(ended, (int, float)) \
@@ -1182,6 +1215,8 @@ def validate_line(line) -> dict:
     # #6433 : série par étape, optionnelle en lecture (corpus antérieur).
     if "series" in mapping:
         _validate_series(mapping["series"])
+    if "counts" in mapping:
+        _validate_counts(mapping["counts"])
     auxiliary = mapping.get("auxiliary_models")
     if not isinstance(auxiliary, list) or any(not _text(item) for item in auxiliary):
         raise CorpusError("line.auxiliary_models must be a list of strings")
