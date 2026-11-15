@@ -67,7 +67,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from . import __version__, acp, adapters, context_profile, harness_versions
-from .context_metrics import REASON_CALL_USAGE_UNKNOWN
+from .context_metrics import REASON_CALL_USAGE_UNKNOWN, stream_counts
 from .adapters import HarnessAdapter
 
 #: start of the harness up to an open session (hooks, MCP servers, login)
@@ -1271,6 +1271,25 @@ class ClaudeStreamJson(ResidentDriver):
 # Codex: app-server (JSON-RPC 2.0 without the `jsonrpc` member)
 # --------------------------------------------------------------------------
 
+def _codex_item_counts(item: Mapping) -> dict:
+    """#7468 : les tailles d'un item terminé de `codex app-server`.
+
+    Le flux `codex exec` et l'app-server décrivent le même ``item`` avec des
+    clés différentes (``agentMessage``/``agent_message``,
+    ``aggregatedOutput``/``aggregated_output``). On le ramène à la forme que
+    ``context_metrics.stream_counts("codex", …)`` lit déjà, sans recopier de
+    contenu : seules des longueurs et des noms d'outil en sortent.
+    """
+    if not isinstance(item, Mapping):
+        return {}
+    traduit = dict(item)
+    if traduit.get("type") == "agentMessage":
+        traduit["type"] = "agent_message"
+    if "aggregated_output" not in traduit and "aggregatedOutput" in traduit:
+        traduit["aggregated_output"] = traduit.get("aggregatedOutput")
+    return stream_counts("codex", {"type": "item.completed", "item": traduit})
+
+
 class CodexAppServer(ResidentDriver):
     """`codex app-server`: one thread, one `turn/start` per turn."""
 
@@ -1588,6 +1607,10 @@ class CodexAppServer(ResidentDriver):
             elif kind not in _CODEX_NOT_ACTIONS and kind:
                 parsed["safe_point"] = True
                 parsed["display"] = ["[tool] %s" % kind]
+            if kind not in ("contextCompaction", "context_compaction", "compaction"):
+                # #7468 : les tailles textuelles de l'item, réduites ici pour
+                # que le normalisateur les lise sans relire un flux `exec`.
+                parsed["content_counts"] = _codex_item_counts(item)
         elif method == "thread/compacted":
             # #6044 : notification dépréciée de compaction réussie ; l'item
             # `contextCompaction` la remplace, les deux peuvent arriver.
@@ -1608,8 +1631,11 @@ class CodexAppServer(ResidentDriver):
                         "cached_input_tokens": _token_or_none(
                             last.get("cachedInputTokens")),
                         "output_tokens": _token_or_none(last.get("outputTokens"))}
-            parsed["usage"] = call
             if has_call:
+                # Un relevé total seul n'est pas l'usage d'un appel : ne pas
+                # publier `usage`, sinon le normalisateur Codex le lirait
+                # comme un cumul de fin de tour (#7468).
+                parsed["usage"] = call
                 parsed["call_usage"] = observed
             # Codex counts the cache inside the input (`adapters.reread_tokens`)
             self._add_usage(max(call["input_tokens"] - call["cached_input_tokens"], 0),
