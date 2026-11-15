@@ -4,7 +4,8 @@
 # Service UTILISATEUR de la minuterie de rôle `ameesh-carte` : posé sur chaque
 # hôte candidat du rôle élu (`mesh-design`), il n'agit que sur l'hôte qui
 # détient le bail vivant (`ameesh role run`). Le dispatch part à 01:00Z, dans
-# la fenêtre de mesure [00:00, 07:00)Z ; le cron GitHub de carte.yml, démarré
+# la fenêtre de mesure [00:00, 07:00)Z ; les autres heures ne demandent
+# une mesure que pour une carte connue de plus de 48 h (#7430). Le cron, démarré
 # avec six à huit heures de retard, ne reste qu'un filet de secours.
 #
 # `ameesh carte dispatch` envoie `workflow_dispatch` (`planifie=true`) aux
@@ -28,6 +29,6 @@ EnvironmentFile=%h/.config/ameesh/env
 # `GH_TOKEN` vit dans notify.env sur les hôtes sans session `gh` ; une minuterie
 # n'est pas un shell de connexion.
 EnvironmentFile=-%h/.config/ameesh/notify.env
-ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run mesh-design -- %h/.local/share/ameesh/venv/bin/ameesh carte dispatch
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run mesh-design -- %h/.local/share/ameesh/venv/bin/ameesh carte dispatch --horaire
 TimeoutStartSec=5min
 NoNewPrivileges=yes

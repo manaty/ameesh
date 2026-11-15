@@ -198,7 +198,7 @@ class CablageTest(unittest.TestCase):
     def test_minuterie_de_role(self):
         timer = (REPO / "deploy/systemd/ameesh-carte.timer").read_text(encoding="utf-8")
         service = (REPO / "deploy/systemd/ameesh-carte.service").read_text(encoding="utf-8")
-        self.assertIn("OnCalendar=*-*-* 01:00:00 UTC", timer)
+        self.assertIn("OnCalendar=*-*-* *:00:00 UTC", timer)
         self.assertIn("Persistent=true", timer)
         self.assertIn("role run mesh-design", service)
         self.assertIn("carte dispatch", service)

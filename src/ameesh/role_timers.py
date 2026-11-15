@@ -162,10 +162,11 @@ RELEASE_DESCRIPTION = "ameesh release at the compiled canon cutoffs (#2448)"
 #: (scripts/carte-fenetre.py) remains the only place that decides to measure.
 #: The unit keeps the name of the hand copy so `role timers` replaces it,
 #: never doubles it.
+#: #7430: hourly wake, daily dispatch at 01:00Z or known stale map only.
 CARTE_PASS = "carte"
 CARTE_UNIT = "ameesh-carte"
-CARTE_INTERVAL_S = 24 * 3600
-CARTE_CALENDAR = "*-*-* 01:00:00 UTC"
+CARTE_INTERVAL_S = 3600
+CARTE_CALENDAR = "*-*-* *:00:00 UTC"
 CARTE_DESCRIPTION = "ameesh — impact-map measurement dispatch in its window (#6777)"
 
 #: #5863: the auditor's short pass, every hour as the canon card says; :15 on
@@ -981,7 +982,7 @@ def render_carte_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
         # `GH_TOKEN` lives in notify.env on the headless candidates; a timer is
         # not a login shell and `gh` may have no local session there.
         "EnvironmentFile=-%h/.config/ameesh/notify.env",
-        "ExecStart=%s role run %s -- %s carte dispatch" % (binary, role, binary),
+        "ExecStart=%s role run %s -- %s carte dispatch --horaire" % (binary, role, binary),
         "TimeoutStartSec=5min",
         "NoNewPrivileges=yes",
         "",

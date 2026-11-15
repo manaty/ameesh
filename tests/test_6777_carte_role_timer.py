@@ -16,6 +16,10 @@ l'alerte `map_stale` reste ouverte. Témoins :
 """
 from __future__ import annotations
 
+import datetime as dt
+import importlib.util
+from unittest import mock
+
 import contextlib
 import io
 import json
@@ -154,6 +158,58 @@ class DispatchTest(unittest.TestCase):
         self.assertEqual(document["results"][0]["action"], "dispatch")
 
 
+class HourlyCatchupTest(unittest.TestCase):
+    def test_hourly_dispatch_leaves_packet_arbitration_to_guard(self):
+        spec = importlib.util.spec_from_file_location("carte_fenetre", REPO / "scripts/carte-fenetre.py")
+        guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        now = dt.datetime(2026, 11, 15, 12, tzinfo=dt.timezone.utc)
+        published = now - dt.timedelta(hours=49)
+        rows = [{"repo": "manaty/ameesh", "branch": "main",
+                 "published_ts": published.timestamp()}]
+        gh = FakeGh(workflows={("manaty/ameesh", "main")})
+        for offset, packet in ((0, True), (1, False)):
+            tick = now + dt.timedelta(hours=offset)
+            with mock.patch.object(carte, "cartes_connues", return_value=rows):
+                self.assertEqual(carte.main(["dispatch", "--horaire"],
+                                           gh=gh, cfg=cfg(), maintenant=tick), 0)
+            measure, _ = guard.decider(evenement="workflow_dispatch", planifie=True,
+                                      maintenant=tick, derniere_carte=published,
+                                      paquet_actif=packet)
+            self.assertEqual(measure, not packet)
+        self.assertEqual(len(gh.dispatches()), 2)
+        self.assertTrue(all(d["inputs"] == {"planifie": "true"} for d in gh.dispatches()))
+
+    def test_fresh_unknown_or_other_branch_never_dispatch_hourly(self):
+        now = dt.datetime(2026, 11, 15, 12, tzinfo=dt.timezone.utc)
+        for age, branch in ((47, "main"), (48, "main"), (None, "main"), (49, "other")):
+            with self.subTest(age=age, branch=branch):
+                rows = [{"repo": "manaty/ameesh", "branch": branch,
+                         "published_ts": None if age is None else
+                         (now - dt.timedelta(hours=age)).timestamp()}]
+                gh = FakeGh(workflows={("manaty/ameesh", "main")})
+                with mock.patch.object(carte, "cartes_connues", return_value=rows):
+                    self.assertEqual(carte.main(["dispatch", "--horaire"],
+                                               gh=gh, cfg=cfg(), maintenant=now), 0)
+                self.assertEqual(gh.calls, [])
+
+    def test_daily_request_does_not_require_known_age(self):
+        now = dt.datetime(2026, 11, 15, 1, tzinfo=dt.timezone.utc)
+        gh = FakeGh(workflows={("manaty/ameesh", "main")})
+        with mock.patch.object(carte, "cartes_connues", side_effect=AssertionError):
+            self.assertEqual(carte.main(["dispatch", "--horaire"], gh=gh,
+                                       cfg=cfg(), maintenant=now), 0)
+        self.assertEqual(len(gh.dispatches()), 1)
+
+    def test_database_unavailable_is_unknown_age(self):
+        now = dt.datetime(2026, 11, 15, 12, tzinfo=dt.timezone.utc)
+        gh = FakeGh(workflows={("manaty/ameesh", "main")})
+        with mock.patch.object(carte, "cartes_connues", side_effect=RuntimeError("offline")):
+            self.assertEqual(carte.main(["dispatch", "--horaire"], gh=gh,
+                                       cfg=cfg(), maintenant=now), 0)
+        self.assertEqual(gh.calls, [])
+
+
 def row(candidates=("agents-a", "agents-b")):
     return {"name": "mesh-design", "releve": "election", "host": "agents-a",
             "candidats": list(candidates)}
@@ -176,7 +232,7 @@ class RoleTimerTest(unittest.TestCase):
     def test_un_candidat_recoit_le_dispatch_a_01h(self):
         item = carte_item(plan())
         self.assertEqual(item["unit"], "ameesh-carte")
-        self.assertEqual(item["interval_s"], 24 * 3600)
+        self.assertEqual(item["interval_s"], 3600)
         self.assertEqual(item["blocked"], "")
 
     def test_un_non_candidat_ne_recoit_rien(self):
@@ -203,9 +259,9 @@ class RoleTimerTest(unittest.TestCase):
             service = (directory / "ameesh-carte.service").read_text(encoding="utf-8")
             timer = (directory / "ameesh-carte.timer").read_text(encoding="utf-8")
             self.assertIn("ExecStart=/opt/ameesh/bin/ameesh role run mesh-design -- "
-                          "/opt/ameesh/bin/ameesh carte dispatch", service)
+                          "/opt/ameesh/bin/ameesh carte dispatch --horaire", service)
             self.assertIn("EnvironmentFile=-%h/.config/ameesh/notify.env", service)
-            self.assertIn("OnCalendar=*-*-* 01:00:00 UTC", timer)
+            self.assertIn("OnCalendar=*-*-* *:00:00 UTC", timer)
             self.assertIn("Persistent=true", timer)
             self.assertEqual(role_timers.check(
                 report, directory=directory, apply=False,
@@ -227,7 +283,7 @@ class RoleTimerTest(unittest.TestCase):
     def test_les_unites_versionnees_portent_la_meme_cadence(self):
         timer = (REPO / "deploy/systemd/ameesh-carte.timer").read_text(encoding="utf-8")
         service = (REPO / "deploy/systemd/ameesh-carte.service").read_text(encoding="utf-8")
-        self.assertIn("OnCalendar=*-*-* 01:00:00 UTC", timer)
+        self.assertIn("OnCalendar=*-*-* *:00:00 UTC", timer)
         self.assertIn("Persistent=true", timer)
         self.assertIn("role run mesh-design", service)
         self.assertIn("carte dispatch", service)

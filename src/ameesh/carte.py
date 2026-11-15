@@ -18,6 +18,14 @@ ignore un dépôt qui ne porte pas ce workflow. ``--repo``, ``--project`` et
 ``--branch`` restreignent la cible ; ``--manuel`` envoie ``planifie=false``
 (dispatch manuel, toujours mesuré) ; ``--dry-run`` n'écrit rien.
 
+#7430 : la minuterie passe chaque heure avec ``--horaire``. À 01:00Z,
+le dispatch quotidien reste systématique. Aux autres heures, seule une
+carte connue de plus de ``exploitation.MAP_STALE_S`` sur la branche visée
+provoque une demande. Une lecture absente ou impossible ne prouve pas cet
+âge. Le dispatcher ne consulte ni les paquets ni les autres mesures : le
+garde du workflow reste seul juge, et une demande sautée à H est retentée
+à H+1 tant que la carte reste périmée.
+
 Sortie : 0 si chaque dépôt visé a été dispatché ou ignoré faute de workflow,
 1 si un dispatch a échoué (le journal de la minuterie le nomme), 2 sur une
 configuration ou un usage invalide.
@@ -25,6 +33,7 @@ configuration ou un usage invalide.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import sys
 
@@ -133,7 +142,31 @@ def _sortie(resultats: list[dict], *, json_sortie: bool) -> None:
                   % (cible, item.get("reason") or "dispatch impossible"), file=sys.stderr)
 
 
-def main(argv=None, *, gh=None, cfg=None) -> int:
+def demande_horaire(cible, cartes, maintenant):
+    """Choose when to ask; packet/measurement arbitration stays in carte.yml."""
+    maintenant = maintenant.astimezone(dt.timezone.utc)
+    if maintenant.hour == 1:
+        return True
+    from .exploitation import MAP_STALE_S
+    for row in cartes:
+        if (row["repo"].casefold() == cible["depot"].casefold()
+                and row.get("branch") == cible["branche"]):
+            published = row.get("published_ts")
+            return (published is not None
+                    and maintenant.timestamp() - float(published) > MAP_STALE_S)
+    return False
+
+
+def cartes_connues(cfg):
+    from . import db as db_mod, storage
+    db = db_mod.connect(cfg)
+    try:
+        return storage.of(db).ci.maps()
+    finally:
+        db.close()
+
+
+def main(argv=None, *, gh=None, cfg=None, maintenant=None) -> int:
     parser = argparse.ArgumentParser(prog="ameesh carte")
     sous = parser.add_subparsers(dest="action")
     dispatch = sous.add_parser(
@@ -144,6 +177,8 @@ def main(argv=None, *, gh=None, cfg=None) -> int:
                           help="projet de github.projects (répétable)")
     dispatch.add_argument("--branch", default="",
                           help="branche de base (défaut : celle du dépôt, sinon main)")
+    dispatch.add_argument("--horaire", action="store_true",
+                          help="01:00Z quotidien ; sinon carte connue de plus de 48 h")
     dispatch.add_argument("--manuel", action="store_true",
                           help="dispatch manuel (planifie=false, toujours mesuré)")
     dispatch.add_argument("--dry-run", action="store_true",
@@ -154,6 +189,9 @@ def main(argv=None, *, gh=None, cfg=None) -> int:
         parser.print_help()
         return 0
 
+    if args.horaire and args.manuel:
+        parser.error("--horaire et --manuel sont incompatibles")
+    maintenant = (maintenant or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
     cfg = config_mod.load() if cfg is None else cfg
     try:
         settings = plan_github.settings_of(cfg)
@@ -174,6 +212,12 @@ def main(argv=None, *, gh=None, cfg=None) -> int:
             print("carte: %s" % exc, file=sys.stderr)
             return 1
 
+    cartes = []
+    if args.horaire and maintenant.hour != 1:
+        try:
+            cartes = cartes_connues(cfg)
+        except Exception as exc:  # unknown age never requests hourly measurement
+            print("carte: âge inconnu : %s" % exc, file=sys.stderr)
     resultats, echec = [], False
     if not visees:
         print("carte: aucun projet dans github.projects — rien à dispatcher",
@@ -182,7 +226,9 @@ def main(argv=None, *, gh=None, cfg=None) -> int:
     for cible in visees:
         item = dict(cible, action="", planifie=not args.manuel)
         try:
-            if not porte(gh, cible["depot"], cible["branche"]):
+            if args.horaire and not demande_horaire(cible, cartes, maintenant):
+                item.update(action="skip", reason="pas de rattrapage horaire dû")
+            elif not porte(gh, cible["depot"], cible["branche"]):
                 item.update(action="skip", reason="workflow %s absent" % WORKFLOW)
             elif args.dry_run:
                 item["action"] = "dry-run"
