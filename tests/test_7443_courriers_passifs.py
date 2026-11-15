@@ -153,6 +153,43 @@ class CiVerdictPilotTest(unittest.TestCase):
         copy.assert_called_once()
         self.assertEqual(out[0]["mode"], "wake")
 
+    def test_a_rerun_of_the_same_run_gets_a_distinct_key(self):
+        """#7443 B/P1: the attempt belongs to the idempotency key.
+
+        `reopen_run` clears the posed message and `_head` writes "attempt 2"
+        in the body; with a key frozen on (repo, run_id) alone,
+        `mail._replay_id` refuses the new body and the pilot never gets the
+        second green.
+        """
+        watcher = ci.Watcher(None)
+        watcher.log = lambda *_a, **_k: None
+        lot = {"id": 42, "branch": "integration/paquet-h-test",
+               "assignee": "composer", "app": "ameesh"}
+        row = dict(work_item_id=42, run_id=7, head_sha=SHA,
+                   branch="integration/paquet-h-test")
+        st = SimpleNamespace(ci=mock.Mock())
+        st.ci.failures.return_value = []
+        with mock.patch.object(ci.storage, "of", return_value=st), \
+                mock.patch.object(work, "get", return_value=lot), \
+                mock.patch.object(ci, "recipient_of", return_value="composer"), \
+                mock.patch.object(watcher, "_attribution", return_value=None), \
+                mock.patch.object(watcher, "_merge_pilot", return_value="pilot"), \
+                mock.patch.object(ci, "verdict_text", return_value="verdict"), \
+                mock.patch.object(packet_automerge, "publication",
+                                  return_value={"armed": False, "requested": False}), \
+                mock.patch.object(ci, "_send_posed", return_value=11) as wake, \
+                mock.patch.object(ci, "_send", return_value=12) as copy:
+            for attempt in (1, 2):
+                watcher._verdict(None, "org/repo", row,
+                                 {"run_attempt": attempt}, "success")
+        pilot_keys = [c.kwargs["idempotency_key"] for c in wake.call_args_list]
+        self.assertEqual(len(pilot_keys), 2)
+        self.assertEqual(len(set(pilot_keys)), 2)
+        self.assertTrue(pilot_keys[0].endswith(":1"))
+        self.assertTrue(pilot_keys[1].endswith(":2"))
+        copy_keys = [c.kwargs["idempotency_key"] for c in copy.call_args_list]
+        self.assertEqual(len(set(copy_keys)), 2)
+
     def test_ordinary_lot_keeps_a_single_wake(self):
         watcher = ci.Watcher(None)
         watcher.log = lambda *_a, **_k: None

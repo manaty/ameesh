@@ -3014,8 +3014,13 @@ class Watcher:
                 payload=pilot_payload, urgent=False,
                 pose=lambda st, mid: st.ci.set_message(repo, int(row["run_id"]),
                                                        "verdict", mid),
-                idempotency_key="ci-verdict-pilot:%s:%s"
-                % (repo.replace("/", "."), int(row["run_id"])))
+                # #7443 B/P1 : l'attempt fait partie de la clé — une relance
+                # du même run_id rend un corps différent (« attempt 2 »), et
+                # `mail._replay_id` refuse une clé réutilisée pour un autre
+                # corps. Sans l'attempt, le second vert ne partait pas.
+                idempotency_key="ci-verdict-pilot:%s:%s:%s"
+                % (repo.replace("/", "."), int(row["run_id"]),
+                   int(view.get("run_attempt") or 1)))
             out = [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
                     "status": status, "to": pilot, "mode": mode, "reason": reason,
                     "message_id": message_id, "copy_to": to}]
@@ -3026,8 +3031,9 @@ class Watcher:
                 copy_id = _send(
                     db, to, text + copy_note, text + copy_note, lot=lot["id"],
                     payload=copy_payload, urgent=False,
-                    idempotency_key="ci-verdict-copy:%s:%s"
-                    % (repo.replace("/", "."), int(row["run_id"])))
+                    idempotency_key="ci-verdict-copy:%s:%s:%s"
+                    % (repo.replace("/", "."), int(row["run_id"]),
+                       int(view.get("run_attempt") or 1)))
                 out.append({"action": "verdict", "repo": repo, "run_id": row["run_id"],
                             "status": status, "to": to, "mode": "info",
                             "reason": "copy: the pilot carries the packet merge",
