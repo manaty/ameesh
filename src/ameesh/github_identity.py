@@ -281,6 +281,36 @@ def _annotated(argv):
                 argv[index] = "-c" + annotated(body)
                 return argv
         return argv
+    # #7475: pflag keeps the last occurrence. Marking the first body
+    # leaves the text actually published by gh unmarked. Drop superseded
+    # occurrences, without interpreting option-looking body/path values.
+    bodies = []
+    body_kinds = set()
+    index = 2
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            break
+        if arg in ("--body", "-b", "--body-file", "-F"):
+            if index + 1 >= len(argv):
+                return argv
+            body_kinds.add("file" if arg in ("--body-file", "-F") else "text")
+            bodies.append((index, index + 2))
+            index += 2
+            continue
+        if (arg.startswith(("--body=", "--body-file=")) or
+                (arg.startswith(("-b", "-F")) and not arg.startswith("--")
+                 and len(arg) > 2)):
+            body_kinds.add("file" if arg.startswith(("--body-file=", "-F")) else "text")
+            bodies.append((index, index + 1))
+        elif arg in ("--repo", "-R", "--attach"):
+            index += 1
+        index += 1
+    if len(body_kinds) > 1:
+        return argv  # Preserve gh's rejection of mutually exclusive flags.
+    if len(bodies) > 1:
+        superseded = {i for start, end in bodies[:-1] for i in range(start, end)}
+        argv = [arg for i, arg in enumerate(argv) if i not in superseded]
     for index, arg in enumerate(argv):
         if arg in ("--body", "-b"):
             if index + 1 < len(argv):
