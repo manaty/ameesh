@@ -210,6 +210,37 @@ class HourlyCatchupTest(unittest.TestCase):
         self.assertEqual(gh.calls, [])
 
 
+class PacketCatchupTest(unittest.TestCase):
+    def test_tick_checks_staleness_before_following_a_reserved_packet(self):
+        from tests.test_3845_paquet_horaire import ph
+        ctx = SimpleNamespace(now=dt.datetime(2026, 11, 15, 12,
+                              tzinfo=dt.timezone.utc).timestamp(),
+                              project="demo", target="develop", dry_run=False, log=[])
+        with mock.patch.object(ph, "paused", return_value=None), \
+             mock.patch.object(ph, "check_fresh"), \
+             mock.patch.object(ph, "align_schema"), \
+             mock.patch.object(ph, "tick", return_value="reserved") as tick, \
+             mock.patch.object(carte, "main", return_value=1) as dispatch:
+            self.assertEqual(ph.run(ctx), "reserved")
+        self.assertEqual(dispatch.call_args.args[0],
+                         ["dispatch", "--horaire", "--project", "demo",
+                          "--branch", "develop"])
+        tick.assert_called_once_with(ctx)
+        self.assertTrue(ctx.log)
+
+    def test_daily_timer_and_dry_run_are_respected(self):
+        from tests.test_3845_paquet_horaire import ph
+        ctx = SimpleNamespace(now=dt.datetime(2026, 11, 15, 1,
+                              tzinfo=dt.timezone.utc).timestamp(),
+                              project="demo", target="main", dry_run=True, log=[])
+        with mock.patch.object(carte, "main", return_value=0) as dispatch:
+            ph.catch_up_map(ctx)
+            dispatch.assert_not_called()
+            ctx.now += 3600
+            ph.catch_up_map(ctx)
+            self.assertIn("--dry-run", dispatch.call_args.args[0])
+
+
 def row(candidates=("agents-a", "agents-b")):
     return {"name": "mesh-design", "releve": "election", "host": "agents-a",
             "candidats": list(candidates)}
@@ -232,7 +263,7 @@ class RoleTimerTest(unittest.TestCase):
     def test_un_candidat_recoit_le_dispatch_a_01h(self):
         item = carte_item(plan())
         self.assertEqual(item["unit"], "ameesh-carte")
-        self.assertEqual(item["interval_s"], 3600)
+        self.assertEqual(item["interval_s"], 24 * 3600)
         self.assertEqual(item["blocked"], "")
 
     def test_un_non_candidat_ne_recoit_rien(self):
@@ -259,9 +290,9 @@ class RoleTimerTest(unittest.TestCase):
             service = (directory / "ameesh-carte.service").read_text(encoding="utf-8")
             timer = (directory / "ameesh-carte.timer").read_text(encoding="utf-8")
             self.assertIn("ExecStart=/opt/ameesh/bin/ameesh role run mesh-design -- "
-                          "/opt/ameesh/bin/ameesh carte dispatch --horaire", service)
+                          "/opt/ameesh/bin/ameesh carte dispatch", service)
             self.assertIn("EnvironmentFile=-%h/.config/ameesh/notify.env", service)
-            self.assertIn("OnCalendar=*-*-* *:00:00 UTC", timer)
+            self.assertIn("OnCalendar=*-*-* 01:00:00 UTC", timer)
             self.assertIn("Persistent=true", timer)
             self.assertEqual(role_timers.check(
                 report, directory=directory, apply=False,
@@ -283,7 +314,7 @@ class RoleTimerTest(unittest.TestCase):
     def test_les_unites_versionnees_portent_la_meme_cadence(self):
         timer = (REPO / "deploy/systemd/ameesh-carte.timer").read_text(encoding="utf-8")
         service = (REPO / "deploy/systemd/ameesh-carte.service").read_text(encoding="utf-8")
-        self.assertIn("OnCalendar=*-*-* *:00:00 UTC", timer)
+        self.assertIn("OnCalendar=*-*-* 01:00:00 UTC", timer)
         self.assertIn("Persistent=true", timer)
         self.assertIn("role run mesh-design", service)
         self.assertIn("carte dispatch", service)
