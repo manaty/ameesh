@@ -21,7 +21,9 @@ cible et de la tête exacte. L’instantané ameesh fait autorité ; modifier la
 ne modifie pas la composition. Le gel, la prévalidation, le rejeu
 `paquet-auto.py --replay REF`, la reprise `--publish` et la fermeture lisent
 cet instantané. Le mode `--local` garde lui aussi le rendu hors du dépôt ;
-avec `--no-packet-record`, ce contrôle ne persiste aucun instantané.
+il prend le même bail que le composeur réel et peut donc être refusé (code 3)
+ou retarder celui-ci. Avec `--local --no-packet-record`, ce contrôle ne prend
+pas ce bail et ne persiste aucun instantané.
 
 Pour relire l’inclusion d’un paquet déjà enregistré, `--manifest` peut désigner
 le nom historique même si le fichier n’existe pas : la branche est déduite du

@@ -133,6 +133,10 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
         from ameesh import packet_close, packet_composition, packet_snapshot
         from ameesh import prevalidation_calls
         from .test_3807_paquet_auto import paquet_auto
+        # Replay invokes Git in a subprocess: keep its identity in the fixture,
+        # independent of the host account and the guest profile environment.
+        git(self.repo, "config", "user.name", "banc")
+        git(self.repo, "config", "user.email", "banc@example.invalid")
         self.base = self.commit("scripts/paquet-compose.py",
             (Path(__file__).resolve().parents[1] / "scripts/paquet-compose.py").read_text(),
             "composition command")

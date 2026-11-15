@@ -6879,7 +6879,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--local", action="store_true",
                         help="composition de contrôle : rendu transitoire, packet "
                              "record et tests par unité, sans poussée, PR, gel, "
-                             "ci-full ni courrier")
+                             "ci-full ni courrier ; prend le même bail que le composeur "
+                             "réel (rc 3 si occupé) ; --no-packet-record évite ce bail")
     parser.add_argument("--force", action="store_true",
                         help="recomposer un paquet existant : réécrit la "
                              "branche distante sous --force-with-lease (retirer "
