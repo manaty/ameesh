@@ -969,8 +969,15 @@ class Packet:
     excluded: list[tuple[int, str]]
 
 
-def packets_between(repo: str, since: str, target: str) -> tuple[list[Packet], list[dict]]:
-    """Packets and direct lot merges merged on the first-parent chain."""
+def packets_between(repo: str, since: str, target: str, *, db=None,
+                    target_branch: str | None = None) -> tuple[list[Packet], list[dict]]:
+    """Packets and direct lot merges merged on the first-parent chain.
+
+    ``target`` is the revision the range ends at (often a release commit);
+    ``target_branch`` is the carrier's target as recorded in packet receipts.
+    Passing a caller connection (``db``) reuses it for every packet instead of
+    opening one per merge.
+    """
     log = _out(repo, "log", "--first-parent", "--reverse", "--format=%H%x1f%s%x1f%b%x1e",
                "%s..%s" % (since, target))
     packets: list[Packet] = []
@@ -1003,8 +1010,9 @@ def packets_between(repo: str, since: str, target: str) -> tuple[list[Packet], l
             # A merge's second parent is the carrier head actually delivered.
             parent = _git(repo, "rev-parse", "--verify", sha + "^2")
             carrier_head = parent.stdout.strip() if parent.returncode == 0 else ""
-            receipt = packet_snapshot.lookup(checkout=repo, head=carrier_head,
-                                             branch=branch) if carrier_head else None
+            receipt = packet_snapshot.lookup(db=db, checkout=repo, head=carrier_head,
+                                             branch=branch, target=target_branch) \
+                if carrier_head else None
             manifest = ("packet-snapshot:%d" % receipt["id"] if receipt else
                         _manifest_for(repo, sha, branch))
             parsed = parse_manifest(receipt["payload"]["manifest"] if receipt else
@@ -1710,7 +1718,8 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         validate_version(previous, version, floor, project.version_bump)
     version_tuple(version)
     since = previous["commit"] if previous else base
-    packets, direct = packets_between(project.repo, since, base)
+    packets, direct = packets_between(project.repo, since, base, db=db,
+                                      target_branch=project.target)
     migrations = migrations_between(project.repo, since, base)
     notes, included, excluded = generate_notes(
         project=project, repo=project.repo, since=since, target=base, version=version,
@@ -3088,7 +3097,8 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                  or "") if _git(project.repo, "cat-file", "-e",
                                 "%s:%s" % (release_sha, notes_path)).returncode == 0 else ""
         since = previous["commit"] if previous else release_sha
-        packets, direct = packets_between(project.repo, since, release_sha)
+        packets, direct = packets_between(project.repo, since, release_sha, db=db,
+                                          target_branch=project.target)
         migrations = migrations_between(project.repo, since, release_sha)
         included = sorted({lot for packet in packets for lot in packet.units}
                           | {lot for row in direct for lot in row["lots"]})

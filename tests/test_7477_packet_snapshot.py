@@ -145,17 +145,19 @@ class SnapshotReadersTest(unittest.TestCase):
 
     def test_closure_only_nominates_receipts_landed_at_the_cutoff(self):
         from ameesh import packet_close
-        from types import SimpleNamespace
         receipt = dict(self.receipt, repository='acme/app', target='develop',
                        package_id=3, branch=self.item['branch'])
         st = Mock()
         st.work.packet_snapshots.return_value = [receipt]
         with patch.object(packet_snapshot, 'repository_name', return_value='acme/app'), \
-             patch.object(packet_snapshot, 'exact', return_value=receipt), \
+             patch.object(packet_snapshot, 'exact', side_effect=AssertionError('one query')), \
              patch.object(storage, 'of', return_value=st), \
              patch.object(packet_close, 'manifest_paths', return_value=[]), \
-             patch.object(packet_close.plan_git, '_git') as git:
-            git.return_value = SimpleNamespace(returncode=1)
+             patch.object(packet_close.plan_git, '_out', return_value='') as out:
             self.assertEqual({}, packet_close.units('/unused', 'cutoff', db=object())[0])
-            git.return_value = SimpleNamespace(returncode=0)
+            # `cutoff` is a revision here, not a branch: no target filter.
+            st.work.packet_snapshots.assert_called_with(
+                repository='acme/app', target=None)
+            self.assertEqual(('rev-list', 'cutoff'), out.call_args.args[1:])
+            out.return_value = 'a' * 40
             self.assertEqual([12], list(packet_close.units('/unused', 'cutoff', db=object())[0]))
