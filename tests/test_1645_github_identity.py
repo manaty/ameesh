@@ -426,6 +426,31 @@ class MarqueurCommentaireTest(Base):
         self.assertIn("Depuis attache", sortie.stdout)
         self.assertEqual(sortie.stdout.count("<!-- ameesh:"), 1)
 
+    def test_derniere_option_de_corps_marquee(self):
+        # gh/pflag conserve la dernière occurrence d'une option de texte.
+        env, _ = self.env_tour(lot="7475")
+        body_file = self.racine / "commentaire.txt"
+        body_file.write_text("Dernier compte rendu", encoding="utf-8")
+        old_file = self.racine / "ancien.txt"
+        old_file.write_text("Ancien", encoding="utf-8")
+        for args in (("--body", "Ancien", "--body", "Dernier compte rendu"),
+                     ("-bAncien", "--body=Dernier compte rendu"),
+                     ("--body-file", str(old_file), "-F" + str(body_file)),
+                     ("-F=" + str(old_file), "--body-file=" + str(body_file))):
+            with self.subTest(args=args):
+                sortie = self.lancer(env, "issue", "comment", "5611", *args)
+                self.assertEqual(sortie.returncode, 3)
+                self.assertIn("Dernier compte rendu\n\n<!-- ameesh:", sortie.stdout)
+                self.assertEqual(sortie.stdout.count("<!-- ameesh:"), 1)
+
+    def test_options_incompatibles_laissees_a_gh(self):
+        env, _ = self.env_tour(lot="7475")
+        args = ("issue", "comment", "5611", "--body", "Texte",
+                "--body-file", "absent.txt")
+        sortie = self.lancer(env, *args)
+        self.assertIn(" ".join(args), sortie.stdout)
+        self.assertNotIn("<!-- ameesh:", sortie.stdout)
+
     def test_autres_commandes_inchangees(self):
         env, _ = self.env_tour(lot="2848")
         sortie = self.lancer(env, "issue", "view", "12")

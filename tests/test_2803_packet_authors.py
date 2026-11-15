@@ -84,6 +84,11 @@ class ReadingTest(TestCase):
         self.assertEqual([row["name"] for row in authors], ["impl"])
         self.assertEqual(unknown, [])
 
+    def test_packet_without_manifest_commit_keeps_its_unit_author(self):
+        authors, unknown, _correctors = self.reading(PACKET, [self.lot])
+        self.assertEqual([row["name"] for row in authors], ["impl"])
+        self.assertEqual(unknown, [])
+
     def test_an_ordinary_lot_still_reads_its_manifest_commit(self):
         authors, _unknown, _correctors = self.reading(
             NORMAL, [self.lot, self.manifest])

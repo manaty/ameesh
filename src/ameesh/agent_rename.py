@@ -93,6 +93,9 @@ CASCADED = (
 # Evidence, authority and unrelated names: never rewritten. Executor
 # allowlists (jsonb) are granted authority, read through the alias.
 KEPT = (
+    # #7477 (0580): immutable composition provenance, including the exact
+    # composer lease identity. Historical receipts are read through aliases.
+    "work_packet_snapshots.recorded_by", "work_packet_snapshots.lease_owner",
     # #7066: the spelling is bound by the owner's signature. A renamed agent
     # needs a fresh decision; rewriting this index must not widen authority.
     "account_turn_exceptions.agent",

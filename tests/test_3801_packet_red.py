@@ -273,6 +273,9 @@ class CompositionTest(unittest.TestCase):
                  "recorded_ts": 1.0}]
 
         class Ops:
+            def packet_snapshots(self, **kwargs):
+                return []
+
             def packet_members(self, **kwargs):
                 return rows
 
@@ -290,6 +293,9 @@ class CompositionTest(unittest.TestCase):
                  "recorded_ts": 1.0}]
 
         class Ops:
+            def packet_snapshots(self, **kwargs):
+                return []
+
             def packet_members(self, **kwargs):
                 return rows
 
@@ -591,6 +597,12 @@ class CardBaseTest(unittest.TestCase):
 class RecordedRunTest(unittest.TestCase):
     """Sans manifeste : la composition `work packet` et les fichiers à l'API."""
 
+    def setUp(self):
+        from ameesh import packet_snapshot
+        absent = mock.patch.object(packet_snapshot, "lookup", return_value=None)
+        absent.start()
+        self.addCleanup(absent.stop)
+
     def test_enregistrement_et_fichiers_api(self):
         head = "c" * 40
         rows = [{"work_item_id": 101, "unit_sha": "a" * 40,
@@ -598,6 +610,9 @@ class RecordedRunTest(unittest.TestCase):
                  "recorded_ts": 1.0}]
 
         class Ops:
+            def packet_snapshots(self, **kwargs):
+                return []
+
             def packet_members(self, **kwargs):
                 return rows
 
@@ -628,6 +643,9 @@ class RecordedRunTest(unittest.TestCase):
                  "recorded_ts": 1.0}]
 
         class Ops:
+            def packet_snapshots(self, **kwargs):
+                return []
+
             def packet_members(self, **kwargs):
                 return rows
 

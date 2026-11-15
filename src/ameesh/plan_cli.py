@@ -63,7 +63,8 @@ def add_parsers(work_sub, func) -> None:
     packet_sub = p_packet.add_subparsers(dest="packet_command", required=True)
     p_prec = packet_sub.add_parser(
         "record", help="read the composition commits (`ameesh-work:` trailers) and link "
-                       "each unit to the carrier lot; never reads the manifest")
+                       "each unit to the carrier lot; --composition-owner also records an exact "
+                       "snapshot of the composition and its manifest rendering")
     p_prec.add_argument("id", type=int, metavar="CARRIER", help="package carrier lot")
     p_prec.add_argument("--repo", default=None,
                         help="local clone of the carrier's repository (default: this "
@@ -79,6 +80,8 @@ def add_parsers(work_sub, func) -> None:
     p_prec.add_argument("--expect-pushed", default=None, metavar="SHA",
                         help="#4501: the pushed head this composition replaces; a head "
                              "other than the carrier's frozen one is refused without it")
+    p_prec.add_argument("--composition-owner", default="")
+    p_prec.add_argument("--composition-epoch", type=int, default=0)
     p_prec.add_argument("--dry-run", action="store_true",
                         help="read and print the composition without writing")
     p_prec.add_argument("--actor", default="")
@@ -698,12 +701,14 @@ def _packet_check(db, args: argparse.Namespace) -> int:
 
 
 def _packet_record(db, args: argparse.Namespace, packet_link) -> int:
-    """#2443 : enregistre la composition d'un paquet, sans lire le manifeste."""
+    """Record membership and, for a leased composer, the durable receipt."""
     try:
         report = packet_link.record(
             db, args.id, repo=args.repo, base=args.base, head=args.head,
             branch=args.branch, target=args.target, actor=args.actor,
             expect_pushed=args.expect_pushed,
+            composition_owner=args.composition_owner,
+            composition_epoch=args.composition_epoch,
             dry_run=args.dry_run, cfg=getattr(db, "cfg", None))
     except (packet_link.PacketLinkError, work.WorkError, plan_git.MergeProbeError,
             GitError) as exc:

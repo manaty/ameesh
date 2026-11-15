@@ -82,6 +82,52 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
         return packet_link.for_item(self.db, lot)
 
     # -- lecture de la composition -----------------------------------------
+    def test_snapshot_composer_records_main_and_develop_atomically(self):
+        from ameesh import packet_composition, packet_snapshot
+        git(self.repo, "branch", "develop", self.base)
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                source = self.unit_branch("lot/snapshot-" + target,
+                    target + ".txt", target + "\n", target)
+                unit = self.lot("snapshot " + target)
+                branch = "integration/paquet-snapshot-" + target
+                merge = self.compose(branch, [(unit["id"], source)])
+                carrier = self.carrier(branch, target)
+                manifest = ("# Paquet\n\nBase : `%s` `%s`\n\n## Composition\n"
+                    "| unité | lot | source | commit |\n|---|---|---|---|\n"
+                    "| 1 | #%d | `%s` | `%s` |\n" % (target, self.base, unit["id"], source, merge))
+                head = self.commit("reviews/" + branch.replace("/", "-", 1) + ".md",
+                                   manifest, "composition receipt")
+                key = packet_composition.key(carrier.get("app") or "", carrier["id"])
+                epoch = storage.of(self.db).work.land_lock(key, "composer", 300)
+                kwargs = dict(repo=self.repo, base=self.base, head=head, target=target,
+                    actor="pilote", cfg=self.cfg, composition_owner="composer",
+                    composition_epoch=epoch)
+                report = packet_link.record(self.db, carrier["id"], **kwargs)
+                receipt = packet_snapshot.exact(self.db, repository="acme/web",
+                    target=target, package_id=carrier["id"], branch=branch, head=head)
+                self.assertEqual(report["units"], receipt["payload"]["units"])
+                self.assertEqual(manifest, receipt["payload"]["manifest"])
+                self.assertEqual("composer", receipt["lease_owner"])
+                self.assertEqual(epoch, receipt["lease_epoch"])
+                self.assertEqual("pending", receipt["payload"]["tests"]["status"])
+                self.assertEqual(receipt["id"], packet_link.record(
+                    self.db, carrier["id"], **kwargs)["snapshot"]["id"])
+                # A failure in the membership write rolls back the new receipt
+                # in the same outer transaction.
+                next_head = self.commit("reviews/" + branch.replace("/", "-", 1) + ".md",
+                                        "\nextra provenance\n", "next composition receipt")
+                from ameesh.storage.postgres.work import WorkItems
+                with mock.patch.object(WorkItems, "record_packet", side_effect=db_mod.DbError("injected")):
+                    with self.assertRaises(packet_link.PacketLinkError):
+                        packet_link.record(self.db, carrier["id"], **dict(kwargs, head=next_head))
+                self.assertIsNone(packet_snapshot.exact(self.db, repository="acme/web",
+                    target=target, package_id=carrier["id"], branch=branch, head=next_head))
+                storage.of(self.db).work.land_unlock(key, "composer", epoch)
+                with self.assertRaises(packet_link.PacketLinkError):
+                    packet_link.record(self.db, carrier["id"], **kwargs)
+                self.assertEqual(head, self.membership(unit["id"])[0]["head_sha"])
+
     def test_record_reads_trailers_and_writes_membership(self):
         first = self.unit_branch("lot/cinq", "src/un.py", "un\n", "un")
         second = self.unit_branch("lot/six", "src/deux.py", "deux\n", "deux")
