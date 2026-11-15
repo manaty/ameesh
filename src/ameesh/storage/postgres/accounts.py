@@ -451,7 +451,7 @@ class Accounts(interface.Accounts):
             params.append(harness)
         params.append(int(limit))
         return self.db.query(
-            "select id, harness, from_account, to_account, kind, reason, agent,"
+            "select id, harness, from_account, to_account, kind, reason, agent, wave_id, wave_epoch,"
             " extract(epoch from at)::float8 as at_ts from account_switches where "
             + " and ".join(clauses) + " order by at desc, id desc limit %s", tuple(params))
 

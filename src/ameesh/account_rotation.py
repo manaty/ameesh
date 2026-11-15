@@ -44,8 +44,11 @@ def coordinate(worker, items, book, choice, *, now, pause=True, margin=False):
                                       expected_plan=int((old or {}).get('id') or 0),
                                       expected_switch=int((last or {}).get('id') or 0)))
         if proposals:
-            store.plan_agent_wave('claude', proposals, wave=str(uuid.uuid4()))
+            published = store.plan_agent_wave('claude', proposals, wave=str(uuid.uuid4()))
             pending = store.pending_agent_plan('claude', worker.name)
+            if not published and pending is None:
+                return accounts.Choice(None, choice.active,
+                                       reason='account wave changed while planning; retry next turn')
     if pending:
         from . import account_turn
         origin = account_turn.session_account(worker, items)

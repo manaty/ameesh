@@ -985,7 +985,7 @@ a newer wave, and an applied epoch cannot run twice.
 
 `account_switches` distinguishes `planned` (proposal), `hysteresis` (withheld
 switch, once per effective switch/destination pair), and `agent` (effective
-application at the turn boundary). The shared `wave_id` and `wave_epoch`
+application with the validated turn environment). The shared `wave_id` and `wave_epoch`
 identify the wave in both proposals and effective applications. The shared `account_active` choice remains separate.
 
 **Fallback order for a critical agent at its threshold**:

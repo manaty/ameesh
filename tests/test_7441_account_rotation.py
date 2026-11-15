@@ -150,6 +150,7 @@ class RotationTest(_Base):
         self.assertFalse(self.journal('agent'))
         worker._pending_claude_switch = choice.switched
         with mock.patch.object(account_turn, '_log'):
+            self.assertTrue(account_turn.begin_switch(worker, choice.profile))
             account_turn.mark(worker, os.path.join(self.tmp, 'events'), choice.profile)
         self.assertEqual(worker._compte_session, choice.profile.name)
         self.assertEqual(len(self.journal('agent')), 1)
@@ -199,8 +200,8 @@ class RotationTest(_Base):
         worker._pending_claude_switch = dict(
             **{'from': 'b', 'to': 'a'}, kind='agent', reason=old['reason'], epoch=old['wave_epoch'])
         path = os.path.join(self.tmp, 'superseded-events')
-        with self.assertRaises(db_mod.DbError):
-            account_turn.mark(worker, path, self.items[0])
+        with mock.patch.object(account_turn, '_log'):
+            self.assertFalse(account_turn.begin_switch(worker, self.items[0]))
         self.assertFalse(os.path.exists(path))
         self.assertEqual(worker._compte_session, 'b')
         self.assertFalse(self.journal('agent'))
@@ -222,6 +223,39 @@ class RotationTest(_Base):
             self.assertEqual(worker._compte_session, 'b')
             self.assertFalse(self.journal('agent'))
             self.assertEqual(len(self.journal('planned')), 1)
+            self.assertTrue(account_turn.begin_switch(worker, worker._account))
             account_turn.mark(worker, os.path.join(self.tmp, 'start-events'), worker._account)
         self.assertEqual(len(self.journal('agent')), 1)
         self.assertEqual(worker._compte_session, worker._account.name)
+
+    def test_rejected_planning_snapshot_defers_instead_of_switching_alone(self):
+        worker = self.worker()
+        with mock.patch.object(account_rotation.registry, 'overview', return_value=[]), \
+                mock.patch.object(type(self.store), 'plan_agent_wave', return_value=[]):
+            choice = account_rotation.coordinate(worker, self.items, self.book,
+                                                   self.choose(), now=NOW)
+        self.assertIsNone(choice.profile)
+        self.assertIn('retry next turn', choice.reason)
+        self.assertFalse(self.journal('agent'))
+
+    def test_failed_wave_insert_rolls_back_every_persona(self):
+        proposals = self.proposals()
+        proposals[1]['to'] = None  # destination is NOT NULL; abort after the first insert
+        with self.assertRaises(db_mod.DbError):
+            self.store.plan_agent_wave('claude', proposals, wave='failed')
+        self.assertFalse(self.journal('planned'))
+
+
+class TurnBoundaryTest(_Base):
+    def test_superseded_marker_restores_instruction_without_starting_harness(self):
+        profiles = self._claude_comptes(partage=True)
+        _runner, worker = self._worker('boundary', 'claude', {'claude': profiles})
+        try:
+            with mock.patch.object(account_turn, 'begin_switch', return_value=False):
+                self.assertIsNotNone(self._tour(worker, 'keep this instruction'))
+            self.assertFalse(worker._turn_launched)
+            self.assertFalse(self.turns())
+            row = account_rotation.registry.get(self.db, worker.name)
+            self.assertIn('keep this instruction', row['pending_prompt'])
+        finally:
+            worker.watchdog_stop.set()

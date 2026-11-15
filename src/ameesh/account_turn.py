@@ -443,16 +443,27 @@ def apply(worker, env: dict, compte) -> bool:
         _log("[%s] %s: turn not started" % (worker.name, exc))
         worker.fail_turn("account unusable", str(exc))
         return False
+    if not begin_switch(worker, compte):
+        registry.restore_prompt(worker.db, worker.name, worker.runner.runner_id, worker.epoch)
+        registry.set_status(worker.db, worker.name, 'queued',
+                            status_text='account wave changed; retry next turn')
+        return False
+    return True
+
+
+def begin_switch(worker, compte) -> bool:
+    """Commit the newest epoch with the validated turn environment, before setup."""
+    pending = getattr(worker, '_pending_claude_switch', None)
+    if compte is not None and compte.harness == 'claude' and pending and pending['to'] == compte.name:
+        if not journal(worker, 'claude', pending):
+            _log('[%s] account wave superseded or not journalized; retry next turn' % worker.name)
+            return False
+        worker._pending_claude_switch = None
     return True
 
 
 def mark(worker, events_path: str, compte) -> None:
     """Écrit le marqueur de compte dans le flux, juste avant le tour."""
-    pending = getattr(worker, '_pending_claude_switch', None)
-    if compte.harness == 'claude' and pending and pending['to'] == compte.name:
-        if not journal(worker, 'claude', pending):
-            raise db_mod.DbError('account wave superseded or not journalized; retry next turn')
-        worker._pending_claude_switch = None
     ligne = {"type": cost_mod.ACCOUNT_MARKER, "harness": compte.harness,
              "account": compte.name, "ts": time.time(), "agent": worker.name}
     try:
