@@ -45,7 +45,6 @@
         | unset [--per-hour] [--per-day] [--agent A]
         mesh budget caps, stored in the database, reloaded live (L70);
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
-  ameesh psql-nocturne dispatch       daily bounded psql workflow dispatch (#7483);
   ameesh carte dispatch [--repo R] [--project P] [--branch B] [--manuel]
         [--dry-run] [--json]
         dispatch carte.yml (planifie=true) to measure the impact map in its
@@ -195,6 +194,7 @@
         le hook `post-commit` constate l'objet né puis écrit la preuve ;
         record --signed : hors runner (bureau/owner), attestation signée par une
         clé owner (#4485), sans PID local ni ameesh sur l'hôte du commit ;
+  ameesh psql-nocturne dispatch       daily bounded psql workflow dispatch (#7483);
   ameesh receipt verify       approval receipts (spec §8);
   ameesh refusal emit --reason "…"   #5529 : preuve positive qu'un harnais a
         refusé le tour avant tout appel fournisseur (ameesh-refusal/1), lue
