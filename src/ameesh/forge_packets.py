@@ -24,7 +24,8 @@ aucun lot porteur ne surveille une telle PR, donc ce silence est borné. La
 ligne reste, et nomme la PR, quand la CI de la PR est rouge, ou quand la PR est
 ouverte depuis plus longtemps que la cible de l'étape (la cible SLO de la
 ligne, aucune durée propre à ce module) : un paquet rouge, abandonné ou
-immobile ne porte plus la fusion.
+immobile demande une alerte. Un dépassement de durée seul est décrit comme
+une PR encore en cours, après relecture de son état sur la forge (#7436).
 
 La liste des PR ouvertes est lue une fois par dépôt et par passe, et gardée
 `TTL_S` entre deux passes (borne de coût de la passe d'alertes, comme
@@ -125,17 +126,50 @@ def _iso_ts(value) -> float | None:
 
 
 def stale_reason(found: dict, target_s, now: float) -> str:
-    """#6104 : pourquoi la PR ouverte trouvée par `vehicle` ne porte plus la
-    fusion (« » si elle la porte) : CI rouge, ou PR ouverte depuis plus que la
-    cible `target_s` de l'étape `verdict_merge`."""
+    """Pourquoi alerter sur la PR : CI rouge ou durée au-delà de la cible.
+
+    L'âge seul ne signifie pas que la PR ne porte plus la fusion (#7436).
+    """
     if found.get("ci") == "red":
         return "its CI is red"
     created = found.get("created_ts")
     if created is not None and target_s:
         age = float(now) - float(created)
         if age > float(target_s):
-            return "open for %ds, beyond the step target (%ds)" % (int(age), int(target_s))
+            status = "still running" if found.get("ci") == "running" else "still open"
+            return "%s past target: open for %ds, beyond the step target (%ds)" % (
+                status, int(age), int(target_s))
     return ""
+
+
+def _refresh_packet(slug: str, pr: dict, *, gh=None, cache=None) -> dict:
+    """Relire une PR trop âgée avant toute alerte, une fois par passe."""
+    key = ("packet-state", slug, pr["number"])
+    if cache is not None and key in cache:
+        return cache[key]
+    try:
+        proc = (gh or _default_gh)([
+            "pr", "view", str(pr["number"]), "--repo", slug, "--json",
+            "state,headRefName,headRefOid,baseRefName,createdAt,statusCheckRollup"])
+        if proc.returncode:
+            raise ValueError("gh pr view rc %s" % proc.returncode)
+        row = json.loads(proc.stdout)
+        state = row["state"]
+        if state not in ("OPEN", "CLOSED", "MERGED"):
+            raise ValueError("unexpected PR state")
+        created = _iso_ts(row["createdAt"])
+        if created is None:
+            raise ValueError("unreadable creation date")
+        result = dict(pr, state=state, branch=str(row["headRefName"]),
+                      head=str(row["headRefOid"] or ""), base=str(row["baseRefName"]),
+                      created_ts=created,
+                      ci=ci_state(row.get("statusCheckRollup")))
+    except Exception as exc:  # noqa: BLE001 — le doute ne tait pas l'alerte
+        result = {"unreadable": "PR #%d: fresh state unreadable (%s)" % (
+            pr["number"], str(exc)[:120])}
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def _frozen_head(milestones) -> str:
@@ -148,14 +182,17 @@ def _frozen_head(milestones) -> str:
 
 
 def vehicle(cfg, row: dict, milestones, *, db=None, gh=None, now: float | None = None,
-            cache: dict | None = None) -> dict:
+            cache: dict | None = None, target_s=None) -> dict:
     """La PR de paquet ouverte qui porte ce lot.
 
     Rend `{"pr": n, "branch": b, "head": h, "created_ts": t, "ci": état}`
     quand une PR ouverte
     `integration/paquet*` cite le lot dans ses trailers de composition et
     que sa tête contient la tête gelée du lot ; `{"unreadable": raison}`
-    quand on ne peut pas conclure ; `{}` quand aucune PR ne le porte."""
+    quand on ne peut pas conclure ; `{}` quand aucune PR ne le porte.
+    Si l'âge dépasse `target_s`, l'état est relu avant de conclure. Une PR
+    fusionnée dont la tête porte toujours le gel rend aussi `merged=True`.
+    """
     from . import planned_waits, work
     from . import plan_git
 
@@ -183,6 +220,16 @@ def vehicle(cfg, row: dict, milestones, *, db=None, gh=None, now: float | None =
         repo = fire.review_checkout(cfg, db, row, slug=slug, caller=True)
     unreadable = ""
     for pr in prs:
+        # #7436 : une liste de PR en cache ne prouve pas qu'une PR ancienne
+        # est encore ouverte. Le rouge est une cause distincte de son âge.
+        if pr.get("ci") != "red" and stale_reason(
+                pr, target_s, time.time() if now is None else now):
+            pr = _refresh_packet(slug, pr, gh=gh, cache=cache)
+            if pr.get("unreadable"):
+                unreadable = pr["unreadable"]
+                continue
+            if pr["state"] == "CLOSED" or not pr["branch"].startswith(PACKET_PREFIX):
+                continue
         if not repo:
             unreadable = "PR #%d: no local clone of %s" % (pr["number"], slug)
             continue
@@ -197,6 +244,13 @@ def vehicle(cfg, row: dict, milestones, *, db=None, gh=None, now: float | None =
             if alternate and not plan_git._git(
                     alternate, "cat-file", "-e", pr["head"] + "^{commit}").returncode:
                 read_repo = alternate
+            else:
+                # Le clone peut précéder la composition : récupérer la ref de
+                # PR explicite, puis lire le SHA observé (jamais FETCH_HEAD).
+                plan_git._git(read_repo, "fetch", "--quiet", "--no-tags",
+                              "--no-write-fetch-head", "--",
+                              "origin", "refs/pull/%d/head" % pr["number"],
+                              timeout=30.0)
         members = planned_waits.packet_trailers(
             read_repo, {"branch": pr["branch"], "branch_head": pr["head"]},
             pr["base"] or None, head=pr["head"])
@@ -213,6 +267,9 @@ def vehicle(cfg, row: dict, milestones, *, db=None, gh=None, now: float | None =
             continue
         if ancestry.returncode != 0:
             continue  # cité, mais la tête du paquet ne contient pas ce gel
-        return {"pr": pr["number"], "branch": pr["branch"], "head": pr["head"],
-                "created_ts": pr.get("created_ts"), "ci": pr.get("ci") or "none"}
+        found = {"pr": pr["number"], "branch": pr["branch"], "head": pr["head"],
+                 "created_ts": pr.get("created_ts"), "ci": pr.get("ci") or "none"}
+        if pr.get("state") == "MERGED":
+            found["merged"] = True
+        return found
     return {"unreadable": unreadable} if unreadable else {}
