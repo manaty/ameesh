@@ -5364,14 +5364,21 @@ def cmd_accounts(cfg: Config, args) -> int:
         from . import account_exception, decisions
         db = _open(cfg)
         try:
-            token = account_exception.register(db, args.decision)
+            token, status = account_exception.register(db, args.decision)
         except (account_exception.ExceptionError, decisions.DecisionError) as exc:
             print("accounts exception: %s" % exc, file=sys.stderr)
             return 1
         finally:
             db.close()
-        print("one-turn exception #%d registered for %s on %s/%s" % (
-            args.decision, token["agent"], token["harness"], token["account"]))
+        who = (args.decision, token["agent"], token["harness"], token["account"])
+        if status == "already-consumed":
+            print("one-turn exception #%d already consumed for %s on %s/%s"
+                  " (not re-armed)" % who)
+        elif status == "already-registered":
+            print("one-turn exception #%d already registered for %s on %s/%s"
+                  " (not re-armed)" % who)
+        else:
+            print("one-turn exception #%d registered for %s on %s/%s" % who)
         return 0
     declares = accounts_mod.parse(cfg.accounts)  # AccountError -> code 1, message
     qui = "human:%s" % (os.environ.get("USER") or getpass.getuser())

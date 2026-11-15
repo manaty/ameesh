@@ -1326,7 +1326,10 @@ borné à 75 %. Aucun plafond partagé ni forçage d'hôte n'est modifié.
 
 Le jeton n'est consommé qu'au début effectif du tour, dans la transaction
 d'admission : les précontrôles ne le consomment pas, un bail refusé le conserve,
-et un rejeu de l'enregistrement ne le réarme pas. Le journal
+et un rejeu de l'enregistrement ne le réarme pas. La commande distingue les
+trois cas : `registered` (le jeton vient d'être armé), `already registered`
+(il l'était déjà et reste armé) et `already consumed` (le tour a déjà commencé ;
+le rejeu n'a aucun effet). Le journal
 `account_turn_exceptions` conserve l'id de décision, l'agent, le harnais, le
 compte, l'heure d'enregistrement, puis l'heure et l'hôte de consommation.
 Au tour suivant, les gardes ordinaires s'appliquent à nouveau.
