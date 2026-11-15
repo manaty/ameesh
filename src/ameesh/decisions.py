@@ -611,6 +611,8 @@ def request_text(decision: dict, *, requester: str, owner: str | None,
         # #4542 : le remplaçant doit savoir pourquoi la demande lui arrive échue.
         tail.insert(0, "ESCALATED: no answer from the first validator by the deadline; "
                        "you are the substitute.")
+    if validation.get("status") == "needs_substitute":
+        tail.insert(0, "REMINDER: no substitute declared, owner reminded.")
     if validation.get("defaulted"):
         tail.append("Default: one business day.")
     lines.extend(validation.get("links") or [])
@@ -1482,7 +1484,9 @@ def describe(view: dict, limit: int = 220) -> str:
     return "decision #%d from %s for %s%s: \"%s\"%s%s — answer: ameesh decide %d <option> " \
            "(or ameesh chat)" % (
                view["id"], view.get("requester"), _owner_label(view.get("owner")),
-               " (escalated)" if escalated(view) else "",
+               " (escalated)" if escalated(view) else
+               " (no substitute declared, owner reminded)"
+               if (view.get("validation") or {}).get("status") == "needs_substitute" else "",
                fil.excerpt(view.get("question") or "", limit),
                " — %s" % options if options else "",
                "; recommended: %s" % view["recommend"] if view.get("recommend") else "",
@@ -1555,6 +1559,8 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
         flags.append("OVERDUE")
     if escalated(view):
         flags.append("ESCALATED")
+    if (view.get("validation") or {}).get("status") == "needs_substitute":
+        flags.append("no substitute declared, owner reminded")
     if view.get("needs_signature"):
         flags.append("signature required")
     head = "#%d  %s ago · %s · work item #%s \"%s\" · from %s → %s%s" % (
