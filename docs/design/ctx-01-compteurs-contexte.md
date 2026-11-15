@@ -2,9 +2,9 @@
 
 | Champ | Valeur |
 |---|---|
-| **Version** | `ameesh-context/1`, révision 4 |
+| **Version** | `ameesh-context/1`, révision 5 |
 | **Statut** | proposition soumise à relecture ; stable à la fusion après verdict |
-| **Date** | 2026-10-29 ; révision 2 du 2026-11-06 (`compact_tokens`) ; révision 3 du 2026-11-06 (`C_peak`, compactions Codex) ; révision 4 du 2026-11-09 (série par étape, #6433) |
+| **Date** | 2026-10-29 ; révision 2 du 2026-11-06 (`compact_tokens`) ; révision 3 du 2026-11-06 (`C_peak`, compactions Codex) ; révision 4 du 2026-11-09 (série par étape, #6433) ; révision 5 du 2026-11-15 (bloc `counts`, #7463/#7468) |
 | **Source** | plan `e18` (CTX-01), `conversation:smichea:2026-10-17:roadmap-gestion-contexte` ; découpage #4510 |
 | **Base de code** | `main` `a02b97c9b` (release 1.29.0) ; canon appliqué `5a488730` |
 | **Classe** | légère (documentation/contrat), avis d'une autre famille, pas de CI lourde |
@@ -103,7 +103,7 @@ appels, seulement le pic du tour. Une valeur absente reste `null` avec sa
 raison (§2.4), jamais `0`. Le corpus de rejeu recopie le bloc quand il est
 publié ; un corpus antérieur le laisse `null` avec `not_published`.
 
-#### Tailles textuelles observées (#7463)
+#### Tailles textuelles observées (#7463, contrat r5)
 
 Le bloc additif `counts` contient `tool_calls` (outils commencés, ou résultats
 sans début observé), `tool_output_chars` (somme), `tool_output_max_chars`
@@ -113,16 +113,20 @@ sans début observé), `tool_output_chars` (somme), `tool_output_max_chars`
 ni des jetons. Aucun contenu ni argument d'outil n'est ajouté à l'observation.
 
 Claude compte les résultats `tool_result` du fil principal et déduplique les
-blocs texte assistant par id de message et empreinte éphémère ; Codex compte les résultats des
-`item.completed` et chaque item terminé comme une étape approximative ; dsh
-compte `tool_result`, relié à `tool_call` par `callId`, et les fins d'étape.
-`counts.steps` reste distinct de `series.steps`, fondé sur l'usage par appel.
-Le texte assistant exclut le raisonnement et les images.
+blocs texte assistant par id de message et empreinte éphémère ; Codex compte
+les résultats des `item.completed` du flux `exec` et des notifications
+`item/completed` de `codex app-server` (le driver résident ramène les clés
+camelCase à la même forme), et chaque item terminé comme une étape
+approximative ; dsh compte `tool_result`, relié à `tool_call` par `callId`, et
+les fins d'étape. `counts.steps` reste distinct de `series.steps`, fondé sur
+l'usage par appel. Le texte assistant exclut le raisonnement et les images.
 
 Le runner mesure `context_first_chars` sur la consigne composée effectivement
 remise au harnais (`resume + prompt`), sans prétendre mesurer les instructions
-internes, outils ou historique que le harnais y ajoute. Sans mesure, ce champ
-vaut `null`. Les flux pris en charge sans outil rendent zéro et une table vide ;
+internes, outils ou historique que le harnais y ajoute. Cette mesure ne dépend
+pas du harnais : un harnais hors des trois conventions (ACP) ne publie pas les
+tailles de flux, mais garde `context_first_chars` ; sans mesure, ce champ vaut
+`null`. Les flux pris en charge sans outil rendent zéro et une table vide ;
 les corpus anciens rendent `null`. Les noms d'outil sont bornés et filtrés ;
 les noms non valides deviennent `unknown`, le surplus `other` (128 noms).
 Les index de déduplication sont bornés à `MAX_CALLS` ; au-delà, les doublons
@@ -696,6 +700,8 @@ devient jamais une valeur par défaut silencieuse.
 | `ameesh-context-corpus/1` r2 | 2026-11-06 | #6044 : `C_peak` (optionnel en lecture) et `decision.compaction.count` |
 | `ameesh-context/1` r4 | 2026-11-09 | #6433 : `series` par étape (`steps`, `C_first`, `dC_max`, `dC_max_rank`) pour les harnais à usage par étape ; additif, optionnel en lecture |
 | `ameesh-context-corpus/1` r3 | 2026-11-09 | #6433 : `series` optionnel, recopié du `turn.context` ; `not_published` sur un événement antérieur |
+| `ameesh-context/1` r5 | 2026-11-15 | #7463/#7468 : bloc additif `counts` (tailles textuelles sans contenu, `steps`, `context_first_chars`) documenté au §2 et recopié au corpus (§8.1) ; `codex app-server` résident alimente le normalisateur ; `context_first_chars` reste mesuré pour un harnais hors des trois conventions |
+| `ameesh-context-corpus/1` r4 | 2026-11-15 | #7463/#7468 : `counts` recopié sur liste blanche (compteurs entiers et noms d'outil bornés/filtrés), optionnel en lecture |
 
 ---
 
@@ -726,6 +732,7 @@ raison, jamais `0` (§2.4).
 | `auxiliary_models` | modèles auxiliaires observés (jamais utilisés pour `W`) |
 | `C_last`, `C_peak`, `O_last`, `C_next_input`, `C_next`, `R_turn`, `R_session`, `R_session_base`, `O`, `S_hist`, `cache_read_tokens`, `cache_write_tokens` | mesures au même format `{value, quality, reasons, granularity, source}` ; `C_peak` est le pic d'entrée du tour (#6044, absent `null` sur un événement antérieur) ; `R_session_base` est le cumul de relecture **avant** le tour |
 | `series` | série par étape du fil principal (#6433) : `steps` (entier ou `null`), `C_first` et `dC_max` (mesures au même format), `dC_max_rank` (entier ≥ 2 ou `null`) ; **optionnel**, un corpus antérieur le laisse `null` avec `not_published` |
+| `counts` | compteurs de tailles textuelles sans contenu (#7463, contrat r5) : `tool_calls`, `tool_output_chars`, `tool_output_max_chars`, `tool_output_chars_by_tool` (noms d'outil bornés et filtrés, `unknown`/`other`), `assistant_chars`, `steps`, `context_first_chars` ; chaque compteur absent reste `null`, jamais `0` (un harnais hors des trois conventions ne publie pas les tailles de flux, sauf `context_first_chars`) ; **optionnel**, un corpus antérieur le laisse `null` |
 | `decision` | décision **observée** : `observed` ∈ `none`/`close`/`rotation`/`compaction`, `cause` normalisée, `compacted` (vrai si une compaction est publiée, `null` sinon), et les blocs `close`, `rotation`, `compaction`, `window` ; `compaction.observed`/`requested` séparent la réussite de la demande, `compaction.count` donne le nombre de compactions du tour (#6044) |
 | `policy` | politique en vigueur au tour : `session`, `context_max_tokens`, `session_max_tokens`, budgets opt-in, part d'entretien, seuil de compaction native `compact_tokens` (#6040) |
 | `legacy` | les onze compteurs legacy publiés à côté des mesures |

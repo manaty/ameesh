@@ -414,6 +414,32 @@ class ResidentRunnerTest(PgTestCase):
                            r["cum_output_tokens"]) for r in rows],
                          [(300, 200, 9), (600, 400, 18)])
 
+    def test_codex_app_server_counts_are_measured_not_zero(self):
+        # #7468 : le flux `codex app-server` n'est pas le format `exec` ; le
+        # driver l'a déjà analysé (`item/completed`, `thread/tokenUsage/…`).
+        # Le normalisateur doit recevoir cet événement, pas un second parse
+        # vide qui publiait des compteurs faux à zéro.
+        _runner, worker = self._worker(doc=codex_doc(), harness="codex")
+        self.assertTrue(self._turn(worker, "premier"))
+        rows = self.db.query(
+            "select data from ameesh_events where type = %s"
+            " and data->>'agent' = %s order by id desc limit 1",
+            ("turn.context", "res1"))
+        self.assertTrue(rows, "aucun événement turn.context publié")
+        document = rows[0]["data"]["context"]
+        counts = document["counts"]
+        self.assertEqual(counts["calls"], 1)
+        self.assertEqual(counts["journal_calls"], 0)  # aucun journal dans ce banc
+        self.assertEqual(counts["steps"], 2)          # commandExecution + agentMessage
+        self.assertEqual(counts["assistant_chars"],
+                         len("ECHO:premier"))
+        self.assertGreater(counts["context_first_chars"], 0)
+        measures = document["measures"]
+        self.assertEqual(measures["C_last"]["value"], 300)
+        self.assertEqual(measures["R_turn"]["value"], 300)
+        self.assertEqual(measures["O_last"]["value"], 9)
+        self.assertNotIn("ECHO:premier", json.dumps(document))
+
     def test_acp_resident_usage_and_cost_are_counted_once_per_turn(self):
         # L80a: ACP reports usage in `session/update`; its `TurnResult` also
         # carries the USD delta when the harness publishes a cumulative cost.
