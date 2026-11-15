@@ -319,7 +319,7 @@ def parse_wake_due(text: str) -> float | None:
     (`_wake_moment`), avec son abréviation. `UTC`/`GMT`, `CET`/`CEST` (le
     fuseau du canon) et l'heure locale sont lus ; une abréviation inconnue
     rend None, jamais une heure devinée."""
-    found = _DUE.search(text or "") or _PROGRAMMED.search(text or "")
+    found = _PROGRAMMED.search(text or "") or _DUE.search(text or "")
     if not found:
         return None
     raw = found.group(1).strip()
@@ -1530,6 +1530,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
         # holds (les lots mergés peuvent encore attendre un déploiement)
         lot_holds: list[dict] = []
         rejected_window: list[str] = []
+        wake = wake_state(lot_events)
         for hold in hold_by_lot.get(ident, {}).values():
             if terminal_ts is not None and float(hold.get("since") or 0.0) <= terminal_ts:
                 continue
@@ -1548,7 +1549,17 @@ def build(*, items: Iterable[Mapping[str, Any]],
             # #4235 : une fenêtre d'observation est un geste de pilote, comme
             # la déclaration externe ; une échéance illisible ne devine rien et
             # laisse le hold en attente d'agent (le sens sûr).
-            window, due_ts = planned_waits.observation_due(note)
+            # #7510 : `work wake` peut armer à part la fenêtre du pilote.
+            # Ne pas recycler un ancien réveil ni celui d'un autre auteur.
+            armed_due = None
+            if (wake and wake.get("by") and wake.get("due_ts") is not None
+                    and _norm(wake.get("by")) == _norm(hold.get("by"))
+                    and float(wake.get("since") or 0.0)
+                    >= float(hold.get("since") or 0.0)):
+                armed_due = datetime.datetime.fromtimestamp(
+                    wake["due_ts"], tz=datetime.timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC")
+            window, due_ts = planned_waits.observation_due(note, due=armed_due)
             if window is not None:
                 if holds_authoritative and hold.get("pilot") is False:
                     # Le lot peut être couvert par la fenêtre d'un autre hold :
@@ -1613,7 +1624,6 @@ def build(*, items: Iterable[Mapping[str, Any]],
                     "lot %d: observation window declared by %s, not a pilot "
                     "hold: it is not a window (#4235)" % (ident, by))
         # réveils
-        wake = wake_state(lot_events)
         if (wake is not None and wake.get("due_ts") is not None
                 and not (terminal_ts is not None
                          and float(wake.get("since") or 0.0) <= terminal_ts)):
