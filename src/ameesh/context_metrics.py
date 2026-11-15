@@ -602,9 +602,11 @@ class TurnNormalizer:
         self._index: dict[tuple[bool, str], int] = {}
         self._content_counts = dict.fromkeys(CONTENT_COUNT_KEYS, 0)
         self._content_counts["tool_output_chars_by_tool"] = {}
-        self._content_counts["context_first_chars"] = context_first_chars
         if self.harness not in ("claude", "codex", "deepseek"):
+            # Les tailles de flux ne sont lues que pour ces trois harnais ;
+            # la consigne composée par le runner, elle, est mesurée pour tous.
             self._content_counts = dict.fromkeys(CONTENT_COUNT_KEYS)
+        self._content_counts["context_first_chars"] = context_first_chars
         self._tool_names = {}
         self._result_ids = set()
         self._assistant_sizes = {}
