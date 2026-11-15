@@ -1623,12 +1623,13 @@ def exclude_discards(requested: list[int], reasons: list[str],
     return discards
 
 
-def composition_text(repo: Path, head: str, name: str) -> str:
+def composition_text(repo: Path, head: str, name: str, *,
+                     target: str | None = None, carrier: int = 0) -> str:
     """#7477: exact receipt first, historical Git rendering on absence."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from ameesh import packet_snapshot
     text = packet_snapshot.text(checkout=str(repo), head=head,
-        branch=package_branch(name),
+        branch=package_branch(name), target=target, package_id=carrier or None,
         fallback=lambda: _decode(git(repo, "show",
             "%s:%s" % (head, manifest_rel(name)), check=False).stdout))
     if not text:
@@ -1636,14 +1637,16 @@ def composition_text(repo: Path, head: str, name: str) -> str:
     return text
 
 
-def composition_specs(repo: Path, reference: str, name: str) -> list[tuple[list[int], str]]:
+def composition_specs(repo: Path, reference: str, name: str, *,
+                      target: str | None = None, carrier: int = 0) -> list[tuple[list[int], str]]:
     """#4581 : la table `## Composition` du manifeste gelé à `reference`."""
     sha = rev(repo, reference)
     if sha is None:
         raise InputError("--keep-composition : référence %r introuvable" % reference)
     rel = manifest_rel(name)
     try:
-        return parse_composition_table(composition_text(repo, sha, name))
+        return parse_composition_table(composition_text(
+            repo, sha, name, target=target, carrier=carrier))
     except InputError as error:
         raise InputError(
             "--keep-composition : %s illisible sur %s : %s"
@@ -3170,7 +3173,8 @@ def attestation_execution_inputs(cfg):
 
 
 def contract_attestation_context(worktree: Path, *, base: str, modules: list,
-                                 timeout: float, project: str = "") -> tuple[dict, Path, list, int | None]:
+                                 timeout: float, project: str = "", target: str | None = None,
+                                 carrier: int = 0) -> tuple[dict, Path, list, int | None]:
     """Exact local execution inputs; unavailable context disables caching.
 
     The Git tree covers runner code, migrations and repository fixtures. The
@@ -3236,7 +3240,8 @@ def contract_attestation_context(worktree: Path, *, base: str, modules: list,
     branch = _decode(git(worktree, "symbolic-ref", "--short", "-q", "HEAD",
                          check=False, timeout=remaining()).stdout).strip()
     head = rev(worktree, "HEAD")
-    receipt = (packet_snapshot.lookup(checkout=str(worktree), head=head, branch=branch)
+    receipt = (packet_snapshot.lookup(checkout=str(worktree), head=head, branch=branch,
+                                      target=target, package_id=carrier or None)
                if head and branch.startswith("integration/") else None)
     if receipt:
         for unit in receipt["payload"]["units"]:
@@ -3313,7 +3318,7 @@ def save_contract_attestation(path: Path, report: dict):
 def prepublication_contracts(worktree: Path, *, base: str,
                              budget: int | None, guard=None, expected_head: str = "",
                              parallel: int = DEFAULT_PARALLEL, carrier: int = 0,
-                             project: str = "") -> ContractPass:
+                             project: str = "", target: str | None = None) -> ContractPass:
     """Plan + slot wait + isolated execution share one canon budget (#6182).
 
     A timeout/absent prerequisite records an inconclusive pass, never a green
@@ -3342,7 +3347,8 @@ def prepublication_contracts(worktree: Path, *, base: str,
             from ameesh.canon import GitDeadline
             try:
                 context = contract_attestation_context(
-                    worktree, base=base, modules=modules, timeout=end - time.monotonic(), project=project)
+                    worktree, base=base, modules=modules, timeout=end - time.monotonic(), project=project,
+                    target=target, carrier=carrier)
             except GitDeadline as exc:
                 raise ValueError("attestation context budget exhausted") from exc
             scope, path, lots, max_age = context
@@ -5087,13 +5093,18 @@ def write_composition(worktree: Path, rel: str, text: str, *,
 
 
 def run_inclusion(worktree: Path, manifest: Path, head: str,
-                  ready_file: Path, expected_file: Path) -> tuple[int, str]:
+                  ready_file: Path, expected_file: Path, *,
+                  target: str | None = None, carrier: int = 0) -> tuple[int, str]:
     script = worktree / INCLUSION_SCRIPT
     if not script.is_file():
         raise PaquetAutoError("%s absent de l'arbre composé" % INCLUSION_SCRIPT)
     cmd = [project_python(worktree), str(script), "--repo", str(worktree),
            "--manifest", str(manifest), "--head", head,
            "--ready-file", str(ready_file), "--expected-file", str(expected_file)]
+    if target:
+        cmd += ["--target", target]
+    if carrier:
+        cmd += ["--carrier", str(carrier)]
     proc = run_command(cmd, cwd=worktree, timeout=DEFAULT_TIMEOUT,
                        env=python_env(worktree))
     return proc.returncode, _output(proc)
@@ -5736,13 +5747,14 @@ def check_replay_admission(specs: list[tuple[list[int], str]], payload: dict,
 
 def replay(repo: Path, reference: str, name: str, base: str, *,
            compose_script: Path | None = None, keep: bool = False,
-           candidates_json: Path | None = None, log=print) -> int:
+           candidates_json: Path | None = None, log=print,
+           target: str | None = None, carrier: int = 0) -> int:
     """Rejoue un manifeste gelé et compare l'arbre obtenu à celui de `reference`."""
     ref = rev(repo, reference)
     if ref is None:
         raise InputError("référence %r introuvable" % reference)
     manifest_path = manifest_rel(name)
-    manifest_text = composition_text(repo, ref, name)
+    manifest_text = composition_text(repo, ref, name, target=target, carrier=carrier)
     specs = parse_composition_table(manifest_text)
     base_sha = rev(repo, base)
     if base_sha is None:
@@ -5861,7 +5873,8 @@ def keep_tested(repo: Path, carrier: int, name: str, base_sha: str, head: str,
 
 
 def check_chain(repo: Path, head: str, base_sha: str, rel: str,
-                candidates: list[Candidate]) -> list[tuple[list[int], str]]:
+                candidates: list[Candidate], *, target: str | None = None,
+                carrier: int = 0) -> list[tuple[list[int], str]]:
     """#4237 : la tête testée est-elle publiable telle quelle sur `base_sha` ?
 
     Une chaîne de fusions (premier parent), éventuellement surmontée du seul
@@ -5887,7 +5900,8 @@ def check_chain(repo: Path, head: str, base_sha: str, rel: str,
         end = parents[0]
     try:
         name = Path(rel).stem.removeprefix("integration-paquet-")
-        specs = parse_composition_table(composition_text(repo, head, name))
+        specs = parse_composition_table(composition_text(
+            repo, head, name, target=target, carrier=carrier))
     except InputError as error:
         raise ChainRefused(str(error)) from error
     lines = out(repo, "rev-list", "--first-parent", "--parents", "--reverse",
@@ -5984,7 +5998,8 @@ def publish_tested(args: argparse.Namespace) -> int:
         ready_out = Path(tmp.name) / "prets.txt"
         # la liste calculée par le code de la cible, à sa tête (comme à la composition)
         candidates, _payload = compute_candidates(reader, args.target, base_sha, ready_out)
-        specs = check_chain(worktree, head, base_sha, rel, candidates)
+        specs = check_chain(worktree, head, base_sha, rel, candidates,
+                            target=args.target, carrier=args.carrier)
         print("chaîne vérifiée : %d unité(s) sur %s" % (len(specs), base_sha[:12]),
               flush=True)
         units = "\n".join("- %s `%s`" % (", ".join("#%d" % lot for lot in row_lots),
@@ -5994,7 +6009,7 @@ def publish_tested(args: argparse.Namespace) -> int:
             report = prepublication_contracts(
                 worktree, base=base_sha, budget=contract_budget(args), guard=guard,
                 expected_head=head, parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
-                carrier=args.carrier, project=getattr(args, "pause_project", "") or "")
+                carrier=args.carrier, project=getattr(args, "pause_project", "") or "", target=args.target)
             record_contract_result(worktree, args.carrier, report, base=base_sha, target=args.target)
             from ameesh.packet_contract_proof import projection
             contract_state = projection(report, base=base_sha, target=args.target)["result"]["state"]
@@ -6037,7 +6052,8 @@ def publish_tested(args: argparse.Namespace) -> int:
                 % (args.carrier, args.target, head), "",
                 "## Copie de la composition", "",
                 "Copie lisible ; l’instantané ameesh de cette tête fait autorité.",
-                "", composition_text(repo, head, args.name), "",
+                "", composition_text(repo, head, args.name,
+                                     target=args.target, carrier=args.carrier), "",
                 "Porteur : #%d. « Verdict non requis » et CI complète restent au pilote."
                 % args.carrier, ""])
             pr_number, pr_url = ensure_pull_request(
@@ -6217,7 +6233,8 @@ def compose_packet(args: argparse.Namespace) -> int:
         # sont nommés aux écartés (le contrôle d'inclusion lit ce motif).
         keep = str(getattr(args, "keep_composition", None) or "")
         if keep:
-            specs = composition_specs(repo, keep, args.name)
+            specs = composition_specs(repo, keep, args.name,
+                                      target=args.target, carrier=args.carrier)
             candidates, kept_discards = keep_composition(
                 candidates, specs, worktree=worktree,
                 already_discarded={item.lot for item in errors})
@@ -6380,7 +6397,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                                     composition_file=composition_file), flush=True)
             _write_id_file(expected_file, [unit.lot for unit in composition.units])
             inclusion_rc, inclusion_output = run_inclusion(
-                worktree, composition_file, head, ready_out, expected_file)
+                worktree, composition_file, head, ready_out, expected_file,
+                target=args.target, carrier=args.carrier)
             print(inclusion_output, flush=True)
             if inclusion_rc != 0:
                 raise PaquetAutoError(
@@ -6400,7 +6418,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                 contract_report = prepublication_contracts(
                     worktree, base=base_sha, budget=contract_budget(args), guard=guard, expected_head=head,
                     parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL), carrier=args.carrier,
-                    project=getattr(args, "pause_project", "") or "")
+                    project=getattr(args, "pause_project", "") or "", target=args.target)
                 contract_run = contract_report.run
                 print("contrats avant publication : %s (%.1f s)%s" % (
                     "NON CONCLUANT" if contract_run.inconclusive else
@@ -7003,7 +7021,7 @@ def main(argv: list[str] | None = None) -> int:
                 candidates_json = None
             return replay(Path(args.repo).resolve(), args.replay, args.name,
                           args.base, keep=args.keep_worktree,
-                          candidates_json=candidates_json)
+                          candidates_json=candidates_json, target=args.target, carrier=args.carrier)
         if args.base:
             raise InputError("--base ne s'applique qu'à --replay : la "
                              "composition part de la tête fraîche de la cible")

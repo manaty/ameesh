@@ -241,6 +241,8 @@ class SnapshotManifestTest(Base):
         self.assertIn("ci-full demandée", result)
         self.assertEqual(HEAD, lookup.call_args.kwargs["head"])
         self.assertEqual(row["branch"], lookup.call_args.kwargs["branch"])
+        self.assertEqual(self.ctx.target, lookup.call_args.kwargs["target"])
+        self.assertEqual(row["id"], lookup.call_args.kwargs["package_id"])
         self.assertTrue(any("fetch" in call for call in self.shell.calls))
 
     def test_contract_result_without_git_manifest_uses_exact_head_tree(self):
