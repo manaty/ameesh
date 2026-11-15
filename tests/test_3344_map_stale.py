@@ -141,7 +141,9 @@ class MapStaleTest(PgTestCase):
         self.assertEqual(row["run_id"], 8)
         self.assertAlmostEqual(row["published_ts"], round(published), delta=1)
 
-    def test_only_skipped_runs_keep_the_previous_reading_aging(self):
+    def test_only_skipped_runs_keep_the_previous_map_and_refresh_the_reading(self):
+        """#7431 : la lecture a réussi ; la carte connue reste la dernière et
+        son relevé est rafraîchi, pour que `map_stale` en dise l'âge réel."""
         published = time.time() - 3 * DAY
         self.watcher(_Api(runs=[{"id": 7, "head_sha": "b",
                                  "updated_at": _iso(published)}]))._map(
@@ -153,6 +155,41 @@ class MapStaleTest(PgTestCase):
         row = self.row()
         self.assertEqual(row["run_id"], 7)
         self.assertAlmostEqual(row["published_ts"], round(published), delta=1)
+        self.assertLess(time.time() - row["seen_ts"], 60)
+        (alert,) = self.alerts()
+        self.assertIn("last published", alert["detail"])
+        self.assertNotIn("age unknown", alert["detail"])
+
+    def test_only_skipped_runs_without_a_known_map_record_nothing(self):
+        self.watcher(_Api(runs=[{"id": 9, "head_sha": "c",
+                                 "updated_at": _iso(time.time())}], skipped={9}))._map(
+            self.db, REPO, ("main",))
+        self.assertIsNone(self.row())
+
+    def test_unreadable_jobs_keep_the_previous_reading_aging(self):
+        self.watcher(_Api(runs=[{"id": 7, "head_sha": "b",
+                                 "updated_at": _iso(time.time() - DAY)}]))._map(
+            self.db, REPO, ("main",))
+        self.age_reading(ci.MAP_READ_S + 5)
+        seen = self.row()["seen_ts"]
+        watcher = self.watcher(_Api(runs=[{"id": 9, "head_sha": "c",
+                                           "updated_at": _iso(time.time())}]))
+        real = watcher.api
+        def api(path):
+            if path.split("?")[0].endswith("/jobs"):
+                raise RuntimeError("HTTP 502")
+            return real(path)
+        watcher.api = api
+        watcher._map(self.db, REPO, ("main",))
+        self.assertEqual(self.row()["run_id"], 7)
+        self.assertAlmostEqual(self.row()["seen_ts"], seen, delta=1)
+
+    def test_reads_twenty_runs_to_cover_a_skip_streak(self):
+        api = _Api(runs=[{"id": 1, "head_sha": "a", "updated_at": _iso(time.time())}])
+        self.watcher(api)._map(self.db, REPO, ("main",))
+        (call,) = api.map_calls()
+        self.assertIn("per_page=%d" % ci.MAP_RUNS_READ, call)
+        self.assertEqual(ci.MAP_RUNS_READ, 20)
 
     def test_github_error_is_logged_and_keeps_the_previous_reading(self):
         published = time.time() - DAY
