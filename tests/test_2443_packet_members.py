@@ -128,6 +128,86 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
                     packet_link.record(self.db, carrier["id"], **kwargs)
                 self.assertEqual(head, self.membership(unit["id"])[0]["head_sha"])
 
+    def test_no_manifest_composition_freeze_prevalidation_and_closure(self):
+        from pathlib import Path
+        from ameesh import packet_close, packet_composition, packet_snapshot
+        from ameesh import prevalidation_calls
+        from .test_3807_paquet_auto import paquet_auto
+        # Replay invokes Git in a subprocess: keep its identity in the fixture,
+        # independent of the host account and the guest profile environment.
+        git(self.repo, "config", "user.name", "banc")
+        git(self.repo, "config", "user.email", "banc@example.invalid")
+        self.base = self.commit("scripts/paquet-compose.py",
+            (Path(__file__).resolve().parents[1] / "scripts/paquet-compose.py").read_text(),
+            "composition command")
+        git(self.repo, "branch", "develop", self.base)
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                source = self.unit_branch("lot/no-file-" + target,
+                                          target + ".txt", "unit\n", "unit")
+                unit = self.lot("no file " + target)
+                self.freeze(unit, source)
+                name = "no-file-" + target
+                branch = "integration/paquet-" + name
+                head = self.compose(branch, [(unit["id"], source)])
+                carrier = self.carrier(branch, target)
+                composition = paquet_auto.Composition(
+                    units=[paquet_auto.Unit(unit["id"], source, head)],
+                    discarded=[], head=head)
+                table = paquet_auto.composition_table(Path(self.repo), self.base)
+                rendering = paquet_auto.build_manifest(name=name, target=target,
+                    base_sha=self.base, carrier=carrier["id"], composition=composition,
+                    table=table, tests=[paquet_auto.TestRun("unit", ["tests.unit"],
+                        0, "Ran 1 test in 0.1s\n\nOK", 0.1)], freeze_seconds=0.1)
+                path = Path(self.make_tmp()) / ("integration-paquet-" + name + ".md")
+                self.assertEqual(head, paquet_auto.write_composition(Path(self.repo),
+                    str(path), rendering, name=name, units=1, discarded=0))
+                key = packet_composition.key(carrier.get("app") or "", carrier["id"])
+                epoch = storage.of(self.db).work.land_lock(key, "composer", 300)
+                report = packet_link.record(self.db, carrier["id"], repo=self.repo,
+                    base=self.base, head=head, target=target, cfg=self.cfg,
+                    composition_owner="composer", composition_epoch=epoch,
+                    composition_text=path.read_text())
+                cli = self.mesh("work", "packet", "record", str(carrier["id"]),
+                    "--repo", self.repo, "--base", self.base, "--head", head,
+                    "--target", target, "--composition-file", str(path),
+                    "--composition-owner", "composer", "--composition-epoch", str(epoch))
+                self.assertEqual(0, cli.returncode, cli.stderr)
+                refused = self.mesh("work", "packet", "record", str(carrier["id"]),
+                    "--repo", self.repo, "--base", self.base, "--head", head,
+                    "--composition-file", str(path))
+                self.assertNotEqual(0, refused.returncode)
+                self.assertIn("requires a composer lease", refused.stderr)
+                self.freeze(carrier, head)
+                receipt = packet_snapshot.exact(self.db, repository="acme/web",
+                    target=target, package_id=carrier["id"], branch=branch, head=head)
+                self.assertEqual(report["snapshot"]["id"], receipt["id"])
+                proof = prevalidation_calls.composer_tested(self.cfg, self.db,
+                    work.get(self.db, carrier["id"]), head, repo=self.repo)
+                self.assertEqual(1, proof["tests"])
+                body = paquet_auto.pr_body(name=name, target=target, base_sha=self.base,
+                    carrier=carrier["id"], composition=composition, candidates=[],
+                    tests=[], inclusion_rc=0, freeze_seconds=0.1,
+                    composition_text=rendering, head=head)
+                self.assertIn(head, body)
+                self.assertIn(rendering, body)
+                # Validate the exact merge chain and replay from the durable
+                # receipt after removing even the transient rendering.
+                path.unlink()
+                with mock.patch.object(packet_snapshot, "lookup", return_value=receipt):
+                    paquet_auto.check_chain(Path(self.repo), head, self.base,
+                        paquet_auto.manifest_rel(name),
+                        [paquet_auto.Candidate(unit["id"], source)])
+                    self.assertEqual(0, paquet_auto.replay(Path(self.repo), head,
+                        name, self.base, log=lambda _line: None))
+                self.assertEqual([], list(Path(self.repo).glob("reviews/*.md")))
+                self.assertEqual("", git(self.repo, "status", "--porcelain"))
+                # No remote publication or merge: the private composed ref is
+                # the simulated landed cutoff used by the real closure sweep.
+                packet_close.sync(self.db, self.repo, target=head)
+                self.assertEqual("delivered", work.get(self.db, unit["id"])["state"])
+                storage.of(self.db).work.land_unlock(key, "composer", epoch)
+
     def test_record_reads_trailers_and_writes_membership(self):
         first = self.unit_branch("lot/cinq", "src/un.py", "un\n", "un")
         second = self.unit_branch("lot/six", "src/deux.py", "deux\n", "deux")

@@ -6,6 +6,31 @@ qu'aucun lot admis, routé vers la coupure ou **prêt** n'a été silencieusemen
 omis à la composition, et que le contenu des lots composés est réellement dans
 l'arbre de la tête.
 
+## Composition sans fichier produit (#7478)
+
+Les nouveaux paquets de `paquet-auto.py` ne créent aucun fichier
+`reviews/integration-paquet-*.md` et aucun commit de métadonnées. Le rendu
+Markdown reste dans un fichier transitoire sous `$TMPDIR`, le temps du contrôle
+d’inclusion et de `ameesh work packet record --composition-file FILE`.
+Cette option exige `--composition-owner` et `--composition-epoch` :
+l’instantané et les appartenances sont enregistrés dans la même transaction,
+sous le bail du composeur, sur la tête exacte des fusions d’unités.
+
+Le corps de la PR contient une copie lisible et la référence du porteur, de la
+cible et de la tête exacte. L’instantané ameesh fait autorité ; modifier la PR
+ne modifie pas la composition. Le gel, la prévalidation, le rejeu
+`paquet-auto.py --replay REF`, la reprise `--publish` et la fermeture lisent
+cet instantané. Le mode `--local` garde lui aussi le rendu hors du dépôt ;
+il prend le même bail que le composeur réel et peut donc être refusé (code 3)
+ou retarder celui-ci. Avec `--local --no-packet-record`, ce contrôle ne prend
+pas ce bail et ne persiste aucun instantané.
+
+Pour relire l’inclusion d’un paquet déjà enregistré, `--manifest` peut désigner
+le nom historique même si le fichier n’existe pas : la branche est déduite du
+nom et le lecteur cherche d’abord l’instantané de `--head`. Les anciens
+manifestes et leurs exceptions de chemin restent compatibles pour l’historique ;
+ce lot ne les supprime pas. Les cibles `main` et `develop` suivent le même chemin.
+
 ## Le constat
 
 Au paquet ameesh de 11h (15/10/2026), quinze lots admis ou routés par le pilote

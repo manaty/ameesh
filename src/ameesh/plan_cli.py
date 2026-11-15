@@ -80,6 +80,9 @@ def add_parsers(work_sub, func) -> None:
     p_prec.add_argument("--expect-pushed", default=None, metavar="SHA",
                         help="#4501: the pushed head this composition replaces; a head "
                              "other than the carrier's frozen one is refused without it")
+    p_prec.add_argument("--composition-file", default=None, metavar="FILE",
+                        help="transient composition rendering for the exact-head snapshot; "
+                             "requires a composer lease; never committed")
     p_prec.add_argument("--composition-owner", default="")
     p_prec.add_argument("--composition-epoch", type=int, default=0)
     p_prec.add_argument("--dry-run", action="store_true",
@@ -703,15 +706,20 @@ def _packet_check(db, args: argparse.Namespace) -> int:
 def _packet_record(db, args: argparse.Namespace, packet_link) -> int:
     """Record membership and, for a leased composer, the durable receipt."""
     try:
+        from pathlib import Path
+        composition_file = getattr(args, "composition_file", None)
+        composition_text = (Path(composition_file).read_text(encoding="utf-8")
+                            if composition_file else None)
         report = packet_link.record(
             db, args.id, repo=args.repo, base=args.base, head=args.head,
             branch=args.branch, target=args.target, actor=args.actor,
             expect_pushed=args.expect_pushed,
             composition_owner=args.composition_owner,
             composition_epoch=args.composition_epoch,
+            composition_text=composition_text,
             dry_run=args.dry_run, cfg=getattr(db, "cfg", None))
     except (packet_link.PacketLinkError, work.WorkError, plan_git.MergeProbeError,
-            GitError) as exc:
+            GitError, OSError, UnicodeError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
     if args.json:

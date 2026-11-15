@@ -169,6 +169,7 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
            head: str = "HEAD", branch: str | None = None, target: str | None = None,
            expect_pushed: str | None = None,
            composition_owner: str = "", composition_epoch: int = 0,
+           composition_text: str | None = None,
            actor: str = "", dry_run: bool = False, cfg=None) -> dict:
     """Enregistre la composition du paquet `package_id` ; rend le compte rendu.
 
@@ -186,6 +187,8 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
     """
     if bool(composition_owner) != bool(composition_epoch):
         raise PacketLinkError("packet snapshot requires both composer owner and epoch")
+    if composition_text is not None and not composition_owner:
+        raise PacketLinkError("composition text requires a composer lease")
     package = work.get(db, package_id)
     if package is None:
         raise PacketLinkError("packet carrier #%s not found" % package_id)
@@ -309,10 +312,12 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
     snapshot = None
     if composition_owner:
         from . import packet_composition, packet_red, packet_snapshot
-        path = packet_red.manifest_name(package_branch)
-        manifest_file = plan_git._git(top, "show", "%s:%s" % (head_sha, path))
-        manifest = (manifest_file.stdout.decode("utf-8")
-                    if manifest_file.returncode == 0 else None)
+        manifest = composition_text
+        if manifest is None:  # Compatibility with historical committed manifests.
+            path = packet_red.manifest_name(package_branch)
+            manifest_file = plan_git._git(top, "show", "%s:%s" % (head_sha, path))
+            manifest = (manifest_file.stdout.decode("utf-8")
+                        if manifest_file.returncode == 0 else None)
         if manifest is None:
             raise PacketLinkError("packet snapshot: composition manifest missing")
         previous = packet_snapshot.exact(db, repository=slug,

@@ -21,7 +21,7 @@ l'ordre, sans agent :
    passe au suivant. Aucune résolution : résoudre est un jugement, il reste à
    un agent ;
 4. `scripts/freeze-checks.py` sur la tête composée ;
-5. le manifeste `reviews/integration-paquet-<nom>.md` : base et SHA de la
+5. l’instantané ameesh (rendu transitoire sous TMPDIR) : base et SHA de la
    cible, table `## Composition` produite par `paquet-compose.py --units`
    (gabarit #3629), admissions, écartés et leur motif, freeze-checks ; ses
    tests par unité y sont dits « en parallèle de la CI » (#4304) ;
@@ -195,11 +195,11 @@ rouges restent le verdict même si la cible a bougé pendant eux (rc 5).
 Modes :
 
 * normal : composition réelle, poussée, PR, gel, ci-full, tests et courrier ;
-* `--local` : manifeste, `packet record` et tests par unité, sans poussée,
+* `--local` : rendu transitoire, `packet record` sous bail et tests par unité, sans poussée,
   PR, gel, ci-full ni courrier (composition de contrôle) ;
 * `--replay <réf> [--candidates-json <sortie paquet-candidats --json>]` :
   rejoue la table `## Composition` d'un manifeste déjà gelé depuis `--base`,
-  reprend le manifeste de `--réf` tel quel (métadonnée, aucun effet sur le
+  reprend le manifeste historique de `--réf` seulement s’il existe (aucun effet sur le
   contenu composé) et compare l'arbre obtenu à `git rev-parse <réf>^{tree}`.
   Avec `--candidates-json`, chaque unité doit être prête et aucune en erreur
   (#3813) : h-31 v3 (`b57c0380`, #3506 en erreur) est refusé, h-31 v4
@@ -5068,22 +5068,16 @@ def _unattributed_lines(tests: list[TestRun]) -> list[str]:
     return lines
 
 
-def write_manifest(worktree: Path, rel: str, text: str, *,
-                   name: str, units: int, discarded: int) -> str:
-    path = worktree / rel
-    if not path.parent.is_dir():
-        path.parent.mkdir(parents=True)
+def write_composition(worktree: Path, rel: str, text: str, *,
+                      name: str, units: int, discarded: int) -> str:
+    """Write the transient rendering outside the product tree, without a commit."""
+    path = Path(rel).resolve()
+    if path.is_relative_to(worktree.resolve()):
+        raise PaquetAutoError("la composition transitoire doit rester hors du dépôt")
     path.write_text(text, encoding="utf-8")
-    git(worktree, "add", "--", rel)
-    message = ("paquet %s : manifeste — %d unité(s), %d écarté(s)"
-               % (name, units, discarded))
-    proc = git(worktree, "commit", "-m", message, check=False)
-    if proc.returncode != 0:
-        raise PaquetAutoError(
-            "commit du manifeste : %s" % _decode(proc.stderr).strip())
     head = rev(worktree, "HEAD")
-    if head is None:
-        raise PaquetAutoError("manifeste commité sans tête")
+    if not head:
+        raise PaquetAutoError("composition sans tête")
     return head
 
 
@@ -5106,10 +5100,13 @@ def run_inclusion(worktree: Path, manifest: Path, head: str,
 
 
 def record_packet(worktree: Path, carrier: int, base_sha: str, head: str,
-                  branch: str, target: str, expect_pushed: str = "", claim=None) -> str:
+                  branch: str, target: str, expect_pushed: str = "", claim=None,
+                  composition_file: Path | None = None) -> str:
     cmd = ["ameesh", "work", "packet", "record", str(carrier),
            "--repo", str(worktree), "--base", base_sha, "--head", head,
            "--branch", branch, "--target", target]
+    if composition_file is not None:
+        cmd += ["--composition-file", str(composition_file)]
     if claim is not None:
         claim.require()
         cmd += ["--composition-owner", claim.owner,
@@ -5361,8 +5358,8 @@ def merged_during_tests(args: argparse.Namespace, worktree: Path, head: str,
     print(note_carrier(
         worktree, args.carrier,
         "paquet %s : PR fusionnée au vert pendant les tests par unité ; tests "
-        "par unité %s sur la tête %s ; manifeste %s (#4322)"
-        % (args.name, summary, head[:12], rel)), flush=True)
+        "par unité %s sur la tête %s ; instantané du porteur (#4322)"
+        % (args.name, summary, head[:12])), flush=True)
     if faulty:
         body = ("Paquet %s (%s, tête %s) : la ci-full verte a fusionné la PR "
                 "pendant les tests par unité, puis ceux-ci ont rougi pour %s "
@@ -5551,7 +5548,7 @@ def notify_flaky(name: str, carrier: int, tests: list[str],
 def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
             composition: Composition, candidates: list[Candidate],
             tests: list[TestRun] | None, inclusion_rc: int,
-            freeze_seconds: float) -> str:
+            freeze_seconds: float, composition_text: str = "", head: str = "") -> str:
     """Le corps de la PR ; `tests=None` à la poussée, avant les tests (#4304)."""
     by_lot = {candidate.lot: candidate for candidate in candidates}
     units = ", ".join("#%d" % unit.lot for unit in composition.units) or "aucun"
@@ -5584,12 +5581,17 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
     lines += [
         "- Contrôle d'inclusion : %s." % ("vert" if inclusion_rc == 0 else "à lire"),
         "- Freeze-checks : vert (%.1f s)." % freeze_seconds,
-        "- Manifeste : `%s`." % manifest_rel(name),
+        "- Enregistrement ameesh : porteur #%d, cible `%s`, tête `%s`."
+        % (carrier, target, head),
         "",
         "Porteur : #%d. CI complète demandée dès la poussée (#4304) ; "
         "« verdict non requis » reste au pilote." % carrier,
         "",
     ]
+    if composition_text:
+        lines += ["## Copie de la composition", "",
+                  "Copie lisible ; l’instantané ameesh de cette tête fait autorité.",
+                  "", composition_text]
     return "\n".join(lines)
 
 
@@ -5619,7 +5621,7 @@ Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branch
 - {direct_note}
 - {non_section}
 - Inclusion : {inclusion}.
-- Gel : `ameesh work milestone` posé sur la tête dès la poussée, ci-full demandée (#4304) ; manifeste `{manifest}`.
+- Gel : `ameesh work milestone` posé sur la tête dès la poussée, ci-full demandée (#4304) ; instantané ameesh du porteur #{carrier}, tête `{head}`.
 
 {next_step}
 """.format(
@@ -5629,7 +5631,7 @@ Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branch
         tests=_tests_summary(tests), direct_note=_direct_note(composition, tests),
         non_section=non_section,
         inclusion="vert" if inclusion_rc == 0 else "à lire",
-        manifest=manifest_rel(name),
+        carrier=carrier,
         next_step=("Le composeur horaire poursuit la publication et traite les demandes "
                    "de geste séparément." if report_info else
                    "« Verdict non requis » reste ton geste ; aucune fusion sur %s." % target),
@@ -5775,16 +5777,21 @@ def replay(repo: Path, reference: str, name: str, base: str, *,
                     % ("/".join("#%d" % lot for lot in lots), _tail(_output(proc))))
             log("rejeu : %s ← %s" % ("/".join("#%d" % lot for lot in lots),
                                      candidate.source[:12]))
-        path = worktree / manifest_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(manifest_text, encoding="utf-8")
-        git(worktree, "add", "--", manifest_path)
-        proc = git(worktree, "commit", "-m",
-                   "paquet %s : manifeste de rejeu (%s)" % (name, ref[:12]),
-                   check=False)
-        if proc.returncode != 0:
-            raise PaquetAutoError(
-                "rejeu : commit du manifeste : %s" % _decode(proc.stderr).strip())
+        parents = out(repo, "rev-list", "--parents", "-n", "1", ref).split()[1:]
+        historical = (len(parents) == 1 and
+            out(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", ref)
+                .splitlines() == [manifest_path])
+        if historical:
+            path = worktree / manifest_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(manifest_text, encoding="utf-8")
+            git(worktree, "add", "--", manifest_path)
+            proc = git(worktree, "commit", "-m",
+                       "paquet %s : manifeste de rejeu (%s)" % (name, ref[:12]),
+                       check=False)
+            if proc.returncode != 0:
+                raise PaquetAutoError(
+                    "rejeu : commit du manifeste : %s" % _decode(proc.stderr).strip())
         head = rev(worktree, "HEAD")
         got = tree_of(worktree, "HEAD")
         expected = tree_of(repo, ref)
@@ -5857,7 +5864,8 @@ def check_chain(repo: Path, head: str, base_sha: str, rel: str,
                 candidates: list[Candidate]) -> list[tuple[list[int], str]]:
     """#4237 : la tête testée est-elle publiable telle quelle sur `base_sha` ?
 
-    Le manifeste seul au-dessus d'une chaîne de fusions (premier parent) qui
+    Une chaîne de fusions (premier parent), éventuellement surmontée du seul
+    manifeste historique, qui
     part de la tête fraîche de la cible ; une fusion par ligne de la table
     `## Composition`, dans l'ordre, son second parent égal à la source de la
     ligne et à la source de chacun de ses lots dans la liste calculée (la tête
@@ -5866,19 +5874,24 @@ def check_chain(repo: Path, head: str, base_sha: str, rel: str,
     stratégie que `paquet-compose`) : un contenu glissé dans une fusion aux
     parents conformes est refusé. Rend la table ; sinon `ChainRefused`.
     """
+    # Historical packets carry one metadata commit; current packets end at
+    # the final unit merge. Validate every merge in either representation.
+    end = head
     parents = out(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
-    files = out(repo, "diff-tree", "--no-commit-id", "--name-only", "-r",
-                head).splitlines()
-    if len(parents) != 1 or files != [rel]:
-        raise ChainRefused("la tête %s n'est pas le seul commit du manifeste %s"
-                           % (head[:12], rel))
+    if len(parents) == 1:
+        files = out(repo, "diff-tree", "--no-commit-id", "--name-only", "-r",
+                    head).splitlines()
+        if files != [rel]:
+            raise ChainRefused("la tête %s n'est pas le seul commit du manifeste %s"
+                               % (head[:12], rel))
+        end = parents[0]
     try:
         name = Path(rel).stem.removeprefix("integration-paquet-")
         specs = parse_composition_table(composition_text(repo, head, name))
     except InputError as error:
         raise ChainRefused(str(error)) from error
     lines = out(repo, "rev-list", "--first-parent", "--parents", "--reverse",
-                "%s..%s" % (base_sha, parents[0]), check=False).splitlines()
+                "%s..%s" % (base_sha, end), check=False).splitlines()
     merges = [line.split() for line in lines]
     if not merges or len(merges[0]) < 2 or merges[0][1] != base_sha:
         raise ChainRefused("tête %s composée sur une autre base que la tête "
@@ -6020,7 +6033,11 @@ def publish_tested(args: argparse.Namespace) -> int:
                 % (args.name, args.target, base_sha[:12], len(specs)), "",
                 units, "", origin, "",
                 "- Contrôle d'inclusion : vert.",
-                "- Manifeste : `%s`." % rel, "",
+                "- Enregistrement ameesh : porteur #%d, cible `%s`, tête `%s`."
+                % (args.carrier, args.target, head), "",
+                "## Copie de la composition", "",
+                "Copie lisible ; l’instantané ameesh de cette tête fait autorité.",
+                "", composition_text(repo, head, args.name), "",
                 "Porteur : #%d. « Verdict non requis » et CI complète restent au pilote."
                 % args.carrier, ""])
             pr_number, pr_url = ensure_pull_request(
@@ -6031,7 +6048,7 @@ def publish_tested(args: argparse.Namespace) -> int:
             worktree, args.carrier,
             "paquet %s : fin publiée par scripts/paquet-auto.py --publish (#4237) "
             "sur la tête poussée %s, tests par unité non rejoués (qualification au journal d'origine) ; "
-            "manifeste %s" % (args.name, head[:12], rel)), flush=True)
+            "instantané du porteur" % (args.name, head[:12])), flush=True)
         check_pause(worktree, getattr(args, "pause_project", "") or "", args.target)
         print(request_full_ci(worktree, args.carrier, head), flush=True)
         pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
@@ -6102,7 +6119,7 @@ def compose_packet(args: argparse.Namespace) -> int:
         # écriture de la branche. Il couvre la composition réelle (pas les
         # modes de contrôle) et il est renouvelé par l'enfant détenteur ; un
         # second composeur — le tic, un agent désigné — est refusé ici (rc 3).
-        if not args.no_packet_record and not args.local:
+        if not args.no_packet_record:
             claim = CompositionClaim(repo, args.carrier, args.name).start()
         base_sha = fresh_base(repo, args.target)
         print("paquet %s : base %s %s"
@@ -6272,7 +6289,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                            carrier=args.carrier, composition=composition,
                            candidates=candidates, tests=tests,
                            inclusion_rc=inclusion_rc,
-                           freeze_seconds=freeze_seconds)
+                           freeze_seconds=freeze_seconds,
+                           composition_text=manifest_text, head=head)
 
         def freeze_changes() -> list[Discarded]:
             """#6566 : relit le gel des unités sur la base, juste avant la poussée.
@@ -6349,17 +6367,20 @@ def compose_packet(args: argparse.Namespace) -> int:
                 ready_count=ready_count,
                 waiting=len(payload.get("waiting") or []),
                 errors=len(errors), client_types=client_note)
-            head = write_manifest(worktree, rel, manifest_text, name=args.name,
-                                  units=len(composition.units),
-                                  discarded=len(composition.discarded))
-            print("manifeste %s : tête %s" % (rel, head), flush=True)
+            # Keep metadata outside the product tree; no metadata commit.
+            composition_file = Path(tmp.name) / Path(rel).name
+            head = write_composition(worktree, str(composition_file), manifest_text,
+                                     name=args.name, units=len(composition.units),
+                                     discarded=len(composition.discarded))
+            print("composition : tête %s" % head, flush=True)
             if not args.no_packet_record:
                 print(record_packet(worktree, args.carrier, base_sha, head,
                                     branch, args.target,
-                                    expect_pushed=lease or "", claim=claim), flush=True)
+                                    expect_pushed=lease or "", claim=claim,
+                                    composition_file=composition_file), flush=True)
             _write_id_file(expected_file, [unit.lot for unit in composition.units])
             inclusion_rc, inclusion_output = run_inclusion(
-                worktree, worktree / rel, head, ready_out, expected_file)
+                worktree, composition_file, head, ready_out, expected_file)
             print(inclusion_output, flush=True)
             if inclusion_rc != 0:
                 raise PaquetAutoError(
@@ -6462,9 +6483,9 @@ def compose_packet(args: argparse.Namespace) -> int:
                 print("PR : %s" % (pr_url or pr_number or "?"), flush=True)
                 note = ("paquet %s poussé par scripts/paquet-auto.py dès la "
                         "composition (canon §6, #4304) : %d unités, %d écartés, "
-                        "inclusion verte, tests par unité en cours ; manifeste %s"
+                        "inclusion verte, tests par unité en cours ; instantané %s"
                         % (args.name, len(composition.units),
-                           len(composition.discarded), rel))
+                           len(composition.discarded), head))
                 print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
                 print(request_full_ci(worktree, args.carrier, head), flush=True)
             try:
@@ -6617,9 +6638,9 @@ def compose_packet(args: argparse.Namespace) -> int:
         print(note_carrier(
             worktree, args.carrier,
             "paquet %s : tests par unité %s sur la tête poussée %s (%s) ; %s ; "
-            "inclusion verte ; manifeste %s"
+            "inclusion verte ; instantané %s"
             % (args.name, tests_note, head[:12], _tests_summary(runs),
-               _direct_note(composition, runs), rel)),
+               _direct_note(composition, runs), head)),
             flush=True)
         mail = mail_body(name=args.name, target=args.target, base_sha=base_sha,
                          carrier=args.carrier, head=head, branch=branch,
@@ -6863,9 +6884,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="expéditeur du courrier (défaut : AMEESH_ROLE, sinon "
                              "l'identité liée)")
     parser.add_argument("--local", action="store_true",
-                        help="composition de contrôle : manifeste, packet "
+                        help="composition de contrôle : rendu transitoire, packet "
                              "record et tests par unité, sans poussée, PR, gel, "
-                             "ci-full ni courrier")
+                             "ci-full ni courrier ; prend le même bail que le composeur "
+                             "réel (rc 3 si occupé) ; --no-packet-record évite ce bail")
     parser.add_argument("--force", action="store_true",
                         help="recomposer un paquet existant : réécrit la "
                              "branche distante sous --force-with-lease (retirer "

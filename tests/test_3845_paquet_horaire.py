@@ -223,6 +223,53 @@ class Base(unittest.TestCase):
          ph.auto.composition_holder) = self._saved
 
 
+class SnapshotManifestTest(Base):
+    """#7478: exercise the actual hourly reader, not the Base rendering stub."""
+
+    def setUp(self):
+        super().setUp()
+        ph.manifest_at = self._saved[1]
+        self.receipt = {"id": 7, "payload": {"manifest": MANIFEST}}
+
+    def test_publish_without_git_manifest_reads_exact_snapshot_and_requests_ci(self):
+        from ameesh import packet_snapshot
+        row = carrier()
+        self.shell.items[row["id"]] = row
+        with mock.patch.object(packet_snapshot, "lookup", return_value=self.receipt) as lookup, \
+             mock.patch.object(ph.auto, "git", side_effect=AssertionError("no Git manifest")):
+            result = ph.publish(self.ctx, row)
+        self.assertIn("ci-full demandée", result)
+        self.assertEqual(HEAD, lookup.call_args.kwargs["head"])
+        self.assertEqual(row["branch"], lookup.call_args.kwargs["branch"])
+        self.assertTrue(any("fetch" in call for call in self.shell.calls))
+
+    def test_contract_result_without_git_manifest_uses_exact_head_tree(self):
+        from ameesh import packet_snapshot, packet_contract_proof
+        proof = {"result": {"state": "green"}}
+        with mock.patch.object(packet_snapshot, "lookup", return_value=self.receipt), \
+             mock.patch.object(ph.auto, "git", side_effect=AssertionError("no Git manifest")), \
+             mock.patch.object(self.ctx, "git", return_value=ph.Result(0, "c" * 40)), \
+             mock.patch.object(packet_contract_proof, "read", return_value=proof) as read:
+            self.assertEqual(proof, ph.contract_result_at(self.ctx, carrier(), HEAD))
+        read.assert_called_once_with(carrier(), head=HEAD, tree="c" * 40, target="main")
+
+    def test_snapshot_failure_is_an_hourly_error_without_git_fallback(self):
+        from ameesh import packet_snapshot
+        for error in (packet_snapshot.SnapshotError("ambiguous"), ph.auto.InputError("missing")):
+            with self.subTest(error=type(error).__name__), \
+                 mock.patch.object(ph.auto, "composition_text", side_effect=error):
+                with self.assertRaisesRegex(ph.HoraireError, "composition.*illisible"):
+                    ph.manifest_at(self.ctx, carrier(), HEAD)
+
+    def test_historical_git_rendering_remains_readable_on_snapshot_absence(self):
+        from ameesh import packet_snapshot
+        with mock.patch.object(packet_snapshot, "lookup", return_value=None), \
+             mock.patch.object(ph.auto, "git", return_value=subprocess.CompletedProcess(
+                 [], 0, stdout=MANIFEST.encode(), stderr=b"")) as git:
+            self.assertEqual(MANIFEST, ph.manifest_at(self.ctx, carrier(), HEAD))
+        self.assertIn("show", git.call_args.args)
+
+
 class RecomposeCloneTest(Base):
     """#4562 : la recomposition n'écrit pas dans le clone d'un agent."""
 
