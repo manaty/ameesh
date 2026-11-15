@@ -7,6 +7,13 @@ paquet 634 (PR #4600) en CI ; `debit --check` sortait 2 en les classant
 à sa tête gelée a le paquet pour voie d'atterrissage : le rapport le classe
 `in_packet` (niveau 0), hors `slow_waits`. Un porteur terminé, une composition
 sur une autre tête ou un état de porteur absent laissent la ligne revenir.
+
+#7445 : un porteur en retenue (`blocked`, `waiting_human`) ne porte plus ses
+membres. Son attente propre peut être invisible (un porteur bloqué sans
+`hold:` n'a aucune ligne à lui) : classer ses membres `in_packet` masquerait
+l'attente jusqu'à recomposition ou fermeture. Le membre redevient donc une
+attente `qa_merge` liée au porteur ; elle reste hors `--check` quand le
+porteur attend une décision humaine (`waiting_human`).
 """
 from __future__ import annotations
 
@@ -104,6 +111,41 @@ class PacketMemberTest(unittest.TestCase):
                 self.assertNotIn("in_packet", qa_row(report, 7101))
                 self.assertEqual(report["totals"]["in_packet"], 0)
 
+    def test_porteur_actif_ou_en_revue_porte_toujours(self):
+        # La frontière de #7445 : seules les retenues retirent la qualité de
+        # porteur ; un porteur en construction ou en revue porte son membre.
+        for state in ("intake", "build", "qa", "validated"):
+            with self.subTest(state=state):
+                report = self.report(state=state)
+                self.assertNotIn((7101, "qa_merge"), kinds(report))
+                self.assertEqual(qa_row(report, 7101)["in_packet"], 7427)
+
+    def test_porteur_bloque_rend_une_attente_d_agent(self):
+        # #7445 : un porteur bloqué ne porte plus son membre ; l'attente
+        # redevient visible, liée au porteur, et reste une attente d'agent
+        # (le pilote débloque le porteur ou recompose le membre).
+        report = self.report(state="blocked")
+        self.assertIn((7101, "qa_merge"), kinds(report))
+        wait = next(row for row in report["slow_waits"] if row["lot"] == 7101)
+        self.assertEqual(wait["packet"], 7427)
+        self.assertEqual(wait["packet_state"], "blocked")
+        self.assertNotIn("in_packet", qa_row(report, 7101))
+        self.assertEqual(report["totals"]["in_packet"], 0)
+
+    def test_porteur_en_attente_humaine_rend_une_attente_humaine(self):
+        # #7445 : un porteur `waiting_human` attend une décision owner ; le
+        # membre est visible dans les attentes humaines, hors `--check`.
+        report = self.report(state="waiting_human")
+        self.assertNotIn((7101, "qa_merge"), kinds(report))
+        self.assertIn((7101, "qa_merge"),
+                      [(row["lot"], row["kind"])
+                       for row in report["human_waits"]])
+        wait = next(row for row in report["human_waits"] if row["lot"] == 7101)
+        self.assertEqual(wait["packet"], 7427)
+        self.assertEqual(wait["packet_state"], "waiting_human")
+        self.assertNotIn("in_packet", qa_row(report, 7101))
+        self.assertEqual(report["totals"]["in_packet"], 0)
+
     def test_porteur_compose_sur_une_autre_tete_rend_la_ligne(self):
         report = self.report(sha="b" * 40)
         self.assertIn((7101, "qa_merge"), kinds(report))
@@ -200,6 +242,23 @@ class ReadPacketTest(PgTestCase):
                       [(row["lot"], row["kind"])
                        for row in report["slow_waits"]])
         self.assertNotIn("in_packet", qa_row(report, self.lot_id))
+
+    def test_porteur_en_retenue_rend_la_ligne(self):
+        # #7445 : `read` porte bien `blocked`/`waiting_human` jusqu'à `build`,
+        # où le membre n'est plus classé `in_packet` ; la ligne est un agent
+        # pour un porteur bloqué, une attente humaine pour `waiting_human`.
+        for state, bucket in (("blocked", "slow_waits"),
+                              ("waiting_human", "human_waits")):
+            with self.subTest(state=state):
+                self.db.execute(
+                    "UPDATE work_items SET state = %s WHERE id = 7427",
+                    (state,))
+                report = self.read()
+                self.assertIn((self.lot_id, "qa_merge"),
+                              [(row["lot"], row["kind"])
+                               for row in report[bucket]])
+                self.assertNotIn("in_packet", qa_row(report, self.lot_id))
+                self.assertEqual(report["totals"]["in_packet"], 0)
 
 
 if __name__ == "__main__":

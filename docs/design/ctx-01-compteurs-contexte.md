@@ -103,6 +103,36 @@ appels, seulement le pic du tour. Une valeur absente reste `null` avec sa
 raison (§2.4), jamais `0`. Le corpus de rejeu recopie le bloc quand il est
 publié ; un corpus antérieur le laisse `null` avec `not_published`.
 
+#### Tailles textuelles observées (#7463)
+
+Le bloc additif `counts` contient `tool_calls` (outils commencés, ou résultats
+sans début observé), `tool_output_chars` (somme), `tool_output_max_chars`
+(maximum d'un résultat), `tool_output_chars_by_tool` (somme par nom d'outil),
+`assistant_chars` (texte assistant, hors copie finale du harnais), `steps` et
+`context_first_chars`. Les tailles sont des caractères Python, pas des octets
+ni des jetons. Aucun contenu ni argument d'outil n'est ajouté à l'observation.
+
+Claude compte les résultats `tool_result` du fil principal et déduplique les
+blocs texte assistant par id de message et empreinte éphémère ; Codex compte les résultats des
+`item.completed` et chaque item terminé comme une étape approximative ; dsh
+compte `tool_result`, relié à `tool_call` par `callId`, et les fins d'étape.
+`counts.steps` reste distinct de `series.steps`, fondé sur l'usage par appel.
+Le texte assistant exclut le raisonnement et les images.
+
+Le runner mesure `context_first_chars` sur la consigne composée effectivement
+remise au harnais (`resume + prompt`), sans prétendre mesurer les instructions
+internes, outils ou historique que le harnais y ajoute. Sans mesure, ce champ
+vaut `null`. Les flux pris en charge sans outil rendent zéro et une table vide ;
+les corpus anciens rendent `null`. Les noms d'outil sont bornés et filtrés ;
+les noms non valides deviennent `unknown`, le surplus `other` (128 noms).
+Les index de déduplication sont bornés à `MAX_CALLS` ; au-delà, les doublons
+peuvent être recomptés. Une interruption conserve les tailles reçues comme
+minorants (`turn_interrupted` dans les raisons du document). Une troncature
+faite par le harnais en amont reste une limite de cette mesure du flux.
+
+Le corpus et `cost turns --over` exportent ces seuls compteurs sur liste
+blanche ; le bloc est optionnel pour relire les corpus antérieurs.
+
 #### Temps et coût
 
 | Id | Grandeur | Unité | Périmètre | Source | Remise à zéro | Déduplication | Absence |

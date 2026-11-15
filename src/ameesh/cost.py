@@ -771,6 +771,7 @@ def explain_turns(db, rows: Sequence[dict], *,
                           "rotation": None, "compacted": None})
             for name in OVER_MEASURES:
                 entry[name] = _unknown_measure(reason)
+            entry["counts"] = context_corpus._counts(None)
             entry["policy"] = None
             out.append(entry)
             continue
@@ -797,6 +798,7 @@ def explain_turns(db, rows: Sequence[dict], *,
             entry[name] = {"value": item.get("value"),
                            "quality": item.get("quality"),
                            "reasons": list(item.get("reasons") or ())}
+        entry["counts"] = line["counts"]
         entry["policy"] = {name: line["policy"].get(name) for name in OVER_POLICY}
         out.append(entry)
     return out

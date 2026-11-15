@@ -149,13 +149,14 @@ class MapStaleTest(PgTestCase):
                                  "updated_at": _iso(published)}]))._map(
             self.db, REPO, ("main",))
         self.age_reading(ci.MAP_READ_S + 5)
+        seen = self.row()["seen_ts"]
         self.watcher(_Api(runs=[{"id": 9, "head_sha": "c",
                                  "updated_at": _iso(time.time())}], skipped={9}))._map(
             self.db, REPO, ("main",))
         row = self.row()
         self.assertEqual(row["run_id"], 7)
         self.assertAlmostEqual(row["published_ts"], round(published), delta=1)
-        self.assertLess(time.time() - row["seen_ts"], 60)
+        self.assertGreater(row["seen_ts"], seen)
         (alert,) = self.alerts()
         self.assertIn("last published", alert["detail"])
         self.assertNotIn("age unknown", alert["detail"])
@@ -165,6 +166,28 @@ class MapStaleTest(PgTestCase):
                                  "updated_at": _iso(time.time())}], skipped={9}))._map(
             self.db, REPO, ("main",))
         self.assertIsNone(self.row())
+
+    def test_skipped_runs_without_a_published_map_refresh_the_reading(self):
+        """#7432 : aucune carte n'a jamais été publiée ; une lecture réussie
+        dont tous les runs sont sautés rafraîchit le relevé. `map_stale` dit
+        alors « no successful carte.yml run found », pas un âge inconnu qui
+        accuse la lecture."""
+        self.watcher(_Api(runs=[]))._map(self.db, REPO, ("main",))
+        self.assertIsNone(self.row()["published_ts"])
+        self.age_reading(exploitation.MAP_READ_FRESH_S + 5)
+        (aged,) = self.alerts()
+        self.assertIn("age unknown", aged["detail"])
+        seen = self.row()["seen_ts"]
+        self.watcher(_Api(runs=[{"id": 9, "head_sha": "c",
+                                 "updated_at": _iso(time.time())}], skipped={9}))._map(
+            self.db, REPO, ("main",))
+        row = self.row()
+        self.assertIsNone(row["published_ts"])
+        self.assertIsNone(row["run_id"])
+        self.assertGreater(row["seen_ts"], seen)
+        (alert,) = self.alerts()
+        self.assertIn("no successful carte.yml run", alert["detail"])
+        self.assertNotIn("age unknown", alert["detail"])
 
     def test_unreadable_jobs_keep_the_previous_reading_aging(self):
         self.watcher(_Api(runs=[{"id": 7, "head_sha": "b",
