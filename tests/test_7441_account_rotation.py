@@ -177,6 +177,31 @@ class RotationTest(_Base):
         self.assertEqual(self.store.last_agent_switch('claude', 'pilot')['to_account'], 'c')
         self.assertIsNone(self.store.pending_agent_plan('claude', 'pilot'))
 
+    def test_cleared_session_origin_without_local_profile(self):
+        self.items = [p for p in self.items if p.name != 'b']
+        self.test_cleared_session_publishes_and_consumes_wave()
+
+    def test_remote_peer_origin_without_local_profile(self):
+        self.items = [p for p in self.items if p.name != 'b']
+        self.switched(name='auditor', age=7200)
+        self.used.update(a=.6, c=.1)
+        worker = self.worker()
+        worker._compte_session = 'a'
+        peers = [dict(name='auditor', harness='claude', host='remote',
+                      session_account='b', status='running')]
+        choice = accounts.choose(
+            self.db, self.cfg.host, 'claude', self.items, self.book,
+            now=NOW, agent='pilot', critical=True, session_account='a')
+        with mock.patch.object(account_rotation.registry, 'overview', return_value=peers):
+            choice = account_rotation.coordinate(worker, self.items, self.book, choice, now=NOW)
+        self.assertEqual(choice.profile.name, 'c')
+        rows = self.journal('planned')
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row['wave_epoch'] for row in rows}), 1)
+        peer = next(row for row in rows if row['agent'] == 'auditor')
+        self.assertEqual((peer['from_account'], peer['to_account']), ('b', 'c'))
+        self.assertTrue(choice.switched['epoch'])
+
     def test_cleared_session_keeps_individual_hysteresis(self):
         self.switched(age=1800)
         choice = accounts.choose(

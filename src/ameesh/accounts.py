@@ -3180,12 +3180,12 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         elif left is not None and not cache[left.name].ok:
             why = "%s at threshold (%s); %s" % (left.name, cache[left.name].reason, why)
         if critical:
-            # L242b : jamais le dernier choix partagé ; la bascule est celle de
-            # l'agent (depuis le compte de sa session, sinon le choix partagé)
-            origin = own if own is not None else active
+            # Keep the persona origin even when this host has no profile for
+            # it: a remote peer may have a different set of declared accounts.
+            origin = origin_name or active.name
             moved = None
-            if target.name != origin.name:
-                moved = {"from": origin.name, "to": target.name, "kind": "agent", "reason": why}
+            if target.name != origin:
+                moved = {"from": origin, "to": target.name, "kind": "agent", "reason": why}
             return Choice(target, active, switched=moved, why=why, per_agent=True)
         if target.name == active.name:
             # #1883 (R2 auditeur, B1) : rien n'est écrit ici — c'est le point de
