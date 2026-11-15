@@ -18,7 +18,8 @@ ignore un dépôt qui ne porte pas ce workflow. ``--repo``, ``--project`` et
 ``--branch`` restreignent la cible ; ``--manuel`` envoie ``planifie=false``
 (dispatch manuel, toujours mesuré) ; ``--dry-run`` n'écrit rien.
 
-#7430 : la minuterie passe chaque heure avec ``--horaire``. À 01:00Z,
+#7430 : le premier tic du paquet horaire appelle ``--horaire`` chaque
+heure, hors 01Z laissé à la minuterie carte quotidienne. À 01:00Z,
 le dispatch quotidien reste systématique. Aux autres heures, seule une
 carte connue de plus de ``exploitation.MAP_STALE_S`` sur la branche visée
 provoque une demande. Une lecture absente ou impossible ne prouve pas cet

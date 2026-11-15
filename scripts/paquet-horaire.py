@@ -2414,7 +2414,8 @@ def catch_up_map(ctx: Context) -> None:
     from ameesh import carte
     now = datetime.fromtimestamp(ctx.now, ZoneInfo("UTC"))
     # La minuterie carte existante assure déjà le dispatch quotidien à 01Z.
-    if now.hour == 1:
+    # Seul le premier tic de l’heure tente le rattrapage (précision : 30 s).
+    if now.hour == 1 or now.minute >= 10:
         return
     argv = ["dispatch", "--horaire", "--project", ctx.project,
             "--branch", ctx.target]

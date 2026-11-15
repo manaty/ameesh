@@ -228,6 +228,20 @@ class PacketCatchupTest(unittest.TestCase):
         tick.assert_called_once_with(ctx)
         self.assertTrue(ctx.log)
 
+    def test_ten_minute_ticks_dispatch_once_per_hour_except_daily_slot(self):
+        from tests.test_3845_paquet_horaire import ph
+        start = dt.datetime(2026, 11, 15, tzinfo=dt.timezone.utc)
+        ctx = SimpleNamespace(project="demo", target="main", dry_run=False, log=[])
+        with mock.patch.object(carte, "main", return_value=0) as dispatch:
+            for minute in range(0, 24 * 60, 10):
+                ctx.now = (start + dt.timedelta(minutes=minute, seconds=30)).timestamp()
+                ph.catch_up_map(ctx)
+            self.assertEqual(dispatch.call_count, 23)
+            attempted = [call.kwargs["maintenant"] for call in dispatch.call_args_list]
+            self.assertEqual([when.hour for when in attempted],
+                             [hour for hour in range(24) if hour != 1])
+            self.assertTrue(all(when.minute == 0 for when in attempted))
+
     def test_daily_timer_and_dry_run_are_respected(self):
         from tests.test_3845_paquet_horaire import ph
         ctx = SimpleNamespace(now=dt.datetime(2026, 11, 15, 1,
