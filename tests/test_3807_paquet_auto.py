@@ -341,7 +341,7 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=([inconclusive], [], [])), \
                 mock.patch.object(paquet_auto, "composition_table",
                                   return_value="## Composition (1 unité, 1 lot)\n"), \
-                mock.patch.object(paquet_auto, "write_manifest",
+                mock.patch.object(paquet_auto, "write_composition",
                                   return_value="d" * 40), \
                 mock.patch.object(paquet_auto, "run_inclusion",
                                   return_value=(0, "inclusion ok")), \
@@ -409,7 +409,7 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=([], [], [])), \
                 mock.patch.object(paquet_auto, "composition_table",
                                   return_value="## Composition (1 unité, 1 lot)\n"), \
-                mock.patch.object(paquet_auto, "write_manifest",
+                mock.patch.object(paquet_auto, "write_composition",
                                   return_value="d" * 40), \
                 mock.patch.object(paquet_auto, "run_inclusion",
                                   return_value=(0, "inclusion ok")), \
@@ -473,7 +473,7 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=([], [], [])), \
                 mock.patch.object(paquet_auto, "composition_table",
                                   return_value="## Composition (1 unité, 1 lot)\n"), \
-                mock.patch.object(paquet_auto, "write_manifest",
+                mock.patch.object(paquet_auto, "write_composition",
                                   return_value="d" * 40), \
                 mock.patch.object(paquet_auto, "run_inclusion",
                                   return_value=(0, "inclusion ok")), \
@@ -696,7 +696,7 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=([], [], [])), \
                 mock.patch.object(paquet_auto, "composition_table",
                                   return_value="## Composition (1 unité, 1 lot)\n"), \
-                mock.patch.object(paquet_auto, "write_manifest",
+                mock.patch.object(paquet_auto, "write_composition",
                                   side_effect=capture), \
                 mock.patch.object(paquet_auto, "run_inclusion",
                                   return_value=(0, "inclusion ok")), \
@@ -759,7 +759,7 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=([], [], [])), \
                 mock.patch.object(paquet_auto, "composition_table",
                                   return_value="## Composition (1 unité, 1 lot)\n"), \
-                mock.patch.object(paquet_auto, "write_manifest",
+                mock.patch.object(paquet_auto, "write_composition",
                                   side_effect=capture), \
                 mock.patch.object(paquet_auto, "run_inclusion",
                                   return_value=(0, "inclusion ok")), \

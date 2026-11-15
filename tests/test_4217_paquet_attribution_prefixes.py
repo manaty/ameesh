@@ -380,7 +380,7 @@ class ComposePacketPilotMailTest(unittest.TestCase):
                                   return_value="# table\n"), \
                 mock.patch.object(paquet_auto, "build_manifest",
                                   return_value="manifeste\n"), \
-                mock.patch.object(paquet_auto, "write_manifest",
+                mock.patch.object(paquet_auto, "write_composition",
                                   return_value="b" * 40), \
                 mock.patch.object(paquet_auto, "run_inclusion",
                                   return_value=(0, "inclusion : vert\n")), \

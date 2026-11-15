@@ -692,7 +692,7 @@ class ComposePacketTest(unittest.TestCase):
                 mock.patch.object(paquet_auto, "composition_table",
                                   return_value="## Composition\n"), \
                 mock.patch.object(paquet_auto, "build_manifest", manifest), \
-                mock.patch.object(paquet_auto, "write_manifest",
+                mock.patch.object(paquet_auto, "write_composition",
                                   return_value="d" * 40), \
                 mock.patch.object(paquet_auto, "run_inclusion",
                                   return_value=(0, "inclusion ok")), \

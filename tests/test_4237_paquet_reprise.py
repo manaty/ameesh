@@ -102,6 +102,20 @@ class CheckChainTest(Chain):
         specs = auto.check_chain(self.repo, self.head, self.base, self.rel, self.candidates())
         self.assertEqual([lots for lots, _ in specs], [[1], [2]])
 
+    def test_receipt_without_metadata_commit_validates_and_rejects_injection(self):
+        text = git(self.repo, "show", "%s:%s" % (self.head, self.rel))
+        head = git(self.repo, "rev-parse", self.head + "^")
+        with mock.patch.object(auto, "composition_text", return_value=text):
+            specs = auto.check_chain(self.repo, head, self.base, self.rel, self.candidates())
+            self.assertEqual([[1], [2]], [lots for lots, _ in specs])
+            git(self.repo, "switch", "-q", "--detach", head)
+            (self.repo / "injected.txt").write_text("injected\n")
+            git(self.repo, "add", "-A")
+            git(self.repo, "commit", "-q", "--amend", "--no-edit")
+            altered = git(self.repo, "rev-parse", "HEAD")
+            with self.assertRaisesRegex(auto.ChainRefused, "arbre différent"):
+                auto.check_chain(self.repo, altered, self.base, self.rel, self.candidates())
+
     def test_cible_bougee_refusee(self):
         moved = self.commit("autre.txt", "x\n", "cible bougée")
         with self.assertRaisesRegex(auto.ChainRefused, "autre base"):
@@ -247,7 +261,7 @@ class EpochLostTest(unittest.TestCase):
             contract_budget=10,
             prepublication_contracts=auto.ContractPass("d" * 40, "e" * 40, green),
             verify_contract_scope=None,
-            composition_table="## Composition\n", write_manifest="d" * 40,
+            composition_table="## Composition\n", write_composition="d" * 40,
             record_packet="", run_inclusion=(0, "ok"), pull_request_state=None,
             ensure_pull_request=(7, "http://pr"), freeze_carrier="",
             request_full_ci="", note_carrier="", send_mail=None,
