@@ -351,7 +351,8 @@ _OBSERVATION_HOLD = re.compile(
     r"(?P<tail>.*)$", re.I | re.S)
 
 
-def observation_hold(text, *, due: str | None = None) -> dict | None:
+def observation_hold(text, *, due: str | None = None,
+                     require_due: bool = True) -> dict | None:
     """#4235 : la déclaration d'une fenêtre d'observation, ou None.
 
     Rend `{motif, due}` : `motif` est ce qui est attendu à l'échéance (le
@@ -359,7 +360,8 @@ def observation_hold(text, *, due: str | None = None) -> dict | None:
     `debit.parse_wake_due`). Une note sans motif ou sans échéance ne déclare
     rien (le sens sûr : elle reste une attente d'agent), et une graphie de
     hold (`hold :`) n'est pas un hold. `due` peut porter le réveil armé à
-    part par le même pilote après ce hold (contrôlé par l'appelant, #7510)."""
+    part par le même pilote après ce hold (contrôlé par l'appelant, #7510).
+    `require_due=False` conserve une déclaration sans date pour le diagnostic."""
     note = str(text or "").strip()
     match = _OBSERVATION_HOLD.match(note)
     if not match:
@@ -368,32 +370,53 @@ def observation_hold(text, *, due: str | None = None) -> dict | None:
     # décision citée dans le motif (#6675), même avec une date illisible.
     found = (_EXTERNAL_WAKE.search(match.group("tail"))
              or _EXTERNAL_DUE.search(match.group("tail")))
-    if due is None and not found:
+    if require_due and due is None and not found:
         return None
     motif = _EXTERNAL_DUE.sub("", match.group("tail"))
     motif = _EXTERNAL_WAKE.sub("", motif)
     motif = _EXTERNAL_TOKEN.sub("", motif).strip(" \t:;,.—–-")
     if not motif:
         return None
-    return {"motif": motif, "due": due if due is not None
-            else found.group("date").strip()}
+    if due is None and found:
+        due = found.group("date").strip()
+    return {"motif": motif, "due": due}
 
 
 def observation_due(text, *, due: str | None = None) -> tuple[dict | None, float | None]:
     """#4235/#5735 : la fenêtre déclarée par la note et son échéance lue.
 
     Rend `(fenêtre, échéance)` : `(None, None)` hors fenêtre, `(fenêtre,
-    None)` quand l'échéance écrite est illisible (le débit le signale, le sens
+    None)` quand l'échéance manque ou est illisible (le débit le signale, le sens
     sûr est alors une attente ordinaire). La lecture de l'échéance est celle
     du réveil (`debit.parse_wake_due`), partagée par le débit et le SLO."""
-    window = observation_hold(text, due=due)
+    window = observation_hold(text, due=due, require_due=False)
     if window is None:
         return None, None
     from .debit import parse_wake_due       # import tardif : pas de cycle
-    return window, parse_wake_due("(due %s)" % window["due"])
+    return window, (parse_wake_due("(due %s)" % window["due"])
+                    if window["due"] else None)
 
 
-def expired_window(holds: dict | None, now: float) -> float | None:
+def observation_for_hold(hold: dict, *, wake: dict | None = None
+                         ) -> tuple[dict | None, float | None]:
+    """#7511: même échéance pour le débit et le SLO, y compris réveil séparé.
+
+    Le réveil encore armé doit venir du même auteur, au plus tôt avec le hold.
+    Le contrôle de l'autorité du pilote reste chez l'appelant.
+    """
+    due = None
+    if (wake and wake.get("by") and wake.get("due_ts") is not None
+            and " ".join(str(wake["by"]).split()).casefold()
+            == " ".join(str(hold.get("by") or "").split()).casefold()
+            and float(wake.get("since") or 0.0)
+            >= float(hold.get("since") or 0.0)):
+        due = datetime.datetime.fromtimestamp(
+            wake["due_ts"], tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return observation_due(hold.get("note"), due=due)
+
+
+def expired_window(holds: dict | None, now: float, *, events=()) -> float | None:
     """#5735 : l'échéance passée de la fenêtre qui retient seule le lot.
 
     `holds` est l'entrée d'un lot dans `active_holds` (`{auteur: hold}`). Rend
@@ -405,9 +428,14 @@ def expired_window(holds: dict | None, now: float) -> float | None:
     pilots = [hold for hold in (holds or {}).values() if hold.get("pilot")]
     if not pilots:
         return None
+    from .debit import wake_state
+    # Le journal du SLO nomme son horodatage `created_ts`, celui du débit
+    # `at_ts`. Le réveil consommé/annulé est écarté par le même lecteur.
+    wake = wake_state({**event, "at_ts": event.get("at_ts", event.get("created_ts"))}
+                      for event in events)
     dues = []
     for hold in pilots:
-        window, due_ts = observation_due(hold.get("note"))
+        window, due_ts = observation_for_hold(hold, wake=wake)
         if window is None or due_ts is None or float(due_ts) > float(now):
             return None
         dues.append(float(due_ts))
