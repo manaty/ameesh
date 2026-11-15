@@ -58,14 +58,20 @@ def document(db, decision_id: int, *, now: float) -> dict:
     return token
 
 
-def register(db, decision_id: int, *, now: float | None = None) -> dict:
+def register(db, decision_id: int, *, now: float | None = None) -> tuple[dict, str]:
+    """Index the signed token; returns (token, status).
+
+    `status` is `registered` when this call armed the token,
+    `already-registered` when it was already indexed and still armed, and
+    `already-consumed` when the one turn it authorizes had already started.
+    """
     if storage.is_remote(db):
         raise ExceptionError("account exceptions require transactional local storage")
     now = time.time() if now is None else now
     token = document(db, decision_id, now=now)
-    storage.of(db).accounts.register_exception(decision_id, token["agent"],
-                                              token["harness"], token["account"])
-    return token
+    status = storage.of(db).accounts.register_exception(
+        decision_id, token["agent"], token["harness"], token["account"])
+    return token, status
 
 
 def eligible(db, cfg, agent, profile, items, book, token, *, now, critical=False,

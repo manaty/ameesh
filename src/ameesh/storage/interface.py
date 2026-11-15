@@ -1249,8 +1249,13 @@ class Accounts(Domain):
     ne passent jamais par ce domaine, qui ne voit que des NOMS de comptes."""
 
     @abc.abstractmethod
-    def register_exception(self, decision_id: int, agent: str, harness: str, account: str):
-        """Index a signed token once; a consumed token cannot be re-armed."""
+    def register_exception(self, decision_id: int, agent: str, harness: str, account: str) -> str:
+        """Index a signed token once; a consumed token cannot be re-armed.
+
+        Returns `registered` when this call indexed the token,
+        `already-registered` when it was already indexed and still armed, and
+        `already-consumed` when the turn it authorizes had already started.
+        """
         raise NotImplementedError
 
     @abc.abstractmethod

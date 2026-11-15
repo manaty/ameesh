@@ -194,6 +194,7 @@
         le hook `post-commit` constate l'objet né puis écrit la preuve ;
         record --signed : hors runner (bureau/owner), attestation signée par une
         clé owner (#4485), sans PID local ni ameesh sur l'hôte du commit ;
+  ameesh psql-nocturne dispatch       daily bounded psql workflow dispatch (#7483);
   ameesh receipt verify       approval receipts (spec §8);
   ameesh refusal emit --reason "…"   #5529 : preuve positive qu'un harnais a
         refusé le tour avant tout appel fournisseur (ameesh-refusal/1), lue
@@ -552,6 +553,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "psql-nocturne":
+        from . import psql_nocturne
+        return psql_nocturne.main(rest)
     if command == "carte":
         # #6777 : dispatch de la mesure de la carte dans sa fenêtre
         from . import carte
