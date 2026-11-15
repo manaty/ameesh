@@ -2405,7 +2405,29 @@ def run(ctx: Context) -> str:
         return held
     check_fresh(ctx)
     align_schema(ctx)
+    catch_up_map(ctx)
     return tick(ctx)
+
+
+def catch_up_map(ctx: Context) -> None:
+    """#7430 : rattrapage horaire sans changer les unités compatibles N-1."""
+    from ameesh import carte
+    now = datetime.fromtimestamp(ctx.now, ZoneInfo("UTC"))
+    # La minuterie carte existante assure déjà le dispatch quotidien à 01Z.
+    # Seul le premier tic de l’heure tente le rattrapage (précision : 30 s).
+    if now.hour == 1 or now.minute >= 10:
+        return
+    argv = ["dispatch", "--horaire", "--project", ctx.project,
+            "--branch", ctx.target]
+    if ctx.dry_run:
+        argv.append("--dry-run")
+    try:
+        code = carte.main(argv, maintenant=now)
+        if code:
+            ctx.log.append("carte : tentative horaire refusée (%s)" % code)
+    except Exception as error:
+        # Un échec de mesure ne doit pas interrompre le suivi du paquet.
+        ctx.log.append("carte : tentative horaire impossible (%s)" % error)
 
 
 def tick(ctx: Context) -> str:

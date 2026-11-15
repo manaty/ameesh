@@ -807,24 +807,30 @@ def pending_text(run: dict, lot: dict | None, waited: float, cancelled: list[int
 
 
 def _send(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
-          urgent: bool, after_commit: list | None = None) -> int:
+          urgent: bool, after_commit: list | None = None,
+          idempotency_key: str | None = None) -> int:
     """Envoie ; un texte refusé comme illisible (extrait binaire ou encodé)
-    part sans ses extraits. `after_commit` (une liste) : l'écriture du fil y
-    est ajoutée, à exécuter par l'appelant après le commit de sa transaction
-    (#795 N2)."""
+    part sans ses extraits. `after_commit` (une liste) : l'écriture du fil y est
+    ajoutée, à exécuter par l'appelant après le commit de sa transaction
+    (#795 N2). `idempotency_key` (#7443) : le second envoi d'un verdict de
+    paquet au pilote ne double pas si le relevé repasse."""
     from . import mail, work
     from .fil import UnreadableBody
     body = dict(payload)
     if urgent:
         body["urgent"] = True
+    kwargs = dict(kind="event", work_item_id=str(lot) if lot else None, payload=body,
+                  after_commit=after_commit, idempotency_key=idempotency_key)
     try:
-        return mail.send(db, work.SYSTEM_SENDER, to, text, kind="event",
-                         work_item_id=str(lot) if lot else None, payload=body,
-                         after_commit=after_commit)
+        return mail.send(db, work.SYSTEM_SENDER, to, text, **kwargs)
     except UnreadableBody:
-        return mail.send(db, work.SYSTEM_SENDER, to, short, kind="event",
-                         work_item_id=str(lot) if lot else None, payload=body,
-                         after_commit=after_commit)
+        return mail.send(db, work.SYSTEM_SENDER, to, short, **kwargs)
+
+
+def _mode_of(payload: dict | None) -> str:
+    """#7443 : `info`/`cc` si le courrier est passif, sinon `wake`."""
+    from . import mail
+    return mail.passive_reason({"payload": dict(payload or {})}) or "wake"
 
 
 @contextlib.contextmanager
@@ -844,14 +850,15 @@ def _atomic(db):
 
 
 def _send_posed(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
-                urgent: bool, pose) -> int:
+                urgent: bool, pose, idempotency_key: str | None = None) -> int:
     """Dépose le courrier de l'événement et pose sa preuve dans la même
     transaction : `pose(stockage, message_id)` écrit la référence relue par
     l'exécuteur. Le fil externe n'est écrit qu'après le commit."""
     threads: list = []
     with _atomic(db) as tx:
         message_id = _send(tx, to, text, short, lot=lot, payload=payload,
-                           urgent=urgent, after_commit=threads)
+                           urgent=urgent, after_commit=threads,
+                           idempotency_key=idempotency_key)
         pose(storage.of(tx), message_id)
     for record in threads:
         record(db.cfg, db)
@@ -2489,6 +2496,8 @@ class Watcher:
         message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
         return [{"action": "pending", "repo": repo, "run_id": int(run["id"]), "to": to,
                  "waited_s": int(waited), "cancelled": list(cancelled),
+                 "mode": "info",
+                 "reason": "waiting for the concurrency group: no action due",
                  "message_id": message_id}]
 
     def _project_pilot(self, db, repo: str) -> str | None:
@@ -2520,6 +2529,38 @@ class Watcher:
                      "recipient" % (repo, project))
             return None
         return pilots[0]
+
+    def _merge_pilot(self, db, repo: str, lot: dict | None) -> str | None:
+        """#7443 : le pilote qui porte la fusion d'un paquet, ou None.
+
+        Le porteur d'un paquet n'est pas toujours celui qui fusionne : le
+        composeur tient la branche, le pilote porte la fusion. Le verdict vert
+        d'un paquet doit réveiller ce pilote-là, et le porteur en copie
+        passive. Le projet du lot est lu d'abord (il nomme le rôle sans
+        dépendre du mappage dépôt → projet) ; le mappage de `github.projects`
+        reste le repli. Une lecture impossible ne fait pas tomber le relevé :
+        le verdict part alors comme avant, au porteur.
+        """
+        from . import alert_briefs, canon as canon_mod
+        project = str((lot or {}).get("app") or "").strip()
+        if project:
+            try:
+                canons = canon_mod.load_configured(self.cfg) \
+                    if getattr(self.cfg, "canon", None) else []
+                pilots = alert_briefs.project_pilots(
+                    project, storage.of(db).operations.listing(),
+                    cfg=self.cfg, db=db, canons=canons)
+                if pilots:
+                    return pilots[0]
+            except Exception as exc:  # noqa: BLE001 - le verdict part au porteur
+                self.log("CI %s: pilot of project %s unreadable (%s)"
+                         % (repo, project, " ".join(str(exc).split())[:200]))
+        try:
+            return self._project_pilot(db, repo)
+        except Exception as exc:  # noqa: BLE001
+            self.log("CI %s: merge pilot unreadable (%s)"
+                     % (repo, " ".join(str(exc).split())[:200]))
+            return None
 
     def _attribution(self, db, lot, row: dict, failures: list[dict]):
         """#3801 : les unités probables d'un run rouge de paquet, jamais fatal.
@@ -2660,9 +2701,18 @@ class Watcher:
         message_id = _send_posed(db, to, text, short,
                                  lot=(lot or {}).get("id"), payload=payload,
                                  urgent=urgent, pose=pose)
+        mode = "wake" if urgent else _mode_of(payload)
+        if urgent:
+            reason = "first CI failure on the head"
+        elif payload.get("ci_passif"):
+            reason = "failure possibly inherited: no base reference"
+        elif payload.get("info"):
+            reason = "failure already announced: the verdict lists them"
+        else:
+            reason = "CI failure: the holder fixes or decides"
         return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
-                 "message_id": message_id}]
+                 "mode": mode, "reason": reason, "message_id": message_id}]
 
     def _log_failures(self, repo: str, row: dict) -> list[dict]:
         """#3783 : les tests en échec lus dans les logs TAP des jobs rouges.
@@ -2891,20 +2941,24 @@ class Watcher:
                           "workflow": row.get("workflow") or ""}}
         message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
         return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
-                 "status": "cancelled", "to": to, "message_id": message_id}]
+                 "status": "cancelled", "to": to, "mode": "wake",
+                 "reason": "last workflow cancelled: passive verdicts would not be read",
+                 "message_id": message_id}]
 
     def _verdict(self, db, repo: str, row: dict, run: dict, status: str, *,
                  pending: list[dict] | None = None) -> list[dict]:
-        """Le verdict d'une exécution conclue, à l'assigné du lot rattaché
-        (#2021 : délivré aussi pour une ligne terminale rattachée tardivement)."""
+        """Le verdict d'une exécution conclue, à qui doit agir (#2021 : délivré
+        aussi pour une ligne terminale rattachée tardivement).
+
+        #7443 : le vert d'un paquet revient au pilote qui porte sa fusion ; le
+        porteur du lot (composeur) reçoit alors une copie passive. Les autres
+        verdicts gardent leur destinataire historique, le porteur du lot.
+        """
         from . import work
         st = storage.of(db)
         failures = st.ci.failures(repo, int(row["run_id"]))
         lot = work.get(db, int(row["work_item_id"])) if row.get("work_item_id") else None
         to = recipient_of(lot)
-        if not to:
-            return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
-                     "status": status, "to": None}]
         # le verdict situe la suite : fichier du workflow et attempt du dernier
         # état GitHub, quand la ligne ne les porte pas encore (#901, #1110)
         view = dict(row, run_attempt=run.get("run_attempt") or row.get("run_attempt") or 1,
@@ -2930,12 +2984,74 @@ class Watcher:
         # #7308 : un paquet armé poursuit sa fusion sans geste du pilote.
         # Sans publication prouvée, le verdict reste actionnable. Le veilleur
         # de paquets signale séparément une fusion qui reste bloquée.
+        pilot = None
+        armed_requested = False
         if status == "success" and lot:
             from . import packet_automerge
             if packet_automerge.carrier(lot.get("branch")):
                 published = packet_automerge.publication(db, int(lot["id"]), row["head_sha"])
-                if published.get("armed") and published.get("requested"):
+                armed_requested = bool(published.get("armed")
+                                       and published.get("requested"))
+                if armed_requested:
                     payload["info"] = True
+                pilot = self._merge_pilot(db, repo, lot)
+        if pilot == to:
+            pilot = None
+        # #7443 : le vert d'un paquet revient au pilote ; le porteur reçoit la
+        # copie passive. Un porteur humain ne lit pas la boîte : le pilote part
+        # seul, et le relevé ne prétend pas lui avoir remis le verdict.
+        if pilot:
+            pilot_payload = dict(payload)
+            mode = _mode_of(pilot_payload)
+            reason = ("green packet CI: the pilot carries the merge"
+                      if mode == "wake" else
+                      "green packet CI armed: no action due")
+            note = ("\n\nPacket merge: you carry it"
+                    + (("; the lot holder %s receives this verdict for "
+                        "information." % to) if to else "."))
+            message_id = _send_posed(
+                db, pilot, text + note, text + note, lot=lot["id"],
+                payload=pilot_payload, urgent=False,
+                pose=lambda st, mid: st.ci.set_message(repo, int(row["run_id"]),
+                                                       "verdict", mid),
+                # #7443 B/P1 : l'attempt fait partie de la clé — une relance
+                # du même run_id rend un corps différent (« attempt 2 »), et
+                # `mail._replay_id` refuse une clé réutilisée pour un autre
+                # corps. Sans l'attempt, le second vert ne partait pas.
+                idempotency_key="ci-verdict-pilot:%s:%s:%s"
+                % (repo.replace("/", "."), int(row["run_id"]),
+                   int(view.get("run_attempt") or 1)))
+            out = [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
+                    "status": status, "to": pilot, "mode": mode, "reason": reason,
+                    "message_id": message_id, "copy_to": to}]
+            if to:
+                copy_payload = dict(payload, info=True)
+                copy_note = ("\n\nPacket merge: the pilot %s carries it; this copy "
+                             "is information only." % pilot)
+                copy_id = _send(
+                    db, to, text + copy_note, text + copy_note, lot=lot["id"],
+                    payload=copy_payload, urgent=False,
+                    idempotency_key="ci-verdict-copy:%s:%s:%s"
+                    % (repo.replace("/", "."), int(row["run_id"]),
+                       int(view.get("run_attempt") or 1)))
+                out.append({"action": "verdict", "repo": repo, "run_id": row["run_id"],
+                            "status": status, "to": to, "mode": "info",
+                            "reason": "copy: the pilot carries the packet merge",
+                            "message_id": copy_id})
+            return out
+        if not to:
+            return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
+                     "status": status, "to": None}]
+        mode = _mode_of(payload)
+        if mode == "wake":
+            reason = ("green CI: the holder's next gesture is due" if status == "success"
+                      else "red CI: the holder fixes or decides")
+        elif armed_requested:
+            reason = "green packet CI armed: no action due"
+        elif payload.get("info") and _same_lot(row, pending):
+            reason = "another workflow of the head still runs: the last verdict wakes"
+        else:
+            reason = "verdict without a new signal: no action due"
         # #795 N2 : le courrier du verdict et `verdict_message_id` restent
         # publiés dans la même transaction (un relevé intercalé ne voit jamais
         # l'un sans l'autre).
@@ -2944,11 +3060,16 @@ class Watcher:
             pose=lambda st, mid: st.ci.set_message(repo, int(row["run_id"]),
                                                    "verdict", mid))
         return [{"action": "verdict", "repo": repo, "run_id": row["run_id"], "status": status,
-                 "to": to, "message_id": message_id}]
+                 "to": to, "mode": mode, "reason": reason, "message_id": message_id}]
 
 
 def describe(record: dict) -> str:
-    """Une ligne de journal de `ameesh notify` pour un envoi ou un retrait."""
+    """Une ligne de journal de `ameesh notify` pour un envoi ou un retrait.
+
+    #7443 : quand un destinataire est nommé, la ligne dit le mode choisi
+    (wake/info/cc/urgent) et sa raison, pour que le journal permette de
+    vérifier le tri sans relire la boîte.
+    """
     where = "CI %s run %s" % (record.get("repo"), record.get("run_id"))
     if record["action"] == "superseded":
         return "%s superseded by %s; %d unread message(s) withdrawn" % (
@@ -2960,6 +3081,10 @@ def describe(record: dict) -> str:
             where, record.get("for"))
     to = "→ %s%s" % (record["to"], " (urgent)" if record.get("urgent") else "") \
         if record.get("to") else "(no recipient)"
+    mode = str(record.get("mode") or "")
+    if record.get("to") and mode:
+        to += " [%s%s]" % (mode, ": %s" % record["reason"]
+                           if record.get("reason") else "")
     if record["action"] == "disk_refusal":
         return "CI %s: disk margin refusal reported %s" % (record.get("repo"), to)
     if record["action"] == "failures":

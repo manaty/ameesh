@@ -229,6 +229,19 @@ class Accounts(interface.Accounts):
                 (host, harness, to, now))
         return True
 
+    def record_agent_switch(self, host, harness, *, from_account, to_account,
+                            reason, agent) -> None:
+        """#7439 : la bascule propre d'un agent critique (L242b), au journal.
+
+        Écriture NARROW : `account_active` ne bouge pas — le choix partagé
+        reste celui des autres agents ; seule la ligne `account_switches`
+        (type `agent`) porte le changement et son auteur.
+        """
+        self.db.execute(
+            "insert into account_switches (host, harness, from_account, to_account,"
+            " kind, reason, agent) values (%s, %s, %s, %s, 'agent', %s, %s)",
+            (host, harness, from_account, to_account, reason, agent))
+
     def set_auto(self, host, harness, *, reason, expected=None,
                  expected_until=None) -> bool:
         with self.db.transaction() as tx:

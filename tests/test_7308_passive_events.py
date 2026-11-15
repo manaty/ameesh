@@ -33,13 +33,28 @@ class AlertTest(unittest.TestCase):
                     step="verdict_merge", waiting={"what": "packet"})
         for delta in ({"level": 2}, {"level": 3}, {"lot_state": "build"},
                       {"step": "blocked_freeze"},
-                      {"waiting": {"what": "merge-approval"}},
-                      {"waiting": {"what": "merge-outcome"}},
-                      {"waiting": {"what": "merge", "who": "executor"}},
+                      {"waiting": {"what": "merge", "candidate": {"owner": "author"}}},
                       {"waiting": {"what": "packet", "candidate": {"owner": "author"}}},
-                      {"waiting": {"what": "packet", "packet_missed": {"slot": 1}}}):
+                      {"waiting": {"what": "packet", "packet_missed": {"slot": 1}}},
+                      {"waiting": {"what": "packet", "canon": True}},
+                      {"waiting": {"what": "packet", "self": True}},
+                      {"waiting": {"what": "packet", "ci": {"state": "red"}}},
+                      {"vehicle_exit_ts": 1}):
             with self.subTest(delta=delta):
                 self.assertEqual(alert_briefs.quiet_payloads(dict(base, **delta), ["pilot"], {}), {})
+
+    def test_named_third_party_waits_are_passive(self):
+        """#7443: a validated lot waiting on a named approver/responsible has no
+        action due at level 1; the pilot is informed on its next turn."""
+        base = dict(type="slo_breach", level=1, lot_state="validated",
+                    step="verdict_merge", waiting={"what": "merge"})
+        for waiting in ({"what": "merge", "who": "executor"},
+                        {"what": "merge-approval", "who": "human:smichea"},
+                        {"what": "merge-outcome", "who": "human:smichea"}):
+            with self.subTest(waiting=waiting):
+                self.assertEqual(
+                    alert_briefs.quiet_payloads(dict(base, waiting=waiting), ["pilot"], {}),
+                    {"pilot": {"info": True}})
 
 
 class VerdictTest(unittest.TestCase):

@@ -192,13 +192,43 @@ class ExecuteurTest(_L30Base):
             self.assertEqual(dernier["compte"]["CLAUDE_CONFIG_DIR"], comptes[1]["path"])
             self.assertIn("--resume", dernier["argv"])
             self.assertIn("claude-sess-1", dernier["argv"])
-            # le choix partagé n'est pas écrit : aucune bascule en base
-            self.assertEqual(self._bascules(), [])
+            # le choix partagé n'est pas écrit ; la bascule de l'agent, elle,
+            # est journalisée en base (lot #7439)
+            self.assertEqual(
+                [(b["from_account"], b["to_account"], b["kind"], b["agent"])
+                 for b in self._bascules()],
+                [("primaire", "secondaire", "agent", "orch")])
             self.assertIsNone(storage.of(self.db).accounts.active(self.cfg.host, "claude"))
             self.assertIn("for this critical agent only", self._fil())
             self.assertEqual(registry.get(self.db, "orch")["session_account"], "secondaire")
         finally:
             worker.watchdog_stop.set()
+
+
+class JournalBasculeAgentTest(_Comptes):
+    """#7439 : la bascule propre d'un agent critique écrit sa ligne, une fois."""
+
+    def test_une_ligne_par_changement_et_le_fil_une_fois(self):
+        notes = []
+        worker = types.SimpleNamespace(
+            name="mesh-design", db=self.db, cfg=self.cfg,
+            _fil_note=lambda texte, meta=None: notes.append((texte, meta)))
+        switched = {"from": "primaire", "to": "secondaire", "kind": "agent",
+                    "reason": "primaire au seuil (95 %)"}
+        with mock.patch.object(account_turn, "_log"):
+            self.assertTrue(account_turn.journal(worker, "codex", switched))
+            # un sondage qui revoit la même bascule n'écrit pas une seconde fois
+            self.assertTrue(account_turn.journal(worker, "codex", dict(switched)))
+        lignes = self.db.query(
+            "select from_account, to_account, kind, agent, reason"
+            " from account_switches order by id")
+        self.assertEqual(
+            [(r["from_account"], r["to_account"], r["kind"], r["agent"])
+             for r in lignes],
+            [("primaire", "secondaire", "agent", "mesh-design")])
+        self.assertEqual(lignes[0]["reason"], "primaire au seuil (95 %)")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("for this critical agent only", notes[0][0])
 
 
 class _Worker:
