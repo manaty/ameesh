@@ -187,6 +187,12 @@ BASE_BRANCHES = ("main",)
 #: dépôt suffit à une alerte dont le seuil est de 48 h
 MAP_WORKFLOW = "carte.yml"
 MAP_READ_S = 3600.0
+#: #7431 : runs verts de `carte.yml` lus par relevé. Deux mesures par jour,
+#: souvent sautées (paquet en cours, hors fenêtre) : cinq ne couvraient que
+#: deux jours et demi, moins que le seuil de `map_stale` en cas de série.
+MAP_RUNS_READ = 20
+#: #7431 : `_published_map` a lu tous les jobs, aucun run n'a publié.
+_NO_MAP: dict = {"_no_map": True}
 #: #6157 : le job de carte.yml qui publie la carte (cache et artefact)
 MAP_JOB = "carte"
 #: #1483 : taille des pages de listes d'exécutions du veilleur (l'API GitHub
@@ -1733,7 +1739,8 @@ class Watcher:
             return
         try:
             data = self.api("repos/%s/actions/workflows/%s/runs?branch=%s&status=success"
-                            "&per_page=5" % (repo, MAP_WORKFLOW, quote(branch, safe=""))) or {}
+                            "&per_page=%d" % (repo, MAP_WORKFLOW, quote(branch, safe=""),
+                                              MAP_RUNS_READ)) or {}
         except plan_github.GithubRateLimited:
             raise
         except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
@@ -1751,7 +1758,20 @@ class Watcher:
                     run_id=candidate["id"], run_attempt=candidate.get("run_attempt") or 1),
                     terminal="success")
         if run is None:
-            return  # aucune carte publiée parmi les runs lus : le relevé vieillit
+            return  # lecture des jobs impossible : le relevé vieillit
+        if run is _NO_MAP:
+            # #7431 : lecture réussie, aucun des runs lus n'a publié (paquet en
+            # cours, hors fenêtre). La carte connue reste la dernière : son
+            # relevé est rafraîchi pour que `map_stale` en dise l'âge réel au
+            # lieu d'un « âge inconnu » qui accuse la lecture.
+            if known is not None and known.get("branch") == branch \
+                    and known.get("published_ts") is not None:
+                st.ci.observe_map(repo, branch=branch, run_id=known.get("run_id"),
+                                  head_sha=known.get("head_sha"),
+                                  published_at=time.strftime(
+                                      "%Y-%m-%dT%H:%M:%SZ",
+                                      time.gmtime(float(known["published_ts"]))))
+            return
         st.ci.observe_map(repo, branch=branch, run_id=run.get("id"),
                           head_sha=run.get("head_sha"),
                           published_at=run.get("updated_at") or None)
@@ -1763,7 +1783,9 @@ class Watcher:
         le run finit vert, job `carte` sauté, sans carte. Le compter pour la
         dernière carte effacerait `map_stale`. Aucun run (dépôt jamais mesuré)
         rend ``{}`` ; une lecture de jobs impossible rend ``None`` (le relevé
-        précédent vieillit, comme pour une erreur de liste)."""
+        précédent vieillit, comme pour une erreur de liste) ; des runs lus dont
+        aucun n'a publié rendent ``_NO_MAP`` (#7431 : la carte connue reste la
+        dernière, son relevé est rafraîchi)."""
         from . import plan_github
         if not runs:
             return {}
@@ -1783,7 +1805,7 @@ class Watcher:
             if any(j.get("name") == MAP_JOB and j.get("conclusion") == "success"
                    for j in jobs.get("jobs") or ()):
                 return run
-        return None
+        return _NO_MAP
 
     def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str],
                   bases=BASE_BRANCHES) -> list[dict]:
