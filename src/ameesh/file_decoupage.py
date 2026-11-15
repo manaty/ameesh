@@ -22,7 +22,8 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   lot de découpage ouvert met en sommeil les agents d'exécution au repos du
   projet (pause opérateur posée par `ameesh:file-decoupage`, l'humain
   responsable n'étant que le principal, raison `SLEEP_REASON`, levée
-  conditionnelle), jamais un relecteur ni un agent critique ; l'alerte
+  conditionnelle), jamais un relecteur, un agent critique ni le veilleur
+  GitHub désigné du projet (#7476) ; l'alerte
   `roadmap_exhausted` (une par lot, dédoublonnée par le notifieur) prévient
   l'owner ; les hôtes burst sont rendus par le drainage de #3167 B (#4148),
   hors de ce module. Le premier lot démarrable du projet réveille les
@@ -1024,6 +1025,12 @@ def _recent_mail(db, name: str, *, now: float, senders, window_s=None) -> tuple:
     return out, None
 
 
+def _github_watchers(canons) -> set[tuple[str, str]]:
+    """#7476 : les sièges de veille valides, selon le même canon que la remise."""
+    from . import github_watch
+    return {(sub.agent, sub.project) for sub in github_watch.subscriptions(canons or ())}
+
+
 def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
            split_id=None, lots=(), listing=(), cfg=None, canons=None,
            mail_window_s=None, waits=None, since_ts: float = 0.0) -> list:
@@ -1037,9 +1044,11 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
     ou d'un orchestrateur, retient aussi l'agent. L'état est relu au moment du
     geste : le relevé de la passe peut précéder l'attribution ou le courrier.
     """
+    #7476 : le veilleur GitHub désigné reste éveillé, même sans entrée récente.
     from . import agent_pause
     out = []
     reason = SLEEP_REASON % project
+    watchers = _github_watchers(canons)
     pending, keep, unreadable = _reviewer_spares(
         db, project, lots, listing, cfg=cfg, canons=canons)
     if unreadable:
@@ -1063,6 +1072,11 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
             out.append({"agent": name, "slept": False, "why": why})
         return out
     for name in item.idle:
+        if (name, project) in watchers:
+            why = "designated GitHub watcher for %s (#7476)" % project
+            out.append({"agent": name, "slept": False, "why": why})
+            _journal_exemption(db, split_id, name, why, since_ts=since_ts)
+            continue
         owner = _owner_of([by_name.get(name) or {}])
         if not owner:
             out.append({"agent": name, "slept": False, "why": "no human responsible"})
@@ -1306,8 +1320,10 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
     commande heavy ; #6734 : réveil programmé dû) lève aussi le dormeur ; une
     lecture en échec ne lève personne sur ce motif.
     """
+    #7476 : le siège de veille lève aussi un ancien sommeil automatique.
     from . import agent_pause
     woken: dict = {}
+    watchers = _github_watchers(canons)
     sleepers = [str(row.get("name") or "").strip() for row in listing
                 if row.get("operator_paused")
                 and is_sleep_reason(str(row.get("operator_pause_reason") or ""))]
@@ -1317,8 +1333,11 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
         reason = str(row.get("operator_pause_reason") or "")
         if not name or not row.get("operator_paused") or not is_sleep_reason(reason):
             continue
+        project = project_of_sleep_reason(reason)
         why = None
-        if int(row.get("actionable_lots") or 0) > 0:
+        if (name, project) in watchers:
+            why = "designated GitHub watcher for %s (#7476)" % project
+        elif int(row.get("actionable_lots") or 0) > 0:
             # #4619 : le lot assigné le plus récemment touché n'est pas
             # forcément actionnable ; le journal nomme celui qui l'est.
             lot_id = row.get("actionable_lot_id")
@@ -1350,7 +1369,14 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
         except Exception:  # noqa: BLE001 - la pause reste, le prochain passage réessaie
             continue
         if done.get("changed"):
-            woken.setdefault(project_of_sleep_reason(reason), []).append(name)
+            woken.setdefault(project, []).append(name)
+            if (name, project) in watchers:
+                try:
+                    split = _open_split(db, project)
+                    if split is not None:
+                        _journal_exemption(db, int(split["id"]), name, why)
+                except Exception:  # noqa: BLE001 - la trace ne défait pas la levée
+                    pass
     return [{"kind": "wake", "project": project, "agents": sorted(names)}
             for project, names in sorted(woken.items())]
 
