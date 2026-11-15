@@ -91,7 +91,7 @@ def _erreur(code: int, out: str, err: str) -> str:
     return " ".join((err or out or "exit code %d" % code).split())[:300]
 
 
-def porte(gh, depot: str, branche: str) -> bool:
+def porte(gh, depot: str, branche: str, *, workflow: str = WORKFLOW) -> bool:
     """Le dépôt porte-t-il ``carte.yml`` sur cette branche ?
 
     Une absence (404) est un non, pas une erreur : la minuterie vise tous les
@@ -101,14 +101,14 @@ def porte(gh, depot: str, branche: str) -> bool:
     """
     code, out, err = gh.run([
         "api", "repos/%s/contents/.github/workflows/%s?ref=%s"
-        % (depot, WORKFLOW, branche)])
+        % (depot, workflow, branche)])
     if code == 0:
         return True
     message = _erreur(code, out, err)
     if "404" in message or "Not Found" in message:
         return False
     raise CarteError("lecture de %s sur %s impossible : %s"
-                     % (WORKFLOW, depot, message))
+                     % (workflow, depot, message))
 
 
 def dispatcher(gh, depot: str, branche: str, *, planifie: bool = True) -> None:

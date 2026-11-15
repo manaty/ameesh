@@ -7,7 +7,7 @@
 # de job). Elle ne tourne plus qu'avec psycopg ; le pilote psql n'y passe que
 # sa liste pilote (tests/parts/pilote-psql.txt) et tout le contrat
 # (tests/parts/toujours.txt). La suite entière sous psql vit ici :
-#   - `schedule` : une fois par nuit sur main ;
+#   - minuterie de rôle ameesh à 01:47Z : une fois par nuit sur main ;
 #   - `workflow_dispatch` : la même à la main (main, release/**,
 #     integration/**, validation/** — porte #1635 de tests.yml), pour
 #     rejouer un nocturne rouge sans attendre la nuit.
@@ -23,10 +23,6 @@
 name: psql-nocturne
 
 on:
-  schedule:
-    # 01:47 UTC : hors des coupures de release (11:00, 23:00 Europe/Paris) et
-    # avant le nocturne macOS (03:17) et la carte (03:30).
-    - cron: "47 1 * * *"
   workflow_dispatch:
 
 # un nocturne n'est jamais annulé par le suivant : il attend son tour
@@ -44,10 +40,25 @@ permissions:
   actions: read
 
 jobs:
+  fenetre:
+    name: fenêtre du nocturne
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      lancer: ${{ steps.garde.outputs.lancer }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: admission UTC (retard du dispatch ou du runner)
+        id: garde
+        env:
+          PYTHONPATH: src
+        run: python3 -m ameesh psql-nocturne gate
   # un job qui appelle un workflow réutilisable ne porte pas de
   # `timeout-minutes` : chaque job de tests.yml garde le sien.
   suite:
     name: suite psql complète (nocturne)
+    needs: fenetre
+    if: needs.fenetre.outputs.lancer == 'true'
     uses: ./.github/workflows/tests.yml
     with:
       psql-full: true
