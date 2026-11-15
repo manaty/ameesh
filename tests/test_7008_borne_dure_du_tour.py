@@ -17,6 +17,7 @@ from unittest import mock
 
 from ameesh import registry, runner as runner_mod
 
+from .support import scaled
 from .test_l105_plafonds_du_tour import _Base
 
 
@@ -70,8 +71,15 @@ class BorneDureTest(_Base):
         self.assertEqual(worker.turn_hard_limit_seconds(), 0.0)
 
     def test_tour_qui_finit_seul_n_est_pas_clos(self):
-        _runner, worker = self._worker("orch-normal", turn_max_seconds=1)
-        with self._env(), self._marge(1.0):
+        # #7440 : le plafond artificiel de 2 s (cap 1 s + marge 1 s) a fermé
+        # un tour normal sous la charge de la part psql (run 43573661952 :
+        # démarrage du harnais + tour au-delà de 2 s). Ce témoin mesure
+        # « un tour fini seul n'est pas clos », pas la borne dure : celle-ci
+        # reste loin de la durée réelle du tour, mise à l'échelle du banc
+        # (#5629) comme les autres bornes murales.
+        plafond = int(scaled(60))
+        _runner, worker = self._worker("orch-normal", turn_max_seconds=plafond)
+        with self._env(), self._marge(scaled(60.0)):
             self.assertTrue(worker.run_turn({"kind": "prompt", "prompt": "x",
                                              "ids": []}))
         self.assertIsNone(worker.last_turn_closed)
