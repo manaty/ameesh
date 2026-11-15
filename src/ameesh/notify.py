@@ -125,7 +125,7 @@ from dataclasses import dataclass, field, replace
 from . import migrations
 from . import config as config_mod
 from . import db as db_mod
-from . import alert_briefs, exploitation, fil, nexlink_alerts, notify_gap, \
+from . import alert_briefs, exploitation, fil, mail, nexlink_alerts, notify_gap, \
     sous_utilisation, storage
 from . import vocab
 from .config import Config
@@ -3641,14 +3641,18 @@ class Notifier:
             # #6642 (accepté par mesh-design, #207423) : ne pas l'ajouter pour
             # mesurer — `lot`, `step` et `level` sont dans le payload.
             delivered = []
-            quiet = alert_briefs.quiet_payloads(alert, briefs, by_name)
+            quiet = alert_briefs.quiet_modes(alert, briefs, by_name)
             for name, text in sorted(briefs.items()):
                 if not self._delivery_open():
                     break
                 if self.dry_run:
                     self.log("[%s] mail to %s (dry run): %s" % (kind, name, text))
                     continue
-                meta = dict(payload, reminder=name in reminders, **quiet.get(name, {}))
+                decision = quiet.get(name) or {"payload": {}, "reason": ""}
+                meta = dict(payload, reminder=name in reminders, **decision["payload"])
+                mode = mail.passive_reason({"payload": meta}) or "wake"
+                reason = decision["reason"] if mode != "wake" \
+                    else alert_briefs.wake_reason(alert, name, meta)
                 try:
                     if kind == "slo_breach" and alert.get("lot"):
                         # #3512: the alert snapshot can predate a merge. Check
@@ -3677,8 +3681,9 @@ class Notifier:
                         mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
                                   payload=meta)
                     delivered.append(name)
-                    self.log("[%s] %s delivered to %s" % (
-                        kind, "reminder" if meta["reminder"] else "mail", name))
+                    self.log("[%s] %s delivered to %s [%s: %s]" % (
+                        kind, "reminder" if meta["reminder"] else "mail", name,
+                        mode, reason))
                 except Exception as exc:  # noqa: BLE001
                     self.log("[%s] mail to %s not delivered (%s)" % (kind, name, exc))
             # #3036 : une remise qui n'a pas eu lieu (destinataire filtré,
