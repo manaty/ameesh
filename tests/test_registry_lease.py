@@ -290,9 +290,16 @@ class RegistryTest(PgTestCase):
 
     def test_reap_marque_mort_un_bail_expire(self):
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")
-        lease = registry.claim(self.db, "alpha", "runner-a", 1.0)
-        registry.begin_turn(self.db, "alpha", "runner-a", int(lease["lease_epoch"]), "tour")
-        time.sleep(1.3)
+        lease = registry.claim(self.db, "alpha", "runner-a", 3600)
+        self.assertIsNotNone(lease)
+        self.assertTrue(registry.begin_turn(
+            self.db, "alpha", "runner-a", int(lease["lease_epoch"]), "tour"))
+        self.assertEqual(registry.reap(self.db, "laptop"), [])
+        # #7514 : poser l'expiration avec l'horloge de la base, sans attente
+        # murale ni dépendance à la durée des appels psql sous charge.
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = clock_timestamp() - interval '1 hour' "
+            "WHERE name = 'alpha'")
         morts = registry.reap(self.db, "laptop")
         self.assertEqual([row["name"] for row in morts], ["alpha"])
         self.assertEqual(registry.get(self.db, "alpha")["status"], "dead")
