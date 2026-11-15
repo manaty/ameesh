@@ -10148,15 +10148,15 @@ class AgentWorker(threading.Thread):
                     self._note_move_launched()
                     self._consume_scheduled_wake(spec)
                     self._livre_courrier(spec)  # consigne acceptée : remise
-                    flux = (json.dumps(raw, ensure_ascii=False)
-                            for raw, _parsed in rp.stream(tour_resident))
+                    flux = ((json.dumps(raw, ensure_ascii=False), parsed)
+                            for raw, parsed in rp.stream(tour_resident))
                 except resident_mod.ResidentError as exc:
                     error = "resident turn not started: %s" % exc
                     flux = ()
             else:
                 self._livre_courrier(spec)
                 log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
-                flux = proc.stdout or ()
+                flux = ((line, None) for line in (proc.stdout or ()))
             # L78: the writer owns its connection; harness output never waits
             # for SQL or the readable thread. ResidentWorker uses the same sink.
             if getattr(self.db, "driver", "") != "mediated":
@@ -10178,7 +10178,7 @@ class AgentWorker(threading.Thread):
                 session_reread_reasons=self._context_baseline_reasons,
                 context_first_chars=len(resume + spec["prompt"]))
             with open(events_path, "a", encoding="utf-8") as events:
-                for raw in flux:
+                for raw, resident_parsed in flux:
                     line = raw.rstrip("\n")
                     if not line:
                         continue
@@ -10202,8 +10202,22 @@ class AgentWorker(threading.Thread):
                         # CTX-03b : frontière de compaction native du fil
                         # principal ; un sous-agent n'en publie pas.
                         compaction_event = parsed["compaction"]
+                    # #7468 : un harnais résident ne parle pas forcément le
+                    # format de flux de son descripteur (`codex app-server` ≠
+                    # `codex exec`, pont ACP ≠ dsh) : le second parse ci-dessus
+                    # y rend un événement vide, et le normalisateur publiait
+                    # des compteurs faux à zéro. Le driver résident a déjà
+                    # analysé l'événement : on lui donne celui-là, en gardant
+                    # la réduction des tailles textuelles du lecteur de flux
+                    # quand le driver ne la publie pas (pont ACP).
+                    observation = parsed
+                    if resident_parsed is not None:
+                        observation = dict(resident_parsed)
+                        if "content_counts" not in observation \
+                                and "content_counts" in parsed:
+                            observation["content_counts"] = parsed["content_counts"]
                     try:
-                        normalizer.observe(parsed)
+                        normalizer.observe(observation)
                     except Exception as exc:  # noqa: BLE001 — observation seule
                         # Un flux inattendu ne prive jamais le tour de sa
                         # comptabilité ni de sa décision legacy (L13).
