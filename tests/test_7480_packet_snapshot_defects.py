@@ -6,8 +6,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from ameesh import (packet_red, packet_snapshot, release_cutoff, storage,
-                    train_shadow)
+from ameesh import (packet_close, packet_red, packet_snapshot, release_cutoff,
+                    storage, train_shadow)
 from ameesh.db import DbError
 
 MANIFEST = "## Composition\n" + (
@@ -103,6 +103,65 @@ class ReaderTargetAndCostTests(unittest.TestCase):
                 '/unused', 'a'*40, 'paquet-x', target='main'))
         lookup.assert_called_once_with(checkout='/unused', head='a'*40,
                                        branch='integration/paquet-x', target='main')
+
+
+class CutoffTargetTests(unittest.TestCase):
+    """B (#41922): snapshots are keyed by branch, a cutoff may be a revision."""
+
+    def receipt(self, *, ident=7, target="main", head="a" * 40, lot=12):
+        return {"id": ident, "repository": "acme/app", "target": target,
+                "head_sha": head, "base_sha": "b" * 40,
+                "payload": {"version": 1, "manifest": "",
+                            "units": [{"work_item_id": lot,
+                                       "unit_sha": "c" * 40}]}}
+
+    def units(self, target, receipts, *, ref="", landed="a" * 40, published=None):
+        def out(repo, *args):
+            if args[:2] == ("rev-parse", "--symbolic-full-name"):
+                return ref
+            if args[:1] == ("rev-list",):
+                return landed
+            return ""
+
+        st = Mock()
+        st.work.packet_snapshots.return_value = receipts
+        with patch.object(packet_snapshot, 'repository_name',
+                          return_value='acme/app'), \
+             patch.object(storage, 'of', return_value=st), \
+             patch.object(packet_close, 'manifest_paths', return_value=[]), \
+             patch.object(packet_close.plan_git, 'published_target',
+                          return_value=published or target), \
+             patch.object(packet_close.plan_git, '_out', side_effect=out):
+            lots, _ = packet_close.units('/unused', target, db=object())
+        return lots, st
+
+    def test_a_branch_cutoff_filters_on_the_normalized_branch(self):
+        lots, st = self.units('origin/main', [self.receipt()],
+                              ref='refs/remotes/origin/main',
+                              published='origin/main')
+        st.work.packet_snapshots.assert_called_with(
+            repository='acme/app', target='main')
+        self.assertIn(12, lots)
+
+    def test_a_revision_cutoff_reads_every_receipt_and_keeps_ancestry(self):
+        for target, ref in (("a" * 40, ""), ("v1.0", "refs/tags/v1.0")):
+            with self.subTest(target=target):
+                lots, st = self.units(target, [self.receipt(head="a" * 40,
+                                                            target="main")],
+                                      ref=ref)
+                st.work.packet_snapshots.assert_called_with(
+                    repository='acme/app', target=None)
+                self.assertIn(12, lots)
+
+    def test_a_head_registered_for_two_targets_nominates_units_once(self):
+        pending = [self.receipt(ident=7, target="main"),
+                   self.receipt(ident=8, target="develop")]
+        lots, _ = self.units("a" * 40, pending)
+        self.assertEqual(1, len(lots[12]))
+
+    def test_a_receipt_outside_the_cutoff_is_not_nominated(self):
+        lots, _ = self.units("a" * 40, [self.receipt()], landed="d" * 40)
+        self.assertEqual({}, lots)
 
 
 if __name__ == "__main__":

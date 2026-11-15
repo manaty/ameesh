@@ -155,8 +155,9 @@ class SnapshotReadersTest(unittest.TestCase):
              patch.object(packet_close, 'manifest_paths', return_value=[]), \
              patch.object(packet_close.plan_git, '_out', return_value='') as out:
             self.assertEqual({}, packet_close.units('/unused', 'cutoff', db=object())[0])
+            # `cutoff` is a revision here, not a branch: no target filter.
             st.work.packet_snapshots.assert_called_with(
-                repository='acme/app', target='cutoff')
+                repository='acme/app', target=None)
             self.assertEqual(('rev-list', 'cutoff'), out.call_args.args[1:])
             out.return_value = 'a' * 40
             self.assertEqual([12], list(packet_close.units('/unused', 'cutoff', db=object())[0]))
