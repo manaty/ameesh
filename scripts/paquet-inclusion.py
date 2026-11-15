@@ -693,7 +693,9 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
         from ameesh import packet_snapshot
         branch = "integration/" + manifest_path.stem.removeprefix("integration-")
-        receipt = packet_snapshot.lookup(checkout=str(repo), head=head, branch=branch)
+        receipt = packet_snapshot.lookup(checkout=str(repo), head=head, branch=branch,
+            target=getattr(args, "target", None) or None,
+            package_id=getattr(args, "carrier", 0) or None)
     if receipt:
         manifest = parse_manifest(manifest_path, text=receipt["payload"]["manifest"])
     else:
@@ -1206,6 +1208,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--head", required=True,
                         help="tête du paquet (SHA ou réf)")
     parser.add_argument("--repo", default=".", help="dépôt git (défaut : .)")
+    parser.add_argument("--target", help="branche cible de l’instantané")
+    parser.add_argument("--carrier", type=int, default=0, help="lot porteur de l’instantané")
     parser.add_argument("--expected", action="append", default=[],
                         help="lots attendus à la coupure (ids, virgules ou espaces)")
     parser.add_argument("--expected-file", action="append", default=[],

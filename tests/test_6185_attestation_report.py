@@ -295,6 +295,18 @@ class ContextTest(unittest.TestCase):
                 scope, path, lots, age = auto.contract_attestation_context(
                     repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
                 self.assertEqual(lots, [{'id': '6185', 'sha': base}])
+                from ameesh import packet_snapshot
+                git('switch', '-qc', 'integration/paquet-example')
+                receipt = {'payload': {'units': [
+                    {'work_item_id': 7491, 'unit_sha': 'd' * 40}]}}
+                with mock.patch.object(packet_snapshot, 'lookup', return_value=receipt) as lookup:
+                    _, _, snapshot_lots, _ = auto.contract_attestation_context(
+                        repo, base=base, modules=['tests.test_a'], timeout=10,
+                        project='demo', target='develop', carrier=7491)
+                self.assertEqual([{'id': '7491', 'sha': 'd' * 40}], snapshot_lots)
+                self.assertEqual('develop', lookup.call_args.kwargs['target'])
+                self.assertEqual(7491, lookup.call_args.kwargs['package_id'])
+                git('checkout', '--detach')
                 self.assertEqual(age, 3600)
                 self.assertEqual(scope['fixtures']['tree'], git('rev-parse', 'HEAD^{tree}'))
                 self.assertNotIn(git('rev-parse', 'HEAD'), json.dumps(scope['plan']))

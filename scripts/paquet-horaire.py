@@ -819,7 +819,8 @@ def manifest_at(ctx: Context, item: dict, sha: str) -> str:
     from ameesh.packet_snapshot import SnapshotError
     from ameesh.db import DbError
     try:
-        return auto.composition_text(ctx.repo, sha, name)
+        return auto.composition_text(ctx.repo, sha, name,
+                                     target=ctx.target, carrier=int(item["id"]))
     except (auto.InputError, SnapshotError, DbError) as exc:
         raise HoraireError("composition de %s illisible sur %s : %s"
                            % (branch, sha[:12], exc)) from exc
