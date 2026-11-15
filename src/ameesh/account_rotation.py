@@ -52,6 +52,9 @@ def coordinate(worker, items, book, choice, *, now, pause=True, margin=False):
     if pending:
         from . import account_turn
         origin = account_turn.session_account(worker, items)
+        if origin is None:
+            last = store.last_agent_switch('claude', worker.name)
+            origin = (last or {}).get('to_account') or pending['from_account']
         if pending['from_account'] == origin:
             # The destination is a preference, rechecked against every local
             # guard (profiles differ by host). Dwell may still hold this persona.

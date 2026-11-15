@@ -155,6 +155,37 @@ class RotationTest(_Base):
         self.assertEqual(worker._compte_session, choice.profile.name)
         self.assertEqual(len(self.journal('agent')), 1)
 
+    def test_cleared_session_publishes_and_consumes_wave(self):
+        self.switched(age=7200)
+        self.used.update(a=.4, b=.6, c=.1)
+        worker = self.worker()
+        worker.current_session = lambda: None
+        choice = accounts.choose(
+            self.db, self.cfg.host, 'claude', self.items, self.book,
+            now=NOW, agent='pilot', critical=True, session_account=None)
+        self.assertEqual(choice.switched['from'], 'b')
+        self.assertEqual(choice.profile.name, 'c')
+        with mock.patch.object(account_rotation.registry, 'overview', return_value=[]):
+            choice = account_rotation.coordinate(worker, self.items, self.book, choice, now=NOW)
+        self.assertIsNotNone(choice.profile)
+        self.assertEqual(len(self.journal('planned')), 1)
+        self.assertEqual(choice.switched['epoch'], self.journal('planned')[0]['wave_epoch'])
+        worker._pending_claude_switch = choice.switched
+        with mock.patch.object(account_turn, '_log'):
+            self.assertTrue(account_turn.begin_switch(worker, choice.profile))
+            account_turn.mark(worker, os.path.join(self.tmp, 'events'), choice.profile)
+        self.assertEqual(self.store.last_agent_switch('claude', 'pilot')['to_account'], 'c')
+        self.assertIsNone(self.store.pending_agent_plan('claude', 'pilot'))
+
+    def test_cleared_session_keeps_individual_hysteresis(self):
+        self.switched(age=1800)
+        choice = accounts.choose(
+            self.db, self.cfg.host, 'claude', self.items, self.book,
+            now=NOW, agent='pilot', critical=True, session_account=None)
+        self.assertEqual(choice.profile.name, 'b')
+        self.assertIsNone(choice.switched)
+        self.assertTrue(choice.retained)
+
     def test_planned_target_still_obeys_current_local_guards(self):
         self.hard.add('a')
         self.used['a'] = .9

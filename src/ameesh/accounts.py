@@ -2957,7 +2957,10 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # (les autres comptes ne sont alors pas relus : rien à choisir). Un compte
         # retenu ne l'est pas : c'est le PROCHAIN tour que ce choix décide, il ne
         # part pas sur un compte facturé au-delà du plan (R1 auditeur, B1).
-        own = by_name(items, session_account) if session_account else None
+        # Clearing a session does not erase the effective persona account.
+        origin_name = session_account or ((last_switch or {}).get('to_account')
+                                          if critical else None)
+        own = by_name(items, origin_name) if origin_name else None
         own_ev = ev(own) if own is not None else None
         # #7006 : un agent critique quitte son compte avant sa saturation. À
         # 100 %, `account_turn.summary_possible` refuse le tour de résumé (le
