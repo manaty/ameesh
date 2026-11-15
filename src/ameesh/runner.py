@@ -10175,7 +10175,8 @@ class AgentWorker(threading.Thread):
                 mode="resident" if rp is not None else "non-resident",
                 session_reread=self._context_baseline,
                 session_reread_quality=self._context_baseline_quality,
-                session_reread_reasons=self._context_baseline_reasons)
+                session_reread_reasons=self._context_baseline_reasons,
+                context_first_chars=len(resume + spec["prompt"]))
             with open(events_path, "a", encoding="utf-8") as events:
                 for raw in flux:
                     line = raw.rstrip("\n")

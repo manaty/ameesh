@@ -856,7 +856,7 @@ class ClaudeStream(StreamReader):
 
     def parse_event(self, event: dict) -> dict:
         kind = event.get("type")
-        out: dict = {}
+        out: dict = {"content_counts": context_metrics.stream_counts("claude", event)}
         # L166 : un événement de sous-agent (outil Agent/Task) ne donne jamais
         # la session de l'agent ; L217 : ni l'usage compté au plafond de
         # contexte du tour, ni un point sûr (le clore là tuerait les
@@ -927,7 +927,7 @@ class CodexStream(StreamReader):
 
     def parse_event(self, event: dict) -> dict:
         kind = event.get("type")
-        out: dict = {}
+        out: dict = {"content_counts": context_metrics.stream_counts("codex", event)}
         if kind == "thread.started":
             out["session"] = event.get("thread_id")
             if event.get("model"):
@@ -982,7 +982,7 @@ class DshStream(StreamReader):
 
     def parse_event(self, event: dict) -> dict:
         kind = event.get("type")
-        out: dict = {}
+        out: dict = {"content_counts": context_metrics.stream_counts("deepseek", event)}
         if kind == "status" and event.get("phase") == "step_end":
             if isinstance(event.get("usage"), dict):
                 out["usage"] = event["usage"]

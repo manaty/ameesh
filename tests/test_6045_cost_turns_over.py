@@ -68,6 +68,21 @@ class CostTurnsOverTest(PgTestCase):
         self.assertEqual(out["over"], 2_000_000)
         return {turn["turn_id"]: turn for turn in out["turns"]}, proc.stdout
 
+    def test_content_counts_exported_without_content(self):
+        self._ledger("sizes", input_tokens=3_000_000)
+        body = payload(agent=AGENT, session="s", turn_id="sizes",
+                       legacy_values=legacy())
+        body["context"]["counts"] = {
+            "tool_output_chars": 200000, "steps": 3,
+            "tool_output_chars_by_tool": {"Bash": 200000},
+            "content": "PRIVATE"}
+        events.record(self.db, cost.CONTEXT_EVENT, "agent:" + AGENT,
+                      project="ameesh", **body)
+        turns, raw = self._over()
+        self.assertEqual(turns["sizes"]["counts"]["steps"], 3)
+        self.assertEqual(turns["sizes"]["counts"]["tool_output_chars"], 200000)
+        self.assertNotIn("PRIVATE", raw)
+
     def test_tour_clos_par_budget(self):
         self._ledger("budget", input_tokens=500_000, cached=2_000_000)
         measures = core(180_000, 900, 2_500_000, 2_500_000, 900)
