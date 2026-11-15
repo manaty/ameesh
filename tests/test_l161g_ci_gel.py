@@ -199,6 +199,11 @@ class FakeDb:
         self.transactions = 0
         self.tx_open = False
 
+    def query(self, sql, params=()):
+        if "to_regclass('work_packet_snapshots')" in sql:
+            return [{"ready": False}]  # legacy database before migration 0580
+        raise AssertionError("unexpected database read: " + sql)
+
     def transaction(self):
         return FakeTx(self)
 

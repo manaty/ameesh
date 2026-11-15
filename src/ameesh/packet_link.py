@@ -168,6 +168,7 @@ def _protected_pushed_head(db, package: dict, repo: str) -> str:
 def record(db, package_id: int, *, repo: str | None = None, base: str | None = None,
            head: str = "HEAD", branch: str | None = None, target: str | None = None,
            expect_pushed: str | None = None,
+           composition_owner: str = "", composition_epoch: int = 0,
            actor: str = "", dry_run: bool = False, cfg=None) -> dict:
     """Enregistre la composition du paquet `package_id` ; rend le compte rendu.
 
@@ -183,6 +184,8 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
     tête le dit explicitement ; un second composeur, dont la lecture de la
     branche précède la poussée du premier, est refusé avant toute écriture.
     """
+    if bool(composition_owner) != bool(composition_epoch):
+        raise PacketLinkError("packet snapshot requires both composer owner and epoch")
     package = work.get(db, package_id)
     if package is None:
         raise PacketLinkError("packet carrier #%s not found" % package_id)
@@ -303,19 +306,42 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
         return report
     note = ("packet composition recorded: %d unit(s) %s..%s (branch %s)"
             % (len(known), base_sha[:12], head_sha[:12], package_branch))
+    snapshot = None
+    if composition_owner:
+        from . import packet_composition, packet_red, packet_snapshot
+        path = packet_red.manifest_name(package_branch)
+        manifest_file = plan_git._git(top, "show", "%s:%s" % (head_sha, path))
+        manifest = (manifest_file.stdout.decode("utf-8")
+                    if manifest_file.returncode == 0 else None)
+        if manifest is None:
+            raise PacketLinkError("packet snapshot: composition manifest missing")
+        previous = packet_snapshot.exact(db, repository=slug,
+            target=target_ref, package_id=int(package_id), branch=package_branch,
+            head=head_sha)
+        if previous and (previous["payload"]["units"] != known
+                         or previous["payload"]["manifest"] != manifest):
+            raise PacketLinkError("packet snapshot: exact head has different composition")
+        snapshot_payload = (previous["payload"] if previous else
+                            packet_snapshot.payload(db, known, manifest))
+        snapshot = dict(
+            repository=slug, target=packet_snapshot.target_name(target_ref),
+            package_id=int(package_id), branch=package_branch,
+            head_sha=head_sha, base_sha=base_sha,
+            payload=snapshot_payload, actor=actor,
+            lease_key=packet_composition.key(package.get("app") or "", int(package_id)),
+            lease_owner=composition_owner, lease_epoch=int(composition_epoch))
     try:
-        if fence is None:
-            report["members"] = storage.of(db).work.record_packet(
+        with db.transaction() as tx:
+            if fence is not None:
+                fence.hold(tx)
+            report["members"] = storage.of(tx).work.record_packet(
                 int(package_id), branch=package_branch, base_sha=base_sha,
                 head_sha=head_sha, units=known, note=note, actor=actor,
                 expect_pushed=expected or None)
-        else:
-            with db.transaction() as tx:
-                fence.hold(tx)
-                report["members"] = storage.of(tx).work.record_packet(
-                    int(package_id), branch=package_branch, base_sha=base_sha,
-                    head_sha=head_sha, units=known, note=note, actor=actor,
-                    expect_pushed=expected or None)
+            # Check the composer lease after acquiring the carrier row lock:
+            # a blocked membership write must not outlive its lease.
+            if snapshot is not None:
+                report["snapshot"] = storage.of(tx).work.record_packet_snapshot(**snapshot)
     except DbError as exc:
         raise PacketLinkError("packet composition not recorded: %s" % exc) from exc
     report["recorded"] = True

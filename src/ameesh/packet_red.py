@@ -235,7 +235,18 @@ def composition(db, item, head: str, *, checkout: str = "", api=None,
                 repo: str = "") -> dict:
     """Les unités de la composition qui a produit `head` (manifeste, sinon
     enregistrement), avec la preuve de leur origine et la base (#3954)."""
+    from . import packet_snapshot
     branch = _text((item or {}).get("branch"))
+    receipt = packet_snapshot.lookup(
+        db=db, checkout=checkout, repository=repo, head=head, branch=branch,
+        target=(item or {}).get("branch_target") or None,
+        package_id=int(item.get("id") or 0))
+    if receipt:
+        members = [dict(unit, lot=int(unit["work_item_id"]))
+                   for unit in receipt["payload"]["units"]]
+        return {"members": members, "source": "snapshot", "path": "",
+                "base": receipt["base_sha"],
+                "why": "composition snapshot #%d" % receipt["id"]}
     members, path, base = _members_from_manifest(checkout, branch, head,
                                                  api=api, repo=repo)
     if members:

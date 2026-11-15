@@ -559,14 +559,17 @@ def _carrier_branch(db, lot: int) -> str:
     return str((row or {}).get("branch") or "").strip()
 
 
-def _carrier_manifest(repo: str, head: str, branch: str) -> str | None:
+def _carrier_manifest(repo: str, head: str, branch: str, *, db=None, lot=None) -> str | None:
     """Le manifeste §12 tel qu'il est **figé** dans `head`, ou None."""
     if not repo or not head or not branch.startswith(CARRIER_PREFIX):
         return None
     # `integration/paquet-<nom>` → `reviews/integration-paquet-<nom>.md`
     # (même dérivation que `paquet-auto.manifest_rel`).
     rel = "reviews/%s.md" % branch.replace("/", "-", 1)
-    return _git(repo, "show", "%s:%s" % (head, rel))
+    from . import packet_snapshot
+    return packet_snapshot.text(
+        db=db, checkout=repo, head=head, branch=branch, package_id=lot,
+        fallback=lambda: _git(repo, "show", "%s:%s" % (head, rel)))
 
 
 def _parallel_manifests_disjoint(db, repo: str, lot: int, peer: int,
@@ -589,8 +592,8 @@ def _parallel_manifests_disjoint(db, repo: str, lot: int, peer: int,
     second_branch = _carrier_branch(db, lot)
     if not first_branch or not second_branch:
         return "inconclusive", "branche de la paire illisible"
-    first_text = _carrier_manifest(repo, first_head, first_branch)
-    second_text = _carrier_manifest(repo, second_head, second_branch)
+    first_text = _carrier_manifest(repo, first_head, first_branch, db=db, lot=lot)
+    second_text = _carrier_manifest(repo, second_head, second_branch, db=db, lot=peer)
     if first_text is None or second_text is None:
         return "inconclusive", "manifeste de la paire illisible dans la tête testée"
     first_units = packet_parallel.manifest_units(first_text)

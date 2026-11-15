@@ -206,7 +206,7 @@ def manifest_paths(repo: str, target: str) -> list[str]:
     return sorted(paths)[-MAX_MANIFESTS:]
 
 
-def units(repo: str, target: str, gaps: list | None = None
+def units(repo: str, target: str, gaps: list | None = None, *, db=None
           ) -> tuple[dict[int, list[dict]], int]:
     """{lot: [{manifest, sources, commits}…]} des unités livrées, et le nombre
     de manifestes lus.
@@ -234,6 +234,25 @@ def units(repo: str, target: str, gaps: list | None = None
                 lots.setdefault(int(lot), []).append(
                     {"manifest": path, "sources": entry["sources"],
                      "commits": entry["commits"]})
+    if db is not None:
+        from . import packet_snapshot
+        repository = packet_snapshot.repository_name(repo)
+        if repository:
+            receipts = storage.of(db).work.packet_snapshots(repository=repository)
+            for receipt in receipts:
+                # Membership alone proves no landing. Only receipts whose exact
+                # heads are ancestors of this cutoff can nominate units.
+                if plan_git._git(repo, "merge-base", "--is-ancestor",
+                                 receipt["head_sha"], target).returncode != 0:
+                    continue
+                exact = packet_snapshot.exact(db, repository=repository,
+                    target=receipt["target"], package_id=receipt["package_id"],
+                    branch=receipt["branch"], head=receipt["head_sha"])
+                for unit in exact["payload"]["units"]:
+                    lots.setdefault(int(unit["work_item_id"]), []).append({
+                        "manifest": "packet-snapshot:%d" % exact["id"],
+                        "sources": [unit["source_sha"]] if unit.get("source_sha") else [],
+                        "commits": [unit["unit_sha"]]})
     return lots, len(paths)
 
 
@@ -292,7 +311,7 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
     except plan_git.GitError as exc:
         raise PacketError(str(exc)) from exc
     gaps: list[dict] = []
-    lots, manifests = units(repo_dir, target, gaps)
+    lots, manifests = units(repo_dir, target, gaps, db=db)
     st = storage.of(db)
     open_rows: dict[int, dict] = {}
     for lot in lots:

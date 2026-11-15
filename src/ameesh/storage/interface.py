@@ -3230,6 +3230,24 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def record_packet_snapshot(self, *, repository: str, target: str,
+                               package_id: int, branch: str, head_sha: str,
+                               base_sha: str, payload: dict, actor: str,
+                               lease_key: str, lease_owner: str,
+                               lease_epoch: int) -> dict:
+        """#7477: append an immutable receipt under the live composer lease.
+
+        An identical replay returns the original receipt; conflicting content
+        for the same repository/target/carrier/exact head is refused.
+        """
+
+    @abc.abstractmethod
+    def packet_snapshots(self, *, repository: str, target: str | None = None,
+                         package_id: int | None = None, branch: str | None = None,
+                         head_sha: str | None = None) -> list[dict]:
+        """#7477: exact filters, never substitute another head's receipt."""
+
+    @abc.abstractmethod
     def packet_members(self, *, item_ids: Sequence[int] | None = None,
                        package_ids: Sequence[int] | None = None) -> list[dict]:
         """#2443 : les appartenances de paquet, filtrées par unités
