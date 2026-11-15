@@ -49,8 +49,10 @@ class StaleReasonTest(unittest.TestCase):
         why = forge_packets.stale_reason({"ci": "red", "created_ts": 90.0}, 3600, 100.0)
         self.assertEqual(why, "its CI is red")
 
-    def test_open_beyond_target_no_longer_carries(self):
+    def test_running_beyond_target_is_still_running(self):
         why = forge_packets.stale_reason({"ci": "running", "created_ts": 0.0}, 3600, 3601.0)
+        self.assertIn("still running past target", why)
+        self.assertNotIn("no longer carries", why)
         self.assertIn("beyond the step target (3600s)", why)
 
     def test_recent_running_pr_carries(self):
@@ -105,7 +107,11 @@ class SilencePassTest(_SloBase):
     def test_packet_pr_open_beyond_target_keeps_alert(self):
         alerts = self.alert_with(self.found(created_ts=self.GO - 3 * 86400.0))
         self.assertEqual(len(alerts), 1, alerts)
-        self.assertIn("beyond the step target", alerts[0]["detail"])
+        self.assertIn("still running past target", alerts[0]["detail"])
+        self.assertNotIn("no longer carries", alerts[0]["detail"])
+
+    def test_merged_packet_pr_does_not_raise_merge_alert(self):
+        self.assertEqual(self.alert_with(self.found(merged=True)), [])
 
 
 if __name__ == "__main__":

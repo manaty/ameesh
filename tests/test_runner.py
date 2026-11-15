@@ -662,17 +662,57 @@ class RunnerTest(PgTestCase):
         registry.claim(self.db, "libre", "runner-parti", 300)
 
         proc = self.runner_popen("--max-turns", "1", "--poll", "60")
+        lignes: list[str] = []
+        lecteur = threading.Thread(
+            target=lambda: lignes.extend(iter(proc.stdout.readline, "")), daemon=True)
+        lecteur.start()
+
+        def attendre(predicat, borne: float, quoi: str) -> None:
+            """Attend une ligne du journal, sans confondre lenteur et sortie.
+
+            #7440 : sous charge, la sortie du processus peut précéder la
+            lecture de sa dernière ligne par le fil lecteur ; un `poll()`
+            seul conclurait à tort. On rejoue le prédicat après la jonction.
+            """
+            echeance = time.monotonic() + borne
+            while not predicat():
+                self.assertLess(time.monotonic(), echeance, "".join(lignes))
+                if proc.poll() is not None:
+                    lecteur.join(2)
+                    if predicat():
+                        return
+                    self.fail("runner exited before %s:\n%s"
+                              % (quoi, "".join(lignes)))
+                time.sleep(0.05)
+
         try:
-            time.sleep(2.0)  # LISTEN établi
+            # #7440 : « LISTEN établi » ne se prouve pas par un délai fixe.
+            # Sous la part psql (run 43573661952), 2 s ne suffisaient pas :
+            # la libération partait avant l'écoute, et le test attendait le
+            # sondage de 60 s (timeout de `communicate`). On attend la ligne
+            # du listener, comme les témoins #3877/#5637.
+            attendre(lambda: any(l.startswith("LISTEN") or " LISTEN " in l
+                                 for l in lignes), scaled(30.0), "LISTEN")
             self.assertEqual(self.turns(), [], "rien ne doit tourner sous bail")
-            debut = time.monotonic()
             registry.release(self.db, "libre", "runner-parti", 1)
-            sortie, _ = proc.communicate(timeout=30)
+            # Le réveil doit venir du NOTIFY, jamais du sondage de 60 s : la
+            # borne reste sous ce sondage même quand le banc psql l'étale
+            # (`scaled(30)` y vaut 150 s).
+            attendre(lambda: any("lease acquired: libre" in l for l in lignes),
+                     min(scaled(30.0), 55.0), "acquiring the released lease")
+            try:
+                proc.wait(timeout=scaled(30.0))
+            except subprocess.TimeoutExpired:
+                self.fail("runner did not exit within %.0f s:\n%s"
+                          % (scaled(30.0), "".join(lignes)))
         finally:
             if proc.poll() is None:
                 proc.terminate()
-                proc.wait(timeout=10)
-        self.assertLess(time.monotonic() - debut, 25.0)
+                proc.wait(timeout=scaled(10.0))
+            lecteur.join(10)
+            if proc.stdout is not None:
+                proc.stdout.close()
+        sortie = "".join(lignes)
         self.assertEqual(proc.returncode, 0, sortie)
         self.assertEqual(len(self.turns()), 1, sortie)
 
