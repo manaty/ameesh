@@ -33,6 +33,7 @@ from ameesh.runner import run_attach
 from .support import FAKEBIN, PgTestCase
 from .test_7120_attach_relay import (AGENT, COMMAND, HOST, HOST_PUBLIC_KEY,
                                      HOST_SIGNING_KEY, TOKEN, FakeVerifier,
+                                     LOCAL_IO_TIMEOUT, SESSION_BUDGET,
                                      _ObservedConnector, _wait_host_connected,
                                      make_grant)
 
@@ -96,7 +97,8 @@ class StationSessionTest(unittest.TestCase):
             listen_host="127.0.0.1", listen_port=0, hosts={HOST: TOKEN},
             plaintext_loopback=True,
             grant_checker=lambda document, expected: (True, "", ""),
-            pair_timeout=0.3, idle_timeout=10.0, max_session_seconds=10.0,
+            pair_timeout=0.3, idle_timeout=SESSION_BUDGET,
+            max_session_seconds=SESSION_BUDGET,
             max_sessions=8, max_sessions_per_host=4, max_sessions_per_ip=8),
             logger=self.logger)
         self.relay.start()
@@ -104,14 +106,33 @@ class StationSessionTest(unittest.TestCase):
             relay_host="127.0.0.1", relay_port=self.relay.port, token=TOKEN,
             host=HOST, agents=(AGENT,), plaintext_loopback=True, command=COMMAND,
             host_signing_key=HOST_SIGNING_KEY, max_sessions=4,
-            max_session_seconds=10.0, keepalive=1.0), self.verifier,
+            max_session_seconds=SESSION_BUDGET,
+            request_timeout=SESSION_BUDGET, keepalive=1.0), self.verifier,
             logger=self.logger)
         self.thread = threading.Thread(target=self.connector.run_forever, daemon=True)
         self.thread.start()
         _wait_host_connected(self.connector, self.thread)
 
     def test_station_opens_requests_and_pumps_bytes(self):
+        self._exercise_session()
+
+    def test_station_echo_survives_a_host_delayed_beyond_old_session_budget(self):
+        # #7490: simulate a descheduled host while verifying REQ. The old
+        # relay deadline (10 s from pairing) closed the session before ACK.
+        self._exercise_session(request_delay=11.0)
+
+    def _exercise_session(self, *, request_delay=0):
         self._start()
+        requested, release = threading.Event(), threading.Event()
+        if request_delay:
+            def verify(request):
+                requested.set()
+                if not release.wait(SESSION_BUDGET):
+                    raise AssertionError("test did not release the host request")
+                return attach_host.GrantResult(
+                    True, "ok", "granted", human="human:alice")
+            self.verifier.result = verify
+
         receipt, device = make_grant()
         config = D.StationConfig(
             agent=AGENT, host=HOST, tenant="",
@@ -124,14 +145,41 @@ class StationSessionTest(unittest.TestCase):
         self.addCleanup(os.close, stdin_r)
         self.addCleanup(os.close, stdout_r)
         result = []
-        worker = threading.Thread(
-            target=lambda: result.append(D.run_session(
-                config, stdin_fd=stdin_r, stdout_fd=stdout_w)), daemon=True)
+        pumping, finished = threading.Event(), threading.Event()
+
+        class ObservedSession(D.Session):
+            def pump(session, **kwargs):
+                # connect() completed handshake and the host accepted REQ.
+                pumping.set()
+                return super().pump(**kwargs)
+
+        def run():
+            try:
+                with mock.patch.object(D, "Session", ObservedSession):
+                    result.append(D.run_session(
+                        config, stdin_fd=stdin_r, stdout_fd=stdout_w))
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run, daemon=True)
         worker.start()
         try:
+            if request_delay:
+                self.assertTrue(requested.wait(D.CONTROL_TIMEOUT),
+                                "host did not receive REQ")
+                # An explicit scheduling pause, longer than the former session
+                # lifetime; release is always set in finally, even on failure.
+                threading.Event().wait(request_delay)
+                release.set()
+            deadline = time.monotonic() + D.CONTROL_TIMEOUT
+            while not pumping.wait(0.05):
+                self.assertFalse(finished.is_set(),
+                                 "station stopped before pumping: %r" % result)
+                self.assertLess(time.monotonic(), deadline,
+                                "station did not finish establishing the session")
             os.write(stdin_w, b"bonjour 7121\n")
             output = bytearray()
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + LOCAL_IO_TIMEOUT
             while time.monotonic() < deadline and b"echo:bonjour 7121" not in output:
                 ready, _, _ = select.select([stdout_r], [], [], 0.2)
                 if ready:
@@ -140,10 +188,11 @@ class StationSessionTest(unittest.TestCase):
             self.assertEqual(self.verifier.requests[0].max_seconds, 30)
             os.close(stdin_w)
             stdin_w = None
-            worker.join(10.0)
+            worker.join(LOCAL_IO_TIMEOUT)
             self.assertFalse(worker.is_alive())
             self.assertEqual(result, [0])
         finally:
+            release.set()
             if stdin_w is not None:
                 os.close(stdin_w)
             os.close(stdout_w)
