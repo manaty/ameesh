@@ -5635,7 +5635,8 @@ def _manual_reseat_alert(db, item: Mapping, freeze: Mapping, recipient: str,
     deposited, or ""."""
     if not recipient:
         return "no reachable designator or pilot"
-    from . import mail
+    from datetime import datetime, timezone
+    from . import accounts, mail
 
     lot = int((item or {}).get("id") or 0)
     lines = []
@@ -5646,6 +5647,16 @@ def _manual_reseat_alert(db, item: Mapping, freeze: Mapping, recipient: str,
         else:
             lines.append("- %s (%s, family %s): %s, the seat is kept."
                          % (name, why, family or "?", kept))
+            # #7437: the host-local pause label is not a usable deadline for
+            # the designator; its @epoch marker is portable across hosts.
+            row = registry.get(db, name) or {}
+            status = str(row.get("status_text") or "")
+            deadline = accounts.pause_deadline(status)
+            if deadline is not None:
+                resume = datetime.fromtimestamp(deadline, timezone.utc).isoformat().replace("+00:00", "Z")
+                qualifier = (" — estimation (plafond de rythme)"
+                             if "pace cap" in status.lower() else "")
+                lines.append("  Reprise annoncée : %s%s." % (resume, qualifier))
     body = "\n".join([
         "Unreachable manual reviewer seat past its review deadline (canon §2, §9;"
         " #4757, decision mesh-design 30/10).",
