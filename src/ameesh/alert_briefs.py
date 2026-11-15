@@ -1028,10 +1028,58 @@ def slo_grace_unbriefed(alert: dict) -> bool:
         return False
 
 
-def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
-    """#5044 : par destinataire, les clés passives de son courrier (`mail.PASSIVE_KEYS`).
+def slo_vehicle_wait(alert: dict, name: str | None = None) -> bool:
+    """#7443 : un lot validé qui attend son véhicule de fusion n'appelle aucun geste.
 
-    Le sommeil automatique n'attend aucun geste : il part sans réveiller. Une
+    Au niveau 1 ordinaire, le composeur ou le paquet porte la fusion : le
+    pilote n'a rien à corriger, rien à décider, et attend un tiers nommé. Le
+    rappel part donc en information passive (lu au tour suivant), comme le
+    faisait déjà #7308 pour le seul cas `packet` et pour `merge` sans
+    responsable nommé.
+
+    Gardent le réveil les cas où le destinataire a un geste : créneau de
+    paquet manqué (`packet_missed`), cause côté auteur (`candidate`), fusion
+    du canon portée par le bureau, lot lui-même véhicule du paquet (`self`),
+    CI de paquet rouge (une unité est à corriger) et sortie du véhicule
+    (`vehicle_exit_ts`, à remettre en build ou au paquet suivant). Les
+    niveaux 2/3, un P1 et une urgence réveillent aussi : la relance du palier
+    supérieur est un geste.
+    """
+    if not (slo_ordinary_l1(alert)
+            and alert.get("lot_state") == "validated"
+            and alert.get("step") == "verdict_merge"):
+        return False
+    waiting = alert.get("waiting") or {}
+    # `merge-approval`/`merge-outcome` attendent un tiers nommé (approbateur,
+    # responsable) : le pilote ne décide ni ne réconcilie à sa place.
+    if waiting.get("what") not in ("merge", "merge-approval", "merge-outcome",
+                                   "packet"):
+        return False
+    if (waiting.get("canon") or waiting.get("candidate")
+            or waiting.get("packet_missed") or waiting.get("self")
+            or alert.get("vehicle_exit_ts") is not None):
+        return False
+    # Le tiers nommé qui reçoit lui-même le rappel n'est plus un tiers : il a
+    # le geste (fusion, approbation, réconciliation) et garde le réveil.
+    who = waiting.get("who")
+    if isinstance(who, str) and name is not None and who == name:
+        return False
+    ci = waiting.get("ci")
+    if isinstance(ci, dict) and ci.get("state") == "red":
+        return False
+    return True
+
+
+def quiet_modes(alert: dict, names, by_name: dict) -> dict:
+    """#7443 : par destinataire, le mode de son courrier et la raison du choix.
+
+    Rend `{nom: {"payload": {...}, "reason": "..."}}`. Le mode se lit dans le
+    payload (`mail.passive_reason`) : `info`/`cc` sont passifs, son absence
+    réveille. Le journal du notifieur nomme ainsi le mode et la raison
+    (#7443), au lieu de laisser le lecteur deviner.
+
+    #5044/#7308 : le sommeil automatique, les constats de capacité et un lot
+    validé qui attend son véhicule de fusion n'attendent aucun geste. Une
     alerte SLO copiée à plusieurs coordinateurs n'en réveille qu'un, stable
     d'une passe à l'autre (`_one_orchestrator`) ; les autres la lisent en copie
     à leur tour suivant, et le palier suivant reprend si rien ne bouge. Un P1
@@ -1048,30 +1096,65 @@ def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
     kind = alert.get("type")
     if kind == "critical_budget_pause":
         account = (alert.get("episode") or ("",))[0]
-        return {name: {"info": True, "urgent": False} for name in names
+        return {name: {"payload": {"info": True, "urgent": False},
+                       "reason": "budget pause on the same account: no action due"}
+                for name in names
                 if account and _budget_paused_on(by_name.get(name), account)}
     if alert.get("urgent"):
         return {}
-    # #7308 : les constats sans geste immédiat restent lisibles au tour suivant.
-    waiting = alert.get("waiting") or {}
-    packet_wait = (slo_ordinary_l1(alert)
-                   and alert.get("lot_state") == "validated"
-                   and alert.get("step") == "verdict_merge"
-                   and (waiting.get("what") == "packet"
-                        or (waiting.get("what") == "merge" and not waiting.get("who")))
-                   and not waiting.get("canon")
-                   and not waiting.get("candidate")
-                   and not waiting.get("packet_missed"))
-    if not alert.get("critical") and (kind in ("idle_capacity", "plan_underused") or packet_wait):
-        return {name: {"info": True} for name in names if name not in escalated}
+    # #7308/#7443 : les constats sans geste immédiat restent lisibles au tour
+    # suivant.
+    if not alert.get("critical") and kind in ("idle_capacity", "plan_underused"):
+        return {name: {"payload": {"info": True},
+                       "reason": "status report: no action due"}
+                for name in names if name not in escalated}
+    vehicles = {name for name in names
+                if name not in escalated and slo_vehicle_wait(alert, name)}
+    if vehicles:
+        return {name: {"payload": {"info": True},
+                       "reason": "validated lot waiting for its merge vehicle: "
+                                 "no action due"} for name in vehicles}
     if kind in ("operator_pause_long", "operator_pause_host") and automatic_sleep(alert):
-        return {name: {"info": True} for name in names}
+        return {name: {"payload": {"info": True},
+                       "reason": "automatic sleep: no action due"}
+                for name in names}
     if kind != "slo_breach" or len(names) < 2:
         return {}
     holder = alert.get("agent")
     woken = holder if holder in names else \
         _one_orchestrator(names, by_name, alert.get("lot"))[0]
-    return {name: {"cc": woken} for name in names if name != woken}
+    return {name: {"payload": {"cc": woken},
+                   "reason": "copy: %s wakes for this SLO" % woken}
+            for name in names if name != woken}
+
+
+def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
+    """#5044 : les payloads passifs par destinataire (compatibilité de l'API).
+
+    `quiet_modes` porte en plus la raison journalisée (#7443)."""
+    return {name: decision["payload"]
+            for name, decision in quiet_modes(alert, names, by_name).items()}
+
+
+def wake_reason(alert: dict, name: str, payload: dict | None = None) -> str:
+    """#7443 : pourquoi ce destinataire est réveillé, pour le journal.
+
+    Le mode `wake` n'a pas de payload passif ; la raison nomme le geste attendu
+    (correction due, verdict de relecture, fusion, urgence)."""
+    if (payload or {}).get("urgent") or alert.get("urgent"):
+        return "urgent"
+    if alert.get("type") == "slo_breach":
+        step = alert.get("step")
+        level = int(alert.get("level") or 1)
+        action = {
+            "blocked_freeze": "correction owed after a review",
+            "green_verdict": "review verdict owed",
+            "verdict_merge": "merge or unblock due",
+            "intake_started": "lot to take",
+            "build_quiet": "work due",
+        }.get(step, "action due")
+        return "%s (SLO level %d)" % (action, level)
+    return "action expected"
 
 
 def _budget_paused_on(row, account: str) -> bool:

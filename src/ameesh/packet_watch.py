@@ -557,15 +557,34 @@ def _auto_merge(cfg, db, name: str, app: str, *, gh, dry_run: bool,
     if db is not None and pending and watch is not None:
         try:
             out += held_after_green(db, watch, state, now=now, dry_run=dry_run,
-                                    gh=gh, lots=pending)
+                                    gh=gh, lots=pending, cfg=cfg)
         except Exception as exc:  # le rappel ne bloque pas les autres projets
             out.append({"project": name, "result": "error",
                         "error": "held-after-green: %s" % exc})
     return out
 
 
+def _pilot_names(cfg, db, watch: ProjectWatch) -> set:
+    """#7443 : les pilotes du projet, pour ne réveiller qu'eux.
+
+    `packet_watch.notify` nomme le composeur puis les informés ; le rôle de
+    pilote se lit au canon (`project_pilots`). Une lecture impossible rend
+    l'ensemble vide : l'appelant garde alors le comportement d'avant.
+    """
+    try:
+        from . import alert_briefs, canon as canon_mod
+        listing = storage.of(db).operations.listing()
+        canons = canon_mod.load_configured(cfg) \
+            if cfg is not None and getattr(cfg, "canon", None) else []
+        return set(alert_briefs.project_pilots(watch.name, listing, cfg=cfg, db=db,
+                                               canons=canons))
+    except Exception:  # noqa: BLE001 - un rôle illisible ne tait pas le rappel
+        return set()
+
+
 def held_after_green(db, watch: ProjectWatch, state: dict, *, now: float,
-                     dry_run: bool = False, gh=None, lots=()) -> list[dict]:
+                     dry_run: bool = False, gh=None, lots=(),
+                     cfg=None) -> list[dict]:
     """#7308 : un réveil par tête armée bloquée après les premiers verts.
 
     Le délai est la grâce configurée du veilleur. Une suite encore en file
@@ -628,14 +647,27 @@ def held_after_green(db, watch: ProjectWatch, state: dict, *, now: float,
                 "sur %s. Motif : %s. Lire la porte du paquet et traiter le blocage."
                 % (lot, (now - max(green)) / 60, armed["sha"][:12], held[-1]["why"]))
         sent = list(notified.get(key, ()))
+        # #7443 : le vert d'un paquet appelle un geste du pilote (la fusion ou
+        # la porte qui la retient), pas du composeur ni des informés. Sans
+        # pilote lisible, on retombe sur le premier informé puis sur tous :
+        # mieux vaut un réveil de trop qu'un blocage silencieux.
+        pilots = _pilot_names(cfg, db, watch)
+        if not (pilots & set(watch.notify)):
+            pilots = set(watch.notify[1:]) or set(watch.notify)
+        modes = {}
         for recipient in watch.notify:
             if recipient in sent:
                 continue
+            mode = "wake" if recipient in pilots else "info"
+            payload = {"packet_merge_held": {"lot": lot, "sha": armed["sha"]}}
+            if mode == "info":
+                payload["info"] = True
             if not dry_run:
                 mail.send(db, work.SYSTEM_SENDER, recipient, text, kind="event",
-                          payload={"packet_merge_held": {"lot": lot, "sha": armed["sha"]}})
+                          payload=payload)
                 sent.append(recipient)
                 notified[key] = sent
+            modes[recipient] = mode
         out.append({"project": watch.name, "lot": lot, "result": "auto-merge-held",
-                    "body": text})
+                    "body": text, "notify": modes})
     return out
