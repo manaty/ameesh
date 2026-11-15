@@ -816,11 +816,14 @@ def manifest_at(ctx: Context, item: dict, sha: str) -> str:
     if not name:
         raise HoraireError("porteur #%s sans branche %s*" % (item.get("id"), auto.PACKAGE_PREFIX))
     ctx.git("fetch", "--no-tags", "origin", branch, timeout=300)
-    result = ctx.git("show", "%s:%s" % (sha, auto.manifest_rel(name)))
-    if result.returncode != 0:
-        raise HoraireError("manifeste de %s illisible sur %s : %s"
-                           % (branch, sha[:12], auto._tail(result.text, 5)))
-    return result.stdout
+    from ameesh.packet_snapshot import SnapshotError
+    from ameesh.db import DbError
+    try:
+        return auto.composition_text(ctx.repo, sha, name)
+    except (auto.InputError, SnapshotError, DbError) as exc:
+        raise HoraireError("composition de %s illisible sur %s : %s"
+                           % (branch, sha[:12], exc)) from exc
+
 
 
 CONTRACT_PROOF_RUN = "contracts-proof"

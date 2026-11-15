@@ -349,6 +349,10 @@ class PublishTest(Chain):
             mocks[done].assert_not_called()
         body = mocks["ensure_pull_request"].call_args.args[4]
         self.assertIn("non rejoués", body)
+        self.assertNotIn("- Manifeste :", body)
+        self.assertIn(self.head, body)
+        self.assertIn("## Copie de la composition", body)
+        self.assertIn("## Composition (2 unités)", body)
         self.assertIn("#1 `%s`" % self.sources[1][:12], body)
         self.assertIn("non rejoués", mocks["note_carrier"].call_args.args[2])
         self.assertEqual(mocks["request_full_ci"].call_args.args[1:], (4000, self.head))

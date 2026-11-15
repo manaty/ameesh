@@ -6030,7 +6030,11 @@ def publish_tested(args: argparse.Namespace) -> int:
                 % (args.name, args.target, base_sha[:12], len(specs)), "",
                 units, "", origin, "",
                 "- Contrôle d'inclusion : vert.",
-                "- Manifeste : `%s`." % rel, "",
+                "- Enregistrement ameesh : porteur #%d, cible `%s`, tête `%s`."
+                % (args.carrier, args.target, head), "",
+                "## Copie de la composition", "",
+                "Copie lisible ; l’instantané ameesh de cette tête fait autorité.",
+                "", composition_text(repo, head, args.name), "",
                 "Porteur : #%d. « Verdict non requis » et CI complète restent au pilote."
                 % args.carrier, ""])
             pr_number, pr_url = ensure_pull_request(
