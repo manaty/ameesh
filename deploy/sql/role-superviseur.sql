@@ -586,7 +586,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('account_switches', ARRAY[
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',
-        'agent', 'at'
+        'agent', 'at', 'wave_id', 'wave_epoch'
     ]),
     -- credential health (L226a/L226b, 0060, 0068): account NAMES and their state
     -- (short cause and fix command), never a credential

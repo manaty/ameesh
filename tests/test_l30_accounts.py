@@ -790,7 +790,8 @@ class ExecuteurTest(_Base):
             self.assertIn("claude-sess-1", dernier["argv"])
             self.assertEqual([(b["from_account"], b["to_account"], b["kind"], b["agent"])
                               for b in self._bascules()],
-                             [("primaire", "secondaire", "bascule", "cl")])
+                             [("primaire", "secondaire", "bascule", "cl"),
+                              ("primaire", "secondaire", "agent", "cl")])
             fil = self._fil()
             self.assertIn("Account switch claude: primaire → secondaire", fil)
             self.assertIn("resumed as is", fil)

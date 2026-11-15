@@ -178,3 +178,4 @@ test_6485_fingerprint_key_scan  # stockage : clé d'empreinte historique portée
 test_7066_account_exception  # stockage : preuve signée, jeton unique et début de tour atomiques (#7066)
 
 test_7442_stable_reviewers_pg  # stockage : sièges stables et contexte des gels successifs (#7442)
+test_7441_account_rotation  # #7441: durable waves, epoch fencing and persona dwell
