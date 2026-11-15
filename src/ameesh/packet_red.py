@@ -822,7 +822,16 @@ def _attribute_run(db, item, run, failures, *, cfg=None, api=None, checkout: str
         card, card_prov, card_known = shared["card"], shared.get("prov"), True
     elif card is None and not card_known and shared.get("card_tried"):
         card_prov, card_known = shared.get("prov"), True
-    comp = composition(db, item, head, checkout=path, api=api, repo=slug)
+    try:
+        comp = composition(db, item, head, checkout=path, api=api, repo=slug)
+    except Exception as exc:  # noqa: BLE001 - ce relevé ne lève jamais
+        # A snapshot read can fail (database outage, invalid or ambiguous
+        # receipt). `ci status` and the mail still owe a status, never a
+        # traceback; the caller keeps the rest of the packet reading.
+        out["status"] = "error"
+        out["why"] = "composition illisible : %s: %s" % (
+            type(exc).__name__, str(exc)[:200])
+        return out
     out["manifest"] = {"source": comp["source"], "path": comp["path"],
                        "units": len(comp["members"])}
     if not comp["members"]:

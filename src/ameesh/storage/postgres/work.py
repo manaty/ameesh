@@ -4196,6 +4196,9 @@ class WorkItems(interface.WorkItems):
                                head_sha, base_sha, payload, actor, lease_key,
                                lease_owner, lease_epoch) -> dict:
         payload = json.loads(json.dumps(payload))
+        # GitHub names are case-insensitive: store the canonical key so a
+        # later checkout cannot miss its own receipt by spelling.
+        repository = str(repository or "").strip().lower()
         with self.db.transaction() as tx:
             lease = tx.query(
                 "SELECT owner, epoch FROM merge_locks WHERE target = %s FOR SHARE",
@@ -4235,6 +4238,7 @@ class WorkItems(interface.WorkItems):
             "SELECT to_regclass('work_packet_snapshots') IS NOT NULL AS ready")
         if not ready or not ready[0]["ready"]:
             return []
+        repository = str(repository or "").strip().lower()
         where, params = ["repository = %s"], [repository]
         for column, value in (("target", target), ("package_id", package_id),
                               ("branch", branch), ("head_sha", head_sha)):

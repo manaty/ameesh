@@ -15,7 +15,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import packet_close, work
+from ameesh import packet_close, packet_snapshot, storage, work
 from ameesh.storage.postgres.work import WorkItems
 
 from .test_canon import _git_env, git, write
@@ -298,6 +298,37 @@ class PacketCloseTest(_PlanDb):
         self.assertEqual(out.returncode, 0, out.stderr)
         report = json.loads(out.stdout)
         self.assertEqual(report["merged"], 1)
+        self.assertEqual(work.get(self.db, unit["id"])["state"], "delivered")
+
+    def test_7480_un_paquet_sans_manifeste_se_ferme_sur_une_revision(self):
+        """B (#41922) : `sync(..., target=head)` — la coupure est un SHA, pas
+        la branche. Les instantanés sont rangés sous `main` ; le relevé doit
+        encore nommer leurs unités et fermer le paquet sans fichier."""
+        git(self.repo, "remote", "add", "origin",
+            "https://github.com/Acme/App.git")
+        unit = self.item("paquet sans manifeste")
+        [composed] = self.package([unit], manifest=False)
+        head = git(self.repo, "rev-parse", "HEAD")
+        base = git(self.repo, "merge-base", composed["unit"], head)
+        st = storage.of(self.db).work
+        epoch = st.land_lock("test-7480-snapshot", "composer", 300)
+        try:
+            receipt = st.record_packet_snapshot(
+                repository="Acme/App", target="main", package_id=unit["id"],
+                branch="integration/paquet-test", head_sha=composed["unit"],
+                base_sha=base,
+                payload=packet_snapshot.payload(self.db, [{
+                    "work_item_id": unit["id"], "unit_sha": composed["unit"],
+                    "source_sha": composed["source"]}], ""),
+                actor="composer", lease_key="test-7480-snapshot",
+                lease_owner="composer", lease_epoch=epoch)
+        finally:
+            st.land_unlock("test-7480-snapshot", "composer", epoch)
+        report = packet_close.sync(self.db, self.repo, target=head)
+        self.assertEqual(report["merged"], 1, report)
+        result = self.by_lot(report)[unit["id"]]
+        self.assertEqual("merged", result["result"])
+        self.assertIn("packet-snapshot:%d" % receipt["id"], result["manifest"])
         self.assertEqual(work.get(self.db, unit["id"])["state"], "delivered")
 
     def _manifest_sans_commit(self, items: list[dict]) -> None:

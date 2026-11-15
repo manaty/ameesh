@@ -520,7 +520,8 @@ class Passage:
         # (`paquet-<n>-nexlink`) carries no hour, so its merge commit date is
         # read in the same zone. The tests pass no rules: UTC stays bounded.
         zone = rules.zone() if rules is not None and hasattr(rules, "zone") else timezone.utc
-        history = self.manual_packets(repository.clone.path, base, zone)
+        history = self.manual_packets(repository.clone.path, base, zone,
+                                      target=self.project.target)
         packets = [packet for packet in history
                    if packet["sha"] not in known and packet["lots"]
                    and packet["created_ts"] >= first
@@ -545,7 +546,8 @@ class Passage:
             missing = sorted(manual - shadow)
             extras = sorted(shadow - manual)
             in_flight, unknown = _in_flight(
-                repository.clone.path, plan, history, open_packets, packet)
+                repository.clone.path, plan, history, open_packets, packet,
+                target=self.project.target)
             carried = {lot: in_flight[lot] for lot in extras if lot in in_flight}
             extra = [lot for lot in extras if lot not in carried]
             # #2727: the manual composer may have synced main as a lot while
@@ -599,7 +601,7 @@ class Passage:
         return comparisons
 
     @staticmethod
-    def manual_packets(clone, base, zone=None):
+    def manual_packets(clone, base, zone=None, *, target=None):
         """The composer's packet merges on the first-parent history of target.
 
         Each entry keeps the exact branch name and its second parent (the
@@ -631,7 +633,8 @@ class Passage:
             stamp = named.group(1) if named else _stamp_of(created, zone)
             parents = raw_parents.split()
             branch_head = parents[1] if len(parents) > 1 else sha
-            manifest_lots = _manifest_lots(clone, sha, tail, receipt_head=branch_head)
+            manifest_lots = _manifest_lots(clone, sha, tail, receipt_head=branch_head,
+                                           target=target)
             lots = manifest_lots
             if lots is None and len(parents) > 1:
                 # The numbered composer declares its units in the merge
@@ -702,7 +705,7 @@ class Passage:
         return open_packets
 
 
-def _in_flight(clone, plan, packets, open_packets, compared):
+def _in_flight(clone, plan, packets, open_packets, compared, *, target=None):
     """({lot: carrier}, unknown) for packets in flight at the plan cutoff.
 
     A packet was in flight at the cutoff when its merge was not on the target
@@ -725,7 +728,8 @@ def _in_flight(clone, plan, packets, open_packets, compared):
             continue
         if packet["created_ts"] <= cutoff:
             continue  # already merged at the cutoff: the shadow saw it on target
-        lots = _lots_at(clone, packet["branch_head"], packet["tail"], cutoff)
+        lots = _lots_at(clone, packet["branch_head"], packet["tail"], cutoff,
+                        target=target)
         if lots is None:
             unknown = True
             continue
@@ -740,7 +744,7 @@ def _in_flight(clone, plan, packets, open_packets, compared):
             continue
         if cutoff - written > MAX_FLIGHT_S:
             continue  # abandoned branch: not a carrier for this cutoff
-        lots = _manifest_lots(clone, commit, packet["tail"])
+        lots = _manifest_lots(clone, commit, packet["tail"], target=target)
         if lots is None:
             unknown = True
             continue
@@ -749,12 +753,12 @@ def _in_flight(clone, plan, packets, open_packets, compared):
     return carried, unknown
 
 
-def _lots_at(clone, head, tail, cutoff):
+def _lots_at(clone, head, tail, cutoff, *, target=None):
     """The lots of a packet branch at the cutoff, or None when unprovable."""
     commit, _ = _first_parent_before(clone, head, cutoff)
     if commit is None:
         return None
-    return _manifest_lots(clone, commit, tail)
+    return _manifest_lots(clone, commit, tail, target=target)
 
 
 def _first_parent_before(clone, head, cutoff):
@@ -774,7 +778,7 @@ def _first_parent_before(clone, head, cutoff):
         raise train.TrainError("unreadable packet commit date") from exc
 
 
-def _manifest_lots(clone, sha, tail, *, receipt_head=None):
+def _manifest_lots(clone, sha, tail, *, receipt_head=None, target=None):
     """The exact ``reviews/integration-<tail>.md`` lots, or None.
 
     No fallback to another packet's manifest: an inherited manifest would
@@ -783,7 +787,7 @@ def _manifest_lots(clone, sha, tail, *, receipt_head=None):
     path = "reviews/integration-%s.md" % tail
     from . import packet_snapshot
     receipt = packet_snapshot.lookup(checkout=clone, head=receipt_head or sha,
-                                     branch="integration/" + tail)
+                                     branch="integration/" + tail, target=target)
     if receipt:
         return parse_manifest(receipt["payload"]["manifest"])
     manifest = resolutions._run(clone, "show", "%s:%s" % (sha, path))

@@ -206,6 +206,27 @@ def manifest_paths(repo: str, target: str) -> list[str]:
     return sorted(paths)[-MAX_MANIFESTS:]
 
 
+def _snapshot_target(repo: str, target: str) -> str | None:
+    """Le nom de branche que `target` désigne, ou None pour une révision.
+
+    Une coupure peut être une branche (`main`, `origin/develop`) mais aussi
+    une révision (SHA ou tag) : `sync_project` passe la pointe fraîchement
+    récupérée, donc le plus souvent un SHA. Les instantanés sont rangés sous
+    le nom de la branche cible (`packet_snapshot.record`) : filtrer une
+    révision par sa propre écriture ne lirait aucune ligne et ne nommerait
+    aucun lot pour un paquet sans manifeste.
+    """
+    from . import packet_snapshot
+    try:
+        resolved = plan_git.published_target(repo, target)
+        ref = plan_git._out(repo, "rev-parse", "--symbolic-full-name", resolved)
+    except plan_git.GitError:
+        return None
+    if not ref or not ref.startswith(("refs/heads/", "refs/remotes/")):
+        return None
+    return packet_snapshot.target_name(resolved)
+
+
 def units(repo: str, target: str, gaps: list | None = None, *, db=None
           ) -> tuple[dict[int, list[dict]], int]:
     """{lot: [{manifest, sources, commits}…]} des unités livrées, et le nombre
@@ -238,17 +259,36 @@ def units(repo: str, target: str, gaps: list | None = None, *, db=None
         from . import packet_snapshot
         repository = packet_snapshot.repository_name(repo)
         if repository:
-            receipts = storage.of(db).work.packet_snapshots(repository=repository)
+            # One query for the whole cutoff: the rows just read are validated
+            # in place instead of re-queried per receipt, and the ancestry
+            # listing is read once. The filter is the *branch* target, and is
+            # absent for a cut revision (SHA/tag) whose spelling names no
+            # receipt; ancestry below still proves landing from the exact
+            # cutoff revision.
+            receipts = storage.of(db).work.packet_snapshots(
+                repository=repository, target=_snapshot_target(repo, target))
+            landed = set()
+            if receipts:
+                try:
+                    landed = set((plan_git._out(repo, "rev-list", target)
+                                  or "").split())
+                except plan_git.GitError:
+                    landed = set()
+            seen: set[tuple[str, int, str]] = set()
             for receipt in receipts:
                 # Membership alone proves no landing. Only receipts whose exact
                 # heads are ancestors of this cutoff can nominate units.
-                if plan_git._git(repo, "merge-base", "--is-ancestor",
-                                 receipt["head_sha"], target).returncode != 0:
+                if receipt["head_sha"] not in landed:
                     continue
-                exact = packet_snapshot.exact(db, repository=repository,
-                    target=receipt["target"], package_id=receipt["package_id"],
-                    branch=receipt["branch"], head=receipt["head_sha"])
+                exact = packet_snapshot.validate(receipt)
                 for unit in exact["payload"]["units"]:
+                    # A head registered for two targets is still one
+                    # composition: nominate each of its units once.
+                    key = (receipt["head_sha"], int(unit["work_item_id"]),
+                           str(unit.get("unit_sha") or ""))
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     lots.setdefault(int(unit["work_item_id"]), []).append({
                         "manifest": "packet-snapshot:%d" % exact["id"],
                         "sources": [unit["source_sha"]] if unit.get("source_sha") else [],

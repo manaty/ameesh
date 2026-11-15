@@ -1210,11 +1210,20 @@ def composer_tested(cfg, db, item, head: str, *, repo: str = "") -> dict | None:
     if not where:
         return None
     from . import packet_snapshot
-    receipt = packet_snapshot.lookup(db=db, checkout=where, head=head,
-        branch=str(item.get("branch") or ""), package_id=int(item.get("id") or 0),
-        target=item.get("branch_target") or None)
+    from .db import DbError
+    try:
+        receipt = packet_snapshot.lookup(db=db, checkout=where, head=head,
+            branch=str(item.get("branch") or ""), package_id=int(item.get("id") or 0),
+            target=item.get("branch_target") or None)
+    except (packet_snapshot.SnapshotError, DbError):
+        # An unreadable receipt proves nothing: the prevalidation remains due,
+        # but a database outage must not break the freeze or the packet gate.
+        return None
     if receipt:
         tests = receipt["payload"].get("tests") or {}
+        if tests.get("status") == "parallel":
+            return {"manifest": "packet-snapshot:%d" % receipt["id"], "sha": head,
+                    "tests": 0, "parallel": True}
         if tests.get("status") != "success" or int(tests.get("count") or 0) <= 0:
             return None
         return {"manifest": "packet-snapshot:%d" % receipt["id"], "sha": head,
