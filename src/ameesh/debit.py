@@ -64,7 +64,12 @@ tête gelée porte des commits d'un autre lot ouvert absents de la cible, sans
 dépendance déclarée (`stacked-undeclared`, même lecture que
 `paquet-candidats`), n'est pas non plus une attente de paquet : la ligne
 devient `stacked_undeclared`, nomme le parent (`depends_on`) et le geste de
-l'auteur ou du pilote (déclarer la dépendance, ou rebaser).
+l'auteur ou du pilote (déclarer la dépendance, ou rebaser). #7435 : un lot
+relu déjà membre d'un **porteur de paquet non terminé à sa tête gelée** n'est
+pas non plus une attente `qa_merge` : le paquet est sa voie d'atterrissage
+(§11 bis/§12), le pilote n'a rien à relancer. Le rapport le classe
+`in_packet` (niveau 0, hors `slow_waits`) ; un porteur terminé, ou une
+composition sur une autre tête, laisse la ligne revenir.
 
 #3256 B : la section `capacity` (spec `docs/design/3256-debit-file.md` §3) —
 agents réveillables au repos, heures-agent au repos, lots démarrables, lot de
@@ -499,6 +504,31 @@ _CLOSURE_STATES = ("blocked", "waiting_human")
 _TERMINAL_STATES = ("merged", "closed", "delivered")
 #: états finis au journal (promu, fermé) : plus aucune attente (#3672)
 _CLOSED_STATES = ("promoted", "delivered", "closed")
+
+
+def _open_packet_member(row: Mapping[str, Any],
+                        packets_by_lot: Mapping[int, Iterable[Mapping[str, Any]]]
+                        ) -> dict | None:
+    """#7435 : le porteur non terminé qui porte déjà ce lot à sa tête gelée.
+
+    L'appartenance vient de `work_packet_members` (la composition enregistrée,
+    #2443) : une recomposition remplace l'ensemble des unités, donc un lot
+    retiré n'est plus membre. Un porteur terminé (`lifecycle.COMPLETED`) ne
+    porte plus rien ; un état absent ne prouve pas un porteur ouvert et laisse
+    donc la ligne revenir. La tête comparée est celle du **gel courant** du
+    lot : un porteur composé avant un regel ne porte plus la tête examinée.
+    """
+    from . import packet_head
+    sha = str(row.get("frozen_sha") or row.get("sha") or "")
+    if not sha:
+        return None
+    for member in packets_by_lot.get(int(row["lot"]), ()):
+        state = str(member.get("package_state") or "")
+        if not state or state in lifecycle.COMPLETED:
+            continue
+        if packet_head.same_commit(member.get("frozen_sha"), sha):
+            return dict(member)
+    return None
 
 
 def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
@@ -1166,7 +1196,15 @@ def build(*, items: Iterable[Mapping[str, Any]],
     de découpage **avant** la note d'épuisement est couvert par elle : il ne
     compte plus comme attente lente (`roadmap_waits`, hors `--check`), le lot
     de découpage restant ouvert dans l'état documenté du canon §4. Un hold
-    reposé après la note est un geste nouveau et garde son traitement."""
+    reposé après la note est un geste nouveau et garde son traitement.
+
+    `packets` (#3256 C, #7435) : les compositions de la fenêtre
+    (`work_packet_members` et l'état du porteur). Un lot membre d'un porteur
+    **non terminé** (`package_state` hors `lifecycle.COMPLETED`) dont le
+    `frozen_sha` est sa tête gelée est classé `in_packet` (niveau 0) : ce
+    n'est pas une attente `qa_merge`. Un état de porteur absent ne prouve
+    rien et laisse la ligne ; un porteur terminé ou composé sur une autre
+    tête la laisse revenir."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
     # la déclaration d'attente externe d'un hold.
@@ -1179,6 +1217,16 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if devices is None else dict(devices)
     items = [dict(row) for row in items or ()]
     by_id = {int(row["id"]): row for row in items}
+    #: #7435 : les compositions de la fenêtre, par lot. Le porteur et son
+    #: état viennent de `_PACKETS_SQL` : un membre d'un porteur non terminé à
+    #: la même tête gelée est déjà dans le paquet, pas en attente.
+    packets_by_lot: dict[int, list[dict]] = {}
+    for packet in packets or ():
+        try:
+            packets_by_lot.setdefault(int(packet["work_item_id"]),
+                                      []).append(dict(packet))
+        except (KeyError, TypeError, ValueError):
+            continue
     # #6215 : le lot de découpage d'un projet épuisé, pour reconnaître un hold
     # que la note d'épuisement couvre (`roadmap_waits`, hors --check).
     roadmap_by_lot = {
@@ -1418,6 +1466,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 "frozen_ts": float(freeze.get("at_ts") or 0.0),
                 "frozen": _iso(freeze.get("at_ts")),
                 "sha": str(freeze.get("sha") or "")[:12] or None,
+                #: #7435 : la tête gelée complète, pour comparer au
+                #: `frozen_sha` enregistré par la composition du paquet.
+                "frozen_sha": str(freeze.get("sha") or "") or None,
                 "age_s": age, "pending_reviewers": [p["name"] for p in pending],
                 "pending_paused": pending_paused,
                 "blocked_verdict": bool(blocked),
@@ -1660,6 +1711,16 @@ def build(*, items: Iterable[Mapping[str, Any]],
         else:
             if row.get("depends_on") or row.get("blocking_dependencies"):
                 continue                # l'attente est celle du prérequis
+            # #7435 : un lot déjà membre d'un porteur non terminé à sa tête
+            # gelée n'attend pas le paquet — il y est (témoin #7374, #7063,
+            # #7150, #7375 dans le paquet 634 le 14/11 à 23:15Z). Classe
+            # `in_packet` de niveau 0 : visible sur la ligne `qa`, jamais une
+            # attente lente ni une sortie 2. Un porteur terminé ou composé sur
+            # une autre tête ne prouve rien et laisse la ligne revenir.
+            member = _open_packet_member(row, packets_by_lot)
+            if member is not None:
+                row["in_packet"] = int(member["package_id"])
+                continue
             # #6423 : un réveil armé ou une fenêtre d'observation, non échus,
             # sont des attentes voulues et datées : le lot n'est pas encore
             # « en attente du paquet » et rien n'est actionnable avant
@@ -1988,6 +2049,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
     totals = {
         "lots": len(by_id),
         "qa": len(qa),
+        #: #7435 : membres d'un porteur non terminé à leur tête gelée,
+        #: classés niveau 0 (aucune attente, aucune sortie 2).
+        "in_packet": len([row for row in qa if row.get("in_packet")]),
         "blocked_reviews": len(blocked_reviews),
         "reviews_due": len([r for r in reviews_due if r.get("reviewer")]),
         "missing_reviewer": len([row for row in qa if row.get("missing_reviewer")]),
@@ -2699,8 +2763,11 @@ _CI_SQL = """
 #: `packet_parallel.daily_waits`. La lecture ne part **pas** des lots de
 #: `_ITEMS_SQL` : un lot fusionné en est exclu, et c'est justement un lot relu
 #: puis composé que la mesure doit compter (relecture auditeur du 28/10).
+#: #7435 : `package_state` dit si le porteur est encore ouvert ; la
+#: classification `in_packet` de `build` en dépend.
 _PACKETS_SQL = """
     SELECT m.package_id, m.work_item_id, m.frozen_sha,
+           p.state AS package_state,
            extract(epoch FROM p.created_at)::float8 AS composed_ts
       FROM work_packet_members m
       JOIN work_items p ON p.id = m.package_id
