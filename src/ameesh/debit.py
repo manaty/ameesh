@@ -1549,17 +1549,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
             # #4235 : une fenêtre d'observation est un geste de pilote, comme
             # la déclaration externe ; une échéance illisible ne devine rien et
             # laisse le hold en attente d'agent (le sens sûr).
-            # #7510 : `work wake` peut armer à part la fenêtre du pilote.
-            # Ne pas recycler un ancien réveil ni celui d'un autre auteur.
-            armed_due = None
-            if (wake and wake.get("by") and wake.get("due_ts") is not None
-                    and _norm(wake.get("by")) == _norm(hold.get("by"))
-                    and float(wake.get("since") or 0.0)
-                    >= float(hold.get("since") or 0.0)):
-                armed_due = datetime.datetime.fromtimestamp(
-                    wake["due_ts"], tz=datetime.timezone.utc
-                ).strftime("%Y-%m-%d %H:%M:%S UTC")
-            window, due_ts = planned_waits.observation_due(note, due=armed_due)
+            window, due_ts = planned_waits.observation_for_hold(hold, wake=wake)
             if window is not None:
                 if holds_authoritative and hold.get("pilot") is False:
                     # Le lot peut être couvert par la fenêtre d'un autre hold :
@@ -1570,7 +1560,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                     if due_ts is None:
                         unreadable.append(
                             "lot %d: observation window due date unreadable: %s"
-                            % (ident, window["due"]))
+                            % (ident, window["due"] or "missing deadline"))
                         window = None
                     else:
                         window["due_ts"] = due_ts
