@@ -351,37 +351,42 @@ _OBSERVATION_HOLD = re.compile(
     r"(?P<tail>.*)$", re.I | re.S)
 
 
-def observation_hold(text) -> dict | None:
+def observation_hold(text, *, due: str | None = None) -> dict | None:
     """#4235 : la déclaration d'une fenêtre d'observation, ou None.
 
     Rend `{motif, due}` : `motif` est ce qui est attendu à l'échéance (le
     texte déclaré, sans la date), `due` la date écrite (texte brut, pour
     `debit.parse_wake_due`). Une note sans motif ou sans échéance ne déclare
     rien (le sens sûr : elle reste une attente d'agent), et une graphie de
-    hold (`hold :`) n'est pas un hold."""
+    hold (`hold :`) n'est pas un hold. `due` peut porter le réveil armé à
+    part par le même pilote après ce hold (contrôlé par l'appelant, #7510)."""
     note = str(text or "").strip()
     match = _OBSERVATION_HOLD.match(note)
     if not match:
         return None
-    found = _EXTERNAL_DUE.search(note) or _EXTERNAL_WAKE.search(note)
-    if not found:
+    # Le réveil programmé date la fenêtre ; une parenthèse peut dater une
+    # décision citée dans le motif (#6675), même avec une date illisible.
+    found = (_EXTERNAL_WAKE.search(match.group("tail"))
+             or _EXTERNAL_DUE.search(match.group("tail")))
+    if due is None and not found:
         return None
     motif = _EXTERNAL_DUE.sub("", match.group("tail"))
     motif = _EXTERNAL_WAKE.sub("", motif)
     motif = _EXTERNAL_TOKEN.sub("", motif).strip(" \t:;,.—–-")
     if not motif:
         return None
-    return {"motif": motif, "due": found.group("date").strip()}
+    return {"motif": motif, "due": due if due is not None
+            else found.group("date").strip()}
 
 
-def observation_due(text) -> tuple[dict | None, float | None]:
+def observation_due(text, *, due: str | None = None) -> tuple[dict | None, float | None]:
     """#4235/#5735 : la fenêtre déclarée par la note et son échéance lue.
 
     Rend `(fenêtre, échéance)` : `(None, None)` hors fenêtre, `(fenêtre,
     None)` quand l'échéance écrite est illisible (le débit le signale, le sens
     sûr est alors une attente ordinaire). La lecture de l'échéance est celle
     du réveil (`debit.parse_wake_due`), partagée par le débit et le SLO."""
-    window = observation_hold(text)
+    window = observation_hold(text, due=due)
     if window is None:
         return None, None
     from .debit import parse_wake_due       # import tardif : pas de cycle
