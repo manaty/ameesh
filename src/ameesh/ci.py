@@ -1767,17 +1767,20 @@ class Watcher:
         if run is None:
             return  # lecture des jobs impossible : le relevé vieillit
         if run is _NO_MAP:
-            # #7431 : lecture réussie, aucun des runs lus n'a publié (paquet en
-            # cours, hors fenêtre). La carte connue reste la dernière : son
-            # relevé est rafraîchi pour que `map_stale` en dise l'âge réel au
-            # lieu d'un « âge inconnu » qui accuse la lecture.
-            if known is not None and known.get("branch") == branch \
-                    and known.get("published_ts") is not None:
-                st.ci.observe_map(repo, branch=branch, run_id=known.get("run_id"),
-                                  head_sha=known.get("head_sha"),
-                                  published_at=time.strftime(
-                                      "%Y-%m-%dT%H:%M:%SZ",
-                                      time.gmtime(float(known["published_ts"]))))
+            # #7431/#7432 : lecture réussie, aucun des runs lus n'a publié
+            # (paquet en cours, hors fenêtre). La carte connue reste la
+            # dernière : son relevé est rafraîchi pour que `map_stale` en dise
+            # l'âge réel au lieu d'un « âge inconnu » qui accuse la lecture.
+            # Sans date connue (aucune carte jamais publiée), la ligne est
+            # re-observée telle quelle, sans inventer de date : l'alerte dit
+            # alors « aucune exécution réussie » plutôt qu'un âge inconnu.
+            if known is not None and known.get("branch") == branch:
+                published = known.get("published_ts")
+                st.ci.observe_map(
+                    repo, branch=branch, run_id=known.get("run_id"),
+                    head_sha=known.get("head_sha"),
+                    published_at=None if published is None else time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(published))))
             return
         st.ci.observe_map(repo, branch=branch, run_id=run.get("id"),
                           head_sha=run.get("head_sha"),
