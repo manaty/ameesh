@@ -197,13 +197,19 @@ class PacketTest(unittest.TestCase):
             self.assertEqual(self.execute.call_count, before + 1)
 
     def test_unavailable_canon_or_heavy_wrapper_does_not_consume_real_services(self):
-        with mock.patch.object(auto, 'contract_attestation_context', side_effect=ValueError('no canon')):
-            report = self.run_pass()
-        self.assertIsNone(report.evidence)
+        from ameesh import packet_snapshot
+        from ameesh.db import DbError
+        for error in (ValueError('no canon'), packet_snapshot.SnapshotError('offline'),
+                      DbError('offline')):
+            with self.subTest(error=type(error).__name__), \
+                 mock.patch.object(auto, 'contract_attestation_context',
+                                   side_effect=error):
+                report = self.run_pass()
+                self.assertIsNone(report.evidence)
         with mock.patch.object(auto.shutil, 'which', return_value=None):
             report = self.run_pass()
         self.assertTrue(report.run.inconclusive)
-        self.assertEqual(self.execute.call_count, 1)
+        self.assertEqual(self.execute.call_count, 3)
 
     def test_existing_json_storage_receives_the_carrier_report(self):
         report = self.run_pass()

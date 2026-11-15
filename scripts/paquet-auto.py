@@ -3337,7 +3337,7 @@ def prepublication_contracts(worktree: Path, *, base: str,
         modules = contract_modules(worktree, base=base,
                                    timeout=max(0.1, end - time.monotonic()))
         from datetime import datetime, timezone
-        from ameesh import prevalidation
+        from ameesh import db as ameesh_db, packet_snapshot, prevalidation
         try:
             from ameesh.canon import GitDeadline
             try:
@@ -3355,7 +3355,10 @@ def prepublication_contracts(worktree: Path, *, base: str,
                     now=datetime.now(timezone.utc), max_age_seconds=max_age)
             print("attestation contrats : " + ("réutilisée" if cached else ", ".join(causes)),
                   flush=True)
-        except (OSError, ValueError, PaquetAutoError, SystemExit) as exc:
+        except (OSError, ValueError, PaquetAutoError, SystemExit,
+                packet_snapshot.SnapshotError, ameesh_db.DbError) as exc:
+            # The attestation is an optimization: an unreadable snapshot only
+            # disables reuse, it never blocks the composition.
             context = None
             print("attestation contrats indisponible : " + str(exc), flush=True)
         remaining = int(end - time.monotonic())

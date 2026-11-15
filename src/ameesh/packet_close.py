@@ -238,16 +238,25 @@ def units(repo: str, target: str, gaps: list | None = None, *, db=None
         from . import packet_snapshot
         repository = packet_snapshot.repository_name(repo)
         if repository:
-            receipts = storage.of(db).work.packet_snapshots(repository=repository)
+            # One target and one query for the whole cutoff: a head registered
+            # for two targets must not nominate units twice, and the rows just
+            # read are validated in place instead of re-queried per receipt.
+            # The ancestry listing is also read once for the whole cutoff.
+            receipts = storage.of(db).work.packet_snapshots(
+                repository=repository, target=packet_snapshot.target_name(target))
+            landed = set()
+            if receipts:
+                try:
+                    landed = set((plan_git._out(repo, "rev-list", target)
+                                  or "").split())
+                except plan_git.GitError:
+                    landed = set()
             for receipt in receipts:
                 # Membership alone proves no landing. Only receipts whose exact
                 # heads are ancestors of this cutoff can nominate units.
-                if plan_git._git(repo, "merge-base", "--is-ancestor",
-                                 receipt["head_sha"], target).returncode != 0:
+                if receipt["head_sha"] not in landed:
                     continue
-                exact = packet_snapshot.exact(db, repository=repository,
-                    target=receipt["target"], package_id=receipt["package_id"],
-                    branch=receipt["branch"], head=receipt["head_sha"])
+                exact = packet_snapshot.validate(receipt)
                 for unit in exact["payload"]["units"]:
                     lots.setdefault(int(unit["work_item_id"]), []).append({
                         "manifest": "packet-snapshot:%d" % exact["id"],
