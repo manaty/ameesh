@@ -33,7 +33,9 @@ Idempotence: the designation is tied to the **`frozen` milestone** (its
 identifier and its exact SHA), not to the lot. The same freeze replayed returns
 the already recorded designation without sending a second mail; a new freeze
 (new milestone, new SHA) is another object, hence a new designation — the old
-one no longer counts. A designation is **final** for its freeze; a waiting
+one no longer counts. Its available, eligible reviewers have priority over new
+candidates (#7442), independently from whether verdict carry is admissible.
+A designation is **final** for its freeze; a waiting
 state is a **retryable** marker (one notification per freeze, the designation
 replaces it if capacity or evidence comes back). The `Port` refuses to write
 for a freeze that is no longer the latest: no return to an old head.
@@ -836,7 +838,8 @@ def _advance_of(candidate, pace: Mapping) -> float:
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
            families, already: Iterable = (), fixers: Iterable = (),
            hypothetical: Iterable = (),
-           advances: Optional[Mapping] = None, automatic: Iterable = ()) -> dict:
+           advances: Optional[Mapping] = None, automatic: Iterable = (),
+           preferred: Iterable = ()) -> dict:
     """Chooses `required` (1 or 2) independent reviewers, by plan pace then load.
 
     - each reviewer's family differs from that of **every** author, and for two
@@ -872,6 +875,11 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
       ones. They count like the manual seats, never twice (a name or family
       already covered by a manual seat is skipped), and they stay automatic:
       a new freeze retires them as today;
+    - `preferred` names the previous freeze's automatic seats (#7442). Only
+      current eligible candidates can retain a seat: manual seats and current
+      automatic seats win, and author/corrector exclusions, live family and
+      availability still apply. Within the remaining seats this preference
+      precedes pace and load. It carries no verdict;
     - `fixers` names the designated reviewers whose small first-round
       correction is an authored commit of the head (#2739/#2888). Their family
       is forbidden like any author's family; their exact name is excluded too,
@@ -999,6 +1007,14 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     # pace, so the load and the name decide. A model-scoped value is selected
     # by the candidate's own model.
     pace = _normalise_advances(advances)
+    # #7442 : a previous seat wins over pace/load only while it is still a
+    # current, eligible candidate. This preserves no verdict and bypasses no
+    # availability, author, corrector, project or family guard.
+    preferred_order = {str(name): index for index, name in enumerate(preferred or ())}
+
+    def order(candidate):
+        return (preferred_order.get(candidate.name, len(preferred_order)),
+                _advance_of(candidate, pace), candidate.load, candidate.name)
     # a single candidate per family: the applicable pace first (cx3 B/P1: a
     # Fable bucket must not make a less-loaded Fable agent hide a further
     # behind Opus agent of the same family), then the least loaded, then the
@@ -1007,14 +1023,11 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     for candidate in eligible:
         family = candidate.family.strip().lower()
         current = best.get(family)
-        if current is None or ((_advance_of(candidate, pace), candidate.load,
-                                candidate.name)
-                               < (_advance_of(current, pace), current.load,
-                                  current.name)):
+        if current is None or order(candidate) < order(current):
             best[family] = candidate
     ordered = [best[family] for family in sorted(best)]
     # pace first, then load, then name; a family absent from `pace` is neutral
-    ordered.sort(key=lambda c: (_advance_of(c, pace), c.load, c.name))
+    ordered.sort(key=order)
     chosen = ordered[:remaining]
     reviewers = [dict(row) for row in kept]
     reviewers.extend({"name": c.name, "family": c.family} for c in chosen)
@@ -1131,7 +1144,8 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      risk: str = "", policy_ref: str = "",
                      eligible_families: Optional[int] = None,
                      correction: Optional[Mapping] = None,
-                     sql_migration: bool = False) -> str:
+                     sql_migration: bool = False,
+                     previous_review: Optional[Mapping] = None) -> str:
     """The mail that hands the reviewer the exact head and its place.
 
     The SHA is written in full, with its `frozen` milestone: the verdict will
@@ -1174,6 +1188,31 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      % (base[:12], sha[:12], risk or "unknown class"))
     else:
         lines.append("- To review: head %s (%s)." % (sha[:12], risk or "unknown class"))
+    context = previous_review or {}
+    prior = context.get("freeze") or {}
+    prior_sha = str(prior.get("sha") or "")
+    reviewer_name = str((reviewer or {}).get("name") or "")
+    returning = reviewer_name in names_of(context.get("reviewers") or ())
+    reviewed = reviewer_name in set(context.get("reviewed") or ())
+    if prior_sha and not _same_freeze(prior_sha, sha):
+        lines += [
+            "- Previous freeze: #%s, head %s." % (prior.get("id"), prior_sha),
+            "- Changes since that freeze: `git diff %s..%s`." % (prior_sha[:12], sha[:12]),
+            ("- Your seat is kept; review this delta and its effects on the previously "
+             "reviewed content. A new verdict on the exact head is still due."
+             if returning and reviewed else
+             "- Your seat is kept, but no prior verdict of yours is recorded: review "
+             "the full diff above; the delta is context."
+             if returning else
+             "- You are new to this seat: review the full diff above; the delta is context."),
+        ]
+        for finding in context.get("blocked") or ():
+            lines.append("- Previous B #%s by %s, to verify against the delta: %s" % (
+                finding.get("id"), finding.get("actor"),
+                " ".join(str(finding.get("note") or "(no detail recorded)").split())[:1200]))
+    if context.get("note"):
+        lines += ["", "Author freeze note (included here; no separate review request is needed):",
+                  str(context["note"]).strip()]
     if policy_ref:
         lines.append("- Review policy: %s (two opinions for SQL, security or prod)."
                      % policy_ref)
@@ -1642,6 +1681,13 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         out = dict(existing)
         out["replayed"] = True
         return out
+    # #7442 : seat continuity is independent of verdict carry (#2487).
+    # Older injected ports have no history reader and keep their old behavior.
+    history_reader = getattr(port, "previous_review", None)
+    context = history_reader(lot, freeze["id"]) if callable(history_reader) else {}
+    context = context or {}
+    preferred = [str(row.get("name") or "")
+                 for row in context.get("reviewers") or ()]
     # #3596: a retry of the same freeze keeps the automatic seats it already
     # named. They count as seats (never re-mailed), so only the missing ones
     # are selected — and a waiting state that gains no seat stays replayable.
@@ -1664,7 +1710,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     else:
         selection = select(required=required, authors=authors, candidates=candidates,
                            families=families, already=already, fixers=fixers,
-                           advances=advances, automatic=previous)
+                           advances=advances, automatic=previous, preferred=preferred)
     # #4679 B/P2 : un reçu de correctif introuvable **sans rattachement de lot**
     # ne prouve rien sur cette tête. Il n'entre ni dans `fixers` ni dans la
     # porte ; le gel le dit, pour que l'objet absent ne disparaisse pas en
@@ -1747,7 +1793,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                                      policy_ref=policy_ref,
                                      eligible_families=eligible_families,
                                      correction=correction,
-                                     sql_migration=migration),
+                                     sql_migration=migration, previous_review=context),
         })
     for index, reviewer in enumerate(selection.get("reviewers") or ()):
         if str(reviewer.get("name") or "") in previous_names:
@@ -1773,7 +1819,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                                      policy_ref=policy_ref,
                                      eligible_families=eligible_families,
                                      correction=correction,
-                                     sql_migration=migration),
+                                     sql_migration=migration, previous_review=context),
         })
     # #6365 : la marque garde le début exact du delta lu (`merge-base` de la
     # cible rafraîchie et de la tête) ; la porte relit la même plage sans

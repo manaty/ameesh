@@ -92,3 +92,24 @@ phase and the number of blocked verdicts can be read in `ameesh work list`
 
 See [Work lifecycle](../concepts/work-lifecycle.md) for the distinction between
 core states and development milestones.
+
+## Re-freezing a corrected lot
+
+A new freeze keeps its previous automatic reviewers while they remain
+available and eligible on the current head. Their current family, the authors
+and correctors, and the manual seats still determine eligibility. Load or plan
+pace alone does not replace a reviewer who already knows the lot. This keeps
+a seat, not an opinion: a verdict on the new exact head is still required
+unless the existing verdict-carry checks independently prove it reusable.
+
+Put the correction summary and targeted-test evidence in the freeze note:
+
+```bash
+ameesh work milestone 42 frozen --sha <full-commit> --note 'B #123 corrected: boundary fixed; targeted tests green.'
+```
+
+The automatic designation includes that note, the previous head, its diff to
+the new head, and the previous blocking findings to verify. This is the review
+request; the author does not need to send a second “ready, review again” mail.
+A returning reviewer reads the delta and its effects on the previous content;
+a replacement reviewer receives the full review diff as well.

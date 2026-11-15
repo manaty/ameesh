@@ -454,6 +454,39 @@ class PgPort:
         a second mail. A waiting mark is read without the `retired` seats."""
         return self._unretired(self._recorded_in(self.db, int(lot), int(freeze_id)))
 
+    def previous_review(self, lot: int, freeze_id: int) -> dict:
+        """#7442 : previous automatic seats and the author's current freeze note.
+
+        The effective mark (selection or carry, last in journal order) is the
+        source. A seat removed from the lot's column is not resurrected. Live
+        availability and independence are checked by the pure selection on the
+        current candidates, never inferred from this historical family.
+        """
+        from . import review_designation_activation as activation
+        ops = storage.of(self.db).work
+        rows = ops.milestones(int(lot), MILESTONES) or []
+        current = next((row for row in rows if int(row.get("id") or 0) == freeze_id), {})
+        item = ops.get(int(lot)) or {}
+        prior = activation._previous_freeze(self.db, lot, freeze_id)
+        marked = (activation._effective_mark(
+            self.db, lot, int(prior["id"]), since_ts=float(prior.get("at_ts") or 0.0))
+            if prior else None)
+        return {
+            "freeze": dict(prior or {}) if marked else {},
+            "reviewers": activation._previous_designees(
+                self.db, lot, freeze_id, item.get("reviewers") or ()),
+            "reviewed": [str(row.get("actor") or "") for row in rows
+                         if prior and row.get("kind") == "verdict"
+                         and int(row.get("id") or 0) < freeze_id
+                         and activation.rd._same_freeze(row.get("sha"), prior.get("sha"))],
+            "blocked": [dict(row) for row in reversed(rows)
+                        if prior and row.get("kind") == "verdict"
+                        and row.get("verdict") == "blocked"
+                        and int(row.get("id") or 0) < freeze_id
+                        and activation.rd._same_freeze(row.get("sha"), prior.get("sha"))],
+            "note": str(current.get("note") or ""),
+        }
+
     def _unretired(self, shape: Optional[dict]) -> Optional[dict]:
         """A waiting designation without the seats the pilot removed (#3661).
 

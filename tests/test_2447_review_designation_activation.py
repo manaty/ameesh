@@ -459,7 +459,11 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(out["state"], rd.DESIGNATED, out)
         self.assertEqual(out["required"], 1)
         self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"])
-        # stale/absent readings are neutral: the load decides again
+        # Stale/absent readings are neutral for a vacant seat: load decides.
+        # #7442 keeps an eligible previous seat ahead of pace/load, so remove
+        # it explicitly here to keep this witness about the load fallback.
+        self.db.execute("UPDATE work_items SET reviewers = '{}' WHERE id = %s",
+                        (self.lot,))
         self.db.execute("DELETE FROM quota_gauge_readings")
         self.repo.write("docs/guide.md", "another lot\n")
         self.frozen = self.repo.commit("another lot")
