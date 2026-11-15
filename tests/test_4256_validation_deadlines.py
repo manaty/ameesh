@@ -126,6 +126,29 @@ class ValidationTest(PgTestCase):
         self.assertIn("[ESCALATED]", decisions.format_view(current, self.now + 62)[0])
         self.assertIn("(escalated)", decisions.describe(current))
 
+    def test_owner_without_substitute_is_reminded_once(self):
+        from ameesh import exploitation
+        self.cfg.project_planning["acme"]["validations"]["domains"] = {}
+        view = decisions.ask(self.cfg, self.db, requester="requester",
+                             lot=str(self.lot["id"]), question="Owner decision?",
+                             due_ts=self.now + 60, now=self.now)
+        self.assertEqual(vd.sweep(self.cfg, self.db, now=self.now + 61),
+                         [{"id": view["id"], "status": "needs_substitute"}])
+        self.assertEqual(vd.sweep(self.cfg, self.db, now=self.now + 62), [])
+        current = decisions.get(self.db, view["id"], self.now + 62)
+        self.assertFalse(decisions.escalated(current))
+        body = storage.of(self.db).decisions.get(view["id"])["body"]
+        for text in (body, decisions.describe(current),
+                     decisions.format_view(current, self.now + 62)[0]):
+            self.assertIn("no substitute declared, owner reminded", text)
+            self.assertNotIn("ESCALATED", text)
+        alerts = exploitation._decisions_pending(self.cfg, self.db, [], self.now + 62)
+        overdue = [a for a in alerts if a["type"] == "decision_overdue"]
+        self.assertEqual(len(overdue), 1)
+        self.assertIn("no substitute declared, owner reminded", str(overdue[0]))
+        self.assertNotIn("escalated to the substitute", str(overdue[0]))
+        self.answer(current, human="human:owner", now=self.now + 63)
+
     def test_withdrawal_closes_each_journalled_request(self):
         """#4542 N2: a withdrawal is the outcome of the initial and the
         substitute's requests, once even on a replay."""

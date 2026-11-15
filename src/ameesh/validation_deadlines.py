@@ -121,7 +121,9 @@ def sweep(cfg, db, *, now=None):
                 needs_substitute = len(route["nodes"]) < 2
                 decision["validation"]["timezone"] = substitute["timezone"]
                 decision["validation"]["due_local"] = stamp(decision["due_ts"], substitute["timezone"])
-                decision["validation"]["status"] = "escalated"
+                status = ("needs_substitute" if substitute["human"] == initial["human"]
+                          else "escalated")
+                decision["validation"]["status"] = status
                 if needs_substitute:
                     decision["question"] += "\nPlease name an authorized substitute."
                 body = decisions.request_text(decision, requester=row["sender"],
@@ -138,7 +140,7 @@ def sweep(cfg, db, *, now=None):
                                               "due_ts": decision["due_ts"],
                                               "escalated_to": substitute["human"],
                                               "needs_substitute": needs_substitute})
-                changed.append({"id": view["id"], "status": "escalated"})
+                changed.append({"id": view["id"], "status": status})
         except Exception as exc:
             # Keep this decision retryable; isolate its rollback and continue.
             # Exception strings can contain private payload/routing details.
