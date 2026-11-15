@@ -45,6 +45,7 @@
         | unset [--per-hour] [--per-day] [--agent A]
         mesh budget caps, stored in the database, reloaded live (L70);
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
+  ameesh psql-nocturne dispatch       daily bounded psql workflow dispatch (#7483);
   ameesh carte dispatch [--repo R] [--project P] [--branch B] [--manuel]
         [--dry-run] [--json]
         dispatch carte.yml (planifie=true) to measure the impact map in its
@@ -552,6 +553,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "psql-nocturne":
+        from . import psql_nocturne
+        return psql_nocturne.main(rest)
     if command == "carte":
         # #6777 : dispatch de la mesure de la carte dans sa fenêtre
         from . import carte

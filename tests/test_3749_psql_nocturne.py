@@ -64,7 +64,7 @@ class PlanTest(unittest.TestCase):
         nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
         with mock.patch.object(plan, "classify", return_value=dict(self.state)), \
                 mock.patch.object(plan, "nature", return_value=nature):
-            return plan.make_plan(event, {}, NOW, **kw)
+            return plan.make_plan(event, {}, NOW, contract_policy=None, **kw)
 
     @staticmethod
     def _ran(p, driver):
@@ -258,11 +258,10 @@ class WorkflowTest(unittest.TestCase):
     def test_le_nocturne_appelle_tests_avec_psql_full(self):
         doc = _workflow("psql-nocturne.yml")
         on = _on(doc)
-        self.assertIn("schedule", on)
-        self.assertTrue(on["schedule"][0]["cron"])
+        self.assertNotIn("schedule", on)
         self.assertIn("workflow_dispatch", on)
         jobs = doc["jobs"]
-        self.assertEqual(list(jobs), ["suite"])
+        self.assertEqual(list(jobs), ["fenetre", "suite"])
         self.assertEqual(jobs["suite"]["uses"], "./.github/workflows/tests.yml")
         self.assertIs(jobs["suite"]["with"]["psql-full"], True)
         self.assertFalse(doc["concurrency"]["cancel-in-progress"])

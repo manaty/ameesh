@@ -979,6 +979,8 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # #7483: leave pool capacity for packets during the nocturne.
+      max-parallel: ${{ inputs.psql-full && 4 || 16 }}
       matrix:
         # sur une PR de lot (L1211) : les modules « pilote » parmi les
         # impactés et le contrat, plus la liste « always » déclenchée (#749) ;
@@ -1012,6 +1014,12 @@ jobs:
     steps:
       - *debut
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      # Recheck after runner allocation: a late part is explicitly incomplete.
+      - name: admission de la part nocturne (#7483)
+        if: inputs.psql-full
+        env:
+          PYTHONPATH: src
+        run: python3 -m ameesh psql-nocturne guard
       - *disque_rapport
       - *node_bridge
       - *node_witness
