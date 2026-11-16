@@ -3,6 +3,10 @@
 -- Compare les droits EFFECTIFS (PUBLIC et appartenances compris) de la
 -- connexion du bureau à la liste exacte de _bureau-droits.sql ; aucune
 -- révocation ici. Administrateur, ON_ERROR_STOP, search_path du mesh.
+-- Les deux vues de #7565 sont auditées ci-dessous par leur requête exacte :
+-- attestations staging.attested et preuves publiques de décisions approuvées
+-- consommées ; aucun accès élargi aux tables sources. La garde 0584 fixe la
+-- date des traces staging.catchup directes du bureau à l'heure du serveur.
 \set ON_ERROR_STOP on
 \if :{?role}
 \else
