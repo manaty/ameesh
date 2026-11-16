@@ -359,3 +359,27 @@ class _Fixture:
 
 class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
     """Les témoins #7252, sur la lecture et la sélection du gel."""
+
+    def test_strict_reading_ignores_explicit_checksums(self):
+        for label in ("checksum", "sha256", "SHA256"):
+            with self.subTest(label=label):
+                self.repo.write("src/ameesh/mail.py", label + "\n")
+                head = self.repo.commit(
+                    "author: SQL %s deadbeef1234" % label, agent="author")
+                self._receipt("author", "deepseek", [head])
+                with mock.patch.object(review_authors, "_forge_commit") as forge:
+                    (_authors, unknown, correctors), _freeze = self._reading(
+                        head, strict=True)
+                self.assertEqual(unknown, [])
+                self.assertEqual(correctors, [])
+                forge.assert_not_called()
+
+    def test_checksum_does_not_hide_a_real_commit_citation(self):
+        fix, head = self._rewrite()
+        self.repo.git("commit", "--amend", "-m",
+                      "author: checksum deadbeef1234; correctif %s" % fix[:12])
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        (_authors, unknown, correctors), _freeze = self._reading(head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
