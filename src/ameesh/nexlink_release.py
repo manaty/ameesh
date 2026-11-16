@@ -927,17 +927,27 @@ def drop_abandoned(project, slot, save):
     """B1 cx3 (gel 34030): the refused cutoff pushed its integration ref but
     no tag, so the next cutoff reuses the version. Delete that ref only while
     it still holds the abandoned candidate (lease); a ref moved by someone
-    else stays, and `ensure_ref` refuses it as before."""
+    else stays, and `ensure_ref` refuses it as before.
+
+    Returns the outcome so the pilot's gesture reports the truth: `dropped`
+    (the ref named the abandoned candidate and was deleted), `moved` (another
+    commit now holds it: nothing was deleted) or `absent` (no candidate was
+    recorded, or the ref is already gone). The old callers ignore the value."""
     stale = slot.get("abandoned_integration")
     if not stale:
-        return
+        return "absent"
     ref = "refs/heads/" + stale["ref"]
     found = rc._git(project.repo, "ls-remote", project.remote, ref, check=True).stdout.split()
+    outcome = "absent"
     if found and found[0] == stale["sha"]:
         rc._git(project.repo, "push", "--force-with-lease=%s:%s" % (ref, stale["sha"]),
                 project.remote, ":" + ref, check=True)
+        outcome = "dropped"
+    elif found:
+        outcome = "moved"
     slot.pop("abandoned_integration")
     save()
+    return outcome
 
 
 def _preflight_refused(cfg, db, project, slot, pending, exc, save, now):
@@ -976,6 +986,196 @@ def _preflight_refused(cfg, db, project, slot, pending, exc, save, now):
     # refusal message above is the one and only report of this error.
     refused.already_reported = True
     raise refused from exc
+
+
+#: Conclusions that prove a dispatched final-tree part is red. The engine
+#: re-reads the same run at every tick, so a still-running, cancelled,
+#: timed-out, skipped or otherwise non-conclusive part is not proof (canon
+#: §3): the pilot never throws the candidate away on it.
+CI_FAILURES = frozenset({"failure"})
+
+
+def failing_ci_parts(pending):
+    """The final-tree parts whose last observed run is conclusively red.
+
+    The durable `dispatches` ledger is the engine's own proof: workflow,
+    exact run id, URL and conclusion. A part without a completed `failure`
+    run is not abandoned on, even if the engine cannot get past it. Only a
+    part still in the planned `ci_parts` can hold the cutoff: a stale ledger
+    entry for a workflow the plan no longer requires is not a reason to
+    abandon."""
+    parts = {str(part.get("workflow")) for part in pending.get("ci_parts") or ()
+             if isinstance(part, dict)}
+    if not parts:
+        return []
+    failures = []
+    for key, attempt in sorted((pending.get("dispatches") or {}).items()):
+        if not str(key).startswith("ci/") or not isinstance(attempt, dict):
+            continue
+        workflow = str(key)[len("ci/"):]
+        if workflow not in parts:
+            continue
+        run = attempt.get("run")
+        if not isinstance(run, dict) or str(run.get("status") or "") != "completed":
+            continue
+        conclusion = str(run.get("conclusion") or "")
+        if conclusion not in CI_FAILURES:
+            continue
+        failures.append(dict(workflow=workflow, conclusion=conclusion,
+                             run=run.get("databaseId") or run.get("id"),
+                             url=str(run.get("url") or "")))
+    return failures
+
+
+def placed_tag(project, pending):
+    """The `release-*` version already naming the candidate, or ''.
+
+    Remote tags are authoritative across release hosts: the candidate's own
+    tag, or any tag on its exact commit, proves the tree is published, so a
+    red-CI abandon would contradict a durable release."""
+    known = release_tags(project)
+    version = str(pending.get("version") or "")
+    if version and version in known:
+        return version
+    sha = str(pending.get("sha") or "")
+    for value, commit in sorted(known.items()):
+        if sha and commit == sha:
+            return value
+    return ""
+
+
+def staging_in_progress(pending):
+    """Why staging owns this cutoff, or '' when it was never handed over."""
+    if pending.get("handoff"):
+        return "a staging handoff is open"
+    if pending.get("staging_attestation"):
+        return "a staging attestation was recorded"
+    if pending.get("handoff_skipped"):
+        return "staging was closed by a pilot skip"
+    if pending.get("migration_attestation"):
+        return "staging migrations were attested"
+    for key in sorted((pending.get("dispatches") or {})):
+        if str(key).startswith("staging/"):
+            return "a staging dispatch was already started"
+    return ""
+
+
+def abandon(cfg, db, project, *, now, reason, actor):
+    """#7567: the pilot's coded way out of a frozen cutoff stuck on red CI.
+
+    The engine re-reads the same failed part at every tick and never rewrites
+    a release branch: without this gesture the only exit was editing the
+    release state by hand. The refusals are the safety of the gesture: no
+    frozen candidate, no *conclusive* red part (a running, cancelled or
+    timed-out part is not proof), a tag already published, or a staging
+    handover in progress.
+
+    On success the cutoff closes exactly like `_preflight_refused`: the slot
+    records `refused-ci` at the candidate's cutoff, the integration ref is
+    dropped under lease, `pending_nexlink` is removed, and an
+    `abandoned_pending` trace survives for the operator. A durable report is
+    written and the release recipients are told. A subsequent
+    `ameesh release cutoff --force` re-cuts the slot from the fixed base;
+    nothing here tags, branches or stages anything.
+    """
+    text = " ".join(str(reason or "").split())
+    if not text:
+        raise rc.ReleaseError("release abandon requires --reason")
+    if str(getattr(project, "model", "")) != "nexlink":
+        raise rc.ReleaseError("release abandon applies to the nexlink model only")
+    with rc._locked(os.path.join(cfg.state_dir, "release", "release.lock")):
+        state = rc.load_state(cfg)
+        slot = rc.project_state(state, project.name)
+        pending = slot.get("pending_nexlink")
+        if not isinstance(pending, dict):
+            raise rc.ReleaseError("no frozen Nexlink cutoff to abandon")
+        version = str(pending.get("version") or "")
+        if not (version and pending.get("sha") and pending.get("integration")
+                and pending.get("cutoff_at") is not None):
+            raise rc.ReleaseError(
+                "pending_nexlink is incomplete: refusing to abandon it")
+        tagged = placed_tag(project, pending)
+        if tagged:
+            raise rc.ReleaseError(
+                "Nexlink %s cannot be abandoned: release-%s is already tagged"
+                % (version, tagged))
+        staging = staging_in_progress(pending)
+        if staging:
+            raise rc.ReleaseError(
+                "Nexlink %s cannot be abandoned: %s" % (version, staging))
+        failures = failing_ci_parts(pending)
+        if not failures:
+            raise rc.ReleaseError(
+                "Nexlink %s cannot be abandoned: no CI part is conclusively red "
+                "(a running, cancelled, timed-out or skipped part is not proof)"
+                % version)
+        red = ", ".join(
+            "ci/%s run %s%s" % (row["workflow"], row["run"] or "?",
+                                " (%s)" % row["url"] if row["url"] else "")
+            for row in failures)
+        trace = dict(version=version, tag=pending.get("tag"), sha=pending["sha"],
+                     base=pending.get("base"), integration=pending.get("integration"),
+                     cutoff_at=pending.get("cutoff_at"), label=pending.get("label"),
+                     red=red, failures=failures, by=actor, why=text, at=now)
+        slot.update(last_cutoff=pending["cutoff_at"], last_result="refused-ci",
+                    last_label=pending.get("label"),
+                    abandoned_integration=dict(ref=pending["integration"],
+                                               sha=pending["sha"]))
+        slot["abandoned_pending"] = trace
+        slot.pop("pending_nexlink")
+        save = lambda: rc.save_state(cfg, state)
+        save()
+        dropped = ""
+        moved = False
+        try:
+            moved = drop_abandoned(project, slot, save) == "moved"
+        except rc.ReleaseError as exc:  # retried before the next candidate
+            dropped = str(exc) or type(exc).__name__
+            print("release: %s" % dropped)
+        if dropped:
+            ref_note = " (retrait à reprendre : %s)" % dropped
+        elif moved:
+            ref_note = " (déplacée par un tiers : `ensure_ref` la refusera)"
+        else:
+            ref_note = ""
+        report = {
+            "schema": rc.SCHEMA, "result": "refused-ci", "project": project.name,
+            "cutoff_at": float(pending["cutoff_at"]), "label": pending.get("label"),
+            "completed_at": now, "version": version, "tag": None,
+            "release_sha": pending["sha"], "base": pending.get("base"),
+            "actor": actor, "reason": text, "failures": failures,
+            "abandoned_pending": trace, "message": "cutoff abandoned by %s: %s"
+            % (actor, red), "host": str(getattr(cfg, "host", "") or ""),
+            "state_path": rc.state_path(cfg),
+        }
+        try:
+            report["report_path"] = rc.write_report(cfg, project, report)
+        except OSError as exc:
+            print("release: abandon report not written: %s" % exc, file=sys.stderr)
+        body = (
+            "Nexlink %s : coupure ABANDONNÉE par %s — aucune part de CI ne peut "
+            "plus la sauver.\n"
+            "Parts concluantes en échec : %s.\n"
+            "Raison : %s\n"
+            "Aucun tag, aucune branche release, aucun staging ni déploiement n'a "
+            "été produit pour ce candidat (sha %s, base %s, créneau %s).\n"
+            "La branche %s est retirée sous lease%s.\n"
+            "Corriger la cause, puis relancer : ameesh release cutoff --project %s "
+            "--force.\n"
+            "Trace durable : %s."
+            % (version, actor, red, text, pending["sha"][:12],
+               (pending.get("base") or "?")[:12], pending.get("label") or "?",
+               pending.get("integration"), ref_note,
+               project.name, report.get("report_path") or rc.state_path(cfg)))
+        delivery = {}
+        try:
+            delivery = rc.send_report(cfg, db, project, body, report, urgent=True)
+        except Exception as exc:  # noqa: BLE001 - the durable trace is already saved
+            print("release: abandon report not sent: %s" % exc, file=sys.stderr)
+        return dict(report, integration=pending.get("integration"),
+                    integration_dropped=not dropped and not moved,
+                    integration_moved=moved, drop_error=dropped,
+                    delivery=delivery)
 
 
 def _handoff_body(pending):

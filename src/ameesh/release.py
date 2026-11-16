@@ -896,14 +896,70 @@ def _attest(cfg, args) -> int:
         db.close()
 
 
+def _abandon(cfg, args) -> int:
+    """`ameesh release abandon` (#7567): the pilot closes a red-CI cutoff.
+
+    A frozen Nexlink cutoff whose final-tree CI part is conclusively red has
+    no automatic exit: the engine re-reads the same run at every tick. This
+    gesture takes the release lock, proves the pilot through `work.corrector`
+    (a human terminal names itself with `--actor human:<id>`), then lets
+    `nexlink_release.abandon` refuse an already published tag, a staging
+    handover or a non-conclusive CI part before writing the durable trace and
+    announcing to the release recipients.
+    """
+    from . import nexlink_release, release_cutoff
+    from .db import open_db
+    db = None
+    try:
+        declared = release_cutoff.projects(cfg)
+        name = args.project or "nexlink"
+        if name not in declared:
+            raise release_cutoff.ReleaseError(
+                "project %r is not declared under release.projects" % name)
+        project = declared[name]
+        if project.model != "nexlink":
+            raise release_cutoff.ReleaseError(
+                "release abandon applies to the nexlink model only")
+        db = open_db(cfg)
+        actor = work.corrector(cfg, db, args.actor, what="release abandon",
+                               history=False)
+        report = nexlink_release.abandon(
+            cfg, db, project,
+            now=time.time() if args.now is None else float(args.now),
+            reason=args.reason, actor=actor)
+    except (work.WorkError, release_cutoff.ReleaseError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    finally:
+        if db is not None:
+            db.close()
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, default=str))
+    else:
+        print("Nexlink %s : coupure abandonnée (%s). Aucun tag, aucun staging ; "
+              "branche %s %s. Recoupe : ameesh release cutoff --project %s --force. "
+              "Trace : %s."
+              % (report["version"],
+                 ", ".join("ci/%s run %s" % (row["workflow"], row["run"] or "?")
+                           for row in report["failures"]),
+                 report.get("integration") or "?",
+                 "retirée" if report.get("integration_dropped")
+                 else ("déplacée par un tiers" if report.get("integration_moved")
+                       else "à retirer (%s)" % report.get("drop_error")),
+                 project.name, report.get("report_path") or "état local"))
+    return 0
+
+
 def run(cfg, args) -> int:
-    """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest`."""
+    """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest|abandon`."""
     from . import release_cutoff
     command = args.release_command
     if command == "catchup":
         return _catchup(cfg, args)
     if command == "attest":
         return _attest(cfg, args)
+    if command == "abandon":
+        return _abandon(cfg, args)
     if (command in ("tick", "packet-watch", "cutoff")
             or command == "staging-needed" and getattr(args, "apply", False)):
         status = _elected_tick(cfg, args)
@@ -1084,3 +1140,14 @@ def add_parser(sub, func) -> None:
     attest_p.add_argument("--actor", default=None,
                           help="--skip at a human terminal: human:<id>")
     attest_p.set_defaults(func=func)
+    abandon_p = rel.add_parser(
+        "abandon", help="#7567: the verified pilot abandons a frozen Nexlink cutoff "
+                        "whose final-tree CI part is conclusively red; no tag, no "
+                        "staging, no deployment")
+    abandon_p.add_argument("--project", default="nexlink")
+    abandon_p.add_argument("--reason", required=True)
+    abandon_p.add_argument("--actor", default=None,
+                           help="at a human terminal: human:<id>")
+    abandon_p.add_argument("--now", type=float, default=None)
+    abandon_p.add_argument("--json", action="store_true")
+    abandon_p.set_defaults(func=func)
