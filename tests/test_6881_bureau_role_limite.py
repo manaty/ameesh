@@ -15,6 +15,8 @@ et l'audit qui refuse un droit en trop.
 from __future__ import annotations
 
 import json
+import hashlib
+from pathlib import Path
 import dataclasses
 import types
 from unittest import mock
@@ -215,6 +217,39 @@ class BureauRoleLimiteTest(PgTestCase):
                 limited, project, "server", "a" * 40, {"sha": "a" * 40, "tag": "v1"},
                 "ok", "bureau")
             self.assertGreater(declared["event"], 0)
+            # Exercise the actual preflight entry point, with its own real
+            # connection and automatic proof source selection.
+            with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
+                repo = Path(directory)
+                sql = b"DROP TABLE obsolete_fixture;"
+                (repo / "migration.sql").write_bytes(sql)
+                (repo / ".ameesh").mkdir()
+                (repo / staging_migrations.POLICY_PATH).write_text(json.dumps({
+                    "schema": "ameesh-staging-migrations/1", "declarations": {
+                        "migration.sql": {"checksum": hashlib.sha256(sql).hexdigest(),
+                                          "lot": 456, "decision": identifier,
+                                          "approval_option": "a"}}}))
+                def git(*args):
+                    return subprocess.check_output(
+                        ["git", "-C", directory, "-c", "core.hooksPath=/dev/null", *args],
+                        env=self.env(), stderr=subprocess.STDOUT).decode().strip()
+                git("init", "-q")
+                git("add", ".")
+                git("-c", "user.name=fixture", "-c", "user.email=fixture@localhost",
+                    "commit", "-qm", "fixture")
+                sha = git("rev-parse", "HEAD")
+                report = staging_migrations.check_inventory(
+                    directory, sha, "ameesh", ["migration.sql"],
+                    cfg=dataclasses.replace(self.cfg, dsn=self.dsn))
+                self.assertTrue(report["allowed"], report)
+                self.assertEqual(report["files"][0]["classification"], "destructive")
+                self.db.execute("ALTER VIEW ameesh_decision_proofs RENAME TO fixture_proofs")
+                try:
+                    report = staging_migrations.check_inventory(
+                        directory, sha, "ameesh", ["migration.sql"], cfg=self.cfg)
+                    self.assertTrue(report["allowed"], report)
+                finally:
+                    self.db.execute("ALTER VIEW fixture_proofs RENAME TO ameesh_decision_proofs")
             with self.assertRaises(db_mod.DbError):
                 proofs.recent(action="decision", artifact_hash=digest, limit=20)
         finally:
