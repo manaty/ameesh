@@ -361,7 +361,7 @@ def _supersession_timestamp(value) -> float | None:
         return None
 
 
-def require_current(db, view: dict, *, reader=None) -> None:
+def require_current(db, view: dict, *, reader=None, public_only: bool = False) -> None:
     """Refuse authority replaced by a signed decision, proven from the log
     (#4991, #4995).
 
@@ -402,7 +402,7 @@ def require_current(db, view: dict, *, reader=None) -> None:
         raise DecisionError(
             "decision #%d: the logged replacement #%d is not a signed replacement: "
             "authority refused" % (identifier, replacement_id))
-    ok, why = verify_proof(db, replacement)
+    ok, why = verify_proof(db, replacement, public_only=public_only)
     if not ok:
         raise DecisionError(
             "decision #%d: the logged replacement #%d is not proven (%s): authority refused"
@@ -1055,7 +1055,7 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
             "signature_key": row.get("signature_key"), "digest": digest}
 
 
-def verify_proof(db, view: dict, *, live: bool = False) -> tuple[bool, str]:
+def verify_proof(db, view: dict, *, live: bool = False, public_only: bool = False) -> tuple[bool, str]:
     """Revérifie la preuve d'une réponse signée : approbation consommée par
     CETTE décision, empreinte recalculée, clé `owner` toujours valide,
     signature Ed25519."""
@@ -1068,7 +1068,8 @@ def verify_proof(db, view: dict, *, live: bool = False) -> tuple[bool, str]:
                            answer.get("by") or "")
     if digest != proof.get("digest"):
         return False, "the digest no longer matches the recorded answer"
-    rows = storage.of(db).approvals.recent(action=APPROVAL_ACTION, artifact_hash=digest, limit=20)
+    rows = storage.of(db).approvals.recent(
+        action=APPROVAL_ACTION, artifact_hash=digest, limit=20, proof_only=public_only)
     row = next((r for r in rows if int(r["id"]) == int(proof.get("approval_id") or 0)), None)
     if row is None:
         return False, "approval #%s not found" % proof.get("approval_id")

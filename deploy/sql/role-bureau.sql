@@ -17,7 +17,7 @@
 --   - lignes : la garde 0567 (`ameesh_limited_login_guard`) refuse toute
 --     écriture pour un autre agent ou un autre hôte, la prise d'une autre
 --     session, toute écriture du registre (son droit UPDATE ne sert qu'au
---     verrou de ligne), tout événement hors trigger ;
+--     verrou de ligne), tout événement hors trigger sauf la trace staging.catchup du bureau ;
 --   - aucun DDL (ni CREATE sur le schéma, ni propriété), aucun SECURITY
 --     DEFINER exécutable, aucune table de secrets, de clés ni d'approbation.
 -- Limite dite : la lecture du courrier n'est pas bornée au destinataire

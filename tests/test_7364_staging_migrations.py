@@ -382,6 +382,8 @@ class DecisionTests(unittest.TestCase):
              mock.patch.object(decisions,'require_current') as current, \
              mock.patch.object(decisions,'verify_proof',return_value=(True,'verified')) as proof:
             self.assertTrue(verify(42,17,'approve'))
+            current.assert_called_once_with(mock.ANY, view, public_only=False)
+            proof.assert_called_once_with(mock.ANY, view, public_only=False)
             self.assertFalse(verify(42,18,'approve'))
             self.assertFalse(verify(42,17,'reject'))
             view['project']='another'

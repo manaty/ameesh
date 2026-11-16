@@ -1,4 +1,22 @@
 {
   "schema": "ameesh-staging-migrations/1",
-  "declarations": {}
+  "declarations": {
+    "src/ameesh/migrations/0583_bureau_staging_catchup.sql": {
+      "checksum": "b9fbafe40466f30ca3b6663ee0e53f250b4c1e36d2f8bf83658c55a06d2e524a",
+      "lot": 7565,
+      "restore": "src/ameesh/migrations/rollback/0583_restore.sql"
+    }
+  },
+  "exceptions": {
+    "additive": [
+      {
+        "pattern": "create view ameesh_staging_attestations with \\(security_barrier = true\\) as select id, type, object, project, data, created_at from ameesh_events where type =\\s*",
+        "reason": "#7565: new filtered staging proof view, frozen query audited by bureau contract"
+      },
+      {
+        "pattern": "create\\ view\\ ameesh_decision_proofs\\ with\\ \\(security_barrier\\ =\\ true\\)\\ as\\ select\\ id,\\ approver,\\ action,\\ artifact_kind,\\ artifact_hash,\\ decision,\\ nonce,\\ signed_payload,\\ signature,\\ signature_key,\\ created_at,\\ expires_at,\\ consumed_at,\\ consumed_by,\\ unconsumed,\\ unexpired,\\ key_known,\\ key_live,\\ key_matches,\\ key_is_owner\\ from\\ mesh_approvals_status\\ where\\ action\\ =\\ \\ \\ and\\ artifact_kind\\ =\\ \\ \\ and\\ decision\\ =\\ \\ \\ and\\ consumed_at\\ is\\ not\\ null\\ and\\ consumed_by\\ \\~",
+        "reason": "#7565: public signature proofs of consumed decisions only, frozen query audited by bureau contract"
+      }
+    ]
+  }
 }

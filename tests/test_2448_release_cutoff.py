@@ -335,7 +335,7 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertEqual(release_cutoff.read_attestation(sha, db)["reportes"],
                          data["reportes"])
-        self.assertIn("ameesh_events", db.sql)
+        self.assertIn("ameesh_staging_attestations", db.sql)
         self.assertEqual(db.params[0], release_cutoff.STAGING_EVENT)
         self.assertEqual(db.params[2], "staging:%s" % sha)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["sha"], sha)

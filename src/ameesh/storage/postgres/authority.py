@@ -206,7 +206,7 @@ class Approvals(interface.Approvals):
         )
         return int(rows[0]["id"])
 
-    def recent(self, *, action, artifact_hash, limit) -> list[dict]:
+    def recent(self, *, action, artifact_hash, limit, proof_only=False) -> list[dict]:
         sql = """
             SELECT id, approver, action, artifact_kind, artifact_hash, decision, nonce,
                    signed_payload, signature, signature_key,
@@ -218,6 +218,8 @@ class Approvals(interface.Approvals):
               FROM mesh_approvals_status
              WHERE true
         """
+        if proof_only:
+            sql = sql.replace("FROM mesh_approvals_status", "FROM ameesh_decision_proofs")
         params: list = []
         if action:
             sql += " AND action = %s"
