@@ -1017,9 +1017,14 @@ def packets_between(repo: str, since: str, target: str, *, db=None,
                         _manifest_for(repo, sha, branch))
             parsed = parse_manifest(receipt["payload"]["manifest"] if receipt else
                                     _manifest_text(repo, sha, manifest))
-            # The merge body may omit units; the manifest composition is the
-            # complete list. Union, never prefer the shorter body (N1).
-            units = sorted(set(units) | set(parsed["included"]))
+            if receipt:
+                # #7560: exact composition is authoritative. Merge prose can
+                # cite tooling lots (auto-merge #2813) that did not ship here.
+                units = sorted({unit["work_item_id"]
+                                for unit in receipt["payload"]["units"]})
+            else:
+                # Historical packets have no structured composition receipt.
+                units = sorted(set(units) | set(parsed["included"]))
             packets.append(Packet(pr=pr, branch=branch, package=branch.split("/", 1)[-1],
                                   units=units, manifest=manifest,
                                   excluded=parsed["excluded"]))

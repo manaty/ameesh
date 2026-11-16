@@ -95,6 +95,26 @@ class ReaderTargetAndCostTests(unittest.TestCase):
         self.assertEqual([12], packets[0].units)
         self.assertEqual([], direct)
 
+    def test_release_snapshot_units_ignore_references_in_merge_body(self):
+        # #7560: the auto-merge implementation reference is not shipped work.
+        log = ('d'*40 + '\x1fMerge pull request #21 from acme/integration/paquet-x'
+               + '\x1fPaquet x — 1 unité (#12)\n\n'
+               'Merged by ameesh at the published head ' + 'a'*40
+               + ' into main (packet auto-merge, #2813).\x1e')
+        receipt = self.receipt()
+        receipt['payload']['units'].append(
+            {"work_item_id": 13, "unit_sha": "e"*40})
+        # The structured composition also supplies units missing in Markdown.
+        with patch.object(packet_snapshot, 'lookup', return_value=receipt), \
+             patch.object(release_cutoff, '_out', return_value=log), \
+             patch.object(release_cutoff, '_git', return_value=SimpleNamespace(
+                 returncode=0, stdout='a'*40)):
+            packets, direct = release_cutoff.packets_between(
+                '/unused', 'before', 'after', db=object(), target_branch='main')
+        self.assertEqual([12, 13], packets[0].units)
+        self.assertEqual('packet-snapshot:7', packets[0].manifest)
+        self.assertEqual([], direct)
+
     def test_shadow_passes_the_target_to_the_snapshot_reader(self):
         with patch.object(packet_snapshot, 'lookup',
                           return_value=self.receipt()) as lookup, \
