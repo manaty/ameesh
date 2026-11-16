@@ -5226,9 +5226,12 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
 
 #: #7252 : une citation de commit retiré dans le message de réécriture de
 #: l'auteur (7 à 40 caractères hexadécimaux). Un identifiant de B (`#40556`)
-#: n'a pas cette longueur et un jeton non-commit est écarté par la résolution.
+#: n'a pas cette longueur. Les empreintes nommées checksum/sha256 sont
+#: écartées avant toute résolution Git (#7576).
 _CITED_COMMIT = re.compile(
-    r"(?<![0-9a-fA-F])[0-9a-fA-F]{7,40}(?![0-9a-fA-F])")
+    r"\b(?:checksum|sha256)\s+[0-9a-f]+\b"
+    r"|(?P<commit>(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f]))",
+    re.IGNORECASE)
 
 #: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
 #: Le relecteur corrige dans son tour : 6 h avant l'avis couvrent un tour
@@ -5644,7 +5647,11 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             citing = citing.strip()
             if not citing or not body:
                 continue
-            tokens = _CITED_COMMIT.findall(body)
+            # #7576 : une empreinte explicitement nommée n'est pas une
+            # citation Git, même si sa longueur ressemble à un SHA abrégé.
+            tokens = [match.group("commit")
+                      for match in _CITED_COMMIT.finditer(body)
+                      if match.group("commit")]
             if not tokens:
                 continue
             check()
