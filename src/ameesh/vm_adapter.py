@@ -507,6 +507,22 @@ def halted(q, request, target, policy, provider, state, probe):
     return 'halt proven'
 
 
+def failure_cause(error):
+    """Keep exception values, filenames, URLs and credentials out of logs."""
+    if isinstance(error, Refused):
+        return str(error)  # All Refused messages in this module are fixed literals.
+    cause = type(error).__name__
+    if isinstance(error, KeyError) and len(error.args) == 1:
+        key = error.args[0]
+        # KeyError accepts arbitrary payloads; only known schema keys are safe.
+        if isinstance(key, str) and key in {
+                'CREDENTIALS_DIRECTORY', 'secret_key', 'io_timeout_s', 'targets',
+                'zone', 'server_id', 'project_id', 'generation', 'release_epoch',
+                'state', 'result', 'host', 'timezone', 'probe_agent'}:
+            cause += ' (missing key: ' + key + ')'
+    return cause
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -517,10 +533,13 @@ def main(argv=None):
     worker.add_argument('--enrollment', required=True)
     args = parser.parse_args(argv)
     db = None
+    stage = 'config'
     try:
         cfg = config.load()
+        stage = 'base'
         db = db_mod.connect(cfg)
         if args.command == 'request':
+            stage = 'request'
             q = Queue(db)
             with db.transaction() as tx:
                 q = Queue(tx)
@@ -545,18 +564,23 @@ def main(argv=None):
             if status == 'pending':
                 return host_release.ADAPTER_WAIT_CODE
             return 1
+        stage = 'enrollment'
         policy = enrollment(private_json(args.enrollment))
+        stage = 'credentials'
         credentials = private_json(Path(os.environ['CREDENTIALS_DIRECTORY']) / 'scaleway.json')
+        stage = 'provider'
         provider = Scaleway(credentials['secret_key'], timeout=policy['io_timeout_s'])
         for host in policy['targets']:
             try:
                 result = tick_host(cfg, db, policy, host, provider)
                 print(host + ': ' + result)
-            except Exception:
-                print(host + ': adapter unavailable; claims remain closed')
+            except Exception as error:
+                print(host + ': adapter unavailable at tick: ' + failure_cause(error)
+                      + '; claims remain closed')
         return 0
-    except Exception:
-        print('VM adapter unavailable; no acknowledgement')
+    except Exception as error:
+        print('VM adapter unavailable at ' + stage + ': ' + failure_cause(error)
+              + '; no acknowledgement')
         return 1
     finally:
         if db is not None:
