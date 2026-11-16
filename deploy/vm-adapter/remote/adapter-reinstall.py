@@ -172,7 +172,7 @@ def build(source, venv):
     run(['/usr/bin/python3', '-I', '-m', 'venv', venv])
     run([venv / 'bin/python', '-I', '-m', 'pip', '--isolated',
          '--disable-pip-version-check', '--no-cache-dir', 'install',
-         '--index-url', 'https://pypi.org/simple', source])
+         '--only-binary=:all:', '--index-url', 'https://pypi.org/simple', source])
     run([venv / 'bin/python', '-I', '-c', 'import ameesh.vm_adapter'])
     # Make the root-built artifacts readable/executable by the service account.
     for folder, dirs, files in os.walk(venv):
@@ -192,6 +192,29 @@ def previous_venv():
         raise Refused('existing venv outside enrolled installation')
     trusted(target, directory=True)
     return target
+
+
+def no_downgrade(tag, previous):
+    # Read metadata as data: never start Python or load .pth from the old venv.
+    candidates = list(previous.glob('lib/python3.*/site-packages/ameesh-*.dist-info/METADATA'))
+    if len(candidates) != 1:
+        raise Refused('one installed ameesh METADATA required')
+    metadata = read_file(candidates[0]).decode('utf-8')
+    # Headers end at the first blank line; descriptions are not metadata.
+    headers = []
+    for line in metadata.splitlines():
+        if not line:
+            break
+        headers.append(line)
+    versions = [line[len('Version: '):] for line in headers
+                if line.lower().startswith('version:')]
+    if len(versions) != 1 or not TAG.fullmatch('v' + versions[0]):
+        raise Refused('one installed package version X.Y.Z required')
+    version = versions[0]
+    installed = tuple(map(int, version.split('.')))
+    requested = tuple(map(int, tag[1:].split('.')))
+    if requested < installed:
+        raise Refused('release downgrade refused')
 
 
 def point(link, target, work):
@@ -214,6 +237,7 @@ def install(tag):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         idle()
         previous = previous_venv()
+        no_downgrade(tag, previous)
         with tempfile.TemporaryDirectory(prefix='.r3-', dir=BASE) as directory:
             work = Path(directory)
             sha, git = fetch(tag, work)
@@ -232,6 +256,7 @@ def install(tag):
                 idle()
                 if previous_venv() != previous:
                     raise Refused('current venv changed during installation')
+                no_downgrade(tag, previous)
                 point(BASE / 'venv-previous', previous, work)
                 point(BASE / 'venv', venv, work)
                 switched = True

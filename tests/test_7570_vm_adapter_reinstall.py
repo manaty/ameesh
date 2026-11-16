@@ -111,7 +111,7 @@ class FakeInstallTest(unittest.TestCase):
 
     def install(self, **overrides):
         defaults = {'fetch': mock.Mock(return_value=(SHA, [])), 'extract': self.extract, 'build': self.build,
-                    'check_unit': mock.Mock(), 'idle': mock.Mock()}
+                    'check_unit': mock.Mock(), 'idle': mock.Mock(), 'no_downgrade': mock.Mock()}
         defaults.update(overrides)
         with mock.patch.multiple(r3, **defaults), mock.patch('sys.stdout', new_callable=io.StringIO):
             r3.install(TAG)
@@ -155,6 +155,83 @@ class FakeInstallTest(unittest.TestCase):
             self.install()
         self.assertEqual(marker.read_text(), 'keep')
         self.assertEqual((self.base / 'venv').resolve(), self.old)
+
+    def test_downgrade_is_refused_before_fetch_and_preserves_installation(self):
+        fetch = mock.Mock()
+        with self.assertRaisesRegex(r3.Refused, 'downgrade'):
+            self.install(fetch=fetch, no_downgrade=mock.Mock(
+                side_effect=r3.Refused('release downgrade refused')))
+        fetch.assert_not_called()
+        self.assertEqual((self.base / 'venv').resolve(), self.old)
+        self.assertFalse((self.base / 'venv-previous').exists())
+
+    def test_installed_version_is_compared_numerically_and_fails_closed(self):
+        for version, tag, accepted in (
+                ('1.9.0', 'v1.10.0', True), ('1.58.0', TAG, True),
+                ('1.59.0', TAG, False), ('2.0.0', TAG, False),
+                ('unknown', TAG, False), ('1.58.0rc1', TAG, False)):
+            metadata = self.old / 'lib/python3.11/site-packages/ameesh-1.58.0.dist-info/METADATA'
+            metadata.parent.mkdir(parents=True, exist_ok=True)
+            metadata.write_text('Metadata-Version: 2.1\nVersion: ' + version + '\n\nDescription')
+            with self.subTest(version=version, tag=tag), mock.patch.object(r3, 'run') as child:
+                if accepted:
+                    r3.no_downgrade(tag, self.old)
+                else:
+                    with self.assertRaises(r3.Refused):
+                        r3.no_downgrade(tag, self.old)
+                child.assert_not_called()
+
+    def test_metadata_missing_ambiguous_or_invalid_refuses_without_executing_pth(self):
+        site = self.old / 'lib/python3.11/site-packages'
+        site.mkdir(parents=True)
+        marker = self.base / 'executed'
+        pth = site / 'hostile.pth'
+        pth.write_text('import pathlib; pathlib.Path(' + repr(str(marker)) + ').touch()\n')
+        pth.chmod(0o666)
+        metadata = site / 'ameesh-1.58.0.dist-info/METADATA'
+        with mock.patch.object(r3, 'run') as child:
+            with self.assertRaises(r3.Refused):
+                r3.no_downgrade(TAG, self.old)
+            metadata.parent.mkdir()
+            for content in ('Name: ameesh\n', 'Version: 1.58.0\nVersion: 1.57.0\n',
+                            'Version: invalid\n', 'Name: ameesh\n\nVersion: 1.58.0'):
+                metadata.write_text(content)
+                with self.subTest(content=content), self.assertRaises(r3.Refused):
+                    r3.no_downgrade(TAG, self.old)
+            metadata.write_text('Version: 1.58.0\n')
+            r3.no_downgrade(TAG, self.old)
+            other = site / 'ameesh-1.57.0.dist-info/METADATA'
+            other.parent.mkdir()
+            other.write_text('Version: 1.57.0\n')
+            with self.assertRaises(r3.Refused):
+                r3.no_downgrade(TAG, self.old)
+            child.assert_not_called()
+        self.assertFalse(marker.exists())
+
+    def test_metadata_must_pass_trusted_file_checks(self):
+        metadata = self.old / 'lib/python3.11/site-packages/ameesh-1.58.0.dist-info/METADATA'
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text('Version: 1.58.0\n')
+        with mock.patch.object(r3, 'read_file', side_effect=r3.Refused('unsafe installed file')) as read:
+            with self.assertRaises(r3.Refused):
+                r3.no_downgrade(TAG, self.old)
+            read.assert_called_once_with(metadata)
+
+    def test_version_is_rechecked_before_publication(self):
+        with self.assertRaises(r3.Refused):
+            self.install(no_downgrade=mock.Mock(side_effect=[None, r3.Refused('downgrade')]))
+        self.assertEqual((self.base / 'venv').resolve(), self.old)
+        self.assertFalse((self.base / ('venv-' + SHA[:12])).exists())
+
+    def test_pip_refuses_source_distributions_for_dependencies(self):
+        venv = self.base / 'build-venv'
+        venv.mkdir()
+        with mock.patch.object(r3, 'run') as child:
+            r3.build(self.base / 'source', venv)
+        install = child.call_args_list[1].args[0]
+        self.assertIn('--only-binary=:all:', install)
+        self.assertIn('--isolated', install)
+        self.assertEqual(install[-1], self.base / 'source')
 
     def test_installed_unit_must_match_except_the_one_user_directive(self):
         source = self.base / 'source'
