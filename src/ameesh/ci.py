@@ -1162,6 +1162,8 @@ class Watcher:
         #: exécutions `pending` déjà signalées (une fois par service : la
         #: mémoire de `ci_runs` ne porte pas ce message, additif sans migration)
         self._pending_alerted: set = set()
+        # #7605: only the plan is cached, never the observation of missing runs.
+        self._dispatch_plans: dict = {}
         #: #3801 : par dépôt, le clone et la carte d'impact déjà lus (ou
         #: l'échec de leur lecture) pour les courriers d'un paquet rouge. Un
         #: téléchargement de carte raté n'est pas retenté à chaque échec du
@@ -1486,6 +1488,7 @@ class Watcher:
         # runners coûte une requête par exécution non conclue (quelques
         # dizaines de secondes en saturation) et ne doit pas les retarder
         self._guard(db, repo)
+        out += self._undispatched_parts(db, repo, lots)
         self._map(db, repo, bases)
         self._disks(db, repo, bases)
         return out
@@ -2458,6 +2461,104 @@ class Watcher:
                 out += self._alert_pending(db, repo, run, lots, cancelled, now)
         return out
 
+    def _undispatched_parts(self, db, repo: str, lots: list[dict]) -> list[dict]:
+        """#7605: a frozen packet can lack a run, not just wait for a runner.
+
+        Reuse the dispatch contract, including its expected_sha and additional
+        inputs. Observe every selected workflow, even ones whose names do not
+        match SUITE_RE. Alert on the first pass: this is a missing gesture,
+        not a test-duration SLO. Never dispatch or change a merge verdict here.
+        """
+        import hashlib
+        import shlex
+        from . import merge_queue, packet_reviews, plan_github, work
+        out = []
+        for lot in lots:
+            if not packet_reviews.is_vehicle(lot):
+                continue
+            try:
+                if repo_of(self.cfg, lot).casefold() != repo.casefold():
+                    continue
+                marks = work.milestones(db, int(lot["id"]))
+                freeze = next((m for m in marks if m["kind"] == "frozen"), None)
+                sha = str((freeze or {}).get("sha") or "")
+                if not _sha_ok(sha):
+                    continue
+                branch = lot["branch"]
+                if _head_of(self.api, repo, branch) != sha:
+                    continue
+                declared = plan_github.settings_of(self.cfg).workflows_for(repo)
+                if ((declared is None or WORKFLOWS[0] in declared)
+                        and _carries_freeze_request(self.api, repo, sha)):
+                    continue  # label-driven CI has its own request supervision
+                # Planning can execute the repository's frozen selector. As
+                # for ci run, do not do this before the required opinions.
+                gate = merge_queue.review_gate_for_item(db, self.cfg, lot, marks)
+                if not gate or not gate.get("ok"):
+                    continue
+                now = float(self.clock())
+                key = (repo, branch, sha)
+                cached = self._dispatch_plans.get(key)
+                if cached is None or now - cached[0] >= self._cache_ttl():
+                    plan = _dispatch_plan(db, self.cfg, lot, self.api, repo, branch, sha)
+                    self._dispatch_plans[key] = (now, plan)
+                else:
+                    plan = cached[1]
+                missing = []
+                for workflow, inputs in plan.items():
+                    data = self.api(
+                        "repos/%s/actions/workflows/%s/runs?per_page=1&head_sha=%s&branch=%s"
+                        % (repo, _q(workflow), _q(sha), _q(branch)))
+                    if (not isinstance(data, dict) or not isinstance(data.get("workflow_runs"), list)
+                            or type(data.get("total_count")) is not int):
+                        raise GelError("cannot read dispatch runs for %s" % workflow)
+                    rows = data["workflow_runs"]
+                    if data["total_count"] < len(rows) or (not rows and data["total_count"] != 0):
+                        raise GelError("incomplete dispatch run response for %s" % workflow)
+                    if any(r.get("head_sha") != sha or r.get("head_branch") != branch
+                           or workflow_of(r.get("path")) != workflow for r in rows):
+                        raise GelError("dispatch runs differ from the frozen packet")
+                    # Queued, running, cancelled and failed all prove that a
+                    # dispatch occurred. Their normal supervision owns them.
+                    if not rows:
+                        missing.append((workflow, inputs))
+                if not missing or _head_of(self.api, repo, branch) != sha:
+                    continue
+                pilot = self._merge_pilot(db, repo, lot)
+                if not pilot:
+                    self.log("CI %s #%s: due workflows not dispatched: %s; no pilot readable"
+                             % (repo, lot["id"], ", ".join(w for w, _ in missing)))
+                    continue
+                for workflow, inputs in missing:
+                    # Mail keys exclude '/' and are limited to 200 characters.
+                    # Hash the complete identity rather than truncating a long
+                    # repository/workflow name and colliding with another part.
+                    identity = json.dumps([repo, int(lot["id"]), sha, workflow])
+                    once = "ci-undispatched:" + hashlib.sha256(identity.encode()).hexdigest()
+                    if storage.of(db).mailbox.by_idempotency_key(work.SYSTEM_SENDER, pilot, once):
+                        continue
+                    argv = ["gh", "workflow", "run", workflow, "--repo", repo, "--ref", branch]
+                    for name, value in sorted(inputs.items()):
+                        argv += ["-f", "%s=%s" % (name, value)]
+                    command = shlex.join(argv)
+                    text = ("Packet #%s (%s @ %s): due workflow %s has no run on the frozen "
+                            "head. Dispatch it: %s. The expected_sha input refuses a moved "
+                            "branch; inspect the runs before retrying an ambiguous dispatch."
+                            % (lot["id"], branch, sha, workflow, command))
+                    payload = {"ci": {"kind": "undispatched", "repo": repo, "head_sha": sha,
+                                      "branch": branch, "workflow": workflow, "command": command}}
+                    message = _send(db, pilot, text, text, lot=int(lot["id"]), payload=payload,
+                                    urgent=False, idempotency_key=once)
+                    out.append(dict(action="undispatched", repo=repo, work_item_id=lot["id"],
+                                    head_sha=sha, workflow=workflow, command=command,
+                                    to=pilot, mode="wake", message_id=message))
+            except plan_github.GithubRateLimited:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one unreadable packet must not stop CI observation
+                self.log("CI %s #%s: dispatch completeness unreadable (%s)"
+                         % (repo, lot["id"], " ".join(str(exc).split())[:300]))
+        return out
+
     def _alert_pending(self, db, repo: str, run: dict, lots: list[dict],
                        cancelled: list[int], now: float) -> list[dict]:
         """Signale à l'assigné une exécution de la tête courante restée
@@ -3090,6 +3191,10 @@ def describe(record: dict) -> str:
                            if record.get("reason") else "")
     if record["action"] == "disk_refusal":
         return "CI %s: disk margin refusal reported %s" % (record.get("repo"), to)
+    if record["action"] == "undispatched":
+        return "CI %s packet #%s @ %s: due %s has no run %s; %s" % (
+            record.get("repo"), record.get("work_item_id"), _short(record.get("head_sha")),
+            record.get("workflow"), to, record.get("command"))
     if record["action"] == "failures":
         return "%s: %d failure(s) %s" % (where, len(record.get("tests") or ()), to)
     if record["action"] == "pending":
