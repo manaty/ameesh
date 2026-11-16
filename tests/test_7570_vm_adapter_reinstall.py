@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """R3 boundaries and publication on a fake /opt; no root, sudo or network."""
-import copy
 import datetime as dt
 import importlib.util
 import io
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -24,17 +22,6 @@ SHA = '02dff619c640' + 'a' * 28
 NOW = dt.datetime(2026, 11, 16, tzinfo=dt.timezone.utc)
 
 
-def report():
-    hosts = {host: {'actif': SHA[:12]} for host in
-             ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3')}
-    return {'schema': 'ameesh-release-cutoff/1', 'project': 'ameesh',
-            'result': 'released', 'tag': TAG, 'release_sha': SHA,
-            'staging': {'exit': 0, 'attestation': {
-                'schema': 'ameesh-staging-actif/1', 'sha': SHA, 'hotes': hosts,
-                'reportes': {host: {'raison': 'offline'} for host in
-                             ('pc-smichea', 'manaty-mesh-1')}}}}
-
-
 class BoundariesTest(unittest.TestCase):
     def test_one_strict_tag_and_expiry(self):
         self.assertEqual(r3.request([TAG], NOW), TAG)
@@ -46,27 +33,6 @@ class BoundariesTest(unittest.TestCase):
         self.assertEqual(r3.request([TAG], r3.EXPIRES - dt.timedelta(seconds=1)), TAG)
         with self.assertRaisesRegex(r3.Refused, 'expired'):
             r3.request([TAG], r3.EXPIRES)
-
-    def test_native_attestation_covers_all_agent_vms_and_exact_commit(self):
-        good = report()
-        self.assertEqual(r3.attested(good, TAG), SHA)
-        for mutate in (
-                lambda p: p.update(tag='v1.57.0'),
-                lambda p: p.update(project='foreign'),
-                lambda p: p.update(result='kept-active'),
-                lambda p: p.update(release_sha=SHA[:12]),
-                lambda p: p['staging'].update(exit=1),
-                lambda p: p['staging'].update(exit=False),
-                lambda p: p['staging']['attestation'].update(sha='b' * 40),
-                lambda p: p['staging']['attestation']['hotes'].pop('ameesh-agents-3'),
-                lambda p: p['staging']['attestation']['hotes']['ameesh-agents-1'].update(actif=''),
-                lambda p: p['staging']['attestation']['hotes']['ameesh-agents-1'].update(actif='b' * 12),
-                lambda p: p['staging']['attestation']['reportes'].update(**{'ameesh-agents-3': {'raison': 'absent'}}),
-                lambda p: p['staging']['attestation']['reportes']['pc-smichea'].update(raison='')):
-            bad = copy.deepcopy(good)
-            mutate(bad)
-            with self.subTest(report=bad), self.assertRaises(r3.Refused):
-                r3.attested(bad, TAG)
 
     def test_timer_active_or_unknown_refuses_even_with_inactive_service(self):
         for state in (b'active\n', b'activating\n', b'failed\n', b'\n'):
@@ -116,15 +82,12 @@ class FakeInstallTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name) / 'opt'
         self.base.mkdir()
-        self.proofs = Path(self.temp.name) / 'proofs'
-        self.proofs.mkdir()
-        (self.proofs / (TAG + '.json')).write_text(json.dumps(report()))
         self.old = self.base / ('venv-' + 'b' * 12)
         self.old.mkdir()
         (self.base / 'venv').symlink_to(self.old.name)
         # Only trust ownership is substituted; all paths, files, locks and
         # atomic replaces below are real in this fake /opt.
-        for name, value in [('BASE', self.base), ('PROOFS', self.proofs),
+        for name, value in [('BASE', self.base),
                             ('trusted', mock.Mock()), ('EXPIRES', dt.datetime(2099, 1, 1, tzinfo=dt.timezone.utc))]:
             patch = mock.patch.object(r3, name, value)
             patch.start()
@@ -138,7 +101,7 @@ class FakeInstallTest(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     @staticmethod
-    def fetch(tag, sha, source, work):
+    def extract(sha, git, source, work):
         (source / 'vm_adapter.py').write_text('reviewed source')
 
     @staticmethod
@@ -147,7 +110,7 @@ class FakeInstallTest(unittest.TestCase):
         (venv / 'installed').write_text('from ' + str(source))
 
     def install(self, **overrides):
-        defaults = {'fetch': self.fetch, 'build': self.build,
+        defaults = {'fetch': mock.Mock(return_value=(SHA, [])), 'extract': self.extract, 'build': self.build,
                     'check_unit': mock.Mock(), 'idle': mock.Mock()}
         defaults.update(overrides)
         with mock.patch.multiple(r3, **defaults), mock.patch('sys.stdout', new_callable=io.StringIO):
@@ -162,19 +125,6 @@ class FakeInstallTest(unittest.TestCase):
         self.assertTrue(self.old.is_dir())
         self.assertFalse(list(self.base.glob('.r3-*')))
 
-    def test_missing_or_foreign_proof_refuses_before_fetch_or_build(self):
-        (self.proofs / (TAG + '.json')).unlink()
-        fetch = mock.Mock()
-        with self.assertRaises(FileNotFoundError):
-            self.install(fetch=fetch)
-        fetch.assert_not_called()
-        bad = report()
-        bad['tag'] = 'v1.0.0'
-        (self.proofs / (TAG + '.json')).write_text(json.dumps(bad))
-        with self.assertRaises(r3.Refused):
-            self.install(fetch=fetch)
-        fetch.assert_not_called()
-
     def test_active_timer_refuses_before_fetch(self):
         fetch = mock.Mock()
         with self.assertRaises(r3.Refused):
@@ -183,7 +133,7 @@ class FakeInstallTest(unittest.TestCase):
         self.assertEqual((self.base / 'venv').resolve(), self.old)
 
     def test_failure_before_switch_keeps_old_venv_and_cleans_partial_build(self):
-        for stage in ('fetch', 'check_unit', 'build'):
+        for stage in ('extract', 'check_unit', 'build'):
             with self.subTest(stage=stage), self.assertRaises(r3.Refused):
                 self.install(**{stage: mock.Mock(side_effect=r3.Refused('failed'))})
             self.assertEqual((self.base / 'venv').resolve(), self.old)
@@ -223,11 +173,66 @@ class FakeInstallTest(unittest.TestCase):
                 r3.check_unit(source)
             run.assert_not_called()
 
-    def test_fetched_tag_commit_mismatch_refuses_before_archive(self):
-        child = mock.Mock(side_effect=[b'', b'', b'c' * 40 + b'\n'])
-        with mock.patch.object(r3, 'run', child), self.assertRaises(r3.Refused):
-            r3.fetch(TAG, SHA, self.base / 'source', self.base)
-        self.assertEqual(child.call_count, 3)
+    def test_forge_requires_main_release_marker_version_and_notes(self):
+        responses = [b'', b'', (SHA + '\n').encode(), b'',
+                     b'release commit\n\nameesh-release: 1.58.0\n',
+                     b'[project]\nname = "ameesh"\nversion = "1.58.0"\n', b'']
+        with mock.patch.object(r3, 'run', side_effect=responses) as child:
+            self.assertEqual(r3.fetch(TAG, self.base)[0], SHA)
+            self.assertIn('refs/heads/main:refs/remotes/origin/main', child.call_args_list[1].args[0])
+            self.assertIn('merge-base', child.call_args_list[3].args[0])
+        for index, value in ((2, b'invalid'), (4, b'ordinary commit'),
+                             (5, b'[project]\nversion = "1.57.0"\n')):
+            bad = list(responses)
+            bad[index] = value
+            with self.subTest(index=index), mock.patch.object(r3, 'run', side_effect=bad), self.assertRaises(r3.Refused):
+                r3.fetch(TAG, self.base)
+        for index in (1, 3, 6):
+            bad = list(responses)
+            bad[index] = r3.Refused('tag, ancestry or notes missing')
+            with self.subTest(index=index), mock.patch.object(r3, 'run', side_effect=bad), self.assertRaises(r3.Refused):
+                r3.fetch(TAG, self.base)
+
+    def test_real_git_fetch_accepts_release_and_refuses_tag_outside_main(self):
+        repo = self.base / 'forge'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.check_output(['/usr/bin/git', '-C', str(repo),
+                                            '-c', 'user.name=Test',
+                                            '-c', 'user.email=test@example.invalid',
+                                            *args], stderr=subprocess.DEVNULL).decode().strip()
+        git('init', '-b', 'main')
+        (repo / 'pyproject.toml').write_text('[project]\nversion = "1.58.0"\n')
+        notes = repo / 'docs/versions/1.58.0.md'
+        notes.parent.mkdir(parents=True)
+        notes.write_text('Release notes')
+        git('add', '.')
+        git('commit', '-m', 'release: 1.58.0\n\nameesh-release: 1.58.0')
+        git('tag', TAG)
+        expected = git('rev-parse', 'HEAD')
+        work = self.base / 'fetch-work'
+        work.mkdir()
+        with mock.patch.object(r3, 'ORIGIN', str(repo)):
+            sha, command = r3.fetch(TAG, work)
+            self.assertEqual(sha, expected)
+            source = self.base / 'extracted'
+            source.mkdir()
+            r3.extract(sha, command, source, work)
+            self.assertEqual((source / 'pyproject.toml').read_bytes(),
+                             (repo / 'pyproject.toml').read_bytes())
+            git('checkout', '-b', 'outside-main')
+            (repo / 'pyproject.toml').write_text('[project]\nversion = "1.59.0"\n')
+            git('add', '.')
+            git('commit', '-m', 'release: 1.59.0\n\nameesh-release: 1.59.0')
+            git('tag', 'v1.59.0')
+            other = self.base / 'other-fetch'
+            other.mkdir()
+            with self.assertRaises(r3.Refused):
+                r3.fetch('v1.59.0', other)
+            missing = self.base / 'missing-fetch'
+            missing.mkdir()
+            with self.assertRaises(r3.Refused):
+                r3.fetch('v9.9.9', missing)
 
     def test_archive_rejects_traversal_symlinks_hardlinks_and_duplicate_files(self):
         for name, kind in (('../escape', tarfile.REGTYPE), ('/absolute', tarfile.REGTYPE),

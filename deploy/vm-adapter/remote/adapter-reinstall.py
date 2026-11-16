@@ -1,16 +1,15 @@
 #!/usr/bin/python3 -I
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#7570: R3, install only a root-enrolled, staging-attested release.
+"""#7570: R3, install only a forge-verified release.
 
 No caller configuration, environment, paths, Git checkout or stdin is used.
 Install this file root:root 0755 as /usr/local/sbin/ameesh-vm-adapter-reinstall.
-The root-only release proof enrollment is described in R3.md.
+The bureau checks staging separately as described in R3.md.
 """
 from __future__ import annotations
 
 import datetime as dt
 import fcntl
-import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -22,7 +21,6 @@ import tarfile
 import tempfile
 
 BASE = Path('/opt/ameesh-vm-adapter')
-PROOFS = Path('/etc/ameesh-vm-adapter/releases')
 UNIT = Path('/etc/systemd/system/ameesh-vm-adapter.service')
 SELF = Path('/usr/local/sbin/ameesh-vm-adapter-reinstall')
 ORIGIN = 'https://github.com/manaty/ameesh.git'
@@ -83,41 +81,6 @@ def request(args, now):
     return args[0]
 
 
-def attested(report, tag):
-    """Native release report + native actif proof; enrollment supplies trust."""
-    if (not isinstance(report, dict) or report.get('schema') != 'ameesh-release-cutoff/1'
-            or report.get('project') != 'ameesh' or report.get('tag') != tag
-            or report.get('result') not in ('released', 'reconciled')):
-        raise Refused('release not attested')
-    sha = report.get('release_sha')
-    if not isinstance(sha, str) or not SHA.fullmatch(sha):
-        raise Refused('full attested commit required')
-    staging = report.get('staging')
-    if not isinstance(staging, dict) or type(staging.get('exit')) is not int or staging['exit'] != 0:
-        raise Refused('successful staging required')
-    proof = staging.get('attestation')
-    if (not isinstance(proof, dict) or proof.get('schema') != 'ameesh-staging-actif/1'
-            or proof.get('sha') != sha):
-        raise Refused('staging commit differs')
-    hosts, reported = proof.get('hotes'), proof.get('reportes', {})
-    if not isinstance(hosts, dict) or not isinstance(reported, dict):
-        raise Refused('staging hosts required')
-    optional = {'manaty-mesh-1', 'pc-smichea'}
-    required = {'ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3'} | optional
-    if (set(reported) - optional or set(hosts) & set(reported)
-            or set(hosts) | set(reported) != required):
-        raise Refused('staging coverage incomplete')
-    for value in hosts.values():
-        active = value.get('actif') if isinstance(value, dict) else None
-        if (not isinstance(active, str) or not re.fullmatch(r'[0-9a-f]{7,40}', active)
-                or not sha.startswith(active)):
-            raise Refused('active host commit differs')
-    for value in reported.values():
-        if not isinstance(value, dict) or not isinstance(value.get('raison'), str) or not value['raison'].strip():
-            raise Refused('reported host reason required')
-    return sha
-
-
 def run(argv, *, cwd=BASE, stdout=subprocess.PIPE, timeout=600):
     # Never execute a shell or import from the invoking user's cwd/environment.
     result = subprocess.run([str(a) for a in argv], cwd=cwd, env=ENV,
@@ -163,14 +126,32 @@ def unpack(archive, destination):
                 target.chmod(0o755 if item.mode & 0o111 else 0o644)
 
 
-def fetch(tag, sha, source, work):
+def fetch(tag, work):
     repo = work / 'repository.git'
     run(['/usr/bin/git', '-c', 'init.templateDir=', 'init', '--bare', repo], cwd=work)
     git = ['/usr/bin/git', '--git-dir=' + str(repo), '-c', 'core.hooksPath=/dev/null']
-    run(git + ['fetch', '--no-tags', '--depth=1', ORIGIN, 'refs/tags/' + tag], cwd=work)
-    actual = run(git + ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], cwd=work).decode().strip()
-    if actual != sha:
-        raise Refused('release tag commit differs from attestation')
+    run(git + ['fetch', '--no-tags', ORIGIN,
+               'refs/tags/' + tag + ':refs/tags/' + tag,
+               'refs/heads/main:refs/remotes/origin/main'], cwd=work)
+    sha = run(git + ['rev-parse', '--verify', 'refs/tags/' + tag + '^{commit}'],
+              cwd=work).decode().strip()
+    if not SHA.fullmatch(sha):
+        raise Refused('full release commit required')
+    run(git + ['merge-base', '--is-ancestor', sha, 'refs/remotes/origin/main'], cwd=work)
+    message = run(git + ['show', '-s', '--format=%B', sha], cwd=work).decode()
+    version = tag[1:]
+    if ('ameesh-release: ' + version) not in message.splitlines():
+        raise Refused('tag is not a release engine commit')
+    metadata = run(git + ['show', sha + ':pyproject.toml'], cwd=work).decode()
+    project = re.search(r'(?ms)^\[project\]\s*$(.*?)(?=^\[|\Z)', metadata)
+    if not project or not re.search(r'^version\s*=\s*"' + re.escape(version) + r'"\s*$',
+                                    project[1], re.MULTILINE):
+        raise Refused('package version differs from release tag')
+    run(git + ['cat-file', '-e', sha + ':docs/versions/' + version + '.md'], cwd=work)
+    return sha, git
+
+
+def extract(sha, git, source, work):
     archive = work / 'source.tar'
     with archive.open('xb') as stream:
         run(git + ['archive', '--format=tar', sha], cwd=work, stdout=stream)
@@ -226,8 +207,6 @@ def point(link, target, work):
 
 def install(tag):
     trusted(BASE, directory=True)
-    trusted(PROOFS, directory=True)
-    sha = attested(json.loads(read_file(PROOFS / (tag + '.json'))), tag)
     lock = BASE / '.r3.lock'
     fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
@@ -235,16 +214,17 @@ def install(tag):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         idle()
         previous = previous_venv()
-        source, venv = BASE / ('src-' + sha[:12]), BASE / ('venv-' + sha[:12])
-        # Never re-use a partial build, path collision or previously altered tree.
-        if os.path.lexists(source) or os.path.lexists(venv):
-            raise Refused('versioned destination already exists; root inspection required')
         with tempfile.TemporaryDirectory(prefix='.r3-', dir=BASE) as directory:
             work = Path(directory)
+            sha, git = fetch(tag, work)
+            print('R3 resolved %s %s' % (tag, sha), flush=True)
+            source, venv = BASE / ('src-' + sha[:12]), BASE / ('venv-' + sha[:12])
+            if os.path.lexists(source) or os.path.lexists(venv):
+                raise Refused('versioned destination already exists; root inspection required')
             source.mkdir(mode=0o755)
             switched = False
             try:
-                fetch(tag, sha, source, work)
+                extract(sha, git, source, work)
                 check_unit(source)
                 build(source, venv)
                 # Expiry/timer can change during a long network/build operation.
