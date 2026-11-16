@@ -1203,7 +1203,8 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
 
 def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
           head: str = "HEAD", repo: pathlib.Path = REPO,
-          own: set[str] | None = None, own_base: str | None = None) -> Impact:
+          own: set[str] | None = None, own_base: str | None = None, *,
+          resolve_imports: bool = True) -> Impact:
     """The impact of `changes` (since the map commit) on the test modules.
 
     `own` is the set of paths the branch itself changes — `own_base` (the base
@@ -1288,8 +1289,14 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
                   own=own is None or path in own)
     #: #1339 : les blocs sans mesure sont couverts par les tests qui importent
     #: leur fichier (sélection élargie), la preuve étant la mesure ou un import
-    #: exécuté au niveau module (relecture Codex, B2 résiduel).
-    _resolve_unmeasured(card, impact, modules, head, repo)
+    #: exécuté au niveau module (relecture Codex, B2 résiduel). #7590 : la
+    #: suite est déjà complète (paquet, main, release, nocturne) : aucun test
+    #: ne peut être omis, l'import graph n'éclaire plus aucune sélection et son
+    #: coût (parcours AST de tous les fichiers à chaque run) sort du chemin
+    #: critique. Le rapport de couverture d'un lot (mode impactés + contrat)
+    #: garde cette résolution.
+    if resolve_imports:
+        _resolve_unmeasured(card, impact, modules, head, repo)
     #: #1909 : le rapport « lignes sans test » nomme les blocs que la branche
     #: change, pas ceux que la cible a changés depuis la carte. La sélection
     #: ci-dessus a déjà gardé le doute de la carte : un bloc hérité reste couvert
@@ -1380,7 +1387,8 @@ def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
 
 def classify(modules: list[str], card: dict | None, now: datetime.datetime,
              base_fallback: str = "HEAD^1", head: str = "HEAD",
-             repo: pathlib.Path = REPO, *, docs_only: bool = False) -> dict:
+             repo: pathlib.Path = REPO, *, docs_only: bool = False,
+             resolve_imports: bool = True) -> dict:
     """Classes of every module, and what the plan knows about its own safety."""
     always = read_list(ALWAYS_FILE, modules)
     problem, age = map_problem(card, now, head, repo)
@@ -1430,7 +1438,8 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                 own_paths = {path for _, path in changes}
             try:
                 impact = judge(card, changes, modules, head, repo, own=own_paths,
-                               own_base=base_fallback)
+                               own_base=base_fallback,
+                               resolve_imports=resolve_imports)
                 if docs_only:
                     inherited = changed_files(card["commit"], base_fallback, repo)
                     if inherited is None:
@@ -1615,6 +1624,39 @@ def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, flo
             complete.setdefault(d, {}).update(valeurs)
         table = complete
     weighed, _ = parts.weight(modules, driver, table)
+    return weighed
+
+
+def split_weights(modules: list[str], driver: str, card: dict | None) -> dict[str, float]:
+    """#7590 : poids de découpage mesurés SANS couverture.
+
+    La carte est mesurée sous couverture : son surcoût varie de 1,2x à 9,3x
+    selon le module (#1341 A), donc ses durées brutes ne décrivent pas le
+    temps d'une part ordinaire. Pour découper les parts, la table
+    `tests/parts/durees.json` (mesurée sans couverture) est la référence,
+    convertie à l'échelle de la carte par le `surcout` du pilote ; la carte ne
+    comble que les modules que la table ne connaît pas. `weights()` garde son
+    contrat L148/#2397 pour les estimations et la sélection d'un lot ; ce
+    découpage-ci ne s'applique qu'aux parts psycopg d'une suite déjà complète
+    (paquet, main, release), où aucune sélection ne dépend des poids et où la
+    table psycopg a été mesurée sur la même suite sans couverture.
+    """
+    mesurees = (json.loads(parts.TABLE.read_text(encoding="utf-8"))
+                if parts.TABLE.exists() else {})
+    statique = {d: dict(v) for d, v in mesurees.items()
+                if isinstance(v, dict) and d != "tests"}
+    complete: dict[str, dict[str, float]] = {}
+    for d, valeurs in statique.items():
+        facteur = _overhead(card, d)
+        complete[d] = {m: (float(v) * facteur if isinstance(v, (int, float)) else v)
+                       for m, v in valeurs.items()}
+    for module, info in (card or {}).get("modules", {}).items():
+        par_pilote = info.get("durations")
+        if par_pilote is None:
+            par_pilote = info.get("durees", {})
+        for d, duree in par_pilote.items():
+            complete.setdefault(d, {}).setdefault(module, duree)
+    weighed, _ = parts.weight(modules, driver, complete)
     return weighed
 
 
@@ -1968,6 +2010,13 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
     head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
     release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
+    pr = event == "pull_request"
+    #: #7590 : la résolution des blocs sans mesure par l'import graph ne sert
+    #: qu'à la sélection impactés + contrat d'un lot. Quand la suite est déjà
+    #: complète (paquet, main, release, nocturne, dispatch), le plan n'a aucun
+    #: test à omettre : on ne paie pas le parcours AST de tous les fichiers.
+    partial_suite = ((mode == "lot" or (mode == "auto" and pr))
+                     and not release and not psql_full)
     if mode == "lot":
         #: #1343 : une demande de lot sur `release/**` ou `integration/**` ne
         #: prend jamais la sélection impactés+contrat — ces branches gardent la
@@ -2023,7 +2072,8 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         plan["why"] = ("lot CI at freeze: impacted + contract" if mode == "lot"
                        else "full CI request: whole suite")
     plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo,
-                         docs_only=bool(plan["docs_only"] and not release)))
+                         docs_only=bool(plan["docs_only"] and not release),
+                         resolve_imports=partial_suite))
     #: #3954 : une déclaration de contrat transverse qui nomme un module
     #: disparu sauterait le contrat en silence (B/P2 cx3). La validation
     #: porte sur les modules réellement présents dans `tests/` à l'arbre du
@@ -2088,7 +2138,6 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         plan["doc_readers"] = []
         plan["why"] = release
     skip = plan["version_only"] or plan["docs_only"]
-    pr = event == "pull_request"
     #: L1211/canon §3 : la sélection impactés+contrat est celle d'un lot — une
     #: PR de lot (mode `auto`) ou la CI dispatchée au gel (mode `lot`, #1343) ;
     #: une PR de release et une CI `full` gardent la suite complète, y compris
@@ -2132,9 +2181,17 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         n = n_pr if lot and chosen_set is not None else n_other
         if chosen_set is not None:
             n = min(n, lot_part_count(driver, selected, card))
+        #: #7590 : hors sélection d'un lot, la suite est complète. Le
+        #: découpage psycopg lit alors les durées sans couverture (la
+        #: stabilité prime sur la fraîcheur de la carte, qui reste
+        #: l'estimation publiée) ; le pilote psql garde la carte, dont la
+        #: mesure porte sur ces modules-là (la table psql vient du nocturne,
+        #: qui exécute la suite entière, et ne décrit pas ce sous-ensemble).
+        weighed = (pleine if driver == "psql" and psql_full
+                   else split_weights(selected, driver, card)
+                   if driver == "psycopg" and not lot else None)
         plan["parts"][driver] = [] if skip else split(
-            selected, driver, n, card, classes,
-            weighed=pleine if driver == "psql" else None)
+            selected, driver, n, card, classes, weighed=weighed)
     every = [m for m in modules]
     weighed = weights(every, "psycopg", card)
     chosen = [m for m in every if classes[m][0] in ("P0", "P1")]
