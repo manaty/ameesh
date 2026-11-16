@@ -605,7 +605,8 @@ class GitTree:
             raise Refused("staging migration policy is not UTF-8") from exc
 
 
-def decision_verifier(db, project):
+def decision_verifier(db, project, *, public_only=False):
+    """Use full authority before migrations, or public consumed proofs for bureau."""
     def verify(identifier, lot, option):
         from . import decisions
         view = decisions.get(db, identifier)
@@ -618,8 +619,8 @@ def decision_verifier(db, project):
                                   if isinstance(entry, dict)}):
             return False
         try:
-            decisions.require_current(db, view, public_only=True)
-            return decisions.verify_proof(db, view, public_only=True)[0]
+            decisions.require_current(db, view, public_only=public_only)
+            return decisions.verify_proof(db, view, public_only=public_only)[0]
         except decisions.DecisionError:
             return False
     return verify

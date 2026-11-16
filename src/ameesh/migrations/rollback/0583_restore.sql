@@ -154,14 +154,3 @@ end $$;
 
 DROP VIEW IF EXISTS ameesh_staging_attestations;
 DROP VIEW IF EXISTS ameesh_decision_proofs;
-
-DO $bureau_supersessions$
-DECLARE login record;
-BEGIN
-    FOR login IN SELECT rolname FROM limited_logins WHERE agent = 'bureau'
-    LOOP
-        EXECUTE format('REVOKE SELECT ON %I.decision_supersessions FROM %I',
-                       current_schema(), login.rolname);
-    END LOOP;
-END
-$bureau_supersessions$;

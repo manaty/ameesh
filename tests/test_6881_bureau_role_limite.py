@@ -201,7 +201,7 @@ class BureauRoleLimiteTest(PgTestCase):
             decisions.require_current(limited, read, public_only=True)
             self.assertTrue(decisions.verify_proof(limited, read, public_only=True)[0])
             from ameesh import staging_migrations
-            self.assertTrue(staging_migrations.decision_verifier(limited, "ameesh")(
+            self.assertTrue(staging_migrations.decision_verifier(limited, "ameesh", public_only=True)(
                 identifier, 456, "a"))
             self.refused("INSERT INTO decision_supersessions VALUES (1, 2, 'bureau', now(), '{}')",
                          "permission denied")
@@ -220,14 +220,11 @@ class BureauRoleLimiteTest(PgTestCase):
         finally:
             limited.close()
 
-    def test_migration_grants_existing_bureau_login_the_public_journal(self):
+    def test_role_replay_grants_existing_bureau_login_the_public_journal(self):
         self.db.execute('REVOKE SELECT ON decision_supersessions FROM "%s"' % self.login)
         self.refused("SELECT * FROM decision_supersessions", "permission denied")
-        migration = os.path.join(REPO, "src", "ameesh", "migrations",
-                                 "0583_bureau_staging_catchup.sql")
-        with open(migration, encoding="utf-8") as source:
-            sql = source.read()
-        self.db.execute(sql[sql.index("DO $bureau_supersessions$"):])
+        replay = self.script("role-bureau.sql")
+        self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(self.sql("SELECT * FROM decision_supersessions").returncode, 0)
         audit = self.script("_contrat-bureau.sql")
         self.assertEqual(audit.returncode, 0, audit.stderr)
