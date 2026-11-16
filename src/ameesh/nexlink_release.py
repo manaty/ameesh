@@ -950,6 +950,22 @@ def drop_abandoned(project, slot, save):
     return outcome
 
 
+def _record_cutoff(slot, at, label, result):
+    """Record the outcome of a cutoff without ever moving the slot backwards.
+
+    The slot names one cutoff: `last_cutoff` with the `last_result` and
+    `last_label` of that same cutoff. A candidate older than the recorded
+    one (an abandon, a refusal or a late close after a later cutoff was
+    recorded) leaves all three alone; its own cutoff, label and trace stay
+    in `abandoned_pending`, the durable report or the announcement. Returns
+    whether the slot was updated."""
+    at = float(at)
+    if at < float(slot.get("last_cutoff") or 0):
+        return False
+    slot.update(last_cutoff=at, last_result=result, last_label=label)
+    return True
+
+
 def _preflight_refused(cfg, db, project, slot, pending, exc, save, now):
     """B1/B2 dev3 (gel 34015): a refused preflight left no tag; the cutoff
     closes as `refused-preflight` so the next one is not held behind it,
@@ -964,8 +980,10 @@ def _preflight_refused(cfg, db, project, slot, pending, exc, save, now):
         reason = "git %s timed out" % " ".join(map(str, exc.cmd[-2:]))
     else:
         reason = str(exc) or type(exc).__name__
-    slot.update(last_cutoff=pending["cutoff_at"], last_result="refused-preflight",
-                abandoned_integration=dict(ref=pending["integration"], sha=pending["sha"]))
+    _record_cutoff(slot, pending["cutoff_at"], pending.get("label"),
+                   "refused-preflight")
+    slot["abandoned_integration"] = dict(ref=pending["integration"],
+                                         sha=pending["sha"])
     slot.pop("pending_nexlink")
     save()
     try:
@@ -1117,14 +1135,12 @@ def abandon(cfg, db, project, *, now, reason, actor):
                      base=pending.get("base"), integration=pending.get("integration"),
                      cutoff_at=pending.get("cutoff_at"), label=pending.get("label"),
                      red=red, failures=failures, by=actor, why=text, at=now)
-        # Never move the recorded slot backwards (a tick may already have
-        # recorded a later one before an older candidate is abandoned).
-        slot.update(last_cutoff=max(float(slot.get("last_cutoff") or 0),
-                                    float(pending["cutoff_at"])),
-                    last_result="refused-ci",
-                    last_label=pending.get("label"),
-                    abandoned_integration=dict(ref=pending["integration"],
-                                               sha=pending["sha"]))
+        # An older candidate leaves a later recorded slot intact; its own
+        # cutoff and label are kept in the trace below.
+        _record_cutoff(slot, pending["cutoff_at"], pending.get("label"),
+                       "refused-ci")
+        slot["abandoned_integration"] = dict(ref=pending["integration"],
+                                             sha=pending["sha"])
         slot["abandoned_pending"] = trace
         slot.pop("pending_nexlink")
         save = lambda: rc.save_state(cfg, state)
@@ -1395,7 +1411,7 @@ def _close_handoff_lot(db, pending, note):
 def _close(cfg, db, project, slot, pending, result, save):
     report = dict(pending, result=result, project=project.name,
                   staging_ok=result == "released")
-    slot.update(last_cutoff=pending["cutoff_at"], last_result=result)
+    _record_cutoff(slot, pending["cutoff_at"], pending.get("label"), result)
     slot.pop("pending_nexlink")
     save()
     rc.write_report(cfg, project, report)
@@ -1446,11 +1462,9 @@ def _skip_cutoff(cfg, db, project, slot, at, label, source, now, save, *,
     reason: a frozen candidate with no content to publish, which never had a
     release tag to name.
     """
-    # Never move the recorded slot backwards: a stale pending is skipped on
-    # its own cutoff, then the current tick still handles the due one.
-    slot["last_cutoff"] = max(float(slot.get("last_cutoff") or 0), at)
-    slot["last_result"] = "skipped"
-    slot["last_label"] = label
+    # A stale pending skipped after a later slot leaves that slot intact;
+    # its own cutoff and label are in the report below.
+    _record_cutoff(slot, at, label, "skipped")
     slot.pop("pending_nexlink", None)
     save()
     if empty:
@@ -1506,9 +1520,7 @@ def _missed_cutoff(cfg, db, project, slot, at, label, source, now, save):
             report["train"] = train
     report["causes"] = causes
     report["message"] = "; ".join(causes)
-    slot["last_cutoff"] = at
-    slot["last_result"] = "missed"
-    slot["last_label"] = label
+    _record_cutoff(slot, at, label, "missed")
     save()
     when = datetime.datetime.fromtimestamp(at, datetime.timezone.utc)
     body = (
