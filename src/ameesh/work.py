@@ -3898,6 +3898,8 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 if row is not None:
                     _notify_released(tx, item_id, blocker_state=lifecycle.DELIVERY_RECORDED,
                                      after_commit=threads)
+                    from . import stacked_delivery
+                    stacked_delivery.notify(tx, row, repo=repo, after_commit=threads)
         except DbError as exc:
             # A refused module requirement is a per-lot result, allowing a
             # merge sweep to continue with other projects. Other DB errors
