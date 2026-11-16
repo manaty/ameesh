@@ -612,6 +612,8 @@ class Config:
     #: (`{harnais: [profil, …]}`), validée par `ameesh.accounts`. Ce sont des
     #: secrets d'hôte : jamais dans le canon, jamais en base.
     accounts: dict = field(default_factory=dict)
+    #: #7519: nonsecret host default; account dsh_provider replaces it in full.
+    dsh_provider: dict = field(default_factory=dict)
     #: #313 (L65b, décision 0033) : un compte dont l'identifiant (dossier de
     #: configuration, fichier de clé, valeur de clé) est déclaré aussi par un
     #: AUTRE mesh de l'hôte. `report` le signale (journal de l'exécuteur,
