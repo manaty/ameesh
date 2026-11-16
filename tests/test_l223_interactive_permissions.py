@@ -217,14 +217,15 @@ class CodexPermissionTest(unittest.TestCase):
         # --no-daemon (4) keeps the session off the shared background server
         self.assertEqual(self.codex.permission_mode(), "")
         argv = self.codex.interactive_command("t1")
-        self.assertEqual(argv, [self.codex.binary, "--no-daemon", "resume", "t1"])
+        self.assertEqual(argv, [self.codex.binary, "-c", "tool_output_token_limit=1700",
+                                "--no-daemon", "resume", "t1"])
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
 
     def test_explicit_bypass_adds_the_flag(self):
         # (1)(2) the flag carries no `{mode}`: bypassPermissions selects
         # `--dangerously-bypass-approvals-and-sandbox`
         argv = self.codex.interactive_command("t1", permission_mode="bypassPermissions")
-        self.assertEqual(argv, [self.codex.binary, "--no-daemon",
+        self.assertEqual(argv, [self.codex.binary, "-c", "tool_output_token_limit=1700", "--no-daemon",
                                 "--dangerously-bypass-approvals-and-sandbox",
                                 "resume", "t1"])
 
@@ -299,7 +300,8 @@ class CodexPermissionTest(unittest.TestCase):
         findings = harnesses.validate(document)
         self.assertEqual([f for f in findings if f.severity == harnesses.ERROR], [])
         self.assertNotIn("harness-key-unknown", [f.code for f in findings])
-        self.assertEqual(document["ameesh"]["interactive"], ["--no-daemon"])
+        self.assertEqual(document["ameesh"]["interactive"],
+                         ["-c", "tool_output_token_limit=1700", "--no-daemon"])
         # harness show renders the mapping
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -372,7 +374,7 @@ class AttachPermissionTest(PgTestCase):
         self.register("cx685", "codex", cwd=cwd)
         argv = self._attach("cx685")
         # no session yet: a fresh session, still without the daemon
-        self.assertEqual(argv[:1], ["--no-daemon"])
+        self.assertEqual(argv[:3], ["-c", "tool_output_token_limit=1700", "--no-daemon"])
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         proc = self.mesh("set", "cx685", "permission_mode=auto")
         self.assertEqual(proc.returncode, 2, proc.stdout)
@@ -381,7 +383,7 @@ class AttachPermissionTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("interactive permission mode (attach): bypassPermissions", proc.stdout)
         argv = self._attach("cx685")
-        self.assertEqual(argv[:2], ["--no-daemon",
+        self.assertEqual(argv[:4], ["-c", "tool_output_token_limit=1700", "--no-daemon",
                                     "--dangerously-bypass-approvals-and-sandbox"])
         self.assertIsNone(registry.get(self.db, "cx685")["lease_owner"])
 
@@ -418,7 +420,7 @@ class AttachPermissionTest(PgTestCase):
         self.assertIn("bypassPermissions", self._attach())
         registry.upsert(self.db, "perm", harness="codex")
         argv, err = self._attach_capturing_stderr()
-        self.assertEqual(argv[:1], ["--no-daemon"])
+        self.assertEqual(argv[:3], ["-c", "tool_output_token_limit=1700", "--no-daemon"])
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertNotIn("bypassPermissions", argv)
         self.assertIn("was set for harness 'claude'", err)
