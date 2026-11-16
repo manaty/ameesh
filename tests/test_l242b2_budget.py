@@ -68,7 +68,7 @@ class ReserveForfaitTest(_Comptes):
         meme_jour = fin[:3] == time.localtime(self.now)[:3]
         heure = time.strftime("%H:%M" if meme_jour else "%d/%m %H:%M", fin)
         self.assertTrue(_sans_epoch(raison).startswith(
-            "pause (account (default), five_hour 96 %%) until %s; plan codex five_hour" % heure),
+            "pause (account (default), five_hour 96 %% reset) until %s; plan codex five_hour" % heure),
             raison)
 
     def test_la_pause_dure_jusqu_a_la_remise_la_plus_tardive(self):
@@ -82,7 +82,7 @@ class ReserveForfaitTest(_Comptes):
             raison = book.pace_exceeded("codex")
         fin = time.strftime("%d/%m %H:%M", time.localtime(self.now + 2 * 86400))
         self.assertTrue(_sans_epoch(raison).startswith(
-            "pause (account (default), seven_day 96 %%) until %s; plan codex seven_day" % fin),
+            "pause (account (default), seven_day 96 %% reset) until %s; plan codex seven_day" % fin),
             raison)
         # une fenêtre qui bloque sans date : aucune heure annoncée
         sans_date = cost.Gauge("codex", "seven_day", 0.96, None, 7 * 86400)
@@ -153,7 +153,7 @@ class DebutDeFenetreTest(unittest.TestCase):
             raison = book.pace_exceeded("codex", accounts.RESERVE)
         fin = avance.free_at(self.now, accounts.RESERVE)
         self.assertTrue(_sans_epoch(raison).startswith(
-            "pause (account (default), seven_day 15 %%) until %s; plan codex seven_day"
+            "pause (account (default), seven_day 15 %% pace) until %s; plan codex seven_day"
             % cost.until_label(fin, self.now)), raison)
         self.assertIn("pace cap 10%", raison)
 
@@ -246,7 +246,7 @@ class AffichageDeLaPauseTest(_Comptes):
         pause = self.choose()
         self.assertIsNone(pause.profile)
         fin = time.strftime("%d/%m %H:%M", time.localtime(self.now + 2 * 86400))
-        self.assertRegex(_sans_epoch(pause.reason), r"^pause \(account \w+, codex-10080min 96 %%\) "
+        self.assertRegex(_sans_epoch(pause.reason), r"^pause \(account \w+, codex-10080min 96 %% reset\) "
                                        r"until %s; " % re.escape(fin))
 
     def test_une_pause_budget_n_est_jamais_un_arret(self):

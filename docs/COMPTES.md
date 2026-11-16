@@ -1113,8 +1113,12 @@ read from the gauge history over the readings taken while the account was
 already at the requester's threshold (the pre-pause readings are excluded);
 the projected time stays put between two readings as long as that rate holds.
 When the usage grows at least as fast as the pace, or the projected usage
-reaches a fixed ceiling, only the window reset is announced. Without declared
-accounts the
+reaches a fixed ceiling, only the window reset is announced. Since #7572 the
+label also carries the **nature** of that time, right after the percentage:
+`reset` for a window reset (a fixed time), `pace` for a pace catch-up (an
+estimate that may recede while other agents consume the account). A label
+written before #7572 has no nature; readers must not invent one. Without
+declared accounts the
 account is `(default)`, the harness's own. `ameesh progress` and the alerts read
 `paused`, never `stopped`, for a budget pause. `ameesh attach` says it.
 

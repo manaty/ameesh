@@ -104,12 +104,16 @@ class ResetFallbackTest(unittest.TestCase):
     """Échéances d'overage sans base : plusieurs fenêtres et plusieurs comptes."""
     NOW = 1800000000.0
 
-    def deadline(self, gauges, reason=OVERAGE):
+    def wait(self, gauges, reason=OVERAGE, *, harness="codex"):
         store = mock.Mock()
         store.operations.gauge_latest.side_effect = lambda **kw: gauges[kw["account"]]
         with mock.patch.object(storage, "of", return_value=store):
-            return exploitation._budget_pause_waits_reset(
-                object(), {"harness": "codex"}, reason, self.NOW)
+            return exploitation._budget_pause_resume(
+                object(), {"harness": harness}, reason, self.NOW)
+
+    def deadline(self, gauges, reason=OVERAGE):
+        found = self.wait(gauges, reason)
+        return None if found is None else found.deadline
 
     def gauge(self, used, delay):
         return {"used": used, "resets_at_ts": None if delay is None else self.NOW + delay}
@@ -131,10 +135,15 @@ class ResetFallbackTest(unittest.TestCase):
 
     def test_first_account_released_suffices(self):
         reason = OVERAGE + "; secondaire: codex plan: in overage (billed beyond the plan)"
-        self.assertEqual(self.deadline({
+        found = self.wait({
             "primaire": [self.gauge(1.0, 3600), self.gauge(1.0, 10800)],
             "secondaire": [self.gauge(1.0, 7200)],
-        }, reason), self.NOW + 7200)
+        }, reason)
+        self.assertEqual(found.deadline, self.NOW + 7200)
+        # #7572 : le compte d'où vient l'échéance est nommé, et une remise à
+        # zéro est une heure fixe.
+        self.assertEqual(found.account, "secondaire")
+        self.assertEqual(found.kind, "reset")
 
     def test_expired_exhausted_window_does_not_hold_account(self):
         self.assertEqual(self.deadline({"primaire": [
@@ -147,6 +156,27 @@ class ResetFallbackTest(unittest.TestCase):
     def test_critical_pause_keeps_action_expected(self):
         self.assertIsNone(self.deadline({"primaire": [self.gauge(1.0, 3600)]},
                                        budget.CRITICAL_MARK + OVERAGE))
+
+    def test_a_pause_label_deadline_is_rendered_even_without_all_at_threshold(self):
+        # #7572 : le cas réel du 16/11 sur agents-3 — le relevé d'un compte
+        # est trop vieux, la raison n'est donc pas « all accounts at
+        # threshold », mais elle annonce bien une échéance.
+        reason = ("pause (account secondaire, seven_day 59 %% pace) until 16/11 "
+                  "17:07@%d; no claude account to place: reading older than every "
+                  "open window (tertiaire until 18/11 06:00)" % int(self.NOW + 3600))
+        found = self.wait({}, reason, harness="claude")
+        self.assertEqual(found.deadline, self.NOW + 3600)
+        self.assertEqual(found.account, "secondaire")
+        self.assertEqual(found.gauge, "seven_day")
+        self.assertEqual(found.kind, "pace")
+
+    def test_a_label_without_nature_has_no_invented_nature(self):
+        reason = ("pause (account primaire, five_hour 96 %%) until 16/11 "
+                  "17:07@%d; all codex accounts at threshold — primaire: ..."
+                  % int(self.NOW + 3600))
+        found = self.wait({}, reason, harness="codex")
+        self.assertIsNone(found.kind)
+        self.assertEqual(found.account, "primaire")
 
 
 class BriefOnceTest(unittest.TestCase):
@@ -169,26 +199,40 @@ class BriefOnceTest(unittest.TestCase):
         self.notifier = notify.Notifier(self.cfg, notify.parse_config({"default": []}),
                                         sender=object(), log=lambda text: None)
 
-    def alert(self, since, resume_ts):
+    def alert(self, since, resume_ts, *, kind="pace"):
         return dict(schema="ameesh-alert/1", type="budget_pause_long", agent="ouvrier",
                     since=since, value=7200, threshold=3600, host="ameesh-agents-3",
                     harness="codex", responsible="human:smichea", detail="pause",
-                    resume_ts=resume_ts, waits_reset=True, orchestrators=["pilot"])
+                    resume_ts=resume_ts, resume_kind=kind, waits_reset=True,
+                    orchestrators=["pilot"])
 
     def test_said_once_until_the_reset(self):
         run = self.notifier._brief_agents
-        run(object(), [self.alert(1000, 40000)], None, 10000)
+        run(object(), [self.alert(1000, 40000, kind="reset")], None, 10000)
         run(object(), [], None, 10030)                          # statut qui clignote
-        run(object(), [self.alert(10031, 40000)], None, 10060)
-        run(object(), [self.alert(10031, 40000)], None, 10000 + 7 * 3600)
+        run(object(), [self.alert(10031, 40000, kind="reset")], None, 10060)
+        run(object(), [self.alert(10031, 40000, kind="reset")], None, 10000 + 7 * 3600)
         self.assertEqual(self.send.call_count, 1)
 
-    def test_after_the_reset_a_new_brief(self):
+    def test_after_the_reset_a_new_episode_gets_a_brief(self):
+        run = self.notifier._brief_agents
+        run(object(), [self.alert(1000, 10500, kind="reset")], None, 10000)
+        run(object(), [], None, 10600)
+        # #7572 : l'absence doit dépasser la grâce du clignotement de statut
+        # pour clore l'épisode — sinon c'est la même pause, dite une fois.
+        run(object(), [], None, 10600 + alert_briefs.BUDGET_PAUSE_GAP_S + 1)
+        run(object(), [self.alert(20000, 50000, kind="reset")], None, 30000)
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_a_pace_deadline_passed_while_the_pause_lasts_is_the_same_brief(self):
+        # #7572 : le cas du 16/11 — l'ancienne échéance de rattrapage passe,
+        # la pause continue sur une nouvelle estimation : même pause, un seul
+        # brief. Une remise à zéro passée, elle, re-briefe (B1, #7572).
         run = self.notifier._brief_agents
         run(object(), [self.alert(1000, 10500)], None, 10000)
-        run(object(), [], None, 10600)
-        run(object(), [self.alert(10601, 50000)], None, 10700)
-        self.assertEqual(self.send.call_count, 2)
+        run(object(), [self.alert(1001, 50000)], None, 10600)
+        run(object(), [self.alert(1001, 50000)], None, 10700)
+        self.assertEqual(self.send.call_count, 1)
 
 
 if __name__ == "__main__":
