@@ -129,7 +129,9 @@ leur part (`idle_share` : sans lot actionnable ni tour sur un lot depuis
 (`idle_agent_hours`), les lots démarrables (`startable_lots`), le lot de
 découpage ouvert et son âge (`decoupage`), la feuille de route notée épuisée
 (`roadmap_exhausted`), et la **part de fenêtre perdue au reset** de chaque
-compte de forfait (`plan_loss_at_reset`, le calcul d'`ameesh accounts`).
+compte de forfait (`plan_loss_at_reset`, le calcul d'`ameesh accounts` ; une
+fenêtre échue n'annonce rien et ne périme pas une fenêtre encore ouverte,
+#7522).
 Les relecteurs, les pilotes, l'auditeur, mesh-design et les agents en pause
 ne sont pas réveillables et n'y comptent pas. Une famille exclue des prises
 (`auto_take.excluded_families` du canon, #5005) ne compte pas non plus tant

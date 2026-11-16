@@ -222,12 +222,22 @@ def _gauge(row: dict) -> cost_mod.Gauge:
     #1789/N6 : la clé d'un seau propre à un modèle porte sa portée
     (`seven_day@fable`, #1580) — l'historique ne stocke pas le `scope` ; le
     relire ici évite qu'un seau de modèle soit pris pour la fenêtre générale
-    du compte (alertes de sous-utilisation, `plan_underused`)."""
+    du compte (alertes de sous-utilisation, `plan_underused`).
+
+    #7522 : la provenance (`produced_at` du relevé, sinon `read_at` pour une
+    source qui ne date que l'insertion, `source`) voyage avec la jauge comme
+    dans `review_pace.gauge_of` ; sans elle, le débit ne pouvait pas distinguer
+    une fenêtre échue d'un ancien relevé d'une fenêtre encore ouverte du
+    relevé courant."""
     key = row["key"]
     _, _, scope = key.partition("@")
-    return cost_mod.Gauge(row["harness"], key, float(row.get("used") or 0.0),
-                          row.get("resets_at_ts"), float(row.get("window_s") or 0.0)
-                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]), scope=scope)
+    produced = row.get("produced_ts")
+    return cost_mod.Gauge(
+        row["harness"], key, float(row.get("used") or 0.0),
+        row.get("resets_at_ts"), float(row.get("window_s") or 0.0)
+        or float(cost_mod.KNOWN_WINDOWS["seven_day"]),
+        read_at=produced if produced is not None else row.get("observed_ts"),
+        produced_at=produced, source=str(row.get("source") or ""), scope=scope)
 
 
 def expiring(gauge, now: float) -> tuple | None:
