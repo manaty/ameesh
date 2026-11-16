@@ -22,6 +22,7 @@ the existing descriptor and official DeepSeek route.
         "context_tokens": 200000,
         "max_output_tokens": 16000,
         "tariffs": {"default": [2, 0.2, 8]},
+        "response_models": ["chosen-model-2026-01-01"],
         "reasoning_efforts": {"off": null, "high": "high", "max": "high"},
         "source": "dated provider model-limit and pricing reference"
       }
@@ -45,8 +46,12 @@ decision naming the authorized key holder. This change creates no account,
 key, balance statement, deployment or paid request.
 
 The selected account must be an `api_key_env` account whose destination `env`
-matches the route's `key_env`, and its `billing_account` must match. Existing
-account validation enforces the owning UID and private mode for `key_file`,
+matches the route's `key_env`, and its `billing_account` must match.
+The destination must be dedicated to this route: automatic harness credential
+names (including `DEEPSEEK_API_KEY`), configuration variables, runtime variables
+and mesh/tool credentials are refused. The account's source `key_env` or
+`key_file` remains separate from this destination; it is read only by its owner.
+Existing account validation enforces the owning UID and private mode for `key_file`,
 or reads the selected source variable in the executor's own environment.
 No secret is read from another process or inserted into a configuration or
 patch file. The ordinary DeepSeek balance probe skips configured-provider
@@ -78,15 +83,25 @@ through `cycle_budget.execute`. The owning connection is fresh for each
 attempt. The upstream transport makes exactly one HTTPS exchange, with neither
 SDK retries nor redirects. A dsh/pi-ai retry is a new incoming HTTP request and
 therefore gets a new attempt ID and both guards. Ordinary turn admission stays
-in force as an additional reservation.
+in force as an additional reservation. Request admission checks the request's
+own bound atomically; it does not add another `profile.reserve_usd` on top of
+the existing turn reservation.
 
 Complete Responses usage settles at the declared input/cache/output tariffs.
-The real response model and tier must match declared prices. Missing or partial
+The real response model and tier must match declared prices. A model's optional
+`response_models` lists exact returned snapshot identities covered by that
+model's documented bounds and tariffs. Unlisted identities keep the full
+reservation; no date suffix or alias is guessed. Missing or partial
 usage, timeout, invalid response or cancellation keeps the full cycle liability;
 the daily ledger records its conservative bound. A write failure closes this
 turn's broker. Each response has its own `turn_costs` row (`source=relay`,
-`harness=deepseek`, account and turn ID); the usual turn row becomes a zero-cost
-timeline marker, avoiding a second charge at the descriptor's DeepSeek rates.
+`harness=deepseek`, account and turn ID). Malformed usage still records the
+conservative amount with only valid nonnegative integer counters. The usual
+turn row carries zero dollars and the sum of its provider-response tokens,
+avoiding a second charge at the descriptor's DeepSeek rates. Only this native
+row carries the session: a fresh worker can reload session and reread totals
+without counting responses as extra turns. Cached input is split out of total
+input for the existing DeepSeek session convention.
 Dated provider statements and operator reconciliation remain separate: a
 transport observation never invents or refreshes available credit.
 
@@ -119,7 +134,8 @@ models must be in the declared catalog and have tariffs.
 The current composition contract is dsh 0.2.1-rc.4. The fake-provider integration
 test boots installed dsh with a private temporary home, composes the patch,
 and serves one Responses stream through the broker. No external credential
-or provider connection is involved. Independent broker tests cover the same
+or provider connection is involved. Closing a broker refuses further
+admission and dispatch before clearing its key. Independent broker tests cover the same
 boundary for main/reasoning/tool/compaction/subagent/retry requests.
 
 Protocol reference: [Responses create and usage fields](https://developers.openai.com/api/reference/resources/responses/methods/create).
