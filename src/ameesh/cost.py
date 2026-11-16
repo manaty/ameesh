@@ -535,7 +535,13 @@ def consumption_rate(history, gauge: "Gauge", *, now: float, account: str | None
     Mêmes précautions que `sous_utilisation._projected_plan_loss` : même
     harnais, compte, jauge et échéance de fenêtre ; horodatage de production
     (`produced_ts`) plutôt que d'insertion quand il existe ; deux relevés au
-    moins, espacés de `min_span` ; usage non décroissant. Une lecture qui ne
+    moins, espacés de `min_span` ; usage non décroissant. #7540 : deux
+    hausses distinctes sont nécessaires pour confirmer la pente : un seul
+    pas de jauge quantifiée ne projette pas la pause jusqu’au reset. Cette
+    hystérésis est bornée à la fenêtre d’observation (six heures) ; les
+    plateaux ne confirment pas une hausse supplémentaire et les anciens pas
+    expirent avec la fenêtre. Sans confirmation, l’annonce utilise l’usage
+    courant figé ; les seuils de pause restent inchangés. Une lecture qui ne
     conclut pas rend 0.0 — le repli est le calcul d'origine, jamais une
     valeur inventée.
 
@@ -575,6 +581,8 @@ def consumption_rate(history, gauge: "Gauge", *, now: float, account: str | None
     if span < min_span or used < initial:
         return 0.0
     if any(later[1] < earlier[1] for earlier, later in zip(samples, samples[1:])):
+        return 0.0
+    if sum(later[1] > earlier[1] for earlier, later in zip(samples, samples[1:])) < 2:
         return 0.0
     return (used - initial) / span
 

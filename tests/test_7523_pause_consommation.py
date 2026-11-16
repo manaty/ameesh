@@ -104,6 +104,7 @@ class ConsumptionRateTest(unittest.TestCase):
     def test_la_pente_des_releves_au_seuil_est_le_rythme(self):
         rows = [self.row(self.now - 2 * HOUR, 0.670),
                 self.row(self.now - HOUR, 0.672),
+                self.row(self.now - HOUR / 2, 0.673),
                 self.row(self.now, 0.674)]
         self.assertAlmostEqual(self.rate(rows), 0.002 / HOUR, delta=1e-12)
 
@@ -112,6 +113,7 @@ class ConsumptionRateTest(unittest.TestCase):
         # il mesurerait leur consommation, qui vient de s'arrêter.
         rows = [self.row(self.now - 2 * HOUR, 0.50),
                 self.row(self.now - HOUR, 0.672),
+                self.row(self.now - HOUR / 2, 0.673),
                 self.row(self.now, 0.674)]
         self.assertAlmostEqual(self.rate(rows), 0.002 / HOUR, delta=1e-12)
 
@@ -129,10 +131,12 @@ class ConsumptionRateTest(unittest.TestCase):
     def test_une_autre_fenetre_ou_un_autre_compte_est_ignore(self):
         rows = [self.row(self.now - 2 * HOUR, 0.670, reset=self.resets + WEEK),
                 self.row(self.now - HOUR, 0.672),
+                self.row(self.now - HOUR / 2, 0.673),
                 self.row(self.now, 0.674)]
         self.assertAlmostEqual(self.rate(rows), 0.002 / HOUR, delta=1e-12)
         rows = [self.row(self.now - 2 * HOUR, 0.670, account="secondaire"),
                 self.row(self.now - HOUR, 0.672),
+                self.row(self.now - HOUR / 2, 0.673),
                 self.row(self.now, 0.674)]
         self.assertAlmostEqual(self.rate(rows), 0.002 / HOUR, delta=1e-12)
 
@@ -150,7 +154,10 @@ class _Historique(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.db.execute("TRUNCATE quota_gauge_readings RESTART IDENTITY")
-        self.now = time.time()
+        # PostgreSQL arrondit les timestamps à la microseconde. Un relevé
+        # produit à « now » peut sinon revenir légèrement dans le futur et
+        # être exclu de consumption_rate, perdant la seconde hausse requise.
+        self.now = int(time.time())
         self.resets = self.now + 0.40 * WEEK
         self.gauge = cost.Gauge("claude", "seven_day", 0.674, self.resets, WEEK)
         self.directory = tempfile.mkdtemp(prefix="ameesh-7523-")
@@ -186,7 +193,8 @@ class EvaluateObserveeTest(_Historique):
 
     def test_l_echeance_est_reculee_par_le_rythme_observe(self):
         without = self.evaluate().until
-        self.read([(2 * HOUR, 0.670), (HOUR, 0.672), (0, 0.674)])
+        self.read([(2 * HOUR, 0.670), (HOUR, 0.672),
+                   (HOUR / 2, 0.673), (0, 0.674)])
         with_rate = self.evaluate().until
         self.assertGreater(with_rate, without + HOUR)
         # 0,2 point par heure : rW = 0,336 ; (67,4 − 60) % × 168 h / 0,664.
@@ -199,14 +207,16 @@ class EvaluateObserveeTest(_Historique):
         self.assertAlmostEqual(self.evaluate().until, expected, delta=1.0)
 
     def test_le_libelle_porte_l_echeance_projetee(self):
-        self.read([(2 * HOUR, 0.670), (HOUR, 0.672), (0, 0.674)])
+        self.read([(2 * HOUR, 0.670), (HOUR, 0.672),
+                   (HOUR / 2, 0.673), (0, 0.674)])
         ev = self.evaluate()
         label = accounts.pause_label({"primaire": ev})
         self.assertIn("@%d" % (int(ev.until) // 60 * 60), label)
         self.assertAlmostEqual(accounts.pause_deadline(label), ev.until, delta=60.0)
 
     def test_un_rythme_au_dessus_du_plafond_annonce_la_remise_a_zero(self):
-        self.read([(2 * HOUR, 0.660), (HOUR, 0.670), (0, 0.680)])
+        self.read([(2 * HOUR, 0.660), (HOUR, 0.670),
+                   (HOUR / 2, 0.675), (0, 0.680)])
         self.assertEqual(self.evaluate().until, self.gauge.resets_at)
 
 
