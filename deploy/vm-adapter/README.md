@@ -145,8 +145,9 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    Vérifier que les seules VM inscrites sont les burst autorisées ; ne pas
    changer le décompte ou la charge d'une VM dans ce lot.
 4. Garder `/etc/ameesh-vm-adapter/scaleway.json` sous le contrôle du détenteur
-   existant (0600), contenu `{"secret_key":"…"}`. `LoadCredential` le rend
-   lisible au seul service, jamais aux runners. Pas de token en argument,
+   existant (0600), contenu `{"secret_key":"…"}`. `LoadCredential` produit sur ramfs
+   une copie privée appartenant au compte du service ; sur tmpfs (systemd 255),
+   une copie root 0440 avec ACL de lecture limitée à ce compte, jamais aux runners. Pas de token en argument,
    dans les courriers, dans le dépôt ou dans les erreurs. Écrire
    `database.env` (0600) avec le chemin `AMEESH_CONFIG` de la connexion mesh
    de l'opérateur. Le DSN ne contient aucune clé cloud.

@@ -37,6 +37,7 @@ from pathlib import Path
 import re
 import socket
 import stat
+import struct
 import subprocess
 import urllib.request
 import uuid
@@ -83,6 +84,52 @@ def private_json(path):
             raise Refused('private file link count must be one')
         if info.st_size > 65536:
             raise Refused('private file size exceeds limit')
+        try:
+            return json.loads(stream.read(65537))
+        except ValueError:
+            raise Refused('invalid private JSON') from None
+
+
+def credential_json(path):
+    """Read only the systemd scaleway credential, including tmpfs ACL copies."""
+    directory = Path(os.environ['CREDENTIALS_DIRECTORY'])
+    path = Path(path)
+    if (not directory.is_absolute() or path != directory / 'scaleway.json'
+            or '..' in directory.parts):
+        raise Refused('credential must be directly under CREDENTIALS_DIRECTORY')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd) as stream:
+        info = os.fstat(stream.fileno())
+        uid = os.geteuid()
+        if not stat.S_ISREG(info.st_mode):
+            raise Refused('credential file must be regular')
+        if info.st_uid not in (uid, 0):
+            raise Refused('credential file owner must be root or effective uid')
+        if info.st_mode & 0o037:
+            raise Refused('credential file unsafe group or other permission bits')
+        if info.st_nlink != 1:
+            raise Refused('credential file link count must be one')
+        if info.st_size > 65536:
+            raise Refused('credential file size exceeds limit')
+        if info.st_uid == uid:
+            if info.st_mode & 0o077:
+                raise Refused('private file group or other permission bits forbidden')
+        else:
+            # Linux POSIX ACL v2: only root and this service uid may read.
+            # st_mode group bits are the ACL mask, not the owning group's rights.
+            try:
+                acl = os.getxattr(stream.fileno(), 'system.posix_acl_access')
+            except OSError:
+                raise Refused('credential ACL required') from None
+            expected = {(1, 0xffffffff): 4, (2, uid): 4,
+                        (4, 0xffffffff): 0, (16, 0xffffffff): 4,
+                        (32, 0xffffffff): 0}
+            if len(acl) != 44 or struct.unpack_from('<I', acl)[0] != 2:
+                raise Refused('credential ACL must grant read only to effective uid')
+            entries = [struct.unpack_from('<HHI', acl, offset)
+                       for offset in range(4, len(acl), 8)]
+            if {(tag, ident): perm for tag, perm, ident in entries} != expected:
+                raise Refused('credential ACL must grant read only to effective uid')
         try:
             return json.loads(stream.read(65537))
         except ValueError:
@@ -574,7 +621,7 @@ def main(argv=None):
         stage = 'enrollment'
         policy = enrollment(private_json(args.enrollment))
         stage = 'credentials'
-        credentials = private_json(Path(os.environ['CREDENTIALS_DIRECTORY']) / 'scaleway.json')
+        credentials = credential_json(Path(os.environ['CREDENTIALS_DIRECTORY']) / 'scaleway.json')
         stage = 'provider'
         provider = Scaleway(credentials['secret_key'], timeout=policy['io_timeout_s'])
         for host in policy['targets']:
