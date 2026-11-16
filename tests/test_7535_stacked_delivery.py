@@ -70,9 +70,22 @@ class StackedDeliveryTest(PgTestCase):
         self.delivered()
         self.assertFalse(any("Base lot #" in e["note"] for e in work.events(self.db, self.child["id"])))
 
-    def test_mail_failure_rolls_back_merge_and_journal(self):
+    def test_mail_failure_preserves_merge_and_rolls_back_alert_journal(self):
         with mock.patch.object(stacked_delivery.mail, "send", side_effect=RuntimeError("mail unavailable")):
-            with self.assertRaisesRegex(RuntimeError, "mail unavailable"):
-                self.delivered()
-        self.assertEqual(work.get(self.db, self.base["id"])["state"], self.base["state"])
+            result = self.delivered()
+        self.assertEqual(result["result"], "merged")
+        self.assertIn("mail unavailable", result["stacked_warning"])
+        self.assertNotEqual(work.get(self.db, self.base["id"])["state"], self.base["state"])
         self.assertFalse(any("Base lot #" in e["note"] for e in work.events(self.db, self.child["id"])))
+        self.assertTrue(any("mail unavailable" in e["note"]
+                            for e in work.events(self.db, self.base["id"])))
+
+    def test_sql_failure_does_not_poison_merge_transaction(self):
+        def fail(db, *_args, **_kwargs):
+            db.query("SELECT * FROM nonexistent_stacked_delivery_table")
+
+        with mock.patch.object(stacked_delivery, "notify", side_effect=fail):
+            result = self.delivered()
+        self.assertEqual(result["result"], "merged")
+        self.assertIn("stacked delivery alert failed", result["stacked_warning"])
+        self.assertNotEqual(work.get(self.db, self.base["id"])["state"], self.base["state"])

@@ -5,8 +5,27 @@ from __future__ import annotations
 from . import alert_briefs, mail, plan_git, registry, storage, work
 
 
+def after_merge(db, base, *, repo=None):
+    """An alert failure must never undo the base's recorded delivery."""
+    try:
+        threads = []
+        with db.transaction() as tx:
+            notify(tx, base, repo=repo, after_commit=threads)
+        for record in threads:
+            record(db.cfg, db)
+        return ""
+    except Exception as exc:  # noqa: BLE001 - delivery has already committed
+        warning = "stacked delivery alert failed for #%s: %s: %s" % (
+            base["id"], type(exc).__name__, str(exc)[:240])
+        try:
+            work.note(db, int(base["id"]), warning, actor=work.SYSTEM_SENDER)
+        except Exception:  # noqa: BLE001 - the caller still receives the warning
+            pass
+        return warning
+
+
 def notify(db, base, *, repo=None, after_commit=None):
-    """Called in the merge transaction: the journal and mail commit with it.
+    """The journal and mail commit together, after the base merge transaction.
 
     Retargeting also requires a GitHub write and migration-slot arbitration.
     Use the requested fallback: tell the project pilot about all three,
