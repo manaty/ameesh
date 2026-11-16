@@ -194,7 +194,7 @@ class TrainCiTest(unittest.TestCase):
         # #2446 : the packet suite is the compiled 12 psycopg + 16 psql matrix;
         # a missing caller gate, aggregate, part or platform job can never be
         # replaced by the workflow's green conclusion.
-        for missing in ("tests", "psycopg 4/12", "psql 6/12",
+        for missing in ("tests", "psycopg 4/12", "psql 6/16",
                         "plateforme macOS", "plan"):
             with self.subTest(missing=missing):
                 actual = next(j["name"] for j in every if j["name"].endswith(missing))

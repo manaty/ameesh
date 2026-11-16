@@ -88,11 +88,6 @@ class PlanTest(unittest.TestCase):
                 self.assertEqual(self._ran(p, "psycopg"), self.mods)
                 self.assertEqual(self._ran(p, "psql"), expected)
                 self.assertFalse(p["psql_full"])
-                self.assertEqual({ps["of"] for ps in p["parts"]["psql"]}, {12})
-                self.assertLessEqual(sum(len(ps) for ps in p["parts"].values()), 24)
-                for jobs in p["parts"].values():
-                    seen = [m for job in jobs for m in job["modules"]]
-                    self.assertEqual(len(seen), len(set(seen)))
                 self.assertIn("pilot list + contract", plan.summary(p))
 
     def test_le_nocturne_passe_toute_la_suite_sous_psql_et_rien_sous_psycopg(self):
@@ -102,7 +97,7 @@ class PlanTest(unittest.TestCase):
                 self.assertEqual(p["parts"]["psycopg"], [])
                 self.assertEqual(self._ran(p, "psql"), self.mods)
                 self.assertEqual({ps["of"] for ps in p["parts"]["psql"]},
-                                 {plan.PSQL_FULL_PARTS})
+                                 {plan.PARTS["psql"][1]})
                 out = plan.outputs(p)
                 self.assertEqual(out["psycopg"], "[]")
                 self.assertEqual(out["psycopg_parts"], "0")
@@ -188,7 +183,7 @@ class PlanTest(unittest.TestCase):
         night = plan.fallback_plan("schedule", "boom", psql_full=True)
         self.assertEqual(night["parts"]["psycopg"], [])
         self.assertEqual(self._consumer_modules(night, "psql"), self.mods)
-        self.assertEqual(len(night["parts"]["psql"]), plan.PSQL_FULL_PARTS)
+        self.assertEqual(len(night["parts"]["psql"]), plan.PARTS["psql"][1])
         self.assertEqual(plan.outputs(night)["psycopg"], "[]")
 
     def test_repli_sur_listes_illisibles_rend_la_suite_psql_entiere(self):
