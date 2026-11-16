@@ -19,7 +19,7 @@
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; hors lot (#3749), la liste
-#               pilote et tout le contrat, en 16 parts (#1476), sur push vers
+#               pilote et tout le contrat, en 12 parts (#7537), sur push vers
 #               main ou release/**, sur une PR de release, à la main
 #               (workflow_dispatch, hors tête de PR ouverte, #1635), sur
 #               l'appel du portier de paquet (workflow_call) et sur une
@@ -35,9 +35,9 @@
 # n'est jamais le check requis d'une PR.
 # #1476 : 16 psql + 8 psycopg = 24 jobs, la taille du pool de #1468 ; le
 # découpage suit les durées mesurées (scripts/test-plan.py, PARTS), jamais ce
-# fichier (rééquilibrage : #3754). #6880 : psycopg passe à 12 parts (28 jobs) ;
-# les quatre parts au-delà du pool attendent qu'un runner se libère, ce qui
-# lisse la fin de paquet au lieu de laisser un hôte avec quatre parts lourdes.
+# fichier (rééquilibrage : #3754). #7537 : 12 psql + 12 psycopg tiennent
+# dans les 24 runners ; les mesures nocturnes comblent les modules psql
+# absents de l'ancienne table. Le nocturne psql garde ses 16 parts.
 # #3754 — chaque part psql/psycopg tourne en deux processus de test
 # (`--parallel 2`), chacun son schéma : les runners auto-hébergés offrent
 # 8 vCPU pour 8 jobs (#6880 : la flotte est à 8 vCPU par hôte, pas 16), une
