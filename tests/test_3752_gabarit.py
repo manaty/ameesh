@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import multiprocessing
 import os
 import shutil
 import tempfile
@@ -114,6 +115,26 @@ def signature(db, schema: str) -> dict:
     return out
 
 
+def _clone_interrompu(cfg, driver, cle, canal):
+    """Worker indépendant : un échec local après lecture du gabarit partagé."""
+    db = db_mod.connect(cfg, driver=driver)
+    try:
+        def interrompre(*args):
+            canal.send("gabarit lu")
+            if not canal.poll(45) or canal.recv() != "échouer":
+                raise RuntimeError("synchronisation du témoin perdue")
+            raise db_mod.DbError("interruption locale du clone (témoin #7532)")
+
+        with mock.patch.object(gabarit, "empreinte", return_value=cle), \
+                mock.patch.object(gabarit, "cloner", side_effect=interrompre), \
+                mock.patch.object(gabarit, "_retirer", wraps=gabarit._retirer) as retirer:
+            chemin = gabarit.preparer(db, cfg.schema)
+            canal.send((chemin, retirer.call_count))
+    finally:
+        db.close()
+        canal.close()
+
+
 class GabaritTest(PgTestCase):
 
     def setUp(self) -> None:
@@ -209,6 +230,46 @@ class GabaritTest(PgTestCase):
                 self.assertEqual(gabarit.preparer(c, troisieme), "migrate")
         self.assertEqual(migrations.pending(c), [])
 
+    def test_un_echec_d_un_worker_preserve_le_gabarit_des_autres(self):
+        """#7532 : empreinte neuve, deux processus ; le lecteur qui échoue
+        ne doit pas retirer le gabarit entre deux préparations d'un autre."""
+        self.exiger_pg_dump()
+        cle = "temoin-7532-%s" % uuid.uuid4().hex
+        self.addCleanup(gabarit._retirer, self.db, cle)
+        self.addCleanup(gabarit._cache.pop, cle, None)
+        premier, a = self.nouveau("course")
+        interrompu, c = self.nouveau("interrompu")
+        ctx = multiprocessing.get_context("spawn")
+        parent, enfant = ctx.Pipe()
+        worker = ctx.Process(target=_clone_interrompu,
+                             args=(c.cfg, c.name, cle, enfant))
+        with mock.patch.object(gabarit, "empreinte", return_value=cle):
+            self.assertEqual(gabarit.preparer(a, premier), "migrate+gabarit")
+            worker.start()
+            enfant.close()
+            try:
+                self.assertTrue(parent.poll(45), "le worker n'a pas lu le gabarit")
+                self.assertEqual(parent.recv(), "gabarit lu")
+                parent.send("échouer")
+                self.assertTrue(parent.poll(45), "le worker n'a pas fini son repli")
+                chemin, retraits = parent.recv()
+                self.assertEqual(chemin, "migrate")
+                worker.join(45)
+                self.assertEqual(worker.exitcode, 0)
+                # Relire le serveur : le cache du premier appel masquerait
+                # justement le retrait fautif par l'autre processus.
+                gabarit._cache.pop(cle, None)
+                second, b = self.nouveau("course")
+                self.assertEqual(gabarit.preparer(b, second), "clone")
+                self.assertEqual(retraits, 0)
+                self.assertEqual(migrations.pending(b), [])
+                self.assertEqual(migrations.pending(c), [])
+            finally:
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(10)
+                parent.close()
+
     def test_une_migration_ajoutee_ou_modifiee_invalide_le_gabarit(self):
         copie = tempfile.mkdtemp(prefix="ameesh-gabarit-")
         self.addCleanup(shutil.rmtree, copie, True)
@@ -241,11 +302,18 @@ class GabaritTest(PgTestCase):
         lire.assert_not_called()
         self.assertEqual(migrations.pending(db), [])
 
-    def test_un_rejeu_en_echec_retire_le_gabarit_et_migre(self):
+    def test_un_rejeu_en_echec_isole_le_processus_et_migre(self):
         schema, db = self.nouveau("echec")
-        with mock.patch.object(gabarit, "_lire", return_value=("t_x", "SELECT 1/0;")), \
+        cle = "temoin-echec-%s" % uuid.uuid4().hex
+        self.addCleanup(gabarit._echecs.discard, cle)
+        with mock.patch.object(gabarit, "empreinte", return_value=cle), \
+                mock.patch.object(gabarit, "_lire", return_value=("t_x", "SELECT 1/0;")) as lire, \
                 mock.patch.object(gabarit, "_retirer") as retirer, \
                 mock.patch.object(gabarit, "_ranger", return_value=False):
             self.assertEqual(gabarit.preparer(db, schema), "migrate")
-        retirer.assert_called_once()
+            suivant, autre = self.nouveau("quarantaine")
+            self.assertEqual(gabarit.preparer(autre, suivant), "migrate")
+            lire.assert_called_once()
+        retirer.assert_not_called()
         self.assertEqual(migrations.pending(db), [])
+        self.assertEqual(migrations.pending(autre), [])

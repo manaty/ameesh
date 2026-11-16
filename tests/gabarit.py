@@ -24,7 +24,8 @@ classes suivantes rejouent ce DDL final sous leur propre nom de schéma
   (`transaction()` + `script()`), psql comme psycopg.
 - **Repli** sur `migrate()`, comme avant : `AMEESH_TEST_GABARIT=0`, nom de
   schéma non simple, aucun `pg_dump` de version majeure ≥ celle du serveur,
-  ou rejeu en échec (le gabarit fautif est alors retiré).
+  ou rejeu en échec (le processus cesse alors d'utiliser cette empreinte,
+  sans retirer le gabarit partagé par les autres workers).
 
 Seule différence connue avec un `migrate()` : une valeur tirée au hasard par
 une migration (identité du journal d'événements, 0448) est celle du gabarit,
@@ -198,6 +199,8 @@ def _ranger(db, cle: str, schema: str, attendre: bool = False) -> bool:
 
 
 def _retirer(db, cle: str) -> None:
+    """Retrait explicite (nettoyage des témoins), jamais par un lecteur dont
+    le clone échoue : cet échec peut être propre à sa connexion (#7532)."""
     _cache.pop(cle, None)
     try:
         db.execute("DELETE FROM " + TABLE + " WHERE cle = %s", (cle,))
@@ -222,7 +225,7 @@ def preparer(db, schema: str) -> str:
         dernier = "migrate"
         return dernier
     cle = empreinte(db)
-    trouve = _lire(db, cle)
+    trouve = None if cle in _echecs else _lire(db, cle)
     if trouve is not None:
         source, ddl = trouve
         try:
@@ -232,10 +235,11 @@ def preparer(db, schema: str) -> str:
                 return dernier
         except db_mod.DbError:
             pass
-        # un rôle de contrat disparu entre-temps, un gabarit incomplet… : on
-        # le retire et on revient à l'historique, sur un schéma propre
+        # L'échec peut être local (connexion, concurrence…) : ce lecteur ne
+        # possède pas le gabarit partagé et ne doit pas le retirer (#7532).
+        # Quarantaine dans ce processus seulement, puis historique sur un
+        # schéma propre ; les autres workers gardent leur gabarit valide.
         _echecs.add(cle)
-        _retirer(db, cle)
         db.execute("DROP SCHEMA IF EXISTS %s CASCADE" % db_mod.quote_ident(schema))
     migrations.migrate(db, log=None)
     dernier = "migrate"
