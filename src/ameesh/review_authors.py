@@ -1159,11 +1159,13 @@ def _read_local_commit(repo, rev):
     return plan_git.local_commit(repo, rev, deadline=_read_bound(plan_git.PROBE_TIMEOUT_S))
 
 
-def _on_own_review_branch(repo: str, actor: str, lot: int, sha: str) -> bool:
+def _on_own_review_branch(repo: str, actor: str, lot: int, sha: str, *,
+                          fetch: bool = False) -> bool:
     """#5197 : `sha` est sur une branche `review/<actor>-<lot>[-…]` du relecteur.
 
     Lu sur les refs du clone (`refs/remotes/origin/…`, puis `refs/heads/…`) :
-    une ref absente ou illisible rend False, l'exclusion demeure (#4457)."""
+    Hors transaction, la forge complète les refs absentes d'un clone de
+    fusion (#7539). Une lecture illisible garde l'exclusion (#4457)."""
     name = str(actor or "").strip()
     if not repo or not name or not lot or not sha:
         return False
@@ -1172,9 +1174,25 @@ def _on_own_review_branch(repo: str, actor: str, lot: int, sha: str) -> bool:
     patterns = [prefix + stem + suffix for prefix in ("refs/remotes/origin/", "refs/heads/")
                 for stem in stems for suffix in ("", "-*")]
     tips = _read_out(repo, "for-each-ref", "--format=%(objectname)", *patterns)
-    if not tips:
+    if any(_is_ancestor(repo, sha, tip) is True for tip in (tips or "").split()):
+        return True
+    if not fetch:
         return False
-    return any(_is_ancestor(repo, sha, tip) is True for tip in tips.split())
+    forge = plan_git.forge_remote(repo)
+    if not forge:
+        return False
+    patterns = ["refs/heads/" + stem + suffix
+                for stem in stems for suffix in ("", "-*")]
+    remote = _read_out(repo, "ls-remote", "--heads", "--", forge, *patterns)
+    for line in (remote or "").splitlines():
+        tip, _, ref = line.partition("\t")
+        if not plan_git.full_commit_id(tip) or not any(
+                ref == "refs/heads/" + stem or ref.startswith("refs/heads/" + stem + "-")
+                for stem in stems):
+            continue
+        if _forge_fetch(repo, tip) is True and _is_ancestor(repo, sha, tip) is True:
+            return True
+    return False
 
 
 def _touches_only_files_absent_from(repo: str, sha: str, heads) -> bool:
@@ -5574,7 +5592,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         `cited` nomme le commit qui le cite. Une citation d'un commit encore
         dans la tête, d'un ancêtre ou d'un commit étranger au lot ne prouve
         rien : elle n'exclut personne. Une forge muette sur un commit absent
-        localement est un doute tracé, jamais une exclusion. `fetch=False`
+        localement est un doute tracé, jamais une exclusion. Ce doute refuse
+        la lecture stricte de la porte (#7539). `fetch=False`
         (#3836) interdit toute interrogation de la forge : l'objet absent
         localement est un doute `not-prefetched`, à préparer hors transaction.
         """
@@ -5637,6 +5656,13 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         def cite_doubt(token: str, citing: str, *,
                        reason: str = "forge-unreadable") -> None:
             """#7252 B/P2 auditeur : une citation non concluante se dit au gel."""
+            # #7539 : la porte ne peut conclure à l'indépendance sans lire
+            # le correctif cité. Le doute reste une trace à la désignation,
+            # mais refuse la lecture stricte, même sans collecteur de traces.
+            if strict:
+                raise review_provenance.ProvenanceError(
+                    "cited commit %s (cited by %s) cannot be read: %s"
+                    % (token, citing, reason))
             if unattached is not None:
                 ignored.setdefault(("", "cited:" + token), {
                     "name": "", "sha": token,
@@ -5723,9 +5749,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 continue
             other_lot = stacked_lot(receipt, full) if receipt else 0
             for actor in candidates:
-                if (_on_own_review_branch(repo, actor, lot, full)
-                        and _touches_only_files_absent_from(
-                            repo, full, (freeze_sha, head_sha))):
+                if (_touches_only_files_absent_from(repo, full, (freeze_sha, head_sha))
+                        and _on_own_review_branch(repo, actor, lot, full, fetch=fetch)):
                     continue            # note de relecture, pas un correctif
                 row = {"name": actor, "family": "", "families": [],
                        "rewritten": full, "freeze": freeze_id,
@@ -5865,9 +5890,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 if _is_ancestor(repo, freeze_sha, full) is not True:
                     continue
                 check()
-                if (_on_own_review_branch(repo, actor, lot, full)
-                        and _touches_only_files_absent_from(repo, full,
-                                                            (freeze_sha, head_sha))):
+                if (_touches_only_files_absent_from(repo, full, (freeze_sha, head_sha))
+                        and _on_own_review_branch(repo, actor, lot, full, fetch=fetch)):
                     # #5197 : une note de relecture — sur la branche review/*
                     # du relecteur et hors du contenu du lot —, pas un
                     # correctif réécrit

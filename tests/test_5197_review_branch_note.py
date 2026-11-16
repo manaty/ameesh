@@ -13,6 +13,9 @@ du lot, ou un commit hors de la branche de relecture, reste exclu (#4457).
 """
 from __future__ import annotations
 
+import os
+from unittest import mock
+
 from ameesh import merge_queue, registry, review_authors, work
 
 from .support import PgTestCase
@@ -108,6 +111,41 @@ class ReviewBranchNoteTest(_ActivationFixture, PgTestCase):
     def test_an_amended_note_on_the_review_branch_does_not_either(self):
         head = self.scenario(amend=True)
         self.assertEqual(self.rewritten(head), {})
+
+    def remote_review(self, *, path=NOTE):
+        head = self.scenario(path=path)
+        ref = "refs/heads/review/cx3-%d" % self.lot
+        note = self.repo.git("rev-parse", ref)
+        forge = os.path.join(self.tmp, "review-forge.git")
+        self.repo.git("clone", "--bare", self.repo.root, forge)
+        self.repo.git("update-ref", "-d", ref)
+        # merge-pr's scratch repository has ameesh.forge, not origin.
+        self.repo.git("config", "ameesh.forge", forge)
+        return head, note
+
+    def test_queue_clone_resolves_review_branch_without_local_refs(self):
+        head, note = self.remote_review()
+        self.assertFalse(review_authors._on_own_review_branch(
+            self.repo.root, "cx3", self.lot, note))
+        self.assertTrue(review_authors._on_own_review_branch(
+            self.repo.root, "cx3", self.lot, note, fetch=True))
+        out = self.gate(head)
+        self.assertFalse(out.get("error"), out)
+        self.assertNotIn("cx3", out["corrections"])
+        self.assertEqual(sorted(row["actor"] for row in out["accepted"]), ["cx3", "r1"])
+
+    def test_remote_review_branch_does_not_disguise_a_product_correction(self):
+        head, _note = self.remote_review(path="src/ameesh/mail.py")
+        out = self.gate(head)
+        self.assertIn("cx3", out["corrections"])
+        self.assertNotIn("cx3", [row["actor"] for row in out["accepted"]])
+
+    def test_freeze_read_does_not_query_remote_review_refs(self):
+        _head, note = self.remote_review()
+        with mock.patch.object(review_authors.plan_git, "forge_remote",
+                               side_effect=AssertionError("network under freeze lock")):
+            self.assertFalse(review_authors._on_own_review_branch(
+                self.repo.root, "cx3", self.lot, note, fetch=False))
 
     # -- ce qui reste un correcteur (#4457) --------------------------------
 
