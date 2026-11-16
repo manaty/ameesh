@@ -8,9 +8,11 @@ mesurées, et peser un module neuf par son nombre de tests.
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("test_parts", REPO / "scripts" / "test-parts.py")
@@ -19,6 +21,29 @@ _spec.loader.exec_module(parts)
 
 
 class RepartitionTest(unittest.TestCase):
+    def test_le_nocturne_comble_les_trous_sans_ecraser_les_mesures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            table = root / "durees.json"
+            table.write_text(json.dumps({
+                "psql": {"test_connu": 0.0},
+                "psql_full": {"test_connu": 900.0, "test_recent": 2100.0},
+                "psycopg": {"test_connu": 10.0, "test_recent": 20.0},
+            }), encoding="utf-8")
+            for name in ("test_connu", "test_recent"):
+                (root / (name + ".py")).write_text("def test_a(): pass\n")
+            mods = ["test_connu", "test_recent"]
+            with mock.patch.object(parts, "TABLE", table):
+                poids, repli = parts.weight(mods, "psql", tests=root)
+                self.assertEqual(repli, [])
+                self.assertEqual(poids, {"test_connu": parts.MIN_WEIGHT,
+                                         "test_recent": 2100.0})
+                carte, _ = parts.weight(mods, "psql",
+                    {"psql": {"test_recent": 50.0}}, root)
+                self.assertEqual(carte["test_recent"], 50.0)
+                psycopg, _ = parts.weight(mods, "psycopg", tests=root)
+                self.assertEqual(psycopg, {"test_connu": 10.0, "test_recent": 20.0})
+
     def test_chaque_module_dans_une_seule_part(self):
         mods = parts.modules()
         self.assertIn("test_l116_parts", mods)

@@ -20,7 +20,7 @@ its ``suite`` job calls ``tests.yml`` and the API exposes the called jobs in
 the same caller run (prefixed by the caller job). There is **no** separate
 ``tests.yml?event=workflow_call`` run. The contract therefore pins the caller
 workflow, the called suite and the planning blobs, and requires the called
-jobs (prefixed by the caller job) — the full 12 psycopg + 16 psql matrix, the
+jobs (prefixed by the caller job) — the full 12 psycopg + 12 psql matrix, the
 short macOS platform job and the aggregate ``tests`` check. #3198: the full
 macOS suite is no longer part of the packet run (it moved to ``macos.yml``,
 nightly and on the ``ci-macos`` label); what this contract requires is the
@@ -44,9 +44,9 @@ def ameesh() -> tuple[Workflow, ...]:
     jobs prefixed by the caller job (e.g. ``suite complète du paquet / plan``).
     A covered push (open PR) leaves ``suite`` skipped, so the called jobs are
     absent and supply no packet CI: the train refuses it.
-    The full matrix is 12 psycopg parts, 16 psql parts, the short macOS
+    The full matrix is 12 psycopg parts, 12 psql parts, the short macOS
     platform job and the aggregate ``tests`` check; doc-only and version lanes
-    are conditional outside this contract. #3749: the 16 psql parts run the
+    are conditional outside this contract. #3749/#7526: the 12 psql parts run the
     pilot list and the contract, the whole suite under psql is nightly
     (``psql-nocturne.yml``, outside the packet proof).
 
@@ -71,14 +71,14 @@ def ameesh() -> tuple[Workflow, ...]:
         path=".github/workflows/paquet.yml",
         jobs=("plan",
               *("psycopg %d/12" % n for n in range(1, 13)),
-              *("psql %d/16" % n for n in range(1, 17)),
+              *("psql %d/12" % n for n in range(1, 13)),
               "plateforme macOS", "tests"),
         event="push",
         called=".github/workflows/tests.yml",
         sources=((".github/workflows/paquet.yml", "fa502a79d4f696b82f77350fbac43b394983e38e"),
-                 (".github/workflows/tests.yml", "e88c304d5a5cf20d397b432bf3a5ebb0605032ce"),
-                 ("scripts/test-plan.py", "254855a9962ec77dd395f3d67199f9c2288c41bd"),
-                 ("scripts/test-parts.py", "520198b8e5dfa5187dcdd50103dd4f77e2548889"),
+                 (".github/workflows/tests.yml", "61d44bc5879483b2654ef4f276fd6ea17fbdfed1"),
+                 ("scripts/test-plan.py", "14641a6488a1c8bf8f66b1a4d67566689986bac3"),
+                 ("scripts/test-parts.py", "1cf4f8556a94946d7c78febdd51a69cb7ef24fe1"),
                  ("scripts/ci-flow.py", "c81e4aff4fcaf1b9ec9a75ba987b3beba50258c2"),
                  ("scripts/ci-test-space.py", "f5535ce3eadcd0b6a6e69567a8c36ed3a121420f"),
                  ("scripts/ci-agregat.py", "b3b84b3d9f40ce567ded8dd446a7d561e9aa5747"),

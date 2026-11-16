@@ -2178,13 +2178,10 @@ class PlanTest(unittest.TestCase):
         # (24/24 runners). Trois parts pèsent ~8 min chacune, ce qui tient au
         # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
-        # #1476 : seize parts psql et huit psycopg (24 jobs = 24 runners),
-        # d'après les durées mesurées du run de paquet 39085758208.
-        # #6880 : psycopg passe à douze parts (28 jobs) pour que chaque part
-        # pèse ~1 423 s contre ~1 227 s en psql ; à huit parts, une part
-        # psycopg pèse ~1,7x une part psql et la répartition par hôte
-        # (quatre parts lourdes sur un hôte contre zéro) domine le mur.
-        self.assertEqual(plan.PARTS["psql"][1], 16)
+        # #7526 : 12 parts par pilote tiennent dans les 24 runners ; le
+        # nocturne conserve 16 parts pour toute la suite psql.
+        self.assertEqual(plan.PARTS["psql"][1], 12)
+        self.assertEqual(plan.PSQL_FULL_PARTS, 16)
         self.assertEqual(plan.PARTS["psycopg"][1], 12)
 
     def test_full_suite_psycopg_is_split_for_the_cap(self):
@@ -3675,7 +3672,7 @@ class LotFreezePlanTest(unittest.TestCase):
         p = plan.fallback_plan("pull_request", "boom", mode="lot",
                                base_ref="main", head_ref="lot/x")
         # #3343 : le repli reste la suite complète, même au gel d'un lot ; il
-        # prend les parts de main (16 psql, 12 psycopg), jamais les 3 d'un lot.
+        # prend les parts de main (12 psql, 12 psycopg), jamais les 3 d'un lot.
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
                          _full_suite_parts("psycopg"))
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],

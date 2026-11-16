@@ -246,7 +246,13 @@ RECENT_FAILURE_DAYS = 7
 #: la simulation sur les charges de h-11 ramène le mur médian de 28,6 à
 #: 26,5 min (p80 31,3 → 27,2, max 38,5 → 29,0). psql reste à 16 : sa part
 #: nocturne complète garde son découpage (#6437, #1692).
-PARTS = {"psycopg": (4, 12), "psql": (3, 16)}
+# #7526 : h-13 (43732594719) et h-17 (43772907809), 15/11 : ~250 min
+# psql et ~255 min psycopg, jusqu'à 18 min de file pour 28 jobs/24 runners.
+# Avec les trous psql comblés par le nocturne, simulation des flux de h-13 :
+# 12 + 12 jobs, mur 28,6 min (durées observées, hors contention nouvelle).
+# Le nocturne conserve ses 16 parts : il passe toute la suite psql, seul.
+PARTS = {"psycopg": (4, 12), "psql": (3, 12)}
+PSQL_FULL_PARTS = 16
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 45 min de psycopg
 #: comme dans celui de 60 min de psql (#1251).
@@ -2130,6 +2136,8 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         # les parts de main. Trois parts psql ne tiennent pas sous le plafond
         # de 60 min (run 40089991398 : psql 1/3 encore en cours à 60m).
         n = n_pr if lot and chosen_set is not None else n_other
+        if driver == "psql" and psql_full:
+            n = PSQL_FULL_PARTS
         if chosen_set is not None:
             n = min(n, lot_part_count(driver, selected, card))
         plan["parts"][driver] = [] if skip else split(
@@ -2198,7 +2206,7 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
         try:
             weighed = psql_full_weights(modules, None)
             psql_split = [(part, sum(weighed[m] for m in part), False)
-                          for part in parts.split(weighed, PARTS["psql"][1])]
+                          for part in parts.split(weighed, PSQL_FULL_PARTS)]
         except (Exception, SystemExit) as exc:  # the fallback must not fail
             plan["unsure"].append(f"psql_full table unreadable ({exc}); "
                                   "whole suite under psql")
@@ -2219,6 +2227,8 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
         # branche de lot : il prend les parts de main, sinon les trois parts
         # psql d'un lot dépassent le plafond de 60 min.
         n = n_other
+        if driver == "psql" and psql_full:
+            n = PSQL_FULL_PARTS
         if driver == "psycopg" and psql_full:
             plan["parts"][driver] = []
             continue

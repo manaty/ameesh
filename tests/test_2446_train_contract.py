@@ -44,7 +44,7 @@ class ContractTest(unittest.TestCase):
         self.assertEqual({job for job in jobs if job.startswith("psycopg ")},
                          {"psycopg %d/12" % n for n in range(1, 13)})
         self.assertEqual({job for job in jobs if job.startswith("psql ")},
-                         {"psql %d/16" % n for n in range(1, 17)})
+                         {"psql %d/12" % n for n in range(1, 13)})
 
     def test_the_aggregate_classifier_is_a_packet_proof_source(self):
         # #3251 : la sémantique de l'agrégat `tests` vit dans
