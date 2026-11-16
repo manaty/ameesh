@@ -3363,6 +3363,24 @@ class Notifier:
                 if alert.get("resume_ts") is not None:
                     entry["resume_ts"] = max(float(alert["resume_ts"]),
                                              float(entry.get("resume_ts") or 0))
+            elif entry is not None and alert.get("type") == "budget_pause_long" \
+                    and alert.get("waits_reset"):
+                # #7521 : l'échéance d'une attente de remise à zéro recule
+                # avant d'être atteinte (le plafond de rythme se recalcule) :
+                # c'est le même épisode continu, l'entrée suit la nouvelle
+                # échéance sans refaire de courrier. Une échéance réellement
+                # atteinte alors que la pause dure est un nouvel épisode (la
+                # promesse du courrier #7175) : l'entrée tombe, le brief
+                # suivant redit l'échéance.
+                announced = entry.get("resume_ts")
+                deadline = alert.get("resume_ts")
+                if announced is not None and deadline is not None:
+                    announced = float(announced)
+                    deadline = float(deadline)
+                    if now >= announced and deadline > now:
+                        del sent[key]
+                        continue
+                    entry["resume_ts"] = max(announced, deadline)
         open_lots = None
         for key in list(sent):
             if key not in alive:
