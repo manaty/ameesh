@@ -57,6 +57,10 @@ class FailingPartsTests(unittest.TestCase):
             self.assertEqual(nx.failing_ci_parts(pending(dispatches={
                 "ci/sql-invariant.yml": {"run": run(conclusion)}})), [],
                              conclusion)
+        self.assertEqual([row["conclusion"] for row in nx.failing_ci_parts(
+            pending(dispatches={"ci/sql-invariant.yml": {
+                "run": run("startup_failure", run_id=3)}}))],
+            ["startup_failure"])
         # An intent with no observed run proves nothing either.
         self.assertEqual(nx.failing_ci_parts(pending(dispatches={
             "ci/sql-invariant.yml": {"intent_at": 1.0}})), [])
@@ -297,6 +301,16 @@ class AbandonTests(unittest.TestCase):
         with self.assertRaisesRegex(rc.ReleaseError, "no frozen Nexlink cutoff"):
             nx.abandon(self.cfg, self.db, self.project, now=1794824001.0,
                        reason="again", actor="mesh-design")
+
+    def test_refuses_while_the_release_lock_is_held(self):
+        lock = os.path.join(self.cfg.state_dir, "release", "release.lock")
+        with rc._locked(lock):
+            with self.assertRaisesRegex(rc.ReleaseBusy, "another release holds"):
+                nx.abandon(self.cfg, self.db, self.project, now=1794824000.0,
+                           reason="red SQL invariant", actor="mesh-design")
+        self.assertIn("pending_nexlink", self.slot())
+        self.assertFalse(self.reports)
+        self.assertFalse(self.sent)
 
 
 class AbandonWithRealRefTests(unittest.TestCase):

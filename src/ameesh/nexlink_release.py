@@ -991,19 +991,19 @@ def _preflight_refused(cfg, db, project, slot, pending, exc, save, now):
 #: Conclusions that prove a dispatched final-tree part is red. The engine
 #: re-reads the same run at every tick, so a still-running, cancelled,
 #: timed-out, skipped or otherwise non-conclusive part is not proof (canon
-#: §3): the pilot never throws the candidate away on it.
-CI_FAILURES = frozenset({"failure"})
+#: §3): the pilot never throws the candidate away on it. `startup_failure`
+#: is a definitive red (the frozen workflow cannot start), unlike a timeout.
+CI_FAILURES = frozenset({"failure", "startup_failure"})
 
 
 def failing_ci_parts(pending):
     """The final-tree parts whose last observed run is conclusively red.
 
     The durable `dispatches` ledger is the engine's own proof: workflow,
-    exact run id, URL and conclusion. A part without a completed `failure`
-    run is not abandoned on, even if the engine cannot get past it. Only a
-    part still in the planned `ci_parts` can hold the cutoff: a stale ledger
-    entry for a workflow the plan no longer requires is not a reason to
-    abandon."""
+    exact run id, URL and conclusion. A part without a completed failure run
+    is not abandoned on, even if the engine cannot get past it. Only a part
+    still in the planned `ci_parts` can hold the cutoff: a stale ledger entry
+    for a workflow the plan no longer requires is not a reason to abandon."""
     parts = {str(part.get("workflow")) for part in pending.get("ci_parts") or ()
              if isinstance(part, dict)}
     if not parts:
@@ -1127,8 +1127,10 @@ def abandon(cfg, db, project, *, now, reason, actor):
         save()
         dropped = ""
         moved = False
+        outcome = ""
         try:
-            moved = drop_abandoned(project, slot, save) == "moved"
+            outcome = drop_abandoned(project, slot, save)
+            moved = outcome == "moved"
         except rc.ReleaseError as exc:  # retried before the next candidate
             dropped = str(exc) or type(exc).__name__
             print("release: %s" % dropped)
@@ -1136,6 +1138,8 @@ def abandon(cfg, db, project, *, now, reason, actor):
             ref_note = " (retrait à reprendre : %s)" % dropped
         elif moved:
             ref_note = " (déplacée par un tiers : `ensure_ref` la refusera)"
+        elif outcome == "absent":
+            ref_note = " (déjà absente)"
         else:
             ref_note = ""
         report = {
