@@ -25,7 +25,8 @@ import subprocess
 
 from unittest import mock
 
-from ameesh import registry, review_authors, review_designation as rd, work
+from ameesh import (registry, review_authors, review_designation as rd,
+                    review_provenance, work)
 
 from .support import PgTestCase
 from .test_2447_review_designation_activation import _Repo
@@ -160,14 +161,14 @@ class _Fixture:
         self._receipt("author", "deepseek", [head_b])
         return fix, head_b
 
-    def _reading(self, head_b, doubts=None, *, fetch=True):
+    def _reading(self, head_b, doubts=None, *, fetch=True, strict=False):
         commits = self.repo.git("rev-list", "--no-merges",
                                 "%s..%s" % (self.base, head_b)).split()
         freeze = self._milestone("frozen", head_b)
         return review_authors.reading(
             self.db, work.get(self.db, self.lot), freeze, commits,
             self.repo.root, FAMILIES, doubts_out=doubts,
-            fetch=fetch), freeze
+            fetch=fetch, strict=strict), freeze
 
     def _select(self, head_b, doubts=None, *, fetch=True):
         (authors, unknown, correctors), _freeze = self._reading(
@@ -264,6 +265,35 @@ class _Fixture:
         self.assertIn("1 cited commit(s) unreadable at the forge", note)
         self.assertIn(fix[:12], note)
         self.assertIn("cited by %s" % head_b[:12], note)
+
+    def test_strict_reading_refuses_an_unresolved_citation_without_a_trace_collector(self):
+        fix, head_b = self._remote_rewrite()
+        for fetch, resolved, fetched, reason in (
+                (False, "", False, "not-prefetched"),
+                (True, "", False, "forge-unreadable"),
+                (True, fix, False, "forge-unreadable"),
+                (True, fix, True, "forge-unreadable")):
+            with self.subTest(fetch=fetch, resolved=resolved, fetched=fetched):
+                with mock.patch.object(review_authors, "_forge_commit",
+                                       return_value=resolved) as resolve, \
+                        mock.patch.object(review_authors, "_forge_fetch",
+                                          return_value=fetched) as download:
+                    with self.assertRaisesRegex(
+                            review_provenance.ProvenanceError,
+                            "cited commit %s .*%s" % (fix[:12], reason)):
+                        self._reading(head_b, fetch=fetch, strict=True)
+                if not fetch:
+                    resolve.assert_not_called()
+                    download.assert_not_called()
+
+    def test_strict_reading_accepts_a_citation_recovered_from_the_forge(self):
+        fix, head_b = self._remote_rewrite()
+        with mock.patch.object(review_authors, "_forge_commit", return_value=fix):
+            (_authors, unknown, correctors), _freeze = self._reading(
+                head_b, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["rewritten"], fix)
 
     def test_a_transaction_reading_never_queries_the_forge(self):
         # #3836 (B/P2 cx2) : `fetch=False` est la lecture de la transaction du

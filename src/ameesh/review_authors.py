@@ -5592,7 +5592,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         `cited` nomme le commit qui le cite. Une citation d'un commit encore
         dans la tête, d'un ancêtre ou d'un commit étranger au lot ne prouve
         rien : elle n'exclut personne. Une forge muette sur un commit absent
-        localement est un doute tracé, jamais une exclusion. `fetch=False`
+        localement est un doute tracé, jamais une exclusion. Ce doute refuse
+        la lecture stricte de la porte (#7539). `fetch=False`
         (#3836) interdit toute interrogation de la forge : l'objet absent
         localement est un doute `not-prefetched`, à préparer hors transaction.
         """
@@ -5655,6 +5656,13 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         def cite_doubt(token: str, citing: str, *,
                        reason: str = "forge-unreadable") -> None:
             """#7252 B/P2 auditeur : une citation non concluante se dit au gel."""
+            # #7539 : la porte ne peut conclure à l'indépendance sans lire
+            # le correctif cité. Le doute reste une trace à la désignation,
+            # mais refuse la lecture stricte, même sans collecteur de traces.
+            if strict:
+                raise review_provenance.ProvenanceError(
+                    "cited commit %s (cited by %s) cannot be read: %s"
+                    % (token, citing, reason))
             if unattached is not None:
                 ignored.setdefault(("", "cited:" + token), {
                     "name": "", "sha": token,
