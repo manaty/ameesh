@@ -201,8 +201,19 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
                 raise OSError('lost reload reply')
             return True
         with mock.patch.object(self.system, 'activate_ssh_configuration', side_effect=interrupted):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(bootstrap.BootstrapError) as held:
                 self.backend.continue_install(self.operation, self.view['id'])
-            self.assertEqual(self.backend.continue_install(self.operation, self.view['id'])['outcome'], 'installed')
+            self.assertIsInstance(held.exception.__context__, OSError)
+            self.assertEqual(str(held.exception.__context__), 'lost reload reply')
+            try:
+                replay = self.backend.continue_install(self.operation, self.view['id'])
+            except bootstrap.BootstrapError as error:
+                # The public backend deliberately hides adapter errors. These
+                # fixtures contain no host secrets: expose the original cause
+                # when a CI-only failure prevents this replay (#7598).
+                if error.__context__ is not None:
+                    raise error.__context__ from error
+                raise
+            self.assertEqual(replay['outcome'], 'installed')
         self.assertEqual(self.old_journal.read_bytes(), self.old_bytes)
         self.assertEqual(self.system.calls, ['group', 'user'])

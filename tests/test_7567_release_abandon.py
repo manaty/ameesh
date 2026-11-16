@@ -376,17 +376,20 @@ class AbandonWithRealRefTests(unittest.TestCase):
 class AbandonCommandTests(unittest.TestCase):
     def args(self, **change):
         values = dict(project="nexlink", reason="red SQL invariant", actor=None,
-                      now=1794824000.0, json=False)
+                      now=None, json=False)
         values.update(change)
         return types.SimpleNamespace(**values)
 
-    def run_abandon(self, args, *, corrector=None, projects=None, report=None,
-                    failure=None):
-        from ameesh import release, work
+    def run_abandon(self, args, *, cfg=None, corrector=None, projects=None,
+                    report=None, failure=None, clock=1794824000.0,
+                    election=None, election_error=None):
+        from ameesh import release, role_run, work
         project = rc.ProjectRelease("nexlink", "/unused", target="develop",
                                     model="nexlink")
         declared = projects if projects is not None else {"nexlink": project}
         corrector = corrector or (lambda *a, **k: "mesh-design")
+        cfg = cfg if cfg is not None else types.SimpleNamespace(host="test-host")
+        election = election or {"held": True, "host": "test-host"}
         engine = ({"side_effect": failure} if failure is not None else
                   {"return_value": report or dict(
                       result="refused-ci", version="11bo",
@@ -394,16 +397,20 @@ class AbandonCommandTests(unittest.TestCase):
                       integration_dropped=True, drop_error="",
                       failures=[{"workflow": "sql-invariant.yml",
                                  "run": RUN_ID}])})
+        live = ({"side_effect": election_error} if election_error is not None
+                else {"return_value": election})
         with mock.patch.object(rc, "projects", return_value=declared), \
                 mock.patch("ameesh.db.open_db") as opened, \
                 mock.patch.object(work, "corrector", side_effect=corrector) as who, \
+                mock.patch.object(role_run, "live", **live) as elected, \
+                mock.patch.object(release.time, "time", return_value=clock), \
                 mock.patch.object(nx, "abandon", **engine) as abandon, \
                 mock.patch("builtins.print"):
-            status = release._abandon(None, args)
-        return status, who, abandon, opened
+            status = release._abandon(cfg, args)
+        return status, who, abandon, opened, elected
 
     def test_the_command_verifies_the_pilot_and_passes_the_reason(self):
-        status, who, abandon, opened = self.run_abandon(self.args())
+        status, who, abandon, opened, _ = self.run_abandon(self.args())
         self.assertEqual(status, 0)
         self.assertEqual(who.call_args.kwargs["what"], "release abandon")
         self.assertFalse(who.call_args.kwargs["history"])
@@ -412,16 +419,31 @@ class AbandonCommandTests(unittest.TestCase):
                           "actor": "mesh-design"})
         opened.return_value.close.assert_called_once_with()
 
+    def test_the_trace_keeps_the_real_hour_within_the_now_window(self):
+        status, _, abandon, _, _ = self.run_abandon(
+            self.args(now=1794824000.0 + 120.0))
+        self.assertEqual(status, 0)
+        self.assertEqual(abandon.call_args.kwargs["now"], 1794824000.0)
+
+    def test_a_now_outside_the_clock_window_is_refused(self):
+        for offset in (-3600.0, 3600.0):
+            with self.subTest(offset=offset):
+                status, who, abandon, _, _ = self.run_abandon(
+                    self.args(now=1794824000.0 + offset))
+                self.assertEqual(status, 1)
+                abandon.assert_not_called()
+                who.assert_not_called()
+
     def test_a_refused_pilot_does_not_touch_the_state(self):
         from ameesh import work
-        status, who, abandon, _ = self.run_abandon(
+        status, who, abandon, _, _ = self.run_abandon(
             self.args(), corrector=lambda *a, **k:
             (_ for _ in ()).throw(work.WorkError("not a pilot")))
         self.assertEqual(status, 1)
         abandon.assert_not_called()
 
     def test_an_engine_refusal_is_reported_and_the_db_closed(self):
-        status, who, abandon, opened = self.run_abandon(
+        status, who, abandon, opened, _ = self.run_abandon(
             self.args(), failure=rc.ReleaseError(
                 "Nexlink 11bo cannot be abandoned: no CI part is conclusively red"))
         self.assertEqual(status, 1)
@@ -429,12 +451,67 @@ class AbandonCommandTests(unittest.TestCase):
         opened.return_value.close.assert_called_once_with()
 
     def test_an_undeclared_or_semver_project_is_refused(self):
-        status, who, abandon, _ = self.run_abandon(self.args(), projects={})
+        status, who, abandon, _, _ = self.run_abandon(self.args(), projects={})
         self.assertEqual(status, 1)
         abandon.assert_not_called()
         semver = {"nexlink": rc.ProjectRelease("nexlink", "/unused", model="semver")}
-        status, who, abandon, _ = self.run_abandon(self.args(), projects=semver)
+        status, who, abandon, _, _ = self.run_abandon(self.args(), projects=semver)
         self.assertEqual(status, 1)
+        abandon.assert_not_called()
+
+    def test_the_elected_release_host_may_abandon(self):
+        cfg = types.SimpleNamespace(host="elected",
+                                    release={"role": "mesh-design"})
+        status, who, abandon, _, elected = self.run_abandon(
+            self.args(), cfg=cfg, election={"held": True, "host": "elected"})
+        self.assertEqual(status, 0)
+        elected.assert_called_once()
+        self.assertEqual(elected.call_args.args[1], "mesh-design")
+        abandon.assert_called_once()
+
+    def test_another_host_is_refused_before_the_pilot_is_even_named(self):
+        cfg = types.SimpleNamespace(host="other",
+                                    release={"role": "mesh-design"})
+        status, who, abandon, _, _ = self.run_abandon(
+            self.args(), cfg=cfg, election={"held": True, "host": "elected"})
+        self.assertEqual(status, 1)
+        who.assert_not_called()
+        abandon.assert_not_called()
+
+    def test_a_release_role_without_a_live_lease_is_refused(self):
+        cfg = types.SimpleNamespace(host="elected",
+                                    release={"role": "mesh-design"})
+        status, who, abandon, _, _ = self.run_abandon(
+            self.args(), cfg=cfg, election={"held": False, "host": "elected"})
+        self.assertEqual(status, 1)
+        who.assert_not_called()
+        abandon.assert_not_called()
+
+    def test_a_host_without_a_configured_role_keeps_the_local_gesture(self):
+        status, who, abandon, _, elected = self.run_abandon(
+            self.args(), cfg=types.SimpleNamespace(host="test-host"))
+        self.assertEqual(status, 0)
+        elected.assert_not_called()
+        abandon.assert_called_once()
+
+    def test_an_unreadable_election_is_refused(self):
+        from ameesh import role_run
+        cfg = types.SimpleNamespace(host="elected",
+                                    release={"role": "mesh-design"})
+        status, who, abandon, _, _ = self.run_abandon(
+            self.args(), cfg=cfg,
+            election_error=role_run.RoleError("unknown role (no agent_registry row)"))
+        self.assertEqual(status, 1)
+        who.assert_not_called()
+        abandon.assert_not_called()
+
+    def test_release_and_packet_watch_roles_must_agree(self):
+        cfg = types.SimpleNamespace(host="elected",
+                                    release={"role": "mesh-design"},
+                                    packet_watch={"role": "bureau"})
+        status, who, abandon, _, elected = self.run_abandon(self.args(), cfg=cfg)
+        self.assertEqual(status, 1)
+        elected.assert_not_called()
         abandon.assert_not_called()
 
 
