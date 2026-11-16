@@ -2466,8 +2466,8 @@ class Watcher:
 
         Reuse the dispatch contract, including its expected_sha and additional
         inputs. Observe every selected workflow, even ones whose names do not
-        match SUITE_RE. Alert on the first pass: this is a missing gesture,
-        not a test-duration SLO. Never dispatch or change a merge verdict here.
+        match SUITE_RE. Allow the CI pending grace after current-head milestones.
+        Never dispatch or change a merge verdict here.
         """
         import hashlib
         import shlex
@@ -2497,6 +2497,15 @@ class Watcher:
                 if not gate or not gate.get("ok"):
                     continue
                 now = float(self.clock())
+                # #7606: allow normal dispatch time, using durable milestones
+                # so restarting the watcher cannot renew the grace period.
+                ready_at = max((float(m["at_ts"]) for m in marks
+                                if m.get("kind") in ("frozen", "verdict", "fire")
+                                and m.get("sha")
+                                and sha.startswith(str(m["sha"]))
+                                and m.get("at_ts") is not None), default=0.0)
+                if now - ready_at < PENDING_ALERT:
+                    continue
                 key = (repo, branch, sha)
                 cached = self._dispatch_plans.get(key)
                 if cached is None or now - cached[0] >= self._cache_ttl():
