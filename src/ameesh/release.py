@@ -896,16 +896,80 @@ def _attest(cfg, args) -> int:
         db.close()
 
 
+#: #7584: the abandon trace carries the hour of the gesture. A caller may
+#: repeat the clock, never forge it: an explicit --now farther from the real
+#: clock than this window is refused, and the trace keeps the real hour.
+ABANDON_NOW_WINDOW_S = 300.0
+
+
+def _abandon_moment(args) -> float:
+    """The real hour of the abandon gesture (#7584)."""
+    from . import release_cutoff
+    real = time.time()
+    if args.now is None:
+        return real
+    try:
+        given = float(args.now)
+    except (TypeError, ValueError) as exc:
+        raise release_cutoff.ReleaseError(
+            "--now must be an epoch in seconds") from exc
+    if abs(given - real) > ABANDON_NOW_WINDOW_S:
+        raise release_cutoff.ReleaseError(
+            "--now is %+d s from the real clock: the abandon trace carries the "
+            "hour of the gesture (at most %d s apart)"
+            % (round(given - real), ABANDON_NOW_WINDOW_S))
+    return real
+
+
+def _require_elected_release_host(cfg, db) -> None:
+    """#7584: refuse the local-state gesture outside the elected release host.
+
+    The release state is host-local (``cfg.state_dir``). Outside the host that
+    holds the release role's live lease, the command would read and rewrite
+    another host's stale state, never the engine's. A host with no configured
+    role keeps the historical host-pinned gesture. The check is direct, not
+    through `_elected_tick`: that is the timer entry and strips the session
+    identity, while this pilot gesture still has to prove itself through
+    `work.corrector`.
+    """
+    from . import release_cutoff, role_run
+    role = (getattr(cfg, "release", None) or {}).get("role")
+    watch_role = (getattr(cfg, "packet_watch", None) or {}).get("role")
+    if role and watch_role and role != watch_role:
+        raise release_cutoff.ReleaseError(
+            "release.role and packet_watch.role must agree")
+    role = role or watch_role
+    if not role:
+        return
+    here = str(getattr(cfg, "host", "") or "").strip()
+    try:
+        report = role_run.live(db, role)
+    except role_run.RoleError as exc:
+        raise release_cutoff.ReleaseError(
+            "release abandon refused: the release role %r has no readable "
+            "election (%s)" % (role, exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - a broken read must not pass
+        raise release_cutoff.ReleaseError(
+            "release abandon refused: the release role %r is unreadable (%s)"
+            % (role, exc)) from exc
+    if not report.get("held") or str(report.get("host") or "") != here:
+        raise release_cutoff.ReleaseError(
+            "release abandon must run on the elected release host %s (role %s): "
+            "the release state is local to that host, and this host is %s"
+            % (report.get("host") or "none", role, here or "unnamed"))
+
+
 def _abandon(cfg, args) -> int:
     """`ameesh release abandon` (#7567): the pilot closes a red-CI cutoff.
 
     A frozen Nexlink cutoff whose final-tree CI part is conclusively red has
     no automatic exit: the engine re-reads the same run at every tick. This
-    gesture takes the release lock, proves the pilot through `work.corrector`
-    (a human terminal names itself with `--actor human:<id>`), then lets
-    `nexlink_release.abandon` refuse an already published tag, a staging
-    handover or a non-conclusive CI part before writing the durable trace and
-    announcing to the release recipients.
+    gesture takes the release lock, runs only on the host that holds the
+    release role's live lease (#7584: the release state is local), proves the
+    pilot through `work.corrector` (a human terminal names itself with
+    `--actor human:<id>`), then lets `nexlink_release.abandon` refuse an
+    already published tag, a staging handover or a non-conclusive CI part
+    before writing the durable trace and announcing to the release recipients.
     """
     from . import nexlink_release, release_cutoff
     from .db import open_db
@@ -920,13 +984,13 @@ def _abandon(cfg, args) -> int:
         if project.model != "nexlink":
             raise release_cutoff.ReleaseError(
                 "release abandon applies to the nexlink model only")
+        moment = _abandon_moment(args)
         db = open_db(cfg)
+        _require_elected_release_host(cfg, db)
         actor = work.corrector(cfg, db, args.actor, what="release abandon",
                                history=False)
         report = nexlink_release.abandon(
-            cfg, db, project,
-            now=time.time() if args.now is None else float(args.now),
-            reason=args.reason, actor=actor)
+            cfg, db, project, now=moment, reason=args.reason, actor=actor)
     except (work.WorkError, release_cutoff.ReleaseError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
@@ -1143,11 +1207,15 @@ def add_parser(sub, func) -> None:
     abandon_p = rel.add_parser(
         "abandon", help="#7567: the verified pilot abandons a frozen Nexlink cutoff "
                         "whose final-tree CI part is conclusively red; no tag, no "
-                        "staging, no deployment")
+                        "staging, no deployment; #7584: only on the elected release "
+                        "host")
     abandon_p.add_argument("--project", default="nexlink")
     abandon_p.add_argument("--reason", required=True)
     abandon_p.add_argument("--actor", default=None,
                            help="at a human terminal: human:<id>")
-    abandon_p.add_argument("--now", type=float, default=None)
+    abandon_p.add_argument("--now", type=float, default=None,
+                           help="epoch seconds: accepted only within %d s of the "
+                                "real clock; the trace keeps the hour of the "
+                                "gesture" % ABANDON_NOW_WINDOW_S)
     abandon_p.add_argument("--json", action="store_true")
     abandon_p.set_defaults(func=func)
