@@ -1519,7 +1519,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     verdict bloquant, proposées à un agent au repos d'une autre famille quand
     aucun lot n'est prenable) ou `backlog` (file d'amélioration, L119). Les
     lots de l'équipe passent d'abord ; tant qu'un lot du projet attend,
-    personne ne prend d'amélioration. Un seuil nul désactive la prise
+    aucune amélioration de ce projet n'est prise. Un seuil nul désactive la prise
     correspondante — `review_max_per_hour` à 0 coupe les propositions
     (#1738 N3). Une proposition faite passe avant la file d'amélioration du
     même passage (« du travail réel sur des lots en cours ») ; propositions
@@ -1846,10 +1846,22 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     # un lot du projet attend un preneur (ou vient d'être pris) : il passe
     # avant toute amélioration ; un lot qu'une attente planifiée retient
     # (dépendance, engagement, date) n'attend pas un agent (#1625)
-    if taken or sous_utilisation.waiting_project_lots(
-            st.operations.open_lots_activity(500), db=db, now=now):
+    if taken:
         return taken
-    pool = candidates(idle_s)
+    # #7525 : un projet ne retient pas les améliorations des autres. Lire
+    # toute la file, puis borner le veto au projet de chaque élément ; un
+    # lot sans projet conserve le comportement conservateur historique.
+    waiting = sous_utilisation.waiting_project_lots(
+        st.operations.open_lots_activity(None), db=db, now=now)
+    waiting_projects = {_lot_project(item) for item in waiting}
+    queue = [item for item in queue
+             if not waiting or (_lot_project(item)
+                                and "" not in waiting_projects
+                                and _lot_project(item) not in waiting_projects)]
+    # Comme pour L165, une relecture/attente humaine ou un ancien lot de
+    # session validé n'occupe pas l'agent. Courrier, consigne et lot
+    # actionnable continuent de fermer la prise dans candidates().
+    pool = candidates(idle_s, waiting_free=True)
     for row in pool:
         # #804 : place relue avant chaque prise (compteur partagé)
         if not queue or len(taken) >= room or place() <= 0:
