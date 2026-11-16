@@ -195,12 +195,22 @@ def previous_venv():
 
 
 def no_downgrade(tag, previous):
-    # Read the installed distribution, never a caller-supplied version.
-    version = run([previous / 'bin/python', '-I', '-c',
-                   'from importlib.metadata import version; print(version("ameesh"))'],
-                  timeout=30).decode().strip()
-    if not TAG.fullmatch('v' + version):
-        raise Refused('installed package version must be X.Y.Z')
+    # Read metadata as data: never start Python or load .pth from the old venv.
+    candidates = list(previous.glob('lib/python3.*/site-packages/ameesh-*.dist-info/METADATA'))
+    if len(candidates) != 1:
+        raise Refused('one installed ameesh METADATA required')
+    metadata = read_file(candidates[0]).decode('utf-8')
+    # Headers end at the first blank line; descriptions are not metadata.
+    headers = []
+    for line in metadata.splitlines():
+        if not line:
+            break
+        headers.append(line)
+    versions = [line[len('Version: '):] for line in headers
+                if line.lower().startswith('version:')]
+    if len(versions) != 1 or not TAG.fullmatch('v' + versions[0]):
+        raise Refused('one installed package version X.Y.Z required')
+    version = versions[0]
     installed = tuple(map(int, version.split('.')))
     requested = tuple(map(int, tag[1:].split('.')))
     if requested < installed:

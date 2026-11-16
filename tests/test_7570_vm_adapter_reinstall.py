@@ -170,15 +170,52 @@ class FakeInstallTest(unittest.TestCase):
                 ('1.9.0', 'v1.10.0', True), ('1.58.0', TAG, True),
                 ('1.59.0', TAG, False), ('2.0.0', TAG, False),
                 ('unknown', TAG, False), ('1.58.0rc1', TAG, False)):
-            with self.subTest(version=version, tag=tag), mock.patch.object(
-                    r3, 'run', return_value=(version + '\n').encode()) as child:
+            metadata = self.old / 'lib/python3.11/site-packages/ameesh-1.58.0.dist-info/METADATA'
+            metadata.parent.mkdir(parents=True, exist_ok=True)
+            metadata.write_text('Metadata-Version: 2.1\nVersion: ' + version + '\n\nDescription')
+            with self.subTest(version=version, tag=tag), mock.patch.object(r3, 'run') as child:
                 if accepted:
                     r3.no_downgrade(tag, self.old)
                 else:
                     with self.assertRaises(r3.Refused):
                         r3.no_downgrade(tag, self.old)
-                self.assertEqual(child.call_args.args[0][0], self.old / 'bin/python')
-                self.assertIn('-I', child.call_args.args[0])
+                child.assert_not_called()
+
+    def test_metadata_missing_ambiguous_or_invalid_refuses_without_executing_pth(self):
+        site = self.old / 'lib/python3.11/site-packages'
+        site.mkdir(parents=True)
+        marker = self.base / 'executed'
+        pth = site / 'hostile.pth'
+        pth.write_text('import pathlib; pathlib.Path(' + repr(str(marker)) + ').touch()\n')
+        pth.chmod(0o666)
+        metadata = site / 'ameesh-1.58.0.dist-info/METADATA'
+        with mock.patch.object(r3, 'run') as child:
+            with self.assertRaises(r3.Refused):
+                r3.no_downgrade(TAG, self.old)
+            metadata.parent.mkdir()
+            for content in ('Name: ameesh\n', 'Version: 1.58.0\nVersion: 1.57.0\n',
+                            'Version: invalid\n', 'Name: ameesh\n\nVersion: 1.58.0'):
+                metadata.write_text(content)
+                with self.subTest(content=content), self.assertRaises(r3.Refused):
+                    r3.no_downgrade(TAG, self.old)
+            metadata.write_text('Version: 1.58.0\n')
+            r3.no_downgrade(TAG, self.old)
+            other = site / 'ameesh-1.57.0.dist-info/METADATA'
+            other.parent.mkdir()
+            other.write_text('Version: 1.57.0\n')
+            with self.assertRaises(r3.Refused):
+                r3.no_downgrade(TAG, self.old)
+            child.assert_not_called()
+        self.assertFalse(marker.exists())
+
+    def test_metadata_must_pass_trusted_file_checks(self):
+        metadata = self.old / 'lib/python3.11/site-packages/ameesh-1.58.0.dist-info/METADATA'
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text('Version: 1.58.0\n')
+        with mock.patch.object(r3, 'read_file', side_effect=r3.Refused('unsafe installed file')) as read:
+            with self.assertRaises(r3.Refused):
+                r3.no_downgrade(TAG, self.old)
+            read.assert_called_once_with(metadata)
 
     def test_version_is_rechecked_before_publication(self):
         with self.assertRaises(r3.Refused):
