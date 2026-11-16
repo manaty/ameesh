@@ -176,7 +176,7 @@ def account_sources(cfg, *, env: dict | None = None, transport: Transport | None
     inutilisable (clé absente, fichier trop ouvert) n'a pas de source : la clé
     n'est jamais lue hors d'un profil valide, ni citée.
     """
-    from . import accounts
+    from . import accounts, dsh_provider
     env = dict(os.environ if env is None else env)
     out: list = []
     for name in (names or SOURCES):
@@ -188,9 +188,17 @@ def account_sources(cfg, *, env: dict | None = None, transport: Transport | None
         except accounts.AccountError:
             items = []
         if not items:
+            if name == "deepseek" and getattr(cfg, "dsh_provider", None):
+                continue  # #7519: no implicit official-provider balance request
             out.append((cls(env=env, transport=transport), None))
             continue
         for profile in items:
+            if name == "deepseek":
+                try:
+                    if dsh_provider.configured(cfg, profile) is not None:
+                        continue  # before credential read: never send this key to DeepSeek
+                except dsh_provider.ProviderError:
+                    continue  # malformed alternate route also fails closed
             tmp: dict = {}
             try:
                 accounts.apply_env(tmp, profile, environ=env)

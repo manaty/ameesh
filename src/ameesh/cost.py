@@ -2466,6 +2466,11 @@ class CostBook:
                              output_tokens=delta[2],
                              **(marque if any(delta) else {}))
 
+        # #7519: each broker request already has its own durable priced row.
+        # The normal turn row remains a zero-valued timeline/input marker.
+        if harness == "deepseek" and any(e.get("type") == "dsh.provider-ledger" for e in events):
+            return TurnUsage(agent, harness, modele, 0.0)
+
         # DeepSeek (et tout harnais qui publie un usage par étape).
         steps = [e.get("usage") or {} for e in events
                  if e.get("type") == "status" and e.get("phase") == "step_end"]

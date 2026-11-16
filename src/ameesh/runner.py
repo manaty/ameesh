@@ -9092,7 +9092,7 @@ class AgentWorker(threading.Thread):
             return spec, []
         return dict(spec, prompt=note + spec["prompt"]), dits
 
-    def modele_du_tour(self, harness: str, adapter, *, emprunte: bool) -> str:
+    def modele_du_tour(self, harness: str, adapter, *, emprunte: bool, account=None) -> str:
         """Le modèle passé au harnais du tour (0019) : vide si le harnais est
         emprunté (L242b), vide aussi quand le réglage appartient positivement à
         la famille d'un **autre** harnais (#1268 : ligne de registre héritée
@@ -9101,6 +9101,12 @@ class AgentWorker(threading.Thread):
         (DeepSeek, L60). Un identifiant de famille inconnue n'est jamais
         refusé : on ne devine pas."""
         model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))
+        from . import dsh_provider
+        route = dsh_provider.configured(self.cfg, account) if harness == "deepseek" else None
+        if route is not None:
+            if model and model not in route.models:
+                raise dsh_provider.ProviderError("model not allowed by selected dsh provider")
+            return model or next(iter(route.models))
         if model and cost_mod.foreign_harness_model(harness, model):
             vu = self.__dict__.get("_foreign_model_seen")
             if vu != model:
@@ -9370,7 +9376,12 @@ class AgentWorker(threading.Thread):
             resume = self._ouverture()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
-        model = self.modele_du_tour(harness, adapter, emprunte=emprunte)
+        from . import dsh_provider
+        try:
+            model = self.modele_du_tour(harness, adapter, emprunte=emprunte, account=compte)
+        except dsh_provider.ProviderError as exc:
+            self._host_missing(str(exc))
+            return False
         effort = "" if emprunte else (self._state_read("effort")
                                       or self.agent.get("effort") or "")
         # Tier (L26) : passé par le descripteur du harnais (Codex :
@@ -9997,7 +10008,19 @@ class AgentWorker(threading.Thread):
             threading.Thread(target=self._turn_hard_cap_monitor,
                              args=(preempt_done, started, borne_dure),
                              daemon=True, name="turn-hard-cap").start()
+        provider_broker = None
         try:
+            from . import dsh_provider
+            route = dsh_provider.configured(self.cfg, compte) if harness == "deepseek" else None
+            if route is not None:
+                try:
+                    provider_broker, argv = dsh_provider.launch(
+                        self, route, compte, env, argv, model, effort, turn_id)
+                    cle_resident = None
+                    if self.resident is not None:
+                        self._close_resident("turn-scoped guarded provider")
+                except (dsh_provider.ProviderError, OSError) as exc:
+                    raise _LancementImpossible(str(exc)) from exc
             from .platform import turn_cgroup
             with open(stderr_path, "ab") as stderr:
                 stderr_debut = stderr.tell()
@@ -10393,6 +10416,8 @@ class AgentWorker(threading.Thread):
             echec_lancement = str(exc)
             result_code = 127
         finally:
+            if provider_broker is not None:
+                provider_broker.close()
             preempt_done.set()
             # L77/B8 : jonction AVANT tout solde de steer — un ACK de
             # `driver.steer` arrivé après le solde laisserait le message réservé.
