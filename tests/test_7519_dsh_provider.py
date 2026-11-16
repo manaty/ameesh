@@ -44,6 +44,24 @@ class ConfigurationTest(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 provider.parse(raw)
 
+    def test_credential_destination_cannot_be_an_automatic_route_or_runtime_variable(self):
+        for name in ('DEEPSEEK_API_KEY', 'CODEX_API_KEY', 'GH_TOKEN', 'AMEESH_DSN',
+                     'DSH_HOME', 'HOME', 'PATH', 'LD_PRELOAD', 'HTTP_PROXY',
+                     'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy',
+                     'https_proxy', 'all_proxy', 'no_proxy'):
+            raw = config()
+            raw['key_env'] = name
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    provider.ProviderError, 'dedicated environment reference'):
+                provider.parse(raw)
+
+    def test_response_model_identities_are_an_explicit_list(self):
+        for aliases in ('gpt-test-snapshot', [None], ['gpt-test\ninjection']):
+            raw = config()
+            raw['models']['gpt-test']['response_models'] = aliases
+            with self.subTest(aliases=aliases), self.assertRaises(ValueError):
+                provider.parse(raw)
+
     def test_account_replaces_host_in_full(self):
         host = config()
         account = config()
@@ -105,6 +123,16 @@ class WireTest(unittest.TestCase):
     def test_reasoning_is_not_charged_twice(self):
         outgoing, _ = provider.prepare(self.route, {'model': 'gpt-test'})
         self.assertEqual(provider.response_cost(self.route, outgoing, response()), Decimal('0.00018'))
+
+    def test_only_explicit_snapshot_names_share_the_requested_model_tariffs(self):
+        raw = config()
+        raw['models']['gpt-test']['response_models'] = ['gpt-test-2026-01-01']
+        route = provider.parse(raw)
+        outgoing, _ = provider.prepare(route, {'model': 'gpt-test'})
+        self.assertEqual(provider.response_cost(route, outgoing,
+                         response(model='gpt-test-2026-01-01')), Decimal('0.00018'))
+        self.assertIsNone(provider.response_cost(route, outgoing,
+                          response(model='gpt-test-2026-02-01')))
 
     def test_partial_or_invalid_usage_retains_full_reservation(self):
         outgoing, _ = provider.prepare(self.route, {'model': 'gpt-test'})
@@ -186,6 +214,17 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         with self.assertRaises(provider.ProviderError):
             self.broker.request({'model': 'gpt-test'})
+
+    def test_close_refuses_further_requests_before_admission_or_dispatch(self):
+        self.broker.close()
+        with self.assertRaisesRegex(provider.ProviderError, 'broker is closed'):
+            self.broker.request({'model': 'gpt-test'})
+        self.assertFalse(self.sent)
+        self.api.cycle_reserve.assert_not_called()
+        self.record.assert_not_called()
+        self.assertEqual(self.broker._key, '')
+        with self.assertRaisesRegex(provider.ProviderError, 'broker is closed'):
+            self.broker.start()
 
     def test_http_token_and_route_are_required(self):
         import urllib.error
@@ -340,6 +379,65 @@ class ProviderLedgerTest(PgTestCase):
         broker.send.assert_not_called()
         self.assertEqual(self.db.query('select count(*) as n from credit_requests')[0]['n'], 0)
 
+    def test_small_requests_fit_without_reserving_a_second_whole_turn(self):
+        from ameesh import storage
+        api = storage.of(self.db).budgets
+        api.account_put('test-billing', 0.02, actor='human:test')
+        self.assertTrue(api.account_reserve('test-billing', 'test-agent', 0.01, 'turn')['ok'])
+        broker = self.launch()
+        with mock.patch('ameesh.cost.CostBook.over', return_value=''):
+            for _ in range(2):
+                broker.request({'model': 'gpt-test'})
+        usage = api.account_usage('test-billing')[0]
+        self.assertAlmostEqual(usage['reserved'], 0.01)
+        self.assertAlmostEqual(usage['settled'], 0.00036)
+        self.assertEqual(api.account_get('turn')['state'], 'open')
+
+    def test_malformed_usage_still_records_and_settles_the_daily_bound(self):
+        from ameesh import storage
+        broker = self.launch()
+        for result in ([], response(usage=[]), response(usage={'input_tokens': 'oops',
+                       'output_tokens': None, 'input_tokens_details': []})):
+            broker.send = lambda *args: (json.dumps(result).encode(), 'application/json')
+            with mock.patch('ameesh.cost.CostBook.over', return_value=''):
+                broker.request({'model': 'gpt-test'})
+        rows = self.db.query('select usd::float8 as usd, input_tokens, cached_input_tokens,'
+                             ' output_tokens from turn_costs')
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertAlmostEqual(row['usd'], 0.0042)
+            self.assertEqual((row['input_tokens'], row['cached_input_tokens'], row['output_tokens']), (0, 0, 0))
+        usage = storage.of(self.db).budgets.account_usage('test-billing')[0]
+        self.assertEqual(usage['reserved'], 0)
+        self.assertAlmostEqual(usage['settled'], 0.0126)
+
+    def test_session_usage_survives_restart_without_double_cost_or_extra_turns(self):
+        from ameesh import cost, storage
+        broker = self.launch()
+        result = response()
+        result['usage']['input_tokens_details']['cached_tokens'] = 20
+        broker.send = lambda *args: (json.dumps(result).encode(), 'application/json')
+        with mock.patch('ameesh.cost.CostBook.over', return_value=''):
+            for _ in range(2):
+                broker.request({'model': 'gpt-test'})
+        book = cost.CostBook(state_dir=self.tmp, db=self.db, tools={'test-agent': 'deepseek'})
+        book.record('test-agent', session='dsh-session', model='gpt-test',
+                    turn_id='test-turn', key='native-turn')
+        # A fresh reader uses only durable state. The response rows account
+        # for dollars; the single native timeline row carries session tokens.
+        fresh = cost.CostBook(state_dir=self.tmp, db=self.db, tools={'test-agent': 'deepseek'})
+        total = storage.of(fresh.db).turn_costs.session_total('test-agent', 'dsh-session')
+        reread = storage.of(fresh.db).turn_costs.session_reread('test-agent', 'dsh-session')
+        self.assertEqual((total['tokens'], total['turns']), (80, 1))
+        self.assertEqual((reread['tokens'], reread['turns']), (100, 1))
+        self.assertAlmostEqual(fresh.spent('test-agent', 3600), 0.000288)
+        self.assertEqual(storage.of(self.db).turn_costs.provider_usage('other-agent', 'test-turn'),
+                         dict(input_tokens=0, cached_input_tokens=0, output_tokens=0))
+        self.assertEqual(storage.of(self.db).turn_costs.provider_usage('test-agent', 'other-turn'),
+                         dict(input_tokens=0, cached_input_tokens=0, output_tokens=0))
+        with self.assertRaisesRegex(cost.CostError, 'does not identify this turn'):
+            fresh.turn_usage('test-agent', model='gpt-test', turn_id='other-turn')
+
     def test_cycle_refusal_releases_proven_unsent_daily_reservation(self):
         from ameesh import storage
         self.db.execute('delete from credit_cycles')
@@ -390,6 +488,28 @@ class TransportTest(unittest.TestCase):
 
 
 class BalanceIsolationTest(unittest.TestCase):
+    def test_unreadable_accounts_never_fall_back_to_an_ambient_key(self):
+        from ameesh import accounts, balance
+        cfg = types.SimpleNamespace(dsh_provider={}, accounts={'deepseek': [
+            {'name': 'alternate', 'dsh_provider': config()}]})
+        transport = mock.Mock()
+        with mock.patch('ameesh.accounts.profiles', side_effect=accounts.AccountError('invalid account')):
+            sources = balance.account_sources(cfg, env={'DEEPSEEK_API_KEY': 'fake-alternate-key'},
+                                              names=['deepseek'], transport=transport)
+        self.assertEqual(sources, [])
+        transport.assert_not_called()
+
+    def test_invalid_alternate_route_does_not_read_or_probe_its_key(self):
+        from ameesh import accounts, balance
+        profile = accounts.Profile(harness='deepseek', name='chosen', kind='api_key_env',
+                                   env='SELECTED_API_KEY', key_env='FAKE_SOURCE',
+                                   billing_account='test-billing')
+        cfg = types.SimpleNamespace(dsh_provider={'provider': 'incomplete'}, accounts={})
+        with mock.patch('ameesh.accounts.profiles', return_value=[profile]), \
+             mock.patch('ameesh.accounts.apply_env') as read_key:
+            self.assertEqual(balance.account_sources(cfg, env={'FAKE_SOURCE': 'fake'}, names=['deepseek']), [])
+            read_key.assert_not_called()
+
     def test_configured_route_never_probes_official_deepseek_with_selected_key(self):
         from ameesh import accounts, balance
         profile = accounts.Profile(harness='deepseek', name='chosen', kind='api_key_env',

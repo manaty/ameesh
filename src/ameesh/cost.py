@@ -2599,9 +2599,18 @@ class CostBook:
                              **(marque if any(delta) else {}))
 
         # #7519: each broker request already has its own durable priced row.
-        # The normal turn row remains a zero-valued timeline/input marker.
-        if harness == "deepseek" and any(e.get("type") == "dsh.provider-ledger" for e in events):
-            return TurnUsage(agent, harness, modele, 0.0)
+        # #7534: preserve session/rotation/reread tokens on the normal turn
+        # row without pricing them again. Response rows have no session so
+        # neither their tokens nor their count become duplicate agent turns.
+        markers = [e for e in events if e.get("type") == "dsh.provider-ledger"]
+        if harness == "deepseek" and markers:
+            identity = markers[-1].get("turn_id")
+            if not identity or (turn_id is not None and identity != turn_id):
+                raise CostError("provider ledger marker does not identify this turn")
+            if self.db is None:
+                raise CostError("provider usage requires its durable ledger")
+            tokens = storage.of(self.db).turn_costs.provider_usage(agent, identity)
+            return TurnUsage(agent, harness, modele, 0.0, **tokens)
 
         # DeepSeek (et tout harnais qui publie un usage par étape).
         steps = [e.get("usage") or {} for e in events

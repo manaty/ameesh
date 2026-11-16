@@ -81,6 +81,15 @@ class TurnCosts(interface.TurnCosts):
                 return None
         return None
 
+    def provider_usage(self, agent, turn_id) -> dict:
+        return self.db.query(
+            "select coalesce(sum(greatest(input_tokens - cached_input_tokens, 0)), 0)::bigint as input_tokens,"
+            " coalesce(sum(cached_input_tokens), 0)::bigint as cached_input_tokens,"
+            " coalesce(sum(output_tokens), 0)::bigint as output_tokens"
+            " from turn_costs where agent = %s and turn_id = %s"
+            " and harness = 'deepseek' and source = 'relay' and turn = 'provider-response'",
+            (agent, turn_id))[0]
+
     def session_total(self, agent, session) -> dict | None:
         """#4448 : la mesure de rotation d'une session, relue du grand livre.
 

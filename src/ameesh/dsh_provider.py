@@ -25,6 +25,25 @@ class ProviderError(ValueError):
     pass
 
 
+def _key_reference(key):
+    """Require a dedicated destination, never an automatic credential route."""
+    from . import accounts, harnesses
+    from .platform import child_environment
+    reserved = (accounts._all_account_keys('key_env')
+                | accounts._all_account_keys('config_env')
+                | set().union(*child_environment.TOOL_CREDENTIALS.values())
+                | set().union(*(child_environment.harness({}, family).credentials
+                                for family in harnesses.known_ids()))
+                | set(child_environment.AUDITOR_CREDENTIALS)
+                | {'HOME', 'PATH', 'TMPDIR', 'USER', 'SHELL', 'PYTHONPATH',
+                   'LD_PRELOAD', 'LD_LIBRARY_PATH', 'NODE_OPTIONS',
+                   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'})
+    if (not isinstance(key, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)
+            or key.upper() in reserved):
+        raise ProviderError('credential destination must be a dedicated environment reference')
+    return key
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
@@ -47,9 +66,7 @@ def parse(raw):
     if (url.scheme != 'https' or not url.hostname or url.username or url.password
             or url.query or url.fragment):
         raise ProviderError('provider endpoint must be credential-free HTTPS')
-    key = raw['key_env']
-    if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
-        raise ProviderError('invalid credential environment reference')
+    key = _key_reference(raw['key_env'])
     account = raw['billing_account']
     if not isinstance(account, str) or not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}', account):
         raise ProviderError('invalid billing account')
@@ -61,13 +78,18 @@ def parse(raw):
         if (not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}', model)
                 or not isinstance(entry, dict)):
             raise ProviderError('invalid model')
-        if (set(entry) - {'context_tokens', 'max_output_tokens', 'tariffs', 'source', 'reasoning_efforts'}
+        if (set(entry) - {'context_tokens', 'max_output_tokens', 'tariffs', 'source', 'reasoning_efforts', 'response_models'}
                 or not {'context_tokens', 'max_output_tokens', 'tariffs', 'source'} <= set(entry)):
             raise ProviderError('model requires context_tokens, max_output_tokens, tariffs, source')
         # context_tokens is the provider-enforced maximum input context, not a
         # character-count estimate. Its dated authority must be supplied locally.
         if not isinstance(entry['source'], str) or not entry['source'].strip():
             raise ProviderError('context limit and tariff evidence required')
+        aliases = entry.get('response_models', [])
+        if (not isinstance(aliases, list) or any(
+                not isinstance(alias, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}', alias)
+                for alias in aliases)):
+            raise ProviderError('response_models must list exact model identities at these tariffs')
         for field in ('context_tokens', 'max_output_tokens'):
             if type(entry[field]) is not int or not 0 < entry[field] <= 10_000_000:
                 raise ProviderError('invalid model token bound')
@@ -178,10 +200,12 @@ def response_cost(route, requested, response):
     """
     if not isinstance(response, dict) or response.get('status') not in ('completed', 'incomplete'):
         return None
-    if response.get('model') != requested['model']:
-        return None
     spec = route.models[requested['model']]
+    if response.get('model') not in [requested['model'], *spec.get('response_models', [])]:
+        return None
     tier = response.get('service_tier', requested['service_tier'])
+    if not isinstance(tier, str):
+        return None
     rates = spec['tariffs'].get(tier)
     usage = response.get('usage')
     if not rates or not isinstance(usage, dict):
@@ -250,6 +274,7 @@ class Broker:
         self.token = secrets.token_urlsafe(32)
         self.lock = threading.Lock()
         self.failed = False
+        self.closed = False
         broker = self
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -280,17 +305,25 @@ class Broker:
         return 'http://127.0.0.1:%d/v1' % self.server.server_port
 
     def start(self):
-        self.thread.start()
+        with self.lock:
+            if self.closed:
+                raise ProviderError('broker is closed')
+            self.thread.start()
         return self
 
     def close(self):
-        self.server.shutdown()
+        with self.lock:
+            self.closed = True
+            self._key = ''
+        if self.thread.ident is not None:
+            self.server.shutdown()
         self.server.server_close()
-        self._key = ''
 
     def request(self, body):
         outgoing, bound = prepare(self.route, body)
         with self.lock:
+            if self.closed:
+                raise ProviderError('broker is closed')
             if self.failed:
                 raise ProviderError('broker accounting unavailable')
             db = self.database()
@@ -351,7 +384,7 @@ def launch(worker, route, profile, env, argv, model, effort, turn_id):
     Called inside the runner's launch/finally scope. No production key or
     account is created by this feature; configuring/activating it is separate.
     """
-    from . import account_budget, cost, db as db_mod, resident_runner, storage
+    from . import cost, db as db_mod, resident_runner, storage
     from .platform import child_environment
     if getattr(worker.runner, 'mediated', False):
         raise ProviderError('configured dsh providers require their owning executor')
@@ -366,7 +399,7 @@ def launch(worker, route, profile, env, argv, model, effort, turn_id):
         limits = worker.runner.budget_limits(db)
         book = cost.CostBook(state_dir=worker.cfg.state_dir, db=db,
                              tools={worker.name: 'deepseek'}, **limits.book_kwargs())
-        if book.over(worker.name, pace=False, account_checked=True) or account_budget.reason(db, profile):
+        if book.over(worker.name, pace=False, account_checked=True):
             return False
         # A separate request identity preserves the runner's still-open turn
         # reservation. Each retry has a distinct ledger key. The same account
@@ -376,14 +409,19 @@ def launch(worker, route, profile, env, argv, model, effort, turn_id):
             bound.quote()[0] / 1_000_000, 'dsh-request:' + attempt)
         return admitted.get('ok') is True
     def record(db, attempt, request, response, amount):
-        usage = (response or {}).get('usage') or {}
+        usage = response.get('usage') if isinstance(response, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        details = usage.get('input_tokens_details')
+        details = details if isinstance(details, dict) else {}
+        def count(value):
+            return value if type(value) is int and value >= 0 else 0
         with db.transaction() as tx:
             storage.of(tx).turn_costs.insert(
                 agent=worker.name, harness='deepseek', turn='provider-response',
                 model=request['model'], session=None, usd=float(amount),
-                input_tokens=usage.get('input_tokens', 0),
-                cached_input_tokens=(usage.get('input_tokens_details') or {}).get('cached_tokens', 0),
-                output_tokens=usage.get('output_tokens', 0), cum_usd=None,
+                input_tokens=count(usage.get('input_tokens')),
+                cached_input_tokens=min(count(details.get('cached_tokens')), count(usage.get('input_tokens'))),
+                output_tokens=count(usage.get('output_tokens')), cum_usd=None,
                 cum_input_tokens=None, cum_cached_input_tokens=None,
                 cum_output_tokens=None, account=profile.name,
                 spend_key='dsh-request:' + attempt, source='relay',
