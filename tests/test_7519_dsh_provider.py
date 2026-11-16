@@ -46,7 +46,9 @@ class ConfigurationTest(unittest.TestCase):
 
     def test_credential_destination_cannot_be_an_automatic_route_or_runtime_variable(self):
         for name in ('DEEPSEEK_API_KEY', 'CODEX_API_KEY', 'GH_TOKEN', 'AMEESH_DSN',
-                     'DSH_HOME', 'HOME', 'PATH', 'LD_PRELOAD'):
+                     'DSH_HOME', 'HOME', 'PATH', 'LD_PRELOAD', 'HTTP_PROXY',
+                     'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy',
+                     'https_proxy', 'all_proxy', 'no_proxy'):
             raw = config()
             raw['key_env'] = name
             with self.subTest(name=name), self.assertRaisesRegex(

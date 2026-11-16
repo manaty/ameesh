@@ -36,7 +36,8 @@ def _key_reference(key):
                                 for family in harnesses.known_ids()))
                 | set(child_environment.AUDITOR_CREDENTIALS)
                 | {'HOME', 'PATH', 'TMPDIR', 'USER', 'SHELL', 'PYTHONPATH',
-                   'LD_PRELOAD', 'LD_LIBRARY_PATH', 'NODE_OPTIONS'})
+                   'LD_PRELOAD', 'LD_LIBRARY_PATH', 'NODE_OPTIONS',
+                   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'})
     if (not isinstance(key, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)
             or key.upper() in reserved):
         raise ProviderError('credential destination must be a dedicated environment reference')
