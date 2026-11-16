@@ -25,7 +25,13 @@ TAG = {"version": "1.57.0", "tag": "v1.57.0", "commit": SHA, "at": 2.0}
 OLD_TAG = {"version": "1.56.0", "tag": "v1.56.0", "commit": OLD, "at": 1.0}
 AGENTS = ("ameesh-agents-1", "ameesh-agents-2", "ameesh-agents-3")
 HOST = "manaty-mesh-1"
-RIGHTS = ({"host": HOST, "decision": 219407, "expires": "2026-12-12"},)
+RIGHTS = ({"host": HOST, "decision": 219407, "option": "a",
+           "expires": "2026-12-12"},)
+
+LABEL = ("Droit root permanent du bureau sur manaty-mesh-1 pour ce seul geste, "
+         "jusqu'au 12/12 : à chaque coupure, les quatre étapes vm.sh puis "
+         "retour au commit attesté, chaque geste déclaré et tracé ; "
+         "révocable à tout moment.")
 
 
 def attestation(sha, *, reportes=None, hotes=None, date="2026-11-15T22:31:37Z"):
@@ -69,9 +75,21 @@ class RightTest(unittest.TestCase):
         self.assertIsNone(staging_deferred.right_for(project(), "pc-smichea"))
         self.assertIsNone(staging_deferred.right_for(project(rights=()), HOST))
 
-    def test_active_right_re_reads_the_signed_decision(self):
+    def view(self, **extra):
         view = {"state": "answered", "withdrawn": None, "superseded_by": None,
-                "answer": {"proof": {"digest": "d" * 64}}}
+                "project": "ameesh",
+                "answer": {"option": "a", "option_label": LABEL, "ts": 1794791782.3,
+                           "proof": {"digest": "d" * 64}}}
+        view.update(extra)
+        return view
+
+    def active(self, view, *, today="2026-11-20"):
+        with mock.patch("ameesh.decisions.get", return_value=view), \
+             mock.patch("ameesh.decisions.verify_proof", return_value=(True, "")):
+            return staging_deferred.active_right(object(), project(), HOST, today=today)
+
+    def test_active_right_re_reads_the_signed_decision(self):
+        view = self.view()
         with mock.patch("ameesh.decisions.get", return_value=view), \
              mock.patch("ameesh.decisions.verify_proof", return_value=(True, "")):
             right = staging_deferred.active_right(object(), project(), HOST,
@@ -79,8 +97,7 @@ class RightTest(unittest.TestCase):
         self.assertTrue(right["active"])
 
     def test_a_refused_signature_grants_nothing(self):
-        view = {"state": "answered", "withdrawn": None, "superseded_by": None,
-                "answer": {"proof": {"digest": "d" * 64}}}
+        view = self.view()
         with mock.patch("ameesh.decisions.get", return_value=view), \
              mock.patch("ameesh.decisions.verify_proof",
                         return_value=(False, "invalid Ed25519 signature")):
@@ -89,12 +106,32 @@ class RightTest(unittest.TestCase):
         self.assertFalse(right["active"])
         self.assertIn("proof refused", right["why"])
 
+    def test_a_decision_without_the_approved_option_grants_nothing(self):
+        for view, why in (
+                (self.view(answer={"option": "c", "option_label": LABEL,
+                                   "ts": 1794791782.3,
+                                   "proof": {"digest": "d" * 64}}), "option"),
+                (self.view(project="nexlink"), "project")):
+            right = self.active(view)
+            self.assertFalse(right["active"], why)
+            self.assertIn(why, right["why"])
+
+    def test_a_configuration_expiry_beyond_the_signed_one_grants_nothing(self):
+        view = self.view()
+        later = ({"host": HOST, "decision": 219407, "option": "a",
+                  "expires": "2027-12-12"},)
+        with mock.patch("ameesh.decisions.get", return_value=view), \
+             mock.patch("ameesh.decisions.verify_proof", return_value=(True, "")):
+            right = staging_deferred.active_right(
+                object(), project(rights=later), HOST, today="2026-11-20")
+        self.assertFalse(right["active"])
+        self.assertIn("exceeds the approved", right["why"])
+
     def test_a_withdrawn_or_superseded_decision_grants_nothing(self):
-        for view in ({"state": "withdrawn", "withdrawn": "why"},
-                     {"state": "answered", "superseded_by": 2,
-                      "answer": {"proof": {"digest": "d" * 64}}},
-                     {"state": "answered", "answer": {"proof": {}}},
-                     {"state": "pending", "answer": None}):
+        for view in (self.view(state="withdrawn", withdrawn="why"),
+                     self.view(superseded_by=2),
+                     self.view(answer={"proof": {}}),
+                     self.view(state="pending", answer=None)):
             with mock.patch("ameesh.decisions.get", return_value=view):
                 right = staging_deferred.active_right(object(), project(), HOST,
                                                       today="2026-11-20")
@@ -117,14 +154,16 @@ class ConfigTest(unittest.TestCase):
     def test_staging_rights_are_parsed_and_canonicalised(self):
         rights = release_cutoff._staging_rights(
             "ameesh", [{"host": " manaty-mesh-1 ", "decision": 219407,
-                        "expires": "2026-12-12"}])
+                        "option": " a ", "expires": "2026-12-12"}])
         self.assertEqual(rights[0]["host"], HOST)
         self.assertEqual(rights[0]["decision"], 219407)
+        self.assertEqual(rights[0]["option"], "a")
 
     def test_an_invalid_right_is_refused_at_configuration_time(self):
         for raw in ("x", [None], [{"host": ""}],
                     [{"host": HOST, "decision": 0}],
                     [{"host": HOST, "decision": 1, "expires": "12/12/2026"}],
+                    [{"host": HOST, "decision": 1, "expires": "2026-12-12"}],
                     [{"host": HOST, "decision": 1, "expires": "2026-12-12",
                       "granted": "2026-11-16"}]):
             with self.assertRaises(release_cutoff.ReleaseError, msg=raw):
@@ -378,6 +417,10 @@ class ActorTest(unittest.TestCase):
             self.actor(name="mty-amh-impl-05", bureau=False)
         with self.assertRaises(release_cutoff.ReleaseError):
             self.actor(name="mty-amh-impl-05", explicit="bureau")
+
+    def test_a_self_declared_name_is_not_a_bound_bureau(self):
+        with self.assertRaises(release_cutoff.ReleaseError):
+            self.actor(name="bureau", source="explicit")
 
     def test_an_unbound_session_is_a_human_terminal_only(self):
         self.assertEqual(self.actor(ok=False, source="none", explicit="human:smichea"),

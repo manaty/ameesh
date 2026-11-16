@@ -162,8 +162,9 @@ def right_for(project, host, today=None) -> dict | None:
     """The configured standing owner right covering ``host``, if any.
 
     ``project`` is a release project carrying ``staging_rights`` (host,
-    decision, expiry). ``today`` is a date (UTC now by default). None when no
-    right names the host: the §10 gesture then stays a per-gesture decision.
+    decision, option, expiry). ``today`` is a date (UTC now by default). None
+    when no right names the host: the §10 gesture then stays a per-gesture
+    decision.
     This reads the configuration only; `active_right` re-reads the decision.
     """
     day = today or _dt.datetime.now(_dt.timezone.utc).date()
@@ -175,18 +176,48 @@ def right_for(project, host, today=None) -> dict | None:
             continue
         expires = str(right.get("expires") or "")
         return {"project": name, "host": host, "decision": right.get("decision"),
-                "expires": expires,
+                "option": right.get("option"), "expires": expires,
                 "expired": day > _dt.date.fromisoformat(expires)}
     return None
+
+
+def _approved_expiry(answer) -> _dt.date | None:
+    """The expiry stated by the signed option label, or None (#7372 B2).
+
+    The decision schema carries no structured expiry: the owner's signed
+    option text is the grant. An ISO date wins; a bare ``JJ/MM`` is read in
+    the year of the answer (the next year if it has already passed). No date,
+    or an unreadable one, grants nothing: the guard fails closed instead of
+    trusting the configuration alone.
+    """
+    label = str(answer.get("option_label") or "")
+    found = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", label)
+    try:
+        if found:
+            return _dt.date(int(found.group(1)), int(found.group(2)),
+                            int(found.group(3)))
+        found = re.search(r"\b(\d{1,2})/(\d{1,2})\b", label)
+        if not found:
+            return None
+        stamp = answer.get("ts")
+        signed = (_dt.datetime.fromtimestamp(float(stamp), _dt.timezone.utc).date()
+                  if stamp else _dt.datetime.now(_dt.timezone.utc).date())
+        day = _dt.date(signed.year, int(found.group(2)), int(found.group(1)))
+        return day if day >= signed else day.replace(year=signed.year + 1)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def active_right(db, project, host, today=None) -> dict | None:
     """The right covering ``host``, re-read against the owner decision.
 
-    A configured right is only usable while its decision is answered, signed,
-    withdrawn neither by its requester nor replaced (`superseded_by`), and
-    unexpired. An unreadable decision, or any doubt, never grants the gesture;
-    the next pass sees a revocation without waiting for a release.
+    A configured right is only usable while its decision is answered, its
+    owner proof verifies, it is neither withdrawn by its requester nor
+    replaced (`superseded_by`), it was answered with the configured option,
+    for the project and host, and the configuration expiry does not exceed
+    the expiry the signed option states. An unreadable decision, or any
+    doubt, never grants the gesture; the next pass sees a revocation without
+    waiting for a release.
     """
     right = right_for(project, host, today=today)
     if right is None:
@@ -211,6 +242,28 @@ def active_right(db, project, host, today=None) -> dict | None:
         signed, why = False, "unreadable proof: %s" % exc
     if not signed:
         return {**right, "active": False, "why": "decision proof refused: %s" % why}
+    name = getattr(project, "name", project)
+    option = str(right.get("option") or "")
+    label = str(answer.get("option_label") or "")
+    approved = _approved_expiry(answer)
+    if not option:
+        why = "no approved option in the configuration"
+    elif answer.get("option") != option:
+        why = ("answered option %r, not the configured %r"
+               % (answer.get("option"), option))
+    elif view.get("project") != name:
+        why = "decision #%s is not the project %s" % (right["decision"], name)
+    elif right["host"] not in label:
+        why = "the approved option does not name %s" % right["host"]
+    elif approved is None:
+        why = "the approved option states no expiry"
+    elif _dt.date.fromisoformat(right["expires"]) > approved:
+        why = ("configuration expiry %s exceeds the approved %s"
+               % (right["expires"], approved.isoformat()))
+    else:
+        why = ""
+    if why:
+        return {**right, "active": False, "why": why}
     return {**right, "active": True, "why": ""}
 
 

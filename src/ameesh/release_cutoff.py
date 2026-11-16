@@ -1138,10 +1138,12 @@ def generate_notes(*, project: "ProjectRelease", repo: str, since: str, target: 
 def _staging_rights(project: str, raw) -> tuple:
     """#7372: parse the standing staging rights of a release project.
 
-    Each entry is `{"host": …, "decision": <id>, "expires": "YYYY-MM-DD"}`.
-    The decision is only a reference here; the guard re-reads it (answered,
-    signed, not withdrawn or superseded) before any use. An invalid entry is
-    refused at configuration time, never silently ignored.
+    Each entry is `{"host": …, "decision": <id>, "option": "a",
+    "expires": "YYYY-MM-DD"}`. The decision is only a reference here; the
+    guard re-reads it (answered, signed, not withdrawn or superseded) and
+    checks the answered option, its project, host and stated expiry before
+    any use (#7372 B2). An invalid entry is refused at configuration time,
+    never silently ignored.
     """
     if raw is None:
         return ()
@@ -1152,7 +1154,7 @@ def _staging_rights(project: str, raw) -> tuple:
         where = "release.projects.%s.staging_rights[%d]" % (project, index)
         if not isinstance(item, dict):
             raise ReleaseError("%s: an object is required" % where)
-        unknown = set(item) - {"host", "decision", "expires"}
+        unknown = set(item) - {"host", "decision", "option", "expires"}
         if unknown:
             raise ReleaseError("%s: unknown key(s) %s" % (where, ", ".join(sorted(unknown))))
         host = item.get("host")
@@ -1161,6 +1163,9 @@ def _staging_rights(project: str, raw) -> tuple:
         decision = item.get("decision")
         if (not isinstance(decision, int) or isinstance(decision, bool) or decision <= 0):
             raise ReleaseError("%s.decision: a positive integer is required" % where)
+        option = item.get("option")
+        if not isinstance(option, str) or not option.strip():
+            raise ReleaseError("%s.option is required" % where)
         expires = item.get("expires")
         if not isinstance(expires, str):
             raise ReleaseError("%s.expires: an ISO date is required" % where)
@@ -1168,7 +1173,8 @@ def _staging_rights(project: str, raw) -> tuple:
             _dt.date.fromisoformat(expires)
         except ValueError as exc:
             raise ReleaseError("%s.expires: an ISO date is required (%s)" % (where, exc)) from exc
-        out.append({"host": host.strip(), "decision": decision, "expires": expires})
+        out.append({"host": host.strip(), "decision": decision,
+                    "option": option.strip(), "expires": expires})
     return tuple(out)
 
 
@@ -1195,7 +1201,8 @@ class ProjectRelease:
     staging_handoff: str = ""
     attestation_timeout_s: float = ATTESTATION_TIMEOUT_S
     #: #7372: standing owner root rights of the bureau, per host. Each entry
-    #: names the decision and its expiry; the decision is re-read at each use
+    #: names the decision, its approved option and its expiry; the decision is
+    #: re-read and its option/scope checked at each use
     #: (answered, signed, not withdrawn or superseded), so a revocation takes
     #: effect on the next pass, without a release. Nothing client-specific is
     #: compiled here: the host, decision and date come from the configuration.

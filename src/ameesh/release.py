@@ -733,8 +733,10 @@ def _elected_tick(cfg, args):
 def _catchup_actor(cfg, db, explicit) -> str:
     """#7372: only the bureau, or a human at a terminal, declares the gesture.
 
-    A bound session acts as itself and must be the bureau (its Agent card names
-    the role; `tenancy.operator` applies the same rule for infrastructure
+    An agent session must be *bound* (`identity.require_bound`: runner lease or
+    session binding), never a bare `AGENT_MAIL_NAME`, which is self-declared
+    (#7372 B1); it then acts as itself and must be the bureau (its Agent card
+    names the role; `tenancy.operator` applies the same rule for infrastructure
     gestures). `--actor` never lets an agent act on behalf of another, and an
     unbound session may only name a known human. A root catch-up is not a
     generic agent gesture: the owner's decision (#219407) names the bureau.
@@ -743,18 +745,21 @@ def _catchup_actor(cfg, db, explicit) -> str:
     text = agent_names.resolve((explicit or "").strip(), db=db,
                                operation="release.catchup")
     binding = identity.resolve_binding(cfg, db)
-    if not binding.ok and (binding.name or binding.source != "none"
-                           or os.environ.get("AGENT_MAIL_NAME")):
+    name = binding.name or ""
+    if os.environ.get("AGENT_MAIL_NAME") and not name:
         raise release_cutoff.ReleaseError(
             "catchup identity refused: %s" % (binding.reason or "invalid session identity"))
-    if binding.name:
-        if text and text != binding.name:
+    if name and not name.startswith(work.HUMAN_PREFIX):
+        try:
+            bound = identity.require_bound(cfg, db, what="release catchup")
+        except ValueError as exc:
+            raise release_cutoff.ReleaseError(
+                "catchup identity refused: %s" % exc) from exc
+        name = bound.name
+        if text and text != name:
             raise release_cutoff.ReleaseError(
                 "this session belongs to %s; it does not declare on behalf of %s"
-                % (binding.name, text))
-        name = binding.name
-        if name.startswith(work.HUMAN_PREFIX):
-            return name
+                % (name, text))
         try:
             canons = canon.load_configured(cfg) if cfg is not None else []
             if name in sous_utilisation.role_orchestrators(canons, ("bureau",)):
@@ -765,6 +770,19 @@ def _catchup_actor(cfg, db, explicit) -> str:
         raise release_cutoff.ReleaseError(
             "%s is not the bureau: the root catch-up is the bureau's gesture "
             "(#219407)" % name)
+    if name:
+        # A human name must come from a bound terminal. A bare
+        # `AGENT_MAIL_NAME=human:…` is self-declared like any agent name; the
+        # unbound path below still accepts `--actor human:<id>` on a terminal.
+        if not binding.ok or binding.source not in identity.BOUND_SOURCES:
+            raise release_cutoff.ReleaseError(
+                "catchup identity refused: %s is not a bound human terminal; an "
+                "unbound terminal names itself with --actor human:<id>" % name)
+        if text and text != name:
+            raise release_cutoff.ReleaseError(
+                "this session belongs to %s; it does not declare on behalf of %s"
+                % (name, text))
+        return name
     if not text:
         raise release_cutoff.ReleaseError(
             "no bound session identity: a human at a terminal names itself with "

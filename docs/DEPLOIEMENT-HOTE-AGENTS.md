@@ -718,13 +718,18 @@ ni échéance n’est codé en dur : le droit se déclare dans la configuration 
 release, sous `release.projects.<projet>.staging_rights` :
 
 ```json
-{"host": "manaty-mesh-1", "decision": 219407, "expires": "2026-12-12"}
+{"host": "manaty-mesh-1", "decision": 219407, "option": "a",
+ "expires": "2026-12-12"}
 ```
 
 La décision n’est qu’une référence : à chaque passage, la garde la relit
-(répondue, signée avec empreinte, non retirée ni remplacée) et refuse le geste
-si elle ne l’est plus ou si l’échéance est passée. Une révocation prend donc
-effet au passage suivant, sans nouvelle release ; retirer l’entrée rend le
+(répondue, preuve d’owner vérifiée, non retirée ni remplacée) et refuse le
+geste si elle ne l’est plus ou si l’échéance est passée. Elle vérifie aussi que
+la réponse a retenu l’option configurée, que la décision porte bien le projet,
+et que son libellé signé nomme l’hôte et une échéance au moins égale à celle de
+la configuration : une option refusée, une décision étrangère ou une échéance
+prolongée au-delà du texte signé rendent le droit inactif. Une révocation prend
+donc effet au passage suivant, sans nouvelle release ; retirer l’entrée rend le
 geste à une décision par geste (§10). Une entrée incomplète, une clé inconnue
 ou une date invalide refuse la configuration.
 
