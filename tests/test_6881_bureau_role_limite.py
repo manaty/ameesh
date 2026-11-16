@@ -164,6 +164,35 @@ class BureauRoleLimiteTest(PgTestCase):
         finally:
             limited.close()
 
+    def test_direct_catchup_timestamp_is_always_the_server_statement_time(self):
+        """#7566: the real limited login cannot backdate or postdate a trace."""
+        payload = json.dumps(dict(schema="ameesh-staging-catchup/1", host="server",
+                                  sha="a" * 40, result="ok", actor="bureau"))
+        for timestamp in ("'2000-01-01'::timestamptz", "NULL", "DEFAULT"):
+            with self.subTest(timestamp=timestamp):
+                before = self.db.query("SELECT clock_timestamp() AS ts")[0]["ts"]
+                proc = self.sql(
+                    "INSERT INTO ameesh_events (type, object, project, data, created_at)"
+                    " VALUES ('staging.catchup', 'staging-catchup:ameesh:server',"
+                    " 'ameesh', '%s'::jsonb, %s) RETURNING id" % (payload, timestamp))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                event_id = int(proc.stdout.splitlines()[0])
+                row = self.db.query("SELECT created_at, clock_timestamp() AS after"
+                                    " FROM ameesh_events WHERE id = %s", (event_id,))[0]
+                self.assertGreaterEqual(row["created_at"], before)
+                self.assertLessEqual(row["created_at"], row["after"])
+        self.refused(
+            "INSERT INTO ameesh_events (type, object, project, data, created_at)"
+            " VALUES ('staging.catchup', 'staging-catchup:ameesh:server',"
+            " 'ameesh', '%s'::jsonb, '2100-01-01'::timestamptz)" % payload,
+            "created_at in the future")
+        # The unrestricted administration connection keeps its old semantics.
+        row = self.db.query(
+            "INSERT INTO ameesh_events (type, object, project, data, created_at)"
+            " VALUES ('staging.catchup', 'admin', 'ameesh', '{}'::jsonb,"
+            " '2000-01-01'::timestamptz) RETURNING extract(year FROM created_at)::int AS year")[0]
+        self.assertEqual(row["year"], 2000)
+
     def test_consumed_decision_signature_is_readable_but_pending_approval_is_not(self):
         from ameesh import authority, decisions, registry, signing, storage, staging_deferred
         seed = b"\x42" * 32  # public fixture, never an enrolled real key

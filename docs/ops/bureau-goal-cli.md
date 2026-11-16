@@ -41,7 +41,10 @@ leur agent et leur hôte. Pour ces connexions, la base refuse :
 - sur le courrier reçu, tout changement autre que la réservation
   (`meta.consigne`) et la remise ; un message remis ne redevient pas non lu ;
 - tout événement écrit hors trigger, sauf une trace `staging.catchup` du bureau
-  inscrit (type, schéma, auteur, objet, SHA et résultat contrôlés par la garde 0583) ;
+  inscrit (type, schéma, auteur, objet, SHA et résultat contrôlés par la garde 0583 ; depuis 0584,
+  `created_at` fixé à `statement_timestamp()` par le serveur, toute date
+  passée ou nulle fournie par la connexion limitée étant remplacée ; une
+  date future reste refusée par `ameesh_events_dated`) ;
 - toute suppression ;
 - la réouverture d'une liaison révoquée.
 

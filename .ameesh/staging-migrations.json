@@ -5,6 +5,11 @@
       "checksum": "b9fbafe40466f30ca3b6663ee0e53f250b4c1e36d2f8bf83658c55a06d2e524a",
       "lot": 7565,
       "restore": "src/ameesh/migrations/rollback/0583_restore.sql"
+    },
+    "src/ameesh/migrations/0584_bureau_catchup_timestamp.sql": {
+      "checksum": "8a8bfc9ac37192a7d9c378ab2707a455aee98edd751fd46468354a09e5ac2085",
+      "restore": "src/ameesh/migrations/rollback/0584_restore.sql",
+      "lot": 7566
     }
   },
   "exceptions": {
