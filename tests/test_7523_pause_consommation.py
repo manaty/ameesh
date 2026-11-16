@@ -154,7 +154,10 @@ class _Historique(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.db.execute("TRUNCATE quota_gauge_readings RESTART IDENTITY")
-        self.now = time.time()
+        # PostgreSQL arrondit les timestamps à la microseconde. Un relevé
+        # produit à « now » peut sinon revenir légèrement dans le futur et
+        # être exclu de consumption_rate, perdant la seconde hausse requise.
+        self.now = int(time.time())
         self.resets = self.now + 0.40 * WEEK
         self.gauge = cost.Gauge("claude", "seven_day", 0.674, self.resets, WEEK)
         self.directory = tempfile.mkdtemp(prefix="ameesh-7523-")
