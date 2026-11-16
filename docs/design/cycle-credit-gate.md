@@ -14,6 +14,11 @@ source can refer to a bureau/owner attestation; runners need no billing/admin
 key. `cycle show --account ID` exposes the latest projection and counted debt.
 No balance or key is configured automatically.
 
+The cycle and request tables remain closed to the supervisor SQL role; reads
+use the budget API. Their actor/agent spellings are historical evidence kept
+on agent rename. Admission and settlement address accounts and attempt ids,
+so those spellings confer no authority and do not select pending liabilities.
+
 The clock is the database clock, read after the account lock. Admission refuses
 an absent, stale, expired, future-dated or unreadable projection. A day boundary
 has no effect. A new projection requires a strictly newer dated observation;
