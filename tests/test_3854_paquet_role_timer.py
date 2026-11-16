@@ -312,10 +312,10 @@ class InstallTest(unittest.TestCase):
                     self.assertEqual(len(problems), 1)
                     text = problems[0]
                     if timer == "ameesh-paquet-horaire.timer":
-                        self.assertIn("scripts/paquet-horaire.py pause", text)
+                        self.assertIn("scripts/paquet-horaire.py pause --until <deadline> --reason <why>", text)
                         self.assertIn("bounded pause, #4361; leave the timer active", text)
                         self.assertIn("never systemctl stop", text)
-                        self.assertIn("systemctl --user start ameesh-paquet-horaire.timer", text)
+                        self.assertIn("systemctl --user enable --now ameesh-paquet-horaire.timer", text)
                     else:
                         self.assertEqual(text, "github-watch: %s is not active" % timer)
                     args = SimpleNamespace(check=True, systemd_dir=str(self.dir),

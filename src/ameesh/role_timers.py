@@ -1334,9 +1334,10 @@ def check(report: dict, *, directory: Path, apply: bool = True,
                                 % (spec.name, name))
         if apply and (directory / spec.timer).is_file():
             pause_hint = (
-                "; to hold packets use `scripts/paquet-horaire.py pause` "
+                "; to hold packets use `scripts/paquet-horaire.py pause --until <deadline> "
+                "--reason <why>` "
                 "(bounded pause, #4361; leave the timer active), never systemctl stop; "
-                "to resume: systemctl --user start ameesh-paquet-horaire.timer"
+                "to restore it: systemctl --user enable --now ameesh-paquet-horaire.timer"
                 if spec.name == PAQUET_PASS else "")
             enabled = _systemctl("is-enabled", "--quiet", spec.timer)
             if enabled.returncode != 0:
