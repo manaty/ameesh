@@ -38,6 +38,57 @@ class ClassificationTests(unittest.TestCase):
             with self.subTest(suffix=suffix):
                 self.assertEqual(sm.classify("ALTER TABLE x ADD COLUMN y text " + suffix).kind, 'destructive')
 
+    def test_mandatory_column_check_accepting_the_default_is_additive(self):
+        # #7531 : 0582 de #7520 portait un CHECK inline utile ; le classeur le
+        # rangeait en destructif (mandatory column). Le CHECK n'est lu que s'il
+        # ne peut dépendre que de la colonne ajoutée et s'il accepte le défaut
+        # que la version N-1 produit en omettant la colonne.
+        for suffix in (
+                "NOT NULL DEFAULT 0 CHECK (y >= 0)",
+                "NOT NULL DEFAULT 0 CHECK (y = 0)",
+                "NOT NULL DEFAULT 0 CHECK (y IN (0, 1))",
+                "NOT NULL DEFAULT 0 CHECK (y IS NOT NULL)",
+                "NOT NULL DEFAULT 0 CHECK (y >= 0 AND y <= 10)",
+                "DEFAULT 0 NOT NULL CHECK (y >= 0)",
+                "NOT NULL DEFAULT -1 CHECK (y < 0)",
+                # SQL NULL: un CHECK passe sur NULL, pas sur FALSE.
+                "NOT NULL DEFAULT 0 CHECK (y > 0 OR NULL)"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(sm.classify("ALTER TABLE x ADD COLUMN y int " + suffix).kind, 'additive')
+        sql = ("ALTER TABLE credit_cycles ADD COLUMN IF NOT EXISTS billing_lag_seconds "
+               "bigint NOT NULL DEFAULT 0 CHECK (billing_lag_seconds >= 0);")
+        self.assertEqual(sm.classify(sql).kind, 'additive')
+        # La porte ne demande ni déclaration ni accord signé pour un additif.
+        self.assertEqual(sm.check('0582.sql', sql.encode(), sm.load_policy(),
+                                  read_file=lambda p: b'', signed_decision=lambda *a: False).kind,
+                         'additive')
+        # Le CHECK est évalué sur la vraie valeur : deux littéraux distincts ne
+        # se confondent pas derrière le jeton opaque du lecteur.
+        for sql, kind in (
+                ("ALTER TABLE x ADD COLUMN y text NOT NULL DEFAULT 'a' CHECK (y IN ('a', 'b'))", 'additive'),
+                ("ALTER TABLE x ADD COLUMN y text NOT NULL DEFAULT 'a' CHECK (y = 'b')", 'destructive'),
+                ("ALTER TABLE x ADD COLUMN y text NOT NULL DEFAULT 'it''s' CHECK (y = 'it''s')", 'additive'),
+                ("ALTER TABLE x ADD COLUMN y boolean NOT NULL DEFAULT false CHECK (y = false)", 'additive'),
+                ("ALTER TABLE x ADD COLUMN y boolean NOT NULL DEFAULT false CHECK (y)", 'destructive')):
+            with self.subTest(sql=sql):
+                self.assertEqual(sm.classify(sql).kind, kind)
+
+    def test_mandatory_column_check_rejecting_or_unprovable_stays_destructive(self):
+        for suffix in (
+                "NOT NULL DEFAULT 0 CHECK (y > 0)",
+                "NOT NULL DEFAULT 0 CHECK (y <> 0)",
+                "NOT NULL DEFAULT 0 CHECK (y = 1)",
+                "NOT NULL DEFAULT 0 CHECK (y IS NULL)",
+                "NOT NULL DEFAULT 0 CHECK (false)",
+                "NOT NULL DEFAULT 0 CHECK (y > 0 AND NULL)",
+                "NOT NULL DEFAULT 0 CHECK (y >= other_column)",
+                "NOT NULL DEFAULT 0 CHECK (length(y::text) > 0)",
+                "NOT NULL DEFAULT 0 CHECK (y BETWEEN 0 AND 1)",
+                "NOT NULL DEFAULT 0 CHECK (y >= 0) CHECK (y <= 10)",
+                "NOT NULL DEFAULT now() CHECK (y >= 0)"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(sm.classify("ALTER TABLE x ADD COLUMN y int " + suffix).kind, 'destructive')
+
     def test_domain_column_default_stays_destructive(self):
         # PostgreSQL accepts ADD COLUMN on an empty table, but the domain CHECK
         # rejects a subsequent N-1 INSERT that omits y. No implicit domain cast
@@ -55,6 +106,8 @@ class ClassificationTests(unittest.TestCase):
         policy = sm.load_policy(json.dumps({'schema':'ameesh-staging-migrations/1',
             'exceptions':{'destructive':[{'pattern':r'alter table protected .*', 'reason':'protected table'}]}}))
         self.assertEqual(sm.classify("ALTER TABLE protected ADD COLUMN y int NOT NULL DEFAULT 1", policy).kind, 'destructive')
+        self.assertEqual(sm.classify("ALTER TABLE protected ADD COLUMN y int NOT NULL DEFAULT 1 CHECK (y >= 0)",
+                                     policy).kind, 'destructive')
 
     def test_actual_migrations_and_new_trigger(self):
         root = Path(__file__).resolve().parents[1]

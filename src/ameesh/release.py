@@ -730,6 +730,121 @@ def _elected_tick(cfg, args):
         min_left=0, dry_run=False, json=False), credentials=credentials)
 
 
+def _catchup_actor(cfg, db, explicit) -> str:
+    """#7372: only the bureau, or a human at a terminal, declares the gesture.
+
+    An agent session must be *bound* (`identity.require_bound`: runner lease or
+    session binding), never a bare `AGENT_MAIL_NAME`, which is self-declared
+    (#7372 B1); it then acts as itself and must be the bureau (its Agent card
+    names the role; `tenancy.operator` applies the same rule for infrastructure
+    gestures). `--actor` never lets an agent act on behalf of another, and an
+    unbound session may only name a known human. A root catch-up is not a
+    generic agent gesture: the owner's decision (#219407) names the bureau.
+    """
+    from . import agent_names, canon, identity, release_cutoff, sous_utilisation
+    text = agent_names.resolve((explicit or "").strip(), db=db,
+                               operation="release.catchup")
+    binding = identity.resolve_binding(cfg, db)
+    name = binding.name or ""
+    if os.environ.get("AGENT_MAIL_NAME") and not name:
+        raise release_cutoff.ReleaseError(
+            "catchup identity refused: %s" % (binding.reason or "invalid session identity"))
+    if name and not name.startswith(work.HUMAN_PREFIX):
+        try:
+            bound = identity.require_bound(cfg, db, what="release catchup")
+        except ValueError as exc:
+            raise release_cutoff.ReleaseError(
+                "catchup identity refused: %s" % exc) from exc
+        name = bound.name
+        if text and text != name:
+            raise release_cutoff.ReleaseError(
+                "this session belongs to %s; it does not declare on behalf of %s"
+                % (name, text))
+        try:
+            canons = canon.load_configured(cfg) if cfg is not None else []
+            if name in sous_utilisation.role_orchestrators(canons, ("bureau",)):
+                return name
+        except Exception as exc:  # noqa: BLE001 - an unreadable authority refuses
+            raise release_cutoff.ReleaseError(
+                "cannot read the bureau role of %s: %s" % (name, exc)) from exc
+        raise release_cutoff.ReleaseError(
+            "%s is not the bureau: the root catch-up is the bureau's gesture "
+            "(#219407)" % name)
+    if name:
+        # A human name must come from a bound terminal. A bare
+        # `AGENT_MAIL_NAME=human:…` is self-declared like any agent name; the
+        # unbound path below still accepts `--actor human:<id>` on a terminal.
+        if not binding.ok or binding.source not in identity.BOUND_SOURCES:
+            raise release_cutoff.ReleaseError(
+                "catchup identity refused: %s is not a bound human terminal; an "
+                "unbound terminal names itself with --actor human:<id>" % name)
+        if text and text != name:
+            raise release_cutoff.ReleaseError(
+                "this session belongs to %s; it does not declare on behalf of %s"
+                % (name, text))
+        return name
+    if not text:
+        raise release_cutoff.ReleaseError(
+            "no bound session identity: a human at a terminal names itself with "
+            "--actor human:<id>; an agent session must be bound to the bureau")
+    if not text.startswith(work.HUMAN_PREFIX):
+        raise release_cutoff.ReleaseError(
+            "an unbound session cannot declare as %r: only a bound bureau or a "
+            "human terminal" % text)
+    human = work.known_human(db, text[len(work.HUMAN_PREFIX):], cfg)
+    if not human:
+        raise release_cutoff.ReleaseError("%s is not a known human" % text)
+    return human
+
+
+def _catchup(cfg, args) -> int:
+    """`ameesh release catchup` (#7372): declare the bureau's root gesture.
+
+    The four `vm.sh` steps stay the bureau's manual gesture; this command
+    records its outcome as a durable `staging.catchup` event, with the host,
+    the active commit read from `controler`, the attested tag, the author and
+    the owner right read from the project configuration. A declaration is a
+    trace, not a proof: the guard keeps the lag until a staging attestation
+    reads the host. `ok` is refused after the right's expiry or if its signed
+    decision is withdrawn or superseded.
+    """
+    from . import release_cutoff, staging_deferred
+    from .db import open_db
+    try:
+        project = release_cutoff.projects(cfg).get(args.project)
+        if project is None:
+            raise release_cutoff.ReleaseError(
+                "project %r is not declared under release.projects" % args.project)
+        db = open_db(cfg)
+        try:
+            base = staging_deferred.baseline(db, project, args.host)
+            if base is None:
+                print("%s: %s is not reported by the latest tagged staging "
+                      "attestation; nothing to declare" % (project.name, args.host))
+                return 0
+            right = staging_deferred.active_right(db, project, args.host)
+            if args.result == "ok" and (right is None or not right.get("active")):
+                raise release_cutoff.ReleaseError(
+                    "no active owner root right covers %s: %s"
+                    % (args.host, "decision #%s %s"
+                       % (right.get("decision"), right.get("why") or "inactive")
+                       if right else "none configured in release.projects.%s."
+                       "staging_rights" % project.name))
+            actor = _catchup_actor(cfg, db, args.actor)
+            row = staging_deferred.declare(
+                db, project, args.host, args.sha, base, args.result, actor, args.note)
+        finally:
+            db.close()
+    except (release_cutoff.ReleaseError, ValueError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    print("staging catch-up declared: %s %s at %s (%s, tag %s, event %s); "
+          "trace only, the alert stays until an attestation proves the host"
+          % (project.name, row["host"], row["sha"][:12], row["result"],
+             row["tag"] or "?", row.get("event")))
+    return 0
+
+
 def _attest(cfg, args) -> int:
     """`ameesh release attest` (#6020): a reserved note on the attestation lot.
 
@@ -785,6 +900,8 @@ def run(cfg, args) -> int:
     """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest`."""
     from . import release_cutoff
     command = args.release_command
+    if command == "catchup":
+        return _catchup(cfg, args)
     if command == "attest":
         return _attest(cfg, args)
     if (command in ("tick", "packet-watch", "cutoff")
@@ -934,6 +1051,22 @@ def add_parser(sub, func) -> None:
     reason_p.add_argument("--text", required=True)
     reason_p.add_argument("--actor", default="")
     reason_p.set_defaults(func=func)
+    catchup_p = rel.add_parser(
+        "catchup", help="#7372: declare the bureau's root catch-up of a reported "
+                        "staging server (four vm.sh steps) in the trace and the "
+                        "cutoff report")
+    catchup_p.add_argument("--project", default="ameesh")
+    catchup_p.add_argument("--host", default="manaty-mesh-1")
+    catchup_p.add_argument("--sha", required=True,
+                           help="the host's active commit after the gesture (full 40 hex, "
+                                "read from vm.sh controler)")
+    catchup_p.add_argument("--result", choices=("ok", "failed"), default="ok")
+    catchup_p.add_argument("--note", default="",
+                           help="what happened, for a failure or a partial gesture")
+    catchup_p.add_argument("--actor", default="",
+                           help="a human terminal names itself (human:<id>); a bound "
+                                "session acts as itself and must be the bureau")
+    catchup_p.set_defaults(func=func)
     attest_p = rel.add_parser(
         "attest", help="#6020: the staging agent attests a handed-over Nexlink staging "
                        "(migrations, then the staging dispatches) on the cutoff's "
