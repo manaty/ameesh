@@ -10,9 +10,10 @@ valeur qu'il a réellement remplacée. Le déclencheur de 0042 émet le réveil
 from __future__ import annotations
 
 from .. import interface
+from .cycle_budgets import CycleBudgets
 
 
-class Budgets(interface.Budgets):
+class Budgets(CycleBudgets, interface.Budgets):
 
     def limits(self) -> list:
         return self.db.query(

@@ -446,6 +446,8 @@ def add_parsers(sub) -> None:
                       help='must match the authenticated Unix human (human:NAME)')
     from . import tranche_budget
     tranche_budget.add_parser(bsub)
+    from . import cycle_budget
+    cycle_budget.add_parser(bsub)
     # #4166 : prépayé déclaré d'un compte fournisseur sans API de solde
     ppre = bsub.add_parser(
         "prepaid", help="#4166: prepaid amount of a provider account (no balance "
@@ -516,6 +518,13 @@ def cmd_budget(cfg: Config, args: argparse.Namespace) -> int:
             print('Accounting reconciliation #%s: %s for %s (by %s).'
                   % (result['id'], result['event'], args.agent, actor))
             return 0
+        if what == "cycle":
+            from . import cycle_budget
+            try:
+                return cycle_budget.command(cfg, db, args)
+            except (BudgetError, ValueError, RuntimeError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
         if what == "release" or getattr(args, "account", None):
             return _cmd_account(cfg, db, args, what)
         if what == "set":
