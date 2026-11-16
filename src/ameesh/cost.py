@@ -535,7 +535,13 @@ def consumption_rate(history, gauge: "Gauge", *, now: float, account: str | None
     Mêmes précautions que `sous_utilisation._projected_plan_loss` : même
     harnais, compte, jauge et échéance de fenêtre ; horodatage de production
     (`produced_ts`) plutôt que d'insertion quand il existe ; deux relevés au
-    moins, espacés de `min_span` ; usage non décroissant. Une lecture qui ne
+    moins, espacés de `min_span` ; usage non décroissant. #7540 : deux
+    hausses distinctes sont nécessaires pour confirmer la pente : un seul
+    pas de jauge quantifiée ne projette pas la pause jusqu’au reset. Cette
+    hystérésis est bornée à la fenêtre d’observation (six heures) ; les
+    plateaux ne confirment pas une hausse supplémentaire et les anciens pas
+    expirent avec la fenêtre. Sans confirmation, l’annonce utilise l’usage
+    courant figé ; les seuils de pause restent inchangés. Une lecture qui ne
     conclut pas rend 0.0 — le repli est le calcul d'origine, jamais une
     valeur inventée.
 
@@ -575,6 +581,8 @@ def consumption_rate(history, gauge: "Gauge", *, now: float, account: str | None
     if span < min_span or used < initial:
         return 0.0
     if any(later[1] < earlier[1] for earlier, later in zip(samples, samples[1:])):
+        return 0.0
+    if sum(later[1] > earlier[1] for earlier, later in zip(samples, samples[1:])) < 2:
         return 0.0
     return (used - initial) / span
 
@@ -2599,9 +2607,18 @@ class CostBook:
                              **(marque if any(delta) else {}))
 
         # #7519: each broker request already has its own durable priced row.
-        # The normal turn row remains a zero-valued timeline/input marker.
-        if harness == "deepseek" and any(e.get("type") == "dsh.provider-ledger" for e in events):
-            return TurnUsage(agent, harness, modele, 0.0)
+        # #7534: preserve session/rotation/reread tokens on the normal turn
+        # row without pricing them again. Response rows have no session so
+        # neither their tokens nor their count become duplicate agent turns.
+        markers = [e for e in events if e.get("type") == "dsh.provider-ledger"]
+        if harness == "deepseek" and markers:
+            identity = markers[-1].get("turn_id")
+            if not identity or (turn_id is not None and identity != turn_id):
+                raise CostError("provider ledger marker does not identify this turn")
+            if self.db is None:
+                raise CostError("provider usage requires its durable ledger")
+            tokens = storage.of(self.db).turn_costs.provider_usage(agent, identity)
+            return TurnUsage(agent, harness, modele, 0.0, **tokens)
 
         # DeepSeek (et tout harnais qui publie un usage par étape).
         steps = [e.get("usage") or {} for e in events

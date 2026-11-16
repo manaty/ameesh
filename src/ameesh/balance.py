@@ -186,7 +186,10 @@ def account_sources(cfg, *, env: dict | None = None, transport: Transport | None
         try:
             items = [p for p in accounts.profiles(cfg, name) if p.kind == "api_key_env"]
         except accounts.AccountError:
-            items = []
+            # #7534: an unreadable account declaration cannot authorize the
+            # historical environment fallback. Its ambient key may belong to
+            # an alternate dsh provider, even without a host default route.
+            continue
         if not items:
             if name == "deepseek" and getattr(cfg, "dsh_provider", None):
                 continue  # #7519: no implicit official-provider balance request

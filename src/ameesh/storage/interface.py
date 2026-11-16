@@ -897,6 +897,17 @@ class TurnCosts(Domain):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def provider_usage(self, agent: str, turn_id: str) -> dict:
+        """#7534: tokens of this turn's durable dsh provider-response rows.
+
+        Returns input_tokens (uncached), cached_input_tokens and output_tokens.
+        The zero-cost native turn row carries these totals into its session;
+        provider-response rows stay outside session aggregates to avoid
+        counting responses as additional agent turns.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
                session: str | None, usd: float, input_tokens: int,
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
