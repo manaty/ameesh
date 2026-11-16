@@ -73,9 +73,16 @@ def private_json(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd) as stream:
         info = os.fstat(stream.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 65536):
-            raise Refused('private operator-owned file required')
+        if not stat.S_ISREG(info.st_mode):
+            raise Refused('private file must be regular')
+        if info.st_uid != os.geteuid():
+            raise Refused('private file uid must match effective uid')
+        if info.st_mode & 0o077:
+            raise Refused('private file group or other permission bits forbidden')
+        if info.st_nlink != 1:
+            raise Refused('private file link count must be one')
+        if info.st_size > 65536:
+            raise Refused('private file size exceeds limit')
         try:
             return json.loads(stream.read(65537))
         except ValueError:

@@ -2,6 +2,11 @@
 """Worker failures identify their boundary without exposing exception values."""
 from contextlib import ExitStack, redirect_stdout
 import io
+import os
+from pathlib import Path
+import stat
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -87,3 +92,40 @@ class WorkerDiagnosticsTest(unittest.TestCase):
         self.assertIn('at credentials: KeyError (missing key: CREDENTIALS_DIRECTORY)', output)
         mocks['Scaleway'].assert_not_called()
         mocks['tick_host'].assert_not_called()
+
+
+class PrivateJsonDiagnosticsTest(unittest.TestCase):
+    def test_each_refused_condition_names_cause_without_values(self):
+        cases = [
+            ({'st_mode': stat.S_IFIFO | 0o600}, 'must be regular'),
+            ({'st_uid': os.geteuid() + 1}, 'uid must match effective uid'),
+            ({'st_mode': stat.S_IFREG | 0o640}, 'group or other permission bits'),
+            ({'st_mode': stat.S_IFREG | 0o604}, 'group or other permission bits'),
+            ({'st_nlink': 2}, 'link count must be one'),
+            ({'st_size': 65537}, 'size exceeds limit'),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'private-secret-path'
+            path.write_text('{"secret_key": "private-token"}')
+            path.chmod(0o600)
+            for changes, expected in cases:
+                metadata = dict(st_mode=stat.S_IFREG | 0o600, st_uid=os.geteuid(),
+                                st_nlink=1, st_size=32)
+                metadata.update(changes)
+                with self.subTest(changes=changes), patch.object(
+                        vm.os, 'fstat', return_value=SimpleNamespace(**metadata)):
+                    with self.assertRaises(vm.Refused) as caught:
+                        vm.private_json(path)
+                    self.assertIn(expected, str(caught.exception))
+                    self.assertNotIn('private-token', str(caught.exception))
+                    self.assertNotIn(str(path), str(caught.exception))
+
+    def test_worker_identifies_file_and_condition(self):
+        for stage in ('enrollment', 'credentials'):
+            error = vm.Refused('private file uid must match effective uid')
+            failures = error if stage == 'enrollment' else [{}, error]
+            code, output, mocks, _ = WorkerDiagnosticsTest().run_worker(
+                'private_json', failures)
+            self.assertEqual(code, 1)
+            self.assertIn('at ' + stage + ': private file uid must match effective uid;', output)
+            mocks['tick_host'].assert_not_called()
