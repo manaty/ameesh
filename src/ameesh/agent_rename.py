@@ -93,6 +93,9 @@ CASCADED = (
 # Evidence, authority and unrelated names: never rewritten. Executor
 # allowlists (jsonb) are granted authority, read through the alias.
 KEPT = (
+    "credit_cycles.actor",  # Dated credit statement provenance (#7518/#7520).
+    "credit_reconciliations.actor",  # Operator reconciliation audit evidence.
+    "credit_requests.agent",  # Historical billable-attempt identity, never rewritten.
     # #7477 (0580): immutable composition provenance, including the exact
     # composer lease identity. Historical receipts are read through aliases.
     "work_packet_snapshots.recorded_by", "work_packet_snapshots.lease_owner",
