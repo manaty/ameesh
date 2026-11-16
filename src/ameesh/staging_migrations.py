@@ -91,9 +91,14 @@ def load_policy(text=None):
         raise Refused("staging migration policy unreadable: %s" % exc) from exc
 
 
-def _code(sql, *, procedural=False, depth=0):
+_LITERAL = r"__staging_lit_\d+__"
+_LITERAL_RE = re.compile(_LITERAL)
+
+
+def _code(sql, *, procedural=False, depth=0, literals=None):
     if depth > 20:
         raise Refused("procedural nesting exceeds lexical analysis")
+    literals = {} if literals is None else literals
     bodies = []
 
     def body_token(literal):
@@ -101,19 +106,27 @@ def _code(sql, *, procedural=False, depth=0):
         bodies.append(literal[len(tag):-len(tag)])
         return " __staging_body_%d__ " % (len(bodies) - 1)
 
+    def string_token(literal):
+        # Un jeton unique par littéral : le classeur range parfois une colonne
+        # d'après le défaut, et doit alors comparer de vraies valeurs sans
+        # jamais réintroduire le contenu d'une chaîne dans le code analysé.
+        token = "__staging_lit_%d__" % len(literals)
+        literals[token] = literal
+        return " " + token + " "
+
     _, code, sure, _ = migrations._lex(sql, dollar_handler=body_token, allow_inline_comments=True,
-                                        string_handler=lambda literal: " '_' ")
+                                        string_handler=string_token)
     if not sure:
         raise Refused("SQL lexical analysis incomplete")
     code = re.sub(r"\s+", " ", code.lower()).strip()
     code = ";".join(part if re.match(r"\s*alter table\b.*\badd column\b", part)
-                    else part.replace("'_'", " ")
+                    else _LITERAL_RE.sub(" ", part)
                     for part in code.split(";"))
     for i, body in enumerate(bodies):
         token = "__staging_body_%d__" % i
         pattern = r"\bdo\s+(?:language\s+plpgsql\s+)?" + token + r"(?:\s+language\s+plpgsql)?"
         if re.search(pattern, code):
-            expanded = _code(body, procedural=True, depth=depth + 1)
+            expanded = _code(body, procedural=True, depth=depth + 1, literals=literals)
             code = re.sub(pattern, lambda m: expanded, code, count=1)
         else:
             # Function definitions store their bodies; they do not execute them.
@@ -175,10 +188,292 @@ def _new_routine_revoke(statement, code):
         for name, signature in targets)
 
 
+class _Unsupported(Exception):
+    """The inline CHECK cannot be proven to accept the default (#7531)."""
+
+
+# A constant default, as normalized by `_code`: a string literal is an opaque
+# token, so a check is evaluated against the real value, never a placeholder.
+_CONSTANT = (r"(?:" + _LITERAL + r"|true|false|"
+             r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?|array\s*\[\s*\])")
+# A domain's implicit cast may reject this constant on an N-1 insert. Restrict
+# both the column type and explicit casts to known built-ins.
+_BUILTIN = (r"(?:pg_catalog\.)?(?:text|varchar|bool|boolean|int|integer|int2|int4|"
+            r"int8|bigint|smallint|numeric|decimal|real|float4|float8|json|jsonb|uuid)")
+_CAST = r"(?:\s*::\s*" + _BUILTIN + r"(?:\[\])?)*"
+_COLUMN = (r'alter table [\w.\"]+ add column (?:if not exists )?(?P<column>[\w\"]+) '
+           + _BUILTIN + r"(?:\[\])?")
+
+
+def _column_definition(statement):
+    """``(default, check, column)`` of an ``ADD COLUMN`` with a constant
+    default, else None. ``check`` is the inline CHECK expression, or None.
+
+    Only a CHECK that ends the column definition is read; anything after it
+    (another constraint, NOT VALID, …) keeps the statement outside this
+    shortcut and therefore destructive.
+    """
+    head = (_COLUMN + r"(?: not null default (?P<default>" + _CONSTANT + ")" + _CAST
+            + r"| default (?P<default2>" + _CONSTANT + ")" + _CAST + r" not null)")
+    for tail in ("", r"\s+check\s*\((?P<check>.*)\)"):
+        match = re.fullmatch(head + tail, statement, re.I | re.S)
+        if match:
+            return (match.group("default") or match.group("default2"),
+                    match.group("check") if tail else None, match.group("column"))
+    return None
+
+
+def _literal_value(raw):
+    if len(raw) < 2 or raw[0] != "'" or raw[-1] != "'":
+        raise _Unsupported("literal")
+    return raw[1:-1].replace("''", "'")
+
+
+def _default_value(text, literals):
+    """The Python value of a normalized constant default."""
+    text = text.strip()
+    if _LITERAL_RE.fullmatch(text):
+        return _literal_value(literals[text])
+    low = text.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?", low):
+        return float(low) if any(ch in low for ch in ".e") else int(low)
+    if re.fullmatch(r"array\s*\[\s*\]", low):
+        return []
+    raise _Unsupported("default")
+
+
+_COLUMN_REF = object()
+
+
+def _truth(value):
+    """A SQL predicate: True, False or None (NULL); anything else is refused."""
+    if value is None or isinstance(value, bool):
+        return value
+    raise _Unsupported("predicate")
+
+
+def _same_type(left, right):
+    if isinstance(left, bool) or isinstance(right, bool):
+        if not (isinstance(left, bool) and isinstance(right, bool)):
+            raise _Unsupported("types")
+    elif isinstance(left, (int, float)):
+        if not isinstance(right, (int, float)) or isinstance(right, bool):
+            raise _Unsupported("types")
+    elif isinstance(left, str):
+        if not isinstance(right, str):
+            raise _Unsupported("types")
+    elif isinstance(left, list):
+        if not isinstance(right, list):
+            raise _Unsupported("types")
+    else:
+        raise _Unsupported("types")
+
+
+def _compare(operator, left, right):
+    if left is None or right is None:
+        return None
+    _same_type(left, right)
+    if operator == "=":
+        return left == right
+    if operator in ("<>", "!="):
+        return left != right
+    # Text ordering depends on the database collation, and booleans/arrays do
+    # not need it here: only numeric order is proven.
+    if isinstance(left, (str, bool, list)):
+        raise _Unsupported("order")
+    if operator == "<":
+        return left < right
+    if operator == "<=":
+        return left <= right
+    if operator == ">":
+        return left > right
+    return left >= right
+
+
+def _in(value, items):
+    if value is None:
+        return None
+    unknown = False
+    for item in items:
+        compared = _compare("=", value, item)
+        if compared is True:
+            return True
+        if compared is None:
+            unknown = True
+    return None if unknown else False
+
+
+def _sql_not(value):
+    return None if value is None else not value
+
+
+def _sql_and(left, right):
+    if left is False or right is False:
+        return False
+    if left is None or right is None:
+        return None
+    return True
+
+
+def _sql_or(left, right):
+    if left is True or right is True:
+        return True
+    if left is None or right is None:
+        return None
+    return False
+
+
+_CHECK_TOKEN = re.compile(r"""
+    (?P<space>\s+)
+  | (?P<literal>__staging_lit_[0-9]+__)
+  | (?P<number>(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)
+  | (?P<word>[a-z_][a-z0-9_$]*)
+  | (?P<op><=|>=|<>|!=|=|<|>)
+  | (?P<sign>[+-])
+  | (?P<punct>[(),])
+""", re.X | re.I)
+
+
+class _CheckParser:
+    """A deliberately small, fail-closed evaluator for an inline CHECK.
+
+    Only the added column (bound to its default), literals, comparisons,
+    IS [NOT] NULL, IN and the boolean operators are understood. Anything else
+    — another column, a function, a cast, another operator — is refused, so
+    the caller keeps the statement destructive.
+    """
+
+    def __init__(self, expression, column, default, literals):
+        self.column = column
+        self.default = default
+        self.literals = literals
+        self.tokens = self._tokenize(expression)
+        self.at = 0
+
+    @staticmethod
+    def _tokenize(expression):
+        tokens, at = [], 0
+        while at < len(expression):
+            match = _CHECK_TOKEN.match(expression, at)
+            if match is None:
+                raise _Unsupported("token")
+            at = match.end()
+            if match.lastgroup != "space":
+                tokens.append((match.lastgroup, match.group()))
+        return tokens
+
+    def parse(self):
+        value = _truth(self._or())
+        if self.at != len(self.tokens):
+            raise _Unsupported("trailing")
+        return value
+
+    def _peek(self):
+        return self.tokens[self.at] if self.at < len(self.tokens) else None
+
+    def _accept(self, kind, text=None):
+        token = self._peek()
+        if token is None or token[0] != kind or (text is not None and token[1] != text):
+            return None
+        self.at += 1
+        return token
+
+    def _value(self, value):
+        return self.default if value is _COLUMN_REF else value
+
+    def _or(self):
+        value = self._and()
+        while self._accept("word", "or"):
+            value = _sql_or(_truth(value), _truth(self._and()))
+        return value
+
+    def _and(self):
+        value = self._not()
+        while self._accept("word", "and"):
+            value = _sql_and(_truth(value), _truth(self._not()))
+        return value
+
+    def _not(self):
+        if self._accept("word", "not"):
+            return _sql_not(_truth(self._not()))
+        return self._predicate()
+
+    def _predicate(self):
+        left = self._primary()
+        token = self._peek()
+        if token is not None and token[0] == "op":
+            self.at += 1
+            return _compare(token[1], self._value(left),
+                            self._value(self._primary()))
+        if self._accept("word", "is"):
+            negate = bool(self._accept("word", "not"))
+            if not self._accept("word", "null"):
+                raise _Unsupported("is")
+            value = self._value(left)
+            return (value is not None) if negate else (value is None)
+        if self._accept("word", "in"):
+            if not self._accept("punct", "("):
+                raise _Unsupported("in")
+            items = [self._primary()]
+            while self._accept("punct", ","):
+                items.append(self._primary())
+            if not self._accept("punct", ")"):
+                raise _Unsupported("in")
+            return _in(self._value(left), [self._value(item) for item in items])
+        return left
+
+    def _primary(self):
+        token = self._peek()
+        if token is None:
+            raise _Unsupported("end")
+        self.at += 1
+        kind, text = token
+        if kind == "literal":
+            return _literal_value(self.literals[text])
+        if kind == "number":
+            return float(text) if any(ch in text for ch in ".e") else int(text)
+        if kind == "word":
+            if text == "true":
+                return True
+            if text == "false":
+                return False
+            if text == "null":
+                return None
+            if text == self.column:
+                return _COLUMN_REF
+            raise _Unsupported("identifier")
+        if kind == "sign":
+            following = self._peek()
+            if following is None or following[0] != "number":
+                raise _Unsupported("sign")
+            number = self._primary()
+            return -number if text == "-" else number
+        if kind == "punct" and text == "(":
+            value = self._or()
+            if not self._accept("punct", ")"):
+                raise _Unsupported("paren")
+            return value
+        raise _Unsupported("primary")
+
+
+def _check_accepts(expression, column, default, literals):
+    """True if the CHECK accepts the default, False if it rejects it, None if
+    the expression cannot be proven (then the caller keeps it destructive)."""
+    try:
+        return _CheckParser(expression, column, default, literals).parse() is not False
+    except _Unsupported:
+        return None
+
+
 def classify(sql, policy=None):
     policy = load_policy() if policy is None else policy
+    literals = {}
     try:
-        code = _code(sql)
+        code = _code(sql, literals=literals)
     except Refused as exc:
         return Classification("unknown", (str(exc),))
     creates_trigger = bool(re.search(
@@ -198,15 +493,24 @@ def classify(sql, policy=None):
             continue
         # Match the entire addition, keeping literal contents opaque. Extra
         # actions, constraints, NULL and computed defaults cannot pass here.
-        constant = r"(?:'_'|true|false|[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?|array\s*\[\s*\])"
-        # A domain's implicit cast may reject this constant on an N-1 insert.
-        # Restrict both the column type and explicit casts to known built-ins.
-        builtin = r"(?:pg_catalog\.)?(?:text|varchar|bool|boolean|int|integer|int2|int4|int8|bigint|smallint|numeric|decimal|real|float4|float8|json|jsonb|uuid)"
-        cast = r"(?:\s*::\s*" + builtin + r"(?:\[\])?)*"
-        column = r'alter table [\w.\"]+ add column (?:if not exists )?[\w\"]+ ' + builtin + r"(?:\[\])?"
-        constant_column = re.fullmatch(
-            column + r"(?: not null default " + constant + cast
-            + r"| default " + constant + cast + r" not null)", statement)
+        definition = _column_definition(statement)
+        constant_column = False
+        if definition is not None:
+            default, check, column = definition
+            if check is None:
+                constant_column = True
+            else:
+                try:
+                    value = _default_value(default, literals)
+                except _Unsupported:
+                    pass
+                else:
+                    # A column constraint's CHECK only has to accept the value
+                    # N-1 writers produce: the default (they omit the column).
+                    # A proven rejection, or an expression we cannot evaluate,
+                    # keeps the add destructive (#7531).
+                    constant_column = _check_accepts(check, column, value,
+                                                     literals) is True
         found = None
         for category in ("destructive", "relaxation", "additive"):
             hits = [entry["reason"] for entry in policy["rules"][category]

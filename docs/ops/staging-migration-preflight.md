@@ -101,6 +101,11 @@ SQL outside the applicator is outside this control.
 A new `ADD COLUMN ... NOT NULL` is additive only for a recognized built-in
 column type (optionally qualified by `pg_catalog`) with a constant default:
 a quoted literal, boolean, number or empty array (optionally with a built-in type cast from the recognized list).
+An inline `CHECK` on the new column keeps that shortcut when the check provably
+accepts the default (the value N-1 writers produce by omitting the column):
+only the added column, literals, comparisons, `IS [NOT] NULL`, `IN` and the
+boolean operators are evaluated. Any other column, function, cast or operator,
+and any check that rejects the default, keeps the add destructive (#7531).
 Absent defaults, NULL, function calls and computed expressions retain the
 destructive classification. Custom types and domains also remain destructive:
 a domain CHECK can reject the default on an N-1 insert even if adding the
