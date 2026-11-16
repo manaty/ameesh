@@ -163,7 +163,8 @@ from typing import Callable, NamedTuple
 from . import auth_failure, gauge_probe, harnesses, platform, storage
 from . import db as db_mod
 from .config import NAME_RE
-from .cost import PACE_CEILING, reading_outdated, stale_reading
+from .cost import (CONSUMPTION_RATE_WINDOW_S, PACE_CEILING, consumption_rate,
+                   reading_outdated, stale_reading)
 
 #: #1469: a billing account id (`openai-manaty`), the same on every host
 BILLING_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -1645,8 +1646,41 @@ def summary_margin_gauge(result, now: float,
     return worst
 
 
+def _consumption_rates(book, profile: Profile, depasses, now: float, *,
+                       reserve: float, ceilings: dict | None) -> dict:
+    """#7523 : le rythme de consommation observé de chaque fenêtre tenue.
+
+    Lit l'historique des jauges du compte (`quota_gauge_readings`) et ne garde
+    que les relevés pris alors que ce demandeur était déjà au seuil
+    (`cost.consumption_rate`) : leur pente est la consommation des agents qui
+    ne sont pas en pause, les critiques. Sans base, sans historique lisible ou
+    sans deux relevés espacés, `{}` — le calcul à usage figé reste le repli.
+    """
+    db = getattr(book, "db", None)
+    if db is None or not depasses:
+        return {}
+    account = profile.name if getattr(profile, "declared", False) else None
+    try:
+        rows = storage.of(db).operations.gauge_history(
+            since_s=CONSUMPTION_RATE_WINDOW_S, harness=profile.harness,
+            account=account)
+    except Exception:  # historique facultatif : jamais fatal à la garde
+        return {}
+    rates = {}
+    for gauge in depasses:
+        ceiling = (ceilings or {}).get(gauge.key)
+        rate = consumption_rate(
+            rows, gauge, now=now, account=account, reserve=reserve,
+            multiplier=profile.pace_multiplier,
+            ceiling=ceiling.value if ceiling is not None else profile.pace_ceiling)
+        if rate > 0.0:
+            rates[gauge.key] = rate
+    return rates
+
+
 def _release(profile: Profile, depasses, hard, now: float,
-             cut: float, ceilings: dict | None = None) -> tuple[float | None, object | None]:
+             cut: float, ceilings: dict | None = None,
+             rates: dict | None = None) -> tuple[float | None, object | None]:
     """La fenêtre qui bloque le plus longtemps, et l'heure où elle libère.
 
     Ne se rattrapent pas par l'écoulé, et attendent donc leur remise à zéro :
@@ -1667,6 +1701,11 @@ def _release(profile: Profile, depasses, hard, now: float,
     zéro : c'est cette heure-là qu'on annonce, pas la remise à zéro — et pas
     avant que le rythme ait rattrapé l'usage sous le plafond relevé
     (#1506, qui reprend le contrat de #1227 N1).
+
+    `rates` (#7523) : le rythme de consommation observé de chaque fenêtre
+    (`Gauge.free_at(rate=…)`) — la consommation des agents critiques pendant
+    la pause, sinon chaque point consommé recule l'heure annoncée de
+    `window_s / 100`. Absent, le calcul à usage figé reste le repli.
     """
     dated = []
     for gauge in depasses:
@@ -1679,9 +1718,10 @@ def _release(profile: Profile, depasses, hard, now: float,
                 short and gauge.used_at(now) >= max(0.0, profile.short_window_cap - cut)):
             free = float(gauge.resets_at)
         else:
+            rate = (rates or {}).get(gauge.key, 0.0)
             free = gauge.free_at(now, cut, profile.pace_multiplier,
                                  ceiling.value if ceiling is not None
-                                 else profile.pace_ceiling)
+                                 else profile.pace_ceiling, rate)
             if free is None:
                 return None, None
             if (ceiling is not None and ceiling.from_ts is not None
@@ -1694,7 +1734,7 @@ def _release(profile: Profile, depasses, hard, now: float,
                 # des deux, sans jamais dépasser la libération calculée au
                 # plafond courant.
                 raised = gauge.free_at(now, cut, profile.pace_multiplier,
-                                       ceiling.end)
+                                       ceiling.end, rate)
                 if raised is not None:
                     free = min(free, max(float(ceiling.from_ts), raised))
         dated.append((free, gauge))
@@ -1822,8 +1862,15 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # croisement du rythme, ou remise à zéro quand il ne rattrape plus ;
         # #1176 : le relèvement de fin de fenêtre peut la libérer avant la
         # remise à zéro.
+        # #7523 : l'heure annoncée tient compte du rythme où les agents
+        # critiques consomment encore la fenêtre pendant la pause ; sans
+        # relevé mesurable, `_release` garde le calcul à usage figé.
+        rates = _consumption_rates(book, profile, depasses, now,
+                                   reserve=RESERVE if reserve else 0.0,
+                                   ceilings=result.ceilings)
         result.until, late = _release(profile, depasses, hard, now,
-                                      RESERVE if reserve else 0.0, result.ceilings)
+                                      RESERVE if reserve else 0.0, result.ceilings,
+                                      rates)
         if late is not None:
             result.held = (late.key, late.used)
         if probe and record:

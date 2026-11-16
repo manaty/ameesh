@@ -179,3 +179,5 @@ test_7066_account_exception  # stockage : preuve signée, jeton unique et début
 
 test_7442_stable_reviewers_pg  # stockage : sièges stables et contexte des gels successifs (#7442)
 test_7441_account_rotation  # #7441: durable waves, epoch fencing and persona dwell
+
+test_7523_pause_consommation  # #7523 : échéance annoncée et rythme critique observé (historique des jauges)
