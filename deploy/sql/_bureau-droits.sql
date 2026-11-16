@@ -7,6 +7,15 @@
 -- Ce que chaque droit sert (chemins tracés, #6881) :
 --   lecture des lots exécutés (`work show`), liaison L41 (`mail bind`), prise
 --   #6839 (`work claim`), reçus de provenance (hooks), `agent-mail send|inbox|list`.
+--   #7565 : `release catchup` lit les attestations via la vue barrière
+--   ameesh_staging_attestations (staging.attested seulement), et les preuves
+--   publiques des décisions approuvées déjà consommées via la vue barrière
+--   ameesh_decision_proofs ; ni méta d'approbation, ni approbation en attente.
+--   INSERT ameesh_events est borné par la garde : staging.catchup au nom du
+--   bureau, objet/projet/hôte, schéma, SHA et résultat contrôlés ; SELECT(id)
+--   sert au RETURNING. Depuis 0584, created_at est fixé par le serveur à
+--   statement_timestamp(), même pour une date passée ou NULL ; une date
+--   future reste refusée par la garde ameesh_events_dated.
 -- Aucune table de secrets, de clés privées, d'approbation ou de comptes.
 CREATE TEMP TABLE IF NOT EXISTS bureau_spec(rel text, priv text, cols text[], opt_cols text[]);
 DELETE FROM pg_temp.bureau_spec;

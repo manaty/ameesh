@@ -11,7 +11,12 @@
 -- Ce que la connexion peut faire : lire les lots, le registre et le courrier ;
 -- se lier (L41, `mail bind`) comme `agent` sur `host` ; prendre et lever un
 -- geste externe réservé à `agent` (#6839) avec une liaison active ; déposer
--- son courrier et ses reçus de provenance. Tout le reste est fermé :
+-- son courrier et ses reçus de provenance ; lire les seules attestations
+-- staging.attested via ameesh_staging_attestations, et les preuves publiques
+-- de décisions approuvées déjà consommées via ameesh_decision_proofs ; écrire
+-- une trace staging.catchup bornée, datée par le serveur (0584). Les tables
+-- sources restent fermées, sauf SELECT(id) sur ameesh_events pour RETURNING.
+-- Tout le reste est fermé :
 --   - droits : la liste exacte de _bureau-droits.sql (droits de colonne pour
 --     toute écriture), rien d'autre, ni PUBLIC, ni appartenance, ni propriété ;
 --   - lignes : la garde 0567 (`ameesh_limited_login_guard`) refuse toute
