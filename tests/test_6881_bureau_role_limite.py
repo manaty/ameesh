@@ -15,6 +15,9 @@ et l'audit qui refuse un droit en trop.
 from __future__ import annotations
 
 import json
+import dataclasses
+import types
+from unittest import mock
 import os
 import secrets
 import subprocess
@@ -124,6 +127,41 @@ class BureauRoleLimiteTest(PgTestCase):
                        actor="human:proprio", cfg=self.cfg, external_executor=executor)
         return int(lot["id"])
 
+    def test_staging_proofs_and_catchup_under_the_limited_login(self):
+        from ameesh import events, release_cutoff, staging_deferred
+        from ameesh.storage.postgres.events import Events
+        proof = {"sha": "a" * 40, "reportes": {"server": {"raison": "root"}}}
+        events.record(self.db, "staging.attested", "staging:" + "a" * 40, **proof)
+        events.record(self.db, "alert.raised", "private", secret="must stay private")
+        limited = db_mod.connect(dataclasses.replace(self.cfg, dsn=self.dsn))
+        try:
+            rows = release_cutoff.stored_attestations(limited, strict=True)
+            self.assertIn(proof, rows)
+            with self.assertRaises(db_mod.DbError):
+                Events(limited).recent_type("alert.raised", 1, 10)
+            with self.assertRaises(db_mod.DbError):
+                limited.query("select data from ameesh_events")
+            payload = dict(schema=staging_deferred.CATCHUP_SCHEMA, host="server",
+                           sha="a" * 40, result="ok", actor="bureau")
+            with mock.patch.object(staging_deferred, "active_right",
+                                   return_value={"active": True, "decision": 123}):
+                declared = staging_deferred.declare(
+                    limited, types.SimpleNamespace(name="ameesh"), "server", "a" * 40,
+                    {"sha": "a" * 40, "tag": "v1.0.0"}, "ok", "bureau", "root catch-up")
+            row = self.db.query("select data from ameesh_events where id = %s", (declared["event"],))[0]
+            for key, value in payload.items():
+                self.assertEqual(row["data"][key], value)
+            self.assertEqual(row["data"]["decision"], 123)
+            for change in ({"actor": "another"}, {"schema": None}, {"host": None},
+                           {"sha": "bad"}, {"result": "anything"}):
+                with self.assertRaises(db_mod.DbError):
+                    events.record(limited, "staging.catchup", "staging-catchup:ameesh:server",
+                                  project="ameesh", **{**payload, **change})
+            with self.assertRaises(db_mod.DbError):
+                events.record(limited, "alert.raised", "private", project="ameesh", **payload)
+        finally:
+            limited.close()
+
     # -- installation et audit ---------------------------------------------
     def test_l_audit_seul_passe_puis_refuse_un_droit_en_trop(self):
         proc = self.script("_contrat-bureau.sql")
@@ -145,6 +183,18 @@ class BureauRoleLimiteTest(PgTestCase):
             self.assertEqual(self.script("_contrat-bureau.sql").returncode, 0)
         finally:
             self.db.execute('REVOKE UPDATE (state) ON work_items FROM "%s"' % self.login)
+
+    def test_a_broadened_staging_view_fails_the_contract(self):
+        self.db.execute("CREATE OR REPLACE VIEW ameesh_staging_attestations WITH (security_barrier=true) AS "
+                        "SELECT id, type, object, project, data, created_at FROM ameesh_events")
+        try:
+            proc = self.script("_contrat-bureau.sql")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("staging attestations view is not narrowly filtered", proc.stderr)
+        finally:
+            self.db.execute("CREATE OR REPLACE VIEW ameesh_staging_attestations WITH (security_barrier=true) AS "
+                            "SELECT id, type, object, project, data, created_at FROM ameesh_events "
+                            "WHERE type = 'staging.attested'")
 
     def test_une_appartenance_en_plus_est_refusee(self):
         other = "t_bur_x_%s" % uuid.uuid4().hex[:8]

@@ -328,6 +328,13 @@ class BaselineTest(unittest.TestCase):
         self.assertEqual(base["tag"], "v1.57.0")
         self.assertEqual(base["raison"], "deferred")
 
+    def test_history_read_failure_is_not_an_empty_baseline(self):
+        with mock.patch("ameesh.storage.of", side_effect=RuntimeError("permission denied")):
+            with self.assertRaisesRegex(release_cutoff.ReleaseError, "history unreadable.*permission denied"):
+                staging_deferred.baseline(object(), project(), HOST)
+            # Background/local-proof callers retain the historical fallback.
+            self.assertEqual(release_cutoff.stored_attestations(object()), [])
+
     def test_a_proved_host_has_nothing_to_declare(self):
         rows = [attestation(SHA, hotes={**{h: {"actif": SHA} for h in AGENTS},
                                         HOST: {"actif": SHA}})]
@@ -546,6 +553,23 @@ class CliTest(unittest.TestCase):
             self.assertEqual(code, 1)
             declare.assert_not_called()
             db.close.assert_called_once()
+
+    def test_unreadable_history_is_an_explicit_failure(self):
+        import contextlib
+        import io
+        error = io.StringIO()
+        with mock.patch.object(release_cutoff, "stored_attestations",
+                               side_effect=release_cutoff.ReleaseError(
+                                   "staging attestation history unreadable: permission denied")), \
+             contextlib.redirect_stderr(error):
+            args = types.SimpleNamespace(project="ameesh", host=HOST, sha=SHA,
+                                         result="ok", actor="", note="")
+            db = mock.MagicMock()
+            with mock.patch.object(release_cutoff, "projects", return_value={"ameesh": project()}), \
+                 mock.patch("ameesh.db.open_db", return_value=db):
+                self.assertEqual(release._catchup(types.SimpleNamespace(), args), 1)
+            db.close.assert_called_once()
+        self.assertIn("history unreadable", error.getvalue())
 
     def test_a_host_that_is_not_reported_has_nothing_to_declare(self):
         code, declare, _db = self.run_cmd(declared=False)

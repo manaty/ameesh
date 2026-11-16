@@ -2427,20 +2427,25 @@ def _write_attestation_file(data: dict) -> str:
     return path
 
 
-def stored_attestations(db, sha: str | None = None) -> list[dict]:
+def stored_attestations(db, sha: str | None = None, *, strict: bool = False) -> list[dict]:
     """The shared staging proofs of `ameesh_events`, newest first (#3981).
 
     A read failure never removes the local proof: the caller falls back to the
-    file. `object` is the exact commit key `actif.py` writes; without `sha`,
+    file. Explicit gestures use `strict=True` to report an unreadable history.
+    `object` is the exact commit key `actif.py` writes; without `sha`,
     every recent staging proof is returned (the active-content view).
     """
     if db is None:
+        if strict:
+            raise ReleaseError("staging attestation history unreadable: no database")
         return []
     key = "staging:%s" % sha if sha and len(sha) == 40 else None
     try:
         rows = storage.of(db).events.recent_type(
             STAGING_EVENT, STAGING_EVENT_DAYS, STAGING_EVENT_LIMIT, object=key)
-    except Exception:  # noqa: BLE001 — a shared-proof read never blocks the local one
+    except Exception as exc:  # noqa: BLE001 — local-proof callers keep their fallback
+        if strict:
+            raise ReleaseError("staging attestation history unreadable: %s" % exc) from exc
         return []
     out = []
     for row in rows or ():

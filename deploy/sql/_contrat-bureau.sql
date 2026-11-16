@@ -20,6 +20,11 @@ SELECT set_config('ameesh.bureau_role', :'role', false),
        set_config('ameesh.bureau_agent', :'agent', false),
        set_config('ameesh.bureau_host', :'host', false) \g /dev/null
 \ir _bureau-droits.sql
+-- Compare the view's actual query with the narrow specification as parsed
+-- by PostgreSQL (no fragile whitespace comparison of hand-written SQL).
+CREATE OR REPLACE TEMP VIEW bureau_expected_staging_attestations AS
+SELECT id, type, object, project, data, created_at
+FROM ameesh_events WHERE type = 'staging.attested';
 DO $audit$
 DECLARE
     r text := current_setting('ameesh.bureau_role');
@@ -140,6 +145,12 @@ BEGIN
                                        item.priv, item.relname);
         END IF;
     END LOOP;
+    IF pg_get_viewdef(to_regclass(format('%I.ameesh_staging_attestations', s)), true)
+       IS DISTINCT FROM pg_get_viewdef('pg_temp.bureau_expected_staging_attestations'::regclass, true)
+       OR NOT EXISTS (SELECT FROM pg_class WHERE oid = to_regclass(format('%I.ameesh_staging_attestations', s))
+                       AND reloptions @> ARRAY['security_barrier=true']) THEN
+        errors := errors || 'staging attestations view is not narrowly filtered'::text;
+    END IF;
     -- aucune fonction SECURITY DEFINER exécutable (elle agirait hors de la garde)
     FOR item IN SELECT p.oid::regprocedure AS fn FROM pg_proc p
            WHERE p.pronamespace = n AND p.prosecdef AND has_function_privilege(rid, p.oid, 'EXECUTE')

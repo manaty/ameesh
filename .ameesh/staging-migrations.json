@@ -1,4 +1,18 @@
 {
   "schema": "ameesh-staging-migrations/1",
-  "declarations": {}
+  "declarations": {
+    "src/ameesh/migrations/0583_bureau_staging_catchup.sql": {
+      "checksum": "062be3570beba7e720035df62de577eadfb3dbcd5bb891c29b722078f04d451a",
+      "lot": 7565,
+      "restore": "src/ameesh/migrations/rollback/0583_restore.sql"
+    }
+  },
+  "exceptions": {
+    "additive": [
+      {
+        "pattern": "create view ameesh_staging_attestations with \\(security_barrier = true\\) as select id, type, object, project, data, created_at from ameesh_events where type =\\s*",
+        "reason": "#7565: new filtered staging proof view, frozen query audited by bureau contract"
+      }
+    ]
+  }
 }

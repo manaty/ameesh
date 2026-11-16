@@ -46,6 +46,9 @@ INSERT INTO pg_temp.bureau_spec(rel, priv, cols) VALUES
   ('thread_index','SELECT',NULL),
   ('thread_index','INSERT',ARRAY['project','lot','transport','host','location','last_entry_id','last_mailbox_id','last_author','last_excerpt','last_at','entries']),
   ('thread_index','UPDATE',ARRAY['location','entries','last_entry_id','last_mailbox_id','last_author','last_excerpt','last_at','counted_until','updated_at']),
+  -- #7565: filtered staging proofs; id alone supports INSERT RETURNING id.
+  ('ameesh_staging_attestations','SELECT',NULL),
+  ('ameesh_events','SELECT',ARRAY['id']),
   ('ameesh_events','INSERT',ARRAY['type','object','project','data','created_at']),
   -- lots (lecture) et prise #6839 (écriture bornée par 0567)
   ('work_items','SELECT',NULL),
