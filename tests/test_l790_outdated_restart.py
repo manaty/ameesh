@@ -465,6 +465,10 @@ class RestartEndToEndTest(PgTestCase):
         marqueur = os.path.join(self.tmp, "perime790")
         env = self.env(
             AMEESH_CANON=canon,
+            # #7601 : ce témoin vérifie execv, pas le drainage des tours
+            # (test_runner_drain). Le premier SIGTERM doit arrêter tout de
+            # suite, sans hériter du délai de drainage de 30 minutes.
+            AMEESH_DRAIN_SECONDS="0",
             L790_STALE_ONCE=marqueur,
             PYTHONPATH=inject + os.pathsep + SRC,
         )
@@ -481,10 +485,13 @@ class RestartEndToEndTest(PgTestCase):
         lecteur = threading.Thread(target=lambda: [lignes.append(l) for l in proc.stdout],
                                    daemon=True)
         lecteur.start()
-        self.wait_for(lambda: sum("starting: host" in l for l in lignes) >= 2,
-                      timeout=60)
+        diagnostic = lambda: "code=%r\n%s" % (proc.poll(), "".join(lignes))
+        self.wait_for(lambda: proc.poll() is not None or
+                      sum("starting: host" in l for l in lignes) >= 2,
+                      timeout=60, msg=diagnostic)
+        self.assertIsNone(proc.poll(), diagnostic())
         proc.send_signal(signal.SIGTERM)
-        self.wait_for(lambda: proc.poll() is not None, timeout=60)
+        self.wait_for(lambda: proc.poll() is not None, timeout=60, msg=diagnostic)
         lecteur.join(timeout=5)
         proc.stdout.close()
         return "".join(lignes)
@@ -496,6 +503,7 @@ class RestartEndToEndTest(PgTestCase):
         with open(marqueur, encoding="utf-8") as fh:
             self.assertEqual(int(fh.read()), proc.pid)
         self.assertEqual(proc.returncode, 0, sortie)
+        self.assertIn("signal %d received: clean shutdown" % signal.SIGTERM, sortie)
         self.assertEqual(sortie.count("outdated runner: restarting between turns"), 1,
                          "une seule péremption : pas de boucle de redémarrages")
         self.assertGreaterEqual(sortie.count("starting: host"), 2, sortie)
