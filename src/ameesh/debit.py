@@ -86,6 +86,7 @@ from ameesh import work_lifecycle as lifecycle
 import argparse
 import datetime
 import json
+import math
 import re
 import statistics
 import sys
@@ -2617,19 +2618,71 @@ def _footprint_gesture(rows: Iterable[Mapping[str, Any]]) -> str:
             % " ; ".join(parts))
 
 
+def _loss_informative(gauge, now: float) -> bool:
+    """#7522 : une fenêtre encore ouverte porte-t-elle encore sa perte ?
+
+    Dans un relevé **partiel** (une fenêtre datée s'est remise à zéro depuis,
+    une autre court encore), la fenêtre ouverte n'est qu'une borne inférieure.
+    Elle n'est annoncée que si son âge de production ne dépasse pas ce qui lui
+    reste (#1672) — même borne que `accounts.reading_outdated` —, sinon le
+    relevé est trop ancien pour borner sa perte et le compte reste périmé.
+    Sans date de production (#1132 : flux sans marqueur), l'âge est inconnu :
+    un relevé non daté n'est pas présumé périmé.
+    """
+    stamp = getattr(gauge, "produced_at", None)
+    if stamp is None:
+        return True
+    try:
+        stamp = float(stamp)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(stamp) or stamp > now:
+        return True
+    reset = getattr(gauge, "resets_at", None)
+    if reset is None:
+        return True
+    return now - stamp <= float(reset) - now
+
+
 def plan_losses(account_gauges: Mapping[Any, list], now: float) -> list[dict]:
     """#3256 : la part de fenêtre perdue au reset par compte de forfait, comme
-    `ameesh accounts` (`accounts.lost_at_reset`, #1561 : un relevé périmé
-    n'annonce aucune perte et le dit). `account_gauges` : la forme de
-    `sous_utilisation.latest_account_gauges`."""
+    `ameesh accounts` (`accounts.lost_at_reset`). `account_gauges` : la forme
+    de `sous_utilisation.latest_account_gauges`.
+
+    #7522 : sur un relevé **partiel**, une fenêtre échue n'annonce aucune
+    perte et ne périme plus les fenêtres encore ouvertes du compte — elle
+    vient d'un autre relevé, ou d'un relevé dont la fenêtre courte s'est
+    remise à zéro depuis ; la seven_day républiée depuis garde sa perte
+    lisible. Une fenêtre ouverte trop ancienne pour ce qui lui reste
+    (`_loss_informative`, borne #1672) laisse le compte périmé, comme #1561
+    le demandait pour un relevé qui n'est plus qu'une borne inférieure.
+    Aucune fenêtre ouverte : rien n'expire, le compte n'est pas périmé.
+    Un relevé courant garde le calcul d'`accounts` sur toutes ses fenêtres :
+    la borne d'âge ne s'applique qu'au partiel.
+    """
     from . import accounts as accounts_mod
     from . import cost as cost_mod
     out = []
     for (harness, account), pairs in sorted(account_gauges.items(),
                                             key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
         gauges = [gauge for gauge, _ in pairs]
-        stale = bool(gauges) and cost_mod.stale_reading(gauges, now)
-        found = None if stale else accounts_mod.expiry(gauges, now)
+        dated = [gauge for gauge in gauges if getattr(gauge, "resets_at", None)]
+        partial = any(gauge.reset_passed(now) for gauge in dated)
+        if partial:
+            opened = [gauge for gauge in gauges if gauge.expiring(now) is not None]
+            informative = [gauge for gauge in opened
+                           if _loss_informative(gauge, now)]
+            stale = bool(opened) and not informative
+            if not opened:
+                # #1566 N2 : une fenêtre non datée ne prouve pas sa remise à
+                # zéro ; elle n'annonce aucune perte, mais le relevé reste
+                # incertain.
+                stale = any(not getattr(gauge, "resets_at", None)
+                            for gauge in gauges)
+            found = accounts_mod.expiry(informative, now) if informative else None
+        else:
+            stale = bool(gauges) and cost_mod.stale_reading(gauges, now)
+            found = None if stale else accounts_mod.expiry(gauges, now)
         out.append({"harness": harness, "account": account, "stale": stale,
                     "lost": round(float(found[1]), 4) if found else None,
                     "window": found[2].key if found else None,

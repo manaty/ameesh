@@ -159,7 +159,8 @@ reconstituer les changements historiques de démarrabilité du lot.
   réveillables (`idle_share`) ;
 - `startable_lots` ;
 - `plan_loss_at_reset`, la part de fenêtre perdue au reset pour chaque compte
-  de forfait, telle que `ameesh accounts` la calcule ;
+  de forfait, comme `ameesh accounts` la calcule ; une fenêtre échue
+  n'annonce rien et ne périme pas une fenêtre encore ouverte (#7522) ;
 - l'état du lot de découpage (§2), s'il est ouvert, et son âge.
 
 `ameesh debit --check` sort 2 quand `idle_share` atteint ou dépasse 0,20

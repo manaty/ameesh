@@ -16,7 +16,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from ameesh import cost, debit
+from ameesh import cost, debit, sous_utilisation
 
 T = 1793195520.0            # 2026-10-28 14:52:00Z
 H = 3600.0
@@ -338,6 +338,110 @@ class PlanLossTest(unittest.TestCase):
         self.assertEqual(cap["plan_loss_at_reset"][0]["lost"], 0.78)
         text = "\n".join(debit._capacity_text(cap))
         self.assertIn("claude/primaire 78 % de five_hour", text)
+
+    def test_an_expired_window_does_not_hide_the_open_window_loss(self):
+        # #7522 : la five_hour du dernier relevé complet a expiré, mais la
+        # seven_day a été republiée depuis (primaire Claude) ; l'ancienne
+        # fenêtre n'annonce aucune perte et ne périme pas la nouvelle.
+        five = cost.Gauge("claude", "five_hour", 0.03, T - 2 * 86400, 5 * H,
+                          produced_at=T - 3 * 86400)
+        week = cost.Gauge("claude", "seven_day", 0.68, T + 2 * 86400, 7 * 86400,
+                          produced_at=T - 120)
+        losses = debit.plan_losses({("claude", "primaire"): [
+            (five, T - 3 * 86400), (week, T - 120)]}, T)
+        self.assertEqual(losses, [{"harness": "claude", "account": "primaire",
+                                   "stale": False, "lost": 0.32, "window": "seven_day",
+                                   "resets_in_s": 2 * 86400}])
+        text = "\n".join(debit._capacity_text(measure(team(1, 1), losses=losses)))
+        self.assertIn("claude/primaire 32 % de seven_day", text)
+
+    def test_a_partial_reading_keeps_the_open_window_it_can_still_bound(self):
+        # #7522 : relevé partiel (five_hour échue) encore informateur pour la
+        # seven_day : son âge (16 h) ne dépasse pas ce qui lui reste (3 j).
+        five = cost.Gauge("claude", "five_hour", 0.01, T - H, 5 * H,
+                          produced_at=T - 16 * H)
+        week = cost.Gauge("claude", "seven_day", 0.59, T + 3 * 86400, 7 * 86400,
+                          produced_at=T - 16 * H)
+        losses = debit.plan_losses({("claude", "secondaire"): [
+            (five, T - 16 * H), (week, T - 16 * H)]}, T)
+        self.assertEqual(losses, [{"harness": "claude", "account": "secondaire",
+                                   "stale": False, "lost": 0.41,
+                                   "window": "seven_day",
+                                   "resets_in_s": 3 * 86400}])
+
+    def test_a_current_reading_keeps_the_soonest_open_window(self):
+        # #7522 : sans fenêtre échue, le calcul d'`accounts` ne bouge pas ; la
+        # borne d'âge ne s'applique qu'à un relevé partiel. Le codex-300min
+        # d'un relevé de 78 min (reset dans 65 min) reste annoncé.
+        short = cost.Gauge("codex", "codex-300min", 0.32, T + 3899, 5 * H,
+                           produced_at=T - 4733)
+        long = cost.Gauge("codex", "codex-10080min", 0.60, T + 307052,
+                          7 * 86400, produced_at=T - 4733)
+        losses = debit.plan_losses({("codex", "secondaire"): [
+            (short, T - 2151), (long, T - 2151)]}, T)
+        self.assertEqual(losses, [{"harness": "codex", "account": "secondaire",
+                                   "stale": False, "lost": 0.68,
+                                   "window": "codex-300min",
+                                   "resets_in_s": 3899}])
+
+    def test_an_open_window_older_than_what_remains_stays_stale(self):
+        # #1561/#1672 : un relevé de quatre jours ne borne plus une fenêtre à
+        # neuf heures de sa remise à zéro — aucune perte n'est annoncée.
+        five = cost.Gauge("claude", "five_hour", 0.30, T - 4 * 86400, 5 * H,
+                          produced_at=T - 4 * 86400)
+        week = cost.Gauge("claude", "seven_day", 0.30, T + 9 * H, 7 * 86400,
+                          produced_at=T - 4 * 86400)
+        losses = debit.plan_losses({("claude", "secondaire"): [
+            (five, T - 4 * 86400), (week, T - 4 * 86400)]}, T)
+        self.assertEqual(losses, [{"harness": "claude", "account": "secondaire",
+                                   "stale": True, "lost": None, "window": None,
+                                   "resets_in_s": None}])
+
+    def test_all_windows_expired_announce_no_loss(self):
+        five = cost.Gauge("claude", "five_hour", 0.03, T - H, 5 * H,
+                          produced_at=T - 6 * H)
+        week = cost.Gauge("claude", "seven_day", 0.54, T - 2 * H, 7 * 86400,
+                          produced_at=T - 6 * H)
+        losses = debit.plan_losses({("claude", "tertiaire"): [
+            (five, T - 6 * H), (week, T - 6 * H)]}, T)
+        self.assertEqual(losses, [{"harness": "claude", "account": "tertiaire",
+                                   "stale": False, "lost": None, "window": None,
+                                   "resets_in_s": None}])
+
+    def test_an_undated_window_keeps_an_expired_reading_uncertain(self):
+        # #1566 N2 : une fenêtre non datée ne prouve pas sa remise à zéro ;
+        # elle n'annonce aucune perte, mais le relevé n'est pas courant.
+        five = cost.Gauge("claude", "five_hour", 0.03, T - H, 5 * H,
+                          produced_at=T - 6 * H)
+        undated = cost.Gauge("claude", "seven_day", 0.40, None, 7 * 86400,
+                             produced_at=T - 6 * H)
+        losses = debit.plan_losses({("claude", "tertiaire"): [
+            (five, T - 6 * H), (undated, T - 6 * H)]}, T)
+        self.assertEqual(losses, [{"harness": "claude", "account": "tertiaire",
+                                   "stale": True, "lost": None, "window": None,
+                                   "resets_in_s": None}])
+
+
+class GaugeProvenanceTest(unittest.TestCase):
+    def test_the_latest_gauge_keeps_its_production_date(self):
+        # #7522 : sans `produced_at`, le débit ne peut pas distinguer une
+        # fenêtre échue d'un ancien relevé d'une fenêtre fraîche.
+        gauge = sous_utilisation._gauge({
+            "harness": "claude", "key": "seven_day@fable", "used": 0.4,
+            "resets_at_ts": T + 3 * 86400, "window_s": 7 * 86400,
+            "produced_ts": T - 120, "observed_ts": T - 60, "source": "mesh-design"})
+        self.assertEqual(gauge.produced_at, T - 120)
+        self.assertEqual(gauge.read_at, T - 120)     # production, pas insertion
+        self.assertEqual(gauge.source, "mesh-design")
+        self.assertEqual(gauge.scope, "fable")
+
+    def test_a_reading_without_production_date_keeps_the_insertion_date(self):
+        gauge = sous_utilisation._gauge({
+            "harness": "codex", "key": "codex-300min", "used": 0.2,
+            "resets_at_ts": T + H, "window_s": 5 * H,
+            "produced_ts": None, "observed_ts": T - 60, "source": ""})
+        self.assertIsNone(gauge.produced_at)
+        self.assertEqual(gauge.read_at, T - 60)
 
 
 class CheckTest(unittest.TestCase):
