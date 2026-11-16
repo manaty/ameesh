@@ -414,8 +414,12 @@ class RunnerTest(PgTestCase):
         cwd = self._cwd("tombe")
         self.register("tombe", "claude", cwd=cwd, prompt="après expiration")
         registry.upsert(self.db, "tombe", harness="claude", host=self.cfg.host, cwd=cwd)
-        registry.claim(self.db, "tombe", "runner-mort", 1.0)
-        time.sleep(1.3)  # l'exécuteur est mort, son bail a expiré
+        registry.claim(self.db, "tombe", "runner-mort", 60)
+        # #7524 : l'exécuteur est mort ; poser l'échéance avec l'horloge de
+        # la base évite d'attendre sur une marge d'horloge murale.
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = clock_timestamp() - interval '1 hour' "
+            "WHERE name = 'tombe'")
         proc = self.runner("--once", "--agents", "tombe")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         row = registry.get(self.db, "tombe")

@@ -325,7 +325,10 @@ class CarriedLeaseTest(_Land):
             self.pending({})
             # the executor dies: its daemon heartbeat dies with it
             land._CARRIED.pop(("p:main", "runner-1")).stop()
-            time.sleep(1.3)
+            # #7524 : rendre l'échéance explicitement passée (le faux verrou
+            # n'a pas d'horloge de base), sans attendre une marge murale.
+            owner, epoch, _expires = self.locks.held["p:main"]
+            self.locks.held["p:main"] = (owner, epoch, time.time() - 1.0)
             self.assertIsNotNone(self.locks.land_lock("p:main", "runner-2", 60),
                                  "another executor takes the target at the short bound")
 
@@ -1417,7 +1420,11 @@ class LeaseDbTest(PgTestCase):
         ops.queue_add(lot, target="main", frozen_sha="a" * 40, note="queued", actor="t")
         dead = ops.land_lock("dead-pass:main", "radar-dead", 0.2)
         self.assertEqual(dead, 1)
-        time.sleep(0.5)
+        # #7524 : l'échéance est posée avec l'horloge de la base, sans
+        # attendre une marge murale contre un décalage d'horloge.
+        self.db.execute(
+            "UPDATE merge_locks SET expires_at = clock_timestamp() - interval '1 hour'"
+            " WHERE target = 'dead-pass:main'")
         # le bail vivant n'a pas de borne courte à prouver : un TTL court
         # expirait avant queue_update sous le pilote psql (rouge CI de h-41)
         live = ops.land_lock("dead-pass:main", "radar-live", 60)

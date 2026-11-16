@@ -165,9 +165,13 @@ class LeaseStorageTest(PgTestCase):
             "alerts", "agents-b:2", 60))
 
     def test_an_expired_lease_is_never_resurrected_by_a_renewal(self):
-        epoch = self.store().acquire_state("alerts", "agents-a:1", 0.2)
+        epoch = self.store().acquire_state("alerts", "agents-a:1", 60)
         self.assertIsNotNone(epoch)
-        time.sleep(0.4)
+        # #7524 : l'expiration est posée avec l'horloge de la base, sans
+        # attente murale dont la marge dépendrait d'un décalage d'horloge.
+        self.db.execute(
+            "update notify_state set expires_at ="
+            " clock_timestamp() - interval '1 hour' where scope = 'alerts'")
         self.assertFalse(self.store().renew_state("alerts", "agents-a:1", epoch, 60))
         self.assertIsNotNone(self.store().acquire_state(
             "alerts", "agents-b:2", 60))
@@ -202,9 +206,21 @@ class LeaseRecoveryTest(PgTestCase):
             self.db, notifier, self.cfg_a, lease_s=2.0, renew_s=0.25)
         self.assertTrue(deliver)
         self.assertIsNotNone(lease)
+        initial = storage.of(self.db).notify_liveness.state_lease("alerts")
+        self.assertIsNotNone(initial)
         try:
-            time.sleep(2.6)  # la TTL seule serait expirée depuis 0,6 s
-            row = storage.of(self.db).notify_liveness.state_lease("alerts")
+            # #7524 : attendre le renouvellement lui-même (échéance lue dans
+            # la base), pas une marge murale qui suppose le fil à l'heure.
+            # C'est le renouvellement qui protège une passe longue.
+            fin = time.monotonic() + 10.0
+            row = initial
+            while time.monotonic() < fin:
+                row = storage.of(self.db).notify_liveness.state_lease("alerts")
+                if float(row["expires_ts"]) > float(initial["expires_ts"]):
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("le renouvellement du bail n'a pas eu lieu")
             self.assertEqual(row["owner"], lease.owner)
             self.assertGreater(float(row["expires_ts"]), float(row["now_ts"]))
             lease_b, deliver_b = notify.enter_shared_state(
@@ -262,7 +278,15 @@ class LeaseRecoveryTest(PgTestCase):
             self.db, notifier_a, self.cfg_a, lease_s=0.2, renew_s=0.05)
         self.assertTrue(deliver_a)
         lease_a.renewal.stop()            # la passe A ne renouvelle plus
-        time.sleep(0.3)                   # sa TTL est passée
+        # #7524 : expirer côté base à l'horloge de la base, puis attendre
+        # l'échéance locale (aucune marge murale contre un décalage d'horloge).
+        self.db.execute(
+            "update notify_state set expires_at ="
+            " clock_timestamp() - interval '1 hour' where scope = 'alerts'")
+        fin = time.monotonic() + 5.0
+        while not lease_a.expired() and time.monotonic() < fin:
+            time.sleep(0.01)
+        self.assertTrue(lease_a.expired(), "l'échéance locale du bail doit être passée")
         notifier_b = self.notifier(self.cfg_b)
         lease_b, deliver_b = notify.enter_shared_state(
             self.db, notifier_b, self.cfg_b, lease_s=60, renew_s=20)
