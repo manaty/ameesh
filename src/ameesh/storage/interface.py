@@ -2628,6 +2628,10 @@ class WorkItems(Domain):
         l'instant où le relevé l'a vue la première fois."""
 
     @abc.abstractmethod
+    def stacked_on(self, app: str, targets: Sequence[str]) -> list[dict]:
+        """#7535: open lots of this project targeting one of these branches."""
+
+    @abc.abstractmethod
     def open_for_sweep(self, limit: int) -> list[dict]:
         """L118 : les lots ouverts que le relevé des fusions examine (avec une
         branche ou un assigné), du plus ancien au plus récent."""

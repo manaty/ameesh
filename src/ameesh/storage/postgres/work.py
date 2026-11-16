@@ -1019,6 +1019,13 @@ class WorkItems(interface.WorkItems):
             (int(item_id),))
         return rows[0] if rows else None
 
+    def stacked_on(self, app, targets) -> list[dict]:
+        return self.db.query(
+            "SELECT %s FROM work_items WHERE app = %%s"
+            " AND branch_target = ANY(%%s::text[]) AND state NOT IN %s"
+            " ORDER BY id" % (item_columns(self.db), _CLOSED),
+            (app, list(targets)))
+
     def items(self, *, state, assignee, limit) -> list[dict]:
         # L61 : lecture de `reviewer` sans sonde, cette commande est bornée
         where = " WHERE true"

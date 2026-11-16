@@ -3911,6 +3911,8 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
         for record in threads:
             record(db.cfg, db)
         if row is not None:
+            from . import stacked_delivery
+            stacked_warning = stacked_delivery.after_merge(db, row, repo=repo)
             # L539 (#1104) : la fusion est écrite ; le lot de relecture suit,
             # sans jamais pouvoir la défaire. Un échec d'ouverture est rendu
             # dans le constat (`review_lot`), pour être repris (`review_lot.catch_up`).
@@ -3918,8 +3920,11 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             detail = "%s → merged" % state
             if not review.get("id") and not review.get("already_reviewed"):
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
+            if stacked_warning:
+                detail += " — " + stacked_warning
             return {"id": int(item_id), "result": "merged", "item": row,
-                    "detail": detail, "review_lot": review}
+                    "detail": detail, "review_lot": review,
+                    "stacked_warning": stacked_warning}
         if frozen_id is not None or unfrozen:
             freezes = [m for m in milestones(db, item_id) if m["kind"] == "frozen"]
             if (bool(freezes) if frozen_id is None
