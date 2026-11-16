@@ -187,3 +187,21 @@ nor the `backlog_empty` alert.
 - Nothing else changes: agent, budget, capacity and host guards, the pickup
   caps, and the lot pickup (L165) itself. A held lot stays in the queue,
   and is never forced on anyone.
+
+
+# Amendment of 2026-11-16: actionable work and project priority
+
+Lot #7525 (issue manaty/ameesh#5697), assigned by mesh-design on
+2026-11-16, applies the canon §4 free-agent rule to improvement pickup as
+well as team-lot pickup (L165b). A frozen lot waiting for review, a lot
+waiting for another actor, or a future planned start does not occupy its
+author. Actionable work, a pending prompt, unread mail and an unfinished
+actionable session lot still prevent pickup; assignment caps, host and
+budget guards remain in force. This replaces the strict open-lot exclusion
+in point 3 above.
+
+The priority of a requested lot in point 3 is scoped to its project: a Web
+request precedes Web improvements, without stopping an API agent from
+taking an API improvement. Missing project metadata retains the conservative
+mesh-wide veto. This does not change the separate roadmap-only definition
+of the throughput counter or the roadmap-exhaustion sleep policy.
