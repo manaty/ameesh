@@ -11,6 +11,7 @@ import json
 import os
 import time
 import unittest
+from unittest import mock
 
 from ameesh import authority, db as db_mod, mail, registry, signing
 
@@ -247,11 +248,14 @@ class AuthorityTest(PgTestCase):
     def test_approbation_expiree(self):
         """Expiration réelle (échéance signée courte), sans toucher la base."""
         artifact = authority.hash_artifact("migration 0005")
-        authority.create_approval(
+        built = authority.create_approval(
             self.db, self.seed, approver=OWNER, action="migration", artifact_kind="migration",
             artifact_hash=artifact, ttl=1.0)
-        time.sleep(1.2)
-        row, verdict = authority.find_approval(self.db, "migration", artifact)
+        # #7524 : avancer l'horloge lue par la vérification, sans attente
+        # murale dont la marge pourrait être mangée par un décalage d'horloge.
+        with mock.patch.object(authority.time, "time",
+                               return_value=built["expires_us"] / 1_000_000 + 1.0):
+            row, verdict = authority.find_approval(self.db, "migration", artifact)
         self.assertIsNone(row)
         self.assertIn("expired", verdict.reason)
 

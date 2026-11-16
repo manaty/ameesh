@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -40,6 +41,21 @@ plan_mod = _charger("plan_3754", "test-plan.py")
 
 
 class UnitesTest(unittest.TestCase):
+
+    def test_le_nocturne_permet_de_decouper_une_classe_psql_recente(self):
+        """#7526 : un module absent de l'ancienne table restait une classe
+        légère malgré sa mesure nocturne, puis retenait tout son worker."""
+        with tempfile.TemporaryDirectory() as tmp:
+            table = pathlib.Path(tmp) / "durees.json"
+            table.write_text(json.dumps({"psql": {},
+                "psql_full": {"test_version": 2100.0}}), encoding="utf-8")
+            with mock.patch.object(parts, "TABLE", table):
+                unites = parts._unites_de(["test_version"])
+                poids = parts._pesees_unites(unites, "psql", ["test_version"])
+                affine, _ = parts._affiner_unites(unites, poids, {})
+        self.assertAlmostEqual(sum(poids.values()), 2100.0)
+        self.assertTrue(all(len(ids) == 1 for ids in affine.values()))
+        self.assertGreater(len(affine), len(unites))
 
     def test_une_classe_reste_une_unite(self):
         unites = parts._unites_de(["test_version", "test_site_art"])

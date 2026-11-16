@@ -12,6 +12,27 @@ from .support import PgTestCase
 
 
 class RegistryTest(PgTestCase):
+    def _attendre_expiration(self, name, timeout=10.0):
+        """Attend que l'échéance du bail soit passée, à l'horloge de la base.
+
+        #7524 : une attente murale de marge courte est fausse dès que l'hôte
+        des tests et celui de la base ne partagent pas exactement la même
+        horloge ; on lit l'échéance dans la base et on attend la condition.
+        """
+        veille = self.connect()
+        fin = time.monotonic() + timeout
+        try:
+            while time.monotonic() < fin:
+                rows = veille.query(
+                    "SELECT lease_expires_at <= clock_timestamp() AS expire"
+                    " FROM agent_registry WHERE name = %s", (name,))
+                if rows and rows[0]["expire"]:
+                    return
+                time.sleep(0.02)
+        finally:
+            veille.close()
+        self.fail("le bail de %s n'a pas expiré dans les %.1f s" % (name, timeout))
+
     def test_upsert_partiel_ne_preserve_que_le_fourni(self):
         """Régression : un upsert minimal (envoi de mail, hook) n'écrase rien."""
         registry.upsert(
@@ -115,12 +136,16 @@ class RegistryTest(PgTestCase):
 
     def test_expiration_et_fencing(self):
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")
-        first = registry.claim(self.db, "alpha", "runner-a", 1.0)
+        first = registry.claim(self.db, "alpha", "runner-a", 60)
         self.assertIsNotNone(first)
         epoch_a = int(first["lease_epoch"])
         self.assertIsNone(registry.claim(self.db, "alpha", "runner-b", 60))  # encore vivant
 
-        time.sleep(1.3)
+        # #7524 : poser l'expiration avec l'horloge de la base, sans attente
+        # murale dont la marge pourrait être mangée par un décalage d'horloge.
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = clock_timestamp() - interval '1 hour' "
+            "WHERE name = 'alpha'")
         second = registry.claim(self.db, "alpha", "runner-b", 60)
         self.assertIsNotNone(second, "le bail expiré doit être reprenable")
         self.assertEqual(int(second["lease_epoch"]), epoch_a + 1)
@@ -132,9 +157,11 @@ class RegistryTest(PgTestCase):
 
     def test_renew_refuse_un_bail_expire(self):
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")
-        lease = registry.claim(self.db, "alpha", "runner-a", 1.0)
+        lease = registry.claim(self.db, "alpha", "runner-a", 60)
         epoch = int(lease["lease_epoch"])
-        time.sleep(1.3)
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = clock_timestamp() - interval '1 hour' "
+            "WHERE name = 'alpha'")
         self.assertIsNone(registry.renew(self.db, "alpha", "runner-a", epoch, 60))
         # le même exécuteur peut reprendre le bail, mais par un nouveau claim
         again = registry.claim(self.db, "alpha", "runner-a", 60)
@@ -144,9 +171,11 @@ class RegistryTest(PgTestCase):
     def test_begin_turn_refuse_un_bail_expire(self):
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")
         registry.set_pending_prompt(self.db, "alpha", "consigne")
-        lease = registry.claim(self.db, "alpha", "runner-a", 1.0)
+        lease = registry.claim(self.db, "alpha", "runner-a", 60)
         epoch = int(lease["lease_epoch"])
-        time.sleep(1.3)
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = clock_timestamp() - interval '1 hour' "
+            "WHERE name = 'alpha'")
         self.assertFalse(registry.begin_turn(self.db, "alpha", "runner-a", epoch, "tour"))
         self.assertIsNone(
             registry.take_pending_prompt(self.db, "alpha", "runner-a", epoch))
@@ -314,10 +343,12 @@ class RegistryTest(PgTestCase):
     def test_reap_retire_le_bail_residuel_d_un_agent_arrete(self):
         """#5722 : un agent arrêté ne garde pas de bail échu sur son hôte."""
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")
-        lease = registry.claim(self.db, "alpha", "runner-a", 1.0)
+        lease = registry.claim(self.db, "alpha", "runner-a", 60)
         registry.set_status(self.db, "alpha", "stopped", status_text="arrêté à la main",
                             stop_reason="manuel")
-        time.sleep(1.3)
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = clock_timestamp() - interval '1 hour' "
+            "WHERE name = 'alpha'")
         retires = registry.reap(self.db, "laptop")
         self.assertEqual([row["name"] for row in retires], ["alpha"])
         self.assertTrue(retires[0]["residual"])
@@ -342,12 +373,14 @@ class RegistryTest(PgTestCase):
         """#5722 : la passe d'un hôte ne retire que les baux de cet hôte."""
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")
         registry.upsert(self.db, "beta", harness="claude", host="autre")
-        registry.claim(self.db, "alpha", "runner-a", 1.0)
-        registry.claim(self.db, "beta", "runner-b", 1.0)
+        registry.claim(self.db, "alpha", "runner-a", 60)
+        registry.claim(self.db, "beta", "runner-b", 60)
         for name in ("alpha", "beta"):
             registry.set_status(self.db, name, "stopped", status_text="arrêté à la main",
                                 stop_reason="manuel")
-        time.sleep(1.3)
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = clock_timestamp() - interval '1 hour' "
+            "WHERE name IN ('alpha', 'beta')")
         registry.reap(self.db, "laptop")
         self.assertIsNone(registry.get(self.db, "alpha")["lease_owner"])
         self.assertEqual(registry.get(self.db, "beta")["lease_owner"], "runner-b")
@@ -370,8 +403,13 @@ class RegistryTest(PgTestCase):
         if self.db.name != "psycopg":
             self.skipTest("verrou tenu entre deux ordres : connexion persistante requise")
         registry.upsert(self.db, "bail", harness="claude", host=self.cfg.host)
-        lease = registry.claim(self.db, "bail", "runner-1", 0.4)
+        lease = registry.claim(self.db, "bail", "runner-1", 60)
         self.assertIsNotNone(lease)
+        # #7524 : l'échéance est posée avec l'horloge de la base et attendue,
+        # sans marge murale : le bail expire pendant l'attente du verrou.
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at ="
+            " clock_timestamp() + interval '0.2 seconds' WHERE name = 'bail'")
         bloqueur = self.connect()
         resultat: list = []
         try:
@@ -383,7 +421,7 @@ class RegistryTest(PgTestCase):
                     self.db, "bail", "runner-1", int(lease["lease_epoch"]), 30)),
                 daemon=True)
             thread.start()
-            time.sleep(0.8)  # le bail expire pendant que le renouvellement attend
+            self._attendre_expiration("bail")
             bloqueur.execute("COMMIT")
             thread.join(timeout=5)
             self.assertEqual(resultat, [None],
@@ -405,12 +443,15 @@ class RegistryTest(PgTestCase):
         if self.db.name != "psycopg":
             self.skipTest("verrou tenu entre deux ordres : connexion persistante requise")
         registry.upsert(self.db, "bail", harness="claude", host=self.cfg.host)
-        lease = registry.claim(self.db, "bail", "runner-1", 0.4)
+        lease = registry.claim(self.db, "bail", "runner-1", 60)
         self.assertIsNotNone(lease)
         registry.set_pending_prompt(self.db, "bail", "consigne en attente")
         bloqueur = self.connect()
         epoch = int(lease["lease_epoch"])
         try:
+            self.db.execute(
+                "UPDATE agent_registry SET lease_expires_at ="
+                " clock_timestamp() + interval '0.2 seconds' WHERE name = 'bail'")
             resultat: list = []
             bloqueur.execute("BEGIN")
             bloqueur.execute(
@@ -420,12 +461,15 @@ class RegistryTest(PgTestCase):
                     registry.renew(self.db, "bail", "runner-1", epoch, 30)),
                 daemon=True)
             thread.start()
-            time.sleep(0.8)  # le bail expire pendant que le renouvellement attend
+            self._attendre_expiration("bail")
             bloqueur.execute("COMMIT")
             thread.join(timeout=5)
             self.assertEqual(resultat, [None],
                              "un bail expiré sous SELECT FOR UPDATE a été renouvelé")
 
+            self.db.execute(
+                "UPDATE agent_registry SET lease_expires_at ="
+                " clock_timestamp() + interval '0.2 seconds' WHERE name = 'bail'")
             resultat2: list = []
             bloqueur.execute("BEGIN")
             bloqueur.execute(
@@ -435,7 +479,7 @@ class RegistryTest(PgTestCase):
                     registry.take_pending_prompt(self.db, "bail", "runner-1", epoch)),
                 daemon=True)
             thread2.start()
-            time.sleep(0.8)
+            self._attendre_expiration("bail")
             bloqueur.execute("COMMIT")
             thread2.join(timeout=5)
             self.assertEqual(resultat2, [None],

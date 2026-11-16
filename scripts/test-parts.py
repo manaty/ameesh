@@ -285,7 +285,12 @@ def weight(mods: list[str], pilote: str, table: dict | None = None,
         for driver, mesures in table.items():
             base.setdefault(driver, {}).update(mesures)
         table = base
-    mesures = table.get(pilote, {})
+    # #7526 : la table ordinaire précède certains modules récents ; le
+    # nocturne les a déjà mesurés. Ses durées comblent seulement ces trous,
+    # derrière toute mesure ordinaire ou fournie par la carte. Même repli
+    # pour le découpage en jobs et celui des classes dans chaque job.
+    mesures = dict(table.get("psql_full", {})) if pilote == "psql" else {}
+    mesures.update(table.get(pilote, {}))
     connus = [m for m in mesures if m in set(mods)]
     total_tests = sum(test_count(m, tests) for m in connus)
     par_test = (sum(mesures[m] for m in connus) / total_tests) if total_tests else DEFAULT_PER_TEST

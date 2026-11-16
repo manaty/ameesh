@@ -122,12 +122,16 @@ class PriseTest(_Libres):
         self.geler(session)
         self.assertEqual(len(self.take()), 1)
 
-    def test_la_file_d_amelioration_reste_stricte(self):
+    def test_la_file_d_amelioration_prend_un_agent_en_attente_de_relecture(self):
+        # #7525 : même disponibilité pour L119 et L165 ; le lot gelé
+        # reste à l'auteur, mais il ne l'occupe pas pendant la relecture.
         self.agent("dev7", team="nexlink")
-        self.tenu("dev7", "qa")
+        previous = self.tenu("dev7", "qa")
         element = self.element("dette", 90, team="nexlink")
-        self.assertEqual(self.take(idle_s=60, lot_idle_s=0), [])
-        self.assertIsNone(work.get(self.db, element["id"])["assignee"])
+        out = self.take(idle_s=60, lot_idle_s=0)
+        self.assertEqual([t["item"]["id"] for t in out], [element["id"]])
+        self.assertEqual(work.get(self.db, element["id"])["assignee"], "dev7")
+        self.assertEqual(work.get(self.db, previous["id"])["state"], "qa")
 
 
 class IdleCapacityTest(_Libres):
