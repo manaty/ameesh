@@ -388,7 +388,8 @@ class Gauge:
         return self.used_at(now) >= self.held_cap(now, reserve, multiplier, ceiling)
 
     def free_at(self, now: float, reserve: float = 0.0,
-                multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> float | None:
+                multiplier: float = 1.0, ceiling: float = PACE_CEILING,
+                rate: float = 0.0) -> float | None:
         """L'heure où la fenêtre cesse de bloquer, ou None si elle ne la dit
         pas (`resets_at` absent).
 
@@ -407,6 +408,18 @@ class Gauge:
         une libération trop tardive en dessous (le seuil, lui, garde le sien).
 
         `ceiling` (#1176) est le plafond effectif du compte à `now`.
+
+        `rate` (#7523) : le rythme de consommation de la fenêtre (fraction de
+        la fenêtre par seconde, 0 = inconnu). Le calcul « à usage figé »
+        n'annonce qu'une heure **au plus tôt** : les agents critiques qui
+        partagent le compte continuent de consommer pendant la pause, et
+        chaque point consommé recule l'heure de `window_s / 100` (1,68 h sur
+        la fenêtre de 7 jours). Avec `rate > 0`, l'heure est celle où le
+        rythme rattrape l'usage **projeté** — `used + rate·Δt` —, ce qui rend
+        l'heure annoncée stable entre deux relevés tant que le rythme se
+        maintient. Si l'usage croît au moins aussi vite que le plafond
+        (`rate ≥ multiplier / window_s`), ou si l'usage projeté atteint le
+        plafond fixe, la fenêtre ne se libère qu'à sa remise à zéro.
         """
         if not self.resets_at:
             return None
@@ -415,6 +428,19 @@ class Gauge:
             return float(self.resets_at)
         share = (used + reserve - PACE_MARGIN) / multiplier
         share = min(max(share, 0.0), 1.0)
+        if rate and rate > 0.0:
+            window = float(self.window_s)
+            # pente autorisée de l'usage, en fraction de fenêtre par seconde
+            slope = multiplier / window
+            if rate >= slope:
+                # le plafond ne rattrapera jamais l'usage : seule la remise
+                # à zéro libère la fenêtre
+                return float(self.resets_at)
+            delta = (share - self.elapsed(now)) * window / (1.0 - rate / slope)
+            if used + rate * delta >= ceiling - reserve:
+                # l'usage projeté atteint un plafond qui ne se rattrape pas
+                return float(self.resets_at)
+            return min(float(self.resets_at), float(now) + delta)
         return float(self.resets_at) - self.window_s * (1.0 - share)
 
     def reset_passed(self, now: float) -> bool:
@@ -472,6 +498,85 @@ def stale_reading(gauges, now: float) -> bool:
     if not stamps:
         return False
     return now - min(stamps) > min(g.window_s for g in gauges)
+
+
+#: #7523 : fenêtre d'observation du rythme de consommation d'un compte tenu.
+#: Six heures, comme la projection de sous-utilisation
+#: (`sous_utilisation.PLAN_RATE_WINDOW_S`) : assez pour voir monter un usage
+#: entier d'un point sur la fenêtre de 7 jours, assez court pour que le
+#: rythme soit encore celui de la pause en cours.
+CONSUMPTION_RATE_WINDOW_S = 6 * 3600.0
+#: #7523 : sans deux relevés espacés d'au moins 30 min, un rythme n'est pas
+#: mesuré (même plancher que `sous_utilisation.PLAN_RATE_MIN_SPAN_S`).
+CONSUMPTION_RATE_MIN_SPAN_S = 1800.0
+
+
+def consumption_rate(history, gauge: "Gauge", *, now: float, account: str | None = None,
+                     reserve: float = 0.0, multiplier: float = 1.0,
+                     ceiling: float = PACE_CEILING,
+                     window_s: float = CONSUMPTION_RATE_WINDOW_S,
+                     min_span: float = CONSUMPTION_RATE_MIN_SPAN_S) -> float:
+    """#7523 : le rythme où l'usage de la fenêtre monte pendant que les
+    non-critiques sont tenus (fraction de fenêtre par seconde), 0.0 quand
+    l'historique ne le mesure pas.
+
+    Le calcul « à usage figé » de `Gauge.free_at` annonce une heure **au plus
+    tôt** : les agents critiques qui partagent le compte continuent de
+    consommer pendant la pause, et chaque point consommé recule l'heure de la
+    fenêtre (`window_s / 100`, soit 1,68 h sur 7 jours). Ce rythme est lisible
+    dans l'historique des jauges (`quota_gauge_readings`) : on ne garde que les
+    relevés pris alors que le compte était **déjà au seuil** pour ce
+    demandeur (`used >= held_cap`, réserve des non-critiques comprise). Leur
+    pente est alors la consommation de ceux qui ne sont pas en pause — les
+    agents critiques. Les relevés d'avant la pause, où les non-critiques
+    consommaient encore, sont écartés : ils mesureraient un rythme qui vient
+    de s'arrêter.
+
+    Mêmes précautions que `sous_utilisation._projected_plan_loss` : même
+    harnais, compte, jauge et échéance de fenêtre ; horodatage de production
+    (`produced_ts`) plutôt que d'insertion quand il existe ; deux relevés au
+    moins, espacés de `min_span` ; usage non décroissant. Une lecture qui ne
+    conclut pas rend 0.0 — le repli est le calcul d'origine, jamais une
+    valeur inventée.
+
+    `history` : les lignes de `operations.gauge_history` (dicts `harness`,
+    `key`, `account`, `used`, `resets_at_ts`, `produced_ts`, `observed_ts`).
+    """
+    wanted_account = account or None
+    points: dict[float, float] = {}
+    for row in history or ():
+        if row.get("harness") != gauge.harness or row.get("key") != gauge.key:
+            continue
+        if (row.get("account") or None) != wanted_account:
+            continue
+        reset = row.get("resets_at_ts")
+        if reset is None or abs(float(reset) - float(gauge.resets_at or 0.0)) > 1.0:
+            continue
+        stamp = row.get("produced_ts") or row.get("observed_ts")
+        if stamp is None:
+            continue
+        stamp = float(stamp)
+        if not now - window_s <= stamp <= now:
+            continue
+        used = float(row.get("used") or 0.0)
+        # Un relevé pris sous le seuil du demandeur compte encore la
+        # consommation des non-critiques : il n'entre pas dans le rythme
+        # critique. `held_cap` porte la même réserve et le même plafond que
+        # l'évaluation qui va annoncer l'heure.
+        if used < gauge.held_cap(stamp, reserve, multiplier, ceiling):
+            continue
+        points[stamp] = max(points.get(stamp, used), used)
+    samples = sorted(points.items())
+    if len(samples) < 2:
+        return 0.0
+    start, initial = samples[0]
+    end, used = samples[-1]
+    span = end - start
+    if span < min_span or used < initial:
+        return 0.0
+    if any(later[1] < earlier[1] for earlier, later in zip(samples, samples[1:])):
+        return 0.0
+    return (used - initial) / span
 
 
 def reading_outdated(gauges, now: float) -> bool:
@@ -1665,6 +1770,28 @@ class CostBook:
         except Exception:  # historique facultatif : jamais fatal
             return 0
 
+    def _consumption_rates(self, gauges, now: float, reserve: float = 0.0) -> dict:
+        """#7523 : le rythme de consommation observé de chaque fenêtre tenue.
+
+        Le compte par défaut n'a pas de nom : on ne garde que les relevés sans
+        compte (les comptes déclarés ont le leur). Un historique illisible
+        rend `{}` — le repli est le calcul d'origine de `free_at`, jamais une
+        heure inventée.
+        """
+        if self.db is None or not gauges:
+            return {}
+        try:
+            rows = storage.of(self.db).operations.gauge_history(
+                since_s=CONSUMPTION_RATE_WINDOW_S, harness=gauges[0].harness)
+        except Exception:  # historique facultatif : jamais fatal à la garde
+            return {}
+        rates = {}
+        for gauge in gauges:
+            rate = consumption_rate(rows, gauge, now=now, account=None, reserve=reserve)
+            if rate > 0.0:
+                rates[gauge.key] = rate
+        return rates
+
     def pace_exceeded(self, harness: str, reserve: float = 0.0) -> str:
         """Le forfait d'un harnais avance-t-il trop vite ? La raison, ou ''.
 
@@ -1696,8 +1823,13 @@ class CostBook:
         # plus.
         head = ""
         if all(gauge.resets_at for gauge in held):
-            free, gauge = max(((float(g.free_at(now, reserve)), g) for g in held),
-                              key=lambda pair: pair[0])
+            # #7523 : le rythme des agents critiques qui consomment encore le
+            # compte décale l'heure annoncée ; sans relevé mesurable, le
+            # calcul d'origine (usage figé) s'applique.
+            rates = self._consumption_rates(held, now, reserve)
+            free, gauge = max(((float(g.free_at(now, reserve,
+                                                rate=rates.get(g.key, 0.0))), g)
+                               for g in held), key=lambda pair: pair[0])
             # #4781 : `@epoch`, voir `accounts.pause_label`
             head = "pause (account %s, %s %.0f %%) until %s@%d; " % (
                 DEFAULT_ACCOUNT_LABEL, gauge.key, gauge.used * 100,

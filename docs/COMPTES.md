@@ -1105,7 +1105,16 @@ usage (the guard is re-evaluated on every turn, #898), while a usage at the
 pace ceiling (90 %, less the reserve kept for critical agents) only falls back
 at the window reset. An account held by several windows frees with the last of
 them: the label names that window, and the date when it is not today ("until
-14/10 09:00"). Without declared accounts the
+14/10 09:00"). Since #7523, the announced time also accounts for the
+consumption observed while the non-critical agents are held: the critical
+agents keep spending the account, and a deadline computed on a frozen usage
+would slide by 1.68 h for every point spent on the 7-day window. The rate is
+read from the gauge history over the readings taken while the account was
+already at the requester's threshold (the pre-pause readings are excluded);
+the projected time stays put between two readings as long as that rate holds.
+When the usage grows at least as fast as the pace, or the projected usage
+reaches a fixed ceiling, only the window reset is announced. Without declared
+accounts the
 account is `(default)`, the harness's own. `ameesh progress` and the alerts read
 `paused`, never `stopped`, for a budget pause. `ameesh attach` says it.
 
