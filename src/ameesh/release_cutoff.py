@@ -1135,6 +1135,63 @@ def generate_notes(*, project: "ProjectRelease", repo: str, since: str, target: 
 # configuration
 # --------------------------------------------------------------------------
 
+def _staging_rights(project: str, raw) -> tuple:
+    """#7372: parse the standing staging rights of a release project.
+
+    Each entry is `{"gesture": "root", "beneficiary": "bureau",
+    "host": …, "lot": 7372, "decision": <id>, "option": "a",
+    "expires": "YYYY-MM-DD"}`. The lot is the signed scope of the decision.
+    The decision is only a reference here; the guard re-reads it (answered,
+    signed, not withdrawn or superseded) and checks the answered option, its
+    project, and the signed grant's gesture, beneficiary, host and expiry
+    against this entry before any use (#7372 B2). An invalid entry is refused
+    at configuration time, never silently ignored.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ReleaseError("release.projects.%s.staging_rights: a list is required" % project)
+    out = []
+    for index, item in enumerate(raw):
+        where = "release.projects.%s.staging_rights[%d]" % (project, index)
+        if not isinstance(item, dict):
+            raise ReleaseError("%s: an object is required" % where)
+        unknown = set(item) - {"gesture", "beneficiary", "host", "lot",
+                               "decision", "option", "expires"}
+        if unknown:
+            raise ReleaseError("%s: unknown key(s) %s" % (where, ", ".join(sorted(unknown))))
+        gesture = item.get("gesture")
+        if not isinstance(gesture, str) or not gesture.strip():
+            raise ReleaseError("%s.gesture is required" % where)
+        beneficiary = item.get("beneficiary")
+        if not isinstance(beneficiary, str) or not beneficiary.strip():
+            raise ReleaseError("%s.beneficiary is required" % where)
+        host = item.get("host")
+        if not isinstance(host, str) or not host.strip():
+            raise ReleaseError("%s.host is required" % where)
+        lot = item.get("lot")
+        if not isinstance(lot, int) or isinstance(lot, bool) or lot <= 0:
+            raise ReleaseError("%s.lot: a positive integer is required" % where)
+        decision = item.get("decision")
+        if (not isinstance(decision, int) or isinstance(decision, bool) or decision <= 0):
+            raise ReleaseError("%s.decision: a positive integer is required" % where)
+        option = item.get("option")
+        if not isinstance(option, str) or not option.strip():
+            raise ReleaseError("%s.option is required" % where)
+        expires = item.get("expires")
+        if not isinstance(expires, str):
+            raise ReleaseError("%s.expires: an ISO date is required" % where)
+        try:
+            _dt.date.fromisoformat(expires)
+        except ValueError as exc:
+            raise ReleaseError("%s.expires: an ISO date is required (%s)" % (where, exc)) from exc
+        out.append({"gesture": gesture.strip().lower(),
+                    "beneficiary": beneficiary.strip().lower(),
+                    "host": host.strip(), "lot": lot, "decision": decision,
+                    "option": option.strip(), "expires": expires})
+    return tuple(out)
+
+
 @dataclasses.dataclass(frozen=True)
 class ProjectRelease:
     name: str
@@ -1157,6 +1214,14 @@ class ProjectRelease:
     #: then attests (`ameesh release attest`, #6020); no staging credential here.
     staging_handoff: str = ""
     attestation_timeout_s: float = ATTESTATION_TIMEOUT_S
+    #: #7372: standing owner root rights of the bureau, per host. Each entry
+    #: names the gesture, beneficiary, decision, approved option and expiry;
+    #: the decision is re-read and its signed grant checked at each use
+    #: (answered, signed, not withdrawn or superseded), so a revocation takes
+    #: effect on the next pass, without a release. Nothing client-specific is
+    #: compiled here: the gesture, beneficiary, host, lot, decision and date
+    #: come from the configuration.
+    staging_rights: tuple = ()
 
     @classmethod
     def from_config(cls, cfg, name: str, entry: dict) -> "ProjectRelease":
@@ -1165,7 +1230,7 @@ class ProjectRelease:
         unknown = set(entry) - {"repo", "target", "remote", "staging", "report",
                                 "github", "window_s", "staging_timeout_s", "staging_executor",
                                 "lock_ttl_s", "lock_wait_s", "version_bump", "model",
-                                "staging_handoff", "attestation_timeout_s"}
+                                "staging_handoff", "attestation_timeout_s", "staging_rights"}
         if unknown:
             raise ReleaseError("release.projects.%s: unknown key(s) %s"
                                % (name, ", ".join(sorted(unknown))))
@@ -1197,6 +1262,7 @@ class ProjectRelease:
             # #6039 N4: canonicalize an alias as early as the configuration,
             # without the registry (which the tick reads before any tag).
             handoff = canonical_handoff(cfg, None, handoff)
+        rights = _staging_rights(name, entry.get("staging_rights", []))
         elected_role = ((getattr(cfg, "release", None) or {}).get("role")
                         or (getattr(cfg, "packet_watch", None) or {}).get("role"))
         executor = entry.get("staging_executor")
@@ -1234,6 +1300,7 @@ class ProjectRelease:
             lock_ttl_s=number("lock_ttl_s", LOCK_TTL_S),
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
             suite_tolerated=tolerated, model=model, staging_handoff=handoff or "",
+            staging_rights=rights,
             attestation_timeout_s=number("attestation_timeout_s", ATTESTATION_TIMEOUT_S))
 
 
@@ -2902,10 +2969,31 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
         # rattrapage soit déclaré à chaque coupure ; le poste, lui, se met à
         # jour à son retour (droit root §10 pour un serveur sans accès root).
         reportes = (staging.get("attestation") or {}).get("reportes") or {}
+        catchups = staging.get("catchups") or {}
+        rights = staging.get("rights") or {}
         for host, detail in sorted(reportes.items()):
             raison = " ".join(str((detail or {}).get("raison") or "absent").split())
             suite = ("mise à jour à son retour" if host == STAGING_POSTE
                      else "rattrapage requis, jamais en dessous (§14)")
+            declared = (catchups.get(host) if isinstance(catchups, dict) else None)
+            if isinstance(declared, dict):
+                suite += (" ; dernier geste déclaré (trace, non prouvé) : commit %s "
+                          "(%s, %s, par %s)"
+                          % (str(declared.get("sha") or "")[:12],
+                             declared.get("result") or "?",
+                             declared.get("date") or "date inconnue",
+                             declared.get("actor") or "auteur inconnu"))
+            elif host != STAGING_POSTE:
+                right = (rights.get(host) if isinstance(rights, dict) else None)
+                if isinstance(right, dict):
+                    if right.get("expired"):
+                        state = "expiré le %s" % right.get("expires")
+                    elif right.get("active"):
+                        state = "actif jusqu'au %s" % right.get("expires")
+                    else:
+                        state = "retiré : %s" % (right.get("why") or "inconnu")
+                    suite += (" ; aucun geste déclaré (droit #%d %s)"
+                              % (right.get("decision"), state))
             lines.append("  - %s: REPORTÉ (%s) — non déployé au tag %s ; %s"
                          % (host, raison, tag, suite))
         if staging.get("error"):
@@ -3640,6 +3728,15 @@ def finish(cfg, db, project: ProjectRelease, report: dict, state: dict,
     """Write the durable report, mail the owner, record the cutoff."""
     result = report.get("result")
     queued = bool(staging and staging.get("queued"))
+    if staging is not None:
+        # #7372 : le rapport de coupure nomme le dernier geste de rattrapage
+        # déclaré et le droit owner qui le couvre ; une lecture illisible
+        # laisse le rapport tel quel, sans jamais retenir la coupure.
+        from . import staging_deferred
+        try:
+            staging_deferred.annotate(db, project, staging)
+        except Exception:  # noqa: BLE001 - a trace read never blocks a report
+            pass
     # #4219 : a skipped staging is not a successful one. A release is tagged
     # AND deployed to staging (canon §11 bis), and not deployed is not done
     # (§5): `--no-staging` is written down and the report goes out urgent.
