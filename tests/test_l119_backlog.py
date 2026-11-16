@@ -386,6 +386,34 @@ class PriseTest(_Base):
         self.db.execute("UPDATE agent_registry SET session_work_item = NULL")
         self.assertEqual([t["item"]["id"] for t in self.take()], [item["id"]])
 
+    def test_another_project_does_not_hold_the_backlog(self):
+        self.agent("dev", team="web")
+        other = work.add(self.db, title="API request", app="api")
+        item = self.element("web cleanup", 50, app="web", team="web", new_project=True)
+        out = self.take(lot_idle_s=0, review_max_per_hour=0)
+        self.assertEqual([t["item"]["id"] for t in out], [item["id"]])
+        self.assertIsNone(work.get(self.db, other["id"])["assignee"])
+
+    def test_own_project_still_precedes_its_backlog(self):
+        self.agent("dev", team="web")
+        request = work.add(self.db, title="Web request", app="web")
+        item = self.element("web cleanup", 50, app="web", team="web", new_project=True)
+        self.assertEqual(self.take(lot_idle_s=0, review_max_per_hour=0), [])
+        self.assertIsNone(work.get(self.db, item["id"])["assignee"])
+        self.assertIsNone(work.get(self.db, request["id"])["assignee"])
+
+    def test_review_wait_does_not_occupy_the_backlog_taker(self):
+        self.agent("dev", team="web")
+        previous = work.add(self.db, title="Previous work", assignee="dev", app="web")
+        self.db.execute("UPDATE work_items SET state = 'validated' WHERE id = %s",
+                        (previous["id"],))
+        self.db.execute("UPDATE agent_registry SET session_work_item = %s WHERE name = 'dev'",
+                        (str(previous["id"]),))
+        item = self.element("web cleanup", 50, app="web", team="web", new_project=True)
+        out = self.take(lot_idle_s=0, review_max_per_hour=0)
+        self.assertEqual([t["item"]["id"] for t in out], [item["id"]])
+        self.assertEqual(work.get(self.db, previous["id"])["assignee"], "dev")
+
     def test_file_non_comptee_comme_travail_en_attente(self):
         # un élément de la file n'est pas un « lot sans assigné » d'idle_capacity
         self.agent("claude1", since_s=60)
