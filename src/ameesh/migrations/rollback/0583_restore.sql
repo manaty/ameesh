@@ -153,3 +153,4 @@ begin
 end $$;
 
 DROP VIEW IF EXISTS ameesh_staging_attestations;
+DROP VIEW IF EXISTS ameesh_decision_proofs;

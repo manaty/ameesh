@@ -162,6 +162,43 @@ class BureauRoleLimiteTest(PgTestCase):
         finally:
             limited.close()
 
+    def test_consumed_decision_signature_is_readable_but_pending_approval_is_not(self):
+        from ameesh import authority, decisions, registry, signing, storage, staging_deferred
+        seed = b"\x42" * 32  # public fixture, never an enrolled real key
+        registry.upsert(self.db, "fixture-owner", harness="other", host=self.cfg.host)
+        authority.register_key(self.db, "fixture-owner", signing.public_from_seed(seed), role="owner")
+        view = {"id": 123, "lot": 456, "project": "ameesh", "created_ts": 1700000000,
+                "question": "fixture grant", "state": "answered",
+                "options": [{"key": "a", "label": "fixture", "grant": {
+                    "gesture": "root", "beneficiary": "bureau", "host": "server",
+                    "expires": "2099-12-12"}}]}
+        digest = decisions.answer_digest(view, "a", "a", "human:fixture-owner")
+        authority.create_approval(self.db, seed, approver="fixture-owner", action="decision",
+                                  artifact_kind="decision", artifact_hash=digest, ttl=900)
+        limited = db_mod.connect(dataclasses.replace(self.cfg, dsn=self.dsn))
+        try:
+            proofs = storage.of(limited).approvals
+            self.assertEqual(proofs.recent(action="decision", artifact_hash=digest,
+                                           limit=20, proof_only=True), [])
+            row, verdict = authority.find_approval(self.db, "decision", digest, consume_by="decision:123")
+            self.assertTrue(verdict.ok)
+            view["answer"] = {"text": "a", "option": "a", "by": "human:fixture-owner",
+                              "proof": {"digest": digest, "approval_id": row["id"]}}
+            self.assertTrue(decisions.verify_proof(limited, view, public_only=True)[0])
+            project = types.SimpleNamespace(name="ameesh", staging_rights=[{
+                "gesture": "root", "beneficiary": "bureau", "host": "server",
+                "expires": "2099-12-12", "decision": 123, "option": "a", "lot": 456}])
+            with mock.patch.object(decisions, "get", return_value=view):
+                self.assertTrue(staging_deferred.active_right(limited, project, "server")["active"])
+                declared = staging_deferred.declare(
+                    limited, project, "server", "a" * 40, {"sha": "a" * 40, "tag": "v1"},
+                    "ok", "bureau")
+                self.assertGreater(declared["event"], 0)
+            with self.assertRaises(db_mod.DbError):
+                proofs.recent(action="decision", artifact_hash=digest, limit=20)
+        finally:
+            limited.close()
+
     # -- installation et audit ---------------------------------------------
     def test_l_audit_seul_passe_puis_refuse_un_droit_en_trop(self):
         proc = self.script("_contrat-bureau.sql")

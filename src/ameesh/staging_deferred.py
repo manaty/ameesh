@@ -292,7 +292,7 @@ def active_right(db, project, host, today=None) -> dict | None:
         return {**right, "active": False,
                 "why": "decision not answered, withdrawn or superseded"}
     try:
-        signed, why = decisions.verify_proof(db, view)
+        signed, why = decisions.verify_proof(db, view, public_only=True)
     except Exception as exc:  # noqa: BLE001 - an unverifiable proof grants nothing
         signed, why = False, "unreadable proof: %s" % exc
     if not signed:

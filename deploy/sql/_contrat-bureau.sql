@@ -25,6 +25,14 @@ SELECT set_config('ameesh.bureau_role', :'role', false),
 CREATE OR REPLACE TEMP VIEW bureau_expected_staging_attestations AS
 SELECT id, type, object, project, data, created_at
 FROM ameesh_events WHERE type = 'staging.attested';
+CREATE OR REPLACE TEMP VIEW bureau_expected_decision_proofs AS
+SELECT id, approver, action, artifact_kind, artifact_hash, decision, nonce,
+       signed_payload, signature, signature_key, created_at, expires_at,
+       consumed_at, consumed_by, unconsumed, unexpired, key_known, key_live,
+       key_matches, key_is_owner
+FROM mesh_approvals_status
+WHERE action = 'decision' AND artifact_kind = 'decision' AND decision = 'approved'
+  AND consumed_at IS NOT NULL AND consumed_by ~ '^decision:[0-9]+$';
 DO $audit$
 DECLARE
     r text := current_setting('ameesh.bureau_role');
@@ -150,6 +158,12 @@ BEGIN
        OR NOT EXISTS (SELECT FROM pg_class WHERE oid = to_regclass(format('%I.ameesh_staging_attestations', s))
                        AND reloptions @> ARRAY['security_barrier=true']) THEN
         errors := errors || 'staging attestations view is not narrowly filtered'::text;
+    END IF;
+    IF pg_get_viewdef(to_regclass(format('%I.ameesh_decision_proofs', s)), true)
+       IS DISTINCT FROM pg_get_viewdef('pg_temp.bureau_expected_decision_proofs'::regclass, true)
+       OR NOT EXISTS (SELECT FROM pg_class WHERE oid = to_regclass(format('%I.ameesh_decision_proofs', s))
+                       AND reloptions @> ARRAY['security_barrier=true']) THEN
+        errors := errors || 'decision proofs view is not narrowly filtered'::text;
     END IF;
     -- aucune fonction SECURITY DEFINER exécutable (elle agirait hors de la garde)
     FOR item IN SELECT p.oid::regprocedure AS fn FROM pg_proc p

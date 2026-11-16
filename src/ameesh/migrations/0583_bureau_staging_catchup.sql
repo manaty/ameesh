@@ -6,6 +6,15 @@ CREATE VIEW ameesh_staging_attestations WITH (security_barrier = true) AS
 SELECT id, type, object, project, data, created_at
 FROM ameesh_events WHERE type = 'staging.attested';
 
+CREATE VIEW ameesh_decision_proofs WITH (security_barrier = true) AS
+SELECT id, approver, action, artifact_kind, artifact_hash, decision, nonce,
+       signed_payload, signature, signature_key, created_at, expires_at,
+       consumed_at, consumed_by, unconsumed, unexpired, key_known, key_live,
+       key_matches, key_is_owner
+FROM mesh_approvals_status
+WHERE action = 'decision' AND artifact_kind = 'decision' AND decision = 'approved'
+  AND consumed_at IS NOT NULL AND consumed_by ~ '^decision:[0-9]+$';
+
 create or replace function ameesh_limited_login_guard() returns trigger
 language plpgsql
 set search_path = pg_catalog, pg_temp
