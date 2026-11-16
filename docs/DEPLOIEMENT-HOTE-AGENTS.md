@@ -713,11 +713,20 @@ signé le 16/11/2026 la décision #219407 (option a) : droit root permanent du
 bureau sur `manaty-mesh-1` pour ce seul geste, **jusqu’au 12/12/2026**,
 révocable à tout moment ; à chaque coupure, les quatre étapes `vm.sh` puis le
 retour au commit attesté en cas d’échec, chaque geste déclaré dans le rapport
-de coupure et tracé ; Postgres n’est jamais arrêté. Le droit est porté par
-`RIGHTS` dans `src/ameesh/staging_deferred.py` (projet, hôte, décision, dates) :
-l’alerte le nomme, et après l’échéance elle demande une nouvelle décision ; la
-déclaration d’un geste réussi est alors refusée. Une révocation se fait par PR
-en retirant l’entrée : le geste retombe sous une décision par geste (§10).
+de coupure et tracé ; Postgres n’est jamais arrêté. Aucun hôte, aucune décision
+ni échéance n’est codé en dur : le droit se déclare dans la configuration de
+release, sous `release.projects.<projet>.staging_rights` :
+
+```json
+{"host": "manaty-mesh-1", "decision": 219407, "expires": "2026-12-12"}
+```
+
+La décision n’est qu’une référence : à chaque passage, la garde la relit
+(répondue, signée avec empreinte, non retirée ni remplacée) et refuse le geste
+si elle ne l’est plus ou si l’échéance est passée. Une révocation prend donc
+effet au passage suivant, sans nouvelle release ; retirer l’entrée rend le
+geste à une décision par geste (§10). Une entrée incomplète, une clé inconnue
+ou une date invalide refuse la configuration.
 
 Après les quatre étapes, le bureau déclare le geste depuis le compte qui les a
 exécutées :
@@ -727,13 +736,19 @@ ameesh release catchup --project ameesh --host manaty-mesh-1 \
   --sha <commit actif relevé par vm.sh controler> [--result failed --note "…"]
 ```
 
+`--actor` ne sert qu’à un humain à un terminal (`--actor human:<id>`) ; une
+session liée n’agit que comme elle-même, et seul le bureau (rôle canonique)
+déclare un `ok` — un autre agent est refusé.
+
 La commande écrit l’événement partagé `staging.catchup` (hôte, commit actif,
 tag attesté, résultat, auteur, décision) : c’est la trace. Le rapport de
 coupure suivant nomme le dernier geste déclaré. La garde vérifie elle-même
 l’ascendance du commit (le commit déclaré doit être le tag attesté ou un
-descendant) et ne croit pas la déclaration sur parole ; une déclaration
-`failed` ne lève jamais l’alerte. En cas d’échec : `vm.sh retour`, puis un
-nouveau geste et sa déclaration.
+descendant). Une déclaration n’est **pas** une preuve d’hôte : elle est saisie,
+pas lue sur la machine, et l’alerte de retard reste « non prouvée » jusqu’à une
+attestation de staging qui lit réellement l’hôte ; une déclaration `failed` ne
+lève jamais l’alerte. En cas d’échec : `vm.sh retour`, puis un nouveau geste et
+sa déclaration.
 
 ## Minuteries de rôle de l’observation GitHub (#3327)
 

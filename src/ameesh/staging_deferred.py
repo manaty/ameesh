@@ -24,13 +24,15 @@ or an old catch-up at an ancestor is still a lag, #7365 review).
 
 #7372: the owner gave the bureau a standing root right for this gesture
 (decision #219407, signed 2026-11-16, until 2026-12-12, revocable). The
-bureau's four ``vm.sh`` steps stay a manual gesture; after them, it declares
-the gesture with ``ameesh release catchup``: a ``staging.catchup`` event
-carries the host, the active commit, the attested tag, the result, the author
-and the decision. The next cutoff report names the declared gesture, and the
-guard treats a declared catch-up at or after the attested tag as a proof, so
-a performed gesture is not re-alerted. After the expiry the declaration is
-refused and the alert asks for a new owner decision.
+right comes from the project configuration (``staging_rights``: host,
+decision, expiry), and the decision is re-read on each pass: a withdrawal or
+a superseding decision takes effect without a release. The bureau's four
+``vm.sh`` steps stay a manual gesture; after them, it declares the gesture
+with ``ameesh release catchup``: a ``staging.catchup`` event carries the
+host, the active commit, the attested tag, the result, the author and the
+decision. The next cutoff report names the declared gesture. A declaration is
+a trace, never a proof: it is a typed value, not a read of the host, so the
+lag alert stays until a staging attestation proves the host.
 """
 from __future__ import annotations
 
@@ -50,14 +52,13 @@ CATCHUP_SCHEMA = "ameesh-staging-catchup/1"
 CATCHUP_DAYS = 120
 CATCHUP_LIMIT = 500
 
-#: #219407 (owner, signed 2026-11-16): standing root right of the bureau to
-#: catch up `manaty-mesh-1` after each cutoff, until 2026-12-12, revocable.
-#: A right is not an automation: the four `vm.sh` steps stay the gesture;
-#: this module records it, guards it and reports it.
-RIGHTS = (
-    {"project": "ameesh", "host": "manaty-mesh-1", "decision": 219407,
-     "granted": "2026-11-16", "expires": "2026-12-12"},
-)
+#: #7372: no client host, decision or date is compiled here. A project's
+#: `staging_rights` (release.projects.<project>.staging_rights) names the host,
+#: the owner decision and its expiry; the decision itself is re-read on each
+#: use (answered, signed, not withdrawn or superseded), so a revocation takes
+#: effect on the next pass. A right is not an automation: the four `vm.sh`
+#: steps stay the bureau's gesture; this module records and reports it, and
+#: the guard keeps the lag until a staging attestation proves the host.
 
 
 def _registry_rows(db):
@@ -158,21 +159,59 @@ def _at_least(actif, baseline, repo) -> bool:
 
 
 def right_for(project, host, today=None) -> dict | None:
-    """The standing owner right covering ``host``, with its expiry state.
+    """The configured standing owner right covering ``host``, if any.
 
-    ``project`` is a project object or its name; ``today`` is a date (UTC now
-    by default). None when no standing right names the host: the §10 gesture
-    then stays covered by a decision per gesture, as before #7372.
+    ``project`` is a release project carrying ``staging_rights`` (host,
+    decision, expiry). ``today`` is a date (UTC now by default). None when no
+    right names the host: the §10 gesture then stays a per-gesture decision.
+    This reads the configuration only; `active_right` re-reads the decision.
     """
+    day = today or _dt.datetime.now(_dt.timezone.utc).date()
+    if isinstance(day, str):
+        day = _dt.date.fromisoformat(day)
     name = getattr(project, "name", project)
-    for right in RIGHTS:
-        if right["project"] != name or right["host"] != host:
+    for right in getattr(project, "staging_rights", ()) or ():
+        if right.get("host") != host:
             continue
-        day = today or _dt.datetime.now(_dt.timezone.utc).date()
-        if isinstance(day, str):
-            day = _dt.date.fromisoformat(day)
-        return {**right, "expired": day > _dt.date.fromisoformat(right["expires"])}
+        expires = str(right.get("expires") or "")
+        return {"project": name, "host": host, "decision": right.get("decision"),
+                "expires": expires,
+                "expired": day > _dt.date.fromisoformat(expires)}
     return None
+
+
+def active_right(db, project, host, today=None) -> dict | None:
+    """The right covering ``host``, re-read against the owner decision.
+
+    A configured right is only usable while its decision is answered, signed,
+    withdrawn neither by its requester nor replaced (`superseded_by`), and
+    unexpired. An unreadable decision, or any doubt, never grants the gesture;
+    the next pass sees a revocation without waiting for a release.
+    """
+    right = right_for(project, host, today=today)
+    if right is None:
+        return None
+    if right["expired"]:
+        return {**right, "active": False, "why": "expired"}
+    try:
+        from . import decisions
+        view = decisions.get(db, right["decision"])
+    except Exception as exc:  # noqa: BLE001 - an unreadable authority grants nothing
+        return {**right, "active": False, "why": "decision unreadable: %s" % exc}
+    answer = (view or {}).get("answer") or {}
+    proof = answer.get("proof") if isinstance(answer, dict) else None
+    if (not view or view.get("state") != "answered" or view.get("withdrawn")
+            or view.get("superseded_by") or not isinstance(proof, dict)
+            or not proof.get("digest")):
+        return {**right, "active": False,
+                "why": "decision not answered, withdrawn or superseded"}
+    try:
+        signed, why = decisions.verify_proof(db, view)
+    except Exception as exc:  # noqa: BLE001 - an unverifiable proof grants nothing
+        signed, why = False, "unreadable proof: %s" % exc
+    if not signed:
+        return {**right, "active": False, "why": "decision proof refused: %s" % why}
+    return {**right, "active": True, "why": ""}
 
 
 def declarations(db, project) -> dict[str, dict]:
@@ -241,8 +280,8 @@ def declare(db, project, host, sha, base, result, actor, note="") -> dict:
     sha = str(sha or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("sha: the full 40-hex active commit is required")
-    right = right_for(project, host)
-    if result == "ok" and (right is None or right["expired"]):
+    right = active_right(db, project, host)
+    if result == "ok" and (right is None or not right.get("active")):
         raise ValueError("no active owner root right covers %s" % host)
     name = getattr(project, "name", project)
     payload = {
@@ -280,7 +319,7 @@ def annotate(db, project, staging) -> dict:
         return staging
     found = declarations(db, project)
     staging["catchups"] = {host: found[host] for host in hosts if host in found}
-    rights = {host: right_for(project, host) for host in hosts}
+    rights = {host: active_right(db, project, host) for host in hosts}
     staging["rights"] = {host: right for host, right in rights.items() if right}
     return staging
 
@@ -303,18 +342,18 @@ def _evidence(rows, index, host) -> dict | None:
     return None
 
 
-def _proved_since(rows, index, host, baseline, repo, declaration=None) -> bool:
-    """A declared catch-up or a newer attestation proves the host caught up.
+def _proved_since(rows, index, host, baseline, repo) -> bool:
+    """A newer staging attestation proves the host caught up (#7365).
 
-    #7365: a newer attestation may prove the host, if the root path was
-    given and `--absent` removed. #7372: the bureau's declared catch-up is
-    the other proof; its commit is checked like an attestation's (the tagged
-    one or a descendant), so an old catch-up or a rollback at an ancestor
-    still leaves the lag in place. A failed declaration proves nothing.
+    This is the other outcome — the root path was given and `--absent`
+    removed. The proof must name the host's active commit, at the tagged
+    commit or after it: an old catch-up or a rollback at an ancestor leaves
+    the lag in place. A report older than a proof is history, not a lag.
+
+    #7372: a declared gesture is deliberately NOT a proof. It is a typed
+    value, not a read of the host; it is reported next to the lag and never
+    silences it. Only an attestation that read the host can.
     """
-    if isinstance(declaration, dict) and declaration.get("result") == "ok":
-        if _at_least(declaration.get("sha"), baseline, repo):
-            return True
     preuve = _evidence(rows, index, host)
     return preuve is not None and _at_least(preuve.get("actif"), baseline, repo)
 
@@ -335,7 +374,7 @@ def _last_proof(rows, start, hosts, by_commit) -> dict:
     return out
 
 
-def _text(project, tag, data, deferred, proofs, declarations=None, today=None) -> str:
+def _text(project, tag, data, deferred, proofs, declarations=None, rights=None) -> str:
     """The alert body: the tag not deployed, the reason, the right, the gesture."""
     hosts = sorted(deferred)
     lines = ["Staging %s : le tag %s (%s) n'est pas déployé sur %s."
@@ -354,24 +393,28 @@ def _text(project, tag, data, deferred, proofs, declarations=None, today=None) -
                             proof.get("date") or "date inconnue"))
         else:
             lines.append("  aucune attestation de staging n'a jamais prouvé cet hôte")
-        right = right_for(project, host, today=today)
-        if right is not None:
-            if right["expired"]:
+        right = (rights or {}).get(host)
+        if isinstance(right, dict):
+            if right.get("expired"):
                 lines.append("  droit root #%d expiré le %s : le geste n'est plus "
                              "autorisé ; demander une décision owner avant de le "
-                             "reprendre." % (right["decision"], right["expires"]))
+                             "reprendre." % (right.get("decision"), right.get("expires")))
+            elif not right.get("active"):
+                lines.append("  droit root #%d retiré ou illisible (%s) : demander une "
+                             "décision owner avant de le reprendre."
+                             % (right.get("decision"), right.get("why") or "inconnu"))
             else:
-                lines.append("  droit root du bureau : décision #%d (owner, signée le "
-                             "%s), valable jusqu'au %s ; geste déclaré au rapport de "
-                             "coupure et tracé (`ameesh release catchup`)."
-                             % (right["decision"], right["granted"], right["expires"]))
+                lines.append("  droit root du bureau : décision #%d (owner), valable "
+                             "jusqu'au %s ; geste déclaré au rapport de coupure et "
+                             "tracé (`ameesh release catchup`), sans valeur de preuve."
+                             % (right.get("decision"), right.get("expires")))
         declared = (declarations or {}).get(host)
         if isinstance(declared, dict):
-            lines.append("  dernier geste déclaré : commit %s (%s, %s, par %s)"
-                         % ((declared.get("sha") or "")[:12],
-                            declared.get("result") or "?",
-                            declared.get("date") or "date inconnue",
-                            declared.get("actor") or "auteur inconnu"))
+            lines.append("  dernier geste déclaré (trace, non prouvé) : commit %s (%s, "
+                         "%s, par %s)" % ((declared.get("sha") or "")[:12],
+                                          declared.get("result") or "?",
+                                          declared.get("date") or "date inconnue",
+                                          declared.get("actor") or "auteur inconnu"))
     lines += [
         "§14 : un hôte reporté est rattrapé, jamais reporté en permanence ; la coupure "
         "suivante ne redescend jamais sous ce commit. Ce n'est pas le report du poste "
@@ -410,15 +453,15 @@ def tick(cfg, db, project, today=None) -> dict:
     repo = getattr(project, "repo", "")
     declared = declarations(db, project)
     deferred = {host: detail for host, detail in _deferred(data).items()
-                if not _proved_since(rows, index, host, baseline_sha, repo,
-                                     declaration=declared.get(host))}
+                if not _proved_since(rows, index, host, baseline_sha, repo)}
     if not deferred:
         return report
     proofs = _last_proof(rows, index, deferred, by_commit)
+    rights = {host: active_right(db, project, host, today=today) for host in deferred}
     key = json.dumps({"tag": tag["tag"], "hosts": sorted(deferred)}, sort_keys=True)
     report.update({"tag": tag["tag"], "version": tag.get("version") or "",
                    "hosts": sorted(deferred), "key": key,
-                   "rights": {host: right_for(project, host) for host in deferred},
+                   "rights": {host: right for host, right in rights.items() if right},
                    "declarations": {host: declared[host] for host in deferred
                                     if host in declared}})
     lock = str(Path(cfg.state_dir) / "release" / "release.lock")
@@ -431,7 +474,7 @@ def tick(cfg, db, project, today=None) -> dict:
         if not targets:
             report["result"] = "already-sent"
             return report
-        text = _text(project, tag, data, deferred, proofs, declared, today=today)
+        text = _text(project, tag, data, deferred, proofs, declared, rights)
         from . import mail, work
         for target in targets:
             mail.send(db, work.SYSTEM_SENDER, target, text, kind="event",

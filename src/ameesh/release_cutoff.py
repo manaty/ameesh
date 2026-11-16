@@ -1135,6 +1135,43 @@ def generate_notes(*, project: "ProjectRelease", repo: str, since: str, target: 
 # configuration
 # --------------------------------------------------------------------------
 
+def _staging_rights(project: str, raw) -> tuple:
+    """#7372: parse the standing staging rights of a release project.
+
+    Each entry is `{"host": …, "decision": <id>, "expires": "YYYY-MM-DD"}`.
+    The decision is only a reference here; the guard re-reads it (answered,
+    signed, not withdrawn or superseded) before any use. An invalid entry is
+    refused at configuration time, never silently ignored.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ReleaseError("release.projects.%s.staging_rights: a list is required" % project)
+    out = []
+    for index, item in enumerate(raw):
+        where = "release.projects.%s.staging_rights[%d]" % (project, index)
+        if not isinstance(item, dict):
+            raise ReleaseError("%s: an object is required" % where)
+        unknown = set(item) - {"host", "decision", "expires"}
+        if unknown:
+            raise ReleaseError("%s: unknown key(s) %s" % (where, ", ".join(sorted(unknown))))
+        host = item.get("host")
+        if not isinstance(host, str) or not host.strip():
+            raise ReleaseError("%s.host is required" % where)
+        decision = item.get("decision")
+        if (not isinstance(decision, int) or isinstance(decision, bool) or decision <= 0):
+            raise ReleaseError("%s.decision: a positive integer is required" % where)
+        expires = item.get("expires")
+        if not isinstance(expires, str):
+            raise ReleaseError("%s.expires: an ISO date is required" % where)
+        try:
+            _dt.date.fromisoformat(expires)
+        except ValueError as exc:
+            raise ReleaseError("%s.expires: an ISO date is required (%s)" % (where, exc)) from exc
+        out.append({"host": host.strip(), "decision": decision, "expires": expires})
+    return tuple(out)
+
+
 @dataclasses.dataclass(frozen=True)
 class ProjectRelease:
     name: str
@@ -1157,6 +1194,12 @@ class ProjectRelease:
     #: then attests (`ameesh release attest`, #6020); no staging credential here.
     staging_handoff: str = ""
     attestation_timeout_s: float = ATTESTATION_TIMEOUT_S
+    #: #7372: standing owner root rights of the bureau, per host. Each entry
+    #: names the decision and its expiry; the decision is re-read at each use
+    #: (answered, signed, not withdrawn or superseded), so a revocation takes
+    #: effect on the next pass, without a release. Nothing client-specific is
+    #: compiled here: the host, decision and date come from the configuration.
+    staging_rights: tuple = ()
 
     @classmethod
     def from_config(cls, cfg, name: str, entry: dict) -> "ProjectRelease":
@@ -1165,7 +1208,7 @@ class ProjectRelease:
         unknown = set(entry) - {"repo", "target", "remote", "staging", "report",
                                 "github", "window_s", "staging_timeout_s", "staging_executor",
                                 "lock_ttl_s", "lock_wait_s", "version_bump", "model",
-                                "staging_handoff", "attestation_timeout_s"}
+                                "staging_handoff", "attestation_timeout_s", "staging_rights"}
         if unknown:
             raise ReleaseError("release.projects.%s: unknown key(s) %s"
                                % (name, ", ".join(sorted(unknown))))
@@ -1197,6 +1240,7 @@ class ProjectRelease:
             # #6039 N4: canonicalize an alias as early as the configuration,
             # without the registry (which the tick reads before any tag).
             handoff = canonical_handoff(cfg, None, handoff)
+        rights = _staging_rights(name, entry.get("staging_rights", []))
         elected_role = ((getattr(cfg, "release", None) or {}).get("role")
                         or (getattr(cfg, "packet_watch", None) or {}).get("role"))
         executor = entry.get("staging_executor")
@@ -1234,6 +1278,7 @@ class ProjectRelease:
             lock_ttl_s=number("lock_ttl_s", LOCK_TTL_S),
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
             suite_tolerated=tolerated, model=model, staging_handoff=handoff or "",
+            staging_rights=rights,
             attestation_timeout_s=number("attestation_timeout_s", ATTESTATION_TIMEOUT_S))
 
 
@@ -2910,7 +2955,8 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
                      else "rattrapage requis, jamais en dessous (§14)")
             declared = (catchups.get(host) if isinstance(catchups, dict) else None)
             if isinstance(declared, dict):
-                suite += (" ; dernier geste déclaré : commit %s (%s, %s, par %s)"
+                suite += (" ; dernier geste déclaré (trace, non prouvé) : commit %s "
+                          "(%s, %s, par %s)"
                           % (str(declared.get("sha") or "")[:12],
                              declared.get("result") or "?",
                              declared.get("date") or "date inconnue",
@@ -2918,11 +2964,14 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
             elif host != STAGING_POSTE:
                 right = (rights.get(host) if isinstance(rights, dict) else None)
                 if isinstance(right, dict):
+                    if right.get("expired"):
+                        state = "expiré le %s" % right.get("expires")
+                    elif right.get("active"):
+                        state = "actif jusqu'au %s" % right.get("expires")
+                    else:
+                        state = "retiré : %s" % (right.get("why") or "inconnu")
                     suite += (" ; aucun geste déclaré (droit #%d %s)"
-                              % (right.get("decision"),
-                                 "expiré le %s" % right.get("expires")
-                                 if right.get("expired")
-                                 else "actif jusqu'au %s" % right.get("expires")))
+                              % (right.get("decision"), state))
             lines.append("  - %s: REPORTÉ (%s) — non déployé au tag %s ; %s"
                          % (host, raison, tag, suite))
         if staging.get("error"):

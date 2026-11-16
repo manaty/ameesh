@@ -730,18 +730,67 @@ def _elected_tick(cfg, args):
         min_left=0, dry_run=False, json=False), credentials=credentials)
 
 
+def _catchup_actor(cfg, db, explicit) -> str:
+    """#7372: only the bureau, or a human at a terminal, declares the gesture.
+
+    A bound session acts as itself and must be the bureau (its Agent card names
+    the role; `tenancy.operator` applies the same rule for infrastructure
+    gestures). `--actor` never lets an agent act on behalf of another, and an
+    unbound session may only name a known human. A root catch-up is not a
+    generic agent gesture: the owner's decision (#219407) names the bureau.
+    """
+    from . import agent_names, canon, identity, release_cutoff, sous_utilisation
+    text = agent_names.resolve((explicit or "").strip(), db=db,
+                               operation="release.catchup")
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise release_cutoff.ReleaseError(
+            "catchup identity refused: %s" % (binding.reason or "invalid session identity"))
+    if binding.name:
+        if text and text != binding.name:
+            raise release_cutoff.ReleaseError(
+                "this session belongs to %s; it does not declare on behalf of %s"
+                % (binding.name, text))
+        name = binding.name
+        if name.startswith(work.HUMAN_PREFIX):
+            return name
+        try:
+            canons = canon.load_configured(cfg) if cfg is not None else []
+            if name in sous_utilisation.role_orchestrators(canons, ("bureau",)):
+                return name
+        except Exception as exc:  # noqa: BLE001 - an unreadable authority refuses
+            raise release_cutoff.ReleaseError(
+                "cannot read the bureau role of %s: %s" % (name, exc)) from exc
+        raise release_cutoff.ReleaseError(
+            "%s is not the bureau: the root catch-up is the bureau's gesture "
+            "(#219407)" % name)
+    if not text:
+        raise release_cutoff.ReleaseError(
+            "no bound session identity: a human at a terminal names itself with "
+            "--actor human:<id>; an agent session must be bound to the bureau")
+    if not text.startswith(work.HUMAN_PREFIX):
+        raise release_cutoff.ReleaseError(
+            "an unbound session cannot declare as %r: only a bound bureau or a "
+            "human terminal" % text)
+    human = work.known_human(db, text[len(work.HUMAN_PREFIX):], cfg)
+    if not human:
+        raise release_cutoff.ReleaseError("%s is not a known human" % text)
+    return human
+
+
 def _catchup(cfg, args) -> int:
     """`ameesh release catchup` (#7372): declare the bureau's root gesture.
 
     The four `vm.sh` steps stay the bureau's manual gesture; this command
     records its outcome as a durable `staging.catchup` event, with the host,
     the active commit read from `controler`, the attested tag, the author and
-    the standing owner right. The guard checks the commit ancestry itself: a
-    declaration never proves anything by itself. The owner's right expires on
-    2026-12-12; after that, an `ok` declaration is refused until a new
-    decision is signed.
+    the owner right read from the project configuration. A declaration is a
+    trace, not a proof: the guard keeps the lag until a staging attestation
+    reads the host. `ok` is refused after the right's expiry or if its signed
+    decision is withdrawn or superseded.
     """
-    from . import identity, release_cutoff, staging_deferred
+    from . import release_cutoff, staging_deferred
     from .db import open_db
     try:
         project = release_cutoff.projects(cfg).get(args.project)
@@ -755,21 +804,15 @@ def _catchup(cfg, args) -> int:
                 print("%s: %s is not reported by the latest tagged staging "
                       "attestation; nothing to declare" % (project.name, args.host))
                 return 0
-            right = staging_deferred.right_for(project, args.host)
-            if args.result == "ok" and (right is None or right["expired"]):
+            right = staging_deferred.active_right(db, project, args.host)
+            if args.result == "ok" and (right is None or not right.get("active")):
                 raise release_cutoff.ReleaseError(
                     "no active owner root right covers %s: %s"
-                    % (args.host, "decision #%d expired on %s"
-                       % (right["decision"], right["expires"]) if right
-                       else "none"))
-            actor = args.actor
-            if not actor:
-                binding = identity.resolve_binding(cfg, db)
-                if binding.ok and binding.name:
-                    actor = binding.name
-            if not actor:
-                raise release_cutoff.ReleaseError(
-                    "--actor: name who performed the gesture (no bound session identity)")
+                    % (args.host, "decision #%s %s"
+                       % (right.get("decision"), right.get("why") or "inactive")
+                       if right else "none configured in release.projects.%s."
+                       "staging_rights" % project.name))
+            actor = _catchup_actor(cfg, db, args.actor)
             row = staging_deferred.declare(
                 db, project, args.host, args.sha, base, args.result, actor, args.note)
         finally:
@@ -778,7 +821,7 @@ def _catchup(cfg, args) -> int:
         print("error: %s" % exc, file=sys.stderr)
         return 1
     print("staging catch-up declared: %s %s at %s (%s, tag %s, event %s); "
-          "the next cutoff report names it"
+          "trace only, the alert stays until an attestation proves the host"
           % (project.name, row["host"], row["sha"][:12], row["result"],
              row["tag"] or "?", row.get("event")))
     return 0
@@ -1003,8 +1046,8 @@ def add_parser(sub, func) -> None:
     catchup_p.add_argument("--note", default="",
                            help="what happened, for a failure or a partial gesture")
     catchup_p.add_argument("--actor", default="",
-                           help="who performed the gesture (default: the bound session "
-                                "identity)")
+                           help="a human terminal names itself (human:<id>); a bound "
+                                "session acts as itself and must be the bureau")
     catchup_p.set_defaults(func=func)
     attest_p = rel.add_parser(
         "attest", help="#6020: the staging agent attests a handed-over Nexlink staging "
