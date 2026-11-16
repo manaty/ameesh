@@ -46,7 +46,7 @@ class UndispatchedPartsTest(unittest.TestCase):
         self.plan = {w: {"expected_sha": SHA} for w in PARTS}
         self.plan["sql-invariant.yml"].update(base_sha="a" * 40, head_sha=SHA)
         self.enter(mock.patch.object(ci.storage, "of", return_value=self.st))
-        self.enter(mock.patch.object(work, "milestones", return_value=[dict(kind="frozen", sha=SHA)]))
+        self.enter(mock.patch.object(work, "milestones", return_value=[dict(kind="frozen", sha=SHA, at_ts=self.observed - ci.PENDING_ALERT)]))
         self.gate = self.enter(mock.patch.object(merge_queue, "review_gate_for_item",
                                                 return_value={"ok": True}))
         self.planner = self.enter(mock.patch.object(ci, "_dispatch_plan", return_value=self.plan))
@@ -113,6 +113,27 @@ class UndispatchedPartsTest(unittest.TestCase):
         self.assertFalse(ci.SUITE_RE.search("civil-crypto.yml"))
         self.assertTrue(all("head_sha=" + SHA in p and "branch=" + ci._q(BRANCH) in p
                             for p in self.paths if "/runs?" in p))
+
+    def test_grace_after_go_survives_restart_and_expires_at_boundary(self):
+        marks = [dict(kind="frozen", sha=SHA, at_ts=self.observed - 600),
+                 dict(kind="verdict", verdict="ok", sha=SHA[:12], at_ts=self.observed)]
+        with mock.patch.object(work, "milestones", return_value=marks):
+            self.assertEqual(self.observe(), [])
+            self.observed += ci.PENDING_ALERT - 1
+            self.watcher = ci.Watcher(self.cfg, api=self.api, log=self.logs.append,
+                                      clock=lambda: self.observed)
+            with mock.patch.object(self.watcher, "_merge_pilot", return_value="pilot"):
+                self.assertEqual(self.observe(), [])
+                self.planner.assert_not_called()
+                self.send.assert_not_called()
+                self.observed += 1
+                self.assertEqual(len(self.observe()), 1)
+
+    def test_other_head_milestones_do_not_renew_grace(self):
+        marks = [dict(kind="frozen", sha=SHA, at_ts=self.observed - 600),
+                 dict(kind="verdict", sha="b" * 40, at_ts=self.observed)]
+        with mock.patch.object(work, "milestones", return_value=marks):
+            self.assertEqual(len(self.observe()), 1)
 
     def test_queue_running_and_terminal_runs_are_all_already_dispatched(self):
         for status in ("queued", "pending", "in_progress", "completed"):
