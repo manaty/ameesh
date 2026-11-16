@@ -9,12 +9,15 @@ remplacée, pas doublée) ; sans clone, la passe est un avertissement, jamais un
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import shlex
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from ameesh import role_timers
 
@@ -292,6 +295,34 @@ class InstallTest(unittest.TestCase):
         problems = role_timers.check(report, directory=self.dir, apply=False)
         self.assertTrue(any("ameesh-paquet-horaire.timer is out of date" in text
                             for text in problems))
+
+    def test_failed_packet_timer_names_bounded_pause_and_stays_red(self):
+        report = plan()
+        role_timers.install(report, directory=self.dir, apply=False)
+        for operation, timer in (("is-active", "ameesh-paquet-horaire.timer"),
+                                 ("is-enabled", "ameesh-paquet-horaire.timer"),
+                                 ("is-active", "ameesh-role-github-watch.timer")):
+            with self.subTest(operation=operation, timer=timer):
+                def systemctl(*args, **kwargs):
+                    failed = args[0] == operation and args[-1] == timer
+                    return subprocess.CompletedProcess(args, int(failed), stdout="", stderr="")
+
+                with mock.patch.object(role_timers, "_systemctl", side_effect=systemctl):
+                    problems = role_timers.check(report, directory=self.dir)
+                    self.assertEqual(len(problems), 1)
+                    text = problems[0]
+                    if timer == "ameesh-paquet-horaire.timer":
+                        self.assertIn("scripts/paquet-horaire.py pause --until <deadline> --reason <why>", text)
+                        self.assertIn("bounded pause, #4361; leave the timer active", text)
+                        self.assertIn("never systemctl stop", text)
+                        self.assertIn("systemctl --user enable --now ameesh-paquet-horaire.timer", text)
+                    else:
+                        self.assertEqual(text, "github-watch: %s is not active" % timer)
+                    args = SimpleNamespace(check=True, systemd_dir=str(self.dir),
+                                           no_apply=False, bin=role_timers.DEFAULT_BIN,
+                                           role="auditeur", json=False)
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(role_timers._run_action(args, report, db=None), 1)
 
 
 if __name__ == "__main__":

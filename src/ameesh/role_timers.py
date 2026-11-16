@@ -1333,12 +1333,18 @@ def check(report: dict, *, directory: Path, apply: bool = True,
                 problems.append("%s: %s is out of date; rerun `ameesh role timers --install`"
                                 % (spec.name, name))
         if apply and (directory / spec.timer).is_file():
+            pause_hint = (
+                "; to hold packets use `scripts/paquet-horaire.py pause --until <deadline> "
+                "--reason <why>` "
+                "(bounded pause, #4361; leave the timer active), never systemctl stop; "
+                "to restore it: systemctl --user enable --now ameesh-paquet-horaire.timer"
+                if spec.name == PAQUET_PASS else "")
             enabled = _systemctl("is-enabled", "--quiet", spec.timer)
             if enabled.returncode != 0:
-                problems.append("%s: %s is not enabled" % (spec.name, spec.timer))
+                problems.append("%s: %s is not enabled%s" % (spec.name, spec.timer, pause_hint))
             active = _systemctl("is-active", "--quiet", spec.timer)
             if active.returncode != 0:
-                problems.append("%s: %s is not active" % (spec.name, spec.timer))
+                problems.append("%s: %s is not active%s" % (spec.name, spec.timer, pause_hint))
             else:
                 reason = stalled(spec.timer)
                 if reason:
