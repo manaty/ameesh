@@ -242,6 +242,14 @@ class AbandonTests(unittest.TestCase):
         state = rc.load_state(self.cfg)
         self.assertEqual(state["projects"]["ameesh"], {"last_result": "released"})
 
+    def test_an_older_pending_does_not_move_the_recorded_slot_backwards(self):
+        self.write_state(pending(), last_cutoff=1794826800.0)
+        nx.abandon(self.cfg, self.db, self.project, now=1794827000.0,
+                   reason="red SQL invariant", actor="mesh-design")
+        self.assertEqual(self.slot()["last_cutoff"], 1794826800.0)
+        self.assertEqual(self.slot()["abandoned_pending"]["cutoff_at"],
+                         1794823200.0)
+
     def assert_refused(self, pattern, *, pending_kept=True):
         with self.assertRaisesRegex(rc.ReleaseError, pattern):
             nx.abandon(self.cfg, self.db, self.project, now=1794824000.0,

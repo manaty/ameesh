@@ -1117,7 +1117,11 @@ def abandon(cfg, db, project, *, now, reason, actor):
                      base=pending.get("base"), integration=pending.get("integration"),
                      cutoff_at=pending.get("cutoff_at"), label=pending.get("label"),
                      red=red, failures=failures, by=actor, why=text, at=now)
-        slot.update(last_cutoff=pending["cutoff_at"], last_result="refused-ci",
+        # Never move the recorded slot backwards (a tick may already have
+        # recorded a later one before an older candidate is abandoned).
+        slot.update(last_cutoff=max(float(slot.get("last_cutoff") or 0),
+                                    float(pending["cutoff_at"])),
+                    last_result="refused-ci",
                     last_label=pending.get("label"),
                     abandoned_integration=dict(ref=pending["integration"],
                                                sha=pending["sha"]))
