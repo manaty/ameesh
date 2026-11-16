@@ -22,7 +22,8 @@ class WorkerDiagnosticsTest(unittest.TestCase):
             'config.load': Mock(return_value={}),
             'db_mod.connect': Mock(return_value=database),
             'enrollment': Mock(return_value=policy),
-            'private_json': Mock(side_effect=[{}, credentials or {'secret_key': 'private-token'}]),
+            'private_json': Mock(return_value={}),
+            'credential_json': Mock(return_value=credentials or {'secret_key': 'private-token'}),
             'Scaleway': Mock(),
             'tick_host': Mock(return_value='inactive'),
         }
@@ -58,7 +59,7 @@ class WorkerDiagnosticsTest(unittest.TestCase):
         for error, expected in [(OSError('private-token'), 'OSError'),
                                 (vm.Refused('invalid private JSON'), 'invalid private JSON')]:
             code, output, mocks, _ = self.run_worker(
-                'private_json', [ {}, error ])
+                'credential_json', error)
             self.assertEqual(code, 1)
             self.assertIn('at credentials: ' + expected + ';', output)
             self.assertNotIn('private-token', output)
@@ -123,9 +124,9 @@ class PrivateJsonDiagnosticsTest(unittest.TestCase):
     def test_worker_identifies_file_and_condition(self):
         for stage in ('enrollment', 'credentials'):
             error = vm.Refused('private file uid must match effective uid')
-            failures = error if stage == 'enrollment' else [{}, error]
+            reader = 'private_json' if stage == 'enrollment' else 'credential_json'
             code, output, mocks, _ = WorkerDiagnosticsTest().run_worker(
-                'private_json', failures)
+                reader, error)
             self.assertEqual(code, 1)
             self.assertIn('at ' + stage + ': private file uid must match effective uid;', output)
             mocks['tick_host'].assert_not_called()
