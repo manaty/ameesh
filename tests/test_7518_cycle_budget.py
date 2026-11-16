@@ -161,10 +161,10 @@ class CycleBudgetTest(PgTestCase):
                 '--observed-at', (self.now - timedelta(minutes=1)).isoformat(),
                 '--expires-at', (self.now + timedelta(days=30)).isoformat(),
                 '--fresh-until', (self.now + timedelta(days=1)).isoformat(),
-                '--source', 'fixture: owner reading')
+                '--source', 'fixture: owner reading', '--billing-lag-seconds', '0')
         refused = self.mesh(*args, env=self.env(AGENT_MAIL_NAME='test-agent'))
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn('only an authorized human', refused.stderr)
+        self.assertIn('bound session identity', refused.stderr)
         self.assertIsNone(self.api.cycle_status(self.account))
         proc = self.mesh(*args, env=self.env(AMEESH_HUMANS='chef', USER='chef'))
         self.assertEqual(proc.returncode, 0, proc.stderr)
