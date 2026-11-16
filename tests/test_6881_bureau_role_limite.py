@@ -172,6 +172,14 @@ class BureauRoleLimiteTest(PgTestCase):
                 "options": [{"key": "a", "label": "fixture", "grant": {
                     "gesture": "root", "beneficiary": "bureau", "host": "server",
                     "expires": "2099-12-12"}}]}
+        # Persist the real request: exercise get, supersession and signature
+        # verification through a separate authenticated limited connection.
+        request = storage.of(self.db).decisions.create(
+            sender="bureau", recipient="human:fixture-owner", body="fixture grant",
+            payload={"decision": {**view, "needs_signature": True}},
+            work_item_id=None, host=self.cfg.host)
+        identifier = int(request["id"])
+        view = decisions.get(self.db, identifier)
         digest = decisions.answer_digest(view, "a", "a", "human:fixture-owner")
         authority.create_approval(self.db, seed, approver="fixture-owner", action="decision",
                                   artifact_kind="decision", artifact_hash=digest, ttl=900)
@@ -180,24 +188,49 @@ class BureauRoleLimiteTest(PgTestCase):
             proofs = storage.of(limited).approvals
             self.assertEqual(proofs.recent(action="decision", artifact_hash=digest,
                                            limit=20, proof_only=True), [])
-            row, verdict = authority.find_approval(self.db, "decision", digest, consume_by="decision:123")
+            row, verdict = authority.find_approval(self.db, "decision", digest, consume_by="decision:%d" % identifier)
             self.assertTrue(verdict.ok)
             view["answer"] = {"text": "a", "option": "a", "by": "human:fixture-owner",
                               "proof": {"digest": digest, "approval_id": row["id"]}}
-            self.assertTrue(decisions.verify_proof(limited, view, public_only=True)[0])
+            self.db.execute(
+                "UPDATE agent_mailbox SET payload = jsonb_set(payload, '{decision,answer}', %s::jsonb)"
+                " WHERE id = %s", (json.dumps(view["answer"]), identifier))
+            read = decisions.get(limited, identifier)
+            self.assertEqual(read["answer"], view["answer"])
+            self.assertIsNone(storage.of(limited).decisions.supersession(identifier))
+            decisions.require_current(limited, read, public_only=True)
+            self.assertTrue(decisions.verify_proof(limited, read, public_only=True)[0])
+            from ameesh import staging_migrations
+            self.assertTrue(staging_migrations.decision_verifier(limited, "ameesh")(
+                identifier, 456, "a"))
+            self.refused("INSERT INTO decision_supersessions VALUES (1, 2, 'bureau', now(), '{}')",
+                         "permission denied")
+            self.refused("UPDATE decision_supersessions SET person = 'bureau'", "permission denied")
+            self.refused("DELETE FROM decision_supersessions", "permission denied")
             project = types.SimpleNamespace(name="ameesh", staging_rights=[{
                 "gesture": "root", "beneficiary": "bureau", "host": "server",
-                "expires": "2099-12-12", "decision": 123, "option": "a", "lot": 456}])
-            with mock.patch.object(decisions, "get", return_value=view):
-                self.assertTrue(staging_deferred.active_right(limited, project, "server")["active"])
-                declared = staging_deferred.declare(
-                    limited, project, "server", "a" * 40, {"sha": "a" * 40, "tag": "v1"},
-                    "ok", "bureau")
-                self.assertGreater(declared["event"], 0)
+                "expires": "2099-12-12", "decision": identifier, "option": "a", "lot": 456}])
+            self.assertTrue(staging_deferred.active_right(limited, project, "server")["active"])
+            declared = staging_deferred.declare(
+                limited, project, "server", "a" * 40, {"sha": "a" * 40, "tag": "v1"},
+                "ok", "bureau")
+            self.assertGreater(declared["event"], 0)
             with self.assertRaises(db_mod.DbError):
                 proofs.recent(action="decision", artifact_hash=digest, limit=20)
         finally:
             limited.close()
+
+    def test_migration_grants_existing_bureau_login_the_public_journal(self):
+        self.db.execute('REVOKE SELECT ON decision_supersessions FROM "%s"' % self.login)
+        self.refused("SELECT * FROM decision_supersessions", "permission denied")
+        migration = os.path.join(REPO, "src", "ameesh", "migrations",
+                                 "0583_bureau_staging_catchup.sql")
+        with open(migration, encoding="utf-8") as source:
+            sql = source.read()
+        self.db.execute(sql[sql.index("DO $bureau_supersessions$"):])
+        self.assertEqual(self.sql("SELECT * FROM decision_supersessions").returncode, 0)
+        audit = self.script("_contrat-bureau.sql")
+        self.assertEqual(audit.returncode, 0, audit.stderr)
 
     # -- installation et audit ---------------------------------------------
     def test_l_audit_seul_passe_puis_refuse_un_droit_en_trop(self):

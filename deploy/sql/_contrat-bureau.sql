@@ -19,6 +19,7 @@
 SELECT set_config('ameesh.bureau_role', :'role', false),
        set_config('ameesh.bureau_agent', :'agent', false),
        set_config('ameesh.bureau_host', :'host', false) \g /dev/null
+-- Includes SELECT-only decision_supersessions for current owner authority.
 \ir _bureau-droits.sql
 -- Compare the view's actual query with the narrow specification as parsed
 -- by PostgreSQL (no fragile whitespace comparison of hand-written SQL).

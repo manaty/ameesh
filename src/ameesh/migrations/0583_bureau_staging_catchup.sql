@@ -176,3 +176,14 @@ begin
     return new;
 end $$;
 
+-- Existing enrolled bureau logins need the public replacement journal too.
+DO $bureau_supersessions$
+DECLARE login record;
+BEGIN
+    FOR login IN SELECT rolname FROM limited_logins WHERE agent = 'bureau'
+    LOOP
+        EXECUTE format('GRANT SELECT ON %I.decision_supersessions TO %I',
+                       current_schema(), login.rolname);
+    END LOOP;
+END
+$bureau_supersessions$;

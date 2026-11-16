@@ -50,6 +50,8 @@ INSERT INTO pg_temp.bureau_spec(rel, priv, cols) VALUES
   ('ameesh_staging_attestations','SELECT',NULL),
   -- Public signatures already consumed by a decision, never usable approvals.
   ('ameesh_decision_proofs','SELECT',NULL),
+  -- Append-only public replacement evidence, required by owner authority gates.
+  ('decision_supersessions','SELECT',NULL),
   ('ameesh_events','SELECT',ARRAY['id']),
   ('ameesh_events','INSERT',ARRAY['type','object','project','data','created_at']),
   -- lots (lecture) et prise #6839 (écriture bornée par 0567)

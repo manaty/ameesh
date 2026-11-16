@@ -361,7 +361,7 @@ def _supersession_timestamp(value) -> float | None:
         return None
 
 
-def require_current(db, view: dict, *, reader=None) -> None:
+def require_current(db, view: dict, *, reader=None, public_only: bool = False) -> None:
     """Refuse authority replaced by a signed decision, proven from the log
     (#4991, #4995).
 
@@ -402,7 +402,7 @@ def require_current(db, view: dict, *, reader=None) -> None:
         raise DecisionError(
             "decision #%d: the logged replacement #%d is not a signed replacement: "
             "authority refused" % (identifier, replacement_id))
-    ok, why = verify_proof(db, replacement)
+    ok, why = verify_proof(db, replacement, public_only=public_only)
     if not ok:
         raise DecisionError(
             "decision #%d: the logged replacement #%d is not proven (%s): authority refused"

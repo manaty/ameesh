@@ -618,8 +618,8 @@ def decision_verifier(db, project):
                                   if isinstance(entry, dict)}):
             return False
         try:
-            decisions.require_current(db, view)
-            return decisions.verify_proof(db, view)[0]
+            decisions.require_current(db, view, public_only=True)
+            return decisions.verify_proof(db, view, public_only=True)[0]
         except decisions.DecisionError:
             return False
     return verify
