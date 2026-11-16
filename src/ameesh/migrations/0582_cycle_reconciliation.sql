@@ -1,7 +1,7 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- #7520: explicit billing lag and append-only operator reconciliation evidence.
 alter table credit_cycles add column if not exists billing_lag_seconds bigint
-    not null default 0 check (billing_lag_seconds >= 0);
+    not null default 0;
 create table if not exists credit_reconciliations (
     id bigserial primary key,
     billing_account text not null,
