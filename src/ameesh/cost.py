@@ -1839,8 +1839,13 @@ class CostBook:
                                                 rate=rates.get(g.key, 0.0))), g)
                                for g in held), key=lambda pair: pair[0])
             # #4781 : `@epoch`, voir `accounts.pause_label`
-            head = "pause (account %s, %s %.0f %%) until %s@%d; " % (
-                DEFAULT_ACCOUNT_LABEL, gauge.key, gauge.used * 100,
+            # #7572 : la nature de l'échéance est dite comme dans
+            # `accounts.pause_label` — `reset` (remise à zéro de la fenêtre,
+            # fixe) ou `pace` (rattrapage du rythme, révisable).
+            nature = (" reset" if gauge.resets_at is not None
+                      and float(free) >= float(gauge.resets_at) - 1.0 else " pace")
+            head = "pause (account %s, %s %.0f %%%s) until %s@%d; " % (
+                DEFAULT_ACCOUNT_LABEL, gauge.key, gauge.used * 100, nature,
                 until_label(free, now), int(free) // 60 * 60)
         else:
             gauge = held[0]

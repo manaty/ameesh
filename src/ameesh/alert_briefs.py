@@ -100,6 +100,11 @@ REMIND_AFTER_S = 6 * 3600.0
 #: 10 à 25 min plus tard sur le même compte et la même fenêtre ; c'est le même
 #: épisode tant que l'absence continue reste sous ce seuil.
 FAMILY_PAUSE_GAP_S = 45 * 60.0
+#: #7572 : le statut d'un agent en pause budget clignote `blocked`/`idle` et
+#: l'alerte peut manquer une passe ; une absence plus longue que ce seuil
+#: ferme l'épisode (l'agent a repris). Une pause ultérieure est un nouvel
+#: épisode, avec son propre brief.
+BUDGET_PAUSE_GAP_S = 15 * 60.0
 #: #3057 : un bail rendu depuis moins de ce délai (redémarrage d'exécuteur,
 #: quelques secondes) n'est pas encore une perte : le brief attend, sans
 #: escalade ni copie au fil ; trois passes du notificateur (30 s)
@@ -970,21 +975,31 @@ def _budget_pause_long(alert: dict) -> str:
     cause possible de la pause (la fenêtre du fournisseur a pu changer sans
     qu'aucun tour ne publie de relevé neuf).
 
-    #7175 : tous les comptes du harnais au seuil sur l'hôte, remise à zéro
-    connue — aucun geste, dit une fois, sans relance avant l'échéance."""
+    #7175 : tous les comptes du harnais au seuil sur l'hôte, échéance
+    connue — aucun geste, dit une fois.
+
+    #7572 : l'échéance peut être une remise à zéro (fixe) ou un rattrapage
+    du rythme (révisable) ; le détail le dit, avec le compte qui la porte.
+    Une pause continue est dite une fois : ni relance de 6 h, ni nouveau
+    courrier quand l'échéance annoncée glisse ou passe (le détail vivant
+    reste dans `ameesh alerts`)."""
     if alert.get("waits_reset"):
-        return ("Agent paused on budget until its window reset: %s. Expected action: "
+        return ("Agent paused on budget until the announced time: %s. Expected action: "
                 "none — every account of its harness on the host is at its threshold "
-                "and the agent resumes on its own at the reset; this is said once, "
-                "without reminder before the reset. A new alert follows if the pause "
-                "outlives it." % (alert.get("detail") or "?"))
+                "and the agent resumes on its own at the announced time; this is said "
+                "once for the whole pause, with no reminder and no new alert when the "
+                "time slides or passes (read the live detail with `ameesh alerts`)."
+                % (alert.get("detail") or "?"))
     return ("Agent paused on budget for a long time: %s. Expected action: check the caps "
             "(ameesh budget), the accounts (ameesh accounts list) and the configuration "
             "the runner reads (ameesh doctor; a profile can diverge from the host's "
             "config.json); free an account, fix the profile, or have the runner restart, "
             "then `ameesh resume` the agent if its runner is not live. If the detail "
-            "says the last gauge reading is old, that reading may be stale and hold the "
-            "pause after its window reset — check it with `ameesh accounts list`."
+            "announces a resume time, its nature is stated there: a window reset is "
+            "fixed, a pace catch-up may recede as the account is consumed. If the last "
+            "gauge reading is old, that reading may be stale and hold the pause after "
+            "its window reset — check it with `ameesh accounts list`. The alert is sent "
+            "once for the pause; it stays live in `ameesh alerts`."
             % (alert.get("detail") or "?"))
 
 

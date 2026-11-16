@@ -83,7 +83,11 @@ class PauseDeRythmeTest(_Comptes):
                 mock.patch.object(self.book, "clock", return_value=self.now):
             raison = self.book.pace_exceeded("codex", accounts.RESERVE)
         # #4781 : le libellé porte l'échéance absolue (`@epoch`), lue à part.
-        self.assertTrue(re.sub(r"@\d+;", ";", raison).startswith(
+        # #7572 : la nature de l'échéance suit le pourcentage ; on la retire
+        # ici, le test porte sur l'heure annoncée.
+        self.assertEqual(accounts.pause_deadline_nature(raison), "pace")
+        entete = re.sub(r"% (?:pace|reset)\)", "%)", re.sub(r"@\d+;", ";", raison))
+        self.assertTrue(entete.startswith(
             "pause (account (default), codex-10080min 10 %%) until %s; plan codex"
             % self.heure(self.now + 0.05 * FENETRE)), raison)
         self.assertAlmostEqual(accounts.pause_deadline(raison),

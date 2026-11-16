@@ -9,9 +9,10 @@ reculs) : 52 courriers et 14 tours de coordinateurs réveillés. L'échéance
 ouvrait un épisode et un brief.
 
 L'épisode reste la pause continue (agent, hôte) : notify suit l'échéance qui
-recule sans re-briefer, et ne rouvre l'épisode que lorsque l'échéance
-annoncée est réellement dépassée alors que la pause dure — la promesse du
-courrier #7175.
+recule sans re-briefer. #7572 étend la règle à toute la pause : une échéance
+dépassée pendant que la pause dure n'ouvre pas un nouvel épisode non plus —
+c'est la même pause, dite une fois, et son détail vivant reste lisible dans
+`ameesh alerts`.
 """
 from __future__ import annotations
 
@@ -50,12 +51,14 @@ class BudgetPauseReculTest(unittest.TestCase):
         self.run = self.notifier._brief_agents
 
     def alert(self, resume_ts, *, since=1000, agent="ouvrier",
-              host="ameesh-agents-3"):
-        return dict(schema="ameesh-alert/1", type="budget_pause_long", agent=agent,
-                    since=since, value=7200, threshold=3600, host=host,
-                    harness="claude", responsible="human:smichea", detail="pause",
-                    resume_ts=resume_ts, waits_reset=True,
-                    orchestrators=["pilot"])
+              host="ameesh-agents-3", waits_reset=True):
+        out = dict(schema="ameesh-alert/1", type="budget_pause_long", agent=agent,
+                   since=since, value=7200, threshold=3600, host=host,
+                   harness="claude", responsible="human:smichea", detail="pause",
+                   resume_ts=resume_ts, orchestrators=["pilot"])
+        if waits_reset:
+            out["waits_reset"] = True
+        return out
 
     def entry(self, alert):
         return self.notifier.state["briefs"][notify.brief_key_of(alert)]
@@ -77,14 +80,40 @@ class BudgetPauseReculTest(unittest.TestCase):
         self.run(object(), [self.alert(50000)], None, 45030)
         self.assertEqual(self.send.call_count, 1)
 
-    def test_une_echeance_depassee_pendant_la_pause_rebriefe_une_fois(self):
+    def test_une_echeance_depassee_pendant_la_pause_ne_rebriefe_pas(self):
         self.run(object(), [self.alert(40000)], None, 10000)
-        # l'échéance est atteinte et la pause repart sur une autre : ce n'est
-        # plus « attendez le reset sans rien faire », un nouveau brief est dû
+        # #7572 : l'échéance est atteinte et la pause continue sur une autre
+        # estimation — c'est la même pause, déjà dite : pas de second brief.
         self.run(object(), [self.alert(50000)], None, 40030)
         self.run(object(), [self.alert(50000)], None, 40060)
-        self.assertEqual(self.send.call_count, 2)
+        self.assertEqual(self.send.call_count, 1)
         self.assertEqual(self.entry(self.alert(50000))["resume_ts"], 50000)
+
+    def test_une_pause_qui_reprend_apres_une_absence_rebriefe(self):
+        self.run(object(), [self.alert(40000)], None, 10000)
+        # l'alerte disparaît : premier passage absent, dans la grâce du
+        # clignotement de statut.
+        self.run(object(), [], None, 20000)
+        # l'absence dure au-delà de BUDGET_PAUSE_GAP_S : l'agent a repris,
+        # l'épisode est clos.
+        self.run(object(), [], None, 20000 + alert_briefs.BUDGET_PAUSE_GAP_S + 1)
+        # une nouvelle pause est un nouvel épisode, même agent et même hôte.
+        self.run(object(), [self.alert(60000, since=25000)], None, 30000)
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_une_pause_sans_attente_de_reset_ne_repete_pas_non_plus(self):
+        # #7572 : le cas du 16/11 — la raison porte le pourcentage et l'heure,
+        # qui changent à chaque relevé ; sans clé stable, chaque passe
+        # refaisait un courrier.
+        first = self.alert(None, waits_reset=False)
+        first["detail"] = "pause (account secondaire, seven_day 59 %) until 17:07"
+        self.run(object(), [first], None, 10000)
+        second = dict(first, since=11000, resume_ts=50000,
+                      detail="pause (account secondaire, seven_day 61 %) until 18:30")
+        self.run(object(), [second], None, 10060)
+        # l'ancienne échéance est passée, la pause continue : même épisode.
+        self.run(object(), [second], None, 40030)
+        self.assertEqual(self.send.call_count, 1)
 
     def test_la_cle_ignore_le_recul_mais_pas_l_agent_ni_l_hote(self):
         first = self.alert(40000)
