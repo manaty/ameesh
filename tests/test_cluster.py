@@ -454,6 +454,15 @@ FERMEES = {
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
 HORS_CONTRAT = {
+    # #7565 (0583): narrow bureau catch-up views, closed to both supervisor
+    # roles. Decision proofs include signature material; no GRANT added.
+    "ameesh_staging_attestations": {"id", "type", "object", "project", "data",
+                                     "created_at"},
+    "ameesh_decision_proofs": {
+        "id", "approver", "action", "artifact_kind", "artifact_hash", "decision",
+        "nonce", "signed_payload", "signature", "signature_key", "created_at",
+        "expires_at", "consumed_at", "consumed_by", "unconsumed", "unexpired",
+        "key_known", "key_live", "key_matches", "key_is_owner"},
     "host_release_operations": {"operation", "host", "manifest_digest", "created_at"},
     "host_release_fences": {"operation", "probe", "created_at"},
     "host_release_fence_receipts": {"action_id", "operation", "step", "receipt",
