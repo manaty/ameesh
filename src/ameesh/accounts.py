@@ -1149,6 +1149,10 @@ class Evaluation:
     until: float | None = None           #: heure de libération si au seuil
                                          #: (#777) : croisement du rythme ou
                                          #: remise à zéro (#898)
+    #: #7572 : nature de `until` — "reset" (remise à zéro de la fenêtre,
+    #: fixe) ou "pace" (rattrapage du rythme, révisable tant que des agents
+    #: consomment le compte). None si `until` n'est pas renseigné.
+    until_kind: str | None = None
     problems: list = field(default_factory=list)
     #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
     held: tuple | None = None
@@ -1807,6 +1811,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         resets = [g.resets_at for g in spent if g.resets_at]
         # (none dated, or a reading without windows: no date, never a guess)
         result.until = max(resets) if resets and len(resets) == len(spent) else None
+        result.until_kind = "reset" if result.until is not None else None
         if probe and record:
             fresh = gauge_probe.refresh(profile, result.gauges, environ=environ,
                                         now=now)
@@ -1873,6 +1878,17 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
                                       rates)
         if late is not None:
             result.held = (late.key, late.used)
+            # #7572 : une échéance égale à la remise à zéro de la fenêtre est
+            # fixe ; une heure de rattrapage du rythme, elle, peut reculer
+            # tant que des agents consomment le compte. Le libellé de pause
+            # le dit (`pause_label`), et l'alerte le reprend.
+            reset = getattr(late, "resets_at", None)
+            if result.until is None:
+                result.until_kind = None
+            else:
+                result.until_kind = (
+                    "reset" if reset is not None
+                    and float(result.until) >= float(reset) - 1.0 else "pace")
         if probe and record:
             fresh = gauge_probe.refresh(profile, result.gauges, held=result.held[0],
                                         environ=environ, now=now)
@@ -1889,6 +1905,9 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
             result.reason = ("account hourly cap: %.2f $ over 60 min (cap %.2f $)"
                              % (spent, profile.hourly_usd))
             result.until = now + 3600.0
+            # #7572 : plafond horaire glissant : l'heure annoncée est un
+            # rattrapage, pas une remise à zéro datée par le fournisseur.
+            result.until_kind = "pace"
             return result
     if profile.min_balance is not None and book.db is not None:
         solde = latest_balance(book.db, profile)
@@ -2067,15 +2086,23 @@ def pause_label(evaluations: dict) -> str:
 
     #4781 : l'heure lisible est celle de l'hôte de l'exécuteur et ne porte pas
     toujours sa date ; `@epoch` (à la minute) la rend lisible d'un autre hôte
-    (`pause_deadline`)."""
+    (`pause_deadline`).
+
+    #7572 : la nature de l'échéance suit le pourcentage — `reset` quand elle
+    est la remise à zéro de la fenêtre (fixe), `pace` quand c'est l'heure où
+    le rythme rattrape l'usage (révisable tant que des agents consomment le
+    compte). Elle est lue par `pause_deadline_nature` et reprise par les
+    alertes ; un texte d'avant ce marqueur n'en annonce pas la nature."""
     dated = [ev for ev in evaluations.values() if ev.until and ev.held]
     if not dated:
         return ""
     first = min(dated, key=lambda ev: ev.until)
     from .cost import until_label
-    return "pause (account %s, %s %.0f %%) until %s@%d; " % (
-        first.profile.name, first.held[0], first.held[1] * 100, until_label(first.until),
-        int(float(first.until)) // 60 * 60)
+    kind = getattr(first, "until_kind", None)
+    nature = " %s" % kind if kind in ("reset", "pace") else ""
+    return "pause (account %s, %s %.0f %%%s) until %s@%d; " % (
+        first.profile.name, first.held[0], first.held[1] * 100, nature,
+        until_label(first.until), int(float(first.until)) // 60 * 60)
 
 
 def pause_deadline(text: str) -> float | None:
@@ -2085,12 +2112,25 @@ def pause_deadline(text: str) -> float | None:
     return float(found.group(1)) if found else None
 
 
+def pause_deadline_nature(text: str) -> str | None:
+    """#7572 : la nature de l'échéance annoncée par `pause_label`, ou None.
+
+    ``reset`` : remise à zéro de la fenêtre, une heure fixe ; ``pace`` :
+    heure de rattrapage du rythme, qui peut reculer tant que d'autres agents
+    consomment le compte. Les libellés d'avant #7572 ne la disent pas."""
+    found = _PAUSE_NATURE.match(str(text or "").strip())
+    if not found:
+        return None
+    return found.group("nature") or None
+
+
 #: #2934 : le préambule d'une pause budget — le compte, la fenêtre qui le
-#: retient et l'échéance annoncée. Le pourcentage qui suit la fenêtre est une
-#: mesure continue : il reste dans `status_text`, pas dans la nature.
+#: retient, la nature de l'échéance (#7572) et l'échéance annoncée. Le
+#: pourcentage qui suit la fenêtre est une mesure continue : il reste dans
+#: `status_text`, pas dans la nature.
 _PAUSE_NATURE = re.compile(
     r"^pause \(account (?P<compte>\(default\)|[^,)]+)"
-    r"(?:, (?P<fenetre>[^\s,]+) [\d.,]+\s*%)?\)"
+    r"(?:, (?P<fenetre>[^\s,]+) [\d.,]+\s*%(?: (?P<nature>reset|pace))?)?\)"
     r"(?: until (?P<echeance>[^;@]+))?")
 
 #: #4781 : l'échéance absolue de `pause_label`, sur le préambule seul
@@ -2136,15 +2176,17 @@ def pause_nature(reason: str) -> str:
     « pause (account tertiaire, seven_day 83 %) until 14:20; … » donne le
     compte, la fenêtre et l'échéance (``tertiaire``, ``seven_day``,
     ``14:20``) ; les pourcentages, qui bougent à chaque relevé, n'en font pas
-    partie (#2934). Une raison sans ce préambule se compare sans ses mesures
-    continues (montants, pourcentages) : deux contrôles qui ne diffèrent que
-    par la dépense ou la jauge ne réécrivent pas la note du fil, le détail
-    restant dans `status_text`."""
+    partie (#2934). #7572 : la nature de l'échéance (``reset`` / ``pace``)
+    en fait partie — passer d'un rattrapage révisable à une remise à zéro
+    fixe change ce qu'on attend de la pause. Une raison sans ce préambule se
+    compare sans ses mesures continues (montants, pourcentages) : deux
+    contrôles qui ne diffèrent que par la dépense ou la jauge ne réécrivent
+    pas la note du fil, le détail restant dans `status_text`."""
     found = _PAUSE_NATURE.match(reason or "")
     if found:
-        return "pause|%s|%s|%s" % (
+        return "pause|%s|%s|%s|%s" % (
             found.group("compte"), found.group("fenetre") or "",
-            found.group("echeance") or "")
+            found.group("echeance") or "", found.group("nature") or "")
     return _PAUSE_MEASURE.sub("#", reason or "")
 
 
@@ -3124,15 +3166,19 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 from .cost import until_label
                 gauge, used = near
                 echeance = ""
+                nature = ""
                 if gauge.resets_at:
                     echeance = " until %s@%d" % (
                         until_label(float(gauge.resets_at), now),
                         int(float(gauge.resets_at)) // 60 * 60)
+                    # #7572 : cette échéance est la remise à zéro de la
+                    # fenêtre, pas un rattrapage du rythme.
+                    nature = " reset"
                 return Choice(None, active, reason=(
-                    "pause (account %s, %s %.1f %%)%s; summary margin — no other %s "
+                    "pause (account %s, %s %.1f %%%s)%s; summary margin — no other %s "
                     "account is placeable before saturation would make the rotation "
                     "summary impossible; %s" % (
-                        own.name, gauge.key, used * 100, echeance, harness,
+                        own.name, gauge.key, used * 100, nature, echeance, harness,
                         _label(cache))))
             # #1672 : un relevé plus vieux que toute fenêtre encore ouverte est
             # écarté du placement — le dire, plutôt que de le compter comme « au
