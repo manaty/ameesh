@@ -147,6 +147,31 @@ class ReviewBranchNoteTest(_ActivationFixture, PgTestCase):
             self.assertFalse(review_authors._on_own_review_branch(
                 self.repo.root, "cx3", self.lot, note, fetch=False))
 
+    def test_the_scan_passes_its_budget_to_the_review_branch_read(self):
+        """#7555 : le fetch de pointe ne retombe pas sur FETCH_TIMEOUT.
+
+        `_rewritten_after_freeze` se donne 60 s hors balayage : ses deux autres
+        fetch passent `remaining()`. La lecture de branche review/* doit le
+        recevoir aussi, sinon son fetch peut durer 180 s."""
+        head = self.scenario()
+        seen = []
+        real = review_authors._on_own_review_branch
+
+        def watched(repo, actor, lot, sha, **kwargs):
+            seen.append(kwargs)
+            return real(repo, actor, lot, sha, **kwargs)
+
+        with mock.patch.object(review_authors, "_on_own_review_branch",
+                               side_effect=watched):
+            self.assertEqual(self.rewritten(head), {})
+        self.assertTrue(seen)
+        for kwargs in seen:
+            self.assertIn("remaining", kwargs)
+            self.assertFalse(kwargs.get("fetch"))
+            self.assertIsNotNone(kwargs["remaining"])
+            self.assertLessEqual(kwargs["remaining"](),
+                                 review_authors.REWRITTEN_SCAN_BUDGET_S)
+
     # -- ce qui reste un correcteur (#4457) --------------------------------
 
     def test_a_lot_file_changed_on_the_review_branch_is_a_correction(self):
