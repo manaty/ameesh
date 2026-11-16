@@ -470,6 +470,22 @@ class MapTest(unittest.TestCase):
                          {"test_a", "test_b", "test_c"})
         self.assertEqual(out["classes"]["test_a"][0], "P1")
 
+    def test_full_suite_classify_skips_the_import_graph(self):
+        # #7590 : la suite est déjà complète (paquet, main, release) : le
+        # graphe d'import ne peut plus omettre un test, et son parcours AST de
+        # tous les fichiers coûtait ~80 s au plan de chaque paquet.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 3"))
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db"]
+        with mock.patch.object(plan, "ALWAYS_FILE", self.repo.path / "none.txt"), \
+                mock.patch.object(plan, "_import_graph",
+                                  side_effect=AssertionError("import graph must not run")):
+            out = plan.classify(mods, self.repo.card(), NOW, head="HEAD",
+                                repo=self.repo.path, resolve_imports=False)
+        self.assertEqual(out["importers"], {})
+        self.assertTrue(out["sure"], out["unsure"])
+        self.assertEqual(set(out["classes"]), set(mods))
+
     def test_phase2_safe_with_a_new_plain_function(self):
         # #1339 : une fonction simple nouvelle est couverte par son appelant
         # modifié (test_a) ; tous les tests qui chargent le fichier restent
@@ -2155,6 +2171,28 @@ class PlanTest(unittest.TestCase):
                          list(range(1, plan.PARTS["psycopg"][1] + 1)))
         self.assertEqual(out["psql_parts"], str(plan.PARTS["psql"][1]))
         self.assertEqual(out["code"], "true")
+
+    def test_push_full_suite_skips_import_resolution(self):
+        # #7590 : une poussée (main/release) ou un paquet a déjà la suite
+        # complète : la résolution des blocs par import graph n'a plus de
+        # sélection à éclairer et sort du chemin critique.
+        with mock.patch.object(plan, "_resolve_unmeasured",
+                               side_effect=AssertionError("resolution must not run")):
+            p = plan.make_plan("push", self.repo.card(), NOW, base=self.repo.base,
+                               repo=self.repo.path, ref="refs/heads/main")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertEqual(p["importers"], {})
+
+    def test_lot_ci_still_resolves_the_import_graph(self):
+        # #7590 : la sélection impactés + contrat d'un lot garde la preuve
+        # d'import ; seul le chemin à suite complète l'évite.
+        with mock.patch.object(plan, "_resolve_unmeasured",
+                               wraps=plan._resolve_unmeasured) as resolved:
+            p = plan.make_plan("pull_request", self.repo.card(), NOW,
+                               base=self.repo.base, repo=self.repo.path,
+                               base_ref="main", head_ref="lot/x", mode="lot")
+        self.assertTrue(resolved.called)
+        self.assertNotEqual(p["selection"]["mode"], "full")
 
     def test_pull_request_runs_the_pilot_modules_with_psql(self):
         p = plan.make_plan("pull_request", None, NOW, base_ref="main", head_ref="lot/x")

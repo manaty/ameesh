@@ -91,6 +91,19 @@ class WeightsScaleTest(unittest.TestCase):
         self.assertEqual(plan.weights(["test_l116_parts", "test_l161e_map"], "psql", card),
                          {"test_l116_parts": 30.0, "test_l161e_map": 20.0})
 
+    def test_split_weights_lit_la_table_sans_couverture(self):
+        # #7590 : le découpage d'une suite complète (psycopg) prend la table
+        # mesurée sans couverture, convertie par le surcoût ; la carte ne
+        # comble que les modules qu'elle ne connaît pas.
+        card = _card({
+            "test_l116_parts": {"durations": {"psycopg": 30.0}},
+            "test_canon": {"durations": {"psycopg": 40.0}},
+        }, surcout={"psycopg": 2.0})
+        self.assertEqual(
+            plan.split_weights(["test_l116_parts", "test_l161e_map", "test_canon"],
+                               "psycopg", card),
+            {"test_l116_parts": 10.0, "test_l161e_map": 16.0, "test_canon": 40.0})
+
     def test_sans_carte_table_brute(self):
         self.assertEqual(plan.weights(["test_l116_parts", "test_l161e_map"], "psql", None),
                          {"test_l116_parts": 10.0, "test_l161e_map": 20.0})
