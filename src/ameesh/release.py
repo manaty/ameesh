@@ -730,6 +730,60 @@ def _elected_tick(cfg, args):
         min_left=0, dry_run=False, json=False), credentials=credentials)
 
 
+def _catchup(cfg, args) -> int:
+    """`ameesh release catchup` (#7372): declare the bureau's root gesture.
+
+    The four `vm.sh` steps stay the bureau's manual gesture; this command
+    records its outcome as a durable `staging.catchup` event, with the host,
+    the active commit read from `controler`, the attested tag, the author and
+    the standing owner right. The guard checks the commit ancestry itself: a
+    declaration never proves anything by itself. The owner's right expires on
+    2026-12-12; after that, an `ok` declaration is refused until a new
+    decision is signed.
+    """
+    from . import identity, release_cutoff, staging_deferred
+    from .db import open_db
+    try:
+        project = release_cutoff.projects(cfg).get(args.project)
+        if project is None:
+            raise release_cutoff.ReleaseError(
+                "project %r is not declared under release.projects" % args.project)
+        db = open_db(cfg)
+        try:
+            base = staging_deferred.baseline(db, project, args.host)
+            if base is None:
+                print("%s: %s is not reported by the latest tagged staging "
+                      "attestation; nothing to declare" % (project.name, args.host))
+                return 0
+            right = staging_deferred.right_for(project, args.host)
+            if args.result == "ok" and (right is None or right["expired"]):
+                raise release_cutoff.ReleaseError(
+                    "no active owner root right covers %s: %s"
+                    % (args.host, "decision #%d expired on %s"
+                       % (right["decision"], right["expires"]) if right
+                       else "none"))
+            actor = args.actor
+            if not actor:
+                binding = identity.resolve_binding(cfg, db)
+                if binding.ok and binding.name:
+                    actor = binding.name
+            if not actor:
+                raise release_cutoff.ReleaseError(
+                    "--actor: name who performed the gesture (no bound session identity)")
+            row = staging_deferred.declare(
+                db, project, args.host, args.sha, base, args.result, actor, args.note)
+        finally:
+            db.close()
+    except (release_cutoff.ReleaseError, ValueError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    print("staging catch-up declared: %s %s at %s (%s, tag %s, event %s); "
+          "the next cutoff report names it"
+          % (project.name, row["host"], row["sha"][:12], row["result"],
+             row["tag"] or "?", row.get("event")))
+    return 0
+
+
 def _attest(cfg, args) -> int:
     """`ameesh release attest` (#6020): a reserved note on the attestation lot.
 
@@ -785,6 +839,8 @@ def run(cfg, args) -> int:
     """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest`."""
     from . import release_cutoff
     command = args.release_command
+    if command == "catchup":
+        return _catchup(cfg, args)
     if command == "attest":
         return _attest(cfg, args)
     if (command in ("tick", "packet-watch", "cutoff")
@@ -934,6 +990,22 @@ def add_parser(sub, func) -> None:
     reason_p.add_argument("--text", required=True)
     reason_p.add_argument("--actor", default="")
     reason_p.set_defaults(func=func)
+    catchup_p = rel.add_parser(
+        "catchup", help="#7372: declare the bureau's root catch-up of a reported "
+                        "staging server (four vm.sh steps) in the trace and the "
+                        "cutoff report")
+    catchup_p.add_argument("--project", default="ameesh")
+    catchup_p.add_argument("--host", default="manaty-mesh-1")
+    catchup_p.add_argument("--sha", required=True,
+                           help="the host's active commit after the gesture (full 40 hex, "
+                                "read from vm.sh controler)")
+    catchup_p.add_argument("--result", choices=("ok", "failed"), default="ok")
+    catchup_p.add_argument("--note", default="",
+                           help="what happened, for a failure or a partial gesture")
+    catchup_p.add_argument("--actor", default="",
+                           help="who performed the gesture (default: the bound session "
+                                "identity)")
+    catchup_p.set_defaults(func=func)
     attest_p = rel.add_parser(
         "attest", help="#6020: the staging agent attests a handed-over Nexlink staging "
                        "(migrations, then the staging dispatches) on the cutoff's "

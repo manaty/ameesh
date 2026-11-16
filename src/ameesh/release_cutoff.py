@@ -2902,10 +2902,27 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
         # rattrapage soit déclaré à chaque coupure ; le poste, lui, se met à
         # jour à son retour (droit root §10 pour un serveur sans accès root).
         reportes = (staging.get("attestation") or {}).get("reportes") or {}
+        catchups = staging.get("catchups") or {}
+        rights = staging.get("rights") or {}
         for host, detail in sorted(reportes.items()):
             raison = " ".join(str((detail or {}).get("raison") or "absent").split())
             suite = ("mise à jour à son retour" if host == STAGING_POSTE
                      else "rattrapage requis, jamais en dessous (§14)")
+            declared = (catchups.get(host) if isinstance(catchups, dict) else None)
+            if isinstance(declared, dict):
+                suite += (" ; dernier geste déclaré : commit %s (%s, %s, par %s)"
+                          % (str(declared.get("sha") or "")[:12],
+                             declared.get("result") or "?",
+                             declared.get("date") or "date inconnue",
+                             declared.get("actor") or "auteur inconnu"))
+            elif host != STAGING_POSTE:
+                right = (rights.get(host) if isinstance(rights, dict) else None)
+                if isinstance(right, dict):
+                    suite += (" ; aucun geste déclaré (droit #%d %s)"
+                              % (right.get("decision"),
+                                 "expiré le %s" % right.get("expires")
+                                 if right.get("expired")
+                                 else "actif jusqu'au %s" % right.get("expires")))
             lines.append("  - %s: REPORTÉ (%s) — non déployé au tag %s ; %s"
                          % (host, raison, tag, suite))
         if staging.get("error"):
@@ -3640,6 +3657,15 @@ def finish(cfg, db, project: ProjectRelease, report: dict, state: dict,
     """Write the durable report, mail the owner, record the cutoff."""
     result = report.get("result")
     queued = bool(staging and staging.get("queued"))
+    if staging is not None:
+        # #7372 : le rapport de coupure nomme le dernier geste de rattrapage
+        # déclaré et le droit owner qui le couvre ; une lecture illisible
+        # laisse le rapport tel quel, sans jamais retenir la coupure.
+        from . import staging_deferred
+        try:
+            staging_deferred.annotate(db, project, staging)
+        except Exception:  # noqa: BLE001 - a trace read never blocks a report
+            pass
     # #4219 : a skipped staging is not a successful one. A release is tagged
     # AND deployed to staging (canon §11 bis), and not deployed is not done
     # (§5): `--no-staging` is written down and the report goes out urgent.
