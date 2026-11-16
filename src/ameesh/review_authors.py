@@ -114,7 +114,7 @@ import os
 import re
 import tempfile
 
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from . import (canon, fetch_cache, grep_cache, plan_git, registry, review_lot,
                review_provenance, storage)
@@ -1160,12 +1160,18 @@ def _read_local_commit(repo, rev):
 
 
 def _on_own_review_branch(repo: str, actor: str, lot: int, sha: str, *,
-                          fetch: bool = False) -> bool:
+                          fetch: bool = False,
+                          remaining: Optional[Callable[[], Optional[float]]] = None) -> bool:
     """#5197 : `sha` est sur une branche `review/<actor>-<lot>[-…]` du relecteur.
 
     Lu sur les refs du clone (`refs/remotes/origin/…`, puis `refs/heads/…`) :
     Hors transaction, la forge complète les refs absentes d'un clone de
-    fusion (#7539). Une lecture illisible garde l'exclusion (#4457)."""
+    fusion (#7539). Une lecture illisible garde l'exclusion (#4457).
+
+    #7555 : `remaining` est le budget de la lecture appelante, comme pour les
+    autres fetch de `_rewritten_after_freeze` ; sans lui, le fetch de pointe
+    retombait sur `FETCH_TIMEOUT` (180 s) alors que la lecture hors balayage
+    se donne 60 s. Un budget nul ne lance aucun fetch (`_forge_fetch`)."""
     name = str(actor or "").strip()
     if not repo or not name or not lot or not sha:
         return False
@@ -1190,7 +1196,9 @@ def _on_own_review_branch(repo: str, actor: str, lot: int, sha: str, *,
                 ref == "refs/heads/" + stem or ref.startswith("refs/heads/" + stem + "-")
                 for stem in stems):
             continue
-        if _forge_fetch(repo, tip) is True and _is_ancestor(repo, sha, tip) is True:
+        timeout = remaining() if remaining is not None else None
+        if _forge_fetch(repo, tip, timeout=timeout) is True \
+                and _is_ancestor(repo, sha, tip) is True:
             return True
     return False
 
@@ -5750,7 +5758,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             other_lot = stacked_lot(receipt, full) if receipt else 0
             for actor in candidates:
                 if (_touches_only_files_absent_from(repo, full, (freeze_sha, head_sha))
-                        and _on_own_review_branch(repo, actor, lot, full, fetch=fetch)):
+                        and _on_own_review_branch(repo, actor, lot, full,
+                                                  fetch=fetch, remaining=remaining)):
                     continue            # note de relecture, pas un correctif
                 row = {"name": actor, "family": "", "families": [],
                        "rewritten": full, "freeze": freeze_id,
@@ -5891,7 +5900,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     continue
                 check()
                 if (_touches_only_files_absent_from(repo, full, (freeze_sha, head_sha))
-                        and _on_own_review_branch(repo, actor, lot, full, fetch=fetch)):
+                        and _on_own_review_branch(repo, actor, lot, full,
+                                                  fetch=fetch, remaining=remaining)):
                     # #5197 : une note de relecture — sur la branche review/*
                     # du relecteur et hors du contenu du lot —, pas un
                     # correctif réécrit
