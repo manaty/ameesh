@@ -125,6 +125,14 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #7518 (0581): internal monetary ledger, read through the budget API.
+    # No supervisor reader is required; source/pricing stay private too.
+    "credit_cycles": {"id", "billing_account", "credit_micro", "cap_micro",
+                      "observed_at", "expires_at", "fresh_until", "source", "actor",
+                      "breached", "created_at"},
+    "credit_requests": {"attempt_id", "cycle_id", "billing_account", "agent",
+                        "bound_micro", "actual_micro", "state", "pricing",
+                        "created_at", "closed_at"},
     # #6320 (0556): private A1 receipts/cursors/refusals. U1 receives only
     # aggregates through the native storage API; no supervisor GRANT added.
     "repair_signal_streams": {"project", "environment", "source", "cursor", "position"},
