@@ -83,3 +83,53 @@ or activate a provider adapter, and existing dsh turns are not covered by it.
 The provider follow-up must demonstrate main turns, reasoning, tool follow-ups,
 compaction/title generation, subagents and retries through the same gate with a
 fake transport before any activation. The key-holder decision remains separate.
+
+## Operator reconciliation and delayed billing
+
+Cycle mutations accept an authorized human, or a runner/session-bound agent
+whose owning, fully readable canon declares the `bureau` role. An inherited
+agent name, a role from another canon, an orchestrator role and a historical
+assignment do not confer this authority. Other budget settings retain their
+human-only authorization. The Python/storage API is trusted internal code;
+operator authentication happens at the CLI boundary.
+
+Attestation requires `--billing-lag-seconds N`: the maximum delay between
+settlement and its appearance in the reported net balance. Zero asserts that
+billing is immediate. Settlements since `observed_at - N seconds` remain
+liabilities, including before the observation itself; older settled costs can
+be absorbed by the net statement. Open/kept requests remain counted without
+timeout. The API's default zero preserves the previous immediate-net contract;
+callers with delayed statements must supply their proven lag. If no finite lag
+can be established, do not attest that balance as usable credit. This margin is
+conservative and can temporarily count a cost twice; it never releases an
+uncertain reservation.
+
+For a completed or definitively unbilled request, the operator records the
+proven total cost, the nonsecret evidence reference and the reason:
+
+```
+ameesh budget cycle reconcile --account ACCOUNT --attempt-id ATTEMPT \
+  --actual-usd COST --source INVOICE_OR_USAGE_REF --reason FINAL_COST_CONFIRMED
+```
+
+Zero is allowed only with evidence that the attempt was not billed. The
+operator must first establish that an `open` request is no longer in flight.
+The journal stores the actor, source, reason and previous liability atomically
+with settlement. Known actual cost cannot be reduced, duplicate reconciliation
+is refused, and an attempt identifier never admits a second dispatch. A larger
+late result is retained and blocks admission, even after a prior reconciliation.
+
+A bound breach is a separate gate: recording its actual cost does not by itself
+assert that the adapter has been repaired. After all disputed known costs have
+been reconciled, the operator can acknowledge the reviewed fix:
+
+```
+ameesh budget cycle clear-breach --account ACCOUNT --source INCIDENT_REF \
+  --reason ADAPTER_FIXED --adapter-evidence REVIEWED_FIX_REF
+```
+
+This records the affected cycle IDs and fix reference before clearing the gate,
+under the same account lock as admission and settlement. It changes neither
+credit, expiry nor outstanding debt. A stale or exhausted envelope still
+refuses admission. No timeout, automatic renewal or reconciliation grants
+additional funds, configures a real account or sends a paid request.

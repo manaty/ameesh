@@ -96,6 +96,7 @@ KEPT = (
     # #7518 (0581): historical statement author and request attribution.
     # Admission/settlement use account + attempt_id, never this spelling.
     "credit_cycles.actor", "credit_requests.agent",
+    "credit_reconciliations.actor",  # Operator reconciliation audit evidence.
     # #7477 (0580): immutable composition provenance, including the exact
     # composer lease identity. Historical receipts are read through aliases.
     "work_packet_snapshots.recorded_by", "work_packet_snapshots.lease_owner",

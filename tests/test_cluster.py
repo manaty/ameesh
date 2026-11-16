@@ -129,10 +129,13 @@ FERMEES = {
     # No supervisor reader is required; source/pricing stay private too.
     "credit_cycles": {"id", "billing_account", "credit_micro", "cap_micro",
                       "observed_at", "expires_at", "fresh_until", "source", "actor",
-                      "breached", "created_at"},
+                      "breached", "created_at", "billing_lag_seconds"},
     "credit_requests": {"attempt_id", "cycle_id", "billing_account", "agent",
                         "bound_micro", "actual_micro", "state", "pricing",
                         "created_at", "closed_at"},
+    # #7520 (0582): operator cost evidence stays private to the budget API.
+    "credit_reconciliations": {"id", "billing_account", "attempt_id", "event",
+                               "actor", "source", "reason", "evidence", "created_at"},
     # #6320 (0556): private A1 receipts/cursors/refusals. U1 receives only
     # aggregates through the native storage API; no supervisor GRANT added.
     "repair_signal_streams": {"project", "environment", "source", "cursor", "position"},

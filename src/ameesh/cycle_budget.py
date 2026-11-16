@@ -57,7 +57,7 @@ def _api(db):
 
 
 def attest(db, account, *, credit_usd, cap_usd, observed_at, expires_at,
-           fresh_until, source, actor):
+           fresh_until, source, actor, billing_lag_seconds=0):
     """Install a nonsecret statement, authenticated by the CLI before this call.
 
     Re-uploading the same observation never resets the ledger. A strictly newer
@@ -72,10 +72,45 @@ def attest(db, account, *, credit_usd, cap_usd, observed_at, expires_at,
     cap, credit = micro(cap_usd, credit=True), micro(credit_usd, credit=True)
     if cap > credit:
         raise ValueError('cap exceeds attested credit')
+    if type(billing_lag_seconds) is not int or not 0 <= billing_lag_seconds <= MAX_MICRO:
+        raise ValueError('billing lag must be a nonnegative integer number of seconds')
     observed, expires, fresh = map(instant, (observed_at, expires_at, fresh_until))
     if not datetime.fromisoformat(observed) < datetime.fromisoformat(fresh) <= datetime.fromisoformat(expires):
         raise ValueError('expected observed_at < fresh_until <= expires_at')
-    return _api(db).cycle_put(account, cap, credit, observed, expires, fresh, source, actor)
+    return _api(db).cycle_put(account, cap, credit, observed, expires, fresh, source, actor,
+                             billing_lag_seconds)
+
+
+def operator(cfg, db):
+    """Authorized human or bound bureau role in a fully readable owning canon."""
+    from . import budget, canon, identity, registry, sous_utilisation
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.name:
+        if 'unreadable' in binding.reason:
+            raise budget.BudgetError('cycle operator identity unreadable')
+        return budget.authorize(cfg, db)
+    binding = identity.require_bound(cfg, db, what='cycle operator')
+    canons = canon.load_configured(cfg)
+    if (not canons or len(canons) != len(canon.configured(cfg))
+            or not all(sous_utilisation.fully_read(c) for c in canons)):
+        raise budget.BudgetError('cycle operator canon unreadable')
+    row = registry.get(db, binding.name)
+    if not row or not sous_utilisation.card_role(row, canons, ('bureau',)):
+        raise budget.BudgetError('cycle operator requires an authorized human or bureau role')
+    return binding.name
+
+
+def reconcile(db, account, attempt, *, actual_usd, source, reason, actor):
+    """Evidence of final cost (zero only for proven nonbilling), never guessed."""
+    if not all(str(value or '').strip() for value in (source, reason, actor)):
+        raise ValueError('reconciliation source, reason and actor required')
+    return _api(db).cycle_reconcile(account, attempt, micro(actual_usd), source, reason, actor)
+
+
+def clear_breach(db, account, *, source, reason, actor, adapter_evidence):
+    if not all(str(value or '').strip() for value in (source, reason, actor, adapter_evidence)):
+        raise ValueError('source, reason, actor and adapter fix evidence required')
+    return _api(db).cycle_clear_breach(account, source, reason, actor, adapter_evidence)
 
 
 @dataclass(frozen=True)
@@ -157,23 +192,41 @@ def execute(db, account, agent, attempt_id, bound, *, daily_admit, send, actual_
 def add_parser(sub):
     p = sub.add_parser('cycle', help='expiring credit envelope (per-request gate)')
     actions = p.add_subparsers(dest='cycle_command', required=True)
-    put = actions.add_parser('attest', help='install a nonsecret credit statement (human only)')
+    put = actions.add_parser('attest', help='install a nonsecret statement (human or bound bureau)')
     for name in ('account', 'credit-usd', 'cap-usd', 'observed-at', 'expires-at',
                  'fresh-until', 'source'):
         put.add_argument('--' + name, required=True)
+    put.add_argument('--billing-lag-seconds', required=True, type=int,
+                     help='maximum reporting delay; zero asserts immediate net billing')
+    reconcile_parser = actions.add_parser('reconcile', help='record proven final cost of a retained attempt')
+    for name in ('account', 'attempt-id', 'actual-usd', 'source', 'reason'):
+        reconcile_parser.add_argument('--' + name, required=True)
+    clear = actions.add_parser('clear-breach', help='acknowledge an evidenced adapter fix')
+    for name in ('account', 'source', 'reason', 'adapter-evidence'):
+        clear.add_argument('--' + name, required=True)
     show = actions.add_parser('show', help='inspect the latest cycle and liabilities')
     show.add_argument('--account', required=True)
 
 
 def command(cfg, db, args):
     import json
-    from . import budget
     if args.cycle_command == 'show':
         print(json.dumps(_api(db).cycle_status(args.account), default=str, ensure_ascii=False))
         return 0
-    actor = budget.authorize(cfg, db)
+    actor = operator(cfg, db)
+    if args.cycle_command == 'reconcile':
+        reconcile(db, args.account, args.attempt_id, actual_usd=args.actual_usd,
+                  source=args.source, reason=args.reason, actor=actor)
+        print('Retained attempt reconciled for %s by %s' % (args.account, actor))
+        return 0
+    if args.cycle_command == 'clear-breach':
+        clear_breach(db, args.account, source=args.source, reason=args.reason,
+                     actor=actor, adapter_evidence=args.adapter_evidence)
+        print('Bound breach reconciled for %s by %s' % (args.account, actor))
+        return 0
     cycle = attest(db, args.account, credit_usd=args.credit_usd, cap_usd=args.cap_usd,
                    observed_at=args.observed_at, expires_at=args.expires_at,
-                   fresh_until=args.fresh_until, source=args.source, actor=actor)
+                   fresh_until=args.fresh_until, source=args.source, actor=actor,
+                   billing_lag_seconds=args.billing_lag_seconds)
     print('Credit cycle #%s recorded for %s by %s' % (cycle, args.account, actor))
     return 0

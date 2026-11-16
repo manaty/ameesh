@@ -22,7 +22,8 @@ class CycleBudgets:
             " else greatest(bound_micro, coalesce(actual_micro, 0)) end), 0)::bigint"
             " as used from credit_requests"
             " where billing_account = %s and (cycle_id = %s or state <> 'settled'"
-            " or closed_at >= (select observed_at from credit_cycles where id = %s))",
+            " or closed_at >= (select observed_at - billing_lag_seconds * interval '1 second'"
+            " from credit_cycles where id = %s))",
             (account, cycle_id, cycle_id))[0]['used'])
 
     @staticmethod
@@ -33,7 +34,8 @@ class CycleBudgets:
             raise ValueError(
                 "account blocked after a bound breach; operator reconciliation required")
 
-    def cycle_put(self, account, cap, credit, observed, expires, fresh, source, actor):
+    def cycle_put(self, account, cap, credit, observed, expires, fresh, source, actor,
+                  billing_lag_seconds=0):
         with self.db.transaction() as tx:
             self._cycle_lock(tx, account)
             self._cycle_not_breached(tx, account)
@@ -47,11 +49,12 @@ class CycleBudgets:
                 raise ValueError('a strictly newer dated credit statement is required')
             rows = tx.query(
                 "insert into credit_cycles (billing_account, cap_micro, credit_micro,"
-                " observed_at, expires_at, fresh_until, source, actor)"
-                " select %s, %s, %s, %s, %s, %s, %s, %s"
+                " observed_at, expires_at, fresh_until, source, actor, billing_lag_seconds)"
+                " select %s, %s, %s, %s, %s, %s, %s, %s, %s"
                 " where %s::timestamptz <= clock_timestamp()"
                 " and %s::timestamptz > clock_timestamp() returning id",
-                (account, cap, credit, observed, expires, fresh, source, actor, observed, fresh))
+                (account, cap, credit, observed, expires, fresh, source, actor,
+                 billing_lag_seconds, observed, fresh))
             if not rows:
                 raise ValueError('credit statement is future-dated or already stale')
             return int(rows[0]['id'])
@@ -65,7 +68,55 @@ class CycleBudgets:
             return None
         row = rows[0]
         row['used_micro'] = self._cycle_used(self.db, account, row['id'])
+        row['account_breached'] = bool(self.db.query(
+            'select id from credit_cycles where billing_account = %s and breached limit 1',
+            (account,)))
         return row
+
+    def cycle_reconcile(self, account, attempt, actual, source, reason, actor):
+        """Explicit operator evidence replaces a retained bound; never a timeout."""
+        with self.db.transaction() as tx:
+            self._cycle_lock(tx, account)
+            rows = tx.query('select state, bound_micro, actual_micro from credit_requests'
+                            ' where billing_account = %s and attempt_id = %s for update',
+                            (account, attempt))
+            if not rows or rows[0]['state'] not in ('open', 'kept'):
+                raise ValueError('unknown or already reconciled attempt')
+            before = rows[0]
+            if actual < int(before['actual_micro'] or 0):
+                raise ValueError('reconciliation cannot reduce an already known actual cost')
+            tx.execute('update credit_requests set state = %s, actual_micro = %s,'
+                       ' closed_at = clock_timestamp() where attempt_id = %s',
+                       ('settled', actual, attempt))
+            if actual > int(before['bound_micro']):
+                tx.execute('update credit_cycles set breached = true where billing_account = %s',
+                           (account,))
+            tx.execute('insert into credit_reconciliations'
+                       ' (billing_account, attempt_id, event, actor, source, reason, evidence)'
+                       " values (%s, %s, 'settle', %s, %s, %s, %s::jsonb)",
+                       (account, attempt, actor, source, reason,
+                        json.dumps(dict(before=before, actual_micro=actual))))
+
+    def cycle_clear_breach(self, account, source, reason, actor, adapter_evidence):
+        """Separate audited acknowledgement of the adapter fix; credits stay unchanged."""
+        with self.db.transaction() as tx:
+            self._cycle_lock(tx, account)
+            breached = tx.query('select id from credit_cycles'
+                                ' where billing_account = %s and breached', (account,))
+            if not breached:
+                raise ValueError('account has no breach to reconcile')
+            if tx.query('select attempt_id from credit_requests where billing_account = %s'
+                        " and state <> 'settled' and actual_micro is not null limit 1",
+                        (account,)):
+                raise ValueError('reconcile all known bound breaches first')
+            tx.execute('insert into credit_reconciliations'
+                       ' (billing_account, event, actor, source, reason, evidence)'
+                       " values (%s, 'clear_breach', %s, %s, %s, %s::jsonb)",
+                       (account, actor, source, reason,
+                        json.dumps(dict(cycle_ids=[r['id'] for r in breached],
+                                        adapter_evidence=adapter_evidence))))
+            tx.execute('update credit_cycles set breached = false where billing_account = %s',
+                       (account,))
 
     def cycle_reserve(self, account, agent, attempt, bound, pricing):
         with self.db.transaction() as tx:
@@ -104,8 +155,15 @@ class CycleBudgets:
                 if (row['state'] == 'settled' and actual == row['actual_micro']) or (
                         row['state'] == 'kept' and actual is None):
                     return
-                raise ValueError('attempt already closed; inconsistent settlement')
-            if actual is not None and actual > int(row['bound_micro']):
+                known = (int(row['actual_micro']) if row['state'] == 'settled'
+                         else max(int(row['bound_micro']), int(row['actual_micro'] or 0)))
+                if actual is None or actual <= known:
+                    raise ValueError('attempt already closed; inconsistent settlement')
+                # A larger late result contradicts an operator's final cost.
+                # Keep that newly known debt and stop admission, even within
+                # the original bound: the reconciliation was not final.
+            if actual is not None and (actual > int(row['bound_micro'])
+                                       or row['state'] != 'open'):
                 # An adapter violated its bound: retain the liability AND close
                 # admission for this projection. Commit before raising outside.
                 tx.execute('update credit_cycles set breached = true where billing_account = %s',
@@ -117,4 +175,5 @@ class CycleBudgets:
                        ' closed_at = clock_timestamp() where attempt_id = %s',
                        ('kept' if actual is None or breach else 'settled', actual, attempt))
         if breach:
-            raise ValueError('actual cost exceeded reserved bound; cycle admission stopped')
+            raise ValueError('actual cost exceeded reserved bound or contradicted reconciliation; '
+                             'cycle admission stopped')
