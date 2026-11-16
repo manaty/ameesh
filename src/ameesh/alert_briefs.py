@@ -980,15 +980,19 @@ def _budget_pause_long(alert: dict) -> str:
 
     #7572 : l'échéance peut être une remise à zéro (fixe) ou un rattrapage
     du rythme (révisable) ; le détail le dit, avec le compte qui la porte.
-    Une pause continue est dite une fois : ni relance de 6 h, ni nouveau
-    courrier quand l'échéance annoncée glisse ou passe (le détail vivant
-    reste dans `ameesh alerts`)."""
+    Un recul de l'échéance ne refait pas de courrier. Une remise à zéro
+    réellement dépassée sans reprise, elle, est un nouvel épisode (#7175) :
+    le brief suivant passe par le texte « check the caps ». Une attente de
+    remise à zéro n'a pas de relance ; une pause avec geste attendu garde
+    celle de 6 h (#1466)."""
     if alert.get("waits_reset"):
         return ("Agent paused on budget until the announced time: %s. Expected action: "
                 "none — every account of its harness on the host is at its threshold "
                 "and the agent resumes on its own at the announced time; this is said "
-                "once for the whole pause, with no reminder and no new alert when the "
-                "time slides or passes (read the live detail with `ameesh alerts`)."
+                "once for the pause, with no reminder while it lasts and no new alert "
+                "when a pace catch-up slides (read the live detail with `ameesh "
+                "alerts`). If the announced window reset passes and the agent has not "
+                "resumed, a new alert follows."
                 % (alert.get("detail") or "?"))
     return ("Agent paused on budget for a long time: %s. Expected action: check the caps "
             "(ameesh budget), the accounts (ameesh accounts list) and the configuration "
@@ -998,8 +1002,9 @@ def _budget_pause_long(alert: dict) -> str:
             "announces a resume time, its nature is stated there: a window reset is "
             "fixed, a pace catch-up may recede as the account is consumed. If the last "
             "gauge reading is old, that reading may be stale and hold the pause after "
-            "its window reset — check it with `ameesh accounts list`. The alert is sent "
-            "once for the pause; it stays live in `ameesh alerts`."
+            "its window reset — check it with `ameesh accounts list`. This is not "
+            "repeated at every reading; it stays live in `ameesh alerts` and is "
+            "reminded after six hours while it lasts."
             % (alert.get("detail") or "?"))
 
 

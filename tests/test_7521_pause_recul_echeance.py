@@ -9,10 +9,10 @@ reculs) : 52 courriers et 14 tours de coordinateurs réveillés. L'échéance
 ouvrait un épisode et un brief.
 
 L'épisode reste la pause continue (agent, hôte) : notify suit l'échéance qui
-recule sans re-briefer. #7572 étend la règle à toute la pause : une échéance
-dépassée pendant que la pause dure n'ouvre pas un nouvel épisode non plus —
-c'est la même pause, dite une fois, et son détail vivant reste lisible dans
-`ameesh alerts`.
+recule sans re-briefer. #7572 étend la règle au rattrapage du rythme (`pace`) :
+une échéance dépassée pendant que la pause dure n'ouvre pas un nouvel épisode.
+Une remise à zéro (`reset`) réellement dépassée, elle, re-briefe une fois
+(#7175, B1 du gel #42425) : l'agent n'a pas repris.
 """
 from __future__ import annotations
 
@@ -51,11 +51,11 @@ class BudgetPauseReculTest(unittest.TestCase):
         self.run = self.notifier._brief_agents
 
     def alert(self, resume_ts, *, since=1000, agent="ouvrier",
-              host="ameesh-agents-3", waits_reset=True):
+              host="ameesh-agents-3", waits_reset=True, kind="pace"):
         out = dict(schema="ameesh-alert/1", type="budget_pause_long", agent=agent,
                    since=since, value=7200, threshold=3600, host=host,
                    harness="claude", responsible="human:smichea", detail="pause",
-                   resume_ts=resume_ts, orchestrators=["pilot"])
+                   resume_ts=resume_ts, resume_kind=kind, orchestrators=["pilot"])
         if waits_reset:
             out["waits_reset"] = True
         return out
@@ -80,10 +80,11 @@ class BudgetPauseReculTest(unittest.TestCase):
         self.run(object(), [self.alert(50000)], None, 45030)
         self.assertEqual(self.send.call_count, 1)
 
-    def test_une_echeance_depassee_pendant_la_pause_ne_rebriefe_pas(self):
+    def test_une_echeance_de_rythme_depassee_ne_rebriefe_pas(self):
         self.run(object(), [self.alert(40000)], None, 10000)
-        # #7572 : l'échéance est atteinte et la pause continue sur une autre
-        # estimation — c'est la même pause, déjà dite : pas de second brief.
+        # #7572 : l'échéance de rattrapage est atteinte et la pause continue
+        # sur une autre estimation — c'est la même pause, déjà dite : pas de
+        # second brief. Une remise à zéro, elle, re-briefe (B1, #7572).
         self.run(object(), [self.alert(50000)], None, 40030)
         self.run(object(), [self.alert(50000)], None, 40060)
         self.assertEqual(self.send.call_count, 1)
@@ -111,8 +112,9 @@ class BudgetPauseReculTest(unittest.TestCase):
         second = dict(first, since=11000, resume_ts=50000,
                       detail="pause (account secondaire, seven_day 61 %) until 18:30")
         self.run(object(), [second], None, 10060)
-        # l'ancienne échéance est passée, la pause continue : même épisode.
-        self.run(object(), [second], None, 40030)
+        # même pause, aucune relance avant les 6 h (une pause avec geste
+        # attendu les garde, #1466/B2).
+        self.run(object(), [second], None, 20000)
         self.assertEqual(self.send.call_count, 1)
 
     def test_la_cle_ignore_le_recul_mais_pas_l_agent_ni_l_hote(self):

@@ -1705,7 +1705,11 @@ def empty_state() -> dict:
             #: gel, la cible, les jalons ou le canon changent
             "gates": {},
             #: #5912 : épisodes de capacité réservée déjà journalisés
-            "capacity_journal": {}}
+            "capacity_journal": {},
+            #: #7572 B1 : remises à zéro déjà re-briefées après leur passage
+            #: (clé de brief → échéance), pour ne pas rouvrir l'épisode à
+            #: chaque passe tant que la pause dure.
+            "reset_rebriefed": {}}
 
 
 #: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
@@ -3368,13 +3372,31 @@ class Notifier:
                 # d'être atteinte (le plafond de rythme se recalcule) et peut
                 # aussi être dépassée par une autre estimation : c'est la même
                 # pause continue (l'identité est agent + hôte, #7572). L'entrée
-                # suit l'échéance courante sans jamais rouvrir l'épisode —
-                # « dit une fois » vaut pour toute la pause, pas pour une de
-                # ses échéances. C'est l'absence prolongée de l'alerte qui
-                # clôt l'entrée (`BUDGET_PAUSE_GAP_S`).
+                # suit l'échéance courante sans rouvrir l'épisode. C'est
+                # l'absence prolongée de l'alerte qui clôt l'entrée
+                # (`BUDGET_PAUSE_GAP_S`).
+                #
+                # #7175/#7572 B1 : une remise à zéro (`reset`) est une
+                # promesse, pas une estimation. Passée alors que la pause
+                # dure, l'agent n'a pas repris — relevé périmé ou profil
+                # divergent, exactement ce que dit « a stale reading can hold
+                # the pause after its window reset ». Un nouveau brief pour
+                # cette échéance, une seule fois (le marqueur), puis
+                # l'épisode suit de nouveau. Un rattrapage de rythme
+                # (`pace`) se suit sans courrier quel que soit son recul
+                # (#7521, cas du 16/11).
                 entry.pop("absent_since", None)
+                announced = entry.get("resume_ts")
+                if entry.get("resume_kind") == "reset" and announced is not None \
+                        and now >= float(announced) \
+                        and entry.get("reset_rebriefed") != float(announced):
+                    self.state.setdefault("reset_rebriefed", {})[key] = float(announced)
+                    del sent[key]
+                    continue
                 if alert.get("resume_ts") is not None:
                     entry["resume_ts"] = float(alert["resume_ts"])
+                if alert.get("resume_kind") is not None:
+                    entry["resume_kind"] = alert["resume_kind"]
         open_lots = None
         for key in list(sent):
             if key not in alive:
@@ -3403,13 +3425,13 @@ class Notifier:
                     continue
                 if entry.get("type") == "budget_pause_long":
                     # #7175 : la pause déjà dite ; le statut qui clignote ne
-                    # la refait pas briefer. #7572 : l'échéance annoncée n'est
-                    # pas une fin d'épisode — qu'elle glisse (rattrapage du
-                    # rythme) ou passe pendant que la pause dure, c'est la
-                    # même pause continue, sans second courrier. Une absence
-                    # plus longue que BUDGET_PAUSE_GAP_S ferme l'épisode
-                    # (l'agent a repris) ; une pause ultérieure reçoit alors
-                    # son propre brief.
+                    # la refait pas briefer. #7572 : un recul de l'échéance
+                    # (rattrapage du rythme) ou son dépassement par une autre
+                    # estimation ne refait pas de courrier non plus — la
+                    # remise à zéro réellement dépassée est traitée plus haut
+                    # (B1). Une absence plus longue que BUDGET_PAUSE_GAP_S
+                    # ferme l'épisode (l'agent a repris) ; une pause
+                    # ultérieure reçoit alors son propre brief.
                     if now - entry.setdefault("absent_since", now) \
                             < alert_briefs.BUDGET_PAUSE_GAP_S:
                         continue
@@ -3459,6 +3481,9 @@ class Notifier:
                             ):
                         continue
                 del sent[key]
+                # #7572 : l'épisode est clos ; le marqueur d'une remise à
+                # zéro déjà re-briefée ne doit pas suivre une pause ultérieure.
+                (self.state.get("reset_rebriefed") or {}).pop(key, None)
         due = []
         dead_only = set()
         for key, alert in alive.items():
@@ -3732,6 +3757,18 @@ class Notifier:
                                  "live_routed": True,
                                  "to": sorted(set((entry or {}).get("to") or ()) | set(delivered))}
             elif entry is None:
+                reset_rebriefed = None
+                if kind == "budget_pause_long":
+                    # #7572 B1 : une remise à zéro re-briefée une fois ne doit
+                    # pas rouvrir l'épisode à chaque passe ; une échéance déjà
+                    # passée au premier brief n'en mérite pas un second (le
+                    # brief lui-même est le signal).
+                    reset_rebriefed = (self.state.get("reset_rebriefed")
+                                       or {}).pop(key, None)
+                    resume_ts = alert.get("resume_ts")
+                    if alert.get("resume_kind") == "reset" and resume_ts is not None \
+                            and float(resume_ts) <= now:
+                        reset_rebriefed = float(resume_ts)
                 sent[key] = {"type": kind, "sent_ts": now,
                              # `mail_undeliverable` reste un envoi unique à la
                              # levée (comportement L118) : une relance de 6 h
@@ -3739,15 +3776,19 @@ class Notifier:
                              # #6824 : une pause critique est un épisode continu
                              # (compte, fenêtre) ; sa durée est couverte par
                              # `budget_pause_long`, pas par un second brief.
-                             # #7572 : une pause budget continue est dite une
-                             # fois — ni relance de 6 h, ni nouveau brief quand
-                             # l'échéance annoncée glisse ou passe.
+                             # #7572 : une pause budget n'est plus redite à
+                             # chaque relevé ; une attente de remise à zéro
+                             # (#7175, rien à faire) n'a pas de relance, mais
+                             # une pause avec geste attendu (#1466) garde la
+                             # sienne — une panne de configuration ne doit pas
+                             # se taire.
                              "reminded": kind in ("mail_undeliverable", "review_family_paused",
-                                                  "critical_budget_pause",
-                                                  "budget_pause_long")
+                                                  "critical_budget_pause")
                              # #7175 : une attente de remise à zéro, sans relance
                              or bool(alert.get("waits_reset")),
                              "resume_ts": alert.get("resume_ts"),
+                             "resume_kind": alert.get("resume_kind"),
+                             "reset_rebriefed": reset_rebriefed,
                              "to": sorted(set(delivered)),
                              # #3036 : les écartés, pour réévaluer la passe
                              # suivante et remettre à qui est revenu, et les

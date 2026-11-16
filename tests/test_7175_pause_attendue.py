@@ -199,33 +199,35 @@ class BriefOnceTest(unittest.TestCase):
         self.notifier = notify.Notifier(self.cfg, notify.parse_config({"default": []}),
                                         sender=object(), log=lambda text: None)
 
-    def alert(self, since, resume_ts):
+    def alert(self, since, resume_ts, *, kind="pace"):
         return dict(schema="ameesh-alert/1", type="budget_pause_long", agent="ouvrier",
                     since=since, value=7200, threshold=3600, host="ameesh-agents-3",
                     harness="codex", responsible="human:smichea", detail="pause",
-                    resume_ts=resume_ts, waits_reset=True, orchestrators=["pilot"])
+                    resume_ts=resume_ts, resume_kind=kind, waits_reset=True,
+                    orchestrators=["pilot"])
 
     def test_said_once_until_the_reset(self):
         run = self.notifier._brief_agents
-        run(object(), [self.alert(1000, 40000)], None, 10000)
+        run(object(), [self.alert(1000, 40000, kind="reset")], None, 10000)
         run(object(), [], None, 10030)                          # statut qui clignote
-        run(object(), [self.alert(10031, 40000)], None, 10060)
-        run(object(), [self.alert(10031, 40000)], None, 10000 + 7 * 3600)
+        run(object(), [self.alert(10031, 40000, kind="reset")], None, 10060)
+        run(object(), [self.alert(10031, 40000, kind="reset")], None, 10000 + 7 * 3600)
         self.assertEqual(self.send.call_count, 1)
 
     def test_after_the_reset_a_new_episode_gets_a_brief(self):
         run = self.notifier._brief_agents
-        run(object(), [self.alert(1000, 10500)], None, 10000)
+        run(object(), [self.alert(1000, 10500, kind="reset")], None, 10000)
         run(object(), [], None, 10600)
         # #7572 : l'absence doit dépasser la grâce du clignotement de statut
         # pour clore l'épisode — sinon c'est la même pause, dite une fois.
         run(object(), [], None, 10600 + alert_briefs.BUDGET_PAUSE_GAP_S + 1)
-        run(object(), [self.alert(20000, 50000)], None, 30000)
+        run(object(), [self.alert(20000, 50000, kind="reset")], None, 30000)
         self.assertEqual(self.send.call_count, 2)
 
-    def test_a_deadline_passed_while_the_pause_lasts_is_the_same_brief(self):
-        # #7572 : le cas du 16/11 — l'ancienne échéance passe, la pause
-        # continue sur une nouvelle estimation : même pause, un seul brief.
+    def test_a_pace_deadline_passed_while_the_pause_lasts_is_the_same_brief(self):
+        # #7572 : le cas du 16/11 — l'ancienne échéance de rattrapage passe,
+        # la pause continue sur une nouvelle estimation : même pause, un seul
+        # brief. Une remise à zéro passée, elle, re-briefe (B1, #7572).
         run = self.notifier._brief_agents
         run(object(), [self.alert(1000, 10500)], None, 10000)
         run(object(), [self.alert(1001, 50000)], None, 10600)

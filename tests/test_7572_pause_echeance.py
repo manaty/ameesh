@@ -12,15 +12,20 @@ raison (pourcentage, heure) : chaque relevé refaisait un courrier
 L'échéance est désormais rendue avec sa nature — remise à zéro de la fenêtre
 (« reset », fixe) ou rattrapage du rythme (« pace », révisable) — et son
 compte ; l'identité de l'alerte est la pause continue (agent, hôte), donc un
-recul ou un dépassement de l'échéance ne refait pas de courrier.
+recul de l'échéance ne refait pas de courrier. Une remise à zéro réellement
+dépassée sans reprise re-briefe une fois (#7175, B1 du gel #42425) ; une
+pause avec geste attendu garde sa relance de 6 h (B2).
 """
 from __future__ import annotations
 
+import tempfile
 import time
 import types
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
-from ameesh import accounts, alert_briefs, exploitation, notify, registry, storage
+from ameesh import accounts, alert_briefs, exploitation, mail, notify, registry, storage
 
 from .support import PgTestCase
 
@@ -137,8 +142,8 @@ class ResumeAlertTest(PgTestCase):
         self.assertIn("may recede", detail)
         self.assertIn("check the caps", detail)
         brief = alert_briefs._budget_pause_long(alerte)
-        self.assertIn("sent once for the pause", brief)
-        self.assertNotIn("A new alert follows", brief)
+        self.assertIn("not repeated at every reading", brief)
+        self.assertIn("reminded after six hours", brief)
 
     def test_a_reset_deadline_says_fixed_and_nothing_to_do(self):
         now = time.time()
@@ -160,6 +165,98 @@ class ResumeAlertTest(PgTestCase):
         self.assertIn("Expected action: none", alert_briefs._budget_pause_long(alerte))
         self.assertIn("live detail with `ameesh alerts`",
                       alert_briefs._budget_pause_long(alerte))
+
+
+class BriefOnceTest(unittest.TestCase):
+    """#7572 B1/B2 : ce qui re-briefe et ce qui ne re-briefe pas.
+
+    B1 — une remise à zéro (`reset`) dépassée sans reprise re-briefe une
+    fois (la promesse de #7175) ; un rattrapage de rythme (`pace`) se suit
+    sans courrier quel que soit son recul.
+    B2 — une pause avec geste attendu (#1466, pas de « rien à faire ») garde
+    sa relance de 6 h ; « dit une fois » ne vaut que pour l'attente d'une
+    remise à zéro.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = SimpleNamespace(canon=(), state_dir=self.tmp.name)
+        self.store = mock.Mock()
+        self.listing = [dict(name=n, team="ameesh", mode="execute")
+                        for n in ("ouvrier", "pilot")]
+        self.store.operations.listing.side_effect = lambda: self.listing
+        for target, attr, value in (
+                (storage, "of", self.store),
+                (mail, "send", 1),
+                (notify.fil, "record", "thread-id"),
+                (alert_briefs, "briefs", {"pilot": "pause budget"})):
+            patch = mock.patch.object(target, attr, return_value=value)
+            mocked = patch.start()
+            self.addCleanup(patch.stop)
+            if attr == "send":
+                self.send = mocked
+        self.notifier = notify.Notifier(self.cfg, notify.parse_config({"default": []}),
+                                        sender=object(), log=lambda text: None)
+        self.run = self.notifier._brief_agents
+
+    def alert(self, resume_ts, *, kind="pace", waits_reset=True, since=1000):
+        out = dict(schema="ameesh-alert/1", type="budget_pause_long", agent="ouvrier",
+                   since=since, value=7200, threshold=3600, host="ameesh-agents-3",
+                   harness="claude", responsible="human:smichea", detail="pause",
+                   resume_ts=resume_ts, orchestrators=["pilot"])
+        if kind is not None:
+            out["resume_kind"] = kind
+        if waits_reset:
+            out["waits_reset"] = True
+        return out
+
+    def test_a_pace_deadline_that_recedes_three_times_gives_one_brief(self):
+        self.run(object(), [self.alert(10500)], None, 10000)
+        # l'échéance de rythme est passée, la suivante recule : même pause.
+        self.run(object(), [self.alert(50000, since=1001)], None, 10600)
+        self.run(object(), [self.alert(90000, since=1002)], None, 50030)
+        self.run(object(), [self.alert(120000, since=1003)], None, 90030)
+        self.assertEqual(self.send.call_count, 1)
+
+    def test_a_passed_reset_while_the_pause_lasts_gives_one_more_brief(self):
+        self.run(object(), [self.alert(10500, kind="reset")], None, 10000)
+        # la remise à zéro est passée et la pause continue : l'agent n'a pas
+        # repris — un second brief, une seule fois pour cette échéance.
+        self.run(object(), [self.alert(10500, kind="reset", since=1001)], None, 10600)
+        self.assertEqual(self.send.call_count, 2)
+        self.run(object(), [self.alert(10500, kind="reset", since=1002)], None, 10700)
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_a_passed_reset_still_rebriefs_when_the_alert_drops_the_deadline(self):
+        # Le cas réel : passé la grâce, `exploitation` ne rend plus d'échéance
+        # (le reset est derrière) et le motif devient « check the caps ».
+        # L'entrée de notify garde la promesse et la voit passer.
+        self.run(object(), [self.alert(10500, kind="reset")], None, 10000)
+        after = self.alert(None, kind=None, waits_reset=False, since=1001)
+        self.run(object(), [after], None, 10600)
+        self.assertEqual(self.send.call_count, 2)
+        self.run(object(), [after], None, 10700)
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_an_action_expected_pause_is_reminded_after_six_hours(self):
+        # #1466 : sans « rien à faire », une panne de configuration ne doit
+        # pas se taire après le premier courrier.
+        alert = self.alert(None, kind=None, waits_reset=False)
+        self.run(object(), [alert], None, 10000)
+        self.run(object(), [alert], None,
+                 10000 + alert_briefs.REMIND_AFTER_S - 1)
+        self.assertEqual(self.send.call_count, 1)
+        self.run(object(), [alert], None,
+                 10000 + alert_briefs.REMIND_AFTER_S + 1)
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_a_nothing_to_do_pause_is_not_reminded(self):
+        alert = self.alert(None, kind=None, waits_reset=True)
+        self.run(object(), [alert], None, 10000)
+        self.run(object(), [alert], None,
+                 10000 + alert_briefs.REMIND_AFTER_S + 1)
+        self.assertEqual(self.send.call_count, 1)
 
 
 if __name__ == "__main__":
