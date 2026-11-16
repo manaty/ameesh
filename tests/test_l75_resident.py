@@ -68,6 +68,20 @@ def codes(findings, severity=harnesses.ERROR) -> list[str]:
 
 
 class DescriptorBlockTest(unittest.TestCase):
+    def test_packaged_codex_caps_output_for_new_and_resumed_residents(self):
+        with tempfile.TemporaryDirectory() as host:
+            adapter = adapters.adapter_for("codex", binary=sys.executable, host_dir=host)
+            for session in (None, "existing-thread"):
+                with self.subTest(session=session):
+                    driver = resident.CodexAppServer(adapter, cwd=host, session=session,
+                                                    model="requested-model", effort="high")
+                    self.assertEqual(driver.argv(), [sys.executable, "-c",
+                        "tool_output_token_limit=1700", "--dangerously-bypass-hook-trust",
+                        "app-server"])
+                    self.assertEqual(driver._thread_params(), {
+                        "cwd": host, "approvalPolicy": "never", "sandbox": "danger-full-access",
+                        "model": "requested-model"})
+
     def test_packaged_descriptors_are_resident_and_pinned(self):
         descriptors, findings = harnesses.scan(host=tempfile.mkdtemp())
         self.assertEqual([str(f) for f in findings], [])

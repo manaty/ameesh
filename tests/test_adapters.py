@@ -52,12 +52,14 @@ class AdapterTest(unittest.TestCase):
             adapter = adapters.adapter_for("codex")
             self.assertEqual(
                 adapter.command("fais X"),
-                [adapter.binary, "--dangerously-bypass-hook-trust", "exec",
+                [adapter.binary, "-c", "tool_output_token_limit=1700",
+                 "--dangerously-bypass-hook-trust", "exec",
                  "--dangerously-bypass-approvals-and-sandbox", "--json", "fais X"],
             )
             self.assertEqual(
                 adapter.command("fais X", "fil-1"),
-                [adapter.binary, "--dangerously-bypass-hook-trust", "exec",
+                [adapter.binary, "-c", "tool_output_token_limit=1700",
+                 "--dangerously-bypass-hook-trust", "exec",
                  "--dangerously-bypass-approvals-and-sandbox", "--json",
                  "resume", "fil-1", "fais X"],
             )
@@ -145,7 +147,8 @@ class AdapterTest(unittest.TestCase):
             codex = adapters.adapter_for("codex")
             # L685: no shared background daemon, bypass only from the setting
             self.assertEqual(codex.interactive_command("t1"),
-                             [codex.binary, "--no-daemon", "resume", "t1"])
+                             [codex.binary, "-c", "tool_output_token_limit=1700",
+                              "--no-daemon", "resume", "t1"])
             dsh = adapters.adapter_for("deepseek")
             # #2706 : dsh n'a pas de profil interactif (son profil `agent` est
             # headless et exige une tâche) ; le descripteur refuse l'attachement

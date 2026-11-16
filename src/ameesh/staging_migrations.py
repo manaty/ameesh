@@ -605,7 +605,8 @@ class GitTree:
             raise Refused("staging migration policy is not UTF-8") from exc
 
 
-def decision_verifier(db, project):
+def decision_verifier(db, project, *, public_only=False):
+    """Use full authority before migrations, or public consumed proofs for bureau."""
     def verify(identifier, lot, option):
         from . import decisions
         view = decisions.get(db, identifier)
@@ -618,8 +619,8 @@ def decision_verifier(db, project):
                                   if isinstance(entry, dict)}):
             return False
         try:
-            decisions.require_current(db, view)
-            return decisions.verify_proof(db, view)[0]
+            decisions.require_current(db, view, public_only=public_only)
+            return decisions.verify_proof(db, view, public_only=public_only)[0]
         except decisions.DecisionError:
             return False
     return verify
@@ -650,16 +651,23 @@ def check_inventory(repo, sha, project, paths, *, cfg=None):
     does not reload the environment. No staging credential is read.
     """
     connection = None
+    public_only = False
 
     def signed_decision(identifier, lot, option):
-        nonlocal connection
+        nonlocal connection, public_only
         # The usual ameesh proof reader is opened only for destructive SQL.
         # No staging credential, SQL execution, or credential CLI option.
         from . import config, db
         if connection is None:
             connection = db.connect(
                 cfg or config.load(register_credentials=False), writer=False)
-        return decision_verifier(connection, project)(identifier, lot, option)
+            # Before 0583 the public view does not exist; after installation
+            # consumed proofs support both full and limited bureau connections.
+            public_only = connection.query(
+                "SELECT to_regclass('ameesh_decision_proofs') IS NOT NULL AS present"
+            )[0]["present"]
+        return decision_verifier(connection, project, public_only=public_only)(
+            identifier, lot, option)
 
     try:
         return inventory(GitTree(repo, sha), paths, signed_decision=signed_decision)

@@ -41,6 +41,33 @@ de la commande et le lancement du pont ACP est refusée (l'empreinte est
 sa provenance et son empreinte SHA-256 (`AgentWorker`, et le pont ACP). La
 signature et l'installation à version épinglée restent le lot L17.
 
+## Plafond des sorties Codex
+
+Le descripteur Codex du paquet passe `-c tool_output_token_limit=1700` aux
+commandes `exec`, `app-server` et interactives, y compris à la reprise d'un
+fil. Ce réglage natif remplace la valeur correspondante de `config.toml`
+pour le processus lancé, sans réécrire le `CODEX_HOME` du compte. Les
+descripteurs d'hôte restent prioritaires : leur commande doit porter le même
+réglage pour bénéficier du plafond.
+
+Source : décision owner #221839 b, signée le 16/11/2026 (approbation #372,
+lot #7569). Le seuil rapproche la sortie textuelle des 8 192 caractères de
+DeepSeek : Codex 0.159.3 estime quatre octets par jeton et ajoute 20 % pour
+la sérialisation, soit environ 8 160 octets pour 1 700 jetons, hors marqueurs.
+La troncature native conserve le début et la fin et signale la partie
+retirée. Une demande de budget supérieur par l'outil reste bornée par le
+plafond de l'historique. Les sorties courtes restent intégrales.
+
+La borne concerne les résultats textuels conservés dans l'historique envoyé
+au modèle. Les événements et les rollouts Codex peuvent garder la sortie
+brute ; les compteurs de sorties du corpus de contexte mesurent ce brut.
+Leur part estimée dans le pic de contexte ne mesure donc pas directement
+la part effectivement transmise après troncature. Les images et l'audio
+suivent les règles natives de Codex.
+
+Référence : [configuration officielle OpenAI](https://developers.openai.com/codex/config-reference),
+`tool_output_token_limit`. Aucun autre réglage de harnais n'est modifié.
+
 ## Manifeste (premier niveau)
 
 Champs du registre ACP repris tels quels :

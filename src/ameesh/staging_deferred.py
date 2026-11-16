@@ -84,10 +84,10 @@ def _recipients(cfg, db, project) -> list[str]:
     return names
 
 
-def _rows(db) -> list[dict]:
-    """The shared staging attestations, newest first (unreadable: empty)."""
+def _rows(db, *, strict=False) -> list[dict]:
+    """Shared proofs; explicit catch-up requests require a readable history."""
     from . import release_cutoff as rc
-    return [row for row in rc.stored_attestations(db) if isinstance(row, dict)]
+    return [row for row in rc.stored_attestations(db, strict=strict) if isinstance(row, dict)]
 
 
 def _tagged(rows, by_commit):
@@ -292,7 +292,7 @@ def active_right(db, project, host, today=None) -> dict | None:
         return {**right, "active": False,
                 "why": "decision not answered, withdrawn or superseded"}
     try:
-        signed, why = decisions.verify_proof(db, view)
+        signed, why = decisions.verify_proof(db, view, public_only=True)
     except Exception as exc:  # noqa: BLE001 - an unverifiable proof grants nothing
         signed, why = False, "unreadable proof: %s" % exc
     if not signed:
@@ -367,10 +367,10 @@ def baseline(db, project, host) -> dict | None:
 
     None when the host is not reported by the latest tagged attestation
     (already proved, or no tagged proof at all): there is nothing to catch
-    up, and an unreadable history concludes nothing.
+    up). An unreadable history raises ReleaseError for the explicit gesture.
     """
     from . import release_cutoff as rc
-    rows = _rows(db)
+    rows = _rows(db, strict=True)
     chosen = _tagged(rows, rc._tags_by_commit(project))
     if chosen is None:
         return None

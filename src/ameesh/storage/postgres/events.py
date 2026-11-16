@@ -43,7 +43,9 @@ class Events(interface.Events):
         # durable exact utilise l'index type/objet/id (#5045, migration 0528).
         if days is None and object is None:
             raise ValueError("an unbounded event read requires an exact object")
-        sql = "select " + _COLUMNS + " from ameesh_events where type = %s"
+        # #7565: this owner-backed, barrier view exposes staging proofs only.
+        relation = "ameesh_staging_attestations" if type == "staging.attested" else "ameesh_events"
+        sql = "select " + _COLUMNS + " from " + relation + " where type = %s"
         params = [type]
         if days is not None:
             sql += " and created_at > now() - make_interval(days => %s::int)"

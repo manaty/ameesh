@@ -201,4 +201,10 @@ class AdoptionSupersessionTest(unittest.TestCase):
         self.assertIn('decision #11 superseded by decision #12', why)
         # The old decision's own proof is never consulted; only the
         # replacement's signed answer is, by the authority gate.
-        verify.assert_called_once_with(mock.ANY, replacement)
+        verify.assert_called_once_with(mock.ANY, replacement, public_only=False)
+        with mock.patch.object(decisions, 'get', side_effect=fake_get), \
+                mock.patch.object(decisions, 'supersession_event', return_value=event), \
+                mock.patch.object(decisions, 'verify_proof', return_value=(True, '')) as verify:
+            with self.assertRaisesRegex(decisions.DecisionError, 'superseded by decision #12'):
+                decisions.require_current(object(), view, public_only=True)
+        verify.assert_called_once_with(mock.ANY, replacement, public_only=True)

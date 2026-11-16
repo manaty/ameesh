@@ -18,6 +18,7 @@ jamais avec le rôle `ameesh` ni un DSN d'agent.
 | prendre / lever un geste externe | `ameesh work claim <lot> --session <id> [--release]` | UPDATE des seules colonnes `external_claim_*` de `work_items` (dont `external_claim_harness` et `external_claim_binding` dès la migration 0566 de #6877) |
 | reçus de provenance | hooks `provenance intent|created|record` | INSERT de `provenance_receipts` |
 | courrier | `agent-mail send`, `agent-mail inbox` | INSERT de `agent_mailbox` ; UPDATE de `meta`, `delivered_at`, `status` (réservation et remise du courrier reçu) |
+| déclarer le rattrapage staging (#7565) | `ameesh release catchup` | SELECT de `ameesh_staging_attestations` (seul type `staging.attested`) ; SELECT du seul `ameesh_events.id` pour INSERT RETURNING ; trace `staging.catchup` au nom du bureau ; signatures de décisions déjà consommées via `ameesh_decision_proofs` |
 | présence et non-lus des agents (#7058) | `agent-mail list` | SELECT de la vue `agent_mesh_overview` (registre et courrier, déjà lisibles) ; pour le prédicat de réclamation, SELECT des seules colonnes lues de `host_lifecycle`, `host_release_fences` et `host_handoffs` |
 
 La liste exacte est `deploy/sql/_bureau-droits.sql` ; `_contrat-bureau.sql`
@@ -39,7 +40,8 @@ leur agent et leur hôte. Pour ces connexions, la base refuse :
   que prennent le dépôt et la remise du courrier) ;
 - sur le courrier reçu, tout changement autre que la réservation
   (`meta.consigne`) et la remise ; un message remis ne redevient pas non lu ;
-- tout événement écrit hors trigger ;
+- tout événement écrit hors trigger, sauf une trace `staging.catchup` du bureau
+  inscrit (type, schéma, auteur, objet, SHA et résultat contrôlés par la garde 0583) ;
 - toute suppression ;
 - la réouverture d'une liaison révoquée.
 
@@ -137,3 +139,15 @@ Avant le premier geste sur un hôte ou un geste à dépense, elle lance
 3. Retrait de la ligne pg_hba.
 
 Ce sont trois gestes distincts (§10).
+
+Pour #7565, appliquer la migration 0583 puis réexécuter `role-bureau.sql`
+et son audit sur la base du mesh avant le rattrapage depuis bureau-goal.
+Une lecture impossible des attestations fait échouer `release catchup` avec
+une erreur explicite ; un hôte absent d'un historique lisible reste sans
+rattrapage à déclarer. La déclaration ne lève pas l'alerte de retard : seule
+une attestation du runtime actif peut la lever.
+La vue `ameesh_decision_proofs` ne donne que les champs publics nécessaires
+à la vérification cryptographique des approbations déjà consommées par une
+décision. Les approbations en attente, leur consommation, les métadonnées et
+les tables de clés restent fermées ; les clés publiques viennent de
+`mesh_keys`, déjà lisible.

@@ -2050,8 +2050,8 @@ class Approvals(Domain):
 
     @abc.abstractmethod
     def recent(self, *, action: str | None, artifact_hash: str | None,
-               limit: int) -> list[dict]:
-        """Approbations avec leur état, de la plus récente à la plus ancienne."""
+               limit: int, proof_only: bool = False) -> list[dict]:
+        """Approvals newest first; proof_only exposes consumed decision proofs only."""
 
     @abc.abstractmethod
     def get(self, approval_id: int) -> dict | None:

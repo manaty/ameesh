@@ -15,6 +15,11 @@ et l'audit qui refuse un droit en trop.
 from __future__ import annotations
 
 import json
+import hashlib
+from pathlib import Path
+import dataclasses
+import types
+from unittest import mock
 import os
 import secrets
 import subprocess
@@ -124,6 +129,141 @@ class BureauRoleLimiteTest(PgTestCase):
                        actor="human:proprio", cfg=self.cfg, external_executor=executor)
         return int(lot["id"])
 
+    def test_staging_proofs_and_catchup_under_the_limited_login(self):
+        from ameesh import events, release_cutoff, staging_deferred
+        from ameesh.storage.postgres.events import Events
+        proof = {"sha": "a" * 40, "reportes": {"server": {"raison": "root"}}}
+        events.record(self.db, "staging.attested", "staging:" + "a" * 40, **proof)
+        events.record(self.db, "alert.raised", "private", secret="must stay private")
+        limited = db_mod.connect(dataclasses.replace(self.cfg, dsn=self.dsn))
+        try:
+            rows = release_cutoff.stored_attestations(limited, strict=True)
+            self.assertIn(proof, rows)
+            with self.assertRaises(db_mod.DbError):
+                Events(limited).recent_type("alert.raised", 1, 10)
+            with self.assertRaises(db_mod.DbError):
+                limited.query("select data from ameesh_events")
+            payload = dict(schema=staging_deferred.CATCHUP_SCHEMA, host="server",
+                           sha="a" * 40, result="ok", actor="bureau")
+            with mock.patch.object(staging_deferred, "active_right",
+                                   return_value={"active": True, "decision": 123}):
+                declared = staging_deferred.declare(
+                    limited, types.SimpleNamespace(name="ameesh"), "server", "a" * 40,
+                    {"sha": "a" * 40, "tag": "v1.0.0"}, "ok", "bureau", "root catch-up")
+            row = self.db.query("select data from ameesh_events where id = %s", (declared["event"],))[0]
+            for key, value in payload.items():
+                self.assertEqual(row["data"][key], value)
+            self.assertEqual(row["data"]["decision"], 123)
+            for change in ({"actor": "another"}, {"schema": None}, {"host": None},
+                           {"sha": "bad"}, {"result": "anything"}):
+                with self.assertRaises(db_mod.DbError):
+                    events.record(limited, "staging.catchup", "staging-catchup:ameesh:server",
+                                  project="ameesh", **{**payload, **change})
+            with self.assertRaises(db_mod.DbError):
+                events.record(limited, "alert.raised", "private", project="ameesh", **payload)
+        finally:
+            limited.close()
+
+    def test_consumed_decision_signature_is_readable_but_pending_approval_is_not(self):
+        from ameesh import authority, decisions, registry, signing, storage, staging_deferred
+        seed = b"\x42" * 32  # public fixture, never an enrolled real key
+        registry.upsert(self.db, "fixture-owner", harness="other", host=self.cfg.host)
+        authority.register_key(self.db, "fixture-owner", signing.public_from_seed(seed), role="owner")
+        view = {"id": 123, "lot": 456, "project": "ameesh", "created_ts": 1700000000,
+                "question": "fixture grant", "state": "answered",
+                "options": [{"key": "a", "label": "fixture", "grant": {
+                    "gesture": "root", "beneficiary": "bureau", "host": "server",
+                    "expires": "2099-12-12"}}]}
+        # Persist the real request: exercise get, supersession and signature
+        # verification through a separate authenticated limited connection.
+        request = storage.of(self.db).decisions.create(
+            sender="bureau", recipient="human:fixture-owner", body="fixture grant",
+            payload={"decision": {**view, "needs_signature": True}},
+            work_item_id=None, host=self.cfg.host)
+        identifier = int(request["id"])
+        view = decisions.get(self.db, identifier)
+        digest = decisions.answer_digest(view, "a", "a", "human:fixture-owner")
+        authority.create_approval(self.db, seed, approver="fixture-owner", action="decision",
+                                  artifact_kind="decision", artifact_hash=digest, ttl=900)
+        limited = db_mod.connect(dataclasses.replace(self.cfg, dsn=self.dsn))
+        try:
+            proofs = storage.of(limited).approvals
+            self.assertEqual(proofs.recent(action="decision", artifact_hash=digest,
+                                           limit=20, proof_only=True), [])
+            row, verdict = authority.find_approval(self.db, "decision", digest, consume_by="decision:%d" % identifier)
+            self.assertTrue(verdict.ok)
+            view["answer"] = {"text": "a", "option": "a", "by": "human:fixture-owner",
+                              "proof": {"digest": digest, "approval_id": row["id"]}}
+            self.db.execute(
+                "UPDATE agent_mailbox SET payload = jsonb_set(payload, '{decision,answer}', %s::jsonb)"
+                " WHERE id = %s", (json.dumps(view["answer"]), identifier))
+            read = decisions.get(limited, identifier)
+            self.assertEqual(read["answer"], view["answer"])
+            self.assertIsNone(storage.of(limited).decisions.supersession(identifier))
+            decisions.require_current(limited, read, public_only=True)
+            self.assertTrue(decisions.verify_proof(limited, read, public_only=True)[0])
+            from ameesh import staging_migrations
+            self.assertTrue(staging_migrations.decision_verifier(limited, "ameesh", public_only=True)(
+                identifier, 456, "a"))
+            self.refused("INSERT INTO decision_supersessions VALUES (1, 2, 'bureau', now(), '{}')",
+                         "permission denied")
+            self.refused("UPDATE decision_supersessions SET person = 'bureau'", "permission denied")
+            self.refused("DELETE FROM decision_supersessions", "permission denied")
+            project = types.SimpleNamespace(name="ameesh", staging_rights=[{
+                "gesture": "root", "beneficiary": "bureau", "host": "server",
+                "expires": "2099-12-12", "decision": identifier, "option": "a", "lot": 456}])
+            self.assertTrue(staging_deferred.active_right(limited, project, "server")["active"])
+            declared = staging_deferred.declare(
+                limited, project, "server", "a" * 40, {"sha": "a" * 40, "tag": "v1"},
+                "ok", "bureau")
+            self.assertGreater(declared["event"], 0)
+            # Exercise the actual preflight entry point, with its own real
+            # connection and automatic proof source selection.
+            with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
+                repo = Path(directory)
+                sql = b"DROP TABLE obsolete_fixture;"
+                (repo / "migration.sql").write_bytes(sql)
+                (repo / ".ameesh").mkdir()
+                (repo / staging_migrations.POLICY_PATH).write_text(json.dumps({
+                    "schema": "ameesh-staging-migrations/1", "declarations": {
+                        "migration.sql": {"checksum": hashlib.sha256(sql).hexdigest(),
+                                          "lot": 456, "decision": identifier,
+                                          "approval_option": "a"}}}))
+                def git(*args):
+                    return subprocess.check_output(
+                        ["git", "-C", directory, "-c", "core.hooksPath=/dev/null", *args],
+                        env=self.env(), stderr=subprocess.STDOUT).decode().strip()
+                git("init", "-q")
+                git("add", ".")
+                git("-c", "user.name=fixture", "-c", "user.email=fixture@localhost",
+                    "commit", "-qm", "fixture")
+                sha = git("rev-parse", "HEAD")
+                report = staging_migrations.check_inventory(
+                    directory, sha, "ameesh", ["migration.sql"],
+                    cfg=dataclasses.replace(self.cfg, dsn=self.dsn))
+                self.assertTrue(report["allowed"], report)
+                self.assertEqual(report["files"][0]["classification"], "destructive")
+                self.db.execute("ALTER VIEW ameesh_decision_proofs RENAME TO fixture_proofs")
+                try:
+                    report = staging_migrations.check_inventory(
+                        directory, sha, "ameesh", ["migration.sql"], cfg=self.cfg)
+                    self.assertTrue(report["allowed"], report)
+                finally:
+                    self.db.execute("ALTER VIEW fixture_proofs RENAME TO ameesh_decision_proofs")
+            with self.assertRaises(db_mod.DbError):
+                proofs.recent(action="decision", artifact_hash=digest, limit=20)
+        finally:
+            limited.close()
+
+    def test_role_replay_grants_existing_bureau_login_the_public_journal(self):
+        self.db.execute('REVOKE SELECT ON decision_supersessions FROM "%s"' % self.login)
+        self.refused("SELECT * FROM decision_supersessions", "permission denied")
+        replay = self.script("role-bureau.sql")
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(self.sql("SELECT * FROM decision_supersessions").returncode, 0)
+        audit = self.script("_contrat-bureau.sql")
+        self.assertEqual(audit.returncode, 0, audit.stderr)
+
     # -- installation et audit ---------------------------------------------
     def test_l_audit_seul_passe_puis_refuse_un_droit_en_trop(self):
         proc = self.script("_contrat-bureau.sql")
@@ -145,6 +285,18 @@ class BureauRoleLimiteTest(PgTestCase):
             self.assertEqual(self.script("_contrat-bureau.sql").returncode, 0)
         finally:
             self.db.execute('REVOKE UPDATE (state) ON work_items FROM "%s"' % self.login)
+
+    def test_a_broadened_staging_view_fails_the_contract(self):
+        self.db.execute("CREATE OR REPLACE VIEW ameesh_staging_attestations WITH (security_barrier=true) AS "
+                        "SELECT id, type, object, project, data, created_at FROM ameesh_events")
+        try:
+            proc = self.script("_contrat-bureau.sql")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("staging attestations view is not narrowly filtered", proc.stderr)
+        finally:
+            self.db.execute("CREATE OR REPLACE VIEW ameesh_staging_attestations WITH (security_barrier=true) AS "
+                            "SELECT id, type, object, project, data, created_at FROM ameesh_events "
+                            "WHERE type = 'staging.attested'")
 
     def test_une_appartenance_en_plus_est_refusee(self):
         other = "t_bur_x_%s" % uuid.uuid4().hex[:8]
