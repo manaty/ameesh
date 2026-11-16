@@ -1138,12 +1138,14 @@ def generate_notes(*, project: "ProjectRelease", repo: str, since: str, target: 
 def _staging_rights(project: str, raw) -> tuple:
     """#7372: parse the standing staging rights of a release project.
 
-    Each entry is `{"host": …, "decision": <id>, "option": "a",
-    "expires": "YYYY-MM-DD"}`. The decision is only a reference here; the
-    guard re-reads it (answered, signed, not withdrawn or superseded) and
-    checks the answered option, its project, host and stated expiry before
-    any use (#7372 B2). An invalid entry is refused at configuration time,
-    never silently ignored.
+    Each entry is `{"gesture": "root", "beneficiary": "bureau",
+    "host": …, "lot": 7372, "decision": <id>, "option": "a",
+    "expires": "YYYY-MM-DD"}`. The lot is the signed scope of the decision.
+    The decision is only a reference here; the guard re-reads it (answered,
+    signed, not withdrawn or superseded) and checks the answered option, its
+    project, and the signed grant's gesture, beneficiary, host and expiry
+    against this entry before any use (#7372 B2). An invalid entry is refused
+    at configuration time, never silently ignored.
     """
     if raw is None:
         return ()
@@ -1154,12 +1156,22 @@ def _staging_rights(project: str, raw) -> tuple:
         where = "release.projects.%s.staging_rights[%d]" % (project, index)
         if not isinstance(item, dict):
             raise ReleaseError("%s: an object is required" % where)
-        unknown = set(item) - {"host", "decision", "option", "expires"}
+        unknown = set(item) - {"gesture", "beneficiary", "host", "lot",
+                               "decision", "option", "expires"}
         if unknown:
             raise ReleaseError("%s: unknown key(s) %s" % (where, ", ".join(sorted(unknown))))
+        gesture = item.get("gesture")
+        if not isinstance(gesture, str) or not gesture.strip():
+            raise ReleaseError("%s.gesture is required" % where)
+        beneficiary = item.get("beneficiary")
+        if not isinstance(beneficiary, str) or not beneficiary.strip():
+            raise ReleaseError("%s.beneficiary is required" % where)
         host = item.get("host")
         if not isinstance(host, str) or not host.strip():
             raise ReleaseError("%s.host is required" % where)
+        lot = item.get("lot")
+        if not isinstance(lot, int) or isinstance(lot, bool) or lot <= 0:
+            raise ReleaseError("%s.lot: a positive integer is required" % where)
         decision = item.get("decision")
         if (not isinstance(decision, int) or isinstance(decision, bool) or decision <= 0):
             raise ReleaseError("%s.decision: a positive integer is required" % where)
@@ -1173,7 +1185,9 @@ def _staging_rights(project: str, raw) -> tuple:
             _dt.date.fromisoformat(expires)
         except ValueError as exc:
             raise ReleaseError("%s.expires: an ISO date is required (%s)" % (where, exc)) from exc
-        out.append({"host": host.strip(), "decision": decision,
+        out.append({"gesture": gesture.strip().lower(),
+                    "beneficiary": beneficiary.strip().lower(),
+                    "host": host.strip(), "lot": lot, "decision": decision,
                     "option": option.strip(), "expires": expires})
     return tuple(out)
 
@@ -1201,11 +1215,12 @@ class ProjectRelease:
     staging_handoff: str = ""
     attestation_timeout_s: float = ATTESTATION_TIMEOUT_S
     #: #7372: standing owner root rights of the bureau, per host. Each entry
-    #: names the decision, its approved option and its expiry; the decision is
-    #: re-read and its option/scope checked at each use
+    #: names the gesture, beneficiary, decision, approved option and expiry;
+    #: the decision is re-read and its signed grant checked at each use
     #: (answered, signed, not withdrawn or superseded), so a revocation takes
     #: effect on the next pass, without a release. Nothing client-specific is
-    #: compiled here: the host, decision and date come from the configuration.
+    #: compiled here: the gesture, beneficiary, host, lot, decision and date
+    #: come from the configuration.
     staging_rights: tuple = ()
 
     @classmethod

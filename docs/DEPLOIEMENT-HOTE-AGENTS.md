@@ -718,20 +718,25 @@ ni échéance n’est codé en dur : le droit se déclare dans la configuration 
 release, sous `release.projects.<projet>.staging_rights` :
 
 ```json
-{"host": "manaty-mesh-1", "decision": 219407, "option": "a",
- "expires": "2026-12-12"}
+{"gesture": "root", "beneficiary": "bureau", "host": "manaty-mesh-1",
+ "lot": 7372, "decision": 219407, "option": "a", "expires": "2026-12-12"}
 ```
 
 La décision n’est qu’une référence : à chaque passage, la garde la relit
 (répondue, preuve d’owner vérifiée, non retirée ni remplacée) et refuse le
-geste si elle ne l’est plus ou si l’échéance est passée. Elle vérifie aussi que
-la réponse a retenu l’option configurée, que la décision porte bien le projet,
-et que son libellé signé nomme l’hôte et une échéance au moins égale à celle de
-la configuration : une option refusée, une décision étrangère ou une échéance
-prolongée au-delà du texte signé rendent le droit inactif. Une révocation prend
-donc effet au passage suivant, sans nouvelle release ; retirer l’entrée rend le
-geste à une décision par geste (§10). Une entrée incomplète, une clé inconnue
-ou une date invalide refuse la configuration.
+geste si elle ne l’est plus ou si l’échéance est passée. Le droit lui-même est
+le **grant** porté par l’option signée, jamais `answer.option_label` ni la date
+de réponse, qui ne sont pas couverts par l’empreinte : la garde lit l’option
+dans `options` (signées) et la date de création signée, puis compare un à un le
+geste, le bénéficiaire, l’hôte, le lot signé et l’échéance au texte signé. Le libellé d’un
+droit root suit la clause « Droit <geste> [permanent] du <bénéficiaire> sur
+<hôte> pour ce seul geste, jusqu’au <date> » ; un refus (« Refuser… », « Aucun
+droit… ») ne l’accorde pas. Une option refusée, une décision étrangère, un hôte
+différent ou une échéance prolongée au-delà du texte signé rendent le droit
+inactif. Une révocation prend donc effet au passage suivant, sans nouvelle
+release ; retirer l’entrée rend le geste à une décision par geste (§10). Une
+entrée incomplète, une clé inconnue ou une date invalide refuse la
+configuration.
 
 Après les quatre étapes, le bureau déclare le geste depuis le compte qui les a
 exécutées :

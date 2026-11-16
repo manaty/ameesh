@@ -25,13 +25,25 @@ TAG = {"version": "1.57.0", "tag": "v1.57.0", "commit": SHA, "at": 2.0}
 OLD_TAG = {"version": "1.56.0", "tag": "v1.56.0", "commit": OLD, "at": 1.0}
 AGENTS = ("ameesh-agents-1", "ameesh-agents-2", "ameesh-agents-3")
 HOST = "manaty-mesh-1"
-RIGHTS = ({"host": HOST, "decision": 219407, "option": "a",
+RIGHTS = ({"gesture": "root", "beneficiary": "bureau", "host": HOST,
+           "lot": 7372, "decision": 219407, "option": "a",
            "expires": "2026-12-12"},)
 
 LABEL = ("Droit root permanent du bureau sur manaty-mesh-1 pour ce seul geste, "
          "jusqu'au 12/12 : à chaque coupure, les quatre étapes vm.sh puis "
          "retour au commit attesté, chaque geste déclaré et tracé ; "
          "révocable à tout moment.")
+REFUSAL = ("Refuser le droit root sur manaty-mesh-1 jusqu'au 2026-12-12 : le "
+           "report reste, aucune autorisation n'est donnée.")
+OPTIONS = [
+    {"key": "a", "label": LABEL},
+    {"key": "b", "label": "Droit root par coupure, comme #215688 pour #7152 : "
+                          "une décision owner à chaque release, avant le geste."},
+    {"key": "c", "label": "Aucun droit : le report reste, l'alerte de retard de "
+                          "version continue à chaque release."},
+]
+#: 2026-11-14: the decision's creation stamp, part of the signed answer digest.
+CREATED = 1794656469.9
 
 
 def attestation(sha, *, reportes=None, hotes=None, date="2026-11-15T22:31:37Z"):
@@ -48,13 +60,15 @@ def project(name="ameesh", repo="/nowhere", rights=RIGHTS):
 
 
 def active(**extra):
-    return {"project": "ameesh", "host": HOST, "decision": 219407,
+    return {"project": "ameesh", "gesture": "root", "beneficiary": "bureau",
+            "host": HOST, "lot": 7372, "decision": 219407,
             "expires": "2026-12-12", "expired": False, "active": True,
             "why": "", **extra}
 
 
 def expired():
-    return {"project": "ameesh", "host": HOST, "decision": 219407,
+    return {"project": "ameesh", "gesture": "root", "beneficiary": "bureau",
+            "host": HOST, "lot": 7372, "decision": 219407,
             "expires": "2026-12-12", "expired": True, "active": False,
             "why": "expired"}
 
@@ -77,11 +91,16 @@ class RightTest(unittest.TestCase):
 
     def view(self, **extra):
         view = {"state": "answered", "withdrawn": None, "superseded_by": None,
-                "project": "ameesh",
-                "answer": {"option": "a", "option_label": LABEL, "ts": 1794791782.3,
-                           "proof": {"digest": "d" * 64}}}
+                "project": "ameesh", "lot": 7372, "created_ts": CREATED,
+                "options": OPTIONS,
+                "answer": {"option": "a", "proof": {"digest": "d" * 64}}}
         view.update(extra)
         return view
+
+    def options(self, label=None, **extra):
+        rows = [{"key": "a", "label": label if label is not None else LABEL}]
+        rows[0].update(extra)
+        return rows
 
     def active(self, view, *, today="2026-11-20"):
         with mock.patch("ameesh.decisions.get", return_value=view), \
@@ -108,17 +127,65 @@ class RightTest(unittest.TestCase):
 
     def test_a_decision_without_the_approved_option_grants_nothing(self):
         for view, why in (
-                (self.view(answer={"option": "c", "option_label": LABEL,
-                                   "ts": 1794791782.3,
+                (self.view(answer={"option": "c",
                                    "proof": {"digest": "d" * 64}}), "option"),
-                (self.view(project="nexlink"), "project")):
+                (self.view(project="nexlink"), "project"),
+                (self.view(lot=9999), "lot")):
             right = self.active(view)
             self.assertFalse(right["active"], why)
             self.assertIn(why, right["why"])
 
+    def test_the_unsigned_answer_fields_are_never_read(self):
+        view = self.view(answer={"option": "a", "option_label": REFUSAL,
+                                 "ts": 1893456000.0,
+                                 "proof": {"digest": "d" * 64}})
+        right = self.active(view)
+        self.assertTrue(right["active"])
+        self.assertEqual(right["expires"], "2026-12-12")
+
+    def test_a_refusal_option_selected_or_configured_grants_nothing(self):
+        selected = self.view(answer={"option": "c",
+                                     "proof": {"digest": "d" * 64}})
+        right = self.active(selected)
+        self.assertFalse(right["active"])
+        self.assertIn("option", right["why"])
+        configured = ({"gesture": "root", "beneficiary": "bureau", "host": HOST,
+                       "lot": 7372, "decision": 219407, "option": "c",
+                       "expires": "2026-12-12"},)
+        with mock.patch("ameesh.decisions.get", return_value=selected), \
+             mock.patch("ameesh.decisions.verify_proof", return_value=(True, "")):
+            right = staging_deferred.active_right(
+                object(), project(rights=configured), HOST, today="2026-11-20")
+        self.assertFalse(right["active"])
+        self.assertIn("no grant", right["why"])
+
+    def test_a_refusal_wording_in_the_signed_option_grants_nothing(self):
+        view = self.view(options=self.options(REFUSAL))
+        right = self.active(view)
+        self.assertFalse(right["active"])
+        self.assertIn("no grant", right["why"])
+
+    def test_a_grant_for_another_host_grants_nothing(self):
+        other = LABEL.replace("manaty-mesh-1", "pc-smichea")
+        right = self.active(self.view(options=self.options(other)))
+        self.assertFalse(right["active"])
+        self.assertIn("names", right["why"])
+
+    def test_a_structured_grant_in_the_signed_option_is_used(self):
+        grant = {"gesture": "root", "beneficiary": "bureau", "host": HOST,
+                 "expires": "2026-12-12"}
+        view = self.view(options=self.options("", grant=grant))
+        right = self.active(view)
+        self.assertTrue(right["active"])
+
     def test_a_configuration_expiry_beyond_the_signed_one_grants_nothing(self):
-        view = self.view()
-        later = ({"host": HOST, "decision": 219407, "option": "a",
+        # The hostile derived fields must not buy a longer right: the signed
+        # option still says 12/12 of the decision's signed creation year.
+        view = self.view(answer={"option": "a", "option_label": LABEL.replace(
+            "12/12", "2030-12-12"), "ts": 1893456000.0,
+            "proof": {"digest": "d" * 64}})
+        later = ({"gesture": "root", "beneficiary": "bureau", "host": HOST,
+                  "lot": 7372, "decision": 219407, "option": "a",
                   "expires": "2027-12-12"},)
         with mock.patch("ameesh.decisions.get", return_value=view), \
              mock.patch("ameesh.decisions.verify_proof", return_value=(True, "")):
@@ -153,18 +220,33 @@ class RightTest(unittest.TestCase):
 class ConfigTest(unittest.TestCase):
     def test_staging_rights_are_parsed_and_canonicalised(self):
         rights = release_cutoff._staging_rights(
-            "ameesh", [{"host": " manaty-mesh-1 ", "decision": 219407,
-                        "option": " a ", "expires": "2026-12-12"}])
+            "ameesh", [{"gesture": " ROOT ", "beneficiary": "bureau",
+                        "host": " manaty-mesh-1 ", "lot": 7372,
+                        "decision": 219407, "option": " a ",
+                        "expires": "2026-12-12"}])
         self.assertEqual(rights[0]["host"], HOST)
         self.assertEqual(rights[0]["decision"], 219407)
         self.assertEqual(rights[0]["option"], "a")
+        self.assertEqual(rights[0]["gesture"], "root")
+        self.assertEqual(rights[0]["beneficiary"], "bureau")
+        self.assertEqual(rights[0]["lot"], 7372)
 
     def test_an_invalid_right_is_refused_at_configuration_time(self):
         for raw in ("x", [None], [{"host": ""}],
-                    [{"host": HOST, "decision": 0}],
-                    [{"host": HOST, "decision": 1, "expires": "12/12/2026"}],
-                    [{"host": HOST, "decision": 1, "expires": "2026-12-12"}],
-                    [{"host": HOST, "decision": 1, "expires": "2026-12-12",
+                    [{"gesture": "root", "beneficiary": "bureau", "host": HOST,
+                      "lot": 7372, "decision": 0}],
+                    [{"gesture": "root", "beneficiary": "bureau", "host": HOST,
+                      "lot": 7372, "decision": 1, "expires": "12/12/2026"}],
+                    [{"gesture": "root", "beneficiary": "bureau", "host": HOST,
+                      "lot": 7372, "decision": 1, "expires": "2026-12-12"}],
+                    [{"gesture": "", "beneficiary": "bureau", "host": HOST,
+                      "lot": 7372, "decision": 1, "option": "a",
+                      "expires": "2026-12-12"}],
+                    [{"gesture": "root", "beneficiary": "", "host": HOST,
+                      "lot": 7372, "decision": 1, "option": "a",
+                      "expires": "2026-12-12"}],
+                    [{"gesture": "root", "beneficiary": "bureau", "host": HOST,
+                      "decision": 1, "option": "a", "expires": "2026-12-12",
                       "granted": "2026-11-16"}]):
             with self.assertRaises(release_cutoff.ReleaseError, msg=raw):
                 release_cutoff._staging_rights("ameesh", raw)

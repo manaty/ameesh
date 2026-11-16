@@ -176,36 +176,91 @@ def right_for(project, host, today=None) -> dict | None:
             continue
         expires = str(right.get("expires") or "")
         return {"project": name, "host": host, "decision": right.get("decision"),
-                "option": right.get("option"), "expires": expires,
+                "option": right.get("option"), "gesture": right.get("gesture"),
+                "beneficiary": right.get("beneficiary"), "lot": right.get("lot"),
+                "expires": expires,
                 "expired": day > _dt.date.fromisoformat(expires)}
     return None
 
 
-def _approved_expiry(answer) -> _dt.date | None:
-    """The expiry stated by the signed option label, or None (#7372 B2).
+#: #7372 B2: the signed grant clause of a root right. Only the owner's signed
+#: option text is authority; a refusal ("Refuser le droit root…", "Aucun
+#: droit…") does not match, and a new wording fails closed until this grammar
+#: is extended with the decision. The beneficiary, the host and the expiry are
+#: captured as fields and compared one by one with the configuration.
+_GRANT_CLAUSE = re.compile(
+    r"^\s*droit\s+(?P<gesture>[a-z][a-z0-9 -]*?)\s+(?:permanent\s+)?du\s+"
+    r"(?P<beneficiary>[a-z][a-z0-9-]*)\s+sur\s+(?P<host>[^\s,;]+)\s+"
+    r"pour ce seul geste,\s+jusqu'au\s+"
+    r"(?P<expiry>20\d{2}-\d{2}-\d{2}|\d{1,2}/\d{1,2})\b",
+    re.IGNORECASE)
 
-    The decision schema carries no structured expiry: the owner's signed
-    option text is the grant. An ISO date wins; a bare ``JJ/MM`` is read in
-    the year of the answer (the next year if it has already passed). No date,
-    or an unreadable one, grants nothing: the guard fails closed instead of
-    trusting the configuration alone.
+
+def _grant_expiry(value, created) -> _dt.date | None:
+    """The expiry a signed grant states, or None (#7372 B2).
+
+    An ISO date carries its year. A bare ``JJ/MM`` is read in the year of the
+    decision's signed creation stamp (`created_ts` is part of `answer_digest`),
+    never from the unsigned answer fields. No date, no year, or an unreadable
+    value grants nothing.
     """
-    label = str(answer.get("option_label") or "")
-    found = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", label)
+    value = str(value or "").strip()
     try:
-        if found:
-            return _dt.date(int(found.group(1)), int(found.group(2)),
-                            int(found.group(3)))
-        found = re.search(r"\b(\d{1,2})/(\d{1,2})\b", label)
+        if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", value):
+            return _dt.date.fromisoformat(value)
+        found = re.fullmatch(r"(\d{1,2})/(\d{1,2})", value)
         if not found:
             return None
-        stamp = answer.get("ts")
-        signed = (_dt.datetime.fromtimestamp(float(stamp), _dt.timezone.utc).date()
-                  if stamp else _dt.datetime.now(_dt.timezone.utc).date())
+        created = float(created or 0)
+        if created <= 0:
+            return None
+        signed = _dt.datetime.fromtimestamp(created, _dt.timezone.utc).date()
         day = _dt.date(signed.year, int(found.group(2)), int(found.group(1)))
         return day if day >= signed else day.replace(year=signed.year + 1)
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _signed_grant(view) -> dict | None:
+    """The structured grant carried by the signed option, or None (#7372 B2).
+
+    `answer_digest` signs `options`, `answer.option` and `created_ts`; it does
+    NOT sign `answer.option_label` or `answer.ts`, which are therefore never
+    read here. The selected option must be unique in the signed list. It may
+    carry a structured `grant` object (gesture, beneficiary, host, expires);
+    otherwise its signed label must match the grant clause grammar, with the
+    year of a bare `JJ/MM` taken from the signed creation stamp.
+    """
+    options = (view or {}).get("options") or []
+    answer = (view or {}).get("answer") or {}
+    key = answer.get("option") if isinstance(answer, dict) else None
+    rows = [o for o in options if isinstance(o, dict) and o.get("key") == key]
+    if len(rows) != 1:
+        return None
+    option = rows[0]
+    explicit = option.get("grant")
+    if isinstance(explicit, dict):
+        fields = {name: explicit.get(name) for name in
+                  ("gesture", "beneficiary", "host", "expires")}
+        if not all(isinstance(value, str) and value.strip()
+                   for value in fields.values()):
+            return None
+        try:
+            expiry = _dt.date.fromisoformat(fields["expires"].strip())
+        except ValueError:
+            return None
+        return {"gesture": fields["gesture"].strip().lower(),
+                "beneficiary": fields["beneficiary"].strip().lower(),
+                "host": fields["host"].strip(), "expires": expiry}
+    found = _GRANT_CLAUSE.match(str(option.get("label") or ""))
+    if found is None:
+        return None
+    expiry = _grant_expiry(found.group("expiry"), view.get("created_ts"))
+    if expiry is None:
+        return None
+    return {"gesture": found.group("gesture").strip().lower(),
+            "beneficiary": found.group("beneficiary").strip().lower(),
+            "host": found.group("host").strip(), "expires": expiry}
 
 
 def active_right(db, project, host, today=None) -> dict | None:
@@ -214,10 +269,10 @@ def active_right(db, project, host, today=None) -> dict | None:
     A configured right is only usable while its decision is answered, its
     owner proof verifies, it is neither withdrawn by its requester nor
     replaced (`superseded_by`), it was answered with the configured option,
-    for the project and host, and the configuration expiry does not exceed
-    the expiry the signed option states. An unreadable decision, or any
-    doubt, never grants the gesture; the next pass sees a revocation without
-    waiting for a release.
+    for the project, and the signed option carries a grant whose gesture,
+    beneficiary, host and expiry match the configuration. An unreadable
+    decision, or any doubt, never grants the gesture; the next pass sees a
+    revocation without waiting for a release.
     """
     right = right_for(project, host, today=today)
     if right is None:
@@ -244,22 +299,31 @@ def active_right(db, project, host, today=None) -> dict | None:
         return {**right, "active": False, "why": "decision proof refused: %s" % why}
     name = getattr(project, "name", project)
     option = str(right.get("option") or "")
-    label = str(answer.get("option_label") or "")
-    approved = _approved_expiry(answer)
+    grant = _signed_grant(view)
     if not option:
         why = "no approved option in the configuration"
     elif answer.get("option") != option:
         why = ("answered option %r, not the configured %r"
                % (answer.get("option"), option))
+    elif view.get("lot") != right.get("lot"):
+        why = ("decision #%s is not lot %s (signed scope)"
+               % (right["decision"], right.get("lot")))
     elif view.get("project") != name:
         why = "decision #%s is not the project %s" % (right["decision"], name)
-    elif right["host"] not in label:
-        why = "the approved option does not name %s" % right["host"]
-    elif approved is None:
-        why = "the approved option states no expiry"
-    elif _dt.date.fromisoformat(right["expires"]) > approved:
+    elif grant is None:
+        why = "the signed option states no grant (gesture, beneficiary, host, expiry)"
+    elif grant["gesture"] != str(right.get("gesture") or ""):
+        why = ("the signed grant is %r, not the configured gesture %r"
+               % (grant["gesture"], right.get("gesture")))
+    elif grant["beneficiary"] != str(right.get("beneficiary") or ""):
+        why = ("the signed grant benefits %r, not the configured %r"
+               % (grant["beneficiary"], right.get("beneficiary")))
+    elif grant["host"] != right["host"]:
+        why = ("the signed grant names %r, not %r"
+               % (grant["host"], right["host"]))
+    elif _dt.date.fromisoformat(right["expires"]) > grant["expires"]:
         why = ("configuration expiry %s exceeds the approved %s"
-               % (right["expires"], approved.isoformat()))
+               % (right["expires"], grant["expires"].isoformat()))
     else:
         why = ""
     if why:
