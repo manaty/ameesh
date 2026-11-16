@@ -2469,6 +2469,7 @@ class Watcher:
         match SUITE_RE. Alert on the first pass: this is a missing gesture,
         not a test-duration SLO. Never dispatch or change a merge verdict here.
         """
+        import hashlib
         import shlex
         from . import merge_queue, packet_reviews, plan_github, work
         out = []
@@ -2529,7 +2530,11 @@ class Watcher:
                              % (repo, lot["id"], ", ".join(w for w, _ in missing)))
                     continue
                 for workflow, inputs in missing:
-                    once = "ci-undispatched:%s:%s:%s:%s" % (repo, lot["id"], sha, workflow)
+                    # Mail keys exclude '/' and are limited to 200 characters.
+                    # Hash the complete identity rather than truncating a long
+                    # repository/workflow name and colliding with another part.
+                    identity = json.dumps([repo, int(lot["id"]), sha, workflow])
+                    once = "ci-undispatched:" + hashlib.sha256(identity.encode()).hexdigest()
                     if storage.of(db).mailbox.by_idempotency_key(work.SYSTEM_SENDER, pilot, once):
                         continue
                     argv = ["gh", "workflow", "run", workflow, "--repo", repo, "--ref", branch]

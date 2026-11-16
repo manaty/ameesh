@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime
 from unittest import mock
 
-from ameesh import ci, merge_queue, plan_github, work
+from ameesh import agent_names, ci, merge_queue, plan_github, work
 
 REPO = "manaty/nexlink"
 SHA = "22de8527c8d0f925f39f14d5a3268f6f1c9bc38b"
@@ -37,8 +37,9 @@ class UndispatchedPartsTest(unittest.TestCase):
         self.heads = [SHA]
         self.logs = []
         self.keys = set()
+        self.db = types.SimpleNamespace(cfg=None)
         self.st = types.SimpleNamespace(mailbox=mock.Mock())
-        self.st.mailbox.by_idempotency_key.side_effect = lambda sender, to, key: key in self.keys
+        self.st.mailbox.by_idempotency_key.side_effect = lambda sender, to, key: 42 if key in self.keys else None
         self.observed = datetime.fromisoformat("2026-11-16T18:44:00+00:00").timestamp()
         self.watcher = ci.Watcher(self.cfg, api=self.api, log=self.logs.append,
                                   clock=lambda: self.observed)
@@ -50,6 +51,7 @@ class UndispatchedPartsTest(unittest.TestCase):
                                                 return_value={"ok": True}))
         self.planner = self.enter(mock.patch.object(ci, "_dispatch_plan", return_value=self.plan))
         self.pilot = self.enter(mock.patch.object(self.watcher, "_merge_pilot", return_value="pilot"))
+        self.real_send = ci._send
         self.send = self.enter(mock.patch.object(ci, "_send", side_effect=self.sent))
 
     def enter(self, context):
@@ -76,7 +78,22 @@ class UndispatchedPartsTest(unittest.TestCase):
         raise AssertionError(path)
 
     def observe(self):
-        return self.watcher._undispatched_parts(None, REPO, [self.lot])
+        return self.watcher._undispatched_parts(self.db, REPO, [self.lot])
+
+    def test_real_mail_send_accepts_the_key_and_reaches_mailbox_deposit(self):
+        # Only storage is simulated: the real ci._send and mail.send validate
+        # the key. Deferring the thread avoids writing an external test trace.
+        self.send.side_effect = lambda *a, **kw: self.real_send(*a, after_commit=[], **kw)
+        self.st.mailbox.send.return_value = {"id": 42}
+        with mock.patch.object(agent_names, "resolve", side_effect=lambda name, **kw: name):
+            records = self.observe()
+        self.assertEqual(len(records), 1, self.logs)
+        self.st.mailbox.send.assert_called_once()
+        self.assertEqual(self.st.mailbox.send.call_args.args[:2], (work.SYSTEM_SENDER, "pilot"))
+        key = self.st.mailbox.send.call_args.kwargs["payload"]["idempotency_key"]
+        self.assertTrue(key.startswith("ci-undispatched:"))
+        self.assertNotIn("/", key)
+        self.assertLessEqual(len(key), 200)
 
     def test_packet_657_alerts_before_slo_with_only_the_missing_part_command(self):
         self.assertEqual(ANNOUNCEMENT["created_at"], "2026-11-16T18:43:49Z")
