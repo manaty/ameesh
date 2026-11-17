@@ -198,6 +198,11 @@ SCOPE_FIELDS = ("scope", "projects")
 #: PREMIER niveau de `extensions.ameesh` seulement — le canon, c'est
 #: l'organisation ; l'entrée d'un membre n'a pas de nommage propre.
 NAMING_KEY = "naming"
+#: #7653 : mode de la porte d'actions, au PREMIER niveau de
+#: `extensions.ameesh` (`action_gate.mode` : journal | enforce). Le contrat de
+#: lecture appartient à #7630 ; absent vaut `journal`, et ce défaut implicite
+#: est signalé pour un canon qui porte un avatar.
+ACTION_GATE_KEY = "action_gate"
 #: L243 (#468) : un segment de nom est en minuscules, 2 à 6 caractères.
 #: `\Z` (et non `$`) : `$` accepte une fin de ligne, donc `"mty\n"` passerait
 #: et engendrerait un nom invalide.
@@ -5339,6 +5344,24 @@ def _relationship_cycles(graph):
                 stack.append((target, iter(graph.get(target, ()))))
 
 
+def _action_gate_mode_declared(federation: dict | None) -> bool:
+    """#7653 : `extensions.ameesh.action_gate.mode` est-il déclaré ?
+
+    Seule la présence de la clé compte ici : le contrat de lecture (défaut
+    `journal`, valeurs `journal | enforce`, valeur inconnue refusée) appartient
+    à #7630. Ce constat ne juge pas la valeur ; il rend visible le défaut
+    implicite d'un canon qui porte un avatar.
+    """
+    extensions = (federation or {}).get("extensions")
+    if not isinstance(extensions, dict):
+        return False
+    ameesh = extensions.get(SCOPE_KEY)
+    if not isinstance(ameesh, dict):
+        return False
+    gate = ameesh.get(ACTION_GATE_KEY)
+    return isinstance(gate, dict) and "mode" in gate
+
+
 def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[Finding]:
     """Constats de lecture + constats du profil. Une erreur est bloquante.
 
@@ -5356,6 +5379,21 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
 
     if not canon.readable:
         return findings
+
+    # -- #7653 : le mode de la porte d'actions est explicite ---------------------
+    # Le contrat de la clé (#7630) vaut `journal` par défaut et ce défaut ne
+    # refuse aucun geste hors charte. Un canon qui porte un avatar sans
+    # déclarer le mode laisserait croire à une politique appliquée : on le dit
+    # sans bloquer, le comportement restant `journal`.
+    if not _action_gate_mode_declared(canon.federation):
+        for agent in canon.agents:
+            if "avatar" in (agent.fiche.data or {}):
+                add("action-gate-mode-implicit", WARNING,
+                    "avatar %s: `extensions.ameesh.action_gate.mode` is not declared "
+                    "in federation.yaml; the action gate defaults to `journal` (it "
+                    "journals reserved actions but refuses none). Declare `journal` "
+                    "or `enforce` to make the policy explicit." % agent.title,
+                    agent.fiche, agent=agent.title)
 
     # -- doublons --------------------------------------------------------------
     for kind, items, subject in (("member", canon.members, None),
