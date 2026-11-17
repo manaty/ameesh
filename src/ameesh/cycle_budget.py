@@ -82,8 +82,8 @@ def attest(db, account, *, credit_usd, cap_usd, observed_at, expires_at,
 
 
 def operator(cfg, db):
-    """Authorized human or bound bureau role in a fully readable owning canon."""
-    from . import budget, canon, identity, registry, sous_utilisation
+    """Authorized human or bound avatar in a fully readable owning canon."""
+    from . import avatars, budget, canon, identity, registry, sous_utilisation
     binding = identity.resolve_binding(cfg, db)
     if not binding.name:
         if 'unreadable' in binding.reason:
@@ -95,8 +95,9 @@ def operator(cfg, db):
             or not all(sous_utilisation.fully_read(c) for c in canons)):
         raise budget.BudgetError('cycle operator canon unreadable')
     row = registry.get(db, binding.name)
-    if not row or not sous_utilisation.card_role(row, canons, ('bureau',)):
-        raise budget.BudgetError('cycle operator requires an authorized human or bureau role')
+    if not row or not avatars.is_avatar_in(canons, binding.name,
+                                           row_canon=row.get('canon')):
+        raise budget.BudgetError('cycle operator requires an authorized human or avatar')
     return binding.name
 
 
@@ -192,7 +193,7 @@ def execute(db, account, agent, attempt_id, bound, *, daily_admit, send, actual_
 def add_parser(sub):
     p = sub.add_parser('cycle', help='expiring credit envelope (per-request gate)')
     actions = p.add_subparsers(dest='cycle_command', required=True)
-    put = actions.add_parser('attest', help='install a nonsecret statement (human or bound bureau)')
+    put = actions.add_parser('attest', help='install a nonsecret statement (human or bound avatar)')
     for name in ('account', 'credit-usd', 'cap-usd', 'observed-at', 'expires-at',
                  'fresh-until', 'source'):
         put.add_argument('--' + name, required=True)
