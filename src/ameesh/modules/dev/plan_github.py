@@ -123,6 +123,11 @@ _ATTENTION = (lifecycle.WAITING_HUMAN, lifecycle.BLOCKED, *lifecycle.TO_VALIDATE
 class GithubError(RuntimeError):
     """gh introuvable, refus ou réponse illisible : message actionnable."""
 
+    def __init__(self, message, *, status=None, body=""):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
 
 def check_repo(repo: str) -> str:
     if not _REPO_RE.fullmatch(repo or ""):
@@ -933,8 +938,9 @@ class Api:
                     self.reads.note(headers, status=304, now=now, resource=resource)
                 self.last_read = ReadMeta(now, False, "revalidated")
                 return entry.value
+            error_body = _error_body(exc)
             until = self.reads.note(headers, status=exc.code, now=now, resource=resource,
-                                    body=_error_body(exc)) \
+                                    body=error_body) \
                 if self.reads is not None else None
             if until:
                 if entry is not None:
@@ -943,7 +949,8 @@ class Api:
                     return entry.value
                 self.reads.count("refused")
                 raise GithubRateLimited(path, until) from exc
-            raise GithubError("GitHub %s: HTTP %d" % (path, exc.code)) from exc
+            raise GithubError("GitHub %s: HTTP %d" % (path, exc.code),
+                              status=exc.code, body=error_body) from exc
         except (urllib.error.URLError, OSError) as exc:
             raise GithubError("GitHub %s: %s"
                               % (path, " ".join(str(exc).split())[:200])) from exc
@@ -1017,7 +1024,8 @@ class GhApi:
             self.reads.count("refused")
             raise GithubRateLimited(path, until)
         if status >= 400:
-            raise GithubError("GitHub %s: HTTP %d" % (path, status))
+            raise GithubError("GitHub %s: HTTP %d" % (path, status),
+                              status=status, body=body)
         try:
             value = json.loads(body) if body.strip() else None
         except ValueError as exc:
