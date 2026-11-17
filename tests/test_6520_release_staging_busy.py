@@ -14,6 +14,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from ameesh import config, release, release_cutoff, staging_watch
+from tests import canon_staging
 from tests.test_2448_release_cutoff import ReleaseFixtureMixin, _paris
 
 SHA = "a" * 40
@@ -295,7 +296,8 @@ class ElectedHandoffTest(unittest.TestCase):
     def run_staging(self, *, submit=None, latest=None, lease=None):
         project = release_cutoff.ProjectRelease(
             name="ameesh", repo="/fixture/repo", target="main",
-            staging_executor="/fixture/executor.json")
+            staging_executor="/fixture/executor.json",
+            staging_topology=canon_staging.topology())
         effect = ({"side_effect": submit} if isinstance(submit, BaseException)
                   else {"return_value": submit})
         with mock.patch("ameesh.staging_executor.settings",
