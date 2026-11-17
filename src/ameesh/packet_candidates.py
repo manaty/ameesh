@@ -576,7 +576,9 @@ def is_remise(ref: str, lot: int, target: str) -> bool:
 def list_remises(repo: str, where: str, lots, target: str) -> tuple[dict, str]:
     """({lot: [(ref, commit)]}, erreur) des remises de `lots` sur `target`,
     lues **fraîches** de `origin` et copiées sous `REMISE_LOCAL` dans `where`
-    (le clone du radar ; jamais le dépôt des agents). Sans `origin`, les refs
+    (le clone du radar ; jamais le dépôt des agents). Toutes les résolutions
+    sont rapatriées pour lire la provenance des anciens gels (#7737), mais
+    seules les remises sur la cible sont rendues. Sans `origin`, les refs
     de `repo` font foi. Une lecture impossible rend l'erreur : aucune remise,
     le lot reste `conflict` avec ce motif."""
     lots = {int(lot) for lot in lots}
@@ -610,12 +612,16 @@ def list_remises(repo: str, where: str, lots, target: str) -> tuple[dict, str]:
         for lot in lots:
             if is_remise(ref, lot, target):
                 found.setdefault(lot, []).append((ref, sha))
-    if not url or not found:
+    if not url:
         return found, ""
-    specs = ["+%s:%s%s" % (ref, REMISE_LOCAL, ref[len(resolutions.REF_PREFIX):])
-             for refs in found.values() for ref, _sha in refs]
+    # #7737: freeze_gate checks every resolution ref on origin. Fetch the
+    # same namespace even when no target remise exists, so prior freezes
+    # retained only by pair resolutions remain readable by review_authors.
+    # Prune only this private cache; deleted refs must not retain provenance.
+    specs = ["+%s*:%s*" % (resolutions.REF_PREFIX, REMISE_LOCAL)]
     try:
-        proc = resolutions._run(where, "fetch", "--quiet", url, *specs, timeout=FETCH_TIMEOUT)
+        proc = resolutions._run(where, "fetch", "--quiet", "--prune", "--no-tags",
+                                url, *specs, timeout=FETCH_TIMEOUT)
     except (resolutions.GitError, OSError) as exc:
         return {}, "cannot fetch the remises from origin: %s" % exc
     if proc.returncode:
@@ -1063,6 +1069,10 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     # sur une remise couvre la remise, il n'est pas un nouveau gel de la
     # branche (sinon `freeze_candidate` y verrait un rebase de la tête).
     found, remise_error = list_remises(repo, where, ids, target_branch)
+    if remise_error:
+        # The shared resolution cache also supplies prior-freeze provenance.
+        # Never read stale provenance after a failed refresh (#7737).
+        raise CandidateError(remise_error)
     remises = {lot: [(ref, listed, plan_git._commit(
                    where, ref if where == repo
                    else REMISE_LOCAL + ref[len(resolutions.REF_PREFIX):]) or "")
