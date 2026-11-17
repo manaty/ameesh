@@ -4018,6 +4018,7 @@ class _Loader:
                 continue
             allowed = set(SCOPE_FIELDS)
             if member == root.member:
+                allowed.add('action_gate')  # #7630: root canon action policy
                 allowed.add(NAMING_KEY)     # L243 (#468) : le nommage est à la racine
                 allowed.add(STANDING_APPROVALS_KEY)  # #7629 : plafond des grants
             for unknown in sorted(set(map(str, raw)) - allowed):
@@ -5680,6 +5681,12 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 % (agent.harness, agent.title, ", ".join(agent.harnesses)),
                 f, agent=agent.title)
         if "avatar" in (agent.fiche.data or {}):
+            from . import avatar_tools
+            from .spawn import SpawnToolsError
+            try:
+                avatar_tools.lists(agent, canon)
+            except SpawnToolsError as exc:
+                add(exc.code, ERROR, str(exc), f, agent=agent.title)
             # #7051 (avatar A3, design 5322 §1.1) : un avatar est attaché par
             # un humain (mode interactif) ET piloté par l'exécuteur entre deux
             # attaches (mode résident). Un harnais qui n'a pas les deux ne peut

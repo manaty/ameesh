@@ -73,7 +73,7 @@ from . import account_window
 from . import provider_credits
 from . import persona_memory as memory_mod
 from . import spawn as spawn_policy
-from . import child_reports
+from . import child_reports, avatar_tools
 from . import train_events
 from . import migrations
 from . import turn_context
@@ -8701,6 +8701,11 @@ class AgentWorker(threading.Thread):
         de lancement, compté parmi les harnais, publié tout de suite (un arrêt
         pendant la poignée de main le trouve)."""
         from . import resident
+        applied = getattr(self, "_avatar_tools", None)
+        if applied is not None:
+            offset = getattr(self, "_avatar_tools_offset", 1)
+            argv = [*argv[:offset], *applied.args, *argv[offset:]]
+            avatar_tools.record(self.db, self.name, applied, "resident")
         with self.runner.launch_lock:
             # jamais moissonné hors de l'arrêt de son groupe (codex r2, #417)
             proc = resident.spawn_leader(argv, **kwargs)
@@ -9530,6 +9535,18 @@ class AgentWorker(threading.Thread):
                 self.fail_turn("spawn policy unavailable",
                                "spawn profile/context not read: %s" % exc)
                 return False
+        self._avatar_tools = None
+        self._avatar_tools_offset = 1 + len((getattr(adapter.descriptor, "resident", None) or {}).get("launcher") or ())
+        if spawn_profile is None:
+            try:
+                self._avatar_tools = avatar_tools.prepare(
+                    self.cfg, self.agent, self.state_dir, cwd, harness=harness)
+                if self._avatar_tools is not None:
+                    spawn_args = list(self._avatar_tools.args)
+            except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+                self._close_resident("avatar tool policy unavailable")
+                self.fail_turn("avatar tool policy unavailable", str(exc))
+                return False
         if spawn_profile is not None:
             try:
                 profile_path, _mcp_path = spawn_policy.write_profile(
@@ -9744,6 +9761,8 @@ class AgentWorker(threading.Thread):
         # par tous les worktrees : un `user.name` écrit par un agent valait
         # pour les autres, incident du 13/10/2026).
         identite.update(identity.git_identity(self.name))
+        if self._avatar_tools is not None:
+            identite["AMEESH_AVATAR_TOOLS_DIGEST"] = self._avatar_tools.proof["digest"]
         env.update(identite)
         # #1645 : chaque geste gh du tour est consigné (agent, tour, lot), et
         # le tour porte le jeton de son rôle GitHub quand il est configuré.
@@ -10136,6 +10155,7 @@ class AgentWorker(threading.Thread):
                                 commande = self.runner.audit_command(
                                     self.name, argv, self.agent, exempt=audit_exempt,
                                     seconds=audit_seconds)
+                            avatar_tools.record(self.db, self.name, self._avatar_tools, "turn")
                             proc = subprocess.Popen(
                                 commande,
                                 cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
@@ -17321,6 +17341,11 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         # ayant réveillé l'agent pour rien. Un harnais sans session interactive
         # doit refuser d'emblée, sans toucher au bail ni à la session.
         adapter.require_interactive()
+        avatar_applied = avatar_tools.prepare(
+            cfg, agent, cfg.agent_dir(name), agent.get("cwd"),
+            harness=agent.get("harness"))
+    except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+        return refuse("avatar_tools_unavailable", "attach: %s" % exc)
     except adapters.HarnessMissing as exc:
         return refuse("harness_missing", "attach: %s" % exc)
     # #7644 : le compte de la session est résolu après l'attente du tour et
@@ -17506,10 +17531,21 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         thread.start()
         veille.start()
         inputs.start()
+        # A wait for the resident to hand back its session may outlive a canon
+        # publication. Re-read the card immediately before constructing argv.
+        try:
+            avatar_applied = avatar_tools.prepare(
+                cfg, agent, cfg.agent_dir(name), agent.get("cwd"),
+                harness=agent.get("harness"))
+        except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+            return refuse("avatar_tools_unavailable", "attach: %s" % exc)
         argv = adapter.interactive_command(
             agent.get("session_id"),
             permission_mode=_attach_permission_mode(
                 cfg, name, harness_revendique, mode_incarnation))
+        if avatar_applied is not None:
+            offset = 1 + len(adapter.spec.launcher)
+            argv = [*argv[:offset], *avatar_applied.args, *argv[offset:]]
         env = _attach_env(cfg, name, lease_owner, epoch,
                           agent.get("harness") or "", human=human)
         env.update(adapter.env())
@@ -17543,6 +17579,10 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         # sans canon chargé, la projection `roles` du registre fait foi.
         auditeur = bool(os.environ.get("AUDITEUR_DSN")) and auditor_mod.is_auditor(
             db, name, canon_mod.load_configured(cfg), agent)
+        try:
+            avatar_tools.record(db, name, avatar_applied, "attach")
+        except (db_mod.DbError, spawn_policy.SpawnToolsError) as exc:
+            return refuse("avatar_tools_unavailable", "attach: tool policy proof not recorded: %s" % exc)
         launched = time.monotonic()
         proc = subprocess.Popen(argv, cwd=cwd, env=child_environment.harness(
                                     env, harness_revendique, compte,
