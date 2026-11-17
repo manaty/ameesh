@@ -54,10 +54,7 @@ list [--all]` donne opérations, plafond, usage, échéance, cadre et accord.
 Le lien bénéficiaire/cible du grant relève du lot §3.5 point 2 de la série.
 
 Accord d'une décision (point 4, validé par le bureau le 17/11) : forme (a)
-`{agent, seq}`, ou forme (b) `{grant: id}`, un grant actif dont les
-opérations couvrent la signature. Les décisions sur la clé owner et les
-attestations de provenance relèvent de `decision-sign-key`, jamais couverte
-par un grant : forme (a) seulement.
+`{agent, seq}` ; la forme (b) `{grant: id}` est reportée (voir §4).
 
 ## 4. Signature de décision (livré)
 
@@ -65,14 +62,18 @@ par un grant : forme (a) seulement.
   seule la session d'un agent déclaré avatar de l'humain (section `avatar` de
   sa fiche, `responsible` résolu) passe la garde « seul un humain répond ».
   Sans `--accord`, la garde est inchangée.
-- Accord vérifié avant de signer : forme (a), message de l'humain au journal,
-  au plus 24 h avant (comme au point 1) ; forme (b), grant actif de l'humain
-  dont les opérations comprennent `decision-sign`.
+- Accord vérifié avant de signer : message de l'humain au journal, au plus
+  24 h avant (comme au point 1).
+- Forme (b), `grant:ID`, refusée dans cette tranche (relecture cx2, B) : un
+  grant ne vaut que par le contrat complet des approbations permanentes
+  (connecteur, classe, plafond, réservation atomique liée à la signature,
+  bénéficiaire et cible de #7629). Elle viendra quand la signature d'une
+  décision passera par la porte comme opération `decision-sign` (point 2).
 - Une décision sur la clé owner ou une attestation de provenance relève de
   `decision-sign-key` : drapeau du demandeur (`decide ask --key-provenance`),
   reclassement par un humain ou un avatar (`decide reclassify <id>
   key-provenance`, jamais l'inverse), ou au doute le texte (clé owner,
-  provenance). Seule la forme (a) la couvre.
+  provenance). Elle ne sera jamais couverte par un grant.
 - En base : `mesh_approvals.meta.signed_by` (`owner` | `avatar`), avec `agent`
   et `accord` pour l'avatar ; la réponse gardée porte `signer`. Pour l'avatar,
   `signer` entre dans l'empreinte signée (le changer casse la preuve) ; les
@@ -101,6 +102,7 @@ Nexlink passent par GitHub Actions). Le module qui déclarera `prod-deploy`
 ## Reste
 
 - Point 2 : connecteur `journal` et déclaration des quatre opérations par un
-  module, après #7628 ; détection des déploiements de production hors porte.
+  module, après #7628 ; détection des déploiements de production hors porte ;
+  signature de décision par la porte, et alors accord par grant réservé.
 - Le mode `extensions.ameesh.action_gate.mode` (#7627) n'est pas lu par ce
   lot : en `journal`, rien n'est bloqué, ce que fait déjà la porte ici.

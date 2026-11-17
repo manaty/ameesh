@@ -279,3 +279,34 @@ class JournalTest(AccordBase):
         # hors de la période : rien
         self.assertEqual(reserved_gestures.journal(self.db, since_ts=now - 7200,
                                                    until_ts=now - 3600)["gestures"], [])
+
+
+class MigrationTest(AccordBase):
+    """0586 : additive ; son retour arrière s'applique et la rejoue."""
+
+    def test_restore_puis_reapplication(self):
+        root = os.path.join(os.path.dirname(__file__), os.pardir, "src", "ameesh",
+                            "migrations")
+        with open(os.path.join(root, "rollback", "0586_restore.sql"), encoding="utf-8") as fh:
+            restore = fh.read()
+        with open(os.path.join(root, "0586_accord_cle_fichier.sql"), encoding="utf-8") as fh:
+            forward = fh.read()
+
+        def has_column(tx) -> bool:
+            return bool(tx.query(
+                "SELECT 1 AS x FROM information_schema.columns WHERE table_schema = "
+                "current_schema() AND table_name = 'authenticators' "
+                "AND column_name = 'accord_operations'"))
+
+        class Undo(Exception):
+            pass
+
+        with self.assertRaises(Undo):
+            with self.db.transaction() as tx:
+                self.assertTrue(has_column(tx))
+                tx.execute(restore)
+                self.assertFalse(has_column(tx))
+                tx.execute(forward)
+                self.assertTrue(has_column(tx))
+                raise Undo()
+        self.assertTrue(has_column(self.db))

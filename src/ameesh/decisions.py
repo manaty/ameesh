@@ -24,8 +24,9 @@ migration 0515; ``decide validation-history`` requires the owner's key.
         requester by mail (it wakes them up), to the thread and to the work item;
   ameesh decide <id> <option | "free text"> --key FILE --accord AGENT#SEQ|grant:ID
         #7631: the human's declared avatar (card section `avatar`) signs for
-        them with the owner key, on the go in the journal (form a) or a
-        standing approval (form b, never for the owner key or provenance);
+        them with the owner key, on the go in the journal (AGENT#SEQ, at most
+        24 h old); `grant:ID` is refused until decision signatures go through
+        the gate with reservation;
         the proof says `signed_by: avatar` and cites the accord;
   ameesh decide reclassify <id> key-provenance
         #7631: the request concerns the owner key or a provenance attestation
@@ -1069,22 +1070,24 @@ def parse_accord(text: str | None) -> dict | None:
 def check_accord(db, view: dict, human: str, accord: dict, *, now: float) -> str:
     """#7631 : l'accord d'une signature d'avatar ; rend une ligne lisible, ou
     DecisionError. Forme (a) : message de `human` au journal L78, au plus
-    24 h avant. Forme (b) : grant actif de `human` qui couvre la signature —
-    jamais pour une décision sur la clé owner ou la provenance."""
+    24 h avant ; elle couvre aussi une décision sur la clé owner ou la
+    provenance.
+
+    Forme (b) (`grant:ID`) : REFUSÉE dans cette tranche (relecture cx2 de
+    #7631, B). Un grant ne vaut que par le contrat complet des approbations
+    permanentes — connecteur, classe, plafond, réservation atomique liée à
+    la signature, bénéficiaire et cible (#7629) — que la signature d'une
+    décision ne suit pas encore ; elle le suivra quand elle passera par la
+    porte comme opération `decision-sign` (point 2, lot de suite)."""
     from . import receipts
-    operation = decision_operation(view)
     if "grant" in accord:
-        if operation == OP_DECISION_SIGN_KEY:
-            raise DecisionError("decision #%d concerns the owner key or a provenance "
-                                "attestation: only the human's go in the journal "
-                                "(--accord AGENT#SEQ) covers it" % view["id"])
-        grant = receipts.get_standing(db, accord["grant"])
-        if (grant is None or grant.get("approver") != human or grant.get("revoked_ts")
-                or float(grant.get("until_ts") or 0) <= now
-                or OP_DECISION_SIGN not in (grant.get("operations") or [])):
-            raise DecisionError("accord grant #%d: no active standing approval of %s for "
-                                "%s" % (accord["grant"], human, OP_DECISION_SIGN))
-        return "grant #%d" % accord["grant"]
+        kind = ("a decision on the owner key or a provenance attestation is never "
+                "covered by a standing approval; "
+                if decision_operation(view) == OP_DECISION_SIGN_KEY else "")
+        raise DecisionError("accord grant #%d refused: %sa standing approval does not yet "
+                            "cover a decision signature (it must go through the gate with "
+                            "reservation); cite the human's go: --accord AGENT#SEQ"
+                            % (accord["grant"], kind))
     code, reason = receipts.check_accord_entry(db, accord, human, int(now),
                                                receipts.Policy())
     if code:
@@ -1906,7 +1909,7 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
                         help="name of the owner key in the registry (default: your name)")
     parser.add_argument("--accord", default=None, metavar="AGENT#SEQ|grant:ID",
                         help="#7631: the human's avatar signs with --key on this accord "
-                             "(the go in the journal, or a standing approval)")
+                             "(the go in the journal; grant:ID is refused for now)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     decision_id = _decision_id(args.id)

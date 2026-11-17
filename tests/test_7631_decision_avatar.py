@@ -74,28 +74,22 @@ class AvatarDecisionTest(_Base):
         with self.assertRaises(DecisionError):
             self.answer(self.ask()["id"], "a", signer=self.avatar(self.go()))
 
-    def grant(self, **extra):
-        return dict({"approver": ALICE, "revoked_ts": None, "until_ts": time.time() + 3600,
-                     "operations": ["decision-sign"]}, **extra)
-
-    def test_grant_couvre_sauf_cle_ou_provenance(self):
+    def test_grant_refuse_tant_que_la_porte_ne_reserve_pas(self):
+        """Relecture cx2 (B) : un grant, même actif et à son nom, ne couvre pas
+        une signature de décision (ni plafond, ni réservation, ni portée)."""
+        grant = {"approver": ALICE, "revoked_ts": None, "until_ts": time.time() + 3600,
+                 "operations": ["decision-sign"], "max_amount": 1, "consumed_amount": 1}
         view = self.ask(needs_signature=True)
-        with mock.patch("ameesh.receipts.get_standing", return_value=self.grant()):
-            signed = self.answer(view["id"], "a", key_path=self.private,
-                                 signer=self.avatar({"grant": 7}))
-        self.assertEqual(self.meta(signed)["accord"], {"grant": 7})
-        for bad in (self.grant(revoked_ts=1.0), self.grant(until_ts=time.time() - 1),
-                    self.grant(approver="human:bob"), self.grant(operations=["spend"]), None):
-            with self.subTest(grant=bad):
-                with mock.patch("ameesh.receipts.get_standing", return_value=bad):
-                    with self.assertRaises(DecisionError):
-                        decisions.check_accord(self.db, self.ask(), ALICE, {"grant": 7},
-                                               now=time.time())
+        with mock.patch("ameesh.receipts.get_standing", return_value=grant):
+            with self.assertRaises(DecisionError) as caught:
+                self.answer(view["id"], "a", key_path=self.private,
+                            signer=self.avatar({"grant": 7}))
+        self.assertIn("refused", str(caught.exception))
+        self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
         key = self.ask(needs_signature=True, key_provenance=True)
         self.assertEqual(decisions.decision_operation(key), decisions.OP_DECISION_SIGN_KEY)
-        with mock.patch("ameesh.receipts.get_standing", return_value=self.grant()):
-            with self.assertRaises(DecisionError):
-                decisions.check_accord(self.db, key, ALICE, {"grant": 7}, now=time.time())
+        with self.assertRaises(DecisionError):
+            decisions.check_accord(self.db, key, ALICE, {"grant": 7}, now=time.time())
         # forme (a) : couvre aussi la clé et la provenance
         self.assertEqual(decisions.check_accord(self.db, key, ALICE, self.go(),
                                                 now=time.time())[:len(AVATAR)], AVATAR)
