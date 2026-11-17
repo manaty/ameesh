@@ -5771,9 +5771,9 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
             continue
         tests = ", ".join(removal.tests[:3]) or "tests ciblés"
         if removal.proof == "prefixes":
-            why = ("les tests ciblés de la composition ont rougi sur la tête "
-                   "composée, et le test rouge apparaît pour la première fois "
-                   "au préfixe de ton unité (%s)"
+            why = ("les tests ciblés de ton unité ont rougi sur son préfixe "
+                   "composé ; le test rouge apparaît pour la première fois "
+                   "au préfixe (%s)"
                    % (" ; ".join(removal.evidence[:3])
                       or "préfixes de l'empilement"))
         elif removal.attributed:
@@ -5781,8 +5781,8 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
                    "composée, et la lecture #3801 désigne ton unité (%s)"
                    % (" ; ".join(removal.evidence[:3]) or "attribution #3801"))
         else:
-            why = ("les tests ciblés de la composition ont rougi sur la tête "
-                   "composée ; le module propre de ton unité est rouge "
+            why = ("les tests ciblés de ton unité ont rougi sur son préfixe "
+                   "composé ; le module propre de ton unité est rouge "
                    "(retrait de repli, sans attribution #3801 sûre)")
         body = (
             "#%d retiré du paquet %s : %s. Tests : %s. Le paquet est recomposé "
