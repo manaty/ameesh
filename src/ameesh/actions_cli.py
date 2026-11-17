@@ -490,7 +490,8 @@ def cmd_recover(cfg: Config, args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 def decisions_view(db, *, human: str | None = None, include_closed: bool = False,
-                   now: float | None = None, viewer: str | None = None) -> dict:
+                   now: float | None = None, viewer: str | None = None,
+                   cfg=None) -> dict:
     """The object of `ameesh decisions --json` (also `GET /api/v1/decisions`,
     L84): the queue of `human` (all when None); `viewer`, when given, only
     sees the prose decisions addressed to the mesh or to them."""
@@ -502,7 +503,7 @@ def decisions_view(db, *, human: str | None = None, include_closed: bool = False
     # L233: decisions written in prose in mail, not filed as requests
     prose = decisions_mod.prose_decisions(db, now)
     if viewer:
-        allowed = decisions_mod.prose_recipients(db) + (viewer, decisions_mod.OWNER_ANY)
+        allowed = decisions_mod.prose_route(viewer, db, cfg=cfg)
         prose = [p for p in prose if p["recipient"] in allowed]
     queue["requests"] = requests["pending"]
     queue["prose"] = prose
@@ -522,6 +523,7 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
         queue = decisions_view(db, human=args.for_human, include_closed=args.all, now=now,
+                               cfg=cfg,
                                viewer=viewer)
         # #3007 : la file ne prouve pas que l'humain a été joint. Les
         # battements partagés des notificateurs disent si un vivant le couvre ;

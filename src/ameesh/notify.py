@@ -3341,9 +3341,10 @@ class Notifier:
                         now: float, db) -> bool:
         """Dépose l'alerte dans la boîte de l'avatar (#7634).
 
-        Le canal direct ne porte rien tant que l'avatar lit : c'est lui qui
-        présente à son humain. Le dépôt est durable ; le repli direct est
-        décidé par `_avatar_followup` après `AVATAR_FALLBACK_S`."""
+        Le contenu reste chez l'avatar ; le canal direct ne porte qu'un
+        signal court, sans le texte de l'alerte (spec #7627 §5). Le dépôt est
+        durable : `_avatar_followup` replie sur le texte entier après
+        `AVATAR_FALLBACK_S` si le message n'a pas été remis."""
         alert = entry["alert"]
         message = render(alert, "raised", now, raised_ts=entry.get("raised_ts"))
         payload = {"alert": alert.get("type"), "human": human,
@@ -3355,34 +3356,78 @@ class Notifier:
         if self.dry_run:
             self.log("[%s] mail to avatar %s (dry run): %s"
                      % (alert.get("type"), avatar, _subject(alert)))
+            entry["avatar_mail_id"] = None
         else:
             try:
-                mail.send(db, work.SYSTEM_SENDER, avatar, message.text,
-                          kind="event", payload=payload)
+                entry["avatar_mail_id"] = mail.send(
+                    db, work.SYSTEM_SENDER, avatar, message.text,
+                    kind="event", payload=payload)
             except Exception as exc:  # noqa: BLE001 — la route directe reprend
                 self.log("[%s] avatar %s unreachable (%s): direct route"
                          % (alert.get("type"), avatar,
                             _clean(_scrub(exc, ()), 160)))
                 return False
+        entry.pop("signal_ts", None)
         entry.update(status="avatar", avatar=avatar, avatar_sent_ts=now,
                      avatar_fallback=False, channels={})
         self._event(db, "avatar.routed", entry.get("key") or "", alert)
         self._record("raised", entry, "avatar", {})
+        self._signal_direct(entry, human, now)
         return True
 
-    def _avatar_followup(self, entry: dict, now: float, db) -> None:
-        """Après le dépôt chez l'avatar : attendre, puis replier (#7634).
+    def _signal_direct(self, entry: dict, human: str, now: float) -> None:
+        """Le signal sans contenu : « ton avatar a besoin de toi » (#7634).
 
-        Tant que l'avatar est joignable, l'alerte reste dans sa boîte. S'il
-        est arrêté ou injoignable au-delà de `AVATAR_FALLBACK_S`, la route
-        actuelle reprend — le canal direct de l'humain, avec le texte entier
-        — et l'événement est journalisé."""
+        Il part une fois, au dépôt. Les canaux de l'humain ne portent jamais
+        le texte de l'alerte tant que son avatar la lit ; après le délai sans
+        remise, `_avatar_followup` envoie le texte entier par la route
+        directe."""
+        if entry.get("signal_ts") is not None or self.dry_run:
+            return
+        channels = self.ncfg.channels_for(human)
+        if not channels:
+            entry["signal_ts"] = now
+            return
+        message = Message(title="Ton avatar a besoin de toi",
+                          body="Une alerte attend dans la boîte de ton avatar.",
+                          urgent=True, event="raised", kind="signal")
+        results = {}
+        for channel in channels:
+            ok, error = self._send(channel, message)
+            results[channel.name] = "ok" if ok else "failed: %s" % error
+            if not ok:
+                self.log("[%s] avatar signal → %s, channel %s: %s"
+                         % (entry["alert"].get("type"), human, channel.name, error))
+        entry["signal_ts"] = now
+        self._record("raised", entry, "signal", results)
+
+    def _avatar_mail_delivered(self, entry: dict, db) -> bool:
+        """Le message déposé chez l'avatar a-t-il été remis (lu) ?"""
+        message_id = entry.get("avatar_mail_id")
+        if not message_id or db is None:
+            return False
+        try:
+            row = mail.get(db, int(message_id))
+        except Exception:  # noqa: BLE001 — non prouvé : le repli reprend
+            return False
+        return bool(row and (row.get("delivered_ts") is not None
+                             or row.get("status") == "delivered"))
+
+    def _avatar_followup(self, entry: dict, now: float, db) -> None:
+        """Après le dépôt chez l'avatar : attendre la remise, puis replier.
+
+        Le repli ne dépend pas de la seule « joignabilité » : un avatar
+        `externe` est toujours joignable, et le bureau a laissé 76 courriers
+        non remis en 24 h (nuit du 16/11). Après `AVATAR_FALLBACK_S`, si le
+        message n'est pas remis — ou si l'avatar est arrêté — la route
+        actuelle reprend avec le texte entier, et l'événement est journalisé."""
         if entry.get("avatar_fallback"):
             return
         sent = float(entry.get("avatar_sent_ts") or 0.0)
         if now - sent < AVATAR_FALLBACK_S:
             return
-        if self._avatar_reachable(entry.get("avatar"), db):
+        if (self._avatar_mail_delivered(entry, db)
+                and self._avatar_reachable(entry.get("avatar"), db)):
             return
         alert = entry["alert"]
         entry["avatar_fallback"] = True
@@ -3678,6 +3723,8 @@ class Notifier:
             kind = alert.get("type")
             human, _ = router.resolve(alert, for_avatar=True)
             avatar = avatars_by_human.get(human) if human else None
+            desks = () if avatar else tuple(avatars.configured_desks(
+                self.cfg, human, listing, alert.get("project")))
             # #3036 : les destinataires écartés par la vivacité, pour que les
             # passes suivantes sachent qu'il reste quelqu'un à remettre.
             dead: dict = {}
@@ -3719,7 +3766,7 @@ class Notifier:
                     module_auditors if kind == "module_deviation" else auditors,
                     orchestrator_names=module_orchestrators,
                     closed_hosts=closed, dead_out=dead, covered=covered,
-                    avatar_names=(avatar,) if avatar else ())
+                    avatar_names=(avatar,) if avatar else (), desk_names=desks)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 unevaluated.add(key)
