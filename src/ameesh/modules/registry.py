@@ -164,10 +164,11 @@ def _discover(*, builtin=True, canon=None):
         try:
             module, compiled = _external(entry)
             _action_declarations({**implementations, name: module})
+            described = _describe(name, module, compiled, source="external",
+                                  version=version, distribution=dist,
+                                  entry_point=row["entry_point"])
             implementations[name] = module
-            modules.append(_describe(name, module, compiled, source="external",
-                                     version=version, distribution=dist,
-                                     entry_point=row["entry_point"]))
+            modules.append(described)
         except ValueError as exc:
             refused.append(dict(row, error=str(exc)))
     discovery = (implementations, tuple(modules), tuple(refused))

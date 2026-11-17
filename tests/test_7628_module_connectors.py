@@ -36,6 +36,14 @@ class ConnectorDeclarationTest(unittest.TestCase):
             self.assertTrue(any('duplicate action connector' in r['error']
                                 for r in registry.discover().refused))
 
+    def test_refused_module_never_remains_an_action_provider(self):
+        module = sample()
+        module.ACTION_CONNECTORS = {'example': lambda: None}
+        module.CAPABILITIES = ('audit',)  # No audit hook: description is refused.
+        with external_points(FakeEntryPoint(module)):
+            self.assertTrue(registry.discover().refused)
+            self.assertNotIn('example', registry.action_connectors())
+
     def test_bare_profile_cannot_steal_the_legacy_merge_name(self):
         module = sample(name='dev')
         module.ACTION_CONNECTORS = {'git-merge': lambda: None}
