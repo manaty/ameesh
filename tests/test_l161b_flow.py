@@ -194,9 +194,41 @@ class WorkflowTest(unittest.TestCase):
             self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", job, pilote)
             # résumé (ancre &resume, reprise par *resume) et artefact, même en échec
             self.assertRegex(job, r"- [&*]resume\b", pilote)
-            self.assertIn("if: always()\n        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", job, pilote)
+            self.assertIn("if: always()", job, pilote)
+            self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", job, pilote)
         self.assertIn('ci-flow.py summary "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"',
                       texte)
+
+
+class ArtefactDiagnosticTest(unittest.TestCase):
+    """Run 43969930787 : un délai du service d'artefacts n'est pas un verdict.
+
+    Le 16/11/2026 à 22:46Z, deux parts vertes (psql 4/16 et psycopg 7/12) ont
+    perdu leur téléversement « flux en artefact » sur `CreateArtifact:
+    ETIMEDOUT`, sur deux hôtes distincts ; l'agrégat requis `tests` est passé
+    rouge alors qu'aucun test n'avait échoué. Le flux est un diagnostic lu par
+    le bilan (non requis) : son échec se consigne et ne rougit jamais le
+    verdict (canon §3, panne d'infrastructure). Le témoin tient les trois
+    étapes de diagnostic — les deux parts requises et la part « autre système
+    de fichiers » — pour qu'aucune ne redevienne un verdict.
+    """
+
+    def _etape(self, job: str) -> str:
+        debut = job.index("- name: flux en artefact")
+        suivant = job.find("\n      - ", debut)
+        return job[debut:suivant if suivant != -1 else len(job)]
+
+    def test_le_flux_diagnostic_ne_rougit_jamais_le_verdict(self):
+        texte = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        for pilote in ("psycopg", "psql", "fs-class"):
+            debut = texte.index(f"\n  {pilote}:\n")
+            fin = re.compile(r"\n  [#\w]").search(texte, debut + 1).start()
+            etape = self._etape(texte[debut:fin])
+            # toujours tenté, même après un échec des tests…
+            self.assertIn("if: always()", etape, pilote)
+            # …et jamais bloquant : le diagnostic ne vaut pas verdict.
+            self.assertIn("continue-on-error: true", etape, pilote)
+            self.assertIn("actions/upload-artifact@", etape, pilote)
 
 
 if __name__ == "__main__":
