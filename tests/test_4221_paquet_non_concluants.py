@@ -159,7 +159,7 @@ class FakeShell:
 class ReplayLocallyTest(unittest.TestCase):
     """`paquet-horaire.replay_locally` : le rejeu seul, hors charge."""
 
-    def replay(self, run) -> str:
+    def replay(self, run) -> "ph.Replay":
         shell = FakeShell()
         ctx = ph.Context(repo=pathlib.Path("."), target="main",
                          project="ameesh", pilot="mesh-design",
@@ -169,31 +169,39 @@ class ReplayLocallyTest(unittest.TestCase):
 
     def test_body_cancel_reproduit_confirme_le_rouge(self) -> None:
         run = _run("rejeu", ["tests.test_target"], 1, BODY_CANCEL)
-        self.assertEqual(self.replay(run), "")
+        replay = self.replay(run)
+        self.assertEqual(replay.state, "red")
+        self.assertEqual(replay.failed, (TARGET,))
 
     def test_body_lock_timeout_reproduit_confirme_le_rouge(self) -> None:
         run = _run("rejeu", ["tests.test_target"], 1, BODY_LOCK_TIMEOUT)
-        self.assertEqual(self.replay(run), "")
+        replay = self.replay(run)
+        self.assertEqual(replay.state, "red")
+        self.assertEqual(replay.failed, (TARGET,))
 
     def test_body_cancel_non_reproduit_reste_non_concluant(self) -> None:
         run = _run("rejeu", ["tests.test_target"], 0,
                    "Ran 1 test in 0.1s\n\nOK")
-        self.assertIn("vert en local", self.replay(run))
+        replay = self.replay(run)
+        self.assertEqual(replay.state, "green")
+        self.assertIn("vert en local", replay.text)
 
     def test_fixture_cancel_reste_non_concluante(self) -> None:
         run = _run("rejeu", ["tests.test_l56_role_executor"], 1,
                    FIXTURE_CANCEL)
-        why = self.replay(run)
-        self.assertIn("non concluant", why)
+        replay = self.replay(run)
+        self.assertEqual(replay.state, "inconclusive")
+        self.assertIn("non concluant", replay.text)
 
     def test_cancel_d_un_autre_test_ne_confirme_pas(self) -> None:
         run = _run("rejeu", ["tests.test_target"], 1, BODY_CANCEL)
-        why = ph.replay_locally(
+        replay = ph.replay_locally(
             ph.Context(repo=pathlib.Path("."), target="main",
                        project="ameesh", pilot="mesh-design",
                        actor="mesh-design", shell=FakeShell()),
             "a" * 40, ["tests.test_other.T.test_other"])
-        self.assertIn("non concluant", why)
+        self.assertEqual(replay.state, "inconclusive")
+        self.assertIn("non concluant", replay.text)
 
 
 class FlakyLocalTest(unittest.TestCase):
