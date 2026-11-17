@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from ameesh import role_run, staging_watch, storage
+from ameesh import canon as canon_mod, role_run, staging_watch, storage
 
 EVENT = "staging.request"
 #: One attempt's worktree is named after its run, so the tree kept after a
@@ -403,12 +403,15 @@ def _bascule_values(path: str) -> dict:
     return values
 
 
-def _topology_targets(env, options):
+def _topology_targets(env, options, topology=None):
     """The staging topology's SSH targets, its declared absents and `ssh`.
 
     Mirrors `quiescence-staging.sh`: `HOTES_STAGING` from BASCULE_ENV, or the
     three per-VM files plus `SERVEUR_SSH`/`VM`. `QUIESCENCE_*` overrides are
     read from the unit's environment and from the file, like the probe does.
+    #7662: the host names and their roles come from the canon's Host cards;
+    a composed topology takes the server's name and the number of agent VMs
+    from `topology`, never from a host name compiled here.
     Returns `(targets, absent, ssh, problem)`; a `problem` is a named refusal.
     """
     path = options.get("bascule_env") or env.get("BASCULE_ENV") or ""
@@ -423,15 +426,23 @@ def _topology_targets(env, options):
         return [], set(), "ssh", "BASCULE_ENV unreadable (%s)" % type(exc).__name__
     merged = dict(env)
     merged.update(values)
-    topology = (merged.get("HOTES_STAGING") or "").strip()
+    declared = (merged.get("HOTES_STAGING") or "").strip()
     parsed = []
-    if topology:
-        for entry in topology.split():
+    if declared:
+        for entry in declared.split():
             host, sep, target = entry.partition("=")
             if not sep or not host or not target:
                 return [], set(), "ssh", "HOTES_STAGING: entree invalide %r" % entry
             parsed.append((host, target))
+        if topology is not None and topology.hosts:
+            unknown = sorted({host for host, _target in parsed} - set(topology.hosts))
+            if unknown:
+                return ([], set(), "ssh", "HOTES_STAGING: hôte(s) hors du canon %s"
+                        % ", ".join(unknown))
     else:
+        if topology is None or not topology.hosts or topology.server is None:
+            return ([], set(), "ssh", "aucun hôte de staging déclaré au canon "
+                    "(ni HOTES_STAGING ni topologie du canon)")
         directory = os.path.dirname(os.path.abspath(path))
         entries = []
         for name in _TOPOLOGY_ENVS:
@@ -448,10 +459,10 @@ def _topology_targets(env, options):
                 entries.append((host, target))
         server = merged.get("SERVEUR_SSH") or (
             "root@" + merged["VM"] if merged.get("VM") else "")
-        if len(entries) < 3 or not server:
+        if len(entries) < len(topology.agents) or not server:
             return ([], set(), "ssh", "topologie illisible (ni HOTES_STAGING ni "
                     "bascule-*.env et SERVEUR_SSH complets)")
-        entries.append(("manaty-mesh-1", server))
+        entries.append((topology.server, server))
         parsed = entries
     effective = []
     for host, target in parsed:
@@ -466,21 +477,23 @@ def _topology_targets(env, options):
     return effective, absent, ssh, None
 
 
-def quiescence_access_problem(env, options) -> str | None:
+def quiescence_access_problem(env, options, topology=None) -> str | None:
     """#6761: the quiescence probe will reach every staging target, or refuse.
 
     A candidate that cannot deploy, or cannot prove a previous execution
     stopped, refuses the take by name (#6532: AG1 took the request while
-    `quiescence-staging.sh` could not reach `manaty-mesh-1`). The preparation
+    `quiescence-staging.sh` could not reach the mesh server). The preparation
     checks the same SSH targets here, before any request is taken; hosts the
     sequence never touches (`QUIESCENCE_ABSENTS`) and the workstation without
-    a target are not blocking, exactly as in the proof itself.
+    a target are not blocking, exactly as in the proof itself. #7662: the
+    workstation is the canon's `workstation`, never a compiled host name.
     """
-    targets, absent, ssh, problem = _topology_targets(env, options)
+    targets, absent, ssh, problem = _topology_targets(env, options, topology)
     if problem:
         return "quiescence access: " + problem
+    workstation = topology.workstation if topology is not None else None
     to_check = [(host, target) for host, target in targets
-                if host not in absent and host != "pc-smichea"
+                if host not in absent and host != workstation
                 and target not in ("poste", "local")]
     if not to_check:
         return None
@@ -552,7 +565,12 @@ def sequence_problem(cfg, env, options=None) -> str | None:
     except Exception as exc:  # noqa: BLE001 - unreachable is a refusal
         return "unreachable (%s)" % public_reason(db_mod.explain(exc), 200)
     if options is not None:
-        return quiescence_access_problem(env, options)
+        try:
+            canons = canon_mod.load_configured(resolved)
+            topology = canon_mod.staging_topology(canons[:1])
+        except Exception:  # noqa: BLE001 - an unreadable canon declares no host
+            topology = canon_mod.StagingTopology()
+        return quiescence_access_problem(env, options, topology)
     return None
 
 

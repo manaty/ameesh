@@ -37,12 +37,14 @@ from ameesh.approve.service import ApproveError, ApproveService
 from ameesh.approve.sources import MemoryActionSource
 from ameesh.connectors.shell_noop import ShellNoopConnector
 
+from .support import standing_limits
 from .test_approve import make_action, write_token_file
 from .test_canon import commit_all, git, write
 from .test_l42_plusieurs_canons import HOST, ID_A, ID_B, _DeuxCanons
 from .webauthn_soft import ORIGIN, RP_ID, SoftWebAuthn, make_request
 
 POLICY = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,))
+STANDING_LIMITS = standing_limits()
 
 
 def member_auth(title: str, *entries: dict) -> str:
@@ -303,10 +305,10 @@ class RecusParCanonTest(_Authentificateurs):
         receipt = self.bob.receipt(make_request("human:bob", standing=standing))
         # bob n'a aucun authentificateur dans le canon par défaut
         verdict, grant = receipts.register_standing(self.db, receipt, POLICY,
-                                                    registered_by="porte")
+                                                    registered_by="porte", limits=STANDING_LIMITS)
         self.assertEqual((verdict.code, grant), (receipts.CANON, None))
         verdict, grant = receipts.register_standing(
-            self.db, receipt, dataclasses.replace(POLICY, canon=ID_B), registered_by="porte")
+            self.db, receipt, dataclasses.replace(POLICY, canon=ID_B), registered_by="porte", limits=STANDING_LIMITS)
         self.assertTrue(verdict.ok, verdict.reason)
         action_a, action_b = self.propose("agent:a1"), self.propose("agent:b1")
         with self.assertRaises(ActionError) as ctx:

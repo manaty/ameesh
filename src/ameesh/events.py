@@ -33,6 +33,9 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        (#7121, written by the host session)
   agent.retired        an agent taken out of the active registry, and
   agent.restored       brought back (#3460, written with the gesture)
+  host.memory_unavailable  a persona memory repository could not be opened on
+                       the host (agent, host, cause code); the turn runs
+                       without memory and tells the agent (#7682)
   cost.recorded        a priced turn (turn_costs)
   thread.entry         an entry in a thread (thread_index)
   decision.created     an action proposed (actions)
@@ -117,7 +120,7 @@ from . import storage
 CHANNEL = "ameesh_events"
 TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
          "turn.context", "agent.updated",
-         "agent.moved", "agent.attach",
+         "agent.moved", "agent.attach", "host.memory_unavailable",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
          "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request", "git.lock_removed",

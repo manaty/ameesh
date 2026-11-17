@@ -10,6 +10,7 @@ from unittest import mock
 
 from ameesh import (release_cutoff, role_run, staging_executor as executor,
                     staging_watch)
+from tests import canon_staging
 
 #: #5665: kept before ExecutorTest replaces it.
 FINGERPRINTS = executor.fingerprints
@@ -562,7 +563,8 @@ class ExecutorTest(unittest.TestCase):
 
     def test_automatic_release_queues_without_running_in_its_launcher(self):
         project = release_cutoff.ProjectRelease(
-            name="test", repo=str(self.root), staging_executor="private.json")
+            name="test", repo=str(self.root), staging_executor="private.json",
+            staging_topology=canon_staging.topology())
         with mock.patch.object(executor, "settings", return_value=self.options), \
              mock.patch("ameesh.config.load", return_value=self.cfg):
             result = release_cutoff.run_staging(project, "a" * 40, [],

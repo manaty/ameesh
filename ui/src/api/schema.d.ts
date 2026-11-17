@@ -122,6 +122,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/agents/{agent}/observation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One agent's admitted profile, lease, bounds and redacted budget (`ameesh agent observe`, read-only, contract E1b) */
+        get: operations["agents_agent_observation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/agents/{agent}/pause": {
         parameters: {
             query?: never;
@@ -658,6 +675,185 @@ export interface components {
             /** @constant */
             schema: "ameesh-agent-detail/1";
         };
+        "ameesh-agent-observation-1": {
+            admission: {
+                admitted: boolean | null;
+                claim_predicate: boolean;
+                governed: boolean;
+                reasons: ("mode_externe" | "retired" | "ephemeral_expired" | "host_claims_closed" | "handoff_fenced" | "responsible_missing" | "responsible_policy_unavailable" | "canon_state_missing" | "canon_state_not_ok" | "canon_stale" | "canon_ref_mismatch" | "placement_missing" | "placement_refused" | "placement_profile_diverged" | "claim_predicate")[];
+                responsible_required: boolean | null;
+            };
+            agent: {
+                ephemeral: boolean;
+                ephemeral_expires_ts: number | null;
+                /** @enum {unknown} */
+                mode: "execute" | "externe";
+                name: string;
+                retired: boolean;
+                status: string;
+                status_since_ts: number | null;
+                status_text: string | null;
+                stop_reason: string | null;
+            };
+            budget: {
+                account_profile: string | null;
+                admitted: boolean | null;
+                available: boolean;
+                billing_account: string | null;
+                kept_usd: number | null;
+                limit_usd: number | null;
+                period: string | null;
+                /** @enum {string|null} */
+                reason: "no_account_profile" | "unknown_account_profile" | "ambiguous_account_profile" | "account_config_unreadable" | "no_billing_account" | "no_account_envelope" | "foreign_host" | "exhausted" | null;
+                remaining_usd: number | null;
+                reserve_usd: number | null;
+                reserved_usd: number | null;
+                reset_ts: number | null;
+                settled_usd: number | null;
+                timezone: string | null;
+                used_usd: number | null;
+            };
+            canon: {
+                age_s: number | null;
+                checked_ts: number | null;
+                diagnostic: string | null;
+                fresh: boolean;
+                last_good_commit: string | null;
+                max_age_s: number;
+                name: string;
+                ref_commit: string | null;
+                ref_matches: boolean;
+                /** @enum {string|null} */
+                state: "ok" | "invalid" | "unreadable" | null;
+            } | null;
+            lease: {
+                epoch: number | null;
+                expires_ts: number | null;
+                live: boolean;
+                owner: string | null;
+                since_ts: number | null;
+                turn_in_progress: boolean;
+            };
+            limits: {
+                available: boolean;
+                declared: {
+                    compact_tokens: number | null;
+                    context_max_tokens: number | null;
+                    session_max_tokens: number | null;
+                    session_policy: string | null;
+                    session_reread_budget: number | null;
+                    turn_grace_seconds: number | null;
+                    turn_mail_max: number | null;
+                    turn_max_seconds: number | null;
+                    turn_reread_budget: number | null;
+                };
+                effective: {
+                    compact_tokens: number | null;
+                    context_max_tokens: number;
+                    session_max_tokens: number | null;
+                    session_policy: string;
+                    session_reread_budget: number;
+                    turn_grace_seconds: number;
+                    turn_mail_max: number;
+                    turn_max_seconds: number;
+                    turn_reread_budget: number;
+                } | null;
+                host: string | null;
+            };
+            missing: ("account_envelope" | "budget_headroom" | "limits" | "responsible_policy" | "canon_state")[];
+            native: {
+                sandbox: {
+                    agent: string;
+                    canon_ref: string;
+                    completed_ts: number | null;
+                    counters: {
+                        model_calls: number;
+                        seconds: number;
+                        tool_calls: number;
+                        turns: number;
+                    } | null;
+                    deadline_ts: number;
+                    epoch: number;
+                    job: {
+                        name: string;
+                        namespace: string;
+                        phase: string | null;
+                        uid: string | null;
+                    };
+                    owner: string;
+                    placement_ref: string;
+                    profile_ref: string;
+                    receipt: {
+                        epoch: number;
+                        job: Record<string, never>;
+                        replayed: boolean;
+                        result_id: string;
+                        result_sha256: string;
+                        /** @constant */
+                        schema: "ameesh-sandbox-receipt/1";
+                        scope: Record<string, never>;
+                        scope_digest: string;
+                        source: Record<string, never>;
+                        turn_id: string;
+                    } | null;
+                    refusal: string | null;
+                    result_sha256: string | null;
+                    /** @constant */
+                    schema: "ameesh-sandbox-turn/1";
+                    scope: Record<string, never>;
+                    scope_digest: string;
+                    source: Record<string, never>;
+                    started_ts: number;
+                    /** @enum {string} */
+                    state: "intent" | "created" | "bound" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "expired" | "orphaned" | "lost";
+                    tranche: {
+                        kept_usd: number | null;
+                        reserved_usd: number;
+                        settled_usd: number | null;
+                        /** @enum {unknown} */
+                        state: "open" | "settled" | "kept" | "released";
+                        tranche_id: string;
+                    } | null;
+                    turn_id: string;
+                    verdict: string | null;
+                } | null;
+                turn: {
+                    created_ts: number | null;
+                    ledger_ambiguous: boolean;
+                    model: string | null;
+                    spend_key: string | null;
+                    turn_id: string | null;
+                    work_item_id: string | null;
+                } | null;
+            };
+            observed_ts: number;
+            placement: {
+                current: string | null;
+                diagnostic: string | null;
+                ok: boolean | null;
+                profile: string | null;
+                profile_ok: boolean | null;
+                ref: string | null;
+            };
+            profile: {
+                canon: string | null;
+                canon_ref: string | null;
+                capabilities: string[];
+                credential_mode: string | null;
+                harness: string | null;
+                host: string | null;
+                model: string | null;
+                provider: string | null;
+                responsible: string | null;
+                session: {
+                    account: string | null;
+                    harness: string | null;
+                    id: string | null;
+                } | null;
+            };
+            /** @constant */
+            schema: "ameesh-agent-observation/1";
+        };
         "ameesh-agent-peek-1": {
             agent: string;
             captured_ts: number | null;
@@ -821,7 +1017,7 @@ export interface components {
             project: string | null;
             ts: number;
             /** @enum {unknown} */
-            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "agent.attach" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "git.lock_removed" | "mail.export" | "packet.pause" | "auditor.pass" | "packet.client_types";
+            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "agent.attach" | "host.memory_unavailable" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "git.lock_removed" | "mail.export" | "packet.pause" | "auditor.pass" | "packet.client_types";
         };
         "ameesh-host-1": {
             history: Record<string, never>[];
@@ -1775,6 +1971,67 @@ export interface operations {
             };
             /** @description key already used for another request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    agents_agent_observation: {
+        parameters: {
+            query?: {
+                /** @description declared account profile whose envelope is reported; otherwise the session's recorded account, then the single declared profile */
+                account_profile?: string;
+            };
+            header?: never;
+            path: {
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One agent's admitted profile, lease, bounds and redacted budget (`ameesh agent observe`, read-only, contract E1b) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-agent-observation-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

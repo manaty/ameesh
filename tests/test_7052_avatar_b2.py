@@ -8,12 +8,15 @@ and never two holders.
 """
 from __future__ import annotations
 
+import dataclasses
+import os
 import time
 import unittest
 import uuid
 from types import SimpleNamespace
 
-from ameesh import conversation_move as M, election, registry, storage
+from ameesh import (conversation as C, conversation_move as M, election, registry,
+                    storage)
 
 from .test_l165_ep2_election_score import _RoleCase
 
@@ -60,8 +63,11 @@ class Base(_RoleCase):
             dry_run=False, mediated=False, agents_filter=None,
             clock=SimpleNamespace(monotonic=time.monotonic),
             _preference_next=0.0, _preference_seen_since={},
-            _preference_plan_next={}, _preference_error=None)
-        for name in ("preference_return_pass", "advance_conversation_moves"):
+            _preference_plan_next={}, _preference_recovery_next={},
+            _preference_error=None)
+        for name in ("preference_return_pass", "advance_conversation_moves",
+                     "election_brief_for", "_preference_claim_or_recovery",
+                     "_load_handover_state", "_note_unleased"):
             setattr(runner, name, getattr(Runner, name).__get__(runner))
         return runner
 
@@ -168,6 +174,9 @@ class ReturnTest(Base):
         closed = M.reclaim(self.db, "pilote", self.CLOUD,
                            holdoff_s=election.PREFERENCE_HOLDOFF_S + 60.0)
         self.assertIsNotNone(closed)
+        # #7680 : le libellé nomme la cible réelle, pas un « hôte préféré ».
+        self.assertIn("preference handover", closed["error"])
+        self.assertIn(self.POSTE, closed["error"])
         row = self.row()
         self.assertEqual((row["host"], row["session_id"]),
                          (self.CLOUD, "sess-source"))
@@ -175,6 +184,63 @@ class ReturnTest(Base):
         lease = registry.claim(self.db, "pilote", "runner-src", 300,
                                host=self.CLOUD)
         self.assertIsNotNone(lease)
+
+    def test_a_host_under_pressure_does_not_close_the_handover(self):
+        # #7680 : une source sous pression ne peut pas servir le retour
+        # qu'elle annoncerait ; la tentative reste ouverte à sa cible.
+        self.hold(self.CLOUD)
+        M.plan(self.db, "pilote", self.POSTE, requested_by="runner-poste",
+               reason="preference")
+        M.advance(self.db, self.POSTE, probes=ready,
+                  cwd_for=lambda m: "/tgt/pilote")
+        self.backdate(election.PREFERENCE_HOLDOFF_S + 60.0)
+        now = time.monotonic()
+        allowed, reason, _ = election.claim_wait(
+            self.db, self.row(), self.CLOUD, now - 1000.0, now=now,
+            hold_turns=True)
+        self.assertFalse(allowed)
+        self.assertIn("deferred", reason)
+        self.assertIn("pressure", reason)
+        self.assertEqual(self.open_move()["state"], "switched")
+        # sans pression, le même instant est bien un reclaim
+        allowed, reason, _ = election.claim_wait(
+            self.db, self.row(), self.CLOUD, now - 1000.0, now=now)
+        self.assertFalse(allowed)
+        self.assertIn("preference reclaim", reason)
+        self.assertEqual(self.open_move()["state"], "switched")
+
+    def test_the_runner_defers_the_reclaim_under_pressure(self):
+        from ameesh.runner import Runner
+        self.hold(self.CLOUD)
+        move = M.plan(self.db, "pilote", self.POSTE, requested_by="runner-poste",
+                      reason="preference")
+        M.advance(self.db, self.POSTE, probes=ready,
+                  cwd_for=lambda m: "/tgt/pilote")
+        self.backdate(election.PREFERENCE_HOLDOFF_S + 60.0)
+        runner = self.runner(self.CLOUD)
+        runner._handover_loaded = True
+        runner._handover_released = {}
+        runner._handover_failed = {}
+        runner._handover_retry_at = 0.0
+        runner._handover_error = None
+        runner._election_free_since = {"pilote": time.monotonic() - 1000.0}
+        runner._preference_plan_next = {}
+        runner._role_error = None
+        runner.pressure_holds_turn = lambda agent, pressure=None: True
+        runner.election_claim_allowed = getattr(
+            Runner, "election_claim_allowed").__get__(runner)
+        allowed, reason, _ = runner.election_claim_allowed(self.row())
+        self.assertFalse(allowed)
+        self.assertIn("deferred", reason)
+        self.assertEqual(self.open_move()["state"], "switched")
+        self.assertEqual(self.row()["host"], self.POSTE)
+        # la pression passée, le même appel referme la tentative et réclame
+        runner.pressure_holds_turn = lambda agent, pressure=None: False
+        runner._preference_plan_next = {}
+        allowed, reason, _ = runner.election_claim_allowed(self.row())
+        self.assertTrue(allowed, reason)
+        self.assertEqual(self.attempt(move["move_id"])["state"], "failed")
+        self.assertEqual(self.row()["host"], self.CLOUD)
 
     def test_another_candidate_waits_for_the_designated_target(self):
         self.hold(self.CLOUD)
@@ -227,9 +293,12 @@ class ReturnTest(Base):
                reason="preference")
         agent = dict(self.row(), previous_host=self.CLOUD)
         runner = self.runner()
-        from ameesh.runner import Runner
         runner.cfg = self.cfg
-        self.assertIsNone(Runner.election_brief_for(runner, agent))
+        from ameesh.runner import Runner
+        # #7680 : la ligne est encore sur l'autre hôte ; aucun brief n'est
+        # construit, et la passe ne réclame pas (""), le déplacement la
+        # basculera ici.
+        self.assertEqual(Runner.election_brief_for(runner, agent), "")
 
     def test_a_handover_nobody_claimed_is_superseded(self):
         # the reviewer's case (B/P2 #40199): after A→B, both A and B are gone
@@ -259,6 +328,72 @@ class ReturnTest(Base):
             ["prepared", "switched"])
         self.assertIsNotNone(registry.claim(self.db, "pilote", "runner-troisieme",
                                             120, host=self.THIRD))
+
+
+class RecoveryTest(Base):
+    """#7680: no election brief for `preference`, even without an open move.
+
+    The host that would take the agent plans the recovery move instead; the
+    target's first turn receives the journal segment, never a resume brief.
+    """
+
+    def test_without_a_move_the_host_plans_a_recovery_with_a_segment(self):
+        from ameesh.runner import Runner
+        self.db.execute("DELETE FROM conversation_log;"
+                        " DELETE FROM conversation_heads")
+        self.cfg = dataclasses.replace(
+            self.cfg, threads_dir=os.path.join(self.tmp, self._testMethodName))
+        self.db.execute(
+            "UPDATE agent_registry SET host = %s, lease_owner = NULL,"
+            " lease_expires_at = NULL, session_id = 'sess-source',"
+            " status = 'idle', status_text = '', cwd = '/src/pilote'"
+            " WHERE name = 'pilote'", (self.CLOUD,))
+        log = C.Log(self.db, self.cfg, agent="pilote", project="acme", lot="7680")
+        log.append("human_message", "garde bien la conversation",
+                   author="human:alice", turn="t1")
+        log.append("turn_end", "je la garde, avec son extrait",
+                   author="agent:pilote", turn="t1",
+                   meta={"status": "completed"})
+        runner = self.runner(self.POSTE)
+        runner.cfg = self.cfg
+        # la ligne est libre sur l'autre hôte : la passe ne réclame pas, elle
+        # planifie la reprise (aucun brief d'élection n'est construit).
+        self.assertEqual(Runner.election_brief_for(runner, self.row()), "")
+        move = self.open_move()
+        self.assertEqual(
+            (move["state"], move["source_host"], move["target_host"],
+             move["source_session"]),
+            ("planned", self.CLOUD, self.POSTE, "sess-source"))
+        # la cible prépare et bascule, puis la réclamation est locale
+        self.assertEqual(
+            [step for _ident, step in M.advance(
+                self.db, self.POSTE, probes=ready,
+                cwd_for=lambda _move: "/tgt/pilote")],
+            ["prepared", "switched"])
+        lease = registry.claim(self.db, "pilote", "runner-poste", 120,
+                               host=self.POSTE)
+        self.assertIsNotNone(lease)
+        row = self.row()
+        self.assertEqual((row["host"], row["session_id"]),
+                         (self.POSTE, "sess-source"))
+        state = os.path.join(self.tmp, self._testMethodName, "state")
+        first = M.open_first_turn(
+            self.db, self.cfg, state, agent="pilote", host=self.POSTE,
+            owner="runner-poste", epoch=lease["lease_epoch"], secrets=[])
+        self.assertIsNotNone(first)
+        self.assertEqual(first.move["move_id"], move["move_id"])
+        with open(first.path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("je la garde, avec son extrait", text)
+
+    def test_a_local_preference_claim_keeps_its_session(self):
+        # la ligne est déjà sur cet hôte : pas de brief, la session locale
+        # reste (une reprise de session locale est normale).
+        from ameesh.runner import Runner
+        runner = self.runner(self.POSTE)
+        runner.cfg = self.cfg
+        agent = dict(self.row(), previous_host=self.CLOUD)
+        self.assertIsNone(Runner.election_brief_for(runner, agent))
 
 
 class InterruptedTurnTest(Base):

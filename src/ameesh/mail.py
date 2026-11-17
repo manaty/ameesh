@@ -145,6 +145,57 @@ def _replay_id(mailbox, message_id: int, body: str, work_item_id: str | None,
     return int(message_id)
 
 
+#: #7668 : le canon n'a pas répondu sur un correspondant (non configuré,
+#: illisible, ou nom absent). L'inconnu est privé, jamais « pas un avatar ».
+_UNKNOWN_QUALIFICATION = object()
+
+
+def _canon_row(cfg, name: str):
+    """#7668 : carte du canon local pour `name`, ou `_UNKNOWN_QUALIFICATION`.
+
+    Repli d'une session médiée, à qui le contrat 1.1 ne sert pas `agents.get` :
+    le canon du poste reste la seule déclaration lisible. Seule une carte
+    effectivement lue est une réponse ; un canon absent ou illisible, ou un nom
+    qu'il ne déclare pas, reste une qualification inconnue. Aucune erreur ne
+    remonte (le courrier ne dépend pas de cette lecture)."""
+    try:
+        from . import canon as canon_mod
+        if cfg is None or not canon_mod.configured(cfg):
+            return _UNKNOWN_QUALIFICATION
+        for canon in canon_mod.from_config_all(cfg):
+            agent = canon.agent(name)
+            if agent is not None:
+                return {"name": agent.title, "team": agent.team,
+                        "releve": agent.releve}
+    except Exception:  # noqa: BLE001 — qualification indisponible, pas un refus
+        return _UNKNOWN_QUALIFICATION
+    return _UNKNOWN_QUALIFICATION
+
+
+def _avatar_correspondence(db, *agents) -> bool:
+    """#7668 : l'un des correspondants est-il un avatar (`releve: preference`) ?
+
+    Lecture faite au même point que la copie R12 (dans `record`, donc après le
+    COMMIT quand elle est différée). Le courrier n'est jamais retenu ; seule
+    sa copie lisible dépend de la réponse. Une panne de registre répond
+    « privé » : la copie est omise plutôt que de publier le corps d'un avatar
+    par défaut (B P2 ameesh-cx2). Un contrat médié qui ne sert pas `agents.get`
+    n'est pas une panne : le canon local qualifie encore les correspondants.
+    Seule une carte lue et ordinaire applique la règle historique du fil
+    (#515) ; une qualification inconnue reste privée (B P2 auditeur/cx2)."""
+    try:
+        from . import registry
+        rows = [registry.get(db, name) for name in agents]
+    except Exception as exc:  # noqa: BLE001 — décision ci-dessous
+        from .mediated_executor.contract import NotSupportedRemotely
+        if not isinstance(exc, NotSupportedRemotely):
+            return True
+        rows = [_canon_row(getattr(db, "cfg", None), name) for name in agents]
+        if any(row is _UNKNOWN_QUALIFICATION for row in rows):
+            return True
+    return any(fil.avatar_conversation(row) for row in rows)
+
+
 def send(
     db: Db,
     sender: str,
@@ -184,7 +235,9 @@ def send(
     quand le message est lié à un lot, sinon celui de l'expéditeur, sinon du
     destinataire — son équipe (`team`) s'il est gouverné par le canon, sinon
     son chantier —, sinon AMEESH_PROJECT, sinon `default` ; lot :
-    `work_item_id`.
+    `work_item_id`. Un courrier dont l'expéditeur ou le destinataire est un avatar
+    (`releve: preference`) n'a hors lot aucune copie R12 : il reste dans la
+    boîte et dans le journal (#7668).
 
     #3892 : `idempotency_key` (une chaîne stable du client, rangée dans
     `payload.idempotency_key`) rejoue un envoi dont la réponse s'est perdue.
@@ -258,12 +311,20 @@ def send(
         if kind != "notify":
             meta["kind"] = kind
         meta.update(thread_meta or {})
+        # #7668 : le courrier d'un avatar (relève `preference`) reste dans son
+        # journal ; hors du lot qu'il traite, il n'est pas publié dans le fil
+        # d'un projet — jamais dans le projet par défaut de l'expéditeur ou de
+        # l'exécuteur. Un simple agent sans projet garde le fil de son
+        # correspondant : son journal est privé, pas le routage du courrier.
 
         def record(cfg=db.cfg, target=db) -> None:
+            lot_project = fil.lot_project(target, work_item_id)
+            if not lot_project and _avatar_correspondence(target, sender, recipient):
+                return
             fil.record(
                 cfg, target, sender=sender, recipients=[recipient], text=body,
                 ts=row.get("created_ts"),
-                project=fil.project_for(cfg, fil.lot_project(target, work_item_id),
+                project=fil.project_for(cfg, lot_project,
                                         row.get("sender_project"),
                                         row.get("recipient_project")),
                 lot=work_item_id, mailbox_ids=[message_id], meta=meta)

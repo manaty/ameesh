@@ -360,6 +360,12 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
     return outcomes
 
 
+def recovery_hint(host, interval=60):
+    return ("Publish every minute for at least %ss; for permanent moves use "
+            "ameesh host reattach %s AGENT --to NEW_HOST; then ameesh host reconcile %s"
+            % (int(staleness_s(interval)), host, host))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="ameesh host")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -374,6 +380,11 @@ def main(argv=None):
         "reconcile", help="verified reopening of a lost host whose readings returned")
     recovered.add_argument("host")
     recovered.add_argument("--actor", help="who reconciles (human:<id>) from an unbound terminal")
+    attach = commands.add_parser("reattach", help="accept an already moved agent's permanent new home")
+    attach.add_argument("host", help="lost origin host")
+    attach.add_argument("agent")
+    attach.add_argument("--to", required=True, dest="target")
+    attach.add_argument("--actor", help="authenticated human or governance actor")
     status = commands.add_parser("status", help="show durable drain and return progress")
     status.add_argument("host", nargs="?")
     args = parser.parse_args(argv)
@@ -397,6 +408,12 @@ def main(argv=None):
                              actor=work.corrector(cfg, db, args.actor))
             if result is None:
                 raise ValueError("host has no drain request")
+        elif args.command == "reattach":
+            for name in (args.host, args.agent, args.target):
+                if not NAME_RE.fullmatch(name):
+                    raise ValueError("invalid host or agent name")
+            result = api.reattach(args.host, args.agent, args.target,
+                                  actor=work.corrector(cfg, db, args.actor))
         elif args.command == "reconcile":
             result = reconcile(cfg, db, args.host,
                                actor=work.corrector(cfg, db, args.actor))
@@ -409,6 +426,12 @@ def main(argv=None):
             result = [row]
         else:
             result = api.listing()
+        if args.command == "status":
+            for row in result:
+                if row and row.get("mode") == "lost":
+                    row["next_action"] = recovery_hint(row["host"], cfg.resource_interval)
+        elif args.command == "reconcile" and result.get("mode") == "lost" and not result.get("reconciled"):
+            result["next_action"] = recovery_hint(args.host, cfg.resource_interval)
         print(json.dumps(result, ensure_ascii=False))
         if args.command == "reconcile" and not (
                 result.get("reconciled") or result.get("mode") == "available"):

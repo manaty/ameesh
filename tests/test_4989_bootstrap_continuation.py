@@ -21,7 +21,10 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
         from tests.release_decision import install_decision_gate
         install_decision_gate(cls)
 
-    sign = fixture.SignedRefusalTest.sign
+    def sign(self, view=None, text='install', signed=True, ttl=None):
+        # Keep real signatures live on the controlled bootstrap timeline.
+        return fixture.SignedRefusalTest.sign(
+            self, view=view, text=text, signed=signed, ttl=900 if ttl is None else ttl)
 
     def ask(self, question, options, **extra):
         return decisions.ask(self.cfg, self.db, requester='fixture-controller', lot=str(self.lot['id']),
@@ -32,6 +35,25 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
         support.PgTestCase.setUp(self)
         fixture.Fixture.setUp(self)
         self.now=time.time(); self.seed=b'\x43'*32
+        # Patch module references, never the process-wide time module: database
+        # timeouts and elapsed-time measurements must keep their real clocks.
+        clock = mock.Mock(wraps=time)
+        clock.time.side_effect = lambda: self.now
+        clock.time_ns.side_effect = lambda: int(self.now * 1_000_000_000)
+        for module in (authority, decisions):
+            patch = mock.patch.object(module, 'time', clock)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.authorities = []
+        initialize = bootstrap.SignedBootstrapAuthority.__init__
+        def controlled_authority(instance, *args, **kwargs):
+            kwargs['clock'] = lambda: self.now
+            initialize(instance, *args, **kwargs)
+            self.authorities.append(instance)
+        patch = mock.patch.object(bootstrap.SignedBootstrapAuthority, '__init__',
+                                  controlled_authority)
+        patch.start()
+        self.addCleanup(patch.stop)
         registry.upsert(self.db,'fixture-owner',harness='other',host=self.cfg.host)
         authority.register_key(self.db,'fixture-owner',signing.public_from_seed(self.seed),role='owner')
         registry.upsert(self.db,'fixture-controller',harness='other',host=self.cfg.host)
@@ -191,10 +213,18 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
         self.assertEqual(self.old_journal.read_bytes(), self.old_bytes)
 
     def test_lost_enable_reply_replays_new_intent_without_rewriting_previous(self):
+        self.replay_lost_enable(expired=False)
+
+    def test_lost_enable_replay_refuses_expired_signed_window(self):
+        self.replay_lost_enable(expired=True)
+
+    def replay_lost_enable(self, *, expired):
         self.sign()
         original = self.system.activate_ssh_configuration
         lost = []
+        activations = []
         def interrupted(bundle):
+            activations.append(True)
             original(bundle)
             if not lost:
                 lost.append(True)
@@ -205,6 +235,17 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
                 self.backend.continue_install(self.operation, self.view['id'])
             self.assertIsInstance(held.exception.__context__, OSError)
             self.assertEqual(str(held.exception.__context__), 'lost reload reply')
+            # The same decision is replayable just before expiry, refused at it.
+            self.now = int(self.now) + (600 if expired else 599)
+            if expired:
+                with self.assertRaises(bootstrap.BootstrapError):
+                    self.backend.continue_install(self.operation, self.view['id'])
+                self.assertEqual(self.authorities[-1].denial_reason,
+                                 'signed bootstrap window expired')
+                self.assertEqual(len(activations), 1)
+                self.assertEqual(self.old_journal.read_bytes(), self.old_bytes)
+                self.assertEqual(self.system.calls, ['group', 'user'])
+                return
             try:
                 replay = self.backend.continue_install(self.operation, self.view['id'])
             except bootstrap.BootstrapError as error:
@@ -215,5 +256,6 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
                     raise error.__context__ from error
                 raise
             self.assertEqual(replay['outcome'], 'installed')
+            self.assertEqual(len(activations), 2)
         self.assertEqual(self.old_journal.read_bytes(), self.old_bytes)
         self.assertEqual(self.system.calls, ['group', 'user'])

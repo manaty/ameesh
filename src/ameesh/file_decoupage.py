@@ -42,6 +42,12 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   réellement actionnable, pas seulement un lot assigné. #5151 : le sommeil
   nomme aussi au journal les lots attribués qu'une attente planifiée écarte
   (« sleep set aside: <agent>: #N (planned start …) »).
+  #7658 : un agent dont la fiche porte un bloc `avatar` n'est jamais endormi :
+  son humain le joint par courrier, et un courrier ordinaire ne lèverait pas
+  le sommeil (#4610). La pause automatique déjà posée sur un avatar est levée
+  à la passe suivante, y compris hors de son équipe ; le motif est journalisé
+  sur le lot de découpage, comme pour un relecteur (#4525) ou le veilleur
+  GitHub (#7476).
   #6575 : un agent qui doit encore un geste sur un travail engagé n'est pas
   endormi, et le dormeur qui en reçoit un est levé : correction due après un
   verdict bloquant (`due_fixes`, la lecture de `work fixes-owed`), lot ouvert
@@ -1031,6 +1037,27 @@ def _github_watchers(canons) -> set[tuple[str, str]]:
     return {(sub.agent, sub.project) for sub in github_watch.subscriptions(canons or ())}
 
 
+def _avatar_agents(canons) -> set[str]:
+    """#7658 : les agents dont la fiche porte un bloc `avatar`.
+
+    Le bloc n'est pas persisté au registre : il est lu dans le canon qui
+    gouverne l'agent, comme les autres champs de la fiche. Un canon absent ou
+    illisible ne produit aucun nom (le sommeil garde alors son comportement
+    d'avant) ; un bloc vide (`avatar:` sans valeur) n'est pas un avatar.
+    """
+    out = set()
+    for card in canons or ():
+        for agent in getattr(card, "agents", ()) or ():
+            fiche = getattr(agent, "fiche", None)
+            data = getattr(fiche, "data", None) or {}
+            if not data.get("avatar"):
+                continue
+            name = str(getattr(agent, "title", "") or "").strip()
+            if name:
+                out.add(name)
+    return out
+
+
 def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
            split_id=None, lots=(), listing=(), cfg=None, canons=None,
            mail_window_s=None, waits=None, since_ts: float = 0.0) -> list:
@@ -1049,6 +1076,7 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
     out = []
     reason = SLEEP_REASON % project
     watchers = _github_watchers(canons)
+    avatars = _avatar_agents(canons)
     pending, keep, unreadable = _reviewer_spares(
         db, project, lots, listing, cfg=cfg, canons=canons)
     if unreadable:
@@ -1072,6 +1100,11 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
             out.append({"agent": name, "slept": False, "why": why})
         return out
     for name in item.idle:
+        if name in avatars:
+            why = "avatar card, never slept (#7658)"
+            out.append({"agent": name, "slept": False, "why": why})
+            _journal_exemption(db, split_id, name, why, since_ts=since_ts)
+            continue
         if (name, project) in watchers:
             why = "designated GitHub watcher for %s (#7476)" % project
             out.append({"agent": name, "slept": False, "why": why})
@@ -1319,11 +1352,16 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
     #6575 : le travail engagé dû (`owed_work` : correction, paquet ouvert,
     commande heavy ; #6734 : réveil programmé dû) lève aussi le dormeur ; une
     lecture en échec ne lève personne sur ce motif.
+
+    #7658 : la pause automatique d'un avatar est levée à toute passe, même
+    s'il a quitté son équipe (`_wake` ne parcourt que les agents du projet) :
+    son humain doit pouvoir le joindre par courrier.
     """
     #7476 : le siège de veille lève aussi un ancien sommeil automatique.
     from . import agent_pause
     woken: dict = {}
     watchers = _github_watchers(canons)
+    avatars = _avatar_agents(canons)
     sleepers = [str(row.get("name") or "").strip() for row in listing
                 if row.get("operator_paused")
                 and is_sleep_reason(str(row.get("operator_pause_reason") or ""))]
@@ -1335,7 +1373,9 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
             continue
         project = project_of_sleep_reason(reason)
         why = None
-        if (name, project) in watchers:
+        if name in avatars:
+            why = "avatar card, never kept asleep (#7658)"
+        elif (name, project) in watchers:
             why = "designated GitHub watcher for %s (#7476)" % project
         elif int(row.get("actionable_lots") or 0) > 0:
             # #4619 : le lot assigné le plus récemment touché n'est pas
@@ -1370,7 +1410,7 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
             continue
         if done.get("changed"):
             woken.setdefault(project, []).append(name)
-            if (name, project) in watchers:
+            if name in avatars or (name, project) in watchers:
                 try:
                     split = _open_split(db, project)
                     if split is not None:

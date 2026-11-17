@@ -825,6 +825,44 @@ class HostLifecycle(interface.HostLifecycle):
             "extract(epoch from updated_at)::float8 AS updated_ts "
             "FROM host_release_locks ORDER BY host")
 
+    def reattach(self, host, agent, target, *, actor):
+        """Retire a lost generation's return obligation, preserving its audit event.
+
+        Does not move a process, change the registry host, clear a fence or
+        cancel a handoff. Only an already completed relocation is accepted.
+        """
+        if not isinstance(actor, str) or not actor.strip() or any(ord(c) < 32 for c in actor):
+            raise ValueError("reattachment actor required")
+        if host == target:
+            raise ValueError("new home must differ from the lost host")
+        with self.db.transaction() as tx:
+            for name in sorted({host, target}):
+                Hosts._lock_gate(tx, name)
+            control = HostLifecycle(tx).get(host)
+            if not control or control["mode"] != "lost":
+                raise ValueError("source host must be lost")
+            rows = tx.query("SELECT host,handoff_fenced FROM agent_registry "
+                            "WHERE name=%s FOR UPDATE", (agent,))
+            if not rows or rows[0]["host"] != target:
+                raise ValueError("agent must already be on the requested new home")
+            if rows[0]["handoff_fenced"]:
+                raise ValueError("agent is fenced; finish its recovery first")
+            if tx.query("SELECT id FROM host_handoffs WHERE agent=%s "
+                        "AND state NOT IN ('verified','cancelled')", (agent,)):
+                raise ValueError("agent has an active handoff; finish it first")
+            origins = tx.query(
+                "DELETE FROM host_lifecycle_agents WHERE host=%s AND generation=%s "
+                "AND agent=%s RETURNING critical,operation,missing",
+                (host, control["generation"], agent))
+            if not origins:
+                raise ValueError("agent has no return obligation in this lost generation")
+            evidence = {"actor": actor, "agent": agent, "from": host, "to": target,
+                        "generation": control["generation"], "origin": origins[0]}
+            tx.execute("INSERT INTO ameesh_events(type,object,project,data) "
+                       "VALUES ('host.agent_reattached',%s,NULL,%s::jsonb)",
+                       ("host:" + host, json.dumps(evidence, sort_keys=True)))
+            return evidence
+
     def reconcile_loss(self, host, *, actor, fresh_within):
         """#3035: reopen a lost host only after a proof that no second executor exists.
 
@@ -912,10 +950,16 @@ class HostLifecycle(interface.HostLifecycle):
             missing.extend("active_handoff:" + row["agent"] for row in active)
             # A recovery attempt since this loss is the explicit refusal: the
             # source was (or may have been) quiesced and fenced for a move.
+            # Explicit reattachment retires that origin, so its completed
+            # recovery no longer belongs to this generation's return proof.
+            # Do not rely on retained audit events for this durable decision.
             recovered = tx.query(
                 "SELECT id, agent FROM host_handoffs WHERE source=%s "
                 "AND evidence ? 'source_recovered' AND updated_at >= to_timestamp(%s) "
-                "ORDER BY id", (host, lost_ts))
+                "AND EXISTS (SELECT 1 FROM host_lifecycle_agents a "
+                "WHERE a.host=host_handoffs.source AND a.agent=host_handoffs.agent "
+                "AND a.generation=%s) "
+                "ORDER BY id", (host, lost_ts, control["generation"]))
             missing.extend("recovery_attempted:" + row["agent"] for row in recovered)
             # #5887: an origin agent moved away by a journaled `agent move`
             # (#3299) during this generation is not a second executor: the

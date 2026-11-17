@@ -868,24 +868,38 @@ def _catchup(cfg, args) -> int:
         if project is None:
             raise release_cutoff.ReleaseError(
                 "project %r is not declared under release.projects" % args.project)
+        # #7662: `projects(cfg)` starts from the bare profile, whose empty
+        # `StagingTopology()` exists but has no host. Fill it from the canon
+        # before reading the default server, as the other release paths do.
+        project = release_cutoff.with_staging_topology(cfg, project)
         db = open_db(cfg)
         try:
-            base = staging_deferred.baseline(db, project, args.host)
+            host = getattr(args, "host", None)
+            if not host:
+                topology = getattr(project, "staging_topology", None)
+                if topology is None or not topology.hosts:
+                    topology = release_cutoff.topology_for(db)
+                host = topology.server
+            if not host:
+                raise release_cutoff.ReleaseError(
+                    "no --host and the canon declares no staging server: name "
+                    "the reported host explicitly")
+            base = staging_deferred.baseline(db, project, host)
             if base is None:
                 print("%s: %s is not reported by the latest tagged staging "
-                      "attestation; nothing to declare" % (project.name, args.host))
+                      "attestation; nothing to declare" % (project.name, host))
                 return 0
-            right = staging_deferred.active_right(db, project, args.host)
+            right = staging_deferred.active_right(db, project, host)
             if args.result == "ok" and (right is None or not right.get("active")):
                 raise release_cutoff.ReleaseError(
                     "no active owner root right covers %s: %s"
-                    % (args.host, "decision #%s %s"
+                    % (host, "decision #%s %s"
                        % (right.get("decision"), right.get("why") or "inactive")
                        if right else "none configured in release.projects.%s."
                        "staging_rights" % project.name))
             actor = _catchup_actor(cfg, db, args.actor)
             row = staging_deferred.declare(
-                db, project, args.host, args.sha, base, args.result, actor, args.note)
+                db, project, host, args.sha, base, args.result, actor, args.note)
         finally:
             db.close()
     except (release_cutoff.ReleaseError, ValueError) as exc:
@@ -1231,7 +1245,9 @@ def add_parser(sub, func) -> None:
                         "staging server (four vm.sh steps) in the trace and the "
                         "cutoff report")
     catchup_p.add_argument("--project", default="ameesh")
-    catchup_p.add_argument("--host", default="manaty-mesh-1")
+    catchup_p.add_argument("--host", default=None,
+                           help="reported staging server; defaults to the server "
+                                "declared by the canon's Host cards (#7662)")
     catchup_p.add_argument("--sha", required=True,
                            help="the host's active commit after the gesture (full 40 hex, "
                                 "read from vm.sh controler)")

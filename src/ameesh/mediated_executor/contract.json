@@ -4656,6 +4656,7 @@
     "launch",
     "launched",
     "log_event",
+    "recap",
     "recent",
     "replace",
     "settle"
@@ -5215,6 +5216,7 @@
     "note_return_request",
     "open_claims",
     "progress",
+    "reattach",
     "reconcile_loss",
     "reopen_return",
     "release_locks",

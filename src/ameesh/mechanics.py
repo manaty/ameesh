@@ -68,6 +68,8 @@ mécanique, ce que l'outillage exécute sans agent :
   #122895) : la branche de prod d'un projet, où un lot de porte de production
   (`prod_gate`) doit être présent pour se fermer. Absente : un tel lot n'est
   jamais fermé par une fusion constatée, aucune branche n'est supposée.
+  `production: none` (#7726) déclare explicitement un projet sans production ;
+  compilé en chaîne vide, distincte de None (déclaration absente).
 - `accounts.pace_multipliers` et `accounts.underused_loss` (#3647, canon §11,
   décision owner #141793 a) : le multiplicateur de rythme de chaque compte de
   forfait, par harnais et nom de compte (absent : ×1), et la perte prévue au
@@ -134,7 +136,7 @@ _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
                   "merge", "prevalidation", "backlog", "staging", "accounts",
-                  "paquet", "packet_tests", "file", "session", "auto_take", "projects")
+                  "paquet", "packet_tests", "file", "session", "auto_take", "projects", "prod_go_max_hours")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
                   "contract_selection", "repair_policy", "prevalidation")
 _PRODUCTION_KEYS = ("branch",)
@@ -238,7 +240,7 @@ class ProjectOverride:
     ci_environment_red: str | None = None
     ci_faulty_lot: str | None = None
     #: #3022 : la branche de prod du projet (`production.branch`)
-    production_branch: str | None = None
+    production_branch: str | None = None  # "": explicit production: none; None: undeclared
     contract_selection: ContractSelection | None = None
     repair_policy: repair_policy.Policy | None = None
     #: #6915 : le bloc `prevalidation` du projet, qui remplace le bloc global
@@ -495,6 +497,9 @@ class Document:
     #: repli de la porte ; 0 = aucun repli ouvert
     paused_family_min_hours: int = 0
 
+    # #7726: absent means production attestations cannot be issued.
+    prod_go_max_hours: int | None = None
+
     def auto_take_excluded_families(self, now: float) -> tuple[str, ...]:
         """La date d'expiration est incluse, dans le fuseau du canon."""
         if self.auto_take is None:
@@ -551,6 +556,8 @@ class Document:
                       "post_merge_red": self.merge_post_merge_red},
             "projects": sorted(item.name for item in self.overrides),
         }
+        if self.prod_go_max_hours is not None:
+            payload["prod_go_max_hours"] = self.prod_go_max_hours
         if self.paused_family_min_hours:
             # #6990 : absent (0), la clé n'existe pas : le document sans clé
             # compile à l'identique, les lecteurs antérieurs ne la refusent pas.
@@ -1053,6 +1060,8 @@ def _backlog(value, where: str) -> int:
 def _production(value, where: str) -> str:
     """Le bloc `production` d'un projet (#3022) : sa branche de prod, nom de
     branche Git simple, jamais un commit ni une ref complète."""
+    if value == "none":
+        return ""  # explicit canon declaration: this project has no production
     data = _mapping(value, where, _PRODUCTION_KEYS)
     branch = data.get("branch")
     if (not isinstance(branch, str) or not _BRANCH.fullmatch(branch)
@@ -1341,6 +1350,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                      if "backlog" in parsed else None)
     families = _families(reviews.get("families"), source + ".reviews.families")
     return Document(
+        prod_go_max_hours=(_positive_int(parsed["prod_go_max_hours"], source + ".prod_go_max_hours")
+                           if "prod_go_max_hours" in parsed else None),
         schema=schema,
         timezone=_timezone(parsed.get("timezone"), source + ".timezone"),
         cutoffs=_cutoffs(parsed.get("cutoffs"), source + ".cutoffs"),

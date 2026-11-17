@@ -29,6 +29,7 @@ from ameesh import bench as bench_mod
 from ameesh import config as config_mod
 from ameesh import db as db_mod
 from ameesh import migrations
+from ameesh import standing_policy
 from ameesh import work as work_mod
 from ameesh.platform import SYSTEM as PLATFORM_SYSTEM
 from . import gabarit
@@ -89,6 +90,29 @@ TIME_SCALE = _time_scale()
 def scaled(seconds: float) -> float:
     """Borne murale `seconds` mise à l'échelle du banc (#5629)."""
     return seconds * TIME_SCALE
+
+
+def standing_limits(*, connectors=("shell-noop",),
+                    operations=("refund", "label", "send", "publish", "merge"),
+                    approvers=("human:alice", "human:bob", "human:carol", "human:zoe"),
+                    max_amount: int = 10 ** 9, max_duration_hours: int = 24 * 365,
+                    currency: str | None = "EUR",
+                    allow_missing_beneficiary: bool = True,
+                    require_charter: bool = False,
+                    require_targets: bool = False) -> standing_policy.Policy:
+    """#7629 : un plafond de canon PERMISSIF pour les tests qui ne portent pas
+    sur la politique (les cas de refus construisent la leur, plus stricte).
+
+    Par défaut, aucun bénéficiaire n'est exigé : les tests historiques
+    enregistrent des grants `any` ; les tests de portée nomment le leur."""
+    rules = tuple(
+        standing_policy.Rule(
+            connector=connector, operations=tuple(operations), approvers=tuple(approvers),
+            max_duration=int(max_duration_hours) * 3600, max_amount=int(max_amount),
+            currency=currency, allow_missing_beneficiary=allow_missing_beneficiary,
+            require_charter=require_charter, require_targets=require_targets)
+        for connector in connectors)
+    return standing_policy.Policy(rules=rules)
 
 
 #: L98 T2b (#4408) : au profil nu (`AMEESH_MODULES=bare`), le cœur tourne sans

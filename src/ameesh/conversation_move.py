@@ -131,17 +131,26 @@ def release_wait(db, agent: str, host: str, *, holdoff_s: float = 0.0) -> dict |
 
 
 def reclaim(db, agent: str, host: str, *, holdoff_s: float = 0.0,
-            error: str = "preferred host did not claim") -> dict | None:
+            error: str | None = None) -> dict | None:
     """#7052: close an attempt the preferred host never claimed.
 
     After the holdoff, the source closes the abandoned attempt: `fail` returns
     the registry row to `host` with its own session, so the source claims
     locally and resumes it (instead of a cross-host claim with an election
     brief, which would drop the conversation). None while the holdoff runs or
-    when the target holds a live lease."""
+    when the target holds a live lease.
+
+    #7680: the default `error` names the move's kind and its actual target;
+    a manual move's failure is not a "preferred host" failure.
+    """
     row = release_wait(db, agent, host, holdoff_s=holdoff_s)
     if row is None or float(row.get("left_s") or 0.0) > 0:
         return None
+    if not error:
+        kind = ("manual move" if (row.get("reason") or "") == "manual"
+                else "preference handover")
+        error = "%s: target host %s did not claim" % (
+            kind, row.get("target_host") or "?")
     return _moves(db).fail(row["move_id"], error=error)
 
 

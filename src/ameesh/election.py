@@ -967,7 +967,8 @@ def rank_delay_s(rank: int) -> float:
 
 
 def claim_wait(db, role: Mapping, host: str, free_since: float, *,
-               now: float | None = None) -> tuple[bool, str, dict | None]:
+               now: float | None = None,
+               hold_turns: bool = False) -> tuple[bool, str, dict | None]:
     """May this host claim the role now, given its rank and the free instant?
 
     `free_since` is the monotonic instant this runner first saw the lease
@@ -983,6 +984,13 @@ def claim_wait(db, role: Mapping, host: str, free_since: float, *,
     closes the abandoned attempt (`conversation_move.reclaim`) and claims
     locally, keeping the source session, instead of taking the row across
     hosts with an election brief.
+
+    #7680: `hold_turns` says the next turn of this host is held by host
+    pressure. The abandoned handover must then stay open — closing it would
+    announce a return this host cannot serve, and the next candidate would
+    take the conversation by an election brief. The answer is
+    `preference reclaim deferred`; the caller claims nothing and retries once
+    the pressure is over (the designated target may claim in the meantime).
     """
     now = time.monotonic() if now is None else float(now)
     ranked = candidacy(db, role["name"])
@@ -1020,6 +1028,12 @@ def claim_wait(db, role: Mapping, host: str, free_since: float, *,
                 if left > 0:
                     return (False, "preference holdoff: waits %ds for %s"
                             % (int(left) + 1, target), mine)
+                if hold_turns:
+                    # #7680 : ne pas annoncer un retour que cet hôte ne peut
+                    # pas servir — la tentative reste ouverte, la cible peut
+                    # encore réclamer ; la pression passée, on referme.
+                    return (False, "preference reclaim deferred: host pressure "
+                            "holds this host's turns", mine)
                 return (False, "preference reclaim: %s did not claim; closing "
                         "the attempt" % target, mine)
             if target != host:

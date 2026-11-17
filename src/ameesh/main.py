@@ -15,6 +15,10 @@
         is stopped (#3299) ; an avatar `releve: preference` moves with its
         conversation, preflight and one `agent.moved` + `conversation_moves`
         transaction, no session or credential copied (#7108);
+  ameesh agent observe <name> [--account-profile NAME] [--json]
+        #7636 E1b: admitted profile, canon/placement, lease, bounds and redacted
+        budget in one read-only snapshot (schema ameesh-agent-observation/1);
+        no claim, reservation, dispatch or credential;
   ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh agent retire <name> --reason R | restore <name>   take an agent out of the
         active registry (never designated, claimed nor mailed), or back (#3460);
@@ -115,9 +119,10 @@
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
-        durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
+  ameesh host reattach SOURCE AGENT --to NEW_HOST
+        durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
         tenants of a shared host: plan, binding, presence (#7106, bureau or
         human only; --register runs on the target host);
@@ -519,7 +524,7 @@ def _dispatch(argv: list[str] | None) -> int:
         # #7106 (avatar B3) : tenants d'un hôte partagé, geste d'infrastructure
         from . import tenancy
         return tenancy.main(rest[1:])
-    if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
+    if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "reattach", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
     if command == "role":

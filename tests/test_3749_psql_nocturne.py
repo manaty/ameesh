@@ -14,6 +14,7 @@ import datetime
 import importlib.util
 import io
 import json
+import math
 import pathlib
 import contextlib
 import tempfile
@@ -133,8 +134,12 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(self._ran(p, "psql"), self.mods)
         porteuse = next(ps for ps in p["parts"]["psql"] if lent in ps["modules"])
         self.assertGreaterEqual(porteuse["estimate_s"], 3600.0)
-        self.assertTrue(all(ps["estimate_s"] < 100.0
-                            for ps in p["parts"]["psql"] if ps is not porteuse))
+        # #7707 : borne déduite de la suite, pas 100 s fixes (rouge dès le
+        # 1487e module) : les autres parts se partagent n - 1 modules à 1 s.
+        autres = [ps for ps in p["parts"]["psql"] if ps is not porteuse]
+        borne = math.ceil((len(self.mods) - 1) / len(autres)) + 1.0
+        self.assertTrue(all(ps["estimate_s"] <= borne for ps in autres),
+                        (borne, max(ps["estimate_s"] for ps in autres)))
 
     def test_le_lot_garde_sa_selection_psql(self):
         p = self._plan("pull_request", base_ref="main", head_ref="lot/x")

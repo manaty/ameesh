@@ -59,9 +59,12 @@ Only the applied policy authorizes the connector in that project. An operation
 missing from `action_classes` is refused at proposal, even if `--class` or the
 programmatic `canon_class` argument supplies a value. The canonical class wins
 over `classify`; no call to the connector's classifier is needed. The gate
-rechecks activation and class before approval, execution and reconciliation.
-A class changed since proposal requires a new action. Deactivation prevents
-execution of previously approved actions.
+rechecks activation and class before approval and execution. A class changed
+since proposal requires a new action. Deactivation prevents execution of
+previously approved actions. Reconciliation is a read-only observation of an
+outcome that already happened: it only checks that the connector name is not
+now served by another provider, so a policy withdrawal, a class change or an
+uninstalled module never leaves an `unknown` action unsettled.
 
 Compatibility for the existing development connector: `git-merge` keeps its
 historical always-active behavior and default classification when no explicit
