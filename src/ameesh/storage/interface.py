@@ -4628,6 +4628,11 @@ class Decisions(Domain):
         `limit` most recent, oldest first, same columns as `source_mail`."""
 
     @abc.abstractmethod
+    def mark_key_provenance(self, decision_id: int) -> dict | None:
+        """#7631 : marque une demande EN ATTENTE comme portant sur la clé owner
+        ou la provenance (jamais l'inverse) ; rend la ligne, ou None."""
+        raise NotImplementedError
+
     def register_chat(self, name: str, *, human: str, host: str, harness: str,
                       cwd: str | None, status_text: str) -> dict | None:
         """Inscrit (ou rafraîchit) l'agent de conversation `name` : mode

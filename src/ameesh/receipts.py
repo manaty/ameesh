@@ -967,7 +967,7 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
     # 4 bis. #7631 : l'accord cité est une entrée du journal de conversation,
     #    écrite par l'approbateur lui-même, avant la signature et récente
     if accord is not None:
-        code, reason = _check_accord_entry(db, accord, request["approver"], iat, policy)
+        code, reason = check_accord_entry(db, accord, request["approver"], iat, policy)
         if code:
             return refuse(code, reason)
         ctx.update(accord={"agent": accord["agent"], "seq": accord["seq"]},
@@ -999,7 +999,7 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         request["decision"], approver, parsed.facade), **ctx), parsed
 
 
-def _check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
+def check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
                         policy: Policy) -> tuple[str, str]:
     """("", "") si l'entrée (agent, seq) du journal L78 porte l'accord de
     `approver` : message humain de confiance, de cet humain, écrit au plus

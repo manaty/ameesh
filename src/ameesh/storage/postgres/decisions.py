@@ -273,6 +273,18 @@ class Decisions(interface.Decisions):
         )
         return rows[0] if rows else None
 
+    def mark_key_provenance(self, decision_id) -> dict | None:
+        rows = self.db.query(
+            """
+            UPDATE agent_mailbox
+               SET payload = jsonb_set(payload, '{decision,key_provenance}', 'true'::jsonb)
+             WHERE id = %s AND delivered_at IS NULL AND __IS_DECISION__
+            RETURNING __COLUMNS__
+            """.replace("__IS_DECISION__", _IS_DECISION).replace("__COLUMNS__", _COLUMNS),
+            (int(decision_id),),
+        )
+        return rows[0] if rows else None
+
     def reply_for(self, decision_id, *, sender=None) -> dict | None:
         # #3892 : le courrier déjà déposé pour cette réponse. Borné à
         # l'expéditeur (index `sender`) : le répondeur est l'humain qui a

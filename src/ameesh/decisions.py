@@ -22,6 +22,14 @@ migration 0515; ``decide validation-history`` requires the owner's key.
   ameesh decide <id> <option | "free text"> [--key FILE [--as NAME] | --signed] [--json]
         the owner answers (a HUMAN identity only); the answer goes to the
         requester by mail (it wakes them up), to the thread and to the work item;
+  ameesh decide <id> <option | "free text"> --key FILE --accord AGENT#SEQ|grant:ID
+        #7631: the human's declared avatar (card section `avatar`) signs for
+        them with the owner key, on the go in the journal (form a) or a
+        standing approval (form b, never for the owner key or provenance);
+        the proof says `signed_by: avatar` and cites the accord;
+  ameesh decide reclassify <id> key-provenance
+        #7631: the request concerns the owner key or a provenance attestation
+        (only form a covers it); never the other way round;
   ameesh decide withdraw <id> [--why "…"] [--json]     the requester withdraws their request;
   ameesh decide repair-forward <id> [--json]           restore an accidentally forwarded request
         (a copy already withdrawn by its requester is kept: its trace stays);
@@ -302,6 +310,7 @@ def view_of(row: dict, now: float | None = None) -> dict:
         "why": d.get("why"),
         "urgent": bool(d.get("urgent")),
         "needs_signature": bool(d.get("needs_signature")),
+        "key_provenance": bool(d.get("key_provenance")),
         "supersedes": d.get("supersedes"),
         "supersedes_option": d.get("supersedes_option"),
         "superseded_by": d.get("superseded_by"),
@@ -652,7 +661,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         source_mail: int | None = None, parent_lot: str | None = None,
         now: float | None = None, domain: str = "decision", issue_links=(),
         supersedes: int | None = None, supersedes_option: str | None = None,
-        repair_plan: dict | None = None) -> dict:
+        repair_plan: dict | None = None, key_provenance: bool = False) -> dict:
     """Dépose une demande de décision de `requester` (un agent) ; rend la
     demande (`ameesh-decision/1`) avec `lot_state`. DecisionError si refusée
     (rien n'est déposé).
@@ -818,6 +827,9 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         }
         if source_mail is not None:
             decision["source_mail"] = int(source_mail)
+        if key_provenance:
+            # #7631 : porte sur la clé owner ou une attestation de provenance
+            decision["key_provenance"] = True
         if supersedes is not None:
             decision["supersedes"] = supersedes
             decision["supersedes_option"] = supersedes_option
@@ -980,10 +992,12 @@ def _option_label(view: dict, key: str | None) -> str | None:
     return None
 
 
-def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
+def answer_digest(view: dict, text: str, option: str | None, human: str,
+                  signer: dict | None = None) -> str:
     """L'empreinte que signe une réponse (sha256 hex) : la demande (numéro,
     demandeur, lot, question, options, heure), le plan de réparation (clé et
-    empreinte de contenu) quand il y en a un, la réponse exacte, son auteur."""
+    empreinte de contenu) quand il y en a un, la réponse exacte, son auteur —
+    et (#7631) qui a tenu la clé, `signer`, quand la réponse le dit."""
     from . import authority
     document = {
         "v": 1, "kind": "ameesh-decision-answer", "decision": int(view["id"]),
@@ -1004,8 +1018,136 @@ def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
     if isinstance(plan, dict) and plan.get("key") and plan.get("digest"):
         document["request"]["repair_plan"] = {"key": plan["key"],
                                               "digest": plan["digest"]}
+    # #7631 : seule une signature d'avatar entre dans le document (agent et
+    # accord) ; une réponse de l'owner, ou d'avant, garde son document
+    if signer and signer.get("by") == SIGNED_BY_AVATAR:
+        document["signer"] = signer
     return authority.hash_artifact(json.dumps(document, sort_keys=True, separators=(",", ":"),
                                               ensure_ascii=False))
+
+
+#: #7631 : qui a tenu la clé owner pour une réponse signée
+SIGNED_BY_OWNER = "owner"
+SIGNED_BY_AVATAR = "avatar"
+#: opérations du mode journal (#7631) : une décision qui porte sur la clé
+#: owner ou une attestation de provenance n'est jamais couverte par un grant
+OP_DECISION_SIGN = "decision-sign"
+OP_DECISION_SIGN_KEY = "decision-sign-key"
+#: refus au doute : une question qui cite la clé owner ou la provenance
+_KEY_PROVENANCE_RE = re.compile(
+    r"(cl[ée]s?|keys?)\W+(de\W+l'?\W*)?(owner|propri[ée]taire)|(owner|owner's)\W+keys?"
+    r"|provenance", re.IGNORECASE)
+
+
+def decision_operation(view: dict) -> str:
+    """#7631 : `decision-sign-key` si la demande porte sur la clé owner ou une
+    attestation de provenance (drapeau du demandeur, reclassement, ou au
+    doute le texte), sinon `decision-sign`."""
+    if view.get("key_provenance"):
+        return OP_DECISION_SIGN_KEY
+    text = " ".join([view.get("question") or ""] + [
+        str(o.get("label") or "") for o in view.get("options") or ()])
+    return OP_DECISION_SIGN_KEY if _KEY_PROVENANCE_RE.search(text) else OP_DECISION_SIGN
+
+
+def parse_accord(text: str | None) -> dict | None:
+    """`AGENT#SEQ` (forme a) ou `grant:ID` (forme b) ; DecisionError sinon."""
+    if not text:
+        return None
+    if text.startswith("grant:"):
+        grant = text[len("grant:"):]
+        if grant.isdigit() and int(grant) > 0:
+            return {"grant": int(grant)}
+    else:
+        agent, sep, seq = text.rpartition("#")
+        if sep and agent and seq.isdigit() and int(seq) > 0:
+            return {"agent": agent, "seq": int(seq)}
+    raise DecisionError("--accord AGENT#SEQ (the human's go in the journal) or grant:ID "
+                        "(a standing approval) expected, not %r" % text)
+
+
+def check_accord(db, view: dict, human: str, accord: dict, *, now: float) -> str:
+    """#7631 : l'accord d'une signature d'avatar ; rend une ligne lisible, ou
+    DecisionError. Forme (a) : message de `human` au journal L78, au plus
+    24 h avant. Forme (b) : grant actif de `human` qui couvre la signature —
+    jamais pour une décision sur la clé owner ou la provenance."""
+    from . import receipts
+    operation = decision_operation(view)
+    if "grant" in accord:
+        if operation == OP_DECISION_SIGN_KEY:
+            raise DecisionError("decision #%d concerns the owner key or a provenance "
+                                "attestation: only the human's go in the journal "
+                                "(--accord AGENT#SEQ) covers it" % view["id"])
+        grant = receipts.get_standing(db, accord["grant"])
+        if (grant is None or grant.get("approver") != human or grant.get("revoked_ts")
+                or float(grant.get("until_ts") or 0) <= now
+                or OP_DECISION_SIGN not in (grant.get("operations") or [])):
+            raise DecisionError("accord grant #%d: no active standing approval of %s for "
+                                "%s" % (accord["grant"], human, OP_DECISION_SIGN))
+        return "grant #%d" % accord["grant"]
+    code, reason = receipts.check_accord_entry(db, accord, human, int(now),
+                                               receipts.Policy())
+    if code:
+        raise DecisionError(reason)
+    return "%s#%d" % (accord["agent"], accord["seq"])
+
+
+def avatar_human(cfg: Config, agent_name: str) -> str | None:
+    """#7631 : l'humain dont `agent_name` est l'avatar déclaré (section
+    `avatar` de sa fiche, `responsible` résolu dans son canon), ou None."""
+    from . import canon as canon_mod
+    for canon in canon_mod.load_configured(cfg):
+        agent = canon.agent(agent_name)
+        if agent is None:
+            continue
+        if not isinstance((agent.fiche.data or {}).get("avatar"), dict):
+            return None
+        return canon.resolve_human(agent.responsible) or None
+    return None
+
+
+def session_agent(cfg: Config, db) -> str:
+    """Le nom de l'agent de cette session (`AGENT_MAIL_NAME`, sinon la
+    session liée), '' si aucun."""
+    name = (os.environ.get("AGENT_MAIL_NAME") or "").strip()
+    if name:
+        return name
+    return identity.resolve_binding(cfg, db).name or ""
+
+
+def avatar_answerer(cfg: Config, db, accord: dict) -> tuple[Answerer, dict]:
+    """#7631 : la session d'un agent déclaré avatar d'un humain répond pour
+    lui, clé owner en main et sur son accord ; DecisionError sinon. Une
+    session humaine signe sans `--accord`."""
+    if agent_session_reason(cfg, db) is None:
+        raise DecisionError("--accord is for the human's avatar; in your own terminal, "
+                            "sign without it")
+    name = session_agent(cfg, db)
+    human = avatar_human(cfg, name) if name else None
+    if not human:
+        raise DecisionError("refused: agent %s is not declared as a human's avatar "
+                            "(section `avatar` of its card); only a human answers a "
+                            "decision request" % (name or "?"))
+    return Answerer(human, "cli"), {"by": SIGNED_BY_AVATAR, "agent": name, "accord": accord}
+
+
+def reclassify_key_provenance(cfg: Config, db, decision_id: int, *, actor: str) -> dict:
+    """#7631 : un humain ou un avatar déclaré reclasse une demande en attente
+    « clé owner / provenance » ; jamais l'inverse (seul le demandeur, à la
+    demande, pose l'autre classe)."""
+    view = get(db, decision_id)
+    if view is None:
+        raise DecisionError("decision #%s not found" % decision_id)
+    if view["state"] != "pending":
+        raise DecisionError(_closed_reason(view))
+    row = storage.of(db).decisions.mark_key_provenance(int(decision_id))
+    if row is None:
+        raise DecisionError(_closed_reason(get(db, decision_id) or view))
+    if str(view.get("lot") or "").isdigit():
+        work.note(db, int(view["lot"]), "decision #%d reclassified by %s: owner key or "
+                  "provenance (only the human's go in the journal covers its signature)"
+                  % (int(decision_id), actor), actor=actor)
+    return view_of(row)
 
 
 def _approver_of(human: str, approver: str | None) -> str:
@@ -1029,11 +1171,14 @@ def signature_hint(view: dict, text: str, option: str | None, human: str) -> str
 
 
 def _sign(db, view: dict, text: str, option: str | None, human: str, *,
-          key_path: str | None, approver: str | None) -> dict:
+          key_path: str | None, approver: str | None, signer: dict | None = None) -> dict:
     """La preuve d'une réponse signée : approbation `mesh_approvals` (clé de
-    rôle `owner`) sur l'empreinte de la réponse, CONSOMMÉE par la décision."""
+    rôle `owner`) sur l'empreinte de la réponse, CONSOMMÉE par la décision.
+    #7631 : `meta.signed_by` (owner | avatar) et `meta.accord` disent qui a
+    tenu la clé et sur quel accord."""
     from . import authority, signing
-    digest = answer_digest(view, text, option, human)
+    digest = answer_digest(view, text, option, human, signer)
+    signer = signer or {"by": SIGNED_BY_OWNER}
     if key_path:
         try:
             seed = signing.read_private(os.path.expanduser(key_path))
@@ -1043,7 +1188,10 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
             authority.create_approval(
                 db, seed, approver=_approver_of(human, approver), action=APPROVAL_ACTION,
                 artifact_kind=APPROVAL_KIND, artifact_hash=digest, ttl=SIGN_TTL_S,
-                meta={"decision": int(view["id"]), "by": human})
+                meta=dict({"decision": int(view["id"]), "by": human,
+                           "signed_by": signer["by"]},
+                          **({"agent": signer["agent"], "accord": signer["accord"]}
+                             if signer["by"] == SIGNED_BY_AVATAR else {})))
         except authority.AuthorityError as exc:
             raise DecisionError("signature rejected: %s" % exc) from exc
     row, verdict = authority.find_approval(db, APPROVAL_ACTION, digest,
@@ -1052,7 +1200,8 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
         raise DecisionError("signed answer rejected: %s\n%s" % (
             verdict.reason, signature_hint(view, text, option, human)))
     return {"approval_id": int(row["id"]), "approver": row.get("approver"),
-            "signature_key": row.get("signature_key"), "digest": digest}
+            "signature_key": row.get("signature_key"), "digest": digest,
+            "signed_by": signer["by"]}
 
 
 def verify_proof(db, view: dict, *, live: bool = False, public_only: bool = False) -> tuple[bool, str]:
@@ -1065,7 +1214,7 @@ def verify_proof(db, view: dict, *, live: bool = False, public_only: bool = Fals
     if not proof:
         return False, "unsigned answer"
     digest = answer_digest(view, answer.get("text") or "", answer.get("option"),
-                           answer.get("by") or "")
+                           answer.get("by") or "", answer.get("signer"))
     if digest != proof.get("digest"):
         return False, "the digest no longer matches the recorded answer"
     rows = storage.of(db).approvals.recent(
@@ -1299,7 +1448,7 @@ def _replay_answer(cfg: Config, db, view: dict, *, text: str, option: str | None
 
 def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel: str,
            key_path: str | None = None, approver: str | None = None, signed: bool = False,
-           now: float | None = None) -> dict:
+           now: float | None = None, signer: dict | None = None) -> dict:
     """Enregistre la réponse de `human` (déjà identifié : `answering_human`).
 
     #3892 : la réponse et la libération du lot sont UNE transaction ; le
@@ -1309,7 +1458,12 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
 
     Rend `{decision, lot, message_id, warning}` (+ `replayed`). DecisionError :
     demande inconnue ou close, humain non visé, texte illisible, signature
-    exigée absente ou refusée."""
+    exigée absente ou refusée.
+
+    `signer` (#7631) : la signature d'un avatar ({by: avatar, agent,
+    accord}, `avatar_answerer`) ; exige `key_path`, et l'accord est vérifié
+    (`check_accord`) avant de signer. Sans lui, une réponse signée est celle
+    de l'owner."""
     now = time.time() if now is None else float(now)
     if channel not in CHANNELS:
         raise DecisionError("unknown channel: %r" % channel)
@@ -1340,6 +1494,11 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
                                   human=human, now=now)
         raise DecisionError(_closed_reason(view))
     signed_requested = bool(key_path or signed)
+    if signer is not None:
+        if not key_path:
+            raise DecisionError("an avatar signs with the owner key (--key), on an accord "
+                                "(--accord)")
+        check_accord(db, view, human, signer["accord"], now=now)
     if signed_requested:
         if channel == "chat":
             raise DecisionError("a signed answer is given in your terminal, not in the "
@@ -1353,7 +1512,8 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         return {"state": "answered", "answer": {
             "by": human, "channel": channel, "text": text, "option": option,
             "option_label": _option_label(view, option), "ts": round(now, 3),
-            "host": cfg.host, "proof": proof}}
+            "host": cfg.host, "proof": proof,
+            **({"signer": signer or {"by": SIGNED_BY_OWNER}} if proof else {})}}
 
     def said(view: dict) -> str:
         if option:
@@ -1365,7 +1525,7 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         # écriture conditionnelle ; le courrier garde sa clé d'idempotence et
         # la re-saisie identique est un rejeu.
         proof = _sign(db, view, text, option, human, key_path=key_path,
-                      approver=approver) if signed_requested else None
+                      approver=approver, signer=signer) if signed_requested else None
         closed = storage.of(db).decisions.close(int(view["id"]), status="answered",
                                                 record=record_for(proof))
         if closed is None:
@@ -1386,7 +1546,7 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     try:
         with db.transaction() as tx:
             proof = _sign(tx, view, text, option, human, key_path=key_path,
-                          approver=approver) if signed_requested else None
+                          approver=approver, signer=signer) if signed_requested else None
             closed = storage.of(tx).decisions.close(int(view["id"]), status="answered",
                                                     record=record_for(proof))
             if closed is None:
@@ -1634,7 +1794,8 @@ USAGE = ("usage: ameesh decide ask (--lot <id|ref> | --new-lot \"title\") --ques
          "--option a=\"…\" [--option b=\"…\"] [--recommend a [--why \"…\"]] [--urgent] "
          "[--by 2h] [--needs-signature] [--from-mail <id>] [--json]\n"
          "        ameesh decide <id> <option | \"free text\"> "
-         "[--key FILE [--as NAME] | --signed] [--json]\n"
+         "[--key FILE [--as NAME] [--accord AGENT#SEQ|grant:ID] | --signed] [--json]\n"
+         "        ameesh decide reclassify <id> key-provenance\n"
          "        ameesh decide withdraw <id> [--why \"…\"] [--json]\n"
          "        ameesh decide repair-forward <id> [--json]\n"
          "        ameesh decide show <id> [--json]")
@@ -1679,6 +1840,9 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
                              "(default: one business day in recipient timezone)")
     parser.add_argument("--domain", default="decision", help="configured validation authority domain")
     parser.add_argument("--issue", action="append", default=[], help="related issue URL (repeatable)")
+    parser.add_argument("--key-provenance", action="store_true",
+                        help="#7631: the decision concerns the owner key or a provenance "
+                             "attestation (never covered by a standing approval)")
     parser.add_argument("--needs-signature", action="store_true",
                         help="production or irreversible action: signed answer required")
     parser.add_argument("--supersedes", type=int, metavar="ID",
@@ -1703,6 +1867,7 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
                    options=args.option, lot=args.lot, new_lot=args.new_lot,
                    recommend=args.recommend, why=args.why, urgent=args.urgent, due_ts=due,
                    needs_signature=args.needs_signature, source_mail=args.from_mail,
+                   key_provenance=args.key_provenance,
                    parent_lot=args.parent_lot, domain=args.domain, issue_links=args.issue,
                    supersedes=args.supersedes, supersedes_option=args.supersedes_option)
     finally:
@@ -1739,6 +1904,9 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
                             "--hash …): find and consume it")
     parser.add_argument("--as", dest="as_name", default=None,
                         help="name of the owner key in the registry (default: your name)")
+    parser.add_argument("--accord", default=None, metavar="AGENT#SEQ|grant:ID",
+                        help="#7631: the human's avatar signs with --key on this accord "
+                             "(the go in the journal, or a standing approval)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     decision_id = _decision_id(args.id)
@@ -1750,10 +1918,15 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
         return 2
     db = _open(cfg)
     try:
-        who = answering_human(cfg, db)
+        accord = parse_accord(args.accord)
+        signer = None
+        if accord is not None:
+            who, signer = avatar_answerer(cfg, db, accord)
+        else:
+            who = answering_human(cfg, db)
         result = answer(cfg, db, decision_id, " ".join(args.answer), human=who.human,
                         channel=who.channel, key_path=args.key, approver=args.as_name,
-                        signed=args.signed)
+                        signed=args.signed, signer=signer)
     finally:
         db.close()
     if args.json:
@@ -1776,6 +1949,12 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
         view["id"], "identical answer replayed (already recorded)" if replayed
         else "answer recorded", answer_["by"], CHANNEL_LABELS[answer_["channel"]],
         "option %s — " % answer_["option"] if answer_.get("option") else "", answer_["text"]))
+    signer = answer_.get("signer") or {}
+    if signer.get("by") == SIGNED_BY_AVATAR:
+        accord = signer.get("accord") or {}
+        print("signed by avatar %s for %s, accord %s" % (
+            signer.get("agent"), answer_["by"], "grant #%s" % accord["grant"]
+            if "grant" in accord else "%s#%s" % (accord.get("agent"), accord.get("seq"))))
     lot = result["lot"]
     if lot.get("moved"):
         print("work item #%s: returns to %s" % (lot["lot"], lot["state"]))
@@ -1888,6 +2067,33 @@ def cmd_show(cfg: Config, argv: list[str]) -> int:
     return 0
 
 
+def cmd_reclassify(cfg: Config, argv: list[str]) -> int:
+    parser = _parser("ameesh decide reclassify")
+    parser.add_argument("id")
+    parser.add_argument("cls", choices=["key-provenance"])
+    args = parser.parse_args(argv)
+    decision_id = _decision_id(args.id)
+    if decision_id is None:
+        print(USAGE, file=sys.stderr)
+        return 2
+    db = _open(cfg)
+    try:
+        if agent_session_reason(cfg, db) is None:
+            actor = current_human()
+        else:
+            name = session_agent(cfg, db)
+            if not (name and avatar_human(cfg, name)):
+                raise DecisionError("refused: only a human or a human's declared avatar "
+                                    "reclassifies a decision request")
+            actor = name
+        reclassify_key_provenance(cfg, db, decision_id, actor=actor)
+    finally:
+        db.close()
+    print("decision #%d: owner key or provenance — only the human's go in the journal "
+          "covers its signature" % decision_id)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-h", "--help", "help"):
@@ -1906,6 +2112,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_repair_forward(cfg, rest)
         if command == "show":
             return cmd_show(cfg, rest)
+        if command == "reclassify":
+            return cmd_reclassify(cfg, rest)
         if _decision_id(command) is not None:
             return cmd_answer(cfg, argv)
         print(USAGE, file=sys.stderr)

@@ -59,12 +59,28 @@ opérations couvrent la signature. Les décisions sur la clé owner et les
 attestations de provenance relèvent de `decision-sign-key`, jamais couverte
 par un grant : forme (a) seulement.
 
-## 4. Signature de décision
+## 4. Signature de décision (livré)
 
-`ameesh decide --key` écrit `mesh_approvals.meta.signed_by` = `owner` (session
-humaine) ou `avatar` (session d'agent, `--accord AGENT#SEQ` exigé, vérifié
-comme au point 1), et `meta.accord`. La vue `ameesh_decision_proofs` expose
-ces deux champs ; les 319 lignes antérieures restent `signed_by` inconnu.
+- `ameesh decide <id> <réponse> --key <clé owner> --accord AGENT#SEQ|grant:ID` :
+  seule la session d'un agent déclaré avatar de l'humain (section `avatar` de
+  sa fiche, `responsible` résolu) passe la garde « seul un humain répond ».
+  Sans `--accord`, la garde est inchangée.
+- Accord vérifié avant de signer : forme (a), message de l'humain au journal,
+  au plus 24 h avant (comme au point 1) ; forme (b), grant actif de l'humain
+  dont les opérations comprennent `decision-sign`.
+- Une décision sur la clé owner ou une attestation de provenance relève de
+  `decision-sign-key` : drapeau du demandeur (`decide ask --key-provenance`),
+  reclassement par un humain ou un avatar (`decide reclassify <id>
+  key-provenance`, jamais l'inverse), ou au doute le texte (clé owner,
+  provenance). Seule la forme (a) la couvre.
+- En base : `mesh_approvals.meta.signed_by` (`owner` | `avatar`), avec `agent`
+  et `accord` pour l'avatar ; la réponse gardée porte `signer`. Pour l'avatar,
+  `signer` entre dans l'empreinte signée (le changer casse la preuve) ; les
+  réponses d'avant et celles de l'owner gardent leur document signé.
+- La vue `ameesh_decision_proofs` n'est pas modifiée : le contrat du rôle
+  bureau limité (`deploy/sql/_contrat-bureau.sql`) fige sa définition et en
+  exclut la méta d'approbation. Les 319 lignes antérieures restent sans
+  `signed_by`.
 
 ## 5. Vue des gestes réservés
 
