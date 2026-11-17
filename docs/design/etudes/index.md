@@ -10,6 +10,7 @@
 * [Multiple accounts](comptes-multiples.md) - Isolating an account and its sessions per harness (Claude Code, Codex, DeepSeek Harness); resuming under another account; basis for L30.
 * [Persona and harness](persona-et-harnais.md) - Identity, prompts and memory of a persona across Claude Code, Codex, dsh and ACP; neutral interim memory; proposed lots.
 * [Orchestration and liveness](orchestration-et-vivacite.md) - A stopped external orchestrator that blocks a project: agent mode, retained assignment, adoption and resumption, pushed alerts, deadline-based delegation, hook isolation; proposed lots L36–L41.
+* [Electing a pilot](election-pilote.md) - A mesh keeps working when the workstation is off: governance roles hold the agent lease from the most reliable candidate host, epoch fencing, lots EP1–EP8.
 * [Multiple canons](plusieurs-canons.md) - What breaks when two canons share a host, the federation model, interim for Acme; lots L42–L45.
 * [Mediated executor](executeur-mediee.md) - Executor without database access: remote storage, server fencing, P-256 enrollment, host availability and model relay; L107–L115.
 * [Resident agent](agent-resident.md) - The human talks to the agent instead of taking it: tests of the harnesses (stream-json, app-server, ACP), resident process under a lease, inputs and authority, shared conversation, rotation, costs; decision 0035 accepted, lots L75–L83.
