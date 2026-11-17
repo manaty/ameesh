@@ -140,18 +140,10 @@ EXCEPTIONS = {
     ("unrecorded.py", "orchestrateur"): 1,
     ("work.py", "auditeur"): 2,
     ("work.py", "orchestrateur"): 1,
-    # -- hôtes et personnes lus au canon (#7662) : 14
+    # -- hôtes et personnes lus au canon (#7662) : 6
     ("migrations/0364_key_holders.sql", "smichea"): 2,
     ("process_observations_cli.py", "bureau-goal"): 1,
-    ("release.py", "manaty-mesh-1"): 1,
-    ("release_cutoff.py", "ameesh-agents-1"): 1,
-    ("release_cutoff.py", "ameesh-agents-2"): 1,
-    ("release_cutoff.py", "ameesh-agents-3"): 1,
-    ("release_cutoff.py", "manaty-mesh-1"): 1,
-    ("release_cutoff.py", "pc-smichea"): 1,
     ("release_cutoff.py", "smichea"): 2,
-    ("staging_executor.py", "manaty-mesh-1"): 1,
-    ("staging_executor.py", "pc-smichea"): 1,
     ("storage/postgres/authority.py", "smichea"): 1,
     # -- release et canal Nexlink dans le module Nexlink (#7663) : 228
     ("approve/config.py", "nexlink"): 2,
