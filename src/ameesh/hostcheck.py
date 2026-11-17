@@ -759,6 +759,32 @@ def memory_cap_lines(cfg, db, canons=None, run=_systemctl,
     return lines
 
 
+def memory_transport_lines(cfg, canons=None) -> list[str]:
+    """#7682 : persona memory repositories this host cannot open.
+
+    The memory Git environment ignores global/system configuration and
+    credential helpers, so an HTTPS repository can never authenticate; an SSH
+    repository also needs the host-managed `persona_memory.ssh_key`. Signalled,
+    never blocking: the persona still runs without memory, and the runner
+    tells it so in its turn and publishes the host defect.
+    """
+    from . import canon as canon_mod, persona_memory
+    if canons is None:
+        try:
+            canons = canon_mod.load_configured(cfg)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic never breaks the doctor
+            return ["memory     : repositories not checked (%s)" % exc]
+    lines = []
+    for canon in canons:
+        try:
+            findings = persona_memory.canon_findings(cfg, canon, cfg.host or "")
+        except Exception as exc:  # noqa: BLE001 - a diagnostic never breaks the doctor
+            lines.append("memory     : repository check failed (%s)" % exc)
+            continue
+        lines.extend("memory     : %s" % finding.message for finding in findings)
+    return lines
+
+
 def turn_cgroup_lines(cfg, db, run=_systemctl) -> list[str]:
     """L498 : lignes de `ameesh doctor` sur le cgroup délégué par tour.
 

@@ -9409,8 +9409,16 @@ class AgentWorker(threading.Thread):
                 if activation or not session:
                     journal_id = "session-" + uuid.uuid4().hex
                     memory_preface = memory_mod.preface(path, self.name, journal_id)
+                # The transport works again: a later failure is a new episode.
+                self.__dict__.pop("_memory_unavailable_code", None)
             except (memory_mod.MemoryError, db_mod.DbError, OSError, subprocess.SubprocessError) as exc:
-                log("[%s] persona memory unavailable for this turn: %s" % (self.name, exc))
+                reason = str(exc)
+                log("[%s] persona memory unavailable for this turn: %s" % (self.name, reason))
+                # A silent degradation is not acceptable: the persona must know
+                # its memory is missing, and the host defect is published to
+                # the responsible (thread + event log), once per cause.
+                memory_preface = memory_mod.unavailable_preface(reason)
+                self._memory_unavailable(reason)
         resume += memory_preface
         # #6040 : seuil de compaction native (Codex : en cours de tour) ; un
         # compte emprunté garde les défauts de son harnais, comme l'effort.
@@ -11226,6 +11234,34 @@ class AgentWorker(threading.Thread):
         return min(self.runner.failure_backoff_max,
                    base * (2 ** (n - 1)))
 
+    def _memory_unavailable(self, reason: str) -> None:
+        """Publish a memory-unavailable host defect, once per cause.
+
+        The agent already receives a visible line in its turn; this trace and
+        the `host.memory_unavailable` event let the responsible see the defect
+        without reading the runner log. A repeated cause (the same turn loop)
+        is not republished; a success clears the marker. Never fails a turn.
+        """
+        code = memory_mod.failure_code(reason)
+        if self.__dict__.get("_memory_unavailable_code") == code:
+            return
+        self.__dict__["_memory_unavailable_code"] = code
+        detail = " ".join(str(reason or "").split())[:240]
+        host = getattr(self.cfg, "host", "") or "this host"
+        self._fil_note(
+            "Persona memory unavailable on %s (%s): %s — the turn runs without "
+            "memory; fix the host configuration (SSH repository and "
+            "persona_memory.ssh_key, `ameesh canon check`)."
+            % (host, code, detail),
+            meta={"action": "memoire_indisponible", "cause": code})
+        try:
+            from . import events
+            events.record(self.db, "host.memory_unavailable", "agent:%s" % self.name,
+                          agent=self.name, host=getattr(self.cfg, "host", "") or "",
+                          cause=code)
+        except Exception as exc:  # noqa: BLE001 - a publication never fails a turn
+            log("[%s] memory unavailable event not recorded: %s" % (self.name, exc))
+
     def _sync_memory(self) -> None:
         """Transport the persona session's memory changes at turn end, in the background."""
         if not self.agent.get("memory_repository") or self.runner.dry_run:
@@ -11236,6 +11272,7 @@ class AgentWorker(threading.Thread):
             memory_mod.require_isolation(self.cfg, self.db, self.name)
         except (memory_mod.MemoryError, db_mod.DbError) as exc:
             log_async("[%s] persona memory disabled: %s" % (self.name, exc))
+            self._memory_unavailable(str(exc))
             return
         path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
         if not os.path.isdir(os.path.join(path, ".git")):

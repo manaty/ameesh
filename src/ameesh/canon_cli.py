@@ -277,9 +277,17 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
     recorded = _recorded(cfg, host, canon)
     # L243 : les projets inconnus ne se vérifient qu'avec la base (lots)
     findings = canon_mod.validate(canon, (recorded or {}).get("projects"))
+    placements = placement_mod.verdicts(canon) if canon.readable else []
+    # #7682 : un dépôt de mémoire que l'environnement Git isolé ne peut pas
+    # ouvrir sur cet hôte (HTTPS, ou SSH sans persona_memory.ssh_key). Un
+    # avertissement, pas une erreur : l'avatar tourne sans mémoire et
+    # l'exécuteur le lui dit dans son tour ; `canon sync` n'est pas bloqué.
+    if canon.readable:
+        from . import persona_memory
+        findings = findings + persona_memory.canon_findings(
+            cfg, canon, host, placements=placements)
     errors = canon_mod.errors(findings)
     status, diagnostic = canon_sync.assess(canon, host, findings)
-    placements = placement_mod.verdicts(canon) if canon.readable else []
     unseen = _registry_errors_unseen(canon, recorded, errors)
     # #5191 : après l'état de l'hôte, que ce contrôle propre au check ne change pas
     if canon.readable:

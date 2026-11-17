@@ -1007,6 +1007,7 @@
               "agent.updated",
               "agent.moved",
               "agent.attach",
+              "host.memory_unavailable",
               "cost.recorded",
               "thread.entry",
               "decision.created",
