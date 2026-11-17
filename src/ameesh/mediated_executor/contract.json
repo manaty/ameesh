@@ -4905,6 +4905,7 @@
     "expire_dead_letters",
     "forward",
     "history",
+    "history_page",
     "human_messages",
     "lock_recipient",
     "pending_recipients",
