@@ -112,13 +112,14 @@ a domain CHECK can reject the default on an N-1 insert even if adding the
 column to an empty table succeeds. This lets N-1 writers omit the new column: 0576
 (`profiles text[] not null default '{}'`) is additive.
 
-A nullable `ADD COLUMN` is additive, with a constant default and an inline
-`CHECK` that accepts the value N-1 writers produce (NULL or that default),
-because old writers simply omit the column. A single `ALTER TABLE` may carry
-several additions: 0565/0568 add several nullable columns in one statement
-(#7655), and every action is judged on its own. A single unsafe action
-(`DROP COLUMN`, an unmarked constraint, a mandatory column without a proven
-constant default) keeps the whole statement in its old class.
+A nullable `ADD COLUMN` is additive because old writers simply omit the
+column: any simple type without a default, or a constant default with an inline
+`CHECK` that accepts the value N-1 writers produce (NULL or that default).
+A single `ALTER TABLE` may carry several additions: 0565/0568 add several
+nullable columns in one statement (#7655), and every action is judged on its
+own. A single unsafe action (`DROP COLUMN`, an unmarked constraint, a
+mandatory column without a proven constant default) keeps the whole statement
+in its old class.
 
 The L151 review markers are honored as the frozen migration's declaration,
 with a narrower scope than `migrations.non_additive`:

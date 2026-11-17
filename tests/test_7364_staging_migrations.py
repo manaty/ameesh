@@ -154,6 +154,12 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(sm.classify(sql).kind, 'additive')
         self.assertEqual(sm.classify("ALTER TABLE t ADD COLUMN y text DEFAULT 'x';").kind,
                          'additive')
+        # A default cast to a custom type or domain, and a non-constant
+        # default, stay unproven (as for a mandatory column).
+        self.assertEqual(sm.classify(
+            "ALTER TABLE c.t ADD COLUMN y custom_domain DEFAULT 'a';").kind, 'unknown')
+        self.assertEqual(sm.classify(
+            "ALTER TABLE t ADD COLUMN y timestamptz DEFAULT now();").kind, 'unknown')
         # One unsafe action keeps the whole statement in the worst class.
         for sql in (
                 "ALTER TABLE t ADD COLUMN a text, ADD COLUMN b int NOT NULL",
