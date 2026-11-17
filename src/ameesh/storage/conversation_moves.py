@@ -77,8 +77,9 @@ class ConversationMoves(abc.ABC):
         whose target has not claimed yet (no live lease).
 
         States `switched`, `recovered` and `rehydrating`; reasons `preference`
-        (B2 return) and `manual` (B4 operator move). Carries `source_host` and
-        `target_host`, plus `switched_ts` and `now_ts` on the database clock,
+        (B2 return) and `manual` (B4 operator move). Carries `source_host`,
+        `target_host` and `reason` (#7680: the failure label names a manual
+        move as such), plus `switched_ts` and `now_ts` on the database clock,
         so the caller computes the holdoff. This is how a candidate tells "the
         conversation was handed to that host, let it claim" from "the row is
         simply free"."""

@@ -182,7 +182,7 @@ class ConversationMoves(Contract):
         """
         return _row(self.db.query(
             """SELECT m.move_id::text AS move_id, m.agent, m.source_host,
-                      m.target_host, m.state,
+                      m.target_host, m.state, m.reason,
                       extract(epoch FROM m.switched_at)::float8 AS switched_ts,
                       extract(epoch FROM clock_timestamp())::float8 AS now_ts
                  FROM conversation_moves m
