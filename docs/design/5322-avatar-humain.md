@@ -545,6 +545,17 @@ conversation ; une bascule que personne ne réclame (cible et source
 disparues) est périmée après `HANDOVER_TTL_S` (300 s) pour qu'un nouveau plan
 aboutisse. Le bail et l'epoch restent les seuls arbitres.
 
+**Correction #7680.** Un agent `preference` ne traverse **jamais** un hôte par
+un `election_brief`, même sans déplacement ouvert : l'hôte qui le prend
+planifie le déplacement de reprise (le segment est bâti depuis le journal au
+premier tour cible) et ne réclame qu'une fois la ligne basculée. Le claim de
+la base refuse d'ailleurs toute réclamation `preference` dont la ligne est
+encore sur un autre hôte, avec ou sans brief. Enfin, une bascule
+abandonnée n'est refermée par sa source que si cette source peut servir un
+tour : sous une pression d'hôte qui retient ses tours, la réclamation est
+différée et la tentative reste ouverte à sa cible (la source la referme à la
+fin de la pression).
+
 ### 3.3 Ce qui n'est pas `election`
 
 `releve: election` reste pour les rôles de gouvernance : disponibilité sur
