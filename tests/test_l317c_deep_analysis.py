@@ -36,6 +36,9 @@ class _Base(PgTestCase):
         self.addCleanup(patcher.stop)
         for name in ("auditeur", "orch", "dev1"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        # #7661 : la fiche projetée au registre déclare le rôle d'auditeur.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                        " WHERE name = 'auditeur'")
         # the IT module (L317a) declares its own trigger; the core only has bug_p1
         triggers = mock.patch.dict(deep_analysis.TRIGGERS)
         triggers.start()
