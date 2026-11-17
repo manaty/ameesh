@@ -193,7 +193,7 @@ core's responsibility. The optional `harness` argument of the internal
 applies to every harness.
 
 IMA's per-document fresh-session policy is covered by this declarative
-surface. Its refusal diagnostics (E3b), prepared native profile (E1b) and
+surface. Its remaining refusal diagnostics, prepared native profile (E1b) and
 lease-bound replay requirements (E2c) remain inventoried in the mapping and
 are not available runner hooks. Until those gaps are delivered, IMA's
 remaining adaptations stay tracked by its
