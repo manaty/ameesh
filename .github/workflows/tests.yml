@@ -942,6 +942,11 @@ jobs:
         run: python scripts/ci-flow.py summary "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"
       - name: flux en artefact
         if: always()
+        # canon §3 : un diagnostic n'est pas un verdict. Le 16/11/2026, deux
+        # parts vertes ont perdu ce téléversement (CreateArtifact: ETIMEDOUT,
+        # run 43969930787) et l'agrégat requis est passé rouge ; le flux ne
+        # sert qu'au bilan (non requis), son échec se consigne.
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: flux-psycopg-${{ matrix.part }}
@@ -1050,6 +1055,9 @@ jobs:
       - *resume
       - name: flux en artefact
         if: always()
+        # canon §3 : même règle que la part psycopg — le flux est un
+        # diagnostic lu par le bilan (non requis), jamais un verdict.
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: flux-psql-${{ matrix.part }}
@@ -1191,6 +1199,9 @@ jobs:
       - *resume
       - name: flux en artefact
         if: always()
+        # canon §3 : même règle que les parts requises — cet artefact est un
+        # diagnostic (hors du motif flux-*), jamais un verdict.
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           # hors du motif `flux-*` : le bilan (L161f) agrège ces flux-là, une
