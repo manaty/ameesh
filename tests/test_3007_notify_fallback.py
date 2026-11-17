@@ -156,6 +156,9 @@ class AlertesTest(PgTestCase):
             # destinataires vivants, le cas mort étant couvert par #3036.
             self.assertIsNotNone(
                 registry.claim(self.db, name, "runner-test", 3600))
+        # #7661 : l'auditeur se lit sur le rôle projeté, pas sur son nom.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                        " WHERE name = 'auditeur'")
         self.db.execute("UPDATE agent_registry SET responsible = %s WHERE name = 'orch'",
                         (ALICE,))
         self.lot = work.add(self.db, title="RT-9", assignee="orch")

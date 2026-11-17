@@ -201,6 +201,9 @@ class LivenessFixture:
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
             self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
                             " WHERE name = %s", (name,))
+        # #7661 : l'auditeur se lit sur le rôle projeté, pas sur son nom.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                        " WHERE name = 'auditeur'")
         self.lease("dev1", "orch", "bureau", "auditeur")
         self.now = time.time()
 

@@ -3550,6 +3550,11 @@ class Notifier:
             module_auditors = alert_briefs.auditors(listing, canons, explicit_only=True)
             from . import sous_utilisation
             module_orchestrators = sous_utilisation.role_orchestrators(canons)
+            # #7661 : les alertes d'hôte visent le rôle de conception déclaré
+            # à la fiche, jamais un nom d'agent ; sans canon, la projection du
+            # registre (`roles`) est la déclaration disponible.
+            observers = sous_utilisation.declared_holders(
+                canons, listing, sous_utilisation.DESIGN_ROLES)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
@@ -3596,6 +3601,7 @@ class Notifier:
                     alert, listing, titles,
                     module_auditors if kind == "module_deviation" else auditors,
                     orchestrator_names=module_orchestrators,
+                    observation_names=observers,
                     closed_hosts=closed, dead_out=dead, covered=covered)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))

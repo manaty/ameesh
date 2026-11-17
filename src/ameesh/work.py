@@ -195,8 +195,9 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
 
 
 def is_auditor(cfg, db, name: str) -> bool:
-    """#3324 : `name` est-il l'auditeur — la persona `auditeur`, ou un agent
-    dont la fiche Agent du canon porte `roles: [auditeur]` (ou `auditor`) ?
+    """#3324 : `name` est-il l'auditeur — un agent dont la fiche Agent du canon
+    porte `roles: [auditeur]` (ou `auditor`) ? #7661 : le titre de la persona
+    ne compte plus, seule la fiche déclare le rôle.
 
     La fiche de l'auditeur (canon, 24/10/2026) range la redésignation d'un
     relecteur au niveau 1 ; le plancher d'avis (`--floor`) reste un geste de
@@ -501,8 +502,8 @@ def publisher(cfg, db, explicit: str | None = None) -> str:
         raise WorkError("--publish refused: invalid session identity (%s)"
                         % (binding.reason or "unbound identity"))
     refus = ("--publish refused: %s is not the auditor; the reference table (L157b) "
-             "is the auditor's pass (persona auditeur, or auditeur role on its Agent "
-             "card in the canon); work estimates without --publish reads it")
+             "is the auditor's pass (the auditeur role on its Agent card in the canon); "
+             "work estimates without --publish reads it")
     if binding.name:
         if text and text != binding.name:
             raise WorkError("--publish refused: this session belongs to %s, it does "
@@ -1813,8 +1814,8 @@ def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
     living = {row.get("name") for row in listing
               if row.get("name")
               and (row.get("status") or "") not in ("stopped", "dead")}
-    if alert_briefs.AUDITOR_NAME in living:   # le nom suffit : pas de canon
-        return alert_briefs.AUDITOR_NAME
+    # #7661 : l'auditeur se lit sur la fiche (rôle du canon, ou projection du
+    # registre sans canon), jamais sur le titre de la persona.
     names = [name for name in alert_briefs.auditors(
                  listing, configured_canons(cfg) if canons is None else canons)
              if name in living]
