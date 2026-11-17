@@ -616,7 +616,11 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
     if not isinstance(policy_version, str) or not 1 <= len(policy_version) <= 128:
         raise ActionError(INVALID, "policy_version: text of 1 to 128 characters")
 
-    default = connector.classify(operation, args)
+    from . import module_actions
+    module_class = module_actions.policy_class(db, connector, project, operation)
+    if module_class is not None:
+        canon_class = module_class
+    default = canon_class if canon_class is not None else connector.classify(operation, args)
     if default not in ACTION_CLASSES:
         raise ActionError(CLASS, "connector %s: unknown class %r" % (connector.name, default))
     if canon_class is not None:
@@ -803,6 +807,8 @@ def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, pol
     (`standing=True`), ou rien pour une classe non gardée.
     """
     action = _require(db, action_id)
+    from . import module_actions
+    module_actions.check_action(db, action)
     if action["state"] not in ("proposed", "approved"):
         hint = {"failed": ": use retry (new receipt, same action)",
                 "unknown": ": unknown outcome, see reconcile / retry / replace"}
@@ -1006,6 +1012,8 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
     policy = policy if policy is not None else policy_from_env()
     recover(db, action_id=action_id)
     action = _require(db, action_id, with_receipts=True)
+    from . import module_actions
+    module_actions.check_action(db, action, connector)
     if action["connector"] != connector.name:
         raise ActionError(CONNECTOR, "action %s: connector %s, not %s"
                           % (action_id, action["connector"], connector.name))
@@ -1122,6 +1130,8 @@ def reconcile(db: Db, action_id: str, connector, *, by: str = "", force: bool = 
     """
     connectors_mod.check(connector)
     action = _require(db, action_id)
+    from . import module_actions
+    module_actions.check_action(db, action, connector)
     if action["connector"] != connector.name:
         raise ActionError(CONNECTOR, "action %s: connector %s, not %s"
                           % (action_id, action["connector"], connector.name))

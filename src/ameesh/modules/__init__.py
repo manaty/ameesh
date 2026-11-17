@@ -113,9 +113,9 @@ def _distribution(entry):
 def _validate_descriptor(name, descriptor, *, allow_empty=False):
     """Refuse a descriptor that cannot become a project policy row.
 
-    A built-in tooling module may declare no work item type (``dev``, L101 T4):
-    ``allow_empty`` is for the trusted built-ins only. An installed external
-    descriptor is a lifecycle extension and must declare at least one type."""
+    The caller admits empty types for tooling, declarative and action-only
+    modules. Other installed descriptors remain lifecycle extensions and must
+    declare at least one type."""
     if not isinstance(descriptor, dict):
         raise ValueError("installed module %r: descriptor must be a mapping" % name)
     extra = set(descriptor) - set(DESCRIPTOR_KEYS)
@@ -178,8 +178,10 @@ def _external(entry):
     except Exception as exc:
         raise ValueError("installed module %r descriptor() failed: %s"
                          % (name, exc)) from exc
-    _validate_descriptor(name, compiled)
+    _validate_descriptor(name, compiled, allow_empty=bool(getattr(module, "ACTION_CONNECTORS", {})))
     _check_types(name, module, compiled)
+    from .registry import _action_declarations
+    _action_declarations({name: module})
     return module, compiled
 
 
@@ -204,6 +206,8 @@ def installed(canon=None):
             if row.get("reason") == "duplicate":
                 raise ValueError(row["error"])
         registry = implementations
+    from .registry import _action_declarations
+    _action_declarations(registry)
     return registry
 
 
@@ -422,12 +426,18 @@ def resolve(federation, canon=None, *, discovery=None):
         seen_types = set()
         for name, (scope, team, options) in selected.items():
             module = implementations[name]
-            descriptor = module.descriptor(options)
-            # L103 T2: a declarative module stores no type (rule of #4357),
-            # yet the canon selects it; an installed one must declare types.
+            from ..module_actions import compile_policy
+            module_options = dict(options)
+            action_classes = module_options.pop("action_classes", {})
+            descriptor = module.descriptor(module_options)
+            # Declarative and action-only modules need no lifecycle types.
+            # Always-active tooling is selected only for an explicit action policy.
+            action_only = (bool(getattr(module, "ACTION_CONNECTORS", {}))
+                           and (name not in always_active() or bool(action_classes)))
             _validate_descriptor(name, descriptor,
-                                 allow_empty=isinstance(module, PipelineModule))
+                                 allow_empty=isinstance(module, PipelineModule) or action_only)
             _check_types(name, module, descriptor)
+            descriptor = compile_policy(name, module, descriptor, action_classes)
             if seen_types.intersection(descriptor["types"]):
                 raise ValueError("conflicting module types for project %s" % project)
             seen_types.update(descriptor["types"])

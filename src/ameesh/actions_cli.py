@@ -769,7 +769,7 @@ def build_parser() -> argparse.ArgumentParser:
     act = p_action.add_subparsers(dest="action_command")
 
     p = act.add_parser("propose")
-    p.add_argument("--connector", required=True, choices=list(connectors.NAMES))
+    p.add_argument("--connector", required=True)
     p.add_argument("--operation", required=True)
     p.add_argument("--project", required=True)
     p.add_argument("--target", required=True, help="targeted account or object")
