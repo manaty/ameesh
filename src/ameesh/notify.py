@@ -3685,6 +3685,26 @@ class Notifier:
             # #6642 (accepté par mesh-design, #207423) : ne pas l'ajouter pour
             # mesurer — `lot`, `step` et `level` sont dans le payload.
             delivered = []
+            suppressed: set = set()
+            # #7625 : un compte rendu de pause budget ne se répète pas tant que
+            # l'état n'a pas changé. L'identité est celle de la pause (agent,
+            # hôte), et l'empreinte ignore la durée, l'échéance reculée et les
+            # relevés de jauge (le texte, lui, les porte) ; le passage de
+            # l'échéance annoncée, lui, est un changement d'état. Un rappel
+            # repart au plus toutes les `alert_briefs.REMIND_AFTER_S` (6 h).
+            report_label = report_fp = None
+            if kind == "budget_pause_long":
+                report_label = "budget_pause_long:%s:%s" % (
+                    alert.get("agent") or "", alert.get("host") or "")
+                resume_ts = alert.get("resume_ts")
+                try:
+                    passed = resume_ts is not None and float(resume_ts) <= now
+                except (TypeError, ValueError):
+                    passed = False
+                report_fp = json.dumps(
+                    [kind, alert.get("agent"), alert.get("host"), alert.get("harness"),
+                     bool(alert.get("waits_reset")), alert.get("resume_kind"), passed],
+                    sort_keys=True, ensure_ascii=False)
             quiet = alert_briefs.quiet_modes(alert, briefs, by_name)
             for name, text in sorted(briefs.items()):
                 if not self._delivery_open():
@@ -3722,8 +3742,20 @@ class Notifier:
                         if not self._send_module_brief(db, alert, name, text, meta):
                             continue
                     else:
-                        mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
-                                  payload=meta)
+                        message_id = mail.send(
+                            db, work.SYSTEM_SENDER, name, text, kind="event",
+                            payload=meta, report=report_label,
+                            report_fingerprint=report_fp)
+                        if message_id is None:
+                            # #7625 : le même compte rendu est déjà dans sa
+                            # boîte ; le destinataire n'est ni dans `to` ni en
+                            # `pending`, et l'épisode n'est pas rejoué à chaque
+                            # passage.
+                            suppressed.add(name)
+                            self.log("[%s] identical report to %s within %d h: "
+                                     "not sent" % (kind, name,
+                                                   int(mail.REPORT_REMIND_S // 3600)))
+                            continue
                     delivered.append(name)
                     self.log("[%s] %s delivered to %s [%s: %s]" % (
                         kind, "reminder" if meta["reminder"] else "mail", name,
@@ -3740,9 +3772,12 @@ class Notifier:
                     if kind != "slo_breach":
                         # #3036 : l'échec transitoire d'un destinataire reste
                         # à tenter ; il n'est ni dans `to` (réussi) ni dans
-                        # `dead` (écarté).
-                        entry["pending"] = sorted(set(briefs) - set(dead))
-                continue
+                        # `dead` (écarté). #7625 : un compte rendu identique
+                        # supprimé n'est pas une remise en échec — il est déjà
+                        # dans la boîte et ne doit pas faire tourner la passe.
+                        entry["pending"] = sorted(set(briefs) - set(dead) - suppressed)
+                if not suppressed or kind == "slo_breach":
+                    continue
             if kind == "slo_breach":
                 if delivered:
                     sent[key] = {"type": kind, "sent_ts": now,
@@ -3794,11 +3829,11 @@ class Notifier:
                              # suivante et remettre à qui est revenu, et les
                              # remises en échec, distinctes des réussies.
                              "dead": sorted(dead),
-                             "pending": sorted(set(briefs) - set(delivered) - set(dead))}
+                             "pending": sorted(set(briefs) - set(delivered) - set(dead) - suppressed)}
             else:
                 entry["to"] = sorted(set(entry.get("to") or ()) | set(delivered))
                 entry["dead"] = sorted(dead)
-                entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead))
+                entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead) - suppressed)
                 if remind_due:
                     entry["reminded"] = True
                     # #5461 : la garde contre l'oscillation se mesure depuis
@@ -3838,6 +3873,9 @@ class Notifier:
                 return False
             message_id = mail.send(tx, work.SYSTEM_SENDER, name, text, kind="event",
                                    payload=payload, thread=False)
+        if message_id is None:
+            # #7625 : le même compte rendu est déjà dans sa boîte.
+            return True
         fil.record(self.cfg, db, sender=work.SYSTEM_SENDER, recipients=[name], text=text,
                    project=project, mailbox_ids=[message_id], meta={"kind": "event"})
         return True
