@@ -3,13 +3,15 @@
 Contract revision: **1.2, 17 November 2026**. Scope: an installed external
 module and its client processes. Reference: [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
-Revision 1.1 adds the Python mail submission and history surface (tranche E2a,
-#7671). Revision 1.2 is the security correction of that unreleased surface
-(#7706): it reserves the core's sender identities and confines module data to
-the imposed `payload.module` namespace. Nothing else in 1.0 or 1.1 changes. The
-[IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
-consumer and the missing surfaces. This document defines the supported boundary;
-it does not claim that the remaining adapters have already been implemented.
+Revision 1.1 adds the immutable canon/directory snapshot CLI (tranche E1a,
+#7669) and the Python mail submission and history surface (tranche E2a,
+#7671). Revision 1.2 is the security correction of that unreleased mail
+surface (#7706): it reserves the core's sender identities and confines module
+data to the imposed `payload.module` namespace. Nothing else in 1.0 or 1.1
+changes. The [IMA mapping](../design/ima-public-contract-mapping.md) records the
+concrete consumer and the missing surfaces. This document defines the supported
+boundary; it does not claim that the remaining adapters have already been
+implemented.
 
 ## Compatibility and availability
 
@@ -62,7 +64,8 @@ release's `--help`. These entry points cover the module integration:
 | `ameesh --version` | Installed package version; it does not prove the running process uses that installation. |
 | `ameesh modules --json` | Discovered module descriptions and refused entries. A refused entry is not an active provider. |
 | `ameesh module list` and `ameesh module NAME …` | Installation evidence and dispatch to the named module's CLI. `list` is reserved. The module owns the arguments after its name. |
-| `ameesh canon check`, `ameesh canon sync` | Validate and admit configured canon through the core's authority checks. These commands do not yet export IMA's complete directory/profile snapshot (mapping E1). |
+| `ameesh canon check`, `ameesh canon sync` | Validate and admit configured canon through the core's authority checks. |
+| `ameesh canon snapshot --expect-commit SHA --json` | [E1a immutable canon/directory snapshot](canon-snapshot-v1.md), available in the release containing #7669 / #5862. No database access or registry admission; profile/lease preparation remains E1b. |
 | `agent-runner --agents-file FILE` | Dynamic admission filter; [format and withdrawal](../RUNNER-ADMISSION.md). It narrows canon admission, never grants authority. |
 | `ameesh turn current --json [--expect-turn ID]` | Current turn's versioned authorization document, with identity and database recheck. `--local` omits the database recheck and must not be treated as proof of a live lease. |
 | `ameesh turn observe (--turn ID \| --request ID) --json` | Read-only `ameesh-turn-observation/1`: request, turn, accounting and quiescence. Absence of a known cost is not zero cost. |
