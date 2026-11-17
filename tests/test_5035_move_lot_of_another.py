@@ -27,6 +27,9 @@ class MoveLotOfAnotherTest(PgTestCase):
         super().setUp()
         for name in ("porteur", "tiers", "relecteur", "pilote", "auditeur", "bureau"):
             self.assertEqual(self.register(name, "codex").returncode, 0)
+        # #7661 : le titre `auditeur` ne suffit pas, la fiche déclare le rôle.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                        " WHERE name = 'auditeur'")
         self.lot = work.add(self.db, title="lot du porteur", assignee="porteur")["id"]
         # #7634 : « bureau » ne tire plus aucun droit de son nom. Sa fiche
         # d'avatar au canon (#7647) le fait route humaine de l'owner ; c'est
