@@ -194,11 +194,12 @@ physique sans agent (Mac, PC de recette) a sa fiche `hotes/` avec
 avertissement ; une date passée, une information (`host-unavailable-past`) :
 la règle a cessé d'elle-même.
 
-**Séquence staging** (#7662, canon §14) : les fiches `Host` sont la seule
-source de la séquence de déploiement staging. `staging.order` (entier positif
-ou nul) donne le rang croissant ; `staging.kind` vaut `agents` (VM d'agents,
-toujours requise), `server` (serveur sans exécutant, reportable) ou
-`workstation` (poste, mis à jour à son retour, reportable, **toujours en
+**Séquence staging** (#7662, canon §14) : les fiches `Host` du **canon par
+défaut** (celui du mesh, L42 — un autre canon configuré n'ajoute pas d'hôte)
+sont la seule source de la séquence de déploiement staging. `staging.order`
+(entier positif ou nul) donne le rang croissant ; `staging.kind` vaut `agents`
+(VM d'agents, toujours requise), `server` (serveur sans exécutant, reportable)
+ou `workstation` (poste, mis à jour à son retour, reportable, **toujours en
 dernier**). Une fiche sans
 bloc `staging` n'est pas un hôte de staging : un canon nu ne déclare aucune
 séquence, et le cœur ne connaît aucun nom d'hôte. `canon check` refuse une
