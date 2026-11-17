@@ -1045,11 +1045,13 @@ def reconcile(db: Db, action_id: str, connector, *, by: str = "", force: bool = 
 
     Trouvée → `confirmed` ou `failed` (une réservation de grant est libérée
     sur `failed`). Introuvable → l'action reste `unknown` : décision humaine.
+    La politique du module n'est pas exigée : une issue déjà survenue se
+    constate même après désactivation, seul le fournisseur est recontrôlé.
     """
     connectors_mod.check(connector)
     action = _require(db, action_id)
     from . import module_actions
-    module_actions.check_action(db, action, connector)
+    module_actions.check_reconcile(action, connector)
     if action["connector"] != connector.name:
         raise ActionError(CONNECTOR, "action %s: connector %s, not %s"
                           % (action_id, action["connector"], connector.name))
