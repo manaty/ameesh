@@ -342,6 +342,17 @@ class PlacementTest(_PlacementDbCase):
         """De bout en bout, sans toucher à runner.py : claimable filtre."""
         cwd = os.path.join(self.tmp, "work")
         os.makedirs(cwd, exist_ok=True)
+        root = self.example_copy()
+        write(root, "agents/place.md", fiche(
+            type="Agent", title="place", responsible="human:alice",
+            harness="claude", team="acme-web", provider="anthropic",
+            credential_mode="subscription"))
+        write(root, "hotes/h-place.md", fiche(
+            type="Host", title="h-place", responsible="human:alice",
+            policy="{work_roots: {acme-web: %s}}" % cwd))
+        write(root, "placements/place-h-place.md", fiche(
+            type="Placement", title="place@h-place", agent="place",
+            hosts=["h-place"], credential_mode="subscription"))
         env = self.env(AMEESH_HOST="h-place")
         proc = self.runner("register", "place", "claude", "--cwd", cwd, "--prompt", "tour",
                            env=env)
@@ -363,7 +374,8 @@ class PlacementTest(_PlacementDbCase):
         self.db.execute("UPDATE agent_registry SET placement_profile = "
                         "ameesh_placement_profile(host, harness, provider, model, "
                         "credential_mode) WHERE name = 'place'")
-        proc = self.runner("--once", "--agents", "place", env=env)
+        proc = self.runner("--once", "--agents", "place", env={
+            **env, "AMEESH_CANON": root, "AMEESH_CANON_UNTRUSTED": "1"})
         self.assertEqual([t["harness"] for t in self.turns()], ["claude"], proc.stdout)
 
 
