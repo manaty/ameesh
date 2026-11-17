@@ -68,16 +68,26 @@ class BootstrapFiles:
                     sha256=hashlib.sha256(data).hexdigest())
 
     def approved(self,request):
+        # Preserve the failed gate without including request or host contents.
+        gate='machine trust'
         try:
             machine=self.path('/etc/machine-id')
             runtime.trusted(machine)
-            ready=(request['step']!='enable' or (callable(self.readiness) and self.readiness(request) is True))
-            allowed=(ready and machine.read_text().strip()==request['bundle']['machine_id']
-                     and self.authority.validate(request['operation'],request['scope_digest'],request['step']) is True)
-        except Exception:
-            allowed=False
-        if not allowed:
-            raise FileError('bootstrap file authority unavailable')
+            gate='readiness'
+            if request['step']=='enable':
+                if not callable(self.readiness) or self.readiness(request) is not True:
+                    raise FileError('bootstrap file authority rejected: readiness')
+            gate='machine identity'
+            if machine.read_text().strip()!=request['bundle']['machine_id']:
+                raise FileError('bootstrap file authority rejected: machine identity')
+            gate='validation'
+            if self.authority.validate(request['operation'],request['scope_digest'],request['step']) is not True:
+                reason=getattr(self.authority,'denial_reason',None)
+                raise FileError('bootstrap file authority rejected: '+(reason or 'validation'))
+        except FileError:
+            raise
+        except Exception as error:
+            raise FileError('bootstrap file authority unavailable: '+gate) from error
 
     @staticmethod
     def expected(info):
