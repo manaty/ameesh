@@ -15,6 +15,7 @@ from ameesh.work_reviewers import designated
 
 from . import test_2447_review_designation_activation as base
 from .support import PgTestCase
+from .test_2487_designation_carry import _Fixture as _CarryFixture
 
 
 class CanonReviewRefreshTest(base._ActivationFixture, PgTestCase):
@@ -160,6 +161,30 @@ class CanonReviewRefreshTest(base._ActivationFixture, PgTestCase):
         self.assertEqual(result["errors"], [], result)
         self.assertEqual(result["examined"], 1)
         self.assertEqual(result["refreshed"], 0)
+
+
+class CanonRefreshCarryTest(_CarryFixture):
+    def test_missing_designation_recovers_carried_verdicts_without_requests(self):
+        self.freeze(self.repo.reviewed)
+        self.verdict("rev1", self.repo.reviewed)
+        self.verdict("rev2", self.repo.reviewed)
+        frozen = self.repo.merge_target()
+
+        def unavailable(tx, milestone, threads):
+            work.note(tx, self.lot, "Automatic reviewer designation unavailable at freeze")
+
+        mark = work.milestone(self.db, self.lot, "frozen", sha=frozen,
+                              actor="author", on_frozen=unavailable, after_commit=[])
+        self.assertIsNone(act._effective_mark(self.db, self.lot, mark["id"]))
+        self.db.execute("DELETE FROM agent_mailbox")
+        result = refresh.after_sync(self.cfg, self.db)
+        self.assertEqual(result["errors"], [], result)
+        self.assertEqual(result["refreshed"], 1, result)
+        effective = act._effective_mark(self.db, self.lot, mark["id"])
+        self.assertIsNotNone(effective)
+        self.assertEqual(effective[1], "carried")
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.assertEqual(self.review_mail(), [])
 
 
 class RunnerRefreshTest(unittest.TestCase):

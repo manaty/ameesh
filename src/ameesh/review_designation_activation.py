@@ -4277,7 +4277,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 # par la même sélection déterministe (famille opposée, charge,
                 # disponibilité) et notifiés.
                 completion = {"mark_id": int(effective[0]), "shape": existing}
-        if completion is None and not floor_error and not refresh_policy:
+        if completion is None and not floor_error:
             plan = carried_plan(cfg, db, int(lot), str(freeze.get("sha") or ""))
             # #4582 : un plan partiel ne couvre pas la tête — la désignation
             # réelle doit tourner — mais ses verdicts reportés ne sont pas
