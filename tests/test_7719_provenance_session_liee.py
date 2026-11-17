@@ -5,13 +5,21 @@ Le 17/11, trois commits de #7705 et six de #7678/#7715 portaient l'identité
 Git native `Codex (PC) <codex-pc@users.noreply.github.com>` : aucun reçu,
 auteur absent du registre, `record_commit` refusait le committer (il exige
 `<agent>@ameesh.invalid`) et `by_ancestry` ne retrouvait pas la session
-native. La liaison `ameesh mail bind` (agent `veille`, harnais codex, hôte
-pc-smichea, session 01a186ba-…) connaissait pourtant l'agent ET la famille.
+native. La liaison `ameesh mail bind` (session `01a186ba-…`, harnais codex,
+hôte pc-smichea) connaissait pourtant l'agent ET la famille.
+
+#7725 : une session ne se lie pas à `veille`, identité d'ÉMISSION sans boîte
+lue ; la session du poste est liée à l'agent qu'elle porte (`bureau`, codex
+sur le PC), et le reçu porte cet acteur. Une liaison historique à `veille` ne
+donne plus d'identité : ni reçu à l'écriture, ni preuve à la lecture. Quand
+une session d'abord liée à `veille` est réparée, la borne de date reste le
+premier lien de cette session au même agent (révocations comprises) — les
+commits faits sous la liaison défectueuse gardent ainsi leur preuve.
 
 Le reçu est écrit par la session liée, à la création (hooks, identité de
 session dans l'environnement) ou à la poussée (`ameesh provenance record
 --session`) : la liaison donne acteur/harnais/session, le commit doit être
-postérieur à la liaison, porté par une ref locale, et son committer ne peut
+postérieur au premier lien, porté par une ref locale, et son committer ne peut
 pas être un autre agent enregistré. Une preuve déjà écrite pour une autre
 identité est refusée, et un reçu de session dont la liaison n'existe pas est
 tenu pour incohérent par la porte.
@@ -21,6 +29,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 
 from ameesh import registry, review_authors, review_provenance as prov
@@ -30,6 +39,12 @@ from .support import PgTestCase, mechanics_canon
 
 FAMILIES = ("claude", "codex", "deepseek")
 CODEX = ("codex-pc", "codex-pc@users.noreply.github.com")
+BUREAU = "bureau"
+SESSION = "s-bureau"
+
+
+def iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
 class SessionReceiptTest(PgTestCase):
@@ -40,10 +55,36 @@ class SessionReceiptTest(PgTestCase):
                             app="ameesh", actor="orchestrateur")
 
     # -- utilitaires ------------------------------------------------------
-    def bind(self, *, agent="veille", session="s-veille", harness="codex",
-             pid=None):
+    def bind(self, *, agent=BUREAU, session=SESSION, harness="codex", pid=None):
         return sb.bind(self.cfg, self.db, agent, session_id=session,
                        harness=harness, pid=pid, by="human:test")
+
+    def unbind(self, *, session=SESSION, harness="codex"):
+        return sb.unbind(self.cfg, self.db, session_id=session, harness=harness,
+                         by="human:test")
+
+    def legacy_binding(self, *, agent="veille", session=SESSION,
+                       harness="codex", created=None):
+        """La liaison #54 d'avant #7725 : l'API refuse de la créer aujourd'hui.
+
+        On écrit donc la ligne directement, comme le fit `mail bind veille`
+        le 13/11 — c'est cette ligne active qui ne doit plus donner d'identité.
+        """
+        row = storage.of(self.db).session_bindings.bind(
+            host=self.cfg.host, harness=harness, session_id=session,
+            agent=agent, pid=None, created_by="human:test")
+        self.assertIsNotNone(row)
+        self.age_binding(row, created=created or time.time() - 4 * 86400)
+        return row
+
+    def age_binding(self, row, *, created, revoked=None):
+        self.db.execute(
+            "UPDATE session_bindings SET created_at = to_timestamp(%s) WHERE id = %s",
+            (float(created), int(row["id"])))
+        if revoked is not None:
+            self.db.execute(
+                "UPDATE session_bindings SET revoked_at = to_timestamp(%s)"
+                " WHERE id = %s", (float(revoked), int(row["id"])))
 
     def repo(self, *, name="codex-pc", email=CODEX[1], committer=None,
              committer_email=None, date=None):
@@ -70,7 +111,7 @@ class SessionReceiptTest(PgTestCase):
         return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=path,
                                        text=True).strip()
 
-    def record(self, head, path, *, session="s-veille", harness="codex"):
+    def record(self, head, path, *, session=SESSION, harness="codex"):
         return prov.record_session_commit(
             self.db, head, session=session, harness=harness,
             families=FAMILIES, cfg=self.cfg, cwd=path)
@@ -89,24 +130,24 @@ class SessionReceiptTest(PgTestCase):
         row = self.record(head, path)
         self.assertTrue(row["recorded"])
         receipt = prov.receipt_for_commit(self.db, head)
-        self.assertEqual(receipt["actor"], "veille")
-        self.assertEqual(receipt["session"], "s-veille")
-        self.assertEqual(receipt["turn"], "session:s-veille")
+        self.assertEqual(receipt["actor"], BUREAU)
+        self.assertEqual(receipt["session"], SESSION)
+        self.assertEqual(receipt["turn"], "session:" + SESSION)
         self.assertEqual(receipt["harness"], "codex")
         # La porte lit la famille du harnais de la liaison ; le nom Git
         # `codex-pc` n'est ni deviné ni crédité.
         authors, unknown, _ = review_authors.reading(
-            self.db, {"id": int(self.lot["id"]), "assignee": "veille",
+            self.db, {"id": int(self.lot["id"]), "assignee": BUREAU,
                       "app": "ameesh"},
             None, [head], repo=path, families=FAMILIES, strict=True)
         self.assertEqual(unknown, [])
-        self.assertIn({"name": "veille", "family": "codex"}, authors)
+        self.assertIn({"name": BUREAU, "family": "codex"}, authors)
 
     def test_the_creation_hooks_accept_the_session_identity(self):
         """La paire de hooks lit `CODEX_SESSION_ID` et enregistre sans PID."""
         self.bind()
         path, env = self.repo()
-        hook_env = {"CODEX_SESSION_ID": "s-veille", "AMEESH_HARNESS": "codex"}
+        hook_env = {"CODEX_SESSION_ID": SESSION, "AMEESH_HARNESS": "codex"}
         with open(os.path.join(path, "f.txt"), "w", encoding="utf-8") as fh:
             fh.write("x\n")
         subprocess.run(["git", "add", "f.txt"], cwd=path, check=True,
@@ -120,30 +161,30 @@ class SessionReceiptTest(PgTestCase):
         self.assertIsNotNone(creation)
         ident = prov.capture(hook_env, families=FAMILIES, db=self.db,
                              cfg=self.cfg)
-        self.assertEqual(ident["actor"], "veille")
-        self.assertEqual(ident["session"], "s-veille")
-        self.assertEqual(ident["turn"], "session:s-veille")
+        self.assertEqual(ident["actor"], BUREAU)
+        self.assertEqual(ident["session"], SESSION)
+        self.assertEqual(ident["turn"], "session:" + SESSION)
         prov.record_commit(self.db, head, identity=ident, cwd=path)
         receipt = prov.receipt_for_commit(self.db, head)
-        self.assertEqual(receipt["actor"], "veille")
+        self.assertEqual(receipt["actor"], BUREAU)
         self.assertEqual(receipt["harness"], "codex")
 
     def test_a_commit_before_the_binding_is_refused(self):
         path, env = self.repo(date="2026-11-16T00:00:00Z")
         head = self.commit(path, env, "avant la liaison")
         self.bind()
-        self.assertIn("before its session binding",
+        self.assertIn("before the session's first binding",
                       self.refused(head, path))
 
     def test_a_commit_of_another_registered_agent_is_refused(self):
-        registry.upsert(self.db, "bureau", harness="codex",
+        registry.upsert(self.db, "auditeur", harness="claude",
                         host=self.cfg.host, mode="externe")
-        self.bind(agent="veille")
-        path, env = self.repo(name="bureau", email="bureau@ameesh.invalid")
+        self.bind(agent=BUREAU)
+        path, env = self.repo(name="auditeur", email="auditeur@ameesh.invalid")
         head = self.commit(path, env)
         message = self.refused(head, path)
-        self.assertIn("committed by bureau", message)
-        self.assertIn("not by veille", message)
+        self.assertIn("committed by auditeur", message)
+        self.assertIn("not by " + BUREAU, message)
         self.assertIsNone(prov.receipt_for_commit(self.db, head))
 
     def test_a_commit_not_carried_by_a_ref_is_refused(self):
@@ -162,8 +203,7 @@ class SessionReceiptTest(PgTestCase):
         self.bind()
         path, env = self.repo()
         head = self.commit(path, env)
-        sb.unbind(self.cfg, self.db, session_id="s-veille", harness="codex",
-                  by="human:test")
+        self.unbind()
         self.assertIn("no active session binding", self.refused(head, path))
 
     def test_a_pid_binding_is_not_bypassed_by_the_explicit_path(self):
@@ -176,7 +216,7 @@ class SessionReceiptTest(PgTestCase):
         """B1 #7719 : un PID lié n'est pas revendiqué par la seule variable."""
         self.bind(pid=999999)
         with self.assertRaises(prov.ProvenanceError) as raised:
-            prov.capture({"CODEX_SESSION_ID": "s-veille",
+            prov.capture({"CODEX_SESSION_ID": SESSION,
                           "AMEESH_HARNESS": "codex"},
                          families=FAMILIES, db=self.db, cfg=self.cfg)
         self.assertIn("session binding", str(raised.exception))
@@ -184,17 +224,17 @@ class SessionReceiptTest(PgTestCase):
     def test_the_ambient_identity_accepts_its_own_pid_binding(self):
         """La garde B1 ne casse pas la session dont le PID est bien ancêtre."""
         self.bind(pid=os.getpid())
-        ident = prov.capture({"CODEX_SESSION_ID": "s-veille",
+        ident = prov.capture({"CODEX_SESSION_ID": SESSION,
                               "AMEESH_HARNESS": "codex"},
                              families=FAMILIES, db=self.db, cfg=self.cfg)
-        self.assertEqual(ident["actor"], "veille")
+        self.assertEqual(ident["actor"], BUREAU)
         self.assertEqual(ident["source"], "session")
 
     def test_the_hooks_do_not_record_a_commit_before_the_binding(self):
         """B1 #7719 : la voie des hooks borne aussi la date à la liaison."""
         self.bind()
         path, env = self.repo(date="2026-11-16T00:00:00Z")
-        hook_env = {"CODEX_SESSION_ID": "s-veille", "AMEESH_HARNESS": "codex"}
+        hook_env = {"CODEX_SESSION_ID": SESSION, "AMEESH_HARNESS": "codex"}
         with open(os.path.join(path, "f.txt"), "w", encoding="utf-8") as fh:
             fh.write("x\n")
         subprocess.run(["git", "add", "f.txt"], cwd=path, check=True,
@@ -208,20 +248,21 @@ class SessionReceiptTest(PgTestCase):
                              cfg=self.cfg)
         with self.assertRaises(prov.ProvenanceError) as raised:
             prov.record_commit(self.db, head, identity=ident, cwd=path)
-        self.assertIn("before its session binding", str(raised.exception))
+        self.assertIn("before the session's first binding", str(raised.exception))
         self.assertIsNone(prov.receipt_for_commit(self.db, head))
 
     def test_another_binding_cannot_claim_an_already_received_commit(self):
         """Témoin (3) : le reçu d'une liaison ne se réattribue pas à une autre."""
-        self.bind(agent="veille", session="s-veille")
+        self.bind(agent=BUREAU, session=SESSION)
         self.bind(agent="codex2", session="s-codex2")
         path, env = self.repo()
         head = self.commit(path, env)
-        self.record(head, path, session="s-veille")
+        self.record(head, path, session=SESSION)
         message = self.refused(head, path, session="s-codex2")
-        self.assertIn("already recorded for veille/session:s-veille", message)
+        self.assertIn("already recorded for %s/session:%s" % (BUREAU, SESSION),
+                      message)
         receipt = prov.receipt_for_commit(self.db, head)
-        self.assertEqual(receipt["actor"], "veille")
+        self.assertEqual(receipt["actor"], BUREAU)
 
     def test_a_session_receipt_without_its_binding_is_refused(self):
         """Témoin (3) : un reçu forgé, dont la session n'est pas liée."""
@@ -229,18 +270,18 @@ class SessionReceiptTest(PgTestCase):
         path, env = self.repo()
         head = self.commit(path, env)
         storage.of(self.db).provenance.add(
-            "commit:" + head, head, "veille", "s-ghost", "session:s-ghost",
+            "commit:" + head, head, BUREAU, "s-ghost", "session:s-ghost",
             "codex")
         with self.assertRaises(prov.ProvenanceError) as raised:
             prov.receipt_for_commit(self.db, head)
         self.assertIn("no binding links", str(raised.exception))
 
     def test_a_receipt_of_another_agents_binding_is_refused(self):
-        self.bind(agent="bureau", session="s-bureau")
+        self.bind(agent=BUREAU, session=SESSION)
         path, env = self.repo()
         head = self.commit(path, env)
         storage.of(self.db).provenance.add(
-            "commit:" + head, head, "veille", "s-bureau", "session:s-bureau",
+            "commit:" + head, head, "auditeur", SESSION, "session:" + SESSION,
             "codex")
         with self.assertRaises(prov.ProvenanceError) as raised:
             prov.receipt_for_commit(self.db, head)
@@ -258,6 +299,68 @@ class SessionReceiptTest(PgTestCase):
                          families=FAMILIES, db=self.db, cfg=self.cfg)
         self.assertIn("session binding", str(raised.exception))
 
+    # -- #7725 : veille n'est pas une identité de session ------------------
+    def test_a_legacy_watch_binding_writes_no_receipt(self):
+        """La ligne #54 restée sur `veille` ne contourne pas #7725 à l'écriture."""
+        self.legacy_binding()
+        path, env = self.repo()
+        head = self.commit(path, env)
+        message = self.refused(head, path)
+        self.assertIn("no read mailbox", message)
+        self.assertIn("agent it carries", message)
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+
+    def test_a_legacy_watch_receipt_is_not_proof(self):
+        """Un reçu `session:` au nom de veille n'est pas une preuve (#7725)."""
+        self.legacy_binding()
+        path, env = self.repo()
+        head = self.commit(path, env)
+        storage.of(self.db).provenance.add(
+            "commit:" + head, head, "veille", SESSION, "session:" + SESSION,
+            "codex")
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            prov.receipt_for_commit(self.db, head)
+        self.assertIn("no read mailbox", str(raised.exception))
+
+    def test_a_repaired_binding_keeps_the_first_link_date(self):
+        """#7705 : la session du poste, réparée de veille vers bureau.
+
+        Le premier lien de cette session à `bureau` précède les commits de
+        #7705 ; la réparation (#7725) crée une ligne plus récente. La borne
+        reste le premier lien au même agent, sinon la voie (a) serait perdue
+        pour ces commits.
+        """
+        now = time.time()
+        first = now - 10 * 86400
+        old = self.bind().row
+        self.unbind()
+        self.age_binding(old, created=first, revoked=first + 60)
+        self.legacy_binding(created=now - 4 * 86400)
+        path, env = self.repo(date=iso(now - 3600))
+        head = self.commit(path, env, "commit du poste sous la liaison veille")
+        self.unbind()
+        repaired = self.bind().row
+        active = storage.of(self.db).session_bindings.active(
+            self.cfg.host, "codex", SESSION)
+        self.assertEqual(int(active["id"]), int(repaired["id"]))
+        self.assertGreater(active["created_ts"], now - 3600)
+        row = self.record(head, path)
+        self.assertTrue(row["recorded"])
+        receipt = prov.receipt_for_commit(self.db, head)
+        self.assertEqual(receipt["actor"], BUREAU)
+        self.assertEqual(receipt["session"], SESSION)
+
+    def test_a_repaired_binding_cannot_claim_before_its_first_link(self):
+        """Sans lien antérieur à `bureau`, la réparation ne couvre pas le passé."""
+        now = time.time()
+        self.legacy_binding(created=now - 4 * 86400)
+        path, env = self.repo(date=iso(now - 3600))
+        head = self.commit(path, env, "commit du poste sous la liaison veille")
+        self.unbind()
+        self.bind()
+        self.assertIn("before the session's first binding",
+                      self.refused(head, path))
+
 
 class SessionReceiptCliTest(PgTestCase):
     def setUp(self):
@@ -271,7 +374,7 @@ class SessionReceiptCliTest(PgTestCase):
         return self.env(AMEESH_CANON=self.canon, AMEESH_CANON_REF="HEAD")
 
     def test_the_cli_records_a_push_range_from_a_linked_session(self):
-        sb.bind(self.cfg, self.db, "veille", session_id="s-cli-7719",
+        sb.bind(self.cfg, self.db, BUREAU, session_id="s-cli-7719",
                 harness="codex", pid=None, by="human:test")
         path = tempfile.mkdtemp(prefix="ameesh-7719-cli-", dir=self.tmp)
         subprocess.run(["git", "init", "-q", path], check=True,
@@ -297,7 +400,7 @@ class SessionReceiptCliTest(PgTestCase):
                         ["git", "rev-list", "HEAD~2..HEAD"], cwd=path,
                         text=True).split()]
         self.assertTrue(all(receipts))
-        self.assertTrue(all(row["actor"] == "veille" for row in receipts))
+        self.assertTrue(all(row["actor"] == BUREAU for row in receipts))
         self.assertTrue(all(row["harness"] == "codex" for row in receipts))
         self.assertTrue(all(row["session"] == "s-cli-7719" for row in receipts))
 

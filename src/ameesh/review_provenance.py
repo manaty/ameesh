@@ -187,7 +187,13 @@ def _session_receipt_binding(db, row) -> dict | None:
     réellement liée à cet acteur et à ce harnais (toute liaison, révoquée
     comprise : la révocation d'une liaison ne réécrit pas une preuve passée).
     Un reçu de session forgé, ou rattaché à la liaison d'un autre agent, est
-    une preuve incohérente : la porte le refuse au lieu de le lire."""
+    une preuve incohérente : la porte le refuse au lieu de le lire.
+
+    #7725 : l'identité d'ÉMISSION de la veille (`veille`) n'a pas de boîte
+    lue ; une liaison à elle ne donne plus d'identité, et l'écriture d'un reçu
+    le refuse désormais. Un reçu `session:` qui la nomme n'est donc pas une
+    preuve : le lire laisserait la porte créditer une identité que le mesh
+    n'accepte plus."""
     from . import session_bindings
     session = str(row.get("session") or "").strip()
     actor = str(row.get("actor") or "").strip()
@@ -204,6 +210,13 @@ def _session_receipt_binding(db, row) -> dict | None:
         if (str(bound.get("session_id") or "").strip() == session
                 and str(bound.get("harness") or "").strip().lower() == harness
                 and _same_agent_identity(db, bound.get("agent"), actor)):
+            refusal = session_bindings.no_read_mailbox_refusal(
+                str(bound.get("agent") or ""))
+            if refusal:
+                raise ProvenanceError(
+                    "%s: session receipt names %s, an identity without a read "
+                    "mailbox (#7725): not a proof (%s)"
+                    % (row.get("subject") or "?", actor, refusal))
             return bound
     return None
 
@@ -428,6 +441,42 @@ def active_binding(db, cfg, *, session: str, harness: str = "",
     return rows[0]
 
 
+def _binding_start_ts(db, row) -> float:
+    """#7719 : le début du lien de CETTE session à CET agent, ou 0.
+
+    La borne d'un reçu de session n'est pas le jour de la réparation de la
+    liaison (#7725) : une session peut avoir été liée à `veille` — identité
+    d'émission sans boîte lue, refusée depuis — puis reliée à l'agent qu'elle
+    porte. La réparation crée une ligne à l'instant du geste ; les commits
+    qu'elle doit couvrir sont antérieurs. Ce qui fait preuve est donc le
+    **premier** lien de cette session à cet agent sur cet hôte, révocations
+    comprises : une liaison révoquée reste un fait daté.
+
+    Le lien vers un AUTRE agent ne compte pas : il ne prouve pas que l'agent
+    revendiqué portait la session. C'est ce qui empêche une session reliée à
+    X puis à Y de réclamer sous Y un commit de l'époque X."""
+    from . import session_bindings
+    earliest = float(row.get("created_ts") or 0.0)
+    host = str(row.get("host") or "")
+    session = str(row.get("session_id") or "").strip()
+    harness = str(row.get("harness") or "").strip().lower()
+    agent = str(row.get("agent") or "").strip()
+    if not (host and session and harness and agent):
+        return earliest
+    try:
+        rows = session_bindings.listing(db, host=host, include_revoked=True)
+    except Exception:  # noqa: BLE001 - une lecture impossible garde la borne connue
+        return earliest
+    for bound in rows or ():
+        if (str(bound.get("session_id") or "").strip() == session
+                and str(bound.get("harness") or "").strip().lower() == harness
+                and str(bound.get("agent") or "").strip() == agent):
+            ts = float(bound.get("created_ts") or 0.0)
+            if ts and (not earliest or ts < earliest):
+                earliest = ts
+    return earliest
+
+
 def _binding_identity(db, row, *, cfg, actor: str = "", require_pid: bool = False,
                       families=None) -> dict:
     """#7719 : l'identité prouvée par une ligne `session_bindings`, ou un refus.
@@ -441,7 +490,11 @@ def _binding_identity(db, row, *, cfg, actor: str = "", require_pid: bool = Fals
     `require_pid` : la voie par ascendance exige le PID (L46/L63). La voie
     explicite (#7719, session native) ne l'exige pas : la liaison d'une
     session native est une déclaration humaine, sans processus vérifiable.
-    """
+
+    #7725 : une liaison à l'identité d'ÉMISSION de la veille ne donne plus
+    d'identité. Ce chemin d'écriture le refusa déjà à la création ; il le
+    refuse aussi pour une liaison active antérieure, sinon `provenance record
+    --session` contournerait le refus d'`identity._session_binding`."""
     from . import registry
     from . import session_bindings
     name = str(row.get("agent") or "").strip()
@@ -465,6 +518,14 @@ def _binding_identity(db, row, *, cfg, actor: str = "", require_pid: bool = Fals
             % (harness, "|".join(session_bindings.HARNESSES)))
     if not session_bindings.SESSION_RE.match(session):
         raise ProvenanceError("invalid session id: %r" % (session,))
+    # #7725 : le refus d'`identity._session_binding` vaut ici aussi ; sans lui,
+    # `provenance record --session` donnerait une identité à la liaison #54
+    # restée sur `veille`, et le reçu contournerait le refus du mesh.
+    refusal = session_bindings.no_read_mailbox_refusal(name)
+    if refusal:
+        raise ProvenanceError(
+            "session %s %s is bound to %s: %s"
+            % (harness, session, name, refusal))
     if require_pid and not row.get("pid"):
         raise ProvenanceError(
             "session %s %s of %s carries no pid: the bound process is not "
@@ -504,7 +565,7 @@ def _binding_identity(db, row, *, cfg, actor: str = "", require_pid: bool = Fals
                 % (harness, ", ".join(sorted(families))))
     return {"actor": name, "turn": SESSION_TURN_PREFIX + session,
             "harness": harness, "session": session, "host": host,
-            "binding_ts": float(row.get("created_ts") or 0.0),
+            "binding_ts": _binding_start_ts(db, row),
             "source": "session"}
 
 
@@ -1625,13 +1686,15 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
                                          actor=identity["actor"])
         # B1 #7719 : la voie des hooks applique la même borne de date que la
         # voie explicite. Le commit doit être HEAD (donc porté par une réf) ;
-        # il ne peut pas dater d'avant la liaison qui le revendique.
+        # il ne peut pas dater d'avant le premier lien de la session à cet
+        # agent (révocations comprises, #7725).
         created = float(identity.get("binding_ts") or 0.0)
         if created and info["committer_ts"] + 1.0 < created:
             raise ProvenanceError(
-                "commit %s was committed on %s, before its session binding "
-                "(%s): refused"
-                % (full[:12], _at_text(info["committer_ts"]), _at_text(created)))
+                "commit %s was committed on %s, before the session's first "
+                "binding to %s (%s): refused"
+                % (full[:12], _at_text(info["committer_ts"]),
+                   identity["actor"], _at_text(created)))
     else:
         from .identity import GIT_EMAIL_DOMAIN
         committer = subprocess.run(
@@ -1728,9 +1791,14 @@ def record_session_commit(db, sha, *, session: str, harness: str = "",
     * la session doit avoir une liaison ACTIVE sur cet hôte, sous un agent
       `externe` au registre, sans bail vivant, et un harnais admis par le
       canon (#7004) ; si la liaison porte un PID, le processus appelant doit
-      en descendre (L46/L63) ;
-    * le commit doit être **postérieur à la liaison** (sa date de committer :
-      une session ne peut pas revendiquer un objet créé avant elle) ;
+      en descendre (L46/L63) ; une liaison à `veille` est refusée (#7725 :
+      identité d'émission sans boîte lue, elle ne donne pas d'identité) ;
+    * le commit doit être **postérieur au premier lien de cette session à cet
+      agent** (sa date de committer, tolérance d'une seconde) : une session ne
+      peut pas revendiquer un objet créé avant elle. Les liaisons révoquées
+      comptent — une session d'abord liée à l'agent qu'elle porte, puis
+      réparée (#7725), garde la date de son premier lien, sinon les commits
+      faits sous la liaison défectueuse resteraient sans preuve ;
     * il doit être **porté par une ref locale** (ou être ancêtre de HEAD) :
       un objet pendant n'est pas un commit poussé ;
     * son **committer ne peut pas être un autre agent enregistré** : la
@@ -1779,12 +1847,13 @@ def record_session_commit(db, sha, *, session: str, harness: str = "",
                 "descendant (%s): record from the linked session"
                 % (ident["session"], row.get("pid"), why))
     info = _refuse_foreign_committer(db, sha=full, cwd=cwd, actor=ident["actor"])
-    created = float(row.get("created_ts") or 0.0)
+    created = float(ident.get("binding_ts") or 0.0)
     if created and info["committer_ts"] + 1.0 < created:
         raise ProvenanceError(
-            "commit %s was committed on %s, before its session binding (%s): "
-            "refused" % (full[:12], _at_text(info["committer_ts"]),
-                         _at_text(created)))
+            "commit %s was committed on %s, before the session's first binding "
+            "to %s (%s): refused"
+            % (full[:12], _at_text(info["committer_ts"]), ident["actor"],
+               _at_text(created)))
     if not _carried_by_a_ref(cwd, full):
         raise ProvenanceError(
             "commit %s is not carried by a local ref (or HEAD): only a pushed "
