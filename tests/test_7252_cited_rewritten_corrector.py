@@ -428,6 +428,73 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
         self.assertEqual(unknown, [])
         self.assertEqual([row["name"] for row in correctors], ["cx3"])
 
+    def test_strict_reading_ignores_a_package_name_date(self):
+        # #7709 : la date d'un nom complet de paquet horaire (h-AAAAMMJJ-NN)
+        # est consommée avec l'identifiant ; ce n'est pas une citation Git.
+        # Le cas se répète dans les messages réels (#7692, #7707) et refusait
+        # la porte en lecture stricte, faute de résolution à la forge.
+        for text in ("paquet h-20261117-05",
+                     "h-20261117-05",
+                     "paquet-h-20261117-05"):
+            with self.subTest(text=text):
+                self.repo.git("reset", "--hard", self.head_a)
+                self.repo.write("src/ameesh/mail.py", text + "\n")
+                head = self.repo.commit("author: " + text, agent="author")
+                self._receipt("author", "deepseek", [head])
+                with mock.patch.object(review_authors, "_forge_commit") as forge:
+                    (_authors, unknown, correctors), _freeze = self._reading(
+                        head, strict=True)
+                self.assertEqual(unknown, [])
+                self.assertEqual(correctors, [])
+                forge.assert_not_called()
+
+    def test_package_name_does_not_hide_a_real_commit_citation(self):
+        # #7709 : écarter la date du nom de paquet ne doit pas écarter la
+        # vraie citation du correctif retiré présente dans le même message.
+        fix, head = self._rewrite()
+        self.repo.git("commit", "--amend", "-m",
+                      "author: paquet h-20261117-05 ; correctif %s" % fix[:12])
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        (_authors, unknown, correctors), _freeze = self._reading(head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head)
+
+    def test_hyphenated_real_citation_is_still_resolved(self):
+        # B/P2 auditeur : un mot suivi d'un tiret n'est pas un identifiant
+        # reconnu. La citation réelle `correctif-<sha>` reste lue et résolue ;
+        # l'exclusion ne vaut que pour le nom complet d'un paquet.
+        fix, head = self._rewrite()
+        self.repo.git("commit", "--amend", "-m",
+                      "author: correctif-%s retiré par la réécriture" % fix[:12])
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        (_authors, unknown, correctors), _freeze = self._reading(head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head)
+
+    def test_package_name_does_not_excuse_an_unreadable_short_sha(self):
+        # #7709 : un vrai jeton court avec tiret, numérique comme la date du
+        # paquet, reste une citation à résoudre ; introuvable, il refuse.
+        self.repo.git("reset", "--hard", self.head_a)
+        self.repo.write("src/ameesh/mail.py", "package\n")
+        head = self.repo.commit(
+            "author: correctif-43969930787 ; paquet h-20261117-05",
+            agent="author")
+        self._receipt("author", "deepseek", [head])
+        with mock.patch.object(review_authors, "_forge_commit",
+                               return_value="") as forge:
+            with self.assertRaisesRegex(
+                    review_provenance.ProvenanceError,
+                    "cited commit 43969930787 .*forge-unreadable"):
+                self._reading(head, strict=True)
+        self.assertEqual([call.args[1] for call in forge.call_args_list],
+                         ["43969930787"])
+
 
 class ForgeCitationResolutionTest(unittest.TestCase):
     def test_gh_without_shared_reads_preserves_commit_absence(self):
