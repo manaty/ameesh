@@ -21,7 +21,7 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
+import shutil
 import sys
 import tempfile
 import threading
@@ -181,7 +181,6 @@ class CliContractTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        import shutil
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def ameesh(self, *args, env=None):
@@ -358,7 +357,7 @@ class HttpContractTest(unittest.TestCase):
 
     def setUp(self):
         tmp = tempfile.mkdtemp(prefix="w7665-http-")
-        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        self.addCleanup(shutil.rmtree, tmp, True)
         cfg = type("Cfg", (), {"approve_url": "https://approve.example",
                                "threads_dir": os.path.join(tmp, "fils"),
                                "threads_root": os.path.join(tmp, "fils")})()
