@@ -110,7 +110,11 @@ La trace du mouvement va sur le lot cité, avec le numéro de la demande et
 l'hôte qui l'a appliquée. Si le détenteur s'interrompt entre l'écriture et la
 résolution de la demande, le journal de l'hôte (qui nomme la demande) fait
 foi à la passe suivante : la demande est résolue sans rejouer l'écriture, au
-lieu d'être refusée comme périmée.
+lieu d'être refusée comme périmée, et une note de lot manquante (arrêt entre
+la ligne de journal et la note) est complétée avant la résolution. Le journal
+est celui de l'hôte détenteur : si le bail change d'hôte avant la résolution,
+le nouveau détenteur applique la demande sur sa propre configuration et sur
+sa propre épingle ; un déplacement déjà fait y est refusé et nommé.
 
 ## Modes
 

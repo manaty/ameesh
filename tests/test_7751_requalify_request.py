@@ -259,6 +259,42 @@ class RequestApplicationTest(_CanonFixture, PgTestCase):
             " WHERE id = %s", (row["id"],))[0]
         self.assertEqual((saved["state"], saved["error"]), ("applied", None))
 
+    def test_a_journaled_move_without_its_note_is_completed_before_resolution(self):
+        """#7751 B: a stop after the journal fsync but before the lot note.
+
+        The journal line is durable and the move is done, but the lot trace is
+        missing: the recovery must write that note (marked as recovered) before
+        resolving, never announce a trace that does not exist.
+        """
+        row = self.record(self.c1)
+        holder = self.host_cfg("host-a")
+        with mock.patch.object(review, "qualify", return_value=self.evidence()):
+            requests.apply_pending(holder, self.db, "ameesh",
+                                   gate_reader=lambda *args: (self.c1, ""))
+        marker = "request: %s; applied on " % row["id"]
+        self.db.execute(
+            "DELETE FROM work_item_events WHERE work_item_id = %s"
+            " AND position(%s in note) > 0", (self.lot, marker))
+        self.db.execute(
+            "UPDATE integration_train_requalifications"
+            " SET state = 'requested', resolved_at = NULL, resolved_by = NULL,"
+            " error = NULL WHERE id = %s", (row["id"],))
+        with mock.patch.object(rq, "apply") as apply:
+            outcomes = requests.apply_pending(
+                holder, self.db, "ameesh",
+                gate_reader=lambda *args: (self.c1, ""))
+        apply.assert_not_called()
+        self.assertTrue(outcomes[0]["recovered"])
+        notes = [note for note in self.notes() if marker in note]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("note recovered after interruption", notes[0])
+        self.assertIn("canon pin requalified", notes[0])
+        self.assertEqual(storage.of(self.db).work.train_requalify_requests("ameesh"), [])
+        saved = self.db.query(
+            "SELECT state FROM integration_train_requalifications WHERE id = %s",
+            (row["id"],))[0]
+        self.assertEqual(saved["state"], "applied")
+
     def test_a_host_without_a_train_configuration_requests_with_explicit_pin(self):
         """The pilot's host needs no train block: the exact reading is stated."""
         blind = types.SimpleNamespace(host="host-b", config_path=self.profile,

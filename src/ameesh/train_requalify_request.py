@@ -152,6 +152,41 @@ def _journaled_move(cfg, project, request_id):
     return None
 
 
+def _note_present(db, lot, request_id):
+    """#7751: is the lot note of this request already written?"""
+    marker = "request: %s; applied on " % int(request_id)
+    rows = db.query(
+        "SELECT 1 FROM work_item_events"
+        " WHERE work_item_id = %s AND position(%s in note) > 0 LIMIT 1",
+        (int(lot), marker))
+    return bool(rows)
+
+
+def _recover_note(db, row, journaled):
+    """#7751: complete the lot note a crash left unwritten before resolution.
+
+    ``train_requalify.journal`` fsyncs its line before ``work.note`` runs; a
+    hard stop between the two leaves the journal durable without the lot
+    trace. The journal row carries every field the note needs, so the holder
+    writes the missing note (marked as recovered) exactly once, then resolves.
+    """
+    lot = int(row["lot"])
+    if _note_present(db, lot, row["id"]):
+        return False
+    text = ("canon pin requalified: %s %s -> %s; diff: %s; config: %s"
+            % (row["project"], str(journaled.get("pin") or "")[:12],
+               str(journaled.get("gate") or "")[:12],
+               ", ".join(journaled.get("changed") or ()) or "none",
+               ", ".join(journaled.get("files") or ()) or "none"))
+    if journaled.get("mode") == "reviewed" and journaled.get("reviews"):
+        text += "; reviews: " + json.dumps(journaled["reviews"],
+                                          ensure_ascii=False)
+    text += ("; request: %s; applied on %s (note recovered after interruption)"
+             % (row["id"], journaled.get("host") or "?"))
+    work.note(db, lot, text, actor=row["requester"])
+    return True
+
+
 def apply_pending(cfg, db, project, *, gate_reader=None, report=None):
     """Apply every pending request of this project with the reviewed guards.
 
@@ -169,22 +204,28 @@ def apply_pending(cfg, db, project, *, gate_reader=None, report=None):
         # as stale (the reviewer's B: interruption between apply and resolve).
         journaled = _journaled_move(cfg, project, row["id"])
         if journaled is not None:
+            # The note follows the journaled line in `apply`; a stop between
+            # them leaves the move journaled but the lot trace missing.
+            recovered = _recover_note(db, row, journaled)
             saved = storage.of(db).work.train_requalify_resolve(
                 row["id"], "applied", actor=cfg.host)
             if saved is not None:
                 if report is not None:
                     report("requalification request #%s already journaled on %s:"
-                           " %s -> %s (resolved after interruption)"
+                           " %s -> %s (resolved after interruption%s)"
                            % (row["id"], cfg.host,
                               str(journaled.get("pin") or "")[:12],
-                              str(journaled.get("gate") or "")[:12]))
+                              str(journaled.get("gate") or "")[:12],
+                              ", note recovered" if recovered else ""))
                 _notify(db, saved, "\n".join([
                     "Requalification %s appliquée par le train (#7751)." % project,
                     "",
                     "- Demande : #%s ; épingle %s ; porte %s."
                     % (row["id"], row["pin"], row["gate"]),
                     "- Déjà journalisée sur %s ; demande résolue sans rejouer"
-                    " l'écriture (reprise après interruption)." % cfg.host,
+                    " l'écriture%s."
+                    % (cfg.host, " (note du lot complétée)"
+                       if recovered else " (reprise après interruption)"),
                     "- Trace sur le lot #%s." % row["lot"],
                 ]))
             outcomes.append(dict(id=row["id"], state="applied",
