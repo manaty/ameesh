@@ -104,7 +104,7 @@ class ValidatedWritersTest(PgTestCase):
                                verdict=None, note="", proof=None)
         self.ops.add_milestone(other, "verdict", sha=HEAD, actor="reader",
                                verdict="ok", note="", proof=None)
-        def gate(_db, _cfg, item, marks):
+        def gate(_db, _cfg, item, marks, **_kw):
             if item["id"] == self.lot:
                 raise OSError("clone unavailable")
             return {"ok": True}
