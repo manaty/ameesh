@@ -43,7 +43,7 @@ Claude** :
    parent, ce qui s'écarte de la décision 11. Il ne devrait être retenu que
    si l'owner l'accepte explicitement, avec les bornes ci-dessous.
 4. Aucune fusion de (b) avant la réponse de l'owner ; le correctif du refus
-   sans nom est un commit séparé, indépendant.
+   sans nom est sorti dans le **lot #7686**, branche dédiée depuis main.
 
 | option | garanties | coût | ce que voit l'owner |
 |---|---|---|---|
@@ -157,9 +157,10 @@ Manaty jusqu'à #7633.
   absent aujourd'hui). La décision est signée.
 - **(b) sur branche** : prêt à être relu si l'owner le retient ; aucune
   fusion avant la réponse, et deux familles d'avis (mode de sécurité).
-- **Correctif sans nom** : commit séparé sur la même branche
-  (`#7681 : le refus sans nom …`), indépendant de la décision ; il peut être
-  fusionné sans (b) si le pilote préfère scinder le lot.
+- **Correctif sans nom** : **lot #7686**, branche
+  `lot/7686-spawn-naming-refusal` depuis main, commit `12919d3f6`, tests
+  `tests/test_468_agent_naming.py` 25/25. Indépendant de la décision : il
+  entre au prochain paquet sans (b).
 - **Après la réponse** :
   - (a) : le geste root reste bureau/humain ; lot de suite pour le compte
     `api-key`, la PR canon et le replay de l'étape 4 de #7635 ;
