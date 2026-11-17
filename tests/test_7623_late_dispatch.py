@@ -6,7 +6,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import ci, merge_queue, plan_github, work
+from ameesh import ci, merge_queue, packet_reviews, plan_github, work
 from tests.support import PgTestCase
 
 
@@ -16,6 +16,7 @@ class LateDispatchTest(unittest.TestCase):
         self.repo = 'acme/project'
         self.lot = dict(id=7623, branch='integration/packet', state='qa')
         self.inputs = dict(expected_sha=self.sha, base_sha='b' * 40)
+        self.now = 1800000000.0
         self.events = []
         self.order = []
         self.db = mock.Mock()
@@ -29,13 +30,14 @@ class LateDispatchTest(unittest.TestCase):
         self.db.transaction.side_effect = transaction
         self.store = mock.Mock()
         self.store.work.lock.return_value = self.lot
-        self.watcher = ci.Watcher(types.SimpleNamespace(), api=mock.Mock())
+        self.watcher = ci.Watcher(types.SimpleNamespace(), api=mock.Mock(),
+                                  clock=lambda: self.now)
         self.watcher.api.return_value = dict(total_count=0, workflow_runs=[])
         self.patch(ci.storage, 'is_remote', return_value=False)
         self.patch(ci.storage, 'of', return_value=self.store)
         self.patch(work, 'events', side_effect=lambda *a, **k: self.events[:])
         self.patch(work, 'milestones', return_value=[dict(kind='frozen', sha=self.sha)])
-        self.patch(work, 'note', side_effect=lambda db, lot, text: self.events.append(dict(note=text)))
+        self.patch(work, 'note', side_effect=lambda db, lot, text: self.events.append(dict(note=text, created_ts=self.now)))
         self.gate = self.patch(merge_queue, 'review_gate_for_item', return_value=dict(ok=True))
         self.head = self.patch(ci, '_head_of', return_value=self.sha)
         self.plan = self.patch(ci, '_dispatch_plan', return_value={'late.yml': self.inputs})
@@ -60,11 +62,30 @@ class LateDispatchTest(unittest.TestCase):
 
     def test_late_part_dispatched_once_even_before_run_becomes_visible(self):
         self.assertTrue(self.retry())
+        self.assertTrue(self.retry())
+        self.now += ci.PENDING_ALERT
         self.assertFalse(self.retry())
         self.gh.run.assert_called_once()
         args, payload = self.gh.run.call_args.args
         self.assertIn('repos/acme/project/actions/workflows/late.yml/dispatches', args)
         self.assertEqual(json.loads(payload), dict(ref=self.lot['branch'], inputs=self.inputs))
+
+    def test_second_observer_pass_waits_then_alerts_without_redispatch(self):
+        self.patch(self.watcher, '_cache_ttl', return_value=60.0)
+        self.patch(packet_reviews, 'is_vehicle', return_value=True)
+        self.patch(ci, 'repo_of', return_value=self.repo)
+        self.patch(plan_github, 'settings_of').return_value.workflows_for.return_value = ['late.yml']
+        self.patch(self.watcher, '_merge_pilot', return_value='pilot')
+        self.store.mailbox.by_idempotency_key.return_value = None
+        send = self.patch(ci, '_send', return_value=42)
+        self.assertEqual(self.watcher._undispatched_parts(self.db, self.repo, [self.lot]), [])
+        self.assertEqual(self.watcher._undispatched_parts(self.db, self.repo, [self.lot]), [])
+        send.assert_not_called()
+        self.now += ci.PENDING_ALERT
+        result = self.watcher._undispatched_parts(self.db, self.repo, [self.lot])
+        self.assertEqual([row['action'] for row in result], ['undispatched'])
+        send.assert_called_once()
+        self.gh.run.assert_called_once()
 
     def test_existing_run_of_any_status_prevents_dispatch(self):
         for status in ('queued', 'in_progress', 'completed'):
@@ -78,7 +99,10 @@ class LateDispatchTest(unittest.TestCase):
         self.gh.run.return_value = (1, '', 'timeout')
         self.gh.run.side_effect = None
         self.assertFalse(self.retry())
-        self.watcher = ci.Watcher(types.SimpleNamespace(), api=mock.Mock())
+        self.watcher = ci.Watcher(types.SimpleNamespace(), api=mock.Mock(),
+                                  clock=lambda: self.now)
+        self.assertTrue(self.retry())
+        self.now += ci.PENDING_ALERT
         self.assertFalse(self.retry())
         self.gh.run.assert_called_once()
 
@@ -200,5 +224,5 @@ class DurableDispatchTest(PgTestCase):
                 thread.join(timeout=40)
             self.assertFalse(any(t.is_alive() for t in threads))
         self.assertEqual(errors, [])
-        self.assertEqual(sorted(results), [False, True])
+        self.assertEqual(results, [True, True])
         gh.run.assert_called_once()
