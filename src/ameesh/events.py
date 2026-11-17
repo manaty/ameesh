@@ -31,6 +31,8 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        identity, host, tenant, device, grant human and
                        `attach_id` — never the receipt, nonce or signature
                        (#7121, written by the host session)
+  agent.tools          canonical avatar tool policy applied at a harness start
+                       (allow-list, MCP names, deny rules, digest; no credentials)
   agent.retired        an agent taken out of the active registry, and
   agent.restored       brought back (#3460, written with the gesture)
   host.memory_unavailable  a persona memory repository could not be opened on
@@ -120,7 +122,7 @@ from . import storage
 CHANNEL = "ameesh_events"
 TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
          "turn.context", "agent.updated",
-         "agent.moved", "agent.attach", "host.memory_unavailable",
+         "agent.moved", "agent.attach", "agent.tools", "host.memory_unavailable",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
          "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request", "git.lock_removed",

@@ -69,6 +69,7 @@ class Support:
     tools_flag: tuple[str, ...]
     mcp_flag: tuple[str, ...]
     mcp_source: str | None
+    deny_flag: tuple[str, ...] = ()
 
     @property
     def tools(self) -> bool:
@@ -89,9 +90,11 @@ def support(harness: str) -> Support | None:
     mcp = raw.get("mcp") if isinstance(raw.get("mcp"), Mapping) else {}
     tools_flag = tuple(tools.get("flag") or ())
     mcp_flag = tuple(mcp.get("flag") or ())
+    deny = raw.get("deny") if isinstance(raw.get("deny"), Mapping) else {}
     source = mcp.get("source")
     return Support(harness=harness, tools_flag=tools_flag, mcp_flag=mcp_flag,
-                   mcp_source=source if isinstance(source, str) and source else None)
+                   mcp_source=source if isinstance(source, str) and source else None,
+                   deny_flag=tuple(deny.get("flag") or ()))
 
 
 def name(value: str, what: str) -> str:
@@ -375,6 +378,7 @@ def write_profile(state_dir: str, profile: Mapping, cwd: str | None) -> tuple[st
         "tools": tools,
         "mcp": mcp,
         "mcp_config": mcp_path or None,
+        **({"deny": list(profile["deny"])} if profile.get("deny") else {}),
     }
     path = write_private(
         os.path.join(state_dir, PROFILE_FILE),
@@ -395,6 +399,11 @@ def argv(profile: Mapping, path: str) -> list[str]:
     if block.mcp_flag:
         mcp_path = os.path.join(os.path.dirname(path), MCP_FILE)
         out += [value.format(path=mcp_path) for value in block.mcp_flag]
+    deny = list(profile.get("deny") or ())
+    if deny:
+        if not block.deny_flag:
+            raise SpawnToolsError("avatar-tools-unsupported", "harness cannot apply deny rules")
+        out += [*block.deny_flag, *deny]
     return out
 
 
