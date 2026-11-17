@@ -66,6 +66,7 @@ from . import cost as cost_mod
 from . import cost_attribution
 from . import context_metrics, context_profile
 from . import conversation_move
+from . import reveil as reveil_mod
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, refusal, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import account_window
@@ -7572,24 +7573,52 @@ class AgentWorker(threading.Thread):
           un redémarrage ne remet pas la fenêtre à zéro ;
         * passifs (accusé, copie, diffusion à tous : `mail.passive_reason`) :
           jamais dus ; lus au tour suivant, ou par le hook pendant un tour.
+
+        #7632 : une fiche qui déclare `reveil` remplace les deux premières
+        règles par la sienne (`_reveil_due`) : ses natures immédiates ouvrent
+        un tour tout de suite, le reste (événements compris) attend la fin de
+        sa fenêtre. Sans déclaration, rien ne change.
         """
         passive = [m for m in messages if mail.passive_reason(m)]
         active = [m for m in messages if not mail.passive_reason(m)]
         self._marque_vu(active)
         events = [m for m in active if mail.is_event(m)]
         others = [m for m in active if not mail.is_event(m)]
-        mail_due = bool(others) and self._mail_due(others)
+        policy = reveil_mod.of(self.agent)
+        if policy is not None:
+            mail_due = bool(active) and self._reveil_due(policy, active)
+            events_due = False
+        else:
+            mail_due = bool(others) and self._mail_due(others)
+            events_due = bool(events) and self._events_due(events)
         if others and any(self._from_human(m) for m in others):
             # L81 (étude §6.3) : tant qu'un message humain attend, l'entretien
             # d'une session résidente lui laisse la place (fenêtre de calme).
             self._dernier_humain = time.monotonic()
-        if not mail_due and not (events and self._events_due(events)):
+        if not mail_due and not events_due:
             return None  # regroupement en cours, ou rien que du courrier passif
         if events:
             registry.mark_event_wake(self.db, self.name)
         rows = active + passive
         return self._courrier_spec(
             "event" if all(mail.is_event(m) for m in rows) else "mail", rows)
+
+    def _reveil_due(self, policy: dict, rows: list[dict]) -> bool:
+        """#7632 : le courrier actif en attente ouvre-t-il un tour sous la
+        cadence déclarée ? Oui si l'un des messages est d'une nature
+        immédiate (l'humain toujours ; un événement urgent seulement d'un
+        expéditeur habilité, comme `_events_due`), sinon à la fin de la
+        fenêtre, comptée comme celle de `_mail_due`."""
+        for row in rows:
+            human = self._from_human(row)
+            if mail.is_event(row) and mail.is_urgent(row) and not human \
+                    and not self.interrupt_allowed(row):
+                found = reveil_mod.natures(row) - {"urgent"}
+                if found & set(policy["immediat"]):
+                    return True
+            elif reveil_mod.immediate(policy, row, human=human):
+                return True
+        return self._window_elapsed(rows, float(policy["fenetre_s"]))
 
     def _events_due(self, events: list[dict]) -> bool:
         """Les événements en attente ouvrent-ils un tour ? (C9)"""
@@ -7644,6 +7673,14 @@ class AgentWorker(threading.Thread):
         """
         window = self.mail_batch()
         if window <= 0 or any(mail.is_urgent(m) or self._from_human(m) for m in rows):
+            return True
+        return self._window_elapsed(rows, window)
+
+    def _window_elapsed(self, rows: list[dict], window: float) -> bool:
+        """L125/#3451 : le plus ancien de `rows` attend-il depuis au moins
+        `window` (depuis son arrivée et depuis la fin du dernier tour) ?
+        Sinon, l'échéance est retenue pour le réveil (#3218)."""
+        if window <= 0:
             return True
         now, mono = time.time(), time.monotonic()
         seen = getattr(self, "_batch_seen", {})

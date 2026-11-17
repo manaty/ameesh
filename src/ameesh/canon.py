@@ -60,6 +60,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from . import harnesses
 from . import review as review_mod
+from . import reveil as reveil_mod
 from .config import NAME_RE
 from .deadline import Deadline
 
@@ -1077,6 +1078,9 @@ class Agent:
     #: #2202 S2 : le profil de relecteur borné (`sandbox:`), None = aucun tour
     #: en bac à sable pour cet agent.
     sandbox: SandboxProfile | None = None
+    #: #7632 : cadence de réveil déclarée (`reveil:`, `reveil.parse`) ; None =
+    #: réveil par courrier de l'exécuteur, inchangé.
+    reveil: dict | None = None
 
     @property
     def is_persona(self) -> bool:
@@ -4219,6 +4223,11 @@ class _Loader:
             relit = self._list(fiche, "relit", where, "agent-relit-invalid", **subject)
         if relit is not None:
             relit = list(dict.fromkeys(p for p in relit if p))
+        # #7632 : cadence de réveil (spec avatars §4.4) ; un bloc fautif est
+        # une erreur de fiche, sa politique garde les défauts de la clé fautive
+        reveil, reveil_problems = reveil_mod.parse(fiche.data.get("reveil"))
+        for problem in reveil_problems:
+            self.add("agent-reveil-invalid", ERROR, problem, **where, **subject)
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -4243,6 +4252,7 @@ class _Loader:
             candidats=candidats,
             relit=relit,
             sandbox=self._sandbox_profile(fiche, where, subject),
+            reveil=reveil,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:

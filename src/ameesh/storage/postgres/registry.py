@@ -57,6 +57,8 @@ AGENT_COLUMNS = """
     canon_ref, canon,
     -- L165 (EP1) : relève (`hote`/`election`) et hôtes candidats d'un rôle élu
     releve, candidats,
+    -- #7632 (0588) : cadence de réveil déclarée par la fiche
+    reveil,
     ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,
