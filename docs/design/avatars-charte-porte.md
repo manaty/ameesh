@@ -1,7 +1,7 @@
 ---
 type: Design
 title: "Avatars, charte et porte d'actions ; répartition IMA / ameesh (v1)"
-description: "Spec validée par l'owner le 17/11/2026 : avatar commun à TPK et Manaty, répartition IMA/ameesh, charte traduite dans la porte d'actions, mode de la porte au canon (journal ou enforce), journal des quatre gestes Manaty, et lots de la série #7627-#7638 avec leur état."
+description: "Spec validée par l'owner le 17/11/2026 : avatar commun à TPK et Manaty, répartition IMA/ameesh, charte traduite dans la porte d'actions, mode de la porte au canon (journal ou enforce), journal des quatre gestes Manaty, et lots de la série #7627-#7638."
 status: draft
 tags: [avatar, charte, porte-actions, action-gate, ima, repartition, gouvernance, autorite]
 generated: { by: "ameesh-dev3/deepseek", at: "2026-11-17T02:45:00Z" }
@@ -17,7 +17,7 @@ sources:
 Spec validée avec l'owner le 17/11/2026 (v1) : les décisions du §1 sont
 opposables ; cette note ne contient aucun code. Le contrat de canon qui fixe
 le mode de la porte pour tous les lots est au §3.7 ; la liste des lots de la
-série et leur état au §8. La question Q4 de `5322-avatar-humain.md` renvoie
+série au §8. La question Q4 de `5322-avatar-humain.md` renvoie
 ici.
 
 # Avatars, charte et porte d'actions ; répartition IMA / ameesh (v1)
@@ -249,27 +249,26 @@ Trois règles s'ajoutent :
 - Si les connecteurs claude.ai (Gmail, Slack) et Remote Control marchent dans une session portée par le runner sur une VM. Les connecteurs marchent sur le poste pour l'avatar du pilote.
 - Le Mac de Tony.
 
-## 8. Lots de la série et état
+## 8. Lots de la série
 
-La série compte douze lots, du #7627 au #7638. Les états ci-dessous sont un
-instantané du **2026-11-17 à 02:45Z** (`ameesh work show <id>`) ; l'état
-vivant est dans ameesh, pas dans cette note. Chaque lot cite la section de
-la spec qu'il applique.
+La série compte douze lots, du #7627 au #7638. Leur état, leur assigné et
+leur estimation sont dans ameesh (`ameesh work show <id>`), pas dans cette
+note (canon §6). Chaque lot cite la section de la spec qu'il applique.
 
-| Lot | Objet | Spec | État au 17/11 02:45Z | Assigné | Est. |
-|---|---|---|---|---|---|
-| **#7627** | Cette note : spec owner, contrat de mode, fermeture de Q4 | toutes | cette note | ameesh-dev3 | 2 h |
-| **#7628** | Un module peut déclarer des connecteurs | §3.5.1 | build | mty-amh-impl-11 | 8 h |
-| **#7629** | Approbation permanente liée au bénéficiaire, à la cible et au plafond ; version de charte ; récap | §3.3, §3.5.2, §3.5.3, §3.5.6 | intake | mty-amh-impl-05 | 10 h |
-| **#7630** | La liste d'outils de la fiche s'applique à l'avatar (tour résident et attach) | §3.5.4 | qa | ameesh-cx2 | 8 h |
-| **#7631** | Journal Manaty des quatre gestes réservés, go de la session, reçu clé fichier | §3.4, §3.5.7 | build | mty-amh-impl-15 | 10 h |
-| **#7632** | Réveil borné de l'avatar (humain, urgent et demandes tout de suite ; le reste groupé) | §4.4 | intake | — | 6 h |
-| **#7633** | Hôte partagé d'avatars en pod Kubernetes, clone dans son pod | décision 11 | intake | — | 3 j |
-| **#7634** | Joindre un humain, c'est écrire à son avatar ; « bureau » hors du cœur | §5 | intake | mty-amh-impl-08 | 8 h |
-| **#7635** | Qualification des fonctions d'avatar sur hôtes réels, avatar d'essai | §4.5.4 | intake | mty-amh-impl-18 | 1 j |
-| **#7636** | Contrat public ameesh ↔ module extérieur (IMA), testé des deux côtés | §5 | intake | — | 2 j |
-| **#7637** | Cœur générique : rôles, hôtes et release de Manaty au canon ou par module | §5 | intake | — | 2 j |
-| **#7638** | Gouvernance Manaty : étude chiffrée de la part mécanique à mettre en code | §5 | build | mty-amh-impl-01 | 1 j |
+| Lot | Objet | Spec |
+|---|---|---|
+| **#7627** | Cette note : spec owner, contrat de mode, fermeture de Q4 | toutes |
+| **#7628** | Un module peut déclarer des connecteurs | §3.5.1 |
+| **#7629** | Approbation permanente liée au bénéficiaire, à la cible et au plafond ; version de charte ; récap | §3.3, §3.5.2, §3.5.3, §3.5.6 |
+| **#7630** | La liste d'outils de la fiche s'applique à l'avatar (tour résident et attach) | §3.5.4 |
+| **#7631** | Journal Manaty des quatre gestes réservés, go de la session, reçu clé fichier | §3.4, §3.5.7 |
+| **#7632** | Réveil borné de l'avatar (humain, urgent et demandes tout de suite ; le reste groupé) | §4.4 |
+| **#7633** | Hôte partagé d'avatars en pod Kubernetes, clone dans son pod | décision 11 |
+| **#7634** | Joindre un humain, c'est écrire à son avatar ; « bureau » hors du cœur | §5 |
+| **#7635** | Qualification des fonctions d'avatar sur hôtes réels, avatar d'essai | §4.5.4 |
+| **#7636** | Contrat public ameesh ↔ module extérieur (IMA), testé des deux côtés | §5 |
+| **#7637** | Cœur générique : rôles, hôtes et release de Manaty au canon ou par module | §5 |
+| **#7638** | Gouvernance Manaty : étude chiffrée de la part mécanique à mettre en code | §5 |
 
 La note de référence ne remplace pas les lots : elle fixe les décisions et
 le contrat commun ; chaque lot porte son périmètre, ses tests et sa note.
