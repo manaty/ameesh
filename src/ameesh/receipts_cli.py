@@ -9,6 +9,10 @@
         of the approved object's canon, --canon; default: the default canon);
         without --consume, the nonce is only checked (not consumed); --consume
         requires --digest and --action-id;
+  ameesh receipt sign <request.json> --key FILE --credential-id ID [--out FILE]
+        sign a request with a file key (facade ed25519); the receipt carries
+        human authority only under a cited accord (`request.accord`), for an
+        operation the canon names on that authenticator (#7631);
   ameesh authenticator list [--approver human:ID] [--all] [--expect-commit SHA]
                             [--canon ID] [--json]
         the authenticator registry (working copy of the canon).
@@ -26,7 +30,7 @@ import os
 import sys
 import time
 
-from . import config as config_mod, db as db_mod, receipts
+from . import config as config_mod, db as db_mod, receipts, signing
 from .config import Config
 from .db import Db
 
@@ -68,6 +72,7 @@ def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
             expected_digest=args.digest, expected_action_id=args.action_id,
             expect_decision=None if args.decision == "any" else args.decision,
             consume_by=args.by if args.consume else None,
+            expected_operation=args.operation,
         )
     finally:
         db.close()
@@ -82,9 +87,43 @@ def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
             print("digest   : %s" % verdict.digest)
         print("expires  : %s   nonce: %s" % (
             _moment(verdict.exp), "consumed" if verdict.consumed else "available"))
+        if verdict.accord:
+            print("accord   : %s#%d%s" % (verdict.accord["agent"], verdict.accord["seq"],
+                                         " (file key)" if verdict.file_key else ""))
     else:
         print("receipt REFUSED [%s]: %s" % (verdict.code, verdict.reason), file=sys.stderr)
     return 0 if verdict.ok else 1
+
+
+def cmd_sign(cfg: Config, args: argparse.Namespace) -> int:
+    """#7631 : reçu `ed25519` d'une demande, signé par une clé fichier (0600)."""
+    with open(args.file, "rb") as fh:
+        try:
+            request = json.loads(fh.read())
+        except ValueError as exc:
+            print("error: request: invalid JSON (%s)" % exc, file=sys.stderr)
+            return 2
+    try:
+        receipts.check_request(request)
+        seed = signing.read_private(args.key)
+    except (receipts.ReceiptError, OSError, ValueError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    if "accord" not in request:
+        print("warning: no accord in the request: the receipt carries no human authority "
+              "from an agents' host", file=sys.stderr)
+    receipt = {"v": receipts.RECEIPT_VERSION, "request": request, "facade": "ed25519",
+               "credential_id": args.credential_id,
+               "proof": {"signature": receipts.b64u_encode(
+                   signing.sign(seed, receipts.challenge(request)))}}
+    text = json.dumps(receipt, ensure_ascii=False, indent=2) + "\n"
+    if args.out:
+        fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    else:
+        sys.stdout.write(text)
+    return 0
 
 
 def cmd_authenticator_list(cfg: Config, args: argparse.Namespace) -> int:
@@ -148,11 +187,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("--canon", default="", metavar="ID",
                           help="canon of the approved object (L44): only its authenticators "
                                "are accepted; default: the default canon")
+    p_verify.add_argument("--operation", default=None,
+                          help="operation of the approved action (#7631: required for a "
+                               "file-key receipt under accord)")
     p_verify.add_argument("--consume", action="store_true",
                           help="consume the nonce (single use)")
     p_verify.add_argument("--by", default=None, metavar="NAME")
     p_verify.add_argument("--json", action="store_true")
     p_verify.set_defaults(func=cmd_verify)
+
+    p_sign = receipt_sub.add_parser("sign", help="sign a request with a file key (ed25519)")
+    p_sign.add_argument("file", help="the request (JSON), e.g. `action request --local`")
+    p_sign.add_argument("--key", required=True, help="private key file (0600)")
+    p_sign.add_argument("--credential-id", required=True,
+                        help="credential_id of the key in the canon")
+    p_sign.add_argument("--out", default=None, help="write the receipt here (0600)")
+    p_sign.set_defaults(func=cmd_sign)
 
     p_auth = sub.add_parser("authenticator", help="authenticator registry")
     auth_sub = p_auth.add_subparsers(dest="authenticator_command")

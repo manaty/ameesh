@@ -4106,8 +4106,9 @@ class Authenticators(Domain):
 
     @abc.abstractmethod
     def update_meta(self, authenticator_id: int, *, level: str, aaguid: str | None,
-                    canon_ref: str) -> bool:
-        """Niveau, aaguid et provenance d'une ligne active (même clé)."""
+                    canon_ref: str, accord_operations=()) -> bool:
+        """Niveau, aaguid, provenance et opérations sous accord (#7631) d'une
+        ligne active (même clé)."""
 
     @abc.abstractmethod
     def revoke(self, authenticator_id: int, *, reason: str, canon_ref: str | None) -> bool:

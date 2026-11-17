@@ -651,14 +651,22 @@ Façades vérifiées en v1 :
   demande le niveau « élevé ».
 - **`ed25519`** : la signature Ed25519 existante sur `challenge` (tests, outils,
   provenance d'agent — **jamais** une autorité humaine si la clé est sur un hôte
-  d'agents : la politique la refuse pour `approve`).
+  d'agents : la politique la refuse pour `approve`). Seule exception (#7631,
+  mode journal) : un reçu `ed25519` d'action ou de grant dont `request` porte
+  `accord = {agent, seq}` est admis si le canon nomme l'opération approuvée
+  (toutes celles du grant) dans `accord_operations` de CET authentificateur
+  (§8.2), et si `accord` désigne une entrée du journal de conversation (L78) :
+  message humain de confiance, écrit par l'approbateur lui-même, au plus
+  120 s après `iat` et au plus `max_ttl` avant. Sinon refus (`facade_refused`,
+  `accord_operation`, `accord_ref`), comme avant.
 - **`device-es256`** : signature ES256 brute sur `challenge` par une clé
   d'appareil (application Nexlink ou application native tierce, 0015).
 
 ## 8.2 Registre de confiance
 
 Les authentificateurs d'un humain (clé publique, façade, AAGUID, niveau,
-date d'enrôlement) sont **dans le canon** (`Member.authenticators`, ou fichiers
+date d'enrôlement ; pour une clé `ed25519`, `accord_operations`, §8.1) sont
+**dans le canon** (`Member.authenticators`, ou fichiers
 `Authenticator` liés) : un ajout ou un retrait est une PR revue. La base garde
 une **copie de travail** synchronisée par `ameesh canon sync`, plus le registre
 des nonces consommés (existant, `mesh_consumed_nonces`).

@@ -204,9 +204,11 @@ def summary_digest(action, *, assume_duplicate: bool = False) -> str:
 def approval_request(action, approver: str, *, decision: str = "approve",
                      assume_duplicate: bool = False, requested_by: str | None = None,
                      ttl: int = DEFAULT_REQUEST_TTL, now: int | None = None,
-                     nonce: str | None = None) -> dict:
+                     nonce: str | None = None, accord: dict | None = None) -> dict:
     """La demande à signer (spec §8.1) pour approuver `action` — ou, avec
-    `assume_duplicate`, pour assumer le doublon et la remplacer."""
+    `assume_duplicate`, pour assumer le doublon et la remplacer. `accord`
+    (#7631) : {agent, seq}, l'entrée du journal de conversation où l'humain a
+    donné son accord (exigée pour un reçu par clé fichier)."""
     if not _HUMAN_RE.fullmatch(approver or ""):
         raise ActionError(INVALID, "approver \"human:<id>\" expected, not %r" % (approver,))
     moment = int(time.time()) if now is None else int(now)
@@ -222,6 +224,8 @@ def approval_request(action, approver: str, *, decision: str = "approve",
         "iat": moment,
         "exp": moment + int(ttl),
     }
+    if accord is not None:
+        request["accord"] = accord
     try:
         receipts.check_request(request)
     except receipts.ReceiptError as exc:
@@ -645,7 +649,8 @@ def _verify(db: Db, action: dict, receipt, policy, *, expected_digest: str,
     verdict = receipts.verify_receipt(
         db, receipt, policy_for(action, policy), kind="action",
         expected_digest=expected_digest, expected_action_id=action["action_id"],
-        expect_decision=expect_decision, consume_by=None, now=now)
+        expect_decision=expect_decision, consume_by=None, now=now,
+        expected_operation=action["operation"])
     if not verdict.ok:
         raise ActionError(verdict.code, "receipt refused: %s" % verdict.reason)
     allowed = action.get("approvers") or []
@@ -670,8 +675,10 @@ def _authorize(db: Db, action: dict, receipt, *, standing: bool, policy, now,
             "auth_challenge": verdict.challenge,
             "auth_authenticator_id": verdict.authenticator_id, "auth_expires": verdict.exp,
             "auth_grant_id": None,
-            "note": "approved by %s (%s, receipt %s…)" % (
-                verdict.approver, verdict.facade, verdict.challenge[:12]),
+            "note": "approved by %s (%s, receipt %s…%s)" % (
+                verdict.approver, verdict.facade, verdict.challenge[:12],
+                ", accord %s#%d" % (verdict.accord["agent"], verdict.accord["seq"])
+                if verdict.accord else ""),
         }
     if standing:
         grant = _covering_grant(db, action)

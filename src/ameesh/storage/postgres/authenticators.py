@@ -25,11 +25,13 @@ comme pour le contrôle (`registry_lock_held`).
 """
 from __future__ import annotations
 
+import json
+
 from .. import interface
 
 AUTH_COLUMNS = """
     id, approver, facade, credential_id, public_key, key_fingerprint, aaguid, level,
-    canon_ref, canon,
+    canon_ref, canon, accord_operations,
     extract(epoch from enrolled_at)::float8 AS enrolled_ts,
     extract(epoch from updated_at)::float8  AS updated_ts,
     extract(epoch from revoked_at)::float8  AS revoked_ts,
@@ -159,11 +161,14 @@ class Authenticators(interface.Authenticators):
             "AND credential_id = %s AND canon = %s AND revoked_at IS NULL",
             (facade, credential_id, canon))
 
-    def update_meta(self, authenticator_id, *, level, aaguid, canon_ref) -> bool:
+    def update_meta(self, authenticator_id, *, level, aaguid, canon_ref,
+                    accord_operations=()) -> bool:
         rows = self.db.query(
             "UPDATE authenticators SET level = %s, aaguid = %s, canon_ref = %s, "
+            "accord_operations = %s::jsonb, "
             "updated_at = now() WHERE id = %s AND revoked_at IS NULL RETURNING id",
-            (level, aaguid, canon_ref, int(authenticator_id)))
+            (level, aaguid, canon_ref, json.dumps(list(accord_operations or ())),
+             int(authenticator_id)))
         return bool(rows)
 
     def revoke(self, authenticator_id, *, reason, canon_ref) -> bool:
@@ -182,12 +187,13 @@ class Authenticators(interface.Authenticators):
             """
             INSERT INTO authenticators
                 (approver, facade, credential_id, public_key, key_fingerprint, aaguid,
-                 level, canon_ref, canon)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 level, canon_ref, canon, accord_operations)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             ON CONFLICT (canon, facade, credential_id) WHERE revoked_at IS NULL DO NOTHING
             RETURNING id
             """,
             (record["approver"], record["facade"], record["credential_id"],
              record["public_key"], record["key_fingerprint"], record["aaguid"],
-             record["level"], record["canon_ref"], record.get("canon") or ""))
+             record["level"], record["canon_ref"], record.get("canon") or "",
+             json.dumps(list(record.get("accord_operations") or ()))))
         return bool(rows)

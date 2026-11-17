@@ -151,6 +151,9 @@ USER_VERIFICATION = "user_verification"
 BACKUP = "backup_eligible"
 SIGNATURE = "bad_signature"
 REPLAY = "replay"
+#: #7631 : reçu par clé fichier (façade ed25519) sous accord journalisé
+ACCORD = "accord_ref"
+ACCORD_OPERATION = "accord_operation"
 
 _NAME = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 _HUMAN_RE = re.compile(r"^human:%s$" % _NAME)
@@ -184,6 +187,11 @@ _LOGIN_FIELDS = _COMMON_FIELDS | {"login_id", "host", "provider", "account", "sc
 _ATTACH_FIELDS = _COMMON_FIELDS | {"attach_id", "agent", "host", "tenant", "device_key"}
 _STANDING_FIELDS = _COMMON_FIELDS | {"standing"}
 _STANDING_KEYS = frozenset({"connector", "operations", "class", "max_amount", "currency", "until"})
+#: #7631 : référence d'accord — l'entrée du journal de conversation (L78) où
+#: l'humain a donné son « go » ; facultative, seulement pour une action ou un
+#: grant, et signée avec le reste de la demande
+_ACCORD_KEYS = frozenset({"agent", "seq"})
+_ACCORD_KINDS = ("action", "standing")
 _PROOF_FIELDS = {
     "webauthn": (frozenset({"authenticatorData", "clientDataJSON", "signature"}),
                  frozenset({"userHandle"})),
@@ -382,6 +390,11 @@ class ReceiptVerdict:
     standing: dict | None = None
     flags: dict = field(default_factory=dict)
     consumed: bool = False
+    #: #7631 : l'entrée de journal citée ({agent, seq}), vérifiée ; None sans accord
+    accord: dict | None = None
+    #: #7631 : vrai si le reçu n'est admis que par l'accord journalisé (clé
+    #: fichier sur un hôte d'agents, opération nommée par le canon)
+    file_key: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -461,6 +474,8 @@ def check_request(request) -> str:
         kind = "action"
     expected = {"standing": _STANDING_FIELDS, "login": _LOGIN_FIELDS,
                 "attach": _ATTACH_FIELDS, "action": _ACTION_FIELDS}[kind]
+    if "accord" in keys and kind in _ACCORD_KINDS:
+        expected = expected | {"accord"}
     if keys != expected:
         raise ReceiptError("request (%s): missing fields %s, extra %s"
                            % (kind, sorted(expected - keys), sorted(keys - expected)))
@@ -519,7 +534,18 @@ def check_request(request) -> str:
             raise ReceiptError("request.device_key: device credential_id expected")
     else:
         _check_standing(request["standing"], iat)
+    if "accord" in request:
+        _check_accord(request["accord"])
     return kind
+
+
+def _check_accord(accord) -> None:
+    if not isinstance(accord, dict) or set(accord) != _ACCORD_KEYS:
+        raise ReceiptError("request.accord: {agent, seq} expected")
+    if not isinstance(accord["agent"], str) or not _IDENT_RE.fullmatch(accord["agent"]):
+        raise ReceiptError("request.accord.agent: agent name expected")
+    if _int(accord["seq"], "request.accord.seq") <= 0:
+        raise ReceiptError("request.accord.seq: positive sequence expected")
 
 
 def parse_receipt(data) -> Receipt:
@@ -756,7 +782,8 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
             expected_digest: str | None, expected_action_id: str | None,
             expected_login: dict | None, expect_decision: str | None,
             consume_by: str | None, now: float | None,
-            expected_attach: dict | None = None) -> tuple[ReceiptVerdict, Receipt | None]:
+            expected_attach: dict | None = None,
+            expected_operation: str | None = None) -> tuple[ReceiptVerdict, Receipt | None]:
     policy = policy or Policy()
     moment = time.time() if now is None else float(now)
     ctx: dict = {}
@@ -778,10 +805,17 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         iat=request["iat"], exp=request["exp"], standing=request.get("standing"),
     )
 
-    # 1. façade, nature, liaison
-    if parsed.facade not in policy.allow_facades:
-        return refuse(FACADE, "facade %s not accepted for this authority (accepted: %s)"
-                      % (parsed.facade, ", ".join(sorted(policy.allow_facades)) or "none"))
+    # 1. façade, nature, liaison — #7631 : une clé fichier (ed25519) hors de
+    #    la politique n'est admise que sous accord journalisé, pour les
+    #    opérations que le canon nomme sur CET authentificateur (étape 3 bis)
+    accord = request.get("accord")
+    file_key = (parsed.facade == "ed25519" and accord is not None
+                and parsed.facade not in policy.allow_facades)
+    if parsed.facade not in policy.allow_facades and not file_key:
+        return refuse(FACADE, "facade %s not accepted for this authority (accepted: %s)%s"
+                      % (parsed.facade, ", ".join(sorted(policy.allow_facades)) or "none",
+                         "; a file-key receipt must cite the accord (journal entry)"
+                         if parsed.facade == "ed25519" else ""))
     if kind is not None and parsed.kind != kind:
         return refuse(KIND, "receipt of kind %s, %s expected" % (parsed.kind, kind))
     if parsed.kind == "standing" and consume_by:
@@ -893,6 +927,25 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
     except ReceiptError as exc:
         return refuse(KEY, "stored key unusable: %s" % exc)
 
+    # 3 bis. #7631 : opérations nommées par le canon pour la clé fichier
+    if file_key:
+        allowed = set(row.get("accord_operations") or ())
+        if parsed.kind == "standing":
+            needed = set(request["standing"]["operations"])
+        elif expected_operation is None:
+            return refuse(UNBOUND, "a file-key receipt is checked against the operation it "
+                                   "approves (expected_operation)")
+        else:
+            needed = {expected_operation}
+        if not allowed:
+            return refuse(ACCORD_OPERATION, "the canon accepts no file-key receipt from "
+                                            "this authenticator")
+        missing = sorted(needed - allowed)
+        if missing:
+            return refuse(ACCORD_OPERATION, "operation(s) %s not named by the canon for "
+                          "a file-key receipt (named: %s)"
+                          % (", ".join(missing), ", ".join(sorted(allowed))))
+
     # 4. preuve
     if parsed.facade == "webauthn":
         code, reason, flags = _verify_webauthn(parsed, key, policy, row["level"])
@@ -901,6 +954,15 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
             return refuse(code, reason)
     elif not key.verify(parsed.challenge, parsed.proof_bytes["signature"]):
         return refuse(SIGNATURE, "signature %s invalide" % key.alg)
+
+    # 4 bis. #7631 : l'accord cité est une entrée du journal de conversation,
+    #    écrite par l'approbateur lui-même, avant la signature et récente
+    if accord is not None:
+        code, reason = _check_accord_entry(db, accord, request["approver"], iat, policy)
+        if code:
+            return refuse(code, reason)
+        ctx.update(accord={"agent": accord["agent"], "seq": accord["seq"]},
+                   file_key=file_key)
 
     # 5. nonce — la consommation recontrôle exp et iat EN SQL, après le
     #    dernier verrou, à l'heure réelle de la base (pas `moment`)
@@ -928,13 +990,35 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         request["decision"], approver, parsed.facade), **ctx), parsed
 
 
+def _check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
+                        policy: Policy) -> tuple[str, str]:
+    """("", "") si l'entrée (agent, seq) du journal L78 porte l'accord de
+    `approver` : message humain de confiance, de cet humain, écrit au plus
+    `clock_skew` après `iat` et au plus `max_ttl` avant ; sinon (code, raison)."""
+    where = "%s#%d" % (accord["agent"], accord["seq"])
+    entry = storage.of(db).conversations.entry(accord["agent"], accord["seq"])
+    if entry is None:
+        return ACCORD, "accord %s: no trusted journal entry" % where
+    if entry.get("kind") != "human_message" or entry.get("author") != approver:
+        return ACCORD, "accord %s: not a message from %s (%s by %s)" % (
+            where, approver, entry.get("kind"), entry.get("author"))
+    ts = float(entry.get("ts") or 0)
+    if ts > iat + policy.clock_skew:
+        return ACCORD, "accord %s: written after the signature" % where
+    if ts < iat - policy.max_ttl:
+        return ACCORD, ("accord %s: older than %d s before the signature (a lasting go "
+                        "is a standing approval)" % (where, policy.max_ttl))
+    return "", ""
+
+
 def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
                    kind: str | None = "action", expected_digest: str | None = None,
                    expected_action_id: str | None = None,
                    expected_login: dict | None = None,
                    expect_decision: str | None = "approve", consume_by: str | None = None,
                    now: float | None = None,
-                   expected_attach: dict | None = None) -> ReceiptVerdict:
+                   expected_attach: dict | None = None,
+                   expected_operation: str | None = None) -> ReceiptVerdict:
     """Vérifie un reçu ; le consomme (une fois, atomiquement) si `consume_by`.
 
     Sans `consume_by`, le nonce est seulement contrôlé (non encore consommé) :
@@ -946,6 +1030,8 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     l'appelant depuis SA demande, jamais lu dans le reçu. Pour un grant
     d'attach (#7119), c'est `expected_attach` (tous les champs de
     `ATTACH_BINDING_FIELDS`), recalculé par l'hôte de l'agent.
+    `expected_operation` (#7631) : l'opération de l'action approuvée,
+    recalculée par la porte ; exigée pour un reçu par clé fichier sous accord.
     `kind=None` accepte les quatre natures ; `expect_decision=None` toutes les
     décisions.
     `now` ne règle que les contrôles faits ici : une consommation recontrôle
@@ -957,7 +1043,7 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
         db, receipt, policy, kind=kind, expected_digest=expected_digest,
         expected_action_id=expected_action_id, expected_login=expected_login,
         expect_decision=expect_decision, consume_by=consume_by, now=now,
-        expected_attach=expected_attach)
+        expected_attach=expected_attach, expected_operation=expected_operation)
     return verdict
 
 
@@ -1171,6 +1257,20 @@ def _normalize_aaguid(value) -> str | None:
     return "%s-%s-%s-%s-%s" % (text[:8], text[8:12], text[12:16], text[16:20], text[20:])
 
 
+def _normalize_accord_operations(facade: str, value) -> list:
+    """#7631 : opérations pour lesquelles le canon accepte un reçu de CETTE clé
+    fichier sous accord journalisé ; absent = aucune (comportement d'avant)."""
+    if value is None:
+        return []
+    if facade != "ed25519":
+        raise ReceiptError("accord_operations: only for an ed25519 file key")
+    if (not isinstance(value, list) or len(value) > 64
+            or any(not isinstance(op, str) or not _IDENT_RE.fullmatch(op) for op in value)
+            or len(set(value)) != len(value)):
+        raise ReceiptError("accord_operations: list of distinct operations expected")
+    return sorted(value)
+
+
 def _label(approver: str, facade: str, credential_id: str) -> str:
     return "%s/%s/%s" % (approver, facade, credential_id)
 
@@ -1252,7 +1352,8 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
 
     `members` : [{"title": "smichea", "canon_ref": "members/smichea.md@<sha>",
     "authenticators": [{facade, credential_id, public_key, aaguid, level,
-    canon_ref?}]}]. Le canon est la référence complète : un authentificateur
+    canon_ref?, accord_operations?}]}] — `accord_operations` (#7631, clé
+    `ed25519` seulement) : opérations admises sous accord journalisé. Le canon est la référence complète : un authentificateur
     actif absent de la liste est révoqué ; un changement de clé révoque
     l'ancienne ligne et en crée une nouvelle. Une révocation est un UPDATE de
     la ligne : elle se sérialise avec les lectures sous verrou partagé (`FOR
@@ -1376,6 +1477,8 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
                     "level": _normalize_level(entry.get("level")),
                     "canon_ref": canon_ref,
                     "canon": canon,
+                    "accord_operations": _normalize_accord_operations(
+                        facade, entry.get("accord_operations")),
                 }
             except ReceiptError as exc:
                 errors.append("%s (%s): %s" % (where, _label(approver, *identity), exc))
@@ -1416,10 +1519,13 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
         if wanted and wanted["approver"] == row["approver"] \
                 and wanted["public_key"] == row["public_key"]:
             keep.add(identity)
-            if (wanted["level"], wanted["aaguid"], wanted["canon_ref"]) != (
-                    row["level"], row.get("aaguid"), row.get("canon_ref")):
+            if (wanted["level"], wanted["aaguid"], wanted["canon_ref"],
+                    wanted["accord_operations"]) != (
+                    row["level"], row.get("aaguid"), row.get("canon_ref"),
+                    sorted(row.get("accord_operations") or ())):
                 store.update_meta(row["id"], level=wanted["level"],
-                                  aaguid=wanted["aaguid"], canon_ref=wanted["canon_ref"])
+                                  aaguid=wanted["aaguid"], canon_ref=wanted["canon_ref"],
+                                  accord_operations=wanted["accord_operations"])
                 result["updated"].append(label)
             else:
                 result["unchanged"] += 1

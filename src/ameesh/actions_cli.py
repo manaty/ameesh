@@ -271,6 +271,17 @@ def request_approval(cfg: Config, db: Db, action: dict, *, approver: str, reques
     return reply
 
 
+def _accord(text: str | None) -> dict | None:
+    """`AGENT#SEQ` → {agent, seq} (#7631) ; la forme est revérifiée par
+    `receipts.check_request`."""
+    if not text:
+        return None
+    agent, sep, seq = text.rpartition("#")
+    if not sep or not agent or not seq.isdigit():
+        raise SystemExit("error: --accord AGENT#SEQ expected, not %r" % text)
+    return {"agent": agent, "seq": int(seq)}
+
+
 def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
@@ -282,7 +293,7 @@ def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
         if args.local:
             _dump(actions.approval_request(
                 action, args.approver, assume_duplicate=args.assume_duplicate, ttl=args.ttl,
-                requested_by=requested_by))
+                requested_by=requested_by, accord=_accord(args.accord)))
             return 0
         reply = request_approval(cfg, db, action, approver=args.approver,
                                  requested_by=requested_by,
@@ -674,6 +685,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="without ameesh-approve: the raw request to sign (tests, tools)")
     p.add_argument("--ttl", type=int, default=actions.DEFAULT_REQUEST_TTL,
                    help="lifetime of the raw request (--local)")
+    p.add_argument("--accord", default=None, metavar="AGENT#SEQ",
+                   help="journal entry of the human's go (--local; #7631: required "
+                        "for a file-key receipt)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_request)
 
