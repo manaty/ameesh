@@ -1539,6 +1539,28 @@ class Canon:
         policies = (self.federation or {}).get("review_policies")
         return policies if isinstance(policies, dict) else {}
 
+    def standing_policy(self):
+        """#7629 : le plafond d'organisation des approbations permanentes.
+
+        Le bloc `standing_approvals` de `federation.yaml`, validé par
+        `ameesh.standing_policy` ; absent = politique VIDE (aucune approbation
+        permanente acceptée, défaut sûr). Une erreur de lecture est levée, pas
+        interprétée comme un élargissement."""
+        from . import standing_policy
+        return standing_policy.from_federation(self.federation)
+
+    def avatar_of(self, human: str) -> Agent | None:
+        """#7629 : l'avatar de `human` dans CE canon (carte `avatar`).
+
+        `canon check` refuse deux avatars du même responsable ; ici le premier
+        l'emporte, et l'absence rend None (un grant `avatar` est alors refusé,
+        jamais résolu vers un autre agent)."""
+        for agent in self.agents:
+            data = getattr(getattr(agent, "fiche", None), "data", None) or {}
+            if "avatar" in data and agent.responsible == human:
+                return agent
+        return None
+
     def loaded_members(self) -> set[str]:
         """Membres dont les fiches ont été lues. L43 : un membre au périmètre
         invalide ou introuvable n'en est pas (rien n'est retiré pour absence)."""

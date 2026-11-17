@@ -666,7 +666,9 @@ des nonces consommés (existant, `mesh_consumed_nonces`).
 ## 8.3 Approbations permanentes bornées (R8)
 
 Un reçu dont `request` porte `standing = {connector, operations, class,
-max_amount, currency, until}` au lieu d'un `action_id` crée un **grant**. Son
+max_amount, currency, until}` — et, depuis #7629, les champs facultatifs
+`beneficiary`, `targets`, `charter_line`, `charter_version` — au lieu d'un
+`action_id` crée un **grant**. Son
 nonce est consommé **une fois, à l'enregistrement du grant**. Ensuite, chaque
 tentative couverte ne consomme pas de nonce : elle **réserve atomiquement** son
 montant sur le plafond cumulé (`cumul + montant <= max_amount`, `until` non
@@ -674,6 +676,22 @@ dépassé, grant non révoqué) et la réservation est liée à l'`action_id` de
 tentative. Une réservation n'est libérée que sur un échec **certain**
 (`failed`), jamais sur `unknown`. Révocable par une entrée du canon ou
 `ameesh standing revoke` (qui exige elle-même un reçu).
+
+**Portée (#7629).** Un grant nomme son bénéficiaire : `agent:<nom>`, ou
+`avatar` (l'avatar de l'approbateur et ses clones, c'est-à-dire les éphémères
+dont la lignée `created_by` atteint cet agent) ; sans bénéficiaire, il ne vaut
+que si le canon l'autorise explicitement. Il peut borner sa cible : `targets`
+est une liste de motifs (dépôt, branche, canal) où seuls `*` et `?` ont un
+sens ; une action hors cible n'est pas couverte. Le canon porte le plafond
+d'organisation (`federation.yaml`, bloc `standing_approvals`) : par connecteur
+et opération, qui peut déléguer, jusqu'à quelle durée et quel montant, si un
+bénéficiaire peut manquer, si la charte et les cibles sont obligatoires. Un
+grant hors plafond est refusé à l'enregistrement (`policy`). Le grant garde la
+ligne et la version de charte ; l'action couverte recopie cette version dans
+`policy_version` et son empreinte est recalculée dans la même écriture.
+`ameesh action show` et le fil citent le grant, le bénéficiaire et la charte ;
+`ameesh action recap --avatar N --since 7d` range les actions de l'avatar par
+issue de la charte (fait seul, soumis, refusé).
 
 # 9. ameesh-approve (C8)
 

@@ -105,11 +105,12 @@ class Actions(interface.Actions):
         return approvals, unknown, interrupted
 
     def covering_grants(self, action_id, amount, connector, operation, action_class,
-                        currency, canon="") -> list[dict]:
+                        currency, canon="", proposed_by="", target="") -> list[dict]:
         """Lecture seule, sans verrou : simple pré-filtre ; la réservation se
         fait au lancement, atomiquement, et y recontrôle tout sous verrou.
         L44 (0031) : seuls les grants dont l'authentificateur est déclaré par
-        `canon` (celui de l'action) la couvrent."""
+        `canon` (celui de l'action) la couvrent. #7629 : le bénéficiaire
+        (`proposed_by`) et la cible sont filtrés ici aussi."""
         return self.db.query(
             """
             SELECT s.id, s.approver,
@@ -121,13 +122,40 @@ class Actions(interface.Actions):
                AND s.action_class = %s AND s.revoked_at IS NULL
                AND s.valid_until > clock_timestamp()
                AND (%s::bigint = 0 OR s.currency = %s)
+               AND ameesh_standing_beneficiary_ok(s.beneficiary_kind, s.beneficiary,
+                                                  %s::text)
+               AND ameesh_standing_target_ok(s.targets, %s::text)
                AND EXISTS (SELECT 1 FROM authenticators a
                             WHERE a.id = s.authenticator_id AND a.revoked_at IS NULL
                               AND a.canon = %s)
              ORDER BY s.valid_until, s.id
             """,
-            (action_id, amount, connector, operation, action_class, amount, currency, canon),
+            (action_id, amount, connector, operation, action_class, amount, currency,
+             proposed_by, target, canon),
         )
+
+    def recap(self, proposed_by, since_ts, until_ts, project=None) -> list[dict]:
+        """Actions proposées par `proposed_by` dans la fenêtre (#7629)."""
+        sql = """
+            SELECT a.action_id, a.state, a.auth_kind, a.auth_grant_id, a.policy_version,
+                   a.connector, a.operation, a.target, a.amount, a.currency,
+                   a.requires_receipt,
+                   extract(epoch from a.created_at)::float8  AS created_ts,
+                   extract(epoch from a.finished_at)::float8 AS finished_ts,
+                   EXISTS (SELECT 1 FROM action_events e
+                            WHERE e.action_id = a.action_id AND e.event = 'cancelled'
+                              AND e.note LIKE 'refused by %') AS refused
+              FROM actions a
+             WHERE a.proposed_by = %s
+               AND a.created_at >= to_timestamp(%s)
+               AND a.created_at <  to_timestamp(%s)
+        """
+        params: list = [proposed_by, float(since_ts), float(until_ts)]
+        if project:
+            sql += " AND a.project = %s"
+            params.append(project)
+        sql += " ORDER BY a.created_at, a.action_id"
+        return self.db.query(sql, tuple(params))
 
     def launched(self, *, action_id, grace, force) -> list[dict]:
         sql = ("SELECT action_id, attempts FROM actions WHERE state = 'launched'")
@@ -159,9 +187,16 @@ class Actions(interface.Actions):
              dedupe, requires_receipt, approvers_json, proposed_by, note),
         )
 
-    def bind(self, action_id, *, from_states, digest, auth, by) -> bool:
+    def bind(self, action_id, *, from_states, digest, auth, by, policy_version=None,
+             new_digest=None) -> bool:
         """`→ approved` si l'action est encore dans `from_states`, non
-        remplacée, et que son empreinte est `digest` ; faux sinon."""
+        remplacée, et que son empreinte est `digest` ; faux sinon.
+
+        #7629 : une couverture permanente recopie la version de charte du
+        grant dans `policy_version` et l'empreinte est recalculée dans la même
+        écriture (la garde SQL n'ouvre ce changement que sur une liaison
+        `standing` dont le grant porte cette version). `policy_version=None`
+        laisse la colonne inchangée."""
         placeholders = ", ".join(["%s"] * len(from_states))
         rows = self.db.query(
             """
@@ -169,14 +204,16 @@ class Actions(interface.Actions):
                SET state = 'approved', auth_kind = %s, auth_receipt = %s, auth_approver = %s,
                    auth_nonce = %s, auth_challenge = %s, auth_authenticator_id = %s::bigint,
                    auth_expires_at = to_timestamp(%s::double precision), auth_grant_id = %s::bigint,
+                   policy_version = coalesce(%s, policy_version),
+                   digest = coalesce(%s, digest),
                    auth_by = %s, approved_at = now(), last_actor = %s, last_note = %s
              WHERE action_id = %s AND state IN (__FROM__) AND replaced_by IS NULL AND digest = %s
             RETURNING action_id
             """.replace("__FROM__", placeholders),
             (auth["auth_kind"], auth["auth_receipt"], auth["auth_approver"], auth["auth_nonce"],
              auth["auth_challenge"], auth["auth_authenticator_id"], auth["auth_expires"],
-             auth["auth_grant_id"], by or "", by or "", auth["note"], action_id,
-             *from_states, digest),
+             auth["auth_grant_id"], policy_version, new_digest, by or "", by or "",
+             auth["note"], action_id, *from_states, digest),
         )
         return bool(rows)
 
