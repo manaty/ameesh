@@ -441,40 +441,56 @@ def active_binding(db, cfg, *, session: str, harness: str = "",
     return rows[0]
 
 
-def _binding_start_ts(db, row) -> float:
-    """#7719 : le début du lien de CETTE session à CET agent, ou 0.
+def _binding_intervals(db, row) -> list[tuple[float, float | None]]:
+    """#7719 : les intervalles où CETTE session était liée à CET agent.
 
-    La borne d'un reçu de session n'est pas le jour de la réparation de la
-    liaison (#7725) : une session peut avoir été liée à `veille` — identité
-    d'émission sans boîte lue, refusée depuis — puis reliée à l'agent qu'elle
-    porte. La réparation crée une ligne à l'instant du geste ; les commits
-    qu'elle doit couvrir sont antérieurs. Ce qui fait preuve est donc le
-    **premier** lien de cette session à cet agent sur cet hôte, révocations
-    comprises : une liaison révoquée reste un fait daté.
+    Un reçu de session ne vaut que pour un commit fait **pendant** un de ces
+    intervalles : `created_ts <= t < revoked_ts`, ou `t >= created_ts` pour la
+    liaison active. Les liaisons révoquées comptent — le commit était couvert
+    quand il a été fait —, mais l'intervalle d'un AUTRE agent ne compte pas :
+    une session reliée à X, puis à Y, puis de nouveau à X ne réclame pas sous
+    X un commit de l'époque Y (B1 des deux relecteurs du gel 43280). Un commit
+    fait sous `veille` (liaison défectueuse, #7725) n'est couvert par aucune
+    liaison à l'agent : il relève de l'attestation owner, pas d'une réparation.
 
-    Le lien vers un AUTRE agent ne compte pas : il ne prouve pas que l'agent
-    revendiqué portait la session. C'est ce qui empêche une session reliée à
-    X puis à Y de réclamer sous Y un commit de l'époque X."""
+    Une base illisible rend une liste vide : la garde refuse, jamais muette."""
     from . import session_bindings
-    earliest = float(row.get("created_ts") or 0.0)
     host = str(row.get("host") or "")
     session = str(row.get("session_id") or "").strip()
     harness = str(row.get("harness") or "").strip().lower()
     agent = str(row.get("agent") or "").strip()
     if not (host and session and harness and agent):
-        return earliest
+        return []
     try:
         rows = session_bindings.listing(db, host=host, include_revoked=True)
-    except Exception:  # noqa: BLE001 - une lecture impossible garde la borne connue
-        return earliest
+    except Exception:  # noqa: BLE001 - une lecture impossible ne prouve rien
+        return []
+    intervals = []
     for bound in rows or ():
-        if (str(bound.get("session_id") or "").strip() == session
+        if not (str(bound.get("session_id") or "").strip() == session
                 and str(bound.get("harness") or "").strip().lower() == harness
                 and str(bound.get("agent") or "").strip() == agent):
-            ts = float(bound.get("created_ts") or 0.0)
-            if ts and (not earliest or ts < earliest):
-                earliest = ts
-    return earliest
+            continue
+        start = float(bound.get("created_ts") or 0.0)
+        if not start:
+            continue
+        end = bound.get("revoked_ts")
+        intervals.append((start, float(end) if end is not None else None))
+    return sorted(intervals, key=lambda pair: pair[0])
+
+
+def _binding_covers(intervals, ts: float) -> bool:
+    """#7719 : `ts` tombe-t-il dans un intervalle de liaison à l'agent ?
+
+    Tolérance d'une seconde aux deux bornes (horloges de la base et du dépôt),
+    la même que la borne historique."""
+    for start, end in intervals or ():
+        if ts + 1.0 < start:
+            continue
+        if end is not None and ts >= end + 1.0:
+            continue
+        return True
+    return False
 
 
 def _binding_identity(db, row, *, cfg, actor: str = "", require_pid: bool = False,
@@ -565,7 +581,7 @@ def _binding_identity(db, row, *, cfg, actor: str = "", require_pid: bool = Fals
                 % (harness, ", ".join(sorted(families))))
     return {"actor": name, "turn": SESSION_TURN_PREFIX + session,
             "harness": harness, "session": session, "host": host,
-            "binding_ts": _binding_start_ts(db, row),
+            "binding_intervals": _binding_intervals(db, row),
             "source": "session"}
 
 
@@ -1684,17 +1700,16 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
     if identity.get("source") == "session":
         info = _refuse_foreign_committer(db, sha=full, cwd=cwd,
                                          actor=identity["actor"])
-        # B1 #7719 : la voie des hooks applique la même borne de date que la
-        # voie explicite. Le commit doit être HEAD (donc porté par une réf) ;
-        # il ne peut pas dater d'avant le premier lien de la session à cet
-        # agent (révocations comprises, #7725).
-        created = float(identity.get("binding_ts") or 0.0)
-        if created and info["committer_ts"] + 1.0 < created:
+        # B1 #7719 : la voie des hooks applique la même garde d'intervalle que
+        # la voie explicite. Le commit doit être HEAD (donc porté par une réf)
+        # ET fait pendant une liaison de la session à cet agent.
+        intervals = identity.get("binding_intervals") or ()
+        if not _binding_covers(intervals, info["committer_ts"]):
             raise ProvenanceError(
-                "commit %s was committed on %s, before the session's first "
-                "binding to %s (%s): refused"
+                "commit %s was committed on %s, outside every interval where "
+                "session %s was bound to %s: refused"
                 % (full[:12], _at_text(info["committer_ts"]),
-                   identity["actor"], _at_text(created)))
+                   identity["session"], identity["actor"]))
     else:
         from .identity import GIT_EMAIL_DOMAIN
         committer = subprocess.run(
@@ -1793,12 +1808,15 @@ def record_session_commit(db, sha, *, session: str, harness: str = "",
       canon (#7004) ; si la liaison porte un PID, le processus appelant doit
       en descendre (L46/L63) ; une liaison à `veille` est refusée (#7725 :
       identité d'émission sans boîte lue, elle ne donne pas d'identité) ;
-    * le commit doit être **postérieur au premier lien de cette session à cet
-      agent** (sa date de committer, tolérance d'une seconde) : une session ne
-      peut pas revendiquer un objet créé avant elle. Les liaisons révoquées
-      comptent — une session d'abord liée à l'agent qu'elle porte, puis
-      réparée (#7725), garde la date de son premier lien, sinon les commits
-      faits sous la liaison défectueuse resteraient sans preuve ;
+    * le commit doit avoir été **fait pendant une liaison de cette session à
+      cet agent** (date de committer, tolérance d'une seconde aux bornes) :
+      liaison active (`t >= created_ts`) ou liaison révoquée dont l'intervalle
+      contient `t`. L'intervalle d'un AUTRE agent ne compte pas : une session
+      reliée à X, puis à Y, puis de nouveau à X ne réclame pas sous X un
+      commit de l'époque Y (B1 des deux relecteurs du gel 43280). Un commit
+      fait sous `veille` (liaison refusée, #7725) n'est couvert par aucune
+      liaison à l'agent : il relève de l'attestation owner, pas d'une
+      réparation ;
     * il doit être **porté par une ref locale** (ou être ancêtre de HEAD) :
       un objet pendant n'est pas un commit poussé ;
     * son **committer ne peut pas être un autre agent enregistré** : la
@@ -1847,13 +1865,13 @@ def record_session_commit(db, sha, *, session: str, harness: str = "",
                 "descendant (%s): record from the linked session"
                 % (ident["session"], row.get("pid"), why))
     info = _refuse_foreign_committer(db, sha=full, cwd=cwd, actor=ident["actor"])
-    created = float(ident.get("binding_ts") or 0.0)
-    if created and info["committer_ts"] + 1.0 < created:
+    if not _binding_covers(ident.get("binding_intervals") or (),
+                           info["committer_ts"]):
         raise ProvenanceError(
-            "commit %s was committed on %s, before the session's first binding "
-            "to %s (%s): refused"
-            % (full[:12], _at_text(info["committer_ts"]), ident["actor"],
-               _at_text(created)))
+            "commit %s was committed on %s, outside every interval where "
+            "session %s was bound to %s: refused"
+            % (full[:12], _at_text(info["committer_ts"]), ident["session"],
+               ident["actor"]))
     if not _carried_by_a_ref(cwd, full):
         raise ProvenanceError(
             "commit %s is not carried by a local ref (or HEAD): only a pushed "

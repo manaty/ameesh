@@ -11,16 +11,17 @@ hôte pc-smichea) connaissait pourtant l'agent ET la famille.
 #7725 : une session ne se lie pas à `veille`, identité d'ÉMISSION sans boîte
 lue ; la session du poste est liée à l'agent qu'elle porte (`bureau`, codex
 sur le PC), et le reçu porte cet acteur. Une liaison historique à `veille` ne
-donne plus d'identité : ni reçu à l'écriture, ni preuve à la lecture. Quand
-une session d'abord liée à `veille` est réparée, la borne de date reste le
-premier lien de cette session au même agent (révocations comprises) — les
-commits faits sous la liaison défectueuse gardent ainsi leur preuve.
+donne plus d'identité : ni reçu à l'écriture, ni preuve à la lecture. Un reçu
+ne couvre qu'un commit **fait pendant** une liaison de la session à cet agent
+(active ou révoquée) : une session reliée à X, puis à Y, puis de nouveau à X
+ne réclame pas sous X un commit de l'époque Y ; les commits faits sous
+`veille` relèvent de l'attestation owner, pas d'une réparation.
 
 Le reçu est écrit par la session liée, à la création (hooks, identité de
 session dans l'environnement) ou à la poussée (`ameesh provenance record
 --session`) : la liaison donne acteur/harnais/session, le commit doit être
-postérieur au premier lien, porté par une ref locale, et son committer ne peut
-pas être un autre agent enregistré. Une preuve déjà écrite pour une autre
+fait pendant un intervalle de cette liaison, porté par une ref locale, et son
+committer ne peut pas être un autre agent enregistré. Une preuve déjà écrite pour une autre
 identité est refusée, et un reçu de session dont la liaison n'existe pas est
 tenu pour incohérent par la porte.
 """
@@ -173,8 +174,7 @@ class SessionReceiptTest(PgTestCase):
         path, env = self.repo(date="2026-11-16T00:00:00Z")
         head = self.commit(path, env, "avant la liaison")
         self.bind()
-        self.assertIn("before the session's first binding",
-                      self.refused(head, path))
+        self.assertIn("outside every interval", self.refused(head, path))
 
     def test_a_commit_of_another_registered_agent_is_refused(self):
         registry.upsert(self.db, "auditeur", harness="claude",
@@ -248,7 +248,7 @@ class SessionReceiptTest(PgTestCase):
                              cfg=self.cfg)
         with self.assertRaises(prov.ProvenanceError) as raised:
             prov.record_commit(self.db, head, identity=ident, cwd=path)
-        self.assertIn("before the session's first binding", str(raised.exception))
+        self.assertIn("outside every interval", str(raised.exception))
         self.assertIsNone(prov.receipt_for_commit(self.db, head))
 
     def test_another_binding_cannot_claim_an_already_received_commit(self):
@@ -322,44 +322,62 @@ class SessionReceiptTest(PgTestCase):
             prov.receipt_for_commit(self.db, head)
         self.assertIn("no read mailbox", str(raised.exception))
 
-    def test_a_repaired_binding_keeps_the_first_link_date(self):
-        """#7705 : la session du poste, réparée de veille vers bureau.
+    def test_a_rebinding_does_not_cover_a_commit_made_under_another_agent(self):
+        """B1 #43280 : X → Y → X ne réclame pas un commit de l'époque Y.
 
-        Le premier lien de cette session à `bureau` précède les commits de
-        #7705 ; la réparation (#7725) crée une ligne plus récente. La borne
-        reste le premier lien au même agent, sinon la voie (a) serait perdue
-        pour ces commits.
+        La session a été liée à bureau, puis à veille, puis de nouveau à
+        bureau. Un commit fait pendant l'intervalle veille n'est couvert par
+        aucune liaison à bureau : le premier lien au même agent ne suffit pas.
         """
         now = time.time()
-        first = now - 10 * 86400
-        old = self.bind().row
+        first = self.bind().row
         self.unbind()
-        self.age_binding(old, created=first, revoked=first + 60)
-        self.legacy_binding(created=now - 4 * 86400)
-        path, env = self.repo(date=iso(now - 3600))
-        head = self.commit(path, env, "commit du poste sous la liaison veille")
+        self.age_binding(first, created=now - 10 * 86400,
+                         revoked=now - 9 * 86400)
+        second = self.legacy_binding(created=now - 8 * 86400)
         self.unbind()
-        repaired = self.bind().row
-        active = storage.of(self.db).session_bindings.active(
-            self.cfg.host, "codex", SESSION)
-        self.assertEqual(int(active["id"]), int(repaired["id"]))
-        self.assertGreater(active["created_ts"], now - 3600)
-        row = self.record(head, path)
-        self.assertTrue(row["recorded"])
-        receipt = prov.receipt_for_commit(self.db, head)
-        self.assertEqual(receipt["actor"], BUREAU)
-        self.assertEqual(receipt["session"], SESSION)
+        self.age_binding(second, created=now - 8 * 86400,
+                         revoked=now - 3 * 86400)
+        self.bind()
+        path, env = self.repo(date=iso(now - 6 * 86400))
+        head = self.commit(path, env, "commit de l'époque veille")
+        self.assertIn("outside every interval", self.refused(head, path))
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
 
-    def test_a_repaired_binding_cannot_claim_before_its_first_link(self):
-        """Sans lien antérieur à `bureau`, la réparation ne couvre pas le passé."""
+    def test_a_rebinding_does_not_cover_the_commits_made_under_veille(self):
+        """#7705 : les commits faits sous #54/veille ne sont pas couverts.
+
+        La réparation vers bureau crée une liaison plus récente que les
+        commits ; aucun intervalle bureau ne contient leur date. La voie juste
+        pour ces commits est l'attestation owner, pas une nouvelle liaison.
+        """
         now = time.time()
         self.legacy_binding(created=now - 4 * 86400)
         path, env = self.repo(date=iso(now - 3600))
         head = self.commit(path, env, "commit du poste sous la liaison veille")
         self.unbind()
         self.bind()
-        self.assertIn("before the session's first binding",
-                      self.refused(head, path))
+        self.assertIn("outside every interval", self.refused(head, path))
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+
+    def test_a_commit_made_while_bound_to_the_same_agent_stays_provable(self):
+        """Un commit de l'intervalle bureau, enregistré après un rebind, reste
+        couvert : c'est l'intervalle au moment du commit qui fait foi."""
+        now = time.time()
+        first = self.bind().row
+        self.unbind()
+        self.age_binding(first, created=now - 10 * 86400,
+                         revoked=now - 9 * 86400)
+        self.legacy_binding(created=now - 8 * 86400)
+        path, env = self.repo(date=iso(now - 9.5 * 86400))
+        head = self.commit(path, env, "commit de l'époque bureau")
+        self.unbind()
+        self.bind()
+        row = self.record(head, path)
+        self.assertTrue(row["recorded"])
+        receipt = prov.receipt_for_commit(self.db, head)
+        self.assertEqual(receipt["actor"], BUREAU)
+        self.assertEqual(receipt["session"], SESSION)
 
 
 class SessionReceiptCliTest(PgTestCase):
