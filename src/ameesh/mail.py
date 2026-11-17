@@ -149,15 +149,17 @@ def _avatar_correspondence(db, *agents) -> bool:
     """#7668 : l'un des correspondants est-il un avatar (`releve: preference`) ?
 
     Lecture faite au même point que la copie R12 (dans `record`, donc après le
-    COMMIT quand elle est différée), et sans jamais retenir le courrier : une
-    base qui ne sait pas lire le registre répond « non » et garde le routage
-    existant."""
+    COMMIT quand elle est différée). Le courrier n'est jamais retenu ; seule
+    sa copie lisible dépend de la réponse. Une base qui ne sait pas lire le
+    registre (panne, contrat médié sans registre) répond « privé » : la copie
+    est omise plutôt que de publier le corps d'un avatar par défaut (B P2
+    ameesh-cx2)."""
     try:
         from . import registry
         return any(fil.avatar_conversation(registry.get(db, name))
                    for name in agents)
-    except Exception:  # noqa: BLE001 — la copie lisible ne retient jamais le courrier
-        return False
+    except Exception:  # noqa: BLE001 — qualification inconnue : privée par défaut
+        return True
 
 
 def send(

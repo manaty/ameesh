@@ -13,6 +13,7 @@ import dataclasses
 import os
 import types
 import unittest
+from unittest import mock
 
 from ameesh import chat, conversation, fil, mail, registry, work
 
@@ -154,6 +155,25 @@ class AvatarConversationTest(PgTestCase):
     def test_mail_from_an_avatar_does_not_create_a_project_copy(self):
         mail.send(self.db, "avatar", "human:smichea", "PRIVATE-REPLY")
         self.assertEqual(self._files_with("PRIVATE-REPLY"), [])
+
+    def test_unknown_avatar_qualification_omits_the_project_copy(self):
+        # B P2 ameesh-cx2 (#42879): a failing registry must not turn an avatar
+        # into a project correspondent. The mail is still deposited; only its
+        # readable copy is omitted (privacy default).
+        real_get = registry.get
+
+        def failing_get(db, name):
+            if name == "avatar":
+                raise RuntimeError("registry unavailable")
+            return real_get(db, name)
+
+        with mock.patch.object(registry, "get", side_effect=failing_get):
+            mail.send(self.db, "sender", "avatar", "PRIVATE-MAIL-UNKNOWN")
+        first = self.db.query(
+            "SELECT count(*) AS n FROM agent_mailbox"
+            " WHERE recipient = 'avatar' AND body = 'PRIVATE-MAIL-UNKNOWN'")
+        self.assertEqual(first[0]["n"], 1)
+        self.assertEqual(self._files_with("PRIVATE-MAIL-UNKNOWN"), [])
 
     def test_mail_to_an_avatar_with_a_lot_stays_in_the_lot_feed(self):
         lot = work.add(self.db, title="Lot du message", app="project-b")
