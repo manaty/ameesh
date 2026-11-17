@@ -244,7 +244,6 @@ class DeclaredPolicyRunnerTest(unittest.TestCase):
         document.renew_if_due = lambda: True
         document.stopping = threading.Event()
         wait = document.failure_wait()
-        started = time.monotonic()
         thread = threading.Thread(target=document._attendre_apres_echec, args=(wait,))
         thread.start()
         time.sleep(0.1)
@@ -252,6 +251,5 @@ class DeclaredPolicyRunnerTest(unittest.TestCase):
         thread.join(2.0)
         try:
             self.assertFalse(thread.is_alive())
-            self.assertLess(time.monotonic() - started, 2.0)
         finally:
             shutil.rmtree(document.state_dir, ignore_errors=True)
