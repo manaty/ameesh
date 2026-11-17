@@ -362,6 +362,12 @@ def _member_freeze(db, lot: int, *, declared_only: bool = False,
     Sans source composée ni gel, le landing ne permet d'attribuer aucun
     contenu au membre. On l'ignore sans soustraire de commits au delta propre
     du véhicule. Un membre composé sans gel reste refusé (#2775).
+
+    B/P2 (#224424) : `None` est réservé aux intentions **sans tête ni avis**
+    (`no-verdict`). Un candidat refusé par la lecture — `blocked-verdict`,
+    `freeze-after-verdict`, avis sans commit — lève, même pour un landing
+    déclaré : l'ignorer retirerait le membre de la porte du véhicule et son
+    blocage ne serait plus appliqué (#2775 ne couvre que l'intention vide).
     """
     row = work.get(db, int(lot))
     if row is None:
@@ -373,13 +379,13 @@ def _member_freeze(db, lot: int, *, declared_only: bool = False,
         raise VehicleError("constituent #%d: effective freeze unreadable: %s"
                            % (int(lot), exc)) from exc
     sha = plan_git.commit_id(candidate.get("sha"))
-    if not sha:
-        if declared_only:
-            return row, marks, None
-        causes = ", ".join(candidate.get("causes") or ()) or "no freeze"
-        raise VehicleError("constituent #%d has no frozen head: compose a reviewed lot"
-                           " (%s)" % (int(lot), causes))
-    return row, marks, dict(candidate, sha=sha)
+    if sha:
+        return row, marks, dict(candidate, sha=sha)
+    causes = list(candidate.get("causes") or ())
+    if declared_only and causes and all(cause == "no-verdict" for cause in causes):
+        return row, marks, None
+    raise VehicleError("constituent #%d has no frozen head: compose a reviewed lot"
+                       " (%s)" % (int(lot), ", ".join(causes) or "no freeze"))
 
 
 def _ancestor(repo: str, tip: str, base: str) -> bool:

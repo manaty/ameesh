@@ -98,10 +98,10 @@ class _Base(unittest.TestCase):
                                 "branch": "integration/paquet"},
                     self.repo, self.base, head, target=target)
 
-    def need(self, marks, head):
+    def need(self, marks, head, landings=()):
         class DB:
             def query(self, _sql, _args=()):
-                return []
+                return list(landings)
 
         with mock.patch.object(packet_reviews.work, "get",
                                side_effect=lambda _db, key: {"id": key, "app": "ameesh"}):
@@ -172,6 +172,58 @@ class NoFreezeTest(_Base):
         self.assertEqual(row["id"], 103)
         self.assertEqual(marks, [])
         self.assertIsNone(freeze)
+
+
+class DeclaredLandingRefusalTest(_Base):
+    """B/P2 (#224424) : un candidat refusé lève, même pour un landing déclaré.
+
+    Un landing sans source composée ne doit pas faire sauter un membre dont le
+    gel effectif est refusé (verdict bloqué, gel postérieur non reporté) : son
+    blocage ne serait plus appliqué par la porte du véhicule.
+    """
+
+    def compose_a_clean_member(self):
+        _git(self.repo, "checkout", "-q", "-b", "m1", "main")
+        _write(self.repo, "src/app.py", "print(1)\n")
+        self.m1 = _commit_all(self.repo, "m1: membre relu")
+        _git(self.repo, "checkout", "-q", "main")
+        self.head = _merge(self.repo, "m1", 101)
+        self.marks = {101: [{"id": 1, "kind": "frozen", "sha": self.m1,
+                             "at_ts": 1.0}]}
+
+    def test_a_blocked_verdict_on_a_declared_landing_refuses_the_vehicle(self):
+        self.compose_a_clean_member()
+        _git(self.repo, "checkout", "-q", "-b", "m2", "main")
+        _write(self.repo, "src/blocked.py", "x = 1\n")
+        blocked = _commit_all(self.repo, "m2: tête bloquée")
+        _git(self.repo, "checkout", "-q", "main")
+        self.marks[102] = [
+            {"id": 2, "kind": "frozen", "sha": blocked, "at_ts": 2.0},
+            {"id": 3, "kind": "verdict", "verdict": "blocked", "sha": blocked,
+             "actor": "rev2", "at_ts": 3.0},
+        ]
+        out = self.need(self.marks, self.head, landings=[{"work_item_id": 102}])
+        self.assertFalse(out["ok"])
+        self.assertIn("constituent #102", out["why"])
+        self.assertIn("blocked-verdict", out["why"])
+
+    def test_a_freeze_after_the_verdict_on_a_landing_refuses_the_vehicle(self):
+        self.compose_a_clean_member()
+        _git(self.repo, "checkout", "-q", "-b", "m2", "main")
+        _write(self.repo, "src/late.py", "x = 1\n")
+        reviewed = _commit_all(self.repo, "m2: tête relue")
+        _write(self.repo, "src/late.py", "x = 2\n")
+        frozen_after = _commit_all(self.repo, "m2: gelée après le verdict")
+        _git(self.repo, "checkout", "-q", "main")
+        self.marks[102] = [
+            {"id": 2, "kind": "verdict", "verdict": "ok", "sha": reviewed,
+             "actor": "rev1", "at_ts": 2.0},
+            {"id": 3, "kind": "frozen", "sha": frozen_after, "at_ts": 3.0},
+        ]
+        out = self.need(self.marks, self.head, landings=[{"work_item_id": 102}])
+        self.assertFalse(out["ok"])
+        self.assertIn("constituent #102", out["why"])
+        self.assertIn("freeze-after-verdict", out["why"])
 
 
 class DeclaredAfterVerdictTest(_Base):
