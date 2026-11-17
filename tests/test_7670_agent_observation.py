@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import unittest
 from unittest import mock
 
@@ -174,7 +175,12 @@ class AgentObservationTest(PgTestCase):
         ctx = serve.Context(cfg=dataclasses.replace(self.cfg, host=HOST),
                             human="human:owner")
         served = serve._agent_observation(ctx, self.db, {"agent": "obs"}, {})
-        out = self.mesh("agent", "observe", "obs", "--json")
+        # the CLI would otherwise observe from this machine's host, not HOST
+        conf = os.path.join(self.tmp, "observer.json")
+        with open(conf, "w", encoding="utf-8") as fh:
+            json.dump({"host": HOST}, fh)
+        out = self.mesh("agent", "observe", "obs", "--json",
+                        env=self.env(AMEESH_CONFIG=conf))
         self.assertEqual(out.returncode, 0, out.stderr)
         cli = json.loads(out.stdout)
         self.assertEqual(cli["schema"], served["schema"])
@@ -306,16 +312,77 @@ class AgentObservationTest(PgTestCase):
 
     def test_manual_agent_is_admitted_without_canon(self):
         self.agent("obs")
-        document = self.observe("obs", host="another-host")
+        document = self.observe("obs")
         admission = document["admission"]
         self.assertFalse(admission["governed"])
         self.assertIsNone(document["canon"])
         self.assertTrue(admission["claim_predicate"])
         self.assertTrue(admission["admitted"])
         self.assertEqual(admission["reasons"], [])
-        # no declared account, and another observer host: both unavailable
-        self.assertEqual(document["missing"],
-                         ["account_envelope", "limits"])
+        # no declared account: the envelope is unavailable, never zero cost
+        self.assertEqual(document["missing"], ["account_envelope"])
+
+    def test_off_host_admission_is_unknown_never_permission(self):
+        """B #42989: the local responsible policy does not answer for a peer.
+
+        Same agent, no `responsible`, observed from its own host and from a
+        peer whose policy differs: on the peer the answer is unknown (None),
+        not `True` from a local `require_responsible=False` nor `False` from a
+        local `True`.
+        """
+        self.agent("obs", responsible=None)
+        local = self.observe("obs")
+        self.assertTrue(local["admission"]["admitted"])
+        self.assertNotIn("responsible_policy", local["missing"])
+
+        for required in (False, True):
+            with self.subTest(required=required):
+                document = self.observe("obs", host="another-host",
+                                        require_responsible=required)
+                admission = document["admission"]
+                self.assertIsNone(admission["admitted"])
+                self.assertIsNone(admission["responsible_required"])
+                self.assertEqual(admission["reasons"],
+                                 ["responsible_policy_unavailable"])
+                self.assertIn("responsible_policy", document["missing"])
+
+        # a machine-level refusal still answers False: the other facts travel
+        self.db.execute("UPDATE agent_registry SET mode = 'externe'"
+                        " WHERE name = 'obs'")
+        document = self.observe("obs", host="another-host")
+        self.assertFalse(document["admission"]["admitted"])
+        self.assertEqual(document["admission"]["reasons"], ["mode_externe"])
+
+    def test_off_host_budget_never_selects_the_local_account(self):
+        """B #42989 witness: same profile name `p1`, different billing accounts.
+
+        The peer's `p1` must not be billed, displayed, or priced for an agent
+        running on another host; on the agent's own host the same name still
+        resolves to that host's account.
+        """
+        self.agent("obs", session_id="s-1", session_account="p1")
+        storage.of(self.db).budgets.account_put("acct-local", 30.0,
+                                                actor="human:t")
+        storage.of(self.db).budgets.account_put("acct-peer", 7.0,
+                                                actor="human:t")
+        local = self.observe("obs", **self.profiles(
+            {"name": "p1", "billing_account": "acct-local"}))
+        self.assertTrue(local["budget"]["available"])
+        self.assertEqual(local["budget"]["billing_account"], "acct-local")
+        self.assertAlmostEqual(local["budget"]["limit_usd"], 30.0)
+
+        document = self.observe("obs", host="another-host", **self.profiles(
+            {"name": "p1", "billing_account": "acct-peer"}))
+        budget = document["budget"]
+        self.assertFalse(budget["available"])
+        self.assertEqual(budget["reason"], "foreign_host")
+        self.assertEqual(budget["account_profile"], "p1")
+        self.assertIsNone(budget["billing_account"])
+        self.assertIsNone(budget["limit_usd"])
+        self.assertIsNone(budget["settled_usd"])
+        self.assertIsNone(budget["used_usd"])
+        self.assertIsNone(budget["remaining_usd"])
+        self.assertIn("account_envelope", document["missing"])
 
     def test_governed_agent_is_admitted_only_when_fresh_and_matching(self):
         self.governed("obs")
@@ -642,12 +709,13 @@ class AgentObservationTest(PgTestCase):
         self.agent("obs")
         with self.db.transaction(isolation="REPEATABLE READ",
                                  read_only=True) as tx:
-            self.assertEqual(
-                tx.query("SHOW transaction_isolation")[0]["transaction_isolation"],
+            self.assertEqual(tx.query(
+                "SELECT current_setting('transaction_isolation')"
+                " AS transaction_isolation")[0]["transaction_isolation"],
                 "repeatable read")
-            self.assertEqual(
-                tx.query("SHOW transaction_read_only")[0]["transaction_read_only"],
-                "on")
+            self.assertEqual(tx.query(
+                "SELECT current_setting('transaction_read_only')"
+                " AS transaction_read_only")[0]["transaction_read_only"], "on")
         with self.assertRaises(db_mod.DbError):
             with self.db.transaction(read_only=True) as tx:
                 tx.execute("UPDATE agent_registry SET status = 'x'"

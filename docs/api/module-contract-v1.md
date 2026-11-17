@@ -94,8 +94,14 @@ billing-account name are included because `/budget` already publishes them.
 `admission.admitted` is the profile verdict (executable mode, responsible when
 the host requires one, fresh canon whose pinned commit is the last good one,
 placement for the current profile); `admission.claim_predicate` is the core SQL
-predicate alone. A fact this observation cannot supply is `null` with a stable
-code in `missing`; it is never permission, admission or zero cost.
+predicate alone. Host-local facts — declared account profiles and the
+responsible policy — are read only when the agent runs on the observer's host.
+Off-host the budget is refused (`foreign_host`) and `admission.admitted` is
+`null` with `responsible_policy` in `missing`: another host's account named
+`p1` may bill a different account, and a local `false` policy must not turn a
+remote admission into `true`. `null` is unknown, never permission. Any other
+fact this observation cannot supply is `null` with a stable code in `missing`;
+it is never permission, admission or zero cost.
 
 Use the server's configured authentication and visibility rules. The client's
 actor, project and lease scope are not elevated by using HTTP. Retry a write
