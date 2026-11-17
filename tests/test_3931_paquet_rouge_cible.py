@@ -415,7 +415,8 @@ class LocalTestCompositionTest(unittest.TestCase):
             discarded=[], head="e" * 40)
 
     def check(self, *, unit_runs=(), contract_run=None, attribute=None,
-              unit_modules=None, contract_module_list=("tests.test_cluster",)):
+              unit_modules=None, contract_module_list=("tests.test_cluster",),
+              confirm=None):
         # Les unités sans module propre ne produisent aucun run : le témoin
         # contracts-only reste lisible.
         modules = unit_modules or {}
@@ -423,6 +424,12 @@ class LocalTestCompositionTest(unittest.TestCase):
 
         def unit_modules_for(_worktree, unit):
             return modules.get(unit.lot, [])
+
+        # Les SHA sont des sentinelles : le vrai rejeu de préfixe ne peut pas
+        # construire son worktree (#7692, couvert par test_7239). Le témoin
+        # injecte donc la confirmation du retrait #3801.
+        def confirmed(_worktree, _composition, removals, **_kwargs):
+            return list(removals), [], ""
 
         with mock.patch.object(paquet_auto, "unit_test_modules",
                                side_effect=unit_modules_for), \
@@ -432,7 +439,8 @@ class LocalTestCompositionTest(unittest.TestCase):
                                   side_effect=side):
             return paquet_auto.check_local_tests(
                 self.worktree, self.composition, timeout=1,
-                log=lambda _line: None, attribute=attribute)
+                log=lambda _line: None, attribute=attribute,
+                confirm=confirm or confirmed)
 
     def test_contrat_rouge_attribue_retire_l_unite_et_garde_l_autre(self) -> None:
         self.assertEqual(self.composition.units[1].lot, 2)
