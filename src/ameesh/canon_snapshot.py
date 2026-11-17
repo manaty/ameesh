@@ -19,7 +19,7 @@ SCHEMA = "ameesh-canon-snapshot/1"
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _UNSAFE_FINDINGS = frozenset({
     "canon-fetch-failed", "canon-local-divergence", "canon-worktree-dirty",
-    "member-absent", "member-repository-mismatch",
+    "member-repository-mismatch",
 })
 
 
@@ -110,6 +110,10 @@ def build(loaded, *, expected_commit, previous_commit=None, expected_scope=None,
         for finding in findings:
             if finding.severity == canon.ERROR or finding.code in _UNSAFE_FINDINGS:
                 refuse(finding.code, finding.member)
+            # A root-only request makes no completeness claim about sibling
+            # bundles. A federation-wide request must not silently omit them.
+            if finding.code == "member-absent" and not single_source:
+                refuse(finding.code, finding.member)
         if loaded.scope_unread:
             refuse("scope-unreadable")
         if result["refusals"]:
@@ -118,6 +122,8 @@ def build(loaded, *, expected_commit, previous_commit=None, expected_scope=None,
         payload = {
             "canon": loaded.id,
             "root_commit": expected_commit,
+            "omitted_members": sorted({f.member for f in findings
+                                       if f.code == "member-absent"}),
             "sources": sorted([
                 {"member": s.member, "commit": s.commit, "ref": s.rev,
                  "prefix": s.prefix, "scope": loaded.scopes.get(s.member),

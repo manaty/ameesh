@@ -261,6 +261,20 @@ class SnapshotContract(unittest.TestCase):
         self.assertIn("member-repository-mismatch", self.codes(doc))
         self.assertNotIn("MUST_NOT_EXPORT", json.dumps(doc))
 
+    def test_explicit_root_slice_lists_unloaded_siblings_without_authority(self):
+        manifest = (self.repo / "federation.yaml").read_text()
+        manifest = manifest.replace("extensions:",
+                                    "  - id: other-project\n    bundle: knowledge\n"
+                                    "    enforcement: migrating\nextensions:")
+        self.write("federation.yaml", manifest)
+        self.commit = self.commit_all()
+        self.assertIn("member-absent", self.codes(self.cli(expected=1)))
+        doc = self.cli("--single-source", "--expect-scope", "canon")
+        self.assertTrue(doc["ok"], doc)
+        self.assertEqual(doc["snapshot"]["omitted_members"], ["other-project"])
+        self.assertEqual(len(doc["snapshot"]["sources"]), 1)
+        self.assertEqual([m["title"] for m in doc["snapshot"]["members"]], ["alice"])
+
 
 if __name__ == "__main__":
     unittest.main()

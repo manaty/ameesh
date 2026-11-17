@@ -36,9 +36,12 @@ Optional checks:
   to be exactly this directory. A missing or broader scope is refused. Select
   the repository root with its federation manifest to retain its scope
   declarations; the normal canon loader interprets that manifest.
-- `--single-source`: refuse additional federation sources. Without it, every
-  loaded source is pinned and checked independently; the root pin alone is
-  not a promise that all sources come from one repository.
+- `--single-source`: explicitly request only the root source; refuse any
+  additional loaded source. Unloaded sibling bundles are listed in
+  `omitted_members` and acquire no authority from the result. Without this
+  flag an absent federation member refuses the snapshot; every loaded source
+  is pinned and checked independently. The root pin alone is not a promise
+  that all sources come from one repository.
 - `--fetch`: explicitly fetch before loading, using the existing canon loader.
   A failed fetch refuses the result instead of authorizing cached refs.
   Without it, there is no network refresh. Fetch updates local tracking refs;
@@ -48,7 +51,7 @@ For every source, the selected ref and HEAD must match the loaded immutable
 commit, and the working tree must be clean (including ordinary untracked
 files). These conditions are checked before validation/projection and again
 before success. A moving ref or checkout, dirty tree, unreadable/untrusted
-source, unavailable Git observation, repository mismatch, omitted federation
+source, unavailable Git observation, repository mismatch, omitted requested federation
 member or validation error yields a refusal. Content is read from commit
 objects, never from working-file edits.
 
@@ -77,6 +80,7 @@ Every response has these fields:
 | --- | --- |
 | `canon` | Canon identifier. |
 | `root_commit` | Exact expected full root commit. |
+| `omitted_members` | Sorted IDs of unloaded sibling bundles outside an explicitly requested single-root slice. Empty for a complete federation snapshot; never evidence about those members’ contents or authority. |
 | `sources` | Sorted array of `{member, commit, ref, prefix, scope, trust}`. `prefix` is relative to its repository; `scope` is a normalized directory list or null; `trust` is `git-pinned`. No raw remote URL or local checkout path. |
 | `members` | Sorted array of `{title, roles, deputies, superiors, ref, directory}`. Roles/deputies/superiors retain declared lists or null; `ref` binds the card to its source commit. |
 | `agents` | Sorted array of `{name, type, responsible, team, roles, projects, aliases, capabilities, ref, directory}`. Projects and aliases are arrays; nullable declarations retain null. This is the canon directory, not the live registry. |
