@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest import mock
 
 from ameesh import alert_briefs, notify, registry
 
@@ -41,7 +42,8 @@ class BriefsTest(unittest.TestCase):
             with self.subTest(kind=kind):
                 alert = {"type": kind, "host": "central", "detail": "host central: act",
                          "orchestrators": ["orch", "orch-b"]}
-                briefs = alert_briefs.briefs(alert, listing, auditor_names=["auditeur"])
+                briefs = alert_briefs.briefs(alert, listing, auditor_names=["auditeur"],
+                                             avatar_names=("bureau",))
                 self.assertEqual(set(briefs), {"mesh-design", "bureau"})
                 self.assertIn("host central: act", briefs["mesh-design"])
                 if kind == "host_unsampled":
@@ -49,12 +51,14 @@ class BriefsTest(unittest.TestCase):
                         self.assertIn(timer, briefs["bureau"])
                 external = [dict(row, mode="externe") if row["name"] == "bureau"
                             else row for row in listing]
-                self.assertEqual(set(alert_briefs.briefs(alert, external)),
+                self.assertEqual(set(alert_briefs.briefs(
+                    alert, external, avatar_names=("bureau",))),
                                  {"mesh-design", "thread:bureau"})
                 dead = {}
                 lost = [dict(row, lease_live=False) if row["name"] == "mesh-design"
                         else row for row in listing]
-                remaining = alert_briefs.briefs(alert, lost, dead_out=dead)
+                remaining = alert_briefs.briefs(alert, lost, dead_out=dead,
+                                                avatar_names=("bureau",))
                 self.assertEqual(set(remaining), {"bureau"})
                 self.assertIn("mesh-design", dead)
                 self.assertIn("No live recipient", remaining["bureau"])
@@ -262,7 +266,8 @@ class NotifierBriefsTest(PgTestCase):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
         self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
                         " lease_expires_at = now() + interval '1 hour'")
-        notifier = notify.Notifier(self.cfg, notify.parse_config({"default": []}),
+        notifier = notify.Notifier(self.cfg, notify.parse_config(
+            {"default": [], "default_human": "human:smichea"}),
                                    sender=object(), log=lambda t: None,
                                    clock=lambda: self.now)
         warning = {"type": "host_disk_soon_full", "host": "central",
@@ -270,8 +275,12 @@ class NotifierBriefsTest(PgTestCase):
         critical = dict(warning, reason="critique", critical=True, urgent=True)
         silent = {"type": "host_unsampled", "host": "central",
                   "detail": "central sampler silent", "since": self.now - HEURE}
-        for current in ([warning], [warning], [critical, silent], [critical, silent]):
-            notifier.run_pass(self.db, current=current)
+        # #7634 : l'avatar de l'humain visé se lit au canon.
+        with mock.patch.object(notify.avatars, "from_canons",
+                               return_value={"human:smichea": "bureau"}):
+            for current in ([warning], [warning], [critical, silent],
+                            [critical, silent]):
+                notifier.run_pass(self.db, current=current)
         for name in ("mesh-design", "bureau"):
             rows = self.mails(name)
             self.assertEqual(len(rows), 3, rows)

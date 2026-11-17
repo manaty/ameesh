@@ -39,7 +39,7 @@ from . import config, db as db_mod, election, pilot_gesture
 CANARY = "canary"
 #: `gate` returned None: the environment holds no elected lease
 NO_LEASE = ("no lease to fence: neither AMEESH_ROLE nor an elected agent bound "
-            "by its runner (a human, the bureau or a host-pinned agent); "
+            "by its runner (a human, the avatar or a host-pinned agent); "
             "nothing journaled")
 
 

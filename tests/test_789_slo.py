@@ -87,14 +87,14 @@ class NiveauxTest(unittest.TestCase):
         self.assertEqual(slo.targets(0), ())
         self.assertEqual(slo.targets(1), ("assignee",))
         self.assertEqual(slo.targets(2), ("pilot",))
-        self.assertEqual(slo.targets(3), ("bureau", "auditeur"))
+        self.assertEqual(slo.targets(3), ("avatar", "auditeur"))
 
     def test_p1_ajoute_bureau_et_auditeur(self):
         # #2395 : le niveau 4 vise le bureau et l'auditeur, jamais l'owner
         # (canon §9, décision owner 18/10).
         self.assertEqual(slo.targets(1, critical=True),
-                         ("assignee", "bureau", "auditeur"))
-        self.assertEqual(slo.targets(3, critical=True), ("bureau", "auditeur"))
+                         ("assignee", "avatar", "auditeur"))
+        self.assertEqual(slo.targets(3, critical=True), ("avatar", "auditeur"))
 
     def test_delai_p1(self):
         self.assertEqual(slo.target_s(slo.step_of("build_quiet")), 7200)
@@ -133,7 +133,7 @@ class MesureTest(unittest.TestCase):
         row = self._row(rows, "signal_assigned")
         self.assertEqual(row["target_s"], 900)
         self.assertEqual(row["level"], 3)
-        self.assertEqual(row["targets"], ("bureau", "auditeur"))
+        self.assertEqual(row["targets"], ("avatar", "auditeur"))
 
     def test_intake_demarre(self):
         events = [_ev("intake", T0), _ev("build", T0 + 1800)]
@@ -599,7 +599,7 @@ class PaquetTest(unittest.TestCase):
         self.assertEqual(row["target_s"], 900)
         self.assertEqual(row["level"], 1)
         self.assertEqual(row["targets"],
-                         ("assignee", "bureau", "auditeur"))
+                         ("assignee", "avatar", "auditeur"))
         self.assertEqual(row["target_source"], "table")
         self.assertEqual(row["started_ts"], T0 + 1800)
         self.assertNotIn("packet", row)
@@ -623,7 +623,7 @@ class PaquetTest(unittest.TestCase):
         self.assertEqual(row["started_ts"], green)
         self.assertEqual(row["level"], 1)
         self.assertEqual(row["overdue_s"], 0)
-        self.assertEqual(row["targets"], ("assignee", "bureau", "auditeur"))
+        self.assertEqual(row["targets"], ("assignee", "avatar", "auditeur"))
 
     def test_hors_paquet_vert_avant_le_go_part_du_go(self):
         # Témoin : une CI verte avant le GO ne fait pas remonter le départ
@@ -729,7 +729,7 @@ class GracePriseTest(unittest.TestCase):
         rows = self._lot_qa(verdict_age_s=3 * 86400, handover_age_s=1860)
         row = [r for r in rows if r["step"] == "verdict_merge"][0]
         self.assertEqual(row["level"], 3)
-        self.assertEqual(row["targets"], ("bureau", "auditeur"))
+        self.assertEqual(row["targets"], ("avatar", "auditeur"))
         self.assertNotIn("handover_grace_s", row)
         self.assertEqual([r["step"] for r in slo.breaches(rows)],
                          ["verdict_merge"])

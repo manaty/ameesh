@@ -169,7 +169,7 @@ def findings(rows, canons, now, signals=()):
                             critical=warning['critical'],
                             urgent=warning['critical'] and not row.get('fork'),
                             detail='CI disk %s (%s) %s: %s bytes free, %.1f%% used%s; '
-                                   'check host retention timer (bureau)%s' % (
+                                   'check host retention timer (avatar)%s' % (
                                        host, repo, row['volume'], row['free_bytes'],
                                        100 * warnings[0]['used'],
                                        ' (last known low measurement, stale)' if stale else '',
