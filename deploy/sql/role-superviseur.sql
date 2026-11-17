@@ -474,6 +474,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L159d (0061): shared host measure, numbers only
         'mem_total_bytes', 'psi_cpu_some', 'psi_mem_some', 'psi_mem_full',
         'psi_io_some', 'app_cpu', 'guest_cpu', 'cpu_window_s', 'guest_mem_bytes',
+        -- #7687 (0589): live offloaded jobs of a lending host, a number
+        'guest_jobs',
         'lendable_cpu', 'lendable_memory_bytes', 'lendable_disk_bytes',
         -- #246 (0067): btrfs allocation, numbers only
         'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes',

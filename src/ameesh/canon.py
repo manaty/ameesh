@@ -4477,16 +4477,20 @@ class _Loader:
                              **where, **subject)
                 policy.lend = offer
                 # #5905: a lending host runs guest jobs offloaded from other
-                # hosts, outside its own turns and leases. No interface counts
-                # them yet (C5): its runs stay unknown, and `none` there would
-                # turn a missing observation into a proven zero.
-                from .host_idle import RUNS_LENDING
-                if policy.runs_interface == "none":
+                # hosts, outside its own turns and leases. `none` there would
+                # turn a missing observation into a proven zero; #7687 adds
+                # `guest`, which counts the live offloaded jobs of the host
+                # measure. Without it the runs stay unknown.
+                from .host_idle import (RUNS_GUEST, RUNS_INVALID, RUNS_LENDING,
+                                        RUNS_NONE)
+                if policy.runs_interface == RUNS_NONE:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.runs_interface: none` on a lending host "
                              "(`policy.lend`): its offloaded guest jobs are runs "
-                             "that no interface counts yet", **where, **subject)
-                policy.runs_interface = RUNS_LENDING
+                             "that `none` would declare absent; use `guest`",
+                             **where, **subject)
+                if policy.runs_interface not in (RUNS_GUEST, RUNS_INVALID):
+                    policy.runs_interface = RUNS_LENDING
             # L101 : espace de travail et ménage, forme canonique
             # `policy.workspaces` ; les anciennes clés restent lues en alias.
             self._host_workspaces(raw, policy, where, subject)

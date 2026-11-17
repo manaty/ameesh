@@ -16,10 +16,13 @@ no cluster or cloud credential.
 * runs: they come from the host measure of part A (#4147, §2.1), never from
   the hook (`busy`, `draining`, `idle-drained` only, owner decision §3.3).
   A host declares them through `runs_interface` (Host card or the
-  `runs_interfaces` configuration, #5905): `none` makes zero a known count.
-  An undeclared host keeps a placeholder source that is unknown, never zero,
-  and forbids both the automatic drain and the idle-drained proof; the
-  scanner reports it (`host_release_no_runs`);
+  `runs_interfaces` configuration, #5905): `none` makes zero a known count;
+  `guest` (#7687) counts the live offloaded jobs of a lending host, and only
+  a fresh reading with a readable count proves zero. A lending host that
+  declares no interface, an undeclared host, a stale or unreadable count
+  keeps a placeholder source that is unknown, never zero, and forbids both
+  the automatic drain and the idle-drained proof; the scanner reports it
+  (`host_release_no_runs`);
 * failures keep the previous acknowledged state and the closed claims, and
   raise `host_release_failed` / `host_release_overdue`.
 * #5932: an adapter that accepts the transition asynchronously (the VM queue
@@ -1075,12 +1078,13 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
             continue
         host = lock["host"]
         detail = ("Host %s is idle and classified burst, but its run count is "
-                  "unknown (%s): the host declares no runs_interface, so the "
-                  "automatic release is refused (a run would be killed). Declare "
-                  "it on the Host card (`policy.runs_interface: none`) or in the "
-                  "configuration (`runs_interfaces`) once nothing runs there "
-                  "outside turns and leases (#5905, #4147); until then no "
-                  "automatic drain of a burst host. The lifecycle adapter is "
+                  "unknown (%s): the host declares no runs_interface, or its "
+                  "count is stale or unreadable, so the automatic release is "
+                  "refused (a run would be killed). Declare it on the Host card "
+                  "(`policy.runs_interface: none`, or `guest` on a lending host "
+                  "so its offloaded jobs are counted) or in the configuration "
+                  "(`runs_interfaces`); until then no automatic drain of a burst "
+                  "host (#5905, #7687, #4147). The lifecycle adapter is "
                   "configured and not at fault." % (
                       host, lock.get("blocked_source")
                       or host_idle.RUNS_UNDECLARED))

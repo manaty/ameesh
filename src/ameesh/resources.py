@@ -3,7 +3,8 @@
 
 Chaque exécuteur relève périodiquement l'état de son hôte — mémoire
 disponible, swap utilisé, charge CPU (1 minute), disque libre et allocation
-btrfs (#246) de chaque volume où l'hôte écrit (#253), tours en cours — et le publie
+btrfs (#246) de chaque volume où l'hôte écrit (#253), tours en cours, jobs
+déportés vivants d'un hôte prêteur (#7687) — et le publie
 en base (`host_resources`). `ameesh hosts` montre le dernier relevé de
 chaque hôte et l'historique court.
 
@@ -1018,6 +1019,111 @@ def guest_memory(cgroups: list[str] | None = None) -> int | None:
     return None if any(v is None for v in values) else sum(values)
 
 
+#: #7687: an offloaded job of a lending host owns one transient slice,
+#: `ameesh.slice/ameesh-job.slice/ameesh-job-<id>.slice` in the job's user
+#: manager (`platform.offload_shell.unit_names`), from its first phase until
+#: the shell closes it. The name is the whole marker: no other unit of the
+#: host starts with it.
+GUEST_JOB_PARTS = ("ameesh.slice", "ameesh-job.slice")
+GUEST_JOB_PREFIX = "ameesh-job-"
+GUEST_JOB_SUFFIX = ".slice"
+#: #7687: an empty job slice is ambiguous only while it is young. The offload
+#: shell opens its slice just after taking the concurrency slot, then may run
+#: a phase at any moment; an empty slice whose directory has not moved for
+#: this long is the leftover of a job whose shell died before `close_slice`
+#: (observed on ameesh-agents-3: two such slices named from 2026-11-11 were
+#: still there on 17/11). Ignoring it is what lets a lending host prove a zero
+#: again instead of staying unknown forever.
+GUEST_JOB_EMPTY_S = 300
+
+
+def _cgroup_populated(path: str) -> bool | None:
+    """`populated` of a cgroup (`cgroup.events`), None when unreadable."""
+    try:
+        with open(os.path.join(path, "cgroup.events"), encoding="utf-8") as fh:
+            for line in fh:
+                key, _, value = line.partition(" ")
+                if key == "populated":
+                    return value.strip() == "1"
+    except OSError:
+        return None
+    return None
+
+
+def _cgroup_age(path: str, now: float) -> float | None:
+    """Seconds since a job slice last changed, None when not provable.
+
+    The slice directory's mtime dates its last change: the offload shell's
+    phase scopes come and go inside it (`systemd-run --scope --slice`), which
+    updates it (measured on cgroupfs, 17/11: a scope stopped 2 s after the
+    slice appeared moved the directory's mtime, while `cgroup.events` kept its
+    creation time). A timestamp in the future counts as an activity now, never
+    as an old slice: an unknown clock must not turn a live job into a zero."""
+    try:
+        stamp = os.stat(path).st_mtime
+    except OSError:
+        return None
+    return max(0.0, float(now) - stamp)
+
+
+def guest_jobs(root: str | None = None, now: float | None = None) -> int | None:
+    """#7687: live offloaded jobs of this host, None when not provable.
+
+    A lending host (`policy.lend`, L159b) runs guest jobs offloaded from other
+    hosts, in the transient slices of its offload shell. A populated slice is
+    a live job. An **empty** job slice is ignored only once it is older than
+    [`GUEST_JOB_EMPTY_S`]: younger, the job may be between two phases (setup,
+    hook, command) and the slice never proves zero; older, it is the leftover
+    of a finished job whose slice was not removed. One gap remains, bounded by
+    that delay: a job that has taken its slot but still waits on its profile's
+    cache lock before its first phase has an empty slice too, and after the
+    delay is no longer counted (nothing runs in it yet). Zero is returned only
+    when every base of the cgroup tree was read and no live or ambiguous job
+    slice exists; an unreadable tree, or an unreadable slice, is None, never a
+    zero by default.
+
+    The count feeds the `guest` runs interface: the automatic drain of a
+    lending host and its `idle-drained` proof must see a known zero, or a
+    guest's job could be killed (#4147, #4148, #5905).
+    """
+    root = root or os.environ.get(CGROUP_ROOT_ENV) or platform.CGROUP_ROOT
+    now = time.time() if now is None else float(now)
+    live = 0
+    ambiguous = unreadable = False
+    for base in host_cgroup_bases(root):
+        parent = os.path.join(base, *GUEST_JOB_PARTS)
+        try:
+            entries = os.listdir(parent)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unreadable = True
+            continue
+        for name in entries:
+            if not (name.startswith(GUEST_JOB_PREFIX)
+                    and name.endswith(GUEST_JOB_SUFFIX)):
+                continue
+            path = os.path.join(parent, name)
+            if not os.path.isdir(path):
+                continue
+            populated = _cgroup_populated(path)
+            if populated is None:
+                unreadable = True
+            elif populated:
+                live += 1
+            else:
+                age = _cgroup_age(path, now)
+                if age is None or age < GUEST_JOB_EMPTY_S:
+                    ambiguous = True
+    # a positive count is enough for the drain (only a zero releases a host):
+    # unreadable extra slices cannot hide the work already counted
+    if live:
+        return live
+    if unreadable or ambiguous:
+        return None
+    return 0
+
+
 #: #2022 (0455): the process counts of a reading
 PROCESS_FIELDS = ("procs_total", "procs_zombie", "runner_procs", "runner_zombies")
 
@@ -1266,6 +1372,8 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     out.update(psi())
     cgroups = guest_cgroups()
     out["guest_mem_bytes"] = guest_memory(cgroups)
+    # #7687: the live offloaded jobs of a lending host, for `runs_interface`
+    out["guest_jobs"] = guest_jobs(now=out["sampled_ts"])
     out.update(_CPU_METER.read(cgroups=cgroups))
     # #2814 : la mesure du cgroup de CE processus, publiée avec le relevé ;
     # elle sert l'admission (`own_cgroup`) et `ameesh hosts` sur un conteneur
