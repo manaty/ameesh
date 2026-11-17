@@ -43,7 +43,7 @@ EXAMPLE = "src/ameesh/example.py"
 
 def reader_keys() -> set[str]:
     """Les clés du schéma, dérivées des constantes du lecteur strict."""
-    keys = {"schema", "timezone", "cutoffs", "projects", "repair_policy"}
+    keys = {"schema", "timezone", "cutoffs", "projects", "repair_policy", "prod_go_max_hours"}
     for block, names in (
             ("packets", mechanics._PACKETS_KEYS),
             ("build", mechanics._BUILD_KEYS),
@@ -81,7 +81,8 @@ class SchemaCoverageTest(unittest.TestCase):
                          {"schema", "timezone", "cutoffs", "packets", "build",
                           "ci", "reviews", "merge", "prevalidation", "backlog",
                           "staging", "accounts", "paquet", "packet_tests",
-                          "file", "session", "auto_take", "projects"})
+                          "file", "session", "auto_take", "projects",
+                          "prod_go_max_hours"})
         # #3022/#6179 : les blocs propres aux projets restent couverts par
         # leurs clés ci-dessus, sans entrer dans le schéma du document global.
         self.assertLessEqual(set(mechanics._OVERRIDE_KEYS),
@@ -100,6 +101,7 @@ class SchemaCoverageTest(unittest.TestCase):
 #: qu'elle produit bien un constat pour cette clé : aucune clé ne peut être
 #: déclarée couverte sans que sa règle existe.
 POSITIVE = {
+    "prod_go_max_hours": "PROD_GO_MAX_HOURS = 24\n",
     "repair_policy": 'REPAIR_POLICY = {"schema": "repair-policy/1", "paused": False, "rules": []}\n',
     "repair_policy.schema": 'repair_policy_schema = "repair-policy/1"\n',
     "repair_policy.paused": 'repair_policy_paused = False\n',

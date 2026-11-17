@@ -165,12 +165,37 @@ class ScriptTest(unittest.TestCase):
                   for arg in args if arg.startswith("tests.")]
         self.assertTrue(nommes)
         for ident in nommes:
-            module, classe = ident.rsplit(".", 1)
-            fichier = REPO.joinpath(*module.split(".")).with_suffix(".py")
-            self.assertTrue(fichier.is_file(), ident)
-            classes = {n.name for n in ast.parse(fichier.read_text(encoding="utf-8")).body
-                       if isinstance(n, ast.ClassDef)}
-            self.assertIn(classe, classes, ident)
+            with self.subTest(ident=ident):
+                self.assertTrue(self.named_test_exists(ident), ident)
+
+    def named_test_exists(self, ident: str) -> bool:
+        """Module + classe, ou module + classe + méthode (#7736).
+
+        Les contrôles de gel nomment d'abord des classes entières ; #7736 en
+        nomme une méthode (`MapTest.test_always_list_sorted_and_known`) parce
+        que la classe entière est une mesure de carte trop lente pour le gel.
+        La méthode doit exister, sinon `unittest` rendrait 0 sur zéro test."""
+        parts = ident.split(".")
+        for cut in range(len(parts) - 1, 0, -1):
+            fichier = REPO.joinpath(*parts[:cut]).with_suffix(".py")
+            if fichier.is_file():
+                break
+        else:
+            return False
+        try:
+            tree = ast.parse(fichier.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            return False
+        classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        reste = parts[cut:]
+        if not reste or reste[0] not in classes:
+            return False
+        if len(reste) == 1:
+            return True
+        if len(reste) != 2:
+            return False
+        return any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and n.name == reste[1] for n in classes[reste[0]].body)
 
     def test_rouge_rend_un_et_montre_sa_sortie(self):
         code, out = self.main(self.tree(), (

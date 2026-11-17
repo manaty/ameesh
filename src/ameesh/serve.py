@@ -71,7 +71,9 @@ import time
 import urllib.parse
 from typing import Callable
 
-from . import events, httpkit, serve_actions, server_faults, storage, turn_observation, sandbox_observation, version
+from . import (agent_observation, events, httpkit, serve_actions,
+               server_faults, storage, turn_observation, sandbox_observation,
+               version)
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -273,6 +275,21 @@ def _agent(ctx: Context, db, params, query) -> dict:
     return {"schema": "ameesh-agent-detail/1", "agent": row}
 
 
+def _agent_observation(ctx: Context, db, params, query) -> dict:
+    """#7636 E1b: the admitted profile, lease, bounds and redacted budget.
+
+    Read-only and closed projection: the builder opens its own repeatable-read
+    read-only transaction and lists every returned field; no prompt, path,
+    credential or raw registry row is exposed."""
+    try:
+        return agent_observation.observe(
+            db, params["agent"], cfg=ctx.cfg,
+            account_profile=_one(query, "account_profile"),
+            sees=ctx.sees)
+    except agent_observation.Unknown as exc:
+        raise ApiError(404, "not_found", str(exc)) from exc
+
+
 def _agent_peek(ctx: Context, db, params, query) -> dict:
     from . import agent_peek
     try:
@@ -467,6 +484,13 @@ ROUTES = (
           "Responsible human's agent summary (`ameesh agent peek`)", _agent_peek,
           query=(("limit", {"type": "integer", "minimum": 1, "maximum": 50},
                   "latest public messages and tool summaries (default 10)"),)),
+    Route(API + "/agents/{agent}/observation", "ameesh-agent-observation/1",
+          "One agent's admitted profile, lease, bounds and redacted budget "
+          "(`ameesh agent observe`, read-only, contract E1b)", _agent_observation,
+          query=(("account_profile", {"type": "string"},
+                  "declared account profile whose envelope is reported; "
+                  "otherwise the session's recorded account, then the single "
+                  "declared profile"),)),
     Route(API + "/agents/{agent}/chat", "ameesh-conversation/1",
           "An agent's shared conversation (`ameesh chat <agent>`, L78/L83)", _chat,
           query=(("after", {"type": "integer", "minimum": 0},
@@ -728,6 +752,119 @@ _OBSERVATION = _obj(
     quiescent={"type": "boolean"},
 )
 
+#: #7636 E1b: the admitted profile, lease, bounds and redacted budget
+#: (`ameesh agent observe`, `GET /api/v1/agents/{agent}/observation`). Closed
+#: projection: the builder lists every field, and an absent fact is null with
+#: a code in `missing`, never an empty object or a zero amount.
+_AGENT_OBS_AGENT = _obj(
+    None,
+    ["name", "status", "status_text", "status_since_ts", "mode", "retired",
+     "stop_reason", "ephemeral", "ephemeral_expires_ts"],
+    name=_STR, status=_STR, status_text=_STR_NULL,
+    status_since_ts=_NUM_NULL, mode={"enum": ["execute", "externe"]},
+    retired={"type": "boolean"}, stop_reason=_STR_NULL,
+    ephemeral={"type": "boolean"}, ephemeral_expires_ts=_NUM_NULL)
+_AGENT_OBS_PROFILE = _obj(
+    None,
+    ["responsible", "host", "harness", "model", "provider", "credential_mode",
+     "capabilities", "canon", "canon_ref", "session"],
+    responsible=_STR_NULL, host=_STR_NULL, harness=_STR_NULL, model=_STR_NULL,
+    provider=_STR_NULL, credential_mode=_STR_NULL,
+    capabilities={"type": "array", "items": _STR},
+    canon=_STR_NULL, canon_ref=_STR_NULL,
+    session=_nullable_obj(["id", "harness", "account"], id=_STR_NULL,
+                          harness=_STR_NULL, account=_STR_NULL))
+_AGENT_OBS_ADMISSION = _obj(
+    None,
+    ["admitted", "claim_predicate", "governed", "responsible_required",
+     "reasons"],
+    admitted={"type": ["boolean", "null"]},
+    claim_predicate={"type": "boolean"},
+    governed={"type": "boolean"},
+    responsible_required={"type": ["boolean", "null"]},
+    reasons={"type": "array", "items": {
+        "type": "string", "enum": list(agent_observation.REASONS)}})
+_AGENT_OBS_CANON = _nullable_obj(
+    ["name", "state", "last_good_commit", "checked_ts", "age_s", "max_age_s",
+     "fresh", "ref_commit", "ref_matches", "diagnostic"],
+    name=_STR,
+    state={"type": ["string", "null"],
+           "enum": ["ok", "invalid", "unreadable", None]},
+    last_good_commit=_STR_NULL, checked_ts=_NUM_NULL, age_s=_NUM_NULL,
+    max_age_s=_NUM, fresh={"type": "boolean"}, ref_commit=_STR_NULL,
+    ref_matches={"type": "boolean"}, diagnostic=_STR_NULL)
+_AGENT_OBS_PLACEMENT = _obj(
+    None, ["ok", "ref", "profile", "current", "profile_ok", "diagnostic"],
+    ok={"type": ["boolean", "null"]}, ref=_STR_NULL, profile=_STR_NULL,
+    current=_STR_NULL, profile_ok={"type": ["boolean", "null"]},
+    diagnostic=_STR_NULL)
+_AGENT_OBS_LEASE = _obj(
+    None, ["owner", "epoch", "live", "expires_ts", "since_ts",
+           "turn_in_progress"],
+    owner=_STR_NULL, epoch=_INT_NULL, live={"type": "boolean"},
+    expires_ts=_NUM_NULL, since_ts=_NUM_NULL,
+    turn_in_progress={"type": "boolean"})
+_AGENT_OBS_DECLARED = _obj(
+    None,
+    ["context_max_tokens", "turn_max_seconds", "turn_mail_max",
+     "turn_grace_seconds", "session_policy", "session_max_tokens",
+     "turn_reread_budget", "session_reread_budget", "compact_tokens"],
+    context_max_tokens=_INT_NULL, turn_max_seconds=_INT_NULL,
+    turn_mail_max=_INT_NULL, turn_grace_seconds=_INT_NULL,
+    session_policy=_STR_NULL, session_max_tokens=_INT_NULL,
+    turn_reread_budget=_INT_NULL, session_reread_budget=_INT_NULL,
+    compact_tokens=_INT_NULL)
+_AGENT_OBS_EFFECTIVE = _obj(
+    None,
+    ["context_max_tokens", "turn_max_seconds", "turn_mail_max",
+     "turn_grace_seconds", "session_policy", "session_max_tokens",
+     "turn_reread_budget", "session_reread_budget", "compact_tokens"],
+    context_max_tokens={"type": "integer"},
+    turn_max_seconds={"type": "integer"},
+    turn_mail_max={"type": "integer"},
+    turn_grace_seconds={"type": "integer"},
+    session_policy=_STR, session_max_tokens=_INT_NULL,
+    turn_reread_budget={"type": "integer"},
+    session_reread_budget={"type": "integer"}, compact_tokens=_INT_NULL)
+_AGENT_OBS_LIMITS = _obj(
+    None, ["host", "available", "declared", "effective"],
+    host=_STR_NULL, available={"type": "boolean"}, declared=_AGENT_OBS_DECLARED,
+    effective=dict(_AGENT_OBS_EFFECTIVE, type=["object", "null"]))
+_AGENT_OBS_BUDGET = _obj(
+    None,
+    ["account_profile", "billing_account", "available", "reason",
+     "reserve_usd", "limit_usd", "settled_usd", "reserved_usd", "kept_usd",
+     "used_usd", "remaining_usd", "admitted", "period", "timezone",
+     "reset_ts"],
+    account_profile=_STR_NULL, billing_account=_STR_NULL,
+    available={"type": "boolean"},
+    reason={"type": ["string", "null"],
+            "enum": list(agent_observation.BUDGET_REASONS) + [None]},
+    reserve_usd=_NUM_NULL, limit_usd=_NUM_NULL, settled_usd=_NUM_NULL,
+    reserved_usd=_NUM_NULL, kept_usd=_NUM_NULL, used_usd=_NUM_NULL,
+    remaining_usd=_NUM_NULL, admitted={"type": ["boolean", "null"]},
+    period=_STR_NULL, timezone=_STR_NULL, reset_ts=_NUM_NULL)
+_AGENT_OBS_NATIVE = _obj(
+    None, ["turn", "sandbox"],
+    turn=_nullable_obj(
+        ["turn_id", "spend_key", "model", "work_item_id", "created_ts",
+         "ledger_ambiguous"],
+        turn_id=_STR_NULL, spend_key=_STR_NULL, model=_STR_NULL,
+        work_item_id=_STR_NULL, created_ts=_NUM_NULL,
+        ledger_ambiguous={"type": "boolean"}),
+    sandbox=dict(_SANDBOX, type=["object", "null"]))
+_AGENT_OBSERVATION = _obj(
+    "ameesh-agent-observation/1",
+    ["observed_ts", "agent", "profile", "admission", "canon", "placement",
+     "lease", "limits", "budget", "native", "missing"],
+    observed_ts=_NUM, agent=_AGENT_OBS_AGENT, profile=_AGENT_OBS_PROFILE,
+    admission=_AGENT_OBS_ADMISSION, canon=_AGENT_OBS_CANON,
+    placement=_AGENT_OBS_PLACEMENT, lease=_AGENT_OBS_LEASE,
+    limits=_AGENT_OBS_LIMITS, budget=_AGENT_OBS_BUDGET,
+    native=_AGENT_OBS_NATIVE,
+    missing={"type": "array", "items": {
+        "type": "string", "enum": list(agent_observation.MISSING)}})
+
 #: the response schemas: the keys every response carries (the objects they
 #: hold are the CLI's, documented in docs/EXPLOITATION.md and docs/PROGRESS.md)
 SCHEMAS = {
@@ -774,6 +911,7 @@ SCHEMAS = {
         id={"type": "integer"}, title=_STR, state=_STR, events=_LIST, milestones=_LIST,
         planned=_OBJ)),
     "ameesh-turn-observation/1": _OBSERVATION,
+    "ameesh-agent-observation/1": _AGENT_OBSERVATION,
     "ameesh-decisions/1": _obj("ameesh-decisions/1", ["requests", "prose", "approvals"],
                                requests=_LIST, prose=_LIST, approvals=_LIST),
     "ameesh-alerts/1": _obj("ameesh-alerts/1", ["alerts"], alerts={

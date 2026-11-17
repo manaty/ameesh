@@ -1,0 +1,273 @@
+# Paramètres mécaniques du processus de lot (#1606 §7, lots ameesh #1616 et
+# #1757).
+#
+# Un bloc par règle mécanique : coupures de release et paquets horaires, fuseau,
+# plafond de lots en développement, CI par paquet et étiquette d'incident,
+# familles et indépendance des avis, seuil de rotation de session par harnais.
+# Les classes sensibles et le nombre d'avis
+# par chemin ne sont pas répétés ici : ils viennent de `federation.yaml`
+# (`review_policies.risk_classes` et `review_policies.train_reviews`), lus au
+# même commit exact.
+#
+# Lu par `ameesh canon sync` (constat, jamais bloquant) et compilé par le
+# lecteur strict `ameesh.mechanics` (#1616) : aucun repli. Une règle absente,
+# inconnue ou mal formée fait refuser le consommateur raccordé, et un paramètre
+# de processus codé en dur dans un consommateur est refusé par la CI.
+schema: ameesh-mechanics/2
+
+# #7726 : fenêtre maximale des attestations owner prod-go/1 (heures).
+# Absence = export et autorisation de production refusés, jamais un repli local.
+prod_go_max_hours: 24
+
+# Coupures de release, en heure locale du fuseau ci-dessous : à 11:00 et 23:00,
+# la tête de la cible est taguée et déployée en staging, sans agent (canon
+# §11 bis). Les paquets horaires, qui composent et fusionnent chaque heure, sont
+# déclarés séparément dans `packets.cutoffs` — jamais déduits d'une durée.
+timezone: Europe/Paris
+cutoffs: ["11:00", "23:00"]
+
+# Paquets horaires (#1467, canon §11 bis horaire du 15/10/2026, home#94) : un
+# créneau par heure locale, distinct des coupures de release ci-dessus. Chaque
+# heure, un petit paquet des lots prêts est composé, passe une CI complète et est
+# fusionné dès le vert. Le calendrier suit le fuseau : 23 créneaux le jour du
+# passage à l'heure d'été (02:00 n'existe pas, il est sauté), 25 le jour du
+# passage à l'heure d'hiver (02:00 existe deux fois, distingué par l'epoch).
+# Bloc absent = aucune cadence : le consommateur refuse `last_packet` et
+# `next_packet`, et ne retombe jamais sur `cutoffs` ni sur une durée locale.
+# Depuis la décision owner #154026 a (28/10/2026), le paquet suivant part dès
+# la fusion du précédent si un lot est prêt ; ces créneaux restent le rythme
+# minimum, plus un passage obligé (canon §11 bis ; déclencheur : lot ameesh #4123).
+packets:
+  cutoffs:
+    - "00:00"
+    - "01:00"
+    - "02:00"
+    - "03:00"
+    - "04:00"
+    - "05:00"
+    - "06:00"
+    - "07:00"
+    - "08:00"
+    - "09:00"
+    - "10:00"
+    - "11:00"
+    - "12:00"
+    - "13:00"
+    - "14:00"
+    - "15:00"
+    - "16:00"
+    - "17:00"
+    - "18:00"
+    - "19:00"
+    - "20:00"
+    - "21:00"
+    - "22:00"
+    - "23:00"
+
+# Au plus 2 lots en développement par agent (owner, 14/10/2026 22:55).
+build:
+  max_in_build: 2
+
+# CI : la suite complète tourne sur le paquet d'une coupure, jamais sur une
+# branche de lot. La valeur d'`incident_label` ci-dessous, `ci-full`, est le
+# préfixe de la demande de suite complète `ci-full-<sha>`, dont la forme vient
+# d'`ameesh ci run` (tête gelée) et de `.github/workflows/tests.yml` (#1343) ;
+# entre deux coupures, la CI d'un lot (`ci-lot-<sha>`) n'est permise que sur
+# exception — incident ou déblocage de la CI — déclarée dans la note du lot
+# (`ameesh ci run --exception incident|unblock`, #2333 ; canon §3 et §11 bis),
+# `--full` n'étant jamais refusé. Allègements du
+# 15/10/2026 14:45 : un test rouge seulement en CI et vert en local ne bloque
+# pas la release (marqué « dépendant de l'environnement », corrigé ensuite par
+# un lot), et un lot fautif est retiré du paquet sans nouvelle relecture du
+# reste.
+ci:
+  packet: full
+  incident_label: ci-full
+  environment_red: does_not_block
+  faulty_lot: removed_without_new_review
+
+# Fusion du paquet (§11 bis, allègements du 15/10/2026 14:45) : dès que la
+# suite complète est verte sur la tête du paquet, le pilote (ou le train
+# automatique) ou le bureau fusionne ; aucun feu nominatif quand les verdicts
+# sont acquis, pas de gel répété, et un rouge découvert après fusion se corrige
+# en avant ou par un revert, sans geler la branche.
+merge:
+  named_fire: false
+  repeat_freeze: false
+  on_green_packet: true
+  post_merge_red: forward_or_revert
+
+# Tests ciblés des unités d'un paquet (lot ameesh #4271, posé par #4453) :
+# paquet-horaire les passe à paquet-auto (`--tests-parallel`,
+# `--tests-timeout`). Bloc absent = séries jouées l'une après l'autre, bornée
+# chacune à 1800 s (le tic de h-11, #4440, 14 unités, encore actif après
+# 41 min le 29/10). `parallel` = séries simultanées, chacune dans un créneau
+# `ameesh heavy` : 2 = le plafond par défaut d'un hôte du tic (agents-1 ou
+# agents-2, 8 vCPU / 4), sous le seuil de pression des hôtes (20 % CPU).
+# `unit_timeout_seconds` borne une série : au-delà, non concluant (canon §3),
+# la CI complète du paquet couvre. 1200 s : au-dessus de toutes les durées
+# relevées sur agents-1 (série des contrats 703 s le 28/10 à 23:59, unités de
+# h-11 de 905 à 1011 s), avec ~19 % de marge ; une borne plus basse rendrait
+# ces séries non concluantes à chaque paquet (pilote, #4453).
+# `total_timeout_seconds` borne la durée totale des tests par unité d'une
+# composition, attente du créneau `ameesh heavy` comprise : chaque série est
+# bornée au temps restant, celles qui ne partent plus sont non concluantes
+# (canon §3, #4463), rien n'est retiré et le tic suivant peut partir. 1800 s
+# (30 min) : sous les 41 min du tic de 00:50Z (paquet h-02 fusionné à 01:23Z,
+# encore en tests à 01:32Z le 30/10) qui retenait h-03, et au-dessus du
+# plafond d'une série (1200 s) ; même cas h-12 et h-14 le 29/10
+# (2026-10-30, #4762, pilote). La garde de fusion arrête déjà les séries non
+# parties ; cette borne couvre celle qui court.
+# Passe contrats avant poussée (unité D, #6182 ; canon lots.md §6) : 12 à
+# 13 min de la composition au résultat sur neuf paquets (h-20261110-06 à
+# h-20261111-13, 1 à 9 unités), sous `unit_timeout_seconds`, environ 35 %
+# de marge. Pas de clé propre (`contracts_timeout_seconds`) tant qu'une
+# passe réelle n'approche pas 1200 s (2026-11-11, #6235, pilote).
+packet_tests:
+  unit_timeout_seconds: 1200
+  parallel: 2
+  total_timeout_seconds: 1800
+
+# Familles de modèle et indépendance des avis (canon §2) : un avis ne vient
+# jamais de la famille de l'auteur, et deux avis viennent de deux familles
+# distinctes. Le nombre d'avis par chemin — un hors auteur par défaut, deux
+# pour droits SQL, secrets, paiement et déploiement en prod réelle (§11 bis,
+# allègements du 15/10/2026 14:45), et pour la porte CI et la porte de fusion
+# (l.33/l.141, expire 2026-12-12) — vient de `federation.yaml`
+# (`review_policies.train_reviews`), lu au même commit exact. Le plancher d'un
+# lot léger est la seule exception : `reviews.light_reviews` est une règle de
+# processus, pas un nombre d'avis par chemin.
+reviews:
+  families: [claude, codex, deepseek]
+  exclude_author_family: true
+  distinct_families: true
+  # Canon §2 : un lot léger demande les tests ciblés et un avis d'une autre
+  # famille, puis entre au paquet (lot ameesh #2642). C'est le plancher de la
+  # classe légère, pas un nombre d'avis par chemin : une règle `**` porterait
+  # reviews: 1 et reclasserait tout chemin en sensible (piège de la porte).
+  light_reviews: 1
+
+# Surcharges par projet : un bloc présent remplace le bloc global pour ce
+# projet. Déclarer un projet ici ne l'active pas ; l'activation reste un geste
+# de pilote.
+# Prévalidation au gel (#1770, owner 19/10/2026 vers 02:30 : « je fais les trois ? » → ok).
+# `ameesh work prevalidate` lance sur une VM d'agents les tests liés au diff
+# (plan L161f, classes ci-dessous, plus les contrats toujours inclus) et écrit
+# un rapport par (lot, tête). L'accroche automatique au gel reste inactive :
+# la commande est explicite. Valeurs de l'étude docs/design/etudes/1770.
+prevalidation:
+  classes: [P0, P1]
+  contracts: [tests/parts/toujours.txt]
+  # 2026-10-28 (#4108, signalement qa-01 #153915, décision mesh-design) :
+  # agents-3 seul porte le guest d'offload (#4011). Retrait du repli agents-1,
+  # sans guest ni accès SSH ; les suites de branches restent hors de l'hôte
+  # des rôles critiques. agents-3 indisponible = prévalidation indisponible.
+  hosts: [ameesh-agents-3]
+  timeout_seconds: 3600
+  parts_script: scripts/test-parts.py
+
+# Panier du backlog (canon §2 l.29 et l.128, owner 19/10/2026 vers 02:30,
+# home#119) : un défaut non bloquant va au panier de son chantier et ne devient
+# un lot qu'à partir de cette valeur (score 1 à 100). Lu par `ameesh work
+# backlog add` (#2584) ; bloc absent = route du panier inactive. Clé connue du
+# lecteur strict depuis v1.13.0 (lot #2697).
+backlog:
+  lot_min_value: 30
+
+# Staging hors créneau (canon §11 bis, lot ameesh #7203) : dès
+# `waiting_lots_min` lots en attente d'un correctif fusionné non déployé, le
+# pilote ou le bureau déploie la tête verte en staging sans tag, au moins
+# `before_cutoff_seconds` avant une coupure et plus de
+# `before_packet_seconds` avant un paquet. Lu par `ameesh release tick` et
+# `ameesh release staging-needed` (#3291) ; bloc absent = relevé `off`, sans
+# seuil supposé. Clé connue du lecteur strict depuis v1.21.0 (lot #3291) :
+# à fusionner seulement quand ce lecteur tourne sur tous les hôtes, un lecteur
+# plus ancien refuse la clé inconnue. Au 13/11/2026, v1.51.0 (759fdd39e649)
+# est actif sur ameesh-agents-1/2/3 (attestation du 12/11 23:02Z) ;
+# pc-smichea et manaty-mesh-1 y sont reportés absents et reçoivent le lecteur
+# à leur retour avant de reprendre (canon §14).
+staging:
+  waiting_lots_min: 3
+  before_cutoff_seconds: 1200
+  before_packet_seconds: 600
+
+# File à remplir quand la capacité est là (#3256, canon §4, owner 28/10/2026) :
+# au moins `repos_part` des agents réveillables d'un projet au repos depuis
+# `repos_s` secondes, sans lot démarrable -> lot de découpage au pilote, repli
+# auditeur à 1 h ; le même seuil fait sortir `ameesh debit --check` en 2.
+# À fusionner seulement quand le lecteur qui connaît `file` (manaty/ameesh#3266)
+# tourne sur tous les hôtes : un lecteur plus ancien refuse la clé inconnue.
+file:
+  repos_part: 0.20
+  repos_s: 1800
+
+# Rythme des comptes de forfait (#3647, canon §11 « Forfait sous-utilisé »,
+# décision owner #141793 a du 26/10/2026, approbation #119) : quand `ameesh
+# accounts` prévoit une perte au reset au-delà de `underused_loss`, le rythme de
+# la fenêtre est relevé, sans dépasser les plafonds fixes, jamais d'overage.
+# `pace_multipliers` : ×1 pour un compte absent. Codex primaire ×2 tant que le
+# voucher de reset intégral reste disponible (§11), à retirer de ce bloc à son
+# application constatée. Ce bloc remplace les multiplicateurs locaux des hôtes.
+# Clé connue du lecteur strict depuis v1.24.0.
+accounts:
+  pace_multipliers:
+    codex:
+      primaire: 2.0
+  underused_loss: 0.5
+
+# Routage temporaire home#232 retiré par le bureau le 31/10/2026
+# (courrier #175240, 13:52Z, retrait de ses #170717/#170722 après recharge DeepSeek).
+
+# Rotation de session (0018/L11, lot ameesh #4448, propositions 8a/8c de
+# l'analyse profonde de l'auditeur #160781) : la rotation sur la taille compare
+# les jetons cumulés de la session au seuil du harnais du dernier tour.
+# `max_tokens` est la valeur commune ; chaque clé de `max_tokens_by_harness`
+# doit être une famille déclarée ci-dessus (`reviews.families`) ; un harnais
+# sans surcharge prend la valeur commune.
+# Mesure du 29/10/2026 (24 h, 209 sessions des relecteurs codex cx1/2/3 et
+# codex1/2/3) : premier tour — médiane 314 k jetons, p75 593 k, p90 1,12 M,
+# p95 1,72 M, p99 4,64 M. 2 M couvre 95 % des premiers tours ; avec le cumul
+# corrigé (Codex publie un usage cumulé), les sessions franchissant le seuil
+# au minimum de 3 tours passent de 203 à 78 sur la même journée. Les autres
+# harnais gardent la commune tant qu'aucune mesure ne justifie une surcharge.
+# Clé connue du lecteur strict depuis v1.29.0 (lot #4448).
+session:
+  max_tokens: 150000
+  max_tokens_by_harness:
+    codex: 2000000
+
+# Politique d'auto-réparation A5 (canon §16 ; étude #6308 §A5 ; lecteur #6636,
+# entrée #6637) : décision owner #204329 b (signée, approbation #294) — schéma
+# `repair-policy/1` inscrit avec une politique VIDE pour ameesh : observation
+# et triage seulement, aucune réparation automatique admise. Les règles se
+# tranchent après le bilan de 7 jours d'observation (#6639), sur nouvelle
+# décision owner. `paused` est l'interrupteur durable des admissions nouvelles.
+# Clé connue du lecteur strict depuis le commit 4e36c68e (lot #6636, fusion
+# d5e667d1) : à fusionner seulement quand ce lecteur tourne sur tous les hôtes,
+# un lecteur plus ancien refuse la clé inconnue.
+projects:
+  # #7726 : cible prod Nexlink (canon §15), avant activation de la garde.
+  nexlink:
+    production:
+      branch: main
+  ameesh:
+    # Canon §14 : staging du mesh, aucune production. Lecteur #7726 requis.
+    production: none
+    # `contract_selection` (versionnement, #6179 ; lot #6932) : registre
+    # tests/parts/contrats.json. Un chemin hors règle garde la CI complète
+    # du paquet, mais la passe contrats et la prévalidation restent legacy ∪
+    # règles appariées (#6931, actif en staging). Mesure du 11/11 sur h-16
+    # (6b178ed5c..9355447e7), politique active, --local-map : 40 contrats
+    # (inventaire : 1353), passe réelle verte en 684 s (parallel 2), sous
+    # `unit_timeout_seconds` 1200 avec ~43 % de marge ; plus long module
+    # test_503_agent_host (684 s). `attestation_max_age_seconds` : 3600
+    # (clé de G, #6185, proposition cx2). Lecteurs tous en 1.47.0 ou plus.
+    # (2026-11-11, #6235, #6932)
+    contract_selection:
+      registry: tests/parts/contrats.json
+      publish: contracts-first
+      attestation_max_age_seconds: 3600
+    repair_policy:
+      schema: repair-policy/1
+      paused: false
+      rules: []

@@ -35,6 +35,16 @@ la seconde) sont cherchées sur la suite, pour ne pas noyer le signal sous les
 constats déjà présents (#5302, #5321, #5607). Le gel n'est pas une CI (§3) :
 le constat est montré, il ne refuse jamais le gel.
 
+#7736 : les quatre témoins d'inventaire (liste « toujours », registre des
+contrats, clés de la garde mécanique, table L107) ne tournaient qu'en CI de
+paquet : le paquet h-08 a coûté quatre rouges et une CI complète abandonnée.
+[`COHERENCE_CHECKS`] les passe au gel, sur la tête gelée, avant la relecture ;
+chacun dure moins d'une seconde. `test_l161f_plan` est trop lourd en entier :
+seule la méthode qui tient la liste attendue tourne. Le pilote a étendu le
+périmètre à l'inventaire des types clients (#4887) : `scripts/garde-types-clients.py`
+refuse une spec OpenAPI changée sans le schéma généré (`gen-api --check` quand
+`node` et les modules du cache sont là, garde statique sinon).
+
 Usage : scripts/freeze-checks.py   (à la racine d'un arbre ameesh)
 Sortie : 0 tous verts, 1 au moins un rouge, 2 hors d'un arbre ameesh.
 """
@@ -48,7 +58,29 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-#: (nom, arguments de l'interpréteur) ; un `unittest` nomme des classes de la suite
+#: #7736 : les témoins d'inventaire qui ne tournaient qu'en CI de paquet. Un
+#: lot qui ajoute un module de contrat, une clé mécanique ou une opération de
+#: stockage sans tenir l'inventaire correspondant est refusé au gel, avec le
+#: nom du témoin, au lieu de faire tomber le paquet une heure plus tard. Ils
+#: sont sans base et courts (moins d'une seconde chacun) ; `MapTest` ne tourne
+#: que par la méthode qui tient la liste attendue, le reste de la classe étant
+#: une mesure de carte.
+COHERENCE_CHECKS = (
+    # #7630 : la liste attendue du plan doit suivre `toujours.txt`
+    ("liste « toujours » #7630", ["-m", "unittest", "-q",
+                                  "tests.test_l161f_plan.MapTest.test_always_list_sorted_and_known"]),
+    # #7726 : le registre universel et la liste « toujours » sont égaux
+    ("registre des contrats #7726", ["-m", "unittest", "-q",
+                                     "tests.test_contract_registry_ameesh.AmeeshRegistryTests"]),
+    # #7726 : une clé mécanique lue sans être couverte par la garde
+    ("couverture de la garde #2449", ["-m", "unittest", "-q",
+                                      "tests.test_2449_garde_mecanique.SchemaCoverageTest"]),
+    # #7671 : toute opération de l'interface de stockage est classée
+    ("table L107 #7671", ["-m", "unittest", "-q",
+                          "tests.test_l107_executor_contract.TableTest"]),
+)
+#: (nom, arguments de l'interpréteur) ; un `unittest` nomme des classes ou
+#: des méthodes de la suite
 CHECKS = (
     # #2809/#2449 : refuser les paramètres du canon codés en dur avant la relecture
     ("garde mécanique #2449", ["scripts/garde-mecanique.py", "--root", "."]),
@@ -80,6 +112,10 @@ CHECKS = (
     # L161a : un module qui lit docs/ ou site/ est déclaré lecteur de la doc
     ("doc readers L161a", ["-m", "unittest", "-q",
                            "tests.test_l161a_ci_sans_code.ReadersTest"]),
+    # #4887/#7736 : une spec OpenAPI changée sans le schéma client généré a
+    # coûté deux compositions (h-08 #7670, h-09 #7630) ; la CI le refusait
+    # seulement après le gel.
+    ("types clients #4887", ["scripts/garde-types-clients.py"]),
     # #4521 : un alias `sys.modules` vers une implémentation de module ne peut
     # pas tomber dans une classe de relecture plus faible que son ancien chemin
     # (les `modules/dev/**` déplacés par L100 tombent au défaut léger).
@@ -91,7 +127,7 @@ CHECKS = (
     ("alias de module #4521 (politique épinglée)",
      ["scripts/garde-alias-classe.py", "--root", ".",
       "--check-policy", "scripts/alias-review-classes.json"]),
-)
+) + COHERENCE_CHECKS
 #: #5427 : les contrôles qui **avertissent sans bloquer** le gel. Le lint
 #: d'herméticité tourne sur les tests que le lot change quand le garde
 #: transmet le diff (toutes règles), sinon sur la suite entière avec les seules
