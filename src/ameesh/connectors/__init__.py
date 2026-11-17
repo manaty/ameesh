@@ -97,6 +97,34 @@ class Connector(Protocol):
     def reconcile(self, action: Action) -> Optional[Outcome]: ...
 
 
+@dataclass(frozen=True)
+class ModuleConnector:
+    """An installed connector keeps its provider when the registry changes."""
+    provider: str
+    inner: Connector
+
+    @property
+    def name(self):
+        return self.inner.name
+
+    @property
+    def dedupe(self):
+        return self.inner.dedupe
+
+    @property
+    def timeout(self):
+        return timeout_of(self.inner)
+
+    def classify(self, operation, args):
+        return self.inner.classify(operation, args)
+
+    def execute(self, action, idempotency_key):
+        return self.inner.execute(action, idempotency_key)
+
+    def reconcile(self, action):
+        return self.inner.reconcile(action)
+
+
 def timeout_of(connector) -> float:
     value = getattr(connector, "timeout", None)
     try:
@@ -108,7 +136,9 @@ def timeout_of(connector) -> float:
 
 def check(connector) -> None:
     """Refuse un objet qui ne respecte pas le protocole (avant toute écriture)."""
-    if not isinstance(connector, Connector):
+    if (not isinstance(connector, Connector)
+            or any(not callable(getattr(connector, method, None))
+                   for method in ("classify", "execute", "reconcile"))):
         raise ConnectorError("object %r: not a connector (name, dedupe, classify, execute, "
                              "reconcile)" % (connector,))
     if getattr(connector, "dedupe", None) not in DEDUPE:
@@ -120,8 +150,8 @@ def check(connector) -> None:
 #: module registry (the development module declares `git-merge`, L100 T1 #4382)
 CORE_NAMES = ("shell-noop",)
 
-#: connectors `ameesh action propose` accepts (`--connector` choices); the
-#: registry remains authoritative for the implementation
+#: Historical names kept for callers; the CLI resolves installed module names
+#: through the registry rather than fixing this list as parser choices.
 NAMES = ("shell-noop", "git-merge")
 
 
@@ -138,4 +168,10 @@ def get(name: str, **options) -> Connector:
         raise ConnectorError("unknown connector: %r (known: %s)"
                              % (name, ", ".join(sorted([*CORE_NAMES, *found]))))
     _provider, connector = entry
-    return connector(**options)
+    instance = connector(**options)
+    check(instance)
+    if instance.name != name:
+        raise ConnectorError("module connector %r declares name %r" % (name, instance.name))
+    if name == "git-merge":
+        return instance  # Existing development API and aliases remain stable.
+    return ModuleConnector(_provider, instance)

@@ -102,11 +102,10 @@ tooling provider in `DELIVERY_CONNECTORS` and read through
 declared merge, `work merged`) or `{action}` (a merge confirmed by the gate).
 L101 tranche 4 (#4357) integrates `dev` on the Module interface: `discover()`
 lists it as a built-in tooling module with the `workspaces` capability and no
-work item type. It is always active, and the canon cannot select it (a
-descriptor without types is refused in a project policy). Project policy
-activation applies to modules with work item types. The core obtains the
-workspaces façade
-through `registry.get("dev")`; its `audit` hook delegates the `canon check`
+work item type. Its tooling remains always active. A project can select an
+explicit action policy for it without adding lifecycle types (#7628); an empty lifecycle-only
+selection is still refused. Project policies activate lifecycle and action
+modules. The core obtains the workspaces façade through `registry.get("dev")`; its `audit` hook delegates the `canon check`
 workspace findings (`host-work-dir-*`, `host-workspaces-unknown`) under the
 Module interface. Those settings are host-scoped, so `modules.audit` runs the
 hook once, with `project=None`, after the project modules: one finding is not
@@ -115,8 +114,10 @@ orchestrator or project event brief; the human route uses the responsible of
 its agent, then of its host, then `notify.default_human`, and two hosts with
 the same rule stay two alerts. The bare profile has no
 `dev` module and documents housekeeping and worktrees as no-ops. Installed
-entry points cannot declare connectors, and a name declared twice or taken by
-the core is refused. `registry.merge_connector()` replaces
+entry points may declare action connectors through the Module interface; delivery connectors remain built-in. Names taken twice or by the
+core are refused. Action activation and operation classes come from the applied
+project policy; see [Module action connectors](module-action-connectors.md).
+`registry.merge_connector()` replaces
 `work_lifecycle.delivery_connector()`. The lot journal names the connector
 (`[via <connector>]`). Tranche 2b (#4366)
 routes the merges observed by the sweeps and the packet and merge-queue paths
@@ -130,7 +131,8 @@ L100 tranche 1 (#4382) moves the development merge paths into the built-in
 `modules/dev/git_merge.py`; `connectors.get("git-merge")` reads it through
 `registry.action_connectors()`, which follows the delivery rule: the core
 keeps `shell-noop`, a name declared twice or taken by the core is refused, and
-installed entry points cannot declare action connectors. The `work merge-pr`
+installed entry points can declare project-scoped action connectors (#7628).
+The `work merge-pr`
 gesture lives in `modules/dev/merge_pr.py`; the `ameesh work merge-pr` route is
 unchanged. The old paths `ameesh.connectors.git_merge` and `ameesh.merge_pr`
 are `sys.modules` aliases of the same module object, so importers and tests
@@ -148,7 +150,8 @@ when no database is reachable), while `doctor` compares declarations, installed
 descriptors and applied policies. Discovery remains separate from activation.
 The standard profile includes the always-active `dev` tooling provider, whose
 CLI is available through `ameesh module dev`; existing command aliases are
-retained. The bare profile has neither built-ins nor external entry points,
+retained. The bare profile has no built-ins (installed entry points remain
+discoverable),
 and workspace operations without `dev` are no-ops.
 
 The site's [Core and modules](../../site/docs/concepts/core-and-modules.md)

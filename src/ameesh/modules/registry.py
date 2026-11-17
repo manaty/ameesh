@@ -42,14 +42,18 @@ class Module:
     entry_point: str | None = None
     descriptor_sha256: str = ""
     card_ref: str | None = None      # L103 T2: canon_ref of a Pipeline card
+    action_connectors: tuple[str, ...] = ()
 
     def as_dict(self):
-        return {"name": self.name, "version": self.version, "source": self.source,
+        result = {"name": self.name, "version": self.version, "source": self.source,
                 "capabilities": list(self.capabilities), "cli": self.cli,
                 "storage": {"types": list(self.storage)},
                 "distribution": self.distribution, "entry_point": self.entry_point,
                 "descriptor_sha256": self.descriptor_sha256,
                 "card_ref": self.card_ref}
+        if self.action_connectors:
+            result["action_connectors"] = list(self.action_connectors)
+        return result
 
 
 class PipelineModule:
@@ -122,7 +126,8 @@ def _describe(name, module, compiled, *, source, version, distribution=None,
                   capabilities=capabilities,
                   cli=("ameesh module %s" % name) if "cli" in capabilities else None,
                   storage=tuple(compiled["types"]), distribution=distribution,
-                  entry_point=entry_point, descriptor_sha256=_digest(compiled))
+                  entry_point=entry_point, descriptor_sha256=_digest(compiled),
+                  action_connectors=tuple(sorted(getattr(module, "ACTION_CONNECTORS", {}))))
 
 
 def _core_version():
@@ -158,10 +163,12 @@ def _discover(*, builtin=True, canon=None):
             continue
         try:
             module, compiled = _external(entry)
+            _action_declarations({**implementations, name: module})
+            described = _describe(name, module, compiled, source="external",
+                                  version=version, distribution=dist,
+                                  entry_point=row["entry_point"])
             implementations[name] = module
-            modules.append(_describe(name, module, compiled, source="external",
-                                     version=version, distribution=dist,
-                                     entry_point=row["entry_point"]))
+            modules.append(described)
         except ValueError as exc:
             refused.append(dict(row, error=str(exc)))
     discovery = (implementations, tuple(modules), tuple(refused))
@@ -243,12 +250,25 @@ CORE_CONNECTORS = ("document", "done")
 CORE_ACTION_CONNECTORS = ("shell-noop",)
 
 
-def _connector_providers():
-    """Built-in providers of action and delivery connectors: the lifecycle
-    modules plus the development tooling (`dev`, now a built-in module).
-    Installed entry points are not read: a connector path is reviewed core
-    code."""
-    return dict(_builtin())
+def _connector_providers(*, external=False):
+    """Delivery providers remain built-in; actions can include installed modules."""
+    return _discover()[0] if external else dict(_builtin())
+
+
+def _action_declarations(providers):
+    found = {}
+    for provider, module in sorted(providers.items()):
+        declarations = getattr(module, "ACTION_CONNECTORS", {})
+        if not isinstance(declarations, dict):
+            raise ValueError("module %r: ACTION_CONNECTORS must be a mapping" % provider)
+        for name, connector in declarations.items():
+            if not isinstance(name, str) or not NAME.fullmatch(name) or not callable(connector):
+                raise ValueError("module %r: invalid action connector %r" % (provider, name))
+            if (name in CORE_ACTION_CONNECTORS or name in found
+                    or (name == "git-merge" and module is not _builtin().get("dev"))):
+                raise ValueError("duplicate action connector: %r (module %s)" % (name, provider))
+            found[name] = (provider, connector)
+    return found
 
 
 def action_connectors():
@@ -257,17 +277,13 @@ def action_connectors():
 
     L100 T1 (#4382): the registry is the core's only way to the development
     module's action connectors (`git-merge`); the core keeps `shell-noop`."""
-    found = {}
-    for provider, module in sorted(_connector_providers().items()):
-        for name, connector in sorted((getattr(module, "ACTION_CONNECTORS", None)
-                                       or {}).items()):
-            if not NAME.fullmatch(name) or not callable(connector):
-                raise ValueError("module %r: invalid action connector %r"
-                                 % (provider, name))
-            if name in CORE_ACTION_CONNECTORS or name in found:
-                raise ValueError("duplicate action connector: %r" % (name,))
-            found[name] = (provider, connector)
-    return found
+    return _action_declarations(_connector_providers(external=True))
+
+
+def action_policy(db, project, provider):
+    """Applied policy read through the module interface, never its implementation."""
+    from .storage import ModuleStore
+    return ModuleStore(db).action_policy(project, provider)
 
 
 def delivery_connectors():
