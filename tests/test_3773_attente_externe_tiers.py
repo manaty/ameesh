@@ -38,13 +38,15 @@ class DeclarationTest(unittest.TestCase):
     def test_executant_nomme_prime_sur_le_tiers(self):
         # #3498 ne change pas : « externe (bureau) » et « attente owner »
         # nomment leur exécutant, ils ne deviennent pas un tiers générique.
+        # #7634 : `bureau` n'est une route que si le runtime la donne.
         for text, who in (
-                ("hold: attente externe (bureau) : geste root", "bureau"),
-                ("hold: attente externe bureau : geste root", "bureau"),
+                ("hold: attente externe (bureau) : geste root", "avatar"),
+                ("hold: attente externe bureau : geste root", "avatar"),
                 ("hold: attente owner : signer le go", "owner"),
                 ("hold: attente du propriétaire : signer le go", "owner")):
             with self.subTest(text=text):
-                declared = planned_waits.external_hold(text)
+                declared = planned_waits.external_hold(
+                    text, executors={"bureau"})
                 self.assertEqual(declared["executor"], who)
 
     def test_prose_et_declaration_sans_geste_ne_declarent_rien(self):
@@ -104,7 +106,7 @@ class ClassificationTest(unittest.TestCase):
         self.assertIn("Attentes externes", text)
         self.assertIn("#666", text)
         self.assertIn("revue Apple", text)
-        self.assertIn("porter au bureau", text)
+        self.assertIn("porter au avatar", text)
 
 
 if __name__ == "__main__":
