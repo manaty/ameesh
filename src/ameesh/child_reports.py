@@ -27,7 +27,7 @@ import os
 import sys
 import time
 
-from . import conversation, db as db_mod, mail, registry, spawn, storage
+from . import conversation, db as db_mod, fil, mail, registry, spawn, storage
 from .platform import host as host_platform
 from .platform import process as process_platform
 
@@ -85,7 +85,11 @@ def _deliver(db, cfg, child: str, kind: str, body: str, *,
     if status is not None:
         meta["status"] = status
     # `mail.send` already wrote the readable R12 copy: no second outbox.
-    entry = conversation.Log(db, cfg, agent=parent).append(
+    # #7668 : sans projet déclaré (avatar, fiche sans équipe) il n'y a pas de
+    # copie de projet, et le journal du parent reste privé.
+    entry = conversation.Log(
+        db, cfg, agent=parent,
+        project=fil.conversation_project(db, cfg, registry.get(db, parent))).append(
         "input", body, author="agent:" + child, event_id=event_id,
         meta=meta, thread=False)
     return {"child": child, "parent": parent, "kind": kind, "seq": seq,
@@ -182,7 +186,9 @@ def copy_human(db, cfg, child: str, *, author: str, body: str,
         return None
     try:
         event_id = "child:%s:human:%d" % (child, int(source_seq))
-        return conversation.Log(db, cfg, agent=parent).append(
+        return conversation.Log(
+            db, cfg, agent=parent,
+            project=fil.conversation_project(db, cfg, registry.get(db, parent))).append(
             "input", body, author=author, event_id=event_id,
             meta={"child": child, "copied_from": int(source_seq)}, thread=False)
     except (ValueError, db_mod.DbError):

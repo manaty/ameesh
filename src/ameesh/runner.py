@@ -3816,7 +3816,7 @@ class AgentWorker(threading.Thread):
             from . import conversation, fil as fil_mod
             log = conversation.Log(
                 self.db, self.cfg, agent=self.name,
-                project=fil_mod.project_for(self.cfg, fil_mod.agent_project(self.agent)))
+                project=fil_mod.conversation_project(self.db, self.cfg, self.agent))
             log.append("state", text, session=session, meta=meta)
         except Exception as exc:  # noqa: BLE001
             log_async("[%s] conversation state not recorded (%s)" % (self.name, exc))
@@ -8438,8 +8438,11 @@ class AgentWorker(threading.Thread):
             author = sender if sender.startswith(("human:", "chat-")) \
                 else "human:" + sender
             try:
-                entry = conversation.Log(self.db, cfg, agent=self.name,
-                                         lot=row.get("lot_id"))
+                entry = conversation.Log(
+                    self.db, cfg, agent=self.name,
+                    project=fil.conversation_project(self.db, cfg, self.agent,
+                                                     row.get("lot_id")),
+                    lot=row.get("lot_id"))
                 written = entry.append("human_message", text=row.get("body") or "",
                                        author=author, event_id="mail:%d" % int(mid),
                                        meta={"messages": [int(mid)]})
@@ -10184,10 +10187,14 @@ class AgentWorker(threading.Thread):
             # for SQL or the readable thread. ResidentWorker uses the same sink.
             if getattr(self.db, "driver", "") != "mediated":
                 from .conversation import Recorder
+                # #7668 : une conversation privée (avatar, fiche sans projet)
+                # ne publie que dans le fil du lot qu'elle traite ; le projet
+                # par défaut de l'exécuteur n'est jamais un repli.
+                feed_lot = lot_du_tour if fil.private_conversation(self.agent) else None
                 conversation_recorder = Recorder(
                     self.cfg, agent=self.name, turn=turn_id, session=session,
-                    project=fil.project_for(self.cfg, fil.agent_project(self.agent)),
-                    reader=adapter.reader, warn=log_async)
+                    project=fil.conversation_project(self.db, self.cfg, self.agent, feed_lot),
+                    lot=feed_lot, reader=adapter.reader, warn=log_async)
                 conversation_recorder.append("input", spec.get("prompt") or "",
                                              author="ameesh:runner")
             # CTX-02b : l'observation se collecte sur le MÊME flux que les

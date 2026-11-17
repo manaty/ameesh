@@ -1174,6 +1174,61 @@ def lot_project(db, lot) -> str:
     return str((item or {}).get("app") or "").strip()
 
 
+def card_project(row: dict | None) -> str:
+    """Projet primaire déclaré par la fiche (`team`, sinon `chantier`), ou "".
+
+    Contrairement à `agent_project`, qui garde la règle historique du chantier
+    pour une ligne non gouvernée, ce lecteur répond à « la fiche déclare-t-elle
+    un projet ? » sans dépendre de `canon_governed` (absent de `registry.get`,
+    #7668) : `team` est la vérité du canon quand elle existe."""
+    if not row:
+        return ""
+    return str(row.get("team") or row.get("chantier") or "").strip()
+
+
+def avatar_conversation(row: dict | None) -> bool:
+    """La conversation de cet agent est-elle privée par sa relève d'avatar ?
+
+    `releve: preference` est la relève qui porte la conversation d'un avatar
+    (design 5322 §3.3) : son courrier et son journal ne sont pas publiés dans
+    le fil d'un projet hors du lot qu'il traite (#7668). Un agent sans projet
+    mais sans cette relève garde son journal privé, sans changer le routage
+    de son courrier : le fil d'un message reste celui de son projet."""
+    return bool(row) and str(row.get("releve") or "") == "preference"
+
+
+def private_conversation(row: dict | None) -> bool:
+    """La conversation de cet agent reste-t-elle hors des fils de projet ?
+
+    Un avatar (`releve: preference`, la relève qui porte la conversation) et
+    tout agent dont la fiche ne déclare aucun projet (ni `team` ni `chantier`)
+    ne publient pas leur conversation au fil d'un projet : elle reste dans
+    `conversation_log`, et dans le fil du lot qu'ils traitent s'il y en a un
+    (#7668, vie privée). Une ligne inconnue est privée : le défaut n'est pas
+    une déclaration de la fiche."""
+    if not row:
+        return True
+    if avatar_conversation(row):
+        return True
+    return not card_project(row)
+
+
+def conversation_project(db, cfg, row: dict | None, lot=None) -> str:
+    """Projet du fil lisible de la conversation (L78/R12) ; "" = aucun fil.
+
+    Le lot traité l'emporte (son fil). Une conversation privée
+    (`private_conversation`) n'est publiée hors lot dans aucun fil : jamais
+    dans le projet par défaut de l'exécuteur, qui n'est pas une déclaration
+    de la fiche. Les autres agents gardent la règle de `project_for` (leur
+    projet, sinon le défaut)."""
+    project = lot_project(db, lot)
+    if project:
+        return project
+    if private_conversation(row):
+        return ""
+    return project_for(cfg, agent_project(row))
+
+
 def _warn(text: str) -> None:
     try:
         print("ameesh fil: %s" % text, file=sys.stderr)
