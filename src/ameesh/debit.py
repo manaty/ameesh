@@ -2790,7 +2790,8 @@ _EVENTS_SQL = """
 
 _AGENTS_SQL = """
     SELECT name, status, host, harness, model, effort,
-           team, relit, mode, status_text, session_account, session_harness,
+           team, relit, mode, responsible, status_text, session_account,
+           session_harness,
            capabilities, roles, ephemeral, operator_paused,
            extract(epoch FROM retired_at)::float8 AS retired_ts,
            extract(epoch FROM last_turn_at)::float8 AS last_turn_ts
