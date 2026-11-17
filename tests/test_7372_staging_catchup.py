@@ -11,6 +11,7 @@ per project (`staging_rights`) and its decision is re-read on each pass.
 """
 import datetime
 import os
+import contextlib
 import tempfile
 import types
 import unittest
@@ -523,17 +524,22 @@ class ActorTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
-    def run_cmd(self, *, right=active(), declared=True, actor="bureau"):
+    def run_cmd(self, *, right=active(), declared=True, actor="bureau", host=HOST,
+                project_ref=None, topology_for=None):
         cfg = types.SimpleNamespace()
         base = {"sha": SHA, "tag": "v1.57.0"}
         row = {"schema": "ameesh-staging-catchup/1", "project": "ameesh", "host": HOST,
                "sha": SHA, "tag": "v1.57.0", "result": "ok", "actor": "bureau",
                "decision": 219407, "event": 42}
-        args = types.SimpleNamespace(project="ameesh", host=HOST, sha=SHA,
+        args = types.SimpleNamespace(project="ameesh", host=host, sha=SHA,
                                      result="ok", actor="", note="")
         db = mock.MagicMock()
-        with mock.patch.object(release_cutoff, "projects",
-                               return_value={"ameesh": project()}), \
+        topology_patch = (mock.patch.object(release_cutoff, "topology_for",
+                                            return_value=topology_for)
+                          if topology_for is not None else contextlib.nullcontext())
+        with topology_patch, \
+             mock.patch.object(release_cutoff, "projects",
+                               return_value={"ameesh": project_ref or project()}), \
              mock.patch("ameesh.db.open_db", return_value=db), \
              mock.patch.object(staging_deferred, "baseline",
                                return_value=(base if declared else None)), \
@@ -542,6 +548,19 @@ class CliTest(unittest.TestCase):
              mock.patch.object(staging_deferred, "declare", return_value=row) as declare:
             code = release._catchup(cfg, args)
         return code, declare, db
+
+    def test_a_missing_host_defaults_to_the_canon_server(self):
+        """#7662 : plus de nom d'hôte codé en défaut de la commande."""
+        code, declare, _db = self.run_cmd(host=None)
+        self.assertEqual(code, 0)
+        self.assertEqual(declare.call_args.args[2], HOST)
+
+    def test_a_missing_host_without_a_canon_server_is_refused(self):
+        code, declare, _db = self.run_cmd(
+            host=None, project_ref=types.SimpleNamespace(name="ameesh"),
+            topology_for=types.SimpleNamespace(server=None))
+        self.assertEqual(code, 1)
+        declare.assert_not_called()
 
     def test_an_active_right_declares_the_gesture(self):
         code, declare, db = self.run_cmd()
