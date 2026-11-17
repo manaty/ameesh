@@ -143,8 +143,10 @@ $$;
 -- Le proposant est-il le bénéficiaire ? `any` couvre tout (uniquement quand
 -- le canon l'a autorisé à l'enregistrement) ; `none` ne couvre rien.
 -- `avatar` couvre l'avatar lui-même et ses clones : les éphémères dont la
--- lignée `created_by` atteint l'avatar. `UNION` (pas `ALL`) borne un éventuel
--- cycle de la lignée ; une lignée rompue ne couvre pas.
+-- lignée `created_by` atteint l'avatar. Seule une arête VERS UN ÉPHÉMÈRE est
+-- suivie : un agent permanent créé par l'avatar rompt la lignée, et ses
+-- propres descendants ne sont pas des clones (spec §8.3). `UNION` (pas `ALL`)
+-- borne un éventuel cycle de la lignée ; une lignée rompue ne couvre pas.
 create or replace function ameesh_standing_beneficiary_ok(
     p_kind text, p_beneficiary text, p_proposed_by text)
 returns boolean
@@ -174,6 +176,7 @@ begin
         select substr(p_beneficiary, 7)
         union
         select r.name from agent_registry r join tree t on r.created_by = t.name
+         where r.ephemeral
     )
     select exists (select 1 from tree t where 'agent:' || t.name = p_proposed_by)
       into v_ok;

@@ -198,6 +198,10 @@ SCOPE_FIELDS = ("scope", "projects")
 #: PREMIER niveau de `extensions.ameesh` seulement — le canon, c'est
 #: l'organisation ; l'entrée d'un membre n'a pas de nommage propre.
 NAMING_KEY = "naming"
+#: #7629 : bloc du plafond d'organisation des approbations permanentes, admis
+#: au PREMIER niveau de `extensions.ameesh` (le schéma OKF Federation n'admet
+#: aucune clé libre à la racine de federation.yaml).
+STANDING_APPROVALS_KEY = "standing_approvals"
 #: L243 (#468) : un segment de nom est en minuscules, 2 à 6 caractères.
 #: `\Z` (et non `$`) : `$` accepte une fin de ligne, donc `"mty\n"` passerait
 #: et engendrerait un nom invalide.
@@ -1542,10 +1546,10 @@ class Canon:
     def standing_policy(self):
         """#7629 : le plafond d'organisation des approbations permanentes.
 
-        Le bloc `standing_approvals` de `federation.yaml`, validé par
-        `ameesh.standing_policy` ; absent = politique VIDE (aucune approbation
-        permanente acceptée, défaut sûr). Une erreur de lecture est levée, pas
-        interprétée comme un élargissement."""
+        Le bloc `extensions.ameesh.standing_approvals` de `federation.yaml`,
+        validé par `ameesh.standing_policy` ; absent = politique VIDE (aucune
+        approbation permanente acceptée, défaut sûr). Une erreur de lecture est
+        levée, pas interprétée comme un élargissement."""
         from . import standing_policy
         return standing_policy.from_federation(self.federation)
 
@@ -3911,6 +3915,7 @@ class _Loader:
             allowed = set(SCOPE_FIELDS)
             if member == root.member:
                 allowed.add(NAMING_KEY)     # L243 (#468) : le nommage est à la racine
+                allowed.add(STANDING_APPROVALS_KEY)  # #7629 : plafond des grants
             for unknown in sorted(set(map(str, raw)) - allowed):
                 self.add("ameesh-key-unknown", WARNING,
                          "`%s.%s`: unknown key (ignored)" % (label, unknown), **where)

@@ -308,9 +308,9 @@ def cmd_standing_register(cfg: Config, args: argparse.Namespace) -> int:
     """#7629 : enregistre un grant sous le plafond du canon.
 
     Le reçu est vérifié (façade, authentificateur du canon choisi, preuve,
-    échéances), puis la politique `standing_approvals` du canon est appliquée :
-    durée, montant, bénéficiaire, cibles et charte. Un grant hors plafond est
-    refusé avant toute écriture, nonce compris.
+    échéances), puis la politique `extensions.ameesh.standing_approvals` du
+    canon est appliquée : durée, montant, bénéficiaire, cibles et charte. Un
+    grant hors plafond est refusé avant toute écriture, nonce compris.
     """
     raw = _read_receipt(args.receipt)
     try:

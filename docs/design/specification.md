@@ -679,11 +679,13 @@ tentative. Une réservation n'est libérée que sur un échec **certain**
 
 **Portée (#7629).** Un grant nomme son bénéficiaire : `agent:<nom>`, ou
 `avatar` (l'avatar de l'approbateur et ses clones, c'est-à-dire les éphémères
-dont la lignée `created_by` atteint cet agent) ; sans bénéficiaire, il ne vaut
+dont la lignée `created_by` atteint cet agent ; une arête par un agent
+permanent rompt la lignée) ; sans bénéficiaire, il ne vaut
 que si le canon l'autorise explicitement. Il peut borner sa cible : `targets`
 est une liste de motifs (dépôt, branche, canal) où seuls `*` et `?` ont un
 sens ; une action hors cible n'est pas couverte. Le canon porte le plafond
-d'organisation (`federation.yaml`, bloc `standing_approvals`) : par connecteur
+d'organisation (`federation.yaml`, bloc `extensions.ameesh.standing_approvals`,
+le schéma OKF n'admettant aucune clé libre à la racine) : par connecteur
 et opération, qui peut déléguer, jusqu'à quelle durée et quel montant, si un
 bénéficiaire peut manquer, si la charte et les cibles sont obligatoires. Un
 grant hors plafond est refusé à l'enregistrement (`policy`). Le grant garde la

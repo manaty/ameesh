@@ -4,20 +4,24 @@
 Le canon porte, par connecteur et par opération, ce qu'une personne peut
 déléguer durablement : qui peut signer, jusqu'à quelle durée et quel montant,
 si une approbation SANS bénéficiaire est tolérée, et si la charte et les
-cibles sont obligatoires. Le bloc vit dans `federation.yaml` :
+cibles sont obligatoires. Le bloc vit sous `extensions.ameesh` de
+`federation.yaml` — le schéma OKF Federation n'admet aucune clé libre au
+premier niveau :
 
-    standing_approvals:
-      schema: ameesh-standing-approvals/1
-      rules:
-        - connector: git
-          operations: [merge]
-          approvers: [human:alice]
-          max_duration_hours: 720
-          max_amount: 0
-          currency: null
-          allow_missing_beneficiary: false
-          require_charter: true
-          require_targets: false
+    extensions:
+      ameesh:
+        standing_approvals:
+          schema: ameesh-standing-approvals/1
+          rules:
+            - connector: git
+              operations: [merge]
+              approvers: [human:alice]
+              max_duration_hours: 720
+              max_amount: 0
+              currency: null
+              allow_missing_beneficiary: false
+              require_charter: true
+              require_targets: false
 
 Sans bloc, la politique est VIDE : aucune approbation permanente n'est
 acceptée (défaut sûr ; aucune n'est en service, spec §3.5). Un bloc illisible
@@ -249,10 +253,31 @@ def parse(data, *, where: str = "standing_approvals") -> Policy:
 
 
 def from_federation(federation) -> Policy:
-    """Le bloc `standing_approvals` de `federation.yaml` ; absent = politique vide."""
+    """Le bloc `extensions.ameesh.standing_approvals` ; absent = politique vide.
+
+    Le schéma OKF Federation n'admet aucune clé libre à la racine : un bloc
+    `standing_approvals` de premier niveau est refusé nommément, jamais lu en
+    silence (même défaut que #7630). Un conteneur `extensions` ou
+    `extensions.ameesh` mal formé est refusé, pas interprété comme une absence.
+    """
     if not isinstance(federation, dict):
         return Policy()
-    return parse(federation.get("standing_approvals"))
+    if "standing_approvals" in federation:
+        raise StandingPolicyError(
+            "standing_approvals: top-level key refused by the OKF Federation schema; "
+            "declare it under extensions.ameesh.standing_approvals")
+    extensions = federation.get("extensions")
+    if extensions is None:
+        return Policy()
+    if not isinstance(extensions, dict):
+        raise StandingPolicyError("extensions: mapping expected")
+    ameesh = extensions.get("ameesh")
+    if ameesh is None:
+        return Policy()
+    if not isinstance(ameesh, dict):
+        raise StandingPolicyError("extensions.ameesh: mapping expected")
+    return parse(ameesh.get("standing_approvals"),
+                 where="extensions.ameesh.standing_approvals")
 
 
 def empty() -> Policy:

@@ -21,6 +21,11 @@ from .test_receipts import standing
 from .webauthn_soft import make_request
 
 
+def federation(block: dict) -> dict:
+    """Un `federation.yaml` conforme OKF : le bloc vit sous `extensions.ameesh`."""
+    return {"extensions": {"ameesh": {"standing_approvals": block}}}
+
+
 class StandingScopeTest(ActionsBase):
     def setUp(self) -> None:
         super().setUp()
@@ -76,6 +81,26 @@ class StandingScopeTest(ActionsBase):
         self.assertEqual(self.bound(clone)["auth_grant_id"], 1)
         # un clone de B n'est pas un clone de l'avatar de A
         self.refused_no_cover(self.propose(proposed_by="agent:bob-clone"))
+
+    def test_avatar_ne_couvre_pas_un_agent_permanent(self) -> None:
+        # un agent permanent créé par l'avatar n'est PAS un clone (spec §8.3)
+        self.db.execute(
+            "INSERT INTO agent_registry (name, ephemeral, ephemeral_expires_at, created_by) "
+            "VALUES ('alice-dev', false, NULL, 'alice-avatar')")
+        self.register(beneficiary="avatar")
+        self.refused_no_cover(self.propose(proposed_by="agent:alice-dev"))
+
+    def test_lignee_traversant_un_agent_permanent_ne_couvre_pas(self) -> None:
+        self.db.execute(
+            "INSERT INTO agent_registry (name, ephemeral, ephemeral_expires_at, created_by) "
+            "VALUES ('alice-dev', false, NULL, 'alice-avatar'), "
+            "('alice-dev-clone', true, now() + interval '1 hour', 'alice-dev')")
+        self.register(beneficiary="avatar")
+        # l'arête permanente rompt la lignée : son descendant n'est pas un clone
+        self.refused_no_cover(self.propose(proposed_by="agent:alice-dev-clone"))
+        # le clone éphémère direct de l'avatar reste couvert
+        self.assertEqual(
+            self.bound(self.propose(proposed_by="agent:alice-clone"))["state"], "approved")
 
     def test_beneficiaire_agent_nomme(self) -> None:
         self.register(beneficiary="agent:alice-avatar")
@@ -267,7 +292,7 @@ class StandingPolicyTest(unittest.TestCase):
                       self.check(standing_policy.empty()))
 
     def test_bloc_valide(self):
-        policy = standing_policy.from_federation({"standing_approvals": self.BLOCK})
+        policy = standing_policy.from_federation(federation(self.BLOCK))
         self.assertTrue(policy)
         self.assertIsNone(self.check(policy))
         self.assertEqual(policy.describe()[0]["max_duration_hours"], 24)
@@ -275,7 +300,7 @@ class StandingPolicyTest(unittest.TestCase):
                       self.check(policy, connector="git"))
 
     def test_plafonds_du_canon(self):
-        policy = standing_policy.from_federation({"standing_approvals": self.BLOCK})
+        policy = standing_policy.from_federation(federation(self.BLOCK))
         self.assertIn("too long", self.check(policy, until=25 * 3600))
         self.assertIn("above the canon cap", self.check(policy, max_amount=101))
         self.assertIn("must name its beneficiary", self.check(policy, beneficiary=None))
@@ -298,13 +323,25 @@ class StandingPolicyTest(unittest.TestCase):
                 with self.assertRaises(standing_policy.StandingPolicyError):
                     standing_policy.parse(block)
 
+    def test_bloc_hors_extensions_refuse(self):
+        # le schéma OKF n'admet aucune clé libre à la racine : refus nommé
+        with self.assertRaises(standing_policy.StandingPolicyError) as ctx:
+            standing_policy.from_federation({"standing_approvals": self.BLOCK})
+        self.assertIn("extensions.ameesh", str(ctx.exception))
+        self.assertFalse(standing_policy.from_federation({"extensions": {"autre": {}}}))
+        # un conteneur mal formé est refusé, jamais lu comme une absence
+        for value in ({"extensions": []}, {"extensions": {"ameesh": []}}):
+            with self.subTest(federation=value):
+                with self.assertRaises(standing_policy.StandingPolicyError):
+                    standing_policy.from_federation(value)
+
 
 class CanonAvatarTest(unittest.TestCase):
     """`Canon.standing_policy` et la résolution de l'avatar de l'approbateur."""
 
     def test_politique_et_avatar(self):
-        canon = canon_mod.Canon(root="/nonexistent", federation={
-            "standing_approvals": StandingPolicyTest.BLOCK})
+        canon = canon_mod.Canon(root="/nonexistent", federation=federation(
+            StandingPolicyTest.BLOCK))
         self.assertTrue(canon.standing_policy())
         card = types.SimpleNamespace(
             title="alice-avatar", responsible=ALICE,
