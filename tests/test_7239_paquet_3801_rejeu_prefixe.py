@@ -481,6 +481,38 @@ class CheckLocalTestsTest(StackCase):
         self.assertEqual(runs[-1].modules, [contract])
         self.assertIn("non appliqué", runs[-1].output)
 
+    def test_contrat_seul_au_rejeu_non_concluant_laisse_la_ci_full(self) -> None:
+        # Relecture B de #7692 : sans rouge propre, un contrat rouge attribué
+        # par #3801 dont le rejeu ne conclut pas n'arrête pas le paquet. Le
+        # retrait n'est pas appliqué, rien n'est retiré, l'échec sort de `red`
+        # (sinon `contract_red` seul lèverait CompositionRed) et le test est
+        # consigné non concluant ; la ci-full tranche (canon §3).
+        contract = "tests.test_contract_x.T.test_contract"
+
+        def fake_run(_worktree, label, modules, **_kwargs):
+            if label == "contrats":
+                return _red(label, modules, test=contract)
+            if label.startswith("préfixe"):
+                return _timed_out(label, modules)
+            return _green(label, modules)
+
+        def attribute(_worktree, _composition, failures):
+            return {"status": "ok", "tests": [
+                {"test": failure["test"], "status": "probable",
+                 "units": [{"lot": 1, "best": 9,
+                            "evidence": [{"kind": "test",
+                                          "file": "tests/test_own_a.py"}]}]}
+                for failure in failures]}
+
+        runs, faulty, removals = self.check(
+            run_tests=fake_run, attribute=attribute, own={},
+            contracts=["tests.test_contract_x"])
+        self.assertEqual((faulty, removals), ([], []))
+        self.assertEqual(runs[-1].label, "préfixes (#3801 non confirmé)")
+        self.assertEqual(runs[-1].modules, [contract])
+        self.assertTrue(runs[-1].inconclusive)
+        self.assertIn("non appliqué", runs[-1].output)
+
     def test_rejeu_non_concluant_d_un_rouge_propre_reste_retire(self) -> None:
         # Le repli du rouge propre reste le geste antérieur : son rejeu #3801
         # non concluant ne le disculpe pas (le module de l'unité a rougi).

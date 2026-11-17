@@ -4831,6 +4831,20 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                        "tranche"
                        % (designation_why or "test ni confirmé ni situé"),
                 seconds=0.0, timed_out=True))
+            # #7692 (relecture B) : un échec non confirmé ne retient pas le
+            # paquet (canon §3) ; il sort de `red`. Un contrat rouge
+            # indépendant, lui, reste bloquant : seuls les noms non confirmés
+            # sont retirés.
+            unconfirmed_set = set(unconfirmed)
+            kept_red: list[tuple[TestRun, list[dict]]] = []
+            for run, found in red:
+                left = [failure for failure in found
+                        if _failure_name(failure) not in unconfirmed_set]
+                if left:
+                    kept_red.append((run, left))
+            red = kept_red
+            contract_left = [found for run, found in red if run is contract]
+            contract_red = bool(contract_left and contract_left[0])
         if flaky_names:
             log("tests ciblés : %d test(s) rouge(s) sur la tête mais "
                 "vert(s) au rejeu des préfixes (instable) : %s — "
