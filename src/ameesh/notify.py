@@ -2909,12 +2909,12 @@ class Notifier:
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
-                self._raise(entry, router, now, db=db)
+                self._raise(entry, router, now)
             elif entry["status"] in ("nouvelle", "sans_destinataire", "sans_canal"):
                 # un responsable (ou une route) a pu apparaître depuis
-                self._raise(entry, router, now, db=db)
+                self._raise(entry, router, now)
             else:
-                self._retry(entry, "raised", now, db=db)
+                self._retry(entry, "raised", now)
         if not unobserved:
             self._local_resolutions(wanted, now)
         else:
@@ -2962,7 +2962,7 @@ class Notifier:
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
-            self._resolved(key, entry, now, db=db)
+            self._resolved(key, entry, now)
         for key in list(self.state["resolved"]):
             if key not in before:
                 continue
@@ -2971,7 +2971,7 @@ class Notifier:
                 continue
             if entry["alert"].get("type") in unobserved:
                 continue
-            self._retry(entry, "resolved", now, db=db)
+            self._retry(entry, "resolved", now)
             if not self._pending(entry):
                 del self.state["resolved"][key]
 
@@ -3458,7 +3458,10 @@ class Notifier:
             return
         entry.update(human=human, source=source)
         # #7634 : d'abord la boîte de l'avatar de l'humain, s'il en a un.
-        avatar = None if entry.get("avatar_fallback") else router.avatar_for(human)
+        # La passe locale n'a pas de base : sa livraison est directe, sans
+        # tenter une boîte avatar qui ne peut pas être écrite (relecture cx1).
+        avatar = (None if db is None or entry.get("avatar_fallback")
+                  else router.avatar_for(human))
         if avatar and self._deliver_avatar(entry, avatar, human, now, db):
             return
         self._raise_direct(entry, human, now, first=first)
