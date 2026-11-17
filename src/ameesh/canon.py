@@ -60,6 +60,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from . import harnesses
 from . import review as review_mod
+from . import reveil as reveil_mod
 from .config import NAME_RE
 from .deadline import Deadline
 
@@ -1082,6 +1083,9 @@ class Agent:
     #: #2202 S2 : le profil de relecteur borné (`sandbox:`), None = aucun tour
     #: en bac à sable pour cet agent.
     sandbox: SandboxProfile | None = None
+    #: #7632 : cadence de réveil déclarée (`reveil:`, `reveil.parse`) ; None =
+    #: réveil par courrier de l'exécuteur, inchangé.
+    reveil: dict | None = None
 
     @property
     def is_persona(self) -> bool:
@@ -4224,6 +4228,11 @@ class _Loader:
             relit = self._list(fiche, "relit", where, "agent-relit-invalid", **subject)
         if relit is not None:
             relit = list(dict.fromkeys(p for p in relit if p))
+        # #7632 : cadence de réveil (spec avatars §4.4) ; un bloc fautif est
+        # une erreur de fiche, sa politique garde les défauts de la clé fautive
+        reveil, reveil_problems = reveil_mod.parse(fiche.data.get("reveil"))
+        for problem in reveil_problems:
+            self.add("agent-reveil-invalid", ERROR, problem, **where, **subject)
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -4248,6 +4257,7 @@ class _Loader:
             candidats=candidats,
             relit=relit,
             sandbox=self._sandbox_profile(fiche, where, subject),
+            reveil=reveil,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -4482,16 +4492,20 @@ class _Loader:
                              **where, **subject)
                 policy.lend = offer
                 # #5905: a lending host runs guest jobs offloaded from other
-                # hosts, outside its own turns and leases. No interface counts
-                # them yet (C5): its runs stay unknown, and `none` there would
-                # turn a missing observation into a proven zero.
-                from .host_idle import RUNS_LENDING
-                if policy.runs_interface == "none":
+                # hosts, outside its own turns and leases. `none` there would
+                # turn a missing observation into a proven zero; #7687 adds
+                # `guest`, which counts the live offloaded jobs of the host
+                # measure. Without it the runs stay unknown.
+                from .host_idle import (RUNS_GUEST, RUNS_INVALID, RUNS_LENDING,
+                                        RUNS_NONE)
+                if policy.runs_interface == RUNS_NONE:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.runs_interface: none` on a lending host "
                              "(`policy.lend`): its offloaded guest jobs are runs "
-                             "that no interface counts yet", **where, **subject)
-                policy.runs_interface = RUNS_LENDING
+                             "that `none` would declare absent; use `guest`",
+                             **where, **subject)
+                if policy.runs_interface not in (RUNS_GUEST, RUNS_INVALID):
+                    policy.runs_interface = RUNS_LENDING
             # L101 : espace de travail et ménage, forme canonique
             # `policy.workspaces` ; les anciennes clés restent lues en alias.
             self._host_workspaces(raw, policy, where, subject)

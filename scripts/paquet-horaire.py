@@ -61,7 +61,9 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    rapporté au pilote, sans lot d'empreinte §16 (#6272). Sur la ci-full rouge de la tête
    gelée : un rouge **déterministe** (chaque échec de test propre au paquet
    attribué par #3801 à une seule unité probable, rejoué rouge en local sur la
-   tête) retire ces unités ; le paquet est recomposé sans elles
+   tête) est **situé sur les préfixes** de l'empilement (#4217, #7691) : la
+   première unité où chaque test apparaît est retirée — jamais l'unité devinée
+   par #3801 quand le rejeu la contredit. Le paquet est recomposé sans elles
    (`paquet-auto.py --force --exclude --keep-composition`), **une fois**, et
    l'auteur de chaque unité retirée reçoit un courrier. La recomposition
    reprend les membres de la composition précédente moins les exclus, à leur
@@ -273,6 +275,13 @@ MAX_RECOMPOSITIONS = 1
 #: #4201 : motif écrit au manifeste pour le retrait automatique d'une unité dont
 #: la ci-full attribuée est rouge (`paquet-auto` seul écrit le motif neutre).
 EXCLUDE_CI_FULL_REASON = "retiré : ci-full rouge attribuée à son unité (#3801)"
+#: #7691 : motif écrit au manifeste quand les préfixes désignent une autre
+#: unité que #3801 (ou aucune des unités qu'il devinait) : la preuve du rejeu
+#: prime sur la carte d'impact.
+EXCLUDE_CI_FULL_PREFIX_REASON = (
+    "retiré : ci-full rouge située sur les préfixes de l'empilement (#4217)")
+#: provenance d'un retrait : #3801 confirme, ou les prefixes tranchent (#7691)
+PROOF_PREFIXES = "prefixes"
 #: lancements de paquet-auto pour une même étape (même tête de départ)
 MAX_ATTEMPTS = 3
 #: un porteur sans tentative plus jeune que ce délai : création en cours
@@ -784,6 +793,9 @@ class UnitRow:
     lots: list[int]
     source: str
     note: str
+    #: #7691 : commit cumulé de l'unité (`base + u1 + … + uN`), la colonne
+    #: « commit » du manifeste : la tête du préfixe à rejouer.
+    commit: str = ""
 
     @property
     def resolution(self) -> bool:
@@ -792,9 +804,11 @@ class UnitRow:
 
 
 def composition_units(text: str) -> list[UnitRow]:
-    """Les unités de la table `## Composition` (gabarit #3629), avec leur note."""
+    """Les unités de la table `## Composition` (gabarit #3629), avec leur note
+    et le commit cumulé de chaque unité (#7691)."""
     rows = auto.parse_composition_table(text)
     notes: list[str] = []
+    commits: list[str] = []
     in_table = False
     for line in text.splitlines():
         if line.strip().startswith("## Composition"):
@@ -804,10 +818,14 @@ def composition_units(text: str) -> list[UnitRow]:
             cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
             if len(cells) >= 3 and re.search(r"#\d+", cells[1]):
                 notes.append(cells[-1] if len(cells) >= 5 else "")
+                found = auto.SHA_RE.search(cells[3]) if len(cells) >= 4 else None
+                commits.append(found.group(0) if found else "")
         elif in_table and notes:
             break
     notes += [""] * (len(rows) - len(notes))
-    return [UnitRow(lots, source, note) for (lots, source), note in zip(rows, notes)]
+    commits += [""] * (len(rows) - len(commits))
+    return [UnitRow(lots, source, note, commit)
+            for (lots, source), note, commit in zip(rows, notes, commits)]
 
 
 def manifest_at(ctx: Context, item: dict, sha: str) -> str:
@@ -943,6 +961,141 @@ class Verdict:
     lots: list[int]
     tests: list[str]
     why: str
+    #: #7691 : provenance du retrait (`PROOF_PREFIXES` quand le rejeu des
+    #: préfixes contredit #3801 ; "" : attribution #3801 confirmée).
+    proof: str = ""
+    #: #7691 : tests verts sur tous les préfixes (instables, #4221), consignés
+    #: non concluants sans retenir le paquet.
+    flaky: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Replay:
+    """Le résultat d'un rejeu local (#7691).
+
+    `state` : « red » (au moins un test demandé rougit), « green » (tous
+    verts) ou « inconclusive » (délai, panne, fixture : aucun retrait).
+    `failed` nomme les tests rouges quand la sortie le permet ; vide sur un
+    rouge confirmé sans noms (`ctx.dry_run`), l'appelant retombe alors sur
+    tous les tests demandés.
+    """
+
+    state: str
+    text: str = ""
+    failed: tuple[str, ...] = ()
+
+
+def replay_state(outcome, tests: list[str]) -> tuple[str, set[str]]:
+    """`(état, tests rouges)` d'un rejeu, structuré ou texte des anciens bancs.
+
+    Les témoins qui remplacent `replay_locally` par une chaîne gardent leur
+    contrat : "" = rouge confirmé (tous les tests demandés), « vert en
+    local » = vert, tout autre texte = non concluant.
+    """
+    if isinstance(outcome, Replay):
+        failed = set(outcome.failed)
+        if outcome.state == "red" and not failed:
+            failed = {str(test) for test in tests}
+        return outcome.state, failed
+    text = str(outcome or "")
+    if not text:
+        return "red", {str(test) for test in tests}
+    if text.startswith("vert en local"):
+        return "green", set()
+    return "inconclusive", set()
+
+
+def replay_locally(ctx: Context, sha: str, tests: list[str]) -> Replay:
+    """Rejoue les tests rouges sur `sha` ; rouge confirmé, vert ou non concluant.
+
+    #4221 : un QueryCanceled/lock timeout **du corps d'un test** qui se
+    reproduit à ce rejeu seul, hors charge, est un rouge réel (la ci-full est
+    rouge, le test est attribué, l'unité est retirée). Une erreur de fixture
+    (`setUpClass`/`tearDownClass`), un QueryCanceled de charge qui ne
+    reproduit pas, ou tout autre rejeu non concluant restent non concluants :
+    aucun retrait.
+
+    #7691 : le rejeu rend aussi les noms des tests rouges, pour situer chaque
+    test sur les préfixes (`locate_on_prefixes`) sans rejouer les tests déjà
+    situés.
+    """
+    if ctx.dry_run:
+        return Replay("red", failed=tuple(str(test) for test in tests))
+    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    path = Path(tempfile.mkdtemp(prefix="paquet-horaire-rejeu-", dir=str(parent)))
+    path.rmdir()
+    added = ctx.git("worktree", "add", "--detach", str(path), sha)
+    if added.returncode != 0:
+        return Replay("inconclusive",
+                      "rejeu local impossible (worktree : %s)"
+                      % auto._tail(added.text, 3))
+    try:
+        run = auto.run_tests(path, "rejeu", sorted(set(tests)), timeout=REPLAY_TIMEOUT)
+        if run.green:
+            return Replay("green", "vert en local (%d test(s)) : rouge non reproduit"
+                          % run.tests)
+        if run.inconclusive:
+            if not run.timed_out and run.returncode == 1 \
+                    and run.body_cancel_tests() & {str(test) for test in tests}:
+                return Replay("red", failed=tuple(sorted(
+                    run.body_cancel_tests() & {str(test) for test in tests})))
+            return Replay("inconclusive", "rejeu local non concluant (%s)" % run.motive())
+        failed = tuple(entry["test"] for entry in auto.unittest_failures(
+            run.output, auto._unusable(run)))
+        return Replay("red", failed=failed)
+    finally:
+        ctx.git("worktree", "remove", "--force", str(path))
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def locate_on_prefixes(ctx: Context, item: dict, sha: str,
+                       tests: list[str]) -> tuple[dict[int, list[str]], list[str], str]:
+    """#7691 : situer chaque test rouge à sa première unité dans l'empilement.
+
+    Même règle que `paquet-auto.prefix_failures` (#4217) : les tests encore
+    non situés sont rejoués sur le commit cumulé de chaque unité du manifeste
+    gelé (`base + u1`, `base + u1 + u2`, …) ; la première unité où un test
+    apparaît le désigne. Une unité de résolution emporte tous ses lots.
+
+    Rend `({lot: [tests]}, [instables], pourquoi)`. `pourquoi` non vide : le
+    rejeu n'a pas conclu (manifeste sans commit, worktree impossible, rejeu
+    non concluant), aucune unité n'est retirée. Les tests verts sur tous les
+    préfixes sont rendus à part : instables (#4221), ils ne retirent rien.
+    """
+    units = composition_units(manifest_at(ctx, item, sha))
+    if not units:
+        return {}, [], "composition sans unité pour situer le rouge"
+    unresolved = [str(test) for test in tests if str(test)]
+    if not unresolved:
+        return {}, [], "aucun nom de test à situer sur les préfixes"
+    located: dict[int, list[str]] = {}
+    for index, unit in enumerate(units, start=1):
+        if not unit.commit:
+            return {}, [], ("préfixe %d (%s) sans commit au manifeste"
+                            % (index, ", ".join("#%d" % lot for lot in unit.lots)))
+        outcome = replay_locally(ctx, unit.commit, unresolved)
+        state, failed = replay_state(outcome, unresolved)
+        if state == "green":
+            continue
+        if state == "inconclusive":
+            return {}, [], ("préfixe %d (%s) non concluant : %s"
+                            % (index, ", ".join("#%d" % lot for lot in unit.lots),
+                               outcome.text if isinstance(outcome, Replay)
+                               else str(outcome)))
+        if not failed:
+            return {}, [], ("préfixe %d (%s) rouge sans nom de test"
+                            % (index, ", ".join("#%d" % lot for lot in unit.lots)))
+        still = []
+        for test in unresolved:
+            if auto._failure_matches(test, failed):
+                for lot in unit.lots:
+                    located.setdefault(lot, []).append(test)
+            else:
+                still.append(test)
+        unresolved = still
+        if not unresolved:
+            break
+    return located, unresolved, ""
 
 
 def classify(run: dict) -> Verdict:
@@ -985,39 +1138,6 @@ def classify(run: dict) -> Verdict:
         if lot not in lots:
             lots.append(lot)
     return Verdict(True, lots, tests, "attribué par #3801")
-
-
-def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
-    """Rejoue les tests rouges sur la tête gelée ; "" si rouge confirmé.
-
-    #4221 : un QueryCanceled/lock timeout **du corps d'un test** qui se
-    reproduit à ce rejeu seul, hors charge, est un rouge réel (la ci-full est
-    rouge, le test est attribué, l'unité est retirée). Une erreur de fixture
-    (`setUpClass`/`tearDownClass`), un QueryCanceled de charge qui ne
-    reproduit pas, ou tout autre rejeu non concluant restent non concluants :
-    aucun retrait.
-    """
-    if ctx.dry_run:
-        return ""
-    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
-    path = Path(tempfile.mkdtemp(prefix="paquet-horaire-rejeu-", dir=str(parent)))
-    path.rmdir()
-    added = ctx.git("worktree", "add", "--detach", str(path), sha)
-    if added.returncode != 0:
-        return "rejeu local impossible (worktree : %s)" % auto._tail(added.text, 3)
-    try:
-        run = auto.run_tests(path, "rejeu", sorted(set(tests)), timeout=REPLAY_TIMEOUT)
-        if run.green:
-            return "vert en local (%d test(s)) : rouge non reproduit" % run.tests
-        if run.inconclusive:
-            if not run.timed_out and run.returncode == 1 \
-                    and run.body_cancel_tests() & {str(test) for test in tests}:
-                return ""
-            return "rejeu local non concluant (%s)" % run.motive()
-        return ""
-    finally:
-        ctx.git("worktree", "remove", "--force", str(path))
-        shutil.rmtree(path, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2089,14 +2209,57 @@ def finished_red(ctx: Context, item: dict, sha: str, run: dict,
     if any(note.startswith(MARK_RED + run_id) for note in noted):
         return "#%d : rouge %s déjà consigné" % (carrier, run_id)
     verdict = classify(run)
-    if verdict.deterministic:
-        why = replay_locally(ctx, sha, verdict.tests)
-        if why:
-            verdict = Verdict(False, verdict.lots, verdict.tests, why)
     # #4237 : une recomposition du pilote n'use pas le retrait automatique
     recomposed = len({a.run_id for a in attempts(item)
                       if a.step == RECOMPOSITION
                       and a.run_id not in (PILOT_RUN, "parallel-proof", CONTRACT_PROOF_RUN)})
+    if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
+        # #7691 : le rejeu sur la tête confirme le rouge, il ne désigne pas
+        # l'unité — la tête contient déjà toutes les unités, donc le test y
+        # rougit quelle que soit la fautive. On situe ensuite chaque test sur
+        # les préfixes (#4217) ; l'unité devinée par #3801 n'est retirée que
+        # si ce rejeu la désigne.
+        head = replay_locally(ctx, sha, verdict.tests)
+        state, failed = replay_state(head, verdict.tests)
+        if state != "red":
+            verdict = Verdict(False, verdict.lots, verdict.tests,
+                              head.text if isinstance(head, Replay) else str(head))
+        else:
+            # #7691 (B #42915) : seuls les tests encore rouges sur la tête
+            # sont situés. Un test que la tête rend vert (instable, ou rouge
+            # corrigé par une unité suivante) ne désigne aucune unité : le
+            # situer sur les préfixes retirerait l'unité où il a rougi avant
+            # d'être corrigé, alors que le paquet final le passe.
+            confirmed = [str(test) for test in verdict.tests
+                         if auto._failure_matches(str(test), failed)]
+            unconfirmed = [str(test) for test in verdict.tests
+                           if str(test) not in confirmed]
+            if not confirmed:
+                verdict = Verdict(
+                    False, verdict.lots, verdict.tests,
+                    "rejeu de la tête rouge sans test confirmé parmi ceux que "
+                    "la ci-full nomme : aucun retrait")
+            else:
+                located, flaky, why = locate_on_prefixes(ctx, item, sha, confirmed)
+                if why:
+                    verdict = Verdict(False, verdict.lots, verdict.tests, why)
+                elif located:
+                    located_tests: list[str] = []
+                    for unit_tests in located.values():
+                        for test in unit_tests:
+                            if test not in located_tests:
+                                located_tests.append(test)
+                    verdict = Verdict(
+                        True, list(located), located_tests,
+                        "situé sur les préfixes de l'empilement (#4217)",
+                        proof=(PROOF_PREFIXES
+                               if set(located) != set(verdict.lots) else ""),
+                        flaky=list(flaky) + unconfirmed)
+                else:
+                    verdict = Verdict(
+                        False, verdict.lots, verdict.tests,
+                        "vert sur tous les préfixes de l'empilement : instable(s), "
+                        "aucun retrait (#4221)", flaky=list(flaky) + unconfirmed)
     if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
         return recompose(ctx, item, run, verdict)
     reason = verdict.why if not verdict.deterministic else \
@@ -2121,6 +2284,11 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
         return "#%d : composition en cours (%s)" % (carrier, holder)
     run_id = str(run.get("run_id") or "?")
     removed = ", ".join("#%d" % lot for lot in verdict.lots)
+    # #7691 : quand les préfixes contredisent #3801, le manifeste porte leur
+    # preuve, pas celle de la carte d'impact.
+    prefix_proof = verdict.proof == PROOF_PREFIXES
+    reason = (EXCLUDE_CI_FULL_PREFIX_REASON if prefix_proof
+              else EXCLUDE_CI_FULL_REASON)
     for lot in verdict.lots:
         if not exclude(ctx, lot, carrier, name, run_id, verdict.tests,
                        packet_frozen_at=frozen_ts(item)):
@@ -2130,21 +2298,33 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
         except HoraireError:
             author = ""
         if author:
+            if prefix_proof:
+                why = ("la ci-full %s (tête %s) est rouge, ton unité est la "
+                       "première où le test apparaît sur les préfixes de "
+                       "l'empilement (#4217)."
+                       % (run_id, frozen_sha(item)[:12]))
+            else:
+                why = ("la ci-full %s (tête %s) est rouge, attribuée à ton "
+                       "unité par la carte d'impact (#3801) et rouge en local."
+                       % (run_id, frozen_sha(item)[:12]))
             ctx.mail(author, lot,
-                     "#%d retiré du paquet %s : la ci-full %s (tête %s) est rouge, "
-                     "attribuée à ton unité par la carte d'impact (#3801) et "
-                     "rouge en local. Tests : %s. Le paquet est recomposé sans "
-                     "ton lot ; corrige puis regèle, il reviendra à une coupure "
-                     "suivante. %s"
-                     % (lot, name, run_id, frozen_sha(item)[:12], ", ".join(verdict.tests),
+                     "#%d retiré du paquet %s : %s Tests : %s. Le paquet est "
+                     "recomposé sans ton lot ; corrige puis regèle, il reviendra "
+                     "à une coupure suivante. %s"
+                     % (lot, name, why, ", ".join(verdict.tests),
                         run.get("url") or ""))
+    detail = ", ".join(verdict.tests)
+    if verdict.flaky:
+        detail += " ; instable(s) sans retrait : " + ", ".join(verdict.flaky)
     ctx.mail(ctx.pilot, carrier,
              "#%d %s : ci-full rouge (run %s), retrait de %s (%s) ; recomposition."
-             % (carrier, name, run_id, removed, ", ".join(verdict.tests)))
+             % (carrier, name, run_id, removed, detail))
     return attempt(ctx, carrier, name, Attempt(RECOMPOSITION, 1, frozen_sha(item),
                                                run_id=run_id,
                                                exclude=list(verdict.lots),
-                                               only=carrier_group(item)))
+                                               only=carrier_group(item),
+                                               reasons=([reason] * len(verdict.lots)
+                                                        if prefix_proof else [])))
 
 
 def exclude(ctx: Context, lot: int, carrier: int, name: str, run_id: str,

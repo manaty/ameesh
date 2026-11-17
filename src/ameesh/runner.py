@@ -66,6 +66,7 @@ from . import cost as cost_mod
 from . import cost_attribution
 from . import context_metrics, context_profile
 from . import conversation_move
+from . import reveil as reveil_mod
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, refusal, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import account_window
@@ -6092,16 +6093,12 @@ class AgentWorker(threading.Thread):
         ses tours sont courts, et c'est lui qui distribue le travail des autres
         (2026-10-10 : charge jusqu'à 43 pour 12 CPU, plus aucun tour, pas même
         le sien, et personne pour répartir). L234 exempte les auditeurs,
-        y compris sous pression critique ; leur harnais a une priorité réduite."""
-        if not pressure.get("blocked"):
-            return False
-        # L234 : la surveillance reste active, même sous pression critique.
-        if self.runner.is_auditor(self.name, self.agent):
-            from .platform import audit_guard
-            return not audit_guard.available()
-        if pressure.get("critical") or not self.runner.is_orchestrator(self.name):
-            return True
-        return any(b.get("power") for b in pressure.get("breaches") or ())
+        y compris sous pression critique ; leur harnais a une priorité réduite.
+
+        #7680 : la règle est portée par `Runner.pressure_holds_turn`, que la
+        réclamation d'un avatar (`claim_wait` → reclaim différé) consulte aussi.
+        """
+        return self.runner.pressure_holds_turn(self.agent, pressure)
 
     def _host_pressure_note(self, pressure: dict) -> None:
         """Trace la contre-pression (L31, 0028) ; en critique, met en pause.
@@ -7572,24 +7569,52 @@ class AgentWorker(threading.Thread):
           un redémarrage ne remet pas la fenêtre à zéro ;
         * passifs (accusé, copie, diffusion à tous : `mail.passive_reason`) :
           jamais dus ; lus au tour suivant, ou par le hook pendant un tour.
+
+        #7632 : une fiche qui déclare `reveil` remplace les deux premières
+        règles par la sienne (`_reveil_due`) : ses natures immédiates ouvrent
+        un tour tout de suite, le reste (événements compris) attend la fin de
+        sa fenêtre. Sans déclaration, rien ne change.
         """
         passive = [m for m in messages if mail.passive_reason(m)]
         active = [m for m in messages if not mail.passive_reason(m)]
         self._marque_vu(active)
         events = [m for m in active if mail.is_event(m)]
         others = [m for m in active if not mail.is_event(m)]
-        mail_due = bool(others) and self._mail_due(others)
+        policy = reveil_mod.of(self.agent)
+        if policy is not None:
+            mail_due = bool(active) and self._reveil_due(policy, active)
+            events_due = False
+        else:
+            mail_due = bool(others) and self._mail_due(others)
+            events_due = bool(events) and self._events_due(events)
         if others and any(self._from_human(m) for m in others):
             # L81 (étude §6.3) : tant qu'un message humain attend, l'entretien
             # d'une session résidente lui laisse la place (fenêtre de calme).
             self._dernier_humain = time.monotonic()
-        if not mail_due and not (events and self._events_due(events)):
+        if not mail_due and not events_due:
             return None  # regroupement en cours, ou rien que du courrier passif
         if events:
             registry.mark_event_wake(self.db, self.name)
         rows = active + passive
         return self._courrier_spec(
             "event" if all(mail.is_event(m) for m in rows) else "mail", rows)
+
+    def _reveil_due(self, policy: dict, rows: list[dict]) -> bool:
+        """#7632 : le courrier actif en attente ouvre-t-il un tour sous la
+        cadence déclarée ? Oui si l'un des messages est d'une nature
+        immédiate (l'humain toujours ; un événement urgent seulement d'un
+        expéditeur habilité, comme `_events_due`), sinon à la fin de la
+        fenêtre, comptée comme celle de `_mail_due`."""
+        for row in rows:
+            human = self._from_human(row)
+            if mail.is_event(row) and mail.is_urgent(row) and not human \
+                    and not self.interrupt_allowed(row):
+                found = reveil_mod.natures(row) - {"urgent"}
+                if found & set(policy["immediat"]):
+                    return True
+            elif reveil_mod.immediate(policy, row, human=human):
+                return True
+        return self._window_elapsed(rows, float(policy["fenetre_s"]))
 
     def _events_due(self, events: list[dict]) -> bool:
         """Les événements en attente ouvrent-ils un tour ? (C9)"""
@@ -7644,6 +7669,14 @@ class AgentWorker(threading.Thread):
         """
         window = self.mail_batch()
         if window <= 0 or any(mail.is_urgent(m) or self._from_human(m) for m in rows):
+            return True
+        return self._window_elapsed(rows, window)
+
+    def _window_elapsed(self, rows: list[dict], window: float) -> bool:
+        """L125/#3451 : le plus ancien de `rows` attend-il depuis au moins
+        `window` (depuis son arrivée et depuis la fin du dernier tour) ?
+        Sinon, l'échéance est retenue pour le réveil (#3218)."""
+        if window <= 0:
             return True
         now, mono = time.time(), time.monotonic()
         seen = getattr(self, "_batch_seen", {})
@@ -11792,6 +11825,9 @@ class Runner:
         #: #7052 : `{rôle: échéance monotone}` — après un plan ou un reclaim
         #: d'avatar qui n'a pas abouti, ne pas réessayer à chaque passe.
         self._preference_plan_next: dict[str, float] = {}
+        #: #7680 : `{rôle: échéance monotone}` — un déplacement de reprise
+        #: planifié sans bascule immédiate n'est pas replanifié à chaque passe.
+        self._preference_recovery_next: dict[str, float] = {}
         #: #7052 : cadence de la passe de retour, et dernier diagnostic (même
         #: règle que `_role_error` : une panne ne casse pas l'exécuteur).
         self._preference_next = 0.0
@@ -12236,18 +12272,17 @@ class Runner:
         due mais le brief n'a pas pu être construit ; l'appelant ne réclame
         pas — jamais de tour sans briefing. Construit APRÈS la porte de rang
         d'EP2, juste avant le CAS : le brief décrit l'état au plus près.
+
+        #7680 : un agent `releve: preference` ne traverse JAMAIS un hôte sur
+        un `election_brief` (le brief remet la session à zéro). Une ligne
+        encore sur un autre hôte sans déplacement ouvert fait planifier ici
+        le déplacement de reprise, avec son segment ; la réclamation attend
+        que `advance` ait basculé la ligne sur cet hôte.
         """
         if not canon_mod.cross_host(agent.get("releve")):
             return None
         if (agent.get("releve") or "") == "preference":
-            # #7052 : tant qu'un déplacement porte la conversation, l'avatar ne
-            # se relève pas par brief — sa session suit par `conversation_moves`
-            # (rehydratation, A2 #7050) et un brief la remettrait à zéro. Sans
-            # déplacement ouvert (source disparue avant tout plan), le brief
-            # reste le dernier recours de reprise, comme pour un rôle élu.
-            from . import conversation_move
-            if conversation_move.holds(self.db, agent["name"]):
-                return None
+            return self._preference_claim_or_recovery(agent)
         previous = agent.get("previous_host")
         if not previous or previous == self.host:
             return None
@@ -12268,6 +12303,45 @@ class Runner:
                       % agent.get("name"))
             return ""
         return brief
+
+    def _preference_claim_or_recovery(self, agent: dict) -> str | None:
+        """#7680 : une réclamation de préférence ne se fait que sur place.
+
+        `None` quand la ligne est déjà sur cet hôte : la réclamation locale
+        garde la session (ou la tentative `conversation_moves` qui l'a
+        basculée). `""` sinon : aucune réclamation cette passe. Sans
+        déplacement ouvert, cet hôte planifie le déplacement de reprise (le
+        segment sera bâti depuis le journal au premier tour cible) ; avec un
+        déplacement ouvert, il attend la bascule. Jamais d'`election_brief`
+        ici : il remettrait la conversation à zéro.
+        """
+        name = agent["name"]
+        nexts = getattr(self, "_preference_recovery_next", None)
+        if nexts is None:
+            nexts = self._preference_recovery_next = {}
+        if agent.get("host") == self.host:
+            nexts.pop(name, None)
+            return None
+        from . import conversation_move
+        try:
+            if conversation_move.holds(self.db, name):
+                return ""  # la tentative ouverte porte déjà la conversation
+            now = self.clock.monotonic()
+            if now < nexts.get(name, 0.0):
+                return ""
+            nexts[name] = now + 20.0
+            move = conversation_move.plan(
+                self.db, name, self.host, requested_by=self.runner_id,
+                reason="preference")
+            if move is not None and move.get("created"):
+                log_async("[%s] preference recovery: no move open; conversation "
+                          "move planned from %s to %s"
+                          % (name, move.get("source_host") or "?",
+                             move.get("target_host") or self.host))
+        except Exception as exc:  # noqa: BLE001 - un avatar ne bloque pas l'hôte
+            log_async("preference recovery for %s not planned (%s): no claim "
+                      "this pass" % (name, db_mod.brief(exc)))
+        return ""
 
     def preference_return_pass(self) -> list:
         """#7052 (5322 §3.2, avatar B2) : ramène la conversation sur son hôte
@@ -12596,11 +12670,20 @@ class Runner:
                         None)
         since = self._election_free_since.setdefault(name, now)
         try:
-            verdict = election.claim_wait(self.db, agent, self.host, since, now=now)
+            # #7680 : un hôte dont la pression retient les tours ne referme pas
+            # une bascule abandonnée (il annoncerait un retour qu'il ne peut
+            # pas servir) ; la tentative reste ouverte à sa cible.
+            hold_turns = ((agent.get("releve") or "") == "preference"
+                          and self.pressure_holds_turn(agent))
+            verdict = election.claim_wait(self.db, agent, self.host, since, now=now,
+                                          hold_turns=hold_turns)
+            if (not verdict[0]
+                    and verdict[1].startswith("preference reclaim deferred")):
+                self._note_unleased(agent, verdict[1])
             if (not verdict[0] and verdict[1].startswith("not ready")
                     and self._republish_reserved(name, now)):
                 verdict = election.claim_wait(self.db, agent, self.host, since,
-                                              now=now)
+                                              now=now, hold_turns=hold_turns)
             if (not verdict[0] and (agent.get("releve") or "") == "preference"
                     and verdict[1].startswith("preference reclaim:")):
                 # #7052 : l'hôte préféré n'a pas réclamé dans la marge. Cet
@@ -12614,12 +12697,17 @@ class Runner:
                         holdoff_s=election.PREFERENCE_HOLDOFF_S + delay)
                     if closed is not None:
                         self._preference_plan_next.pop(name, None)
+                        kind = ("manual move"
+                                if (closed.get("reason") or "") == "manual"
+                                else "preference")
                         log_async(
-                            "[%s] preference reclaim: %s did not claim; the "
+                            "[%s] %s reclaim: %s did not claim; the "
                             "conversation returns to %s" % (
-                                name, closed.get("target_host") or "?", self.host))
+                                name, kind, closed.get("target_host") or "?",
+                                self.host))
                         verdict = election.claim_wait(self.db, agent, self.host,
-                                                      since, now=now)
+                                                      since, now=now,
+                                                      hold_turns=hold_turns)
                     else:
                         self._preference_plan_next[name] = now + 5.0
             return verdict
@@ -15587,6 +15675,26 @@ class Runner:
     def container_runtime(self):
         """Le moteur de conteneurs de l'hôte, ou None (L31, 0028)."""
         return getattr(self, "_container_runtime", None)
+
+    def pressure_holds_turn(self, agent: dict, pressure: dict | None = None) -> bool:
+        """L31 (0028), #7680 : la pression retient-elle le prochain tour de `agent` ?
+
+        Même règle que `AgentWorker._held_by_pressure` (qui délègue ici pour
+        que la réclamation d'un avatar ne se juge pas avec une autre règle) :
+        toute brèche retient le tour, sauf un orchestrateur sous une pression
+        NON critique et hors batterie basse ; un auditeur passe tant que son
+        scope gardé est disponible (L234).
+        """
+        pressure = self.host_pressure() if pressure is None else pressure
+        if not pressure.get("blocked"):
+            return False
+        name = str((agent or {}).get("name") or "")
+        if self.is_auditor(name, agent):
+            from .platform import audit_guard
+            return not audit_guard.available()
+        if pressure.get("critical") or not self.is_orchestrator(name):
+            return True
+        return any(b.get("power") for b in pressure.get("breaches") or ())
 
     def host_pressure(self, now: float | None = None) -> dict:
         """Verdict de pression de l'hôte (L31, 0028), cache court.

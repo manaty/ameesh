@@ -90,7 +90,7 @@ class ServerUnitsTest(unittest.TestCase):
         service = (ROOT / "deploy/serveur/ameesh-releve-hote.service").read_text()
         self.assertIn("User=ameesh", service)
         self.assertIn("ExecStart=/opt/ameesh/venv/bin/ameesh hosts --publish", service)
-        self.assertIn("OnUnitActiveSec=5min",
+        self.assertIn("OnUnitActiveSec=60s",
                       (ROOT / "deploy/serveur/ameesh-releve-hote.timer").read_text())
         for script in ("deploy/serveur/installer-serveur.sh", "deploy/mise-a-jour/vm.sh"):
             self.assertIn("systemctl enable --now ameesh-releve-hote.timer",

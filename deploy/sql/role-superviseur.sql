@@ -264,6 +264,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #7004 (0573) : harnais admis d'une identité (des noms de harnais,
         -- pas de contenu) — même nature que `harness` et `session_harness`
         'harnesses',
+        -- #7632 (0588) : cadence de réveil déclarée par la fiche (des natures
+        -- et une durée, pas de contenu) — lue avec la ligne, comme `releve`
+        'reveil',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
         'workstream',
         -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,
@@ -474,6 +477,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L159d (0061): shared host measure, numbers only
         'mem_total_bytes', 'psi_cpu_some', 'psi_mem_some', 'psi_mem_full',
         'psi_io_some', 'app_cpu', 'guest_cpu', 'cpu_window_s', 'guest_mem_bytes',
+        -- #7687 (0589): live offloaded jobs of a lending host, a number
+        'guest_jobs',
         'lendable_cpu', 'lendable_memory_bytes', 'lendable_disk_bytes',
         -- #246 (0067): btrfs allocation, numbers only
         'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes',

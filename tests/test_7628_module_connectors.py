@@ -136,7 +136,7 @@ class InstalledActionTest(ActionsBase):
         self.refused(actions.CONNECTOR, self.execute, action, self.connector())
         self.assertFalse(Path(self.directory).exists())
 
-    def test_withdrawn_policy_prevents_approval_and_reconciliation(self):
+    def test_withdrawn_policy_prevents_approval_but_not_reconciliation(self):
         action = self.propose_module()
         ModuleStore(self.db).replace('', [])
         self.refused(actions.CONNECTOR, self.approve, action)
@@ -145,7 +145,42 @@ class InstalledActionTest(ActionsBase):
         self.assertEqual(self.execute(action, self.connector())['state'], 'unknown')
         connector = self.connector()
         ModuleStore(self.db).replace('', [])
-        self.refused(actions.CONNECTOR, actions.reconcile, self.db, action['action_id'], connector)
+        reconciled = actions.reconcile(self.db, action['action_id'], connector)
+        self.assertEqual(reconciled['state'], 'confirmed')
+        self.assertEqual(self.get(action)['state'], 'confirmed')
+        self.assertEqual(list(Path(self.directory).iterdir()),
+                         [Path(self.directory) / action['action_id']])
+
+    def test_class_change_after_an_unknown_outcome_still_reconciles(self):
+        action = self.propose_module()
+        self.approve(action)
+        self.assertEqual(self.execute(action, self.connector())['state'], 'unknown')
+        connector = self.connector()
+        self.activate('costly')
+        reconciled = actions.reconcile(self.db, action['action_id'], connector)
+        self.assertEqual(reconciled['state'], 'confirmed')
+        self.assertEqual(self.get(action)['state'], 'confirmed')
+
+    def test_uninstalled_module_reconciles_through_the_retained_connector(self):
+        action = self.propose_module()
+        self.approve(action)
+        self.assertEqual(self.execute(action, self.connector())['state'], 'unknown')
+        connector = self.connector()
+        with mock.patch.object(registry, 'action_connectors', return_value={}):
+            reconciled = actions.reconcile(self.db, action['action_id'], connector)
+        self.assertEqual(reconciled['state'], 'confirmed')
+        self.assertEqual(self.get(action)['state'], 'confirmed')
+
+    def test_reconciliation_refuses_a_connector_name_served_by_another_provider(self):
+        action = self.propose_module()
+        self.approve(action)
+        self.assertEqual(self.execute(action, self.connector())['state'], 'unknown')
+        connector = self.connector()
+        with mock.patch.object(registry, 'action_connectors',
+                               return_value={'bench-journal': ('other', lambda: None)}):
+            self.refused(actions.CONNECTOR, actions.reconcile,
+                         self.db, action['action_id'], connector)
+        self.assertEqual(self.get(action)['state'], 'unknown')
 
     def test_stale_connector_does_not_execute_after_its_module_is_removed(self):
         action = self.propose_module()
