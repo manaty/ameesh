@@ -94,7 +94,9 @@ class GelAvantPousseeTest(unittest.TestCase):
     """Le témoin de h-17 : la composition puis le regel, avant la poussée."""
 
     def test_unite_reglee_ne_part_pas_et_le_paquet_est_recompose(self) -> None:
-        flux = Flux(self, tests=[([green()], [], [])],
+        # #7740 : la recomposition après regel rejoue la série directe de
+        # l'unité restante ; la fixture fournit les deux séries.
+        flux = Flux(self, tests=[([green()], [], []), ([green()], [], [])],
                     compositions=[two(), one()],
                     candidate_reads=[INITIAL, REFROZEN])
         self.assertEqual(flux.run(), 0)
@@ -113,7 +115,8 @@ class GelAvantPousseeTest(unittest.TestCase):
         self.assertGreaterEqual(flux.candidate_calls, 2)
 
     def test_lot_sorti_de_la_liste_ne_part_pas_non_plus(self) -> None:
-        flux = Flux(self, tests=[([green()], [], [])],
+        # #7740 : même recomposition, seconde série directe sur l'unité #1.
+        flux = Flux(self, tests=[([green()], [], []), ([green()], [], [])],
                     compositions=[two(), one()],
                     candidate_reads=[INITIAL, GONE])
         self.assertEqual(flux.run(), 0)

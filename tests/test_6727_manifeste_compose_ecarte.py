@@ -51,7 +51,9 @@ def read(*sources: tuple[int, str]):
 class RecompositionApresRegelTest(unittest.TestCase):
 
     def test_lot_ecarte_puis_compose_quitte_les_ecartes(self) -> None:
-        flux = Flux(self, tests=[([green()], [], [])],
+        # #7740 : la recomposition après regel rejoue la série directe de la
+        # composition restante ; la fixture fournit les deux séries.
+        flux = Flux(self, tests=[([green()], [], []), ([green()], [], [])],
                     compositions=[first_pass(), without_two()],
                     candidate_reads=[read((1, A), (2, C), (3, G)),
                                      read((1, A), (2, E), (3, G)),
