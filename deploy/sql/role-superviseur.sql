@@ -47,7 +47,8 @@
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
 --       key_holders.public_key (et la vue mesh_keys, #330)
---       authenticators.public_key, .credential_id
+--       authenticators.public_key, .credential_id, .accord_operations
+--       (#7631 : politique du registre de confiance, inutile à la supervision)
 --   * exécuteurs médiés (voie B, 0062 et 0063) — empreintes de jetons et de
 --     codes, identifiants d'assertions, clé et attestation d'appareil,
 --     réponses rejouables du cache d'idempotence :
