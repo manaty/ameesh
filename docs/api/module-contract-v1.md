@@ -1,9 +1,12 @@
 # External module public contract, version 1
 
-Contract revision: **1.1, 17 November 2026** (additive E1a snapshot). Scope: an installed external
-module and its client processes. Reference: [#5827](https://github.com/manaty/ameesh/issues/5827),
+Contract revision: **1.1, 17 November 2026** (additive E1a and E2a snapshots).
+Scope: an installed external module and its client processes. Reference:
+[#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
-The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
+Revision 1.1 adds the Python mail submission and history surface (tranche E2a,
+#7671); nothing else in 1.0 changes. The
+[IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
 
@@ -173,6 +176,56 @@ mapping. Their proposed schemas are not available runner hooks. Until those
 gaps are delivered, IMA's existing adaptations remain tracked by its
 [#1803](https://github.com/thepackengers/issue-manager-agent/issues/1803), rather
 than acquiring compatibility guarantees for private methods.
+
+## Mail submission and history (Python)
+
+Contract 1.1 adds the first write surface for a module that already holds the
+deployment's database identity: `ameesh.public.mail`. This is the replacement
+for direct `agent_mailbox` submission and history SQL (mapping E2a); the
+governed `agent-mail` commands and the HTTP boundary above remain the public
+surfaces for an ordinary caller. This Python surface does not authenticate a
+remote client: the database credential remains the trust boundary. A process
+that runs under a mesh runner must use the identity that runner verified; a
+module service with no declared runner identity keeps the actor it names.
+Mediated executor connections are refused — their contract is separate.
+
+Enable the surface only when `ameesh.public.CONTRACT_VERSION` is `"1.1"` or a
+compatible later minor.
+
+| Element | Contract |
+| --- | --- |
+| `Submission(recipient, body, kind="notify", payload=None, work_item_id=None, thread=True, idempotency_key=None)` | One typed message. `recipient` is a registered agent; `kind` is `request`, `reply`, `notify` or `event`; `payload` is the module-owned JSON object; `work_item_id` optionally links a lot; `thread=False` keeps the content out of the readable project thread (the mailbox row and this history remain); `idempotency_key` is the client key described below. |
+| `submit(db, actor, submission) -> Receipt` | Deposit one message as `actor`. The sender is always the actor; another sender cannot be named. |
+| `submit_many(db, actor, submissions) -> BatchResult` | Deposit up to 50 submissions in input order. Each item commits or is refused on its own; a refusal appears in its `SubmissionResult` and does not hide later outcomes. A larger batch is refused before anything is deposited. |
+| `find(db, actor, recipient, idempotency_key) -> Receipt \| None` | The durable receipt already deposited under this `(actor, recipient, key)`, or `None`. |
+| `history(db, actor, *, peer=None, after_id=None, limit=100, since_ts=None, until_ts=None, kind=None) -> HistoryPage` | Bounded history of the messages where `actor` is sender or recipient, oldest first by durable id, strictly after `after_id`. `peer` restricts the page to the two-party conversation with that agent; `kind` filters the nature; `since_ts`/`until_ts` bound the creation time. `limit` is between 1 and 200. |
+| `Receipt(id, actor, recipient, kind, created_ts, reused)` | `id` is the durable mailbox row id, stable across retries; `request_id` is that id for a `request` and `None` otherwise; `reused` says this call returned an existing deposit. |
+| `HistoryEntry` and `HistoryPage` | One message (`id`, `sender`, `recipient`, `body`, `kind`, `payload`, `work_item_id`, `created_ts`, `delivered_ts`) and a page (`entries`, `next_cursor`, `has_more`). `next_cursor` is the last returned id, or the supplied cursor for an empty page; pass it back as `after_id`. `delivered_ts` is observation only and never a lease claim. |
+| `SubmissionResult` and `BatchResult` | Ordered batch outcomes (`index`, `receipt`, `error`, `detail`) and the batch (`results`, `ok`). The value objects expose `as_dict()` for JSON clients. |
+| Errors | `InvalidSubmission` (code `invalid`), `IdempotencyConflict` (`conflict`), `ScopeRefused` or `RecipientRefused` (`refused`), `UnsupportedStorage` (`unsupported`). A batch reports the same codes in `SubmissionResult.error`. |
+
+Idempotency is scoped to `(actor, recipient)`. The content is the body, the
+kind, the module payload and the work item. The same key with the same content
+returns the same `id` with `reused=True`; the same key with another content
+raises `IdempotencyConflict`; concurrent retries end on one durable row. The
+core stores the key in `payload.idempotency_key`; the unique index of
+migration 0497 is the authority, so the guarantee holds across processes, not
+only within one caller.
+
+The module payload supports role, document and Memoria data under its own
+namespace without core business fields. Core delivery and accounting markers
+(`idempotency_key`, `report`, `report_fingerprint`, `urgent`, `ack`, `info`,
+`cc`, `broadcast`, `radar`, `ci_passif`, `human`, `human_account`, `verdict`,
+`arbitration`, `reassigned`, `request_expires_ts`) are reserved and refused.
+`payload.attribution` is the one admitted core key: it is validated with the
+closed caller-attribution schema and remains data, never admission, budget or
+authorization.
+
+Published bounds: body at most 64 KiB UTF-8, serialized payload at most
+256 KiB, 50 submissions per batch, 200 history entries per page. Bodies must be
+readable text (the thread rule). Signatures, request deadlines, urgent wake-up,
+acknowledgements and copies are not part of this surface; a consumer that needs
+them uses the governed command or HTTP boundary.
 
 ## Named SQL read views
 
