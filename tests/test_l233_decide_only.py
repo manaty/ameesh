@@ -198,12 +198,12 @@ class ProseTest(_Base):
 
     def setUp(self):
         super().setUp()
-        # #7634 : sans avatar au canon, la route humaine est l'agent `externe`
-        # du registre (le bureau du mesh Manaty) ; le cœur n'en connaît plus
-        # le nom.
+        # #7634 : sans avatar au canon, la route humaine est la route
+        # explicitement configurée de l'humain (le bureau du mesh Manaty),
+        # rattachée ici à human:alice ; le cœur n'en connaît plus le nom.
         registry.upsert(self.db, "bureau", harness="claude", host=self.cfg.host)
-        self.db.execute("UPDATE agent_registry SET mode = 'externe'"
-                        " WHERE name = 'bureau'")
+        self.db.execute("UPDATE agent_registry SET mode = 'externe',"
+                        " responsible = %s WHERE name = 'bureau'", (ALICE,))
 
     def send(self, body, *, sender="orch", recipient="bureau", lot=None, kind="notify"):
         return mail.send(self.db, sender, recipient, body, kind=kind,

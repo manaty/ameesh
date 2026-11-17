@@ -259,15 +259,18 @@ def buried_hold_marker(text) -> str | None:
 #: l'exécutant rendu est `externe`. Une échéance facultative `(due
 #: 2026-10-25 12:00 UTC)` ou `(échéance …)`, avant ou après le geste, borne la
 #: relance ; sans elle, le débit relance après son seuil.
+#: #7634 : un exécutant nommé, quel qu'il soit ; les noms historiques
+#: (`bureau`) se décodent donc encore, normalisés vers `avatar` quand ils ne
+#: sont pas un mot réservé. Aucun nom d'avatar n'est connu du cœur.
+_EXECUTOR_NAME = r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ0-9._@-]*"
 _EXTERNAL_HEAD = re.compile(
     r"(?<![\w])attente\s+"
     r"(?:externe\s*[\(\[]?\s*)?"
     r"(?:de\s+la\s+|du\s+|de\s+l'|de\s+)?"
-    r"(?P<who>avatar|owner|propri[eé]taire|externe)"
-    r"\s*(?:[\)\]]\s*)?"
+    r"(?P<who>%s)" % _EXECUTOR_NAME + r"\s*(?:[\)\]]\s*)?"
     r"(?P<tail>.*)", re.I | re.S)
 _EXTERNAL_COMMA_HEAD = re.compile(
-    r"^hold:\s*attente\s+(?P<who>avatar|owner|propri[eé]taire|externe)\s*,", re.I)
+    r"^hold:\s*attente\s+(?P<who>%s)\s*," % _EXECUTOR_NAME, re.I)
 _EXTERNAL_WRITE_HEAD = re.compile(
     r"^hold:\s*attente\s+(?:owner|avatar)\b", re.I)
 _EXTERNAL_COMMA = re.compile(r"^\s*,\s*(?P<gesture>.+)$", re.S)
@@ -300,9 +303,9 @@ def external_hold(text) -> dict | None:
     match = _EXTERNAL_HEAD.search(note)
     if not match:
         return None
-    who = _EXTERNAL_EXECUTORS.get(match.group("who").strip().casefold())
-    if not who:
-        return None
+    # #7634 : un exécutant nommé hors vocabulaire (`bureau`, le nom propre
+    # d'un agent) reste une attente de la route humaine, normalisée `avatar`.
+    who = _EXTERNAL_EXECUTORS.get(match.group("who").strip().casefold(), "avatar")
     tail = match.group("tail")
     head_due = _EXTERNAL_DUE.match(tail)
     if head_due:
