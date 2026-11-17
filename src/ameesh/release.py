@@ -1318,6 +1318,7 @@ def add_parser(sub, func) -> None:
     for each in (pin_p, verify_p):
         each.add_argument("--repo", default=".",
                           help="any git clone of the project (default: .)")
-        each.add_argument("--remote", default="https://github.com/manaty/ameesh",
-                          help="the publishing repository")
+        each.add_argument("--remote", default="origin",
+                          help="the publishing repository: a remote of --repo or a "
+                               "URL (default: origin)")
         each.set_defaults(func=func)
