@@ -221,6 +221,15 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(sm.check('0572.sql', new_table.encode(), sm.load_policy(),
                                   read_file=lambda p:b'', signed_decision=lambda *a:False).kind,
                          'additive')
+        # A table created under a DO guard may already exist: not proven new.
+        guarded = """DO $$ BEGIN
+        IF to_regclass('public.conversation_moves') IS NULL THEN
+            CREATE TABLE conversation_moves (id int);
+        END IF;
+        END $$;
+        CREATE TRIGGER spelling BEFORE INSERT ON conversation_moves
+            FOR EACH ROW EXECUTE FUNCTION f();"""
+        self.assertEqual(sm.classify(guarded).kind, 'relaxation')
         # On an existing table, without the marker, the trigger is still a
         # relaxation owing its declaration and rejects_previous_writes.
         unmarked = ("CREATE TRIGGER guard BEFORE INSERT ON work_items "

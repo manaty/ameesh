@@ -627,7 +627,10 @@ def _proven_additive(statement, code, literals, *, proves_new, constraint_marker
         if trigger_marker and _simple_name(trigger.group("name")) and _simple_name(table):
             return ("trigger %s declared compatible with previous code"
                     % trigger.group("name"),)
-        if table and _simple_name(table) and migrations._proven_new(code, "table", table):
+        # A CREATE TABLE flattened out of a DO block may be conditional
+        # (to_regclass guard): the table is then not proven new.
+        if (unconditional and table and _simple_name(table)
+                and migrations._proven_new(code, "table", table)):
             return ("trigger %s on a table created by this migration"
                     % trigger.group("name"),)
         return None
