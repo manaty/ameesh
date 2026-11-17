@@ -267,6 +267,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #7632 (0588) : cadence de réveil déclarée par la fiche (des natures
         -- et une durée, pas de contenu) — lue avec la ligne, comme `releve`
         'reveil',
+        -- #7674 (0590) : politique de session déclarée par la fiche (une
+        -- nature, un booléen et des nombres, pas de contenu) — lue avec la
+        -- ligne, comme `reveil` et les réglages `session_policy`/`context_max_tokens`
+        'declared_policy',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
         'workstream',
         -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,
