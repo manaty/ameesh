@@ -876,15 +876,29 @@ def _require_readable(canons: list) -> None:
                reasons[0] if reasons else "no source read"))
 
 
-def _generated_name(naming, role: str | None, projects, canons: list, db) -> str:
-    """Nom par défaut engendré par le nommage, ou refus explicite (L243, #468)."""
+def _generated_name(naming, role: str | None, projects, canons: list, db, *,
+                    for_spawn: bool = False) -> str:
+    """Nom par défaut engendré par le nommage, ou refus explicite (L243, #468).
+
+    `for_spawn` (#7681) : `spawn` peut toujours recevoir un nom explicite, qui
+    ne demande aucune convention. Le refus le dit, au lieu de laisser croire
+    qu'il faut d'abord déclarer `extensions.ameesh.naming` pour créer un
+    éphémère."""
     _require_readable(canons)
     if naming is None:
+        if for_spawn:
+            raise canon_mod.NamingError(
+                "no `extensions.ameesh.naming` in the canon: pass an explicit name "
+                "instead (`ameesh agent spawn <name> --by … --ttl …`), or declare org, "
+                "projects and roles in its federation.yaml")
         raise canon_mod.NamingError(
             "no `extensions.ameesh.naming` in the canon: declare org, projects and "
             "roles in its federation.yaml")
     if not role:
-        raise canon_mod.NamingError("--role is required to generate a name")
+        raise canon_mod.NamingError(
+            "--role is required to generate a name%s"
+            % (", or pass an explicit name (`ameesh agent spawn <name> --by … --ttl …`)"
+               if for_spawn else ""))
     known = canon_mod.known_projects(canons, projects or [], naming)
     return naming.next_name(role, projects or [], _taken_agent_names(canons, db), known)
 
@@ -943,7 +957,8 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
     try:
         db_mod.require_schema(db)
         name = args.name or _generated_name(
-            canon[0].naming if canon else None, args.role, args.project, canon, db)
+            canon[0].naming if canon else None, args.role, args.project, canon, db,
+            for_spawn=True)
         row = canon_sync.spawn(db, name, args.by, ttl, cwd=args.cwd, canon=canon,
                                tools=args.tool, mcp=args.mcp, context=context)
         if args.prompt:
