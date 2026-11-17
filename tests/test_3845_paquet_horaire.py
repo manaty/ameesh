@@ -47,6 +47,25 @@ MANIFEST = """# Paquet
 RESOLVED = MANIFEST.replace("| 1 | #3801 | `035249f490d2` | `035249f49` | composition |",
                             "| 1 | #3779, #3755 | `404177ae7c83` | `51762f6fa8b1` | résolution |")
 
+#: #7691, cas h-04 (run 44027465689) : #3801 devine u1 (#7629), mais le rouge
+#: apparaît à u2 (#7654) et u4 (#7634). Les commits sont les têtes cumulées
+#: (`base + u1`, …) que le rejeu des préfixes doit suivre.
+H04_MANIFEST = """# Paquet
+
+## Composition (4 unités, 4 lots)
+
+| unité | lot(s) | source | commit | note |
+|---|---|---|---|---|
+| 1 | #7629 | `111111111111` | `111111111111` | composition |
+| 2 | #7654 | `222222222222` | `222222222222` | composition |
+| 3 | #7659 | `333333333333` | `333333333333` | composition |
+| 4 | #7634 | `444444444444` | `444444444444` | composition |
+"""
+T2179 = "tests.test_2179_attribution.T.test_2179"
+T4572 = "tests.test_4572_attribution.T.test_4572"
+T5035 = "tests.test_5035_attribution.T.test_5035"
+H04_TESTS = (T2179, T4572, T5035)
+
 
 def _logical(cmd, input_text):
     """#7091 : un texte passé par l'entrée standard (« - ») est relu à sa
@@ -164,6 +183,19 @@ def red_run(*, attribution=True, best=(3801,), status="failure", part="psycopg 1
             "units": [{"lot": lot, "best": 4} for lot in best]
             + [{"lot": 3807, "best": 1}]}]}
     return run
+
+
+def h04_run():
+    """#7691 : trois rouges, tous attribués par #3801 à u1 (#7629)."""
+    failures = [{"test": test, "part": "psycopg 1/8", "inherited": False}
+                for test in H04_TESTS]
+    return {"run_id": "44027465689", "head_sha": HEAD, "status": "failure",
+            "url": "u", "failures": failures,
+            "attribution": {"status": "ok", "tests": [{
+                "test": test, "status": "probable",
+                "units": [{"lot": 7629, "best": 4}, {"lot": 7654, "best": 2},
+                          {"lot": 7634, "best": 1}]} for test in H04_TESTS]}}
+
 
 
 class FakeLease:
@@ -894,6 +926,123 @@ class FollowTest(Base):
         self.shell.ci[4000] = {"runs": [red_run()]}
         self.assertIn("vert en local", ph.tick(self.ctx))
         self.assertFalse([c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)])
+
+
+class PrefixSituationTest(Base):
+    """#7691 : la ci-full rouge situe l'unité sur les préfixes (#4217).
+
+    Le rejeu sur la tête ne désigne personne : elle contient déjà toutes les
+    unités, donc les tests y rougissent quelle que soit la fautive. La
+    première unité où chaque test apparaît est la seule à retirer — l'unité
+    devinée par #3801 ne l'est que si ce rejeu la désigne.
+    """
+
+    def open_h04(self):
+        item = carrier(notes=(ph.MARK_CI + HEAD,))
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        for lot in (7629, 7654, 7659, 7634):
+            self.shell.items[lot] = {"id": lot, "assignee": "auteur-%d" % lot}
+        self.shell.ci[4000] = {"runs": [h04_run()]}
+        self.shell.recomposed_head = HEAD2
+        return item
+
+    def test_les_unites_portent_leur_commit_de_prefixe(self):
+        units = ph.composition_units(H04_MANIFEST)
+        self.assertEqual([unit.lots for unit in units],
+                         [[7629], [7654], [7659], [7634]])
+        self.assertEqual([unit.commit for unit in units],
+                         ["111111111111", "222222222222",
+                          "333333333333", "444444444444"])
+
+    def test_h04_u1_verte_n_est_pas_retiree_u2_et_u4_le_sont(self):
+        self.manifest = H04_MANIFEST
+        self.open_h04()
+        calls = []
+
+        def replay(ctx, sha, tests):
+            tests = list(tests)
+            calls.append((sha, tests))
+            if sha == HEAD:
+                return ph.Replay("red", failed=tuple(tests))
+            if sha == "222222222222":
+                return ph.Replay("red", failed=(T2179,))
+            if sha == "444444444444":
+                return ph.Replay("red", failed=tuple(
+                    test for test in tests if test in (T4572, T5035)))
+            return ph.Replay("green", "vert en local (1 test(s)) : rouge non reproduit")
+
+        ph.replay_locally = replay
+        ph.tick(self.ctx)
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
+        excluded = [auto[i + 1] for i, arg in enumerate(auto) if arg == "--exclude"]
+        self.assertEqual(excluded, ["7654", "7634"])
+        self.assertNotIn("7629", excluded)
+        reasons = [auto[i + 1] for i, arg in enumerate(auto)
+                   if arg == "--exclude-reason"]
+        self.assertEqual(reasons, [ph.EXCLUDE_CI_FULL_PREFIX_REASON] * 2)
+        self.assertIn("ci-full rouge située sur les préfixes", reasons[0])
+        self.assertEqual(auto[auto.index("--keep-composition") + 1], HEAD)
+        # u1 (devinée par #3801) et u3 restent dans le paquet : ni retrait, ni
+        # courrier, ni trace d'exclusion.
+        for lot in (7629, 7659):
+            self.assertEqual(self.shell.ran("work", "move", str(lot)), [])
+            self.assertNotIn("auteur-%d" % lot, [to for to, _ in self.shell.mails])
+        # u2 et u4, les premières unités où les tests apparaissent, sortent.
+        for lot in (7654, 7634):
+            self.assertEqual(
+                len(self.shell.ran("work", "move", str(lot), "build")), 1)
+            self.assertIn("auteur-%d" % lot, [to for to, _ in self.shell.mails])
+        # rejeu de la tête, puis préfixes dans l'ordre ; un test situé n'est
+        # plus rejoué aux préfixes suivants.
+        self.assertEqual([sha for sha, _ in calls],
+                         [HEAD, "111111111111", "222222222222",
+                          "333333333333", "444444444444"])
+        self.assertEqual(calls[1][1], list(H04_TESTS))
+        self.assertEqual(calls[2][1], list(H04_TESTS))
+        self.assertEqual(calls[3][1], [T4572, T5035])
+        self.assertEqual(calls[4][1], [T4572, T5035])
+
+    def test_vert_sur_tous_les_prefixes_instable_ne_retire_rien(self):
+        self.manifest = H04_MANIFEST
+        item = self.open_h04()
+
+        def replay(ctx, sha, tests):
+            if sha == HEAD:
+                return ph.Replay("red", failed=tuple(tests))
+            return ph.Replay("green", "vert en local (1 test(s)) : rouge non reproduit")
+
+        ph.replay_locally = replay
+        out = ph.tick(self.ctx)
+        self.assertIn("rouge consigné", out)
+        self.assertIn("instable", out)
+        self.assertFalse([c for c in self.shell.calls
+                          if "paquet-auto.py" in " ".join(c)])
+        self.assertEqual(self.shell.ran("work", "move"), [])
+        self.assertTrue(any(n.startswith(ph.MARK_RED + "44027465689")
+                            for n in ph.marks(item)))
+
+    def test_prefixe_non_concluant_ne_retire_rien_et_previent(self):
+        self.manifest = H04_MANIFEST
+        item = self.open_h04()
+
+        def replay(ctx, sha, tests):
+            if sha == HEAD:
+                return ph.Replay("red", failed=tuple(tests))
+            if sha == "222222222222":
+                return ph.Replay("inconclusive", "délai dépassé")
+            return ph.Replay("green", "vert en local (1 test(s)) : rouge non reproduit")
+
+        ph.replay_locally = replay
+        out = ph.tick(self.ctx)
+        self.assertIn("rouge consigné", out)
+        self.assertIn("préfixe 2", out)
+        self.assertFalse([c for c in self.shell.calls
+                          if "paquet-auto.py" in " ".join(c)])
+        self.assertEqual(self.shell.ran("work", "move"), [])
+        self.assertTrue(any(n.startswith(ph.MARK_RED + "44027465689")
+                            for n in ph.marks(item)))
+        self.assertIn("mesh-design", [to for to, _ in self.shell.mails])
 
 
 class RedHeadPublishTest(Base):
