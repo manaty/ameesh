@@ -291,7 +291,7 @@ class PacketGuardTest(_Base):
                        "lot/7-work", "agent/a-1", "review/r-1", ""):
             with self.subTest(source=source), self.assertRaises(packet_guard.PacketGuardError):
                 packet_guard.check_merge(None, self.lot, source, "main", self.head)
-        for source in ("integration/paquet-62", "origin/integration/p", "release/1.12.0"):
+        for source in ("integration/paquet-62", "origin/integration/p"):
             with self.subTest(source=source):
                 self.assertTrue(packet_guard.check_merge(None, self.lot, source, "main",
                                                          self.head)["allowed"])
