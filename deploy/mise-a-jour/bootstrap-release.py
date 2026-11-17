@@ -118,13 +118,16 @@ class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
 
     def validate(self,operation,digest,step):
         self.denial_reason=None
-        if operation!=self.operation or step not in self.steps or self.scopes[step]!=digest:
+        def refused(reason):
+            self.denial_reason=reason
             return False
+        if operation!=self.operation or step not in self.steps or self.scopes[step]!=digest:
+            return refused('bootstrap authority scope mismatch')
         view=signed.decisions.get_for_controller(self.db,self.decision_id)
         if view and not self._current(view):
             return False
         if not view or view.get('state')!='answered' or view.get('needs_signature') is not True:
-            return False
+            return refused('signed bootstrap decision unavailable')
         answer=view.get('answer') or {}
         # #4788: install/revoke (release and channel bundles share this check)
         # name the option through the bounded native forms of
@@ -133,18 +136,22 @@ class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
         if (view.get('options')!=self.options or answer.get('option')!=self.option
                 or answer.get('channel')!='signed'
                 or signed.decisions.match_option(view,answer.get('text') or '')!=self.option):
-            return False
+            return refused('signed bootstrap answer mismatch')
         text=view.get('question') or ''
         if not text.startswith(self.prefix):
-            return False
+            return refused('signed bootstrap question prefix mismatch')
         try:
             expires=json.loads(text[len(self.prefix):])['expires_at']
             if type(expires) is not int or text!=self.render(operation,expires):
-                return False
+                return refused('signed bootstrap question mismatch')
         except (KeyError,ValueError,TypeError):
-            return False
+            return refused('signed bootstrap question malformed')
         now=self.clock()
-        return now<expires and self._proof_live(view,now,expires)
+        if now>=expires:
+            return refused('signed bootstrap window expired')
+        if not self._proof_live(view,now,expires):
+            return refused('signed bootstrap proof unavailable or expired')
+        return True
 
 
 class SignedBootstrapRevokeAuthority(SignedBootstrapAuthority):
@@ -171,10 +178,11 @@ def _run(journal,operation,bundle, *, authority,adapter,steps=STEPS,scopes_of=No
     def approved(step):
         try:
             valid=authority.validate(operation,action_scopes[step],step) is True
-        except Exception:
-            valid=False
+        except Exception as error:
+            raise BootstrapError('bootstrap authority unavailable at '+step) from error
         if not valid:
-            raise BootstrapError(getattr(authority,'denial_reason',None) or 'bootstrap authority unavailable')
+            raise BootstrapError(getattr(authority,'denial_reason',None)
+                                 or 'bootstrap authority rejected at '+step)
     approved('preflight')
     with protocol.locked(journal,bundle['host']) as root:
         approved('preflight')
