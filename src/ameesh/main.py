@@ -115,10 +115,10 @@
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
-  ameesh host reattach SOURCE AGENT --to NEW_HOST
-        durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
+  ameesh host reattach SOURCE AGENT --to NEW_HOST
+        durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
         tenants of a shared host: plan, binding, presence (#7106, bureau or
         human only; --register runs on the target host);
