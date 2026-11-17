@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Public mail surface, contract v1.2 (tranche E2a, #7636/#5827).
+"""Public mail surface, contract v1.2 (tranche E2a, #7636/#5827/#7706).
 
 An installed external module already trusted with a database identity submits
 typed mail and reads its own bounded history through this module instead of
@@ -10,15 +10,20 @@ part of it.
 What the core owns here:
 
 * the **actor** is fixed by the call — a submission is always deposited with
-  ``sender = actor``; a caller cannot name another sender;
+  ``sender = actor``; a caller cannot name another sender, and the core's own
+  sender identities (``ameesh``, ``veille``, the governance roles, human and
+  chat prefixes) are refused before alias resolution or deposit;
 * **idempotency** is scoped to ``(actor, recipient)``: the same key with the
   same content reuses the durable message id, the same key with another
   content refuses, and concurrent retries end on one durable row (the unique
   index of migration 0497 is the authority);
 * **history** is bounded by a cursor and restricted to conversations the actor
   takes part in;
-* the module-owned ``payload`` stays free-form (bounded JSON), while core
-  delivery markers are reserved.
+* the module-owned payload is a JSON object under the imposed
+  ``payload["module"]`` namespace; every other top-level key is core-owned and
+  refused, so a core marker added in a later release is closed to modules by
+  default.  ``payload.attribution`` is the one admitted core key, validated
+  and never authority.
 
 The database credential remains the trust boundary: this surface scopes a
 caller that already holds the database identity, it does not authenticate a
@@ -60,10 +65,10 @@ _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 #: unique index that carries idempotency in the core mailbox (migration 0497)
 _IDEMPOTENCY_INDEX = "agent_mailbox_idempotency_key_idx"
 
-#: payload keys the core reads for delivery, review, decisions, accounting or
-#: threading.  A module writes its own data under its own namespace;
-#: ``attribution`` is the one core key admitted here, and it is validated,
-#: never authority.
+#: known payload keys the core reads for delivery, review, decisions,
+#: accounting or threading.  They are listed for diagnostics and for the
+#: precise refusal message; admission is the allow-list below, so a marker
+#: added later is refused even before this list knows it.
 RESERVED_PAYLOAD_KEYS = frozenset((
     "idempotency_key",
     "report",
@@ -96,6 +101,34 @@ RESERVED_PAYLOAD_KEYS = frozenset((
     "staging_actif",
 ))
 
+#: the one top-level payload namespace a module owns; its value is the module's
+#: JSON object.  Every other top-level key is core-owned and refused.
+MODULE_PAYLOAD_KEY = "module"
+
+#: top-level payload keys admitted by the public surface.  This is an
+#: allow-list, not a deny-list: a core marker added to the mailbox in a later
+#: release is refused here by default, even before RESERVED_PAYLOAD_KEYS names
+#: it.  ``attribution`` is validated by the closed caller-attribution schema.
+ADMITTED_PAYLOAD_KEYS = frozenset((MODULE_PAYLOAD_KEY, "attribution"))
+
+#: Sender identities the core owns: the system sender, the governance pseudo
+#: senders/roles the core addresses by literal name, and the core prefixes.
+#: A public module submits under its own identity; these names are refused
+#: before alias resolution, identity checks and any deposit.  Their sources
+#: are cross-checked by tests/test_7706_mail_contract.py so drift is caught.
+RESERVED_ACTORS = frozenset((
+    "ameesh",      # work.SYSTEM_SENDER: system events, CI, deep analysis
+    "veille",      # watch.SENDER: periodic watch reports
+    "inconnu",     # work.UNKNOWN_ACTOR: no bound identity
+    "bureau",      # tenancy.BUREAU_ROLES
+    "auditeur",    # alert_briefs.AUDITOR_ROLES / AUDITOR_NAME
+    "auditor",     # the auditor role's English spelling
+    "mesh-design",  # governance role addressed literally by the core
+))
+
+#: Prefixes owned by the core: human identities and chat agents.
+RESERVED_ACTOR_PREFIXES = ("human:", "chat-")
+
 
 # ---------------------------------------------------------------------------
 # typed values
@@ -106,11 +139,12 @@ class Submission:
     """One message to deposit.
 
     ``recipient`` must be a registered agent.  ``kind`` is one of
-    :data:`KINDS`.  ``payload`` is the module-owned JSON object (bounded);
-    ``work_item_id`` optionally links the message to a lot; ``thread=False``
-    keeps private module content out of the readable project thread (the
-    mailbox row and its history remain).  ``idempotency_key`` scopes retries
-    to ``(actor, recipient)``.
+    :data:`KINDS`.  ``payload`` is the module-owned JSON object, carried under
+    the imposed ``payload["module"]`` namespace (a top-level key outside that
+    namespace and ``attribution`` is refused); ``work_item_id`` optionally
+    links the message to a lot; ``thread=False`` keeps private module content
+    out of the readable project thread (the mailbox row and its history
+    remain).  ``idempotency_key`` scopes retries to ``(actor, recipient)``.
     """
 
     recipient: str
@@ -333,6 +367,13 @@ def _resolve(db: Db, name: str, operation: str) -> str:
     return agent_names.resolve(name, db=db, cfg=cfg, operation=operation)
 
 
+def _reserved_actor(name: str) -> bool:
+    """``name`` is one of the core's own sender identities (case-insensitive)."""
+    folded = name.casefold()
+    return (folded in RESERVED_ACTORS
+            or folded.startswith(RESERVED_ACTOR_PREFIXES))
+
+
 def _actor(db: Db, actor: Any) -> str:
     """Resolve the actor and check the identity this process declares.
 
@@ -340,10 +381,21 @@ def _actor(db: Db, actor: Any) -> str:
     is that a process run by a mesh runner cannot submit under another name.
     Processes with no declared identity (an installed module service) keep the
     actor they name — the database credential is their trust boundary.
+
+    The core's own sender identities are never available to this surface: a
+    module payload that named ``ameesh`` (or a governance role, human or chat
+    name) would inherit the paths and authority those senders carry.  The check
+    runs on the supplied spelling **and** its resolved primary, so an alias
+    cannot launder a reserved name.
     """
-    name = _resolve(db, _name(actor, "actor"), "public_mail.actor")
-    if name == "all":
+    raw = _name(actor, "actor")
+    if raw == "all":
         raise InvalidSubmission("actor cannot be \"all\": name the sender identity")
+    name = _resolve(db, raw, "public_mail.actor")
+    if _reserved_actor(raw) or _reserved_actor(name):
+        raise ScopeRefused(
+            "actor %s is a sender identity reserved by the core: nothing "
+            "submitted" % (name if raw == name else "%s (%s)" % (raw, name)))
     if not (os.environ.get("AGENT_MAIL_NAME") or os.environ.get("AMEESH_RUNNER_ID")):
         return name
     cfg = getattr(db, "cfg", None)
@@ -364,7 +416,16 @@ def _actor(db: Db, actor: Any) -> str:
 
 
 def _sender(db: Db, name: str) -> str:
-    """A registered sender must be live; a service identity may stay unknown."""
+    """A registered sender must be live; a service identity may stay unknown.
+
+    The reserved-identity guard is repeated here as the last line of defence:
+    ``_actor`` already refused those names before any preparation, but a future
+    caller of this helper must not be able to deposit under one.
+    """
+    if _reserved_actor(name):
+        raise ScopeRefused(
+            "sender %s is a sender identity reserved by the core: nothing "
+            "submitted" % name)
     row = storage.of(db).agents.get(name)
     if row is None:
         return name
@@ -422,12 +483,21 @@ def _payload(value: Any) -> dict:
             "payload is larger than %d bytes" % MAX_PAYLOAD_BYTES)
     payload = json.loads(text)
     # Validate the serialized object, not only the caller's mapping: a custom
-    # Mapping could hide a reserved key from iteration while ``dict()`` keeps
-    # it, and the core reads the stored JSON, never the caller's object.
+    # Mapping could hide a key from iteration while ``dict()`` keeps it, and the
+    # core reads the stored JSON, never the caller's object.
     for key in payload:
         if key in RESERVED_PAYLOAD_KEYS:
             raise InvalidSubmission(
                 "payload key %r is reserved by the core" % key)
+        if key not in ADMITTED_PAYLOAD_KEYS:
+            raise InvalidSubmission(
+                "payload key %r is not admitted: module data goes under "
+                "payload[%r], the imposed module namespace"
+                % (key, MODULE_PAYLOAD_KEY))
+    if MODULE_PAYLOAD_KEY in payload and not isinstance(
+            payload[MODULE_PAYLOAD_KEY], dict):
+        raise InvalidSubmission(
+            "payload[%r] must be a JSON object" % MODULE_PAYLOAD_KEY)
     attribution = payload.get("attribution")
     if attribution is not None:
         try:
@@ -730,6 +800,8 @@ def history(db: Db, actor: str, *, peer: str | None = None,
 __all__ = [
     "CONTRACT_VERSION", "MAX_BODY_BYTES", "MAX_PAYLOAD_BYTES", "MAX_BATCH",
     "MAX_HISTORY", "DEFAULT_HISTORY", "KINDS", "RESERVED_PAYLOAD_KEYS",
+    "MODULE_PAYLOAD_KEY", "ADMITTED_PAYLOAD_KEYS", "RESERVED_ACTORS",
+    "RESERVED_ACTOR_PREFIXES",
     "Submission", "Receipt", "HistoryEntry", "HistoryPage", "SubmissionResult",
     "BatchResult", "PublicMailError", "InvalidSubmission", "IdempotencyConflict",
     "ScopeRefused", "RecipientRefused", "UnsupportedStorage",
