@@ -4170,7 +4170,7 @@ def _stale(freeze: Mapping, why: str = "") -> dict:
 
 
 def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
-              force: bool = False) -> dict:
+              force: bool = False, refresh_policy: bool = False) -> dict:
     """Replays the latest freeze outside the hook (recovery, CLI).
 
     The selection's mark, its mails and the reviewer column are written in ONE
@@ -4179,6 +4179,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     an old freeze writes nothing at all (B/P1 of the Codex review cx2). A
     policy/evidence problem is journaled in its own transaction; a selection
     refusal is returned, never raised to the caller.
+
+    `refresh_policy` (#7624) rechecks a final designation against the current
+    audited canon, completing missing seats without resending acquired requests.
 
     `force` (#2487) : rejoue la désignation réelle même quand un plan de report
     couvrait la tête (le report a refusé après le gel : les sièges manquants
@@ -4262,19 +4265,19 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 completion = {"mark_id": int(effective[0]), "shape": shape}
             elif effective[1] == "carried":
                 carried = _carried_shape(effective[2])
-                if _mark_covers(carried, floor, column=live):
+                if not refresh_policy and _mark_covers(carried, floor, column=live):
                     return carried
                 completion = {"mark_id": int(effective[0]), "shape": carried}
             elif effective[2].get("state") == rd.DESIGNATED:
                 existing = dict(effective[2])
-                if _mark_covers(existing, floor, column=live):
+                if not refresh_policy and _mark_covers(existing, floor, column=live):
                     return existing
                 # #3557 : le plancher dépasse le compte enregistré. Les sièges
                 # de la marque sont gardés ; seuls les manquants seront choisis
                 # par la même sélection déterministe (famille opposée, charge,
                 # disponibilité) et notifiés.
                 completion = {"mark_id": int(effective[0]), "shape": existing}
-        if completion is None and not floor_error:
+        if completion is None and not floor_error and not refresh_policy:
             plan = carried_plan(cfg, db, int(lot), str(freeze.get("sha") or ""))
             # #4582 : un plan partiel ne couvre pas la tête — la désignation
             # réelle doit tourner — mais ses verdicts reportés ne sont pas

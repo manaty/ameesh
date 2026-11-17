@@ -14220,7 +14220,8 @@ class Runner:
         return False
 
     def retry_review_designations(self) -> None:
-        """#2561: retry the freezes whose automatic designation was journaled
+        """#7624: recheck in-flight seats against the synced audited canon.
+        #2561: retry the freezes whose automatic designation was journaled
         unavailable. A canon publication/sync (or a worktree that became
         readable) can lift the cause after the freeze; the freeze is kept, so
         the same head is replayed, never a newer one. #3328: the same pass
@@ -14238,12 +14239,16 @@ class Runner:
             from .scoped_db import ScopedDb
             db = ScopedDb(self.cfg, family="runner.scoped.review_retry")
             try:
+                from . import review_canon_refresh
+                refreshed = review_canon_refresh.after_sync(self.cfg, db)
                 report = activation.retry_pending(self.cfg, db)
                 # #3328 : a seat whose reviewer's host vanished is reattributed
                 # on the same pass, on the same freeze. Bounded and never fatal.
                 moved = activation.reassign_unreachable(self.cfg, db)
             finally:
                 db.close()
+            if refreshed.get("refreshed") or refreshed.get("errors"):
+                log_async("review canon refresh: %s" % refreshed)
             if report.get("attempted") or report.get("errors"):
                 detail = "" if not report.get("errors") else (
                     " (%d error(s): %s)" % (len(report["errors"]), report["errors"][0]))
