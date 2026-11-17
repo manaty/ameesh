@@ -259,9 +259,11 @@ def buried_hold_marker(text) -> str | None:
 #: l'exécutant rendu est `externe`. Une échéance facultative `(due
 #: 2026-10-25 12:00 UTC)` ou `(échéance …)`, avant ou après le geste, borne la
 #: relance ; sans elle, le débit relance après son seuil.
-#: #7634 : un exécutant nommé, quel qu'il soit ; les noms historiques
-#: (`bureau`) se décodent donc encore, normalisés vers `avatar` quand ils ne
-#: sont pas un mot réservé. Aucun nom d'avatar n'est connu du cœur.
+#: #7634 : un exécutant nommé hors vocabulaire n'est une route humaine que si
+#: l'appelant fournit son nom au runtime (avatar du canon, `report` configure
+#: dont le registre dit l'agent `responsible`, agent externe rattaché à un
+#: humain). Le cœur ne connaît aucun nom d'avatar, et un nom ordinaire
+#: (`pilote`, `relecture`, `CI`, `mesh-design`) reste une attente d'agent.
 _EXECUTOR_NAME = r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ0-9._@-]*"
 _EXTERNAL_HEAD = re.compile(
     r"(?<![\w])attente\s+"
@@ -287,7 +289,7 @@ _EXTERNAL_EXECUTORS = {"avatar": "avatar", "owner": "owner",
                        "externe": "externe"}
 
 
-def external_hold(text) -> dict | None:
+def external_hold(text, *, executors=()) -> dict | None:
     """#3498 : la déclaration d'attente externe portée par un hold, ou None.
 
     Rend `{executor, gesture, due}` : `executor` est `avatar`, `owner`
@@ -298,14 +300,25 @@ def external_hold(text) -> dict | None:
     déclaration : le hold reste une attente ordinaire, et rien n'est deviné
     depuis la prose (« attente de l'avatar depuis 3 h » ne déclare pas).
     #7309 : la virgule est acceptée seulement dans l’en-tête ancré
-    `hold: attente <exécutant>, <geste>`."""
+    `hold: attente <exécutant>, <geste>`.
+
+    `executors` sont les noms de route humaine connus au runtime (#7634) :
+    un nom hors vocabulaire n'est accepté que s'il y figure, et il est alors
+    normalisé `avatar`. Sans ce set, un nom ordinaire (`pilote`, `relecture`,
+    `CI`, `mesh-design`) n'est pas une attente externe."""
     note = str(text or "").strip()
     match = _EXTERNAL_HEAD.search(note)
     if not match:
         return None
-    # #7634 : un exécutant nommé hors vocabulaire (`bureau`, le nom propre
-    # d'un agent) reste une attente de la route humaine, normalisée `avatar`.
-    who = _EXTERNAL_EXECUTORS.get(match.group("who").strip().casefold(), "avatar")
+    # #7634 : un nom propre n'est une route que si l'appelant l'a résolu au
+    # runtime (canon, configuration, registre) ; le cœur ne le connaît pas.
+    raw = match.group("who").strip()
+    who = _EXTERNAL_EXECUTORS.get(raw.casefold())
+    if who is None:
+        known = {str(name).strip().casefold() for name in executors or () if name}
+        if raw.casefold() not in known:
+            return None
+        who = "avatar"
     tail = match.group("tail")
     head_due = _EXTERNAL_DUE.match(tail)
     if head_due:
