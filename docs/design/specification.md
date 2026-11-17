@@ -176,8 +176,10 @@ waiting for the resident to release the session.
 The mesh's `federation.yaml` can require an explicit avatar list:
 
 ```yaml
-action_gate:
-  mode: enforce                 # journal | enforce; omitted: journal
+extensions:
+  ameesh:
+    action_gate:
+      mode: enforce                 # journal | enforce; omitted: journal
 ```
 
 In `enforce` mode, `canon check` and session preparation refuse an avatar

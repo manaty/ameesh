@@ -17,7 +17,13 @@ class Applied:
 
 def required(canon) -> bool:
     """An omitted policy preserves the historical, journal-only mesh."""
-    policy = (canon.federation or {}).get('action_gate', {})
+    extensions = (canon.federation or {}).get('extensions', {})
+    if not isinstance(extensions, Mapping):
+        raise spawn.SpawnToolsError('avatar-tools-policy-invalid', 'extensions must be an object')
+    ameesh = extensions.get('ameesh', {})
+    if not isinstance(ameesh, Mapping):
+        raise spawn.SpawnToolsError('avatar-tools-policy-invalid', 'extensions.ameesh must be an object')
+    policy = ameesh.get('action_gate', {})
     if not isinstance(policy, Mapping):
         raise spawn.SpawnToolsError('avatar-tools-policy-invalid', 'action_gate must be an object')
     mode = policy.get('mode', 'journal')

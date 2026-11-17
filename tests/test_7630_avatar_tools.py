@@ -18,7 +18,7 @@ def avatar(raw):
 
 
 def mesh(card, mode='journal'):
-    return types.SimpleNamespace(readable=True, federation={'action_gate': {'mode': mode}},
+    return types.SimpleNamespace(readable=True, federation={'extensions': {'ameesh': {'action_gate': {'mode': mode}}}},
                                  owns=lambda value: value in (None, ''), agent=lambda name: card)
 
 
@@ -67,10 +67,17 @@ class AvatarPolicyTest(unittest.TestCase):
     def test_legacy_mesh_accepts_missing_list_but_enforced_mesh_refuses(self):
         self.card.fiche.data = {'avatar': {}}
         self.assertIsNone(self.prepare())
-        self.mesh.federation['action_gate']['mode'] = 'enforce'
+        self.mesh.federation['extensions']['ameesh']['action_gate']['mode'] = 'enforce'
         with self.assertRaises(spawn.SpawnToolsError) as error:
             self.prepare()
         self.assertEqual(error.exception.code, 'avatar-tools-missing')
+
+    def test_malformed_policy_containers_are_refused(self):
+        for federation in ({'extensions': None}, {'extensions': {'ameesh': None}},
+                           {'extensions': {'ameesh': {'action_gate': None}}}):
+            self.mesh.federation = federation
+            with self.subTest(federation=federation), self.assertRaises(spawn.SpawnToolsError):
+                self.prepare()
 
     def test_malformed_list_never_becomes_unrestricted(self):
         for value in (None, 'Read', [None], ['--tools']):
@@ -208,8 +215,12 @@ class AvatarCanonCheckTest(unittest.TestCase):
             import shutil
             shutil.copytree(test_canon.EXAMPLE, root, dirs_exist_ok=True)
             test_canon.write(root, 'agents/alice-avatar.md', avatar_card('alice-avatar', 'claude'))
+            test_canon.write(root, 'federation.yaml',
+                             'id: test\nroot: test\nmembers: []\nextensions:\n'
+                             '  ameesh:\n    action_gate:\n      mode: ' + mode + '\n')
             loaded = canon.load(root, untrusted=True)
-            loaded.federation = {**(loaded.federation or {}), 'action_gate': {'mode': mode}}
+            self.assertFalse(any(f.code == 'ameesh-key-unknown' and 'action_gate' in f.message
+                                 for f in canon.validate(loaded)))
             loaded.agent('alice-avatar').fiche.data.update(raw)
             return {f.code for f in canon.validate(loaded) if f.severity == canon.ERROR}
 

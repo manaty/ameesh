@@ -3888,6 +3888,7 @@ class _Loader:
                 continue
             allowed = set(SCOPE_FIELDS)
             if member == root.member:
+                allowed.add('action_gate')  # #7630: root canon action policy
                 allowed.add(NAMING_KEY)     # L243 (#468) : le nommage est à la racine
             for unknown in sorted(set(map(str, raw)) - allowed):
                 self.add("ameesh-key-unknown", WARNING,
