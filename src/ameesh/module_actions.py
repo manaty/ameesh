@@ -33,20 +33,37 @@ def compile_policy(name, module, descriptor, classes):
                                   dict(kind=RULE, types=[], connectors=classes)])
 
 
-def policy_class(db, connector, project, operation):
-    """Return a module operation's applied class; unregistered legacy APIs keep defaults."""
+def _provider_of(connector, *, require_installed=True):
+    """Provider serving a module connector name; None for core and legacy APIs.
+
+    An installed provider that differs from the wrapper's is always refused:
+    the action would be read from another module's connector. With
+    `require_installed=False` (reconciliation), a name no longer served by any
+    module is accepted: the outcome already happened and reading it must stay
+    possible after the module is uninstalled.
+    """
     from . import actions, connectors
     from .modules import registry
     if connector.name in connectors.CORE_NAMES:
         return None
     entry = registry.action_connectors().get(connector.name)
-    if entry is None and isinstance(connector, connectors.ModuleConnector):
-        raise actions.ActionError(actions.CONNECTOR, 'module connector is no longer installed')
     if entry is None:
+        if require_installed and isinstance(connector, connectors.ModuleConnector):
+            raise actions.ActionError(actions.CONNECTOR, 'module connector is no longer installed')
         return None  # Existing direct-connector API, no module implementation.
     provider, _factory = entry
     if isinstance(connector, connectors.ModuleConnector) and provider != connector.provider:
         raise actions.ActionError(actions.CONNECTOR, 'module connector provider changed')
+    return provider
+
+
+def policy_class(db, connector, project, operation):
+    """Return a module operation's applied class; unregistered legacy APIs keep defaults."""
+    from . import actions
+    from .modules import registry
+    provider = _provider_of(connector)
+    if provider is None:
+        return None
     policy = registry.action_policy(db, project, provider)
     if policy is None and connector.name in LEGACY:
         return None
@@ -62,10 +79,24 @@ def policy_class(db, connector, project, operation):
 
 
 def check_action(db, action, connector=None):
-    """Recheck activation and policy at authorization, launch and reconciliation."""
+    """Recheck activation and class before approval and launch."""
     from . import actions
     from types import SimpleNamespace
     chosen = policy_class(db, connector or SimpleNamespace(name=action['connector']),
                           action['project'], action['operation'])
     if chosen is not None and chosen != action['class']:
         raise actions.ActionError(actions.CLASS, 'module operation class changed; propose a new action')
+
+
+def check_reconcile(action, connector=None):
+    """Recheck only the provider before a read-only reconciliation.
+
+    Reconciliation observes an outcome that already happened: withdrawing the
+    project policy, changing the operation's class or uninstalling the module
+    must not leave an `unknown` action forever. Approval and launch keep the
+    full activation check (`check_action`); a connector name now served by
+    another provider is still refused.
+    """
+    from types import SimpleNamespace
+    _provider_of(connector or SimpleNamespace(name=action['connector']),
+                 require_installed=False)
