@@ -64,6 +64,11 @@ class SequenceTest(_TmpMixin, unittest.TestCase):
                          ("ameesh-agents-1", "ameesh-agents-2",
                           "ameesh-agents-3", "manaty-mesh-1"))
 
+    def test_an_empty_sequence_is_falsy(self):
+        """#7662 : un objet vide ne vaut jamais un hôte dans un `or`."""
+        self.assertFalse(canon.StagingTopology())
+        self.assertTrue(self.manaty())
+
     def test_a_bare_canon_declares_no_staging_host_at_all(self):
         topology = canon.staging_topology([self.loaded()])
         self.assertEqual(topology.hosts, ())
@@ -133,6 +138,22 @@ staging:
         findings = canon.validate(self.loaded())
         self.assertIn("host-staging-invalid", codes(findings))
         self.assertIn("host-staging-unknown", codes(findings, "warning"))
+
+    def test_an_empty_project_sequence_falls_back_to_the_database_canon(self):
+        """#7662 B : un projet au profil nu retombe sur le canon de la base."""
+        topology = self.manaty()
+        project = release_cutoff.ProjectRelease(
+            name="ameesh", repo=self.root, target="main")
+        sha = "a" * 40
+        with mock.patch.object(release_cutoff, "topology_for",
+                               return_value=topology) as fallback, \
+             mock.patch.object(release_cutoff, "read_attestation",
+                               return_value={"sha": sha}) as read, \
+             mock.patch.object(release_cutoff, "staging_local_host",
+                               return_value="ameesh-agents-1"):
+            release_cutoff.maybe_staging(project, sha, [], self.root)
+        fallback.assert_called_once()
+        self.assertIs(read.call_args.args[2], topology)
 
     def test_the_project_carries_the_canon_sequence(self):
         topology = self.manaty()

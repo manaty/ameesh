@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from ameesh import release, release_cutoff, staging_deferred
+from ameesh import canon, release, release_cutoff, staging_deferred
 from tests import canon_staging
 
 SHA = "a" * 40
@@ -525,7 +525,7 @@ class ActorTest(unittest.TestCase):
 
 class CliTest(unittest.TestCase):
     def run_cmd(self, *, right=active(), declared=True, actor="bureau", host=HOST,
-                project_ref=None, topology_for=None):
+                project_ref=None, topology_for=None, canon_declares=False):
         cfg = types.SimpleNamespace()
         base = {"sha": SHA, "tag": "v1.57.0"}
         row = {"schema": "ameesh-staging-catchup/1", "project": "ameesh", "host": HOST,
@@ -537,7 +537,10 @@ class CliTest(unittest.TestCase):
         topology_patch = (mock.patch.object(release_cutoff, "topology_for",
                                             return_value=topology_for)
                           if topology_for is not None else contextlib.nullcontext())
-        with topology_patch, \
+        canon_patch = (mock.patch.object(canon, "load_configured",
+                                         return_value=[canon_staging.fake_canon()])
+                       if canon_declares else contextlib.nullcontext())
+        with canon_patch, topology_patch, \
              mock.patch.object(release_cutoff, "projects",
                                return_value={"ameesh": project_ref or project()}), \
              mock.patch("ameesh.db.open_db", return_value=db), \
@@ -555,9 +558,29 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(declare.call_args.args[2], HOST)
 
-    def test_a_missing_host_without_a_canon_server_is_refused(self):
+    def test_the_default_project_reads_the_canon_server(self):
+        """#7662 B : `projects(cfg)` rend un `ProjectRelease` au profil nu.
+
+        Sa topologie vide existe mais n'a aucun hôte : sans `--host`, le
+        serveur staging doit venir du canon, jamais d'un `or` sur l'objet
+        vide. Le repli `topology_for` est ici sans serveur : le test échoue
+        si le canon n'est pas lu d'abord."""
+        bare = release_cutoff.ProjectRelease(
+            name="ameesh", repo="/nowhere", target="main", remote="origin",
+            report="human", github="manaty/ameesh", staging_rights=RIGHTS)
+        self.assertEqual(bare.staging_topology.hosts, ())
         code, declare, _db = self.run_cmd(
-            host=None, project_ref=types.SimpleNamespace(name="ameesh"),
+            host=None, project_ref=bare, canon_declares=True,
+            topology_for=types.SimpleNamespace(server=None))
+        self.assertEqual(code, 0)
+        self.assertEqual(declare.call_args.args[2], HOST)
+
+    def test_a_missing_host_without_a_canon_server_is_refused(self):
+        bare = release_cutoff.ProjectRelease(
+            name="ameesh", repo="/nowhere", target="main", remote="origin",
+            report="human", github="manaty/ameesh", staging_rights=RIGHTS)
+        code, declare, _db = self.run_cmd(
+            host=None, project_ref=bare,
             topology_for=types.SimpleNamespace(server=None))
         self.assertEqual(code, 1)
         declare.assert_not_called()

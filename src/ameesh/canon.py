@@ -1720,6 +1720,10 @@ class StagingTopology:
     server: str | None = None
     workstation: str | None = None
 
+    def __bool__(self) -> bool:
+        """Une séquence nue est fausse : un profil vide n'est jamais un hôte."""
+        return bool(self.hosts)
+
     @property
     def vms(self) -> tuple[str, ...]:
         """Les VM de la séquence : les VM d'agents, puis le serveur."""

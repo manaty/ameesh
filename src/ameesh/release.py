@@ -815,12 +815,18 @@ def _catchup(cfg, args) -> int:
         if project is None:
             raise release_cutoff.ReleaseError(
                 "project %r is not declared under release.projects" % args.project)
+        # #7662: `projects(cfg)` starts from the bare profile, whose empty
+        # `StagingTopology()` exists but has no host. Fill it from the canon
+        # before reading the default server, as the other release paths do.
+        project = release_cutoff.with_staging_topology(cfg, project)
         db = open_db(cfg)
         try:
             host = getattr(args, "host", None)
             if not host:
-                host = (getattr(project, "staging_topology", None)
-                        or release_cutoff.topology_for(db)).server
+                topology = getattr(project, "staging_topology", None)
+                if topology is None or not topology.hosts:
+                    topology = release_cutoff.topology_for(db)
+                host = topology.server
             if not host:
                 raise release_cutoff.ReleaseError(
                     "no --host and the canon declares no staging server: name "
