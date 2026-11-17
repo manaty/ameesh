@@ -349,7 +349,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'approver', 'authenticator_id', 'connector', 'operations',
         'action_class', 'max_amount', 'currency', 'consumed_amount', 'uses',
         'valid_until', 'registered_by', 'created_at', 'last_used_at',
-        'revoked_at', 'revoked_by'
+        'revoked_at', 'revoked_by',
+        -- #7629 (0585) : portée du grant, non secrète et nécessaire à la
+        -- supervision (bénéficiaire, cibles, ligne et version de charte)
+        'beneficiary_kind', 'beneficiary', 'beneficiary_clones', 'targets',
+        'charter_line', 'charter_version'
     ]),
     ('standing_reservations', ARRAY[
         'id', 'grant_id', 'action_id', 'amount', 'connector', 'operation',
