@@ -847,7 +847,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                        lot=lot_id, mailbox_ids=[decision_id],
                        meta={"kind": KIND, "decision": decision_id,
                              "urgent": True if urgent else None,
-                             "signature": "exigée" if needs_signature else None})
+                             "signature": "exigée" if signature_required else None})
             state = _hold_lot(tx, item, actor=requester,
                               note="decision #%d requested from %s: %s" % (
                                   decision_id, _owner_label(owner),

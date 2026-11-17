@@ -27,6 +27,9 @@ avant activation.
 
 Pour une fusion `release/*` vers la branche de production déclarée dans le
 canon, le corps de PR contient exactement une ligne `Production decision: #123`.
+Le projet est résolu depuis le dépôt radar fusionné et doit correspondre au
+projet du lot, avant toute exemption. La PR ouverte est recherchée par dépôt,
+source et cible ; le champ de clôture `pr_ref` n’est pas utilisé.
 La garde commune vérifie la tête, la source et la cible actuelles de la PR,
 puis exige une preuve autorisant `merge` sur cette tête. Une exception de
 paquet ne dispense pas de cette autorisation. Les projets déclarés sans

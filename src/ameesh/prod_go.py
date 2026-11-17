@@ -114,38 +114,51 @@ def authorize(cfg, db, decision_id, *, project, sha, operation, now=None):
     return proof
 
 
-def check_release_merge(cfg, db, lot, source, target, sha, *, gh=None):
+def check_release_merge(cfg, db, lot, source, target, sha, *, repo="", gh=None):
     """Shared by packet_guard: queue, composer, fire, land and merge-pr."""
     if not source.startswith("release/"):
         return
     if db is None:
         raise ProdGoError("release authorization requires the decision database")
-    from . import land, work
+    from . import land, work, merge_queue, migrations, radar
     item = work.get(db, int(lot))
-    project = (item or {}).get("app")
-    if not project:
-        raise ProdGoError("release has no project")
+    if not repo:
+        raise ProdGoError("release requires the repository being merged")
+    try:
+        # Callers pass either a checkout or the configured GitHub repository.
+        key = migrations.repo_key(repo)
+        matches = [p for p in radar.settings_of(cfg).projects.values()
+                   if key and migrations.repo_key(p.github) == key]
+        if len(matches) > 1:
+            raise ProdGoError("release repository has ambiguous radar projects")
+        project_view = matches[0] if matches else merge_queue.radar_project(cfg, repo)
+    except (radar.SettingsError, merge_queue.QueueError) as exc:
+        raise ProdGoError("cannot resolve release repository project") from exc
+    if project_view is None or (item or {}).get("app") != project_view.name:
+        raise ProdGoError("release lot project differs from repository radar project")
+    project = project_view.name
     document = mechanics.configured(cfg)
     override = document.override(project)
     if override is None:
         raise ProdGoError("release project is not declared in compiled canon")
     production = override.production_branch
     if not production:
-        return  # project explicitly has no production branch (e.g. mesh staging)
+        return  # repository project explicitly has no production branch
     if target != production:
         return
-    ref = str(item.get("pr_ref") or "")
-    match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)", ref)
-    if match:
-        args = [match[2], "--repo", match[1]]
-    elif re.fullmatch(r"https://github.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*", ref):
-        args = [ref]
-    else:
-        raise ProdGoError("release requires a linked GitHub PR")
-    proc = (gh or land._gh)(["pr", "view", *args, "--json", "body,headRefOid,headRefName,baseRefName"], timeout=60)
+    slug = migrations.repo_key(project_view.github)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug):
+        raise ProdGoError("release repository has no GitHub identity")
+    # pr_ref is written at closure, so it cannot identify an open release.
+    proc = (gh or land._gh)(["pr", "list", "--repo", slug, "--head", source,
+                             "--base", target, "--state", "open", "--limit", "2",
+                             "--json", "body,headRefOid,headRefName,baseRefName"], timeout=60)
     if proc.returncode:
         raise ProdGoError("cannot read release PR decision")
-    view = json.loads(proc.stdout)
+    views = json.loads(proc.stdout)
+    if not isinstance(views, list) or len(views) != 1:
+        raise ProdGoError("release requires exactly one open GitHub PR")
+    view = views[0]
     if view.get("headRefOid") != sha or view.get("headRefName") != source or view.get("baseRefName") != target:
         raise ProdGoError("release PR head/base changed")
     ids = re.findall(r"^Production decision:\s*#?([1-9][0-9]*)\s*$", view.get("body") or "", re.M)

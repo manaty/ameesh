@@ -297,7 +297,7 @@ def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: st
     if source_name.startswith("release/"):
         from . import prod_go
         try:
-            prod_go.check_release_merge(cfg, db, lot, source_name, target_name, sha)
+            prod_go.check_release_merge(cfg, db, lot, source_name, target_name, sha, repo=repo)
         except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError, ValueError) as exc:
             raise PacketGuardError("production authorization: %s" % exc) from exc
     if not is_work_branch(source_name):

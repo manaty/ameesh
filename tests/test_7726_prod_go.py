@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Bounded owner proofs and immutable authority during the signed window."""
+from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -141,6 +142,32 @@ class SignedExportTest(fixtures._Base):
         with self.assertRaisesRegex(prod_go.ProdGoError, 'not VALID'):
             prod_go.export_proof(self.cfg, self.db, ordinary['id'])
 
+    def test_open_lot_without_pr_ref_signed_decision_allows_release_merge(self):
+        from ameesh import work, packet_guard, land
+        view = self.production()
+        self.answer(view['id'], 'a', key_path=self.key)
+        self.assertIsNone(work.get(self.db, self.lot['id']).get('pr_ref'))
+        cfg = replace(self.cfg, radar={'projects': {'acme': {'repo': '/fixture/acme', 'github': 'acme/app'}}})
+        document = SimpleNamespace(prod_go_max_hours=24,
+                                   override=lambda project: SimpleNamespace(production_branch='main'))
+        pr = {'body': 'Production decision: #%d' % view['id'], 'headRefOid': SHA,
+              'headRefName': 'release/11x', 'baseRefName': 'main'}
+        with mock.patch.object(mechanics, 'configured', return_value=document), mock.patch.object(
+                land, '_gh', return_value=SimpleNamespace(returncode=0, stdout=json.dumps([pr]))) as gh:
+            result = packet_guard.check_merge(self.db, self.lot['id'], 'release/11x', 'main', SHA,
+                                              cfg=cfg, repo='acme/app')
+            self.assertTrue(result['allowed'])
+            self.assertEqual(gh.call_args.args[0][:4], ['pr', 'list', '--repo', 'acme/app'])
+            self.assertTrue(packet_guard.check_merge(
+                self.db, self.lot['id'], 'release/11x', 'main', SHA,
+                cfg=cfg, repo='/fixture/acme')['allowed'])
+            self.db.execute("UPDATE work_items SET app = 'wrong' WHERE id = %s", (self.lot['id'],))
+            # Even a wrongly labelled project with no prod branch must not exempt this repo.
+            document.override = lambda project: SimpleNamespace(production_branch='' if project == 'wrong' else 'main')
+            with self.assertRaisesRegex(packet_guard.PacketGuardError, 'differs from repository'):
+                packet_guard.check_merge(self.db, self.lot['id'], 'release/11x', 'main', SHA,
+                                         cfg=cfg, repo='acme/app')
+
 
 class ReleaseMergeTest(unittest.TestCase):
     def test_packet_exception_cannot_bypass_production_authorization(self):
@@ -150,22 +177,33 @@ class ReleaseMergeTest(unittest.TestCase):
                 packet_guard.check_merge(None, 7, 'release/11x', 'main', SHA,
                                          exception='incident', reason='target red')
 
+    def test_missing_or_ambiguous_open_pr_refuses(self):
+        from ameesh import work
+        cfg = SimpleNamespace(radar={'projects': {'acme': {'repo': '/fixture/acme', 'github': 'acme/app'}}})
+        document = SimpleNamespace(override=lambda project: SimpleNamespace(production_branch='main'))
+        with mock.patch.object(work, 'get', return_value={'app': 'acme'}), mock.patch.object(mechanics, 'configured', return_value=document):
+            for views in ([], [{}, {}]):
+                gh = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps(views)))
+                with self.subTest(views=views), self.assertRaisesRegex(prod_go.ProdGoError, 'exactly one open'):
+                    prod_go.check_release_merge(cfg, object(), 7, 'release/11x', 'main', SHA, repo='acme/app', gh=gh)
+
     def test_exact_pr_context_is_required(self):
         from ameesh import work
-        item = {'app': 'acme', 'pr_ref': 'acme/app#42'}
+        item = {'app': 'acme', 'pr_ref': None}
+        cfg = SimpleNamespace(radar={'projects': {'acme': {'repo': '/fixture/acme', 'github': 'acme/app'}}})
         document = SimpleNamespace(override=lambda project: SimpleNamespace(production_branch='main'))
         pr = {'body': 'Production decision: #123', 'headRefOid': SHA,
               'headRefName': 'release/11x', 'baseRefName': 'main'}
         cases = ({}, {'body': ''}, {'body': 'Production decision: #123\nProduction decision: #456'},
                  {'headRefOid': 'b' * 40}, {'headRefName': 'release/other'}, {'baseRefName': 'develop'})
         for changes in cases:
-            gh = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps({**pr, **changes})))
+            gh = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps([{**pr, **changes}])))
             with self.subTest(changes=changes), mock.patch.object(work, 'get', return_value=item), mock.patch.object(mechanics, 'configured', return_value=document), mock.patch.object(prod_go, 'authorize') as authorize:
                 if changes:
                     with self.assertRaises(prod_go.ProdGoError):
-                        prod_go.check_release_merge(None, object(), 7, 'release/11x', 'main', SHA, gh=gh)
+                        prod_go.check_release_merge(cfg, object(), 7, 'release/11x', 'main', SHA, repo='acme/app', gh=gh)
                     authorize.assert_not_called()
                 else:
-                    prod_go.check_release_merge(None, object(), 7, 'release/11x', 'main', SHA, gh=gh)
+                    prod_go.check_release_merge(cfg, object(), 7, 'release/11x', 'main', SHA, repo='acme/app', gh=gh)
                     self.assertEqual(authorize.call_args.args[2], '123')
                     self.assertEqual(authorize.call_args.kwargs, dict(project='acme', sha=SHA, operation='release'))
