@@ -605,6 +605,42 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
+    def history_page(self, actor, *, peer=None, after_id=None, limit=100,
+                     since_ts=None, until_ts=None, kind=None) -> list[dict]:
+        """Contrat public 1.1 (E2a) : voir `interface.Mailbox.history_page`.
+
+        Le curseur est l'id, stable quand de nouveaux messages arrivent ; la
+        page est rendue du plus ancien au plus récent. Le filtre de périmètre
+        (acteur expéditeur ou destinataire, ou conversation avec `peer`) est
+        dans la requête, jamais appliqué après la borne.
+        """
+        limit = max(1, min(int(limit), 200))
+        clauses = ["m.id > %s"]
+        params: list = [int(after_id or 0)]
+        if peer is None:
+            clauses.append("(m.sender = %s OR m.recipient = %s)")
+            params += [actor, actor]
+        else:
+            clauses.append(
+                "((m.sender = %s AND m.recipient = %s)"
+                " OR (m.sender = %s AND m.recipient = %s))")
+            params += [actor, peer, peer, actor]
+        if since_ts is not None:
+            clauses.append("m.created_at >= to_timestamp(%s)")
+            params.append(float(since_ts))
+        if until_ts is not None:
+            clauses.append("m.created_at <= to_timestamp(%s)")
+            params.append(float(until_ts))
+        if kind is not None:
+            clauses.append("m.kind = %s")
+            params.append(kind)
+        params.append(limit + 1)
+        return self.db.query(
+            "SELECT " + MAIL_COLUMNS
+            + " FROM agent_mailbox m WHERE " + " AND ".join(clauses)
+            + " ORDER BY m.id ASC LIMIT %s",
+            params)
+
     def staging_emission(self, recipient, sender, key) -> int | None:
         rows = self.db.query(
             """
