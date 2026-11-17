@@ -8,7 +8,8 @@ pour un test TLS rouge sous charge qui passait au rejeu. Avant un retrait
 l'unité désignée, puis sur les préfixes suivants : vert au préfixe de l'unité
 = innocente (la première unité dont le préfixe le rend rouge est retirée à sa
 place), vert partout = instable (#4221), rouge dès son préfixe = retrait
-confirmé. Un rejeu non concluant garde le retrait antérieur. Aucune base,
+confirmé. #7692 : un rejeu non concluant ne confirme pas le retrait, qui n'est
+pas appliqué (canon §3) ; l'unité reste et la ci-full tranche. Aucune base,
 aucun réseau ; rejeu simulé sur un vrai empilement git.
 """
 from __future__ import annotations
@@ -173,6 +174,35 @@ class DesignatedPrefixTest(StackCase):
         self.assertEqual([failure["test"] for failure in flaky], [TARGET])
         self.assertEqual(prefix.calls, [(1, [TARGET])])
 
+    def test_temoin_h04_innocente_avec_rejeu_concluant(self) -> None:
+        # Témoin h-04 réduit : #7629 (u1) est désignée, mais le test ne rougit
+        # qu'au dernier préfixe ; l'unité 1 est innocente, la tardive part.
+        prefix = FakePrefix({TARGET: 3})
+        removals, flaky, why = self.run_designated([self.removal(1)], prefix)
+        self.assertEqual((flaky, why), ([], ""))
+        self.assertEqual([removal.lot for removal in removals], [3])
+        self.assertEqual(removals[0].proof, "prefixes")
+        self.assertEqual(prefix.calls, [(1, [TARGET])])
+
+    def test_temoin_h04_rejeu_non_concluant_ne_retire_personne(self) -> None:
+        # Même empilement, mais le rejeu ne conclut pas (délai, worktree) :
+        # il aurait disculpé l'unité 1 et désigné l'unité tardive ; sans
+        # preuve, aucun retrait n'est appliqué (canon §3, #7692).
+        class Inconclusive(FakePrefix):
+            def __call__(self, *args, **kwargs):
+                self.would_be, _why, _flaky = super().__call__(*args, **kwargs)
+                return {}, "préfixe 1 (#1) non concluant : délai", []
+
+        prefix = Inconclusive({TARGET: 3})
+        removals, flaky, why = self.run_designated([self.removal(1)], prefix)
+        self.assertEqual(removals, [])
+        self.assertEqual(flaky, [])
+        self.assertEqual(why, "préfixe 1 (#1) non concluant : délai")
+        self.assertEqual(prefix.calls, [(1, [TARGET])])
+        # S'il avait conclu, le rejeu aurait disculpé l'unité 1 et désigné
+        # l'unité 3 : le témoin est bien le cas h-04, pas un test rouge à u1.
+        self.assertEqual(list(prefix.would_be), [3])
+
     def test_rouge_au_prefixe_de_l_unite_confirme_le_retrait(self) -> None:
         prefix = FakePrefix({TARGET: 1})
         removals, flaky, why = self.run_designated([self.removal(1)], prefix)
@@ -181,12 +211,12 @@ class DesignatedPrefixTest(StackCase):
         self.assertEqual(removals[0].proof, "3801")
         self.assertEqual(removals[0].evidence, ["test tests/test_own_a.py"])
 
-    def test_rejeu_non_concluant_garde_le_retrait_anterieur(self) -> None:
+    def test_rejeu_non_concluant_n_applique_pas_le_retrait(self) -> None:
         prefix = FakePrefix({}, why="worktree de préfixe impossible")
         removals, flaky, why = self.run_designated([self.removal(1)], prefix)
-        self.assertEqual([removal.lot for removal in removals], [1])
-        self.assertEqual(removals[0].proof, "3801")
-        self.assertEqual((flaky, why), ([], "worktree de préfixe impossible"))
+        self.assertEqual(removals, [])
+        self.assertEqual(flaky, [])
+        self.assertEqual(why, "worktree de préfixe impossible")
 
     def test_le_rejeu_commence_au_prefixe_de_l_unite_designee(self) -> None:
         # Une unité en position 3 ne rejoue pas les préfixes 1 et 2.
@@ -233,13 +263,12 @@ class DesignatedPrefixTest(StackCase):
         self.assertEqual([(removal.lot, removal.tests) for removal in removals],
                          [(2, [TARGET]), (3, [other])])
 
-    def test_budget_epuise_garde_le_retrait_anterieur(self) -> None:
+    def test_budget_epuise_n_applique_pas_le_retrait(self) -> None:
         def budget(*_args, **_kwargs):
             raise paquet_auto.BudgetSpent("borne totale atteinte")
 
         removals, flaky, why = self.run_designated([self.removal(1)], budget)
-        self.assertEqual([removal.lot for removal in removals], [1])
-        self.assertEqual(removals[0].proof, "3801")
+        self.assertEqual(removals, [])
         self.assertIn("borne totale", why)
         self.assertEqual(flaky, [])
 
@@ -360,8 +389,10 @@ class CheckLocalTestsTest(StackCase):
         # L'arbre composé est à la tête (l'unité 2 casse le test).
         self.git("checkout", "-q", self.unit_c)
 
-    def check(self, *, run_tests=None, attribute=None):
-        own = {1: ["tests.test_own_a"], 2: []}
+    def check(self, *, run_tests=None, attribute=None, own=None,
+              contracts=None):
+        own = {1: ["tests.test_own_a"], 2: []} if own is None else own
+        contracts = [] if contracts is None else list(contracts)
         attribution = attribute or (lambda _worktree, _composition, failures: {
             "status": "ok", "tests": [{
                 "test": failures[0]["test"], "status": "probable",
@@ -374,7 +405,7 @@ class CheckLocalTestsTest(StackCase):
             mock.patch.object(paquet_auto, "unit_test_modules",
                               side_effect=lambda _w, unit: own.get(unit.lot, [])),
             mock.patch.object(paquet_auto, "contract_modules",
-                              return_value=[]),
+                              return_value=contracts),
         ]
         if run_tests is not None:
             patches.append(mock.patch.object(paquet_auto, "run_tests",
@@ -412,7 +443,79 @@ class CheckLocalTestsTest(StackCase):
         self.assertTrue(runs[0].inconclusive)
         self.assertFalse(runs[0].real_failure)
 
-    def test_rejeu_non_concluant_garde_le_retrait_3801(self) -> None:
+    def test_rejeu_non_concluant_ne_retire_pas_l_unite_designee(self) -> None:
+        # Témoin h-04 : l'unité 1 est désignée par la couverture pour un
+        # contrat (comme #7629 pour test_5035), vert à son préfixe mais le
+        # rejeu ne conclut pas ; son retrait n'est pas appliqué (canon §3).
+        # L'unité 2, dont le module propre a réellement rougi, part au repli.
+        other = "tests.test_own_b.T.test_other"
+        contract = "tests.test_contract_x.T.test_contract"
+
+        def fake_run(_worktree, label, modules, **_kwargs):
+            if label == "unité #2":
+                return _red(label, modules, test=other)
+            if label == "contrats":
+                return _red(label, modules, test=contract)
+            if label.startswith("préfixe"):
+                return _timed_out(label, modules)
+            return _green(label, modules)
+
+        def attribute(_worktree, _composition, failures):
+            return {"status": "ok", "tests": [
+                {"test": failure["test"], "status": "probable",
+                 "units": [{"lot": 1 if failure["test"] == contract else 2,
+                            "best": 9,
+                            "evidence": [{"kind": "test",
+                                          "file": "tests/test_own_b.py"}]}]}
+                for failure in failures]}
+
+        runs, faulty, removals = self.check(
+            run_tests=fake_run, attribute=attribute,
+            own={2: ["tests.test_own_b"]},
+            contracts=["tests.test_contract_x"])
+        self.assertNotIn(1, faulty)
+        self.assertEqual([removal.lot for removal in removals], [2])
+        self.assertNotEqual(removals[0].proof, "3801")
+        self.assertTrue(any(run.inconclusive for run in runs))
+        self.assertEqual(runs[-1].label, "préfixes (#3801 non confirmé)")
+        self.assertEqual(runs[-1].modules, [contract])
+        self.assertIn("non appliqué", runs[-1].output)
+
+    def test_contrat_seul_au_rejeu_non_concluant_laisse_la_ci_full(self) -> None:
+        # Relecture B de #7692 : sans rouge propre, un contrat rouge attribué
+        # par #3801 dont le rejeu ne conclut pas n'arrête pas le paquet. Le
+        # retrait n'est pas appliqué, rien n'est retiré, l'échec sort de `red`
+        # (sinon `contract_red` seul lèverait CompositionRed) et le test est
+        # consigné non concluant ; la ci-full tranche (canon §3).
+        contract = "tests.test_contract_x.T.test_contract"
+
+        def fake_run(_worktree, label, modules, **_kwargs):
+            if label == "contrats":
+                return _red(label, modules, test=contract)
+            if label.startswith("préfixe"):
+                return _timed_out(label, modules)
+            return _green(label, modules)
+
+        def attribute(_worktree, _composition, failures):
+            return {"status": "ok", "tests": [
+                {"test": failure["test"], "status": "probable",
+                 "units": [{"lot": 1, "best": 9,
+                            "evidence": [{"kind": "test",
+                                          "file": "tests/test_own_a.py"}]}]}
+                for failure in failures]}
+
+        runs, faulty, removals = self.check(
+            run_tests=fake_run, attribute=attribute, own={},
+            contracts=["tests.test_contract_x"])
+        self.assertEqual((faulty, removals), ([], []))
+        self.assertEqual(runs[-1].label, "préfixes (#3801 non confirmé)")
+        self.assertEqual(runs[-1].modules, [contract])
+        self.assertTrue(runs[-1].inconclusive)
+        self.assertIn("non appliqué", runs[-1].output)
+
+    def test_rejeu_non_concluant_d_un_rouge_propre_reste_retire(self) -> None:
+        # Le repli du rouge propre reste le geste antérieur : son rejeu #3801
+        # non concluant ne le disculpe pas (le module de l'unité a rougi).
         def fake_run(_worktree, label, modules, **_kwargs):
             if label == "unité #1":
                 return _red(label, modules)
@@ -423,8 +526,11 @@ class CheckLocalTestsTest(StackCase):
         runs, faulty, removals = self.check(run_tests=fake_run)
         self.assertEqual(faulty, [1])
         self.assertEqual([removal.lot for removal in removals], [1])
-        self.assertEqual(removals[0].proof, "3801")
-        self.assertFalse(runs[0].inconclusive)
+        self.assertNotEqual(removals[0].proof, "3801")
+        # Le test propre est couvert par le repli : il n'est pas consigné à
+        # part comme non confirmé.
+        self.assertFalse(any(run.label.startswith("préfixes (#3801")
+                             for run in runs))
 
 
 if __name__ == "__main__":

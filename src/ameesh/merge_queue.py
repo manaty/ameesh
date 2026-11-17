@@ -1830,6 +1830,7 @@ def _gate_cache_store(cache, lot, signature, ok, now: float) -> None:
 def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
                          overview=None, gate_cache=None,
                          cache_only: bool = False,
+                         refresh_target: bool = False,
                          now: float | None = None) -> dict | None:
     """La porte des avis du dernier gel d'un lot, lue comme la composition du
     paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
@@ -1849,6 +1850,15 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
     `cache_only` (#7350) : une observation SLO ne reconstruit pas une porte.
     Sans résultat frais de même signature, rend None. Aucun chemin de fusion
     ne passe cette option ; l'inconnu conserve l'alerte, jamais un GO.
+
+    `refresh_target` (#7677) : la cible est rafraîchie (`review_target.resolve`,
+    un fetch) avant de lire la classe, comme la désignation au gel. Sans lui,
+    un `origin/<cible>` local périmé recule le merge-base et met dans le diff
+    tout ce qui a été fusionné depuis : #7659 (note docs seule, light à la
+    désignation) lu `sensitive` à deux avis par le clone d'un hôte en retard de
+    quatre jours. Seuls les appelants hors transaction qui décident d'un état
+    le passent ; un fetch raté garde la cible locale (plus stricte, jamais
+    plus légère).
 
     Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
     introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
@@ -1880,8 +1890,10 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
         # Comme la file : origin/<cible> avant la branche locale, qui peut
         # encore contenir dans le diff des changements déjà fusionnés (#2207).
         target = lot_class.default_base(cfg, item, repo) if repo else None
+        fresh_sha = (_refreshed_target(repo, target)
+                     if refresh_target and target and not cache_only else None)
         base = _class_base(repo, target) if target else None
-        base_sha = plan_git._commit(repo, base) if base else None
+        base_sha = fresh_sha or (plan_git._commit(repo, base) if base else None)
     except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
         return None
     signature = _gate_cache_signature(cfg, item, marks, repo, frozen, target,
@@ -1934,6 +1946,19 @@ def _remote_branch(name: str) -> str:
         if name.startswith(prefix):
             return name[len(prefix):]
     return name
+
+
+def _refreshed_target(repo: str, target: str) -> str | None:
+    """Le commit de la cible rafraîchie, lu comme la désignation (#7677).
+
+    `review_target.resolve` fetch la branche distante puis l'épingle ; un dépôt
+    sans remote rend sa cible locale. Un échec rend None : l'appelant garde la
+    lecture locale, dont le diff ne peut que contenir plus de chemins."""
+    from . import review_target
+    try:
+        return review_target.resolve(repo, target, fetch=True)
+    except (review_target.TargetError, GitError):
+        return None
 
 
 def _class_base(repo: str, target: str, *, queue: bool = False) -> str | None:
