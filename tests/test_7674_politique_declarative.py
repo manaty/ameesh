@@ -18,8 +18,9 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
-from ameesh import canon, canon_sync, exploitation, registry, runner
+from ameesh import canon, canon_sync, exploitation, registry, reprise, runner
 from ameesh.config import Config
 
 from . import test_canon as canon_tests
@@ -194,6 +195,42 @@ class DeclaredPolicyRunnerTest(unittest.TestCase):
             self.assertEqual(ordinary.current_session(), "sess-ordinaire")
             self.assertEqual(document.session_policy(), "jamais")
             self.assertEqual(ordinary.session_policy(), "par-lot")
+        finally:
+            shutil.rmtree(document.state_dir, ignore_errors=True)
+            shutil.rmtree(ordinary.state_dir, ignore_errors=True)
+
+    def test_session_neuve_reinjecte_les_regles_a_chaque_tour(self):
+        document = _worker({"fresh_session": True})
+        ordinary = _worker(None, name="ordinaire")
+        appels = []
+
+        def rules(cfg, **kwargs):
+            appels.append(kwargs)
+            return "CANON-RULES"
+
+        try:
+            for worker in (document, ordinary):
+                worker.resume_summary = None
+                worker._canon_id = lambda: None
+            with mock.patch.object(reprise, "process_rules_block", rules):
+                # premier tour : compteurs neufs, règles injectées
+                self.assertIn("CANON-RULES", document._ouverture())
+                # fin du tour : le compteur avance ; la session suivante est
+                # pourtant neuve et repart de zéro, règles comprises
+                document.session_turns = 1
+                document.session_tokens = 42.0
+                document._fresh_session_reset()
+                self.assertEqual((document.session_turns,
+                                  document.session_tokens), (0, 0.0))
+                self.assertIn("CANON-RULES", document._ouverture())
+                self.assertEqual(len(appels), 2, appels)
+                # l'agent ordinaire qui reprend une session ne réinjecte rien
+                ordinary.agent["session_id"] = None
+                ordinary.session_turns = 1
+                ordinary._fresh_session_reset()
+                self.assertEqual(ordinary.session_turns, 1)
+                self.assertEqual(ordinary._ouverture(), "")
+                self.assertEqual(len(appels), 2, appels)
         finally:
             shutil.rmtree(document.state_dir, ignore_errors=True)
             shutil.rmtree(ordinary.state_dir, ignore_errors=True)

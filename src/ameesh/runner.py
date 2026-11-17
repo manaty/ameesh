@@ -1161,6 +1161,21 @@ class AgentWorker(threading.Thread):
         value = (self.agent or {}).get("declared_policy")
         return value if isinstance(value, dict) else {}
 
+    def fresh_session(self) -> bool:
+        """#7674 (E3a) : la fiche demande-t-elle une session neuve par tour ?"""
+        return self.declared_policy().get("fresh_session") is True
+
+    def _fresh_session_reset(self) -> None:
+        """#7674 (E3a) : une session neuve par tour reprend des compteurs neufs.
+
+        `session_turns`, `session_tokens`, la relu et le contexte mesurent la
+        session ouverte. Quand aucune session n'est reprise, celle du tour
+        précédent est close : ses compteurs ne doivent ni peser sur la
+        suivante, ni lui faire sauter le bloc de règles du canon, que
+        `_ouverture` réinjecte à chaque tour d'une session neuve."""
+        if self.fresh_session() and self.current_session() is None:
+            self._reset_session_counts()
+
     def current_session(self) -> str | None:
         """La session à reprendre : celle du registre, sinon le fichier local.
 
@@ -1185,7 +1200,7 @@ class AgentWorker(threading.Thread):
             # #7050 (5322 §2.3) : la session native de la cible est neuve ; le
             # registre garde celle de la source jusqu'à `verified`
             return self._move_turn.session
-        if self.declared_policy().get("fresh_session") is True:
+        if self.fresh_session():
             return None
         session = (self.agent or {}).get("session_id")
         if session:
@@ -7883,8 +7898,8 @@ class AgentWorker(threading.Thread):
     def _ouverture(self) -> str:
         """Ce qui ouvre la consigne du prochain tour : le résumé de rotation
         (règles relues) quand il y en a un, sinon les règles de travail du canon
-        pour une session neuve ordinaire (premier démarrage) ; "" quand la
-        session reprend.
+        pour une session neuve (premier démarrage, ou chacun des tours d'une
+        fiche `fresh_session`) ; "" quand la session reprend.
 
         #538 : `_budget_courrier` réserve ces octets — le bloc de première
         session ne se paie pas sur le courrier (verdict codex #510 r2, P2)."""
@@ -7897,7 +7912,10 @@ class AgentWorker(threading.Thread):
             return ""
         if self.resume_summary:
             return self._resume_prompt()
-        if self.session_turns:
+        # #7674 (E3a) : une fiche `fresh_session` rouvre une session à chaque
+        # tour ; les règles du canon ouvrent donc chacun d'eux, jamais
+        # seulement le premier (les compteurs du tour précédent ne comptent pas).
+        if self.session_turns and not self.fresh_session():
             return ""
         from . import reprise
         bloc = reprise.process_rules_block(
@@ -9405,6 +9423,9 @@ class AgentWorker(threading.Thread):
             if not adopted and (not lot or not self._switch_lot(
                     str(self.agent.get("session_work_item") or ""), str(lot))):
                 return False
+        # #7674 (E3a) : une session neuve déclarée par la fiche est rouverte à
+        # chaque tour ; les compteurs de la précédente ne mesurent pas celle-ci.
+        self._fresh_session_reset()
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
         harness = self.turn_harness()
