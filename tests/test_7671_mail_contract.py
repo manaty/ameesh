@@ -599,7 +599,7 @@ class HistoryTest(PublicMailBase):
 
 class ContractSurfaceTest(unittest.TestCase):
     def test_version_and_exported_surface(self):
-        self.assertEqual(public_mail.CONTRACT_VERSION, "1.1")
+        self.assertEqual(public_mail.CONTRACT_VERSION, "1.2")
         self.assertEqual(public_mail.MAX_BATCH, 50)
         self.assertEqual(public_mail.MAX_HISTORY, 200)
         for name in ("Submission", "Receipt", "HistoryEntry", "HistoryPage",

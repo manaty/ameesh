@@ -7,11 +7,14 @@ part of it, even when they are importable: only the surfaces listed there and
 exported here carry the compatibility promise.
 
 Contract 1.1 adds :mod:`ameesh.public.mail` (tranche E2a, #7636/#5827).
+Contract 1.2 reserves the core's sender identities and confines module data to
+the imposed ``payload["module"]`` namespace (#7706); the 1.1 mail surface stays
+source-compatible for a caller that already used that namespace.
 """
 from __future__ import annotations
 
 #: revision of the written contract served by this package
-CONTRACT_VERSION = "1.1"
+CONTRACT_VERSION = "1.2"
 
 from . import mail  # noqa: E402  (the version is defined before the surface)
 

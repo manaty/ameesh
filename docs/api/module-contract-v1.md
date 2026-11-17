@@ -1,10 +1,12 @@
 # External module public contract, version 1
 
-Contract revision: **1.1, 17 November 2026**. Scope: an installed external
+Contract revision: **1.2, 17 November 2026**. Scope: an installed external
 module and its client processes. Reference: [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
 Revision 1.1 adds the Python mail submission and history surface (tranche E2a,
-#7671); nothing else in 1.0 changes. The
+#7671). Revision 1.2 is the security correction of that unreleased surface
+(#7706): it reserves the core's sender identities and confines module data to
+the imposed `payload.module` namespace. Nothing else in 1.0 or 1.1 changes. The
 [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -24,6 +26,17 @@ advertised schema version. A previously valid required field, argument, result
 type, identity binding or idempotency guarantee cannot silently change. Missing
 and null retain their documented meanings. A new required request field, a
 narrower accepted input, or a changed side effect is a breaking change.
+
+Revision 1.2 is a security revision of the unreleased 1.1 mail surface, so it
+tightens admission before any installed client can rely on the wider input. A
+1.1-draft caller that already put its data under `payload.module` is
+source-compatible. A caller that wrote a bare top-level module key moves it
+under `payload.module`: the 1.2 surface refuses the old spelling before any
+deposit (`InvalidSubmission`) and names the namespace in the message. Rows
+already stored by a 1.1-draft caller remain readable through `history`
+unchanged; the revision performs no data rewrite. A consumer that pins mail
+against `CONTRACT_VERSION == "1.1"` keeps working only on a 1.1 installation;
+it enables 1.2 after applying this migration.
 
 The version of this document is independent of the package version. Its scope
 is the surfaces listed below, not every importable Python name. A future
@@ -177,30 +190,54 @@ than acquiring compatibility guarantees for private methods.
 
 ## Mail submission and history (Python)
 
-Contract 1.1 adds the first write surface for a module that already holds the
+Contract 1.1 added the first write surface for a module that already holds the
 deployment's database identity: `ameesh.public.mail`. This is the replacement
 for direct `agent_mailbox` submission and history SQL (mapping E2a); the
 governed `agent-mail` commands and the HTTP boundary above remain the public
 surfaces for an ordinary caller. This Python surface does not authenticate a
 remote client: the database credential remains the trust boundary. A process
 that runs under a mesh runner must use the identity that runner verified; a
-module service with no declared runner identity keeps the actor it names.
-Mediated executor connections are refused — their contract is separate.
+module service with no declared runner identity keeps the actor it names, as
+long as that name is not one the core reserves (below). Mediated executor
+connections are refused — their contract is separate.
 
-Enable the surface only when `ameesh.public.CONTRACT_VERSION` is `"1.1"` or a
-compatible later minor.
+Enable the surface only when `ameesh.public.CONTRACT_VERSION` is `"1.2"` or a
+compatible later minor. A consumer written against the 1.1 draft applies the
+`payload.module` migration above before treating 1.2 as compatible.
 
 | Element | Contract |
 | --- | --- |
-| `Submission(recipient, body, kind="notify", payload=None, work_item_id=None, thread=True, idempotency_key=None)` | One typed message. `recipient` is a registered agent; `kind` is `request`, `reply`, `notify` or `event`; `payload` is the module-owned JSON object; `work_item_id` optionally links a lot; `thread=False` keeps the content out of the readable project thread (the mailbox row and this history remain); `idempotency_key` is the client key described below. |
-| `submit(db, actor, submission) -> Receipt` | Deposit one message as `actor`. The sender is always the actor; another sender cannot be named. |
+| `Submission(recipient, body, kind="notify", payload=None, work_item_id=None, thread=True, idempotency_key=None)` | One typed message. `recipient` is a registered agent; `kind` is `request`, `reply`, `notify` or `event`; `payload` is the module-owned JSON object carried under `payload.module`; `work_item_id` optionally links a lot; `thread=False` keeps the content out of the readable project thread (the mailbox row and this history remain); `idempotency_key` is the client key described below. |
+| `submit(db, actor, submission) -> Receipt` | Deposit one message as `actor`. The sender is always the actor; another sender cannot be named, and a core-owned sender identity is refused. |
 | `submit_many(db, actor, submissions) -> BatchResult` | Deposit up to 50 submissions in input order. Each item commits or is refused on its own; a refusal appears in its `SubmissionResult` and does not hide later outcomes. A larger batch is refused before anything is deposited. |
 | `find(db, actor, recipient, idempotency_key) -> Receipt \| None` | The durable receipt already deposited under this `(actor, recipient, key)`, or `None`. |
 | `history(db, actor, *, peer=None, after_id=None, limit=100, since_ts=None, until_ts=None, kind=None) -> HistoryPage` | Bounded history of the messages where `actor` is sender or recipient, oldest first by durable id, strictly after `after_id`. `peer` restricts the page to the two-party conversation with that agent; `kind` filters the nature; `since_ts`/`until_ts` bound the creation time. `limit` is between 1 and 200. |
 | `Receipt(id, actor, recipient, kind, created_ts, reused)` | `id` is the durable mailbox row id, stable across retries; `request_id` is that id for a `request` and `None` otherwise; `reused` says this call returned an existing deposit. |
-| `HistoryEntry` and `HistoryPage` | One message (`id`, `sender`, `recipient`, `body`, `kind`, `payload`, `work_item_id`, `created_ts`, `delivered_ts`) and a page (`entries`, `next_cursor`, `has_more`). `next_cursor` is the last returned id, or the supplied cursor for an empty page; pass it back as `after_id`. `delivered_ts` is observation only and never a lease claim. |
+| `HistoryEntry` and `HistoryPage` | One message (`id`, `sender`, `recipient`, `body`, `kind`, `payload`, `work_item_id`, `created_ts`, `delivered_ts`) and a page (`entries`, `next_cursor`, `has_more`). The stored `payload` keeps the module object under `payload.module`; a 1.1-draft row is returned as stored, never rewritten. `next_cursor` is the last returned id, or the supplied cursor for an empty page; pass it back as `after_id`. `delivered_ts` is observation only and never a lease claim. |
 | `SubmissionResult` and `BatchResult` | Ordered batch outcomes (`index`, `receipt`, `error`, `detail`) and the batch (`results`, `ok`). The value objects expose `as_dict()` for JSON clients. |
-| Errors | `InvalidSubmission` (code `invalid`), `IdempotencyConflict` (`conflict`), `ScopeRefused` or `RecipientRefused` (`refused`), `UnsupportedStorage` (`unsupported`). A batch reports the same codes in `SubmissionResult.error`. |
+| Errors | `InvalidSubmission` (code `invalid`), `IdempotencyConflict` (`conflict`), `ScopeRefused` or `RecipientRefused` (`refused`), `UnsupportedStorage` (`unsupported`). A reserved sender identity raises `ScopeRefused` before any deposit. A batch reports the same codes in `SubmissionResult.error`. |
+
+### Reserved sender identities
+
+The public surface is for a module's own identity, never for the core's. The
+following actors are refused before the declared-identity check and any deposit,
+with `ScopeRefused` (code `refused`); the comparison is case-insensitive, and it
+checks both the supplied spelling and its resolved primary:
+
+* the system sender `ameesh` (`work.SYSTEM_SENDER`) — system events, CI
+  notifications, review and deep-analysis requests;
+* the watch sender `veille` (`watch.SENDER`) — periodic watch reports;
+* the unbound actor `inconnu` (`work.UNKNOWN_ACTOR`);
+* the governance role literals `bureau` (`tenancy.BUREAU_ROLES`), `auditeur` /
+  `auditor` (`alert_briefs.AUDITOR_ROLES`) and `mesh-design` (the core's host
+  and staging operator role);
+* every `human:*` and `chat-*` name (the core's human and chat prefixes).
+
+`all` (broadcast) remains `InvalidSubmission`. A module service with no declared
+runner identity may submit under any other non-reserved service name; the
+database credential remains its trust boundary. The exported
+`RESERVED_ACTORS` and `RESERVED_ACTOR_PREFIXES` constants name the refused list,
+and the contract tests cross-check them against their core sources.
 
 Idempotency is scoped to `(actor, recipient)`. The content is the body, the
 kind, the module payload and the work item. The same key with the same content
@@ -210,17 +247,26 @@ core stores the key in `payload.idempotency_key`; the unique index of
 migration 0497 is the authority, so the guarantee holds across processes, not
 only within one caller.
 
-The module payload supports role, document and Memoria data under its own
-namespace without core business fields. Core control markers — delivery and
-accounting (`idempotency_key`, `report`, `report_fingerprint`, `urgent`, `ack`,
-`info`, `cc`, `broadcast`, `radar`, `ci_passif`, `human`, `human_account`,
-`verdict`, `arbitration`, `reassigned`, `request_expires_ts`), review
-(`review_designation`, `review_request`), decisions (`decision`,
-`decision_answer`) and operations (`pass`, `ci`, `staging_actif`) — are
-reserved and refused before any deposit. A payload key never selects a core
-delivery, review, decision or accounting path. `payload.attribution` is the one
-admitted core key: it is validated with the closed caller-attribution schema
-and remains data, never admission, budget or authorization.
+The module payload is confined to `payload.module`, a JSON object (at most
+256 KiB serialized). The namespace belongs to the calling actor: the module
+submits under its own identity, so `payload.module` is already scoped by that
+name. Admission is an allow-list: the only admitted top-level
+keys are `module` and `attribution`. Every other top-level key is core-owned and
+refused before any deposit, so a core control marker added in a later release is
+closed to modules by default instead of becoming open through a deny-list that
+did not know it yet. The exported `ADMITTED_PAYLOAD_KEYS` states the list;
+`RESERVED_PAYLOAD_KEYS` lists the known core markers for diagnostics only.
+Core control markers — delivery and accounting (`idempotency_key`, `report`,
+`report_fingerprint`, `urgent`, `ack`, `info`, `cc`, `broadcast`, `radar`,
+`ci_passif`, `human`, `human_account`, `verdict`, `arbitration`, `reassigned`,
+`request_expires_ts`), review (`review_designation`, `review_request`),
+decisions (`decision`, `decision_answer`) and operations (`pass`, `ci`,
+`staging_actif`) — are never available at the top level. A key with one of
+those names is ordinary data when it is nested inside `payload.module`: it does
+not select a core delivery, review, decision or accounting path.
+`payload.attribution` is the one admitted core key: it is validated with the
+closed caller-attribution schema and remains data, never admission, budget or
+authorization.
 
 Published bounds: body at most 64 KiB UTF-8, serialized payload at most
 256 KiB, 50 submissions per batch, 200 history entries per page. Bodies must be
