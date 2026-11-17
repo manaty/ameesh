@@ -202,7 +202,14 @@ class GateTitularTest(PgTestCase):
         self.freeze(by_titular, actor="titular")
         out = self.gate(by_titular, ["r_claude"])
         self.assertFalse(out["ok"], out)
-        self.assertEqual(out["accepted"], [])
+        # #7745 : l'avis claude reste retenu pour le delta deepseek (impl) ;
+        # sa famille ne ferme que le delta du titulaire, qui reste non couvert
+        # et refuse la porte.
+        self.assertEqual([row["actor"] for row in out["accepted"]], ["r_claude"])
+        rows = {row["sha"]: row for row in out["deltas"]}
+        self.assertFalse(rows[by_titular]["covered"])
+        self.assertEqual(rows[by_titular]["eligible"], [])
+        self.assertEqual(rows[by_titular]["missing"], 1)
         self.assertEqual(sorted(row["name"] for row in out["authors"]),
                          ["impl", "titular"])
 
