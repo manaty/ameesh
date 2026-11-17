@@ -1157,6 +1157,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
           roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None,
           families: Iterable[str] = (),
           external_executors: Mapping[str, Mapping[str, Any]] | None = None,
+          human_routes: Iterable[str] = (),
           review_pilots: Mapping[str, str] | None = None,
           closed_hosts: Iterable[str] = (),
           zone: str = "UTC") -> dict:
@@ -1189,6 +1190,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
     le responsable humain d'une réservation et font dire au débit qu'une
     réservation dont le système est retiré n'a plus personne : le pilote la
     lève. Sans cette lecture, la ligne garde le texte générique de #3447.
+
+    `human_routes` (#7634) : les noms que le runtime reconnaît comme route
+    humaine (avatar au canon, `report` configure dont le registre dit l'agent
+    `responsible`, agent externe rattaché à un humain). Un hold qui nomme l'un
+    d'eux est une attente externe `avatar` ; un nom hors de ce set
+    (`pilote`, `relecture`, `CI`, `mesh-design`) reste une attente d'agent.
+    Le cœur ne connaît aucun nom d'avatar en dur.
 
     `dependencies` (#6214) : les prérequis explicites, groupés par lot
     (`work_dependencies.grouped`). Un lot relu dont un prérequis est encore
@@ -1264,6 +1272,12 @@ def build(*, items: Iterable[Mapping[str, Any]],
             if blocker != lot:
                 blocked_by.setdefault(lot, set()).add(blocker)
     agents = [dict(row) for row in agents or ()]
+    #: #7634 : les noms de route humaine connus au runtime (canon, `report`
+    #: configure, agent externe rattaché à un humain). Un hold qui nomme l'un
+    #: d'eux est une attente externe normalisée `avatar` ; un nom ordinaire
+    #: (`pilote`, `relecture`, `CI`) reste une attente d'agent. Le cœur ne
+    #: connaît aucun nom d'avatar.
+    human_routes = {str(name).strip() for name in human_routes or () if name}
     #: #6664 : un relecteur que le registre dit en pause (budget de jauge ou
     #: pause opérateur) ne lira pas la relance : le geste va au pilote, comme
     #: pour un auteur endormi (#6396/#6423). La fenêtre courte du compte
@@ -1539,7 +1553,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
             age = _age(now, hold.get("since"))
             # #3498 : la déclaration externe est un geste de pilote ; un hold
             # ordinaire qui la porte ne soustrait pas son lot à `--check`.
-            declared = planned_waits.external_hold(note)
+            declared = planned_waits.external_hold(note, executors=human_routes)
             if declared is not None and holds_authoritative \
                     and hold.get("pilot") is False:
                 unreadable.append(
@@ -2861,6 +2875,28 @@ _PACKETS_SQL = """
 """
 
 
+def human_route_names(cfg, agents, canons) -> set[str]:
+    """#7634 : les noms que le runtime reconnaît comme route humaine.
+
+    L'avatar déclaré au canon, le `report` configuré d'un projet dont le
+    registre dit l'agent `responsible` de l'humain, et l'agent `externe`
+    rattaché à un humain par `responsible`. Aucun nom n'est connu en dur :
+    `bureau` n'est accepté que si l'une de ces lectures le donne."""
+    from . import avatars
+    names = {str(name) for name in avatars.from_canons(canons or ()).values()
+             if name}
+    rows = list(agents or ())
+    for row in rows:
+        name = str(row.get("name") or "")
+        human = str(row.get("responsible") or "")
+        if not name or not human:
+            continue
+        names.update(avatars.configured_desks(cfg, human, rows))
+        if row.get("mode") == "externe":
+            names.add(name)
+    return names
+
+
 def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
          wait_s: float = DEFAULT_WAIT_S, ci_hours: int = DEFAULT_CI_HOURS,
          ci_slow_s: float = DEFAULT_CI_SLOW_S, canons=None,
@@ -2950,6 +2986,16 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
             unreadable.append("canon unavailable: %s" % " ".join(str(exc).split())[:200])
     devices = unavailable_devices(canons, now)
     unreadable.extend(devices.get("unreadable") or ())
+
+    # #7634 : les noms de route humaine connus au runtime. Un hold historique
+    # qui nomme l'avatar (`bureau`) reste une attente externe ; un nom
+    # ordinaire n'en devient pas une. Aucun nom n'est écrit dans le cœur.
+    human_routes: set[str] = set()
+    try:
+        human_routes = human_route_names(cfg, agents, canons)
+    except Exception as exc:  # noqa: BLE001 - route illisible : dite, pas devinée
+        unreadable.append("human routes unreadable: %s"
+                          % " ".join(str(exc).split())[:160])
 
     # Les retenues actives : la lecture d'autorité de #3219 (un hold de pilote
     # lève toute la retenue, celui d'un auteur ne lève que la sienne).
@@ -3055,6 +3101,7 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    roadmap_exhausted=roadmap_exhausted,
                    families=families,
                    external_executors=external_executors,
+                   human_routes=human_routes,
                    review_pilots=review_pilots,
                    closed_hosts=closed_hosts, zone=zone)
     annotate_candidate_causes(db, cfg, report, milestones, unreadable)

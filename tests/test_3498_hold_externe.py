@@ -69,9 +69,23 @@ class DeclarationTest(unittest.TestCase):
                      "hold: attente externe (bureau) : signer le go",
                      "hold: attente bureau, signer le go"):
             with self.subTest(text=text):
-                declared = planned_waits.external_hold(text)
+                declared = planned_waits.external_hold(
+                    text, executors={"bureau"})
                 self.assertEqual(declared["executor"], "avatar")
                 self.assertIn("signer le go", declared["gesture"])
+
+    def test_un_nom_ordinaire_n_est_pas_une_route_humaine(self):
+        # #7634 (relecture auditeur) : sans le set des routes runtime, un nom
+        # de rôle ordinaire reste une attente d'agent — sinon le lot quitte le
+        # débit et la relance part à l'humain.
+        for text in ("hold: attente pilote : composer le paquet",
+                     "hold: attente relecture : avis 2/2 de cx2",
+                     "hold: attente CI, run 1234",
+                     "hold: attente mesh-design : decision du feu"):
+            with self.subTest(text=text):
+                self.assertIsNone(planned_waits.external_hold(text))
+                self.assertIsNone(planned_waits.external_hold(
+                    text, executors={"bureau"}))
 
     def test_attente_externe_avec_parentheses(self):
         for text in ("hold: attente externe (avatar) : geste root",
@@ -138,6 +152,33 @@ class ClassificationTest(unittest.TestCase):
         self.assertEqual([row["who"] for row in report["external_waits"]],
                          ["owner"])
         self.assertIn("l'owner", report["external_waits"][0]["gesture"])
+
+    def test_hold_nomme_hors_routes_reste_attente_agent(self):
+        # #7634 (relecture auditeur) : un nom ordinaire ne devient pas une
+        # route humaine ; le lot reste dans le débit, la relance reste agent.
+        for note in ("hold: attente pilote : composer le paquet",
+                     "hold: attente relecture : avis 2/2 de cx2",
+                     "hold: attente CI, run 1234",
+                     "hold: attente mesh-design : decision du feu"):
+            with self.subTest(note=note):
+                report = run(
+                    items=[item(7601)],
+                    events=[event(7601, 1, T - 3 * H, note)])
+                self.assertEqual(report["external_waits"], [])
+                self.assertEqual([row["kind"] for row in report["slow_waits"]],
+                                 ["hold"])
+
+    def test_route_runtime_nommee_se_decode(self):
+        # #7634 : le nom historique n'est accepté que parce que la base le
+        # donne comme route humaine au runtime ; le cœur ne le connaît pas.
+        report = run(
+            items=[item(7602)],
+            events=[event(7602, 1, T - 3 * H,
+                          "hold: attente bureau : signer le go")],
+            human_routes={"bureau"})
+        self.assertEqual([row["who"] for row in report["external_waits"]],
+                         ["avatar"])
+        self.assertEqual(report["slow_waits"], [])
 
     def test_une_declaration_couvre_les_autres_holds_du_lot(self):
         # Le pilote a posé une retenue, l'auditeur déclare l'attente externe
