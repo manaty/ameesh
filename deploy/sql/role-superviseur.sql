@@ -338,6 +338,18 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('schema_migrations', ARRAY[
         'version', 'name', 'checksum', 'applied_at'
     ]),
+    -- #7649 (0591) : schémas et migrations de module, même état de schéma que
+    -- les deux registres du noyau ci-dessus ; noms, versions et empreintes,
+    -- aucun contenu d'agent.
+    ('module_schemas', ARRAY[
+        'module', 'schema_name', 'schema_sha256', 'created_at'
+    ]),
+    ('module_schema_migrations', ARRAY[
+        'module', 'version', 'name', 'checksum', 'applied_at'
+    ]),
+    ('module_schema_non_additive_migrations', ARRAY[
+        'module', 'version', 'name', 'checksum'
+    ]),
     ('spend_pending', ARRAY[
         'agent', 'start_index', 'turn', 'model', 'created_at',
         -- #796 (0423) : lot et tour du marqueur comptable, gardés pour la
