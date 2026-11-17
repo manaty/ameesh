@@ -45,6 +45,12 @@ Claude** :
 4. Aucune fusion de (b) avant la réponse de l'owner ; le correctif du refus
    sans nom est un commit séparé, indépendant.
 
+| option | garanties | coût | ce que voit l'owner |
+|---|---|---|---|
+| (a) tenant api-key | UID et runner propres, conforme à la décision 11 | compte Anthropic api-key, avatar admis en api-key, PR canon `policy.shared`/`tenants`, geste root bureau, deux avis | une dépense récurrente et un changement de compte de l'avatar |
+| (b) `same-host` | clone immédiat, sans dépense ; borné au mesh mono-humain, hôte non partagé, allowlist `tools`, workdir neuf | même UID/runner que le parent ; l'enfant peut lire les fichiers du parent ; écart à la décision 11 | une capacité de clone tout de suite, avec un risque de sécurité assumé |
+| (c) attendre #7633/#7659 | aucun risque ni dépense, reste dans la spec | clone indisponible jusqu'à l'hôte/pod dédié | la règle « l'avatar se clone » attend, sans action |
+
 ## 1. Constat mesuré (17/11 vers 05:10Z)
 
 - `ameesh host tenant list` → **« no tenant »** : aucune ligne `host_tenants`.
