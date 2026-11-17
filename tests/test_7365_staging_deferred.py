@@ -38,7 +38,7 @@ class DeferredGuardTest(unittest.TestCase):
         self.cfg = types.SimpleNamespace(state_dir=self.tmp.name)
         self.project_ref = release_cutoff.ProjectRelease(
             name="ameesh", repo="/nowhere", target="main", remote="origin",
-            report="human", github="manaty/ameesh")
+            report="bureau", github="manaty/ameesh")
 
     def tick(self, rows, by_commit, *, pilots=("pilot",), pairs=()):
         pairs = set(pairs)
@@ -58,7 +58,9 @@ class DeferredGuardTest(unittest.TestCase):
                                return_value=by_commit), \
              mock.patch.object(staging_deferred, "_is_ancestor",
                                side_effect=ancestry), \
-             mock.patch.object(staging_deferred, "_registry_rows", return_value=[]), \
+             mock.patch.object(staging_deferred, "_registry_rows", return_value=[
+                 {"name": "bureau", "mode": "externe",
+                  "responsible": "human:smichea"}]), \
              mock.patch("ameesh.alert_briefs.project_pilots",
                         return_value=list(pilots)), \
              mock.patch("ameesh.mail.send") as send:

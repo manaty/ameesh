@@ -16,10 +16,13 @@ from .train import TrainError
 
 
 def _role(cfg, db, name, *, desk=False):
+    from . import avatars
     try:
-        return assignments.is_orchestrator(
-            cfg, db, name, roles=(*work.CORRECTOR_ROLES, "bureau") if desk
-            else work.CORRECTOR_ROLES, history=False, strict=True)
+        if assignments.is_orchestrator(
+                cfg, db, name, roles=work.CORRECTOR_ROLES, history=False,
+                strict=True):
+            return True
+        return bool(desk and avatars.is_avatar(cfg, name))
     except Exception as exc:
         raise TrainError("reviewed requalification authority unreadable: %s" % exc) from exc
 
@@ -31,7 +34,7 @@ def actor(cfg, db):
     if not binding.ok or not binding.name:
         raise TrainError("reviewed requalification requires a valid bound identity")
     if not _role(cfg, db, binding.name, desk=True):
-        raise TrainError("reviewed requalification requires a pilot or bureau role")
+        raise TrainError("reviewed requalification requires a pilot or avatar role")
     return binding.name
 
 
