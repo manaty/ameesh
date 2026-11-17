@@ -219,6 +219,9 @@ class RunnerStandbyTest(_ElectionCase):
     def runner_for(self, host: str, *, budget_usd_per_hour: float = 0.0) -> Runner:
         cfg = dataclasses.replace(
             self.cfg, host=host, runner_id="runner-%s" % host,
+            # #7630 : le runner relit la fiche avant le lancement, même
+            # pour constater que ce rôle élu n’est pas un avatar.
+            canon=self.root, canon_untrusted=True,
             state_dir=os.path.join(self.tmp, "state-%s" % host),
             # #5175 : le tour de ce test ne dépend pas du budget. La garde de
             # rythme Codex lit les journaux du compte par défaut
