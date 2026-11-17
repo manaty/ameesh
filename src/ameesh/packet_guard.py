@@ -294,6 +294,12 @@ def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: st
     est journalisée ici, sur la tête `sha` ; une exception déjà déclarée est
     relue. Rend la déclaration retenue, ou lève `PacketGuardError`."""
     source_name, target_name = branch_of(source), branch_of(target)
+    if source_name.startswith("release/"):
+        from . import prod_go
+        try:
+            prod_go.check_release_merge(cfg, db, lot, source_name, target_name, sha)
+        except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError, ValueError) as exc:
+            raise PacketGuardError("production authorization: %s" % exc) from exc
     if not is_work_branch(source_name):
         return {"allowed": True, "why": "source %s is a packet or an integration ref"
                 % source_name,

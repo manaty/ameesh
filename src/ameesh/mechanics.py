@@ -134,7 +134,7 @@ _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
                   "merge", "prevalidation", "backlog", "staging", "accounts",
-                  "paquet", "packet_tests", "file", "session", "auto_take", "projects")
+                  "paquet", "packet_tests", "file", "session", "auto_take", "projects", "prod_go_max_hours")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
                   "contract_selection", "repair_policy", "prevalidation")
 _PRODUCTION_KEYS = ("branch",)
@@ -495,6 +495,9 @@ class Document:
     #: repli de la porte ; 0 = aucun repli ouvert
     paused_family_min_hours: int = 0
 
+    # #7726: absent means production attestations cannot be issued.
+    prod_go_max_hours: int | None = None
+
     def auto_take_excluded_families(self, now: float) -> tuple[str, ...]:
         """La date d'expiration est incluse, dans le fuseau du canon."""
         if self.auto_take is None:
@@ -551,6 +554,8 @@ class Document:
                       "post_merge_red": self.merge_post_merge_red},
             "projects": sorted(item.name for item in self.overrides),
         }
+        if self.prod_go_max_hours is not None:
+            payload["prod_go_max_hours"] = self.prod_go_max_hours
         if self.paused_family_min_hours:
             # #6990 : absent (0), la clé n'existe pas : le document sans clé
             # compile à l'identique, les lecteurs antérieurs ne la refusent pas.
@@ -1341,6 +1346,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                      if "backlog" in parsed else None)
     families = _families(reviews.get("families"), source + ".reviews.families")
     return Document(
+        prod_go_max_hours=(_positive_int(parsed["prod_go_max_hours"], source + ".prod_go_max_hours")
+                           if "prod_go_max_hours" in parsed else None),
         schema=schema,
         timezone=_timezone(parsed.get("timezone"), source + ".timezone"),
         cutoffs=_cutoffs(parsed.get("cutoffs"), source + ".cutoffs"),

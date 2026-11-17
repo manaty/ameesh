@@ -740,6 +740,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         repair_plan = clean_plan
 
     def body(db):
+        signature_required = needs_signature
         requester_row = registry.get(db, requester)
         if parent_lot is not None and new_lot is None:
             raise DecisionError("--parent-lot goes with --new-lot")
@@ -786,6 +787,12 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                                     "reference, or --new-lot \"title\"" % lot)
         owner, source = resolve_owner(cfg, db, requester_row, item)
         project = _project(db, item, requester_row)
+        from . import prod_go
+        try:
+            if prod_go.validate_request(cfg, question, opts, project, now=now):
+                signature_required = True
+        except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError) as exc:
+            raise DecisionError(str(exc)) from exc
         try:
             route = validations.routing(cfg, project, domain, owner or OWNER_ANY)
         except (ValueError, KeyError) as exc:
@@ -811,7 +818,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         decision = {
             "v": 1, "state": "pending", "question": question, "options": opts,
             "recommend": recommend, "why": why, "urgent": bool(urgent),
-            "due_ts": round(due, 3), "needs_signature": bool(needs_signature),
+            "due_ts": round(due, 3), "needs_signature": bool(signature_required),
             "validation": validation,
             "owner_source": source, "project": _project(db, item, requester_row),
             "lot": lot_id, "lot_title": item.get("title") or "", "previous_state": previous,
@@ -980,11 +987,10 @@ def _option_label(view: dict, key: str | None) -> str | None:
     return None
 
 
-def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
+def answer_document(view: dict, text: str, option: str | None, human: str) -> dict:
     """L'empreinte que signe une réponse (sha256 hex) : la demande (numéro,
     demandeur, lot, question, options, heure), le plan de réparation (clé et
     empreinte de contenu) quand il y en a un, la réponse exacte, son auteur."""
-    from . import authority
     document = {
         "v": 1, "kind": "ameesh-decision-answer", "decision": int(view["id"]),
         "request": {"requester": view.get("requester"), "lot": view.get("lot"),
@@ -1004,8 +1010,13 @@ def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
     if isinstance(plan, dict) and plan.get("key") and plan.get("digest"):
         document["request"]["repair_plan"] = {"key": plan["key"],
                                               "digest": plan["digest"]}
-    return authority.hash_artifact(json.dumps(document, sort_keys=True, separators=(",", ":"),
-                                              ensure_ascii=False))
+    return document
+
+
+def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
+    from . import authority
+    return authority.hash_artifact(json.dumps(answer_document(view, text, option, human),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
 
 def _approver_of(human: str, approver: str | None) -> str:
@@ -1034,6 +1045,9 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
     rôle `owner`) sur l'empreinte de la réponse, CONSOMMÉE par la décision."""
     from . import authority, signing
     digest = answer_digest(view, text, option, human)
+    from . import prod_go
+    production = prod_go.parse(view.get("question"), view.get("options") or ())
+    ttl = max(SIGN_TTL_S, production["until"] - time.time() + 1) if production else SIGN_TTL_S
     if key_path:
         try:
             seed = signing.read_private(os.path.expanduser(key_path))
@@ -1042,7 +1056,7 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
         try:
             authority.create_approval(
                 db, seed, approver=_approver_of(human, approver), action=APPROVAL_ACTION,
-                artifact_kind=APPROVAL_KIND, artifact_hash=digest, ttl=SIGN_TTL_S,
+                artifact_kind=APPROVAL_KIND, artifact_hash=digest, ttl=ttl,
                 meta={"decision": int(view["id"]), "by": human})
         except authority.AuthorityError as exc:
             raise DecisionError("signature rejected: %s" % exc) from exc
@@ -1051,6 +1065,10 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
     if row is None or not verdict.ok:
         raise DecisionError("signed answer rejected: %s\n%s" % (
             verdict.reason, signature_hint(view, text, option, human)))
+    if production:
+        signed = json.loads(row["signed_payload"].split("|", 2)[2])
+        if type(signed.get("expires")) is not int or production["until"] * 1e6 > signed["expires"]:
+            raise DecisionError("production until exceeds signed approval expiry")
     return {"approval_id": int(row["id"]), "approver": row.get("approver"),
             "signature_key": row.get("signature_key"), "digest": digest}
 
@@ -1329,6 +1347,13 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     if reason:
         raise DecisionError("unreadable answer — %s" % reason)
     option = match_option(view, text)
+    from . import prod_go
+    try:
+        if prod_go.validate_request(cfg, view["question"], view["options"], view["project"], now=now):
+            if not (key_path or signed):
+                raise DecisionError("prod-go/1 requires the owner's signed answer")
+    except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError) as exc:
+        raise DecisionError(str(exc)) from exc
     if view["state"] != "pending":
         if validations.can_answer(db, decision_id, human):
             followup = validations.late_response(cfg, db, view, human=human,
@@ -1426,6 +1451,11 @@ def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | No
     view = get(db, decision_id, now)
     if view is None:
         raise DecisionError("decision #%s not found" % decision_id)
+    from . import prod_go
+    try:
+        prod_go.require_unlocked(view, now=now)
+    except prod_go.ProdGoError as exc:
+        raise DecisionError(str(exc)) from exc
     if view["state"] != "pending":
         raise DecisionError(_closed_reason(view))
     if view["requester"] != requester:
@@ -1637,7 +1667,8 @@ USAGE = ("usage: ameesh decide ask (--lot <id|ref> | --new-lot \"title\") --ques
          "[--key FILE [--as NAME] | --signed] [--json]\n"
          "        ameesh decide withdraw <id> [--why \"…\"] [--json]\n"
          "        ameesh decide repair-forward <id> [--json]\n"
-         "        ameesh decide show <id> [--json]")
+         "        ameesh decide show <id> [--json]\n"
+         "        ameesh decide export <id> [--json]")
 
 
 def _decision_id(text) -> int | None:
@@ -1855,6 +1886,23 @@ def cmd_repair_forward(cfg: Config, argv: list[str]) -> int:
     return 0
 
 
+def cmd_export(cfg: Config, argv: list[str]) -> int:
+    from . import prod_go
+    parser = _parser("ameesh decide export")
+    parser.add_argument("id", type=int)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    db = _open(cfg)
+    try:
+        result = prod_go.export_proof(cfg, db, args.id)
+    except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError) as exc:
+        raise DecisionError(str(exc)) from exc
+    finally:
+        db.close()
+    _dump(result)
+    return 0
+
+
 def cmd_show(cfg: Config, argv: list[str]) -> int:
     parser = _parser("ameesh decide show")
     parser.add_argument("id")
@@ -1904,6 +1952,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_withdraw(cfg, rest)
         if command == "repair-forward":
             return cmd_repair_forward(cfg, rest)
+        if command == "export":
+            return cmd_export(cfg, rest)
         if command == "show":
             return cmd_show(cfg, rest)
         if _decision_id(command) is not None:
