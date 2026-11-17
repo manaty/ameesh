@@ -4656,6 +4656,7 @@
     "launch",
     "launched",
     "log_event",
+    "recap",
     "recent",
     "replace",
     "settle"
