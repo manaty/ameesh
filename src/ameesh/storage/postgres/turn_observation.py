@@ -80,6 +80,8 @@ LEDGER_SQL = """
 #: expose (`*_ts` epoch).
 AGENT_SQL = """
     SELECT name, status, status_text, harness, model, session_id,
+           coalesce(operator_paused, false) AS operator_paused,
+           extract(epoch from operator_pause_at)::float8 AS operator_pause_ts,
            extract(epoch from status_since)::float8 AS status_since_ts,
            turns, budget_usd::float8 AS budget_usd, spent_usd::float8 AS spent_usd,
            extract(epoch from last_turn_at)::float8 AS last_turn_ts,
