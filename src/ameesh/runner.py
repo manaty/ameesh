@@ -17106,10 +17106,11 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     name = resolve(name, db=db, operation="lease.attach")
 
     def refuse(code: str, message: str, status: int = 1) -> int:
-        print(message, file=sys.stderr)
+        if message:
+            print(message, file=sys.stderr)
         if remote:
             attach_session_mod.record_event(
-                db, name, outcome="refused", code=code, reason=message,
+                db, name, outcome="refused", code=code, reason=message or code,
                 owner=lease_owner, host=cfg.host, tenant=tenant, device=device,
                 human=human, attach_id=attach_id)
         return status
@@ -17153,11 +17154,11 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         adapter.require_interactive()
     except adapters.HarnessMissing as exc:
         return refuse("harness_missing", "attach: %s" % exc)
-    # L30 : la session interactive prend le compte actif du harnais ; un profil
-    # inutilisable est refusé AVANT de prendre le bail.
-    ok, compte = account_turn.attach_profile(cfg, db, agent.get("harness") or "")
-    if not ok:
-        return refuse("account_unavailable", "attach: no usable account for %s" % name)
+    # #7644 : le compte de la session est résolu après l'attente du tour et
+    # la relecture du registre (une rotation a pu changer `session_account`),
+    # et avant la prise du bail. `attach_profile` explique lui-même un compte
+    # inutilisable.
+    compte = None
     if ttl is None:
         # §5.4 : le bail distant est court (coupure du poste) ; le local garde
         # le TTL de l'exécuteur.
@@ -17210,7 +17211,12 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         if ((finished.get("harness") or "") == (agent.get("harness") or "")
                 and agent_incarnation(finished) == agent_incarnation(agent)):
             agent = dict(agent, session_id=finished.get("session_id"),
+                         session_account=finished.get("session_account"),
                          pending_prompt=finished.get("pending_prompt"))
+        ok, compte = account_turn.attach_profile(
+            cfg, db, agent.get("harness") or "", row=agent)
+        if not ok:
+            return refuse("account_unavailable", "")
         lease = registry.attach_claim(db, name, lease_owner, ttl)
         if lease:
             break
@@ -17369,6 +17375,7 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
             name == alert_briefs.AUDITOR_NAME
             or auditor_mod.is_auditor(
                 db, name, canon_mod.load_configured(cfg), agent))
+        launched = time.monotonic()
         proc = subprocess.Popen(argv, cwd=cwd, env=child_environment.harness(
                                     env, harness_revendique, compte,
                                     auditor=auditeur),
@@ -17386,6 +17393,13 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                 break
             time.sleep(0.2)
         code = proc.wait()
+        if (code and not expired.is_set() and not perdu.is_set()
+                and not stop_event.is_set()
+                and time.monotonic() - launched < attach_mod.EARLY_FAILURE_S):
+            for line in attach_mod.early_failure_lines(
+                    cfg, name, agent, compte,
+                    time.monotonic() - launched, code):
+                print(line, file=sys.stderr)
         if stop_event.is_set() and not perdu.is_set():
             # Coupure du relais ou SIGTERM de l'hôte : la session se ferme
             # proprement (bail rendu), un code négatif de groupe tué n'est pas
