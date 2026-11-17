@@ -61,6 +61,9 @@ class CardRolesTest(unittest.TestCase):
         self.assertEqual(su.row_roles({"role": "conception"}), ["conception"])
         self.assertEqual(su.row_roles({"roles": "auditeur"}), ["auditeur"])
         self.assertEqual(su.row_roles({"roles": 42}), [])
+        # `roles: []` ne masque pas la forme singulière, comme `_card_roles`.
+        self.assertEqual(su.row_roles({"roles": [], "role": "auditeur"}),
+                         ["auditeur"])
         self.assertTrue(su.row_has_role({"roles": ["auditeur"]},
                                         alert_briefs.AUDITOR_ROLES))
         self.assertFalse(su.row_has_role({"name": "auditeur"}, ()))
