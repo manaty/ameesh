@@ -14,7 +14,10 @@ ne porte que des appels d'une ligne :
                  la reprendre sous le nouveau, rotation avec résumé (L11) ;
 * `for_turn`, `apply`, `mark` — dans le tour : le compte du tour, son
                  environnement (CLAUDE_CONFIG_DIR / CODEX_HOME / clé), et le
-                 marqueur qui attribue au compte les relevés du tour.
+                 marqueur qui attribue au compte les relevés du tour ;
+* `attach_profile` — à l'attache interactive : reprend la session sur le
+                 compte sous lequel elle a tourné, jamais le compte actif de
+                 l'hôte quand il diffère (#7644).
 
 Jamais au milieu d'un tour : tout se décide avant le lancement du harnais.
 """
@@ -1002,8 +1005,20 @@ def rotate(worker, harness: str, old, new, session: str, *, new_label: str | Non
 # attach (session interactive)
 # --------------------------------------------------------------------------
 
-def attach_profile(cfg, db, harness: str):
-    """(ok, compte) pour `ameesh attach` : le compte actif, vérifié."""
+def attach_profile(cfg, db, harness: str, *, row: dict | None = None):
+    """(ok, compte) pour `ameesh attach` : le compte de la session, vérifié.
+
+    #7644 : l'attache reprend la session de l'agent, donc le compte sous
+    lequel elle a tourné (`agent_registry.session_account`), jamais le compte
+    actif de l'hôte quand il diffère. La règle est celle de l'exécuteur
+    (`reprise.plan`, L39/0034 §4) : le compte de la session reste tant qu'il
+    est utilisable ; une session portable peut suivre le compte du prochain
+    tour ; sinon l'attache refuse et propose une session neuve avec le résumé
+    de reprise (`ameesh resume <agent> --fresh`).
+
+    `row` est la ligne du registre de l'agent (`None` pour `ameesh chat`, qui
+    ouvre une session neuve et garde le compte actif).
+    """
     try:
         items = accounts.profiles(cfg, harness)
     except accounts.AccountError as exc:
@@ -1012,7 +1027,11 @@ def attach_profile(cfg, db, harness: str):
     if not items:
         return True, None
     try:
-        profile = accounts.current(db, cfg.host, harness, items)
+        profile, handled = _attach_profile_for_row(cfg, db, harness, items, row)
+        if handled and profile is None:
+            return False, None
+        if not handled:
+            profile = accounts.current(db, cfg.host, harness, items)
     except db_mod.DbError as exc:
         print("attach: account state unavailable: %s" % db_mod.explain(exc),
               file=sys.stderr)
@@ -1021,8 +1040,65 @@ def attach_profile(cfg, db, harness: str):
     if problems:
         print("attach: account %s/%s unusable: %s"
               % (harness, profile.name, "; ".join(problems)), file=sys.stderr)
+        _propose_fresh(cfg, db, harness, items, row)
         return False, None
     return True, profile
+
+
+def _attach_profile_for_row(cfg, db, harness: str, items, row: dict | None):
+    """(profil, traité) pour une attache sur une session existante.
+
+    `traité` faux : pas de session, l'appelant prend le compte actif.
+    `traité` vrai et profil None : l'attache est refusée, la raison est dite.
+    """
+    if not row:
+        return None, False
+    from . import reprise
+    normalized = dict(row)
+    normalized["harness"] = normalized.get("harness") or harness
+    normalized.setdefault("name", "")
+    try:
+        plan = reprise.plan(cfg, db, normalized)
+    except reprise.RepriseError as exc:
+        print("attach: %s" % exc, file=sys.stderr)
+        return None, True
+    if not plan.get("session"):
+        return None, False
+    name = normalized["name"] or "<agent>"
+    target = accounts.by_name(items, plan.get("next")) if plan.get("next") else None
+    old = plan.get("old")
+    previous = plan.get("previous")
+    if plan.get("keep") and target is not None:
+        if (previous == target.name
+                or (previous is None and old is not None
+                    and old.home() == target.home())
+                or accounts.session_portable(harness, old, target)):
+            return target, True
+        # Session non portable, mais son compte d'origine encore utilisable :
+        # l'attache reprend la conversation là où elle vit. La rotation avec
+        # résumé reste le travail du runner au tour suivant.
+        if old is not None:
+            return old, True
+        return target, True
+    reason = plan.get("why") or "the session cannot be resumed"
+    nxt = target.name if target is not None else accounts.current(
+        db, cfg.host, harness, items).name
+    print("attach: session %s cannot be resumed: %s"
+          % (plan.get("session"), reason), file=sys.stderr)
+    print("attach: run `ameesh resume %s --fresh` to open a new session on "
+          "account %s with a resume summary." % (name, nxt), file=sys.stderr)
+    return None, True
+
+
+def _propose_fresh(cfg, db, harness: str, items, row: dict | None) -> None:
+    """Après un compte inutilisable : la suite lisible, jamais un harnais muet."""
+    name = ((row or {}).get("name") or "<agent>")
+    try:
+        nxt = accounts.current(db, cfg.host, harness, items).name
+    except db_mod.DbError:
+        nxt = "another account"
+    print("attach: run `ameesh resume %s --fresh` to open a new session on "
+          "account %s with a resume summary." % (name, nxt), file=sys.stderr)
 
 
 def apply_env_attach(env: dict, profile, cfg=None) -> bool:
