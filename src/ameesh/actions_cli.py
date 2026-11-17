@@ -7,6 +7,10 @@
                         [--receipt-class C]… [--by agent:ID] [--json]
   ameesh action show <id> [--json]          action, attempts, log
   ameesh action list [--state S] [--project P] [--limit N] [--json]
+  ameesh action journal [--since 7d] [--until ISO] [--json]
+        #7631: the reserved gestures of the period (production, spending,
+        publication, decision signature) with proposer, accord, receipt and
+        outcome; signals a decision signed without saying who held the key
   ameesh action request <id> --approver human:ID [--assume-duplicate] [--requested-by M]
                         [--json]
         files the request with ameesh-approve (POST /requests, service token)
@@ -209,6 +213,44 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     for event in action["events"]:
         print("  %s  %-14s %-16s %s" % (_moment(event.get("created_ts")), event["event"],
                                         (event.get("actor") or "—")[:16], event["note"]))
+    return 0
+
+
+def cmd_journal(cfg: Config, args: argparse.Namespace) -> int:
+    from . import progress, reserved_gestures
+    now = time.time()
+    try:
+        since = progress.parse_since(args.since, now)
+        until = progress.parse_since(args.until, now) if args.until else now
+    except progress.ProgressError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    db = _open(cfg)
+    try:
+        view = reserved_gestures.journal(db, since_ts=since, until_ts=until)
+    finally:
+        db.close()
+    if args.json:
+        _dump(view)
+        return 0
+    print("reserved gestures from %s to %s: %d, %d signal(s)" % (
+        _moment(since), _moment(until), len(view["gestures"]), len(view["signals"])))
+    for g in view["gestures"]:
+        accord = reserved_gestures.accord_text(g.get("accord"))
+        if g["kind"] == "action":
+            print("  %s  %-11s %s %s on %s — proposed by %s, approved by %s (%s, receipt "
+                  "%s), %s" % (_moment(g["ts"]), g["gesture"], g["action_id"], g["operation"],
+                               g.get("target") or "?", g.get("proposed_by") or "?",
+                               g.get("approver") or "-", accord, g.get("receipt") or "-",
+                               g.get("state")))
+        else:
+            who = {"owner": "by the owner", "avatar": "by avatar %s (%s)" % (
+                g.get("agent"), accord)}.get(g.get("signed_by"), "signer UNRECORDED")
+            print("  %s  %-11s decision #%s signed with the key of %s, %s" % (
+                _moment(g["ts"]), g["gesture"], g.get("decision"), g.get("approver"), who))
+    for sig in view["signals"]:
+        print("signal [%s] decision #%s: %s" % (sig["code"], sig.get("decision"),
+                                                sig["reason"]), file=sys.stderr)
     return 0
 
 
@@ -666,6 +708,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_show)
+
+    p = act.add_parser("journal", help="reserved gestures of a period (#7631)")
+    p.add_argument("--since", default="7d", help="duration (16h, 7d) or ISO date")
+    p.add_argument("--until", default=None, help="ISO date (default: now)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_journal)
 
     p = act.add_parser("list")
     p.add_argument("--state", choices=list(actions.STATES), default=None)

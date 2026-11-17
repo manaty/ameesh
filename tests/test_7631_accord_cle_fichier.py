@@ -245,3 +245,37 @@ class GrantTest(AccordBase):
                                                        registered_by="bureau")
         self.assertIsNone(grant_id)
         self.assertEqual(verdict.code, receipts.ACCORD_OPERATION, verdict.reason)
+
+
+class JournalTest(AccordBase):
+    """Point 5 : la vue des gestes réservés d'une période."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.noop = ShellNoopConnector(os.path.join(self.tmp, "noop"), timeout=10.0)
+
+    def test_mise_en_production_inscrite(self):
+        from ameesh import reserved_gestures
+        action = actions.propose(self.db, self.noop, operation="prod-deploy", project="demo",
+                                 proposed_by="agent:bureau", target="prod:ameesh",
+                                 args={"version": "1.58.0"}, action_class="irreversible")
+        other = actions.propose(self.db, self.noop, operation="send", project="demo",
+                                proposed_by="agent:bureau", target="client:1", args={})
+        accord = self.go()
+        request = actions.approval_request(action, ALICE, accord=accord)
+        actions.approve(self.db, action["action_id"], self.key.receipt(request),
+                        policy=POLICY, by="bureau")
+        actions.execute(self.db, action["action_id"], self.noop, policy=POLICY, by="bureau")
+        now = time.time()
+        view = reserved_gestures.journal(self.db, since_ts=now - 3600, until_ts=now + 1)
+        ids = [g.get("action_id") for g in view["gestures"] if g["kind"] == "action"]
+        self.assertEqual(ids, [action["action_id"]])
+        self.assertNotIn(other["action_id"], ids)
+        g = [g for g in view["gestures"] if g["kind"] == "action"][0]
+        self.assertEqual((g["gesture"], g["proposed_by"], g["approver"], g["accord"],
+                          g["state"]),
+                         ("production", "agent:bureau", ALICE, accord, "confirmed"))
+        self.assertTrue(g["receipt"])
+        # hors de la période : rien
+        self.assertEqual(reserved_gestures.journal(self.db, since_ts=now - 7200,
+                                                   until_ts=now - 3600)["gestures"], [])

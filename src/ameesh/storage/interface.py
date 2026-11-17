@@ -2053,6 +2053,11 @@ class Approvals(Domain):
                limit: int, proof_only: bool = False) -> list[dict]:
         """Approvals newest first; proof_only exposes consumed decision proofs only."""
 
+    def decision_signatures(self, *, since_ts: float, until_ts: float) -> list[dict]:
+        """#7631 : approbations de décision consommées par une décision,
+        créées dans [since, until[ (meta comprise, `key_is_owner`)."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     def get(self, approval_id: int) -> dict | None:
         """L'approbation `approval_id`, meta compris, ou None."""
@@ -3574,6 +3579,11 @@ class Actions(Domain):
     @abc.abstractmethod
     def recent(self, *, state: str | None, project: str | None, limit: int) -> list[dict]:
         """Actions, de la plus récente à la plus ancienne."""
+
+    def reserved(self, operations, *, since_ts: float, until_ts: float) -> list[dict]:
+        """#7631 : actions des `operations` proposées dans [since, until[, de
+        la plus ancienne à la plus récente, avec `auth_receipt`."""
+        raise NotImplementedError
 
     @abc.abstractmethod
     def attempts(self, action_id: str) -> list[dict]:

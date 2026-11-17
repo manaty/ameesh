@@ -82,9 +82,25 @@ par un grant : forme (a) seulement.
   exclut la méta d'approbation. Les 319 lignes antérieures restent sans
   `signed_by`.
 
-## 5. Vue des gestes réservés
+## 5. Vue des gestes réservés (livré)
 
-`ameesh action journal --since 7d` : actions des quatre opérations avec go,
-reçu et issue. Signalés en plus, quand c'est détectable : une décision signée
-par la clé de l'owner sans `signed_by`, et un déploiement de production
-(journal des déploiements) sans action `prod-deploy` correspondante.
+`ameesh action journal [--since 7d] [--until ISO] [--json]`
+(`reserved_gestures.journal`) : pour la période, les actions des opérations
+`prod-deploy`, `spend`, `publish`, `decision-sign(-key)` — proposant,
+approbateur, accord (go cité par le reçu, ou grant), reçu, issue — et les
+décisions signées avec une clé owner, par l'owner ou par son avatar (agent,
+accord).
+
+Signalé : une décision signée dont la preuve ne dit pas qui a tenu la clé
+(`decision_signer_unrecorded` : avant #7631, ou hors de `ameesh decide`).
+Non détectable ici : un déploiement de production fait hors de la porte —
+ameesh ne tient pas de journal des déploiements de production (ceux de
+Nexlink passent par GitHub Actions). Le module qui déclarera `prod-deploy`
+(point 2, après #7628) apportera sa détection.
+
+## Reste
+
+- Point 2 : connecteur `journal` et déclaration des quatre opérations par un
+  module, après #7628 ; détection des déploiements de production hors porte.
+- Le mode `extensions.ameesh.action_gate.mode` (#7627) n'est pas lu par ce
+  lot : en `journal`, rien n'est bloqué, ce que fait déjà la porte ici.

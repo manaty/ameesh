@@ -122,3 +122,22 @@ class AvatarDecisionTest(_Base):
             with mock.patch.object(decisions, "avatar_human", return_value=ALICE):
                 who, signer = decisions.avatar_answerer(self.cfg, self.db, accord)
         self.assertEqual((who.human, signer), (ALICE, self.avatar(accord)))
+
+    def test_journal_distingue_et_signale(self):
+        from ameesh import reserved_gestures
+        since = time.time() - 1
+        self.answer(self.ask(needs_signature=True)["id"], "a", key_path=self.private)
+        accord = self.go()
+        self.answer(self.ask(needs_signature=True)["id"], "a", key_path=self.private,
+                    signer=self.avatar(accord))
+        # une signature d'avant #7631 : meta sans signed_by
+        legacy = self.ask(needs_signature=True)
+        signed = self.answer(legacy["id"], "a", key_path=self.private)
+        self.db.execute("UPDATE mesh_approvals SET meta = meta - 'signed_by' WHERE id = %s",
+                        (signed["decision"]["answer"]["proof"]["approval_id"],))
+        view = reserved_gestures.journal(self.db, since_ts=since, until_ts=time.time() + 1)
+        rows = [g for g in view["gestures"] if g["kind"] == "decision"]
+        self.assertEqual([g["signed_by"] for g in rows], ["owner", "avatar", None])
+        self.assertEqual(rows[1]["accord"], accord)
+        self.assertEqual([(s["code"], s["decision"]) for s in view["signals"]],
+                         [(reserved_gestures.UNRECORDED_SIGNER, legacy["id"])])
