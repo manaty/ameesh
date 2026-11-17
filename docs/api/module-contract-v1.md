@@ -30,11 +30,14 @@ lists it in this contract. Clients check that version before enabling it.
 In particular, the baseline here is ameesh commit
 `aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007`; an open PR is not an installed feature.
 
-The weekly stable channel and single consumer pin are specified by
-[#7666 / #5858](https://github.com/manaty/ameesh/issues/5858).
-Until that work supplies a released channel, retain an immutable upstream tag
-and peeled commit in one consumer manifest; derive image, tests and diagnostics
-from it. Never track a moving construction branch as a stable version.
+External modules follow the [weekly stable channel](stable-channel.md)
+([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
+pin file, `ameesh-stable.json`, from which image, tests and diagnostics derive.
+A deprecation announced for stable followers must have been part of at least
+one published stable before its removal. Construction tags cut twice a day do
+not count toward that notice. Until the first stable is published, keep an
+immutable upstream tag and peeled commit in that same single file. Never track
+a moving construction branch as a stable version.
 
 ## CLI boundary
 
