@@ -157,7 +157,9 @@ Manaty jusqu'à #7633.
 - **Après la réponse** :
   - (a) : le geste root reste bureau/humain ; lot de suite pour le compte
     `api-key`, la PR canon et le replay de l'étape 4 de #7635 ;
-  - (b) : relire/fusionner la branche, puis rejouer `agent spawn
+  - (b) : relire/fusionner la branche, mettre à jour
+    `docs/design/5322-avatar-humain.md` §3.6 (mode `same-host` et sa limite)
+    et ajouter l'avertissement `canon check`, puis rejouer `agent spawn
     avatar-essai-clone1 --by avatar-essai --ttl 30m --tool Read` sur AG1,
     `child report`, retrait de l'enfant ;
   - (c) : clore la limite connue, la rattacher à #7633/#7659, et laisser
