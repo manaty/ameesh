@@ -367,6 +367,23 @@ class NamingCliTest(_CanonDbCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("--role", proc.stderr)
 
+    def test_spawn_without_a_name_says_an_explicit_name_suffices(self):
+        """#7681 : sans `naming`, le refus de `spawn` ne disait pas qu'un nom
+        explicite suffit — il envoyait déclarer une convention inutile."""
+        self.sync()                       # canon d'exemple, sans `naming`
+        proc = self.mesh("agent", "spawn", "--by", "orchestre", "--ttl", "30m",
+                         env=self.cli_env())
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("no `extensions.ameesh.naming`", proc.stderr)
+        self.assertIn("explicit name", proc.stderr)
+        self.assertIn("ameesh agent spawn <name>", proc.stderr)
+        self.assertIsNone(registry.get(self.db, "mty-amh-impl-01"))
+        # le nom explicite crée l'éphémère sans aucune convention
+        proc = self.mesh("agent", "spawn", "aide3", "--by", "orchestre", "--ttl", "30m",
+                         env=self.cli_env())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(registry.get(self.db, "aide3"))
+
     def test_agent_group_is_reachable_under_canon_too(self):
         """Codex r1 (#452, P2) : `canon agent name|spawn` sortait en code 2."""
         self.naming()
