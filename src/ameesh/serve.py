@@ -71,7 +71,7 @@ import time
 import urllib.parse
 from typing import Callable
 
-from . import events, httpkit, serve_actions, server_faults, storage, turn_observation, sandbox_observation, version
+from . import deferral_observation, events, httpkit, serve_actions, server_faults, storage, turn_observation, sandbox_observation, version
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -680,6 +680,27 @@ _SANDBOX = _obj(
     tranche=_nullable_obj(['tranche_id', 'state', 'reserved_usd', 'settled_usd', 'kept_usd'],
         tranche_id=_STR, state={'enum': ['open', 'settled', 'kept', 'released']},
         reserved_usd=_NUM, settled_usd=_NUM_NULL, kept_usd=_NUM_NULL))
+#: E3b (#7675): the pressure `queued` object, already published by
+#: `ameesh list --json`; the deferral block reuses it rather than a free text.
+_QUEUE = _nullable_obj(
+    ["state", "reason", "host", "scope", "critical", "detail", "queued_s",
+     "retry_s", "capacity"],
+    state={"const": "queued", "type": "string"},
+    reason={"const": "pressure", "type": "string"},
+    host=_STR, scope={"enum": ["own_cgroup", "host"]},
+    critical={"type": "boolean"}, detail=_STR,
+    queued_s=_INT_NULL, retry_s=_INT_NULL, capacity=_STR_NULL)
+
+#: E3b (#7675): one bounded block for the current hold. The reason enum is
+#: the module's closed list, so a new reason cannot be documented without the
+#: builder and the tests seeing it.
+_DEFERRAL = _nullable_obj(
+    ["schema", "state", "reason", "since_ts", "age_s"],
+    schema={"const": deferral_observation.SCHEMA, "type": "string"},
+    state={"enum": list(deferral_observation.STATES)},
+    reason={"enum": list(deferral_observation.REASONS)},
+    since_ts=_NUM_NULL, age_s=_INT_NULL, queue=_QUEUE)
+
 #: #2167 B1: the observation of one turn or one request (study l2894, §3).
 #: The enums are the domain constants, so a new state cannot be documented
 #: without the builder and the tests seeing it.
@@ -725,6 +746,7 @@ _OBSERVATION = _obj(
             turn_id=_STR_NULL, spend_key=_STR_NULL, billing_account=_STR_NULL,
             usd=_NUM, model=_STR_NULL, recorded_ts=_NUM, source=_STR_NULL)),
     sandbox=_SANDBOX,
+    deferral=_DEFERRAL,
     quiescent={"type": "boolean"},
 )
 

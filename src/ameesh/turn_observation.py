@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import time
 
-from . import account_budget, storage
+from . import account_budget, deferral_observation, storage
 
 SCHEMA = "ameesh-turn-observation/1"
 #: `turn.state` values, in the study's vocabulary
@@ -252,6 +252,10 @@ def observe(db, *, turn: str | None = None, request: int | None = None,
             "expires_ts": agent.get("lease_expires_ts"),
         },
         "accounting": accounting,
+        # E3b (#7675): why the agent currently holds the turn. Bounded and
+        # closed; None is not permission, and it never replaces `accounting`.
+        "deferral": deferral_observation.classify(
+            agent, since_ts=agent.get("status_since_ts"), now=observed_ts),
         "quiescent": quiescent,
     }
 
