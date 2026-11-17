@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#7687 (C5 of #6002): a lending host counts its live guest offload jobs.
 
-A lending host runs jobs offloaded from other hosts, in the transient
-`ameesh-job-<id>.slice` of its offload shell. The `guest` runs interface
-publishes their count in the host measure, so the automatic drain and the
-`idle-drained` proof know the host's runs instead of staying unknown forever
-(#4147, #4148, #5905); a live job is never turned into a proven zero.
+A lending host runs jobs offloaded from other hosts. Each job is witnessed
+twice: by its `ameesh-offload-shell` process, alive from the SSH session's
+start, and by its transient `ameesh-job-<id>.slice`, alive from the first
+phase (an orphan). The `guest` runs interface publishes their count in the
+host measure, so the automatic drain and the `idle-drained` proof know the
+host's runs instead of staying unknown forever (#4147, #4148, #5905); a live
+job is never turned into a proven zero.
 """
 from __future__ import annotations
 
@@ -26,6 +28,8 @@ NOW = 100000.0
 
 #: where systemd nests an offload job slice in a user manager
 USER_BASE = os.path.join("user.slice", "user-1002.slice", "user@1002.service")
+#: the installed shell and its forced command (deploy/guest/install.sh)
+SHELL_PATH = "/usr/local/lib/ameesh-guest/ameesh-offload-shell"
 
 
 def write(path: str, text: str) -> str:
@@ -35,8 +39,23 @@ def write(path: str, text: str) -> str:
     return path
 
 
-def job_slice(root: str, name: str, *, populated: bool | None = False,
-              age: float = 0.0, base: str = "", now: float = NOW) -> str:
+def proc_entry(root: str, pid: str, *argv: str) -> str:
+    """One fake `/proc/<pid>/cmdline` (NUL-separated argv, as the kernel)."""
+    path = os.path.join(root, pid)
+    os.makedirs(path)
+    with open(os.path.join(path, "cmdline"), "wb") as fh:
+        fh.write(b"\0".join(arg.encode() for arg in argv) + b"\0")
+    return path
+
+
+def shell(proc_root: str, pid: int = 4242) -> str:
+    """A live offload shell, exactly as the forced command runs it."""
+    return proc_entry(proc_root, str(pid), "/usr/bin/python3", "-I",
+                      SHELL_PATH, "--config", "/etc/ameesh-guest/offload.json")
+
+
+def job_slice(root: str, name: str, *, populated: bool | None = True,
+              base: str = "") -> str:
     """A fake job slice; `populated=None` leaves `cgroup.events` unreadable."""
     path = os.path.join(root, base, *resources.GUEST_JOB_PARTS, name)
     os.makedirs(path)
@@ -46,101 +65,153 @@ def job_slice(root: str, name: str, *, populated: bool | None = False,
     else:
         write(os.path.join(path, "cgroup.events"),
               "populated %d\nfrozen 0\n" % int(populated))
-    stamp = now - age
-    os.utime(path, (stamp, stamp))
     return path
 
 
 class GuestJobsTest(unittest.TestCase):
-    """The cgroup scan: live, ambiguous and leftover job slices."""
+    """Two witnesses of a live job: its offload shell and its populated slice."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = self.tmp.name
+        self.root = os.path.join(self.tmp.name, "cgroup")
+        self.proc = os.path.join(self.tmp.name, "proc")
+        os.makedirs(self.root)
+        os.makedirs(self.proc)
+        # PID 1 makes the fake table a complete one (a table without it is a
+        # hidden one: hidepid, a container's own namespace)
+        proc_entry(self.proc, "1", "/sbin/init")
         self.addCleanup(self.tmp.cleanup)
 
-    def scan(self, **kw):
-        return resources.guest_jobs(self.root, now=NOW, **kw)
+    def scan(self) -> int | None:
+        return resources.guest_jobs(self.root, proc_root=self.proc)
 
-    def test_a_tree_without_a_job_slice_is_a_known_zero(self):
-        os.makedirs(os.path.join(self.root, "ameesh.slice", "ameesh-job.slice"))
+    # -- the shell covers the job's whole life ------------------------------
+
+    def test_no_job_is_a_known_zero(self):
         self.assertEqual(self.scan(), 0)
 
-    def test_a_missing_tree_is_a_known_zero(self):
-        self.assertEqual(self.scan(), 0)
-
-    def test_a_populated_slice_is_a_live_job(self):
-        job_slice(self.root, "ameesh-job-20261117_054411_1639f9.slice",
-                  populated=True)
+    def test_a_shell_is_a_live_job_before_its_first_slice(self):
+        # B1/B3 of the review: checkout and the cache-lock wait happen before
+        # executor.open(); the shell exists, the slice does not
+        shell(self.proc)
         self.assertEqual(self.scan(), 1)
 
-    def test_every_live_job_counts(self):
-        for job in ("20261117_054411_1639f9", "20261117_054848_13987c"):
-            job_slice(self.root, "ameesh-job-%s.slice" % job, populated=True)
+    def test_every_shell_counts(self):
+        shell(self.proc, 4242)
+        shell(self.proc, 4243)
         self.assertEqual(self.scan(), 2)
+
+    def test_a_process_that_merely_names_the_shell_is_not_one(self):
+        # a job's own command line may contain the path: only a whole argument
+        # whose basename is the installed shell is a shell
+        proc_entry(self.proc, "500", "/bin/sh", "-c",
+                   "grep %s /etc/passwd" % SHELL_PATH)
+        proc_entry(self.proc, "501", "/usr/bin/python3", "-c",
+                   "print('%s')" % SHELL_PATH)
+        self.assertEqual(self.scan(), 0)
+
+    # -- the slice covers an orphan whose shell died -------------------------
+
+    def test_a_populated_slice_is_a_live_job_without_a_shell(self):
+        job_slice(self.root, "ameesh-job-20261117_054411_1639f9.slice")
+        self.assertEqual(self.scan(), 1)
 
     def test_a_job_slice_in_a_user_manager_counts_too(self):
         job_slice(self.root, "ameesh-job-20261117_054411_1639f9.slice",
-                  populated=True, base=USER_BASE)
+                  base=USER_BASE)
         self.assertEqual(self.scan(), 1)
 
-    def test_a_young_empty_slice_is_ambiguous(self):
-        # the job may be between two phases: never a proven zero
-        job_slice(self.root, "ameesh-job-x.slice", age=0)
-        self.assertIsNone(self.scan())
-        job_slice(self.root, "ameesh-job-y.slice",
-                  age=resources.GUEST_JOB_EMPTY_S - 0.5)
-        self.assertIsNone(self.scan())
+    def test_the_larger_witness_wins(self):
+        shell(self.proc)
+        job_slice(self.root, "ameesh-job-a.slice")
+        self.assertEqual(self.scan(), 1)
+        shell(self.proc, 4243)
+        self.assertEqual(self.scan(), 2)
+        job_slice(self.root, "ameesh-job-b.slice")
+        self.assertEqual(self.scan(), 2)
+        job_slice(self.root, "ameesh-job-c.slice")
+        self.assertEqual(self.scan(), 3)
 
-    def test_an_old_empty_slice_is_a_leftover_and_ignored(self):
-        job_slice(self.root, "ameesh-job-20261111_004106_20bfd4.slice",
-                  age=resources.GUEST_JOB_EMPTY_S)
+    def test_an_empty_slice_neither_proves_nor_hides_a_job(self):
+        # no age guess: a job between phases is covered by its shell
+        job_slice(self.root, "ameesh-job-x.slice", populated=False)
         self.assertEqual(self.scan(), 0)
-        job_slice(self.root, "ameesh-job-20261111_130121_a97235.slice",
-                  age=6 * 24 * 3600)
-        self.assertEqual(self.scan(), 0)
-
-    def test_an_old_populated_slice_is_still_a_live_job(self):
-        # the age rule only decides an *empty* slice: a live job is never
-        # ignored, however old its slice looks
-        job_slice(self.root, "ameesh-job-old.slice", populated=True,
-                  age=6 * 24 * 3600)
+        shell(self.proc)
         self.assertEqual(self.scan(), 1)
 
-    def test_a_future_mtime_is_an_activity_now_never_an_old_slice(self):
-        job_slice(self.root, "ameesh-job-x.slice", age=-60)
+    # -- an unreadable source is never a zero -------------------------------
+
+    def test_a_hidden_process_table_is_unknown(self):
+        hidden = os.path.join(self.tmp.name, "hidden")
+        proc_entry(hidden, "2", "kthreadd")
+        self.assertIsNone(resources.guest_jobs(self.root, proc_root=hidden))
+
+    def test_a_missing_process_table_is_unknown(self):
+        self.assertIsNone(resources.guest_jobs(
+            self.root, proc_root=os.path.join(self.tmp.name, "no-proc")))
+
+    def test_an_unreadable_cmdline_is_unknown(self):
+        os.makedirs(os.path.join(self.proc, "600", "cmdline"))
         self.assertIsNone(self.scan())
+
+    def test_an_unreadable_user_slice_is_unknown(self):
+        # cx2's probe: a `user.slice` that cannot be listed used to vanish and
+        # let the scan return a false zero
+        write(os.path.join(self.root, "user.slice"), "")
+        self.assertIsNone(self.scan())
+
+    def test_a_positive_shell_count_survives_an_unreadable_cgroup_tree(self):
+        shell(self.proc)
+        write(os.path.join(self.root, "user.slice"), "")
+        self.assertEqual(self.scan(), 1)
 
     def test_an_unreadable_slice_is_unknown(self):
         job_slice(self.root, "ameesh-job-x.slice", populated=None)
         self.assertIsNone(self.scan())
-
-    def test_an_unreadable_parent_is_unknown(self):
-        # a file where the job-slice directory is expected: the tree is not read
-        write(os.path.join(self.root, *resources.GUEST_JOB_PARTS), "")
-        self.assertIsNone(self.scan())
-
-    def test_a_positive_count_survives_an_unreadable_extra_slice(self):
-        # the drain only needs to know that runs are not zero
-        job_slice(self.root, "ameesh-job-live.slice", populated=True)
-        job_slice(self.root, "ameesh-job-unknown.slice", populated=None)
+        shell(self.proc)  # the positive count is kept: the drain needs it
         self.assertEqual(self.scan(), 1)
+
+    def test_a_container_process_table_cannot_witness_the_host(self):
+        # a runner in a container sees its own /proc: a zero there would hide
+        # every guest job of the host, so the measure stays unknown
+        shell(self.proc)
+        with mock.patch.object(resources.platform, "in_container", return_value=True):
+            self.assertIsNone(resources.guest_jobs(self.root))
+            self.assertEqual(
+                resources.guest_jobs(self.root, proc_root=self.proc), 1)
 
     def test_slices_of_another_kind_are_ignored(self):
         parent = os.path.join(self.root, *resources.GUEST_JOB_PARTS)
         os.makedirs(parent)
-        # a scope, an unrelated unit, and a plain file are not job slices
         os.makedirs(os.path.join(parent, "ameesh-job-x.scope"))
         os.makedirs(os.path.join(parent, "ameesh-runner@x.service"))
         write(os.path.join(parent, "ameesh-job-file.slice"), "")
         self.assertEqual(self.scan(), 0)
+
+    # -- the measure and the installed guest stay in step --------------------
 
     def test_the_reading_publishes_the_count(self):
         with mock.patch.object(resources, "guest_jobs", return_value=3) as scan, \
                 mock.patch.object(resources, "runner_cgroups", return_value=[]):
             out = resources.sample("vm", now=NOW)
         self.assertEqual(out["guest_jobs"], 3)
-        scan.assert_called_once_with(now=NOW)
+        scan.assert_called_once_with()
+
+    def test_the_shell_marker_is_the_installed_one(self):
+        # a rename in the install would make every real host prove a false zero
+        for path in ("deploy/guest/install.sh",
+                     "deploy/mise-a-jour/guest-runtime.py"):
+            with open(os.path.join(REPO, path), encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertIn(resources.GUEST_SHELL, text, path)
+
+    def test_the_slice_names_are_the_shell_ones(self):
+        from ameesh.platform import offload_shell
+        name, _scope = offload_shell.unit_names("20261117-054411-1639f9")
+        self.assertTrue(name.startswith(resources.GUEST_JOB_PREFIX))
+        self.assertTrue(name.endswith(resources.GUEST_JOB_SUFFIX))
+        self.assertEqual(os.path.dirname(resources.slice_path(name)),
+                         os.path.join(*resources.GUEST_JOB_PARTS))
 
 
 def reading(**extra):
