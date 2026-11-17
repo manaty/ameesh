@@ -61,7 +61,7 @@ import threading
 import time
 import uuid
 
-from . import account_budget, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
+from . import account_budget, account_rotation, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import cost_attribution
 from . import context_metrics, context_profile
@@ -3817,7 +3817,7 @@ class AgentWorker(threading.Thread):
             from . import conversation, fil as fil_mod
             log = conversation.Log(
                 self.db, self.cfg, agent=self.name,
-                project=fil_mod.project_for(self.cfg, fil_mod.agent_project(self.agent)))
+                project=fil_mod.conversation_project(self.db, self.cfg, self.agent))
             log.append("state", text, session=session, meta=meta)
         except Exception as exc:  # noqa: BLE001
             log_async("[%s] conversation state not recorded (%s)" % (self.name, exc))
@@ -5354,10 +5354,14 @@ class AgentWorker(threading.Thread):
             # un budget — bloqué sous `CONFIG_BLOCK_PREFIX` (alerte
             # `account_config_invalid`), sans échéance de pause
             config = raison.startswith(accounts_mod.NO_VALID_PREFIX)
+            # #7712 : un refus de coordination de vague n'est pas une pause
+            # budget — le statut garde `WAVE_PREFIX` (alerte
+            # `account_wave_coordination`), sans marque critique de budget.
+            vague = raison.startswith(account_rotation.WAVE_PREFIX)
             marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) \
-                and not config else ""
+                and not config and not vague else ""
             registry.set_status(self.db, self.name, "blocked",
-                                status_text=(raison if fenetre_courte
+                                status_text=(raison if fenetre_courte or vague
                                              else "%s%s%s" % (
                                                  accounts_mod.CONFIG_BLOCK_PREFIX
                                                  if config
@@ -5376,6 +5380,11 @@ class AgentWorker(threading.Thread):
                                    "the host configuration is fixed (ameesh doctor)."
                                    % raison,
                                    meta={"action": "account_config", "raison": raison})
+                elif vague:
+                    self._fil_note("Account wave coordination: %s. No turn until the "
+                                   "wave settles; the next turn retries on its own."
+                                   % raison[len(account_rotation.WAVE_PREFIX):],
+                                   meta={"action": "account_wave", "raison": raison})
                 elif not account_window.is_short_window(raison):
                     self._fil_note("Budget pause: %s. No turn until the gauge goes "
                                    "back down." % raison,
@@ -5393,8 +5402,11 @@ class AgentWorker(threading.Thread):
         # #5783 : une pause de fenêtre courte s'écrit désormais sans le préfixe
         # budget ; elle se lève comme lui, sinon un agent idle resterait
         # `blocked` avec une raison de quelques secondes.
+        # #7712 : même chose pour un refus de coordination de vague, qui se
+        # lève au tour suivant quand la vague s'est posée.
         if agent.get("status") != "blocked" or not (
-                texte.startswith(("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX))
+                texte.startswith(("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX,
+                                  account_rotation.WAVE_PREFIX))
                 or account_window.is_short_window(texte)):
             return
         issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
@@ -8471,8 +8483,11 @@ class AgentWorker(threading.Thread):
             author = sender if sender.startswith(("human:", "chat-")) \
                 else "human:" + sender
             try:
-                entry = conversation.Log(self.db, cfg, agent=self.name,
-                                         lot=row.get("lot_id"))
+                entry = conversation.Log(
+                    self.db, cfg, agent=self.name,
+                    project=fil.conversation_project(self.db, cfg, self.agent,
+                                                     row.get("lot_id")),
+                    lot=row.get("lot_id"))
                 written = entry.append("human_message", text=row.get("body") or "",
                                        author=author, event_id="mail:%d" % int(mid),
                                        meta={"messages": [int(mid)]})
@@ -9437,8 +9452,16 @@ class AgentWorker(threading.Thread):
                 if activation or not session:
                     journal_id = "session-" + uuid.uuid4().hex
                     memory_preface = memory_mod.preface(path, self.name, journal_id)
+                # The transport works again: a later failure is a new episode.
+                self.__dict__.pop("_memory_unavailable_code", None)
             except (memory_mod.MemoryError, db_mod.DbError, OSError, subprocess.SubprocessError) as exc:
-                log("[%s] persona memory unavailable for this turn: %s" % (self.name, exc))
+                reason = str(exc)
+                log("[%s] persona memory unavailable for this turn: %s" % (self.name, reason))
+                # A silent degradation is not acceptable: the persona must know
+                # its memory is missing, and the host defect is published to
+                # the responsible (thread + event log), once per cause.
+                memory_preface = memory_mod.unavailable_preface(reason)
+                self._memory_unavailable(reason)
         resume += memory_preface
         # #6040 : seuil de compaction native (Codex : en cours de tour) ; un
         # compte emprunté garde les défauts de son harnais, comme l'effort.
@@ -10217,10 +10240,14 @@ class AgentWorker(threading.Thread):
             # for SQL or the readable thread. ResidentWorker uses the same sink.
             if getattr(self.db, "driver", "") != "mediated":
                 from .conversation import Recorder
+                # #7668 : une conversation privée (avatar, fiche sans projet)
+                # ne publie que dans le fil du lot qu'elle traite ; le projet
+                # par défaut de l'exécuteur n'est jamais un repli.
+                feed_lot = lot_du_tour if fil.private_conversation(self.agent) else None
                 conversation_recorder = Recorder(
                     self.cfg, agent=self.name, turn=turn_id, session=session,
-                    project=fil.project_for(self.cfg, fil.agent_project(self.agent)),
-                    reader=adapter.reader, warn=log_async)
+                    project=fil.conversation_project(self.db, self.cfg, self.agent, feed_lot),
+                    lot=feed_lot, reader=adapter.reader, warn=log_async)
                 conversation_recorder.append("input", spec.get("prompt") or "",
                                              author="ameesh:runner")
             # CTX-02b : l'observation se collecte sur le MÊME flux que les
@@ -11239,6 +11266,34 @@ class AgentWorker(threading.Thread):
         return min(self.runner.failure_backoff_max,
                    base * (2 ** (n - 1)))
 
+    def _memory_unavailable(self, reason: str) -> None:
+        """Publish a memory-unavailable host defect, once per cause.
+
+        The agent already receives a visible line in its turn; this trace and
+        the `host.memory_unavailable` event let the responsible see the defect
+        without reading the runner log. A repeated cause (the same turn loop)
+        is not republished; a success clears the marker. Never fails a turn.
+        """
+        code = memory_mod.failure_code(reason)
+        if self.__dict__.get("_memory_unavailable_code") == code:
+            return
+        self.__dict__["_memory_unavailable_code"] = code
+        detail = " ".join(str(reason or "").split())[:240]
+        host = getattr(self.cfg, "host", "") or "this host"
+        self._fil_note(
+            "Persona memory unavailable on %s (%s): %s — the turn runs without "
+            "memory; fix the host configuration (SSH repository and "
+            "persona_memory.ssh_key, `ameesh canon check`)."
+            % (host, code, detail),
+            meta={"action": "memoire_indisponible", "cause": code})
+        try:
+            from . import events
+            events.record(self.db, "host.memory_unavailable", "agent:%s" % self.name,
+                          agent=self.name, host=getattr(self.cfg, "host", "") or "",
+                          cause=code)
+        except Exception as exc:  # noqa: BLE001 - a publication never fails a turn
+            log("[%s] memory unavailable event not recorded: %s" % (self.name, exc))
+
     def _sync_memory(self) -> None:
         """Transport the persona session's memory changes at turn end, in the background."""
         if not self.agent.get("memory_repository") or self.runner.dry_run:
@@ -11249,6 +11304,7 @@ class AgentWorker(threading.Thread):
             memory_mod.require_isolation(self.cfg, self.db, self.name)
         except (memory_mod.MemoryError, db_mod.DbError) as exc:
             log_async("[%s] persona memory disabled: %s" % (self.name, exc))
+            self._memory_unavailable(str(exc))
             return
         path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
         if not os.path.isdir(os.path.join(path, ".git")):

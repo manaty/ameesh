@@ -28,7 +28,7 @@ from ameesh.connectors.git_merge import GitMergeConnector, parse_target, resolve
 from ameesh.connectors.shell_noop import ShellNoopConnector
 from ameesh.db import DbError
 
-from .support import FAKEBIN, PgTestCase, apply_authenticators
+from .support import FAKEBIN, PgTestCase, apply_authenticators, standing_limits
 from .test_receipts import HeldTransaction, Worker
 from .webauthn_soft import ORIGIN, RP_ID, SoftEd25519, SoftWebAuthn, make_request
 
@@ -37,6 +37,9 @@ BOB = "human:bob"
 AGENT = "agent:deepseek7"
 COMMIT = "a" * 40
 POLICY = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,))
+#: #7629 : plafond PERMISSIF pour les tests de porte (les cas de politique
+#: construisent la leur, plus stricte).
+STANDING_LIMITS = standing_limits()
 FAKE_GH = os.path.join(FAKEBIN, "gh")
 PR = "o/r#12"
 #: Marge (s) avant l'échéance d'un reçu « presque échu » : la préparation
@@ -228,7 +231,7 @@ class ActionsBase(PgTestCase):
                     "max_amount": max_amount, "currency": "EUR",
                     "until": int(time.time()) + 3600}
         receipt = self.alice.receipt(make_request(ALICE, standing=standing))
-        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="porte")
+        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="porte", limits=STANDING_LIMITS)
         self.assertTrue(verdict.ok, verdict.reason)
         return grant
 

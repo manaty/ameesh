@@ -59,6 +59,13 @@ Identity verification is the caller's responsibility. Ordinary `input`
 entries can use the mail/event identifier as `event_id`; they do not
 duplicate mail already recorded in the readable thread.
 
+`project` names the readable R12 thread and is never defaulted. Resolve it
+with `fil.conversation_project`: the project of the lot the entry belongs to,
+else the project declared by the agent's card (`team`, else `chantier`). An
+avatar — or any agent whose card declares no project — has a private
+conversation: its entries keep `conversation_log.project` NULL and queue no
+R12 copy; a lot-tied entry is still published in that lot's thread (#7668).
+
 L76 attaches a nonblocking sink to L75's reader callback:
 
 ```python
@@ -115,8 +122,9 @@ without hooks (ACP) do not record attach exchanges.
 
 ## Readable thread and retention
 
-Every human message and final answer has a durable R12 outbox in its log
-entry. `Log.drain_threads()` locks pending entries, publishes them with
+Every human message and final answer of a project conversation has a durable
+R12 outbox in its log entry (a private conversation queues none, #7668).
+`Log.drain_threads()` locks pending entries, publishes them with
 `fil.record`, then acknowledges successful posts. Failure keeps the entry
 pending for the next drain (including at recorder startup). A crash after
 posting but before acknowledging may create a duplicate; its metadata

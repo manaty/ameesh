@@ -47,8 +47,10 @@ class AttachJournalTest(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.db.execute("DELETE FROM conversation_log; DELETE FROM conversation_heads")
-        registry.upsert(self.db, "avatar", harness="claude", host=self.cfg.host,
-                        cwd=self.tmp, session_id=SID)
+        # #7668 : sans projet déclaré la conversation est privée (aucune copie
+        # R12) ; A0 vérifie le fil, donc la fiche de ce test en déclare un.
+        registry.upsert(self.db, "avatar", chantier="persona-proj", harness="claude",
+                        host=self.cfg.host, cwd=self.tmp, session_id=SID)
 
     def _entries(self):
         return self.db.query("SELECT kind, author, text, event_id, turn, session,"

@@ -9,7 +9,7 @@ Consumer removal is tracked in
 Every replacement below is either an existing public command, a named native
 feature to adopt through configuration, or a proposed extension with that
 upstream ticket and a tranche identifier. A proposed extension is not a usable
-API. The pilot creates its implementation lot from the final table.
+API. Implementation lots created by the pilot are listed in the final table.
 
 ## Reproducible scope
 
@@ -186,21 +186,23 @@ No absence is permission, successful settlement or zero spend.
 
 ## Implementation tranches for the pilot
 
-Each row is at most one working day. **These are proposed implementation
-tranches**, all attached to named upstream #5827 until the pilot creates their
-lots; this document does not claim such lots already exist. The F/S lots
-already exist. Each upstream delivery needs a corresponding removal commit
+Each row is at most one working day. The pilot created lots #7669–#7675
+(mesh-design, 17 November 2026, message #223560), all under named upstream
+#5827 with consumer removal in IMA#1803. E1a is implemented by the
+[public snapshot CLI](../api/canon-snapshot-v1.md); the other rows remain
+delivery work, not available APIs. F/S are the existing qualification/stable
+lots. Each upstream delivery needs a corresponding removal commit
 referenced in IMA#1803 before the external request closes.
 
 | Key | Estimate | Deliverable and acceptance | Dependencies / owner of next step |
 | --- | --- | --- | --- |
-| E1a | 6 h | Read-only versioned canon/directory snapshot API: immutable source SHA, scope/trust/freshness, member metadata, validation findings; stale or moving source refuses authority. Test equivalent of `read_snapshot`, including monotonic source and metadata. | Pilot creates lot under #5827; IMA#1803 adopts it. |
-| E1b | 8 h | Read-only prepared admission/profile API: responsible and admitted canon/placement references, live lease owner/epoch, bounded redacted budget/capacity/limits, native turn/sandbox refs where available. Atomic consistent read; no claim, reservation, dispatch or credentials. Missing correlation explicitly unavailable. | Pilot creates lot under #5827 after E1a; IMA#1803 removes preparation/observation SQL. |
-| E2a | 8 h | Generic typed mail submission/history API with actor/scope checks, durable request IDs, scoped idempotency keys and bounded batch submission. Same key/same content reuses ID; conflicting content refuses; concurrent retries make one durable submission. Module-owned payload supports role/document/Memoria without core-specific business fields. | Pilot creates lot under #5827; IMA#1803 removes submit/history SQL. |
-| E2b | 8 h | Lease-fenced pending/reply operation tied to request ID and native turn: expired/replaced epoch refuses; one correlated reply across concurrent retry; native spend marker stays authoritative. Test request/reply races and visibility. | Pilot creates lot under #5827 after E2a; IMA#1803 removes reply and lease SQL. |
-| E2c | 6 h | Core-owned interrupted-request replay at drain/shutdown: exact captured lease/request set, already-replied exclusion, preserve unrelated pending prompt, no duplicate reservation or response. Test shutdown before Popen publication and concurrent reply. | Pilot creates lot under #5827 after E2b; IMA#1803 removes HandoverRunner. |
-| E3a | 6 h | Declarative per-agent fresh-session/context and bounded refusal-retry policy consumed by the runner; no AgentWorker subclass. Test document and ordinary agent side by side, optional harness handling, failure delay and graceful shutdown. | Pilot creates lot under #5827; IMA#1803 removes session monkey patch. |
-| E3b | 8 h | Native pressure/admission qualification and structured bounded deferral observation. Native `own_cgroup`, budget/ledger and lock stay authoritative; fairness/latency witness for awakened document vs role/background, ambiguous accounting retained. Add missing declarative policy only if witness proves a gap; no arbitrary runner callback or lock replacement. | Pilot creates lot under #5827; IMA#1803 removes pressure/scheduling subclasses. |
+| E1a (#7669) | 6 h | Read-only versioned canon/directory snapshot API: immutable source SHA, scope/trust/freshness, member metadata, validation findings; stale or moving source refuses authority. Test equivalent of `read_snapshot`, including monotonic source and metadata. | Implementation lot under #5827; IMA#1803 adopts it. |
+| E1b (#7670) | 8 h | Read-only prepared admission/profile API: responsible and admitted canon/placement references, live lease owner/epoch, bounded redacted budget/capacity/limits, native turn/sandbox refs where available. Atomic consistent read; no claim, reservation, dispatch or credentials. Missing correlation explicitly unavailable. | Implementation lot under #5827 after E1a; IMA#1803 removes preparation/observation SQL. |
+| E2a (#7671) | 6 h | Generic typed mail submission/history API with actor/scope checks, durable request IDs, scoped idempotency keys and bounded batch submission. Same key/same content reuses ID; conflicting content refuses; concurrent retries make one durable submission. Module-owned payload supports role/document/Memoria without core-specific business fields. | Implementation lot under #5827; IMA#1803 removes submit/history SQL. |
+| E2b (#7672) | 8 h | Lease-fenced pending/reply operation tied to request ID and native turn: expired/replaced epoch refuses; one correlated reply across concurrent retry; native spend marker stays authoritative. Test request/reply races and visibility. | Implementation lot under #5827 after E2a; IMA#1803 removes reply and lease SQL. |
+| E2c (#7673) | 6 h | Core-owned interrupted-request replay at drain/shutdown: exact captured lease/request set, already-replied exclusion, preserve unrelated pending prompt, no duplicate reservation or response. Test shutdown before Popen publication and concurrent reply. | Implementation lot under #5827 after E2b; IMA#1803 removes HandoverRunner. |
+| E3a (#7674) | 6 h | Declarative per-agent fresh-session/context and bounded refusal-retry policy consumed by the runner; no AgentWorker subclass. Test document and ordinary agent side by side, optional harness handling, failure delay and graceful shutdown. | Implementation lot under #5827; IMA#1803 removes session monkey patch. |
+| E3b (#7675) | 6 h | Native pressure/admission qualification and structured bounded deferral observation. Native `own_cgroup`, budget/ledger and lock stay authoritative; fairness/latency witness for awakened document vs role/background, ambiguous accounting retained. Add missing declarative policy only if witness proves a gap; no arbitrary runner callback or lock replacement. | Implementation lot under #5827; IMA#1803 removes pressure/scheduling subclasses. |
 | F | 8 h | External module witness and public fixture/setup/observation protocol; contract element → test matrix, deliberate break witness. Include fixture use for Process, usage, refusal and mail races without importing upstream tests. | Existing #7665 / #5857; pilot may split fixture work further if needed. |
 | S | 6 h | Deterministic weekly stable designation, immutable consumer manifest and one unchanged witness across consecutive stables; all current checks derive from manifest. | Existing #7666 / #5858; publication and adoption retain their own gates. |
 

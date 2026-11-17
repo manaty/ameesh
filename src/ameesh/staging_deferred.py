@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#7365: a reported staging server is a version lag, not a permanent state.
 
-The staging sequence deploys the four VMs of the mesh (``STAGING_VMS``) and
-may report the workstation, which updates at its return, and a server without
-root access. Canon §14 allows a report, never a permanent one: the next cutoff
+The staging sequence deploys the VMs declared by the canon's Host cards
+(``staging.kind: agents`` and the ``server``; #7662) and may report the
+workstation, which updates at its return, and a server without root access.
+Canon §14 allows a report, never a permanent one: the next cutoff
 never goes back below the last commit, and a reported host is caught up.
 
 The sequence cannot catch up a server without root itself: in server mode
@@ -100,20 +101,19 @@ def _tagged(rows, by_commit):
     return None
 
 
-def _deferred(data) -> dict:
+def _deferred(data, topology) -> dict:
     """The hosts reported by an attestation, except the workstation.
 
-    A `pc-smichea` report is the normal "updated at its return": it is a
-    report, not a lag. Any other reported host is a runtime the sequence
-    never deploys, which §14 forbids to leave permanent.
+    A report of the canon's workstation (#7662) is the normal "updated at its
+    return": it is a report, not a lag. Any other reported host is a runtime
+    the sequence never deploys, which §14 forbids to leave permanent.
     """
-    from . import release_cutoff as rc
     reportes = data.get("reportes") or {}
     if not isinstance(reportes, dict):
         return {}
     out = {}
     for host, detail in reportes.items():
-        if not isinstance(host, str) or not host or host == rc.STAGING_POSTE:
+        if not isinstance(host, str) or not host or host == topology.workstation:
             continue
         out[host] = detail if isinstance(detail, dict) else {}
     return out
@@ -362,6 +362,15 @@ def declarations(db, project) -> dict[str, dict]:
     return out
 
 
+def _topology(db, project=None):
+    """The staging sequence of the project, else of the database's canon (#7662)."""
+    from . import release_cutoff as rc
+    topology = getattr(project, "staging_topology", None)
+    if topology is not None and topology.hosts:
+        return topology
+    return rc.topology_for(db)
+
+
 def baseline(db, project, host) -> dict | None:
     """The tagged staging attestation that reports ``host``, or None.
 
@@ -375,7 +384,7 @@ def baseline(db, project, host) -> dict | None:
     if chosen is None:
         return None
     _index, tag, data = chosen
-    deferred = _deferred(data)
+    deferred = _deferred(data, _topology(db, project))
     if host not in deferred:
         return None
     return {"sha": data.get("sha") or "", "tag": str(tag.get("tag") or ""),
@@ -423,15 +432,18 @@ def annotate(db, project, staging) -> dict:
     Called before the cutoff report is written; an unreadable trace simply
     leaves the report as it was (a report never fails on a declaration read).
     """
-    from . import release_cutoff as rc
     if not isinstance(staging, dict):
         return staging
     attestation = staging.get("attestation")
     reportes = attestation.get("reportes") if isinstance(attestation, dict) else None
     if not isinstance(reportes, dict):
         return staging
+    topology = _topology(db, project)
+    if not topology.hosts:
+        return staging
+    workstation = topology.workstation
     hosts = [host for host in reportes if isinstance(host, str)
-             and host and host != rc.STAGING_POSTE]
+             and host and host != workstation]
     if not hosts:
         return staging
     found = declarations(db, project)
@@ -557,7 +569,10 @@ def tick(cfg, db, project, today=None) -> dict:
     """Alert the pilot and the bureau once per release whose staging reported
     a server. Never blocks a release: an unreadable input concludes nothing."""
     from . import release_cutoff as rc
+    project = rc.with_staging_topology(cfg, project)
     report = {"schema": SCHEMA, "project": project.name, "result": "none"}
+    if not project.staging_topology.hosts:
+        return report
     rows = _rows(db)
     if not rows:
         return report
@@ -569,7 +584,8 @@ def tick(cfg, db, project, today=None) -> dict:
     baseline_sha = data.get("sha")
     repo = getattr(project, "repo", "")
     declared = declarations(db, project)
-    deferred = {host: detail for host, detail in _deferred(data).items()
+    deferred = {host: detail for host, detail in
+                _deferred(data, project.staging_topology).items()
                 if not _proved_since(rows, index, host, baseline_sha, repo)}
     if not deferred:
         return report

@@ -3599,10 +3599,23 @@ class Actions(Domain):
     @abc.abstractmethod
     def covering_grants(self, action_id: str, amount: int, connector: str, operation: str,
                         action_class: str, currency: str | None,
-                        canon: str = "") -> list[dict]:
+                        canon: str = "", proposed_by: str = "",
+                        target: str = "") -> list[dict]:
         """Grants vivants qui couvrent l'action (pré-filtre sans verrou), avec
         `live` : une réservation vivante de l'action existe déjà. L44 : seuls
-        ceux dont l'authentificateur est déclaré par `canon`."""
+        ceux dont l'authentificateur est déclaré par `canon`. #7629 : seuls
+        ceux dont le bénéficiaire couvre `proposed_by` et dont une cible couvre
+        `target` ; la réservation recontrôle tout sous verrou."""
+
+    @abc.abstractmethod
+    def recap(self, proposed_by: str, since_ts: float, until_ts: float,
+              project: str | None = None) -> list[dict]:
+        """Actions proposées par `proposed_by` dans la fenêtre (#7629).
+
+        Chaque ligne porte sa nature (`auth_kind`, `auth_grant_id`,
+        `policy_version`) et `refused` : une décision `deny` a annulé l'action
+        (événement `cancelled` avec la note du refus). Le classement par issue
+        de charte est fait par `actions.recap`."""
 
     @abc.abstractmethod
     def launched(self, *, action_id: str | None, grace: float, force: bool) -> list[dict]:
@@ -3618,9 +3631,13 @@ class Actions(Domain):
 
     @abc.abstractmethod
     def bind(self, action_id: str, *, from_states: tuple, digest: str, auth: dict,
-             by: str) -> bool:
+             by: str, policy_version: str | None = None,
+             new_digest: str | None = None) -> bool:
         """Lie une autorisation (`→ approved`) si l'action est encore dans
-        `from_states`, non remplacée, d'empreinte `digest`."""
+        `from_states`, non remplacée, d'empreinte `digest`.
+
+        #7629 : `policy_version` / `new_digest` recopient la version de charte
+        du grant permanent et l'empreinte recalculée, dans la même écriture."""
 
     @abc.abstractmethod
     def launch(self, action_id: str, *, digest: str, auth_kind: str, auth_nonce: str | None,
@@ -4132,9 +4149,18 @@ class Grants(Domain):
     def register(self, *, approver: str, nonce: str, challenge: str, authenticator_id: int,
                  receipt_json: str, connector: str, operations_json: str, action_class: str,
                  max_amount: int, currency: str | None, exp: int, iat: int, until: int,
-                 clock_skew: int, registered_by: str) -> int | None:
+                 clock_skew: int, registered_by: str,
+                 beneficiary_kind: str = "none", beneficiary: str = "",
+                 beneficiary_clones: bool = False, targets_json: str = "[]",
+                 charter_line: str = "", charter_version: str = "") -> int | None:
         """Consomme le nonce du reçu `standing` et crée le grant ; rend son id,
-        ou None (nonce déjà consommé, authentificateur révoqué)."""
+        ou None (nonce déjà consommé, authentificateur révoqué).
+
+        #7629 : `beneficiary_kind` (`none|any|agent|avatar`), le bénéficiaire
+        nommé, la lignée de clones, les motifs de cible (`targets_json`) et la
+        référence de charte sont écrits dans la même transaction. Les défauts
+        (`none`, aucun bénéficiaire, aucune cible) ne couvrent RIEN : un
+        écrivain qui ne les nomme pas n'élargit jamais un grant."""
 
     @abc.abstractmethod
     def reserve(self, grant_id: int, action_id: str, amount: int, *, reserved_by: str | None,
@@ -4152,9 +4178,12 @@ class Grants(Domain):
 
     @abc.abstractmethod
     def candidates(self, connector: str, operation: str, action_class: str, amount: int,
-                   currency: str | None, canon: str = "") -> list[dict]:
+                   currency: str | None, canon: str = "", proposed_by: str = "",
+                   target: str = "") -> list[dict]:
         """Grants qui pourraient couvrir l'action (pré-filtre sans verrou) ;
-        L44 : seuls ceux dont l'authentificateur est déclaré par `canon`."""
+        L44 : seuls ceux dont l'authentificateur est déclaré par `canon`.
+        #7629 : le bénéficiaire (`proposed_by`) et la cible sont pré-filtrés
+        ici aussi ; la décision finale reste `ameesh_standing_reserve`."""
 
     @abc.abstractmethod
     def revoke(self, grant_id: int, by: str) -> bool:
@@ -4162,7 +4191,7 @@ class Grants(Domain):
 
     @abc.abstractmethod
     def get(self, grant_id: int) -> dict | None:
-        """Un grant, ou None."""
+        """Un grant, ou None (avec sa portée et sa charte, #7629)."""
 
 
 # --------------------------------------------------------------------------

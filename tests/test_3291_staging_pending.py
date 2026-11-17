@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from ameesh import mechanics, release_cutoff, staging_pending
+from tests import canon_staging
 from tests.test_2448_release_cutoff import MECHANICS, ReleaseFixtureMixin, _paris
 
 
@@ -36,11 +37,11 @@ class ActiveFloorTest(ReleaseFixtureMixin, unittest.TestCase):
         compte dans la vue des hotes actifs, sans fichier local."""
         data = {"sha": self.head, "date": "2026-10-24T04:00:00Z",
                 "hotes": {hote: {"actif": self.head}
-                          for hote in release_cutoff.STAGING_AGENTS}}
+                          for hote in canon_staging.AGENTS}}
         with mock.patch.object(release_cutoff, "stored_attestations",
                                return_value=[data]):
             active = staging_pending.active_hosts(db=object())
-        for hote in release_cutoff.STAGING_AGENTS:
+        for hote in canon_staging.AGENTS:
             self.assertEqual(active[hote]["sha"], self.head)
             self.assertTrue(active[hote]["attestation"].startswith("ameesh_events:"))
 
@@ -56,11 +57,11 @@ class ActiveFloorTest(ReleaseFixtureMixin, unittest.TestCase):
 
         ecrire("actif-ancienne.json", {
             "sha": old, "date": "2026-10-24T04:00:00Z",
-            "hotes": {hote: {"actif": old} for hote in release_cutoff.STAGING_HOSTS}
+            "hotes": {hote: {"actif": old} for hote in canon_staging.HOSTS}
             | {"pc-smichea": {"actif": self.head}}})
         ecrire("actif-reportee.json", {
             "sha": self.head, "date": "2026-10-24T05:00:00Z",
-            "hotes": {hote: {"actif": old} for hote in release_cutoff.STAGING_VMS},
+            "hotes": {hote: {"actif": old} for hote in canon_staging.VMS},
             "reportes": {"pc-smichea": {"raison": "poste absent",
                                         "mise_a_jour": "a son retour"}}})
         active = staging_pending.active_hosts()
@@ -70,7 +71,7 @@ class ActiveFloorTest(ReleaseFixtureMixin, unittest.TestCase):
         # une attestation complete plus recente reprend le poste
         ecrire("actif-complete.json", {
             "sha": old, "date": "2026-10-24T06:00:00Z",
-            "hotes": {hote: {"actif": old} for hote in release_cutoff.STAGING_HOSTS}})
+            "hotes": {hote: {"actif": old} for hote in canon_staging.HOSTS}})
         active = staging_pending.active_hosts()
         self.assertFalse(active["pc-smichea"].get("absent"))
         self.assertEqual(active["pc-smichea"]["sha"], old)

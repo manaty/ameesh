@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import config, release, release_cutoff
+from tests import canon_staging
 from tests.test_6520_release_staging_busy import FakeRules, tag
 
 SHA = "a" * 40
@@ -227,7 +228,8 @@ class ElectedHandoffTest(unittest.TestCase):
     def run_staging(self, data, *, sequences=None, start_timeout_s=300.0):
         project = release_cutoff.ProjectRelease(
             name="ameesh", repo="/fixture/repo", target="main",
-            staging_executor="/fixture/executor.json")
+            staging_executor="/fixture/executor.json",
+            staging_topology=canon_staging.topology())
         with mock.patch("ameesh.staging_executor.settings",
                         return_value={"key": "staging", "project": "ameesh",
                                       "start_timeout_s": start_timeout_s}), \
