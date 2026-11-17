@@ -210,7 +210,8 @@ de la récupération native, jamais d'un forçage par l'adaptateur.
    archivage jusqu'à `stopped`, restauration jusqu'à la santé.
 8. Au feu d'installation seulement : rendre l'inscription active, poser les
    unités, recharger systemd et activer le timer sur ce seul hôte. Déclarer
-   le hook sans secret dans la configuration des seuls hôtes autorisés.
+   le hook sans secret dans la configuration des seuls hôtes autorisés,
+   dans l'ordre de la section « Déclarer le hook d'une cible » (#7656).
    Aucune commande de cette étape n'a été exécutée par l'auteur du lot.
 
 ## Commandes par VM (#6252)
@@ -470,6 +471,94 @@ réelle. Les cas couvrent le reçu incomplet/étranger, la réadmission,
 l'idempotence, les commandes interdites, l'échec de santé et la réconciliation
 qui garde les prises fermées. Le boot précédent reste à qualifier au premier
 cycle mesuré par le bureau.
+
+## Déclarer le hook d'une cible (#7656)
+
+Sans `lifecycle_hook`, `host_release` garde le chemin manuel L232e : un
+drainage, même posé par le pilote, n'envoie aucune demande à l'adaptateur.
+La fenêtre R1 du 17/11 a été perdue pour cette raison. Le hook se déclare
+sur la carte Host (`policy.lifecycle_hook`), sans secret :
+
+    /home/ameesh/.local/share/ameesh/venv/bin/python -m ameesh.vm_adapter request
+
+Un hôte contrôlé (`draining`, `returning`) avance depuis le scanner de
+**n'importe quel** runner, pas seulement celui de la cible. Ce chemin
+absolu doit donc exister sur chaque hôte qui fait tourner un runner ou le
+serveur médié. Une absence donne `host_release_failed` à la tentative de cet
+hôte, et les prises restent fermées.
+
+Il faut aussi que les runs de la cible soient connus. Sans cela, ni le
+drainage automatique, ni `idle-drained`, ni la preuve d'arrêt du worker
+(`stop_evidence`) ne passent. `policy.runs_interface: none` ne vaut que
+si rien ne tourne hors tours et baux. **Un hôte prêteur (`policy.lend`) ne
+peut pas le déclarer** : le canon le refuse (#5905), et `lending` l'emporte
+même sur `runs_interfaces` en configuration. AG3 est prêteur : il porte le
+guest d'offload de la prévalidation au gel.
+
+Déclarer le hook arme deux effets à toute heure :
+- le drainage automatique (`_auto_drain`, burst inactif depuis
+  `idle_after_s`) sur un hôte aux runs connus ;
+- la demande à l'adaptateur pour tout drainage, manuel compris.
+  `request` n'inspecte pas l'inscription : il met la demande en file et rend
+  75. Si le worker est inactif (timer arrêté, `enabled: false`), l'hôte reste
+  `draining`, prises fermées, en `hook_wait`. Seule l'alerte
+  `host_release_adapter_stalled` le signale, au bout de
+  `AMEESH_HOST_RELEASE_ADAPTER_STALL`.
+
+Ce qui ne peut pas servir de garde-fou permanent :
+- une retenue (`ameesh hosts HOST --hold`) : elle ferme les baux de tous
+  les agents de l'hôte (`claimable`) et expire au bout de 24 h ;
+- `capacity: baseline` : `stop_evidence` exige un hôte burst, ce qui
+  bloquerait aussi la fenêtre.
+
+L'ordre retenu tient donc à **ne rien déclarer hors fenêtre**. Hors
+fenêtre, le hook est absent et `lend` présent. Le drainage automatique est
+refusé deux fois (`no lifecycle hook`, `declared runs unknown: lending`), et
+un drainage manuel se rouvre au retour par L232e (tests
+`test_4148_host_release`, `test_5905_runs_interface`). La déclaration passe
+par une PR canon « fenêtre », fusionnée au feu par le pilote, et retirée par
+une PR inverse :
+
+| | hors fenêtre (carte actuelle) | PR fenêtre (au feu) |
+|---|---|---|
+| `policy.lend` | présent | retiré |
+| `policy.runs_interface` | absent | `none` |
+| `policy.lifecycle_hook` | absent | la commande ci-dessus |
+
+### Séquence R1 (plan de #6002, remplace l'étape « drain » de v3.4.1)
+
+1. Gardes d'entrée, hors coupure (10:00Z, 22:00Z) et hors CI de paquet,
+   avec le composeur suspendu. Aucun job guest d'offload vivant sur AG3
+   (`ameesh offload run`, compte `ameesh-guest` : aucun processus). Aucun
+   contrôle `draining`/`returning` sur AG3 (`ameesh host status
+   ameesh-agents-3`), et aucune retenue.
+2. Le bureau active l'inscription (`enabled: true`, copie avant) et démarre
+   le timer (R1 de D1). Le worker doit être vu (`vm_adapter_observations`)
+   **avant** l'étape 3 : un hook sans worker laisse l'hôte fermé.
+3. Le pilote fusionne la PR fenêtre, puis vérifie sur un runner d'AG3 et sur
+   un runner d'un autre hôte que la carte synchronisée donne ce hook et
+   `runs_interface: none (Host card)` (`ameesh canon show`, projection
+   `ameesh hosts ameesh-agents-3`).
+4. Le drainage frais vient **après** l'étape 3 : `ameesh host drain
+   ameesh-agents-3 --for 3h`. Un drainage antérieur au hook a consommé une
+   partie de `host_release_drain_bound` (2100 s) depuis son `requested_ts` :
+   le lever (`ameesh host undrain`) et en poser un nouveau. Si le drainage
+   automatique est parti entre-temps, il tient lieu de drainage frais : ne
+   pas en poser un second.
+5. Suite de v3.4.1 sans changement : préchauffe (hystérésis), halt, preuve,
+   archivage, poweron, santé dans les 15 min. Relever T_halt, T_archive,
+   T_restore et T_health.
+6. Clôture : une fois AG3 revenu (`available`, prises ouvertes, santé
+   verte), le pilote fusionne la PR inverse (lend rétabli, hook et `none`
+   retirés). Ensuite le bureau arrête le timer (R2) et remet `enabled: false`.
+   **Si AG3 est encore arrêté ou en retour, garder le hook** (« Contrôle et
+   retour arrière ») : sans lui, L232e rouvrirait les prises sur une VM
+   éteinte.
+
+Pendant la fenêtre, la prévalidation au gel est indisponible (son seul hôte
+est AG3). C'est un résultat non concluant, qui ne retient rien. Pour
+déclarer le hook en permanence, il faut une interface qui compte les jobs
+guest d'un hôte prêteur (C5). Ce lot ne la livre pas.
 
 ## Contrôle et retour arrière
 
