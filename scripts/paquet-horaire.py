@@ -2220,31 +2220,46 @@ def finished_red(ctx: Context, item: dict, sha: str, run: dict,
         # les préfixes (#4217) ; l'unité devinée par #3801 n'est retirée que
         # si ce rejeu la désigne.
         head = replay_locally(ctx, sha, verdict.tests)
-        state, _ = replay_state(head, verdict.tests)
+        state, failed = replay_state(head, verdict.tests)
         if state != "red":
             verdict = Verdict(False, verdict.lots, verdict.tests,
                               head.text if isinstance(head, Replay) else str(head))
         else:
-            located, flaky, why = locate_on_prefixes(ctx, item, sha, verdict.tests)
-            if why:
-                verdict = Verdict(False, verdict.lots, verdict.tests, why)
-            elif located:
-                located_tests: list[str] = []
-                for unit_tests in located.values():
-                    for test in unit_tests:
-                        if test not in located_tests:
-                            located_tests.append(test)
-                verdict = Verdict(
-                    True, list(located), located_tests,
-                    "situé sur les préfixes de l'empilement (#4217)",
-                    proof=(PROOF_PREFIXES
-                           if set(located) != set(verdict.lots) else ""),
-                    flaky=list(flaky))
-            else:
+            # #7691 (B #42915) : seuls les tests encore rouges sur la tête
+            # sont situés. Un test que la tête rend vert (instable, ou rouge
+            # corrigé par une unité suivante) ne désigne aucune unité : le
+            # situer sur les préfixes retirerait l'unité où il a rougi avant
+            # d'être corrigé, alors que le paquet final le passe.
+            confirmed = [str(test) for test in verdict.tests
+                         if auto._failure_matches(str(test), failed)]
+            unconfirmed = [str(test) for test in verdict.tests
+                           if str(test) not in confirmed]
+            if not confirmed:
                 verdict = Verdict(
                     False, verdict.lots, verdict.tests,
-                    "vert sur tous les préfixes de l'empilement : instable(s), "
-                    "aucun retrait (#4221)", flaky=list(flaky))
+                    "rejeu de la tête rouge sans test confirmé parmi ceux que "
+                    "la ci-full nomme : aucun retrait")
+            else:
+                located, flaky, why = locate_on_prefixes(ctx, item, sha, confirmed)
+                if why:
+                    verdict = Verdict(False, verdict.lots, verdict.tests, why)
+                elif located:
+                    located_tests: list[str] = []
+                    for unit_tests in located.values():
+                        for test in unit_tests:
+                            if test not in located_tests:
+                                located_tests.append(test)
+                    verdict = Verdict(
+                        True, list(located), located_tests,
+                        "situé sur les préfixes de l'empilement (#4217)",
+                        proof=(PROOF_PREFIXES
+                               if set(located) != set(verdict.lots) else ""),
+                        flaky=list(flaky) + unconfirmed)
+                else:
+                    verdict = Verdict(
+                        False, verdict.lots, verdict.tests,
+                        "vert sur tous les préfixes de l'empilement : instable(s), "
+                        "aucun retrait (#4221)", flaky=list(flaky) + unconfirmed)
     if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
         return recompose(ctx, item, run, verdict)
     reason = verdict.why if not verdict.deterministic else \

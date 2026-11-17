@@ -1044,6 +1044,65 @@ class PrefixSituationTest(Base):
                             for n in ph.marks(item)))
         self.assertIn("mesh-design", [to for to, _ in self.shell.mails])
 
+    def test_test_vert_sur_la_tete_ne_situe_pas_son_prefixe(self):
+        """B #42915 : la ci-full nomme A et B, la tête ne rougit que A.
+
+        B rougit au préfixe u1 puis u3 le corrige : la tête le passe. Le
+        situer quand même retirerait u1 sans rouge sur la tête ; seuls les
+        tests confirmés rouges sur la tête sont situés.
+        """
+        self.manifest = H04_MANIFEST
+        self.open_h04()
+        run = {
+            "run_id": "44027465690", "head_sha": HEAD, "status": "failure",
+            "url": "u",
+            "failures": [{"test": test, "part": "psycopg 1/8",
+                          "inherited": False} for test in (T2179, T4572)],
+            "attribution": {"status": "ok", "tests": [{
+                "test": test, "status": "probable",
+                "units": [{"lot": 7629, "best": 4},
+                          {"lot": 7654, "best": 1}]}
+                for test in (T2179, T4572)]}}
+        self.shell.ci[4000] = {"runs": [run]}
+        calls = []
+
+        def replay(ctx, sha, tests):
+            tests = list(tests)
+            calls.append((sha, tests))
+            if sha == HEAD:
+                # B a rougi en ci-full, mais la tête le passe (instable).
+                return ph.Replay("red", failed=(T2179,))
+            if sha == "111111111111":
+                # u1 casse B, que u3 corrige plus loin dans l'empilement.
+                if T4572 in tests:
+                    return ph.Replay("red", failed=(T4572,))
+                return ph.Replay("green", "vert en local (1 test(s)) : rouge "
+                                 "non reproduit")
+            if sha == "222222222222":
+                return ph.Replay("red", failed=(T2179,))
+            return ph.Replay("green", "vert en local (1 test(s)) : rouge non "
+                             "reproduit")
+
+        ph.replay_locally = replay
+        ph.tick(self.ctx)
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
+        excluded = [auto[i + 1] for i, arg in enumerate(auto) if arg == "--exclude"]
+        # u2 seule est désignée ; u1 (où B a rougi avant d'être corrigé) reste.
+        self.assertEqual(excluded, ["7654"])
+        self.assertNotIn("7629", excluded)
+        self.assertEqual(self.shell.ran("work", "move", "7629"), [])
+        self.assertNotIn("auteur-7629", [to for to, _ in self.shell.mails])
+        self.assertEqual(len(self.shell.ran("work", "move", "7654", "build")), 1)
+        # B n'est pas passé aux préfixes : seul A y est situé.
+        self.assertEqual([sha for sha, _ in calls],
+                         [HEAD, "111111111111", "222222222222"])
+        self.assertEqual(calls[0][1], [T2179, T4572])
+        self.assertEqual(calls[1][1], [T2179])
+        self.assertEqual(calls[2][1], [T2179])
+        pilot = [text for to, text in self.shell.mails if to == "mesh-design"]
+        self.assertTrue(any("instable" in text and T4572 in text
+                            for text in pilot), pilot)
+
 
 class RedHeadPublishTest(Base):
     """#6665 (récidive de #6565) : `publish` ne redemande jamais une ci-full
