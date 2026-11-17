@@ -303,11 +303,13 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
         for gap in gaps:
             alert = alert_of(gap, orchestrators)
             avatar = avatars_by_human.get(gap["human"])
+            desks = () if avatar else tuple(avatars_mod.configured_desks(
+                cfg, gap["human"], listing))
             texts = alert_briefs.briefs(
                 alert, listing, auditor_names=auditors,
                 orchestrator_names=set(orchestrators),
                 closed_hosts=closed,
-                avatar_names=(avatar,) if avatar else ())
+                avatar_names=(avatar,) if avatar else (), desk_names=desks)
             for recipient, text in sorted(texts.items()):
                 claim = storage.of(db).notify_liveness.claim_brief(
                     recipient, gap["human"], since=since, now=now)

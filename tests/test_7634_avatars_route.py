@@ -20,7 +20,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import avatars, config, mail, notify, registry
+from ameesh import alert_briefs, avatars, config, mail, notify, registry
 
 from .support import PgTestCase
 
@@ -125,6 +125,16 @@ class NotifyAvatarRouteTest(PgTestCase):
             "SELECT body, payload FROM agent_mailbox WHERE recipient = %s"
             " ORDER BY id", (name,))
 
+    def alerts(self, name: str) -> list:
+        """Les courriers qui portent l'alerte elle-même.
+
+        La boîte reçoit aussi les briefs d'escalade du même type (le desk est
+        l'avatar ici) : les tests de route comptent les alertes, pas les
+        briefs qui les nomment. Seul le dépôt chez l'avatar porte `human`."""
+        return [row for row in self.mails(name)
+                if (row["payload"] or {}).get("alert") == "mail_undeliverable"
+                and (row["payload"] or {}).get("human")]
+
     def entry(self) -> dict:
         [entry] = self.notifier.state["active"].values()
         return entry
@@ -138,10 +148,14 @@ class NotifyAvatarRouteTest(PgTestCase):
         alert = self.alert()
         before = len(self.events("avatar.routed", alert))
         self.notifier.run_pass(self.db, current=[alert])
-        [sent] = self.mails("bureau")
+        [sent] = self.alerts("bureau")
         self.assertIn("undeliverable mail", sent["body"])
         self.assertEqual(sent["payload"]["human"], "human:smichea")
-        self.assertEqual(self.sender.sent, [])       # aucun push direct
+        # #7634 : le canal direct ne porte qu'un signal court, sans le texte.
+        [(channel, signal)] = self.sender.sent
+        self.assertEqual(channel, "app")
+        self.assertIn("Ton avatar a besoin de toi", signal.title)
+        self.assertNotIn("undeliverable", signal.body)
         entry = self.entry()
         self.assertEqual((entry["status"], entry["avatar"]), ("avatar", "bureau"))
         self.assertEqual(len(self.events("avatar.routed", alert)), before + 1)
@@ -149,34 +163,67 @@ class NotifyAvatarRouteTest(PgTestCase):
     def test_avatar_arrete_replie_apres_le_delai_et_journalise(self):
         alert = self.alert()          # le `since` ne bouge pas d'une passe à l'autre
         self.notifier.run_pass(self.db, current=[alert])
-        self.assertEqual(len(self.mails("bureau")), 1)
+        self.assertEqual(len(self.alerts("bureau")), 1)
         self.db.execute("UPDATE agent_registry SET status = 'stopped'"
                         " WHERE name = 'bureau'")
         before = len(self.events("avatar.fallback", alert))
         with mock.patch.object(notify, "AVATAR_FALLBACK_S", 60.0):
             self.now += 61.0
             self.notifier.run_pass(self.db, current=[alert])
-        alerts = [row for row in self.mails("bureau")
-                  if (row["payload"] or {}).get("alert") == "mail_undeliverable"]
-        self.assertEqual(len(alerts), 1)                 # pas de doublon
-        self.assertEqual([name for name, _ in self.sender.sent], ["app"])
+        self.assertEqual(len(self.alerts("bureau")), 1)   # pas de doublon
+        # signal court au dépôt, puis texte entier au repli
+        self.assertEqual([name for name, _ in self.sender.sent], ["app", "app"])
+        self.assertNotIn("undeliverable", self.sender.sent[0][1].body)
+        self.assertIn("undeliverable", self.sender.sent[1][1].body)
         self.assertTrue(self.entry()["avatar_fallback"])
         self.assertEqual(len(self.events("avatar.fallback", alert)), before + 1)
 
     def test_avatar_joignable_garde_l_alerte_dans_sa_boite(self):
         alert = self.alert()
         self.notifier.run_pass(self.db, current=[alert])
+        entry = self.entry()
+        # l'avatar a remis (lu) son courrier : pas de repli, même longtemps après
+        self.assertTrue(mail.mark_delivered(self.db, [entry["avatar_mail_id"]]))
         with mock.patch.object(notify, "AVATAR_FALLBACK_S", 60.0):
             self.now += 3600.0
             self.notifier.run_pass(self.db, current=[alert])
-        self.assertEqual(self.sender.sent, [])
+        self.assertEqual([name for name, _ in self.sender.sent], ["app"])  # le signal
         self.assertFalse(self.entry()["avatar_fallback"])
+
+    def test_avatar_externe_joignable_mais_non_remis_replie(self):
+        """#7634 (relecture auditeur) : un externe joignable mais non lu."""
+        self.db.execute("UPDATE agent_registry SET mode = 'externe'"
+                        " WHERE name = 'bureau'")
+        alert = self.alert()
+        self.notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.alerts("bureau")), 1)
+        before = len(self.events("avatar.fallback", alert))
+        with mock.patch.object(notify, "AVATAR_FALLBACK_S", 60.0):
+            self.now += 61.0
+            self.notifier.run_pass(self.db, current=[alert])
+        self.assertTrue(self.entry()["avatar_fallback"])
+        self.assertEqual(len(self.events("avatar.fallback", alert)), before + 1)
+        self.assertIn("undeliverable", self.sender.sent[-1][1].body)
 
     def test_humain_sans_avatar_garde_la_route_directe(self):
         os.unlink(os.path.join(self.root, "agents", "bureau.md"))
         self.notifier.run_pass(self.db, current=[self.alert()])
         self.assertEqual(self.mails("bureau"), [])
         self.assertEqual([name for name, _ in self.sender.sent], ["app"])
+
+
+class DeskReplacementTest(unittest.TestCase):
+    """Le libellé de route est réécrit, jamais le titre du lot (#7634)."""
+
+    def test_un_titre_qui_parle_d_avatar_reste_intact(self):
+        alert = {"lot": 7634, "level": 3, "step": "blocked_freeze",
+                 "blocked_by": "auditeur", "agent": "mty-amh-impl-08",
+                 "lot_state": "qa", "value": 1200, "threshold": 600,
+                 "title": "Joindre un humain, c'est écrire à son avatar"}
+        text = alert_briefs._slo_breach(alert, desk="bureau")
+        self.assertIn("écrire à son avatar", text)
+        self.assertIn("bureau or auditor", text)
+        self.assertNotIn("écrire à son bureau", text)
 
 
 class CoreHasNoDeskNameTest(unittest.TestCase):

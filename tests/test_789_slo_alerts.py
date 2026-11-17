@@ -133,8 +133,11 @@ class _Base(PgTestCase):
 
     def briefs(self, alert):
         listing = [{"name": n, "team": ""} for n in ("dev1", "orch", "bureau", "auditeur")]
+        # #7634 : le rôle `avatar` du moteur SLO se résout au canon ; ici
+        # l'avatar de l'humain visé est `bureau`, comme avant le lot.
         return alert_briefs.briefs(alert, listing, orchestrator_names=("orch",),
-                                   auditor_names=("auditeur",))
+                                   auditor_names=("auditeur",),
+                                   avatar_names=("bureau",))
 
 
 class AlerteTest(_Base):
@@ -198,7 +201,7 @@ class AlerteTest(_Base):
         self.assertEqual(len(alerts), 1, alerts)
         alert = alerts[0]
         self.assertEqual((alert["level"], alert["targets"]),
-                         (3, ["bureau", "auditeur"]))
+                         (3, ["avatar", "auditeur"]))
         self.assertEqual(alert["threshold"], 900)          # délai court du P1
         self.assertTrue(alert["critical"])
         self.assertTrue(alert["urgent"])
@@ -1061,7 +1064,7 @@ class PaquetTest(_Base):
         self.assertEqual([(a["step"], a["level"], a["threshold"], a["targets"])
                           for a in alerts],
                          [("verdict_merge", 3, 1800,
-                           ["pilot", "bureau", "auditeur"])])
+                           ["pilot", "avatar", "auditeur"])])
         alert = alerts[0]
         self.assertEqual((alert["waiting"] or {}).get("what"), "packet")
         self.assertEqual((alert["waiting"] or {}).get("vehicle"), carrier["id"])
@@ -1085,7 +1088,7 @@ class PaquetTest(_Base):
         self.now = self.GO + 46 * 60
         alerts = self.slo()
         self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
-                         [("verdict_merge", 3, ["bureau", "auditeur"])])
+                         [("verdict_merge", 3, ["avatar", "auditeur"])])
         self.assertIsNone(alerts[0]["waiting"])
         out = self.briefs(alerts[0])
         self.assertEqual(sorted(out), ["auditeur", "bureau"])
@@ -1108,7 +1111,7 @@ class PaquetTest(_Base):
         all_alerts = self.slo()
         alerts = [a for a in all_alerts if a["step"] == "blocked_freeze"]
         self.assertEqual([(a["level"], a["targets"], a["returned"]) for a in alerts],
-                         [(3, ["bureau", "auditeur"], True)])
+                         [(3, ["avatar", "auditeur"], True)])
         self.assertEqual([a for a in all_alerts if a["step"] == "build_quiet"], [])
         out = self.briefs(alerts[0])
         self.assertEqual(sorted(out), ["auditeur", "bureau"])
@@ -1367,7 +1370,7 @@ class AttentePorteurTest(_Base):
         self.qa(verdict_s=100 * 60)
         alerts = self.slo()
         self.assertEqual([(a["level"], a["targets"]) for a in alerts],
-                         [(3, ["pilot", "bureau", "auditeur"])])
+                         [(3, ["pilot", "avatar", "auditeur"])])
         out = self.briefs(alerts[0])
         self.assertEqual(sorted(out), ["auditeur", "bureau", "orch"])
         for text in out.values():
@@ -1382,7 +1385,7 @@ class AttentePorteurTest(_Base):
         work.set_branch(self.db, self.lot["id"], "canon/2511-test")
         alerts = self.slo()
         self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
-                         [("verdict_merge", 1, ["bureau"])])
+                         [("verdict_merge", 1, ["avatar"])])
         alert = alerts[0]
         self.assertEqual((alert["waiting"] or {}).get("what"), "merge")
         self.assertTrue((alert["waiting"] or {}).get("canon"))
@@ -1400,7 +1403,7 @@ class AttentePorteurTest(_Base):
         work.set_branch(self.db, self.lot["id"], "canon/2511-test")
         alerts = self.slo()
         self.assertEqual([(a["level"], a["targets"]) for a in alerts],
-                         [(3, ["bureau", "auditeur"])])
+                         [(3, ["avatar", "auditeur"])])
         out = self.briefs(alerts[0])
         self.assertEqual(sorted(out), ["auditeur", "bureau"])
         for text in out.values():
@@ -1514,7 +1517,7 @@ class AttenteDecisionTest(_Base):
         self.expire(view)
         alerts = self.slo()
         self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
-                         [("verdict_merge", 3, ["pilot", "bureau", "auditeur"])])
+                         [("verdict_merge", 3, ["pilot", "avatar", "auditeur"])])
         waiting = alerts[0]["waiting"]
         self.assertEqual((waiting["what"], waiting["decision"]), ("decision", view["id"]))
         out = self.briefs(alerts[0])
@@ -1695,7 +1698,11 @@ class NotifyLivreTest(_Base):
 
     def test_courrier_agent_urgent_pour_un_p1_et_ordinaire_sinon(self):
         self.p1()
-        self.notifier(types=["long_turn"]).run_pass(self.db, current=self.slo())
+        # #7634 : le rôle `avatar` se résout au canon ; le banc déclare ici
+        # `bureau` comme avatar de l'humain visé.
+        with mock.patch.object(notify.avatars, "from_canons",
+                               return_value={"human:owner": "bureau"}):
+            self.notifier(types=["long_turn"]).run_pass(self.db, current=self.slo())
         self.assertTrue(self.payload("bureau").get("urgent"))
         self.db.execute("UPDATE agent_mailbox SET delivered_at = now()")
         self.db.execute("DELETE FROM agent_mailbox")

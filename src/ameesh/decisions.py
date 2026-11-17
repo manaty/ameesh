@@ -156,6 +156,39 @@ def prose_recipients(db=None) -> tuple:
     return tuple(dict.fromkeys(names))
 
 
+def prose_route(human, db=None, cfg=None) -> tuple:
+    """Les destinataires de prose que ``human`` peut voir (#7634, cx1 B1).
+
+    Son propre courrier, l'owner, son avatar au canon, puis la route
+    explicitement configurée pour lui : le `report` d'un projet de release
+    dont le registre le dit `responsible`, ou à défaut un agent `externe` qui
+    lui est rattaché. Jamais l'avatar ou la session externe d'un autre humain :
+    un mode `externe` seul ne fait pas une autorité."""
+    from . import avatars, config as config_mod
+    allowed = [human, OWNER_ANY]
+    if cfg is None:
+        try:
+            cfg = config_mod.load()
+        except Exception:  # noqa: BLE001 — sans configuration, son courrier seul
+            cfg = None
+    rows = []
+    if db is not None:
+        try:
+            rows = list(storage.of(db).operations.listing())
+        except Exception:  # noqa: BLE001 — registre illisible : rien de deviné
+            rows = []
+    name = avatars.name_for(cfg, human) if cfg is not None and human else None
+    if name:
+        allowed.append(name)
+    elif cfg is not None:
+        allowed += avatars.configured_desks(cfg, human, rows)
+        if len(allowed) == 2:
+            allowed += [str(row["name"]) for row in rows
+                        if row.get("name") and row.get("mode") == "externe"
+                        and row.get("responsible") == str(human)]
+    return tuple(dict.fromkeys(n for n in allowed if n))
+
+
 #: how far back mail is read (seconds)
 PROSE_WINDOW_S = 24 * 3600.0
 #: at most this many candidate mails, the most recent

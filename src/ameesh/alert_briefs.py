@@ -45,6 +45,7 @@ module rend les textes ; l'envoi et le dédoublonnage sont dans
 
 from __future__ import annotations
 
+import re
 import time
 
 from . import sous_utilisation, vocab, work_lifecycle as lifecycle
@@ -272,26 +273,25 @@ def _external(by_name: dict, name) -> bool:
     return (by_name.get(name) or {}).get("mode") == "externe"
 
 
-def _desk_names(alert: dict, by_name: dict, avatar_names=()) -> list[str]:
+def _desk_names(alert: dict, by_name: dict, avatar_names=(),
+                desk_names=()) -> list[str]:
     """Les agents qui portent la route humaine d'une alerte, dans l'ordre.
 
-    L'avatar déclaré au canon de l'humain visé d'abord ; à défaut, un rôle
-    du `targets` qui nomme un agent (compatibilité des alertes écrites avant
-    #7634) ; à défaut, **un** agent `externe` du registre : une session
-    humaine qui lit son courrier elle-même est la route humaine d'avant les
-    avatars, et un humain sans avatar garde ce comportement (#7634, point 4).
-    Un seul, le premier dans l'ordre stable du registre : la route humaine
-    d'avant était un desk unique, pas une copie à chaque session externe."""
+    L'avatar déclaré au canon de l'humain visé d'abord ; à défaut, la route
+    explicitement configurée pour cet humain (`desk_names`, lue au registre
+    par l'appelant) ; à défaut, un rôle du `targets` qui nomme un agent
+    (compatibilité des alertes écrites avant #7634). Aucun agent n'est deviné
+    depuis son seul mode `externe` : la session d'un autre humain ne reçoit
+    pas ce courrier (#7634, relecture cx1 B1)."""
     names = [str(n) for n in avatar_names or () if n]
     if names:
         return list(dict.fromkeys(names))
+    names = [str(n) for n in desk_names or () if n in by_name]
+    if names:
+        return list(dict.fromkeys(names))
     known = {"assignee", "pilot", "auditeur", "avatar"}
-    legacy = [str(role) for role in alert.get("targets") or ()
-              if role not in known and role in by_name]
-    if legacy:
-        return legacy
-    return sorted(str(name) for name, row in by_name.items()
-                  if (row or {}).get("mode") == "externe")[:1]
+    return [str(role) for role in alert.get("targets") or ()
+            if role not in known and role in by_name]
 
 
 def _fallback_avatar(by_name: dict, text: str, names=()) -> dict:
@@ -643,10 +643,15 @@ def _desk_label(alert: dict, avatar_names=()) -> str:
 
 
 def _with_desk(text: str, desk: str | None) -> str:
-    """Le texte de l'escalade nomme la route humaine réellement visée."""
+    """Le texte de l'escalade nomme la route humaine réellement visée.
+
+    Seuls les libellés de route sont réécrits (`avatar or auditor:`,
+    `avatar:`, « the avatar … ») : le remplacement porte sur le geste, jamais
+    sur le titre du lot, où le mot peut être du contenu (#7634, relecture
+    auditeur)."""
     if not desk:
         return text
-    return text.replace("avatar", str(desk))
+    return re.sub(r"\bavatar\b", lambda _: str(desk), text)
 
 
 def _slo_breach(alert: dict, *, level: int | None = None,
@@ -1004,7 +1009,7 @@ def _slo_breach(alert: dict, *, level: int | None = None,
         move += ("; the %s is P1: the avatar handles it with the auditor (canon §9, "
                  "niveau 4), and no SLO delay is notified to the owner — nothing waits "
                  "for a human that an agent can do" % v.noun)
-    return _with_desk("%s Expected action: %s." % (head, move), desk)
+    return "%s Expected action: %s." % (head, _with_desk(move, desk))
 
 
 def _critical_budget_pause(alert: dict) -> str:
@@ -1483,7 +1488,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
 
 def _mail_undeliverable_briefs(alert: dict, by_name: dict, auditor_names,
                                closed: set, dead_out: dict | None = None,
-                               avatar_names=()) -> dict:
+                               avatar_names=(), desk_names=()) -> dict:
     """#3036 : le courrier en souffrance part aux orchestrateurs VIVANTS de
     l'équipe ; à défaut aux auditeurs, puis au bureau, puis au fil lisible.
 
@@ -1509,7 +1514,7 @@ def _mail_undeliverable_briefs(alert: dict, by_name: dict, auditor_names,
             dead_out.update(dead)
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
-    desk = _desk_names(alert, by_name, avatar_names)
+    desk = _desk_names(alert, by_name, avatar_names, desk_names)
     fallback = _fallback_avatar(by_name, text, desk)
     live, more = _split_live(fallback, by_name, closed)
     dead.update(more)
@@ -1529,7 +1534,7 @@ def _mail_undeliverable_briefs(alert: dict, by_name: dict, auditor_names,
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
            auditor_names=(), *, orchestrator_names=(),
            closed_hosts=(), dead_out: dict | None = None, covered=(),
-           avatar_names=()) -> dict:
+           avatar_names=(), desk_names=()) -> dict:
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
@@ -1568,7 +1573,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     by_name = {row["name"]: row for row in listing}
     orchestras = list(alert.get("orchestrators") or ())
     closed = set(closed_hosts or ())
-    desks = _desk_names(alert, by_name, avatar_names)
+    desks = _desk_names(alert, by_name, avatar_names, desk_names)
     if kind in ("host_disk_soon_full", "host_unsampled"):
         # #5563 : opérateurs du mesh, sans diffusion aux pilotes produit.
         # Le bureau externe lit le fil, pas sa boîte.
@@ -1609,7 +1614,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         return {name: note + body for name, body in live.items()}
     elif kind == "mail_undeliverable":
         return _mail_undeliverable_briefs(alert, by_name, auditor_names, closed,
-                                          dead_out=dead_out)
+                                          dead_out=dead_out, desk_names=desks)
     elif kind == "idle_actionable_lot":
         out = {}
         audit_text = _idle_actionable_lot(alert)

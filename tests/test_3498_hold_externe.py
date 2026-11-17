@@ -60,6 +60,19 @@ class DeclarationTest(unittest.TestCase):
                 self.assertEqual(declared["executor"], "owner")
                 self.assertEqual(declared["gesture"], "signer le go")
 
+    def test_attente_historique_nommee_se_decode_encore(self):
+        # #7634 : les holds persistés d'avant la bascule nomment l'exécutant
+        # historique du mesh ; ils restent des attentes de la route humaine,
+        # normalisées `avatar`, sans que le cœur connaisse ce nom.
+        for text in ("hold: attente bureau : signer le go",
+                     "hold: attente du bureau : signer le go",
+                     "hold: attente externe (bureau) : signer le go",
+                     "hold: attente bureau, signer le go"):
+            with self.subTest(text=text):
+                declared = planned_waits.external_hold(text)
+                self.assertEqual(declared["executor"], "avatar")
+                self.assertIn("signer le go", declared["gesture"])
+
     def test_attente_externe_avec_parentheses(self):
         for text in ("hold: attente externe (avatar) : geste root",
                      "hold: attente externe avatar : geste root",
