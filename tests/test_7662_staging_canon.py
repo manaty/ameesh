@@ -87,6 +87,17 @@ class SequenceTest(_TmpMixin, unittest.TestCase):
                                     "no staging host declared in the canon"):
             release_cutoff.run_staging(project, sha, [], state_dir=self.root)
 
+    def test_another_configured_canon_adds_no_staging_host(self):
+        # L42 : seul le canon par défaut (celui du mesh) porte la séquence.
+        other_root = self.make_tmp()
+        write(other_root, "hotes/autre.md", HOSTE % ("autre", 10, "agents"))
+        other = canon.load(other_root, untrusted=True)
+        with mock.patch.object(canon, "load_configured",
+                               return_value=[self.loaded(), other]):
+            topology = release_cutoff.staging_topology_of(mock.Mock())
+        self.assertEqual(topology.hosts, ())
+        self.assertEqual(topology.agents, ())
+
     def test_validator_refuses_a_sequence_without_agents_vm(self):
         self.host("manaty-mesh-1", 40, "server")
         self.host("pc-smichea", 50, "workstation")

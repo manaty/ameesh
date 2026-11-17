@@ -1737,11 +1737,13 @@ class StagingTopology:
 
 
 def staging_topology(canons: Iterable["Canon"]) -> StagingTopology:
-    """#7662 : la séquence staging déclarée par les fiches Host des canons.
+    """#7662 : la séquence staging déclarée par les fiches Host d'un mesh.
 
-    Les fiches sont triées par `(staging.order, title)` ; une fiche sans bloc
-    `staging` n'est jamais un hôte de staging. Un même nom déclaré par deux
-    canons ne compte qu'une fois (le premier canon configuré gagne), comme
+    L'appelant passe le canon du mesh — le canon par défaut (L42) — et non la
+    liste des canons configurés : un autre client ne doit pas ajouter d'hôte à
+    la séquence. Les fiches sont triées par `(staging.order, title)` ; une
+    fiche sans bloc `staging` n'est jamais un hôte de staging. Un même nom
+    déclaré par deux canons ne compte qu'une fois (le premier gagne), comme
     `Canon.host`. Plusieurs serveurs ou plusieurs postes ne sont pas devinés :
     le premier de la séquence représente seul son rôle."""
     entries: list[tuple[int, str, str]] = []

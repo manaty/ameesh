@@ -566,7 +566,8 @@ def sequence_problem(cfg, env, options=None) -> str | None:
         return "unreachable (%s)" % public_reason(db_mod.explain(exc), 200)
     if options is not None:
         try:
-            topology = canon_mod.staging_topology(canon_mod.load_configured(resolved))
+            canons = canon_mod.load_configured(resolved)
+            topology = canon_mod.staging_topology(canons[:1])
         except Exception:  # noqa: BLE001 - an unreadable canon declares no host
             topology = canon_mod.StagingTopology()
         return quiescence_access_problem(env, options, topology)

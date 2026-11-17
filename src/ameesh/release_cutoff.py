@@ -1380,11 +1380,14 @@ def projects(cfg) -> dict[str, ProjectRelease]:
 def staging_topology_of(cfg) -> canon_mod.StagingTopology:
     """#7662: the staging sequence declared by the canon's Host cards.
 
-    A missing or unreadable canon gives the empty sequence, never a fallback
-    to a known host: the bare profile has no staging host at all. Callers that
-    need to deploy refuse on an empty sequence (`run_staging`)."""
+    Only the default canon (the mesh's, L42) declares it: another configured
+    canon must not add hosts to the sequence. A missing or unreadable canon
+    gives the empty sequence, never a fallback to a known host: the bare
+    profile has no staging host at all. Callers that need to deploy refuse on
+    an empty sequence (`run_staging`)."""
     try:
-        return canon_mod.staging_topology(canon_mod.load_configured(cfg))
+        canons = canon_mod.load_configured(cfg)
+        return canon_mod.staging_topology(canons[:1])
     except Exception:  # noqa: BLE001 - an unreadable canon declares no host
         return canon_mod.StagingTopology()
 
