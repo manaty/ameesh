@@ -120,6 +120,25 @@ class HostIdleTest(unittest.TestCase):
                                        ['a', 'b', 'c'], protected=['c'])
         self.assertEqual(caps['c'], 'burst')
 
+    def test_hosts_admitting_no_agent_are_out_of_capacity(self):
+        def canon(**cards):
+            return NS(hosts=[NS(title=n, fiche=NS(data=d)) for n, d in cards.items()])
+        # #7727: a server card (staging.kind), a retired host (max_agents: 0)
+        # and an explicit opt-out never fill a baseline slot, even elected.
+        caps, _ = host_idle.capacities(
+            [canon(server={'staging': {'order': 1, 'kind': 'server'}},
+                   retired={'policy': {'max_agents': 0}},
+                   explicit={'capacity': 'none'}, vm={})],
+            ['server', 'retired', 'explicit', 'vm'],
+            protected=['server', 'retired', 'explicit'])
+        self.assertEqual(caps, dict(server='none', retired='none', explicit='none',
+                                    vm='burst'))
+        # The strictest max_agents wins across cards: one zero is enough.
+        caps, _ = host_idle.capacities(
+            [canon(retired={'policy': {'max_agents': 4}}),
+             canon(retired={'policy': {'max_agents': 0}})], ['retired'])
+        self.assertEqual(caps['retired'], 'none')
+
     def test_snapshot_reads_only_and_failure_is_conservative(self):
         store = mock.MagicMock()
         store.operations.listing.return_value = [self.agent()]
