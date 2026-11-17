@@ -382,6 +382,40 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
                     self.assertEqual(correctors, [])
                     forge.assert_not_called()
 
+    def test_hex_word_requires_a_definitive_forge_negative(self):
+        from ameesh import plan_github
+
+        _fix, head = self._rewrite(cite="ed25519")
+        for status, message, accepted in (
+                (404, "No commit found for SHA: ed25519", True),
+                (422, "No commit found for SHA: ed25519", True),
+                (404, "Not Found", False),
+                (422, "Ambiguous SHA", False),
+                (403, "API rate limit exceeded", False),
+                (503, "Service unavailable", False)):
+            with self.subTest(status=status, message=message):
+                def unavailable(*args, **kwargs):
+                    raise urllib.error.HTTPError(
+                        "https://api.invalid", status, "failure", {},
+                        io.BytesIO(json.dumps({"message": message}).encode()))
+
+                api = plan_github.Api(token="test", opener=unavailable)
+                with mock.patch.object(review_authors, "_repository_slug",
+                                       return_value="owner/repo"), \
+                        mock.patch.object(plan_github, "client", return_value=api), \
+                        mock.patch.object(review_authors, "_forge_fetch") as fetch:
+                    if accepted:
+                        (_authors, unknown, correctors), _freeze = self._reading(
+                            head, strict=True)
+                        self.assertEqual(unknown, [])
+                        self.assertEqual(correctors, [])
+                    else:
+                        with self.assertRaisesRegex(
+                                review_provenance.ProvenanceError,
+                                "cited commit ed25519 .*forge-unreadable"):
+                            self._reading(head, strict=True)
+                    fetch.assert_not_called()
+
     def test_numeric_citation_requires_a_definitive_forge_negative(self):
         _fix, head = self._rewrite(cite="43969930787")
         with mock.patch.object(review_authors, "_forge_commit", return_value=None):

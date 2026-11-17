@@ -5730,8 +5730,11 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     cite_doubt(token, citing, reason="not-prefetched")
                     continue
                 resolved = _forge_commit(repo, token, timeout=remaining())
-                if resolved is None and token.isdecimal():
-                    continue  # #7618 : numéro dont la forge prouve l’absence
+                if resolved is None:
+                    # #7730 : la forge prouve l’absence du commit, même
+                    # pour un mot hexadécimal tel que « ed25519 ».
+                    non_commits.add(token)
+                    continue
                 if not resolved:
                     cite_doubt(token, citing)
                     continue
