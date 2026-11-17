@@ -5,7 +5,8 @@
 -- {"immediat": ["humain", "urgent", …], "fenetre_s": 1800}. Les natures
 -- listées ouvrent un tour tout de suite ; le reste est regroupé et remis au
 -- tour suivant, au plus tard à la fin de la fenêtre. NULL = aucune
--- déclaration : réveil par courrier de l'exécuteur, inchangé.
+-- déclaration : réveil par courrier de l'exécuteur, inchangé. Pas de CHECK
+-- en ligne (le préflight de staging la classerait inconnue) : le lecteur
+-- (`reveil.of`) tient une valeur qui n'est pas un objet pour une absence.
 alter table agent_registry
-    add column if not exists reveil jsonb
-        check (reveil is null or jsonb_typeof(reveil) = 'object');
+    add column if not exists reveil jsonb;

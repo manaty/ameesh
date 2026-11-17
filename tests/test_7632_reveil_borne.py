@@ -314,6 +314,29 @@ class ReveilReelTest(_Base):
                       "the rest grouped every 30 min", texte)
         self.assertIn("3 grouped mail(s) pending — next grouped turn", texte)
 
+    def test_n1_insertion_sans_colonne_reste_au_comportement_d_avant(self):
+        """Un écrivain N-1 ignore `reveil` : la ligne qu'il crée n'a pas de
+        cadence, l'exécuteur et `show` gardent le réveil par courrier."""
+        self.previous_insert("agent_registry", {
+            "name": "ancien", "harness": "claude", "host": self.cfg.host,
+            "mode": "execute"}, added=("reveil",))
+        row = registry.get(self.db, "ancien")
+        self.assertIsNone(row["reveil"])
+        self.assertIsNone(reveil.of(row))
+        self.assertIsNone(mesh_cli.agent_detail(self.db, "ancien", cfg=self.cfg)["wake"])
+
+    def test_n1_mise_a_jour_garde_la_cadence_declaree(self):
+        """Un écrivain N-1 qui réécrit la ligne (sync, réglage) ne connaît pas
+        `reveil` : la cadence déclarée reste, l'exécuteur la lit encore."""
+        _, worker = self._worker("avatar", policy=AVATAR)
+        self.previous_update("agent_registry", {"harness": "claude", "model": "opus"},
+                             where={"name": "avatar"}, added=("reveil",))
+        row = registry.get(self.db, "avatar")
+        self.assertEqual(reveil.of(row), dict(AVATAR, fenetre_s=1800.0))
+        worker.agent = row
+        mail.send(self.db, "pair", "avatar", "courrier ordinaire")
+        self.assertIsNone(worker.pick())
+
     def test_sans_declaration_show_inchange(self):
         self._worker("ordinaire", policy=None)
         self.assertIsNone(mesh_cli.agent_detail(self.db, "ordinaire", cfg=self.cfg)["wake"])
