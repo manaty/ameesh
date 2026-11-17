@@ -384,6 +384,30 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         self.assertNotIn("reportes", attestation)
         self.assertEqual(set(attestation["hotes"]), set(canon_staging.HOSTS))
 
+    def test_a_reported_local_proof_does_not_mask_a_complete_shared_one(self):
+        """#7662 B : seule une preuve locale sans report prime.
+
+        Une preuve locale au poste reporte ne prouve pas toute la sequence ;
+        l'evenement du meme SHA qui prouve tous les hotes gagne et remplace
+        le fichier local, comme avant que la sequence vienne du canon."""
+        sha = self.git(self.clone, "rev-parse", "origin/main")
+        folder = self.home / ".local/state/ameesh/mise-a-jour"
+        folder.mkdir(parents=True)
+        path = folder / ("actif-%s.json" % sha[:12])
+        local = {"sha": sha, "date": "2026-10-18T09:00:00Z",
+                 "hotes": {hote: {"actif": sha} for hote in canon_staging.VMS},
+                 "reportes": {canon_staging.WORKSTATION: {"raison": "poste absent"}}}
+        path.write_text(json.dumps(local))
+        shared = {"sha": sha, "date": "2026-10-18T10:00:00Z",
+                  "hotes": {hote: {"actif": sha} for hote in canon_staging.HOSTS}}
+        with mock.patch.object(release_cutoff, "stored_attestations",
+                               return_value=[shared]):
+            attestation = release_cutoff.read_attestation(
+                sha, db=object(), topology=canon_staging.topology())
+        self.assertEqual(set(attestation["hotes"]), set(canon_staging.HOSTS))
+        self.assertNotIn("reportes", attestation)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), shared)
+
     def test_reported_server_attestation_is_complete(self):
         """#147558 : sans acces root, le serveur peut etre reporte ; les deux
         VM d'agents restent requises et le poste prouve fait sauter la relance."""

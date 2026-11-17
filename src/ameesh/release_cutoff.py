@@ -2386,19 +2386,21 @@ def read_attestation(sha: str, db=None, topology=None) -> dict | None:
     Complete = the canon's staging sequence (#7662): every host required, save
     the reportable ones explicitly reported absent (`reportes`, #3848). A
     reported poste does not make the VMs inactive; `maybe_staging` reruns the
-    sequence only on the poste, so it catches up when it is back.
+    sequence only on the poste, so it catches up when it is back. A local
+    file primes only when it proves every host (no report); a local proof
+    with a reported host lets a more complete shared event of the same SHA
+    win, exactly as before the sequence came from the canon.
     """
     topology = topology_for(db, topology)
     if not topology.hosts:
         return None
     local = _read_attestation_file(sha, topology)
     # le fichier local est la preuve COMPLETE : il porte aussi l'etat
-    # d'emission (cle de courrier). S'il couvre tous les hotes, il prime et
-    # aucune lecture de base n'est utile.
-    if local is not None:
-        reportes = local.get("reportes") or {}
-        if len(local.get("hotes") or {}) == len(topology.hosts) - len(reportes):
-            return local
+    # d'emission (cle de courrier). Seul un fichier qui couvre toute la
+    # sequence prime ; avec un report, l'evenement partage plus complet du
+    # meme SHA peut gagner.
+    if local is not None and len(local.get("hotes") or {}) == len(topology.hosts):
+        return local
     best = local
     for data in stored_attestations(db, sha):
         if not _attestation_valid(data, sha, topology):
