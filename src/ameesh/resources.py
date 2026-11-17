@@ -174,7 +174,17 @@ DEFAULT_MAX_CGROUP_MEMORY_USED = 0.9
 #: tasks is real pressure even when the host load is low. Critical at
 #: halfway to 1.0.
 DEFAULT_MAX_CGROUP_THROTTLED = 0.5
-CGROUP_KEYS = ("max_cgroup_memory_used", "max_cgroup_throttled")
+#: #7675 (E3b): CPU consumed against the cgroup quota
+#: (`usage_usec` delta / wall time, divided by `cpu.max` quota/period). A
+#: container that runs at its quota without being throttled is visible here
+#: and nowhere else in the native guards. **No default**: a host that does
+#: not declare it keeps the previous behaviour (unwatched).
+#: #7675 (E3b): share of CPU periods with at least one throttled task
+#: (`nr_throttled` delta / `nr_periods` delta), the measure IMA's private
+#: gate used. Distinct from the wall-time `max_cgroup_throttled`: a single
+#: throttled microsecond counts a whole period. **No default** either.
+CGROUP_KEYS = ("max_cgroup_memory_used", "max_cgroup_throttled",
+               "max_cgroup_cpu_used", "max_cgroup_throttled_periods")
 #: seuils exprimés en PART (0 < x <= 1, ou texte « 80% ») et non en octets
 FRACTION_KEYS = ("max_tmpfs_used", "warn_disk_used", *CGROUP_KEYS)
 #: clés de seuil reconnues dans `policy.resources` (liste fermée)
@@ -975,7 +985,8 @@ class CgroupMeter:
             "cpu_some": None, "mem_some": None, "mem_full": None,
             "cpu_quota": None,
             "mem_current_bytes": None, "mem_max_bytes": None,
-            "mem_used": None, "throttled": None, "cpu_used": None,
+            "mem_used": None, "throttled": None, "throttled_periods": None,
+            "cpu_used": None, "cpu_used_ratio": None,
         }
         # VM reservation comes from machine CPU/MemTotal. Its runner may
         # have no delegated cpu controller, or no cgroup at all (macOS).
@@ -1032,9 +1043,27 @@ class CgroupMeter:
                 and before.get("throttled_usec") is not None:
             delta = max(0, stat["throttled_usec"] - before["throttled_usec"])
             out["throttled"] = round(min(1.0, delta / (window * 1e6)), 4)
+        # #7675: the period ratio is a different fact from the wall-time one:
+        # one throttled microsecond makes a whole period count. Kept separate
+        # so a policy can watch either (IMA's gate is the period ratio).
+        periods = stat.get("nr_periods")
+        before_periods = before.get("nr_periods")
+        throttled = stat.get("nr_throttled")
+        before_throttled = before.get("nr_throttled")
+        if None not in (periods, before_periods, throttled, before_throttled) \
+                and periods > before_periods:
+            elapsed_periods = periods - before_periods
+            throttled_periods = max(0, throttled - before_throttled)
+            out["throttled_periods"] = round(
+                min(1.0, throttled_periods / elapsed_periods), 4)
         if stat.get("usage_usec") is not None and before.get("usage_usec") is not None:
             delta = max(0, stat["usage_usec"] - before["usage_usec"])
             out["cpu_used"] = round(delta / (window * 1e6), 4)
+            # The quota is `cpu.max` quota/period (CPUs). Without a finite
+            # quota the ratio is unknown — never a guessed 100 %.
+            if out["cpu_quota"]:
+                out["cpu_used_ratio"] = round(
+                    out["cpu_used"] / out["cpu_quota"], 4)
         return out
 
 
@@ -1629,7 +1658,8 @@ def reading_pressure_scope(reading: dict | None) -> str:
 #: mesures d'un cgroup v2 qui rendent `own_cgroup` utile (#2825 N2)
 CGROUP_MEASURES = ("cpu_some", "mem_some", "mem_full", "cpu_quota",
                    "mem_current_bytes", "mem_max_bytes", "mem_used",
-                   "throttled", "cpu_used")
+                   "throttled", "throttled_periods", "cpu_used",
+                   "cpu_used_ratio")
 
 
 def cgroup_measured(reading: dict | None) -> bool:
@@ -1688,6 +1718,8 @@ def thresholds(policy=None, *, local: bool = True,
     mem_pressure = parse_percent(raw.get("max_mem_pressure"))
     cg_mem_used = parse_fraction(raw.get("max_cgroup_memory_used"))
     cg_throttled = parse_fraction(raw.get("max_cgroup_throttled"))
+    cg_cpu_used = parse_fraction(raw.get("max_cgroup_cpu_used"))
+    cg_throttled_periods = parse_fraction(raw.get("max_cgroup_throttled_periods"))
     unallocated = parse_bytes(raw.get("min_btrfs_unallocated"))
     headroom = parse_bytes(raw.get("min_btrfs_metadata_headroom"))
     zombies = parse_count(raw.get("max_zombies"))
@@ -1716,6 +1748,9 @@ def thresholds(policy=None, *, local: bool = True,
                                    if cg_mem_used is None else cg_mem_used),
         "max_cgroup_throttled": (DEFAULT_MAX_CGROUP_THROTTLED
                                  if cg_throttled is None else cg_throttled),
+        # #7675: no default; absent means "not watched", preserving behaviour
+        "max_cgroup_cpu_used": cg_cpu_used,
+        "max_cgroup_throttled_periods": cg_throttled_periods,
         # L159d: the offer (`policy.lend`) caps the lendable capacity; None:
         # the host lends nothing
         "lend": lend_offer(policy),
@@ -2135,6 +2170,21 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
                         "label": "cgroup CPU throttled (share of wall time)",
                         "value": throttled, "limit": limit,
                         "critical": throttled >= limit + (1.0 - limit) / 2.0})
+        # #7675 (E3b): the two measures IMA's private gate used. Same
+        # critical rule as the other cgroup ceilings.
+        used, limit = cg("cpu_used_ratio"), limits.get("max_cgroup_cpu_used")
+        if used is not None and limit is not None and used > limit:
+            out.append({"key": "max_cgroup_cpu_used",
+                        "label": "cgroup CPU used (usage / cpu.max quota)",
+                        "value": used, "limit": limit,
+                        "critical": used >= limit + (1.0 - limit) / 2.0})
+        periods, limit = cg("throttled_periods"), \
+            limits.get("max_cgroup_throttled_periods")
+        if periods is not None and limit is not None and periods > limit:
+            out.append({"key": "max_cgroup_throttled_periods",
+                        "label": "cgroup CPU throttled (share of periods)",
+                        "value": periods, "limit": limit,
+                        "critical": periods >= limit + (1.0 - limit) / 2.0})
     etat = power_state(reading, limits)
     if etat["state"] in ("low", "stop"):
         # L106 : jamais `critical` — la pause des agents peu prioritaires ne
@@ -2356,7 +2406,8 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None,
         "cgroup": {key: cgroup_value(key) for key in
                    ("path", "cpu_some", "mem_some", "mem_full", "cpu_quota",
                     "mem_current_bytes", "mem_max_bytes", "mem_used",
-                    "throttled", "cpu_used")},
+                    "throttled", "throttled_periods", "cpu_used",
+                    "cpu_used_ratio")},
     }
     if scope_fallback:
         verdict["scope_fallback"] = scope_fallback
