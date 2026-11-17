@@ -191,6 +191,18 @@ class ReleaseMergeTest(unittest.TestCase):
             with self.assertRaisesRegex(prod_go.ProdGoError, 'projects.acme.production.branch'):
                 prod_go.check_release_merge(cfg, object(), 7, 'release/11x', 'main', SHA, repo='acme/app')
 
+    def test_radar_divergence_and_canon_without_branch_refuse(self):
+        from ameesh import work
+        document = mechanics.compile_document((Path(__file__).parent / 'fixtures/home-300-mecanique.yaml').read_text())
+        cfg = SimpleNamespace(radar={'projects': {'nexlink': {
+            'repo': '/fixture/nexlink', 'github': 'manaty/nexlink', 'production_branch': 'develop'}}})
+        missing = mechanics.compile_document(MECHANICS.replace('projects: {}', 'projects:\n  nexlink: {}'))
+        for canon, error in ((document, 'differs from compiled canon'), (missing, 'missing projects.nexlink.production.branch')):
+            with self.subTest(error=error), mock.patch.object(work, 'get', return_value={'app': 'nexlink'}), mock.patch.object(mechanics, 'configured', return_value=canon), mock.patch.object(prod_go, 'authorize') as authorize:
+                with self.assertRaisesRegex(prod_go.ProdGoError, error):
+                    prod_go.check_release_merge(cfg, object(), 7, 'release/11x', 'main', SHA, repo='manaty/nexlink')
+                authorize.assert_not_called()
+
     def test_missing_production_configuration_refuses_without_authorizing(self):
         from ameesh import work
         cfg = SimpleNamespace(radar={'projects': {'acme': {

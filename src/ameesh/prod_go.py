@@ -143,7 +143,9 @@ def check_release_merge(cfg, db, lot, source, target, sha, *, repo="", gh=None):
         raise ProdGoError("compiled canon missing projects.%s.production.branch" % project)
     production = override.production_branch
     if not production:
-        return  # repository project explicitly has no production branch
+        raise ProdGoError("compiled canon missing projects.%s.production.branch" % project)
+    if project_view.production_branch and project_view.production_branch != production:
+        raise ProdGoError("radar projects.%s.production_branch differs from compiled canon projects.%s.production.branch" % (project, project))
     if target != production:
         return
     slug = migrations.repo_key(project_view.github)
