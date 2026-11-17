@@ -88,6 +88,27 @@ puis B1 cx2/Codex, 15/10 12:12).
   lit « auteur inconnu » et refuse ; `record_commit` / `record_signed_commit`
   refusent de ressusciter le reçu. La lecture brute de `provenance show` garde
   la ligne et affiche sa révocation pour l'audit.
+
+#7741 — une session peut avoir été liée à plusieurs agents dans sa vie (la
+session Codex du poste : bureau #32–50 révoquées, puis veille #54 active). La
+voie signée ne refuse plus toute la session dès qu'une ligne historique nomme
+un autre agent : elle retient la liaison qui **couvrait la date de committer**
+du commit, et exige que l'acteur signé soit celui de cet intervalle. Un commit
+fait sous veille ne s'atteste pas sous bureau, et réciproquement ; un commit
+hors de tout intervalle, une session liée après le commit ou sur un autre hôte
+sont refusés. Le garde #7725 reste entier pour les reçus de session (une
+liaison à `veille` n'y donne aucune identité) ; ici, c'est la signature owner
+qui fait autorité, et elle peut nommer l'agent historique réel sans réactiver
+la liaison ni réétiqueter le commit. Le committer d'un autre agent enregistré
+reste refusé, et la liaison retenue est écrite dans le meta de l'approbation
+(`binding`), hors du texte signé version 1.
+
+La dérogation « hôte sans ameesh » de #4485 est retirée (B/P1 de la revue
+#43307) : une session sans aucune liaison est refusée, car l'absence de lignes
+pour un nom d'hôte déclaré ne prouve pas qu'un hôte est sans ameesh et une
+session et un hôte inventés contourneraient les liaisons réelles du commit.
+L'owner qui doit attester un commit d'un hôte sans ameesh y installe la CLI et
+lie la session, ou recrée le commit après une liaison régulière.
 """
 from __future__ import annotations
 
@@ -794,23 +815,133 @@ def signed_digest(**fields) -> str:
         signed_statement(**fields).encode("utf-8")).hexdigest()
 
 
-def _signed_identity(db, *, actor, session, harness, host, families) -> dict:
+def _binding_covers_row(row, ts: float) -> bool:
+    """#7741 : cette liaison de session couvrait-elle `ts` ?
+
+    Même borne que le reçu de session (#7719) : `created_ts <= t < revoked_ts`,
+    ou `t >= created_ts` pour la liaison active, tolérance d'une seconde aux
+    deux bornes pour les horloges de la base et du dépôt. Une liaison révoquée
+    décrit un intervalle réel : elle prouve le commit fait pendant qu'elle
+    était active, jamais un commit postérieur."""
+    start = float(row.get("created_ts") or 0.0)
+    if not start or ts + 1.0 < start:
+        return False
+    end = row.get("revoked_ts")
+    if end is not None and ts >= float(end) + 1.0:
+        return False
+    return True
+
+
+def _same_bound_agent(db, one: str, other: str) -> bool:
+    """Deux noms de liaison désignent-ils la même fiche (alias compris) ?"""
+    return _same_agent_identity(db, one, other)
+
+
+def _signed_binding_at(db, bindings, *, actor, session, harness, host,
+                       commit_ts) -> dict:
+    """#7741 : la liaison qui prouve `actor` à l'instant du commit, ou un refus.
+
+    Une session peut avoir été liée à plusieurs agents dans sa vie (bureau
+    #32–50 révoquées, puis veille #54 active pour la session Codex du poste).
+    Le nom signé doit être l'agent de la liaison qui **couvrait la date de
+    committer**, pas un agent d'un autre intervalle : c'est ce qui interdit la
+    réattribution rétroactive sans rendre la session inattestable.
+
+    Une session sans aucune liaison est refusée : l'absence de lignes pour un
+    nom d'hôte déclaré ne prouve pas un « hôte sans ameesh », et une session
+    inventée avec un hôte inventé contournerait autrement les liaisons réelles
+    du commit (B/P1 de la revue #43307). Une session liée sur un autre hôte
+    n'est pas une preuve non plus, et une session liée après le commit ne peut
+    pas le revendiquer (l'anti « nouvelle session artificielle »)."""
+    session_rows = [row for row in bindings or ()
+                    if str(row.get("session_id") or "").strip() == session]
+    if not session_rows:
+        raise ProvenanceError(
+            "session %s has no binding on any host: a signed statement requires "
+            "the binding that covered the commit; an unbound session is not "
+            "evidence of the author" % session)
+    same_host = [row for row in session_rows
+                 if str(row.get("host") or "") == host]
+    if not same_host:
+        hosts = sorted({str(row.get("host") or "?") for row in session_rows})
+        raise ProvenanceError(
+            "session %s is bound on %s, not on %s: a signed statement names the "
+            "host of its binding" % (session, ", ".join(hosts), host))
+    same_harness = [row for row in same_host
+                    if str(row.get("harness") or "").strip().lower() == harness]
+    if not same_harness:
+        harnesses = sorted({str(row.get("harness") or "?") for row in same_host})
+        raise ProvenanceError(
+            "session %s is bound under %s, but the signed statement declares %s: "
+            "a session keeps the harness of its binding"
+            % (session, ", ".join(harnesses), harness))
+    covering = [row for row in same_harness
+                if _binding_covers_row(row, commit_ts)]
+    if not covering:
+        raise ProvenanceError(
+            "commit was created at %s, outside every interval where session %s "
+            "was bound to %s on %s"
+            % (_at_text(commit_ts), session, actor, host))
+    agents = []
+    for row in covering:
+        bound = str(row.get("agent") or "")
+        if bound and not any(_same_bound_agent(db, bound, seen)
+                             for seen in agents):
+            agents.append(bound)
+    if not any(_same_bound_agent(db, bound, actor) for bound in agents):
+        raise ProvenanceError(
+            "session %s was bound to %s at commit time (%s), not to the signed "
+            "actor %s" % (session, ", ".join(agents), _at_text(commit_ts), actor))
+    if len(agents) > 1:
+        raise ProvenanceError(
+            "session %s was bound to several agents at commit time (%s): the "
+            "evidence is ambiguous" % (session, ", ".join(agents)))
+    chosen = max(covering, key=lambda row: (float(row.get("created_ts") or 0.0),
+                                            int(row.get("id") or 0)))
+    end = chosen.get("revoked_ts")
+    return {
+        "id": int(chosen.get("id") or 0),
+        "agent": str(chosen.get("agent") or ""),
+        "harness": str(chosen.get("harness") or "").strip().lower(),
+        "host": str(chosen.get("host") or ""),
+        "created_ts": float(chosen.get("created_ts") or 0.0),
+        "revoked_ts": float(end) if end is not None else None,
+    }
+
+
+def _signed_identity(db, *, actor, session, harness, host, families,
+                     commit_ts) -> dict:
     """L'identité d'un auteur signé, contrôlée comme une session externe.
 
     L'acteur doit être au registre en mode `externe` (liste d'admission : mode
     absent = `execute`), sans bail vivant — sinon le tour managé est la preuve,
     pas une signature. Le harnais est une propriété de la SESSION (#5756) :
 
-    * si la session figure dans `session_bindings` (toute ligne, révoquée
-      comprise), elle fixe l'agent ET le harnais : toute divergence est refusée ;
-    * sinon (hôte sans ameesh, session jamais liée), le harnais déclaré doit
-      être un harnais déjà connu de l'acteur : le courant du registre ou celui
-      d'une de ses liaisons passées. Un harnais jamais vu reste refusé.
+    * la session doit figurer dans `session_bindings` (toute ligne, révoquée
+      comprise) ; la liaison qui **couvrait la date de committer** fixe l'agent
+      ET le harnais (#7741) : une session liée à bureau puis à veille nomme
+      l'agent de l'intervalle du commit, jamais l'autre. Un commit hors de tout
+      intervalle, une session liée après le commit, une session liée sur un
+      autre hôte ou une session sans aucune liaison sont refusés ;
+    * une session sans liaison n'est pas une preuve : la dérogation « hôte sans
+      ameesh » de #4485 est retirée (B/P1 de la revue #43307). L'absence de
+      lignes pour un nom d'hôte déclaré ne prouve pas qu'un hôte est sans
+      ameesh ; une session et un hôte inventés contourneraient les liaisons
+      réelles du commit. L'owner qui doit attester un commit d'un hôte sans
+      ameesh y installe la CLI et lie la session, ou recrée le commit après une
+      liaison régulière.
 
-    Le harnais doit être une famille du canon. L'hôte est un nom borné : il ne
-    prouve rien à lui seul, il est couvert par la signature avec le reste. Le
-    harnais courant du registre, quand il diverge du harnais signé, est rendu
-    dans `registry_harness` : il est écrit dans le meta de l'approbation."""
+    #7725 reste effectif pour les reçus de session (`_binding_identity`,
+    `record_session_commit`, lecture) : une liaison à `veille` n'y donne aucune
+    identité. Ici, la signature owner est l'autorité, pas l'ascendance ; elle
+    peut attester l'agent historique réel d'une session, y compris `veille`,
+    sans réactiver cette liaison ni réétiqueter le commit.
+
+    Le harnais doit être une famille du canon. L'hôte est un nom borné ; quand
+    la session est liée, la liaison doit être celle de cet hôte. Le harnais
+    courant du registre, quand il diverge du harnais signé, est rendu dans
+    `registry_harness`, et la liaison retenue dans `binding` : les deux sont
+    écrits dans le meta de l'approbation, sans changer le texte signé."""
     from . import agent_names
     from . import registry
     from . import session_bindings
@@ -845,41 +976,28 @@ def _signed_identity(db, *, actor, session, harness, host, families) -> dict:
         raise ProvenanceError(
             "%s holds a live lease (runner-driven): its turns are the proof, "
             "not a signed statement" % name)
+    if not commit_ts:
+        raise ProvenanceError(
+            "a signed receipt requires the commit creation time")
     declared = str(reg.get("harness") or "").strip().lower()
     # #5756 : le registre porte le harnais COURANT de l'acteur, pas celui de la
     # session qui a créé le commit. Les liaisons de session (révoquées
     # comprises) disent les harnais réellement vus pour l'acteur.
-    bindings = session_bindings.listing(db, include_revoked=True)
-    session_rows = [row for row in bindings
-                    if str(row.get("session_id") or "") == session]
-    if session_rows:
-        for row in session_rows:
-            bound_agent = str(row.get("agent") or "")
-            bound_harness = str(row.get("harness") or "").strip().lower()
-            if bound_agent != name:
-                raise ProvenanceError(
-                    "session %s is bound to %s, not to the signed actor %s"
-                    % (session, bound_agent or "?", name))
-            if bound_harness != harness:
-                raise ProvenanceError(
-                    "session %s is bound under %r, but the signed statement "
-                    "declares %r: a session keeps the harness of its binding"
-                    % (session, bound_harness or "?", harness))
-    else:
-        known = {str(row.get("harness") or "").strip().lower()
-                 for row in bindings
-                 if str(row.get("agent") or "") == name}
-        if declared:
-            known.add(declared)
-        if harness not in known:
-            registered = ("is registered under %r" % declared if declared
-                          else "has no harness in the registry")
-            raise ProvenanceError(
-                "agent %s %s but the signed statement declares %r: no session "
-                "binding of %s ever used %r"
-                % (name, registered, harness, name, harness))
+    try:
+        bindings = session_bindings.listing(db, include_revoked=True)
+    except Exception as exc:  # noqa: BLE001 - une lecture impossible ne prouve rien
+        raise ProvenanceError(
+            "cannot read the session bindings of %s: %s"
+            % (name, " ".join(str(exc).split())[:160])) from exc
+    # #7741 : la liaison est choisie par l'instant du commit, pas par
+    # l'ensemble de l'histoire de la session. Une session liée à X puis à Y
+    # s'atteste sous X pour l'intervalle X, sous Y pour l'intervalle Y.
+    binding = _signed_binding_at(
+        db, bindings, actor=name, session=session, harness=harness, host=host,
+        commit_ts=float(commit_ts))
     return {"actor": name, "session": session, "harness": harness, "host": host,
-            "registry_harness": declared if declared != harness else ""}
+            "registry_harness": declared if declared != harness else "",
+            "binding": binding}
 
 
 def _approval_row(db, approval_id, digest: str) -> dict:
@@ -1015,7 +1133,14 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     #6873 : une approbation dont le détenteur est l'acteur attesté, un agent,
     ou qui signe avec une clé détenue par un agent est refusée
     (`_refuse_delegated_attestation`). Un reçu révoqué est définitif : ni
-    celui-ci ni `record_commit` ne le ressuscitent."""
+    celui-ci ni `record_commit` ne le ressuscitent.
+
+    #7741 : quand la session a plusieurs liaisons historiques, l'acteur signé
+    est celui de la liaison qui couvrait la date de committer. La signature
+    owner reste l'autorité ; le committer d'un autre agent enregistré est
+    refusé comme sur la voie de session. Une session sans liaison est refusée :
+    la dérogation « hôte sans ameesh » de #4485 est retirée (B/P1 de la revue
+    #43307), l'absence de lignes pour un nom d'hôte déclaré ne prouvant rien."""
     from . import authority, signing
     from . import work as work_mod
     full = resolve_commit(sha, cwd=cwd)
@@ -1023,9 +1148,17 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
         raise ProvenanceError(
             "commit %r does not resolve to a commit in %s (fetch it first)"
             % (sha, cwd or os.getcwd()))
+    # L'instant de création de l'objet (date de committer) choisit la liaison
+    # historique qui a porté la session ; il est lu avant toute signature.
+    info = _commit_git_identity(cwd, full)
     ident = _signed_identity(
         db, actor=actor, session=session, harness=harness, host=host,
-        families=families)
+        families=families, commit_ts=info["committer_ts"])
+    # Le committer d'un AUTRE agent enregistré contredit l'acteur attesté.
+    # L'auteur Git peut différer (un relecteur réécrit un commit) ; un
+    # committer natif hors registre (codex-pc) reste admis.
+    _refuse_foreign_committer(db, sha=full, cwd=cwd, actor=ident["actor"],
+                              info=info)
     statement = signed_statement(
         commit=full, actor=ident["actor"], session=ident["session"],
         harness=ident["harness"], host=ident["host"], lot=lot)
@@ -1077,6 +1210,10 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
         # du registre, quand il diverge, reste lisible dans l'approbation.
         if ident.get("registry_harness"):
             meta["registry_harness"] = ident["registry_harness"]
+        # #7741 : la liaison datée qui a fondé l'acteur est un diagnostic
+        # d'audit, hors du texte signé (version 1) comme `registry_harness`.
+        if ident.get("binding"):
+            meta["binding"] = ident["binding"]
         try:
             built = authority.create_approval(
                 db, seed, approver=approver, action=SIGNED_ACTION,
@@ -1125,6 +1262,8 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     meta_update = {}
     if pre_signed and ident.get("registry_harness"):
         meta_update["registry_harness"] = ident["registry_harness"]
+    if pre_signed and ident.get("binding"):
+        meta_update["binding"] = ident["binding"]
     if pre_signed:
         signing_host = str(getattr(getattr(db, "cfg", None), "host", "") or "").strip()
         if signing_host:
@@ -1626,18 +1765,23 @@ def _commit_git_identity(cwd, sha: str) -> dict:
             "committer": fields[2].strip().lower(), "committer_ts": committer_ts}
 
 
-def _refuse_foreign_committer(db, *, sha: str, cwd, actor: str) -> dict:
-    """Refuse un commit créé par un AUTRE agent enregistré (#7719).
+def _refuse_foreign_committer(db, *, sha: str, cwd, actor: str,
+                             info: dict | None = None) -> dict:
+    """Refuse un commit créé par un AUTRE agent enregistré (#7719, #7741).
 
     Seul le committer est contrôlé : l'auteur Git peut être celui d'un autre
     agent — un relecteur qui réécrit un commit conserve l'auteur —, et un
     committer hors registre (une session native, `codex-pc`) ne contredit pas
     la liaison. Un committer d'agent enregistré différent de l'acteur, lui,
     dit que l'objet a été créé par quelqu'un d'autre : la session ne peut pas
-    se l'approprier."""
+    se l'approprier. La voie signée applique le même refus (#7741), avec
+    l'acteur historique retenu par la liaison.
+
+    `info`, quand l'appelant l'a déjà lu (`_commit_git_identity`), évite une
+    seconde lecture de git sans changer le contrôle."""
     from . import identity as identity_mod
     from . import registry
-    info = _commit_git_identity(cwd, sha)
+    info = info or _commit_git_identity(cwd, sha)
     other = identity_mod.agent_of_git_email(info["committer"], info["committer_ts"])
     if other and registry.get(db, other) and not _same_agent_identity(db, other, actor):
         raise ProvenanceError(
@@ -2031,8 +2175,9 @@ def build_parser():
     rec.add_argument("--lot", type=int, default=None, help="attach to a work item")
     rec.add_argument("--quiet", action="store_true")
     rec.add_argument("--json", action="store_true")
-    # #4485 : provenance hors runner, attestée par une clé owner (bureau/owner
-    # sur un hôte sans ameesh ni PID local). Les champs sont signés ensemble.
+    # #4485/#7741 : provenance hors runner, attestée par une clé owner, sur la
+    # liaison qui a porté la session (le commit peut être hors de HEAD). Les
+    # champs sont signés ensemble.
     rec.add_argument("--signed", action="store_true",
                      help="owner-signed provenance, outside a managed turn")
     rec.add_argument("--actor", default="", help="signed actor (external agent)")
@@ -2264,12 +2409,20 @@ def main(argv: list[str] | None = None) -> int:
                          _at_text(revoked["at_ts"]), revoked["reason"]))
             return 0
         registry_harness = ""
+        binding_meta = {}
         if recu is not None:
-            registry_harness = str(
-                _signed_meta(db, recu.get("turn") or "").get("registry_harness") or "")
+            meta = _signed_meta(db, recu.get("turn") or "")
+            registry_harness = str(meta.get("registry_harness") or "")
+            if isinstance(meta.get("binding"), dict):
+                binding_meta = meta["binding"]
         if args.json:
+            extra = {}
             if registry_harness:
-                recu = dict(recu, registry_harness=registry_harness)
+                extra["registry_harness"] = registry_harness
+            if binding_meta:
+                extra["binding"] = binding_meta
+            if extra:
+                recu = dict(recu, **extra)
             print(json.dumps(recu, default=str))
         elif recu is None:
             print("unknown origin (no exact receipt)")
@@ -2280,6 +2433,18 @@ def main(argv: list[str] | None = None) -> int:
             if registry_harness:
                 print("registry harness: %s (the signed statement declares %s)"
                       % (registry_harness, recu["harness"]))
+            if binding_meta:
+                # #7741 : la liaison datée qui a fondé l'acteur signé, hors du
+                # texte signé (diagnostic d'audit, comme registry_harness).
+                print("historical binding: #%s %s/%s@%s from %s (%s)"
+                      % (binding_meta.get("id") or "?",
+                         binding_meta.get("agent") or "?",
+                         binding_meta.get("harness") or "?",
+                         binding_meta.get("host") or "?",
+                         _at_text(binding_meta.get("created_ts") or 0),
+                         ("revoked %s" % _at_text(binding_meta["revoked_ts"]))
+                         if binding_meta.get("revoked_ts") is not None
+                         else "active"))
         return 0 if recu is not None else 3
     except ProvenanceError as exc:
         print("provenance refused: %s" % exc, file=sys.stderr)

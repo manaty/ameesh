@@ -505,8 +505,8 @@ before #7725 is repaired, not edited: `ameesh mail unbind --session … --harnes
 session really carries (it must declare the session's harness, #7004). A
 repair changes the identity for the following commits only: a provenance
 receipt (#7719) covers a commit made while the session was bound to that
-agent, and a commit made under `veille` stays without a receipt (the owner's
-signed attestation covers it).
+agent, and a commit made under `veille` stays without a session receipt (the
+owner's signed attestation covers it, #7741).
 
 **Without a lease, never on the row of an `execute` agent (L46).** A hook without
 a lease (source `explicit` or `session`) only advances `last_seen` on the
