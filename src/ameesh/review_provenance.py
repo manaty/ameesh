@@ -102,6 +102,13 @@ qui fait autorité, et elle peut nommer l'agent historique réel sans réactiver
 la liaison ni réétiqueter le commit. Le committer d'un autre agent enregistré
 reste refusé, et la liaison retenue est écrite dans le meta de l'approbation
 (`binding`), hors du texte signé version 1.
+
+La dérogation « hôte sans ameesh » de #4485 est retirée (B/P1 de la revue
+#43307) : une session sans aucune liaison est refusée, car l'absence de lignes
+pour un nom d'hôte déclaré ne prouve pas qu'un hôte est sans ameesh et une
+session et un hôte inventés contourneraient les liaisons réelles du commit.
+L'owner qui doit attester un commit d'un hôte sans ameesh y installe la CLI et
+lie la session, ou recrée le commit après une liaison régulière.
 """
 from __future__ import annotations
 
@@ -831,7 +838,7 @@ def _same_bound_agent(db, one: str, other: str) -> bool:
 
 
 def _signed_binding_at(db, bindings, *, actor, session, harness, host,
-                       commit_ts) -> dict | None:
+                       commit_ts) -> dict:
     """#7741 : la liaison qui prouve `actor` à l'instant du commit, ou un refus.
 
     Une session peut avoir été liée à plusieurs agents dans sa vie (bureau
@@ -840,21 +847,19 @@ def _signed_binding_at(db, bindings, *, actor, session, harness, host,
     committer**, pas un agent d'un autre intervalle : c'est ce qui interdit la
     réattribution rétroactive sans rendre la session inattestable.
 
-    Rend `None` seulement quand la session n'a jamais été liée et que l'hôte
-    ne porte aucune liaison — l'hôte sans ameesh de #4485, où seule la
-    signature owner couvre le commit. Sur un hôte qui utilise ameesh, une
-    session sans liaison n'est pas une preuve ; une session liée sur un autre
-    hôte ne l'est pas non plus, et une session liée après le commit ne peut pas
-    le revendiquer (l'anti « nouvelle session artificielle »)."""
+    Une session sans aucune liaison est refusée : l'absence de lignes pour un
+    nom d'hôte déclaré ne prouve pas un « hôte sans ameesh », et une session
+    inventée avec un hôte inventé contournerait autrement les liaisons réelles
+    du commit (B/P1 de la revue #43307). Une session liée sur un autre hôte
+    n'est pas une preuve non plus, et une session liée après le commit ne peut
+    pas le revendiquer (l'anti « nouvelle session artificielle »)."""
     session_rows = [row for row in bindings or ()
                     if str(row.get("session_id") or "").strip() == session]
     if not session_rows:
-        if any(str(row.get("host") or "") == host for row in bindings or ()):
-            raise ProvenanceError(
-                "session %s has no binding on %s or anywhere: a host that uses "
-                "ameesh does not attest an unbound session"
-                % (session, host))
-        return None
+        raise ProvenanceError(
+            "session %s has no binding on any host: a signed statement requires "
+            "the binding that covered the commit; an unbound session is not "
+            "evidence of the author" % session)
     same_host = [row for row in session_rows
                  if str(row.get("host") or "") == host]
     if not same_host:
@@ -912,15 +917,19 @@ def _signed_identity(db, *, actor, session, harness, host, families,
     absent = `execute`), sans bail vivant — sinon le tour managé est la preuve,
     pas une signature. Le harnais est une propriété de la SESSION (#5756) :
 
-    * si la session figure dans `session_bindings` (toute ligne, révoquée
-      comprise), la liaison qui **couvrait la date de committer** fixe l'agent
+    * la session doit figurer dans `session_bindings` (toute ligne, révoquée
+      comprise) ; la liaison qui **couvrait la date de committer** fixe l'agent
       ET le harnais (#7741) : une session liée à bureau puis à veille nomme
       l'agent de l'intervalle du commit, jamais l'autre. Un commit hors de tout
-      intervalle, une session liée après le commit ou sur un autre hôte sont
-      refusés ;
-    * sinon (hôte sans ameesh, session jamais liée), le harnais déclaré doit
-      être un harnais déjà connu de l'acteur : le courant du registre ou celui
-      d'une de ses liaisons passées. Un harnais jamais vu reste refusé.
+      intervalle, une session liée après le commit, une session liée sur un
+      autre hôte ou une session sans aucune liaison sont refusés ;
+    * une session sans liaison n'est pas une preuve : la dérogation « hôte sans
+      ameesh » de #4485 est retirée (B/P1 de la revue #43307). L'absence de
+      lignes pour un nom d'hôte déclaré ne prouve pas qu'un hôte est sans
+      ameesh ; une session et un hôte inventés contourneraient les liaisons
+      réelles du commit. L'owner qui doit attester un commit d'un hôte sans
+      ameesh y installe la CLI et lie la session, ou recrée le commit après une
+      liaison régulière.
 
     #7725 reste effectif pour les reçus de session (`_binding_identity`,
     `record_session_commit`, lecture) : une liaison à `veille` n'y donne aucune
@@ -986,24 +995,9 @@ def _signed_identity(db, *, actor, session, harness, host, families,
     binding = _signed_binding_at(
         db, bindings, actor=name, session=session, harness=harness, host=host,
         commit_ts=float(commit_ts))
-    if binding is None:
-        # Hôte sans ameesh, session jamais liée (#4485) : seul le harnais déjà
-        # connu de l'acteur peut être déclaré.
-        known = {str(row.get("harness") or "").strip().lower()
-                 for row in bindings
-                 if str(row.get("agent") or "") == name}
-        if declared:
-            known.add(declared)
-        if harness not in known:
-            registered = ("is registered under %r" % declared if declared
-                          else "has no harness in the registry")
-            raise ProvenanceError(
-                "agent %s %s but the signed statement declares %r: no session "
-                "binding of %s ever used %r"
-                % (name, registered, harness, name, harness))
     return {"actor": name, "session": session, "harness": harness, "host": host,
             "registry_harness": declared if declared != harness else "",
-            "binding": binding or None}
+            "binding": binding}
 
 
 def _approval_row(db, approval_id, digest: str) -> dict:
@@ -1144,7 +1138,9 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     #7741 : quand la session a plusieurs liaisons historiques, l'acteur signé
     est celui de la liaison qui couvrait la date de committer. La signature
     owner reste l'autorité ; le committer d'un autre agent enregistré est
-    refusé comme sur la voie de session."""
+    refusé comme sur la voie de session. Une session sans liaison est refusée :
+    la dérogation « hôte sans ameesh » de #4485 est retirée (B/P1 de la revue
+    #43307), l'absence de lignes pour un nom d'hôte déclaré ne prouvant rien."""
     from . import authority, signing
     from . import work as work_mod
     full = resolve_commit(sha, cwd=cwd)
@@ -2179,8 +2175,9 @@ def build_parser():
     rec.add_argument("--lot", type=int, default=None, help="attach to a work item")
     rec.add_argument("--quiet", action="store_true")
     rec.add_argument("--json", action="store_true")
-    # #4485 : provenance hors runner, attestée par une clé owner (bureau/owner
-    # sur un hôte sans ameesh ni PID local). Les champs sont signés ensemble.
+    # #4485/#7741 : provenance hors runner, attestée par une clé owner, sur la
+    # liaison qui a porté la session (le commit peut être hors de HEAD). Les
+    # champs sont signés ensemble.
     rec.add_argument("--signed", action="store_true",
                      help="owner-signed provenance, outside a managed turn")
     rec.add_argument("--actor", default="", help="signed actor (external agent)")

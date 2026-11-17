@@ -255,11 +255,11 @@ indépendante est #6872.
   été créé sur l'autre hôte ;
 - vérifie que l'acteur est `externe`, sans bail vivant, et que le harnais
   déclaré est une famille du canon. Ce harnais est celui de la SESSION
-  (#5756) : si la session figure dans `session_bindings` (toute ligne, révoquée
-  comprise), la liaison qui **couvrait la date de committer** fixe l'agent et
-  le harnais (#7741) ; sinon (hôte sans ameesh, session jamais liée) le harnais
-  doit être déjà connu de l'acteur — le courant du registre ou celui d'une
-  liaison passée. Le
+  (#5756) : la session doit figurer dans `session_bindings` (toute ligne,
+  révoquée comprise), et la liaison qui **couvrait la date de committer** fixe
+  l'agent et le harnais (#7741). Une session sans aucune liaison est refusée :
+  la dérogation « hôte sans ameesh » de #4485 est retirée (B/P1 de la revue
+  #43307, voir la section #7741). Le
   registre porte le harnais courant, pas celui de la session qui a créé le
   commit : un acteur qui a changé de harnais garde donc ses attestations
   passées. Le harnais courant divergent est conservé dans le `meta` de
@@ -278,6 +278,15 @@ n'est pas attestée par les hooks (absents sur l'hôte) ; c'est la signature qui
 couvre le SHA exact. Le correctif d'environnement de #4485 (un nom annoncé est
 couvert par une liaison valide, au lieu de la masquer) reste utile pour l'option
 « ameesh installé » et pour toute session liée dont le shell a gardé un nom.
+
+**Depuis #7741 (17/11), l'attestation signée exige une liaison qui couvre le
+commit** : la branche « hôte sans ameesh, session jamais liée » de #4485 est
+retirée (B/P1 de la revue #43307). L'absence de lignes pour un nom d'hôte
+déclaré ne prouve pas qu'un hôte est sans ameesh ; elle laissait une session et
+un hôte inventés contourner les liaisons réelles du commit. Un hôte sans
+ameesh qui doit faire attester ses commits installe donc la CLI et lie la
+session (le bureau-goal a reçu cette CLI par #6881), ou recrée les commits
+après une liaison régulière.
 
 ### Une session historiquement liée à deux agents (#7741, 17/11)
 
@@ -302,9 +311,12 @@ Le choix retenu est la **liaison qui couvrait la date de committer** :
   sous bureau ne se signe pas `veille` ; un commit entre deux liaisons (après
   révocation, avant la suivante) n'a pas d'acteur attribuable ;
 - une session liée après le commit ne peut pas le revendiquer (le témoin
-  « nouvelle session artificielle ») ; sur un hôte qui utilise ameesh, une
-  session sans liaison n'est pas une preuve ; une session liée sur un autre
-  hôte est refusée, car le texte signé nomme l'hôte de sa liaison ;
+  « nouvelle session artificielle ») ; une session sans aucune liaison est
+  refusée : l'absence de lignes pour un nom d'hôte déclaré ne prouve pas un
+  hôte sans ameesh, et une session et un hôte inventés contourneraient les
+  liaisons réelles du commit (B/P1 de la revue #43307, la dérogation #4485 est
+  retirée) ; une session liée sur un autre hôte est refusée, car le texte
+  signé nomme l'hôte de sa liaison ;
 - le committer d'un autre agent enregistré reste refusé sur la voie signée
   comme sur la voie de session (`_refuse_foreign_committer`) ; un committer
   natif hors registre (`codex-pc`) reste admis.
@@ -331,13 +343,22 @@ harnais `codex`, hôte `pc-smichea`, lot 7705) ; les brouillons `9ed10787` et
 `0af91b19` ne sont pas dans la PR et ne s'attestent pas (le second a en outre
 un committer `bureau@manaty.net`).
 
+Le retrait de la dérogation #4485 est plus strict que le gel précédent : un
+commit créé hors de toute liaison n'a plus d'attestation signée possible. C'est
+la réponse au contournement « session neuve + hôte neuf » : le contrôle ne
+s'appuie plus sur l'absence de lignes pour un nom déclaré, mais exige la
+liaison qui a réellement porté la session à la date du commit. Le bureau-goal
+dispose de la CLI depuis #6881, donc ses sessions s'y lient comme ailleurs ;
+à défaut, la recréation après liaison régulière reste la voie.
+
 Témoins : `tests/test_7741_signed_provenance_historique.py` (commit sous veille
 signé `veille`, commit sous bureau signé `bureau`, refus de l'acteur de l'autre
 intervalle, refus entre deux liaisons, session nouvelle liée après le commit,
-hôte divergent, committer tiers, clé déléguée, reçu révoqué, #7725 toujours
-refusé en reçu de session, approbation pré-signée, `provenance show`) ; les
-témoins #4485 de la liaison révoquée ont été ajustés pour exiger un commit
-**pendant** l'intervalle.
+session et hôte inventés refusés, hôte divergent, committer tiers, clé
+déléguée, reçu révoqué, #7725 toujours refusé en reçu de session, approbation
+pré-signée, `provenance show`) ; les témoins #4485 de la liaison révoquée ont
+été ajustés pour exiger un commit **pendant** l'intervalle, et la dérogation
+« session jamais liée » y est devenue un refus.
 
 ### Bornes ajoutées par #6873
 

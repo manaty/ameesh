@@ -248,6 +248,19 @@ class SignedMultiBindingTest(PgTestCase):
         self.assertIn("outside every interval", str(raised.exception))
         self.assertIsNone(prov.receipt_for_commit(self.db, head))
 
+    def test_a_new_session_on_a_new_host_cannot_claim_the_old_commit(self):
+        """B/P1 de la revue #43307 : changer session ET hôte ne contourne pas
+        les liaisons réelles du commit. L'absence de lignes pour un nom d'hôte
+        déclaré ne prouve pas un hôte sans ameesh : une session inconnue est
+        refusée, même sur un hôte inconnu."""
+        self.history()
+        head = self.commit(COMMIT_VEILLE, "session et hôte inventés")
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            self.sign(head, actor=BUREAU, session=NEW_SESSION,
+                      host="hote-neuf")
+        self.assertIn("has no binding on any host", str(raised.exception))
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+
     def test_x_then_y_then_x_does_not_reclaim_the_y_commit(self):
         """#7719 B1 étendu à la voie signée : le retour à X ne récupère pas le
         commit de l'époque Y."""
