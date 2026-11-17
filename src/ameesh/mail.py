@@ -145,24 +145,31 @@ def _replay_id(mailbox, message_id: int, body: str, work_item_id: str | None,
     return int(message_id)
 
 
-def _canon_row(cfg, name: str) -> dict | None:
-    """#7668 : carte du canon local pour `name`, ou None s'il ne la connaît pas.
+#: #7668 : le canon n'a pas répondu sur un correspondant (non configuré,
+#: illisible, ou nom absent). L'inconnu est privé, jamais « pas un avatar ».
+_UNKNOWN_QUALIFICATION = object()
+
+
+def _canon_row(cfg, name: str):
+    """#7668 : carte du canon local pour `name`, ou `_UNKNOWN_QUALIFICATION`.
 
     Repli d'une session médiée, à qui le contrat 1.1 ne sert pas `agents.get` :
-    le canon du poste reste la seule déclaration lisible. Aucune erreur ne
+    le canon du poste reste la seule déclaration lisible. Seule une carte
+    effectivement lue est une réponse ; un canon absent ou illisible, ou un nom
+    qu'il ne déclare pas, reste une qualification inconnue. Aucune erreur ne
     remonte (le courrier ne dépend pas de cette lecture)."""
     try:
         from . import canon as canon_mod
         if cfg is None or not canon_mod.configured(cfg):
-            return None
+            return _UNKNOWN_QUALIFICATION
         for canon in canon_mod.from_config_all(cfg):
             agent = canon.agent(name)
             if agent is not None:
                 return {"name": agent.title, "team": agent.team,
                         "releve": agent.releve}
     except Exception:  # noqa: BLE001 — qualification indisponible, pas un refus
-        return None
-    return None
+        return _UNKNOWN_QUALIFICATION
+    return _UNKNOWN_QUALIFICATION
 
 
 def _avatar_correspondence(db, *agents) -> bool:
@@ -173,9 +180,9 @@ def _avatar_correspondence(db, *agents) -> bool:
     sa copie lisible dépend de la réponse. Une panne de registre répond
     « privé » : la copie est omise plutôt que de publier le corps d'un avatar
     par défaut (B P2 ameesh-cx2). Un contrat médié qui ne sert pas `agents.get`
-    n'est pas une panne : la carte locale du canon qualifie encore l'avatar ;
-    sans canon lisible, la règle historique du fil (#515) s'applique, sinon
-    toute session médiée perdrait ses copies lisibles."""
+    n'est pas une panne : le canon local qualifie encore les correspondants.
+    Seule une carte lue et ordinaire applique la règle historique du fil
+    (#515) ; une qualification inconnue reste privée (B P2 auditeur/cx2)."""
     try:
         from . import registry
         rows = [registry.get(db, name) for name in agents]
@@ -184,6 +191,8 @@ def _avatar_correspondence(db, *agents) -> bool:
         if not isinstance(exc, NotSupportedRemotely):
             return True
         rows = [_canon_row(getattr(db, "cfg", None), name) for name in agents]
+        if any(row is _UNKNOWN_QUALIFICATION for row in rows):
+            return True
     return any(fil.avatar_conversation(row) for row in rows)
 
 

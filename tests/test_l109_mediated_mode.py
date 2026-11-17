@@ -409,6 +409,28 @@ class SessionTest(unittest.TestCase):
             code = isolated_entrypoint(main_mod.main, list(argv))
         return code, out.getvalue(), err.getvalue()
 
+    def use_canon(self) -> None:
+        """#7668 : le canon local déclare les correspondants ordinaires.
+
+        Une session médiée n'a pas `agents.get` (contrat 1.1) : c'est ce canon
+        qui répond « pas un avatar », donc qui autorise la copie lisible
+        historique (#515). Sans canon, la qualification est inconnue et la
+        copie reste privée."""
+        root = os.path.join(self.tmp, "canon")
+        for name in ("inge-front", "coord"):
+            path = os.path.join(root, "agents", name + ".md")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("---\ntype: Agent\ntitle: %s\nteam: site\n"
+                         "releve: hote\nharness: claude\n"
+                         "capabilities: [read, propose]\n---\n\n# %s\n"
+                         % (name, name))
+        config = os.path.join(self.tmp, "config-canon.json")
+        with open(config, "w", encoding="utf-8") as fh:
+            json.dump({"canon": root}, fh)
+        os.environ["AMEESH_CONFIG"] = config
+        os.environ["AMEESH_CANON_UNTRUSTED"] = "1"
+
     def session_requests(self) -> list:
         return [r for r in self.server.requests if r["path"].endswith("/session/op")]
 
@@ -479,7 +501,9 @@ class SessionTest(unittest.TestCase):
         # (le sien, un lot qui lui est délégué, ou le projet de son équipe) ;
         # le lot d'un autre projet se lit `null` — le fil garde alors la règle
         # historique (projet de l'expéditeur), sans échouer ni perdre le
-        # message.
+        # message. #7668 : la session médiée qualifie ses correspondants par le
+        # canon local, sinon la copie lisible resterait privée.
+        self.use_canon()
         self.responder.script["mailbox.send"] = {
             "id": 814, "created_ts": 1791640000.12, "sender_project": "site",
             "recipient_project": "canon"}

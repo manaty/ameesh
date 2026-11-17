@@ -76,14 +76,16 @@ class HelperTest(unittest.TestCase):
             self.assertTrue(mail._avatar_correspondence(db, "sender", "avatar"))
             self.assertFalse(mail._avatar_correspondence(db, "sender"))
 
-    def test_a_mediated_contract_gap_without_canon_keeps_the_historical_rule(self):
+    def test_a_mediated_contract_gap_without_canon_is_private(self):
+        # Qualification inconnue : un canon non configuré ne dit pas « ce n'est
+        # pas un avatar », donc la copie reste privée (B P2 auditeur/cx2).
         db = types.SimpleNamespace(cfg=types.SimpleNamespace(canon=""))
 
         def unsupported(_db, _name):
             raise NotSupportedRemotely("agents.get is not served to a session")
 
         with mock.patch.object(registry, "get", side_effect=unsupported):
-            self.assertFalse(mail._avatar_correspondence(db, "sender", "avatar"))
+            self.assertTrue(mail._avatar_correspondence(db, "sender", "avatar"))
 
 
 class AvatarConversationTest(PgTestCase):
@@ -208,6 +210,22 @@ class AvatarConversationTest(PgTestCase):
             " WHERE recipient = 'avatar' AND body = 'PRIVATE-MAIL-UNKNOWN'")
         self.assertEqual(first[0]["n"], 1)
         self.assertEqual(self._files_with("PRIVATE-MAIL-UNKNOWN"), [])
+
+    def test_a_mediated_session_without_canon_publishes_no_copy(self):
+        # B P2 auditeur/cx2 : sans canon lisible (contrat 1.1 sans
+        # `agents.get`), la qualification est inconnue — la copie reste
+        # privée, le courrier est déposé.
+        def unsupported(_db, _name):
+            raise NotSupportedRemotely("agents.get is not served to a session")
+
+        with mock.patch.object(registry, "get", side_effect=unsupported), \
+                mock.patch.object(canon_mod, "configured", return_value=()):
+            mail.send(self.db, "sender", "avatar", "MEDIATED-UNKNOWN")
+        first = self.db.query(
+            "SELECT count(*) AS n FROM agent_mailbox"
+            " WHERE recipient = 'avatar' AND body = 'MEDIATED-UNKNOWN'")
+        self.assertEqual(first[0]["n"], 1)
+        self.assertEqual(self._files_with("MEDIATED-UNKNOWN"), [])
 
     def test_mail_to_an_avatar_with_a_lot_stays_in_the_lot_feed(self):
         lot = work.add(self.db, title="Lot du message", app="project-b")
