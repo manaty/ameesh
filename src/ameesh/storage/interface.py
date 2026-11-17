@@ -5281,12 +5281,21 @@ class HostLifecycle(Domain):
         """
 
     @abc.abstractmethod
+    def reattach(self, host: str, agent: str, target: str, *, actor: str) -> dict:
+        """Accept an already moved agent's permanent home and journal its origin.
+
+        The source must be lost, the registry must name target, and no fence
+        or active handoff may remain. Retires only this generation's return
+        obligation; never moves a process or changes the agent's host.
+        """
+
+    @abc.abstractmethod
     def reconcile_loss(self, host: str, *, actor: str, fresh_within: int) -> dict:
         """Reopen a lost host only on a verified proof.
 
         Readings in database time must cover at least `fresh_within` without a
         hole that large, with no reading dated in the future; every origin
-        agent must still be home and unfenced, with no active handoff and no
+        agent not explicitly reattached must still be home and unfenced, with no active handoff and no
         `recover_source` attempt since the loss. A live lease of an agent that
         is home is the returning host's own runner and does not block the
         proof (#3180). The transition `lost -> returning -> available` is

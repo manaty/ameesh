@@ -1,13 +1,15 @@
-# #2022 — publishes this host's reading every 5 minutes (host without a runner).
+# #2022 — publishes this host's reading every minute (host without a runner).
 # Install: cp ameesh-host-publish.{service,timer} ~/.config/systemd/user/ &&
 #          systemctl --user enable --now ameesh-host-publish.timer
 [Unit]
-Description=ameesh host reading every 5 minutes (#2022)
+Description=ameesh host reading every minute (#2022)
 
 [Timer]
+# Keep gaps below the 180s lifecycle proof window, including timer coalescing.
+AccuracySec=1s
 OnActiveSec=1min
-OnUnitActiveSec=5min
-RandomizedDelaySec=30s
+OnUnitActiveSec=60s
+RandomizedDelaySec=10s
 Persistent=true
 
 [Install]
