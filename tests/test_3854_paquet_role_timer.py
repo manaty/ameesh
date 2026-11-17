@@ -23,13 +23,14 @@ from ameesh import role_timers
 
 
 def row(candidates=("agents-a", "agents-b")):
-    return {"name": "mesh-design", "releve": "election", "host": "agents-a",
+    return {"name": "mesh-design", "roles": ["conception"], "releve": "election",
+            "host": "agents-a",
             "candidats": list(candidates)}
 
 
-def plan(host="agents-a", paquet=("", "/srv/clone"), role="mesh-design"):
+def plan(host="agents-a", paquet=("", "/srv/clone"), role="mesh-design", row_value=None):
     return role_timers.plan(
-        host=host, role=role, row=row(),
+        host=host, role=role, row=row_value or row(),
         settings=SimpleNamespace(projects={"ameesh": "manaty/ameesh"}, interval=900),
         watch_intervals=[900], notify_humans=["human:owner"], paquet=paquet)
 
@@ -128,7 +129,8 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(item["advisory"])
 
     def test_another_role_does_not_carry_the_tick(self):
-        names = [item["name"] for item in plan(role="auditeur")["timers"]]
+        names = [item["name"] for item in plan(
+            role="auditeur", row_value=dict(row(), roles=["auditeur"]))["timers"]]
         self.assertNotIn(role_timers.PAQUET_PASS, names)
 
     def test_a_non_candidate_gets_nothing(self):

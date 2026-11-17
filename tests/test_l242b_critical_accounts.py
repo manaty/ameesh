@@ -280,7 +280,8 @@ class IdentiteTest(unittest.TestCase):
         fake = self.fake(declared=("mesh-design",), orchestras=("orchestrateur",))
         self.assertTrue(self.critical(fake, "mesh-design"))
         self.assertTrue(self.critical(fake, "orchestrateur"))
-        self.assertTrue(self.critical(fake, "auditeur"))
+        # #7661 : sans fiche qui déclare le rôle, le titre ne rend pas critique.
+        self.assertFalse(self.critical(fake, "auditeur"))
         self.assertFalse(self.critical(fake, "dev7"))
 
     def test_role_au_canon_proprietaire_seulement(self):

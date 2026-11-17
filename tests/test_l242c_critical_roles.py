@@ -109,7 +109,8 @@ class CritiqueTest(unittest.TestCase):
             self.assertFalse(runner.Runner.is_critical(fake, "dev7"))
 
     def test_persona_auditeur_sans_canon(self):
-        self.assertTrue(self.critical(self.fake([]), "auditeur", {}))
+        # #7661 : sans canon, aucun rôle n'est déclaré ; le titre ne suffit pas.
+        self.assertFalse(self.critical(self.fake([]), "auditeur", {}))
 
     def test_reprise_juge_de_meme(self):
         canon = _Canon("A", CARTES)
@@ -676,9 +677,10 @@ class Relecture921Test(_Cache):
     def test_sans_canon_rien_grave_puis_repli_critique(self):
         from ameesh import auditor
         fake = self.unconfigured(state_dir=self.tmp)
-        # hôte sans canon : la persona auditeur seule, pas un fait sur l'agent
+        # hôte sans canon : aucun rôle déclaré, donc personne n'est critique
+        # par rôle — pas même une persona nommée `auditeur` (#7661).
         self.assertFalse(self.critical(fake, "dev7"))
-        self.assertTrue(self.critical(fake, "auditeur"))
+        self.assertFalse(self.critical(fake, "auditeur"))
         # rien de gravé, ni sur le disque ni dans la mémoire du processus
         self.assertFalse(os.path.exists(self.path))
         self.assertEqual(fake._critical_known, {})
@@ -686,8 +688,8 @@ class Relecture921Test(_Cache):
         with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": ""}):
             self.assertFalse(auditor.is_critical(fake.cfg, None, "dev7", (),
                                                  declared=(), agent=self.rows["dev7"]))
-            self.assertTrue(auditor.is_critical(fake.cfg, None, "auditeur", (),
-                                                declared=(), agent=self.rows["auditeur"]))
+            self.assertFalse(auditor.is_critical(fake.cfg, None, "auditeur", (),
+                                                 declared=(), agent=self.rows["auditeur"]))
         self.assertFalse(os.path.exists(self.path))
         # le canon devient configuré puis illisible, dans le même processus :
         # `known` n'a rien retenu du passage sans canon, le repli est critique

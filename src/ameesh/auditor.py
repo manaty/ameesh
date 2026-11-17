@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L234 : rôles et fiches protégées, résolus dans le canon propriétaire."""
+"""L234 : rôles et fiches protégées, résolus dans le canon propriétaire.
+
+#7661 : l'auditeur est l'agent dont la fiche du canon déclare le rôle
+(`roles: [auditeur]`, ou `auditor`, `role:`) ; son nom de persona ne compte
+ni pour le reconnaître ni pour lui donner une permission. Un mesh sans ce rôle
+n'a pas d'auditeur — ni fiche protégée, ni tour exempté de pression.
+"""
 from . import canon as canon_mod
-from .alert_briefs import AUDITOR_NAME, AUDITOR_ROLES
+from .alert_briefs import AUDITOR_ROLES
 
 
 def _readable(loaded):
@@ -37,24 +43,22 @@ def may_take(row, canons):
 def cards(listing, canons):
     """name -> fiche de l'auditeur, seulement dans le canon propriétaire.
 
-    La persona sans fiche reste reconnue ; une fiche en conflit dans un autre
-    canon ne donne jamais de rôle ni de permission au nom déjà au registre.
+    Seule une fiche qui déclare le rôle compte : une persona sans fiche, ou
+    dont la fiche ne le déclare pas, n'est pas auditrice. Une fiche en conflit
+    dans un autre canon ne donne jamais de rôle ni de permission au nom déjà
+    au registre.
     """
     found = {}
     for row in listing:
-        name = row["name"]
-        if name == AUDITOR_NAME:
-            found[name] = None
-        card = owned_card(row, canons, AUDITOR_ROLES, persona=name == AUDITOR_NAME)
+        card = owned_card(row, canons, AUDITOR_ROLES)
         if card is not None:
-            found[name] = card
+            found[row["name"]] = card
     return found
 
 
-def owned_card(row, canons, roles, *, persona=False):
+def owned_card(row, canons, roles):
     """La fiche de l'agent `row` qui nomme l'un des `roles`, prise seulement
-    dans son canon propriétaire (None sinon) ; `persona` : sa fiche, quel que
-    soit son rôle."""
+    dans son canon propriétaire (None sinon)."""
     wanted = {str(role).strip().lower() for role in roles}
     card = None
     for canon in canons:
@@ -67,7 +71,7 @@ def owned_card(row, canons, roles, *, persona=False):
         named = data.get("roles") or data.get("role") or []
         if isinstance(named, str):
             named = [named]
-        if persona or any(str(role).strip().lower() in wanted for role in named):
+        if any(str(role).strip().lower() in wanted for role in named):
             card = definition.fiche
     return card
 
@@ -81,16 +85,20 @@ def card_markers(card):
 
 
 def is_auditor(db, name, canons, agent=None):
-    """L234 : persona auditeur ou rôle auditeur/auditor dans le canon
-    propriétaire. Le registre n'est lu que pour un nom candidat ; `agent`, la
-    ligne fraîche de l'appelant, évite cette lecture."""
+    """L234 : rôle auditeur/auditor déclaré par la fiche du canon propriétaire.
+    Le nom de la persona ne suffit jamais. Canon chargé, la fiche fait foi ;
+    sans canon (hôte sans dépôt, #3327 B/P1), la projection `roles` du registre
+    — copiée de la carte par `canon sync` — est la déclaration disponible. Le
+    registre n'est lu que pour un nom candidat ; `agent`, la ligne fraîche de
+    l'appelant, évite cette lecture."""
     from . import registry, sous_utilisation as su
-    if name == AUDITOR_NAME:
-        return True
-    if name not in su.role_orchestrators(canons, AUDITOR_ROLES):
-        return False
+    if canons:
+        if name not in su.role_orchestrators(canons, AUDITOR_ROLES):
+            return False
+        row = agent if agent is not None else registry.get(db, name)
+        return bool(row and name in cards([row], canons))
     row = agent if agent is not None else registry.get(db, name)
-    return bool(row and name in cards([row], canons))
+    return bool(row and su.row_has_role(row, AUDITOR_ROLES))
 
 
 def is_critical(cfg, db, name, canons, *, declared=(), agent=None):
