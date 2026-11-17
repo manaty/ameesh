@@ -237,6 +237,12 @@ def agent_detail(db, name: str, *, cfg=None, footprint: bool = False, sees=None)
     from . import sandbox_observation
     row['sandbox'] = sandbox_observation.current_agents(db, [name], sees=sees).get(name)
     row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
+    # #7632 : cadence de réveil déclarée, courrier en attente, prochain tour groupé
+    from . import reveil as reveil_mod
+    try:
+        row["wake"] = reveil_mod.status(db, row, human_names=getattr(cfg, "human_names", ()))
+    except db_mod.DbError:
+        row["wake"] = None  # le courrier illisible ne prive pas de la fiche
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
     row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
@@ -1404,6 +1410,16 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         elif credit_harness:
             print("credits  : %s ok (no credit exhaustion seen)" % credit_harness)
         print("lease    : %s" % _lease(row))
+        # #7632 : la cadence de réveil déclarée et le prochain tour groupé
+        wake = row.get("wake")
+        if wake:
+            print("wake     : %s" % wake["cadence"])
+            print("           %d grouped mail(s) pending%s, %d immediate%s" % (
+                wake["pending"],
+                (" — next grouped turn %s" % _fmt_moment(wake["next_wake_ts"]))
+                if wake.get("next_wake_ts") else "",
+                wake["immediate_pending"],
+                " (turn due now)" if wake["immediate_pending"] else ""))
         print("model    : %-9s budget: %s" % (row.get("model") or "—", _budget(row)))
         # #6046 : réglages de contexte et leur source (agent, role:<classe>,
         # host, default)

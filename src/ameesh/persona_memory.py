@@ -40,6 +40,158 @@ class MemoryError(RuntimeError):
     pass
 
 
+#: A memory repository is cloned by the isolated Git environment built by
+#: `_git_env`: it removes every `GIT_CONFIG*` variable and sets
+#: `GIT_CONFIG_NOSYSTEM` / `GIT_CONFIG_GLOBAL=/dev/null`. The `gh` credential
+#: helper installed by the executor units is therefore invisible, and HTTPS
+#: has no way to authenticate. The only supported credential is the
+#: host-managed `persona_memory.ssh_key`, used by an SSH URL. This isolation is
+#: deliberate (EXPLOITATION.md, persona memory): do not loosen it to make an
+#: HTTPS repository work.
+_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
+#: scp-like SSH syntax (`git@github.com:owner/repo.git`), not a Windows drive.
+_SCP_RE = re.compile(r"^(?:[^/@:]+@)?[^/:]+:[^/]")
+
+
+def transport_kind(repository: str) -> str:
+    """`ssh`, `http`, a named scheme, or `local` for a Git URL/path."""
+    value = (repository or "").strip()
+    match = _SCHEME_RE.match(value)
+    if match:
+        scheme = match.group(1).lower()
+        if scheme in ("ssh", "git+ssh"):
+            return "ssh"
+        if scheme == "file":
+            return "local"
+        return scheme
+    if _SCP_RE.match(value) and not re.match(r"^[A-Za-z]:[\\/]", value):
+        return "ssh"
+    return "local"
+
+
+def _display_repository(value: str) -> str:
+    """Never echo credentials embedded in a repository URL (userinfo)."""
+    return re.sub(r"(://)[^/@\s]+@", r"\1<redacted>@", str(value))
+
+
+def transport_problem(repository: str | None, cfg_raw: dict | None, *,
+                      check_key: bool = True) -> str | None:
+    """Why this host cannot clone `repository`, or None when it can.
+
+    `check_key=False` judges the URL only (another host's key file is not
+    readable from here); the local check also requires an existing, readable
+    `persona_memory.ssh_key`, the transport's only credential source.
+    """
+    if not repository or not str(repository).strip():
+        return "no memory repository is declared"
+    value = str(repository).strip()
+    shown_repo = _display_repository(value)
+    kind = transport_kind(value)
+    if kind == "local":
+        # A local path needs no credential; tests and mirrors use one.
+        return None
+    if kind != "ssh":
+        match = _SCHEME_RE.match(value)
+        scheme = match.group(1).lower() if match else kind
+        shown = ("HTTPS" if scheme in ("http", "https")
+                 else "the %s:// protocol" % scheme)
+        return (
+            "memory.repository %s uses %s, which cannot authenticate: the memory "
+            "Git environment ignores global/system configuration and credential "
+            "helpers (deliberate isolation); use an SSH URL "
+            "(git@github.com:<owner>/<repo>.git)" % (shown_repo, shown))
+    if not check_key:
+        return None
+    key = cfg_raw.get("ssh_key") if isinstance(cfg_raw, dict) else None
+    if not key:
+        return (
+            "memory.repository %s is an SSH URL but this host sets no "
+            "persona_memory.ssh_key, the only credential source of the memory "
+            "transport" % shown_repo)
+    key_path = os.path.expanduser(str(key))
+    if not os.path.isfile(key_path):
+        return "persona_memory.ssh_key %s does not exist on this host" % key
+    if not os.access(key_path, os.R_OK):
+        return "persona_memory.ssh_key %s is not readable by the executor" % key
+    return None
+
+
+def canon_findings(cfg, canon, host: str | None = None, *, placements=None,
+                   check_key: bool | None = None) -> list:
+    """Warnings for memory repositories that cannot be cloned on `host`.
+
+    Only agents admitted on that host are judged: a memory repository is a
+    property of the persona, but the transport (URL and key file) is a
+    property of the host. A check never judges another host's key file — its
+    configuration is unknown here — so the key requirement is local, while a
+    non-SSH URL is refused everywhere. Warning, not error: the persona still
+    runs, without memory, and the runner tells it so in its turn.
+    """
+    from . import canon as canon_mod
+    from . import placement as placement_mod
+    where = host or getattr(cfg, "host", "") or ""
+    if not where:
+        return []
+    local = where == (getattr(cfg, "host", "") or "")
+    if check_key is None:
+        check_key = local
+    try:
+        verdicts = (placement_mod.verdicts(canon, where) if placements is None
+                    else [v for v in placements if v.host == where])
+        admitted = {v.agent for v in verdicts if v.ok}
+    except Exception:  # noqa: BLE001 - a diagnostic never breaks the check
+        return []
+    out = []
+    agents = getattr(canon, "agents", ())
+    if not isinstance(agents, (list, tuple)):
+        return out
+    for agent in agents:
+        repository = getattr(agent, "memory_repository", None)
+        if not repository or agent.title not in admitted:
+            continue
+        problem = transport_problem(
+            repository, getattr(cfg, "persona_memory", None) if local else None,
+            check_key=check_key)
+        if not problem:
+            continue
+        fiche = getattr(agent, "fiche", None)
+        out.append(canon_mod.Finding(
+            "agent-memory-transport", canon_mod.WARNING,
+            "memory.repository of %s cannot be cloned on %s: %s — the persona "
+            "runs without memory (docs/EXPLOITATION.md, persona memory)"
+            % (agent.title, where, problem),
+            member=getattr(fiche, "member", ""), path=getattr(fiche, "path", ""),
+            agent=agent.title, host=where,
+            untrusted=bool(getattr(fiche, "untrusted", False))))
+    return out
+
+
+def failure_code(reason: str) -> str:
+    """A stable code for a memory-unavailable cause (event data, dedup)."""
+    text = str(reason or "").lower()
+    if "persona_memory.ssh_key" in text:
+        return ("ssh_key_missing" if "sets no" in text
+                else "ssh_key_unreadable")
+    if "cannot authenticate" in text or "uses https" in text or "uses http" in text:
+        return "https_transport"
+    if "share uid" in text or "memory transport disabled" in text:
+        return "isolation"
+    if "clone failed" in text or "could not read" in text or "not found" in text:
+        return "clone_failed"
+    return "unknown"
+
+
+def unavailable_preface(reason: str) -> str:
+    """The visible line a turn carries when its memory could not be opened."""
+    text = " ".join(str(reason or "unknown cause").split())[:300]
+    return (
+        "PERSONA MEMORY UNAVAILABLE for this turn: %s\n"
+        "Your durable memory was not loaded; any journal written this turn may "
+        "not be synchronized. The host configuration must be fixed: an SSH "
+        "memory.repository and persona_memory.ssh_key (`ameesh canon check`).\n"
+        % text)
+
+
 def isolation_policy(cfg, canon_id: str | None = None) -> str:
     """Only an approved Host card can opt into shared-UID memory transport."""
     from . import canon as canon_mod
@@ -164,6 +316,13 @@ def _safe_copy(path: str, repository: str | None = None) -> None:
 
 def open_copy(repository: str, state_dir: str, agent: str, *, cfg_raw=None) -> str:
     """Open or refresh a private local working copy of the persona repository."""
+    # Refuse before any Git call: an HTTPS URL cannot authenticate in the
+    # isolated memory environment, and an SSH URL without a configured key has
+    # no credential source. The caller gets a named cause instead of a raw
+    # Git error, and can tell the persona why its memory is missing.
+    problem = transport_problem(repository, cfg_raw)
+    if problem:
+        raise MemoryError(problem)
     path = copy_dir(state_dir, agent)
     env = _git_env(cfg_raw)
     if os.path.lexists(path) and os.path.realpath(path) != os.path.abspath(path):
@@ -277,6 +436,9 @@ def sync(path: str, message: str, *, cfg_raw=None, repository: str | None = None
     """Commit changes and push, preserving the working copy on failure."""
     _safe_copy(path, repository)
     url = repository or _origin_url(path)
+    problem = transport_problem(url, cfg_raw)
+    if problem:
+        raise MemoryError(problem)
     branch = _git(path, "symbolic-ref", "--short", "HEAD").stdout.strip()
     target = _git(path, "config", "--get", "branch." + branch + ".merge").stdout.strip()
     if not target.startswith("refs/heads/"):

@@ -8,6 +8,8 @@
                                          [--project-repo PROJET=CHEMIN] : tout fichier
                                          suivi non léger a un nombre d'avis (#5191)
   ameesh canon show [--json]             fiches lues, et d'où (commit)
+  ameesh canon snapshot --expect-commit SHA [--json]
+                                         public immutable directory; read-only, no DB
   ameesh canon sync [--host H] [--json] [--bootstrap-ref BRANCHE]
                      [--allow-rewind]
                                          canon → registre de l'hôte (§4.4) ; enregistre
@@ -277,9 +279,17 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
     recorded = _recorded(cfg, host, canon)
     # L243 : les projets inconnus ne se vérifient qu'avec la base (lots)
     findings = canon_mod.validate(canon, (recorded or {}).get("projects"))
+    placements = placement_mod.verdicts(canon) if canon.readable else []
+    # #7682 : un dépôt de mémoire que l'environnement Git isolé ne peut pas
+    # ouvrir sur cet hôte (HTTPS, ou SSH sans persona_memory.ssh_key). Un
+    # avertissement, pas une erreur : l'avatar tourne sans mémoire et
+    # l'exécuteur le lui dit dans son tour ; `canon sync` n'est pas bloqué.
+    if canon.readable:
+        from . import persona_memory
+        findings = findings + persona_memory.canon_findings(
+            cfg, canon, host, placements=placements)
     errors = canon_mod.errors(findings)
     status, diagnostic = canon_sync.assess(canon, host, findings)
-    placements = placement_mod.verdicts(canon) if canon.readable else []
     unseen = _registry_errors_unseen(canon, recorded, errors)
     # #5191 : après l'état de l'hôte, que ce contrôle propre au check ne change pas
     if canon.readable:
@@ -876,15 +886,29 @@ def _require_readable(canons: list) -> None:
                reasons[0] if reasons else "no source read"))
 
 
-def _generated_name(naming, role: str | None, projects, canons: list, db) -> str:
-    """Nom par défaut engendré par le nommage, ou refus explicite (L243, #468)."""
+def _generated_name(naming, role: str | None, projects, canons: list, db, *,
+                    for_spawn: bool = False) -> str:
+    """Nom par défaut engendré par le nommage, ou refus explicite (L243, #468).
+
+    `for_spawn` (#7681) : `spawn` peut toujours recevoir un nom explicite, qui
+    ne demande aucune convention. Le refus le dit, au lieu de laisser croire
+    qu'il faut d'abord déclarer `extensions.ameesh.naming` pour créer un
+    éphémère."""
     _require_readable(canons)
     if naming is None:
+        if for_spawn:
+            raise canon_mod.NamingError(
+                "no `extensions.ameesh.naming` in the canon: pass an explicit name "
+                "instead (`ameesh agent spawn <name> --by … --ttl …`), or declare org, "
+                "projects and roles in its federation.yaml")
         raise canon_mod.NamingError(
             "no `extensions.ameesh.naming` in the canon: declare org, projects and "
             "roles in its federation.yaml")
     if not role:
-        raise canon_mod.NamingError("--role is required to generate a name")
+        raise canon_mod.NamingError(
+            "--role is required to generate a name%s"
+            % (", or pass an explicit name (`ameesh agent spawn <name> --by … --ttl …`)"
+               if for_spawn else ""))
     known = canon_mod.known_projects(canons, projects or [], naming)
     return naming.next_name(role, projects or [], _taken_agent_names(canons, db), known)
 
@@ -943,7 +967,8 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
     try:
         db_mod.require_schema(db)
         name = args.name or _generated_name(
-            canon[0].naming if canon else None, args.role, args.project, canon, db)
+            canon[0].naming if canon else None, args.role, args.project, canon, db,
+            for_spawn=True)
         row = canon_sync.spawn(db, name, args.by, ttl, cwd=args.cwd, canon=canon,
                                tools=args.tool, mcp=args.mcp, context=context)
         if args.prompt:
@@ -1272,7 +1297,7 @@ def _add_agent_parsers(parent, *, move: bool = False) -> None:
 
 def add_parsers(sub) -> None:
     """Branche `canon …` (dont `canon agent …`), `placement …` et `agent …`."""
-    p_canon = sub.add_parser("canon", help="OKF canon: check, show, sync")
+    p_canon = sub.add_parser("canon", help="OKF canon: check, show, snapshot, sync")
     canon_sub = p_canon.add_subparsers(dest="canon_command")
     p_check = canon_sub.add_parser("check", help="validate the canon (§4.3)")
     _canon_options(p_check)
@@ -1288,6 +1313,19 @@ def add_parsers(sub) -> None:
     p_cshow = canon_sub.add_parser("show", help="cards read and their source")
     _canon_options(p_cshow)
     p_cshow.set_defaults(func=cmd_show)
+    from .canon_snapshot import cmd_snapshot
+    p_snapshot = canon_sub.add_parser(
+        "snapshot", help="immutable public canon/directory snapshot (read-only, JSON)")
+    _canon_options(p_snapshot)
+    p_snapshot.add_argument("--expect-commit", required=True, metavar="SHA",
+                            help="trusted full commit expected for the selected canon root")
+    p_snapshot.add_argument("--previous-commit", metavar="SHA",
+                            help="previous root commit that must be an ancestor of the snapshot")
+    p_snapshot.add_argument("--expect-scope", metavar="DIR",
+                            help="required root scope (refuse an absent or broader scope)")
+    p_snapshot.add_argument("--single-source", action="store_true",
+                            help="refuse federation sources beyond the selected root")
+    p_snapshot.set_defaults(func=cmd_snapshot)
     p_sync = canon_sub.add_parser("sync", help="canon → host registry (§4.4)")
     _canon_options(p_sync)
     p_sync.add_argument("--host", default=None, help="host (otherwise AMEESH_HOST / this machine)")

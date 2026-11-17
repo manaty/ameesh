@@ -42,7 +42,10 @@
 #                JIT de Postgres coupé par défaut sur la base du mesh (#3503)
 #   redemarrer   exécuteurs du poste un par un (arrêt prouvé avant chaque
 #                démarrage), puis notify, puis les exécuteurs de l'ancienne base
-#                refusé depuis une unité ameesh-* (risque de tuer le script)
+#                refusé depuis une unité ameesh-* (risque de tuer le script) ;
+#                un agent en pause budget ou opérateur lisible au registre ne
+#                reprend aucun bail : unité rechargée, « non vérifiée : pause … »
+#                sans échec (#7717)
 #   timers       pose les minuteries mécaniques EP5 (veille GitHub, CI,
 #                projection) sur cet hôte s'il est candidat du rôle élu ;
 #                refuse explicitement les passes dont la clé `github` manque
@@ -800,6 +803,20 @@ print(json.dumps(r))' <<<"$sortie" 2>/dev/null && return 0
   done
   return 3  # #4358 : lecture non concluante, aucun redémarrage
 }
+# #7717 : la pause lisible au registre, budget d'abord puis opérateur. Un
+# agent dans cet état ne peut commencer aucun tour : son bail n'a pas à être
+# repris, et le redémarrage ne doit pas échouer pour cela (le venv reste
+# prouvé par `controler`).
+pause_de_json() {  # stdin : show JSON → « budget », « opérateur » ou vide
+  python3 -c 'import json,sys
+r = json.loads(sys.stdin.read() or "{}")
+budget = (r.get("paused_on_budget")
+          or (r.get("status") == "blocked"
+              and (r.get("status_text") or "").startswith("budget : ")))
+if budget: print("budget")
+elif r.get("operator_paused"): print("opérateur")
+else: print("")'
+}
 # base … → the clock of that base's database, epoch seconds, read through
 # ameesh's own connection, as `ameesh show` is: no DSN nor password in argv
 heure_base() {
@@ -934,7 +951,7 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
 # sans bail ni tour.
 redemarrer_liste() {
   local base=$1; shift
-  local u p st avant ligne heure tenu attendu rc
+  local u p st avant ligne heure tenu attendu rc pause
   for u in "$@"; do
     p=$(persona_de "$u")
     [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
@@ -968,6 +985,10 @@ redemarrer_liste() {
       echo "WARNING $p: bail illisible — unité $u laissée en l'état (non concluant, sans retour)"
       continue
     fi
+    # #7717 : pause budget (ou opérateur) lisible au registre — aucun tour ne
+    # peut partir, donc le bail n'est pas à reprendre. La lecture `show` du
+    # registre suffit à le constater, avant l'arrêt.
+    pause=$(pause_de_json <<<"$ligne")
     [ "$rc" = 0 ] && heure=$(heure_base "$base") \
       && attendu=$(proprietaire_de "$u") \
       || { echo "$u: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
@@ -984,7 +1005,18 @@ redemarrer_liste() {
       echo "$u : ne redémarre pas — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
       exit 1
     fi
-    if [ "$tenu" = 0 ]; then
+    # #7717 : l'unité tourne sur le code installé ; la pause interdit tout
+    # tour, donc le bail n'est ni repris ni exigé (le venv est prouvé par
+    # `controler`). Non concluant, jamais un échec de redémarrage.
+    if [ "$pause" = budget ]; then
+      pauses_budget+=("$p")
+      echo "$p : redémarré (était $st) — non vérifiée : pause budget (aucun tour, aucun bail à reprendre)"
+      continue
+    elif [ "$pause" = opérateur ]; then
+      pauses_operateur+=("$p")
+      echo "$p : redémarré (était $st) — non vérifiée : pause opérateur (aucun tour, aucun bail à reprendre)"
+      continue
+    elif [ "$tenu" = 0 ]; then
       echo "WARNING $p: not checked: no lease before the restart, no sign of life"
       non_verifiees+=("$p")
     elif ! attendu=$(proprietaire_de "$u") || ! attendre_bail "$avant" "$attendu" "$base" "$p"; then
@@ -1017,6 +1049,10 @@ redemarrer() {
   . "$ICI/bail.sh"
   local unites
   non_verifiees=()
+  # #7717 : personas en pause budgétaire ou opérateur — aucun tour, donc
+  # aucun bail à reprendre ; nommées à la trace, sans retour arrière.
+  pauses_budget=()
+  pauses_operateur=()
   mapfile -t unites < <(unites_mesh)
   etape "exécuteurs du poste, base du mesh (${#unites[@]}), arrêt prouvé avant démarrage"
   [ ${#unites[@]} -gt 0 ] && redemarrer_liste mesh "${unites[@]}"
@@ -1032,6 +1068,12 @@ redemarrer() {
   fi
   if [ ${#non_verifiees[@]} -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ ${#pauses_budget[@]} -gt 0 ]; then
+    etape "WARNING: ${#pauses_budget[@]} persona(s) non vérifiée(s) : pause budget (aucun tour, aucun bail à reprendre) : ${pauses_budget[*]}"
+  fi
+  if [ ${#pauses_operateur[@]} -gt 0 ]; then
+    etape "WARNING: ${#pauses_operateur[@]} persona(s) non vérifiée(s) : pause opérateur (aucun tour, aucun bail à reprendre) : ${pauses_operateur[*]}"
   fi
 }
 

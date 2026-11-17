@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# #5559 : un relevé de l'hôte toutes les 5 minutes (serveur du mesh).
+# #5559 : un relevé de l'hôte chaque minute (serveur du mesh).
 [Unit]
-Description=ameesh — relevé de l'hôte toutes les 5 minutes (#5559)
+Description=ameesh — relevé de l'hôte chaque minute (#5559)
 
 [Timer]
+# Keep gaps below the 180s lifecycle proof window, including timer coalescing.
+AccuracySec=1s
 OnBootSec=1min
-OnUnitActiveSec=5min
-RandomizedDelaySec=30s
+OnUnitActiveSec=60s
+RandomizedDelaySec=10s
 Persistent=true
 
 [Install]

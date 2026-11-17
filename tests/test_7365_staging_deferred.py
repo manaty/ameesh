@@ -15,6 +15,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from ameesh import release_cutoff, staging_deferred
+from tests import canon_staging
 
 SHA = "a" * 40
 OLD = "b" * 40
@@ -38,7 +39,8 @@ class DeferredGuardTest(unittest.TestCase):
         self.cfg = types.SimpleNamespace(state_dir=self.tmp.name)
         self.project_ref = release_cutoff.ProjectRelease(
             name="ameesh", repo="/nowhere", target="main", remote="origin",
-            report="human", github="manaty/ameesh")
+            report="human", github="manaty/ameesh",
+            staging_topology=canon_staging.topology())
 
     def tick(self, rows, by_commit, *, pilots=("pilot",), pairs=()):
         pairs = set(pairs)
@@ -174,7 +176,9 @@ class DeferredGuardTest(unittest.TestCase):
 
 class ReportBodyTest(unittest.TestCase):
     def test_release_report_names_the_reported_host_and_the_missed_tag(self):
-        project = types.SimpleNamespace(name="ameesh", target="main")
+        project = types.SimpleNamespace(
+            name="ameesh", target="main",
+            staging_topology=canon_staging.topology())
         rules = types.SimpleNamespace(zone=lambda: ZoneInfo("Europe/Paris"))
         staging = {"exit": 0, "duration_s": 12.0, "log": "/tmp/journal", "summary": [],
                    "attestation": attestation(SHA, reportes={
@@ -190,7 +194,9 @@ class ReportBodyTest(unittest.TestCase):
                       "mise à jour à son retour", body)
 
     def test_report_without_reported_host_keeps_its_shape(self):
-        project = types.SimpleNamespace(name="ameesh", target="main")
+        project = types.SimpleNamespace(
+            name="ameesh", target="main",
+            staging_topology=canon_staging.topology())
         rules = types.SimpleNamespace(zone=lambda: ZoneInfo("Europe/Paris"))
         body = release_cutoff._report_body(
             project, None, result="released", version="1.54.0", tag="v1.54.0",

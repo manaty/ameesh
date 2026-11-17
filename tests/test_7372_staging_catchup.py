@@ -11,13 +11,15 @@ per project (`staging_rights`) and its decision is re-read on each pass.
 """
 import datetime
 import os
+import contextlib
 import tempfile
 import types
 import unittest
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from ameesh import release, release_cutoff, staging_deferred
+from ameesh import canon, release, release_cutoff, staging_deferred
+from tests import canon_staging
 
 SHA = "a" * 40
 OLD = "b" * 40
@@ -56,7 +58,8 @@ def attestation(sha, *, reportes=None, hotes=None, date="2026-11-15T22:31:37Z"):
 def project(name="ameesh", repo="/nowhere", rights=RIGHTS):
     return release_cutoff.ProjectRelease(
         name=name, repo=repo, target="main", remote="origin",
-        report="human", github="manaty/%s" % name, staging_rights=rights)
+        report="human", github="manaty/%s" % name, staging_rights=rights,
+        staging_topology=canon_staging.topology())
 
 
 def active(**extra):
@@ -521,17 +524,25 @@ class ActorTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
-    def run_cmd(self, *, right=active(), declared=True, actor="bureau"):
+    def run_cmd(self, *, right=active(), declared=True, actor="bureau", host=HOST,
+                project_ref=None, topology_for=None, canon_declares=False):
         cfg = types.SimpleNamespace()
         base = {"sha": SHA, "tag": "v1.57.0"}
         row = {"schema": "ameesh-staging-catchup/1", "project": "ameesh", "host": HOST,
                "sha": SHA, "tag": "v1.57.0", "result": "ok", "actor": "bureau",
                "decision": 219407, "event": 42}
-        args = types.SimpleNamespace(project="ameesh", host=HOST, sha=SHA,
+        args = types.SimpleNamespace(project="ameesh", host=host, sha=SHA,
                                      result="ok", actor="", note="")
         db = mock.MagicMock()
-        with mock.patch.object(release_cutoff, "projects",
-                               return_value={"ameesh": project()}), \
+        topology_patch = (mock.patch.object(release_cutoff, "topology_for",
+                                            return_value=topology_for)
+                          if topology_for is not None else contextlib.nullcontext())
+        canon_patch = (mock.patch.object(canon, "load_configured",
+                                         return_value=[canon_staging.fake_canon()])
+                       if canon_declares else contextlib.nullcontext())
+        with canon_patch, topology_patch, \
+             mock.patch.object(release_cutoff, "projects",
+                               return_value={"ameesh": project_ref or project()}), \
              mock.patch("ameesh.db.open_db", return_value=db), \
              mock.patch.object(staging_deferred, "baseline",
                                return_value=(base if declared else None)), \
@@ -540,6 +551,39 @@ class CliTest(unittest.TestCase):
              mock.patch.object(staging_deferred, "declare", return_value=row) as declare:
             code = release._catchup(cfg, args)
         return code, declare, db
+
+    def test_a_missing_host_defaults_to_the_canon_server(self):
+        """#7662 : plus de nom d'hôte codé en défaut de la commande."""
+        code, declare, _db = self.run_cmd(host=None)
+        self.assertEqual(code, 0)
+        self.assertEqual(declare.call_args.args[2], HOST)
+
+    def test_the_default_project_reads_the_canon_server(self):
+        """#7662 B : `projects(cfg)` rend un `ProjectRelease` au profil nu.
+
+        Sa topologie vide existe mais n'a aucun hôte : sans `--host`, le
+        serveur staging doit venir du canon, jamais d'un `or` sur l'objet
+        vide. Le repli `topology_for` est ici sans serveur : le test échoue
+        si le canon n'est pas lu d'abord."""
+        bare = release_cutoff.ProjectRelease(
+            name="ameesh", repo="/nowhere", target="main", remote="origin",
+            report="human", github="manaty/ameesh", staging_rights=RIGHTS)
+        self.assertEqual(bare.staging_topology.hosts, ())
+        code, declare, _db = self.run_cmd(
+            host=None, project_ref=bare, canon_declares=True,
+            topology_for=types.SimpleNamespace(server=None))
+        self.assertEqual(code, 0)
+        self.assertEqual(declare.call_args.args[2], HOST)
+
+    def test_a_missing_host_without_a_canon_server_is_refused(self):
+        bare = release_cutoff.ProjectRelease(
+            name="ameesh", repo="/nowhere", target="main", remote="origin",
+            report="human", github="manaty/ameesh", staging_rights=RIGHTS)
+        code, declare, _db = self.run_cmd(
+            host=None, project_ref=bare,
+            topology_for=types.SimpleNamespace(server=None))
+        self.assertEqual(code, 1)
+        declare.assert_not_called()
 
     def test_an_active_right_declares_the_gesture(self):
         code, declare, db = self.run_cmd()

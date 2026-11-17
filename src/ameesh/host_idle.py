@@ -15,15 +15,19 @@ from .host_lifecycle import staleness_s
 
 DONE = frozenset(lifecycle.COMPLETED)
 #: #5905: the run interfaces a host may declare. `none`: nothing runs on the
-#: host outside its turns and leases, so zero runs is a known count.
-RUNS_INTERFACES = ("none",)
+#: host outside its turns and leases, so zero runs is a known count. `guest`
+#: (#7687): the host measures the live offloaded jobs of its guest
+#: (`resources.guest_jobs`), the only interface a lending host can use.
+RUNS_NONE = "none"
+RUNS_GUEST = "guest"
+RUNS_INTERFACES = (RUNS_NONE, RUNS_GUEST)
 #: the source of an undeclared host: unknown for the release, never zero
 RUNS_UNDECLARED = 'aucune interface de déclaration'
 #: a Host card whose `runs_interface` did not parse keeps this value, so it
 #: still contradicts any other card of the host instead of vanishing
 RUNS_INVALID = 'invalid'
-#: a lending host (`policy.lend`, L159b) whatever its card says: guest jobs
-#: offloaded from other hosts run there, and no interface counts them yet
+#: a lending host (`policy.lend`, L159b) whose card did not declare `guest`:
+#: guest jobs offloaded from other hosts run there, and their count is unknown
 RUNS_LENDING = 'lending'
 
 
@@ -32,25 +36,48 @@ def runs_interface(cfg, canons, host):
 
     `RUNS_LENDING` is returned as such, so that the projection names why the
     runs of a lending host stay unknown; it never counts as a declaration.
+    `guest` is the counting interface of such a host (#7687): the count comes
+    from its host measure.
 
-    A Host card that cannot declare (`RUNS_INVALID`, or `RUNS_LENDING` on a
-    lending host) refuses first, even against the configuration and beside
-    a valid card. Then the per-host configuration wins over the Host card.
-    Two Host cards that disagree declare nothing: a run count is never
-    chosen by canon order."""
+    A Host card that cannot declare (`RUNS_INVALID`) refuses first, even
+    against the configuration and beside a valid card. A counting card
+    (`guest`) is never downgraded to `none` by the configuration: a false
+    zero there would kill a guest job. Then the per-host configuration wins
+    over a non-counting Host card. Two Host cards that disagree declare
+    nothing: a run count is never chosen by canon order."""
+    cards = [card for canon in canons or ()
+             for card in getattr(canon, 'hosts', ()) or ()
+             if getattr(card, 'title', None) == host]
     values = {getattr(getattr(card, 'policy', None), 'runs_interface', None)
-              for canon in canons or () for card in getattr(canon, 'hosts', ()) or ()
-              if getattr(card, 'title', None) == host}
+              for card in cards}
     values.discard(None)
-    if RUNS_LENDING in values:
-        return RUNS_LENDING, 'Host card'
-    if any(value not in RUNS_INTERFACES for value in values):
+    if RUNS_INVALID in values:
+        return None, None
+    if any(value not in RUNS_INTERFACES and value != RUNS_LENDING
+           for value in values):
         return None, None
     per_host = getattr(cfg, 'runs_interfaces', None) or {}
-    if isinstance(per_host, dict) and per_host.get(host) in RUNS_INTERFACES:
-        return per_host[host], 'configuration'
-    if len(values) == 1:
-        return next(iter(values)), 'Host card'
+    configured = per_host.get(host) if isinstance(per_host, dict) else None
+    if configured not in RUNS_INTERFACES:
+        configured = None
+    if RUNS_GUEST in values:
+        if configured == RUNS_GUEST:
+            return RUNS_GUEST, 'configuration'
+        if values == {RUNS_GUEST}:
+            return RUNS_GUEST, 'Host card'
+        # a counting card beside another one: they disagree, and `none` may
+        # not turn the count into a proven zero
+        return None, None
+    if RUNS_LENDING in values:
+        # the lending marker is not a declaration: only the counting
+        # interface may be added by the configuration, never `none`
+        if configured == RUNS_GUEST:
+            return RUNS_GUEST, 'configuration'
+        return RUNS_LENDING, 'Host card'
+    if configured is not None:
+        return configured, 'configuration'
+    if values == {RUNS_NONE}:
+        return RUNS_NONE, 'Host card'
     return None, None
 
 
@@ -60,24 +87,43 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
     """Pure projection. None inputs mean unreadable sources, never empty ones.
 
     `runs_declared` (#5905) is the `(interface, origin)` of `runs_interface`;
-    without it the run count stays the undeclared placeholder. `cost` (#5912):
-    the card's cost per state (`cost_states`); it replaces `cost_eur_h`, the
-    cost of the running host.
+    without it the run count stays the undeclared placeholder. `guest`
+    (#7687) counts the live offloaded jobs of the host measure, only on a
+    fresh reading. `cost` (#5912): the card's cost per state (`cost_states`);
+    it replaces `cost_eur_h`, the cost of the running host.
 
     `lots` may be the reduced open-lot projection of `work.activity` (#7327);
     `latest_ts` then carries the latest `updated_at` over every lot, closed
     ones included, so the quiet interval is bounded exactly as with the full
     per-agent lists."""
+    reading = reading or {}
     out = resources.footprint(reading)
     interface, origin = runs_declared or (None, None)
-    if interface in RUNS_INTERFACES:
+    ts = resources.finite_float(reading.get('sampled_ts'))
+    fresh = ts is not None and 0 <= now - ts <= fresh_within
+    runs = 0
+    if interface == RUNS_NONE:
         source = 'runs_interface: %s (%s)' % (interface, origin)
+    elif interface == RUNS_GUEST:
+        # #7687: the count is an observation, never a default. Only a fresh
+        # reading carrying a non-negative integer proves it; a missing,
+        # stale or ill-typed measure leaves the runs unknown, and the release
+        # refuses, instead of turning a guest job into a proven zero.
+        count = reading.get('guest_jobs')
+        if fresh and isinstance(count, int) and not isinstance(count, bool) \
+                and count >= 0:
+            runs = count
+            source = 'runs_interface: %s (%s)' % (interface, origin)
+        else:
+            runs = None
+            source = ('runs_interface: %s (%s), aucune mesure fraîche'
+                      % (interface, origin))
     elif interface == RUNS_LENDING:
         source = RUNS_UNDECLARED + ' (hôte prêteur : travaux déportés non comptés)'
     else:
         source = RUNS_UNDECLARED
     cost = cost or {}
-    out.update(active_turns=None, leases=None, runs=0,
+    out.update(active_turns=None, leases=None, runs=runs,
                runs_source=source, state='busy',
                idle_since=None, capacity=capacity,
                cost_eur_h=cost.get('on', cost_eur_h),
@@ -85,9 +131,7 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
                cost_source=cost.get('source'), cost_problem=cost.get('problem'),
                idle_after_s=idle_after_s, unknown=[])
     unknown = out['unknown']
-    reading = reading or {}
-    ts = resources.finite_float(reading.get('sampled_ts'))
-    if ts is None or not 0 <= now - ts <= fresh_within:
+    if not fresh:
         unknown.append('host sample stale or unreadable')
     if any(out[key] is None for key in ('reserved_cpu', 'reserved_mem_bytes')):
         unknown.append('reserved capacity unreadable')

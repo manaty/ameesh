@@ -79,7 +79,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from . import authority, cose, jcs, p256, storage
+from . import authority, cose, jcs, p256, standing_policy, storage
 from .db import Db, DbError
 from .storage.interface import RegistryLock, RegistryLockError  # noqa: F401 (API publique)
 from .storage.postgres import authenticators as _pg_authenticators
@@ -155,6 +155,13 @@ REPLAY = "replay"
 _NAME = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 _HUMAN_RE = re.compile(r"^human:%s$" % _NAME)
 _MEMBER_RE = re.compile(r"^(human|agent):%s$" % _NAME)
+_AGENT_RE = re.compile(r"^agent:%s$" % _NAME)
+#: #7629 : un motif de cible (dépôt, branche, canal) — `*` et `?` seulement
+#: ont un sens ; tout le reste est littéral.
+_TARGET_MAX = 256
+_CHARTER_LINE_MAX = 512
+_CHARTER_VERSION_MAX = 128
+_TARGETS_MAX = 64
 _ACTION_ID_RE = re.compile(r"^act_[0-9A-Za-z]{26}$")
 _LOGIN_ID_RE = re.compile(r"^lgn_[0-9a-z]{26}$")
 _LOGIN_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
@@ -183,7 +190,13 @@ _LOGIN_FIELDS = _COMMON_FIELDS | {"login_id", "host", "provider", "account", "sc
 #: `device-es256` du même humain) ; ni action ni empreinte d'action
 _ATTACH_FIELDS = _COMMON_FIELDS | {"attach_id", "agent", "host", "tenant", "device_key"}
 _STANDING_FIELDS = _COMMON_FIELDS | {"standing"}
-_STANDING_KEYS = frozenset({"connector", "operations", "class", "max_amount", "currency", "until"})
+#: #7629 : le bénéficiaire, les cibles et la charte sont OPTIONNELS dans le
+#: reçu ; c'est la politique du canon qui décide si leur absence est permise.
+_STANDING_REQUIRED = frozenset({"connector", "operations", "class", "max_amount",
+                                "currency", "until"})
+_STANDING_OPTIONAL = frozenset({"beneficiary", "targets", "charter_line",
+                                "charter_version"})
+_STANDING_KEYS = _STANDING_REQUIRED | _STANDING_OPTIONAL
 _PROOF_FIELDS = {
     "webauthn": (frozenset({"authenticatorData", "clientDataJSON", "signature"}),
                  frozenset({"userHandle"})),
@@ -422,9 +435,11 @@ def _check_standing(standing, iat: int) -> None:
     if not isinstance(standing, dict):
         raise ReceiptError("standing: object expected")
     keys = set(standing)
-    if keys != _STANDING_KEYS:
+    missing = _STANDING_REQUIRED - keys
+    extra = keys - _STANDING_KEYS
+    if missing or extra:
         raise ReceiptError("standing: missing fields %s, extra %s"
-                           % (sorted(_STANDING_KEYS - keys), sorted(keys - _STANDING_KEYS)))
+                           % (sorted(missing), sorted(extra)))
     if not isinstance(standing["connector"], str) or not _IDENT_RE.fullmatch(standing["connector"]):
         raise ReceiptError("standing.connector invalide")
     operations = standing["operations"]
@@ -443,6 +458,37 @@ def _check_standing(standing, iat: int) -> None:
         raise ReceiptError("standing: a non-zero cap requires a currency")
     if _int(standing["until"], "standing.until") <= iat:
         raise ReceiptError("standing.until must be after iat")
+    # #7629 : le bénéficiaire nommé (« agent:<nom> ») ou « avatar » (l'avatar
+    # de l'approbateur et ses clones, résolu à l'enregistrement). Absent = pas
+    # de bénéficiaire : la politique du canon seule peut l'autoriser.
+    beneficiary = standing.get("beneficiary")
+    if beneficiary is not None:
+        if not isinstance(beneficiary, str):
+            raise ReceiptError("standing.beneficiary: \"agent:<id>\" or \"avatar\" expected")
+        if beneficiary != "avatar" and not _AGENT_RE.fullmatch(beneficiary):
+            raise ReceiptError("standing.beneficiary: \"agent:<id>\" or \"avatar\" expected")
+    targets = standing.get("targets")
+    if targets is not None:
+        if (not isinstance(targets, list) or len(targets) > _TARGETS_MAX
+                or any(not isinstance(pattern, str) for pattern in targets)
+                or len(set(targets)) != len(targets)):
+            raise ReceiptError("standing.targets: list of at most %d distinct patterns expected"
+                               % _TARGETS_MAX)
+        for pattern in targets:
+            if (not pattern or len(pattern) > _TARGET_MAX
+                    or any(ord(char) < 32 or ord(char) == 127 for char in pattern)):
+                raise ReceiptError("standing.targets: printable patterns of 1 to %d "
+                                   "characters expected" % _TARGET_MAX)
+    charter_line = standing.get("charter_line")
+    if charter_line is not None:
+        if not isinstance(charter_line, str) or len(charter_line) > _CHARTER_LINE_MAX:
+            raise ReceiptError("standing.charter_line: text of at most %d characters expected"
+                               % _CHARTER_LINE_MAX)
+    charter_version = standing.get("charter_version")
+    if charter_version is not None:
+        if not isinstance(charter_version, str) or len(charter_version) > _CHARTER_VERSION_MAX:
+            raise ReceiptError("standing.charter_version: text of at most %d characters expected"
+                               % _CHARTER_VERSION_MAX)
 
 
 def check_request(request) -> str:
@@ -994,24 +1040,64 @@ def consume_nonce(db: Db, approver: str, nonce: str, *, by: str, exp: int, iat: 
 # approbations permanentes bornées (§8.3)
 # --------------------------------------------------------------------------
 
+def _standing_scope(standing: dict, *, avatar: str | None) -> tuple[dict | None, str]:
+    """Colonnes de portée d'un grant (#7629), ou (None, raison du refus).
+
+    `beneficiary` absent = « aucun bénéficiaire » (`any`) : seul
+    `Policy.check` a pu l'autoriser. `avatar` = l'avatar de l'approbateur et
+    ses clones ; le nom est résolu depuis le canon AVANT l'écriture (le grant
+    est immuable, un avatar renommé plus tard n'élargit rien).
+    """
+    beneficiary = standing.get("beneficiary")
+    if beneficiary is None:
+        return {"beneficiary_kind": "any", "beneficiary": "",
+                "beneficiary_clones": False}, ""
+    if beneficiary == "avatar":
+        if not avatar:
+            return None, ("beneficiary \"avatar\": the approver has no avatar declared "
+                          "by the canon")
+        return {"beneficiary_kind": "avatar", "beneficiary": "agent:%s" % avatar,
+                "beneficiary_clones": True}, ""
+    return {"beneficiary_kind": "agent", "beneficiary": beneficiary,
+            "beneficiary_clones": False}, ""
+
+
 def register_standing(db: Db, receipt, policy: Policy | None = None, *, registered_by: str,
+                      limits: standing_policy.Policy | None = None,
+                      avatar: str | None = None,
                       now: float | None = None) -> tuple[ReceiptVerdict, int | None]:
     """Vérifie un reçu `standing` et enregistre le grant ; consomme son nonce.
 
     Consommation du nonce et insertion du grant sont une seule opération
-    (fonction `ameesh_standing_register`), qui recontrôle les échéances
+    (fonction `ameesh_standing_register_scoped`), qui recontrôle les échéances
     signées (exp, iat, until) APRÈS le verrou de l'authentificateur, à
     l'heure réelle de la base (`now` ne règle que les contrôles Python) : un
     dépassement donne EXPIRED (ou iat_future), sans nonce consommé ni grant.
+
+    `limits` est la politique du canon (`standing_policy.Policy`) : un grant
+    hors durée, hors montant, sans bénéficiaire ou sans charte quand la règle
+    l'exige est refusé (`policy`) AVANT toute écriture, nonce compris.
+    `avatar` est le nom de l'avatar de l'approbateur dans ce canon, résolu par
+    l'appelant ; il sert au bénéficiaire `avatar` (l'avatar et ses clones).
     Renvoie (verdict, id du grant).
     """
     policy = policy or Policy()
+    limits = limits if limits is not None else standing_policy.empty()
     verdict, parsed = _verify(
         db, receipt, policy, kind="standing", expected_digest=None, expected_action_id=None,
         expected_login=None, expect_decision="approve", consume_by=None, now=now)
     if not verdict.ok or parsed is None:
         return verdict, None
     standing = parsed.request["standing"]
+    reason = limits.check(approver=verdict.approver, standing=standing,
+                          iat=parsed.request["iat"])
+    if reason:
+        return dataclasses.replace(verdict, ok=False, code=POLICY,
+                                   reason=reason), None
+    scope, reason = _standing_scope(standing, avatar=avatar)
+    if scope is None:
+        return dataclasses.replace(verdict, ok=False, code=POLICY,
+                                   reason=reason), None
     try:
         grant_id = storage.of(db).grants.register(
             approver=verdict.approver, nonce=verdict.nonce, challenge=verdict.challenge,
@@ -1020,7 +1106,13 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
             action_class=standing["class"], max_amount=standing["max_amount"],
             currency=standing["currency"], exp=parsed.request["exp"],
             iat=parsed.request["iat"], until=standing["until"],
-            clock_skew=policy.clock_skew, registered_by=registered_by)
+            clock_skew=policy.clock_skew, registered_by=registered_by,
+            beneficiary_kind=scope["beneficiary_kind"],
+            beneficiary=scope["beneficiary"],
+            beneficiary_clones=scope["beneficiary_clones"],
+            targets_json=jcs.dumps(standing.get("targets") or []),
+            charter_line=standing.get("charter_line") or "",
+            charter_version=standing.get("charter_version") or "")
     except DbError as exc:
         deadline = _deadline_error(exc)
         if deadline is None:
@@ -1105,10 +1197,13 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
     """Trouve un grant qui couvre l'action et y réserve son montant.
 
     `action` : action_id, connector, operation, class, amount (facultatif),
-    currency (facultatif), canon (facultatif, L44 : '' = canon par défaut).
+    currency (facultatif), proposed_by (bénéficiaire), target (cible),
+    canon (facultatif, L44 : '' = canon par défaut).
     Seuls les grants dont l'authentificateur est déclaré par le canon de
-    l'action la couvrent. Une réservation vivante existante pour l'action est
-    réutilisée en priorité — si elle décrit la même action, sinon ReceiptError
+    l'action, dont le bénéficiaire couvre `proposed_by` (agent nommé, ou
+    avatar et sa lignée de clones) et dont une cible couvre `target` la
+    couvrent. Une réservation vivante existante pour l'action est réutilisée
+    en priorité — si elle décrit la même action, sinon ReceiptError
     (`standing_reserve`). None = aucune couverture.
     """
     action_id = action["action_id"]
@@ -1118,11 +1213,13 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
     live = storage.of(db).grants.live_reservations(action_id)
     candidates = [int(row["grant_id"]) for row in live]
     # simple PRÉ-FILTRE, sans verrou : la décision (révocation, échéance à
-    # l'heure réelle après le dernier verrou, cumul) est refaite par
-    # ameesh_standing_reserve pour chaque candidat
+    # l'heure réelle après le dernier verrou, couverture, cumul) est refaite
+    # par ameesh_standing_reserve pour chaque candidat
     rows = storage.of(db).grants.candidates(action["connector"], action["operation"],
                                             action_class, value, currency,
-                                            canon=action.get("canon") or "")
+                                            canon=action.get("canon") or "",
+                                            proposed_by=action.get("proposed_by") or "",
+                                            target=action.get("target") or "")
     candidates += [int(row["id"]) for row in rows if int(row["id"]) not in candidates]
     for grant_id in candidates:
         reserved = standing_reserve(

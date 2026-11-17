@@ -1,0 +1,222 @@
+# IMA → public module contract: inventory and replacement plan
+
+Document revision 1, 17 November 2026. This is the consumer mapping for
+[contract v1](../api/module-contract-v1.md), requested by
+[#7664 / #5856](https://github.com/manaty/ameesh/issues/5856), under
+[#7636 / #5827](https://github.com/manaty/ameesh/issues/5827).
+Consumer removal is tracked in
+[thepackengers/issue-manager-agent#1803 — native functions](https://github.com/thepackengers/issue-manager-agent/issues/1803).
+Every replacement below is either an existing public command, a named native
+feature to adopt through configuration, or a proposed extension with that
+upstream ticket and a tranche identifier. A proposed extension is not a usable
+API. Implementation lots created by the pilot are listed in the final table.
+
+## Reproducible scope
+
+The IMA default branch `main`, inspected at
+`883d219b37962b39b0a551340f537559ccf26820`, does not contain these integration
+scripts. The inventory uses **`develop` at
+`23e0a944bc82647e929a2cb96b4af3245030354c`**, which does contain them. Compare
+the upgrade branch `ameesh-v1.57.0` at
+`63a017ccc7bc0911f7d4a62516e378e6d81f65eb`: develop adds the Memoria relay
+and forwards the additional accounting keyword in `document_scheduling.py`.
+These are observations of source trees, not proof of the image running in IMA.
+
+The upstream baseline is
+`aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007`. IMA's image definition instead pins
+ameesh v1.57.0, annotated tag object
+`4101332dd3467b26a604170e4f5ce9ccf0f4a2e7`, peeled commit
+`89f32d7da51a0c9f65bcc3da187177615d1dbf4e`.
+Do not mistake the newer upstream baseline or an open PR for an adopted IMA
+feature. Native replacements below require qualification against IMA's chosen
+release before its old implementation is removed.
+
+To reproduce the inventory on a read-only checkout of the IMA SHA:
+
+```sh
+git grep -n -E 'from ameesh[ .]|import ameesh\b|tests.support' -- '*.py'
+git grep -n -E 'AgentWorker|runner.Runner|_tx_lock|agent_mailbox|agent_registry' -- scripts
+git grep -l -E '89f32d7da51a0c9f65bcc3da187177615d1dbf4e|4101332dd3467b26a604170e4f5ce9ccf0f4a2e7|1.57.0'
+```
+
+The first query finds 18 scripts with direct Python ameesh imports and nine
+files importing `tests.support`. It also finds integration-test dependencies
+listed separately below. `document_scheduling.py` receives the imported runner
+as an argument and `ima-db-bridge.py` receives the database implementation;
+they are additional indirect dependencies, not a reason to inflate the direct
+import count. Package-local names such as `ameesh_psycopg` are IMA modules and
+are not counted as ameesh package imports.
+
+All IMA source links below are pinned to the inventory SHA. Filenames in the
+tables are relative to that repository, not this repository.
+
+## The 18 directly importing scripts
+
+Extension keys E1–E3 and fixture/stable work F/S are defined in the final
+table. For every E key, the named upstream ticket is
+[manaty/ameesh#5827](https://github.com/manaty/ameesh/issues/5827);
+the consumer adoption/removal ticket is
+[IMA#1803](https://github.com/thepackengers/issue-manager-agent/issues/1803).
+Existing public commands do not automatically reproduce every check in a
+private helper: the gap column preserves the remaining requirement.
+
+| # | IMA script and internal dependency | Public/native replacement and remaining work |
+| --- | --- | --- |
+| 1 | [`scripts/ameesh-directory-snapshot.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-directory-snapshot.py): `canon.load_yaml/load/validate/errors`, member objects, `ameesh.__file__` | `ameesh canon check` for validation; **E1a** for a public immutable canon/directory snapshot with member metadata, source SHA and freshness. `GET /projects` alone does not return members or their directory metadata. Source-pin validation → S. |
+| 2 | [`scripts/ameesh-mailbox-bridge.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-mailbox-bridge.py): `config`, `db`, `accounts`, `storage`, `mail`, `registry`; raw mailbox/registry/spend queries | Ordinary mail → `agent-mail send`; request observation → `ameesh turn observe --request ID --json` / HTTP `/requests/{request}`. **E2a/E2b** preserve request key dedupe, typed payload, lease-bound pending/reply and reply correlation; **E1b** replaces account/capacity introspection. These guarantees are not provided by generic message send alone. |
+| 3 | [`scripts/ameesh-process-qualification.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-process-qualification.py): `process_workflow`, `process_registry`, `process_verifiers`, `DbError`, `PgTestCase`; synthetic registry rows | Native Process cards through `ameesh canon check/sync`; **F** supplies an external fixture and CLI/API qualification path for acceptance, refusal and verifier outcomes without private workflow imports or synthetic core SQL. Pin checks → S. |
+| 4 | [`scripts/ameesh-reviewer-observation.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-reviewer-observation.py): `registry.get/lease_matches/pending_spend_get/canon_claim_predicate_sql`, raw canon state | `turn current`, `turn observe`, `/agents/{agent}`, `/turns/{turn}`, `/sandbox/turns/{turn}` provide native references; **E1b** supplies the atomic admitted-profile/lease observation and freshness it additionally needs. Missing sandbox or tranche evidence remains unavailable, never invented or treated as admitted. |
+| 5 | [`scripts/ameesh-reviewer-preparation.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-reviewer-preparation.py): `accounts`, `account_budget`, `exploitation`, `registry`, `storage`, private profile digest | Native Kubernetes sandbox turns and turn observation replace a parallel execution/accounting path. **E1b** for read-only prepared admission/capacity evidence (responsible, canon/placement references, lease epoch, bounded budget and limits). It must not reserve spend or launch a Job. Source checks → S. |
+| 6 | [`scripts/ameesh-reviewer-qualification.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-reviewer-qualification.py): `PgTestCase`, accounts/budget/canon/persona/registry/storage internals | **F** for public fixture and API-based preparation/observation checks; **E1b** for the prepared profile; native sandbox/turn references for qualification; pin → S. |
+| 7 | [`scripts/ameesh-role-bridge.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-role-bridge.py): mail/registry imports, raw role mailbox and lease transactions | Generic mail/turn observation plus **E2a/E2b** for atomic `submit_many`, request scope, lease-bound reply and dedupe. Reuse the same generic protocol as document requests; no role-specific core schema. |
+| 8 | [`scripts/ameesh-role-runner.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-role-runner.py): config/db import, dynamically installed Runner replacement, direct `runner.main` | Installed `agent-runner`, governed harness adapters and `--agents-file`; native `own_cgroup` pressure. Account admission qualification → **E1b**; remaining policy/diagnostics → **E3a/E3b**. Remove the placeholder role harness only with real role execution correlated to the native turn/sandbox, tracked in IMA#1803. |
+| 9 | [`scripts/ameesh-runtime-admission.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-runtime-admission.py): `accounts.parse`, direct `account_budgets` SQL | Native governed account admission/budget caps; HTTP `/budget` for observation. **E1b** supplies the admitted profile/capacity check required before runtime startup without exposing credentials. Keep IMA's own provider/endpoint allowlist in IMA. |
+| 10 | [`scripts/ameesh-upgrade-runtime.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-upgrade-runtime.py): `config`, `db`, `migrations`, `cli.main` | Execute `ameesh migrate --dry-run --additive-only` and documented migrate/doctor CLI under existing operator gates. **F** for disposable upgrade fixtures; **S** for pin and qualification across stable versions. This mapping authorizes no migration application. |
+| 11 | [`scripts/document-ameesh-preflight-smoke.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-preflight-smoke.py): `PgTestCase`, canon sync, registry/storage, accounts/budgets, `CostBook/load_prices` | **F** replaces fixture/seed/ledger test internals with public setup and observations. Native canon, `/budget` and `turn observe` for assertions; **E1b** for admission capacity evidence. IMA owns its expected cost examples. |
+| 12 | [`scripts/document-ameesh-preflight.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-preflight.py): config/db/registry, private registry binding reads and package location | `ameesh --version`, public agents/hosts observations and **E1b** for complete admitted binding evidence. Immutable source identity comes from **S**, not `ameesh.__file__`. |
+| 13 | [`scripts/document-ameesh-runner.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-runner.py): canon/config/db imports, `cost.load_prices/max_price_of`, direct bindings, installed monkey patches | Installed `agent-runner --agents-file`; native admission priority and `own_cgroup`; governed canon and budget admission. **E1b** for preflight bindings/capacity; **E3a/E3b** for policy/diagnostics; **E2c** for interrupted request replay. IMA's business binding restrictions stay in its module. |
+| 14 | [`scripts/document-canon-check.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-canon-check.py): `canon`, `canon_sync`, `config`, `db` and package/source checks | `ameesh canon check/sync`; **E1a** for source SHA and monotonic snapshot admission evidence. Synchronization must retain existing canon authority checks. Pin → **S**. |
+| 15 | [`scripts/document-container-pressure.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-container-pressure.py): Runner subclass, `host_pressure`, `_pressure_lock`, replacement of `self.db._tx_lock` | Native canon `policy.resources.pressure_scope: own_cgroup`, resource thresholds and native shared-connection admission priority (`admission_lock`, on by default). Native priority boosts awakened/control work, not a permanent document-agent class: **E3b** must qualify IMA's latency/fairness requirement before removal. CPU/throttling/request-limit threshold parity must be checked, not assumed. |
+| 16 | [`scripts/document-runtime-handover.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-runtime-handover.py): Runner shutdown subclass, worker locks/epoch/host_yield, raw mailbox and registry updates | Native drain/withdrawal is the control path; **E2c** adds core-owned interrupted-request requeue with captured lease identity, exact request IDs and reply-race protection. No external callback writes restored prompts. |
+| 17 | [`scripts/document-session-policy.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-session-policy.py): AgentWorker overrides `current_session`, `session_policy`, `context_max_tokens`, `run_turn`, `_attendre_reprise` | Existing session configuration plus **E3a** for per-agent declarative fresh-session/context policy and bounded failure retry. The public contract does not freeze the optional `harness` argument of `context_max_tokens`. |
+| 18 | [`scripts/memoria-avatar-relay.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/memoria-avatar-relay.py): config/db/mail/registry; mailbox history and advisory locking for cursor/dedupe | Public mail send plus **E2a** generic scoped idempotent submission/history cursor. Memoria masking, aggregation, 72-hour horizon, daily recap and source cursor remain IMA logic; ameesh supplies durable mail identifiers and atomic dedupe, without a Memoria-specific table or endpoint. |
+
+## Indirect runner and connection dependencies
+
+These rows complete the dependency inventory even though they are not additional
+direct package imports. All adoption/removal remains in IMA#1803.
+
+| IMA file / usage | Replacement and boundary |
+| --- | --- |
+| `scripts/document_scheduling.py`: `install_worker_diagnostics(runner)` replaces AgentWorker; overrides `_compta_ecrit`, `budget_ok`, `_held_by_pressure`, `host_ready`, `workdir_ready` | Native turn/accounting and `turn observe` keep the reservation ledger authoritative. **E3b** exposes bounded structured deferral reasons; unknown/ambiguous ledger evidence retains native reservations and never creates a second settlement path. |
+| `scripts/document_scheduling.py`: `PriorityAdmission`, attached by the pressure module to `_tx_lock` | Native shared-connection admission lock with FIFO, aging and bounded control burst; **E3b** qualifies document-vs-role latency and starvation behavior. If a native priority policy is missing, add it in that tranche through declared scheduling policy, not a public lock pointer. |
+| `scripts/ima-db-bridge.py`: receives private database module, calls `connect/DbError`, wraps connection via `__getattr__`, rewrites DSN application name | Migrate bridge operations to long-lived HTTP/CLI APIs and E1/E2. Connection limits, retry and database admission stay in the core. IMA may still limit its subprocess count, but must not need the core driver object or its locks. |
+| `scripts/rehearse-ameesh-upgrade.py`: pinned source, copied test fixture/source runner in disposable upgrade exercise | **F/S**, a consumer-owned disposable database fixture plus public executable/API contract. Running upstream private tests may be an optional source qualification tool, never an installed-module dependency. |
+
+## Core SQL access requiring removal
+
+| Core objects / current purpose | Replacement (named upstream ticket #5827, consumer IMA#1803) |
+| --- | --- |
+| `agent_mailbox`: pending delivery, request/reply lookup, payload filtering, request key reuse and Memoria relay history | **E2a/E2b**. Typed payload is module-owned data; request identity, visibility, idempotency and transactionality belong to the core. Public ordinary mail and turn/request observations remain usable immediately. |
+| `agent_registry`: checking owner/epoch/lease expiry, `FOR UPDATE`, changing `pending_prompt` and status during shutdown | **E1b** read-only admitted-profile observation, **E2b** fenced reply, **E2c** core-owned replay. `agent_mesh_overview` can replace fleet display, not authorization under a mutable lease. |
+| `spend_pending` and ledger joins: match mailbox delivery to native turn/reservation and determine whether a request is still current | Native `turn current` and `turn observe`; **E1b/E2b** for atomic protocol checks. Never publish a writable reservation capability. |
+| `canon_state`, account/budget/binding tables: freshness, provider limits and admission preparation | **E1a/E1b** and native canon/budget APIs; return redacted facts and opaque references instead of raw credentials or core tables. |
+| Core SQL in synthetic tests (`INSERT`, `UPDATE`, `DELETE` on registry/mail/budget/ledger) | **F**: consumer-owned isolated fixtures using public setup/operations; no test-only production bypass. |
+
+## All nine `tests.support` consumers
+
+The replacement for every row is **F**, upstream
+[#7665 / #5857](https://github.com/manaty/ameesh/issues/5857), with removal and
+public-fixture adoption in IMA#1803. Pin fixture API alongside the contract;
+do not move `tests.support` to another private import path.
+
+| IMA file | Public fixture / assertion to retain |
+| --- | --- |
+| `scripts/ameesh-process-qualification.py` | Disposable Process-card admission, verifier success/refusal and journal observation. |
+| `scripts/ameesh-reviewer-qualification.py` | Prepared native profile, lease mismatch, budget refusal and no unauthorized dispatch. |
+| `scripts/document-ameesh-preflight-smoke.py` | Canon binding, account/capacity refusal and native turn accounting. |
+| `tests/integration/ameesh_mailbox_test.py` | Correlated request/reply, retry/dedupe and native ledger reference. |
+| `tests/integration/data_scientist_usage_test.py` | Consumer-owned usage examples; native budget/accounting observation. |
+| `tests/integration/document_codex_usage_test.py` | Native usage reporting without importing `CostBook` or storage writers. |
+| `tests/integration/document_housekeeping_test.py` | Refused/deferred work observed through CLI/API instead of constructing AgentWorker. |
+| `tests/integration/memoria_avatar_relay_test.py` | Idempotent relay delivery with module-owned payload/cursor, using E2a. |
+| `tests/integration/migration_budget_test.py` | Public migration dry-run, budget behavior and accounting observations on an isolated fixture. |
+
+Other direct private imports also occur in
+`tests/integration/document_listen_test.py`,
+`tests/integration/document_priority_test.py`,
+`tests/integration/job_bridge_application_name_test.py`, and
+`tests-integration/memoria-corpus-native-fixture.py`.
+They are **F + IMA#1803** work as well: listen/reply through E2b,
+priority through E3b, public native request/turn correlation rather than
+driver application-name assertions, and module-owned corpus setup respectively.
+`document_listen_test.py` also changes delivery/lease/prompt fields in SQL;
+the fixture must recreate those races through its controlled process lifecycle.
+
+## Version pin inventory
+
+The original request reports 17 files. At the frozen develop SHA, the literal
+tag-object, peeled-commit or `1.57.0` search finds **16 executable/config/test
+files**, plus three historical knowledge documents. This is a source-snapshot
+difference, not a claim that any duplication has already been removed.
+Every row below has replacement **S**, upstream
+[#7666 / #5858](https://github.com/manaty/ameesh/issues/5858), consumer IMA#1803.
+One immutable manifest must drive all executable checks. Historical upgrade
+evidence may retain its old version as history, identified as such.
+
+| IMA file | Treatment |
+| --- | --- |
+| `.github/workflows/pr-ci.yml` | Read the single manifest for source/test qualification. |
+| `Dockerfile` | Build from the manifest tag object and verify its peeled commit. |
+| `document-agent-channel.js` | Derive the advertised installed version. |
+| `helm-issue-manager/Chart.yaml` | Generate application version metadata. |
+| `scripts/ameesh-directory-snapshot.py` | Use manifest identity, then public snapshot E1a. |
+| `scripts/ameesh-process-qualification.py` | Use manifest identity and F. |
+| `scripts/ameesh-reviewer-preparation.py` | Use manifest identity and E1b. |
+| `scripts/ameesh-upgrade-runtime.py` | Read source/target manifest identities. |
+| `scripts/document-ameesh-preflight.py` | Read manifest and installed public version. |
+| `scripts/document-canon-check.py` | Read manifest and E1a source identity. |
+| `scripts/rehearse-ameesh-upgrade.py` | Read source/target manifest identities. |
+| `tests-integration/ameesh-upgrade.cjs` | Parameterize by the two manifests. |
+| `tests-integration/ameesh-work-bindings.cjs` | Read fixture's version from the manifest. |
+| `tests-integration/document-runtime-image.cjs` | Compare actual image/source identity with manifest. |
+| `tests-integration/memoria-corpus.cjs` | Read native fixture identity from manifest. |
+| `tests/ameesh-release.test.js` | Assert consumers derive metadata from one manifest. |
+| `knowledge/operations/ameesh-v157-migrations.json` | Keep historical migration evidence; label its source/target versions. |
+| `knowledge/operations/ameesh-v157-upgrade.md` | Keep historical upgrade evidence; link current manifest procedure. |
+| `knowledge/operations/mesh-host-onboarding.md` | Replace current installation instructions with manifest procedure; retain dated historical examples only. |
+
+## Native adoption and qualification
+
+IMA#1803 names six already shipped native functions. Their availability does
+not by itself establish equivalence with every IMA override:
+
+| Native function | IMA replacement / qualification |
+| --- | --- |
+| Container pressure from `own_cgroup` | Replace `DocumentRunner.host_pressure`; compare container memory, CPU/throttling thresholds, unknown readings and admission behavior (E3b). |
+| Process cards | Replace custom workflow assembly through public canon/Process admission; qualify verifier and refusal cases (F). |
+| Priority admission lock | Remove `_tx_lock` replacement after awakened documents/roles and background fairness satisfy the measured acceptance case (E3b). |
+| `turn current`, `turn observe` | Replace copied reservation/lease interpretation where the public document suffices; retain atomic write gaps under E2b. |
+| Kubernetes sandbox turns | Replace the placeholder-harness/parallel real-execution pattern only after native Job/turn/result/cost correlation is proven; E1b supplies preparation evidence, IMA#1803 owns adoption. |
+| HTTP `/api/v1` | Replace agents/hosts/budget/work/turn display and ordinary control bridges now; E1/E2 cover missing directory, profile and correlated mail operations. |
+
+The two API consumers must keep unknown cost, expired lease, stale canon,
+missing sandbox correlation and missing tranche admission as distinct states.
+No absence is permission, successful settlement or zero spend.
+
+## Implementation tranches for the pilot
+
+Each row is at most one working day. The pilot created lots #7669–#7675
+(mesh-design, 17 November 2026, message #223560), all under named upstream
+#5827 with consumer removal in IMA#1803. E1a is implemented by the
+[public snapshot CLI](../api/canon-snapshot-v1.md); the other rows remain
+delivery work, not available APIs. F/S are the existing qualification/stable
+lots. Each upstream delivery needs a corresponding removal commit
+referenced in IMA#1803 before the external request closes.
+
+| Key | Estimate | Deliverable and acceptance | Dependencies / owner of next step |
+| --- | --- | --- | --- |
+| E1a (#7669) | 6 h | Read-only versioned canon/directory snapshot API: immutable source SHA, scope/trust/freshness, member metadata, validation findings; stale or moving source refuses authority. Test equivalent of `read_snapshot`, including monotonic source and metadata. | Implementation lot under #5827; IMA#1803 adopts it. |
+| E1b (#7670) | 8 h | Read-only prepared admission/profile API: responsible and admitted canon/placement references, live lease owner/epoch, bounded redacted budget/capacity/limits, native turn/sandbox refs where available. Atomic consistent read; no claim, reservation, dispatch or credentials. Missing correlation explicitly unavailable. | Implementation lot under #5827 after E1a; IMA#1803 removes preparation/observation SQL. |
+| E2a (#7671) | 6 h | Generic typed mail submission/history API with actor/scope checks, durable request IDs, scoped idempotency keys and bounded batch submission. Same key/same content reuses ID; conflicting content refuses; concurrent retries make one durable submission. Module-owned payload supports role/document/Memoria without core-specific business fields. | Implementation lot under #5827; IMA#1803 removes submit/history SQL. |
+| E2b (#7672) | 8 h | Lease-fenced pending/reply operation tied to request ID and native turn: expired/replaced epoch refuses; one correlated reply across concurrent retry; native spend marker stays authoritative. Test request/reply races and visibility. | Implementation lot under #5827 after E2a; IMA#1803 removes reply and lease SQL. |
+| E2c (#7673) | 6 h | Core-owned interrupted-request replay at drain/shutdown: exact captured lease/request set, already-replied exclusion, preserve unrelated pending prompt, no duplicate reservation or response. Test shutdown before Popen publication and concurrent reply. | Implementation lot under #5827 after E2b; IMA#1803 removes HandoverRunner. |
+| E3a (#7674) | 6 h | Declarative per-agent fresh-session/context and bounded refusal-retry policy consumed by the runner; no AgentWorker subclass. Test document and ordinary agent side by side, optional harness handling, failure delay and graceful shutdown. | Implementation lot under #5827; IMA#1803 removes session monkey patch. |
+| E3b (#7675) | 6 h | Native pressure/admission qualification and structured bounded deferral observation. Native `own_cgroup`, budget/ledger and lock stay authoritative; fairness/latency witness for awakened document vs role/background, ambiguous accounting retained. Add missing declarative policy only if witness proves a gap; no arbitrary runner callback or lock replacement. | Implementation lot under #5827; IMA#1803 removes pressure/scheduling subclasses. |
+| F | 8 h | External module witness and public fixture/setup/observation protocol; contract element → test matrix, deliberate break witness. Include fixture use for Process, usage, refusal and mail races without importing upstream tests. | Existing #7665 / #5857; pilot may split fixture work further if needed. |
+| S | 6 h | Deterministic weekly stable designation, immutable consumer manifest and one unchanged witness across consecutive stables; all current checks derive from manifest. | Existing #7666 / #5858; publication and adoption retain their own gates. |
+
+For #7665, the minimum contract coverage matrix is:
+
+| Contract element | Required witness |
+| --- | --- |
+| Compatibility | Compare released baseline and candidate inputs/results; deliberate removed field or changed required argument fails the expected test. |
+| CLI | Installed executables, documented JSON schemas, status/refusal behavior; no dispatcher imports. |
+| HTTP | All documented methods/paths and schemas, identity/visibility, pagination, SSE resume/reset/delayed behavior and idempotency where promised. |
+| Module | Real external distribution, discovery/refusals, descriptor and capability checks, canon-scoped activation, CLI help with no DB, audit/store named operations; default and bare test profiles. |
+| Runner | Supported harness/config/admission-file protocol and native turn context/observation; add E1–E3 witnesses only when those surfaces are implemented. |
+| Named SQL views | Explicit admitted columns, result types/meaning, column ACL retention and read-only consumer behavior. |
+| Fixture | Installed consumer can create/tear down its isolated witness using only the fixture's published protocol, with no core table writes or `tests.support`. |
+| Stable/pin | One consumer manifest, actual executable/image identity, unchanged witness on two consecutive stable versions (with S). |
+
+No code removal, migration, deployment or release is performed by this document.

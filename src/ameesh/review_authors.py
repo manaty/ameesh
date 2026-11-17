@@ -5244,9 +5244,15 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
 #: #7252 : une citation de commit retiré dans le message de réécriture de
 #: l'auteur (7 à 40 caractères hexadécimaux). Un identifiant de B (`#40556`)
 #: n'a pas cette longueur. Les empreintes nommées checksum/sha256 sont
-#: écartées avant toute résolution Git (#7576).
+#: écartées avant toute résolution Git (#7576). Le nom complet d'un paquet
+#: horaire (`h-AAAAMMJJ-NN`) est un identifiant, pas une citation : sa date
+#: (huit chiffres hexadécimaux) est consommée avec lui (#7709). Une citation
+#: avec tiret (`correctif-<sha>`) reste lue et résolue : l'exclusion ne vaut
+#: que pour l'identifiant reconnu, jamais pour un mot quelconque (B/P2
+#: auditeur).
 _CITED_COMMIT = re.compile(
     r"\b(?:checksum|sha256)\s+[0-9a-f]+\b"
+    r"|\bh-\d{8}-\d+\b"
     r"|(?P<commit>(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f]))",
     re.IGNORECASE)
 

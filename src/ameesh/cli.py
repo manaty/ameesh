@@ -2507,6 +2507,15 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
                                  % ", ".join(exceptions) if exceptions else
                                  "UID isolation required; active host peers disable transport",
                                  memory_note))
+    # #7682 : un dépôt de mémoire de persona que cet hôte ne peut pas ouvrir
+    # (HTTPS, ou SSH sans persona_memory.ssh_key) — signalé, sans changer le
+    # verdict : l'exécuteur le dit à l'agent dans son tour et publie le défaut.
+    try:
+        from . import hostcheck as hostcheck_mod
+        for line in hostcheck_mod.memory_transport_lines(cfg, canons):
+            print(line)
+    except Exception as exc:  # noqa: BLE001 - un diagnostic ne casse jamais le doctor
+        print("memory     : repositories not checked (%s)" % exc)
     # #3103 : un pont Docker sur le réseau local de l'hôte (incident #3092) ;
     # lu avant la base, injoignable quand le réseau local est capté
     from . import netcheck

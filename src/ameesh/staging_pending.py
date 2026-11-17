@@ -337,6 +337,7 @@ def inspect(cfg, db, project, *, now: float) -> dict:
 def apply(cfg, db, project, *, now: float, actor=None) -> dict:
     """Pilot/bureau gesture: the usual staging script, no version or tag."""
     from . import release_cutoff as rc, staging_watch, work
+    project = rc.with_staging_topology(cfg, project)
     work.corrector(cfg, db, actor, what="staging", history=False)
     started = time.monotonic()
     # Nonblocking lease: never wait through a cutoff then use an old plan.

@@ -171,8 +171,10 @@ def capture(cfg, db, binding, event: str, data: dict) -> dict | None:
             return None
     name = binding.name
     turn, seq = next_ids(cfg, name, session, event)
-    # B1 (relecture cx2) : le fil de la persona, jamais celui de l'opérateur
-    project = fil.project_for(cfg, fil.agent_project(registry.get(db, name)))
+    # B1 (relecture cx2) : le fil de la persona, jamais celui de l'opérateur.
+    # #7668 : un avatar (ou une fiche sans projet) garde sa conversation dans
+    # le journal ; le projet par défaut n'est plus un repli.
+    project = fil.conversation_project(db, cfg, registry.get(db, name))
     log = conversation.Log(db, cfg, agent=name, project=project)
     event_id = "attach:%s:%s:%d" % (session, turn, seq)
     turn_ref = "attach:%s" % turn

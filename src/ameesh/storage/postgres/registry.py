@@ -57,6 +57,8 @@ AGENT_COLUMNS = """
     canon_ref, canon,
     -- L165 (EP1) : relève (`hote`/`election`) et hôtes candidats d'un rôle élu
     releve, candidats,
+    -- #7632 (0588) : cadence de réveil déclarée par la fiche
+    reveil,
     ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,
@@ -414,8 +416,8 @@ OVERVIEW_SQL = ("""
                    -- #3460 : retrait (la vue ne porte pas la colonne)
                    extract(epoch from (j.__row->>'retired_at')::timestamptz)::float8
                        AS retired_ts,
-                   chantier, harness, host, cwd, session_id, status, status_text,
-                   model,
+                   chantier, harness, host, cwd, session_id, session_account,
+                   status, status_text, model,
                    -- #4293 : colonne absente de la vue figée ; lue sur la ligne
                    j.__row->>'harness_bin' AS harness_bin,
                    budget_usd, spent_usd, turns, pending_prompt, last_error,
@@ -1072,7 +1074,10 @@ class Leases(interface.Leases):
         # L165 (EP3) : une relève n'est croisée que si la ligne était encore
         # chez un AUTRE hôte. Le brief ne peut alors pas être un reste d'un
         # tour local : la session de l'ancien hôte n'est jamais reprise ici.
-        takeover = """(p.brief IS NOT NULL AND r.releve IN ('election', 'preference')
+        # #7680 : seuls les rôles ÉLUS passent par un brief ; un agent
+        # `preference` ne change jamais d'hôte ainsi — sa conversation suit
+        # `conversation_moves` et la ligne est déjà chez la cible au claim.
+        takeover = """(p.brief IS NOT NULL AND r.releve = 'election'
                        AND verrou.host IS DISTINCT FROM __H__)"""
         r5 = """CASE
                            WHEN r.current_prompt IS NOT NULL
@@ -1159,7 +1164,10 @@ class Leases(interface.Leases):
                        ELSE r.current_prompt END,
                    -- L165 (EP3) : briefing persisté de la relève, consommé par
                    -- le nouveau détenteur ; aucune session ne traverse un hôte.
+                   -- #7680 : un agent `preference` n'a jamais de brief (un
+                   -- reste d'une ancienne version est effacé au claim).
                    election_brief   = CASE WHEN __TAKEOVER__ THEN p.brief
+                                           WHEN r.releve = 'preference' THEN NULL
                                            ELSE r.election_brief END,
                    -- L165 (EP3) : aucune session ne traverse un hôte. La
                    -- remise à zéro est durable (`session_reset_at`), donc un
@@ -1200,8 +1208,12 @@ class Leases(interface.Leases):
                -- jamais sans brief. Sans lui, la ligne changerait d'hôte en
                -- gardant la session et le compte de l'ancien (le contrat médié
                -- force le brief à null) : le CAS refuse, sans rien écrire.
-               AND (r.releve NOT IN ('election', 'preference') OR verrou.host = __H__
-                    OR p.brief IS NOT NULL)
+               -- #7680 : un agent `preference` ne se réclame JAMAIS de
+               -- l'autre hôte, brief compris ; le déplacement de conversation
+               -- a déjà mis la ligne chez la cible (`verrou.host = H`).
+               AND (r.releve NOT IN ('election', 'preference')
+                    OR verrou.host = __H__
+                    OR (r.releve = 'election' AND p.brief IS NOT NULL))
                -- #6134 : le même identifiant d'exécuteur ne reprend pas un
                -- tour EN COURS tant que son bail est vivant. L'ancien
                -- processus ne verrait la perte de son epoch qu'au battement

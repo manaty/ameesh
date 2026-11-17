@@ -296,11 +296,21 @@ def session_account(worker, items) -> str | None:
     None sans session (ouverture : le choix est libre). Session d'avant L30
     (aucun compte noté) : le compte déclaré dont le dossier est celui que le
     harnais prend par défaut, s'il y en a un.
+
+    #7712 : un nom de compte n'a de sens que dans son harnais (« primaire »
+    existe aussi chez Codex). Une session ouverte sous un autre harnais ne
+    fournit donc aucune origine au harnais demandé : elle vaut « pas de
+    session » pour lui. Sans cette borne, l'auditeur revenu de Codex vers
+    Claude proposait une bascule depuis « primaire » qui contredisait sa
+    dernière bascule effective.
     """
     try:
         if not worker.current_session():
             return None
     except Exception:
+        return None
+    harness = items[0].harness if items else own_harness(worker)
+    if session_harness(worker) != harness:
         return None
     name = _session_account(worker)
     if name:
@@ -447,9 +457,11 @@ def apply(worker, env: dict, compte) -> bool:
         worker.fail_turn("account unusable", str(exc))
         return False
     if not begin_switch(worker, compte):
+        from . import account_rotation
         registry.restore_prompt(worker.db, worker.name, worker.runner.runner_id, worker.epoch)
         registry.set_status(worker.db, worker.name, 'queued',
-                            status_text='account wave changed; retry next turn')
+                            status_text=account_rotation.WAVE_PREFIX
+                            + 'changed; retry next turn')
         return False
     return True
 
