@@ -120,6 +120,20 @@ SIGNED_VERSION = 1
 #: un nom d'hôte dans l'attestation : simple et borné (jamais une option).
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 
+#: #7719 : variables par lesquelles une session native liée dit son identité
+#: à ses outils. Les harnais passent l'identifiant de session à leurs hooks
+#: (JSON `session_id`) ; quand ils le posent aussi dans l'environnement des
+#: commandes, les hooks Git le lisent sans dépendre de l'ascendance du
+#: processus — c'est le cas d'une session Codex native, dont les outils ne
+#: descendent pas du processus lié. `AMEESH_SESSION_ID` est la forme
+#: explicite ; le harnais vient alors d'`AMEESH_HARNESS`.
+SESSION_ENV = (
+    ("AMEESH_SESSION_ID", ""),
+    ("CODEX_SESSION_ID", "codex"),
+    ("CLAUDE_SESSION_ID", "claude"),
+    ("DSH_SESSION_ID", "deepseek"),
+)
+
 
 class ProvenanceError(Exception):
     """Preuve incohérente ou identité d'écriture incomplète : on refuse."""
@@ -166,6 +180,47 @@ def _revoked_error(subject: str, revoked) -> ProvenanceError:
            _at_text(revoked.get("at_ts")), revoked.get("reason") or "?"))
 
 
+def _session_receipt_binding(db, row) -> dict | None:
+    """#7719 : la liaison qui porte un reçu de session, ou None.
+
+    Un reçu `turn = "session:<id>"` ne vaut que s'il nomme une session
+    réellement liée à cet acteur et à ce harnais (toute liaison, révoquée
+    comprise : la révocation d'une liaison ne réécrit pas une preuve passée).
+    Un reçu de session forgé, ou rattaché à la liaison d'un autre agent, est
+    une preuve incohérente : la porte le refuse au lieu de le lire.
+
+    #7725 : l'identité d'ÉMISSION de la veille (`veille`) n'a pas de boîte
+    lue ; une liaison à elle ne donne plus d'identité, et l'écriture d'un reçu
+    le refuse désormais. Un reçu `session:` qui la nomme n'est donc pas une
+    preuve : le lire laisserait la porte créditer une identité que le mesh
+    n'accepte plus."""
+    from . import session_bindings
+    session = str(row.get("session") or "").strip()
+    actor = str(row.get("actor") or "").strip()
+    harness = str(row.get("harness") or "").strip().lower()
+    if not session or not actor or not harness:
+        return None
+    try:
+        rows = session_bindings.listing(db, include_revoked=True)
+    except Exception as exc:  # noqa: BLE001 - une lecture impossible refuse
+        raise ProvenanceError(
+            "%s: cannot read the session binding of a session receipt (%s)"
+            % (row.get("subject") or "?", " ".join(str(exc).split())[:120])) from exc
+    for bound in rows or ():
+        if (str(bound.get("session_id") or "").strip() == session
+                and str(bound.get("harness") or "").strip().lower() == harness
+                and _same_agent_identity(db, bound.get("agent"), actor)):
+            refusal = session_bindings.no_read_mailbox_refusal(
+                str(bound.get("agent") or ""))
+            if refusal:
+                raise ProvenanceError(
+                    "%s: session receipt names %s, an identity without a read "
+                    "mailbox (#7725): not a proof (%s)"
+                    % (row.get("subject") or "?", actor, refusal))
+            return bound
+    return None
+
+
 def _receipt(row, *, commit: str, milestone) -> dict:
     """Le reçu aux champs de `train_review.Receipt`."""
     return {
@@ -204,6 +259,11 @@ def receipt_for_commit(db, sha) -> dict | None:
         # ce n'est pas une absence (unknown), c'est une preuve corrompue.
         raise ProvenanceError(
             "%s: proof records commit %s, not the subject" % (subject, row["sha"]))
+    if str(row["turn"] or "").startswith(SESSION_TURN_PREFIX) \
+            and _session_receipt_binding(db, row) is None:
+        raise ProvenanceError(
+            "%s: session receipt names %s/%s, which no binding links"
+            % (subject, row["actor"], row["session"]))
     return _receipt(row, commit=row["sha"], milestone=None)
 
 
@@ -240,6 +300,11 @@ def receipt_for_milestone(db, milestone_id) -> dict | None:
             raise ProvenanceError(
                 "%s: declared sha %r does not resolve the recorded commit %s"
                 % (subject, row["mark_sha"], row["sha"]))
+    if str(row["turn"] or "").startswith(SESSION_TURN_PREFIX) \
+            and _session_receipt_binding(db, row) is None:
+        raise ProvenanceError(
+            "%s: session receipt names %s/%s, which no binding links"
+            % (subject, row["actor"], row["session"]))
     return _receipt(row, commit=row["sha"], milestone={
         "id": row["milestone_id"],
         "actor": row["mark_actor"],
@@ -297,21 +362,255 @@ def _declared_harnesses(reg: dict, name: str):
     return allowed
 
 
-def _bound_session(db, *, actor: str = "", cfg=None) -> dict:
+def session_from_env(environ=None) -> tuple[str, str]:
+    """#7719 : `(harnais, session)` déclarés par l'environnement, ou ("", "").
+
+    Une session native (Codex du poste, par exemple) ne descend pas forcément
+    du processus lié : son outil Git n'est pas un descendant du harnais, et
+    `by_ancestry` ne la retrouve pas. Le harnais, lui, connaît son identifiant
+    de session et le passe à ses hooks ; quand il le pose aussi dans
+    l'environnement des commandes, les hooks Git peuvent le lire. Les variables
+    connues sont réunies, jamais devinées : deux valeurs différentes (ou un
+    harnais inconnu) sont ambiguës et refusées. `AMEESH_SESSION_ID` est la
+    forme explicite, avec `AMEESH_HARNESS`."""
+    from . import session_bindings
+    env = os.environ if environ is None else environ
+    explicit_harness = str(env.get("AMEESH_HARNESS") or "").strip().lower()
+    found = set()
+    for name, harness in SESSION_ENV:
+        value = str(env.get(name) or "").strip()
+        if value:
+            found.add((harness or explicit_harness, value))
+    if not found:
+        return "", ""
+    if len(found) > 1:
+        raise ProvenanceError(
+            "ambiguous session identity in the environment: %s"
+            % ", ".join("%s:%s" % pair for pair in sorted(found)))
+    harness, session = next(iter(found))
+    if not harness:
+        raise ProvenanceError(
+            "AMEESH_SESSION_ID is set without AMEESH_HARNESS: the harness of the "
+            "session is unknown")
+    if harness not in session_bindings.HARNESSES:
+        raise ProvenanceError(
+            "invalid harness %r in the session identity (%s)"
+            % (harness, "|".join(session_bindings.HARNESSES)))
+    if not session_bindings.SESSION_RE.match(session):
+        raise ProvenanceError("invalid session id: %r" % (session,))
+    return harness, session
+
+
+def active_binding(db, cfg, *, session: str, harness: str = "",
+                   required: bool = True) -> dict | None:
+    """#7719 : la liaison ACTIVE de cette session sur cet hôte, ou un refus.
+
+    `harness` est facultatif : sans lui, une session liée sous un seul harnais
+    se résout ; deux harnais pour le même identifiant sont une ambiguïté, pas
+    un choix. La liaison est lue par (hôte, harnais, session) — la clé que
+    `ameesh mail bind` a écrite — jamais par un nom d'agent ou un dossier.
+
+    `required=False` rend None au lieu de refuser une absence : la voie
+    ambiante (variable d'environnement du harnais) retombe alors sur
+    l'ascendance ; un identifiant explicite (`--session`) reste exigeant."""
+    from . import session_bindings
+    session = str(session or "").strip()
+    harness = str(harness or "").strip().lower()
+    if not session or not session_bindings.SESSION_RE.match(session):
+        raise ProvenanceError("invalid session id: %r" % (session,))
+    if harness and harness not in session_bindings.HARNESSES:
+        raise ProvenanceError(
+            "invalid harness: %r (%s)"
+            % (harness, "|".join(session_bindings.HARNESSES)))
+    rows = [
+        row for row in session_bindings.listing(db, host=cfg.host)
+        if str(row.get("session_id") or "").strip() == session
+        and (not harness or str(row.get("harness") or "").strip().lower() == harness)
+    ]
+    if not rows:
+        if not required:
+            return None
+        raise ProvenanceError(
+            "no active session binding for session %s%s on %s (ameesh mail bind)"
+            % (session, (" (%s)" % harness) if harness else "", cfg.host))
+    if len(rows) > 1:
+        raise ProvenanceError(
+            "session %s is bound under %d harnesses on %s (%s): name the harness"
+            % (session, len(rows), cfg.host,
+               ", ".join(sorted(str(row.get("harness") or "?") for row in rows))))
+    return rows[0]
+
+
+def _binding_intervals(db, row) -> list[tuple[float, float | None]]:
+    """#7719 : les intervalles où CETTE session était liée à CET agent.
+
+    Un reçu de session ne vaut que pour un commit fait **pendant** un de ces
+    intervalles : `created_ts <= t < revoked_ts`, ou `t >= created_ts` pour la
+    liaison active. Les liaisons révoquées comptent — le commit était couvert
+    quand il a été fait —, mais l'intervalle d'un AUTRE agent ne compte pas :
+    une session reliée à X, puis à Y, puis de nouveau à X ne réclame pas sous
+    X un commit de l'époque Y (B1 des deux relecteurs du gel 43280). Un commit
+    fait sous `veille` (liaison défectueuse, #7725) n'est couvert par aucune
+    liaison à l'agent : il relève de l'attestation owner, pas d'une réparation.
+
+    Une base illisible rend une liste vide : la garde refuse, jamais muette."""
+    from . import session_bindings
+    host = str(row.get("host") or "")
+    session = str(row.get("session_id") or "").strip()
+    harness = str(row.get("harness") or "").strip().lower()
+    agent = str(row.get("agent") or "").strip()
+    if not (host and session and harness and agent):
+        return []
+    try:
+        rows = session_bindings.listing(db, host=host, include_revoked=True)
+    except Exception:  # noqa: BLE001 - une lecture impossible ne prouve rien
+        return []
+    intervals = []
+    for bound in rows or ():
+        if not (str(bound.get("session_id") or "").strip() == session
+                and str(bound.get("harness") or "").strip().lower() == harness
+                and str(bound.get("agent") or "").strip() == agent):
+            continue
+        start = float(bound.get("created_ts") or 0.0)
+        if not start:
+            continue
+        end = bound.get("revoked_ts")
+        intervals.append((start, float(end) if end is not None else None))
+    return sorted(intervals, key=lambda pair: pair[0])
+
+
+def _binding_covers(intervals, ts: float) -> bool:
+    """#7719 : `ts` tombe-t-il dans un intervalle de liaison à l'agent ?
+
+    Tolérance d'une seconde aux deux bornes (horloges de la base et du dépôt),
+    la même que la borne historique."""
+    for start, end in intervals or ():
+        if ts + 1.0 < start:
+            continue
+        if end is not None and ts >= end + 1.0:
+            continue
+        return True
+    return False
+
+
+def _binding_identity(db, row, *, cfg, actor: str = "", require_pid: bool = False,
+                      families=None) -> dict:
+    """#7719 : l'identité prouvée par une ligne `session_bindings`, ou un refus.
+
+    Une liaison dit (agent, harnais, hôte, session). Elle ne prouve une
+    famille que si l'agent est `externe` au registre, sans bail vivant, et si
+    le harnais de la liaison est celui que le registre (ou l'ensemble
+    `harnesses:` du canon, #7004) lui connaît. Le `turn` rendu est synthétique
+    (`session:<id>`), jamais un tour managé.
+
+    `require_pid` : la voie par ascendance exige le PID (L46/L63). La voie
+    explicite (#7719, session native) ne l'exige pas : la liaison d'une
+    session native est une déclaration humaine, sans processus vérifiable.
+
+    #7725 : une liaison à l'identité d'ÉMISSION de la veille ne donne plus
+    d'identité. Ce chemin d'écriture le refusa déjà à la création ; il le
+    refuse aussi pour une liaison active antérieure, sinon `provenance record
+    --session` contournerait le refus d'`identity._session_binding`."""
+    from . import registry
+    from . import session_bindings
+    name = str(row.get("agent") or "").strip()
+    session = str(row.get("session_id") or "").strip()
+    harness = str(row.get("harness") or "").strip().lower()
+    host = str(row.get("host") or "").strip()
+    if not name or not session or not harness:
+        raise ProvenanceError(
+            "session binding is incomplete (agent, session and harness are required)")
+    if host != str(cfg.host):
+        raise ProvenanceError(
+            "session %s %s is bound on %r, not on %r: a receipt names the host "
+            "of its binding" % (harness, session, host, cfg.host))
+    if actor and str(actor).strip() != name:
+        raise ProvenanceError(
+            "actor %r is not the agent of this bound session (%r)"
+            % (actor, name))
+    if harness not in session_bindings.HARNESSES:
+        raise ProvenanceError(
+            "invalid harness: %r (%s)"
+            % (harness, "|".join(session_bindings.HARNESSES)))
+    if not session_bindings.SESSION_RE.match(session):
+        raise ProvenanceError("invalid session id: %r" % (session,))
+    # #7725 : le refus d'`identity._session_binding` vaut ici aussi ; sans lui,
+    # `provenance record --session` donnerait une identité à la liaison #54
+    # restée sur `veille`, et le reçu contournerait le refus du mesh.
+    refusal = session_bindings.no_read_mailbox_refusal(name)
+    if refusal:
+        raise ProvenanceError(
+            "session %s %s is bound to %s: %s"
+            % (harness, session, name, refusal))
+    if require_pid and not row.get("pid"):
+        raise ProvenanceError(
+            "session %s %s of %s carries no pid: the bound process is not "
+            "proven (re-bind with --pid)" % (harness, session, name))
+    reg = registry.get(db, name) or {}
+    if not reg:
+        raise ProvenanceError(
+            "session binding names %s, absent from the registry" % name)
+    if str(reg.get("mode") or "execute").strip() != "externe":
+        # Liste d'admission, comme le registre (`mode` absent = `execute`).
+        raise ProvenanceError(
+            "%s is an execute agent (runner-driven): a session binding cannot "
+            "prove a family outside a managed turn" % name)
+    if session_bindings.lease_holder(db, name):
+        raise ProvenanceError(
+            "%s holds a live lease (runner-driven): its turns are the proof, "
+            "not a session binding" % name)
+    declared = str(reg.get("harness") or "").strip().lower()
+    allowed = _declared_harnesses(reg, name)
+    if allowed is None:
+        refused = bool(declared) and declared != harness
+        registered = declared
+    else:
+        refused = harness not in allowed
+        registered = ", ".join(allowed)
+    if refused:
+        raise ProvenanceError(
+            "agent %s is registered under %r but its session binding declares "
+            "%r: rebind the session or correct the registry"
+            % (name, registered, harness))
+    if families is not None:
+        if not families:
+            raise ProvenanceError("no model families: the canon cannot be read")
+        if harness not in families:
+            raise ProvenanceError(
+                "unknown harness %r (expected %s)"
+                % (harness, ", ".join(sorted(families))))
+    return {"actor": name, "turn": SESSION_TURN_PREFIX + session,
+            "harness": harness, "session": session, "host": host,
+            "binding_intervals": _binding_intervals(db, row),
+            "source": "session"}
+
+
+def _bound_session(db, *, actor: str = "", cfg=None, environ=None) -> dict:
     """L'identité d'une session liée (`ameesh mail bind`), ou un refus nommé.
 
-    La liaison est lue par l'ascendance du processus : elle doit porter un PID
-    (contrôle L46/L63 de `session_bindings.by_ancestry`) et être active sur cet
-    hôte. L'agent doit être `externe` au registre, sans bail vivant, et le
-    harnais de la liaison doit être celui que le registre lui connaît : deux
-    sources qui divergent ne prouvent rien. #7004 : une identité liée session
-    par session (le bureau : codex sur le PC, claude sur BG) déclare au canon
-    l'ensemble fermé de ses harnais (`harnesses:`, colonne 0573) ; le harnais
-    de la liaison doit alors y appartenir, et c'est LUI que porte le reçu
-    (§11 : la famille est le harnais exécuté). Un ensemble vide, illisible ou
-    portant un harnais inconnu refuse. Le `turn` rendu est synthétique
-    (`session:<id>`) — un reçu de session ne se fait jamais passer pour un tour
-    managé.
+    Deux voies, selon ce que la session peut prouver :
+
+    * **ascendance** (historique, #3985) : la liaison du processus porte un PID
+      ancêtre (L46/L63), et le harnais est retrouvé par `by_ancestry` ;
+    * **identité de session** (#7719) : le harnais pose l'identifiant de
+      session dans l'environnement de ses outils (`CODEX_SESSION_ID`,
+      `AMEESH_SESSION_ID`, …). C'est le cas d'une session native liée, dont
+      l'outil Git ne descend pas du processus lié. La liaison est alors lue
+      par (hôte, harnais, session) — la clé écrite par `ameesh mail bind` —
+      sans exiger un PID qu'une session native ne peut pas fournir. Si la
+      liaison porte un PID, l'identifiant de session ne suffit jamais : le
+      processus doit en descendre (et le PID ne doit pas avoir été réutilisé),
+      sinon on retombe sur l'ascendance (B1 #7719).
+
+    Dans les deux cas, l'agent doit être `externe` au registre, sans bail
+    vivant, et le harnais de la liaison doit être celui que le registre lui
+    connaît : deux sources qui divergent ne prouvent rien. #7004 : une identité
+    liée session par session déclare au canon l'ensemble fermé de ses harnais
+    (`harnesses:`, colonne 0573) ; le harnais de la liaison doit alors y
+    appartenir, et c'est LUI que porte le reçu (§11 : la famille est le harnais
+    exécuté). Un ensemble vide, illisible ou portant un harnais inconnu refuse.
+    Le `turn` rendu est synthétique (`session:<id>`) — un reçu de session ne se
+    fait jamais passer pour un tour managé.
 
     #4485 : la liaison est lue **même si `AGENT_MAIL_NAME` est posé**. Ce nom
     annoncé ne prouve rien à lui seul ; quand il est fourni (`actor`), il doit
@@ -319,8 +618,34 @@ def _bound_session(db, *, actor: str = "", cfg=None) -> dict:
     shell portant encore le nom annoncé masquait une liaison valide."""
     from . import config as config_mod
     from . import identity as identity_mod
-    from . import registry
+    from . import session_bindings
     cfg = cfg or getattr(db, "cfg", None) or config_mod.load()
+    try:
+        harness, session = session_from_env(environ)
+    except ProvenanceError:
+        # Variable ambiante, pas une déclaration explicite : on retombe sur
+        # l'ascendance, qui est une preuve plus forte quand elle existe.
+        harness, session = "", ""
+    if session:
+        row = active_binding(db, cfg, session=session, harness=harness,
+                             required=False)
+        if row is not None and row.get("pid"):
+            # B1 #7719 : une liaison à PID ne se revendique pas par le seul
+            # identifiant de session. Sans ce contrôle, un processus étranger
+            # poserait `CODEX_SESSION_ID` et écrirait au nom de la session
+            # liée, alors que la voie historique exigeait l'ascendance
+            # (L46/L63). `for_hook` vérifie aussi que le PID n'a pas été
+            # réutilisé (heure de démarrage). Sinon, on retombe sur
+            # l'ascendance : elle prouvera ou refusera.
+            _, why = session_bindings.for_hook(
+                cfg, db, str(row.get("harness") or ""),
+                str(row.get("session_id") or ""))
+            if why:
+                row = None
+        if row is not None:
+            return _binding_identity(
+                db, row, cfg=cfg, actor=actor,
+                require_pid=bool(row.get("pid")))
     try:
         binding = identity_mod.resolve_session_binding(cfg, db)
     except Exception as exc:  # noqa: BLE001 - liaison illisible : origine inconnue
@@ -337,45 +662,8 @@ def _bound_session(db, *, actor: str = "", cfg=None) -> dict:
             "no managed turn (AMEESH_TURN_ID): outside a turn, and the session "
             "binding of %s does not hold (%s)"
             % (binding.name or "?", binding.reason or "not bound"))
-    row = binding.session or {}
-    name = str(binding.name or "").strip()
-    session = str(row.get("session_id") or "").strip()
-    harness = str(row.get("harness") or "").strip().lower()
-    if not name or not session or not harness:
-        raise ProvenanceError(
-            "session binding is incomplete (agent, session and harness are required)")
-    if actor and str(actor).strip() != name:
-        raise ProvenanceError(
-            "actor %r is not the agent of this bound session (%r)"
-            % (actor, name))
-    if not row.get("pid"):
-        raise ProvenanceError(
-            "session %s %s of %s carries no pid: the bound process is not "
-            "proven (re-bind with --pid)" % (harness, session, name))
-    reg = registry.get(db, name) or {}
-    if not reg:
-        raise ProvenanceError(
-            "session binding names %s, absent from the registry" % name)
-    if str(reg.get("mode") or "execute").strip() != "externe":
-        # Liste d'admission, comme le registre (`mode` absent = `execute`).
-        raise ProvenanceError(
-            "%s is an execute agent (runner-driven): a session binding cannot "
-            "prove a family outside a managed turn" % name)
-    declared = str(reg.get("harness") or "").strip().lower()
-    allowed = _declared_harnesses(reg, name)
-    if allowed is None:
-        refused = bool(declared) and declared != harness
-        registered = declared
-    else:
-        refused = harness not in allowed
-        registered = ", ".join(allowed)
-    if refused:
-        raise ProvenanceError(
-            "agent %s is registered under %r but its session binding declares "
-            "%r: rebind the session or correct the registry"
-            % (name, registered, harness))
-    return {"actor": name, "turn": SESSION_TURN_PREFIX + session,
-            "harness": harness, "session": session}
+    return _binding_identity(db, binding.session or {}, cfg=cfg, actor=actor,
+                             require_pid=True)
 
 
 def _identity(environ=None, *, actor: str = "", db=None, cfg=None) -> dict:
@@ -412,7 +700,7 @@ def _identity(environ=None, *, actor: str = "", db=None, cfg=None) -> dict:
             try:
                 # Le nom annoncé (s'il existe) doit être celui de la liaison :
                 # une liaison valide le couvre, une autre identité le refuse.
-                return _bound_session(db, actor=who, cfg=cfg)
+                return _bound_session(db, actor=who, cfg=cfg, environ=env)
             except ProvenanceError as exc:
                 if announced:
                     raise ProvenanceError(
@@ -1319,6 +1607,62 @@ def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
     return ident
 
 
+def _commit_git_identity(cwd, sha: str) -> dict:
+    """L'auteur et le committer Git d'un commit, avec leurs instants."""
+    out = _git(cwd, "log", "-1", "--format=%ae%x1f%at%x1f%ce%x1f%ct", sha)
+    if not out:
+        raise ProvenanceError(
+            "commit %s cannot be read in %s" % (sha[:12], cwd or os.getcwd()))
+    fields = str(out).split("\x1f")
+    if len(fields) != 4:
+        raise ProvenanceError("commit %s has an unreadable identity" % sha[:12])
+    try:
+        author_ts = float(fields[1].strip())
+        committer_ts = float(fields[3].strip())
+    except ValueError as exc:
+        raise ProvenanceError(
+            "commit %s has an unreadable date" % sha[:12]) from exc
+    return {"author": fields[0].strip().lower(), "author_ts": author_ts,
+            "committer": fields[2].strip().lower(), "committer_ts": committer_ts}
+
+
+def _refuse_foreign_committer(db, *, sha: str, cwd, actor: str) -> dict:
+    """Refuse un commit créé par un AUTRE agent enregistré (#7719).
+
+    Seul le committer est contrôlé : l'auteur Git peut être celui d'un autre
+    agent — un relecteur qui réécrit un commit conserve l'auteur —, et un
+    committer hors registre (une session native, `codex-pc`) ne contredit pas
+    la liaison. Un committer d'agent enregistré différent de l'acteur, lui,
+    dit que l'objet a été créé par quelqu'un d'autre : la session ne peut pas
+    se l'approprier."""
+    from . import identity as identity_mod
+    from . import registry
+    info = _commit_git_identity(cwd, sha)
+    other = identity_mod.agent_of_git_email(info["committer"], info["committer_ts"])
+    if other and registry.get(db, other) and not _same_agent_identity(db, other, actor):
+        raise ProvenanceError(
+            "commit %s was committed by %s, not by %s: a session cannot record "
+            "another agent's commit" % (sha[:12], other, actor))
+    return info
+
+
+def _carried_by_a_ref(cwd, sha: str) -> bool:
+    """Le commit est-il porté par une ref locale (ou ancêtre de HEAD) ?"""
+    if _git(cwd, "for-each-ref", "--contains", sha, "--count=1",
+            "--format=%(refname)"):
+        return True
+    head = resolve_commit("HEAD", cwd=cwd)
+    if not head:
+        return False
+    try:
+        run = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, head],
+            cwd=cwd or os.getcwd(), capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return run.returncode == 0
+
+
 def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
                   cwd: str | None = None) -> dict:
     """Écrit la preuve exacte d'un commit créé dans ce tour, ou refuse.
@@ -1335,6 +1679,13 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
     inconnue (écart cx3, 15/10 04:37 ; B1 cx2/Codex, 15/10 12:12), jamais
     réattribuée au nouveau tour.
 
+    #7719 : une identité de **session liée** (source `session`) ne porte pas
+    le committer `<agent>@ameesh.invalid` — une session native commite sous
+    l'identité Git de son harnais (`codex-pc` par exemple). La liaison est
+    alors l'identité : on remplace le contrôle du committer par le refus d'un
+    committer qui serait un AUTRE agent enregistré. L'attestation de création
+    reste exigée, elle, dans les deux cas.
+
     Une preuve déjà écrite pour ce commit n'est pas réécrite : une identité
     différente est une erreur."""
     full = full_sha(sha) if FULL_SHA.fullmatch(str(sha or "").strip().lower()) \
@@ -1346,16 +1697,30 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
         raise ProvenanceError(
             "only the current worktree HEAD can be recorded (HEAD is %s, not %s)"
             % ((head or "?")[:12], full[:12]))
-    from .identity import GIT_EMAIL_DOMAIN
-    committer = subprocess.run(
-        ["git", "log", "-1", "--format=%ce", full], capture_output=True, text=True,
-        cwd=cwd or os.getcwd(), timeout=20)
-    email = (committer.stdout or "").strip().lower()
-    expected = ("%s@%s" % (identity["actor"], GIT_EMAIL_DOMAIN)).lower()
-    if committer.returncode != 0 or email != expected:
-        raise ProvenanceError(
-            "commit %s was not committed by %s (committer %r)"
-            % (full[:12], identity["actor"], email or "?"))
+    if identity.get("source") == "session":
+        info = _refuse_foreign_committer(db, sha=full, cwd=cwd,
+                                         actor=identity["actor"])
+        # B1 #7719 : la voie des hooks applique la même garde d'intervalle que
+        # la voie explicite. Le commit doit être HEAD (donc porté par une réf)
+        # ET fait pendant une liaison de la session à cet agent.
+        intervals = identity.get("binding_intervals") or ()
+        if not _binding_covers(intervals, info["committer_ts"]):
+            raise ProvenanceError(
+                "commit %s was committed on %s, outside every interval where "
+                "session %s was bound to %s: refused"
+                % (full[:12], _at_text(info["committer_ts"]),
+                   identity["session"], identity["actor"]))
+    else:
+        from .identity import GIT_EMAIL_DOMAIN
+        committer = subprocess.run(
+            ["git", "log", "-1", "--format=%ce", full], capture_output=True,
+            text=True, cwd=cwd or os.getcwd(), timeout=20)
+        email = (committer.stdout or "").strip().lower()
+        expected = ("%s@%s" % (identity["actor"], GIT_EMAIL_DOMAIN)).lower()
+        if committer.returncode != 0 or email != expected:
+            raise ProvenanceError(
+                "commit %s was not committed by %s (committer %r)"
+                % (full[:12], identity["actor"], email or "?"))
     subject = subject_of_commit(full)
     ops = storage.of(db).provenance
     revoked = ops.revocation(subject)
@@ -1420,6 +1785,112 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
     clear_commit_intent(cwd)
     clear_commit_creation(cwd)
     return row
+
+
+def record_session_commit(db, sha, *, session: str, harness: str = "",
+                          families, lot=None, cwd: str | None = None,
+                          cfg=None) -> dict:
+    """#7719 : écrit la provenance d'un commit poussé depuis une session liée.
+
+    Une session native (Codex du poste) ne descend pas forcément du processus
+    lié et ne commite pas sous `<agent>@ameesh.invalid` : la paire de hooks
+    peut ne rien attester, et `record_commit` refuse un committer hors
+    `<agent>@ameesh.invalid`. La liaison `ameesh mail bind`, elle, dit déjà
+    (agent, harnais, hôte, session). Cette fonction écrit le reçu à partir de
+    cette liaison, sans signature owner commit par commit.
+
+    Ce n'est pas une preuve d'ascendance : c'est une **déclaration de la
+    session liée**, au même titre que la voie par hooks (#3985). Elle est
+    bornée par ce que le dépôt et la base permettent de contredire :
+
+    * la session doit avoir une liaison ACTIVE sur cet hôte, sous un agent
+      `externe` au registre, sans bail vivant, et un harnais admis par le
+      canon (#7004) ; si la liaison porte un PID, le processus appelant doit
+      en descendre (L46/L63) ; une liaison à `veille` est refusée (#7725 :
+      identité d'émission sans boîte lue, elle ne donne pas d'identité) ;
+    * le commit doit avoir été **fait pendant une liaison de cette session à
+      cet agent** (date de committer, tolérance d'une seconde aux bornes) :
+      liaison active (`t >= created_ts`) ou liaison révoquée dont l'intervalle
+      contient `t`. L'intervalle d'un AUTRE agent ne compte pas : une session
+      reliée à X, puis à Y, puis de nouveau à X ne réclame pas sous X un
+      commit de l'époque Y (B1 des deux relecteurs du gel 43280). Un commit
+      fait sous `veille` (liaison refusée, #7725) n'est couvert par aucune
+      liaison à l'agent : il relève de l'attestation owner, pas d'une
+      réparation ;
+    * il doit être **porté par une ref locale** (ou être ancêtre de HEAD) :
+      un objet pendant n'est pas un commit poussé ;
+    * son **committer ne peut pas être un autre agent enregistré** : la
+      session ne s'approprie pas le commit d'un tiers ; un committer hors
+      registre (l'identité Git native du harnais) est admis ;
+    * une preuve déjà écrite fait foi : une autre identité est refusée, et
+      une preuve révoquée n'est jamais ressuscitée.
+
+    Limite dite : sans PID, le processus n'est pas prouvé descendant de la
+    session — la liaison est une déclaration humaine, et la CLI atteste pour
+    elle. C'est le prix d'une session native ; l'owner qui veut la borne plus
+    forte re-lie avec `--pid` quand le harnais le permet."""
+    from . import config as config_mod
+    from . import session_bindings
+    from . import work as work_mod
+    cfg = cfg or getattr(db, "cfg", None) or config_mod.load()
+    full = resolve_commit(sha, cwd=cwd)
+    if full is None:
+        raise ProvenanceError(
+            "commit %r does not resolve to a commit in %s (fetch it first)"
+            % (sha, cwd or os.getcwd()))
+    row = active_binding(db, cfg, session=session, harness=harness)
+    ident = _binding_identity(db, row, cfg=cfg, families=families)
+    subject = subject_of_commit(full)
+    ops = storage.of(db).provenance
+    revoked = ops.revocation(subject)
+    if revoked is not None:
+        raise _revoked_error(subject, revoked)
+    existing = ops.get(subject)
+    if existing is not None:
+        if _same_identity(existing, ident):
+            return dict(existing, recorded=False)
+        raise ProvenanceError(
+            "%s: already recorded for %s/%s, not %s/%s"
+            % (subject, existing["actor"], existing["turn"],
+               ident["actor"], ident["turn"]))
+    if row.get("pid"):
+        # La liaison porte un PID : la voie explicite ne le contourne pas.
+        # `for_hook` vérifie l'ascendance ET que le PID est le même processus
+        # (heure de démarrage, L46/L63) ; un OS qui ne sait pas le dire refuse.
+        _, why = session_bindings.for_hook(
+            cfg, db, ident["harness"], ident["session"])
+        if why:
+            raise ProvenanceError(
+                "session %s carries pid %s, but this process is not its "
+                "descendant (%s): record from the linked session"
+                % (ident["session"], row.get("pid"), why))
+    info = _refuse_foreign_committer(db, sha=full, cwd=cwd, actor=ident["actor"])
+    if not _binding_covers(ident.get("binding_intervals") or (),
+                           info["committer_ts"]):
+        raise ProvenanceError(
+            "commit %s was committed on %s, outside every interval where "
+            "session %s was bound to %s: refused"
+            % (full[:12], _at_text(info["committer_ts"]), ident["session"],
+               ident["actor"]))
+    if not _carried_by_a_ref(cwd, full):
+        raise ProvenanceError(
+            "commit %s is not carried by a local ref (or HEAD): only a pushed "
+            "commit can be recorded by a session" % full[:12])
+    work_item_id = None
+    if lot is not None:
+        item = work_mod.get(db, int(lot))
+        if item is None:
+            raise ProvenanceError("work item #%s not found" % lot)
+        work_item_id = int(item["id"])
+    receipt = ops.add(subject, full, ident["actor"], ident["session"],
+                      ident["turn"], ident["harness"],
+                      work_item_id=work_item_id)
+    if not receipt.get("recorded") and not _same_identity(receipt, ident):
+        raise ProvenanceError(
+            "%s: already recorded for %s/%s, not %s/%s"
+            % (subject, receipt["actor"], receipt["turn"],
+               ident["actor"], ident["turn"]))
+    return receipt
 
 
 #: les hooks posés par `ameesh provenance install` — ils ne bloquent JAMAIS un
@@ -1554,7 +2025,9 @@ def build_parser():
         description="#1465 : preuves exactes d'origine d'un commit et d'un jalon.")
     sub = parser.add_subparsers(dest="command", required=True)
     rec = sub.add_parser("record", help="record the exact origin of a commit")
-    rec.add_argument("--commit", required=True, help="commit id (HEAD accepted)")
+    rec.add_argument("--commit", default="", help="commit id (HEAD accepted)")
+    rec.add_argument("--range", default="",
+                     help="commit range A..B pushed from a linked session (#7719)")
     rec.add_argument("--lot", type=int, default=None, help="attach to a work item")
     rec.add_argument("--quiet", action="store_true")
     rec.add_argument("--json", action="store_true")
@@ -1563,8 +2036,10 @@ def build_parser():
     rec.add_argument("--signed", action="store_true",
                      help="owner-signed provenance, outside a managed turn")
     rec.add_argument("--actor", default="", help="signed actor (external agent)")
-    rec.add_argument("--session", default="", help="signed harness session id")
-    rec.add_argument("--harness", default="", help="signed harness (claude|codex|deepseek)")
+    rec.add_argument("--session", default="",
+                     help="signed session id, or the linked session (#7719)")
+    rec.add_argument("--harness", default="",
+                     help="harness of the session (claude|codex|deepseek)")
     rec.add_argument("--host", default="", help="host where the signed session ran")
     rec.add_argument("--repo", default=".", help="repository holding the commit")
     rec.add_argument("--key", default="",
@@ -1666,6 +2141,9 @@ def main(argv: list[str] | None = None) -> int:
     db = _connect()
     try:
         if args.command == "record" and args.signed:
+            if not args.commit:
+                print("error: --signed requires --commit", file=sys.stderr)
+                return 2
             if not (args.actor and args.session and args.harness and args.host):
                 print("error: --signed requires --actor, --session, --harness "
                       "and --host", file=sys.stderr)
@@ -1688,7 +2166,54 @@ def main(argv: list[str] | None = None) -> int:
                       % (row["subject"], row["actor"], row["session"],
                          row["turn"]))
             return 0
+        if args.command == "record" and args.session:
+            # #7719 : le reçu d'une session liée, sans signature owner commit
+            # par commit. L'acteur vient de la liaison, jamais de --actor.
+            if args.actor:
+                print("error: a session record takes its actor from the binding; "
+                      "--actor belongs to --signed", file=sys.stderr)
+                return 2
+            if bool(args.commit) == bool(args.range):
+                print("error: exactly one of --commit or --range is required "
+                      "with --session", file=sys.stderr)
+                return 2
+            repo = os.path.abspath(args.repo)
+            if args.range:
+                listed = _git(repo, "rev-list", "--reverse", args.range)
+                if listed is None:
+                    print("error: --range %r does not resolve in %s"
+                          % (args.range, repo), file=sys.stderr)
+                    return 2
+                commits = [line.strip() for line in listed.splitlines()
+                           if line.strip()]
+                if not commits:
+                    print("error: --range %r selects no commit" % args.range,
+                          file=sys.stderr)
+                    return 2
+            else:
+                commits = [args.commit]
+            families = compiled_families(db)
+            rows = [
+                record_session_commit(
+                    db, sha, session=args.session, harness=args.harness,
+                    families=families, lot=args.lot, cwd=repo,
+                    cfg=getattr(db, "cfg", None))
+                for sha in commits
+            ]
+            if args.json:
+                print(json.dumps(rows if len(rows) > 1 else rows[0], default=str))
+            elif not args.quiet:
+                for row in rows:
+                    print("provenance recorded (session %s): %s by %s"
+                          % (row["session"], row["subject"], row["actor"]))
+            return 0
         if args.command == "record":
+            if not args.commit:
+                print("error: --commit is required", file=sys.stderr)
+                return 2
+            if args.range:
+                print("error: --range requires --session", file=sys.stderr)
+                return 2
             identity = capture(families=compiled_families(db), db=db)
             if "session" not in identity:
                 identity["session"] = live_session(db, identity["actor"],
