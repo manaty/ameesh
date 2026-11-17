@@ -1,8 +1,10 @@
 # External module public contract, version 1
 
-Contract revision: **1.0, 17 November 2026**. Scope: an installed external
+Contract revision: **1.1, 17 November 2026**. Scope: an installed external
 module and its client processes. Reference: [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
+Revision 1.1 adds the read-only agent observation (CLI `ameesh agent observe`,
+HTTP `/api/v1/agents/{agent}/observation`); it is additive to revision 1.0.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -51,6 +53,7 @@ release's `--help`. These entry points cover the module integration:
 | `agent-runner --agents-file FILE` | Dynamic admission filter; [format and withdrawal](../RUNNER-ADMISSION.md). It narrows canon admission, never grants authority. |
 | `ameesh turn current --json [--expect-turn ID]` | Current turn's versioned authorization document, with identity and database recheck. `--local` omits the database recheck and must not be treated as proof of a live lease. |
 | `ameesh turn observe (--turn ID \| --request ID) --json` | Read-only `ameesh-turn-observation/1`: request, turn, accounting and quiescence. Absence of a known cost is not zero cost. |
+| `ameesh agent observe AGENT [--account-profile NAME] [--json]` | Read-only `ameesh-agent-observation/1`: admitted canon/placement references, responsible, live lease owner/epoch, declared and effective bounds, redacted provider budget and native turn/sandbox references. One repeatable-read snapshot; no claim, reservation, settlement, dispatch or canon synchronization. A missing fact is `null` plus a code in `missing`, never permission or zero cost. |
 | `agent-mail send`, `agent-mail show` | Ordinary governed mail. The help documents flags and stdin. These commands alone do not provide IMA's atomic request/reply/deduplication protocol (E2). |
 | `ameesh migrate --dry-run --additive-only` | Core migration classification; the module does not import or invoke the migration implementation. Actual application retains its operator and staging gates. |
 | `ameesh action propose\|approve\|execute\|reconcile` | Governed action lifecycle; external connector availability is conditional on #7628, below. |
@@ -65,18 +68,32 @@ semantics; do not convert an unavailable observation into permission.
 
 The normative method, path, input and response schemas are the checked-in
 [OpenAPI v1 document](openapi-v1.json), also served at
-`GET /api/v1/openapi.json`. At the baseline there are 34 paths, including the
-discovery document `/.well-known/ameesh`. The path count is an observation, not a
-limit. Only the methods described there are public.
+`GET /api/v1/openapi.json`. At this revision there are 35 paths, including the
+discovery document `/.well-known/ameesh`. Revision 1.0 had 34; revision 1.1
+adds `/api/v1/agents/{agent}/observation`. The path count is an observation, not
+a limit. Only the methods described there are public.
 
 | Area | Public paths (prefix `/api/v1`) |
 | --- | --- |
 | Identity and fleet | `/me`, `/agents`, `/agents/{agent}`, `/hosts`, `/hosts/{host}`, `/projects` |
 | Work and progress | `/lots`, `/lots/{id}`, `/lots/{id}/assign`, `/projects/{project}/progress`, `/projects/{project}/timeline` |
 | Agent interaction | `/agents/{agent}/chat`, `/agents/{agent}/messages`, `/agents/{agent}/peek`, and the documented interrupt/pause/resume/stop methods |
-| Observation | `/requests/{request}`, `/turns/{turn}`, `/sandbox/turns`, `/sandbox/turns/{turn}`, `/events` |
+| Observation | `/agents/{agent}/observation`, `/requests/{request}`, `/turns/{turn}`, `/sandbox/turns`, `/sandbox/turns/{turn}`, `/events` |
 | Governance | `/budget`, `/budget/caps`, `/decisions`, `/alerts`, `/alerts/{key}/ack`, `/actions/{action}/approval-request` |
 | Threads | `/threads/{project}`, `/threads/{project}/{lot}` |
+
+`/agents/{agent}/observation` is built inside one `REPEATABLE READ, READ ONLY`
+transaction and answers the same document as `ameesh agent observe`. It
+performs no claim, renewal, reservation, settlement, dispatch or canon
+synchronization, and it cannot write even the alias-resolution journal. The
+projection is closed: prompts, working directories, session paths, credential
+values or key paths are never selected. Provider budget amounts and the
+billing-account name are included because `/budget` already publishes them.
+`admission.admitted` is the profile verdict (executable mode, responsible when
+the host requires one, fresh canon whose pinned commit is the last good one,
+placement for the current profile); `admission.claim_predicate` is the core SQL
+predicate alone. A fact this observation cannot supply is `null` with a stable
+code in `missing`; it is never permission, admission or zero cost.
 
 Use the server's configured authentication and visibility rules. The client's
 actor, project and lease scope are not elevated by using HTTP. Retry a write
