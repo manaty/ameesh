@@ -61,7 +61,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from . import harnesses
 from . import review as review_mod
 from . import reveil as reveil_mod
-from .config import NAME_RE
+from .config import NAME_RE, SESSION_POLICIES
 from .deadline import Deadline
 
 try:  # facultatif : jamais requis
@@ -1090,6 +1090,30 @@ class Agent:
     #: #7632 : cadence de réveil déclarée (`reveil:`, `reveil.parse`) ; None =
     #: réveil par courrier de l'exécuteur, inchangé.
     reveil: dict | None = None
+    #: #7674 (E3a) : politique de session déclarée par la fiche, consommée par
+    #: l'exécuteur. `None`/`False` = rien de déclaré, les réglages impératifs
+    #: (`ameesh set`) et les défauts de l'exécuteur restent seuls juges.
+    session_policy: str | None = None
+    fresh_session: bool = False
+    context_max_tokens: int | None = None
+    failure_wait_min: int | None = None
+
+    def declared_policy(self) -> dict | None:
+        """#7674 : la politique de session que la fiche déclare, ou None.
+
+        Objet stable écrit au registre (`declared_policy`) et lu par
+        l'exécuteur ; les clés absentes ne sont pas écrites, pour qu'une
+        suppression dans la fiche rende la main au réglage impératif."""
+        policy: dict = {}
+        if self.session_policy is not None:
+            policy["session_policy"] = self.session_policy
+        if self.fresh_session:
+            policy["fresh_session"] = True
+        if self.context_max_tokens is not None:
+            policy["context_max_tokens"] = int(self.context_max_tokens)
+        if self.failure_wait_min is not None:
+            policy["failure_wait_min"] = int(self.failure_wait_min)
+        return policy or None
 
     @property
     def is_persona(self) -> bool:
@@ -4355,6 +4379,50 @@ class _Loader:
         reveil, reveil_problems = reveil_mod.parse(fiche.data.get("reveil"))
         for problem in reveil_problems:
             self.add("agent-reveil-invalid", ERROR, problem, **where, **subject)
+        # #7674 (E3a) : politique de session déclarée. Une valeur illisible est
+        # une ERREUR de fiche (fail closed : l'agent n'est plus réclamable),
+        # jamais un repli silencieux vers un réglage impératif qui changerait
+        # la session ou le contexte de l'agent à son insu.
+        session_policy = _text(fiche.data.get("session_policy"))
+        if session_policy is not None:
+            session_policy = session_policy.strip().lower()
+            if session_policy not in SESSION_POLICIES:
+                self.add("agent-session-policy-invalid", ERROR,
+                         "`session_policy`: %s expected, not %r"
+                         % (" | ".join(SESSION_POLICIES), fiche.data.get("session_policy")),
+                         **where, **subject)
+                session_policy = None
+        fresh_session = False
+        raw = fiche.data.get("fresh_session")
+        if raw is not None:
+            parsed = _card_bool(raw)
+            if parsed is None:
+                self.add("agent-fresh-session-invalid", ERROR,
+                         "`fresh_session`: boolean expected, not %r" % (raw,),
+                         **where, **subject)
+            else:
+                fresh_session = parsed
+        if fresh_session and session_policy not in (None, "jamais"):
+            self.add("agent-session-policy-conflict", ERROR,
+                     "`fresh_session: true` requires no session rotation, but "
+                     "`session_policy: %s` asks for one" % session_policy,
+                     **where, **subject)
+        context_max_tokens = None
+        raw = fiche.data.get("context_max_tokens")
+        if raw is not None:
+            context_max_tokens = _card_tokens(raw)
+            if context_max_tokens is None:
+                self.add("agent-context-max-invalid", ERROR,
+                         "`context_max_tokens`: tokens >= 0 expected (`15000000`, "
+                         "`15M`, `500k`), not %r" % (raw,), **where, **subject)
+        failure_wait_min = None
+        raw = fiche.data.get("failure_wait_min")
+        if raw is not None:
+            failure_wait_min = _card_seconds(raw)
+            if failure_wait_min is None:
+                self.add("agent-failure-wait-invalid", ERROR,
+                         "`failure_wait_min`: duration >= 0 expected (`60s`, `1m`), "
+                         "not %r" % (raw,), **where, **subject)
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -4380,6 +4448,10 @@ class _Loader:
             relit=relit,
             sandbox=self._sandbox_profile(fiche, where, subject),
             reveil=reveil,
+            session_policy=session_policy,
+            fresh_session=fresh_session,
+            context_max_tokens=context_max_tokens,
+            failure_wait_min=failure_wait_min,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -5213,6 +5285,60 @@ def _text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+#: #7674 : formes acceptées par les durées et les compteurs de jetons d'une
+#: fiche Agent — les mêmes suffixes que `ameesh set` (`30m`, `15M`, `500k`).
+_CARD_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smh]?)$", re.I)
+_CARD_TOKEN_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([km]?)$", re.I)
+_CARD_DURATION_FACTORS = {"": 1, "s": 1, "m": 60, "h": 3600}
+_CARD_TOKEN_FACTORS = {"": 1, "k": 1_000, "m": 1_000_000}
+
+
+def _card_bool(value: Any) -> bool | None:
+    """#7674 : booléen de fiche, ou None si la valeur est illisible.
+
+    Accepte aussi les deux textes `true`/`false` entre guillemets : le lecteur
+    YAML minimal du canon ne les convertit pas toujours, et une fiche générée
+    les cite parfois."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "yes", "on", "1"):
+        return True
+    if text in ("false", "no", "off", "0"):
+        return False
+    return None
+
+
+def _card_seconds(value: Any) -> int | None:
+    """#7674 : durée >= 0 en secondes (`60`, `60s`, `1.5m`), None si illisible."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 2 ** 40 else None
+    match = _CARD_DURATION_RE.match(str(value).strip())
+    if not match:
+        return None
+    seconds = float(match.group(1)) * _CARD_DURATION_FACTORS[match.group(2).lower()]
+    if seconds != seconds or seconds > 2 ** 40:
+        return None
+    return int(round(seconds))
+
+
+def _card_tokens(value: Any) -> int | None:
+    """#7674 : compteur de jetons >= 0 (`0`, `250000`, `15M`), None si illisible."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 2 ** 62 else None
+    match = _CARD_TOKEN_RE.match(str(value).strip())
+    if not match:
+        return None
+    tokens = float(match.group(1)) * _CARD_TOKEN_FACTORS[match.group(2).lower()]
+    if tokens != tokens or tokens > 2 ** 62:
+        return None
+    return int(round(tokens))
 
 
 def _utf8_safe(text: str) -> str:
