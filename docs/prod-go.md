@@ -35,3 +35,14 @@ branche de production restent exempts. Les fusions hors outillage ne sont pas co
 La signature créée pour une prod-go couvre au moins son échéance `until`.
 Une approbation pré-signée plus courte est refusée ; l’export et le consommateur
 vérifient également l’échéance signée `expires`.
+
+Une preuve exportée est une capacité bornée et non révocable : elle reste
+utilisable jusqu’à `until` (au plus `expires` signé et la borne canon), même
+si le registre de clés change après l’export. La clé épinglée dans le dépôt
+est l’ancre du runner ; il ne consulte pas le registre du mesh. Toute révocation
+de clé owner entraîne, dans le même tour, le retrait ou le remplacement de
+l’épingle de chaque dépôt consommateur. Sans cette mise à jour, le runner
+continue d’accepter la clé compromise. Annuler les runs déjà partis et tenir
+le verrou pendant la rotation ; une révision déjà chargée conserve son ancienne
+épingle. Les champs d’état du JSON, non signés, ne constituent pas une preuve
+de non-révocation.
