@@ -310,3 +310,30 @@ class MigrationTest(AccordBase):
                 self.assertTrue(has_column(tx))
                 raise Undo()
         self.assertTrue(has_column(self.db))
+
+
+class CompatibiliteN1Test(AccordBase):
+    """CONTRIBUTING « Compatibilité N-1 » : un écrivain N-1 du registre
+    (`storage.postgres.authenticators.insert` d'avant 0586) ignore
+    `accord_operations` ; le défaut `'[]'` suffit et le nouveau lecteur
+    refuse la clé fichier, comme avant."""
+
+    def test_ligne_ecrite_par_n1(self):
+        import hashlib
+        self.db.execute("TRUNCATE authenticators RESTART IDENTITY CASCADE")
+        raw = receipts.b64u_decode(self.key.public_key())
+        self.previous_insert("authenticators", {
+            "approver": ALICE, "facade": "ed25519",
+            "credential_id": self.key.credential_id,
+            "public_key": receipts.b64u_encode(raw),
+            "key_fingerprint": hashlib.sha256(raw).hexdigest(), "aaguid": None,
+            "level": "standard", "canon_ref": "members/alice.md@" + COMMIT, "canon": "",
+        }, added=["accord_operations"])
+        row = receipts.list_authenticators(self.db)[0]
+        self.assertEqual(row["accord_operations"], [])
+        accord = self.go()
+        self.assertRefused(self.verify(self.receipt(accord)), receipts.ACCORD_OPERATION)
+        self.assertRefused(self.verify(self.receipt()), receipts.FACADE)
+        # le nouveau code sur la ligne N-1 : une resynchronisation l'ouvre
+        self.assertEqual(self.sync(["prod-deploy"])["errors"], [])
+        self.assertTrue(self.verify(self.receipt(accord)).ok)

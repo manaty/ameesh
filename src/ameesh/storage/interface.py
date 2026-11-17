@@ -2054,8 +2054,8 @@ class Approvals(Domain):
         """Approvals newest first; proof_only exposes consumed decision proofs only."""
 
     def decision_signatures(self, *, since_ts: float, until_ts: float) -> list[dict]:
-        """#7631 : approbations de décision consommées par une décision,
-        créées dans [since, until[ (meta comprise, `key_is_owner`)."""
+        """#7631 : approbations de décision consommées par une décision dans
+        [since, until[ (meta comprise, `key_is_owner`)."""
         raise NotImplementedError
 
     @abc.abstractmethod

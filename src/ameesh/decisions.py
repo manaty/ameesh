@@ -1104,8 +1104,10 @@ def avatar_human(cfg: Config, agent_name: str) -> str | None:
         if agent is None:
             continue
         if not isinstance((agent.fiche.data or {}).get("avatar"), dict):
-            return None
-        return canon.resolve_human(agent.responsible) or None
+            continue
+        human = canon.resolve_human(agent.responsible)
+        if human:
+            return human
     return None
 
 
@@ -1501,7 +1503,13 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         if not key_path:
             raise DecisionError("an avatar signs with the owner key (--key), on an accord "
                                 "(--accord)")
-        check_accord(db, view, human, signer["accord"], now=now)
+        accord = signer.get("accord") or {}
+        if accord.get("agent") not in (None, signer.get("agent")):
+            # relecture impl-06 : le go d'une session ne sert qu'à son avatar
+            raise DecisionError("accord %s#%s: the go was given in the session of %s, not "
+                                "of %s" % (accord.get("agent"), accord.get("seq"),
+                                           accord.get("agent"), signer.get("agent")))
+        check_accord(db, view, human, accord, now=now)
     if signed_requested:
         if channel == "chat":
             raise DecisionError("a signed answer is given in your terminal, not in the "

@@ -135,3 +135,11 @@ class AvatarDecisionTest(_Base):
         self.assertEqual(rows[1]["accord"], accord)
         self.assertEqual([(s["code"], s["decision"]) for s in view["signals"]],
                          [(reserved_gestures.UNRECORDED_SIGNER, legacy["id"])])
+
+    def test_go_d_une_autre_session_refuse(self):
+        accord = self.go()
+        other = {"by": decisions.SIGNED_BY_AVATAR, "agent": "autre-avatar", "accord": accord}
+        view = self.ask(needs_signature=True)
+        with self.assertRaises(DecisionError):
+            self.answer(view["id"], "a", key_path=self.private, signer=other)
+        self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")

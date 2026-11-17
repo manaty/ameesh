@@ -89,7 +89,7 @@ def journal(db: Db, *, since_ts: float, until_ts: float) -> dict:
             "approval_id": int(row["id"]), "approver": row.get("approver"),
             "signed_by": signed_by, "agent": meta.get("agent"),
             "accord": meta.get("accord"), "owner_key": bool(row.get("key_is_owner")),
-            "ts": row.get("created_ts"),
+            "ts": row.get("consumed_ts"),
         }
         gestures.append(entry)
         if signed_by not in ("owner", "avatar"):
