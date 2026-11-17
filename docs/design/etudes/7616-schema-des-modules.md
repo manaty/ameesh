@@ -15,17 +15,17 @@ lot, toute action irréversible ou de production (déploiement, fusion,
 suppression de données, serveur de production, dépense engagée).
 
 Compagnon exhaustif : [`7616-schema-des-modules/inventaire.tsv`](7616-schema-des-modules/inventaire.tsv),
-170 lignes, une par table du schéma, avec propriétaire proposé, origine,
+174 lignes, une par table du schéma, avec propriétaire proposé, origine,
 lecteurs et écrivains dans le code, fonctions et triggers SQL, notes.
 
 ## 1. Résumé
 
-L'inventaire du code à `1ac9cb6a1` (16/11/2026 22:25) trouve **170 tables** :
-**135 du noyau** (dont les deux registres de migrations du runner) et **35
+L'inventaire du code à `1ac9cb6a1` (16/11/2026 22:25) trouve **174 tables** :
+**138 du noyau** (dont les deux registres de migrations du runner) et **36
 proposées au module `dev`** ; le module `it` n'en possède aucune. Trois vues
 noyau complètent le schéma ; elles ne lisent que des tables noyau.
 
-Les 35 tables `dev` ne sont pas isolées : le noyau les lit ou les écrit
+Les 36 tables `dev` ne sont pas isolées : le noyau les lit ou les écrit
 directement (au moins douze modules Python hors du stockage), des triggers du
 noyau les mettent à jour, `work_items` porte encore douze colonnes de
 développement, et la machine d'états des lots ne laisse atteindre `delivered`
@@ -101,9 +101,14 @@ L'inventaire a été produit par analyse statique du dépôt à `1ac9cb6a1` :
 
 - les 243 migrations forward de `src/ameesh/migrations/*.sql` (plus trois
   fichiers de retour arrière manuels dans `rollback/`) ;
-- les 169 `CREATE TABLE` trouvés dans ces migrations, plus
+- les 173 `CREATE TABLE` distincts trouvés dans ces migrations (recherche
+  insensible à la casse, `IF NOT EXISTS` et nom qualifié acceptés), plus
   `schema_migrations`, créée par le `BOOTSTRAP` de `migrations.py`, soit
-  170 tables ;
+  174 tables ;
+- le contrôle de complétude compare ces noms à la colonne 1 du TSV
+  (`comm`) : aucun écart. Il a rattrapé quatre tables créées après la
+  première rédaction, `work_packet_snapshots` (0580), `credit_cycles` et
+  `credit_requests` (0581), `credit_reconciliations` (0582) ;
 - les chaînes SQL du code Python (`ast`), classées en lecture, écriture ou
   simple mention selon le verbe qui précède le nom de table (`FROM`, `JOIN`,
   `INSERT`, `UPDATE`, `DELETE`, `ALTER`, `TRUNCATE`…) ; les docstrings sont
@@ -128,17 +133,17 @@ régénéré si le code bouge avant la revue.
 
 | Catégorie | Nombre | Remarque |
 |---|---:|---|
-| Tables du schéma | 170 | 169 créées par les migrations + `schema_migrations` (bootstrap) |
-| Tables noyau | 135 | dont `schema_migrations` et `schema_non_additive_migrations` |
-| Tables `dev` (proposées) | 35 | voir §3.2 |
+| Tables du schéma | 174 | 173 créées par les migrations + `schema_migrations` (bootstrap) |
+| Tables noyau | 138 | dont `schema_migrations` et `schema_non_additive_migrations` |
+| Tables `dev` (proposées) | 36 | voir §3.2 |
 | Tables `it` | 0 | `it` utilise `work_module_milestones` (noyau) |
 | Vues | 3 | `agent_mesh_overview`, `mesh_approvals_status`, `mesh_keys` ; aucune table `dev` |
 | Migrations forward | 243 | `0001` à `0584` |
 | Retours arrière manuels | 3 | `rollback/0518`, `rollback/0583_restore`, `rollback/0584_restore` |
 
-Le TSV contient 170 lignes : 135 `core`, 35 `dev`, 0 `it`.
+Le TSV contient 174 lignes : 138 `core`, 36 `dev`, 0 `it`.
 
-### 3.2 Les 35 tables `dev`
+### 3.2 Les 36 tables `dev`
 
 Le classement suit le **producteur de la donnée** (le workflow de
 développement), pas le lecteur d'aujourd'hui : c'est précisément le lecteur
@@ -147,7 +152,7 @@ noyau qui est le couplage à retirer.
 | Famille | Tables | Stockage principal |
 |---|---|---|
 | CI | `ci_runs`, `ci_test_failures`, `ci_runner_state`, `ci_queue_state`, `ci_guard_scan`, `ci_guard_run`, `ci_map_state`, `ci_disk_state`, `ci_disk_refusals`, `ci_disk_dispatch` | `storage/postgres/ci.py` |
-| Fusion, trains, paquets | `merge_queue`, `merge_locks`, `integration_trains`, `integration_train_fires`, `integration_train_queue_receipts`, `work_packet_members`, `work_landings`, `work_resolutions` | `storage/postgres/work.py`, `train_*.py`, `merge_queue.py` |
+| Fusion, trains, paquets | `merge_queue`, `merge_locks`, `integration_trains`, `integration_train_fires`, `integration_train_queue_receipts`, `work_packet_members`, `work_packet_snapshots`, `work_landings`, `work_resolutions` | `storage/postgres/work.py`, `train_*.py`, `merge_queue.py` |
 | Réservation de migration | `work_migration_reservations` | `storage/postgres/migration_reservations.py` |
 | Espaces de travail | `managed_worktrees`, `work_item_branch_heads` | `storage/postgres/work.py` |
 | Prévalidation | `prevalidation_reports` | `storage/postgres/prevalidation.py` |
@@ -192,6 +197,7 @@ Lecteurs ou écrivains hors `src/ameesh/storage/postgres/` et
 | `model_evaluation_report.py` | `ci_runs`, `ci_test_failures`, `provenance_receipts`, `review_finding_resolutions` | rapport d'évaluation | port optionnel ; rapport partiel sans module |
 | `exploitation.py` | `integration_trains` | tableau d'exploitation | port optionnel ou déplacement dans `dev` |
 | `packet_reviews.py` | `work_landings`, `work_packet_members` | revue de paquet | déplacer dans `dev` (logique de paquet) |
+| `packet_link.py`, `packet_close.py`, `packet_snapshot.py` | `work_packet_snapshots` | reçus de composition | déplacer dans `dev` (logique de paquet) |
 | `repair_observation.py` | `github_watch_pending` | observation de réparation | déplacer dans `dev` |
 | `reprise.py`, `review_designation_activation.py` | `managed_worktrees` | reprise et désignation | passer par la façade `workspaces` de `dev` |
 | `alerts_delegation_pg.py` | `merge_locks` | alerte de bail | port optionnel |
@@ -201,8 +207,8 @@ Lecteurs ou écrivains hors `src/ameesh/storage/postgres/` et
 | `train_admissions.py`, `train_candidates.py`, `train_initial.py` | `integration_train_queue_receipts` | admissions de train | déplacer dans `dev` (code `train_*`) |
 | `agent_rename.py` | liste codée en dur `REWRITTEN` | renommage d'agent | lire la liste des tables du module, pas une constante |
 
-Le stockage `storage/postgres/work.py` touche à lui seul 24 des 35 tables
-`dev` ; `storage/postgres/ci.py` en touche 18. Ce sont les deux gros
+Le stockage `storage/postgres/work.py` lit ou écrit 14 des 36 tables `dev` ;
+`storage/postgres/ci.py` en lit ou écrit 11. Ce sont les deux gros
 déplacements de code. La bascule des tables ne les exige pas (les vues
 protègent l'ancien code), mais le retrait des vues, si.
 
@@ -215,10 +221,10 @@ protègent l'ancien code), mais le retrait des vues, si.
 | `ameesh_review_seats_guard` | trigger sur `work_items` | lit/écrit `work_review_withdrawals` | 0529 | enregistre un retrait de relecteur |
 | `ameesh_review_verdict_guard` | trigger sur `work_item_milestones` | lit `work_review_withdrawals` | 0529 | refuse un verdict d'un relecteur retiré |
 | `zz_ameesh_limited_login` | trigger sur `provenance_receipts` | `limited_logins` (noyau) | 0567, recréé 0583/0584 | limite les écritures sous login limité ; `tg_table_schema` devient le schéma du module après déplacement |
-| `ameesh_agent_spelling` | triggers sur de nombreuses tables (dont 12 `dev`) | colonnes d'agent | 0516 (boucle), 0519, 0534 | normalise l'orthographe des agents |
+| `ameesh_agent_spelling` | triggers sur de nombreuses tables (dont 13 `dev`) | colonnes d'agent | 0516 (boucle), 0519, 0534 | normalise l'orthographe des agents |
 | `review_finding_resolution_guard` | trigger sur `review_finding_resolutions` | la table elle-même | 0564 | garde les résolutions de constat |
 | `merge_queue_generation_seq` | séquence explicite | `merge_queue.generation` | 0412 | non `OWNED BY` : `ALTER TABLE … SET SCHEMA` ne la déplace pas |
-| `REWRITTEN` | constante Python | 35 tables `dev` | `agent_rename.py` | liste de tables à réécrire lors d'un renommage |
+| `REWRITTEN` | constante Python | 36 tables `dev` | `agent_rename.py` | liste de tables à réécrire lors d'un renommage |
 
 Les fonctions SQL qui **lisent ou écrivent** une table `dev` sont peu
 nombreuses : `work_items_migration_slot_sync`,
@@ -489,7 +495,7 @@ Deux tests de frontière rendent la règle mécanique :
 
 La liste `REWRITTEN` d'`agent_rename.py` est remplacée par la lecture des
 tables déclarées par les modules (ou par une constante générée), pas par une
-liste de 35 noms dans le noyau.
+liste de 36 noms dans le noyau.
 
 ### 4.7 Profil nu
 
@@ -511,7 +517,7 @@ Deux niveaux doivent être distingués :
   les tables `dev` ; en profil nu, il fonctionne sans elles. C'est ce que
   les ports et les tests de frontière garantissent.
 - **Absence physique** (question Q2) : une base neuve en profil nu ne
-  contient pas les 35 tables. Les migrations historiques les créent encore ;
+  contient pas les 36 tables. Les migrations historiques les créent encore ;
   il faudrait une **base de départ par profil** (squash des migrations) ou
   un mécanisme de migration conditionnelle. C'est un chantier distinct, plus
   risqué, qui touche l'immutabilité et les empreintes. La présente étude ne
@@ -542,15 +548,14 @@ devient sélectionnable (Q1).
 | P0 | étude | cette étude, décisions Q1–Q8 adoptées le 17/11/2026 | inchangé |
 | P1a | additive | registres, interface module, runner, tests de frontière ; **aucune table déplacée** | inchangé |
 | P1b | code | ports et SQL qualifié dans les modules ; après P1a, avant ou après P2, sans bascule | inchangé |
-| P2 | non additive | `ALTER TABLE … SET SCHEMA` des 35 tables, vues de compatibilité, migration de module `dev/0001` | fonctionne via les vues |
+| P2 | non additive | `ALTER TABLE … SET SCHEMA` des 36 tables, vues de compatibilité, migration de module `dev/0001` | fonctionne via les vues |
 | P3 | non additive | retrait des vues par la migration de module `dev/0002`, après une release de P2 et le déploiement de P1b | fonctionne via les ports |
 | P4 | optionnelle | base de départ par profil, colonnes `dev` de `work_items`, machine d'états | lot distinct |
 
-État après la décision #222989 : P1a et P1b sont ouverts (#7649, #7650) et
-peuvent démarrer ; P2 (#7651) et P3 (#7652) sont ouverts mais **retenus
-jusqu'au go de l'owner**, car ils ne sont pas additifs (note du bureau du
-17/11/2026 sur #7616 ; consigne de l'owner du 17/11 : migrations additives
-seulement sur les meshs en service).
+Condition de la décision #222989 : seule la phase **additive** P1 (P1a, P1b)
+démarre. P2 et P3 ne sont pas additifs et restent **retenus jusqu'au go de
+l'owner** (note du bureau du 17/11/2026 sur #7616 ; consigne de l'owner du
+17/11 : migrations additives seulement sur les meshs en service).
 
 La règle de compatibilité est **N-1** : la release qui retire les vues ne
 supporte que la release précédente, qui doit déjà utiliser les ports ou au
@@ -697,8 +702,8 @@ Un fichier `rollback/<version>_module_schema_cutover.sql` est écrit, testé
 sur une copie avec des données, et **jamais appliqué automatiquement** (même
 convention que `rollback/0518`). Il :
 
-1. `DROP VIEW` des 35 vues (seulement si elles existent) ;
-2. `ALTER TABLE <schéma>__dev.<table> SET SCHEMA <schéma_noyau>` pour les 35
+1. `DROP VIEW` des 36 vues (seulement si elles existent) ;
+2. `ALTER TABLE <schéma>__dev.<table> SET SCHEMA <schéma_noyau>` pour les 36
    tables ;
 3. restaure les triggers/fonctions déplacés dans leur schéma d'origine ;
 4. `DROP SCHEMA <schéma>__dev` seulement s'il est vide (aucun objet restant) ;
@@ -767,7 +772,7 @@ bureau.
 ### 5.8 Preuves de non-perte
 
 - `ALTER TABLE … SET SCHEMA` est une opération de catalogue : aucune ligne
-  n'est lue, copiée ou réécrite. Les 35 tables gardent leurs OID, leurs
+  n'est lue, copiée ou réécrite. Les 36 tables gardent leurs OID, leurs
   données, leurs index, leurs contraintes et leurs triggers.
 - Les vues sont des objets vides ; les créer ne duplique aucune donnée.
 - Aucun `DROP TABLE`, `DROP COLUMN`, `DELETE`, `TRUNCATE` dans la bascule.
@@ -792,7 +797,7 @@ bureau.
 | Profil nu sans tables | P1b rend le noyau indépendant ; l'absence physique est P4, pas P2 |
 | Module externe non revu | migration de module = SQL sensible, deux familles ; `SECURITY DEFINER` avec `search_path` obligatoire |
 | ACL perdues sur une vue | recopie des privilèges de la table sur la vue, `GRANT USAGE` sur le schéma, contrôle par rôle |
-| RLS sur une table déplacée | vérifier l'absence de politique RLS sur les 35 tables ; sinon `security_invoker` ou politique équivalente |
+| RLS sur une table déplacée | vérifier l'absence de politique RLS sur les 36 tables ; sinon `security_invoker` ou politique équivalente |
 | `zz_ameesh_limited_login` après déplacement | passer le schéma noyau en `tg_argv[0]` ou faire lire `limited_logins` au noyau ; test de login limité |
 
 ## 6. Décisions demandées
@@ -800,7 +805,7 @@ bureau.
 | # | Question | Recommandation |
 |---|---|---|
 | Q1 | Le but est-il un **hôte réel sans `dev`** (mesh non informatique), ou seulement le profil nu de CI/test ? | Séparer : cette étude livre l'indépendance fonctionnelle ; un lot de politique distinct rend `dev` sélectionnable si un hôte réel sans `dev` est voulu. Ne pas changer `ALWAYS_ACTIVE` ici. |
-| Q2 | Le profil nu doit-il être **physiquement** sans les 35 tables sur une base neuve ? | Non dans cette bascule : les migrations historiques les créent. Une base de départ par profil est un lot distinct (P4), à cause de l'immutabilité des migrations. |
+| Q2 | Le profil nu doit-il être **physiquement** sans les 36 tables sur une base neuve ? | Non dans cette bascule : les migrations historiques les créent. Une base de départ par profil est un lot distinct (P4), à cause de l'immutabilité des migrations. |
 | Q3 | Les douze colonnes `dev` de `work_items` sont-elles dans ce lot ? | Non : lot suivant, après la bascule des tables ; sinon la frontière reste dans la table noyau. |
 | Q4 | `delivered` doit-il rester inatteignable sans `dev` ? | Non : un connecteur de livraison noyau (`document`, `done`) devrait pouvoir produire un `delivered` générique, ou `delivered` devient un état `dev`. Décision de machine d'états, lot séparé. |
 | Q5 | Les modules externes peuvent-ils déclarer des migrations ? | Oui, code installé et revu comme SQL sensible ; le canon ne fournit jamais de chemin d'exécution. Un module sans migration reste valide (`it`). |
@@ -830,15 +835,15 @@ non exécuté.
 
 ## 7. Découpage adopté
 
-Décision #222989 (option a, 17/11/2026) : P1a, P1b, P2 et P3 sont découpés.
-Le pilote (`mesh-design`) a ouvert les lots le 17/11/2026 à 03:37 :
+Décision #222989 (option a, 17/11/2026) : P1a, P1b, P2 et P3 sont découpés
+en lots.
 
-| Phase | Lot | Contenu | État à l'ouverture |
+| Phase | Lot | Contenu | Condition |
 |---|---|---|---|
-| P1a | #7649 | Mécanisme de schéma et de migrations de module : registres, interface, runner, `doctor`, `non_additive` `SET SCHEMA`, tests. Aucune table déplacée. SQL sensible. | `intake`, après #7616 |
-| P1b | #7650 | Code générique : ports et SQL qualifié. Stockage `dev` dans `modules/dev`, ports, consommateurs noyau, test de frontière, `REWRITTEN`. | `intake`, après #7616 et #7649 |
-| P2 | #7651 | Bascule des tables : migration `dev/0001`, vues, triggers, rollback, Manaty puis IMA/TPK. SQL sensible. | `intake`, **retenu** (non additif) jusqu'au go owner, après #7616 et #7649 |
-| P3 | #7652 | Retrait des vues : `DROP VIEW`, tests, exceptions, migration `dev/0002`. SQL sensible. | `intake`, **retenu** (non additif) jusqu'au go owner, après #7650 et #7651 |
+| P1a | #7649 | Mécanisme de schéma et de migrations de module : registres, interface, runner, `doctor`, `non_additive` `SET SCHEMA`, tests. Aucune table déplacée. SQL sensible. | additif ; après #7616 |
+| P1b | #7650 | Code générique : ports et SQL qualifié. Stockage `dev` dans `modules/dev`, ports, consommateurs noyau, test de frontière, `REWRITTEN`. | additif ; après #7616 et #7649 |
+| P2 | #7651 | Bascule des tables : migration `dev/0001`, vues, triggers, rollback, Manaty puis IMA/TPK. SQL sensible. | non additif, **retenu jusqu'au go owner** ; après #7616 et #7649 |
+| P3 | #7652 | Retrait des vues : `DROP VIEW`, tests, exceptions, migration `dev/0002`. SQL sensible. | non additif, **retenu jusqu'au go owner** ; après #7650 et #7651 |
 
 Restent de simples propositions, non ouvertes :
 
@@ -862,11 +867,12 @@ Restent de simples propositions, non ouvertes :
 - `src/ameesh/modules/__init__.py`, `registry.py`, `storage.py` ;
   `src/ameesh/migrations.py` ; `src/ameesh/work_lifecycle.py`.
 - Migrations citées : 0013, 0412, 0419, 0432, 0456, 0462, 0467, 0516,
-  0518, 0519, 0524, 0529, 0534, 0564, 0567, 0583, 0584.
+  0518, 0519, 0524, 0529, 0534, 0564, 0567, 0580, 0581, 0582, 0583,
+  0584.
 - `docs/design/etudes/project-modules.md`, `l243-projects-and-names.md`,
   `1467-trains-integration.md`.
 - Inventaire : `docs/design/etudes/7616-schema-des-modules/inventaire.tsv`
-  (170 lignes, code à `1ac9cb6a1`).
+  (174 lignes, code à `1ac9cb6a1`).
 - Vérification PostgreSQL 17.11 sur la base de test locale
   `agent_mesh` (schémas `t_7616_*`, transaction annulée) : DML via vue,
   `ON CONFLICT`, `FOR UPDATE`, `RETURNING`, clé étrangère inter-schémas,
