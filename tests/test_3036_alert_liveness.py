@@ -230,6 +230,12 @@ class LivenessFixture:
             fh.write("---\ntype: Agent\ntitle: bureau\n"
                      "responsible: human:smichea\nroles: [bureau]\n"
                      "avatar:\n  conversation: portable\n---\n")
+        # #7661 : le canon fait foi quand il est chargé ; l'auditeur doit y
+        # déclarer son rôle, comme sur le canon réel du mesh.
+        with open(os.path.join(root, "agents", "auditeur.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("---\ntype: Agent\ntitle: auditeur\n"
+                     "responsible: human:smichea\nroles: [auditeur]\n---\n")
         return root
 
     def lease(self, *names):
