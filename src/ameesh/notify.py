@@ -224,6 +224,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
                  # L242b : un agent critique est en pause budget
                  "critical_budget_pause",
+                 # #7712 : une coordination de vague qui refuse tour après tour
+                 "account_wave_coordination",
                  # #3969 : un compte déclaré invalide tient un agent sans tour
                  "account_config_invalid",
                  # #1268 : un agent critique enchaîne les échecs de tour réels
@@ -428,6 +430,7 @@ TYPE_LABELS = {
     "owner_key_registered": "owner key registered",
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
+    "account_wave_coordination": "critical agent blocked by account wave coordination",
     "account_config_invalid": "no valid harness account on the host",
     "account_profile_confined": "harness account usable on no agent host",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
@@ -478,6 +481,8 @@ URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "orphan_lot", "dead_runne
                 # #5503 : un compte entier bloqué par des réservations gardées
                 "account_cap_kept",
                 "credential_failing", "critical_budget_pause", "critical_turn_failures",
+                # #7712 : l'agent critique ne tourne plus, sans plafond en cause
+                "account_wave_coordination",
                 # #3969 : aucun tour tant que l'hôte n'est pas réparé
                 "account_config_invalid",
                 "owner_key_registered",

@@ -988,6 +988,18 @@ switch, once per effective switch/destination pair), and `agent` (effective
 application with the validated turn environment). The shared `wave_id` and `wave_epoch`
 identify the wave in both proposals and effective applications. The shared `account_active` choice remains separate.
 
+**Session origin and a refused wave (#7712).** An account name only means
+something inside its harness ("primaire" exists under Claude and under Codex):
+an origin read from a session opened under another harness is no origin at all.
+When the only disagreement is a persona's own stale origin and its last
+effective switch already designates the proposed destination, the turn goes on
+that account instead of refusing. A genuine concurrent wave change may refuse
+one turn; the next turn reconciles on the effective account and goes on
+(this one-retry latch is local agent state). A repeated refusal is not a budget
+pause: the status keeps the `account wave: …` prefix and `ameesh alerts` raises
+`account_wave_coordination` (default 120 s, `--wave-refusal`) instead of
+`critical_budget_pause`, naming the switch journal to read.
+
 **Fallback order for a critical agent at its threshold**:
 
 1. another plan account of the same harness with headroom (§ 4 order);

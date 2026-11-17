@@ -71,6 +71,10 @@ BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
                  "fingerprints_source_failing", "idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
                  "critical_budget_pause", "idle_actionable_lot", "slo_breach",
+                 # #7712 : une coordination de vague qui refuse tour après
+                 # tour — l'agent critique ne tourne plus, ce n'est pas un
+                 # plafond de budget ; l'équipe vérifie les bascules
+                 "account_wave_coordination",
                  # #1466 : une pause qui dure est un plafond périmé, un compte
                  # retiré ou une configuration que l'exécuteur ne lit pas ; les
                  # orchestrateurs peuvent vérifier, l'auditeur suit
@@ -959,6 +963,18 @@ def _critical_budget_pause(alert: dict) -> str:
             % (alert.get("detail") or "?"))
 
 
+def _account_wave_coordination(alert: dict) -> str:
+    """#7712 : aux orchestrateurs de l'équipe et aux auditeurs."""
+    return ("Critical agent blocked by Claude account-wave coordination: %s. "
+            "No budget cap is involved: its session origin and the last effective "
+            "switch disagree, and the planner keeps refusing the wave. Expected "
+            "action: read `account_switches` (planned/agent) for that persona and "
+            "the wave journal; the turn retries on its own after one refusal, so "
+            "check again next pass before acting, then free the effective account "
+            "(`ameesh accounts`) or let the pending switch apply."
+            % (alert.get("detail") or "?"))
+
+
 def _account_config_invalid(alert: dict) -> str:
     """#3969 : aux orchestrateurs de l'équipe et aux auditeurs."""
     return ("No valid harness account on the host: %s. Expected action: apply the fix "
@@ -1589,6 +1605,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "critical_budget_pause":
             text = _critical_budget_pause(alert)
             teams = _projects(by_name, alert.get("agent"))
+        elif kind == "account_wave_coordination":
+            text = _account_wave_coordination(alert)
+            teams = _projects(by_name, alert.get("agent"))
         elif kind == "account_config_invalid":
             text = _account_config_invalid(alert)
             teams = _projects(by_name, alert.get("agent"))
@@ -1666,7 +1685,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                 continue
             out.setdefault(name, audit_text)
     if kind in ("critical_budget_pause", "budget_pause_long", "rate_limited_chronic",
-                "account_config_invalid", "operator_pause_long"):
+                "account_config_invalid", "operator_pause_long",
+                "account_wave_coordination"):
         out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     if kind == "operator_pause_host":
         for name in alert.get("agents") or ():
