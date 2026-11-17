@@ -113,8 +113,11 @@ column to an empty table succeeds. This lets N-1 writers omit the new column: 05
 (`profiles text[] not null default '{}'`) is additive.
 
 A nullable `ADD COLUMN` is additive because old writers simply omit the
-column: any simple type without a default, or a constant default with an inline
-`CHECK` that accepts the value N-1 writers produce (NULL or that default).
+column: a PostgreSQL built-in scalar type without a default, or a constant
+default with an inline `CHECK` that accepts the value N-1 writers produce
+(NULL or that default). A domain type is not proven: it may be `NOT NULL` or
+carry its own default, so an omitted column is not necessarily NULL and an
+N-1 insert can fail (#7655).
 A single `ALTER TABLE` may carry several additions: 0565/0568 add several
 nullable columns in one statement (#7655), and every action is judged on its
 own. A single unsafe action (`DROP COLUMN`, an unmarked constraint, a

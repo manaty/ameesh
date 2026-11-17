@@ -19,13 +19,29 @@ from . import migrations
 
 POLICY_PATH = ".ameesh/staging-migrations.json"
 
+# A domain's implicit cast may reject a constant on an N-1 insert. Restrict
+# both the column type and explicit casts to known built-ins.
+_BUILTIN_TYPES = (r"text|varchar|bool|boolean|int|integer|int2|int4|"
+                  r"int8|bigint|smallint|numeric|decimal|real|float4|float8|"
+                  r"json|jsonb|uuid")
+_BUILTIN = r"(?:pg_catalog\.)?(?:" + _BUILTIN_TYPES + r")"
+# A domain may carry `NOT NULL` or its own DEFAULT: a plain type name does not
+# prove that an omitted value is NULL. Only PostgreSQL's scalar built-ins
+# (with no implicit constraint or default) keep the nullable-column shortcut
+# (#7655).
+_PLAIN_TYPE = (r"(?:pg_catalog\.)?(?:" + _BUILTIN_TYPES +
+               r"|timestamptz|timetz|timestamp|time|date|interval|bytea|inet|"
+               r"cidr|macaddr|macaddr8|money|xml|tsvector|tsquery|oid|name|"
+               r"regclass|regtype)")
+
 _DEFAULT_RULES = {
     'additive': [
         {"pattern": r'(?:begin|commit)', "reason": 'transaction'},
         {"pattern": r'set local (?:search_path|lock_timeout)\s*=.*', "reason": 'settings'},
         {"pattern": r'create table (?:if not exists )?[\w.\"]+\s*\([^;]*\)', "reason": 'new table'},
         {"pattern": r'create (?:unique )?index (?:concurrently )?(?:if not exists )?[\w.\"]+ on [^;]+', "reason": 'new index'},
-        {"pattern": r'alter table [\w.\"]+ add column (?:if not exists )?[\w\"]+ [\w.]+(?:\[\])?(?: null)?', "reason": 'new column'},
+        {"pattern": r'alter table [\w.\"]+ add column (?:if not exists )?[\w\"]+ '
+                    + _PLAIN_TYPE + r'(?:\[\])?(?: null)?', "reason": 'new column'},
         {"pattern": r'comment on [^;]+ is\s*', "reason": 'documentation'},
         {"pattern": r'create (?:function|procedure)\s+[^;]+', "reason": 'new routine'},
         {"pattern": r'grant\s+[^;]+', "reason": 'privilege added'},
@@ -199,10 +215,6 @@ class _Unsupported(Exception):
 # token, so a check is evaluated against the real value, never a placeholder.
 _CONSTANT = (r"(?:" + _LITERAL + r"|true|false|"
              r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?|array\s*\[\s*\])")
-# A domain's implicit cast may reject this constant on an N-1 insert. Restrict
-# both the column type and explicit casts to known built-ins.
-_BUILTIN = (r"(?:pg_catalog\.)?(?:text|varchar|bool|boolean|int|integer|int2|int4|"
-            r"int8|bigint|smallint|numeric|decimal|real|float4|float8|json|jsonb|uuid)")
 _CAST = r"(?:\s*::\s*" + _BUILTIN + r"(?:\[\])?)*"
 _COLUMN = (r'alter table [\w.\"]+ add column (?:if not exists )?(?P<column>[\w\"]+) '
            + _BUILTIN + r"(?:\[\])?")
@@ -502,7 +514,7 @@ _CREATE_OR_REPLACE_ROUTINE = re.compile(
     r"create or replace (?P<kind>function|procedure) (?P<name>[\w\"]+)\s*\(", re.I)
 _NULLABLE_COLUMN = (
     r"add column (?:if not exists )?(?P<column>[\w\"]+) "
-    r"[\w.]+(?:\[\])?(?: null)?")
+    + _PLAIN_TYPE + r"(?:\[\])?(?: null)?")
 _NULLABLE_CONSTANT = (
     r"add column (?:if not exists )?(?P<column>[\w\"]+) "
     + _BUILTIN + r"(?:\[\])?"

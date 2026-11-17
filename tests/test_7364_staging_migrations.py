@@ -102,6 +102,31 @@ class ClassificationTests(unittest.TestCase):
                              read_file=lambda p:b'-- restore', signed_decision=lambda *a:False)
         self.assertEqual(sm.classify("ALTER TABLE c.t ADD COLUMN y pg_catalog.text NOT NULL DEFAULT 'bad'").kind, 'additive')
 
+    def test_domain_nullable_column_stays_unproven(self):
+        # #7655: `positive_required` may be a domain `AS integer NOT NULL` (or
+        # one carrying its own DEFAULT). Omitting the column then does not
+        # produce NULL, so an N-1 INSERT fails even though the ADD COLUMN was
+        # accepted on an empty table. Only a PostgreSQL built-in scalar type
+        # proves the nullable shortcut: a domain name is indistinguishable from
+        # a type name in this SQL.
+        for typename in ('positive_required', 'domain_with_default',
+                         'c.positive_required', 'positive_required[]',
+                         '"positive_required"'):
+            for suffix in ('', ' NULL', ' CHECK (c IS NULL)'):
+                with self.subTest(typename=typename, suffix=suffix):
+                    sql = f"ALTER TABLE t ADD COLUMN c {typename}{suffix};"
+                    self.assertEqual(sm.classify(sql).kind, 'unknown')
+        sql = "ALTER TABLE t ADD COLUMN c positive_required;"
+        with self.assertRaises(sm.Refused):
+            sm.check('domain.sql', sql.encode(), sm.load_policy(),
+                     read_file=lambda p:b'-- restore', signed_decision=lambda *a:False)
+        # Built-in types, including date/time and arrays, keep the shortcut.
+        for typename in ('text', 'text[]', 'timestamptz', 'date',
+                         'pg_catalog.timestamptz'):
+            with self.subTest(typename=typename):
+                self.assertEqual(sm.classify(
+                    f"ALTER TABLE t ADD COLUMN c {typename};").kind, 'additive')
+
     def test_constant_column_does_not_override_project_destructive_rules(self):
         policy = sm.load_policy(json.dumps({'schema':'ameesh-staging-migrations/1',
             'exceptions':{'destructive':[{'pattern':r'alter table protected .*', 'reason':'protected table'}]}}))
