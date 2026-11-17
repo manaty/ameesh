@@ -63,7 +63,7 @@ class SweepWithoutOverviewTest(_Base):
     def test_promoted_lot_still_goes_to_the_living_auditor(self):
         """La liste complète n'est lue que sur ce chemin rare, par
         `measurement_actor` : l'auditeur vivant reçoit le lot promu."""
-        self.agent("auditeur")
+        self.agent("auditeur", roles=["auditeur"])
         self.agent("dev1")
         lot = self.promoted("dev1")
         self.stopped("dev1")
