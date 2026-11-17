@@ -20,8 +20,9 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import (alert_briefs, avatars, canon as canon_mod, config, debit,
-                    mail, notify, registry)
+from ameesh import (alert_briefs, avatars, canon as canon_mod, config, db_sante,
+                    debit, mail, migration_alerts, notify, pgbouncer_local,
+                    registry)
 
 from .support import PgTestCase
 
@@ -228,6 +229,88 @@ class NotifyAvatarRouteTest(PgTestCase):
         self.notifier.run_pass(self.db, current=[self.alert()])
         self.assertEqual(self.mails("bureau"), [])
         self.assertEqual([name for name, _ in self.sender.sent], ["app"])
+
+    def test_passe_locale_sans_base_livre_directement_sans_avatar(self):
+        """#7634 (relecture cx1) : la passe locale n'a pas de `db`.
+
+        Levée, retry et résolution y restent directes : ni NameError, ni
+        tentative d'écriture dans une boîte avatar inaccessible."""
+        ncfg = notify.parse_config({
+            "default_human": "human:smichea",
+            "routes": {"human:smichea": ["app"]},
+            "types": ["pgbouncer_pool_waiting"],
+        })
+        sender = notify.DrySender()
+        notifier = notify.Notifier(
+            self.cfg, ncfg, notify.empty_state(), sender=sender,
+            log=lambda text: None, clock=lambda: self.now)
+        alert = {"type": "pgbouncer_pool_waiting", "host": self.cfg.host,
+                 "responsible": "human:smichea", "since": self.now - 900,
+                 "detail": "pool waiting"}
+        with mock.patch.object(pgbouncer_local, "probe", return_value=[alert]), \
+                mock.patch.object(migration_alerts, "local",
+                                  return_value=([], [])), \
+                mock.patch.object(db_sante, "local", return_value=([], [])):
+            records = notifier.run_local_pass()
+        self.assertEqual([name for name, _ in sender.sent], ["app"])
+        self.assertIn("pool waiting", sender.sent[0][1].body)
+        self.assertEqual([row["event"] for row in records], ["raised"])
+        [entry] = notifier.state["active"].values()
+        self.assertNotEqual(entry["status"], "avatar")
+        self.assertNotIn("avatar_mail_id", entry)
+        self.assertEqual(self.mails("bureau"), [])
+        # La console se calme : la résolution locale part aussi, sans base.
+        with mock.patch.object(pgbouncer_local, "probe", return_value=[]), \
+                mock.patch.object(migration_alerts, "local",
+                                  return_value=([], [])), \
+                mock.patch.object(db_sante, "local", return_value=([], [])):
+            records = notifier.run_local_pass()
+        self.assertEqual([name for name, _ in sender.sent], ["app", "app"])
+        self.assertEqual([row["event"] for row in records], ["resolved"])
+        self.assertEqual(notifier.state["active"], {})
+        self.assertEqual(self.mails("bureau"), [])
+
+    def test_passe_locale_sans_base_retente_sans_nameerror(self):
+        """#7634 (relecture cx1) : le retry local ne lit pas une base absente."""
+        class _FailFirst(notify.DrySender):
+            def __init__(self):
+                super().__init__()
+                self.failed = False
+
+            def send(self, channel, message):
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("boom")
+                super().send(channel, message)
+
+        ncfg = notify.parse_config({
+            "default_human": "human:smichea",
+            "routes": {"human:smichea": ["app"]},
+            "types": ["pgbouncer_pool_waiting"],
+        })
+        sender = _FailFirst()
+        notifier = notify.Notifier(
+            self.cfg, ncfg, notify.empty_state(), sender=sender,
+            log=lambda text: None, clock=lambda: self.now)
+        alert = {"type": "pgbouncer_pool_waiting", "host": self.cfg.host,
+                 "responsible": "human:smichea", "since": self.now - 900,
+                 "detail": "pool waiting"}
+
+        def run_local():
+            with mock.patch.object(pgbouncer_local, "probe",
+                                   return_value=[alert]), \
+                    mock.patch.object(migration_alerts, "local",
+                                      return_value=([], [])), \
+                    mock.patch.object(db_sante, "local", return_value=([], [])):
+                return notifier.run_local_pass()
+
+        run_local()
+        [key] = list(notifier.state["active"])
+        self.assertEqual(notifier.state["active"][key]["status"], "envoi")
+        self.assertTrue(notifier._pending(notifier.state["active"][key]))
+        run_local()
+        self.assertEqual([name for name, _ in sender.sent], ["app"])
+        self.assertFalse(notifier._pending(notifier.state["active"][key]))
 
 
 class DeskReplacementTest(unittest.TestCase):
