@@ -14,8 +14,9 @@ sur la tête gelée :
    générateur ne bougent, il n'y a rien à faire (sortie 0, cas courant) ;
 2. `node ui/scripts/gen-api.mjs --check` tranche quand `node` et les
    `ui/node_modules` du cache sont là (lien par `ameesh deps link --no-fill`,
-   sans réseau) ; un rc non nul pour un module manquant n'est pas une preuve
-   de péremption ;
+   sans réseau) ; seul son diagnostic explicite `is stale` prouve la
+   péremption. Un module manquant, un signal (SIGKILL) ou un refus d'accès
+   sont des échecs d'environnement : ils restent non concluants ;
 3. sans `node` ni modules, la garde statique de #4887 s'applique : une spec
    changée sans le schéma refuse le gel ; les autres cas restent non
    concluants et ne bloquent pas (canon §3).
@@ -43,6 +44,8 @@ PATHS_ENV = "AMEESH_FREEZE_PATHS"
 TIMEOUT = 120
 #: un rc non nul avec ces marqueurs dit une dépendance absente, pas un schéma périmé
 MODULE_MISSING = ("ERR_MODULE_NOT_FOUND", "Cannot find module")
+#: le seul diagnostic qui prouve la péremption : celui du générateur (#7736 B)
+STALE_MARKER = "is stale"
 
 
 def changed_paths(environ=None) -> list[str] | None:
@@ -131,8 +134,17 @@ def check(root: str, paths: list[str] | None, *, which=None,
         return 0, "types clients : à jour (`gen-api --check`)"
     if any(marker in text for marker in MODULE_MISSING):
         return _unsure("modules incomplets : %s" % _one_line(text), static)
-    return 1, ("types clients périmés (`gen-api --check`, rc %d) : %s"
-               % (proc.returncode, _one_line(text) or "sans sortie"))
+    if proc.returncode < 0:
+        # SIGKILL, OOM, arrêt du groupe : un échec d'environnement, pas une
+        # preuve de péremption (#7736 B)
+        return _unsure("gen-api tué par le signal %d : %s"
+                       % (-proc.returncode, _one_line(text)), static)
+    if STALE_MARKER in text:
+        return 1, ("types clients périmés (`gen-api --check`, rc %d) : %s"
+                   % (proc.returncode, _one_line(text) or "sans sortie"))
+    # EACCES, disque, sortie illisible : le générateur n'a pas pu conclure
+    return _unsure("gen-api rc %d : %s"
+                   % (proc.returncode, _one_line(text) or "sans sortie"), static)
 
 
 def main(argv=None) -> int:
@@ -142,7 +154,14 @@ def main(argv=None) -> int:
         print("garde-types-clients: run from the root of an ameesh tree",
               file=sys.stderr)
         return 2
-    code, message = check(root, changed_paths())
+    paths = changed_paths()
+    if paths is None:
+        # Un lancement à la main n'a pas le diff du gel : le contrôle réel
+        # tourne (et peut lier les modules du cache), il faut le dire.
+        print("types clients : chemins du diff gelé illisibles, "
+              "contrôle réel exécuté (les ui/node_modules du cache peuvent "
+              "être liés)")
+    code, message = check(root, paths)
     print(message)
     return code
 

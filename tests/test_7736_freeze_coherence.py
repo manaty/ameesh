@@ -242,6 +242,31 @@ class ClientTypesTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("modules incomplets", message)
 
+    def test_generation_tuee_ne_prouve_pas_la_peremption(self):
+        """#7736 B : SIGKILL n'est pas un diagnostic de schéma périmé."""
+        (self.ui / "node_modules").mkdir()
+        code, message = self.check([self.SPEC, self.SCHEMA],
+                                   replies=[Proc(-9, "", "")])
+        self.assertEqual(code, 0)
+        self.assertIn("non concluant", message)
+        self.assertIn("signal 9", message)
+
+    def test_refus_d_acces_ne_prouve_pas_la_peremption(self):
+        (self.ui / "node_modules").mkdir()
+        code, message = self.check(
+            [self.SPEC, self.SCHEMA],
+            replies=[Proc(1, "", "EACCES: permission denied, open 'spec'")])
+        self.assertEqual(code, 0)
+        self.assertIn("non concluant", message)
+        self.assertIn("EACCES", message)
+
+    def test_refus_d_acces_avec_spec_sans_schema_refuse_par_la_garde(self):
+        (self.ui / "node_modules").mkdir()
+        code, message = self.check(
+            [self.SPEC], replies=[Proc(1, "", "EACCES: permission denied")])
+        self.assertEqual(code, 1)
+        self.assertIn(self.SCHEMA, message)
+
     def test_le_cache_est_lie_avant_le_controle(self):
         code, message = self.check(
             [self.SPEC], replies=[Proc(0, "linked"), Proc(0, "ok")],
