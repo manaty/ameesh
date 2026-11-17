@@ -5244,13 +5244,16 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
 #: #7252 : une citation de commit retiré dans le message de réécriture de
 #: l'auteur (7 à 40 caractères hexadécimaux). Un identifiant de B (`#40556`)
 #: n'a pas cette longueur. Les empreintes nommées checksum/sha256 sont
-#: écartées avant toute résolution Git (#7576). Un jeton collé à un mot par
-#: un tiret (`h-20261117`, `build-20261117`) appartient à un identifiant —
-#: nom de paquet `h-AAAAMMJJ-NN`, version — et n'est pas une citation
-#: (#7709) ; un vrai abrégé cité reste lu et prudent.
+#: écartées avant toute résolution Git (#7576). Le nom complet d'un paquet
+#: horaire (`h-AAAAMMJJ-NN`) est un identifiant, pas une citation : sa date
+#: (huit chiffres hexadécimaux) est consommée avec lui (#7709). Une citation
+#: avec tiret (`correctif-<sha>`) reste lue et résolue : l'exclusion ne vaut
+#: que pour l'identifiant reconnu, jamais pour un mot quelconque (B/P2
+#: auditeur).
 _CITED_COMMIT = re.compile(
     r"\b(?:checksum|sha256)\s+[0-9a-f]+\b"
-    r"|(?P<commit>(?<![0-9a-f])(?<!\w-)[0-9a-f]{7,40}(?![0-9a-f]))",
+    r"|\bh-\d{8}-\d+\b"
+    r"|(?P<commit>(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f]))",
     re.IGNORECASE)
 
 #: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
