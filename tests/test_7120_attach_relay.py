@@ -47,6 +47,14 @@ COMMAND = ["/bin/sh", "-c", 'while IFS= read -r line; do printf "echo:%s\\n" "$l
 #: psycopg ou des unités voisines, 5 s ne suffisent pas. La condition reste un
 #: événement ou une trame attendue ; la borne n'est qu'un garde-fou.
 LOCAL_IO_TIMEOUT = 30.0
+#: #7640 : borne de la *mise en place* (connexion de l'hôte, session créée
+#: côté hôte). Le relais répond PAIRED dès qu'il a mis le PAIR en file pour
+#: l'hôte, pas quand celui-ci a créé sa session ; sous la charge d'une part,
+#: ce démarrage a consommé à lui seul la borne des échanges (run 43994301490 :
+#: poignée de main du poste à 30,7 s). La mise en place est un événement de
+#: cycle de vie : sa borne reste loin du tour normal (#7440), 120 s ne coûtent
+#: rien au vert et distinguent un hôte lent d'un hôte muet.
+HOST_SETUP_TIMEOUT = 120.0
 #: budget des sessions ouvertes par les tests : très au-dessus de la borne
 #: d'E/S du poste, pour qu'une part lente ne ferme jamais une session en cours
 #: de test (le relais rendait `max_duration` avant la réponse, #7325). Les
@@ -75,7 +83,7 @@ class _ObservedConnector(attach_host.HostConnector):
             raise
 
 
-def _wait_host_connected(connector, thread, *, timeout=LOCAL_IO_TIMEOUT):
+def _wait_host_connected(connector, thread, *, timeout=HOST_SETUP_TIMEOUT):
     """Attend l'événement de connexion ; un refus définitif échoue aussitôt.
 
     La borne est un garde-fou, pas le mécanisme d'attente : le réveil vient de
@@ -95,6 +103,30 @@ def _wait_host_connected(connector, thread, *, timeout=LOCAL_IO_TIMEOUT):
                                  % connector.refusal)
         if not thread.is_alive():
             raise AssertionError("the host connector stopped before connecting")
+
+
+def _wait_host_session(connector, session, *, timeout=HOST_SETUP_TIMEOUT):
+    """Attend la session *créée* par l'hôte, pas seulement la trame PAIRED.
+
+    #7640 : le relais envoie PAIRED au poste dès qu'il a mis le PAIR en file
+    pour l'hôte. Sous charge, l'hôte peut créer sa session bien plus tard ;
+    le KEY du poste attend alors derrière le PAIR non traité et consomme sa
+    propre borne de poignée de main. Le réveil vient de l'événement de cycle
+    de vie du connecteur ; la borne reste un garde-fou, et un connecteur
+    arrêté ou refusé échoue sans l'attendre.
+    """
+    deadline = time.monotonic() + timeout
+    while session not in connector.sessions:
+        if connector.refused.is_set():
+            raise AssertionError("the relay refused the host: %s"
+                                 % connector.refusal)
+        if connector._stop.is_set():
+            raise AssertionError("the host connector stopped before pairing "
+                                 "the session")
+        if time.monotonic() >= deadline:
+            raise AssertionError("the host did not pair the session within %.1fs"
+                                 % timeout)
+        time.sleep(0.02)
 
 
 def make_grant(*, agent=AGENT, host=HOST, tenant=TENANT, ttl=300, exp=None,
@@ -488,12 +520,22 @@ class RelayTest(unittest.TestCase):
         _wait_host_connected(self.connector, thread)
         self.addCleanup(thread.join, 2.0)
 
+    def station(self, receipt, device, **kwargs):
+        """Ouvre un poste et attend que l'hôte ait créé la session (#7640).
+
+        Le relais rend PAIRED avant que l'hôte n'ait traité le PAIR ; la
+        poignée de main ne démarre qu'une fois la session côté hôte visible.
+        """
+        station = Station(self.relay.port, receipt, device, **kwargs)
+        self.addCleanup(station.close)
+        _wait_host_session(self.connector, station.session)
+        return station
+
     def test_session_e2e_ptyt_et_journaux_sans_contenu(self):
         self.start()
         self.host()
         receipt, device = make_grant()
-        station = Station(self.relay.port, receipt, device)
-        self.addCleanup(station.close)
+        station = self.station(receipt, device)
         station.handshake()
         self.assertEqual(station.request()["v"], 1)
         self.assertEqual(len(self.verifier.requests), 1)
@@ -539,8 +581,7 @@ class RelayTest(unittest.TestCase):
 
         self.verifier.result = verify
         receipt, device = make_grant()
-        station = Station(self.relay.port, receipt, device)
-        self.addCleanup(station.close)
+        station = self.station(receipt, device)
         station.handshake()
         session = self.connector.sessions[station.session]
         with mock.patch.object(attach_host.attach_pty, "PtyProcess", FakePty):
@@ -571,8 +612,7 @@ class RelayTest(unittest.TestCase):
                                                        "not allowed")
         self.host()
         receipt, device = make_grant()
-        station = Station(self.relay.port, receipt, device)
-        self.addCleanup(station.close)
+        station = self.station(receipt, device)
         station.handshake()
         answer = station.request()
         self.assertEqual(answer.get("code"), "not_authorized")
@@ -583,8 +623,7 @@ class RelayTest(unittest.TestCase):
         self.start()
         self.host()
         receipt, device = make_grant()
-        station = Station(self.relay.port, receipt, device)
-        self.addCleanup(station.close)
+        station = self.station(receipt, device)
         station.handshake()
         answer = station.request(transcript_hash=hashlib.sha256(b"autre").digest())
         self.assertEqual(answer.get("code"), "bad_request")
@@ -630,8 +669,7 @@ class RelayTest(unittest.TestCase):
         self.start()
         self.host()
         receipt, device = make_grant()
-        first = Station(self.relay.port, receipt, device)
-        self.addCleanup(first.close)
+        first = self.station(receipt, device)
         second_sock = socket.create_connection(("127.0.0.1", self.relay.port),
                                                timeout=LOCAL_IO_TIMEOUT)
         second_sock.settimeout(LOCAL_IO_TIMEOUT)
@@ -646,8 +684,7 @@ class RelayTest(unittest.TestCase):
         self.start(max_sessions_per_host=1)
         self.host(max_sessions=1)
         first_receipt, first_device = make_grant()
-        first = Station(self.relay.port, first_receipt, first_device)
-        self.addCleanup(first.close)
+        first = self.station(first_receipt, first_device)
         second_receipt, second_device = make_grant()
         frame = open_only(self.relay.port, second_receipt)
         self.assertEqual(t.parse_json(frame.payload, "err")["code"], "host_busy")
@@ -656,7 +693,7 @@ class RelayTest(unittest.TestCase):
         self.start(max_sessions_per_ip=1)
         self.host()
         first_receipt, first_device = make_grant()
-        first = Station(self.relay.port, first_receipt, first_device)
+        first = self.station(first_receipt, first_device)
         first.handshake()
         first.request()
         first.close()
@@ -664,8 +701,7 @@ class RelayTest(unittest.TestCase):
         while time.monotonic() < deadline and self.connector.sessions:
             time.sleep(0.02)
         second_receipt, second_device = make_grant()
-        second = Station(self.relay.port, second_receipt, second_device)
-        self.addCleanup(second.close)
+        second = self.station(second_receipt, second_device)
         second.handshake()
         self.assertEqual(second.request()["v"], 1)
 
@@ -673,8 +709,7 @@ class RelayTest(unittest.TestCase):
         self.start(max_sessions=1)
         self.host(max_sessions=1)
         first_receipt, first_device = make_grant()
-        first = Station(self.relay.port, first_receipt, first_device)
-        self.addCleanup(first.close)
+        first = self.station(first_receipt, first_device)
         second_receipt, _second_device = make_grant()
         frame = open_only(self.relay.port, second_receipt)
         self.assertEqual(t.parse_json(frame.payload, "err")["code"], "relay_busy")
@@ -701,7 +736,7 @@ class RelayTest(unittest.TestCase):
         self.start()
         self.host()
         receipt, device = make_grant()
-        station = Station(self.relay.port, receipt, device)
+        station = self.station(receipt, device)
         station.handshake()
         station.request()
         session = next(iter(self.connector.sessions.values()))
@@ -713,6 +748,40 @@ class RelayTest(unittest.TestCase):
         self.assertIn("peer_closed", self.logs.getvalue())
         self.assertIsNone(session.pty)
 
+    def test_poignee_de_main_attend_le_pair_cote_hote(self):
+        # #7640 : le relais rend PAIRED dès qu'il a *mis en file* le PAIR de
+        # l'hôte ; sous charge, l'hôte peut créer sa session bien après. Si le
+        # poste envoie son KEY avant cet événement de cycle de vie, l'attente
+        # de l'hôte consomme la borne de la poignée de main et le KEY attend
+        # derrière un PAIR non traité. Témoin : un hôte lent à appairer, et
+        # l'ordre « session de l'hôte visible AVANT le KEY du poste ».
+        self.start()
+        original_pair = attach_host.HostConnector._pair
+
+        def pair_after_a_descheduled_host(connector, frame):
+            time.sleep(1.0)
+            return original_pair(connector, frame)
+
+        with mock.patch.object(attach_host.HostConnector, "_pair",
+                               pair_after_a_descheduled_host):
+            self.host()
+            receipt, device = make_grant()
+            station = self.station(receipt, device)
+            key_before_pair = []
+            original_send = station._send
+
+            def spy(ftype, payload):
+                if ftype == t.KEY:
+                    key_before_pair.append(
+                        station.session not in self.connector.sessions)
+                return original_send(ftype, payload)
+
+            station._send = spy
+            station.handshake()
+        self.assertEqual(key_before_pair, [False],
+                         "the station KEY left before the host paired the session")
+        self.assertTrue(station.channel.ready)
+
     def test_reconnexion_de_l_hote(self):
         self.start()
         self.host()
@@ -723,8 +792,7 @@ class RelayTest(unittest.TestCase):
         frame = open_only(self.relay.port, receipt)
         self.assertEqual(t.parse_json(frame.payload, "err")["code"], "unknown_host")
         self.host()
-        station = Station(self.relay.port, receipt, device)
-        self.addCleanup(station.close)
+        station = self.station(receipt, device)
         station.handshake()
         self.assertEqual(station.request()["v"], 1)
 
@@ -809,6 +877,7 @@ class TlsTest(unittest.TestCase):
         receipt, device = make_grant()
         station = Station(relay.port, receipt, device, tls_context=self.client_ctx)
         self.addCleanup(station.close)
+        _wait_host_session(connector, station.session)
         station.handshake()
         self.assertEqual(station.request()["v"], 1)
 

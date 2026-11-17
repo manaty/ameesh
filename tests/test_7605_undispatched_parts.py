@@ -43,6 +43,7 @@ class UndispatchedPartsTest(unittest.TestCase):
         self.observed = datetime.fromisoformat("2026-11-16T18:44:00+00:00").timestamp()
         self.watcher = ci.Watcher(self.cfg, api=self.api, log=self.logs.append,
                                   clock=lambda: self.observed)
+        self.retry = self.enter(mock.patch.object(ci.Watcher, "_retry_missing_part", return_value=False))
         self.plan = {w: {"expected_sha": SHA} for w in PARTS}
         self.plan["sql-invariant.yml"].update(base_sha="a" * 40, head_sha=SHA)
         self.enter(mock.patch.object(ci.storage, "of", return_value=self.st))
@@ -79,6 +80,13 @@ class UndispatchedPartsTest(unittest.TestCase):
 
     def observe(self):
         return self.watcher._undispatched_parts(self.db, REPO, [self.lot])
+
+    def test_missing_part_is_reconciled_before_escalating_to_pilot(self):
+        self.retry.return_value = True
+        self.assertEqual(self.observe(), [])
+        self.retry.assert_called_once_with(self.db, REPO, self.lot, SHA,
+                                           "civil-crypto.yml", self.plan["civil-crypto.yml"])
+        self.send.assert_not_called()
 
     def test_real_mail_send_accepts_the_key_and_reaches_mailbox_deposit(self):
         # Only storage is simulated: the real ci._send and mail.send validate
