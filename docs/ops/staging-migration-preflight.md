@@ -112,10 +112,40 @@ a domain CHECK can reject the default on an N-1 insert even if adding the
 column to an empty table succeeds. This lets N-1 writers omit the new column: 0576
 (`profiles text[] not null default '{}'`) is additive.
 
-A new trigger is a relaxation requiring a declaration and frozen restore:
-it can reject writes from N-1 code. Replacing and dropping triggers retain
-their existing classes. Migration 0572 therefore requires a declaration and
-restore. Migration 0575 also requires them because `CREATE OR REPLACE FUNCTION`
-is a relaxation, even alongside new tables. The complete 799 fixture remains
-doubtful because its outer DO contains an unsupported RAISE EXCEPTION;
-classifying its new trigger as relaxation does not authorize other statements.
+A nullable `ADD COLUMN` is additive, with a constant default and an inline
+`CHECK` that accepts the value N-1 writers produce (NULL or that default),
+because old writers simply omit the column. A single `ALTER TABLE` may carry
+several additions: 0565/0568 add several nullable columns in one statement
+(#7655), and every action is judged on its own. A single unsafe action
+(`DROP COLUMN`, an unmarked constraint, a mandatory column without a proven
+constant default) keeps the whole statement in its old class.
+
+The L151 review markers are honored as the frozen migration's declaration,
+with a narrower scope than `migrations.non_additive`:
+
+* `-- ameesh: constraint not tightened` makes an `ADD CONSTRAINT ... CHECK
+  (...)` additive and a `DROP CONSTRAINT [IF EXISTS] <name>` additive only when
+  the migration re-adds the same constraint name. `UNIQUE`, `PRIMARY KEY` and
+  `FOREIGN KEY` additions keep their destructive class, and a dropped
+  constraint that is not re-added remains a relaxation. 0570/0578/0579 replace
+  a widened CHECK and 0565 adds its CHECKs on new columns, all without an
+  owner decision (#7655).
+* `-- ameesh: trigger compatible with previous code` makes the trigger
+  creation additive, including the `DROP TRIGGER IF EXISTS <name> ON <table>`
+  that recreates the same trigger name on the same table. A trigger on a table
+  created by the same migration is additive without the marker (0572). An
+  unmarked trigger on an existing table remains a relaxation requiring its
+  declaration and frozen restore (`rejects_previous_writes`, see above).
+
+A `CREATE OR REPLACE FUNCTION` or `PROCEDURE` is additive only when its name
+is absent from every migration of a lower version in the frozen tree: under
+`OR REPLACE`, a new name creates a new object rather than replacing one. The
+proof is read from Git at the frozen SHA, never from the worktree; a mention
+in an earlier migration, even in a comment, keeps the routine a relaxation.
+Qualified, quoted and non-simple names are not proven. 0567 and 0575 thus pass
+without a declaration (#7655); 0583/0584 replace the function created by 0567
+and remain declared relaxations.
+
+The complete 799 fixture remains doubtful because its outer DO contains an
+unsupported RAISE EXCEPTION; classifying its new trigger as relaxation does
+not authorize other statements.

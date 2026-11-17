@@ -58,6 +58,9 @@ class Refused(ValueError):
 class Classification:
     kind: str
     reasons: tuple[str, ...]
+    #: A trigger creation that is not proven harmless for N-1 writes. A new
+    #: trigger on a table created by the same migration, or one declared
+    #: compatible with previous code, does not set it (#7655).
     creates_trigger: bool = False
 
 
@@ -469,8 +472,197 @@ def _check_accepts(expression, column, default, literals):
         return None
 
 
-def classify(sql, policy=None):
+# --- #7655 : preuves déjà revues avec la migration (L151) ------------------
+#
+# Les marqueurs `-- ameesh: …` sont la déclaration de l'auteur, relue avec la
+# migration, que `migrations.non_additive` honore déjà. La porte reprend les
+# mêmes marqueurs, sans élargir leur portée :
+#   * `constraint not tightened` ne couvre que des CHECK (jamais UNIQUE, PK,
+#     FK), et un DROP CONSTRAINT n'est idempotent que si le même nom est
+#     rajouté dans la migration ;
+#   * `trigger compatible with previous code` couvre la création du trigger et
+#     son éventuel DROP IF EXISTS + CREATE du même nom sur la même table.
+# Une fonction `CREATE OR REPLACE` n'est additive que si son nom est absent de
+# toute migration antérieure du SHA gelé : la preuve se lit dans l'arbre, pas
+# dans le fichier.
+
+_ALTER_TABLE_HEAD = re.compile(
+    r"alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?(?P<table>[\w.\"]+)\s+", re.I)
+_ADD_CONSTRAINT_ACTION = re.compile(
+    r"add constraint (?P<name>[\w\"]+) check \((?P<check>.*)\)", re.I | re.S)
+_DROP_CONSTRAINT_ACTION = re.compile(
+    r"drop constraint (?:if exists )?(?P<name>[\w\"]+)", re.I)
+_CREATE_TRIGGER = re.compile(
+    r"create (?:or replace )?(?:constraint )?trigger (?P<name>[\w\"]+)\s+"
+    r"(?P<rest>.*)", re.I | re.S)
+_TRIGGER_TARGET = re.compile(r"\bon (?:only )?([\w.\"]+)", re.I)
+_DROP_TRIGGER = re.compile(
+    r"drop trigger (if exists )?(?P<name>[\w\"]+) on (?P<table>[\w.\"]+)", re.I)
+_CREATE_OR_REPLACE_ROUTINE = re.compile(
+    r"create or replace (?P<kind>function|procedure) (?P<name>[\w\"]+)\s*\(", re.I)
+_NULLABLE_COLUMN = (
+    r"add column (?:if not exists )?(?P<column>[\w\"]+) "
+    r"[\w.]+(?:\[\])?(?: null)?")
+_NULLABLE_CONSTANT = (
+    r"add column (?:if not exists )?(?P<column>[\w\"]+) "
+    + _BUILTIN + r"(?:\[\])?"
+    + r"(?: null)?(?: default (?P<default>" + _CONSTANT + ")" + _CAST + r")")
+
+
+def _alter_actions(statement):
+    """``(table, actions)`` of an ``ALTER TABLE``, splitting top-level commas."""
+    match = _ALTER_TABLE_HEAD.match(statement)
+    if not match:
+        return None
+    text, actions, depth, start = statement, [], 0, match.end()
+    for at in range(start, len(text)):
+        if text[at] == "(":
+            depth += 1
+        elif text[at] == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif text[at] == "," and depth == 0:
+            actions.append(text[start:at].strip())
+            start = at + 1
+    if depth:
+        return None
+    actions.append(text[start:].strip())
+    if not all(actions):
+        return None
+    return match.group("table"), actions
+
+
+def _nullable_column(action, literals):
+    """A new nullable column. Without a default any simple type is safe (old
+    writers omit it, so the value is NULL); with a constant default the type
+    must be a built-in, for the same domain-cast reason as a mandatory column,
+    and an inline CHECK must accept the value N-1 writers produce."""
+    for tail in ("", r"\s+check\s*\((?P<check>.*)\)"):
+        match = re.fullmatch(_NULLABLE_COLUMN + tail, action, re.I | re.S)
+        if match is not None:
+            check = match.group("check") if tail else None
+            if check is None or _check_accepts(
+                    check, match.group("column"), None, literals) is True:
+                return True
+    for tail in ("", r"\s+check\s*\((?P<check>.*)\)"):
+        match = re.fullmatch(_NULLABLE_CONSTANT + tail, action, re.I | re.S)
+        if match is None:
+            continue
+        check = match.group("check") if tail else None
+        if check is None:
+            return True
+        raw = match.group("default")
+        try:
+            value = _default_value(raw, literals)
+        except _Unsupported:
+            continue
+        if _check_accepts(check, match.group("column"), value, literals) is True:
+            return True
+    return False
+
+
+def _constant_column(definition, literals):
+    """A mandatory column is additive only with a constant default the inline
+    CHECK provably accepts (#7531)."""
+    default, check, column = definition
+    if check is None:
+        return True
+    try:
+        value = _default_value(default, literals)
+    except _Unsupported:
+        return False
+    return _check_accepts(check, column, value, literals) is True
+
+
+def _additive_column_action(action, literals):
+    if _nullable_column(action, literals):
+        return True
+    definition = _column_definition("alter table t " + action)
+    return definition is not None and _constant_column(definition, literals)
+
+
+def _simple_name(value):
+    """The lexer replaces every quoted identifier by the same ``"_"`` token, so
+    a quoted name cannot be paired or proven without confusing two objects."""
+    return bool(value) and '"' not in value
+
+
+def _proven_additive(statement, code, literals, *, proves_new, constraint_marker,
+                     trigger_marker, added_constraints, created_triggers,
+                     unconditional):
+    """Reasons this statement cannot break N-1 code, or None.
+
+    Only exact shapes are accepted: every ALTER TABLE action is proven on its
+    own, so a single DROP COLUMN or an unmarked constraint keeps the statement
+    in the generic (worst-class) path.
+    """
+    altered = _alter_actions(statement)
+    if altered is not None:
+        table, actions = altered
+        reasons = []
+        for action in actions:
+            if _additive_column_action(action, literals):
+                reasons.append("additive column: " + action)
+                continue
+            constraint = _ADD_CONSTRAINT_ACTION.fullmatch(action)
+            if (constraint is not None and constraint_marker
+                    and _simple_name(table) and _simple_name(constraint.group("name"))):
+                reasons.append("constraint %s declared not tightened"
+                               % constraint.group("name"))
+                continue
+            dropped = _DROP_CONSTRAINT_ACTION.fullmatch(action)
+            if (dropped is not None and constraint_marker and unconditional
+                    and _simple_name(table) and _simple_name(dropped.group("name"))
+                    and (table, dropped.group("name")) in added_constraints):
+                reasons.append("constraint %s replaced, declared not tightened"
+                               % dropped.group("name"))
+                continue
+            return None
+        return tuple(reasons) or None
+    trigger = _CREATE_TRIGGER.fullmatch(statement)
+    if trigger is not None:
+        target = _TRIGGER_TARGET.search(trigger.group("rest"))
+        table = target.group(1) if target else None
+        if trigger_marker and _simple_name(trigger.group("name")) and _simple_name(table):
+            return ("trigger %s declared compatible with previous code"
+                    % trigger.group("name"),)
+        if table and _simple_name(table) and migrations._proven_new(code, "table", table):
+            return ("trigger %s on a table created by this migration"
+                    % trigger.group("name"),)
+        return None
+    dropped = _DROP_TRIGGER.fullmatch(statement)
+    if dropped is not None:
+        name, table = dropped.group("name"), dropped.group("table")
+        if (dropped.group(1) and unconditional and _simple_name(name)
+                and _simple_name(table) and (table, name) in created_triggers
+                and (trigger_marker or migrations._proven_new(code, "table", table))):
+            return ("trigger %s recreated in this migration" % name,)
+        return None
+    routine = _CREATE_OR_REPLACE_ROUTINE.match(statement)
+    if routine is not None:
+        name = routine.group("name")
+        if re.fullmatch(r"[a-z_][a-z0-9_]*", name) and proves_new(routine.group("kind"), name):
+            return ("routine %s absent from earlier migrations" % name,)
+        return None
+    return None
+
+
+def _residual_hits(policy, statement):
+    """Project exceptions keep their class, even on a proven-additive shape."""
+    hits = []
+    for category in ("destructive", "relaxation"):
+        for entry in policy["rules"][category]:
+            if entry in _DEFAULT_RULES[category]:
+                continue
+            if re.fullmatch(entry["pattern"], statement, re.I | re.S):
+                hits.append(entry["reason"])
+    return hits
+
+
+def classify(sql, policy=None, *, proves_new=None):
     policy = load_policy() if policy is None else policy
+    proves_new = (lambda kind, name, signature="": False) if proves_new is None else proves_new
     literals = {}
     try:
         code = _code(sql, literals=literals)
@@ -482,7 +674,26 @@ def classify(sql, policy=None):
         return Classification("unknown", ("no SQL statement",))
     rank = {"additive": 0, "relaxation": 1, "destructive": 2, "unknown": 3}
     unconditional = not re.search(r"\bdo\b", migrations._lex(sql)[1], re.I)
+    constraint_marker = bool(migrations._CONSTRAINT_MARKER.search(sql))
+    trigger_marker = bool(migrations._TRIGGER_MARKER.search(sql))
+    # Names are collected before judging any statement, so a DROP CONSTRAINT
+    # or DROP TRIGGER is idempotent only when the same name is recreated.
+    added_constraints, created_triggers = set(), set()
+    for statement in code.split(";"):
+        altered = _alter_actions(statement.strip())
+        if altered is not None:
+            table, actions = altered
+            for action in actions:
+                constraint = _ADD_CONSTRAINT_ACTION.fullmatch(action)
+                if constraint is not None:
+                    added_constraints.add((table, constraint.group("name")))
+        trigger = _CREATE_TRIGGER.fullmatch(statement.strip())
+        if trigger is not None:
+            target = _TRIGGER_TARGET.search(trigger.group("rest"))
+            if target is not None:
+                created_triggers.add((target.group(1), trigger.group("name")))
     kind, reasons = "additive", []
+    unsafe_trigger = False
     for statement in code.split(";"):
         statement = statement.strip()
         if not statement:
@@ -491,6 +702,19 @@ def classify(sql, policy=None):
             return Classification("unknown", ("dynamic SQL not analysed",), creates_trigger)
         if unconditional and _new_routine_revoke(statement, code):
             continue
+        proof = _proven_additive(
+            statement, code, literals, proves_new=proves_new,
+            constraint_marker=constraint_marker, trigger_marker=trigger_marker,
+            added_constraints=added_constraints, created_triggers=created_triggers,
+            unconditional=unconditional)
+        if proof is not None and not _residual_hits(policy, statement):
+            # The marker or the frozen proof is the reviewed declaration: an
+            # additive file needs no policy entry. Project exceptions keep
+            # their class through _residual_hits.
+            reasons.extend(proof)
+            continue
+        if _CREATE_TRIGGER.fullmatch(statement) is not None:
+            unsafe_trigger = True
         # Match the entire addition, keeping literal contents opaque. Extra
         # actions, constraints, NULL and computed defaults cannot pass here.
         definition = _column_definition(statement)
@@ -527,13 +751,13 @@ def classify(sql, policy=None):
                 break
         if found is None:
             return Classification("unknown", ("statement outside SQL rules: " + statement[:120],), creates_trigger)
-    return Classification(kind, tuple(dict.fromkeys(reasons)), creates_trigger)
+    return Classification(kind, tuple(dict.fromkeys(reasons)), unsafe_trigger)
 
 
-def check(path, data, policy, *, read_file, signed_decision):
+def check(path, data, policy, *, read_file, signed_decision, proves_new=None):
     """The frozen policy entry itself is the reviewed migration declaration."""
     try:
-        result = classify(data.decode("utf-8"), policy)
+        result = classify(data.decode("utf-8"), policy, proves_new=proves_new)
     except UnicodeError:
         result = Classification("unknown", ("SQL is not UTF-8",))
     if result.kind == "additive" and not result.creates_trigger:
@@ -573,6 +797,7 @@ class GitTree:
         if not re.fullmatch(r"[0-9a-f]{40}", sha):
             raise Refused("a full frozen commit SHA is required")
         self.repo, self.sha = repo, sha
+        self._grep_cache = {}
         self.git("rev-parse", "--verify", sha + "^{commit}")
 
     def git(self, *args):
@@ -581,6 +806,30 @@ class GitTree:
                                   check=True, timeout=30).stdout
         except (OSError, subprocess.SubprocessError) as exc:
             raise Refused("frozen Git read failed: %s" % " ".join(args)) from exc
+
+    def grep(self, word):
+        """Repository-relative migration paths whose frozen text contains
+        `word`, case-insensitively. A fixed-string search: the word is SQL, not
+        a pattern. Exit 1 is an honest "no match"; any other failure refuses."""
+        if word in self._grep_cache:
+            return self._grep_cache[word]
+        try:
+            result = subprocess.run(
+                ["git", "-C", self.repo, "grep", "-l", "-i", "-w", "-F", "-e",
+                 word, self.sha, "--", migrations.REPO_PATH],
+                capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise Refused("frozen Git read failed: git grep") from exc
+        if result.returncode == 1:
+            paths = []
+        elif result.returncode != 0:
+            raise Refused("frozen Git read failed: git grep")
+        else:
+            paths = [line.partition(":")[2] for line in
+                     result.stdout.decode("utf-8", "replace").splitlines()
+                     if line.partition(":")[2]]
+        self._grep_cache[word] = paths
+        return paths
 
     def read(self, path, *, optional=False):
         if (not isinstance(path, str) or not path or PurePosixPath(path).is_absolute()
@@ -626,13 +875,47 @@ def decision_verifier(db, project, *, public_only=False):
     return verify
 
 
+def _migration_version(path):
+    """Version of a top-level frozen migration file, or None for any other path."""
+    if not isinstance(path, str):
+        return None
+    candidate = PurePosixPath(path)
+    if candidate.parent != PurePosixPath(migrations.REPO_PATH):
+        return None
+    match = re.fullmatch(r"(\d{4})_[A-Za-z0-9._-]+\.sql", candidate.name)
+    return int(match.group(1)) if match else None
+
+
+def _history_prover(tree, path):
+    """Prove a routine new from the frozen tree: its name is absent from every
+    migration of a *lower* version. Mentions in later files, rollback files and
+    the migration itself do not count. Unknown paths or non-simple names stay
+    conservative (no proof)."""
+    version = _migration_version(path)
+    if version is None:
+        return None
+
+    def proves_new(kind, name, signature=""):
+        if kind not in ("function", "procedure") or not re.fullmatch(
+                r"[a-z_][a-z0-9_]*", name):
+            return False
+        for found in tree.grep(name):
+            earlier = _migration_version(found)
+            if earlier is not None and earlier < version:
+                return False
+        return True
+
+    return proves_new
+
+
 def inventory(tree, paths, *, signed_decision):
     policy, rows, refused = tree.policy(), [], False
     for path in dict.fromkeys(paths):
         try:
             data = tree.read(path)
             classification = check(path, data, policy, read_file=tree.read,
-                                   signed_decision=signed_decision)
+                                   signed_decision=signed_decision,
+                                   proves_new=_history_prover(tree, path))
             rows.append(dict(path=path, checksum=hashlib.sha256(data).hexdigest(),
                              classification=classification.kind,
                              reasons=list(classification.reasons), allowed=True))

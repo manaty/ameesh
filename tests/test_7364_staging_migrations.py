@@ -111,11 +111,16 @@ class ClassificationTests(unittest.TestCase):
 
     def test_actual_migrations_and_new_trigger(self):
         root = Path(__file__).resolve().parents[1]
-        for name, kind in (("0572_conversation_moves.sql", 'relaxation'),
-                           ("0575_shared_host_tenants.sql", 'relaxation'),
+        for name, kind in (("0572_conversation_moves.sql", 'additive'),
+                           ("0575_shared_host_tenants.sql", 'additive'),
                            ("0576_tenant_account_profiles.sql", 'additive')):
             with self.subTest(name=name):
-                self.assertEqual(sm.classify((root/'src/ameesh/migrations'/name).read_text()).kind, kind)
+                # 0575 replaces functions created by that same migration; the
+                # frozen-tree history proof is exercised end to end below.
+                prover = ((lambda kind, name, signature="": True)
+                          if name.startswith("0575") else None)
+                self.assertEqual(sm.classify((root/'src/ameesh/migrations'/name).read_text(),
+                                             proves_new=prover).kind, kind)
         path = FIXTURES/'799_c1_residual_hub_fks.sql'
         meta = json.loads(path.with_suffix('.source.json').read_text())
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), meta['sha256'])
@@ -129,6 +134,160 @@ class ClassificationTests(unittest.TestCase):
         policy['declarations']['migration.sql'] = {'checksum':hashlib.sha256(data).hexdigest(), 'lot':1, 'restore':'cleanup_restore.sql',
             'rejects_previous_writes':False, 'previous_writes_justification':'Only cleans up deleted rows; function reviewed'}
         self.assertEqual(sm.check('migration.sql', data, policy, read_file=lambda p:b'DROP TRIGGER cleanup ON conversations;', signed_decision=lambda *a:False).kind, 'relaxation')
+
+    def test_multiple_nullable_columns_in_one_alter_table_are_additive(self):
+        # #7655: 0565 and 0568 add several nullable columns in one statement.
+        sql = ("ALTER TABLE work_items "
+               "ADD COLUMN IF NOT EXISTS external_session text, "
+               "ADD COLUMN IF NOT EXISTS external_claim_session text, "
+               "ADD COLUMN IF NOT EXISTS external_claimed_at timestamptz;")
+        self.assertEqual(sm.classify(sql).kind, 'additive')
+        self.assertEqual(sm.check('0565.sql', sql.encode(), sm.load_policy(),
+                                  read_file=lambda p:b'', signed_decision=lambda *a:False).kind,
+                         'additive')
+        # Nullable columns with a constant default are additive too, and a
+        # mandatory column with a proven constant default keeps its #7531
+        # shortcut inside the same statement.
+        sql = ("ALTER TABLE t ADD COLUMN a text, "
+               "ADD COLUMN b integer NOT NULL DEFAULT 0, "
+               "ADD COLUMN c text DEFAULT 'x' CHECK (c <> '');")
+        self.assertEqual(sm.classify(sql).kind, 'additive')
+        self.assertEqual(sm.classify("ALTER TABLE t ADD COLUMN y text DEFAULT 'x';").kind,
+                         'additive')
+        # One unsafe action keeps the whole statement in the worst class.
+        for sql in (
+                "ALTER TABLE t ADD COLUMN a text, ADD COLUMN b int NOT NULL",
+                "ALTER TABLE t ADD COLUMN a text, DROP COLUMN z",
+                "ALTER TABLE t ADD COLUMN a text, "
+                "ADD COLUMN b int NOT NULL DEFAULT 1 CHECK (b > 1)"):
+            with self.subTest(sql=sql):
+                self.assertEqual(sm.classify(sql).kind, 'destructive')
+
+    def test_constraint_not_tightened_marker_is_additive(self):
+        # #7655: 0570, 0578 and 0579 replace a CHECK by a wider one; 0565 adds
+        # several CHECKs on new columns. The L151 marker is the reviewed
+        # declaration that the constraint does not tighten.
+        marked = """-- ameesh: constraint not tightened
+        ALTER TABLE account_switches DROP CONSTRAINT IF EXISTS account_switches_kind_check;
+        ALTER TABLE account_switches ADD CONSTRAINT account_switches_kind_check
+            CHECK (kind IN ('bascule', 'retour', 'agent'));"""
+        self.assertEqual(sm.classify(marked).kind, 'additive')
+        self.assertEqual(sm.check('0578.sql', marked.encode(), sm.load_policy(),
+                                  read_file=lambda p:b'', signed_decision=lambda *a:False).kind,
+                         'additive')
+        marked = """-- ameesh: constraint not tightened
+        ALTER TABLE work_items
+            ADD CONSTRAINT a_ck CHECK (a IS NULL OR btrim(a) <> ''),
+            ADD CONSTRAINT b_ck CHECK ((b IS NULL) = (c IS NULL));"""
+        self.assertEqual(sm.classify(marked).kind, 'additive')
+        # Without the marker, the old classes are kept.
+        unmarked = marked.replace('-- ameesh: constraint not tightened\n', '')
+        self.assertEqual(sm.classify(unmarked).kind, 'destructive')
+        # A drop without a same-name re-add stays a removal, even marked.
+        alone = """-- ameesh: constraint not tightened
+        ALTER TABLE t DROP CONSTRAINT IF EXISTS c;"""
+        self.assertEqual(sm.classify(alone).kind, 'relaxation')
+        # The marker never covers UNIQUE, PRIMARY KEY or FOREIGN KEY.
+        unique = """-- ameesh: constraint not tightened
+        ALTER TABLE t ADD CONSTRAINT u UNIQUE (a);"""
+        self.assertEqual(sm.classify(unique).kind, 'destructive')
+        # A project destructive exception still wins over the marker.
+        policy = sm.load_policy(json.dumps({'schema':'ameesh-staging-migrations/1',
+            'exceptions':{'destructive':[{'pattern':r'alter table protected .*', 'reason':'protected table'}]}}))
+        self.assertEqual(sm.classify(
+            "-- ameesh: constraint not tightened\nALTER TABLE protected ADD CONSTRAINT ck CHECK (a > 0);",
+            policy).kind, 'destructive')
+
+    def test_trigger_marker_and_new_table_are_additive(self):
+        # #7655: 0567 declares its triggers compatible with previous code;
+        # 0572 creates its trigger on a table created by the same migration.
+        marked = """-- ameesh: trigger compatible with previous code
+        CREATE TRIGGER zz_guard BEFORE INSERT ON work_items
+            FOR EACH ROW EXECUTE FUNCTION guard();"""
+        self.assertEqual(sm.classify(marked).kind, 'additive')
+        self.assertEqual(sm.check('0567.sql', marked.encode(), sm.load_policy(),
+                                  read_file=lambda p:b'', signed_decision=lambda *a:False).kind,
+                         'additive')
+        new_table = """CREATE TABLE conversation_moves (id int);
+        CREATE TRIGGER spelling BEFORE INSERT ON conversation_moves
+            FOR EACH ROW EXECUTE FUNCTION f();"""
+        self.assertEqual(sm.classify(new_table).kind, 'additive')
+        self.assertEqual(sm.check('0572.sql', new_table.encode(), sm.load_policy(),
+                                  read_file=lambda p:b'', signed_decision=lambda *a:False).kind,
+                         'additive')
+        # On an existing table, without the marker, the trigger is still a
+        # relaxation owing its declaration and rejects_previous_writes.
+        unmarked = ("CREATE TRIGGER guard BEFORE INSERT ON work_items "
+                    "FOR EACH ROW EXECUTE FUNCTION guard();")
+        self.assertEqual(sm.classify(unmarked).kind, 'relaxation')
+        with self.assertRaises(sm.Refused):
+            sm.check('migration.sql', unmarked.encode(), sm.load_policy(),
+                     read_file=lambda p:b'-- restore', signed_decision=lambda *a:False)
+        # A DROP is only idempotent when the same trigger is recreated.
+        replaced = """-- ameesh: trigger compatible with previous code
+        DROP TRIGGER IF EXISTS zz_guard ON work_items;
+        CREATE TRIGGER zz_guard BEFORE INSERT ON work_items
+            FOR EACH ROW EXECUTE FUNCTION guard();"""
+        self.assertEqual(sm.classify(replaced).kind, 'additive')
+        for sql in (
+                """-- ameesh: trigger compatible with previous code
+                DROP TRIGGER IF EXISTS zz_guard ON work_items;""",
+                """-- ameesh: trigger compatible with previous code
+                DROP TRIGGER IF EXISTS zz_guard ON work_items;
+                CREATE TRIGGER other BEFORE INSERT ON work_items
+                    FOR EACH ROW EXECUTE FUNCTION guard();""",
+                """-- ameesh: trigger compatible with previous code
+                DROP TRIGGER zz_guard ON work_items;
+                CREATE TRIGGER zz_guard BEFORE INSERT ON work_items
+                    FOR EACH ROW EXECUTE FUNCTION guard();"""):
+            with self.subTest(sql=sql):
+                self.assertEqual(sm.classify(sql).kind, 'destructive')
+        # The marker covers the trigger, never another destructive statement.
+        self.assertEqual(sm.classify(
+            "-- ameesh: trigger compatible with previous code\nDROP TABLE x;").kind,
+            'destructive')
+        # Quoted identifiers are one neutral token in the lexer: never pair a
+        # quoted drop with a quoted create, or prove a quoted table new.
+        quoted = """-- ameesh: trigger compatible with previous code
+        DROP TRIGGER IF EXISTS "old" ON t;
+        CREATE TRIGGER "new" BEFORE INSERT ON t
+            FOR EACH ROW EXECUTE FUNCTION guard();"""
+        self.assertEqual(sm.classify(quoted).kind, 'destructive')
+        self.assertEqual(sm.classify(
+            '-- ameesh: constraint not tightened\n'
+            'ALTER TABLE t DROP CONSTRAINT IF EXISTS "old";\n'
+            'ALTER TABLE t ADD CONSTRAINT "new" CHECK (a > 0);').kind,
+            'destructive')
+        # A conditional branch keeps the worst class: the drop and its
+        # re-creation may not execute together.
+        conditional = """-- ameesh: trigger compatible with previous code
+        DO $$ BEGIN DROP TRIGGER IF EXISTS g ON t;
+        CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f(); END $$;"""
+        self.assertEqual(sm.classify(conditional).kind, 'destructive')
+
+    def test_create_or_replace_routine_proven_new(self):
+        # #7655: 0567 and 0575 introduce their functions with CREATE OR
+        # REPLACE, but no earlier migration defines them.
+        sql = ("CREATE OR REPLACE FUNCTION ameesh_host_shared(h text) "
+               "RETURNS boolean LANGUAGE sql AS $$ SELECT true $$;")
+        self.assertEqual(sm.classify(sql).kind, 'relaxation')
+        self.assertEqual(sm.classify(sql, proves_new=lambda kind, name, signature="": True).kind,
+                         'additive')
+        self.assertEqual(sm.check('0575.sql', sql.encode(), sm.load_policy(),
+                                  read_file=lambda p:b'', signed_decision=lambda *a:False,
+                                  proves_new=lambda kind, name, signature="": True).kind,
+                         'additive')
+        # A name present in an earlier migration keeps the relaxation class.
+        prover = lambda kind, name, signature="": name == "another_function"
+        self.assertEqual(sm.classify(sql, proves_new=prover).kind, 'relaxation')
+        self.assertEqual(sm.classify(
+            "CREATE OR REPLACE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$;",
+            proves_new=lambda kind, name, signature="": kind == "procedure").kind,
+            'additive')
+        # Qualified or quoted names are not proven by the frozen-tree search.
+        self.assertEqual(sm.classify(
+            "CREATE OR REPLACE FUNCTION public.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
+            proves_new=lambda kind, name, signature="": True).kind, 'relaxation')
 
     def test_trigger_previous_writes_declaration_and_owner_proof(self):
         for timing in ('BEFORE', 'AFTER'):
@@ -254,6 +413,64 @@ class GitInventoryTests(unittest.TestCase):
         report=sm.inventory(sm.GitTree(str(self.repo),sha),['sql/1.sql'],signed_decision=lambda *args:False)
         self.assertFalse(report['allowed'])
         self.assertIn('destructive',report['files'][0]['reason'])
+
+    def test_routine_proof_reads_only_earlier_frozen_migrations(self):
+        # #7655: a CREATE OR REPLACE FUNCTION is additive only when the name
+        # is absent from every migration of a lower version in the frozen
+        # tree; a replacement of an object created earlier stays relaxation.
+        base = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\n"
+        replace = "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;\n"
+        new = "CREATE OR REPLACE FUNCTION g() RETURNS int LANGUAGE sql AS $$ SELECT 3 $$;\n"
+        self.put('src/ameesh/migrations/0100_base.sql', base)
+        self.put('src/ameesh/migrations/0200_replace.sql', replace)
+        self.put('src/ameesh/migrations/0300_new.sql', new)
+        self.put('rollback/0200_restore.sql', '-- reviewed restore\n')
+        self.policy({'src/ameesh/migrations/0200_replace.sql': {
+            'checksum': hashlib.sha256(replace.encode()).hexdigest(), 'lot': 17,
+            'restore': 'rollback/0200_restore.sql'}})
+        sha = self.commit()
+        report = sm.inventory(
+            sm.GitTree(str(self.repo), sha),
+            ['src/ameesh/migrations/0200_replace.sql',
+             'src/ameesh/migrations/0300_new.sql'],
+            signed_decision=lambda *args: False)
+        self.assertTrue(report['allowed'], report)
+        by_path = {row['path']: row for row in report['files']}
+        self.assertEqual(by_path['src/ameesh/migrations/0200_replace.sql']['classification'],
+                         'relaxation')
+        self.assertEqual(by_path['src/ameesh/migrations/0300_new.sql']['classification'],
+                         'additive')
+
+    def test_twenty_pending_migrations_pass_at_the_frozen_head(self):
+        # #7655 witness: the exact 0565..0584 inventory of the SHA where the
+        # fix is taken passes the gate, through the same CLI the applicator
+        # uses, with no signed owner decision.
+        root = Path(__file__).resolve().parents[1]
+        try:
+            sha = subprocess.check_output(
+                ['git', '-C', str(root), 'rev-parse', 'HEAD'],
+                stderr=subprocess.DEVNULL).decode().strip()
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest('no frozen Git checkout available')
+        paths = ['src/ameesh/migrations/' + path.name for path in
+                 sorted((root/'src/ameesh/migrations').glob('05*.sql'))
+                 if '0565' <= path.name[:4] <= '0584']
+        self.assertEqual(len(paths), 20)
+        def no_decision(*args):
+            self.fail('no signed owner decision expected: %r' % (args,))
+        report = sm.inventory(sm.GitTree(str(root), sha), paths,
+                              signed_decision=no_decision)
+        self.assertTrue(report['allowed'],
+                        [row for row in report['files'] if not row.get('allowed')])
+        kinds = [row['classification'] for row in report['files']]
+        self.assertEqual(kinds.count('additive'), 18)
+        self.assertEqual(kinds.count('relaxation'), 2)  # 0583/0584, declared
+        pending = self.repo / 'pending-0565-0584.txt'
+        pending.write_text('\n'.join(paths) + '\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sm.main(['--repo', str(root), '--sha', sha,
+                                      '--project', 'ameesh',
+                                      '--files-from', str(pending)]), 0)
 
     def test_real_796_797_pass_only_when_declared_with_frozen_restore(self):
         meta=json.loads((FIXTURES/'source.json').read_text())
