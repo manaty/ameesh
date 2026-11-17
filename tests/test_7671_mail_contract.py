@@ -411,6 +411,95 @@ class BatchTest(PublicMailBase):
         self.assertEqual(batch.results, ())
 
 
+class ControlPayloadTest(PublicMailBase):
+    """Review B/P1 (#7671): a module payload never selects a core control path.
+
+    The mailbox rewrites a pending review request when it sees
+    ``payload.review_designation`` on a request linked to a lot
+    (``Mailbox.send`` → ``_send_review(automatic=True)``).  A module payload is
+    data, so the public surface must refuse that key before any deposit and
+    leave the core request intact.
+    """
+
+    LOT = 7671
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.execute(
+            "INSERT INTO work_items (id, type, source, title, app, state)"
+            " VALUES (%s, 'evolution', 'mesh-design', 'lot de relecture',"
+            " 'ameesh', 'qa')", (self.LOT,))
+        self.pending = mail.send(
+            self.db, "beta", "alpha", "relecture du lot",
+            kind="request", work_item_id=str(self.LOT),
+            payload={"review_request": {"freeze": {"sha": "a" * 40}}})
+
+    def mailbox_rows(self) -> list[dict]:
+        return self.db.query(
+            "SELECT id, sender, recipient, body, payload, work_item_id,"
+            " delivered_at FROM agent_mailbox ORDER BY id")
+
+    def replacement_notes(self) -> list[dict]:
+        return self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s"
+            " AND note LIKE %s", (self.LOT, "review-designation-replaced%"))
+
+    def test_every_reserved_key_is_refused_before_deposit(self):
+        before = self.mailbox_rows()
+        for key in sorted(public_mail.RESERVED_PAYLOAD_KEYS):
+            with self.subTest(key=key):
+                with self.assertRaises(InvalidSubmission):
+                    public_mail.submit(
+                        self.db, "gamma", self.submission(
+                            recipient="alpha", body="marker " + key,
+                            payload={key: {"sha": "b" * 40}}))
+        self.assertEqual(self.mailbox_rows(), before)
+
+    def test_a_mapping_cannot_hide_a_reserved_key(self):
+        class Hidden(dict):
+            def __iter__(self):
+                return (key for key in super().__iter__()
+                        if key not in ("review_designation", "review_request"))
+
+        before = self.mailbox_rows()
+        for key in ("review_designation", "review_request"):
+            with self.subTest(key=key):
+                with self.assertRaises(InvalidSubmission):
+                    public_mail.submit(
+                        self.db, "gamma", self.submission(
+                            recipient="alpha", body="hidden " + key,
+                            kind="request", work_item_id=self.LOT,
+                            payload=Hidden({key: {"sha": "b" * 40}})))
+        self.assertEqual(self.mailbox_rows(), before)
+
+    def test_a_module_cannot_replace_a_pending_review_request(self):
+        before = self.mailbox_rows()
+        with self.assertRaises(InvalidSubmission):
+            public_mail.submit(
+                self.db, "gamma", self.submission(
+                    recipient="alpha", body="take over", kind="request",
+                    work_item_id=self.LOT,
+                    payload={"review_designation": {"sha": "b" * 40}}))
+        self.assertEqual(self.mailbox_rows(), before)
+        self.assertEqual(self.replacement_notes(), [])
+
+    def test_a_batch_reports_a_reserved_key_as_invalid(self):
+        before = self.mailbox_rows()
+        batch = public_mail.submit_many(self.db, "gamma", (
+            self.submission(recipient="alpha", body="fine"),
+            self.submission(
+                recipient="alpha", body="take over", kind="request",
+                work_item_id=self.LOT,
+                payload={"review_request": {"freeze": {"sha": "c" * 40}}}),
+        ))
+        self.assertEqual([result.ok for result in batch.results], [True, False])
+        self.assertEqual(batch.results[1].error, "invalid")
+        rows = self.mailbox_rows()
+        self.assertEqual(len(rows), len(before) + 1)
+        self.assertEqual([row for row in rows if row["id"] == self.pending],
+                         [row for row in before if row["id"] == self.pending])
+
+
 class HistoryTest(PublicMailBase):
     def setUp(self) -> None:
         super().setUp()
