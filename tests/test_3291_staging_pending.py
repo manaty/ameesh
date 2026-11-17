@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Staging must never undo a fix already active on the mesh (#3291)."""
+import dataclasses
 import json
 import types
 import unittest
@@ -334,6 +335,7 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
             self.st.work.land_lock.assert_not_called()
 
     def test_timer_alert_is_deduplicated_for_each_recipient_and_rearmed(self):
+        project = dataclasses.replace(self.project, report="bureau")  # route d'ameesh (#7634)
         report = {"result": "needed", "lots": [1, 2, 3], "candidate": self.head,
                   "active": self.active}
         cfg = types.SimpleNamespace(state_dir=self.cfg.state_dir,
@@ -341,14 +343,14 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
                                         "notify": ["pilot", "bureau"]}}})
         with mock.patch.object(staging_pending, "inspect", return_value=report), \
              mock.patch("ameesh.mail.send") as send:
-            staging_pending.tick(cfg, None, self.project, now=_paris(22, 30))
-            staging_pending.tick(cfg, None, self.project, now=_paris(22, 31))
+            staging_pending.tick(cfg, None, project, now=_paris(22, 30))
+            staging_pending.tick(cfg, None, project, now=_paris(22, 31))
             self.assertEqual(send.call_count, 2)
             self.assertEqual({c.args[2] for c in send.call_args_list}, {"pilot", "bureau"})
             with mock.patch.object(staging_pending, "inspect", return_value={
                     "result": "below-threshold"}):
-                staging_pending.tick(cfg, None, self.project, now=_paris(22, 32))
-            staging_pending.tick(cfg, None, self.project, now=_paris(22, 33))
+                staging_pending.tick(cfg, None, project, now=_paris(22, 32))
+            staging_pending.tick(cfg, None, project, now=_paris(22, 33))
             self.assertEqual(send.call_count, 4)
 
 

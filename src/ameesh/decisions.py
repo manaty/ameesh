@@ -122,11 +122,40 @@ LEASE_ENV = ("AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH")
 
 _TIME_RE = re.compile(r"^\s*(\d{1,2})[:h](\d{2})\s*$")
 
-#: L233: a decision written in prose in mail to the owner's desk or to a
+#: L233: a decision written in prose in mail to the owner's avatar or to a
 #: human never counts; `ameesh decisions` (and so `ameesh chat`) shows such
 #: mail and offers to convert it (`ameesh decide ask --from-mail <id>`).
-#: Recipients watched besides any `human:*`:
-PROSE_RECIPIENTS = ("bureau",)
+#: The recipients watched besides any `human:*` are the avatars declared at
+#: the canon (#7634): the core knows no avatar name.
+PROSE_RECIPIENTS = ()
+
+
+def prose_recipients(db=None) -> tuple:
+    """Les avatars des canons configurés, destinataires d'une prose L233.
+
+    À défaut d'avatar déclaré, la route humaine d'avant reste l'agent
+    `externe` du registre (une session que l'humain lit lui-même), **un
+    seul**, le premier dans l'ordre stable du registre : un humain sans
+    avatar garde le comportement actuel (#7634, point 4), un desk unique et
+    non une copie à chaque session externe. Un canon ou un registre illisible
+    ne devine aucun nom : la lecture humaine (`human:*`) reste couverte par
+    la requête."""
+    from . import avatars, config as config_mod
+    names = []
+    try:
+        names += list(avatars.configured(config_mod.load()).values())
+    except Exception:  # noqa: BLE001 — sans canon, la route humaine suffit
+        pass
+    if db is not None and not names:
+        try:
+            names += sorted(str(row["name"])
+                            for row in storage.of(db).operations.listing()
+                            if row.get("name") and row.get("mode") == "externe")[:1]
+        except Exception:  # noqa: BLE001 — registre illisible : aucun nom deviné
+            pass
+    return tuple(dict.fromkeys(names))
+
+
 #: how far back mail is read (seconds)
 PROSE_WINDOW_S = 24 * 3600.0
 #: at most this many candidate mails, the most recent
@@ -887,15 +916,17 @@ def prose_cues(text: str) -> list[str]:
 
 
 def prose_decisions(db, now: float | None = None, *, since_s: float = PROSE_WINDOW_S,
-                    recipients=PROSE_RECIPIENTS, limit: int = PROSE_LIMIT) -> list[dict]:
-    """Mail of the last `since_s` seconds in which an agent wrote to bureau
-    (`recipients`) or to a human something that reads as a decision expected
-    from the owner, and that no request names as its source. Oldest first:
+                    recipients=None, limit: int = PROSE_LIMIT) -> list[dict]:
+    """Mail of the last `since_s` seconds in which an agent wrote to an avatar
+    (`recipients`, the canon's avatars by default) or to a human something
+    that reads as a decision expected from the owner, and that no request
+    names as its source. Oldest first:
     `{id, sender, recipient, lot, created_ts, age_s, cues, excerpt, convert}`
     — `convert`, the command its author runs to file it as a request."""
     now = time.time() if now is None else float(now)
     rows = storage.of(db).decisions.prose_candidates(
-        recipients=list(recipients), since_ts=now - float(since_s), limit=int(limit))
+        recipients=list(prose_recipients(db) if recipients is None else recipients),
+        since_ts=now - float(since_s), limit=int(limit))
     out = []
     for row in rows:
         cues = prose_cues(row.get("body") or "")
@@ -931,12 +962,16 @@ def format_prose(row: dict, now: float | None = None) -> list[str]:
 
 #: Les deux mentions que `signer-owner.sh` (manaty/home, #3443) ajoute à
 #: l'option d'une signature au nom de l'owner, décision #135142 b : la première
-#: sans source, la seconde avec la session d'origine. Elles sont figées dans le
-#: script : `match_option` ne reconnaît qu'elles, jamais un autre texte (#3454).
-BUREAU_MENTIONS = (
-    "— saisi par le bureau, délégation §10",
-    "— réponse de l'owner relayée par le bureau, source ",
-)
+#: sans source, la seconde avec la session d'origine. Le nom qui les porte est
+#: celui de l'avatar, lu au canon (#7634) : le cœur ne fige plus un nom, et
+#: `match_option` reconnaît la forme signée, jamais un autre texte (#3454).
+AVATAR_SAISI_RE = re.compile(
+    r"—\s*saisi par (?P<name>(?:le\s+|la\s+|l')?[A-Za-z0-9][A-Za-z0-9._@-]{0,127}),"
+    r"\s*délégation\s+§\s*10")
+AVATAR_RELAY_RE = re.compile(
+    r"—\s*réponse de l'owner relayée par "
+    r"(?P<name>(?:le\s+|la\s+|l')?[A-Za-z0-9][A-Za-z0-9._@-]{0,127}),"
+    r"\s*source\s+(?P<source>.*)")
 
 #: Le contrat de `--source` de `signer-owner.sh` : la session relayée est un mot
 #: de [A-Za-z0-9._:@-], sans tiret initial, 200 caractères au plus. Une mention
@@ -965,10 +1000,10 @@ def match_option(view: dict, text: str) -> str | None:
         if wanted[:len(head)].lower() != head.lower():
             continue
         mention = wanted[len(head):]
-        if mention == BUREAU_MENTIONS[0]:
+        if AVATAR_SAISI_RE.fullmatch(mention):
             return option["key"]
-        relay = BUREAU_MENTIONS[1]
-        if mention.startswith(relay) and RELAY_SOURCE_RE.fullmatch(mention[len(relay):]):
+        relay = AVATAR_RELAY_RE.fullmatch(mention)
+        if relay and RELAY_SOURCE_RE.fullmatch(relay.group("source")):
             return option["key"]
     return None
 

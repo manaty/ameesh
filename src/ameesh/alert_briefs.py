@@ -261,22 +261,49 @@ def _split_live(out: dict, by_name: dict, closed: set,
     return live, dead
 
 
-def _bureau_externe(by_name: dict) -> bool:
-    """Le bureau `externe` (session humaine, 0030) ne lit pas sa boîte : sa
-    copie va au fil lisible du lot, jamais un courrier de plus."""
-    return (by_name.get("bureau") or {}).get("mode") == "externe"
+def _external(by_name: dict, name) -> bool:
+    """Un avatar `externe` (session humaine, 0030) ne lit pas sa boîte par
+    l'exécuteur : sa copie va au fil lisible du lot, jamais un courrier de
+    plus."""
+    return (by_name.get(name) or {}).get("mode") == "externe"
 
 
-def _fallback_bureau(by_name: dict, text: str) -> dict:
-    """#3036 : quand plus aucun agent ne peut lire, la route humaine est le
-    bureau : sa boîte s'il est un agent normal, sinon le fil lisible du lot
-    (la voie déjà employée pour le bureau externe). Sans bureau au registre,
+def _desk_names(alert: dict, by_name: dict, avatar_names=()) -> list[str]:
+    """Les agents qui portent la route humaine d'une alerte, dans l'ordre.
+
+    L'avatar déclaré au canon de l'humain visé d'abord ; à défaut, un rôle
+    du `targets` qui nomme un agent (compatibilité des alertes écrites avant
+    #7634) ; à défaut, **un** agent `externe` du registre : une session
+    humaine qui lit son courrier elle-même est la route humaine d'avant les
+    avatars, et un humain sans avatar garde ce comportement (#7634, point 4).
+    Un seul, le premier dans l'ordre stable du registre : la route humaine
+    d'avant était un desk unique, pas une copie à chaque session externe."""
+    names = [str(n) for n in avatar_names or () if n]
+    if names:
+        return list(dict.fromkeys(names))
+    known = {"assignee", "pilot", "auditeur", "avatar"}
+    legacy = [str(role) for role in alert.get("targets") or ()
+              if role not in known and role in by_name]
+    if legacy:
+        return legacy
+    return sorted(str(name) for name, row in by_name.items()
+                  if (row or {}).get("mode") == "externe")[:1]
+
+
+def _fallback_avatar(by_name: dict, text: str, names=()) -> dict:
+    """#3036 : quand plus aucun agent ne peut lire, la route humaine est
+    l'avatar : sa boîte s'il est un agent normal, sinon le fil lisible du lot
+    (la voie déjà employée pour un avatar externe). Sans avatar au registre,
     rien n'est inventé : l'appelant réessaiera au passage suivant."""
-    if "bureau" not in by_name:
-        return {}
-    if _bureau_externe(by_name):
-        return {"thread:bureau": text}
-    return {"bureau": text}
+    out = {}
+    for name in names or ():
+        if name not in by_name:
+            continue
+        if _external(by_name, name):
+            out["thread:%s" % name] = text
+        else:
+            out[name] = text
+    return out
 
 
 def auditors(listing: list, canons=None, *, explicit_only=False) -> list:
@@ -539,7 +566,7 @@ def _waiting_without_question(alert: dict) -> str:
             "owner through the queue — ameesh decide ask --lot %d --question \"…\" "
             "--option a=\"…\" [--recommend a --why \"…\"] — or, if nothing is expected from "
             "him, move the %s back: ameesh work move %d <state>. A decision written in a "
-            "mail (to bureau or anyone) never counts." % (
+            "mail (to an avatar or anyone) never counts." % (
                 v.label(lot, capital=True), " « %s »" % title if title else "",
                 v.noun, lot, v.noun, lot))
 
@@ -595,7 +622,31 @@ READY_HOLD_HINT = ("; acknowledge with a plain note, never `hold: …` — a pil
                    "hold is read by scripts/paquet-candidats.py as `pilot-hold` and "
                    "drops the lot from the next package (#7205)")
 
-def _slo_breach(alert: dict, *, level: int | None = None) -> str:
+def _desk_label(alert: dict, avatar_names=()) -> str:
+    """Le nom de la route humaine pour le texte d'escalade (#7634).
+
+    L'avatar déclaré au canon quand il est connu ; sinon le rôle du `targets`
+    qui nomme un agent (les alertes d'avant #7634 et les bancs nomment encore
+    leur avatar « bureau »), sinon « avatar »."""
+    for name in avatar_names or ():
+        if name:
+            return str(name)
+    known = {"assignee", "pilot", "auditeur", "avatar"}
+    for role in alert.get("targets") or ():
+        if role not in known:
+            return str(role)
+    return "avatar"
+
+
+def _with_desk(text: str, desk: str | None) -> str:
+    """Le texte de l'escalade nomme la route humaine réellement visée."""
+    if not desk:
+        return text
+    return text.replace("avatar", str(desk))
+
+
+def _slo_breach(alert: dict, *, level: int | None = None,
+                desk: str | None = None) -> str:
     """#789 tranche 2 (canon §9) : une étape interne du lot a dépassé son
     délai ; le texte dit l'étape, le retard, et le geste du niveau atteint
     (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, bureau et
@@ -683,12 +734,12 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
     if what in ("merge", "merge-approval", "merge-outcome"):
         if canon:
             if level >= 3:
-                move = ("bureau: merge it directly — its `canon/…` branch targets the canon "
+                move = ("avatar: merge it directly — its `canon/…` branch targets the canon "
                         "repository (manaty/home), which an ameesh package does not carry; "
-                        "auditor: see that the bureau does it, do not reassign or nudge the "
+                        "auditor: see that the avatar does it, do not reassign or nudge the "
                         "holder")
             else:
-                move = ("bureau: merge it directly — its `canon/…` branch targets the canon "
+                move = ("avatar: merge it directly — its `canon/…` branch targets the canon "
                         "repository (manaty/home), outside the ameesh package; the "
                         "pilot/composer cannot carry it, do not wait for them")
         elif cause and cause.get("code") and cause.get("owner") == "author":
@@ -698,7 +749,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
             seen = " — %s" % detail if detail else ""
             gesture = str(cause.get("gesture") or "")
             if level >= 3:
-                move = ("bureau or auditor: the %s is frozen with its review verdict "
+                move = ("avatar or auditor: the %s is frozen with its review verdict "
                         "acquired, but a package cannot carry it — cause `%s`%s; the "
                         "author %s still owes the fix (%s) — push the author and the "
                         "pilot, reassign the %s to a free agent of the same family if "
@@ -721,7 +772,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
             # on ne nomme ni l'auteur ni le composeur au hasard ; le brief
             # renvoie à la liste calculée, qui fait foi à la composition.
             if level >= 3:
-                move = ("bureau or auditor: the %s is frozen with its review verdict "
+                move = ("avatar or auditor: the %s is frozen with its review verdict "
                         "acquired; this host cannot read the candidate refusal — check "
                         "`scripts/paquet-candidats.py` before pushing the composer, the "
                         "%s may be waiting on its author (freeze-not-head, conflict)"
@@ -743,7 +794,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                     "out (ameesh work note %d \"packet: <reason>\", per "
                     "scripts/paquet-candidats.py) or include it in the next package; "
                     "do not reassign or nudge its holder"
-                    % ("bureau or auditor" if level >= 3 else "pilot", slot, v.noun,
+                    % ("avatar or auditor" if level >= 3 else "pilot", slot, v.noun,
                        int(missed.get("count") or 0),
                        "push the pilot/composer to" if level >= 3 else "either", lot))
         elif alert.get("vehicle_exit_ts") is not None:
@@ -754,10 +805,10 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                     "from there, not from the GO) — do not reassign or nudge its holder; "
                     "%s return it to build with the cause (ameesh work move %d build) "
                     "or include it in the next package"
-                    % ("bureau or auditor" if level >= 3 else "pilot", v.noun, left,
+                    % ("avatar or auditor" if level >= 3 else "pilot", v.noun, left,
                        "push the composer/pilot to" if level >= 3 else "either", lot))
         elif level >= 3:
-            move = ("bureau or auditor: the %s waits for its merge vehicle/package — "
+            move = ("avatar or auditor: the %s waits for its merge vehicle/package — "
                     "the composer/pilot carries it, and reassigning or nudging its holder "
                     "does not advance it; push the pilot/composer to include it in the next "
                     "package" % v.noun)
@@ -782,7 +833,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         # du décideur est celui de la demande (`decision_overdue`), pas un
         # geste dicté par l'alerte SLO.
         if level >= 3:
-            move = ("bureau or auditor: the %s is `waiting_human` on decision #%d for "
+            move = ("avatar or auditor: the %s is `waiting_human` on decision #%d for "
                     "%s%s — reassigning or nudging its holder does not advance it; push "
                     "the pilot to check the deadline with the requester, who renews or "
                     "withdraws the request (ameesh decide show %d)"
@@ -795,7 +846,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                     % (v.noun, decision, decider, late, decision))
     elif what == "unblock":
         if level >= 3:
-            move = ("bureau or auditor: the %s is `blocked` and the pilot owns the "
+            move = ("avatar or auditor: the %s is `blocked` and the pilot owns the "
                     "unblock (or the recorded decision) — do not reassign its holder; "
                     "push the pilot to unblock it or to say why the %s waits"
                     % (v.noun, v.noun))
@@ -818,7 +869,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
             # attente est sa propre CI complète, puis sa fusion. Aucun
             # composeur ne le portera et aucune dépendance n'est à déclarer.
             if level >= 3:
-                move = ("bureau or auditor: the %s is itself the packet vehicle %s%s "
+                move = ("avatar or auditor: the %s is itself the packet vehicle %s%s "
                         "and waits for its full CI%s — push the pilot to merge it once "
                         "green; no composer carries it and no dependency is to be "
                         "declared" % (v.noun, packet, where, ci))
@@ -828,7 +879,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                         "dependency: merge it once its CI is green"
                         % (v.noun, packet, where, ci))
         elif level >= 3:
-            move = ("bureau or auditor: the %s is carried by packet %s%s and waits for "
+            move = ("avatar or auditor: the %s is carried by packet %s%s and waits for "
                     "the packet's full CI%s — do not reassign or nudge its holder; push "
                     "the pilot/composer to see the packet through (the %s merges with "
                     "it)" % (v.noun, packet, where, ci, v.noun))
@@ -843,7 +894,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         verdict = "ameesh work milestone %d verdict ok|blocked --sha %s" % (
             lot, sha or "<frozen sha>")
         if level >= 3:
-            move = ("bureau or auditor: the pilot has not replaced reviewer %s — designate "
+            move = ("avatar or auditor: the pilot has not replaced reviewer %s — designate "
                     "another reviewer of an independent family now (ameesh work reviewer "
                     "%d <agent>, then ameesh work reviewer %d %s --remove)"
                     % (who or "?", lot, lot, who or "<reviewer>"))
@@ -867,7 +918,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         reason = ("the fix owed after returning to build" if alert.get("returned")
                   else "the blocking verdict of %s" % (blocker or "a reviewer"))
         if level >= 3:
-            move = ("bureau or auditor: %s is still owed by %s, who carries the fix — do "
+            move = ("avatar or auditor: %s is still owed by %s, who carries the fix — do "
                     "not reassign the holder (a reassignment loses the context of the "
                     "fix); push the holder and the pilot to deliver the new freeze, and "
                     "ask the pilot to record a hold if it cannot advance (a pilot hold is "
@@ -896,7 +947,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                     "work external-executor %d --clear)"
                     % (v.label(lot), external, lot))
         elif responsible and level >= 3:
-            move = ("bureau or auditor: %s is reserved to %s, a non-agent system whose "
+            move = ("avatar or auditor: %s is reserved to %s, a non-agent system whose "
                     "declared responsible is %s — this is not an assignment; the "
                     "responsible acts, or the pilot clears the reservation before any "
                     "reassignment (ameesh work external-executor %d --clear)"
@@ -914,7 +965,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                     "work external-executor %d --clear)"
                     % (responsible, external, v.label(lot), lot))
         elif level >= 3:
-            move = ("bureau or auditor: %s is reserved to %s (external executor, not "
+            move = ("avatar or auditor: %s is reserved to %s (external executor, not "
                     "an assignee) — this is not an assignment; the executor acts, or the "
                     "pilot clears the reservation before any reassignment (ameesh work "
                     "external-executor %d --clear)" % (v.label(lot), external, lot))
@@ -929,7 +980,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                     "ameesh work external-executor %d --clear)"
                     % (external, v.label(lot), lot))
     elif level >= 3:
-        move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
+        move = ("avatar or auditor: reassign it now to a free agent (ameesh work assign "
                 "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "
                 "for the pilot if it is itself late" % (lot, holder, lot))
     elif level >= 2:
@@ -944,11 +995,12 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                 "%d \"hold: <reason>\") — a silent %s is not a hold. Your own hold only "
                 "postpones the `sans_tour` reminder for 24 h; it does not suspend this "
                 "SLO clock — only a pilot's hold does" % (lot, v.noun))
+    desk = desk or _desk_label(alert)
     if alert.get("critical"):
-        move += ("; the %s is P1: the bureau handles it with the auditor (canon §9, "
+        move += ("; the %s is P1: the avatar handles it with the auditor (canon §9, "
                  "niveau 4), and no SLO delay is notified to the owner — nothing waits "
                  "for a human that an agent can do" % v.noun)
-    return "%s Expected action: %s." % (head, move)
+    return _with_desk("%s Expected action: %s." % (head, move), desk)
 
 
 def _critical_budget_pause(alert: dict) -> str:
@@ -1278,34 +1330,35 @@ def _for_auditor(alert: dict) -> str:
 
 
 def _target_names(role: str, alert: dict, by_name: dict, orchestras, teams: set,
-                  auditor_names=()) -> list:
+                  auditor_names=(), avatar_names=()) -> list:
     """#3036 : les noms que porte un rôle d'escalade du §9, avant vivacité.
 
     `assignee` : l'agent du lot ; `pilot` : les orchestrateurs de l'équipe (le
-    `targets` du moteur SLO dit le rôle, pas les noms) ; `bureau` : le bureau,
-    sauf `externe` (0030 : il ne lit pas sa boîte, sa copie va au fil) ;
-    `auditeur` : les auditeurs configurés. L'ordre est stable, sans doublon."""
+    `targets` du moteur SLO dit le rôle, pas les noms) ; `avatar` : l'avatar
+    de l'humain visé, lu au canon (#7634), sauf `externe` (0030 : il ne lit
+    pas sa boîte, sa copie va au fil) ; `auditeur` : les auditeurs
+    configurés. Un rôle inconnu qui nomme un agent du registre est cet agent
+    (compatibilité des alertes antérieures à #7634 et des bancs). L'ordre est
+    stable, sans doublon."""
     if role == "assignee":
         name = alert.get("agent")
-        return ([name] if name in by_name
-                and not (name == "bureau" and _bureau_externe(by_name)) else [])
+        return ([name] if name in by_name and not _external(by_name, name) else [])
     if role == "pilot":
-        # #2602 : le bureau `externe` ne lit pas sa boîte, même s'il est listé
-        # parmi les pilotes ou les auditeurs ; sa copie est au fil.
         return [name for name in _of_teams(orchestras, by_name, teams)
-                if not (name == "bureau" and _bureau_externe(by_name))]
-    if role == "bureau":
-        bureau = by_name.get("bureau")
-        return ["bureau"] if bureau and bureau.get("mode") != "externe" else []
+                if not _external(by_name, name)]
+    if role == "avatar":
+        return [name for name in dict.fromkeys(str(n) for n in avatar_names or ())
+                if name in by_name and not _external(by_name, name)]
     if role == "auditeur":
         return [name for name in auditor_names or ()
-                if name in by_name
-                and not (name == "bureau" and _bureau_externe(by_name))]
+                if name in by_name and not _external(by_name, name)]
+    if role in by_name:
+        return [] if _external(by_name, role) else [str(role)]
     return []
 
 
 def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
-                auditor_names, closed: set, covered=()) -> dict:
+                auditor_names, closed: set, covered=(), avatar_names=()) -> dict:
     """#3036 : destinataires d'un `slo_breach`, filtrés par vivacité, avec
     passage au palier suivant quand le palier atteint n'a personne qui lise.
 
@@ -1330,18 +1383,20 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     courrier ne la lève pas ; le palier suivant doit porter le geste."""
     covered = set(covered or ())
     roles = set(alert.get("targets") or ("assignee",))
-    text = _slo_breach(alert)
+    desk = _desk_names(alert, by_name, avatar_names)
+    text = _slo_breach(alert, desk=desk[0] if desk else None)
     raw: dict = {}
     for role in roles:
         for name in _target_names(role, alert, by_name, orchestras, teams,
-                                  auditor_names):
+                                  auditor_names, avatar_names):
             raw.setdefault(name, role)
     live, dead = _split_live({name: text for name in raw}, by_name, closed, covered,
                              respect_pause=True)
-    if "assignee" in roles and alert.get("agent") == "bureau" \
-            and _bureau_externe(by_name):
-        dead.setdefault("bureau", "external desk, reads the %s thread"
-                       % vocab.active().noun)
+    if "assignee" in roles and alert.get("agent") \
+            and _external(by_name, alert.get("agent")):
+        dead.setdefault(str(alert.get("agent")),
+                        "external avatar, reads the %s thread"
+                        % vocab.active().noun)
     if live and len(live) > 1 and slo_ordinary_l1(alert):
         # #6642 : au niveau 1 ordinaire, le courrier va au seul débiteur —
         # le porteur s'il lit, sinon un pilote stable d'une passe à l'autre ;
@@ -1363,18 +1418,21 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     if live:
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
-    current = (3 if roles & {"bureau", "auditeur"}
+    known = {"assignee", "pilot", "auditeur", "avatar"}
+    current = (3 if roles & {"avatar", "auditeur"} or any(r not in known for r in roles)
                else 2 if "pilot" in roles else 1)
     for next_level in range(current + 1, 4):
         next_text = _slo_breach(alert, level=next_level)
         if next_level == 2:
             names = _target_names("pilot", alert, by_name, orchestras, teams,
-                                  auditor_names)
+                                  auditor_names, avatar_names)
         else:
-            names = (_target_names("bureau", alert, by_name, orchestras, teams,
-                                   auditor_names)
+            names = (_target_names("avatar", alert, by_name, orchestras, teams,
+                                   auditor_names, avatar_names)
                      + _target_names("auditeur", alert, by_name, orchestras, teams,
-                                     auditor_names))
+                                     auditor_names, avatar_names))
+            if not names:
+                names = list(desk)
         candidates = {name: next_text for name in dict.fromkeys(names)}
         live, more = _split_live(candidates, by_name, closed, covered,
                                  respect_pause=True)
@@ -1382,26 +1440,34 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         if live:
             note = _escalation_note(dead, current, next_level)
             return {name: note + body for name, body in live.items()}
-        if next_level == 3 and _bureau_externe(by_name):
-            # Le bureau externe est la route humaine du dernier palier : sa
+        if next_level == 3:
+            # Un avatar externe est la route humaine du dernier palier : sa
             # copie va au fil lisible, sans courrier de plus.
-            return {"thread:bureau": _escalation_note(dead, current, 3) + next_text}
-    # Plus aucun agent au registre ne peut lire : route humaine (fil du
-    # bureau), en nommant les absents. Sans bureau, rien n'est inventé — le
+            for name in desk:
+                if name in by_name and _external(by_name, name):
+                    return {"thread:%s" % name:
+                            _escalation_note(dead, current, 3) + next_text}
+    # Plus aucun agent au registre ne peut lire : route humaine (fil de
+    # l'avatar), en nommant les absents. Sans avatar, rien n'est inventé — le
     # passage suivant réessaiera (l'alerte reste dans `ameesh alerts`).
-    fallback = _fallback_bureau(by_name, _slo_breach(alert, level=3))
+    fallback = _fallback_avatar(by_name, _slo_breach(alert, level=3, desk=desk[0]
+                                                    if desk else None), desk)
     live, more = _split_live(fallback, by_name, closed, covered, respect_pause=True)
     dead.update(more)
     if live:
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
-    if "bureau" in by_name:
-        return {"thread:bureau": _dead_note(dead) + _slo_breach(alert, level=3)}
+    for name in desk:
+        if name in by_name:
+            return {"thread:%s" % name:
+                    _dead_note(dead) + _slo_breach(alert, level=3,
+                                                   desk=name)}
     return {}
 
 
 def _mail_undeliverable_briefs(alert: dict, by_name: dict, auditor_names,
-                               closed: set, dead_out: dict | None = None) -> dict:
+                               closed: set, dead_out: dict | None = None,
+                               avatar_names=()) -> dict:
     """#3036 : le courrier en souffrance part aux orchestrateurs VIVANTS de
     l'équipe ; à défaut aux auditeurs, puis au bureau, puis au fil lisible.
 
@@ -1427,7 +1493,8 @@ def _mail_undeliverable_briefs(alert: dict, by_name: dict, auditor_names,
             dead_out.update(dead)
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
-    fallback = _fallback_bureau(by_name, text)
+    desk = _desk_names(alert, by_name, avatar_names)
+    fallback = _fallback_avatar(by_name, text, desk)
     live, more = _split_live(fallback, by_name, closed)
     dead.update(more)
     if live:
@@ -1437,14 +1504,16 @@ def _mail_undeliverable_briefs(alert: dict, by_name: dict, auditor_names,
         return {name: note + body for name, body in live.items()}
     if dead_out is not None:
         dead_out.update(dead)
-    if "bureau" in by_name:
-        return {"thread:bureau": _dead_note(dead) + text}
+    for name in desk:
+        if name in by_name:
+            return {"thread:%s" % name: _dead_note(dead) + text}
     return {}
 
 
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
            auditor_names=(), *, orchestrator_names=(),
-           closed_hosts=(), dead_out: dict | None = None, covered=()) -> dict:
+           closed_hosts=(), dead_out: dict | None = None, covered=(),
+           avatar_names=()) -> dict:
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
@@ -1483,6 +1552,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     by_name = {row["name"]: row for row in listing}
     orchestras = list(alert.get("orchestrators") or ())
     closed = set(closed_hosts or ())
+    desks = _desk_names(alert, by_name, avatar_names)
     if kind in ("host_disk_soon_full", "host_unsampled"):
         # #5563 : opérateurs du mesh, sans diffusion aux pilotes produit.
         # Le bureau externe lit le fil, pas sa boîte.
@@ -1492,12 +1562,15 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                      "or ameesh-host-publish.timer (user, publish@); verify that "
                      "a fresh reading appears in ameesh hosts.")
         out = {"mesh-design": text} if "mesh-design" in by_name else {}
-        out.update(_fallback_bureau(by_name, text))
+        out.update(_fallback_avatar(by_name, text, desks))
         live, dead = _split_live(out, by_name, closed)
         if dead_out is not None:
             dead_out.update(dead)
-        if not live and "bureau" in by_name:
-            live = {"thread:bureau": text}
+        if not live:
+            for name in desks:
+                if name in by_name:
+                    live = {"thread:%s" % name: text}
+                    break
         return {name: _dead_note(dead) + body for name, body in live.items()}
     if kind == "module_deviation":
         text = alert.get("action") or alert.get("detail") or "Module procedure deviation"
@@ -1539,7 +1612,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         # `orchestrators` (niveau 1 d'une passe sans autre lot de niveau 2) ;
         # le notificateur fournit les rôles vivants du canon.
         return _slo_briefs(alert, by_name, orchestras or orchestrator_names,
-                           teams, auditor_names, closed, covered)
+                           teams, auditor_names, closed, covered,
+                           avatar_names=desks)
     else:
         extra: dict[str, str] = {}
         no_reviewer = False
@@ -1585,7 +1659,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "review_family_paused":
             text = alert["detail"]
             teams = {row["project"] for row in alert["held_lots"] if row.get("project")}
-            extra.update(_fallback_bureau(by_name, text))
+            extra.update(_fallback_avatar(by_name, text, desks))
         elif kind == "critical_budget_pause":
             text = _critical_budget_pause(alert)
             teams = _projects(by_name, alert.get("agent"))
@@ -1693,7 +1767,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         return {name: note + body for name, body in live.items()}
     if kind == "stale_lot":
         return {}
-    fallback = _fallback_bureau(by_name, audit_text)
+    fallback = _fallback_avatar(by_name, audit_text, desks)
     live, more = _split_live(fallback, by_name, closed)
     dead.update(more)
     if live:
@@ -1703,8 +1777,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         return {name: note + body for name, body in live.items()}
     if dead_out is not None:
         dead_out.update(dead)
-    if "bureau" in by_name:
-        return {"thread:bureau": _dead_note(dead) + audit_text}
+    for name in desks:
+        if name in by_name:
+            return {"thread:%s" % name: _dead_note(dead) + audit_text}
     return {}
 
 

@@ -19,10 +19,10 @@ ask`) waits for its decider until the request's deadline; past the deadline,
 the ordinary alerts come back.
 
 #3498: a pilot's hold may declare its external executor and the gesture
-expected (`hold: attente bureau : <geste>`, `hold: attente owner : <geste>`,
+expected (`hold: attente avatar : <geste>`, `hold: attente owner : <geste>`,
 optionally dated `(due 2026-10-25 12:00 UTC)` or `[réveil programmé: …]`).
 `external_hold` reads that declaration; the debit keeps the lot out of the
-agent waits and reports the reminder to the bureau or owner.
+agent waits and reports the reminder to the avatar or owner.
 
 #4235: a pilot hold may declare an **observation window** — a wanted, dated
 wait (`hold: fenêtre : <motif>`, with its deadline armed by `--wake-at`) —
@@ -251,10 +251,10 @@ def buried_hold_marker(text) -> str | None:
     return None
 
 
-#: #3498 : un hold peut nommer son exécutant externe (bureau ou owner) et le
-#: geste attendu — `hold: attente bureau : <geste>`, `hold: attente owner :
-#: <geste>`, `hold: attente externe (bureau) : <geste>`. #3773 : il peut aussi
-#: déclarer un tiers extérieur sans nommer le bureau ou l'owner — `hold:
+#: #3498 : un hold peut nommer son exécutant externe (avatar ou owner) et le
+#: geste attendu — `hold: attente avatar : <geste>`, `hold: attente owner :
+#: <geste>`, `hold: attente externe (avatar) : <geste>`. #3773 : il peut aussi
+#: déclarer un tiers extérieur sans nommer l'avatar ou l'owner — `hold:
 #: attente externe : revue Apple`. Le tiers est alors dans le geste et
 #: l'exécutant rendu est `externe`. Une échéance facultative `(due
 #: 2026-10-25 12:00 UTC)` ou `(échéance …)`, avant ou après le geste, borne la
@@ -263,13 +263,13 @@ _EXTERNAL_HEAD = re.compile(
     r"(?<![\w])attente\s+"
     r"(?:externe\s*[\(\[]?\s*)?"
     r"(?:de\s+la\s+|du\s+|de\s+l'|de\s+)?"
-    r"(?P<who>bureau|owner|propri[eé]taire|externe)"
+    r"(?P<who>avatar|owner|propri[eé]taire|externe)"
     r"\s*(?:[\)\]]\s*)?"
     r"(?P<tail>.*)", re.I | re.S)
 _EXTERNAL_COMMA_HEAD = re.compile(
-    r"^hold:\s*attente\s+(?P<who>bureau|owner|propri[eé]taire|externe)\s*,", re.I)
+    r"^hold:\s*attente\s+(?P<who>avatar|owner|propri[eé]taire|externe)\s*,", re.I)
 _EXTERNAL_WRITE_HEAD = re.compile(
-    r"^hold:\s*attente\s+(?:owner|bureau)\b", re.I)
+    r"^hold:\s*attente\s+(?:owner|avatar)\b", re.I)
 _EXTERNAL_COMMA = re.compile(r"^\s*,\s*(?P<gesture>.+)$", re.S)
 _EXTERNAL_DUE = re.compile(
     r"\s*[\(\[]\s*(?:échéance|echeance|due|au\s+plus\s+tard|jusqu'au|avant\s+le)"
@@ -279,7 +279,7 @@ _EXTERNAL_DASH = re.compile(r"^\s*[—–-]\s*(?P<gesture>.+)$", re.S)
 _EXTERNAL_WAKE = re.compile(r"\[\s*réveil programmé\s*:\s*(?P<date>[^\]]+)\]",
                             re.I)
 _EXTERNAL_TOKEN = re.compile(r"(?:^|\s)wake_at=\S+", re.I)
-_EXTERNAL_EXECUTORS = {"bureau": "bureau", "owner": "owner",
+_EXTERNAL_EXECUTORS = {"avatar": "avatar", "owner": "owner",
                        "propriétaire": "owner", "proprietaire": "owner",
                        "externe": "externe"}
 
@@ -287,13 +287,13 @@ _EXTERNAL_EXECUTORS = {"bureau": "bureau", "owner": "owner",
 def external_hold(text) -> dict | None:
     """#3498 : la déclaration d'attente externe portée par un hold, ou None.
 
-    Rend `{executor, gesture, due}` : `executor` est `bureau`, `owner`
+    Rend `{executor, gesture, due}` : `executor` est `avatar`, `owner`
     (`propriétaire` est normalisé) ou `externe` pour un tiers non nommé
     (#3773, `hold: attente externe : revue Apple`), `gesture` le texte attendu
     après le séparateur, `due` la date déclarée (texte brut, pour
     `debit.parse_wake_due`) ou None. Une déclaration sans geste n'est pas une
     déclaration : le hold reste une attente ordinaire, et rien n'est deviné
-    depuis la prose (« attente du bureau depuis 3 h » ne déclare pas).
+    depuis la prose (« attente de l'avatar depuis 3 h » ne déclare pas).
     #7309 : la virgule est acceptée seulement dans l’en-tête ancré
     `hold: attente <exécutant>, <geste>`."""
     note = str(text or "").strip()
@@ -328,7 +328,7 @@ def external_hold_warning(text) -> str:
     note = str(text or "").strip()
     if _EXTERNAL_WRITE_HEAD.match(note) and external_hold(note) is None:
         return ('external wait not recognized; write "hold: attente owner : '
-                '<gesture>" (or bureau); use a colon, dash or comma followed '
+                '<gesture>" (or avatar); use a colon, dash or comma followed '
                 'by the expected gesture')
     return ""
 

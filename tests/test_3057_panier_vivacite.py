@@ -33,7 +33,7 @@ class RoutePureTest(unittest.TestCase):
             _slo(level=1, targets=("assignee",), agent="bureau", orchestrators=()),
             listing, auditor_names=["auditeur"], orchestrator_names=("orch",))
         self.assertEqual(list(briefs), ["orch"])
-        self.assertIn("bureau (external desk, reads the lot thread). "
+        self.assertIn("bureau (external avatar, reads the lot thread). "
                       "Escalated from level 1 to level 2", briefs["orch"])
 
     def test_grace_du_bail_rendu(self):
@@ -81,7 +81,7 @@ class PanierNotifierTest(LivenessFixture, PgTestCase):
     def test_grace_passee_la_perte_est_traitee(self):
         self.dead("orch", "bureau", "auditeur")
         self.release("dev1")
-        notifier = self.notifier()
+        notifier = self.notifier(default_human="human:smichea")
         alert = _slo(level=1, targets=("assignee",))
         notifier.run_pass(self.db, current=[alert])
         self.assertEqual(self.thread("ameesh", 42), [])

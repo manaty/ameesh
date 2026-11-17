@@ -43,7 +43,7 @@ LAN_RANGE = ipaddress.ip_network("192.168.0.0/16")
 BRIDGE_DRIVERS = ("bridge",)
 #: un relevé du ménage plus vieux ne lève plus l'alerte (trois passages)
 MAX_AGE_S = 1800
-FIX = ("fix (host, root — bureau): set `default-address-pools` outside the LAN "
+FIX = ("fix (host, root — avatar): set `default-address-pools` outside the LAN "
        "ranges in /etc/docker/daemon.json, restart Docker, recreate the network")
 
 

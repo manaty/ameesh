@@ -9,10 +9,10 @@ never goes back below the last commit, and a reported host is caught up.
 The sequence cannot catch up a server without root itself: in server mode
 ``vm.sh`` runs ``ssh root@$VM``, installs ``/opt/ameesh`` and writes
 ``/root/.cache/ameesh``, and the staging account holds no root path. The
-gesture is the bureau's, after each cutoff, under an owner root right (§10).
+gesture is the avatar's, after each cutoff, under an owner root right (§10).
 This module is its guard, run by the release timer: the latest tagged staging
 attestation names each reported host except the workstation, its reason and
-the last tag that proved it, and mails the pilot and the bureau once per
+the last tag that proved it, and mails the pilot and the avatar once per
 release. The gesture is declared after each cutoff instead of being forgotten.
 
 A workstation report is normal and is never alerted. No readable attestation,
@@ -22,11 +22,11 @@ A later attestation lifts the alert only when its host proof is a commit: the
 host's active commit must be the tagged one or a descendant of it (a rollback
 or an old catch-up at an ancestor is still a lag, #7365 review).
 
-#7372: the owner gave the bureau a standing root right for this gesture
+#7372: the owner gave the avatar a standing root right for this gesture
 (decision #219407, signed 2026-11-16, until 2026-12-12, revocable). The
 right comes from the project configuration (``staging_rights``: host,
 decision, expiry), and the decision is re-read on each pass: a withdrawal or
-a superseding decision takes effect without a release. The bureau's four
+a superseding decision takes effect without a release. The avatar's four
 ``vm.sh`` steps stay a manual gesture; after them, it declares the gesture
 with ``ameesh release catchup``: a ``staging.catchup`` event carries the
 host, the active commit, the attested tag, the result, the author and the
@@ -46,7 +46,7 @@ SCHEMA = "ameesh-staging-deferred/1"
 #: the state slot key holding the last alert sent, per recipient
 SLOT = "staging_deferred_alerts"
 
-#: #7372: event type of a declared catch-up (the trace of the bureau's gesture)
+#: #7372: event type of a declared catch-up (the trace of the avatar's gesture)
 CATCHUP_EVENT = "staging.catchup"
 CATCHUP_SCHEMA = "ameesh-staging-catchup/1"
 CATCHUP_DAYS = 120
@@ -57,7 +57,7 @@ CATCHUP_LIMIT = 500
 #: the owner decision and its expiry; the decision itself is re-read on each
 #: use (answered, signed, not withdrawn or superseded), so a revocation takes
 #: effect on the next pass. A right is not an automation: the four `vm.sh`
-#: steps stay the bureau's gesture; this module records and reports it, and
+#: steps stay the avatar's gesture; this module records and reports it, and
 #: the guard keeps the lag until a staging attestation proves the host.
 
 
@@ -69,14 +69,45 @@ def _registry_rows(db):
         return []
 
 
-def _recipients(cfg, db, project) -> list[str]:
-    """The bureau, which performs the gesture, then the project's pilot."""
-    from . import alert_briefs
-    names = ["bureau"]
+def owner_human(cfg, db, project, rows=()) -> str | None:
+    """L'humain responsable de la route de release du projet, ou None.
+
+    `project.report` est l'agent configuré qui reçoit les rapports (le bureau
+    pour ameesh) ; son `responsible` au registre donne l'humain dont l'avatar
+    porte le geste. Un `report` qui est déjà un humain se lit tel quel."""
+    report = str(getattr(project, "report", "") or "")
+    if not report:
+        return None
+    if report.startswith("human:"):
+        return report
+    for row in rows:
+        if row.get("name") == report:
+            responsible = row.get("responsible")
+            return str(responsible) if responsible else None
+    from . import work
     try:
-        pilots = alert_briefs.project_pilots(project.name, _registry_rows(db),
-                                             cfg=cfg, db=db)
-    except Exception:  # noqa: BLE001 - the bureau still receives the gesture
+        return work.known_human(db, report, cfg)
+    except Exception:  # noqa: BLE001 - pas de humain lisible : route d'avant
+        return None
+
+
+def _recipients(cfg, db, project) -> list[str]:
+    """L'avatar de l'humain responsable, qui porte le geste, puis le pilote.
+
+    #7634 : l'avatar est lu au canon (bloc `avatar:`). Sans avatar déclaré,
+    la route humaine d'avant reste l'agent configuré du projet (`report`) :
+    c'est le comportement que le mesh Manaty garde tant que sa fiche ne porte
+    pas le bloc `avatar`."""
+    from . import alert_briefs, avatars
+    rows = _registry_rows(db)
+    owner = owner_human(cfg, db, project, rows)
+    avatar = avatars.name_for(cfg, owner) if owner else None
+    names = [avatar] if avatar else []
+    if not names and getattr(project, "report", ""):
+        names.append(str(project.report))
+    try:
+        pilots = alert_briefs.project_pilots(project.name, rows, cfg=cfg, db=db)
+    except Exception:  # noqa: BLE001 - the avatar still receives the gesture
         pilots = []
     for name in pilots:
         if isinstance(name, str) and name and name not in names:
@@ -385,7 +416,7 @@ def baseline(db, project, host) -> dict | None:
 
 
 def declare(db, project, host, sha, base, result, actor, note="") -> dict:
-    """Record the bureau's catch-up gesture (#7372) as a durable trace.
+    """Record the avatar's catch-up gesture (#7372) as a durable trace.
 
     The declaration is host, active commit, attested tag, result, author and
     the decision that authorized it. It does not by itself prove the host is
@@ -521,7 +552,7 @@ def _text(project, tag, data, deferred, proofs, declarations=None, rights=None) 
                              "décision owner avant de le reprendre."
                              % (right.get("decision"), right.get("why") or "inconnu"))
             else:
-                lines.append("  droit root du bureau : décision #%d (owner), valable "
+                lines.append("  droit root de l'avatar : décision #%d (owner), valable "
                              "jusqu'au %s ; geste déclaré au rapport de coupure et "
                              "tracé (`ameesh release catchup`), sans valeur de preuve."
                              % (right.get("decision"), right.get("expires")))
@@ -537,7 +568,7 @@ def _text(project, tag, data, deferred, proofs, declarations=None, rights=None) 
         "suivante ne redescend jamais sous ce commit. Ce n'est pas le report du poste "
         "(mis à jour à son retour) : ce serveur n'a pas d'accès root, la séquence ne "
         "peut pas l'installer (vm.sh serveur passe par root).",
-        "Geste bureau, après chaque coupure (droit owner §10, ou droit permanent "
+        "Geste de l'avatar, après chaque coupure (droit owner §10, ou droit permanent "
         "ci-dessus quand il est actif) : depuis le compte de staging, avec son "
         "BASCULE_ENV (VM = adresse du serveur, PERSONAS_VM vide), "
         "deploy/mise-a-jour/vm.sh verifier ; vm.sh installer %s ; vm.sh redemarrer ; "
@@ -547,14 +578,13 @@ def _text(project, tag, data, deferred, proofs, declarations=None, rights=None) 
         "--sha <commit actif relevé par controler> [--result failed --note « … »] ; "
         "le rapport de coupure suivant le nomme."
         % (project.name, hosts[0] if len(hosts) == 1 else "<hôte>"),
-        "Procédure : docs/DEPLOIEMENT-HOTE-AGENTS.md, « Serveur sans accès root : "
-        "geste bureau après chaque coupure ».",
+        "Procédure : docs/DEPLOIEMENT-HOTE-AGENTS.md, « Serveur sans accès root ».",
     ]
     return "\n".join(lines)
 
 
 def tick(cfg, db, project, today=None) -> dict:
-    """Alert the pilot and the bureau once per release whose staging reported
+    """Alert the pilot and the avatar once per release whose staging reported
     a server. Never blocks a release: an unreadable input concludes nothing."""
     from . import release_cutoff as rc
     report = {"schema": SCHEMA, "project": project.name, "result": "none"}

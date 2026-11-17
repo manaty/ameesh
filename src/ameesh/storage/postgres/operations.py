@@ -243,7 +243,7 @@ class Operations(interface.Operations):
                   -- courrier passif (accusé, copie, diffusion) est compté à part.
                   -- #3923 : deux index partiels disjoints (actif 0495, passif
                   -- 0489) au lieu d'un parcours du tas de tous les non-lus —
-                  -- les 5 074 non-lus de `bureau` coûtaient 443 ms à eux seuls.
+                  -- les 5 074 non-lus de l'agent de supervision coûtaient 443 ms à eux seuls.
                   SELECT actif.n, actif.oldest, passif.n_passive
                     FROM (SELECT count(*) AS n,
                                  min(mb.created_at) AS oldest
