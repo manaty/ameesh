@@ -3734,7 +3734,10 @@ class Notifier:
             # par rôles, sans boîte d'avatar.
             human = None
             if router is not None:
-                human, _ = router.resolve(alert, for_avatar=True)
+                try:
+                    human, _ = router.resolve(alert, for_avatar=True)
+                except Exception as exc:  # noqa: BLE001 - brief par rôles quand même
+                    self.log("[%s] human route unreadable (%s)" % (kind, exc))
             avatar = avatars_by_human.get(human) if human else None
             desks = () if avatar else tuple(avatars.configured_desks(
                 self.cfg, human, listing, alert.get("project")))
