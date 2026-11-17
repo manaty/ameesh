@@ -182,3 +182,5 @@ test_7441_account_rotation  # #7441: durable waves, epoch fencing and persona dw
 
 test_7523_pause_consommation  # #7523 : échéance annoncée et rythme critique observé (historique des jauges)
 test_7535_stacked_delivery  # stockage : livraison et alerte des lots empilés dans la même transaction (#7535)
+
+test_7623_late_dispatch  # durable missing-part intent and cross-watcher packet lock
