@@ -347,6 +347,10 @@ Operator procedure and exact relay values: `docs/EXECUTEUR-MEDIEE.md`.
 Host resource views include a `footprint` projection (also in the JSON `measure`).
 Host cards may declare `capacity: baseline` or `capacity: burst`,
 `tarif_eur_h`, and `policy.lifecycle_hook` (an external adapter command).
+A host that admits no agent (`policy.max_agents: 0`, `staging.kind: server`,
+or an explicit `capacity: none`) is outside the capacity projection: it is
+neither a baseline reserve nor a burst candidate, and raises no
+`host_idle_reserved` or `baseline_oversized` alert (#7727).
 Missing prices and reservations remain unknown. The projection requires fresh,
 uninterrupted samples with readable cgroup limits; older publishers without
 the readability marker cannot prove inactivity. Declared runs are zero with
