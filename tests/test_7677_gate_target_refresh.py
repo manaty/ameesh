@@ -14,7 +14,8 @@ Témoins :
     `prepare_target` de la désignation, et le diff ne porte que la note ;
 (3) fetch impossible : la cible locale est gardée (plus stricte), sans lever ;
 (4) les écrivains de `validated` (stockage, `work.move`) rafraîchissent hors
-    transaction, jamais dans une transaction.
+    transaction, jamais dans une transaction ;
+(5) le quorum reporté (`promote_carried`) lit la même porte que `work.move`.
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import canon, lot_class, merge_queue, review_designation_activation as rda, work
+from ameesh import canon, lot_class, merge_queue, review_designation_activation as rda, verdict_carry, work
 from ameesh.storage.postgres import work as pg_work
 
 NOTE = "docs/design/7659-note.md"
@@ -136,6 +137,60 @@ class GateTargetRefreshTest(_Clones):
         seen = self.gate_read(refresh_target=True)
         self.assertEqual(seen["base_sha"], self.old)
         self.assertIn(CRITICAL, seen["paths"])
+
+
+class PromoteCarriedRefreshTest(_Clones):
+    """(5) le quorum reporté (`verdict_carry.promote_carried`) lit la même
+    porte que `work.move` : sur le clone périmé, un seul avis reporté valide
+    la note docs seule, au lieu de la lire `sensitive` à deux avis."""
+
+    def promote(self, in_tx):
+        seen = {}
+        row = dict(self.item, state="qa")
+        marks = self.marks + [{"id": 2, "kind": "verdict", "verdict": "ok",
+                               "sha": self.head, "actor": "impl-12",
+                               "note": verdict_carry.CARRIED + " from x"}]
+
+        def of_lot(db, lot, **kw):
+            paths = canon.git_range_paths(kw["repo"], kw["base_sha"], kw["head"])
+            seen["base_sha"] = kw["base_sha"]
+            klass = "sensitive" if CRITICAL in paths else "light"
+            return {"class": klass, "files": [{"path": p, "class": klass}
+                                              for p in paths],
+                    "frozen_sha": kw["head"], "doubt": False}
+
+        def review_gate(db, marks, frozen, **kw):
+            # Un seul avis reporté : assez pour light, pas pour sensitive.
+            if kw["klass"]["class"] == "light":
+                return {"ok": True}
+            return {"ok": False, "why": "class: sensitive: 2 verdicts required"}
+
+        with mock.patch("ameesh.db.in_transaction", return_value=in_tx), \
+                mock.patch.object(verdict_carry.work, "get", return_value=row), \
+                mock.patch.object(verdict_carry.work, "milestones",
+                                  return_value=marks), \
+                mock.patch.object(verdict_carry.work, "move") as move, \
+                mock.patch.object(verdict_carry, "_notify_held"), \
+                mock.patch.object(lot_class, "repo_for_freeze",
+                                  return_value=(self.stale, self.head)), \
+                mock.patch.object(lot_class, "default_base", return_value="main"), \
+                mock.patch.object(lot_class, "of_lot", side_effect=of_lot), \
+                mock.patch.object(merge_queue, "review_gate",
+                                  side_effect=review_gate):
+            out = verdict_carry.promote_carried(None, 7659)
+        return out, seen, move
+
+    def test_carried_quorum_on_a_stale_clone_reads_the_fresh_target(self):
+        out, seen, move = self.promote(in_tx=False)
+        self.assertEqual(seen["base_sha"], self.fresh)
+        self.assertEqual(out["result"], "validated")
+        move.assert_called_once()
+
+    def test_no_fetch_inside_a_transaction(self):
+        out, seen, move = self.promote(in_tx=True)
+        self.assertEqual(seen["base_sha"], self.old)
+        self.assertEqual(out["result"], "closed")
+        move.assert_not_called()
 
 
 class ValidationWritersRefreshTest(unittest.TestCase):

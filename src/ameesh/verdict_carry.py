@@ -1869,12 +1869,16 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
     # d'essai (le budget est par hôte) ; le prochain passage d'un hôte qui
     # résout le gel fera la transition.
     from . import lot_class
+    from .db import in_transaction
     frozen = _norm(freeze.get("sha"))
 
     def _read_gate():
         try:
+            # #7677 : la cible fraîche, comme `work.move` (hors transaction
+            # seulement : jamais de fetch sous un verrou).
             found = merge_queue.review_gate_for_item(
-                db, getattr(db, "cfg", None), row, marks)
+                db, getattr(db, "cfg", None), row, marks,
+                refresh_target=not in_transaction(db))
         except Exception as caught:  # noqa: BLE001 - une lecture ratée ne conclut pas
             return None, caught
         return found, None
