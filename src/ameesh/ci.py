@@ -2462,7 +2462,9 @@ class Watcher:
         return out
 
     def _retry_missing_part(self, db, repo, lot, sha, workflow, inputs) -> bool:
-        """#7623: one durable intent per frozen packet/part, under its lock.
+        """#7623: reconcile one durable intent per frozen packet/part, under its lock.
+
+        True also means an existing intent is awaiting run visibility (#7639).
 
         Commit intent before contacting GitHub: an ambiguous POST or a killed
         watcher must never create another automatic attempt. Mediated storage
@@ -2506,8 +2508,13 @@ class Watcher:
             # Take the same packet lock as ci run before inspecting intent.
             if not storage.of(tx).work.lock(item_id):
                 return False
-            if any(e.get("note") == marker for e in work.events(tx, item_id, limit=None)):
-                return False
+            intent = next((e for e in work.events(tx, item_id, limit=None)
+                           if e.get("note") == marker), None)
+            if intent is not None:
+                # A dispatch can precede the runs API by several watcher passes.
+                # Use the durable timestamp so restart cannot renew this grace.
+                created = intent.get("created_ts")
+                return created is not None and float(self.clock()) - float(created) < PENDING_ALERT
             if not eligible(tx):
                 return False
             work.note(tx, item_id, marker)
