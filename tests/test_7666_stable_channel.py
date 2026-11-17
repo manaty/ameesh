@@ -112,6 +112,22 @@ class StableChannelTest(unittest.TestCase):
         self.assertIn({"tag": "v1.2.0", "reason": "tagged less than 24 h before the "
                                                   "designation"}, report["refused"])
 
+    def test_a_stale_local_target_does_not_hide_a_remote_release(self):
+        # main moved on the remote (another clone landed v1.1.5); the local
+        # branch and the local tag list are behind
+        other = os.path.join(self.tmp.name, "other")
+        subprocess.run(["git", "clone", "-q", self.remote, other], check=True)
+        git(other, "commit", "-q", "--allow-empty", "-m", "release 1.1.5",
+            date=W47 - 30 * 3600)
+        git(other, "tag", "-a", "v1.1.5", "-m", "ameesh 1.1.5", date=W47 - 30 * 3600)
+        git(other, "push", "-q", "origin", "main", "--tags")
+        commit = git(other, "rev-parse", "HEAD")
+        self.green.add(commit)
+        self.attested.add(commit)
+        report = self.designate("2026-W47")
+        self.assertEqual((report["manifest"]["tag"], report["manifest"]["commit"]),
+                         ("v1.1.5", commit))
+
     def test_red_or_unattested_tag_is_skipped(self):
         self.green.discard(self.commits["1.1.0"])
         report = self.designate("2026-W47")
@@ -242,7 +258,9 @@ class StableChannelTest(unittest.TestCase):
 class FirstDecisionTest(unittest.TestCase):
     """The first public stable needs an answered, signed, current `publish`."""
 
-    project = types.SimpleNamespace(name="ameesh")
+    project = types.SimpleNamespace(name="ameesh", repo="/nonexistent", remote="origin",
+                                    github="manaty/ameesh")
+    scope = "stable-channel:ameesh@https://github.com/manaty/ameesh"
 
     def check(self, view, proof=(True, "")):
         from ameesh import decisions
@@ -256,9 +274,16 @@ class FirstDecisionTest(unittest.TestCase):
             sc.check_first_decision(None, self.project, None)
         with self.assertRaises(sc.StableError):
             self.check(None)
-        approved = {"state": "answered", "project": "ameesh", "answer": {"option": "publish"}}
+        approved = {"state": "answered", "project": "ameesh", "answer": {"option": "publish"},
+                    "options": [{"key": "publish", "label": "Publier " + self.scope},
+                                {"key": "hold", "label": "Attendre"}]}
+        other = [{"key": "publish", "label": "Publier la release v1.59.0 sur le site"}]
         for view in (dict(approved, state="pending"), dict(approved, answer={"option": "hold"}),
-                     dict(approved, project="nexlink")):
+                     dict(approved, project="nexlink"), dict(approved, project=None),
+                     # a valid signed publish for another operation
+                     dict(approved, options=other),
+                     dict(approved, options=[{"key": "publish", "label":
+                                              "Publier stable-channel:nexlink@x"}])):
             with self.assertRaises(sc.StableError):
                 self.check(view)
         with self.assertRaises(sc.StableError):

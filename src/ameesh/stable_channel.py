@@ -49,6 +49,9 @@ SOAK_S = 24 * 3600.0
 PIN_FILE = "ameesh-stable.json"
 #: decision option that approves the first public stable publication
 FIRST_OPTION = "publish"
+#: the scope clause the signed `publish` option label must contain, so that a
+#: decision signed for another publication cannot open this channel
+FIRST_SCOPE = "stable-channel:%s@%s"
 #: the release tick runs every minute: a week already published, or still
 #: awaiting the first decision, is re-read from the remote at most this often
 RECHECK_S = 3600.0
@@ -271,7 +274,12 @@ def designate(project, rules, week: str, *, previous: dict | None, tags=None,
     before = designation_at(rules, week)
     green = green or (lambda sha: rc.commit_is_green(project.repo, project, sha))
     attested = attested or (lambda sha: rc.read_attestation(sha) is not None)
-    rows = rc.tags(project.repo, project.target) if tags is None else tags
+    if tags is None:
+        # the remote target, refreshed with its tags: a stale local branch
+        # would hide an eligible release and freeze the week on an old one
+        rc.fetch(project.repo, project.remote, project.target)
+        tags = rc.tags(project.repo, "%s/%s" % (project.remote, project.target))
+    rows = tags
     floor = previous["version"] if previous else None
     candidates = []
     for row in rows:
@@ -323,21 +331,33 @@ def previous_of(published_weeks: dict, week: str) -> dict | None:
 
 
 def check_first_decision(db, project, decision_id: int | None) -> int:
-    """The signed owner decision approving the first public stable publication."""
+    """The signed owner decision approving the first public stable publication.
+
+    Validity (answered, current, signed) is not enough: the signed label of
+    the answered `publish` option must carry the scope clause
+    `stable-channel:<project>@<repository>` of this exact gesture. The
+    options are part of the signed document; the decision's project is not.
+    """
     from . import decisions
     if not decision_id:
         raise StableError(
             "%s has no published stable yet: the first stable tag is a public publication "
             "and needs a signed owner decision (option %r), --decision ID"
             % (project.name, FIRST_OPTION))
+    scope = FIRST_SCOPE % (project.name, repository_of(project))
     view = decisions.get(db, int(decision_id))
     if view is None:
         raise StableError("decision #%s not found" % decision_id)
     answer = view.get("answer") or {}
     if view.get("state") != "answered" or answer.get("option") != FIRST_OPTION:
         raise StableError("decision #%s does not approve %r" % (decision_id, FIRST_OPTION))
-    if view.get("project") not in (None, project.name):
+    if view.get("project") != project.name:
         raise StableError("decision #%s is for project %s" % (decision_id, view.get("project")))
+    labels = [str(o.get("label") or "") for o in view.get("options") or ()
+              if isinstance(o, dict) and o.get("key") == FIRST_OPTION]
+    if len(labels) != 1 or scope not in labels[0].split():
+        raise StableError("decision #%s: its signed %r option does not name the scope %s"
+                          % (decision_id, FIRST_OPTION, scope))
     try:
         decisions.require_current(db, view)
     except decisions.DecisionError as exc:

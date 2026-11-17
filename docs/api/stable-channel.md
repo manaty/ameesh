@@ -51,7 +51,11 @@ ameesh release stable publish --project ameesh --decision <id>
 ```
 
 The decision is re-read before the gesture. It must be answered, signed and
-current, and belong to the project. Its id is recorded in the first manifest.
+current, and belong to the project. Its signed `publish` option must also name
+this exact gesture with the scope token
+`stable-channel:<project>@<repository>`, for example
+`--option "publish=Publier le canal stable stable-channel:ameesh@https://github.com/manaty/ameesh"`.
+A decision signed for another publication cannot open the channel. Its id is recorded in the first manifest.
 Until that gesture, the tick reports `awaiting-decision` and publishes nothing.
 After the first stable, each weekly tag is published by the tick without a
 human gesture. This is ordinary channel operation, not a new publication.
