@@ -15,7 +15,9 @@ import types
 import unittest
 from unittest import mock
 
+from ameesh import canon as canon_mod
 from ameesh import chat, conversation, fil, mail, registry, work
+from ameesh.mediated_executor.contract import NotSupportedRemotely
 
 from .support import PgTestCase
 
@@ -50,6 +52,38 @@ class HelperTest(unittest.TestCase):
             None, self.cfg, {"releve": "preference"}), "")
         self.assertEqual(fil.conversation_project(None, self.cfg, {}), "")
         self.assertEqual(fil.conversation_project(None, self.cfg, None), "")
+
+    def test_a_mediated_contract_gap_reads_the_avatar_from_the_local_canon(self):
+        # Contrat 1.1 : `agents.get` n'est pas servi à une session médiée ; la
+        # carte du canon local qualifie encore l'avatar. La carte ordinaire
+        # garde le fil historique (#515), sinon toute session médiée perdrait
+        # ses copies lisibles.
+        db = types.SimpleNamespace(cfg=types.SimpleNamespace(canon="/canon"))
+        cards = {
+            "avatar": types.SimpleNamespace(title="avatar", team="alice",
+                                            releve="preference"),
+            "sender": types.SimpleNamespace(title="sender", team="ameesh",
+                                            releve="hote"),
+        }
+        canon = types.SimpleNamespace(agent=cards.get)
+
+        def unsupported(_db, _name):
+            raise NotSupportedRemotely("agents.get is not served to a session")
+
+        with mock.patch.object(registry, "get", side_effect=unsupported), \
+                mock.patch.object(canon_mod, "configured", return_value=(object(),)), \
+                mock.patch.object(canon_mod, "from_config_all", return_value=[canon]):
+            self.assertTrue(mail._avatar_correspondence(db, "sender", "avatar"))
+            self.assertFalse(mail._avatar_correspondence(db, "sender"))
+
+    def test_a_mediated_contract_gap_without_canon_keeps_the_historical_rule(self):
+        db = types.SimpleNamespace(cfg=types.SimpleNamespace(canon=""))
+
+        def unsupported(_db, _name):
+            raise NotSupportedRemotely("agents.get is not served to a session")
+
+        with mock.patch.object(registry, "get", side_effect=unsupported):
+            self.assertFalse(mail._avatar_correspondence(db, "sender", "avatar"))
 
 
 class AvatarConversationTest(PgTestCase):

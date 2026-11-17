@@ -145,21 +145,46 @@ def _replay_id(mailbox, message_id: int, body: str, work_item_id: str | None,
     return int(message_id)
 
 
+def _canon_row(cfg, name: str) -> dict | None:
+    """#7668 : carte du canon local pour `name`, ou None s'il ne la connaît pas.
+
+    Repli d'une session médiée, à qui le contrat 1.1 ne sert pas `agents.get` :
+    le canon du poste reste la seule déclaration lisible. Aucune erreur ne
+    remonte (le courrier ne dépend pas de cette lecture)."""
+    try:
+        from . import canon as canon_mod
+        if cfg is None or not canon_mod.configured(cfg):
+            return None
+        for canon in canon_mod.from_config_all(cfg):
+            agent = canon.agent(name)
+            if agent is not None:
+                return {"name": agent.title, "team": agent.team,
+                        "releve": agent.releve}
+    except Exception:  # noqa: BLE001 — qualification indisponible, pas un refus
+        return None
+    return None
+
+
 def _avatar_correspondence(db, *agents) -> bool:
     """#7668 : l'un des correspondants est-il un avatar (`releve: preference`) ?
 
     Lecture faite au même point que la copie R12 (dans `record`, donc après le
     COMMIT quand elle est différée). Le courrier n'est jamais retenu ; seule
-    sa copie lisible dépend de la réponse. Une base qui ne sait pas lire le
-    registre (panne, contrat médié sans registre) répond « privé » : la copie
-    est omise plutôt que de publier le corps d'un avatar par défaut (B P2
-    ameesh-cx2)."""
+    sa copie lisible dépend de la réponse. Une panne de registre répond
+    « privé » : la copie est omise plutôt que de publier le corps d'un avatar
+    par défaut (B P2 ameesh-cx2). Un contrat médié qui ne sert pas `agents.get`
+    n'est pas une panne : la carte locale du canon qualifie encore l'avatar ;
+    sans canon lisible, la règle historique du fil (#515) s'applique, sinon
+    toute session médiée perdrait ses copies lisibles."""
     try:
         from . import registry
-        return any(fil.avatar_conversation(registry.get(db, name))
-                   for name in agents)
-    except Exception:  # noqa: BLE001 — qualification inconnue : privée par défaut
-        return True
+        rows = [registry.get(db, name) for name in agents]
+    except Exception as exc:  # noqa: BLE001 — décision ci-dessous
+        from .mediated_executor.contract import NotSupportedRemotely
+        if not isinstance(exc, NotSupportedRemotely):
+            return True
+        rows = [_canon_row(getattr(db, "cfg", None), name) for name in agents]
+    return any(fil.avatar_conversation(row) for row in rows)
 
 
 def send(
