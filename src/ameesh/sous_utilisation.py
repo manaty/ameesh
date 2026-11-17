@@ -1353,7 +1353,18 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     # #1608 : la liste garde les lots retenus par une attente et les classe
     # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
     # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).
+    # #7622 : même verdict que le débit et le sommeil, sur les notes du
+    # lot de découpage ouvert. Son intake épuisé n'est pas du travail à confier.
+    from . import debit, projects as projects_mod
+    roadmap_notes = []
+    for lot in lots:
+        if debit._decoupage_project(lot):
+            roadmap_notes.extend(dict(note, work_item_id=int(lot["id"]))
+                                 for note in file_decoupage.roadmap_notes(db, lot["id"]))
+    exhausted = debit._roadmap_verdicts(roadmap_notes, lots)
+    exhausted_splits = {entry["lot"] for entry in exhausted.values()}
     waiting_lots = waiting_project_lots(lots)
+    waiting_lots = [lot for lot in waiting_lots if int(lot["id"]) not in exhausted_splits]
     # #3447 : les lots réservés à un exécutant externe ne sont pas « sans
     # assigné » ; ils sont nommés à part, avec leur exécutant.
     reserved_lots = external_project_lots(lots)
@@ -1376,6 +1387,10 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                           if paid and row.get("harness") in paid
                           and _state(row) == "working" and not _attached(row))
     plan_idle = [row for row in idle if paid is not None and row.get("harness") not in paid]
+    plan_idle = [row for row in plan_idle
+                 if not projects_mod.agent_projects(row)
+                 or any(project not in exhausted
+                        for project in projects_mod.agent_projects(row))]
     aggravating = bool(paid_working and plan_idle)
     # #2337 : la levée se lit sur les lots DÉMARRABLES — un lot qu'une
     # dépendance ou une date retient n'est pas du travail à confier, et
