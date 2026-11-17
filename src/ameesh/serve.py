@@ -778,9 +778,10 @@ _AGENT_OBS_ADMISSION = _obj(
     None,
     ["admitted", "claim_predicate", "governed", "responsible_required",
      "reasons"],
-    admitted={"type": "boolean"}, claim_predicate={"type": "boolean"},
+    admitted={"type": ["boolean", "null"]},
+    claim_predicate={"type": "boolean"},
     governed={"type": "boolean"},
-    responsible_required={"type": "boolean"},
+    responsible_required={"type": ["boolean", "null"]},
     reasons={"type": "array", "items": {
         "type": "string", "enum": list(agent_observation.REASONS)}})
 _AGENT_OBS_CANON = _nullable_obj(

@@ -321,7 +321,10 @@
           "admission": {
             "properties": {
               "admitted": {
-                "type": "boolean"
+                "type": [
+                  "boolean",
+                  "null"
+                ]
               },
               "claim_predicate": {
                 "type": "boolean"
@@ -338,6 +341,7 @@
                     "host_claims_closed",
                     "handoff_fenced",
                     "responsible_missing",
+                    "responsible_policy_unavailable",
                     "canon_state_missing",
                     "canon_state_not_ok",
                     "canon_stale",
@@ -352,7 +356,10 @@
                 "type": "array"
               },
               "responsible_required": {
-                "type": "boolean"
+                "type": [
+                  "boolean",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -471,6 +478,7 @@
                   "account_config_unreadable",
                   "no_billing_account",
                   "no_account_envelope",
+                  "foreign_host",
                   "exhausted",
                   null
                 ],
@@ -806,6 +814,7 @@
                 "account_envelope",
                 "budget_headroom",
                 "limits",
+                "responsible_policy",
                 "canon_state"
               ],
               "type": "string"

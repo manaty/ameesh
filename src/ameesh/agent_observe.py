@@ -69,7 +69,8 @@ def _text(document: dict) -> str:
             (", responsible " + profile["responsible"])
             if profile["responsible"] else ""),
         "admission  %s%s" % (
-            "admitted" if admission["admitted"] else "not admitted",
+            ("unknown" if admission["admitted"] is None else
+             "admitted" if admission["admitted"] else "not admitted"),
             (" (%s)" % ", ".join(admission["reasons"]))
             if admission["reasons"] else ""),
     ]

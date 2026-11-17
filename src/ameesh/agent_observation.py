@@ -16,6 +16,12 @@ ever selected. Budget figures are amounts, never a credential. A missing fact
 is null plus a stable code in `missing`; it is never permission, admission or
 zero cost.
 
+Host-local facts are used only when the observed agent runs on the observer's
+host. Another host's account profiles and responsible policy are not readable
+here: off-host, the budget is refused (`foreign_host`) and the admission is
+`null` with `responsible_policy` in `missing`, rather than substituting the
+observer's configuration.
+
 Atomicity: the builder opens its own ``REPEATABLE READ, READ ONLY``
 transaction (`db.transaction(isolation=…, read_only=True)`) and reads every
 fact inside it. One snapshot serves the whole document, and the transaction
@@ -39,7 +45,8 @@ SCHEMA = "ameesh-agent-observation/1"
 CANON_MAX_AGE_S = placement.SANDBOX_CANON_MAX_AGE
 
 #: stable reason codes of the admission block. The list is closed in `/1`:
-#: a new code is an additive value a consumer must read as "not admitted".
+#: a new code is an additive value a consumer must read as "not proven
+#: admitted", never as permission.
 REASONS = (
     "mode_externe",
     "retired",
@@ -47,6 +54,7 @@ REASONS = (
     "host_claims_closed",
     "handoff_fenced",
     "responsible_missing",
+    "responsible_policy_unavailable",
     "canon_state_missing",
     "canon_state_not_ok",
     "canon_stale",
@@ -65,6 +73,7 @@ BUDGET_REASONS = (
     "account_config_unreadable",
     "no_billing_account",
     "no_account_envelope",
+    "foreign_host",
     "exhausted",
 )
 
@@ -75,6 +84,7 @@ MISSING = (
     "account_envelope",
     "budget_headroom",
     "limits",
+    "responsible_policy",
     "canon_state",
 )
 
@@ -174,7 +184,18 @@ def _ref_commit(canon_ref):
     return commit or None
 
 
-def _admission(row: dict, *, responsible_required: bool, fresh: bool,
+def _same_host(cfg, row: dict) -> bool:
+    """Whether the observer's host is the agent's host.
+
+    Host-local configuration (declared account profiles, the responsible
+    policy) describes the observer's host, not another host's. It is used only
+    on a same-host read; elsewhere those facts are reported unavailable.
+    """
+    host = getattr(cfg, "host", "") or ""
+    return bool(host) and row.get("host") == host
+
+
+def _admission(row: dict, *, responsible_required: bool | None, fresh: bool,
                ref_matches: bool) -> dict:
     """The closed admission verdict and its stable reasons.
 
@@ -182,8 +203,15 @@ def _admission(row: dict, *, responsible_required: bool, fresh: bool,
     handoff fence, canon state and placement). `admitted` adds the profile
     level: an executable agent, a non-expired ephemeral, the responsible when
     the host requires one, and a *fresh* canon whose pinned commit is the last
-    good one. Scheduler-only conditions (host holds, tenant claimer) belong to
-    the claim path and are not encoded here.
+    good one.
+
+    `responsible_required` is None when the observer host is not the agent's
+    host: that policy is host-local and cannot be read from another host.
+    Every other fact is row- or database-global, so a failed profile condition
+    still answers `False`; when all of them pass the answer is `None`
+    (unknown, never permission) with `responsible_policy_unavailable`.
+    Scheduler-only conditions (host holds, tenant claimer) belong to the claim
+    path and are not encoded here.
     """
     reasons = []
     if row["mode"] != "execute":
@@ -196,7 +224,8 @@ def _admission(row: dict, *, responsible_required: bool, fresh: bool,
         reasons.append("host_claims_closed")
     if row["handoff_fenced"] and row["releve"] not in ("election", "preference"):
         reasons.append("handoff_fenced")
-    if responsible_required and not (row.get("responsible") or "").strip():
+    with_responsible = bool((row.get("responsible") or "").strip())
+    if responsible_required is True and not with_responsible:
         reasons.append("responsible_missing")
     if row["governed"]:
         if row["canon_status"] is None:
@@ -213,12 +242,18 @@ def _admission(row: dict, *, responsible_required: bool, fresh: bool,
             reasons.append("canon_stale")
         if row["canon_status"] == "ok" and not ref_matches:
             reasons.append("canon_ref_mismatch")
-    admitted = (bool(row["claim_predicate"]) and row["mode"] == "execute"
-                and not row["ephemeral_expired"]
-                and (not responsible_required
-                     or bool((row.get("responsible") or "").strip()))
-                and (not row["governed"] or (fresh and ref_matches)))
-    if not admitted and not reasons:
+    profile_ok = (bool(row["claim_predicate"]) and row["mode"] == "execute"
+                  and not row["ephemeral_expired"]
+                  and (not row["governed"] or (fresh and ref_matches)))
+    if responsible_required is True and not with_responsible:
+        profile_ok = False
+    if responsible_required is None:
+        admitted = None if profile_ok else False
+        if profile_ok:
+            reasons.append("responsible_policy_unavailable")
+    else:
+        admitted = profile_ok
+    if admitted is False and not reasons:
         reasons.append("claim_predicate")
     return {"admitted": admitted,
             "claim_predicate": bool(row["claim_predicate"]),
@@ -317,8 +352,7 @@ def _effective_limits(cfg, row: dict) -> dict:
 
 def _limits_block(cfg, row: dict) -> dict:
     declared = _declared_limits(row)
-    same_host = bool(getattr(cfg, "host", "")) and row.get("host") == cfg.host
-    effective = _effective_limits(cfg, row) if same_host else None
+    effective = _effective_limits(cfg, row) if _same_host(cfg, row) else None
     return {"host": row.get("host") or None,
             "available": effective is not None,
             "declared": declared,
@@ -357,14 +391,11 @@ def _account_profile(cfg, row: dict, requested: str | None):
     return None, "ambiguous_account_profile"
 
 
-def _budget_block(db, cfg, row: dict, requested: str | None) -> tuple[dict, list]:
-    profile, reason = _account_profile(cfg, row, requested)
-    missing = []
-    block = {
-        "account_profile": (profile.name if profile is not None else
-                            (requested or row.get("session_account") or None)),
-        "billing_account": (getattr(profile, "billing_account", "") or None
-                            if profile is not None else None),
+def _empty_budget(account_profile, reason) -> dict:
+    """The unavailable budget block: amounts stay null, never zero."""
+    return {
+        "account_profile": account_profile,
+        "billing_account": None,
         "available": False,
         "reason": reason,
         "reserve_usd": None,
@@ -379,23 +410,34 @@ def _budget_block(db, cfg, row: dict, requested: str | None) -> tuple[dict, list
         "timezone": None,
         "reset_ts": None,
     }
+
+
+def _budget_block(db, cfg, row: dict, requested: str | None) -> tuple[dict, list]:
+    """The redacted envelope of the agent's account, or an unavailable block.
+
+    The declared account profiles are host-local: another host's `p1` may bill
+    a different account. Off the agent's host the selection is refused with
+    `foreign_host` rather than substituting the observer's account.
+    """
+    recorded = requested or row.get("session_account") or None
+    if not _same_host(cfg, row):
+        return _empty_budget(recorded, "foreign_host"), ["account_envelope"]
+    profile, reason = _account_profile(cfg, row, requested)
     if profile is None:
-        missing.append("account_envelope")
-        return block, missing
+        return _empty_budget(recorded, reason), ["account_envelope"]
+    block = _empty_budget(profile.name, None)
     block["reserve_usd"] = float(profile.reserve_usd)
     account = getattr(profile, "billing_account", "") or ""
     if not account:
         block["reason"] = "no_billing_account"
-        missing.append("account_envelope")
-        return block, missing
+        return block, ["account_envelope"]
     # A database failure is not a fact about the envelope: it propagates and
     # the whole observation fails closed (the transaction is already aborted,
     # so returning a partial document would be a lie).
     rows = storage.of(db).budgets.account_usage(account)
     if not rows:
         block["reason"] = "no_account_envelope"
-        missing.append("account_envelope")
-        return block, missing
+        return block, ["account_envelope"]
     envelope = rows[0]
     settled = float(envelope.get("settled") or 0.0)
     reserved = float(envelope.get("reserved") or 0.0)
@@ -420,8 +462,8 @@ def _budget_block(db, cfg, row: dict, requested: str | None) -> tuple[dict, list
         "reset_ts": _float(envelope.get("reset_ts")),
     })
     if not admitted:
-        missing.append("budget_headroom")
-    return block, missing
+        return block, ["budget_headroom"]
+    return block, []
 
 
 def _pending_turn(db, row: dict) -> dict | None:
@@ -450,7 +492,10 @@ def _build(tx, name: str, *, cfg, account_profile: str | None,
         raise Unknown("unknown agent: %s" % name)
     row = rows[0]
     observed_ts = float(row["observed_ts"])
-    responsible_required = bool(getattr(cfg, "responsible_required", False))
+    # The responsible policy is host-local: another host's value is unknown,
+    # and a local `False` must not turn a remote admission into `True`.
+    responsible_required = (bool(getattr(cfg, "responsible_required", False))
+                            if _same_host(cfg, row) else None)
     canon = _canon_block(row, observed_ts=observed_ts)
     fresh = bool(canon["fresh"]) if canon is not None else False
     ref_matches = bool(canon["ref_matches"]) if canon is not None else False
@@ -459,6 +504,8 @@ def _build(tx, name: str, *, cfg, account_profile: str | None,
     limits = _limits_block(cfg, row)
     budget, budget_missing = _budget_block(tx, cfg, row, account_profile)
     missing = list(budget_missing)
+    if responsible_required is None:
+        missing.append("responsible_policy")
     if not limits["available"]:
         missing.append("limits")
     if canon is not None and canon["state"] is None:
@@ -516,8 +563,9 @@ def observe(db, name: str, *, cfg, account_profile: str | None = None,
     Opens a repeatable-read, read-only transaction for the whole document.
     Raises `Unknown` when the agent does not exist. `cfg` supplies the
     observer's host defaults and declared account profiles; it is never
-    written. `account_profile` selects a declared profile to report; without
-    it the session's recorded account, then the single default, is used.
+    written, and it is used only when the agent runs on `cfg.host`.
+    `account_profile` selects a declared profile to report; without it the
+    session's recorded account, then the single declared profile, is used.
     """
     with db.transaction(isolation="REPEATABLE READ", read_only=True) as tx:
         return _build(tx, name, cfg=cfg, account_profile=account_profile,
