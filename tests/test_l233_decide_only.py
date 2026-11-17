@@ -15,7 +15,7 @@ import os
 import unittest
 from unittest import mock
 
-from ameesh import alert_briefs, chat, decisions, exploitation, mail, notify, work
+from ameesh import alert_briefs, chat, decisions, exploitation, mail, notify, registry, work
 
 from .support import hold_for_owner
 from .test_l124_decisions import ALICE, _Base
@@ -195,6 +195,15 @@ class BriefsTest(unittest.TestCase):
 class ProseTest(_Base):
     REPORT = ("Rapport 02:56, section 4 — décisions : 1) GO ? pour la bascule ; "
               "2) le schéma est à valider.")
+
+    def setUp(self):
+        super().setUp()
+        # #7634 : sans avatar au canon, la route humaine est l'agent `externe`
+        # du registre (le bureau du mesh Manaty) ; le cœur n'en connaît plus
+        # le nom.
+        registry.upsert(self.db, "bureau", harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET mode = 'externe'"
+                        " WHERE name = 'bureau'")
 
     def send(self, body, *, sender="orch", recipient="bureau", lot=None, kind="notify"):
         return mail.send(self.db, sender, recipient, body, kind=kind,

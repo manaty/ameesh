@@ -125,8 +125,8 @@ from dataclasses import dataclass, field, replace
 from . import migrations
 from . import config as config_mod
 from . import db as db_mod
-from . import alert_briefs, exploitation, fil, mail, nexlink_alerts, notify_gap, \
-    sous_utilisation, storage
+from . import alert_briefs, avatars, exploitation, fil, mail, nexlink_alerts, notify_gap, \
+    sous_utilisation, storage, work
 from . import vocab
 from .config import Config
 from .platform import notify as platform_notify
@@ -1602,6 +1602,7 @@ class Router:
         self._agents = None
         self._canon = None
         self._canon_read = False
+        self._avatars = None
 
     def agents(self) -> dict:
         if self._agents is None:
@@ -1644,7 +1645,27 @@ class Router:
         fiche = canon_mod.find_host(self._canon or [], host)
         return fiche.responsible if fiche is not None else None
 
-    def resolve(self, alert: dict) -> tuple:
+    def avatar_for(self, human: str | None) -> str | None:
+        """L'agent avatar de `human`, lu au canon (#7634), ou None."""
+        if not human:
+            return None
+        if self._avatars is None:
+            try:
+                self._avatars = avatars.configured(self.cfg)
+            except Exception:  # noqa: BLE001 — un canon illisible ne fait pas d'avatar
+                self._avatars = {}
+        return self._avatars.get(str(human))
+
+    def avatars(self) -> dict:
+        """`{human: avatar}` des canons configurés (cache de la passe)."""
+        if self._avatars is None:
+            try:
+                self._avatars = avatars.configured(self.cfg)
+            except Exception:  # noqa: BLE001
+                self._avatars = {}
+        return self._avatars
+
+    def resolve(self, alert: dict, *, for_avatar: bool = False) -> tuple:
         """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None).
 
         #2395 (canon §9, owner 18/10) : un `slo_breach` n'est **jamais** poussé
@@ -1684,7 +1705,7 @@ class Router:
         for source, value in steps:
             human = normalize_human(value())
             if human:
-                if (alert.get("type") == "slo_breach"
+                if (alert.get("type") == "slo_breach" and not for_avatar
                         and human == normalize_human(self.ncfg.default_human)):
                     # #2395 : même explicitement configuré, un dépassement de
                     # délai ne part pas sur le bureau de l'owner.
@@ -1730,6 +1751,10 @@ def empty_state() -> dict:
 #: la passe s'arrête d'elle-même avant.
 STATE_SCOPE = "alerts"
 STATE_LEASE_S = 90.0
+
+#: #7634 : délai laissé à l'avatar d'un humain pour lire son courrier avant
+#: que la route directe (canaux de l'humain) ne reprenne, avec journal.
+AVATAR_FALLBACK_S = 15 * 60.0
 #: intervalle de renouvellement : trois occasions avant l'expiration
 STATE_RENEW_S = STATE_LEASE_S / 3.0
 #: attente maximale du fil de renouvellement au rendu du bail
@@ -2667,7 +2692,7 @@ class Notifier:
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
-            self._resolved(key, entry, now)
+            self._resolved(key, entry, now, db=db)
             self._event(db, "alert.resolved", key, entry["alert"])
         for key, alert in wanted.items():
             entry = active.get(key)
@@ -2722,7 +2747,7 @@ class Notifier:
                     "channels": {}}
                 if alert.get("type") in exploitation.ESCALATING:
                     entry["escalated"] = bool(alert.get("critical"))
-                self._raise(entry, router, now)
+                self._raise(entry, router, now, db=db)
                 self._event(db, "alert.raised", key, alert)
             elif (alert.get("type") in exploitation.ESCALATING and alert.get("critical")
                   and not entry.get("escalated")):
@@ -2731,15 +2756,15 @@ class Notifier:
                 # retour au seuil puis au critique ne la relève pas)
                 entry.update(alert={k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
                              escalated=True, status="nouvelle", channels={})
-                self._raise(entry, router, now)
+                self._raise(entry, router, now, db=db)
             else:
                 if alert.get("type") == "orphan_lot" and alert.get("grouped"):
                     entry["alert"] = {k: alert.get(k) for k in _KEPT if alert.get(k) is not None}
                 if entry["status"] in ("nouvelle", "sans_destinataire", "sans_canal"):
                     # un responsable (ou une route) a pu apparaître depuis
-                    self._raise(entry, router, now)
+                    self._raise(entry, router, now, db=db)
                 else:
-                    self._retry(entry, "raised", now)
+                    self._retry(entry, "raised", now, db=db)
             entry.update(severity=level, ack_subjects=subjects)
         self._journal_capacity(db, current, now)
         self._brief_agents(db, current, router, now, unreadable=unreadable)
@@ -2754,7 +2779,7 @@ class Notifier:
             if self._acknowledged(entry, acknowledgements):
                 del self.state["resolved"][key]
                 continue
-            self._retry(entry, "resolved", now)
+            self._retry(entry, "resolved", now, db=db)
             if not self._pending(entry):
                 del self.state["resolved"][key]
         self._summaries(now)
@@ -2884,12 +2909,12 @@ class Notifier:
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
-                self._raise(entry, router, now)
+                self._raise(entry, router, now, db=db)
             elif entry["status"] in ("nouvelle", "sans_destinataire", "sans_canal"):
                 # un responsable (ou une route) a pu apparaître depuis
-                self._raise(entry, router, now)
+                self._raise(entry, router, now, db=db)
             else:
-                self._retry(entry, "raised", now)
+                self._retry(entry, "raised", now, db=db)
         if not unobserved:
             self._local_resolutions(wanted, now)
         else:
@@ -2937,7 +2962,7 @@ class Notifier:
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
-            self._resolved(key, entry, now)
+            self._resolved(key, entry, now, db=db)
         for key in list(self.state["resolved"]):
             if key not in before:
                 continue
@@ -2946,7 +2971,7 @@ class Notifier:
                 continue
             if entry["alert"].get("type") in unobserved:
                 continue
-            self._retry(entry, "resolved", now)
+            self._retry(entry, "resolved", now, db=db)
             if not self._pending(entry):
                 del self.state["resolved"][key]
 
@@ -3289,7 +3314,90 @@ class Notifier:
         except Exception as exc:  # noqa: BLE001 — the notification goes on
             self.log("capacity alert journal not recorded: %s" % type(exc).__name__)
 
-    def _raise(self, entry: dict, router: Router, now: float) -> None:
+    def _avatar_reachable(self, name: str | None, db) -> bool:
+        """L'avatar est-il joignable maintenant ?
+
+        `externe` (session humaine, 0030) lit son courrier par son propre
+        script : joignable, sauf s'il est lui-même arrêté. Sinon le registre
+        tranche : une ligne arrêtée, en pause ou en erreur, ou un bail rendu,
+        ne l'est pas (même règle que `alert_briefs._split_live`, sans exiger
+        de bail pour un externe). Un registre illisible ne fait pas attendre
+        l'alerte : elle suit la route directe, une fois."""
+        if not name:
+            return False
+        if db is None:
+            return True
+        try:
+            row = next((item for item in storage.of(db).operations.listing()
+                        if item.get("name") == str(name)), None)
+        except Exception:  # noqa: BLE001 — la route directe reprend
+            return False
+        if row is None:
+            return False
+        if row.get("mode") in ("stopped", "off"):
+            return False
+        if str(row.get("status") or "") in ("stopped", "paused", "error", "dead"):
+            return False
+        if row.get("mode") == "externe":
+            return True
+        return bool(row.get("lease_live", True))
+
+    def _deliver_avatar(self, entry: dict, avatar: str, human: str,
+                        now: float, db) -> bool:
+        """Dépose l'alerte dans la boîte de l'avatar (#7634).
+
+        Le canal direct ne porte rien tant que l'avatar lit : c'est lui qui
+        présente à son humain. Le dépôt est durable ; le repli direct est
+        décidé par `_avatar_followup` après `AVATAR_FALLBACK_S`."""
+        alert = entry["alert"]
+        message = render(alert, "raised", now, raised_ts=entry.get("raised_ts"))
+        payload = {"alert": alert.get("type"), "human": human,
+                   "avatar": avatar, "key": entry.get("key")}
+        if db is None and not self.dry_run:
+            entry["status"] = "sans_destinataire"
+            self._record("raised", entry, "sans_destinataire", {})
+            return False
+        if self.dry_run:
+            self.log("[%s] mail to avatar %s (dry run): %s"
+                     % (alert.get("type"), avatar, _subject(alert)))
+        else:
+            try:
+                mail.send(db, work.SYSTEM_SENDER, avatar, message.text,
+                          kind="event", payload=payload)
+            except Exception as exc:  # noqa: BLE001 — la route directe reprend
+                self.log("[%s] avatar %s unreachable (%s): direct route"
+                         % (alert.get("type"), avatar,
+                            _clean(_scrub(exc, ()), 160)))
+                return False
+        entry.update(status="avatar", avatar=avatar, avatar_sent_ts=now,
+                     avatar_fallback=False, channels={})
+        self._event(db, "avatar.routed", entry.get("key") or "", alert)
+        self._record("raised", entry, "avatar", {})
+        return True
+
+    def _avatar_followup(self, entry: dict, now: float, db) -> None:
+        """Après le dépôt chez l'avatar : attendre, puis replier (#7634).
+
+        Tant que l'avatar est joignable, l'alerte reste dans sa boîte. S'il
+        est arrêté ou injoignable au-delà de `AVATAR_FALLBACK_S`, la route
+        actuelle reprend — le canal direct de l'humain, avec le texte entier
+        — et l'événement est journalisé."""
+        if entry.get("avatar_fallback"):
+            return
+        sent = float(entry.get("avatar_sent_ts") or 0.0)
+        if now - sent < AVATAR_FALLBACK_S:
+            return
+        if self._avatar_reachable(entry.get("avatar"), db):
+            return
+        alert = entry["alert"]
+        entry["avatar_fallback"] = True
+        self._event(db, "avatar.fallback", entry.get("key") or "", alert)
+        self.log("[%s] avatar %s did not read within %ds: direct route for %s"
+                 % (alert.get("type"), entry.get("avatar"), int(AVATAR_FALLBACK_S),
+                    entry.get("human")))
+        self._raise_direct(entry, entry.get("human"), now, first=False)
+
+    def _raise(self, entry: dict, router: Router, now: float, db=None) -> None:
         if not self._delivery_open():
             return
         alert = entry["alert"]
@@ -3303,8 +3411,19 @@ class Notifier:
                 self._record("raised", entry, "sans_destinataire", {})
             entry["status"] = "sans_destinataire"
             return
-        channels = self.ncfg.channels_for(human)
         entry.update(human=human, source=source)
+        # #7634 : d'abord la boîte de l'avatar de l'humain, s'il en a un.
+        avatar = None if entry.get("avatar_fallback") else router.avatar_for(human)
+        if avatar and self._deliver_avatar(entry, avatar, human, now, db):
+            return
+        self._raise_direct(entry, human, now, first=first)
+
+    def _raise_direct(self, entry: dict, human: str, now: float, *,
+                      first: bool) -> None:
+        """La route directe historique : les canaux configurés de l'humain."""
+        alert = entry["alert"]
+        channels = self.ncfg.channels_for(human)
+        entry.update(human=human)
         if not channels:
             if entry["status"] != "sans_canal":
                 self.log("no channel for %s (notify.routes, notify.default): alert [%s] "
@@ -3555,12 +3674,15 @@ class Notifier:
             module_auditors = alert_briefs.auditors(listing, canons, explicit_only=True)
             from . import sous_utilisation
             module_orchestrators = sous_utilisation.role_orchestrators(canons)
+            avatars_by_human = avatars.from_canons(canons)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
         unevaluated: set = set()
         for key, alert, entry in due:
             kind = alert.get("type")
+            human, _ = router.resolve(alert, for_avatar=True)
+            avatar = avatars_by_human.get(human) if human else None
             # #3036 : les destinataires écartés par la vivacité, pour que les
             # passes suivantes sachent qu'il reste quelqu'un à remettre.
             dead: dict = {}
@@ -3601,7 +3723,8 @@ class Notifier:
                     alert, listing, titles,
                     module_auditors if kind == "module_deviation" else auditors,
                     orchestrator_names=module_orchestrators,
-                    closed_hosts=closed, dead_out=dead, covered=covered)
+                    closed_hosts=closed, dead_out=dead, covered=covered,
+                    avatar_names=(avatar,) if avatar else ())
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 unevaluated.add(key)
@@ -3611,16 +3734,17 @@ class Notifier:
                 # escalade, la passe suivante remet à son retour.
                 briefs.pop(name)
                 dead[name] = "lease returned, grace"
-            if kind == "slo_breach" and "bureau" in (alert.get("targets") or ()) \
-                    and any(
-                        row.get("name") == "bureau" and row.get("mode") == "externe"
-                        for row in listing):
-                # Keep the desk's copy in the readable lot thread, without
+            if kind == "slo_breach" and avatar \
+                    and "avatar" in (alert.get("targets") or ()) \
+                    and any(row.get("name") == avatar
+                            and row.get("mode") == "externe" for row in listing):
+                # Keep the avatar's copy in the readable lot thread, without
                 # growing a mailbox nobody wakes to read. No `home` project
                 # exception (#2640): canon lots are `app=ameesh` (#2511).
                 # #3036 : `setdefault` — un repli a pu y placer le texte du
                 # palier effectivement visé, avec ses absents nommés.
-                briefs.setdefault("thread:bureau", alert_briefs._slo_breach(alert))
+                briefs.setdefault("thread:%s" % avatar,
+                                  alert_briefs._slo_breach(alert, desk=avatar))
             if kind == "slo_breach":
                 briefs = {n: t for n, t in briefs.items() if n not in covered}
             if not briefs:
@@ -3735,11 +3859,12 @@ class Notifier:
                             if slo_delivery.merge_observed(
                                     self.cfg, db, item, overview=listing):
                                 break
-                    if name == "thread:bureau":
+                    if name.startswith("thread:"):
                         # #3036 : la route humaine — le fil lisible du lot,
-                        # comme la copie du bureau externe (#2602/#2640).
+                        # comme la copie de l'avatar externe (#2602/#2640).
+                        thread_name = name.split(":", 1)[1]
                         if fil.record(self.cfg, db, sender=work.SYSTEM_SENDER,
-                                      recipients=["bureau"], text=text,
+                                      recipients=[thread_name], text=text,
                                       project=alert.get("project"), lot=alert.get("lot"),
                                       meta=meta) is None:
                             continue
@@ -3886,11 +4011,38 @@ class Notifier:
         return True
 
     # -- résolution -----------------------------------------------------------
-    def _resolved(self, key: str, entry: dict, now: float) -> None:
+    def _resolve_avatar(self, entry: dict, now: float, db) -> None:
+        """La résolution suit l'alerte déposée chez l'avatar (#7634)."""
+        avatar = entry.get("avatar")
+        if not avatar:
+            self._record("resolved", entry, "abandonnee", {})
+            return
+        if db is None or self.dry_run:
+            self._record("resolved", entry, "sans_envoi", {})
+            return
+        message = render(entry["alert"], "resolved", now,
+                         raised_ts=entry.get("raised_ts"))
+        try:
+            mail.send(db, work.SYSTEM_SENDER, avatar, message.text, kind="event",
+                      payload={"alert": entry["alert"].get("type"),
+                               "human": entry.get("human"), "avatar": avatar,
+                               "key": entry.get("key")})
+        except Exception as exc:  # noqa: BLE001 — la résolution ne bloque pas
+            self.log("[%s] avatar %s resolution not delivered: %s"
+                     % (entry["alert"].get("type"), avatar,
+                        _clean(_scrub(exc, ()), 160)))
+            self._record("resolved", entry, "abandonnee", {})
+            return
+        self._record("resolved", entry, "avatar", {})
+
+    def _resolved(self, key: str, entry: dict, now: float, db=None) -> None:
         if not self._delivery_open():
             return
         alert, human = entry["alert"], entry.get("human")
         status = entry.get("status")
+        if status == "avatar":
+            self._resolve_avatar(entry, now, db)
+            return
         if alert.get("type") in QUIET_RESOLUTION_TYPES:
             # L124 : l'humain a répondu (ou la demande est retirée) : rien à envoyer
             self._record("resolved", entry, "sans_envoi", {})
@@ -3949,8 +4101,11 @@ class Notifier:
         return [name for name, st in entry.get("channels", {}).items()
                 if not st.get("ok") and st.get("attempts", 0) < self.ncfg.max_attempts]
 
-    def _retry(self, entry: dict, event: str, now: float) -> None:
+    def _retry(self, entry: dict, event: str, now: float, db=None) -> None:
         if not self._delivery_open():
+            return
+        if event == "raised" and entry.get("status") == "avatar":
+            self._avatar_followup(entry, now, db)
             return
         if entry.get("status") == "envoi" and self._pending(entry):
             self._attempt(entry, event, now)

@@ -375,7 +375,8 @@ class GuardTest(unittest.TestCase):
                                return_value=right), \
              mock.patch.object(staging_deferred, "_is_ancestor",
                                side_effect=ancestry), \
-             mock.patch.object(staging_deferred, "_registry_rows", return_value=[]), \
+             mock.patch.object(staging_deferred, "_registry_rows",
+                               return_value=[{"name": "bureau", "mode": "externe"}]), \
              mock.patch("ameesh.alert_briefs.project_pilots",
                         return_value=["pilot"]), \
              mock.patch("ameesh.mail.send") as send:
@@ -495,8 +496,8 @@ class ActorTest(unittest.TestCase):
              mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": ""}), \
              mock.patch("ameesh.agent_names.resolve", side_effect=lambda text, **kw: text), \
              mock.patch("ameesh.canon.load_configured", return_value=[]), \
-             mock.patch("ameesh.sous_utilisation.role_orchestrators",
-                        return_value={"bureau"} if bureau else set()), \
+             mock.patch("ameesh.avatars.is_avatar_in",
+                        side_effect=lambda canons, name: bool(bureau)), \
              mock.patch("ameesh.work.known_human",
                         return_value=human if human else None):
             return release._catchup_actor(types.SimpleNamespace(), object(), explicit)

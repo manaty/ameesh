@@ -641,9 +641,8 @@ def decisions_view(db, *, human: str | None = None, include_closed: bool = False
     # L233: decisions written in prose in mail, not filed as requests
     prose = decisions_mod.prose_decisions(db, now)
     if viewer:
-        prose = [p for p in prose
-                 if p["recipient"] in decisions_mod.PROSE_RECIPIENTS
-                 + (viewer, decisions_mod.OWNER_ANY)]
+        allowed = decisions_mod.prose_recipients(db) + (viewer, decisions_mod.OWNER_ANY)
+        prose = [p for p in prose if p["recipient"] in allowed]
     queue["requests"] = requests["pending"]
     queue["prose"] = prose
     if include_closed:
