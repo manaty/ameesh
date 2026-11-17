@@ -280,6 +280,52 @@ class NonAdditiveTest(unittest.TestCase):
             checksum="0" * 64, module="dev")
         self.assertEqual(migrations.module_sql_problems(commented), [])
 
+    def sql_migration(self, sql):
+        return migrations.Migration(
+            version=1, name="f", path="", sql=sql,
+            checksum="0" * 64, module="dev")
+
+    def test_each_security_definer_routine_needs_its_own_search_path(self):
+        safe = ("create function safe() returns trigger language plpgsql "
+                "security definer set search_path = pg_catalog, pg_temp "
+                "as $$ begin return new; end $$;")
+        unsafe = ("create function unsafe() returns trigger language plpgsql "
+                  "security definer as $$ begin return new; end $$;")
+        for sql in (safe + "\n" + unsafe, unsafe + "\n" + safe):
+            with self.subTest(sql=sql):
+                self.assertEqual(
+                    migrations.module_sql_problems(self.sql_migration(sql)),
+                    ["SECURITY DEFINER without SET search_path"])
+
+    def test_a_search_path_in_a_body_literal_or_other_statement_does_not_count(self):
+        for sql in (
+                "create function f() returns void language plpgsql security definer "
+                "as $$ begin perform set_config('search_path', 'pg_catalog', true); "
+                "end $$;",
+                "select 'set search_path = pg_catalog';"
+                " create function f() returns void language plpgsql security definer "
+                "as $$ begin return; end $$;",
+                "create function f() returns void language plpgsql security definer "
+                "as $$ begin raise notice 'set search_path = pg_catalog'; end $$;"):
+            with self.subTest(sql=sql):
+                self.assertEqual(
+                    migrations.module_sql_problems(self.sql_migration(sql)),
+                    ["SECURITY DEFINER without SET search_path"])
+
+    def test_security_definer_in_dynamic_sql_is_refused(self):
+        sql = ("do $$ begin execute 'create function f() returns void "
+               "language plpgsql security definer as $body$ begin return; end "
+               "$body$'; end $$;")
+        self.assertEqual(migrations.module_sql_problems(self.sql_migration(sql)),
+                         ["SECURITY DEFINER cannot be verified"])
+
+    def test_an_uncertain_parse_is_refused(self):
+        sql = ("create function f() returns void language plpgsql /* note */ "
+               "security definer set search_path = pg_catalog "
+               "as $$ begin return; end $$;")
+        self.assertEqual(migrations.module_sql_problems(self.sql_migration(sql)),
+                         ["SECURITY DEFINER cannot be verified"])
+
 
 class SchemaMigrationDbTest(support.PgTestCase):
     def setUp(self):

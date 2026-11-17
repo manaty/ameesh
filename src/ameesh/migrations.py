@@ -120,19 +120,36 @@ MODULE_SCHEMA_SEP = "__"
 #: l'appelant et pourrait résoudre un objet d'un autre schéma.
 _SECURITY_DEFINER = re.compile(r"\bsecurity\s+definer\b", re.IGNORECASE)
 _SET_SEARCH_PATH = re.compile(r"\bset\s+search_path\b", re.IGNORECASE)
+_ROUTINE = re.compile(r"\b(?:create\s+(?:or\s+replace\s+)?|alter\s+)"
+                      r"(?:function|procedure)\b", re.IGNORECASE)
 
 
 def module_sql_problems(migration: Migration) -> list[str]:
     """Raisons de refuser le SQL d'une migration de module (lecture prudente).
 
-    Le texte est lu par `_lex` : commentaires retirés, corps `$$` compris dans
-    les chaînes examinées (ils sont exécutés à la création de la fonction).
-    Une forme non sûre reste un refus, jamais une permission."""
-    strings, code, _sure, _source = _lex(migration.sql)
-    text = " ".join([code, *strings])
-    if _SECURITY_DEFINER.search(text) and not _SET_SEARCH_PATH.search(text):
-        return ["SECURITY DEFINER without SET search_path"]
-    return []
+    Le texte est lu par `_lex` : commentaires retirés, corps `$$` et littéraux
+    remplacés par des jetons. `SECURITY DEFINER` se juge donc **par routine**,
+    dans l'instruction qui la définit : un `SET search_path` écrit dans le
+    corps d'une fonction, dans un littéral ou dans une autre instruction ne
+    couvre rien. Un `SECURITY DEFINER` dans un corps ou un littéral peut être
+    exécuté par SQL dynamique, et un lecteur incertain ne prouve rien : ces
+    cas sont refusés."""
+    strings, code, sure, _source = _lex(migration.sql)
+    declared = _SECURITY_DEFINER.search(code)
+    dynamic = _SECURITY_DEFINER.search("\n".join(strings))
+    if not declared and not dynamic:
+        return []
+    if dynamic or not sure:
+        return ["SECURITY DEFINER cannot be verified"]
+    problems = []
+    for statement in code.split(";"):
+        if not _SECURITY_DEFINER.search(statement):
+            continue
+        if not _ROUTINE.search(statement):
+            problems.append("SECURITY DEFINER outside a routine definition")
+        if not _SET_SEARCH_PATH.search(statement):
+            problems.append("SECURITY DEFINER without SET search_path")
+    return list(dict.fromkeys(problems))
 
 
 def module_metadata(name: str, implementation) -> dict:

@@ -119,8 +119,11 @@ database, declare `-- ameesh: non-additive` when it is not, and qualify core
 objects explicitly (the runner sets `search_path` to
 `<module schema>, <core schema>, pg_temp`). `ameesh migrate --additive-only`
 refuses the whole pass if either the core or a module has a non-additive
-migration. `ameesh modules --json` reports the declared schema, requirements
-and migrations, and `ameesh doctor` reports each module schema's state.
+migration. Every `SECURITY DEFINER` routine must set `search_path` in its own
+definition; the runner refuses one that does not, and refuses a migration
+whose dynamic SQL or uncertain parse prevents that proof. `ameesh modules
+--json` reports the declared schema, requirements and migrations, and `ameesh
+doctor` reports each module schema's state.
 
 ## 3. Install, discover and trust
 
