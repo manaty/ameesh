@@ -172,6 +172,45 @@ class SessionReceiptTest(PgTestCase):
         head = self.commit(path, env)
         self.assertIn("not its descendant", self.refused(head, path))
 
+    def test_the_ambient_identity_does_not_bypass_a_pid_binding(self):
+        """B1 #7719 : un PID lié n'est pas revendiqué par la seule variable."""
+        self.bind(pid=999999)
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            prov.capture({"CODEX_SESSION_ID": "s-veille",
+                          "AMEESH_HARNESS": "codex"},
+                         families=FAMILIES, db=self.db, cfg=self.cfg)
+        self.assertIn("session binding", str(raised.exception))
+
+    def test_the_ambient_identity_accepts_its_own_pid_binding(self):
+        """La garde B1 ne casse pas la session dont le PID est bien ancêtre."""
+        self.bind(pid=os.getpid())
+        ident = prov.capture({"CODEX_SESSION_ID": "s-veille",
+                              "AMEESH_HARNESS": "codex"},
+                             families=FAMILIES, db=self.db, cfg=self.cfg)
+        self.assertEqual(ident["actor"], "veille")
+        self.assertEqual(ident["source"], "session")
+
+    def test_the_hooks_do_not_record_a_commit_before_the_binding(self):
+        """B1 #7719 : la voie des hooks borne aussi la date à la liaison."""
+        self.bind()
+        path, env = self.repo(date="2026-11-16T00:00:00Z")
+        hook_env = {"CODEX_SESSION_ID": "s-veille", "AMEESH_HARNESS": "codex"}
+        with open(os.path.join(path, "f.txt"), "w", encoding="utf-8") as fh:
+            fh.write("x\n")
+        subprocess.run(["git", "add", "f.txt"], cwd=path, check=True,
+                       capture_output=True)
+        self.assertIsNotNone(prov.prepare_commit_intent(
+            path, environ=hook_env, db=self.db, cfg=self.cfg))
+        head = self.commit(path, env, "avant la liaison", staged=True)
+        self.assertIsNotNone(prov.prepare_commit_creation(
+            path, environ=hook_env, db=self.db, cfg=self.cfg))
+        ident = prov.capture(hook_env, families=FAMILIES, db=self.db,
+                             cfg=self.cfg)
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            prov.record_commit(self.db, head, identity=ident, cwd=path)
+        self.assertIn("before its session binding", str(raised.exception))
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+
     def test_another_binding_cannot_claim_an_already_received_commit(self):
         """Témoin (3) : le reçu d'une liaison ne se réattribue pas à une autre."""
         self.bind(agent="veille", session="s-veille")

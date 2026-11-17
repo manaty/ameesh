@@ -380,7 +380,14 @@ Gardes d'écriture (`record_session_commit`) :
 - une preuve déjà écrite n'est rejouable que pour la même identité, et une
   preuve révoquée n'est jamais ressuscitée ;
 - une liaison qui porte un PID garde l'ascendance : la voie explicite ne la
-  contourne pas (`for_hook`, L46/L63) ;
+  contourne pas (`for_hook`, L46/L63) ; la **voie ambiante des hooks** non plus
+  — un identifiant de session posé dans l'environnement ne suffit jamais à
+  revendiquer une liaison à PID, et un PID réutilisé (heure de démarrage
+  différente) est refusé ; sinon on retombe sur l'ascendance (B1 des deux
+  relecteurs) ;
+- la voie des hooks applique la **même borne de date** que la voie explicite
+  (`binding_ts`) : un commit antérieur à la liaison est refusé, même avec une
+  attestation de création (B1 de l'auditeur) ;
 - l'environnement ambiant n'est pas autoritaire : un shell qui porte le
   `DSH_SESSION_ID` de l'hôte ne détourne pas un geste manuel vers une session
   sans rapport ; sans liaison, l'ascendance reste le seul chemin.
@@ -403,10 +410,11 @@ Bornes, dites sans prétendre plus :
   présent sur une réf ; la liaison reste l'autorité, et le committer d'un agent
   enregistré est refusé.
 
-Témoins : `tests/test_7719_provenance_session_liee.py` (13 tests : reçu d'un
+Témoins : `tests/test_7719_provenance_session_liee.py` (16 tests : reçu d'un
 commit natif ; hooks de création qui lisent `CODEX_SESSION_ID` ; commit
-antérieur à la liaison ; commit d'un autre agent enregistré ; commit non porté
-par une réf ; liaison révoquée ; liaison à PID non contournée ; reçu déjà pris
-par une autre liaison ; reçu de session sans liaison ; reçu d'une liaison d'un
-autre agent ; commit non lié inconnu ; CLI sur une plage poussée ; CLI d'une
-session non liée).
+antérieur à la liaison, aussi par les hooks ; commit d'un autre agent
+enregistré ; commit non porté par une réf ; liaison révoquée ; liaison à PID
+non contournée par la voie explicite et par la voie ambiante ; PID courant
+accepté ; reçu déjà pris par une autre liaison ; reçu de session sans liaison ;
+reçu d'une liaison d'un autre agent ; commit non lié inconnu ; CLI sur une
+plage poussée ; CLI d'une session non liée).
