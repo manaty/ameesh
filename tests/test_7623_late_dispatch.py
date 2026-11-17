@@ -120,6 +120,27 @@ class LateDispatchTest(unittest.TestCase):
             self.assertFalse(self.retry())
         self.assertEqual(self.events, [])
 
+    def test_cached_transport_is_revalidated_and_stale_absence_is_refused(self):
+        calls = []
+
+        class Transport(plan_github.GhApi):
+            stale = True
+
+            def get(self, path, *, ttl=None):
+                calls.append(ttl)
+                self.last_read = plan_github.ReadMeta(1.0, self.stale, 'cache')
+                return dict(total_count=0, workflow_runs=[])
+
+        transport = Transport(mock.Mock())
+        self.watcher.api = transport.get
+        with self.assertRaisesRegex(ci.GelError, 'fresh GitHub read'):
+            self.retry()
+        self.assertEqual(self.events, [])
+        self.gh.run.assert_not_called()
+        transport.stale = False
+        self.assertTrue(self.retry())
+        self.assertEqual(calls, [0, 0, 0])
+
     def test_dry_run_and_mediated_storage_keep_observation_only(self):
         self.watcher.dry_run = True
         self.assertFalse(self.retry())

@@ -2471,6 +2471,16 @@ class Watcher:
         from . import merge_queue, plan_github, work
         if self.dry_run or storage.is_remote(db):
             return False
+        client = getattr(self.api, "__self__", None)
+
+        def read(path):
+            if isinstance(client, (plan_github.Api, plan_github.GhApi)):
+                value = self.api(path, ttl=0)
+                if client.last_read is None or client.last_read.stale:
+                    raise GelError("missing-part dispatch requires a fresh GitHub read")
+                return value
+            return self.api(path)
+
         marker = "ci-missing-part " + json.dumps([repo, sha, workflow], separators=(",", ":"))
         item_id = int(lot["id"])
         def eligible(tx):
@@ -2482,12 +2492,12 @@ class Watcher:
             freeze = next((m for m in marks if m["kind"] == "frozen"), None)
             gate = merge_queue.review_gate_for_item(tx, self.cfg, current, marks)
             if (not freeze or freeze.get("sha") != sha or not gate or not gate.get("ok")
-                    or _head_of(self.api, repo, lot["branch"]) != sha):
+                    or _head_of(read, repo, lot["branch"]) != sha):
                 return False
-            plan = _dispatch_plan(tx, self.cfg, current, self.api, repo, lot["branch"], sha)
+            plan = _dispatch_plan(tx, self.cfg, current, read, repo, lot["branch"], sha)
             if workflow not in plan or plan[workflow] != inputs:
                 return False
-            data = self.api("repos/%s/actions/workflows/%s/runs?per_page=1&head_sha=%s&branch=%s"
+            data = read("repos/%s/actions/workflows/%s/runs?per_page=1&head_sha=%s&branch=%s"
                             % (repo, _q(workflow), _q(sha), _q(lot["branch"])))
             return (isinstance(data, dict) and data.get("workflow_runs") == []
                     and type(data.get("total_count")) is int and data["total_count"] == 0)
@@ -2507,7 +2517,7 @@ class Watcher:
             if not eligible(tx):
                 return False
             decision = dict(repo=repo, branch=lot["branch"], sha=sha, dispatch={workflow: inputs})
-            result = _pose_dispatch(plan_github.Gh(), decision, api=self.api)
+            result = _pose_dispatch(plan_github.Gh(), decision, api=read)
         self.log("CI %s #%s: missing part %s: %s (automatic intent retained)"
                  % (repo, item_id, workflow, result.get("why") or result["action"]))
         return bool(result.get("requested"))
