@@ -414,8 +414,8 @@ OVERVIEW_SQL = ("""
                    -- #3460 : retrait (la vue ne porte pas la colonne)
                    extract(epoch from (j.__row->>'retired_at')::timestamptz)::float8
                        AS retired_ts,
-                   chantier, harness, host, cwd, session_id, status, status_text,
-                   model,
+                   chantier, harness, host, cwd, session_id, session_account,
+                   status, status_text, model,
                    -- #4293 : colonne absente de la vue figée ; lue sur la ligne
                    j.__row->>'harness_bin' AS harness_bin,
                    budget_usd, spent_usd, turns, pending_prompt, last_error,

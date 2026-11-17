@@ -61,7 +61,7 @@ import threading
 import time
 import uuid
 
-from . import account_budget, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
+from . import account_budget, account_rotation, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import cost_attribution
 from . import context_metrics, context_profile
@@ -5353,10 +5353,14 @@ class AgentWorker(threading.Thread):
             # un budget — bloqué sous `CONFIG_BLOCK_PREFIX` (alerte
             # `account_config_invalid`), sans échéance de pause
             config = raison.startswith(accounts_mod.NO_VALID_PREFIX)
+            # #7712 : un refus de coordination de vague n'est pas une pause
+            # budget — le statut garde `WAVE_PREFIX` (alerte
+            # `account_wave_coordination`), sans marque critique de budget.
+            vague = raison.startswith(account_rotation.WAVE_PREFIX)
             marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) \
-                and not config else ""
+                and not config and not vague else ""
             registry.set_status(self.db, self.name, "blocked",
-                                status_text=(raison if fenetre_courte
+                                status_text=(raison if fenetre_courte or vague
                                              else "%s%s%s" % (
                                                  accounts_mod.CONFIG_BLOCK_PREFIX
                                                  if config
@@ -5375,6 +5379,11 @@ class AgentWorker(threading.Thread):
                                    "the host configuration is fixed (ameesh doctor)."
                                    % raison,
                                    meta={"action": "account_config", "raison": raison})
+                elif vague:
+                    self._fil_note("Account wave coordination: %s. No turn until the "
+                                   "wave settles; the next turn retries on its own."
+                                   % raison[len(account_rotation.WAVE_PREFIX):],
+                                   meta={"action": "account_wave", "raison": raison})
                 elif not account_window.is_short_window(raison):
                     self._fil_note("Budget pause: %s. No turn until the gauge goes "
                                    "back down." % raison,
@@ -5392,8 +5401,11 @@ class AgentWorker(threading.Thread):
         # #5783 : une pause de fenêtre courte s'écrit désormais sans le préfixe
         # budget ; elle se lève comme lui, sinon un agent idle resterait
         # `blocked` avec une raison de quelques secondes.
+        # #7712 : même chose pour un refus de coordination de vague, qui se
+        # lève au tour suivant quand la vague s'est posée.
         if agent.get("status") != "blocked" or not (
-                texte.startswith(("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX))
+                texte.startswith(("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX,
+                                  account_rotation.WAVE_PREFIX))
                 or account_window.is_short_window(texte)):
             return
         issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
