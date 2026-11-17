@@ -1,18 +1,18 @@
 ---
 type: Study
-status: draft
+status: decided
 work_item: 7616
 ---
 
 # Schéma des modules : sortir les tables de développement du schéma commun
 
 Lot #7616 (manaty/ameesh#5802), demande de Sébastien du 16 novembre 2026.
-Cette étude est une **proposition de spécification** : elle ne modifie aucun
-profil, aucune base, aucun code, ne fusionne rien, ne déploie rien et ne
-supprime aucune donnée. La consigne #222966 (`ameesh`, 16/11/2026 23:01)
-demande de l'écrire avec Sébastien avant tout code et interdit, dans ce lot,
-toute action irréversible ou de production (déploiement, fusion, suppression
-de données, serveur de production, dépense engagée).
+Cette étude est la **spécification de référence** des lots issus de la
+décision #222989 (owner, 17/11/2026) : elle ne modifie aucun profil, aucune
+base, aucun code, ne fusionne rien, ne déploie rien et ne supprime aucune
+donnée. La consigne #222966 (`ameesh`, 16/11/2026 23:01) interdit, dans ce
+lot, toute action irréversible ou de production (déploiement, fusion,
+suppression de données, serveur de production, dépense engagée).
 
 Compagnon exhaustif : [`7616-schema-des-modules/inventaire.tsv`](7616-schema-des-modules/inventaire.tsv),
 170 lignes, une par table du schéma, avec propriétaire proposé, origine,
@@ -54,7 +54,9 @@ L101 T4 #4357) et le profil nu `AMEESH_MODULES=bare` est réservé à la CI et
 aux tests, refusé par `doctor` sur un hôte. Le mécanisme de schéma ne suffit
 donc pas, à lui seul, à débarrasser un mesh non informatique des tables de
 développement : il faut aussi une décision de politique sur l'activation de
-`dev` (question Q1). C'est la principale décision qui manque avant tout code.
+`dev` (question Q1). La décision #222989 tranche Q1–Q8 : cette étude livre
+l'indépendance fonctionnelle, et l'activation d'un hôte réel sans `dev`
+reste un lot de politique distinct (§6, §7).
 
 ## 2. Cadrage
 
@@ -537,12 +539,18 @@ devient sélectionnable (Q1).
 
 | Phase | Nature | Contenu | Ancien code |
 |---|---|---|---|
-| P0 | étude | cette proposition, décisions Q1–Q8 | inchangé |
+| P0 | étude | cette étude, décisions Q1–Q8 adoptées le 17/11/2026 | inchangé |
 | P1a | additive | registres, interface module, runner, tests de frontière ; **aucune table déplacée** | inchangé |
 | P1b | code | ports et SQL qualifié dans les modules ; après P1a, avant ou après P2, sans bascule | inchangé |
 | P2 | non additive | `ALTER TABLE … SET SCHEMA` des 35 tables, vues de compatibilité, migration de module `dev/0001` | fonctionne via les vues |
 | P3 | non additive | retrait des vues par la migration de module `dev/0002`, après une release de P2 et le déploiement de P1b | fonctionne via les ports |
 | P4 | optionnelle | base de départ par profil, colonnes `dev` de `work_items`, machine d'états | lot distinct |
+
+État après la décision #222989 : P1a et P1b sont ouverts (#7649, #7650) et
+peuvent démarrer ; P2 (#7651) et P3 (#7652) sont ouverts mais **retenus
+jusqu'au go de l'owner**, car ils ne sont pas additifs (note du bureau du
+17/11/2026 sur #7616 ; consigne de l'owner du 17/11 : migrations additives
+seulement sur les meshs en service).
 
 La règle de compatibilité est **N-1** : la release qui retire les vues ne
 supporte que la release précédente, qui doit déjà utiliser les ports ou au
@@ -800,25 +808,45 @@ bureau.
 | Q7 | `merge_queue_generation_seq` : noyau ou `dev` ? | Noyau pour cette bascule ; déplacement ultérieur avec la méthode qualifier-puis-déplacer, ou abandon au profit d'une identité. |
 | Q8 | Nommage `<schéma_noyau>__<module>` ? | Oui : évite les collisions entre schémas de test, reste lisible, et le nom physique est dans le registre. |
 
-## 7. Découpage proposé
+### Décision #222989 (owner, 17/11/2026)
 
-Aucun de ces lots n'est ouvert par cette étude ; ils sont proposés à
-`mesh-design` et à l'owner.
+La demande a été confirmée par l'owner : décision #222989, option **a**,
+signée par `human:smichea` le 2026-11-17 à 03:34Z (approbation #377, clé
+owner, source `pc-smichea:710c45bf`, réponse relayée par le bureau). Texte
+enregistré de la réponse :
 
-1. **Mécanisme de schéma et de migrations de module** (P1a, SQL sensible) :
-   registres, interface, runner, `doctor`, `non_additive` `SET SCHEMA`,
-   tests. Aucune table déplacée.
-2. **Code générique : ports et SQL qualifié** (P1b, code) : déplacer le
-   stockage `dev` dans `modules/dev`, exposer les ports, adapter les
-   consommateurs noyau, test de frontière, `REWRITTEN`.
-3. **Bascule des tables** (P2, SQL sensible + release) : migration
-   `dev/0001`, vues, triggers, rollback, Manaty puis IMA/TPK.
-4. **Retrait des vues** (P3, SQL sensible) : `DROP VIEW`, tests, exceptions.
+> a — réponse de l'owner relayée par le bureau, source pc-smichea:710c45bf
+
+L'owner adopte les recommandations **Q1–Q8 telles qu'écrites** et découpe la
+suite en **P1a, P1b, P2 et P3** (lots #7649 à #7652, §7).
+
+Portée du go, consignée par le bureau le 17/11/2026 à 03:34 sur #7616 :
+**seule la phase additive P1 (P1a, P1b) démarre**. P2 et P3 sont découpés
+mais **retenus jusqu'au go de l'owner**, car ils ne sont pas additifs
+(consigne de l'owner du 17/11 sur ce lot : migrations additives seulement
+sur les meshs en service). La présente étude ne déplace donc aucune table :
+elle est la spécification de P1a et P1b, et le plan de P2/P3 reste prêt,
+non exécuté.
+
+## 7. Découpage adopté
+
+Décision #222989 (option a, 17/11/2026) : P1a, P1b, P2 et P3 sont découpés.
+Le pilote (`mesh-design`) a ouvert les lots le 17/11/2026 à 03:37 :
+
+| Phase | Lot | Contenu | État à l'ouverture |
+|---|---|---|---|
+| P1a | #7649 | Mécanisme de schéma et de migrations de module : registres, interface, runner, `doctor`, `non_additive` `SET SCHEMA`, tests. Aucune table déplacée. SQL sensible. | `intake`, après #7616 |
+| P1b | #7650 | Code générique : ports et SQL qualifié. Stockage `dev` dans `modules/dev`, ports, consommateurs noyau, test de frontière, `REWRITTEN`. | `intake`, après #7616 et #7649 |
+| P2 | #7651 | Bascule des tables : migration `dev/0001`, vues, triggers, rollback, Manaty puis IMA/TPK. SQL sensible. | `intake`, **retenu** (non additif) jusqu'au go owner, après #7616 et #7649 |
+| P3 | #7652 | Retrait des vues : `DROP VIEW`, tests, exceptions, migration `dev/0002`. SQL sensible. | `intake`, **retenu** (non additif) jusqu'au go owner, après #7650 et #7651 |
+
+Restent de simples propositions, non ouvertes :
+
 5. **Colonnes `dev` de `work_items` et machine d'états** (P4, SQL sensible) :
-   lot suivant, séparé.
+   lot suivant, séparé (Q3, Q4).
 6. **Base de départ par profil** (P4, optionnel) : squash des migrations ou
-   baseline ; seulement si Q2 est « oui ».
-7. **Activation de `dev`** (politique) : seulement si Q1 est « hôte réel
+   baseline ; seulement si Q2 devient « oui ».
+7. **Activation de `dev`** (politique) : seulement si Q1 devient « hôte réel
    sans `dev` ».
 
 ## 8. Sources et preuves
@@ -826,6 +854,11 @@ Aucun de ces lots n'est ouvert par cette étude ; ils sont proposés à
 - Lot #7616, corps de la demande (Sébastien, 16/11/2026), issue
   manaty/ameesh#5802.
 - Consigne #222966 (`ameesh`, 16/11/2026 23:01).
+- Décision #222989 (option a), signée par `human:smichea` le 2026-11-17 à
+  03:34Z, approbation #377, source `pc-smichea:710c45bf` ; note du bureau du
+  17/11/2026 sur #7616 (P2 et P3 retenus jusqu'au go owner).
+- Lots #7649 (P1a), #7650 (P1b), #7651 (P2), #7652 (P3), ouverts par
+  `mesh-design` le 17/11/2026 à 03:37.
 - `src/ameesh/modules/__init__.py`, `registry.py`, `storage.py` ;
   `src/ameesh/migrations.py` ; `src/ameesh/work_lifecycle.py`.
 - Migrations citées : 0013, 0412, 0419, 0432, 0456, 0462, 0467, 0516,
