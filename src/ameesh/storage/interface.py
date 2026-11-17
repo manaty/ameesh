@@ -1846,6 +1846,22 @@ class Mailbox(Domain):
         """Derniers messages du destinataire, du plus récent au plus ancien."""
 
     @abc.abstractmethod
+    def history_page(self, actor: str, *, peer: str | None = None,
+                     after_id: int | None = None, limit: int = 100,
+                     since_ts: float | None = None, until_ts: float | None = None,
+                     kind: str | None = None) -> list[dict]:
+        """Contrat public 1.1 (E2a) : page d'historique du périmètre de `actor`.
+
+        Messages où `actor` est expéditeur OU destinataire, du plus ancien au
+        plus récent par id, strictement après `after_id`. `peer` restreint à la
+        conversation entre `actor` et cet agent (dans les deux sens). Les
+        bornes `since_ts`/`until_ts` s'appliquent à la création ; `kind`
+        filtre la nature. Rend au plus `limit + 1` lignes : la ligne
+        surnuméraire prouve qu'une page suivante existe, l'appelant la retire.
+        `limit` est borné à 200 par le pilote. Lecture seule, sans remise.
+        """
+
+    @abc.abstractmethod
     def staging_emission(self, recipient: str, sender: str, key: str) -> int | None:
         """#4180 : id du signal staging de cette clé, sans fenêtre historique.
 
