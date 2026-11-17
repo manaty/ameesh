@@ -186,6 +186,12 @@ class AvatarAttachTest(PgTestCase):
                     worker._close_resident('test end')
                     registry.release(self.db, name, owner.runner_id, int(lease['lease_epoch']))
 
+    def test_missing_proof_refuses_attach_and_returns_the_lease(self):
+        with mock.patch.object(policy.events, 'record', side_effect=NotImplementedError):
+            self.assertEqual(runner.run_attach(self.cfg, self.db, 'avatar7630'), 1)
+        self.assertEqual(self.turns(), [])
+        self.assertIsNone(registry.get(self.db, 'avatar7630')['lease_owner'])
+
     def test_unsupported_avatar_refused_before_attach_lease(self):
         with mock.patch.object(spawn, 'support', return_value=None), \
                 mock.patch.object(registry, 'attach_claim') as claim:
