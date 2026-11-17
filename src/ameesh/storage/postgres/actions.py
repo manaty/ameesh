@@ -144,7 +144,7 @@ class Actions(interface.Actions):
                    extract(epoch from a.finished_at)::float8 AS finished_ts,
                    EXISTS (SELECT 1 FROM action_events e
                             WHERE e.action_id = a.action_id AND e.event = 'cancelled'
-                              AND e.note LIKE 'refused by %') AS refused
+                              AND left(e.note, 11) = 'refused by ') AS refused
               FROM actions a
              WHERE a.proposed_by = %s
                AND a.created_at >= to_timestamp(%s)

@@ -39,6 +39,16 @@
 -- un écrivain N-1 : il enregistre un grant `none`, qui ne couvre rien —
 -- jamais un élargissement silencieux. Le nouveau chemin est
 -- `ameesh_standing_register_scoped`.
+--
+-- Les trois contraintes ci-dessous ne resserrent rien : une ligne existante
+-- (et toute ligne écrite par l'ancien `ameesh_standing_register`, qui laisse
+-- les défauts) a `beneficiary_kind = 'none'`, `beneficiary = ''`,
+-- `beneficiary_clones = false`, `targets = '[]'` et des chaînes de charte
+-- vides ; elle satisfait donc la branche `none`, le tableau vide et les
+-- longueurs. L'analyse de texte ne sait pas lire un CHECK : le marqueur
+-- ci-dessous donne cette preuve, qui n'est pas une dérogation de confort.
+--
+-- ameesh: constraint not tightened
 
 -- --------------------------------------------------------------------------
 -- 1. portée du grant
