@@ -289,7 +289,7 @@ def _desk_names(alert: dict, by_name: dict, avatar_names=(),
     names = [str(n) for n in desk_names or () if n in by_name]
     if names:
         return list(dict.fromkeys(names))
-    known = {"assignee", "pilot", "auditeur", "avatar"}
+    known = {"assignee", "pilot", AUDITOR_NAME, "avatar"}
     return [str(role) for role in alert.get("targets") or ()
             if role not in known and role in by_name]
 
@@ -635,7 +635,7 @@ def _desk_label(alert: dict, avatar_names=()) -> str:
     for name in avatar_names or ():
         if name:
             return str(name)
-    known = {"assignee", "pilot", "auditeur", "avatar"}
+    known = {"assignee", "pilot", AUDITOR_NAME, "avatar"}
     for role in alert.get("targets") or ():
         if role not in known:
             return str(role)
@@ -1439,7 +1439,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     if live:
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
-    known = {"assignee", "pilot", "auditeur", "avatar"}
+    known = {"assignee", "pilot", AUDITOR_NAME, "avatar"}
     current = (3 if roles & {"avatar", "auditeur"} or any(r not in known for r in roles)
                else 2 if "pilot" in roles else 1)
     for next_level in range(current + 1, 4):

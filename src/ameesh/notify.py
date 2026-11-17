@@ -3729,7 +3729,12 @@ class Notifier:
         unevaluated: set = set()
         for key, alert, entry in due:
             kind = alert.get("type")
-            human, _ = router.resolve(alert, for_avatar=True)
+            # #7634 : la route humaine vient du routeur quand la passe en a
+            # un ; l'appel direct des témoins (router=None) garde les briefs
+            # par rôles, sans boîte d'avatar.
+            human = None
+            if router is not None:
+                human, _ = router.resolve(alert, for_avatar=True)
             avatar = avatars_by_human.get(human) if human else None
             desks = () if avatar else tuple(avatars.configured_desks(
                 self.cfg, human, listing, alert.get("project")))
@@ -3784,17 +3789,28 @@ class Notifier:
                 # escalade, la passe suivante remet à son retour.
                 briefs.pop(name)
                 dead[name] = "lease returned, grace"
-            if kind == "slo_breach" and avatar \
-                    and "avatar" in (alert.get("targets") or ()) \
-                    and any(row.get("name") == avatar
-                            and row.get("mode") == "externe" for row in listing):
-                # Keep the avatar's copy in the readable lot thread, without
-                # growing a mailbox nobody wakes to read. No `home` project
-                # exception (#2640): canon lots are `app=ameesh` (#2511).
-                # #3036 : `setdefault` — un repli a pu y placer le texte du
-                # palier effectivement visé, avec ses absents nommés.
-                briefs.setdefault("thread:%s" % avatar,
-                                  alert_briefs._slo_breach(alert, desk=avatar))
+            if kind == "slo_breach":
+                # #7634 : la copie de la route humaine externe va au fil
+                # lisible, sans boîte que personne ne réveille. L'avatar
+                # résolu par le routeur d'abord ; un target qui nomme
+                # directement un agent externe (alertes écrites avant #7634,
+                # état repris au déploiement) garde sa copie au fil, sans nom
+                # d'avatar en dur. Aucune exception `home` (#2640) : les lots
+                # du canon sont `app=ameesh` (#2511).
+                human_targets = alert.get("targets") or ()
+                thread_desks = ([str(avatar)] if avatar and "avatar" in human_targets
+                                else [])
+                thread_desks += [str(name) for name in human_targets
+                                 if name not in ("assignee", "pilot", "auditeur",
+                                                 "avatar")]
+                for name in dict.fromkeys(thread_desks):
+                    row = by_name.get(name)
+                    if row is None or row.get("mode") != "externe":
+                        continue
+                    # #3036 : `setdefault` — un repli a pu y placer le texte
+                    # du palier effectivement visé, avec ses absents nommés.
+                    briefs.setdefault("thread:%s" % name,
+                                      alert_briefs._slo_breach(alert, desk=name))
             if kind == "slo_breach":
                 briefs = {n: t for n, t in briefs.items() if n not in covered}
             if not briefs:
