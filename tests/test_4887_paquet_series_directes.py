@@ -414,11 +414,13 @@ class DepotTest(unittest.TestCase):
 
 
 class TemoinsEmpreinteTest(DepotTest):
-    """#7740 : migration et stockage traînent leurs témoins globaux."""
+    """#7740 : migration, stockage et alertes de pause traînent leurs témoins."""
 
     def setUp(self) -> None:
         super().setUp()
-        for name in paquet_auto.MIGRATION_WITNESSES + paquet_auto.STORAGE_WITNESSES:
+        for name in (paquet_auto.MIGRATION_WITNESSES
+                     + paquet_auto.STORAGE_WITNESSES
+                     + paquet_auto.ALERT_BRIEF_WITNESSES):
             self.write(name.replace(".", "/") + ".py", "")
         self.base = self.commit("base")
 
@@ -443,6 +445,16 @@ class TemoinsEmpreinteTest(DepotTest):
         self.assertEqual(modules, ["tests.test_l107_executor_contract",
                                    "tests.test_contract_registry_ameesh",
                                    "tests.test_contract_selection"])
+
+    def test_une_alerte_de_pause_joue_son_temoin(self) -> None:
+        # Veille 17:58 du 17/11 : test_5424 est resté rouge en CI parce que
+        # l'unité touchait alert_briefs.py sans le jouer.
+        base, commit = self.unit("src/ameesh/alert_briefs.py")
+        rows = paquet_auto.footprint_witnesses(
+            self.repo, paquet_auto.Unit(10, base, commit))
+        self.assertEqual([row["module"] for row in rows],
+                         ["tests.test_5424_review_family_paused"])
+        self.assertEqual(rows[0]["files"], ["src/ameesh/alert_briefs.py"])
 
     def test_sans_empreinte_aucun_temoin(self) -> None:
         base, commit = self.unit("docs/readme.md")

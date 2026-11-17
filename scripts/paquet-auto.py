@@ -251,12 +251,22 @@ CONTRACT_ALWAYS = "tests/parts/toujours.txt"
 CONTRACT_MODULES = ("tests.test_l161f_plan", "tests.test_cluster")
 #: #7740 : témoins globaux qu'une empreinte touche, en plus de la sélection
 #: des voisins : une migration change les rôles et le schéma, un stockage
-#: change le contrat des écrivains.
+#: change le contrat des écrivains, `alert_briefs.py` porte les alertes de
+#: pause (veille 17:58, test_5424 rouge sur une tête qui le touchait).
 MIGRATION_WITNESSES = ("tests.test_cluster", "tests.test_migrations",
                        "tests.test_migrations_additives")
 STORAGE_WITNESSES = ("tests.test_l107_executor_contract",
                      "tests.test_contract_registry_ameesh",
                      "tests.test_contract_selection")
+ALERT_BRIEF_WITNESSES = ("tests.test_5424_review_family_paused",)
+#: (préfixes de chemin, modules témoins) : chaque groupe dont un préfixe est
+#: touché ajoute ses témoins à la série de l'unité.
+FOOTPRINT_WITNESSES = (
+    (("src/ameesh/migrations/", "deploy/sql/", "deploy/migrations/"),
+     MIGRATION_WITNESSES),
+    (("src/ameesh/storage/",), STORAGE_WITNESSES),
+    (("src/ameesh/alert_briefs.py",), ALERT_BRIEF_WITNESSES),
+)
 #: #6274 : les outils de la convention d'ameesh ; un projet les remplace par
 #: son bloc `prevalidation` (`plan_script`, `parts_script`, `contracts`)
 DEFAULT_PLAN_SCRIPT = "scripts/test-plan.py"
@@ -2584,29 +2594,27 @@ def footprint_witnesses(worktree: Path, unit: Unit, *,
 
     Une migration change les rôles (test_cluster, SuperviseurRoleTest) et le
     schéma (test_migrations*) ; une modification de stockage touche le
-    contrat des écrivains. Ces modules sont joués dans la série de l'unité,
-    sur son préfixe composé, même quand la carte d'impact ne les sélectionne
-    pas. `tree` est ce préfixe : un témoin absent de l'arbre n'est pas joué.
+    contrat des écrivains ; `alert_briefs.py` porte les alertes de pause
+    (test_5424, veille 17:58). `FOOTPRINT_WITNESSES` associe ces préfixes à
+    leurs témoins. Ces modules sont joués dans la série de l'unité, sur son
+    préfixe composé, même quand la carte d'impact ne les sélectionne pas.
+    `tree` est ce préfixe : un témoin absent de l'arbre n'est pas joué.
     """
     paths = unit_delta_paths(worktree, unit) if paths is None else paths
-    modules: list[str] = []
-    if any(path.startswith("src/ameesh/migrations/")
-           or path.startswith("deploy/sql/") or path.startswith("deploy/migrations/")
-           for path in paths):
-        modules.extend(MIGRATION_WITNESSES)
-    if any(path.startswith("src/ameesh/storage/") for path in paths):
-        modules.extend(STORAGE_WITNESSES)
     base = tree or worktree
     rows: list[dict] = []
-    for module in modules:
-        path = base / (module.replace(".", "/") + ".py")
-        if path.is_file():
-            rows.append({"module": module, "reason": "empreinte",
-                         "files": [p for p in paths
-                                   if p.startswith("src/ameesh/migrations/")
-                                   or p.startswith("deploy/sql/")
-                                   or p.startswith("deploy/migrations/")
-                                   or p.startswith("src/ameesh/storage/")][:3]})
+    seen: set[str] = set()
+    for prefixes, witnesses in FOOTPRINT_WITNESSES:
+        files = [path for path in paths if path.startswith(prefixes)]
+        if not files:
+            continue
+        for module in witnesses:
+            if module in seen:
+                continue
+            if (base / (module.replace(".", "/") + ".py")).is_file():
+                seen.add(module)
+                rows.append({"module": module, "reason": "empreinte",
+                             "files": files[:3]})
     return rows
 
 
@@ -4523,9 +4531,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     avec une unité antérieure est vu à l'unité qui le crée. La série reçoit
     `timeout` et non une part de `deadline` ; `deadline` ne la coupe qu'en
     temps mural, à la borne totale. Les témoins globaux de l'empreinte
-    (`footprint_witnesses` : migration, stockage) rejoignent ses modules. Une
-    série sans module, ou dont le préfixe est indisponible, est un
-    non-concluant nommé, jamais un vert.
+    (`footprint_witnesses` : migration, stockage, alertes de pause)
+    rejoignent ses modules. Une série sans module, ou dont le préfixe est
+    indisponible, est un non-concluant nommé, jamais un vert.
 
     #4271 : avec `parallel` > 1, les séries des unités et celle des contrats
     sont indépendantes et jouées en même temps (au plus `parallel`), chacune
@@ -4768,9 +4776,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             found = unittest_failures(run.output, _unusable(run))
             proper_names = {module.split(".", 1)[1] for module in proper}
             mine = set(proper_names)
-            # #7740 : un témoin d'empreinte (migration, stockage) est une
-            # preuve du lot lui-même, pas un voisin de la carte : son rouge
-            # s'attribue au lot, sans rejeu de base.
+            # #7740 : un témoin d'empreinte (migration, stockage, alertes de
+            # pause) est une preuve du lot lui-même, pas un voisin de la
+            # carte : son rouge s'attribue au lot, sans rejeu de base.
             neighbor = {row["module"].split(".", 1)[1] for row in added
                         if row["reason"] != "empreinte"}
             mine |= {row["module"].split(".", 1)[1] for row in added
