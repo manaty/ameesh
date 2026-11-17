@@ -142,6 +142,10 @@ def check_release_merge(cfg, db, lot, source, target, sha, *, repo="", gh=None):
     if override is None:
         raise ProdGoError("compiled canon missing projects.%s.production.branch" % project)
     production = override.production_branch
+    if production == "":
+        if project_view.production_branch:
+            raise ProdGoError("radar projects.%s.production_branch conflicts with compiled canon production: none" % project)
+        return
     if not production:
         raise ProdGoError("compiled canon missing projects.%s.production.branch" % project)
     if project_view.production_branch and project_view.production_branch != production:

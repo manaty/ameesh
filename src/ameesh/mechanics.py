@@ -68,6 +68,8 @@ mécanique, ce que l'outillage exécute sans agent :
   #122895) : la branche de prod d'un projet, où un lot de porte de production
   (`prod_gate`) doit être présent pour se fermer. Absente : un tel lot n'est
   jamais fermé par une fusion constatée, aucune branche n'est supposée.
+  `production: none` (#7726) déclare explicitement un projet sans production ;
+  compilé en chaîne vide, distincte de None (déclaration absente).
 - `accounts.pace_multipliers` et `accounts.underused_loss` (#3647, canon §11,
   décision owner #141793 a) : le multiplicateur de rythme de chaque compte de
   forfait, par harnais et nom de compte (absent : ×1), et la perte prévue au
@@ -238,7 +240,7 @@ class ProjectOverride:
     ci_environment_red: str | None = None
     ci_faulty_lot: str | None = None
     #: #3022 : la branche de prod du projet (`production.branch`)
-    production_branch: str | None = None
+    production_branch: str | None = None  # "": explicit production: none; None: undeclared
     contract_selection: ContractSelection | None = None
     repair_policy: repair_policy.Policy | None = None
     #: #6915 : le bloc `prevalidation` du projet, qui remplace le bloc global
@@ -1058,6 +1060,8 @@ def _backlog(value, where: str) -> int:
 def _production(value, where: str) -> str:
     """Le bloc `production` d'un projet (#3022) : sa branche de prod, nom de
     branche Git simple, jamais un commit ni une ref complète."""
+    if value == "none":
+        return ""  # explicit canon declaration: this project has no production
     data = _mapping(value, where, _PRODUCTION_KEYS)
     branch = data.get("branch")
     if (not isinstance(branch, str) or not _BRANCH.fullmatch(branch)

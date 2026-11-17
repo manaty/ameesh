@@ -251,6 +251,8 @@ projects:
     production:
       branch: main
   ameesh:
+    # Canon §14 : staging du mesh, aucune production. Lecteur #7726 requis.
+    production: none
     # `contract_selection` (versionnement, #6179 ; lot #6932) : registre
     # tests/parts/contrats.json. Un chemin hors règle garde la CI complète
     # du paquet, mais la passe contrats et la prévalidation restent legacy ∪

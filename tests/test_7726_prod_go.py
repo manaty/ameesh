@@ -150,7 +150,7 @@ class SignedExportTest(fixtures._Base):
         self.answer(view['id'], 'a', key_path=self.key)
         self.assertIsNone(work.get(self.db, self.lot['id']).get('pr_ref'))
         cfg = replace(self.cfg, radar={'projects': {'nexlink': {'repo': '/fixture/acme', 'github': 'manaty/nexlink'}}})
-        # home#300 at 4ca1599faca7170040496ab2c601856721a236cf.
+        # home#300 at a3095957ce94c4f19d1d9ba40b48f406abc734b3.
         document = mechanics.compile_document((Path(__file__).parent / 'fixtures/home-300-mecanique.yaml').read_text())
         pr = {'body': 'Production decision: #%d' % view['id'], 'headRefOid': SHA,
               'headRefName': 'release/11x', 'baseRefName': 'main'}
@@ -202,6 +202,19 @@ class ReleaseMergeTest(unittest.TestCase):
                 with self.assertRaisesRegex(prod_go.ProdGoError, error):
                     prod_go.check_release_merge(cfg, object(), 7, 'release/11x', 'main', SHA, repo='manaty/nexlink')
                 authorize.assert_not_called()
+
+    def test_ameesh_release_without_production_is_explicitly_exempt(self):
+        from ameesh import work
+        document = mechanics.compile_document((Path(__file__).parent / 'fixtures/home-300-mecanique.yaml').read_text())
+        self.assertEqual(document.override('ameesh').production_branch, '')
+        cfg = SimpleNamespace(radar={'projects': {'ameesh': {
+            'repo': '/fixture/ameesh', 'github': 'manaty/ameesh'}}})
+        with mock.patch.object(work, 'get', return_value={'app': 'ameesh'}), mock.patch.object(mechanics, 'configured', return_value=document), mock.patch.object(prod_go, 'authorize') as authorize:
+            prod_go.check_release_merge(cfg, object(), 7, 'release/1.2.3-coupure-1', 'main', SHA, repo='manaty/ameesh')
+            authorize.assert_not_called()
+        for value in ('null', 'false', '""', '{}'):
+            with self.subTest(value=value), self.assertRaises(mechanics.MechanicsError):
+                mechanics.compile_document(MECHANICS.replace('projects: {}', 'projects:\n  ameesh:\n    production: ' + value))
 
     def test_missing_production_configuration_refuses_without_authorizing(self):
         from ameesh import work
