@@ -12,12 +12,12 @@ from .support import PgTestCase
 
 
 class _Base(PgTestCase):
-    def agent(self, name, *, status="idle", team="nexlink"):
+    def agent(self, name, *, status="idle", team="nexlink", roles=None):
         registry.upsert(self.db, name, harness="deepseek", host=self.cfg.host)
         self.db.execute(
-            "UPDATE agent_registry SET status = %s, team = %s,"
+            "UPDATE agent_registry SET status = %s, team = %s, roles = %s,"
             " responsible = 'human:proprio' WHERE name = %s",
-            (status, team, name))
+            (status, team, roles, name))
 
     def lot(self, title, *, assignee=None):
         item = work.add(self.db, title=title, app="nexlink")
@@ -97,11 +97,11 @@ class PromotedMeasurementTest(_Base):
         return lot
 
     def test_measurement_actor_is_the_auditor(self):
-        self.agent("auditeur")
+        self.agent("auditeur", roles=["auditeur"])
         self.assertEqual(work.measurement_actor(self.db, self.cfg), "auditeur")
 
     def test_stopped_measure_actor_is_not_used(self):
-        self.agent("auditeur")
+        self.agent("auditeur", roles=["auditeur"])
         registry.set_status(self.db, "auditeur", "stopped", status_text="stopped",
                             stop_reason="manuel")
         self.assertEqual(work.measurement_actor(self.db, self.cfg), "")
@@ -110,7 +110,7 @@ class PromotedMeasurementTest(_Base):
         # R1 auditeur, témoin demandé : dev1 arrêté, auditeur arrêté — aucun
         # promu n'est réattribué à un agent arrêté ; le lot reste en place (et
         # `orphan_lot` le signale, test_l37_mode_et_alertes).
-        self.agent("auditeur")
+        self.agent("auditeur", roles=["auditeur"])
         registry.set_status(self.db, "auditeur", "stopped", status_text="stopped",
                             stop_reason="manuel")
         lot = self.promoted()

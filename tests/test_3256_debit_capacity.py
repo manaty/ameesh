@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import types
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -64,6 +65,19 @@ def split_lot(ident=90, project="ameesh", state="intake", **extra):
            "title": "Découper la feuille de route de %s" % project}
     row.update(extra)
     return row
+
+
+class _Canon:
+    """Canon minimal (#7661) : les fiches des agents, rôles déclarés."""
+
+    readable = True
+    federation: dict = {}
+
+    def __init__(self, cards):
+        self.agents = [
+            types.SimpleNamespace(
+                title=name, fiche=types.SimpleNamespace(data={"roles": roles}))
+            for name, roles in cards.items()]
 
 
 def mechanics_doc(*, families=("claude", "codex", "deepseek"), excluded=()):
@@ -248,7 +262,8 @@ class WakeableTest(unittest.TestCase):
             agent("auditeur"), agent("held"), agent("eph", ephemeral=True),
             agent("paused", operator_paused=True), agent("stopped", status="stopped"),
             agent("chat", mode="external")]
-        cap = measure(agents, held={"held": "budget"})
+        cap = measure(agents, held={"held": "budget"},
+                      canons=[_Canon({"auditeur": ["auditeur"]})], configured=True)
         self.assertEqual(cap["projects"][0]["wakeable"], 5)
         self.assertEqual(cap["projects"][0]["idle_agents"], ["ameesh-idle-0"])
         self.assertEqual(cap["held"], [{"agent": "held", "reason": "budget"}])
@@ -300,7 +315,8 @@ class IdleHoursTest(unittest.TestCase):
     def test_a_critical_role_counts_no_idle_hours(self):
         # #5043 : un critique ou un relecteur n'est pas réveillable ; ses
         # trous ne gonflent pas la perte affichée
-        cap = measure([agent("a"), agent("auditeur")])
+        cap = measure([agent("a"), agent("auditeur")],
+                      canons=[_Canon({"auditeur": ["auditeur"]})], configured=True)
         self.assertEqual(cap["projects"][0]["wakeable"], 1)
         self.assertEqual(cap["mesh"]["idle_agent_hours"], 6.0)
 
