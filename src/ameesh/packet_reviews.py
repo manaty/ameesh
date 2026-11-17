@@ -311,13 +311,18 @@ def own_changes(repo: str, base: str, head: str, sources) -> dict:
     return {"paths": sorted(paths), "commits": commits}
 
 
-def designation_changes(db, vehicle: int, row, repo: str, base: str, head: str) -> Optional[dict]:
+def designation_changes(db, vehicle: int, row, repo: str, base: str, head: str,
+                        *, target: str | None = None) -> Optional[dict]:
     """Le delta propre à désigner au gel d'un véhicule, ou None.
 
     None quand la ligne n'est pas un véhicule, ou quand aucun membre n'est
     lisible : la désignation garde alors le diff gelé entier. Une déclaration
     sans source composée ni gel est ignorée ; un membre composé sans tête
     gelée lève, car ses avis acquis ne peuvent pas être nommés.
+
+    `target` est la cible épinglée de la lecture (à défaut la borne `base`,
+    qui appartient à sa ligne) : elle sert à résoudre le gel effectif d'un
+    membre, comme au lien du paquet (#7716).
     """
     if not is_vehicle(row):
         return None
@@ -327,7 +332,8 @@ def designation_changes(db, vehicle: int, row, repo: str, base: str, head: str) 
     sources = []
     for entry in found:
         _member_row, _marks, freeze = _member_freeze(
-            db, entry["lot"], declared_only=not entry.get("source"))
+            db, entry["lot"], declared_only=not entry.get("source"),
+            repo=repo, target=target or base)
         if freeze is None:
             continue
         frozen = plan_git._commit(repo, freeze["sha"])
@@ -342,8 +348,16 @@ def designation_changes(db, vehicle: int, row, repo: str, base: str, head: str) 
 # la porte du véhicule
 # --------------------------------------------------------------------------
 
-def _member_freeze(db, lot: int, *, declared_only: bool = False) -> tuple:
+def _member_freeze(db, lot: int, *, declared_only: bool = False,
+                   repo: str | None = None, target: str | None = None) -> tuple:
     """`(row, marks, freeze)` du membre ; une simple intention peut attendre.
+
+    Le gel du membre est son gel **effectif** (#7716) : celui que
+    `packet_link` enregistre dans `work_packet_members` et que `work show`
+    affiche — `freeze_candidate` (gel déclaré ou, à défaut, tête du dernier
+    avis favorable), jamais le seul dernier jalon `frozen`. Un gel déclaré
+    périmé sous un verdict plus récent ne doit pas faire compter au véhicule
+    les commits déjà relus du membre (delta propre faux, désignation refusée).
 
     Sans source composée ni gel, le landing ne permet d'attribuer aucun
     contenu au membre. On l'ignore sans soustraire de commits au delta propre
@@ -353,14 +367,19 @@ def _member_freeze(db, lot: int, *, declared_only: bool = False) -> tuple:
     if row is None:
         raise VehicleError("constituent #%d is not a work item" % int(lot))
     marks = work.milestones(db, int(lot))
-    freeze = plan_git.latest_freeze(marks)
-    sha = str((freeze or {}).get("sha") or "").strip()
+    try:
+        candidate = plan_git.freeze_candidate(marks, repo=repo, target=target)
+    except Exception as exc:  # noqa: BLE001 - un gel illisible n'est pas une preuve
+        raise VehicleError("constituent #%d: effective freeze unreadable: %s"
+                           % (int(lot), exc)) from exc
+    sha = plan_git.commit_id(candidate.get("sha"))
     if not sha:
         if declared_only:
             return row, marks, None
+        causes = ", ".join(candidate.get("causes") or ()) or "no freeze"
         raise VehicleError("constituent #%d has no frozen head: compose a reviewed lot"
-                           % int(lot))
-    return row, marks, dict(freeze, sha=sha)
+                           " (%s)" % (int(lot), causes))
+    return row, marks, dict(candidate, sha=sha)
 
 
 def _ancestor(repo: str, tip: str, base: str) -> bool:
@@ -515,7 +534,8 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
         lot = int(entry["lot"])
         try:
             member_row, member_marks, freeze = _member_freeze(
-                db, lot, declared_only=not entry.get("source"))
+                db, lot, declared_only=not entry.get("source"),
+                repo=repo, target=base)
         except VehicleError as exc:
             return {"ok": False, "required": None, "klass": None,
                     "why": str(exc), "members": found, "own_paths": []}

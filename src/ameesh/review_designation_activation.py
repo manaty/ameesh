@@ -816,8 +816,10 @@ def _reading_range(db, item: Mapping, repo: str, base: str,
     start, paths, commits = _range(repo, base, head,
                                    bounded=not packet_reviews.is_vehicle(item))
     if packet_reviews.is_vehicle(item):
+        # #7716 : la cible épinglée sert aussi à résoudre le gel effectif des
+        # membres (repli mécanique d'un avis reporté), comme au lien du paquet.
         own = packet_reviews.designation_changes(db, int(item["id"]), item,
-                                                 repo, start, head)
+                                                 repo, start, head, target=base)
         if own is not None:
             paths, commits = own["paths"], own["commits"]
     return start, paths, commits
