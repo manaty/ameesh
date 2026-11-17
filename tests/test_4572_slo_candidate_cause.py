@@ -254,8 +254,13 @@ class _SloBase(PgTestCase):
     def briefs(self, alert):
         listing = [{"name": n, "team": ""}
                    for n in ("dev1", "orch", "bureau", "auditeur")]
+        # #7634 : le moteur vise le rôle `avatar` ; le desk qui reçoit est
+        # l'avatar déclaré au canon (`notify` le résout et le passe ici). Le
+        # nom `bureau` n'est plus un rôle du cœur, c'est la fiche qui le fait
+        # avatar.
         return alert_briefs.briefs(alert, listing, orchestrator_names=("orch",),
-                                   auditor_names=("auditeur",))
+                                   auditor_names=("auditeur",),
+                                   avatar_names=("bureau",))
 
 
 class EscaladeAuteurTest(_SloBase):
@@ -289,9 +294,13 @@ class EscaladeAuteurTest(_SloBase):
                                return_value=dict(self.CAUSE)):
             self.now = self.GO + 3 * 1800 + 1
             alerts = self.alert()
+        # #7634 : le palier 3 vise la route humaine `avatar`, pas un nom en
+        # dur ; le texte remis nomme le desk réellement déclaré (`bureau`).
         self.assertEqual([(a["level"], a["targets"]) for a in alerts],
-                         [(3, ["bureau", "auditeur"])])
+                         [(3, ["avatar", "auditeur"])])
         text = self.briefs(alerts[0])["bureau"]
+        self.assertIn("bureau or auditor", text)
+        self.assertNotIn("avatar or auditor", text)
         self.assertIn("freeze-not-head", text)
         self.assertIn("author dev1", text)
         self.assertIn("do not wait for the composer", text)
