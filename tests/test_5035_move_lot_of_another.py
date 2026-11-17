@@ -42,6 +42,11 @@ class MoveLotOfAnotherTest(PgTestCase):
                "---\ntype: Agent\ntitle: bureau\n"
                "responsible: human:smichea\n"
                "avatar:\n  conversation: portable\n---\n")
+        # #7661 : le canon chargé fait foi ; l'auditeur y déclare son rôle,
+        # comme sur le canon réel (le titre seul ne donne plus le droit).
+        _write(os.path.join(self.canon, "agents", "auditeur.md"),
+               "---\ntype: Agent\ntitle: auditeur\n"
+               "responsible: human:smichea\nroles: [auditeur]\n---\n")
 
     def _env(self, name=None, **extra):
         env = self.env(**extra)
