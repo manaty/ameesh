@@ -1,15 +1,15 @@
 # External module public contract, version 1
 
 Contract revision: **1.2, 17 November 2026** (additive E1a snapshot, E1b
-observation, E2a mail submission and history, module schema and migrations
-snapshot). Scope: an installed external module and its client processes.
-Reference: [#5827](https://github.com/manaty/ameesh/issues/5827),
+observation, E2a mail submission and history, E3a session policy, module schema
+and migrations snapshot). Scope: an installed external module and its client
+processes. Reference: [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
 Revision 1.1 adds the read-only agent observation (CLI `ameesh agent observe`,
 HTTP `/api/v1/agents/{agent}/observation`); it is additive to revision 1.0.
 Revision 1.2 adds the Python mail submission and history surface (tranche E2a,
-#7671) and the module schema/migrations snapshot; both are additive to
-revision 1.1.
+#7671), the declarative per-agent session policy (tranche E3a, #7674) and the
+module schema/migrations snapshot; all are additive to revision 1.1.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -197,12 +197,38 @@ turn observation, and the native Kubernetes sandbox execution path. These
 features retain their existing gates and configuration. A command that merely
 starts an unrelated Kubernetes Job does not create a native sandbox turn.
 
-IMA's per-document fresh-session policy, refusal diagnostics, prepared native
-profile and lease-bound replay requirements are inventoried as E1–E3 in the
-mapping. Their proposed schemas are not available runner hooks. Until those
-gaps are delivered, IMA's existing adaptations remain tracked by its
-[#1803](https://github.com/thepackengers/issue-manager-agent/issues/1803), rather
-than acquiring compatibility guarantees for private methods.
+### Declarative per-agent session policy (E3a, #7674)
+
+An `Agent` or `Persona` card may declare its own session and retry policy at
+the top level. `canon sync` carries the declaration to the agent's admitted
+record; the runner consumes it, so a module needs no `AgentWorker` or
+`Runner` subclass for these settings:
+
+| Key | Accepted value | Effect |
+| --- | --- | --- |
+| `fresh_session` | boolean | `true`: every turn opens a new harness session; no previous session id is resumed. Default `false` (existing resume behaviour). |
+| `session_policy` | `par-lot`, `taille`, `jamais` | Same vocabulary as `ameesh set`. `jamais` disables rotation; `fresh_session: true` implies it. |
+| `context_max_tokens` | integer ≥ 0, or a token count with `k`/`M` suffix | Per-agent context cap; `0` disables the cap, including the harness default. |
+| `failure_wait_min` | duration (`60s`, `1m`, seconds) | Floor on the delay between an ordinary failed or refused turn and the next attempt; the executor's `failure_backoff_max` remains the ceiling. A durable provider rate-limit deadline remains authoritative. |
+
+A declared value takes precedence over the agent's imperative setting
+(`ameesh set`) and the executor default; a key absent from the card leaves the
+existing resolution unchanged. Attribute all four keys to the card, not to the
+release's package version: enable them only in a release that lists them here.
+An unreadable value or a contradictory `fresh_session: true` with a rotating
+`session_policy` is a card error, so the agent is not claimable. The wait after
+a failure is interrupted by shutdown and draining; graceful stop remains the
+core's responsibility. The optional `harness` argument of the internal
+`context_max_tokens()` helper is not frozen by this contract: a declared cap
+applies to every harness.
+
+IMA's per-document fresh-session policy is covered by this declarative
+surface. Its remaining refusal diagnostics, prepared native profile (E1b) and
+lease-bound replay requirements (E2c) remain inventoried in the mapping and
+are not available runner hooks. Until those gaps are delivered, IMA's
+remaining adaptations stay tracked by its
+[#1803](https://github.com/thepackengers/issue-manager-agent/issues/1803),
+rather than acquiring compatibility guarantees for private methods.
 
 ## Mail submission and history (Python)
 

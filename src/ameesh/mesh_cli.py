@@ -3758,7 +3758,9 @@ def cmd_set(cfg: Config, args) -> int:
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
     (L26 : `list --json` les rend quel que soit l'hôte) ; la politique de
-    session (`par-lot` | `taille` | `jamais`, décision 0025) en base seulement.
+    session (`par-lot` | `taille` | `jamais`, décision 0025) en base seulement
+    — une carte `Agent`/`Persona` du canon peut la déclarer, et sa déclaration
+    fait foi (#7674).
     Le tour suivant les lit et les applique ; une valeur vide revient au
     défaut. Le tier n'a d'effet que sur un harnais dont le descripteur le
     déclare (Codex : `service_tier`). Le mode (`execute` | `externe`, L37) est
