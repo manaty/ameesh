@@ -144,6 +144,10 @@ def live_pid():
     return enfant.pid
 def reload_epoch():
     # un runner redémarré reprend son bail à une époque supérieure
+    if (state / 'pas-de-reprise').exists():
+        # #7717 : l'agent en pause ne peut pas commencer de tour, son bail
+        # n'est pas repris ; le banc le fige pour éprouver l'exemption.
+        return
     epoch = state / ('lease-epoch-' + name)
     epoch.write_text(str(int(epoch.read_text()) + 2 if epoch.exists() else 9))
 if 'mask' in args:
@@ -1078,6 +1082,23 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertIn('aucun retour possible', r.stderr)
 
     # -- rollback -----------------------------------------------------------
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_retour_exempte_un_agent_en_pause_budget_du_bail(self):
+        """#7717 témoin (3) : le retour rejoue le même balayage puis le même
+        contrôle ; un agent en pause budget ne fait plus échouer le retour, qui
+        prouve son venv et conclut vert (aucun bail à reprendre)."""
+        (self.state / 'agents.json').write_text(json.dumps([dict(
+            name='dev9', host='host-agents', mode='execute', status='blocked',
+            status_text='budget : per-hour cap', paused_on_budget=True)]))
+        (self.state / 'pas-de-reprise').touch()
+        r = self.run_vm('retour')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertIn('dev9 : redémarré (était blocked) — non vérifiée :'
+                      ' pause budget', r.stdout)
+        self.assertIn('WARNING dev9: non vérifiée : pause budget', r.stdout)
+        self.assertIn('contrôles verts', r.stdout)
+
     def test_retour_refuses_without_previous_sha(self):
         (self.parts / 'previous-sha').unlink()
         p = self.run_vm('retour')
