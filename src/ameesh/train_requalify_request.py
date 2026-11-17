@@ -20,6 +20,7 @@ This module records the exact request in the database instead:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 
@@ -119,6 +120,38 @@ def _notify(db, row, text):
         pass
 
 
+def _journaled_move(cfg, project, request_id):
+    """#7751: the move already journaled for this request, or None.
+
+    ``train_requalify.apply`` writes the host journal (naming the request) and
+    the lot note before returning. If the process stops, or the resolve update
+    fails, between that return and ``train_requalify_resolve``, the request is
+    still ``requested`` but its move is durable. The next pass finds it here
+    and resolves the request instead of re-reading a pin it already moved.
+
+    An unreadable journal is no proof: the pass keeps its normal path and the
+    request is refused or retried there, never marked applied on a guess.
+    """
+    path = train_assembly.journal_path(cfg)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as source:
+            lines = source.readlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(row, dict) and row.get("event") == "canon-requalified"
+                and row.get("project") == project
+                and row.get("request") == request_id):
+            return row
+    return None
+
+
 def apply_pending(cfg, db, project, *, gate_reader=None, report=None):
     """Apply every pending request of this project with the reviewed guards.
 
@@ -131,6 +164,33 @@ def apply_pending(cfg, db, project, *, gate_reader=None, report=None):
     """
     outcomes = []
     for row in storage.of(db).work.train_requalify_requests(project):
+        # #7751: a move already journaled for this request is durable proof it
+        # ran; resolve it without replaying the write or reading the moved pin
+        # as stale (the reviewer's B: interruption between apply and resolve).
+        journaled = _journaled_move(cfg, project, row["id"])
+        if journaled is not None:
+            saved = storage.of(db).work.train_requalify_resolve(
+                row["id"], "applied", actor=cfg.host)
+            if saved is not None:
+                if report is not None:
+                    report("requalification request #%s already journaled on %s:"
+                           " %s -> %s (resolved after interruption)"
+                           % (row["id"], cfg.host,
+                              str(journaled.get("pin") or "")[:12],
+                              str(journaled.get("gate") or "")[:12]))
+                _notify(db, saved, "\n".join([
+                    "Requalification %s appliquée par le train (#7751)." % project,
+                    "",
+                    "- Demande : #%s ; épingle %s ; porte %s."
+                    % (row["id"], row["pin"], row["gate"]),
+                    "- Déjà journalisée sur %s ; demande résolue sans rejouer"
+                    " l'écriture (reprise après interruption)." % cfg.host,
+                    "- Trace sur le lot #%s." % row["lot"],
+                ]))
+            outcomes.append(dict(id=row["id"], state="applied",
+                                 pin=journaled.get("pin"),
+                                 gate=journaled.get("gate"), recovered=True))
+            continue
         try:
             result = train_requalify.apply(
                 cfg, db, project, lot=int(row["lot"]), actor=row["requester"],
@@ -150,7 +210,8 @@ def apply_pending(cfg, db, project, *, gate_reader=None, report=None):
                     "- Demande : #%s ; épingle %s ; porte %s."
                     % (row["id"], row["pin"], row["gate"]),
                     "- Motif : %s" % exc,
-                    "- Rien n'a été écrit : la demande est refusée et nommée.",
+                    "- Rien n'a été journalisé ni noté pour cette demande ;"
+                    " vérifier la configuration de l'hôte avant de la rejouer.",
                 ]))
             outcomes.append(dict(id=row["id"], state="refused", error=str(exc)))
             continue

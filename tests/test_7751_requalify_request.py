@@ -221,6 +221,44 @@ class RequestApplicationTest(_CanonFixture, PgTestCase):
         self.assertEqual((applied["state"], applied["resolved_by"], applied["error"]),
                          ("applied", "host-a", None))
 
+    def test_an_interruption_between_the_move_and_its_resolution_is_recovered(self):
+        """#7751 B: the journal proves a completed move after a crash.
+
+        A process stopped between ``train_requalify.apply`` returning and
+        ``train_requalify_resolve`` leaves the request ``requested`` while the
+        configuration already carries the gate. The next pass must resolve it
+        from the durable journal, not refuse it as a stale pin.
+        """
+        row = self.record(self.c1)
+        holder = self.host_cfg("host-a")
+        real_apply = rq.apply
+
+        def interrupted(*args, **kwargs):
+            real_apply(*args, **kwargs)
+            raise SystemExit("crash between the move and its resolution")
+
+        with mock.patch.object(review, "qualify", return_value=self.evidence()), \
+                mock.patch.object(rq, "apply", side_effect=interrupted):
+            with self.assertRaises(SystemExit):
+                requests.apply_pending(holder, self.db, "ameesh",
+                                       gate_reader=lambda *args: (self.c1, ""))
+        self.assertEqual(self.pins(), (self.c1, self.c1))
+        self.assertEqual(
+            len(storage.of(self.db).work.train_requalify_requests("ameesh")), 1)
+        with mock.patch.object(rq, "apply") as apply:
+            outcomes = requests.apply_pending(
+                holder, self.db, "ameesh",
+                gate_reader=lambda *args: (self.c1, ""))
+        apply.assert_not_called()
+        self.assertEqual(outcomes[0]["state"], "applied")
+        self.assertTrue(outcomes[0]["recovered"])
+        self.assertEqual(outcomes[0]["gate"], self.c1)
+        self.assertEqual(storage.of(self.db).work.train_requalify_requests("ameesh"), [])
+        saved = self.db.query(
+            "SELECT state, error FROM integration_train_requalifications"
+            " WHERE id = %s", (row["id"],))[0]
+        self.assertEqual((saved["state"], saved["error"]), ("applied", None))
+
     def test_a_host_without_a_train_configuration_requests_with_explicit_pin(self):
         """The pilot's host needs no train block: the exact reading is stated."""
         blind = types.SimpleNamespace(host="host-b", config_path=self.profile,

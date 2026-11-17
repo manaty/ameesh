@@ -107,7 +107,10 @@ l'épingle ou la porte a changé entre la demande et l'application est refusée
 et nommée, sans écriture ; le demandeur reçoit le motif par courrier et
 `train_cli show`, sur un train persisté, nomme les demandes encore en attente.
 La trace du mouvement va sur le lot cité, avec le numéro de la demande et
-l'hôte qui l'a appliquée.
+l'hôte qui l'a appliquée. Si le détenteur s'interrompt entre l'écriture et la
+résolution de la demande, le journal de l'hôte (qui nomme la demande) fait
+foi à la passe suivante : la demande est résolue sans rejouer l'écriture, au
+lieu d'être refusée comme périmée.
 
 ## Modes
 
