@@ -421,6 +421,13 @@ class HostReconcileTest(PgTestCase):
             self.assertEqual(isolated_entrypoint(main_mod.main, ["host", "reconcile", "source"]), 0)
         impl.assert_called_once_with(["reconcile", "source"])
 
+    def test_cli_dispatch_routes_host_reattach(self):
+        from ameesh import main as main_mod
+        args = ["reattach", "source", "dev", "--to", "target"]
+        with mock.patch("ameesh.host_lifecycle.main", return_value=0) as impl:
+            self.assertEqual(isolated_entrypoint(main_mod.main, ["host", *args]), 0)
+        impl.assert_called_once_with(args)
+
     def test_module_reconcile_uses_the_session_corrector(self):
         self.returned()
         with mock.patch.object(host_lifecycle.work, "corrector",
