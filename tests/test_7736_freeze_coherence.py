@@ -11,6 +11,11 @@ Témoins : les quatre contrôles sont branchés dans `COHERENCE_CHECKS` et chaqu
 identifiant désigne une classe ou une méthode réelle ; un arbre propre passe ;
 un arbre où un module entre dans la liste « toujours » sans le registre des
 contrats voit son gel refusé, avec le nom des témoins et le module fautif.
+
+Le pilote a étendu le périmètre à l'inventaire des types clients (#4887) :
+`scripts/garde-types-clients.py` refuse une spec OpenAPI changée sans le
+schéma généré, avec `gen-api --check` quand `node` et les modules du cache
+sont là, et la garde statique sinon.
 """
 from __future__ import annotations
 
@@ -30,6 +35,10 @@ _spec = importlib.util.spec_from_file_location(
     "freeze_checks_script_7736", REPO / "scripts" / "freeze-checks.py")
 script = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(script)
+_spec_types = importlib.util.spec_from_file_location(
+    "garde_types_clients_7736", REPO / "scripts" / "garde-types-clients.py")
+types_guard = importlib.util.module_from_spec(_spec_types)
+_spec_types.loader.exec_module(types_guard)
 
 #: nom du contrôle → identifiant `unittest` appelé au gel
 WITNESSES = {
@@ -136,6 +145,117 @@ class ScriptTest(unittest.TestCase):
         # les inventaires intacts restent verts : seule la faute est nommée
         self.assertIn("ok  couverture de la garde #2449", out)
         self.assertIn("ok  table L107 #7671", out)
+
+    def test_la_garde_types_clients_est_branchee(self):
+        commands = [args for _name, args in script.CHECKS]
+        self.assertIn(["scripts/garde-types-clients.py"], commands)
+
+
+class Proc:
+    def __init__(self, code=0, out="", err=""):
+        self.returncode = code
+        self.stdout = out
+        self.stderr = err
+
+
+class ClientTypesTest(unittest.TestCase):
+    """#4887 : le contrôle réel quand node est là, la garde statique sinon."""
+
+    SPEC = "docs/api/openapi-v1.json"
+    SCHEMA = "ui/src/api/schema.d.ts"
+    GENERATOR = "ui/scripts/gen-api.mjs"
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ameesh-7736-types-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.ui = pathlib.Path(self.root, "ui")
+        (self.ui / "scripts").mkdir(parents=True)
+        pathlib.Path(self.root, self.GENERATOR).write_text("", encoding="utf-8")
+        self.calls = []
+
+    def fake_run(self, replies=(), on_link=None):
+        replies = list(replies)
+
+        def fake(argv, **_kwargs):
+            self.calls.append(list(argv))
+            if on_link and argv[1:3] == ["deps", "link"]:
+                on_link()
+            return replies.pop(0) if replies else Proc()
+
+        return fake
+
+    def fake_which(self, node="/opt/node", ameesh="/opt/ameesh"):
+        return lambda name: {"node": node, "ameesh": ameesh}.get(name)
+
+    def check(self, paths, *, node="/opt/node", ameesh="/opt/ameesh",
+              replies=(), on_link=None):
+        return types_guard.check(self.root, paths, which=self.fake_which(node, ameesh),
+                                 run=self.fake_run(replies, on_link))
+
+    def test_inchanges_sans_sous_processus(self):
+        self.assertEqual(self.check(["src/ameesh/chain.py"]),
+                         (0, "types clients : inchangés"))
+        self.assertEqual(self.calls, [])
+
+    def test_spec_sans_schema_sans_node_refuse(self):
+        code, message = self.check([self.SPEC], node=None)
+        self.assertEqual(code, 1)
+        self.assertIn(self.SPEC, message)
+        self.assertIn(self.SCHEMA, message)
+        self.assertIn("npm run gen", message)
+
+    def test_spec_avec_schema_sans_node_reste_non_concluant(self):
+        code, message = self.check([self.SPEC, self.SCHEMA], node=None)
+        self.assertEqual(code, 0)
+        self.assertIn("non concluant", message)
+
+    def test_chemins_illisibles_sont_un_doute(self):
+        self.assertIsNone(types_guard.changed_paths({}))
+        self.assertIsNone(types_guard.changed_paths(
+            {types_guard.PATHS_ENV: "pas du json"}))
+        self.assertIsNone(types_guard.changed_paths(
+            {types_guard.PATHS_ENV: '{"docs/api/openapi-v1.json": 1}'}))
+        self.assertEqual(types_guard.changed_paths(
+            {types_guard.PATHS_ENV: '["docs/api/openapi-v1.json"]'}), [self.SPEC])
+
+    def test_gen_api_vert_quand_les_modules_sont_la(self):
+        (self.ui / "node_modules").mkdir()
+        code, message = self.check([self.SPEC], replies=[Proc(0, "ok")])
+        self.assertEqual(code, 0)
+        self.assertIn("à jour", message)
+        self.assertEqual(self.calls, [["/opt/node", self.GENERATOR, "--check"]])
+
+    def test_gen_api_rouge_prouve_le_schema_perime(self):
+        (self.ui / "node_modules").mkdir()
+        code, message = self.check(
+            [self.SPEC, self.SCHEMA],
+            replies=[Proc(1, "", "schema.d.ts is stale: run `npm run gen`")])
+        self.assertEqual(code, 1)
+        self.assertIn("périmés", message)
+        self.assertIn("stale", message)
+
+    def test_module_manquant_replie_sur_la_garde_statique(self):
+        (self.ui / "node_modules").mkdir()
+        missing = Proc(1, "", "Error [ERR_MODULE_NOT_FOUND]: openapi-typescript")
+        self.assertEqual(self.check([self.SPEC], replies=[missing])[0], 1)
+        code, message = self.check([self.SPEC, self.SCHEMA], replies=[missing])
+        self.assertEqual(code, 0)
+        self.assertIn("modules incomplets", message)
+
+    def test_le_cache_est_lie_avant_le_controle(self):
+        code, message = self.check(
+            [self.SPEC], replies=[Proc(0, "linked"), Proc(0, "ok")],
+            on_link=lambda: (self.ui / "node_modules").mkdir())
+        self.assertEqual(code, 0, message)
+        self.assertEqual(self.calls[0],
+                         ["/opt/ameesh", "deps", "link", "--no-fill", "ui"])
+        self.assertEqual(self.calls[1], ["/opt/node", self.GENERATOR, "--check"])
+
+    def test_cache_impossible_replie_sur_la_garde(self):
+        code, message = self.check([self.SPEC], ameesh=None)
+        self.assertEqual(code, 1)
+        self.assertIn("ameesh absent", message)
+        self.assertEqual(self.check([self.SPEC, self.SCHEMA], ameesh=None)[0], 0)
 
 
 if __name__ == "__main__":

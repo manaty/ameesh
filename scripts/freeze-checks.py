@@ -40,7 +40,10 @@ contrats, clés de la garde mécanique, table L107) ne tournaient qu'en CI de
 paquet : le paquet h-08 a coûté quatre rouges et une CI complète abandonnée.
 [`COHERENCE_CHECKS`] les passe au gel, sur la tête gelée, avant la relecture ;
 chacun dure moins d'une seconde. `test_l161f_plan` est trop lourd en entier :
-seule la méthode qui tient la liste attendue tourne.
+seule la méthode qui tient la liste attendue tourne. Le pilote a étendu le
+périmètre à l'inventaire des types clients (#4887) : `scripts/garde-types-clients.py`
+refuse une spec OpenAPI changée sans le schéma généré (`gen-api --check` quand
+`node` et les modules du cache sont là, garde statique sinon).
 
 Usage : scripts/freeze-checks.py   (à la racine d'un arbre ameesh)
 Sortie : 0 tous verts, 1 au moins un rouge, 2 hors d'un arbre ameesh.
@@ -109,6 +112,10 @@ CHECKS = (
     # L161a : un module qui lit docs/ ou site/ est déclaré lecteur de la doc
     ("doc readers L161a", ["-m", "unittest", "-q",
                            "tests.test_l161a_ci_sans_code.ReadersTest"]),
+    # #4887/#7736 : une spec OpenAPI changée sans le schéma client généré a
+    # coûté deux compositions (h-08 #7670, h-09 #7630) ; la CI le refusait
+    # seulement après le gel.
+    ("types clients #4887", ["scripts/garde-types-clients.py"]),
     # #4521 : un alias `sys.modules` vers une implémentation de module ne peut
     # pas tomber dans une classe de relecture plus faible que son ancien chemin
     # (les `modules/dev/**` déplacés par L100 tombent au défaut léger).
