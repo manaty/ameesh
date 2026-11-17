@@ -817,26 +817,28 @@ def canon_drift_findings(records, *, head: str, first_ahead, now: float) -> list
         # (the executor's commit unknown to it, e.g. after rewritten history).
         if not refused and (since is None or now - since < CANON_DRIFT_S):
             continue
+        host = data.get("host")
+        who = key if not host else "%s on %s" % (key, host)
         detail = ("Staging executor %s reads canon %s; the agents' canon is at %s, "
-                  % (key, ref[:12], head[:12]))
+                  % (who, ref[:12], head[:12]))
         detail += ("ahead for %.1f d (threshold 1 d). " % ((now - since) / 86400.0)
                    if since is not None else "drift not datable from the agents' clone. ")
         detail += "Host fiches and rules read by staging may be stale. "
         if refused:
-            detail += ("The automatic refresh of its last completed pass was refused "
-                       "(%s): copy kept; fix the cause, or see the operator gesture "
-                       "in DEPLOIEMENT-HOTE-AGENTS.md." % refused[:200])
+            detail += ("The automatic refresh was refused (%s): copy kept; fix "
+                       "the cause, or see the operator gesture in "
+                       "DEPLOIEMENT-HOTE-AGENTS.md." % refused[:200])
         elif pinned:
             detail += ("Its canon_ref is pinned (%s): no pass moves it; advance "
                        "the pin by the operator bump in DEPLOIEMENT-HOTE-AGENTS.md "
                        "(\"canon_ref épinglé\")."
                        % str(refresh.get("ref") or ref)[:40])
         else:
-            detail += ("Its next completed pass refreshes the copy (#7053); "
-                       "without one, see the operator gesture in "
+            detail += ("Its next candidate tick refreshes the copy (#7053, "
+                       "#7750); without one, see the operator gesture in "
                        "DEPLOIEMENT-HOTE-AGENTS.md.")
         out.append(dict(schema="ameesh-alert/1", type="staging_canon_stale",
-                        agent=None, since=since,
+                        agent=None, since=since, host=host,
                         value=now - since if since is not None else None,
                         threshold=CANON_DRIFT_S, reason=key, canon_ref=ref,
                         head=head, urgent=False,
@@ -907,7 +909,22 @@ def canon_alerts(db, *, now: float, cfg) -> list[dict]:
             break
     if not head:
         return []
-    return canon_drift_findings(executor_canons(db), head=head,
+    records = executor_canons(db)
+    # #7750: a candidate that never completed a pass has no record carrying
+    # its `canon_ref`; its tick does, and the same drift rule applies.
+    covered = {(key, (data or {}).get("host")) for key, data in records}
+    extra = []
+    for (key, host), tick in executor_ticks(db).items():
+        if (key, host) in covered:
+            continue
+        data = tick.get("data") or {}
+        if not isinstance(data, dict) or not data.get("canon_ref"):
+            continue
+        if not _tick_fresh(tick, data, host, now):
+            continue
+        extra.append((key, dict(data, host=host,
+                                notify=data.get("role") or "")))
+    return canon_drift_findings(records + extra, head=head,
                                 first_ahead=_first_ahead(repo), now=now)
 
 
@@ -920,9 +937,26 @@ EXECUTOR_REFRESH_S = 7200.0
 PASS_SOURCE = "its last completed pass"
 
 
+#: #7750: a tick older than this no longer speaks for its host (the timer
+#: publishes every minute; a host that stopped ticking is another alert).
+EXECUTOR_TICK_MAX_S = 3600.0
+
+
+def _tick_fresh(tick: dict, data: dict, host: str, now: float) -> bool:
+    """#7750: read a tick only while it is recent and its host a candidate."""
+    try:
+        ts = float(tick.get("ts") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not ts or now - ts > EXECUTOR_TICK_MAX_S:
+        return False
+    candidates = data.get("candidates")
+    return not isinstance(candidates, list) or host in candidates
+
+
 def executor_version_findings(records, *, now: float, attested=(),
                               descends=None, ticks=None) -> list[dict]:
-    """#7164: one alert per executor key whose own venv lags staging.
+    """#7164: one alert per executor whose own venv lags staging.
 
     `records`: (key, row) pairs, the newest `completed` executor record per
     key with its event id. The executor's venv is only ever updated by its
@@ -936,7 +970,13 @@ def executor_version_findings(records, *, now: float, attested=(),
     that executor on that host. Published after the pass (a higher id), its
     `executor_venv` is the version actually launched, read instead of the
     pass's: an install made after the last completed pass is not stale. The
-    alert names the source it read."""
+    alert names the source it read.
+
+    #7750: a candidate that never completed a pass has no `completed` row at
+    all, so it was invisible here. Its newest tick is read against the commit
+    the key's last completed pass deployed; an `ahead` or freshly refreshed
+    venv is not stale. The alert names the host."""
+    ticks = ticks or {}
     newest = None
     for row in attested or ():
         sha = (row.get("data") or {}).get("sha")
@@ -944,22 +984,33 @@ def executor_version_findings(records, *, now: float, attested=(),
                 newest is None or int(row.get("id") or 0) > newest[0]):
             newest = (int(row.get("id") or 0), sha)
     out = []
+    deployed = {}
+    covered = set()
     for key, row in records:
         data = row.get("data") or {}
         sha = str(data.get("sha") or "")
+        host = data.get("host")
+        if host:
+            covered.add((key, host))
+        if sha:
+            deployed.setdefault(key, sha)
         version = data.get("executor_venv")
         live = str(version.get("live") or "") if isinstance(version, dict) else ""
         source = PASS_SOURCE
-        tick = (ticks or {}).get((key, data.get("host")))
-        if tick and int(tick.get("id") or 0) > int(row.get("id") or 0):
-            launched = (tick.get("data") or {}).get("executor_venv")
+        tick = ticks.get((key, host))
+        tick_data = (tick.get("data") or {}) if tick else {}
+        newer = bool(tick) and int(tick.get("id") or 0) > int(row.get("id") or 0)
+        if newer:
+            launched = tick_data.get("executor_venv")
             launched = (str(launched.get("running") or launched.get("live") or "")
                         if isinstance(launched, dict) else "")
             if launched:
                 live = launched
-                source = "the tick of %s at %s" % (data.get("host"), time.strftime(
+                source = "the tick of %s at %s" % (host, time.strftime(
                     "%Y-%m-%d %H:%MZ", time.gmtime(float(tick.get("ts") or 0))))
         refresh = data.get("venv_refresh")
+        if newer and isinstance(tick_data.get("venv_refresh"), dict):
+            refresh = tick_data["venv_refresh"]
         target = sha
         running = (isinstance(refresh, dict) and refresh.get("state") == "running"
                    and not (source != PASS_SOURCE and live
@@ -967,6 +1018,9 @@ def executor_version_findings(records, *, now: float, attested=(),
         started = refresh.get("started") if running else None
         if running and isinstance(started, (int, float)) and (
                 now - started < EXECUTOR_REFRESH_S):
+            continue
+        if isinstance(refresh, dict) and refresh.get("state") == "ahead":
+            # #7750: manually moved past the last deployment; not a lag.
             continue
         if running:
             cause = ("the venv refresh of its last completed pass (%s) never "
@@ -1005,13 +1059,59 @@ def executor_version_findings(records, *, now: float, attested=(),
             cause += "; version read from %s" % source
         out.append(dict(
             schema="ameesh-alert/1", type="staging_executor_stale", agent=None,
-            since=None, value=None, threshold=None, reason=key,
+            since=None, value=None, threshold=None, reason=key, host=host,
             executor_venv=live, sha=target, urgent=False,
             orchestrators=[data["notify"]] if data.get("notify") else [],
             detail=("Staging executor %s runs an old version: %s. Fixes to "
                     "the executor stay inactive until its venv moves; see "
                     "\"Venv de l'exécutant\" in DEPLOIEMENT-HOTE-AGENTS.md."
                     % (key, cause))))
+    # #7750: candidates without a completed pass, read from their tick.
+    for (key, host), tick in sorted(ticks.items()):
+        if (key, host) in covered:
+            continue
+        sha = deployed.get(key)
+        if not sha:
+            continue
+        data = tick.get("data") or {}
+        if not _tick_fresh(tick, data, host, now):
+            continue
+        version = data.get("executor_venv")
+        if not isinstance(version, dict) or not version:
+            continue
+        live = str(version.get("live") or version.get("running") or "")
+        refresh = data.get("venv_refresh")
+        if isinstance(refresh, dict) and refresh.get("state") in (
+                "installed", "current", "ahead"):
+            continue
+        if live and sha.startswith(live):
+            continue
+        if not live:
+            cause = ("its version is not recorded (executor older than #7164, "
+                     "or venv unreadable)")
+        else:
+            cause = ("no completed pass on this candidate; its tick of %s "
+                     "launched venv-%s while the key's last completed pass "
+                     "deployed %s" % (
+                         time.strftime("%Y-%m-%d %H:%MZ",
+                                       time.gmtime(float(tick.get("ts") or 0))),
+                         live, sha[:12]))
+            if isinstance(refresh, dict):
+                cause += " (venv refresh %s%s%s)" % (
+                    refresh.get("state") or "?",
+                    " at %s" % refresh["step"] if refresh.get("step") else "",
+                    ": %s" % str(refresh["reason"])[:200]
+                    if refresh.get("reason") else "")
+        out.append(dict(
+            schema="ameesh-alert/1", type="staging_executor_stale", agent=None,
+            since=None, value=None, threshold=None, reason=key, host=host,
+            executor_venv=live, sha=sha, urgent=False,
+            orchestrators=([data["role"]]
+                           if isinstance(data.get("role"), str) else []),
+            detail=("Staging executor %s on %s runs an old version: %s. Fixes "
+                    "to the executor stay inactive until its venv moves; see "
+                    "\"Venv de l'exécutant\" in DEPLOIEMENT-HOTE-AGENTS.md."
+                    % (key, host, cause))))
     return out
 
 
