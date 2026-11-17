@@ -92,7 +92,8 @@ class StartFactsTest(unittest.TestCase):
         rows = _intake(self._rows(item, events, now=T0 + 3600))
         self.assertEqual(len(rows), 1)
         self.assertGreaterEqual(rows[0]["level"], 1)
-        self.assertIn("bureau", rows[0]["targets"])
+        # #7634 : le rôle humain du palier s'appelle `avatar`.
+        self.assertIn("avatar", rows[0]["targets"])
 
 
 if __name__ == "__main__":

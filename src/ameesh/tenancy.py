@@ -19,7 +19,7 @@ La garde est en base (`ameesh_tenant_claim_ok`, migration 0575) : le runner
 lié au tenant `responsible` de l'agent, et lui seul, prend le bail ; le
 filtre de ce module n'est qu'une optimisation et un diagnostic.
 
-Le provisionnement est un geste du bureau ou d'un humain, jamais d'un agent
+Le provisionnement est un geste de l'avatar ou d'un humain, jamais d'un agent
 (§3.4) ; `add --register` se lance sur l'hôte cible, dont le passwd donne
 l'UID du tenant.
 
@@ -44,11 +44,6 @@ TENANT_RE = re.compile(r"^human:[A-Za-z0-9][A-Za-z0-9._@-]*$")
 TENANT_UNIT = "ameesh-runner-tenant@%s.service"
 #: préfixe de l'utilisateur système d'un tenant
 USER_PREFIX = "ameesh-"
-#: rôle du bureau dans le canon (§10) : avec les humains, le seul à écrire une
-#: liaison de tenant (design 5322 §3.4 : « bureau, jamais un agent »)
-BUREAU_ROLES = ("bureau",)
-
-
 class TenancyError(ValueError):
     """Refus d'un geste de tenant (code stable, message lisible)."""
 
@@ -298,7 +293,7 @@ def remove(db, host: str, tenant: str) -> dict:
 def shell_plan(host: str, tenant: str) -> str:
     """Le plan lisible de `add` (commandes citées, unité à installer)."""
     user = unix_user(tenant)
-    lines = ["# #7106: tenant %s on shared host %s (run as root by the bureau)"
+    lines = ["# #7106: tenant %s on shared host %s (run as root by the avatar)"
              % (check_tenant(tenant), host)]
     lines += [" ".join(shlex.quote(part) for part in step) for step in add_plan(host, tenant)]
     lines.append("# unit %s, installed as %s:"
@@ -306,10 +301,10 @@ def shell_plan(host: str, tenant: str) -> str:
                     "/home/%s/.config/systemd/user/ameesh-runner-tenant@.service" % user))
     lines += ["#   " + line for line in unit_text(host, tenant).splitlines()]
     lines.append("# %s: the tenant's configuration (database, no secret in this plan),"
-                 " installed by the bureau like the organization keys"
+                 " installed by the avatar like the organization keys"
                  % ("/home/%s/.config/ameesh/config.json" % user))
     lines.append("# then, on the target host (as the host supervisor): ameesh host tenant"
-                 " add %s --host %s --register --actor <human:<id>|bureau>"
+                 " add %s --host %s --register --actor <human:<id>|avatar>"
                  % (shlex.quote(check_tenant(tenant)), shlex.quote(host)))
     return "\n".join(lines)
 
@@ -328,13 +323,14 @@ def describe(rows: list[Mapping[str, Any]]) -> list[str]:
 
 
 def operator(cfg, db, explicit: str | None = None) -> str:
-    """Qui écrit ou retire une liaison de tenant : un humain ou le bureau.
+    """Qui écrit ou retire une liaison de tenant : un humain ou son avatar.
 
-    La conception réserve ce geste d'infrastructure au bureau, « jamais un
-    agent » (5322 §3.4) ; `work.corrector` est plus large (orchestrateurs et
-    agents de conception) et ne convient donc pas ici. Une session liée agit
-    en son nom seul ; un terminal humain dit qui il est (`--actor`)."""
-    from . import agent_names, canon, identity, sous_utilisation, work
+    La conception réserve ce geste d'infrastructure à l'avatar de l'humain,
+    « jamais un agent » (5322 §3.4) ; `work.corrector` est plus large
+    (orchestrateurs et agents de conception) et ne convient donc pas ici. Une
+    session liée agit en son nom seul ; un terminal humain dit qui il est
+    (`--actor`)."""
+    from . import agent_names, avatars, canon, identity, work
 
     text = (explicit or "").strip()
     text = agent_names.resolve(text, db=db, operation="tenancy.operator")
@@ -355,7 +351,7 @@ def operator(cfg, db, explicit: str | None = None) -> str:
     else:
         if not text:
             raise TenancyError("tenant-actor-missing",
-                               "say who does it (--actor human:<id> or --actor bureau)")
+                               "say who does it (--actor human:<id> or --actor avatar)")
         name = text
     if name.startswith(work.HUMAN_PREFIX):
         return name
@@ -363,18 +359,18 @@ def operator(cfg, db, explicit: str | None = None) -> str:
     if human:
         return human
     try:
-        # Le rôle de la fiche Agent, pas la liste d'alerte
-        # (`AMEESH_ALERT_ORCHESTRATORS` nomme des orchestrateurs, jamais le
-        # bureau) : un agent ne signe pas une liaison de tenant.
+        # La fiche Agent du canon, pas la liste d'alerte
+        # (`AMEESH_ALERT_ORCHESTRATORS` nomme des orchestrateurs, jamais un
+        # avatar) : un agent ne signe pas une liaison de tenant.
         canons = canon.load_configured(cfg) if cfg is not None else []
-        if name in sous_utilisation.role_orchestrators(canons, BUREAU_ROLES):
+        if avatars.is_avatar_in(canons, name):
             return name
     except Exception as exc:  # noqa: BLE001 - autorité illisible : refus
         raise TenancyError("tenant-authority-unreadable",
-                           "cannot read the bureau role of %s: %s" % (name, exc)) from exc
-    raise TenancyError("tenant-bureau-only",
-                       "%s is neither a human nor the bureau: a tenant binding is "
-                       "an infrastructure gesture, \"bureau, jamais un agent\" "
+                           "cannot read the avatar of %s: %s" % (name, exc)) from exc
+    raise TenancyError("tenant-avatar-only",
+                       "%s is neither a human nor an avatar: a tenant binding is "
+                       "an infrastructure gesture, \"l'avatar, jamais un agent\" "
                        "(design 5322 §3.4)" % name)
 
 
@@ -382,7 +378,7 @@ def operator(cfg, db, explicit: str | None = None) -> str:
 # `ameesh host tenant add|list|remove`
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
-    """`ameesh host tenant …` : geste d'infrastructure (bureau ou humain,
+    """`ameesh host tenant …` : geste d'infrastructure (avatar ou humain,
     jamais un agent ni le runner d'un tenant).
 
     `add` sans `--register` imprime le plan système (utilisateur, home 0700,
@@ -405,7 +401,7 @@ def main(argv=None) -> int:
     add.add_argument("--register", action="store_true",
                      help="write the binding (system user, UID, runner) in the database")
     add.add_argument("--actor",
-                     help="who registers (human:<id> or bureau) from an unbound terminal")
+                     help="who registers (human:<id> or avatar) from an unbound terminal")
     listing = commands.add_parser("list", help="tenants and runner presence")
     listing.add_argument("--host")
     listing.add_argument("--json", action="store_true")
@@ -413,7 +409,7 @@ def main(argv=None) -> int:
     drop.add_argument("tenant")
     drop.add_argument("--host")
     drop.add_argument("--actor",
-                      help="who removes (human:<id> or bureau) from an unbound terminal")
+                      help="who removes (human:<id> or avatar) from an unbound terminal")
     args = parser.parse_args(argv)
     cfg = config.load()
     host = args.host or cfg.host

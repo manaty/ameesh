@@ -255,10 +255,11 @@ indépendante est #6872.
   été créé sur l'autre hôte ;
 - vérifie que l'acteur est `externe`, sans bail vivant, et que le harnais
   déclaré est une famille du canon. Ce harnais est celui de la SESSION
-  (#5756) : si la session figure dans `session_bindings` (toute ligne, révoquée
-  comprise), elle fixe l'agent et le harnais, et toute divergence est refusée ;
-  sinon (hôte sans ameesh, session jamais liée) le harnais doit être déjà connu
-  de l'acteur — le courant du registre ou celui d'une liaison passée. Le
+  (#5756) : la session doit figurer dans `session_bindings` (toute ligne,
+  révoquée comprise), et la liaison qui **couvrait la date de committer** fixe
+  l'agent et le harnais (#7741). Une session sans aucune liaison est refusée :
+  la dérogation « hôte sans ameesh » de #4485 est retirée (B/P1 de la revue
+  #43307, voir la section #7741). Le
   registre porte le harnais courant, pas celui de la session qui a créé le
   commit : un acteur qui a changé de harnais garde donc ses attestations
   passées. Le harnais courant divergent est conservé dans le `meta` de
@@ -277,6 +278,87 @@ n'est pas attestée par les hooks (absents sur l'hôte) ; c'est la signature qui
 couvre le SHA exact. Le correctif d'environnement de #4485 (un nom annoncé est
 couvert par une liaison valide, au lieu de la masquer) reste utile pour l'option
 « ameesh installé » et pour toute session liée dont le shell a gardé un nom.
+
+**Depuis #7741 (17/11), l'attestation signée exige une liaison qui couvre le
+commit** : la branche « hôte sans ameesh, session jamais liée » de #4485 est
+retirée (B/P1 de la revue #43307). L'absence de lignes pour un nom d'hôte
+déclaré ne prouve pas qu'un hôte est sans ameesh ; elle laissait une session et
+un hôte inventés contourner les liaisons réelles du commit. Un hôte sans
+ameesh qui doit faire attester ses commits installe donc la CLI et lie la
+session (le bureau-goal a reçu cette CLI par #6881), ou recrée les commits
+après une liaison régulière.
+
+### Une session historiquement liée à deux agents (#7741, 17/11)
+
+La session Codex du poste `01a186ba-…` porte deux histoires : les liaisons
+bureau #32–50, toutes révoquées, puis #54 liée à `veille` le 13/11 et active
+pendant les commits du 17/11 (#7705 : `d4a8170e`, `07ee0492` ; Nexlink #7678 :
+six commits). Le garde #5756 refusait toute la session dès qu'une ligne
+historique nommait un autre agent : `--actor bureau` échouait à cause de #54,
+`--actor veille` à cause de #32–50. La seule sortie était de changer
+l'identifiant de session ou de rebaptiser les commits, c'est-à-dire une fausse
+déclaration.
+
+Le choix retenu est la **liaison qui couvrait la date de committer** :
+
+- `_signed_binding_at` cherche, parmi les lignes `session_bindings` de la
+  session sur l'hôte et le harnais déclarés, celles dont l'intervalle
+  `[created_ts, revoked_ts)` contient l'instant de création de l'objet
+  (`t >= created_ts` si la liaison est active), tolérance d'une seconde aux
+  bornes. L'acteur signé doit être l'agent de cet intervalle, et l'intervalle
+  ne peut désigner qu'un seul agent ;
+- un commit fait sous `veille` ne se signe donc pas `bureau`, et un commit fait
+  sous bureau ne se signe pas `veille` ; un commit entre deux liaisons (après
+  révocation, avant la suivante) n'a pas d'acteur attribuable ;
+- une session liée après le commit ne peut pas le revendiquer (le témoin
+  « nouvelle session artificielle ») ; une session sans aucune liaison est
+  refusée : l'absence de lignes pour un nom d'hôte déclaré ne prouve pas un
+  hôte sans ameesh, et une session et un hôte inventés contourneraient les
+  liaisons réelles du commit (B/P1 de la revue #43307, la dérogation #4485 est
+  retirée) ; une session liée sur un autre hôte est refusée, car le texte
+  signé nomme l'hôte de sa liaison ;
+- le committer d'un autre agent enregistré reste refusé sur la voie signée
+  comme sur la voie de session (`_refuse_foreign_committer`) ; un committer
+  natif hors registre (`codex-pc`) reste admis.
+
+Le garde #7725 n'est pas contourné : `veille` ne donne toujours aucune identité
+dans un reçu de session (`_binding_identity`, `record_session_commit`, lecture),
+parce qu'une liaison de session à une identité d'émission sans boîte lue ne
+recevrait jamais les réponses. Sur la voie signée, l'autorité n'est pas
+l'ascendance mais la signature owner ; elle peut nommer l'agent historique réel
+`veille` sans réactiver la liaison #54 ni réétiqueter le commit. Le texte signé
+reste en version 1 ; la liaison retenue est écrite dans le `meta` de
+l'approbation (`binding`), comme `registry_harness`, et `provenance show`
+l'affiche. Une approbation pré-signée reste consommable : le diagnostic est
+ajouté à la consommation, sans toucher au payload ni à l'empreinte.
+
+Limite dite : la date de committer est déclarative (un auteur peut la forcer),
+et l'hôte signé l'est aussi. Le garde choisit la liaison cohérente avec la
+signature ; il ne transforme pas la signature owner en preuve d'ascendance. Le
+geste opératoire reste : l'owner signe **en personne**, agent aucun ne lit la
+clé ; on n'atteste que les SHA exacts de la PR ; aucun reçu ni rebinding de #54
+n'est fait pour « réparer » les commits. Pour #7705, les deux SHA de la PR
+`#5910` sont `d4a8170e` et `07ee0492` (acteur `veille`, session `01a186ba-…`,
+harnais `codex`, hôte `pc-smichea`, lot 7705) ; les brouillons `9ed10787` et
+`0af91b19` ne sont pas dans la PR et ne s'attestent pas (le second a en outre
+un committer `bureau@manaty.net`).
+
+Le retrait de la dérogation #4485 est plus strict que le gel précédent : un
+commit créé hors de toute liaison n'a plus d'attestation signée possible. C'est
+la réponse au contournement « session neuve + hôte neuf » : le contrôle ne
+s'appuie plus sur l'absence de lignes pour un nom déclaré, mais exige la
+liaison qui a réellement porté la session à la date du commit. Le bureau-goal
+dispose de la CLI depuis #6881, donc ses sessions s'y lient comme ailleurs ;
+à défaut, la recréation après liaison régulière reste la voie.
+
+Témoins : `tests/test_7741_signed_provenance_historique.py` (commit sous veille
+signé `veille`, commit sous bureau signé `bureau`, refus de l'acteur de l'autre
+intervalle, refus entre deux liaisons, session nouvelle liée après le commit,
+session et hôte inventés refusés, hôte divergent, committer tiers, clé
+déléguée, reçu révoqué, #7725 toujours refusé en reçu de session, approbation
+pré-signée, `provenance show`) ; les témoins #4485 de la liaison révoquée ont
+été ajustés pour exiger un commit **pendant** l'intervalle, et la dérogation
+« session jamais liée » y est devenue un refus.
 
 ### Bornes ajoutées par #6873
 
@@ -341,6 +423,115 @@ harnais au registre, harnais jamais vu refusé, session liée sous un autre
 harnais ou à un autre agent refusée, `registry_harness` dans le meta et affiché
 par `provenance show` ; #6873 : refus d'un détenteur agent, d'une copie
 enregistrée sous un autre agent, owner en personne accepté, révocation finale
-et inconnue à la lecture, CLI liée et refus d'une identité non liée) et les
-trois témoins #4485 de `tests/test_3985_bound_session_provenance.py` (nom
-annoncé couvert par une liaison, jamais une autre).
+et inconnue à la lecture, CLI liée et refus d'une identité non liée ; #7741 :
+liaison choisie par la date de committer, acteur de l'autre intervalle refusé,
+session artificielle et hôte divergent refusés, #7725 intact) et les trois
+témoins #4485 de `tests/test_3985_bound_session_provenance.py` (nom annoncé
+couvert par une liaison, jamais une autre).
+
+## 9. Session externe liée sans ascendance : le reçu de session (#7719, 17/11)
+
+Le commit d'une session native liée (Codex sur le poste) n'avait aucun reçu :
+les hooks lisaient l'identité par l'ascendance du processus, or l'outil Git
+d'une session native ne descend pas du processus lié, et la session, sans PID,
+n'est pas retrouvée par `by_ancestry`. Les deux autres voies ne couvrent pas ce
+cas : un tour managé n'existe pas dans une session native hors runner, et
+l'attestation signée (#4485) demande une signature owner par commit —
+précisément ce que le lot devait éviter. La désignation restait donc impossible
+sans une signature owner commit par commit.
+
+Option retenue (celle de #224791 a) : **l'enregistrement par la CLI dans la
+session liée**, `ameesh provenance record --session <id> [--harness H]
+(--commit SHA | --range A..B) [--repo DIR] [--lot N]`. La session dit son
+identité par ses variables d'environnement — `AMEESH_SESSION_ID`
+(+`AMEESH_HARNESS`), `CODEX_SESSION_ID`, `CLAUDE_SESSION_ID`,
+`DSH_SESSION_ID` ; les variables connues sont réunies, deux valeurs divergentes
+ou un harnais inconnu sont refusés. Le reçu porte `turn = "session:<id>"` : il
+ne se fait jamais passer pour un tour managé, et le gel y lit la famille comme
+pour un tour.
+
+### #7725 : lier la session à l'agent qu'elle porte
+
+La liaison #54 avait été créée le 13/11 sur `veille`, l'identité d'ÉMISSION de
+la consigne de veille. #7725 la refuse désormais : `veille` n'a pas de boîte
+lue, donc une session qui s'y lie n'y recevrait jamais de réponse. La
+conséquence pour ce lot est double :
+
+- l'écriture **et** la lecture d'un reçu de session refusent une liaison à
+  `veille` : `--session` ne doit pas redonner par la bande l'identité que
+  `identity._session_binding` refuse ;
+- un reçu ne couvre qu'un commit **fait pendant** une liaison de cette session
+  à l'agent qui le revendique : liaison active (`t >= created_ts`) ou liaison
+  révoquée dont l'intervalle `[created_ts, revoked_ts)` contient `t`. Le lien
+  vers un AUTRE agent ne compte pas : une session reliée à X, puis à Y, puis
+  de nouveau à X ne réclame pas sous X un commit de l'époque Y (B1 des deux
+  relecteurs du gel 43280). Une réparation de liaison ne rend donc pas
+  rétroactivement prouvables les commits faits sous `veille`.
+
+Conséquence pour #7705 : les commits `d4a8170e` et `07ee0492` ont été faits
+sous la liaison `veille` ; aucune liaison à l'agent qui les revendiquerait ne
+contient leur date. La voie juste reste l'attestation owner signée, commit par
+commit (#4485), qui retient désormais la liaison de l'intervalle (#7741), ou
+des commits recréés après une liaison régulière. Relier #54
+à `bureau` — courrier du bureau, copie de clé owner, sans PID, sur un poste où
+tournent d'autres agents, session du dispatch prod de #7724 — est un geste
+d'identité privilégiée : décision signée de l'orchestrateur ou de l'owner,
+hors de ce lot, et il ne couvrirait pas ces commits.
+
+Gardes d'écriture (`record_session_commit`) :
+
+- la liaison est résolue par `(hôte, harnais, session)` et doit être **active** ;
+  l'agent doit être `externe`, sans bail vivant, et le harnais déclaré par le
+  registre ou le canon (#7004) ; une liaison à `veille` est refusée (#7725) ;
+- le commit doit être **fait pendant un intervalle de liaison de cette session
+  à cet agent** (date de committer, tolérance d'une seconde aux bornes), et
+  **porté par une réf locale** ou HEAD : un objet pendant n'est pas un commit
+  poussé ;
+- son **committer ne peut pas être un autre agent enregistré** — l'auteur Git
+  peut différer (rebase) ; un committer natif hors registre, comme `codex-pc`,
+  est admis, un agent enregistré est refusé (`_refuse_foreign_committer`) ;
+- une preuve déjà écrite n'est rejouable que pour la même identité, et une
+  preuve révoquée n'est jamais ressuscitée ;
+- une liaison qui porte un PID garde l'ascendance : la voie explicite ne la
+  contourne pas (`for_hook`, L46/L63) ; la **voie ambiante des hooks** non plus
+  — un identifiant de session posé dans l'environnement ne suffit jamais à
+  revendiquer une liaison à PID, et un PID réutilisé (heure de démarrage
+  différente) est refusé ; sinon on retombe sur l'ascendance (B1 des deux
+  relecteurs) ;
+- la voie des hooks applique la **même garde d'intervalle** que la voie
+  explicite : un commit hors de tout intervalle de liaison à l'agent est
+  refusé, même avec une attestation de création (B1 de l'auditeur) ;
+- l'environnement ambiant n'est pas autoritaire : un shell qui porte le
+  `DSH_SESSION_ID` de l'hôte ne détourne pas un geste manuel vers une session
+  sans rapport ; sans liaison, l'ascendance reste le seul chemin.
+
+Garde de lecture : `receipt_for_commit` et `receipt_for_milestone` refusent un
+reçu `session:` dont la session, le harnais ou l'agent n'est porté par aucune
+liaison (révoquée comprise), et un reçu qui nomme `veille` (#7725, identité sans
+boîte lue). Un reçu forgé, ou rattaché à la liaison d'un autre agent, est une
+preuve incohérente, pas une preuve (`_session_receipt_binding`).
+
+Bornes, dites sans prétendre plus :
+
+- l'hôte est vérifié à l'écriture par la liaison, pas figé dans le reçu ; la
+  lecture résout la liaison vivante ;
+- une liaison **sans PID est une déclaration** (geste humain de `bind`) : le
+  risque résiduel est qu'un autre processus du même hôte, non enregistré,
+  commite pendant la session active et soit attribué à la session. Le reçu
+  prouve « la session liée revendique ce commit, sur cet hôte, à ce moment »,
+  pas l'ascendance du processus ;
+- une session active peut revendiquer un commit d'un tiers **non enregistré**
+  présent sur une réf ; la liaison reste l'autorité, et le committer d'un agent
+  enregistré est refusé.
+
+Témoins : `tests/test_7719_provenance_session_liee.py` (21 tests : reçu d'un
+commit natif ; hooks de création qui lisent `CODEX_SESSION_ID` ; commit hors
+intervalle, aussi par les hooks ; commit d'un autre agent enregistré ; commit
+non porté par une réf ; liaison révoquée ; liaison à PID non contournée par la
+voie explicite et par la voie ambiante ; PID courant accepté ; reçu déjà pris
+par une autre liaison ; reçu de session sans liaison ; reçu d'une liaison d'un
+autre agent ; commit non lié inconnu ; CLI sur une plage poussée ; CLI d'une
+session non liée ; #7725 : liaison historique à `veille` qui n'écrit ni ne lit
+de reçu ; X → Y → X refusé pour un commit de l'époque Y ; commits faits sous
+`veille` non couverts par une réparation ; commit d'un intervalle révolu du
+même agent accepté).
