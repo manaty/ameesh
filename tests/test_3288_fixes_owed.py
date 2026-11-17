@@ -349,7 +349,9 @@ class BlockedFreezeSLOTest(_Base):
         self.assertIn("same family", text)
         self.assertIn("ameesh work assign %d" % lot, text)
         text = alert_briefs._slo_breach(dict(alert, level=3))
-        self.assertIn("bureau or auditor:", text)
+        # #7634 : le cœur nomme le rôle `avatar` ; la remise le réécrit avec
+        # le nom du desk déclaré (couvert par test_7634).
+        self.assertIn("avatar or auditor:", text)
         # #3487 : le porteur porte le correctif ; le niveau 3 ne le réassigne pas.
         self.assertIn("do not reassign the holder", text)
         self.assertIn("carries the fix", text)
