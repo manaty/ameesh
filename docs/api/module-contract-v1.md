@@ -307,16 +307,20 @@ checks both the supplied spelling and its resolved primary:
   notifications, review and deep-analysis requests;
 * the watch sender `veille` (`watch.SENDER`) — periodic watch reports;
 * the unbound actor `inconnu` (`work.UNKNOWN_ACTOR`);
-* the governance role literals `bureau` (`tenancy.BUREAU_ROLES`), `auditeur` /
-  `auditor` (`alert_briefs.AUDITOR_ROLES`) and `mesh-design` (the core's host
-  and staging operator role);
+* every Agent/Persona of the configured canon whose card declares a role: the
+  core reads the titles from the canon and never writes a mesh's role names
+  (#7637/#7660). This covers the governance identities of every mesh —
+  orchestrator, auditor, bureau, pilot, composer, watch, reviewer — including a
+  role added later or declared by another canon. `reserved_actors(db)` returns
+  the resolved names;
 * every `human:*` and `chat-*` name (the core's human and chat prefixes).
 
 `all` (broadcast) remains `InvalidSubmission`. A module service with no declared
 runner identity may submit under any other non-reserved service name; the
-database credential remains its trust boundary. The exported
-`RESERVED_ACTORS` and `RESERVED_ACTOR_PREFIXES` constants name the refused list,
-and the contract tests cross-check them against their core sources.
+database credential remains its trust boundary. The exported `RESERVED_ACTORS`
+and `RESERVED_ACTOR_PREFIXES` constants name the static names and the prefixes;
+the canon part is read per deployment. When no canon is configured or it cannot
+be read, only the static names and prefixes apply.
 
 Idempotency is scoped to `(actor, recipient)`. The content is the body, the
 kind, the module payload and the work item. The same key with the same content

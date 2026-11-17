@@ -11,8 +11,9 @@ What the core owns here:
 
 * the **actor** is fixed by the call — a submission is always deposited with
   ``sender = actor``; a caller cannot name another sender, and the core's own
-  sender identities (``ameesh``, ``veille``, the governance roles, human and
-  chat prefixes) are refused before alias resolution or deposit;
+  sender identities (``ameesh``, ``veille``, the canon's role-holding
+  Agent/Persona names, human and chat prefixes) are refused before alias
+  resolution or deposit;
 * **idempotency** is scoped to ``(actor, recipient)``: the same key with the
   same content reuses the durable message id, the same key with another
   content refuses, and concurrent retries end on one durable row (the unique
@@ -36,6 +37,7 @@ import dataclasses
 import json
 import os
 import re
+import time
 from typing import Any, Mapping, Sequence
 
 from .. import agent_names, cost_attribution, fil, mail, storage
@@ -111,23 +113,27 @@ MODULE_PAYLOAD_KEY = "module"
 #: it.  ``attribution`` is validated by the closed caller-attribution schema.
 ADMITTED_PAYLOAD_KEYS = frozenset((MODULE_PAYLOAD_KEY, "attribution"))
 
-#: Sender identities the core owns: the system sender, the governance pseudo
-#: senders/roles the core addresses by literal name, and the core prefixes.
-#: A public module submits under its own identity; these names are refused
-#: before alias resolution, identity checks and any deposit.  Their sources
-#: are cross-checked by tests/test_7706_mail_contract.py so drift is caught.
+#: Sender identities the core owns statically: the system sender, the watch
+#: sender and the unbound actor.  A public module submits under its own
+#: identity; these names are refused before alias resolution, identity checks
+#: and any deposit.  The governance identities are **not** named here: they
+#: are read from the configured canon (:func:`reserved_actors`), so a mesh's
+#: roles stay in its canon (#7637/#7660).  Their sources are cross-checked by
+#: tests/test_7706_mail_contract.py so drift is caught.
 RESERVED_ACTORS = frozenset((
     "ameesh",      # work.SYSTEM_SENDER: system events, CI, deep analysis
     "veille",      # watch.SENDER: periodic watch reports
     "inconnu",     # work.UNKNOWN_ACTOR: no bound identity
-    "bureau",      # tenancy.BUREAU_ROLES
-    "auditeur",    # alert_briefs.AUDITOR_ROLES / AUDITOR_NAME
-    "auditor",     # the auditor role's English spelling
-    "mesh-design",  # governance role addressed literally by the core
 ))
 
 #: Prefixes owned by the core: human identities and chat agents.
 RESERVED_ACTOR_PREFIXES = ("human:", "chat-")
+
+#: How long the canon's role-holding identities are reused before a new read:
+#: a module may submit often, a canon changes rarely.
+_CANON_ACTORS_TTL_S = 60.0
+#: configured canon key -> (monotonic read time, reserved titles)
+_CANON_ACTORS: dict[tuple, tuple[float, frozenset[str]]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -367,11 +373,76 @@ def _resolve(db: Db, name: str, operation: str) -> str:
     return agent_names.resolve(name, db=db, cfg=cfg, operation=operation)
 
 
-def _reserved_actor(name: str) -> bool:
+def _canon_key(cfg) -> tuple:
+    """Identity of the configured canons, for the short read cache."""
+    from .. import canon as canon_mod
+
+    return tuple((str(getattr(entry, "path", "")),
+                  str(getattr(entry, "ref", "")),
+                  bool(getattr(entry, "untrusted", False)))
+                 for entry in canon_mod.configured(cfg))
+
+
+def _canon_actor_names(db: Db) -> frozenset[str]:
+    """Titles of the canon Agent/Persona cards that declare a role.
+
+    The core never names a mesh's governance roles (#7637/#7660): a card that
+    declares ``roles:`` is a governed identity, whatever its labels are
+    (orchestrator, auditor, bureau, pilot, composer, watch...).  Reading the
+    cards therefore covers a role added later or declared by another canon.
+    The read is reused for a short window; an absent or unreadable canon
+    leaves only the static :data:`RESERVED_ACTORS` and the prefixes.
+    """
+    cfg = getattr(db, "cfg", None)
+    if cfg is None:
+        return frozenset()
+    try:
+        key = _canon_key(cfg)
+    except Exception:  # noqa: BLE001 - illisible : le garde statique suffit
+        return frozenset()
+    now = time.monotonic()
+    cached = _CANON_ACTORS.get(key)
+    if cached is not None and now - cached[0] < _CANON_ACTORS_TTL_S:
+        return cached[1]
+    from .. import canon as canon_mod
+
+    try:
+        canons = canon_mod.load_configured(cfg)
+    except Exception:  # noqa: BLE001 - canon illisible : le garde statique reste
+        names = frozenset()
+    else:
+        names = frozenset(
+            name for name in (
+                str(getattr(card, "title", "") or "").strip().casefold()
+                for canon in canons
+                for card in getattr(canon, "agents", ()) or ()
+                if getattr(card, "roles", None))
+            if name)
+    _CANON_ACTORS[key] = (now, names)
+    return names
+
+
+def reserved_actors(db: Db) -> frozenset[str]:
+    """The sender names this deployment refuses on the public surface.
+
+    The static system senders plus the role-holding Agent/Persona titles of
+    the configured canon, case-folded.  The reserved **prefixes** are separate
+    and listed by :data:`RESERVED_ACTOR_PREFIXES`.
+    """
+    return frozenset(RESERVED_ACTORS | _canon_actor_names(db))
+
+
+def _reset_canon_cache() -> None:
+    """Forget the canon identities read so far (tests, explicit reload)."""
+    _CANON_ACTORS.clear()
+
+
+def _reserved_actor(db: Db, name: str) -> bool:
     """``name`` is one of the core's own sender identities (case-insensitive)."""
     folded = name.casefold()
     return (folded in RESERVED_ACTORS
-            or folded.startswith(RESERVED_ACTOR_PREFIXES))
+            or folded.startswith(RESERVED_ACTOR_PREFIXES)
+            or folded in _canon_actor_names(db))
 
 
 def _actor(db: Db, actor: Any) -> str:
@@ -383,16 +454,17 @@ def _actor(db: Db, actor: Any) -> str:
     actor they name — the database credential is their trust boundary.
 
     The core's own sender identities are never available to this surface: a
-    module payload that named ``ameesh`` (or a governance role, human or chat
-    name) would inherit the paths and authority those senders carry.  The check
-    runs on the supplied spelling **and** its resolved primary, so an alias
-    cannot launder a reserved name.
+    module payload that named ``ameesh`` (or a canon role-holder, human or
+    chat name) would inherit the paths and authority those senders carry.  The
+    governance names are read from the configured canon, not written here.  The
+    check runs on the supplied spelling **and** its resolved primary, so an
+    alias cannot launder a reserved name.
     """
     raw = _name(actor, "actor")
     if raw == "all":
         raise InvalidSubmission("actor cannot be \"all\": name the sender identity")
     name = _resolve(db, raw, "public_mail.actor")
-    if _reserved_actor(raw) or _reserved_actor(name):
+    if _reserved_actor(db, raw) or _reserved_actor(db, name):
         raise ScopeRefused(
             "actor %s is a sender identity reserved by the core: nothing "
             "submitted" % (name if raw == name else "%s (%s)" % (raw, name)))
@@ -422,7 +494,7 @@ def _sender(db: Db, name: str) -> str:
     ``_actor`` already refused those names before any preparation, but a future
     caller of this helper must not be able to deposit under one.
     """
-    if _reserved_actor(name):
+    if _reserved_actor(db, name):
         raise ScopeRefused(
             "sender %s is a sender identity reserved by the core: nothing "
             "submitted" % name)
@@ -801,7 +873,7 @@ __all__ = [
     "CONTRACT_VERSION", "MAX_BODY_BYTES", "MAX_PAYLOAD_BYTES", "MAX_BATCH",
     "MAX_HISTORY", "DEFAULT_HISTORY", "KINDS", "RESERVED_PAYLOAD_KEYS",
     "MODULE_PAYLOAD_KEY", "ADMITTED_PAYLOAD_KEYS", "RESERVED_ACTORS",
-    "RESERVED_ACTOR_PREFIXES",
+    "RESERVED_ACTOR_PREFIXES", "reserved_actors",
     "Submission", "Receipt", "HistoryEntry", "HistoryPage", "SubmissionResult",
     "BatchResult", "PublicMailError", "InvalidSubmission", "IdempotencyConflict",
     "ScopeRefused", "RecipientRefused", "UnsupportedStorage",

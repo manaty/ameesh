@@ -15,6 +15,7 @@ Postgres réel.
 from __future__ import annotations
 
 import os
+import types
 import unittest
 from unittest import mock
 
@@ -27,9 +28,17 @@ from ameesh.public.mail import (
 from .support import PgTestCase
 
 
+def fake_canon(*cards) -> types.SimpleNamespace:
+    """Un canon minimal : des fiches Agent/Persona (titre, rôles)."""
+    return types.SimpleNamespace(
+        agents=[types.SimpleNamespace(title=title, roles=list(roles))
+                for title, roles in cards])
+
+
 class PublicMailBase(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
+        public_mail._reset_canon_cache()
         for name in ("alpha", "beta", "gamma"):
             registry.upsert(self.db, name, harness="codex", host=self.cfg.host)
 
@@ -82,8 +91,8 @@ class ReservedActorTest(PublicMailBase):
         self.assertNotIn("deep_analysis", row["payload"])
 
     def test_case_variants_and_core_prefixes_are_refused(self):
-        for actor in ("Ameesh", "AMEESH", "Veille", "Bureau", "Auditeur",
-                      "AUDITOR", "Mesh-Design", "Chat-smichea", "chat-smichea"):
+        for actor in ("Ameesh", "AMEESH", "Veille", "Inconnu",
+                      "Chat-smichea", "chat-smichea"):
             with self.subTest(actor=actor):
                 with self.assertRaises(ScopeRefused):
                     public_mail.submit(self.db, actor, self.submission())
@@ -108,15 +117,17 @@ class ReservedActorTest(PublicMailBase):
         self.assertEqual(self.rows(), [])
 
     def test_reserved_actor_is_refused_through_find_history_and_batch(self):
-        for actor in ("ameesh", "veille", "bureau", "auditeur"):
-            with self.subTest(actor=actor):
-                with self.assertRaises(ScopeRefused):
-                    public_mail.find(self.db, actor, "beta", "key")
-                with self.assertRaises(ScopeRefused):
-                    public_mail.history(self.db, actor)
-                with self.assertRaises(ScopeRefused):
-                    public_mail.submit_many(
-                        self.db, actor, [self.submission()])
+        canon = fake_canon(("sonde", ["orchestrateur"]))
+        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+            for actor in ("ameesh", "veille", "sonde"):
+                with self.subTest(actor=actor):
+                    with self.assertRaises(ScopeRefused):
+                        public_mail.find(self.db, actor, "beta", "key")
+                    with self.assertRaises(ScopeRefused):
+                        public_mail.history(self.db, actor)
+                    with self.assertRaises(ScopeRefused):
+                        public_mail.submit_many(
+                            self.db, actor, [self.submission()])
         self.assertEqual(self.rows(), [])
 
     def test_an_alias_cannot_launder_a_reserved_primary(self):
@@ -147,23 +158,60 @@ class ReservedActorTest(PublicMailBase):
         self.assertEqual(row["sender"], "ameesh")
         self.assertEqual(row["body"], "core event")
 
-    def test_reserved_names_match_their_core_sources(self):
-        from ameesh import alert_briefs, chat, tenancy, watch, work
+    def test_a_canon_role_holder_is_refused(self):
+        """A role declared only by the canon is reserved, with no core literal."""
+        canon = fake_canon(("sonde-orchestrateur", ["orchestrateur"]))
+        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+            for actor in ("sonde-orchestrateur", "SONDE-ORCHESTRATEUR"):
+                with self.subTest(actor=actor):
+                    with self.assertRaises(ScopeRefused):
+                        public_mail.submit(self.db, actor, self.submission())
+        self.assertEqual(self.rows(), [])
+
+    def test_a_canon_role_holder_cannot_be_laundered_by_an_alias(self):
+        registry.upsert(self.db, "sonde", harness="codex", host=self.cfg.host)
+        self.db.execute(
+            "UPDATE agent_registry SET aliases = ARRAY['zulu']"
+            " WHERE name = 'sonde'")
+        canon = fake_canon(("sonde", ["auditeur"]))
+        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+            with self.assertRaises(ScopeRefused):
+                public_mail.submit(self.db, "zulu", self.submission())
+        self.assertEqual(self.rows(), [])
+
+    def test_reserved_names_come_from_the_canon_not_the_core(self):
+        from ameesh import alert_briefs, chat, watch, work
 
         self.assertIn(work.SYSTEM_SENDER, public_mail.RESERVED_ACTORS)
         self.assertIn(watch.SENDER, public_mail.RESERVED_ACTORS)
         self.assertIn(work.UNKNOWN_ACTOR, public_mail.RESERVED_ACTORS)
-        self.assertIn(alert_briefs.AUDITOR_NAME, public_mail.RESERVED_ACTORS)
-        for role in tenancy.BUREAU_ROLES:
-            self.assertIn(role, public_mail.RESERVED_ACTORS)
-        for role in alert_briefs.AUDITOR_ROLES:
-            self.assertIn(role, public_mail.RESERVED_ACTORS)
-        # The core addresses mesh-design literally for host and staging
-        # operations (alert_briefs, staging_executor); it is a governance
-        # identity, not a module name.
-        self.assertIn("mesh-design", public_mail.RESERVED_ACTORS)
         self.assertIn(chat.CHAT_PREFIX, public_mail.RESERVED_ACTOR_PREFIXES)
         self.assertIn(work.HUMAN_PREFIX, public_mail.RESERVED_ACTOR_PREFIXES)
+        # No mesh role is written in the core: they are read from the canon.
+        for name in (alert_briefs.AUDITOR_NAME, "bureau"):
+            self.assertNotIn(name, public_mail.RESERVED_ACTORS)
+        canon = fake_canon(
+            (alert_briefs.AUDITOR_NAME, list(alert_briefs.AUDITOR_ROLES)),
+            ("bureau", ["bureau"]),
+            ("pilote-nexlink", ["pilote"]),
+            ("agent-sans-role", []),
+        )
+        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+            names = public_mail.reserved_actors(self.db)
+        self.assertIn(alert_briefs.AUDITOR_NAME, names)
+        self.assertIn("bureau", names)
+        # A role declared by another canon, unknown to the core, is covered.
+        self.assertIn("pilote-nexlink", names)
+        # A card without a role is not a governance identity.
+        self.assertNotIn("agent-sans-role", names)
+        self.assertNotIn("ima-service", names)
+
+    def test_a_canon_card_without_roles_still_submits(self):
+        canon = fake_canon(("agent-sans-role", []))
+        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+            receipt = public_mail.submit(
+                self.db, "agent-sans-role", self.submission())
+        self.assertGreater(receipt.id, 0)
 
 
 class ModulePayloadNamespaceTest(PublicMailBase):
@@ -291,7 +339,8 @@ class ContractVersionTest(unittest.TestCase):
                          frozenset(("module", "attribution")))
         self.assertEqual(public_mail.MODULE_PAYLOAD_KEY, "module")
         for name in ("MODULE_PAYLOAD_KEY", "ADMITTED_PAYLOAD_KEYS",
-                     "RESERVED_ACTORS", "RESERVED_ACTOR_PREFIXES"):
+                     "RESERVED_ACTORS", "RESERVED_ACTOR_PREFIXES",
+                     "reserved_actors"):
             self.assertIn(name, public_mail.__all__)
 
 
