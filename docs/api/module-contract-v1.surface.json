@@ -1,0 +1,1179 @@
+{
+  "schema": "ameesh-module-contract-surface/1",
+  "contract": "1.0",
+  "document": "docs/api/module-contract-v1.md",
+  "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
+  "cli": {
+    "ameesh --version": [],
+    "ameesh modules": [
+      "--json",
+      "--active",
+      "--no-canon"
+    ],
+    "ameesh module": [],
+    "ameesh canon check": [
+      "--canon",
+      "--ref",
+      "--host"
+    ],
+    "ameesh canon sync": [
+      "--host"
+    ],
+    "ameesh turn current": [
+      "--json",
+      "--expect-turn",
+      "--local"
+    ],
+    "ameesh turn observe": [
+      "--json",
+      "--turn",
+      "--request"
+    ],
+    "ameesh migrate": [
+      "--dry-run",
+      "--additive-only"
+    ],
+    "ameesh action propose": [],
+    "ameesh action approve": [],
+    "ameesh action execute": [],
+    "ameesh action reconcile": [],
+    "agent-runner": [
+      "--agents-file"
+    ],
+    "agent-mail send": [],
+    "agent-mail show": []
+  },
+  "module": {
+    "name_pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+    "reserved_names": [
+      "list"
+    ],
+    "descriptor_keys": [
+      "schemas",
+      "rules",
+      "types"
+    ],
+    "capabilities": [
+      "lifecycle",
+      "cli",
+      "audit",
+      "workspaces"
+    ],
+    "callbacks": {
+      "main": "(db, argv, *, actor)",
+      "audit": "(store, project)"
+    },
+    "discover": "(*, builtin=True, canon=None)",
+    "registry": [
+      "modules",
+      "refused",
+      "names",
+      "get"
+    ],
+    "record_fields": [
+      "name",
+      "version",
+      "source",
+      "capabilities",
+      "cli",
+      "storage",
+      "distribution",
+      "entry_point",
+      "descriptor_sha256",
+      "card_ref"
+    ],
+    "selection_scopes": [
+      "extensions.ameesh.modules",
+      "extensions.ameesh.teams.TEAM.modules",
+      "extensions.ameesh.projects.PROJECT.modules"
+    ],
+    "store_operations": {
+      "enabled": "(project, module)",
+      "admits": "(project, kind)",
+      "latest": "(item_id, module, kind)",
+      "milestones": "(item_id, limit=100)",
+      "record": "(item_id, module, kind, subject, payload, *, actor, binding_id=None)"
+    }
+  },
+  "http": {
+    "unauthenticated": [
+      "/.well-known/ameesh",
+      "/api/v1/openapi.json"
+    ],
+    "operations": {
+      "GET /.well-known/ameesh": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [],
+        "required_parameters": [],
+        "response_properties": [
+          "api",
+          "approve_url",
+          "languages",
+          "mode",
+          "oidc_issuer",
+          "openapi",
+          "organisation",
+          "schema",
+          "version",
+          "versions",
+          "vocabulary"
+        ],
+        "response_required": [
+          "api",
+          "approve_url",
+          "languages",
+          "mode",
+          "oidc_issuer",
+          "openapi",
+          "organisation",
+          "schema",
+          "version",
+          "versions"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/agents": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [],
+        "required_parameters": [],
+        "response_properties": [
+          "agents",
+          "schema"
+        ],
+        "response_required": [
+          "agents",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/agents/{agent}": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:agent"
+        ],
+        "required_parameters": [
+          "path:agent"
+        ],
+        "response_properties": [
+          "agent",
+          "schema"
+        ],
+        "response_required": [
+          "agent",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/agents/{agent}/chat": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:agent",
+          "query:after",
+          "query:limit"
+        ],
+        "required_parameters": [
+          "path:agent"
+        ],
+        "response_properties": [
+          "agent",
+          "entries",
+          "gap",
+          "last_seq",
+          "more",
+          "next_seq",
+          "oldest_seq",
+          "schema"
+        ],
+        "response_required": [
+          "agent",
+          "entries",
+          "gap",
+          "last_seq",
+          "more",
+          "next_seq",
+          "oldest_seq",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/agents/{agent}/peek": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:agent",
+          "query:limit"
+        ],
+        "required_parameters": [
+          "path:agent"
+        ],
+        "response_properties": [
+          "agent",
+          "captured_ts",
+          "events",
+          "host",
+          "lot",
+          "schema",
+          "stale",
+          "workspace"
+        ],
+        "response_required": [
+          "agent",
+          "captured_ts",
+          "events",
+          "host",
+          "lot",
+          "schema",
+          "stale",
+          "workspace"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/alerts": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [],
+        "required_parameters": [],
+        "response_properties": [
+          "alerts",
+          "schema"
+        ],
+        "response_required": [
+          "alerts",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/budget": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [],
+        "required_parameters": [],
+        "response_properties": [
+          "limits",
+          "schema"
+        ],
+        "response_required": [
+          "limits",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/decisions": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "query:all"
+        ],
+        "required_parameters": [],
+        "response_properties": [
+          "approvals",
+          "prose",
+          "requests",
+          "schema"
+        ],
+        "response_required": [
+          "approvals",
+          "prose",
+          "requests",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/events": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "header:Last-Event-ID"
+        ],
+        "required_parameters": [],
+        "response_properties": [],
+        "response_required": [],
+        "response_types": [
+          "text/event-stream"
+        ]
+      },
+      "GET /api/v1/hosts": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [],
+        "required_parameters": [],
+        "response_properties": [
+          "hosts",
+          "schema"
+        ],
+        "response_required": [
+          "hosts",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/hosts/{host}": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:host"
+        ],
+        "required_parameters": [
+          "path:host"
+        ],
+        "response_properties": [
+          "history",
+          "host",
+          "limits",
+          "schema"
+        ],
+        "response_required": [
+          "history",
+          "host",
+          "limits",
+          "pressure",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/lots": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "query:assignee",
+          "query:limit",
+          "query:state"
+        ],
+        "required_parameters": [],
+        "response_properties": [
+          "lots",
+          "schema"
+        ],
+        "response_required": [
+          "lots",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/lots/{id}": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:id"
+        ],
+        "required_parameters": [
+          "path:id"
+        ],
+        "response_properties": [
+          "lot",
+          "schema"
+        ],
+        "response_required": [
+          "lot",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/me": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [],
+        "required_parameters": [],
+        "response_properties": [
+          "deputyships",
+          "human",
+          "language",
+          "mode",
+          "organisation",
+          "roles",
+          "schema"
+        ],
+        "response_required": [
+          "deputyships",
+          "human",
+          "language",
+          "mode",
+          "organisation",
+          "roles",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/openapi.json": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [],
+        "required_parameters": [],
+        "response_properties": [],
+        "response_required": [],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/projects": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "query:project"
+        ],
+        "required_parameters": [],
+        "response_properties": [
+          "projects",
+          "schema"
+        ],
+        "response_required": [
+          "projects",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/projects/{project}/progress": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:project",
+          "query:since"
+        ],
+        "required_parameters": [
+          "path:project"
+        ],
+        "response_properties": [
+          "generated_ts",
+          "lots",
+          "schema"
+        ],
+        "response_required": [
+          "generated_ts",
+          "lots",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/projects/{project}/timeline": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:project",
+          "query:since"
+        ],
+        "required_parameters": [
+          "path:project"
+        ],
+        "response_properties": [
+          "generated_ts",
+          "lots",
+          "schema",
+          "truncated",
+          "window"
+        ],
+        "response_required": [
+          "generated_ts",
+          "lots",
+          "schema",
+          "window"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/requests/{request}": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:request"
+        ],
+        "required_parameters": [
+          "path:request"
+        ],
+        "response_properties": [
+          "accounting",
+          "agent",
+          "by",
+          "lease",
+          "observed_ts",
+          "quiescent",
+          "request",
+          "sandbox",
+          "schema",
+          "turn"
+        ],
+        "response_required": [
+          "accounting",
+          "agent",
+          "by",
+          "lease",
+          "observed_ts",
+          "quiescent",
+          "request",
+          "schema",
+          "turn"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/sandbox/turns": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "query:agent",
+          "query:limit",
+          "query:scope",
+          "query:state"
+        ],
+        "required_parameters": [],
+        "response_properties": [
+          "schema",
+          "turns"
+        ],
+        "response_required": [
+          "schema",
+          "turns"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/sandbox/turns/{turn}": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:turn"
+        ],
+        "required_parameters": [
+          "path:turn"
+        ],
+        "response_properties": [
+          "agent",
+          "canon_ref",
+          "completed_ts",
+          "counters",
+          "deadline_ts",
+          "epoch",
+          "job",
+          "owner",
+          "placement_ref",
+          "profile_ref",
+          "receipt",
+          "refusal",
+          "result_sha256",
+          "schema",
+          "scope",
+          "scope_digest",
+          "source",
+          "started_ts",
+          "state",
+          "tranche",
+          "turn_id",
+          "verdict"
+        ],
+        "response_required": [
+          "agent",
+          "canon_ref",
+          "completed_ts",
+          "counters",
+          "deadline_ts",
+          "epoch",
+          "job",
+          "owner",
+          "placement_ref",
+          "profile_ref",
+          "receipt",
+          "refusal",
+          "result_sha256",
+          "schema",
+          "scope",
+          "scope_digest",
+          "source",
+          "started_ts",
+          "state",
+          "tranche",
+          "turn_id",
+          "verdict"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/threads/{project}": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:project",
+          "query:since"
+        ],
+        "required_parameters": [
+          "path:project"
+        ],
+        "response_properties": [
+          "entries",
+          "lot",
+          "project",
+          "schema"
+        ],
+        "response_required": [
+          "entries",
+          "lot",
+          "project",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/threads/{project}/{lot}": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:lot",
+          "path:project",
+          "query:since"
+        ],
+        "required_parameters": [
+          "path:lot",
+          "path:project"
+        ],
+        "response_properties": [
+          "entries",
+          "lot",
+          "project",
+          "schema"
+        ],
+        "response_required": [
+          "entries",
+          "lot",
+          "project",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "GET /api/v1/turns/{turn}": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "path:turn"
+        ],
+        "required_parameters": [
+          "path:turn"
+        ],
+        "response_properties": [
+          "accounting",
+          "agent",
+          "by",
+          "lease",
+          "observed_ts",
+          "quiescent",
+          "request",
+          "sandbox",
+          "schema",
+          "turn"
+        ],
+        "response_required": [
+          "accounting",
+          "agent",
+          "by",
+          "lease",
+          "observed_ts",
+          "quiescent",
+          "request",
+          "schema",
+          "turn"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/actions/{action}/approval-request": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:action"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:action"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/agents/{agent}/chat": {
+        "body_properties": [
+          "lot",
+          "text"
+        ],
+        "body_required": [
+          "text"
+        ],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/agents/{agent}/interrupt": {
+        "body_properties": [
+          "text"
+        ],
+        "body_required": [
+          "text"
+        ],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/agents/{agent}/messages": {
+        "body_properties": [
+          "lot",
+          "text",
+          "urgent"
+        ],
+        "body_required": [
+          "text"
+        ],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/agents/{agent}/pause": {
+        "body_properties": [
+          "indefinite",
+          "reason",
+          "until"
+        ],
+        "body_required": [
+          "reason"
+        ],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/agents/{agent}/resume": {
+        "body_properties": [
+          "reason"
+        ],
+        "body_required": [
+          "reason"
+        ],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/agents/{agent}/stop": {
+        "body_properties": [
+          "reason"
+        ],
+        "body_required": [
+          "reason"
+        ],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:agent"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/alerts/{key}/ack": {
+        "body_properties": [],
+        "body_required": [],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:key"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:key"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/budget/caps": {
+        "body_properties": [
+          "agent",
+          "usd",
+          "window"
+        ],
+        "body_required": [
+          "usd",
+          "window"
+        ],
+        "parameters": [
+          "header:Idempotency-Key"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/hosts/{host}/drain": {
+        "body_properties": [
+          "duration_s"
+        ],
+        "body_required": [],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:host"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:host"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/lots/{id}/assign": {
+        "body_properties": [
+          "assignee"
+        ],
+        "body_required": [
+          "assignee"
+        ],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:id"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:id"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/threads/{project}": {
+        "body_properties": [
+          "text"
+        ],
+        "body_required": [
+          "text"
+        ],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:project"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:project"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      },
+      "POST /api/v1/threads/{project}/{lot}": {
+        "body_properties": [
+          "text"
+        ],
+        "body_required": [
+          "text"
+        ],
+        "parameters": [
+          "header:Idempotency-Key",
+          "path:lot",
+          "path:project"
+        ],
+        "required_parameters": [
+          "header:Idempotency-Key",
+          "path:lot",
+          "path:project"
+        ],
+        "response_properties": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_required": [
+          "action",
+          "by",
+          "for",
+          "result",
+          "schema"
+        ],
+        "response_types": [
+          "application/json"
+        ]
+      }
+    }
+  },
+  "views": {
+    "agent_mesh_overview": {
+      "name": "text",
+      "host": "text",
+      "harness": "text",
+      "status": "text",
+      "status_text": "text",
+      "last_seen_ts": "double precision",
+      "last_turn_ts": "double precision",
+      "lease_expires_ts": "double precision",
+      "unread": "bigint",
+      "passive_unread": "bigint"
+    },
+    "mesh_keys": {
+      "name": "text",
+      "holder": "text",
+      "public_key": "text",
+      "public_key_fingerprint": "text",
+      "key_role": "text",
+      "key_updated_at": "timestamp with time zone",
+      "key_revoked_at": "timestamp with time zone"
+    },
+    "mesh_approvals_status": {
+      "id": "bigint",
+      "unconsumed": "boolean",
+      "unexpired": "boolean",
+      "key_known": "boolean",
+      "key_live": "boolean",
+      "key_matches": "boolean",
+      "expires_ts": "double precision",
+      "key_is_owner": "boolean"
+    }
+  }
+}
