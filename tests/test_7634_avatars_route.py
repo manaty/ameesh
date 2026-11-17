@@ -20,7 +20,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import alert_briefs, avatars, config, mail, notify, registry
+from ameesh import (alert_briefs, avatars, canon as canon_mod, config, debit,
+                    mail, notify, registry)
 
 from .support import PgTestCase
 
@@ -85,6 +86,23 @@ class AvatarCanonTest(_CanonCase):
     def test_un_responsable_sans_membre_ne_fait_pas_un_avatar(self):
         self.avatar("bureau", human="inconnu")
         self.assertEqual(avatars.configured(self.cfg), {})
+
+    def test_les_routes_humaines_du_debit_lisent_canon_et_registre(self):
+        """#7634 : le nom historique n'est une route que lu au runtime."""
+        self.avatar("bureau")
+        canons = canon_mod.load_configured(self.cfg)
+        rows = [{"name": "bureau", "responsible": "human:smichea",
+                 "mode": "externe"}]
+        self.assertEqual(debit.human_route_names(self.cfg, rows, canons),
+                         {"bureau"})
+        # sans canon, le `report` configuré et le `responsible` du registre
+        # suffisent ; un agent externe non rattaché n'entre pas.
+        cfg = dataclasses.replace(
+            self.cfg, canon="",
+            release={"projects": {"ameesh": {"report": "bureau"}}})
+        self.assertEqual(debit.human_route_names(cfg, rows, []), {"bureau"})
+        self.assertEqual(debit.human_route_names(
+            cfg, [{"name": "bureau2", "mode": "externe"}], []), set())
 
 
 class NotifyAvatarRouteTest(PgTestCase):
