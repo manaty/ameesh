@@ -291,7 +291,10 @@ class WatchTest(PgTestCase):
         self.assertIn("information was deposited", watch.send(self.here, self.db, "w121"))
         [note] = [m for m in storage.of(self.db).mailbox.unread("w121", 200)
                   if m["sender"] == "veille"]
-        self.assertEqual(note["payload"], {"info": True})
+        self.assertEqual(note["payload"]["info"], True)
+        # #7625 : le compte rendu est marqué pour la fenêtre des doublons.
+        self.assertEqual(note["payload"]["report"], "info")
+        self.assertTrue(note["payload"]["report_fingerprint"])
         self.assertEqual(note["body"], watch.UNCHANGED_TEXT % "w121")
         self.assertNotEqual(note["body"], watch.consigne("w121"))
         self.assertEqual(storage.of(self.db).watches.list("w121")[0]["last_reading"], first)

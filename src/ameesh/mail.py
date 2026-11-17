@@ -17,6 +17,7 @@ Le SQL est dans le stockage (`storage.of(db).mailbox`, spec §10).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -39,6 +40,90 @@ MAIL_COLUMNS = _pg.MAIL_COLUMNS
 
 #: #3892 : forme d'une clé d'idempotence d'envoi (stable, du client)
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+
+#: #7625 : fenêtre d'un compte rendu identique au même destinataire. Un
+#: compte rendu (rapport d'état, « rien à faire », note de veille) ne repart
+#: pas avant cette fenêtre ; au-delà, c'est un rappel.
+REPORT_REMIND_S = 6 * 3600.0
+#: #7625 : messages relus pour retrouver le compte rendu précédent. Une boîte
+#: plus chargée que cela en 6 h garde le comportement d'avant (un envoi).
+REPORT_SCAN = 200
+#: #7625 : forme d'une étiquette de compte rendu (`report`)
+_REPORT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,120}$")
+
+
+def report_digest(body: str) -> str:
+    """#7625 : l'empreinte du contenu d'un compte rendu (le texte exact)."""
+    return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+
+
+def report_last(db: Db, sender: str, recipient: str, report: str,
+                fingerprint: str, *, now: float | None = None,
+                limit: int = REPORT_SCAN) -> float | None:
+    """#7625 : l'heure du dernier compte rendu identique encore dans la fenêtre.
+
+    Un compte rendu est identifié par son étiquette (`report`, rangée dans
+    `payload.report`) et par l'empreinte de son contenu
+    (`payload.report_fingerprint`) : deux textes différents sont deux comptes
+    rendus différents, même sous la même étiquette. Rend l'heure du dernier
+    envoi s'il date de moins de `REPORT_REMIND_S`, sinon None (le compte
+    rendu est dû).
+
+    Lecture seule et tolérante : une source illisible ou un exécuteur médié
+    (contrat fermé) ne supprime jamais un envoi — None, comme un compte rendu
+    dû. La fenêtre est glissante : l'heure du message fait foi, pas une
+    tranche d'horloge, si bien qu'un rappel ne part jamais moins de six heures
+    après le précédent.
+    """
+    now = time.time() if now is None else float(now)
+    if not report or not fingerprint:
+        return None
+    from .agent_names import resolve as resolve_agent_name
+    try:
+        if storage.is_remote(db):
+            return None
+        sender = resolve_agent_name(sender, db=db, operation="mail.report")
+        recipient = resolve_agent_name(recipient, db=db, operation="mail.report")
+        rows = storage.of(db).mailbox.history(recipient, int(limit))
+    except Exception:  # noqa: BLE001 — une lecture qui échoue ne supprime rien
+        return None
+    last = None
+    for row in rows:
+        try:
+            ts = float(row.get("created_ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0 or ts < now - REPORT_REMIND_S:
+            continue
+        charge = row.get("payload")
+        if isinstance(charge, str):
+            try:
+                charge = json.loads(charge)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(charge, dict):
+            continue
+        if (str(row.get("sender") or "") == sender
+                and charge.get("report") == report
+                and charge.get("report_fingerprint") == fingerprint):
+            last = ts if last is None else max(last, ts)
+    return last
+
+
+def report_due(db: Db, sender: str, recipient: str, report: str,
+               fingerprint: str, *, now: float | None = None,
+               limit: int = REPORT_SCAN) -> bool:
+    """#7625 : ce compte rendu est-il dû (aucun identique dans la fenêtre) ?"""
+    return report_last(db, sender, recipient, report, fingerprint, now=now,
+                       limit=limit) is None
+
+
+def _report_label(report: str) -> str:
+    """Normalise et vérifie une étiquette de compte rendu (#7625)."""
+    label = str(report or "").strip()
+    if not _REPORT_LABEL_RE.match(label):
+        raise ValueError("invalid report label: %r" % (report,))
+    return label
 
 
 def _replay_id(mailbox, message_id: int, body: str, work_item_id: str | None,
@@ -81,7 +166,9 @@ def send(
     thread_meta: dict | None = None,
     after_commit: list | None = None,
     idempotency_key: str | None = None,
-) -> int:
+    report: str | None = None,
+    report_fingerprint: str | None = None,
+) -> int | None:
     """Dépose un message pour UN destinataire, l'écrit dans son fil. Renvoie son id.
 
     Les champs `signed_*` viennent de `authority.sign_message` : un message
@@ -107,10 +194,35 @@ def send(
     exécuteur médié qui n'a pas cette lecture préalable. Une clé réutilisée
     pour un autre corps ou un autre lot est refusée (`ValueError`), jamais
     rendue comme envoyée.
+
+    #7625 : un compte rendu (`report`, ou le marqueur `payload.report` posé
+    par son producteur) identique au précédent pour ce destinataire ne repart
+    pas avant `REPORT_REMIND_S` ; le message n'est alors pas déposé et le
+    rendu est None. L'empreinte est celle du contenu (`report_fingerprint`,
+    par défaut le corps) : un texte changé part tout de suite. Le marqueur
+    (`payload.report` et `payload.report_fingerprint`) est posé par ce module.
+    `idempotency_key` l'emporte : un envoi déjà dédoublonné par sa clé n'est
+    pas réévalué.
     """
     from .agent_names import resolve as resolve_agent_name
     sender = resolve_agent_name(sender, db=db, operation="mail.send")
     recipient = resolve_agent_name(recipient, db=db, operation="mail.send")
+    if report is None and isinstance(payload, dict):
+        # Seul un producteur qui nomme son compte rendu est dédoublonné :
+        # `info` marque un courrier passif, pas forcément un état inchangé.
+        report = payload.get("report")
+    if report is not None:
+        report = _report_label(report)
+        fingerprint = str(
+            report_fingerprint
+            or (payload or {}).get("report_fingerprint")
+            or report_digest(body))
+        if idempotency_key is None and not report_due(
+                db, sender, recipient, report, fingerprint):
+            return None
+        payload = dict(payload or {})
+        payload["report"] = report
+        payload["report_fingerprint"] = fingerprint
     if idempotency_key is not None:
         idempotency_key = str(idempotency_key).strip()
         if not _IDEMPOTENCY_KEY_RE.match(idempotency_key):

@@ -745,6 +745,26 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         payload["ack"] = True
     if passif_info:
         payload["info"] = True
+    if not passif_info and not urgent and not sign:
+        # #7625 : `veille` est une identité d'émission de système (minuteries
+        # de veille, unités héritées). Ses messages sont des comptes rendus
+        # périodiques : le même texte au même destinataire ne repart pas avant
+        # `mail.REPORT_REMIND_S`, sinon la minuterie réveille l'agent pour
+        # rien. Un texte changé, une urgence ou un message signé passent.
+        from . import watch as watch_mod
+        if sender == watch_mod.SENDER:
+            payload.setdefault("report", "veille")
+    # Le dépôt garde la garde (course entre deux minuteries) ; ce contrôle
+    # évite seulement d'annoncer « delivered » pour un compte rendu supprimé.
+    if payload.get("report") and dest != "all" and bk.kind == "pg":
+        try:
+            if not mail.report_due(bk.db, sender, dest, payload["report"],
+                                   mail.report_digest(text)):
+                print("identical report to %s within %d h: not sent"
+                      % (dest, int(mail.REPORT_REMIND_S // 3600)))
+                return 0
+        except Exception:  # noqa: BLE001 — une lecture qui échoue ne retient rien
+            pass
     if request_expires is not None:
         # #2814 : échéance de REQUÊTE explicite, distincte de la TTL de
         # signature (`--expires`). Absolue en base, pour ne pas dépendre de
