@@ -1484,7 +1484,7 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
             else os.path.join(session_dir(cfg), name)
         waiting = decisions.pending(db, human=human)
         # L233: decisions written in prose in mail, to offer converting them
-        allowed = decisions.prose_recipients(db) + (human, decisions.OWNER_ANY)
+        allowed = decisions.prose_route(human, db, cfg=cfg)
         prose = [p for p in decisions.prose_decisions(db)
                  if p["recipient"] in allowed]
         prompt = instruction(human, name)

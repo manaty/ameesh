@@ -115,6 +115,33 @@ def human_of(cfg, name: str | None) -> str | None:
     return by_name(cfg).get(str(name))
 
 
+def configured_desks(cfg, human: str | None, rows=(), project=None) -> list[str]:
+    """Les agents configurés comme route d'un humain, sans avatar déclaré.
+
+    La configuration de release nomme son destinataire (`release.projects.*
+    .report`, le bureau pour ameesh). Un agent n'est retenu que si le registre
+    le dit `responsible` DE CET humain : le mode `externe` seul ne fait pas une
+    route, et la session d'un autre humain ne reçoit jamais son courrier
+    (#7634, relecture cx1 B1). `project` restreint au projet de l'alerte."""
+    if not human:
+        return []
+    release = getattr(cfg, "release", None) or {}
+    projects = (release.get("projects") or {}) if isinstance(release, dict) else {}
+    if project and project in projects:
+        chosen = [projects.get(project)]
+    else:
+        chosen = list(projects.values())
+    by_name = {str(row.get("name")): row for row in rows or ()
+               if (row or {}).get("name")}
+    found = []
+    for entry in chosen:
+        report = str((entry or {}).get("report") or "")
+        row = by_name.get(report)
+        if report and row is not None and row.get("responsible") == str(human):
+            found.append(report)
+    return list(dict.fromkeys(found))
+
+
 def from_canons(canons_list) -> dict[str, str]:
     """Comme :func:`configured`, sur une liste de canons déjà chargée."""
     merged: dict[str, str] = {}
