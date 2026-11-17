@@ -3796,8 +3796,8 @@ class Notifier:
                 thread_desks = ([str(avatar)] if avatar and "avatar" in human_targets
                                 else [])
                 thread_desks += [str(name) for name in human_targets
-                                 if name not in ("assignee", "pilot", "auditeur",
-                                                 "avatar")]
+                                 if name not in ("assignee", "pilot",
+                                                 alert_briefs.AUDITOR_NAME, "avatar")]
                 for name in dict.fromkeys(thread_desks):
                     row = by_name.get(name)
                     if row is None or row.get("mode") != "externe":
