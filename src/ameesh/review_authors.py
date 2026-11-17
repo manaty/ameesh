@@ -106,6 +106,8 @@ reçu exact contradictoire est une erreur, pas une absence.
 """
 from __future__ import annotations
 
+import json
+
 import codecs
 import contextlib
 import contextvars
@@ -1301,6 +1303,7 @@ def _is_ancestor(repo: str, before: str, after: str, cache=None) -> Optional[boo
 
 
 def _present_commits(repo: str, shas: Sequence[str], *,
+                     non_commits: Optional[set[str]] = None,
                      timeout: Optional[float] = None) -> Optional[dict[str, str]]:
     """Les SHA de commits présents **localement**, en une seule commande git.
 
@@ -1308,6 +1311,8 @@ def _present_commits(repo: str, shas: Sequence[str], *,
     reçu ; 500 reçus prenaient ~40 s, au-delà du budget de 60 s du balayage en
     CI. `cat-file --batch-check` lit la présence des objets en un passage, sans
     fetch paresseux (magasin sans remote), et rend `{sha: sha complet}`.
+    `non_commits`, si fourni, reçoit les objets résolus de type blob, tree
+    ou tag (#7618) ; les objets absents ou ambigus restent non concluants.
     `None` quand la lecture échoue : la preuve locale reste non concluante.
     """
     wanted = list(dict.fromkeys(str(sha).lower() for sha in shas or ()
@@ -1332,6 +1337,9 @@ def _present_commits(repo: str, shas: Sequence[str], *,
         fields = line.split()
         if len(fields) == 2 and fields[1] == "commit":
             present[rev] = fields[0].lower()
+        elif (len(fields) == 2 and fields[1] in {"blob", "tree", "tag"}
+              and non_commits is not None):
+            non_commits.add(rev)
     return present
 
 
@@ -4316,7 +4324,7 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
         return None
 
 
-def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> str:
+def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> Optional[str]:
     """Le SHA complet d'un commit cité **abrégé**, résolu par la forge (#7252).
 
     Le correctif d'un relecteur retiré par un push forcé n'est plus dans la
@@ -4326,7 +4334,8 @@ def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> 
     devenu pendant (`repos/<slug>/commits/<token>`), et rend le SHA complet ;
     `_forge_fetch` rapatrie ensuite l'objet exact pour les contrôles de
     topologie. Rend `""` sans forge, sur réponse illisible ou sur échéance :
-    un doute, jamais une exclusion silencieuse.
+    un doute, jamais une exclusion silencieuse. `None` désigne uniquement
+    une réponse HTTP 404/422 disant explicitement « No commit found ».
     """
     token = str(token or "").strip()
     if not repo or not token:
@@ -4347,7 +4356,15 @@ def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> 
 
         client = plan_github.client(timeout=bound, caller="review-authors")
         data = client.get("repos/%s/commits/%s" % (slug, token))
-    except Exception:  # noqa: BLE001 - forge injoignable ou muette : doute
+    except Exception as exc:  # noqa: BLE001 - forge injoignable : doute
+        if (isinstance(exc, plan_github.GithubError)
+                and exc.status in {404, 422}):
+            try:
+                message = json.loads(exc.body).get("message", "")
+            except (ValueError, TypeError, AttributeError):
+                message = ""
+            if str(message).lower().startswith("no commit found for sha:"):
+                return None
         return ""
     full = str((data or {}).get("sha") or "").strip().lower() \
         if isinstance(data, Mapping) else ""
@@ -5664,7 +5681,9 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         if not cited:
             return {}
         check()
-        present = _present_commits(repo, sorted(cited), timeout=remaining())
+        non_commits: set[str] = set()
+        present = _present_commits(repo, sorted(cited),
+                                   non_commits=non_commits, timeout=remaining())
         check()
         found: dict[str, dict] = {}
 
@@ -5688,6 +5707,11 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             full = (_read_local_commit(repo, token) if present is None
                     else present.get(token))
             if not full:
+                # #7618 : un objet explicitement non commit ne prouve aucun
+                # correctif. Toute citation absente reste à résoudre, même
+                # numérique : un abrégé Git peut ne contenir que des chiffres.
+                if token in non_commits:
+                    continue
                 # #7252 B/P2 auditeur : le commit réécrit a disparu du clone
                 # (push forcé). La forge le résout par l'abrégé, puis sert
                 # l'objet exact pour les contrôles de topologie. Forge muette :
@@ -5700,6 +5724,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     cite_doubt(token, citing, reason="not-prefetched")
                     continue
                 resolved = _forge_commit(repo, token, timeout=remaining())
+                if resolved is None and token.isdecimal():
+                    continue  # #7618 : numéro dont la forge prouve l’absence
                 if not resolved:
                     cite_doubt(token, citing)
                     continue
