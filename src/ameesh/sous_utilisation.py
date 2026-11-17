@@ -645,8 +645,11 @@ def row_roles(row) -> list:
     named = (row or {}).get("roles")
     if isinstance(named, str):
         named = [named]
-    elif not (isinstance(named, (list, tuple))
-              and all(isinstance(role, str) for role in named)):
+    elif isinstance(named, (list, tuple)) \
+            and all(isinstance(role, str) for role in named):
+        # même contrat que `_card_roles` : `roles: []` ne masque pas `role:`
+        named = list(named) or None
+    else:
         named = None
     if named is None:
         single = (row or {}).get("role")
