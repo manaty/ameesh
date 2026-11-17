@@ -1,15 +1,18 @@
 # External module public contract, version 1
 
 Contract revision: **1.2, 17 November 2026** (additive E1a snapshot, E1b
-observation, E2a mail submission and history, E3a session policy, module schema
-and migrations snapshot). Scope: an installed external module and its client
-processes. Reference: [#5827](https://github.com/manaty/ameesh/issues/5827),
+observation, E2a mail submission and history, E3a session policy, E3b bounded
+deferral observation, module schema and migrations snapshot). Scope: an
+installed external module and its client processes. Reference:
+[#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
-Revision 1.1 adds the read-only agent observation (CLI `ameesh agent observe`,
-HTTP `/api/v1/agents/{agent}/observation`); it is additive to revision 1.0.
+Revision 1.1 adds the E1a canon/directory snapshot and the read-only agent
+observation (tranche E1b; CLI `ameesh agent observe`, HTTP
+`/api/v1/agents/{agent}/observation`); it is additive to revision 1.0.
 Revision 1.2 adds the Python mail submission and history surface (tranche E2a,
-#7671), the declarative per-agent session policy (tranche E3a, #7674) and the
-module schema/migrations snapshot; all are additive to revision 1.1.
+#7671), the declarative per-agent session policy (tranche E3a, #7674), the
+bounded deferral observation and native qualification (tranche E3b, #7675) and
+the module schema/migrations snapshot; all are additive to revision 1.1.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -36,6 +39,10 @@ surface becomes available only in a released version that implements it and
 lists it in this contract. Clients check that version before enabling it.
 In particular, the baseline here is ameesh commit
 `aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007`; an open PR is not an installed feature.
+The revision 1.1 elements (#7669 E1a, #7670 E1b) and revision 1.2 elements
+(#7671 E2a, #7674 E3a, #7675 E3b) are available only in a released version
+that carries those lots; at the 1.0 baseline they are absent, and a consumer
+must still treat their absence as "unknown", never as permission.
 
 The weekly stable channel and single consumer pin are specified by
 [#7666 / #5858](https://github.com/manaty/ameesh/issues/5858).
@@ -58,8 +65,9 @@ release's `--help`. These entry points cover the module integration:
 | `ameesh canon snapshot --expect-commit SHA --json` | [E1a immutable canon/directory snapshot](canon-snapshot-v1.md), available in the release containing #7669 / #5862. No database access or registry admission; profile/lease preparation remains E1b. |
 | `agent-runner --agents-file FILE` | Dynamic admission filter; [format and withdrawal](../RUNNER-ADMISSION.md). It narrows canon admission, never grants authority. |
 | `ameesh turn current --json [--expect-turn ID]` | Current turn's versioned authorization document, with identity and database recheck. `--local` omits the database recheck and must not be treated as proof of a live lease. |
-| `ameesh turn observe (--turn ID \| --request ID) --json` | Read-only `ameesh-turn-observation/1`: request, turn, accounting and quiescence. Absence of a known cost is not zero cost. |
+| `ameesh turn observe (--turn ID \| --request ID) --json` | Read-only `ameesh-turn-observation/1`: request, turn, accounting, bounded deferral and quiescence. Absence of a known cost is not zero cost. |
 | `ameesh agent observe AGENT [--account-profile NAME] [--json]` | Read-only `ameesh-agent-observation/1`: admitted canon/placement references, responsible, live lease owner/epoch, declared and effective bounds, redacted provider budget and native turn/sandbox references. One repeatable-read snapshot; no claim, reservation, settlement, dispatch or canon synchronization. A missing fact is `null` plus a code in `missing`, never permission or zero cost. |
+| `ameesh list --json`, `ameesh show --json` | `ameesh-agents/1`: the same bounded `deferral` block (revision 1.2, #7675), closed reasons; its absence or `null` is not permission to run. |
 | `agent-mail send`, `agent-mail show` | Ordinary governed mail. The help documents flags and stdin. These commands alone do not provide IMA's atomic request/reply/deduplication protocol (E2). |
 | `ameesh migrate --dry-run --additive-only` | Core migration classification; the module does not import or invoke the migration implementation. Actual application retains its operator and staging gates. |
 | `ameesh action propose\|approve\|execute\|reconcile` | Governed action lifecycle; external connector availability is conditional on #7628, below. |
@@ -84,7 +92,7 @@ a limit. Only the methods described there are public.
 | Identity and fleet | `/me`, `/agents`, `/agents/{agent}`, `/hosts`, `/hosts/{host}`, `/projects` |
 | Work and progress | `/lots`, `/lots/{id}`, `/lots/{id}/assign`, `/projects/{project}/progress`, `/projects/{project}/timeline` |
 | Agent interaction | `/agents/{agent}/chat`, `/agents/{agent}/messages`, `/agents/{agent}/peek`, and the documented interrupt/pause/resume/stop methods |
-| Observation | `/agents/{agent}/observation`, `/requests/{request}`, `/turns/{turn}`, `/sandbox/turns`, `/sandbox/turns/{turn}`, `/events` |
+| Observation | `/agents/{agent}/observation`, `/requests/{request}`, `/turns/{turn}`, `/sandbox/turns`, `/sandbox/turns/{turn}`, `/events`; `/agents` and `/agents/{agent}` also carry the bounded `deferral` block |
 | Governance | `/budget`, `/budget/caps`, `/decisions`, `/alerts`, `/alerts/{key}/ack`, `/actions/{action}/approval-request` |
 | Threads | `/threads/{project}`, `/threads/{project}/{lot}` |
 
@@ -223,16 +231,30 @@ core's responsibility. The optional `harness` argument of the internal
 applies to every harness.
 
 IMA's per-document fresh-session policy is covered by this declarative
-surface. Its remaining refusal diagnostics, prepared native profile (E1b) and
-lease-bound replay requirements (E2c) remain inventoried in the mapping and
-are not available runner hooks. Until those gaps are delivered, IMA's
-remaining adaptations stay tracked by its
+surface. The remaining gap is the lease-bound replay requirement (tranche
+E2c), inventoried in the mapping and not available as a runner hook. Until it
+is delivered, IMA's remaining adaptation stays tracked by its
 [#1803](https://github.com/thepackengers/issue-manager-agent/issues/1803),
 rather than acquiring compatibility guarantees for private methods.
 
+### Bounded deferral observation and native qualification (E3b, #7675)
+
+Revision 1.2 (#7675, E3b) adds two **optional** resource-policy keys for a
+bounded `own_cgroup`: `max_cgroup_cpu_used` (CPU used against the `cpu.max`
+quota) and `max_cgroup_throttled_periods` (share of CPU periods with a
+throttled task). Neither has a default: absent means unwatched, and no existing
+Host fiche changes verdict. The corresponding observation is the bounded
+`ameesh-deferral/1` block ([contract](deferral-observation-v1.md)), whose
+closed reasons replace private diagnostics parsing. The
+[qualification note](../design/7675-native-pressure-admission-qualification.md)
+records the parity witness, including the retained authority of accounting
+when the ledger is ambiguous. The native admission lock is qualified as-is: no
+permanent document priority class and no `_tx_lock` replacement are part of
+this contract.
+
 ## Mail submission and history (Python)
 
-Contract 1.1 adds the first write surface for a module that already holds the
+Contract 1.2 adds the first write surface for a module that already holds the
 deployment's database identity: `ameesh.public.mail`. This is the replacement
 for direct `agent_mailbox` submission and history SQL (mapping E2a); the
 governed `agent-mail` commands and the HTTP boundary above remain the public
@@ -242,7 +264,7 @@ that runs under a mesh runner must use the identity that runner verified; a
 module service with no declared runner identity keeps the actor it names.
 Mediated executor connections are refused — their contract is separate.
 
-Enable the surface only when `ameesh.public.CONTRACT_VERSION` is `"1.1"` or a
+Enable the surface only when `ameesh.public.CONTRACT_VERSION` is `"1.2"` or a
 compatible later minor.
 
 | Element | Contract |

@@ -607,7 +607,7 @@ class Mailbox(interface.Mailbox):
 
     def history_page(self, actor, *, peer=None, after_id=None, limit=100,
                      since_ts=None, until_ts=None, kind=None) -> list[dict]:
-        """Contrat public 1.1 (E2a) : voir `interface.Mailbox.history_page`.
+        """Contrat public 1.2 (E2a) : voir `interface.Mailbox.history_page`.
 
         Le curseur est l'id, stable quand de nouveaux messages arrivent ; la
         page est rendue du plus ancien au plus récent. Le filtre de périmètre

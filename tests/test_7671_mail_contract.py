@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#7671 — contrat public 1.1, E2a : courrier typé, idempotent et borné.
+"""#7671 — contrat public 1.2, E2a : courrier typé, idempotent et borné.
 
 Le banc vérifie la surface ``ameesh.public.mail`` telle que le contrat écrit
 la décrit (`docs/api/module-contract-v1.md`) : soumission typée, clé
@@ -599,7 +599,7 @@ class HistoryTest(PublicMailBase):
 
 class ContractSurfaceTest(unittest.TestCase):
     def test_version_and_exported_surface(self):
-        self.assertEqual(public_mail.CONTRACT_VERSION, "1.1")
+        self.assertEqual(public_mail.CONTRACT_VERSION, "1.2")
         self.assertEqual(public_mail.MAX_BATCH, 50)
         self.assertEqual(public_mail.MAX_HISTORY, 200)
         for name in ("Submission", "Receipt", "HistoryEntry", "HistoryPage",

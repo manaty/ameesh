@@ -203,6 +203,9 @@ def _annotate_agents(cfg: Config, db, rows: list, *, sees=None) -> list:
         # sans décoder le texte français (`ameesh-agents/1`,
         # `GET /api/v1/agents`) ; None hors d'une attente de pression.
         row["queue"] = _queue_of(row)
+        # E3b (#7675): same block as `show`, for `/api/v1/agents` and list.
+        from . import deferral_observation
+        row.setdefault("deferral", deferral_observation.classify(row))
     return rows
 
 
@@ -234,6 +237,9 @@ def agent_detail(db, name: str, *, cfg=None, footprint: bool = False, sees=None)
     row["paused_on_budget"] = progress.paused_on_budget(row)
     # #2814 : même objet `queued` que `ameesh list --json`
     row["queue"] = _queue_of(row)
+    # E3b (#7675): the closed bounded deferral block of `ameesh show --json`.
+    from . import deferral_observation
+    row["deferral"] = deferral_observation.classify(row)
     from . import sandbox_observation
     row['sandbox'] = sandbox_observation.current_agents(db, [name], sees=sees).get(name)
     row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
@@ -809,13 +815,28 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 tag("pressure_scope") if fiches else "",
                 scope_note))
             if limits.get("pressure_scope") == "own_cgroup":
-                print("  thresholds cgroup memory ≤ %s%s; cgroup throttled ≤ %s%s"
-                      % (res.fmt_value("max_cgroup_memory_used",
-                                       limits.get("max_cgroup_memory_used")),
-                         tag("max_cgroup_memory_used"),
-                         res.fmt_value("max_cgroup_throttled",
-                                       limits.get("max_cgroup_throttled")),
-                         tag("max_cgroup_throttled")))
+                # #7675: the two IMA-era measures are optional (no default);
+                # print them only when a Host fiche declares them.
+                parts = ["cgroup memory ≤ %s%s"
+                         % (res.fmt_value("max_cgroup_memory_used",
+                                          limits.get("max_cgroup_memory_used")),
+                            tag("max_cgroup_memory_used")),
+                         "cgroup throttled ≤ %s%s"
+                         % (res.fmt_value("max_cgroup_throttled",
+                                          limits.get("max_cgroup_throttled")),
+                            tag("max_cgroup_throttled"))]
+                if limits.get("max_cgroup_cpu_used") is not None:
+                    parts.append("cgroup CPU used ≤ %s%s"
+                                 % (res.fmt_value("max_cgroup_cpu_used",
+                                                  limits["max_cgroup_cpu_used"]),
+                                    tag("max_cgroup_cpu_used")))
+                if limits.get("max_cgroup_throttled_periods") is not None:
+                    parts.append("cgroup throttled periods ≤ %s%s"
+                                 % (res.fmt_value(
+                                     "max_cgroup_throttled_periods",
+                                     limits["max_cgroup_throttled_periods"]),
+                                    tag("max_cgroup_throttled_periods")))
+                print("  thresholds " + "; ".join(parts))
             if limits.get("max_cpu_pressure") is not None:
                 print("  thresholds CPU pressure ≤ %s%s"
                       % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
@@ -844,6 +865,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 if cgroup.get("throttled") is not None:
                     parts.append("throttled %s" % res.fmt_value(
                         "max_cgroup_throttled", cgroup["throttled"]))
+                if cgroup.get("cpu_used_ratio") is not None:
+                    parts.append("CPU used %s of quota" % res.fmt_value(
+                        "max_cgroup_cpu_used", cgroup["cpu_used_ratio"]))
+                if cgroup.get("throttled_periods") is not None:
+                    parts.append("throttled periods %s" % res.fmt_value(
+                        "max_cgroup_throttled_periods",
+                        cgroup["throttled_periods"]))
                 if cgroup.get("cpu_some") is not None:
                     parts.append("CPU PSI %.1f %%" % cgroup["cpu_some"])
                 if cgroup.get("mem_some") is not None:

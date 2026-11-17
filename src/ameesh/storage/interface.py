@@ -1850,7 +1850,7 @@ class Mailbox(Domain):
                      after_id: int | None = None, limit: int = 100,
                      since_ts: float | None = None, until_ts: float | None = None,
                      kind: str | None = None) -> list[dict]:
-        """Contrat public 1.1 (E2a) : page d'historique du périmètre de `actor`.
+        """Contrat public 1.2 (E2a) : page d'historique du périmètre de `actor`.
 
         Messages où `actor` est expéditeur OU destinataire, du plus ancien au
         plus récent par id, strictement après `after_id`. `peer` restreint à la

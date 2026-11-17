@@ -1260,6 +1260,30 @@ export interface components {
                 request?: number | null;
                 turn?: string | null;
             };
+            deferral?: {
+                age_s: number | null;
+                queue?: {
+                    capacity: string | null;
+                    critical: boolean;
+                    detail: string;
+                    host: string;
+                    queued_s: number | null;
+                    /** @constant */
+                    reason: "pressure";
+                    retry_s: number | null;
+                    /** @enum {unknown} */
+                    scope: "own_cgroup" | "host";
+                    /** @constant */
+                    state: "queued";
+                } | null;
+                /** @enum {unknown} */
+                reason: "operator" | "pressure" | "authentication" | "provider_credits" | "budget" | "account" | "account_window" | "session" | "database" | "host" | "workdir" | "shutdown" | "restart" | "other";
+                /** @constant */
+                schema: "ameesh-deferral/1";
+                since_ts: number | null;
+                /** @enum {unknown} */
+                state: "deferred";
+            } | null;
             lease: {
                 epoch: number | null;
                 expires_ts: number | null;
