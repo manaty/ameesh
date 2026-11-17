@@ -79,6 +79,7 @@ class StackCase(unittest.TestCase):
                    "        root = pathlib.Path(__file__).resolve().parents[1]\n"
                    "        self.assertEqual(\n"
                    "            (root / 'VALUE.txt').read_text().strip(), '1')\n")
+        self.write("tests/test_own_b.py", "# témoin #7239, joué par un faux run\n")
         self.base = self.commit("base")
         self.unit_a = self.commit_unit("a", "docs/a.md", "a\n")
         self.unit_b = self.commit_unit("b", "VALUE.txt", "2\n")
@@ -390,9 +391,15 @@ class CheckLocalTestsTest(StackCase):
         self.git("checkout", "-q", self.unit_c)
 
     def check(self, *, run_tests=None, attribute=None, own=None,
-              contracts=None):
+              contracts=None, neighbors=None):
         own = {1: ["tests.test_own_a"], 2: []} if own is None else own
         contracts = [] if contracts is None else list(contracts)
+        # #7740 : le rouge n'est plus vu sur la tête par la série de l'unité 1,
+        # mais par la série de l'unité 2 sur son préfixe, où son empreinte
+        # (VALUE.txt) sélectionne le test de l'unité 1.
+        if neighbors is None:
+            neighbors = {2: [{"module": "tests.test_own_a", "reason": "carte",
+                              "files": ["VALUE.txt"]}]}
         attribution = attribute or (lambda _worktree, _composition, failures: {
             "status": "ok", "tests": [{
                 "test": failures[0]["test"], "status": "probable",
@@ -402,8 +409,11 @@ class CheckLocalTestsTest(StackCase):
         patches = [
             mock.patch.object(paquet_auto, "project_python",
                               return_value=sys.executable),
+            mock.patch.object(paquet_auto, "unit_test_candidates",
+                              side_effect=lambda _w, unit, _paths=None:
+                              own.get(unit.lot, [])),
             mock.patch.object(paquet_auto, "unit_test_modules",
-                              side_effect=lambda _w, unit: own.get(unit.lot, [])),
+                              side_effect=lambda _w, unit, **_k: own.get(unit.lot, [])),
             mock.patch.object(paquet_auto, "contract_modules",
                               return_value=contracts),
         ]
@@ -415,7 +425,7 @@ class CheckLocalTestsTest(StackCase):
                 stack.enter_context(patch)
             return paquet_auto.check_local_tests(
                 self.repo, self.composition, timeout=30, base_sha=self.base,
-                select=lambda *_a: ({}, ""), attribute=attribution,
+                select=lambda *_a: (neighbors, ""), attribute=attribution,
                 parallel=1, log=lambda _line: None)
 
     def test_unite_en_tete_innocente_devant_la_fautive(self) -> None:
@@ -425,7 +435,9 @@ class CheckLocalTestsTest(StackCase):
         self.assertEqual(faulty, [2])
         self.assertEqual([removal.lot for removal in removals], [2])
         self.assertEqual(removals[0].proof, "prefixes")
-        self.assertIn("préfixe base+u2", removals[0].evidence[0])
+        # #7740 : la série de l'unité 2 voit le rouge sur son propre préfixe ;
+        # le rejeu des préfixes le situe au même endroit.
+        self.assertIn("premier rouge à #2", removals[0].evidence[0])
         self.assertNotIn(1, faulty)
 
     def test_rouge_sous_charge_vert_au_rejeu_est_instable(self) -> None:

@@ -85,7 +85,8 @@ class PartDeBorneTest(unittest.TestCase):
 
 
 class PartageDeBorneTest(unittest.TestCase):
-    """#4887 : la part de chaque série, puis le rouge direct d'un lot tardif."""
+    """#4887/#7740 : la série directe garde sa borne entière ; seule la borne
+    totale (temps mural) peut la couper, et un lot tardif reste atteint."""
 
     def local(self, lots, run, **kwargs):
         composition = _composition(lots)
@@ -96,13 +97,14 @@ class PartageDeBorneTest(unittest.TestCase):
             return run(label, modules, timeout=timeout)
 
         with mock.patch.object(paquet_auto, "unit_test_modules",
-                               side_effect=lambda _w, unit: ["tests.test_u%d" % unit.lot]), \
+                               side_effect=lambda _w, unit, **_k: [
+                                   "tests.test_u%d" % unit.lot]), \
                 mock.patch.object(paquet_auto, "contract_modules",
                                   return_value=["tests.test_contrat"]), \
-                mock.patch.object(paquet_auto.shutil, "which", return_value="/bin/ameesh"), \
+                mock.patch.object(paquet_auto.shutil, "which", return_value=None), \
                 mock.patch.object(paquet_auto, "run_tests", side_effect=fake):
             return paquet_auto.check_local_tests(
-                pathlib.Path("."), composition, timeout=900, parallel=2,
+                pathlib.Path("."), composition, timeout=900, parallel=1,
                 select=lambda *_: ({}, ""), attribute=lambda *_a: {
                     "status": "no-helper", "tests": [], "why": "banc"},
                 log=lines.append, **kwargs)
@@ -110,27 +112,28 @@ class PartageDeBorneTest(unittest.TestCase):
     def setUp(self) -> None:
         self.calls: list[tuple[str, int, int | None]] = []
 
-    def test_part_de_borne_fait_partir_chaque_lot(self) -> None:
+    def test_chaque_serie_directe_garde_sa_borne(self) -> None:
         clock = [1000.0]
 
         def run(label, modules, *, timeout):
-            clock[0] += timeout       # la série consomme toute sa part
+            # La première série consomme presque toute la borne totale : avec
+            # la part #4887, les suivantes ne partaient plus.
+            clock[0] += 800 if label == "unité #1" else 10
             return _green(label, modules)
 
         with mock.patch.object(paquet_auto.time, "monotonic",
                                side_effect=lambda: clock[0]):
             runs, faulty, _ = self.local((1, 2, 3), run,
-                                         deadline=1000.0 + 120)
-        # 4 séries, 2 à la fois : 60 s, puis 30 s, puis 30 s ; les contrats
-        # tombent à l'échéance. Sans part, la première prenait les 120 s et les
-        # deux autres ne partaient jamais.
-        # 120 s, réserve de 30 s pour les rejeux : 90 s utiles sur 2 vagues
-        # (45, puis 22 sur les 3 séries restantes, puis 23) ; les contrats
-        # tombent sur la réserve seule et ne partent pas.
-        self.assertEqual([(label, limit) for label, limit, _wall in self.calls],
-                         [("unité #1", 45), ("unité #2", 22),
-                          ("unité #3", 23)])
-        self.assertTrue(all(wall is not None for _label, _limit, wall in self.calls))
+                                         deadline=1000.0 + 900)
+        units = [call for call in self.calls if call[0].startswith("unité")]
+        self.assertEqual([label for label, _limit, _wall in units],
+                         ["unité #1", "unité #2", "unité #3"])
+        # #7740 : chaque série part avec `--tests-timeout`, jamais une part de
+        # la borne totale ; le temps restant ne la coupe qu'en temps mural.
+        self.assertEqual([limit for _label, limit, _wall in units],
+                         [900, 900, 900])
+        self.assertEqual([wall for _label, _limit, wall in units],
+                         [900, 100, 90])
         self.assertEqual(faulty, [])
         unit_runs = [run for run in runs if run.label.startswith("unité #")]
         self.assertEqual([run.direct for run in unit_runs],
@@ -140,7 +143,7 @@ class PartageDeBorneTest(unittest.TestCase):
         clock = [1000.0]
 
         def run(label, modules, *, timeout):
-            clock[0] += timeout
+            clock[0] += 5
             if label == "unité #3":
                 return _red(label, modules, "test_u3")
             return _green(label, modules)
@@ -158,11 +161,11 @@ class PartageDeBorneTest(unittest.TestCase):
         clock = [1000.0]
 
         def run(label, modules, *, timeout):
-            clock[0] += timeout
+            clock[0] += 5
             if label == "unité #2":
                 return paquet_auto.TestRun(
                     label, list(modules), None,
-                    "borne totale atteinte : série arrêtée", float(timeout),
+                    "borne totale atteinte : série arrêtée", 5.0,
                     timed_out=True)
             return _green(label, modules)
 
@@ -173,7 +176,7 @@ class PartageDeBorneTest(unittest.TestCase):
         self.assertTrue(cut.inconclusive)
         self.assertFalse(cut.finished)
         self.assertEqual(faulty, [])
-        self.assertIn("non (série coupée", "\n".join(
+        self.assertIn("0/1, série coupée", "\n".join(
             paquet_auto._direct_lines(_composition((1, 2)), runs)))
 
 
@@ -259,9 +262,9 @@ class ManifesteDirectTest(unittest.TestCase):
         runs[0].direct = ["tests.test_a"]
         text = "\n".join(paquet_auto._direct_lines(composition, runs))
         self.assertIn("| #1 | 1 | oui (1/1) |", text)
-        self.assertIn("| #2 | 2 | non (série coupée après 5 s)", text)
+        self.assertIn("| #2 | 2 | non (0/2, série coupée après 5 s)", text)
         self.assertEqual(paquet_auto._direct_note(composition, runs),
-                         "modules directs non joués : #2")
+                         "modules directs non joués (non concluant) : #2")
 
     def test_le_corps_de_pr_porte_la_table(self) -> None:
         composition = _composition((1,))
@@ -271,8 +274,17 @@ class ManifesteDirectTest(unittest.TestCase):
             composition=composition, candidates=[candidate],
             tests=[_green("unité #1", ["tests.test_a"])],
             inclusion_rc=0, freeze_seconds=1.0)
-        self.assertIn("Modules directs par lot (#4887)", text)
+        self.assertIn("Modules directs par lot (#4887, #7740)", text)
         self.assertIn("| #1 | 1 | oui (1/1) |", text)
+
+    def test_zero_module_direct_est_un_non_concluant_nomme(self) -> None:
+        # #7740 : 0 module joué n'est jamais un « oui (0/0) » vert.
+        composition = _composition((1,))
+        runs = [_green("unité #1", [])]
+        text = "\n".join(paquet_auto._direct_lines(composition, runs))
+        self.assertIn("| #1 | 0 | aucun module direct (non concluant) |", text)
+        self.assertEqual(paquet_auto._direct_note(composition, runs),
+                         "modules directs non joués (non concluant) : #1")
 
 
 class TypesClientsTest(unittest.TestCase):
@@ -369,6 +381,210 @@ class TypesClientsTest(unittest.TestCase):
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.resolve(), source.parent.resolve())
         link.unlink()
+
+
+class DepotTest(unittest.TestCase):
+    """Un dépôt git réel, sans base ni réseau, pour les témoins #7740."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="paquet-7740-")
+        self.addCleanup(tmp.cleanup)
+        self.repo = pathlib.Path(tmp.name) / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "banc")
+        self.git("config", "user.email", "banc@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+        self.write("tests/__init__.py", "")
+        self.write("src/__init__.py", "")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(self.repo), *args],
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def write(self, name: str, content: str) -> None:
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def commit(self, message: str) -> str:
+        self.git("add", "-A")
+        self.git("commit", "-qm", message)
+        return self.git("rev-parse", "HEAD")
+
+
+class TemoinsEmpreinteTest(DepotTest):
+    """#7740 : migration et stockage traînent leurs témoins globaux."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name in paquet_auto.MIGRATION_WITNESSES + paquet_auto.STORAGE_WITNESSES:
+            self.write(name.replace(".", "/") + ".py", "")
+        self.base = self.commit("base")
+
+    def unit(self, *paths: str) -> tuple[str, str]:
+        for path in paths:
+            self.write(path, "X = 1\n")
+        return self.base, self.commit("unité")
+
+    def test_une_migration_joue_les_temoins_de_roles_et_de_schema(self) -> None:
+        base, commit = self.unit("src/ameesh/migrations/0001_x.py")
+        rows = paquet_auto.footprint_witnesses(
+            self.repo, paquet_auto.Unit(7, base, commit))
+        self.assertEqual([row["module"] for row in rows],
+                         ["tests.test_cluster", "tests.test_migrations",
+                          "tests.test_migrations_additives"])
+        self.assertTrue(all(row["reason"] == "empreinte" for row in rows))
+
+    def test_un_stockage_joue_les_contrats_des_ecrivains(self) -> None:
+        base, commit = self.unit("src/ameesh/storage/x.py")
+        modules = [row["module"] for row in paquet_auto.footprint_witnesses(
+            self.repo, paquet_auto.Unit(8, base, commit))]
+        self.assertEqual(modules, ["tests.test_l107_executor_contract",
+                                   "tests.test_contract_registry_ameesh",
+                                   "tests.test_contract_selection"])
+
+    def test_sans_empreinte_aucun_temoin(self) -> None:
+        base, commit = self.unit("docs/readme.md")
+        self.assertEqual(paquet_auto.footprint_witnesses(
+            self.repo, paquet_auto.Unit(9, base, commit)), [])
+
+
+class PrefixeComposeTest(DepotTest):
+    """#7740 : chaque série directe joue sur son préfixe composé.
+
+    Cas de sens réel (#7719 vs #7725) : l'unité 1 ajoute un test qui attend la
+    valeur 0, l'unité 2 passe la valeur à 2, l'unité 3 la ramène à 0. La tête
+    composée est verte, mais le préfixe de l'unité 2 est rouge : le conflit
+    est vu à l'unité qui le crée, et elle est retirée avant la poussée.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write("src/value.py", "VALUE = 0\n")
+        self.base = self.commit("base")
+        self.write("tests/test_value.py",
+                   "import unittest\n\n"
+                   "from src.value import VALUE\n\n\n"
+                   "class T(unittest.TestCase):\n"
+                   "    def test_value(self):\n"
+                   "        self.assertEqual(VALUE, 0)\n")
+        self.a = self.commit("a : test attend 0")
+        self.write("src/value.py", "VALUE = 2\n")
+        self.b = self.commit("b : valeur 2")
+        self.write("src/value.py", "VALUE = 0\n")
+        self.c = self.commit("c : retour à 0")
+
+    def composition(self) -> "paquet_auto.Composition":
+        return paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, self.base, self.a),
+                   paquet_auto.Unit(2, self.a, self.b),
+                   paquet_auto.Unit(3, self.b, self.c)],
+            discarded=[], head=self.c)
+
+    def test_le_conflit_de_sens_est_vu_au_prefixe_de_l_unite(self) -> None:
+        calls: list[tuple[str, tuple[str, ...], int]] = []
+        lines: list[str] = []
+        neighbors = {2: [{"module": "tests.test_value", "reason": "carte",
+                          "files": ["src/value.py"]}]}
+
+        def value_at(tree) -> int:
+            text = (pathlib.Path(tree) / "src" / "value.py").read_text()
+            return int(text.rsplit("=", 1)[1])
+
+        def fake(tree, label, modules, *, timeout, heavy=False, wall=None):
+            watched = [module for module in modules
+                       if module == "tests.test_value"
+                       or module.startswith("tests.test_value.")]
+            calls.append((label, tuple(modules), value_at(tree)))
+            if watched and value_at(tree) == 2:
+                return _red(label, modules, "test_value")
+            return _green(label, modules)
+
+        with mock.patch.object(paquet_auto.shutil, "which", return_value=None), \
+                mock.patch.object(paquet_auto, "contract_modules", return_value=[]), \
+                mock.patch.object(paquet_auto, "run_tests", side_effect=fake):
+            runs, faulty, removals = paquet_auto.check_local_tests(
+                self.repo, self.composition(), timeout=900, parallel=1,
+                base_sha=self.base,
+                select=lambda *_: (neighbors, "carte simulée"),
+                on_base=lambda *_a, **_k: set(),
+                attribute=lambda *_a: {"status": "no-helper", "tests": [],
+                                       "why": "banc"},
+                log=lines.append)
+        # La tête composée est verte : le rouge n'existe que sur le préfixe.
+        self.assertEqual((self.repo / "src" / "value.py").read_text().strip(),
+                         "VALUE = 0")
+        series = {label: value for label, _modules, value in calls}
+        self.assertEqual(series["unité #1"], 0)
+        self.assertEqual(series["unité #2"], 2)   # a + b, pas la tête
+        self.assertEqual(faulty, [2])
+        self.assertEqual([(removal.lot, removal.proof) for removal in removals],
+                         [(2, "prefixes")])
+        by_label = {run.label: run for run in runs}
+        self.assertEqual(by_label["unité #2"].direct, ["tests.test_value"])
+        self.assertFalse(by_label["unité #2"].green)
+        # 0 module joué pour l'unité 3 : non concluant nommé, jamais vert.
+        self.assertTrue(by_label["unité #3"].inconclusive)
+        self.assertIn("aucun module direct sélectionné", by_label["unité #3"].output)
+        self.assertEqual(paquet_auto._direct_note(self.composition(), runs),
+                         "modules directs non joués (non concluant) : #3")
+        # les worktrees de préfixe ne restent pas derrière.
+        listing = self.git("worktree", "list", "--porcelain")
+        self.assertEqual(listing.count("worktree "), 1)
+
+    def test_une_serie_sans_module_est_non_concluante_sans_retrait(self) -> None:
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(3, self.b, self.c)], discarded=[],
+            head=self.c)
+        lines: list[str] = []
+        with mock.patch.object(paquet_auto.shutil, "which", return_value=None), \
+                mock.patch.object(paquet_auto, "contract_modules", return_value=[]):
+            runs, faulty, removals = paquet_auto.check_local_tests(
+                self.repo, composition, timeout=900, parallel=1,
+                base_sha=self.b, select=lambda *_: ({}, ""),
+                log=lines.append)
+        self.assertEqual(faulty, [])
+        self.assertEqual(removals, [])
+        self.assertTrue(runs[0].inconclusive)
+        self.assertIn("non concluant", "\n".join(lines))
+
+    def test_un_test_supprime_plus_tard_reste_joue_sur_son_prefixe(self) -> None:
+        # #7740 : le test n'existe plus sur la tête, mais il existe sur le
+        # préfixe de l'unité qui l'apporte ; l'unité suivante le supprime.
+        self.write("tests/test_deleted.py",
+                   "import unittest\n\n\n"
+                   "class T(unittest.TestCase):\n"
+                   "    def test_ok(self):\n"
+                   "        pass\n")
+        added = self.commit("ajoute un test")
+        (self.repo / "tests" / "test_deleted.py").unlink()
+        removed = self.commit("supprime le test")
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(5, self.base, added),
+                   paquet_auto.Unit(6, added, removed)],
+            discarded=[], head=removed)
+        calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def fake(tree, label, modules, *, timeout, heavy=False, wall=None):
+            calls.append((label, tuple(modules)))
+            return _green(label, modules)
+
+        with mock.patch.object(paquet_auto.shutil, "which", return_value=None), \
+                mock.patch.object(paquet_auto, "contract_modules", return_value=[]), \
+                mock.patch.object(paquet_auto, "run_tests", side_effect=fake):
+            runs, faulty, removals = paquet_auto.check_local_tests(
+                self.repo, composition, timeout=60, parallel=1,
+                base_sha=self.base, select=lambda *_: ({}, ""),
+                log=lambda _line: None)
+        self.assertEqual(faulty, [])
+        self.assertEqual(removals, [])
+        self.assertIn(("unité #5", ("tests.test_deleted",)), calls)
+        by_label = {run.label: run for run in runs}
+        self.assertTrue(by_label["unité #5"].green)
+        self.assertTrue(by_label["unité #6"].inconclusive)
+
+
 
 
 if __name__ == "__main__":
