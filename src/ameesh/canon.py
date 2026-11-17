@@ -2135,7 +2135,7 @@ def sandbox_profile_problems(profile: SandboxProfile) -> list[str]:
         out.append("`sandbox.profile`: non-empty lowercase name expected (letters, "
                    "digits, `.`, `_`, `-`, 64 characters at most)")
     if not profile.admitted_ref or not profile.admitted_ref.strip():
-        out.append("`sandbox.admitted_ref`: the bureau-reviewed canon PR/decision "
+        out.append("`sandbox.admitted_ref`: the reviewed canon PR/decision "
                    "reference is required")
     if profile.status not in SANDBOX_STATUSES:
         out.append("`sandbox.status`: %s expected, not %r"
@@ -2204,7 +2204,7 @@ def sandbox_placement_problems(placement: SandboxPlacement,
         out.append("`policy.sandbox.image`: a digest-shaped image is required "
                    "(`repository@sha256:<64 hex>`), not a mutable tag")
     if not placement.admitted_ref or not placement.admitted_ref.strip():
-        out.append("`policy.sandbox.admitted_ref`: the bureau-reviewed canon "
+        out.append("`policy.sandbox.admitted_ref`: the reviewed canon "
                    "PR/decision reference is required")
     for name in placement.allowed_profiles:
         if not isinstance(name, str) or not SANDBOX_PROFILE_RE.match(name):
@@ -4447,7 +4447,7 @@ class _Loader:
             self.add("agent-sandbox-ref-weak", WARNING,
                      "`sandbox.admitted_ref` %r does not look like a canon PR/decision "
                      "reference (`owner/repo#123`, `#123` or `card@commit`): the "
-                     "bureau's evidence must be citable" % admitted_ref,
+                     "avatar's evidence must be citable" % admitted_ref,
                      **where, **subject)
         return profile
 
@@ -4965,7 +4965,7 @@ class _Loader:
             self.add("host-sandbox-ref-weak", WARNING,
                      "`policy.sandbox.admitted_ref` %r does not look like a canon "
                      "PR/decision reference (`owner/repo#123`, `#123` or `card@commit`): "
-                     "the bureau's evidence must be citable" % admitted_ref,
+                     "the avatar's evidence must be citable" % admitted_ref,
                      **where, **subject)
         return placement
 

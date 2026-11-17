@@ -84,33 +84,12 @@ RECORDED_BY_TRANCHE = {
 #: (path relative to src/ameesh, canonical name) -> allowed occurrences.
 #: Generated from the inventory; each entry is a debt the owning tranche pays.
 EXCEPTIONS = {
-    # -- le nom « bureau » sort du cœur (#7634) : 135
-    ("alert_briefs.py", "bureau"): 58,
-    ("canon.py", "bureau"): 4,
-    ("ci_disk.py", "bureau"): 1,
-    ("cycle_budget.py", "bureau"): 3,
-    ("debit.py", "bureau"): 6,
-    ("decisions.py", "bureau"): 6,
-    ("exploitation.py", "bureau"): 3,
-    ("hostcheck.py", "bureau"): 1,
-    ("mesh_cli.py", "bureau"): 1,
+    # -- le nom « bureau » sort du cœur (#7634) : 3
+    # Migrations déjà appliquées : leur SQL est figé (rollback compris), le
+    # nom y reste une donnée du déploiement, pas une décision du cœur.
     ("migrations/0583_bureau_staging_catchup.sql", "bureau"): 1,
     ("migrations/0584_bureau_catchup_timestamp.sql", "bureau"): 1,
     ("migrations/rollback/0584_restore.sql", "bureau"): 1,
-    ("netcheck.py", "bureau"): 1,
-    ("notify.py", "bureau"): 5,
-    ("notify_gap.py", "bureau"): 2,
-    ("packet_guard.py", "bureau"): 1,
-    ("planned_waits.py", "bureau"): 6,
-    ("release.py", "bureau"): 9,
-    ("role.py", "bureau"): 1,
-    ("slo.py", "bureau"): 2,
-    ("staging_deferred.py", "bureau"): 4,
-    ("staging_pending.py", "bureau"): 1,
-    ("stagnation.py", "bureau"): 1,
-    ("tenancy.py", "bureau"): 13,
-    ("train_requalify_review.py", "bureau"): 2,
-    ("work.py", "bureau"): 1,
     # -- rôles lus à la fiche du canon (#7661) : 54
     ("alert_briefs.py", "auditeur"): 5,
     ("alert_briefs.py", "mesh-design"): 2,
@@ -140,9 +119,8 @@ EXCEPTIONS = {
     ("unrecorded.py", "orchestrateur"): 1,
     ("work.py", "auditeur"): 2,
     ("work.py", "orchestrateur"): 1,
-    # -- hôtes et personnes lus au canon (#7662) : 6
+    # -- hôtes et personnes lus au canon (#7662) : 5
     ("migrations/0364_key_holders.sql", "smichea"): 2,
-    ("process_observations_cli.py", "bureau-goal"): 1,
     ("release_cutoff.py", "smichea"): 2,
     ("storage/postgres/authority.py", "smichea"): 1,
     # -- release et canal Nexlink dans le module Nexlink (#7663) : 228

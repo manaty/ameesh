@@ -9,7 +9,7 @@ réveils, agents au repos avec du travail dû, tours et fusions par heure,
 durée des runs de CI. La mesure est **lue sur les jalons** — gels, avis,
 fusions, journal — et **jamais sur les colonnes d'un lot** : `state`,
 `reviewer`/`reviewers`, `wake_at` et `updated_at` peuvent être périmés, et
-c'est l'erreur du bureau du 24/10 à 03:20Z (un lot annoncé « en attente de
+c'est l'erreur de l'avatar du 24/10 à 03:20Z (un lot annoncé « en attente de
 relecture » alors que la colonne `reviewer` ne nommait personne de courant).
 
 Ce module sépare la lecture (SQL, `read`) du calcul (`build`), pour que le
@@ -34,13 +34,13 @@ n'est pas `--check` qui la pousse. #6105 : pour un `system:…` déclaré, la
 ligne nomme son responsable humain et la relance s'adresse à lui ; une
 déclaration retirée marque la ligne et renvoie la réservation au pilote, au
 lieu de laisser une attente orpheline. #3498 : un hold peut nommer son exécutant
-externe et le geste attendu (`hold: attente bureau : …`,
+externe et le geste attendu (`hold: attente avatar : …`,
 `hold: attente owner : …`) ; le débit le range dans les mêmes « attentes
 externes », avec une relance à cet exécutant — à l'échéance déclarée
 (`(due 2026-10-25 12:00 UTC)`), sinon après le seuil du débit — et non à
 l'agent. Une attente externe, même échue, ne fait pas sortir `--check` 2 : le
 rapport la relance à chaque passage. #3773 : le hold peut aussi déclarer un
-tiers extérieur sans nommer le bureau ni l'owner (`hold: attente externe :
+tiers extérieur sans nommer l'avatar ni l'owner (`hold: attente externe :
 revue Apple`) ; le débit le range dans les mêmes « attentes externes », avec
 la même relance à l'échéance ou au seuil. #4235 : un hold de pilote peut
 déclarer une **fenêtre d'observation** — une attente voulue et datée
@@ -126,7 +126,7 @@ _VERSION = re.compile(r"(?<![\d.])\b(\d+)\.(\d+)\.(\d+)\b(?!\.\d)")
 #: une retenue qui attend un déploiement (#3497) : « pas/non/jamais déployé »,
 #: le verbe (« reste à déployer main »), et le nom dans une formule d'attente
 #: (« attente du déploiement », « inerte jusqu'au déploiement ») ou de
-#: constat. « déploiement » seul ne suffit pas : un compte rendu de bureau
+#: constat. « déploiement » seul ne suffit pas : un compte rendu d'avatar
 #: (« vidage de déploiement 06:02Z ») n'est pas une retenue.
 _UNDEPLOYED = re.compile(
     r"(?:pas|non|jamais)(?:\s+encore)?\s+d[ée]ploy[ée]e?s?"
@@ -182,12 +182,12 @@ GESTURES = {
 def _external_gesture(declared: Mapping[str, Any]) -> str:
     """Le geste affiché pour une attente externe (#3498, #3773).
 
-    Un exécutant nommé (bureau, owner) se relance ; un tiers extérieur
+    Un exécutant nommé (avatar, owner) se relance ; un tiers extérieur
     (`externe`) se suit, et la relance va au pilote."""
     if str(declared.get("executor") or "") == "externe":
         return GESTURES["hold_external_third"].format(
             gesture=declared.get("gesture") or "")
-    actor = "le bureau" if declared.get("executor") == "bureau" else "l'owner"
+    actor = "l'avatar" if declared.get("executor") == "avatar" else "l'owner"
     return GESTURES["hold_external"].format(
         actor=actor, gesture=declared.get("gesture") or "")
 
@@ -660,8 +660,8 @@ _HUMAN_WAIT_PATTERNS = (
     r"(?:valider|signer|donner|d[ée]cider|trancher|r[ée]pondre|approuver|"
     r"fournir|faire|se\s+connecter)|est\s+attendu|reviendra|signera|donnera|"
     r"validera|fournira|transmettra|r[ée]pondra)\b",
-    # gestes réservés au bureau ou au propriétaire, non réassignables à un agent
-    r"\br[ée]serv[ée]s?\s+(?:au|à\s+la|à\s+l'|aux)\s+(?:bureau\s+ou\s+au\s+)?"
+    # gestes réservés à l'avatar ou au propriétaire, non réassignables à un agent
+    r"\br[ée]serv[ée]s?\s+(?:au|à\s+la|à\s+l'|aux)\s+(?:avatar\s+ou\s+au\s+)?"
     r"(?:owner|propri[ée]taire)\b",
     r"\bnon\s+r[ée]assignable\s+à\s+un\s+agent\b",
 )
@@ -1157,6 +1157,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
           roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None,
           families: Iterable[str] = (),
           external_executors: Mapping[str, Mapping[str, Any]] | None = None,
+          human_routes: Iterable[str] = (),
           review_pilots: Mapping[str, str] | None = None,
           closed_hosts: Iterable[str] = (),
           zone: str = "UTC") -> dict:
@@ -1189,6 +1190,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
     le responsable humain d'une réservation et font dire au débit qu'une
     réservation dont le système est retiré n'a plus personne : le pilote la
     lève. Sans cette lecture, la ligne garde le texte générique de #3447.
+
+    `human_routes` (#7634) : les noms que le runtime reconnaît comme route
+    humaine (avatar au canon, `report` configure dont le registre dit l'agent
+    `responsible`, agent externe rattaché à un humain). Un hold qui nomme l'un
+    d'eux est une attente externe `avatar` ; un nom hors de ce set
+    (`pilote`, `relecture`, `CI`, `mesh-design`) reste une attente d'agent.
+    Le cœur ne connaît aucun nom d'avatar en dur.
 
     `dependencies` (#6214) : les prérequis explicites, groupés par lot
     (`work_dependencies.grouped`). Un lot relu dont un prérequis est encore
@@ -1264,6 +1272,12 @@ def build(*, items: Iterable[Mapping[str, Any]],
             if blocker != lot:
                 blocked_by.setdefault(lot, set()).add(blocker)
     agents = [dict(row) for row in agents or ()]
+    #: #7634 : les noms de route humaine connus au runtime (canon, `report`
+    #: configure, agent externe rattaché à un humain). Un hold qui nomme l'un
+    #: d'eux est une attente externe normalisée `avatar` ; un nom ordinaire
+    #: (`pilote`, `relecture`, `CI`) reste une attente d'agent. Le cœur ne
+    #: connaît aucun nom d'avatar.
+    human_routes = {str(name).strip() for name in human_routes or () if name}
     #: #6664 : un relecteur que le registre dit en pause (budget de jauge ou
     #: pause opérateur) ne lira pas la relance : le geste va au pilote, comme
     #: pour un auteur endormi (#6396/#6423). La fenêtre courte du compte
@@ -1377,7 +1391,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if terminal_ts is not None and _reopened(lot_events, terminal_ts):
             terminal_ts = None
         # #3447 : un lot réservé à un exécutant externe n'est pas « sans
-        # assigné » ; il attend cet exécutant (bureau, owner), pas un agent.
+        # assigné » ; il attend cet exécutant (avatar, owner), pas un agent.
         # La mesure reste lue sur le journal : la déclaration nommée par
         # `work.EXTERNAL_EXECUTOR_NOTE`, sinon la création du lot.
         external = str(item.get("external_executor") or "").strip()
@@ -1417,7 +1431,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                            "object (`ameesh work external-executor %d --clear`)"
                            % (external, responsible, ident))
             else:
-                gesture = ("the external executor %s acts (bureau/owner, not an "
+                gesture = ("the external executor %s acts (avatar/owner, not an "
                            "agent); the pilot clears the reservation if it is no "
                            "longer wanted (`ameesh work external-executor %d "
                            "--clear`)" % (external, ident))
@@ -1539,7 +1553,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
             age = _age(now, hold.get("since"))
             # #3498 : la déclaration externe est un geste de pilote ; un hold
             # ordinaire qui la porte ne soustrait pas son lot à `--check`.
-            declared = planned_waits.external_hold(note)
+            declared = planned_waits.external_hold(note, executors=human_routes)
             if declared is not None and holds_authoritative \
                     and hold.get("pilot") is False:
                 unreadable.append(
@@ -1909,7 +1923,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
             **dependents_of(lot),
         })
     #: un réveil sur une attente externe relance l'assigné qui doit porter le
-    #: geste au bureau ; ce n'est pas une attente d'agent (#3498).
+    #: geste à l'avatar ; ce n'est pas une attente d'agent (#3498).
     external_lots = set(external_by_lot)
     for row in wakes_out:
         ident = int(row["lot"])
@@ -2776,7 +2790,8 @@ _EVENTS_SQL = """
 
 _AGENTS_SQL = """
     SELECT name, status, host, harness, model, effort,
-           team, relit, mode, status_text, session_account, session_harness,
+           team, relit, mode, responsible, status_text, session_account,
+           session_harness,
            capabilities, roles, ephemeral, operator_paused,
            extract(epoch FROM retired_at)::float8 AS retired_ts,
            extract(epoch FROM last_turn_at)::float8 AS last_turn_ts
@@ -2859,6 +2874,28 @@ _PACKETS_SQL = """
      WHERE p.created_at > to_timestamp(%s)
      ORDER BY p.created_at, m.work_item_id
 """
+
+
+def human_route_names(cfg, agents, canons) -> set[str]:
+    """#7634 : les noms que le runtime reconnaît comme route humaine.
+
+    L'avatar déclaré au canon, le `report` configuré d'un projet dont le
+    registre dit l'agent `responsible` de l'humain, et l'agent `externe`
+    rattaché à un humain par `responsible`. Aucun nom n'est connu en dur :
+    `bureau` n'est accepté que si l'une de ces lectures le donne."""
+    from . import avatars
+    names = {str(name) for name in avatars.from_canons(canons or ()).values()
+             if name}
+    rows = list(agents or ())
+    for row in rows:
+        name = str(row.get("name") or "")
+        human = str(row.get("responsible") or "")
+        if not name or not human:
+            continue
+        names.update(avatars.configured_desks(cfg, human, rows))
+        if row.get("mode") == "externe":
+            names.add(name)
+    return names
 
 
 def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
@@ -2950,6 +2987,16 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
             unreadable.append("canon unavailable: %s" % " ".join(str(exc).split())[:200])
     devices = unavailable_devices(canons, now)
     unreadable.extend(devices.get("unreadable") or ())
+
+    # #7634 : les noms de route humaine connus au runtime. Un hold historique
+    # qui nomme l'avatar (`bureau`) reste une attente externe ; un nom
+    # ordinaire n'en devient pas une. Aucun nom n'est écrit dans le cœur.
+    human_routes: set[str] = set()
+    try:
+        human_routes = human_route_names(cfg, agents, canons)
+    except Exception as exc:  # noqa: BLE001 - route illisible : dite, pas devinée
+        unreadable.append("human routes unreadable: %s"
+                          % " ".join(str(exc).split())[:160])
 
     # Les retenues actives : la lecture d'autorité de #3219 (un hold de pilote
     # lève toute la retenue, celui d'un auteur ne lève que la sienne).
@@ -3055,6 +3102,7 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    roadmap_exhausted=roadmap_exhausted,
                    families=families,
                    external_executors=external_executors,
+                   human_routes=human_routes,
                    review_pilots=review_pilots,
                    closed_hosts=closed_hosts, zone=zone)
     annotate_candidate_causes(db, cfg, report, milestones, unreadable)
@@ -3431,12 +3479,12 @@ def format_text(report: Mapping[str, Any]) -> str:
                 lines.append("         ! système retiré : le pilote lève la réservation "
                              "ou réaffecte le lot")
             if row.get("reminder_due"):
-                # #3773 : un tiers extérieur (`externe`) se suit au bureau ;
-                # les autres exécutants gardent la règle #3498 (bureau, sinon
+                # #3773 : un tiers extérieur (`externe`) se suit à l'avatar ;
+                # les autres exécutants gardent la règle #3498 (avatar, sinon
                 # owner). #6105 : un système déclaré nomme son responsable
                 # humain, et c'est à lui que la relance s'adresse.
                 recipient = (row.get("responsible")
-                             or ("bureau" if row.get("who") in ("bureau", "externe")
+                             or ("avatar" if row.get("who") in ("avatar", "externe")
                                  else "owner"))
                 lines.append(
                     "         ! relance due le %s — porter %s %s%s (canon §10)"

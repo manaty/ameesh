@@ -166,23 +166,26 @@ class CycleReconcileTest(PgTestCase):
 
 
 class OperatorAuthorityTest(unittest.TestCase):
-    def authorize(self, *, source='runner', role='bureau', readable=True, owns=True):
+    def authorize(self, *, source='runner', avatar=True, readable=True, owns=True):
         binding = identity.Binding(name='office-agent', source=source, ok=True)
-        card = SimpleNamespace(title='office-agent', roles=[role])
+        fiche = SimpleNamespace(data={'avatar': {'human': 'human:smichea'}} if avatar else {})
+        card = SimpleNamespace(title='office-agent', roles=['bureau'], fiche=fiche,
+                               responsible='human:smichea')
         canon = SimpleNamespace(agents=[card], readable=readable,
-                                owns=lambda _: owns)
+                                owns=lambda _: owns,
+                                resolve_human=lambda human: object())
         with mock.patch('ameesh.identity.resolve_binding', return_value=binding), \
              mock.patch('ameesh.canon.load_configured', return_value=[canon]), \
              mock.patch('ameesh.canon.configured', return_value=[object()]), \
              mock.patch('ameesh.registry.get', return_value={'name': 'office-agent', 'canon': 'mesh'}):
             return gate.operator(object(), object())
 
-    def test_bound_bureau_role_can_operate_without_a_fixed_agent_name(self):
+    def test_bound_avatar_can_operate_without_a_fixed_agent_name(self):
         self.assertEqual(self.authorize(), 'office-agent')
         self.assertEqual(self.authorize(source='session'), 'office-agent')
 
-    def test_self_declared_other_role_and_foreign_card_are_refused(self):
-        for values in ({'source': 'explicit'}, {'role': 'orchestrateur'},
+    def test_self_declared_non_avatar_and_foreign_card_are_refused(self):
+        for values in ({'source': 'explicit'}, {'avatar': False},
                        {'owns': False}, {'readable': False}):
             with self.subTest(values=values), self.assertRaises((ValueError, budget.BudgetError)):
                 self.authorize(**values)

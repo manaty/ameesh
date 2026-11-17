@@ -8,7 +8,7 @@ des holds, dont beaucoup attendaient un geste du bureau au go déjà signé. Ni
 un agent suit le lot, et le bureau doit agir. Le débit les comptait comme
 attentes d'agent et `--check` sortait 2 sans geste possible.
 
-Témoin : un lot assigné, en hold « attente bureau : <geste> », sort des
+Témoin : un lot assigné, en hold « attente avatar : <geste> », sort des
 `slow_waits` et entre dans `external_waits` avec son exécutant. La relance va
 au bureau (ou à l'owner), à l'échéance déclarée ou après le seuil du débit ;
 une attente externe ne fait pas sortir `--check` 2, même échue.
@@ -46,8 +46,8 @@ def run(**extra):
 class DeclarationTest(unittest.TestCase):
     def test_attente_bureau(self):
         declared = planned_waits.external_hold(
-            "hold: attente bureau : poser le backup 011 et l'apply")
-        self.assertEqual(declared["executor"], "bureau")
+            "hold: attente avatar : poser le backup 011 et l'apply")
+        self.assertEqual(declared["executor"], "avatar")
         self.assertEqual(declared["gesture"], "poser le backup 011 et l'apply")
         self.assertIsNone(declared["due"])
 
@@ -60,20 +60,47 @@ class DeclarationTest(unittest.TestCase):
                 self.assertEqual(declared["executor"], "owner")
                 self.assertEqual(declared["gesture"], "signer le go")
 
+    def test_attente_historique_nommee_se_decode_encore(self):
+        # #7634 : les holds persistés d'avant la bascule nomment l'exécutant
+        # historique du mesh ; ils restent des attentes de la route humaine,
+        # normalisées `avatar`, sans que le cœur connaisse ce nom.
+        for text in ("hold: attente bureau : signer le go",
+                     "hold: attente du bureau : signer le go",
+                     "hold: attente externe (bureau) : signer le go",
+                     "hold: attente bureau, signer le go"):
+            with self.subTest(text=text):
+                declared = planned_waits.external_hold(
+                    text, executors={"bureau"})
+                self.assertEqual(declared["executor"], "avatar")
+                self.assertIn("signer le go", declared["gesture"])
+
+    def test_un_nom_ordinaire_n_est_pas_une_route_humaine(self):
+        # #7634 (relecture auditeur) : sans le set des routes runtime, un nom
+        # de rôle ordinaire reste une attente d'agent — sinon le lot quitte le
+        # débit et la relance part à l'humain.
+        for text in ("hold: attente pilote : composer le paquet",
+                     "hold: attente relecture : avis 2/2 de cx2",
+                     "hold: attente CI, run 1234",
+                     "hold: attente mesh-design : decision du feu"):
+            with self.subTest(text=text):
+                self.assertIsNone(planned_waits.external_hold(text))
+                self.assertIsNone(planned_waits.external_hold(
+                    text, executors={"bureau"}))
+
     def test_attente_externe_avec_parentheses(self):
-        for text in ("hold: attente externe (bureau) : geste root",
-                     "hold: attente externe bureau : geste root",
-                     "hold: attente du bureau : geste root"):
+        for text in ("hold: attente externe (avatar) : geste root",
+                     "hold: attente externe avatar : geste root",
+                     "hold: attente de l'avatar : geste root"):
             with self.subTest(text=text):
                 self.assertEqual(planned_waits.external_hold(text),
-                                 {"executor": "bureau", "gesture": "geste root",
+                                 {"executor": "avatar", "gesture": "geste root",
                                   "due": None})
 
     def test_echeance_avant_ou_apres_le_geste(self):
         for text in (
-                "hold: attente bureau (due 2026-10-25 12:00 UTC) : poser",
-                "hold: attente bureau : poser (due 2026-10-25 12:00 UTC)",
-                "hold: attente bureau (échéance 2026-10-25 12:00 UTC) : poser"):
+                "hold: attente avatar (due 2026-10-25 12:00 UTC) : poser",
+                "hold: attente avatar : poser (due 2026-10-25 12:00 UTC)",
+                "hold: attente avatar (échéance 2026-10-25 12:00 UTC) : poser"):
             with self.subTest(text=text):
                 declared = planned_waits.external_hold(text)
                 self.assertEqual(declared["gesture"], "poser")
@@ -81,17 +108,17 @@ class DeclarationTest(unittest.TestCase):
 
     def test_jeton_de_reveil_hors_du_geste(self):
         declared = planned_waits.external_hold(
-            "hold: attente bureau : poser wake_at=2026-10-25T12:00:00+00:00 "
+            "hold: attente avatar : poser wake_at=2026-10-25T12:00:00+00:00 "
             "[réveil programmé: 2026-10-25 12:00 UTC]")
         self.assertEqual(declared["gesture"], "poser")
         self.assertEqual(declared["due"], "2026-10-25 12:00 UTC")
 
     def test_prose_et_declaration_sans_geste_ne_declarent_rien(self):
         for text in ("hold: attend un paquet Nexlink",
-                     "hold: attente du bureau depuis 3 h",
-                     "hold: attente bureau :",
-                     "hold: attente bureau",
-                     "hold: attente de la réponse du bureau : x"):
+                     "hold: attente de l'avatar depuis 3 h",
+                     "hold: attente avatar :",
+                     "hold: attente avatar",
+                     "hold: attente de la réponse de l'avatar : x"):
             with self.subTest(text=text):
                 self.assertIsNone(planned_waits.external_hold(text))
 
@@ -101,7 +128,7 @@ class ClassificationTest(unittest.TestCase):
         report = run(
             items=[item(3482)],
             events=[event(3482, 1, T - 3 * H,
-                          "hold: attente bureau : déplacer pc-smichea et "
+                          "hold: attente avatar : déplacer pc-smichea et "
                           "vérifier les comptes")])
         self.assertEqual(report["slow_waits"], [])
         self.assertEqual(report["human_waits"], [])
@@ -110,9 +137,8 @@ class ClassificationTest(unittest.TestCase):
         external = report["external_waits"][0]
         self.assertEqual(external["lot"], 3482)
         self.assertEqual(external["kind"], "hold_external")
-        self.assertEqual(external["who"], "bureau")
+        self.assertEqual(external["who"], "avatar")
         self.assertIn("déplacer pc-smichea", external["gesture"])
-        self.assertIn("bureau", external["gesture"])
         # Le hold reste compté comme hold, mais ce n'est pas une attente
         # d'agent.
         self.assertEqual(report["totals"]["holds"], 1)
@@ -127,6 +153,33 @@ class ClassificationTest(unittest.TestCase):
                          ["owner"])
         self.assertIn("l'owner", report["external_waits"][0]["gesture"])
 
+    def test_hold_nomme_hors_routes_reste_attente_agent(self):
+        # #7634 (relecture auditeur) : un nom ordinaire ne devient pas une
+        # route humaine ; le lot reste dans le débit, la relance reste agent.
+        for note in ("hold: attente pilote : composer le paquet",
+                     "hold: attente relecture : avis 2/2 de cx2",
+                     "hold: attente CI, run 1234",
+                     "hold: attente mesh-design : decision du feu"):
+            with self.subTest(note=note):
+                report = run(
+                    items=[item(7601)],
+                    events=[event(7601, 1, T - 3 * H, note)])
+                self.assertEqual(report["external_waits"], [])
+                self.assertEqual([row["kind"] for row in report["slow_waits"]],
+                                 ["hold"])
+
+    def test_route_runtime_nommee_se_decode(self):
+        # #7634 : le nom historique n'est accepté que parce que la base le
+        # donne comme route humaine au runtime ; le cœur ne le connaît pas.
+        report = run(
+            items=[item(7602)],
+            events=[event(7602, 1, T - 3 * H,
+                          "hold: attente bureau : signer le go")],
+            human_routes={"bureau"})
+        self.assertEqual([row["who"] for row in report["external_waits"]],
+                         ["avatar"])
+        self.assertEqual(report["slow_waits"], [])
+
     def test_une_declaration_couvre_les_autres_holds_du_lot(self):
         # Le pilote a posé une retenue, l'auditeur déclare l'attente externe
         # sur le même lot : le lot ne doit pas rester dans les attentes
@@ -136,10 +189,10 @@ class ClassificationTest(unittest.TestCase):
             events=[event(3482, 1, T - 5 * H,
                           "hold: pilote — attente du paquet", actor="mesh-design"),
                     event(3482, 2, T - 3 * H,
-                          "hold: attente bureau : geste root", actor="auditeur")])
+                          "hold: attente avatar : geste root", actor="auditeur")])
         self.assertEqual(report["slow_waits"], [])
         self.assertEqual(len(report["external_waits"]), 1)
-        self.assertEqual(report["external_waits"][0]["who"], "bureau")
+        self.assertEqual(report["external_waits"][0]["who"], "avatar")
         self.assertEqual(report["totals"]["holds"], 2)
         self.assertTrue(all(row.get("external_lot") for row in report["holds"]))
 
@@ -155,7 +208,7 @@ class ClassificationTest(unittest.TestCase):
         report = run(
             items=[item(3482)],
             events=[event(3482, 1, T - 3 * H,
-                          "hold: attente bureau : geste root")])
+                          "hold: attente avatar : geste root")])
         external = report["external_waits"][0]
         self.assertTrue(external["reminder_due"])
         self.assertIsNone(external["due_ts"])
@@ -166,7 +219,7 @@ class ClassificationTest(unittest.TestCase):
         report = run(
             items=[item(3482)],
             events=[event(3482, 1, T - 3 * H,
-                          "hold: attente bureau : geste root "
+                          "hold: attente avatar : geste root "
                           "(due 2026-10-24 10:00 UTC)")])
         external = report["external_waits"][0]
         self.assertFalse(external["reminder_due"])
@@ -177,7 +230,7 @@ class ClassificationTest(unittest.TestCase):
         report = run(
             items=[item(3482)],
             events=[event(3482, 1, T - 5 * H,
-                          "hold: attente bureau : geste root "
+                          "hold: attente avatar : geste root "
                           "[réveil programmé: 2026-10-24 02:00 UTC]")])
         external = report["external_waits"][0]
         self.assertEqual(external["due_ts"], T - H - 20 * 60)
@@ -199,7 +252,7 @@ class ClassificationTest(unittest.TestCase):
         self.assertEqual(external["due_ts"], T - H - 20 * 60)
 
     def test_un_hold_non_pilote_ne_soustrait_pas_le_lot(self):
-        note = "hold: attente bureau : geste root"
+        note = "hold: attente avatar : geste root"
         holds = {3482: {"dev": {"what": "hold", "by": "dev", "since": T - 3 * H,
                                 "note": note, "pilot": False}}}
         report = run(items=[item(3482)], events=[event(3482, 1, T - 3 * H, note)],
@@ -213,7 +266,7 @@ class ClassificationTest(unittest.TestCase):
         report = run(
             items=[item(3482)],
             events=[event(3482, 1, T - 3 * H,
-                          "hold: attente bureau : geste root (due demain)")])
+                          "hold: attente avatar : geste root (due demain)")])
         self.assertTrue(any("due date unreadable" in text
                             for text in report["unreadable"]))
         # Le repli périodique reste borné : la relance ne dort pas.
@@ -223,10 +276,10 @@ class ClassificationTest(unittest.TestCase):
         report = run(
             items=[item(3482)],
             events=[event(3482, 1, T - 3 * H,
-                          "hold: attente bureau : geste root")])
+                          "hold: attente avatar : geste root")])
         text = debit.format_text(report)
         self.assertIn("Attentes externes", text)
-        self.assertIn("bureau", text)
+        self.assertIn("avatar", text)
         self.assertIn("relance due", text)
         self.assertIn("canon §10", text)
 
@@ -251,14 +304,14 @@ class ReadTest(_Base):
         canons = types.SimpleNamespace(hosts=[], processes=[])
         self._item(3482, "mty-amh-impl-05")
         self._event(3482, 1, T - 3 * H,
-                    "hold: attente bureau : geste root (due 2026-10-24 10:00 UTC)")
+                    "hold: attente avatar : geste root (due 2026-10-24 10:00 UTC)")
         report = debit.read(self.db, cfg=self.cfg, now=T, canons=[canons],
                             installed="1.21.0", jobs=False)
         self.assertNotIn(3482, [row["lot"] for row in report["slow_waits"]])
         external = [row for row in report["external_waits"]
                     if row["lot"] == 3482]
         self.assertEqual(len(external), 1)
-        self.assertEqual(external[0]["who"], "bureau")
+        self.assertEqual(external[0]["who"], "avatar")
         self.assertEqual(external[0]["kind"], "hold_external")
         self.assertFalse(external[0]["reminder_due"])
         self.assertEqual(report["totals"]["external_reminders"], 0)

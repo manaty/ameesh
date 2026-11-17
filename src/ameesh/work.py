@@ -5342,7 +5342,7 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     (`assign --claim`) venait d'être refusée, le lot était à `ameesh-dev3`, et
     la commande suivante de la chaîne n'a rien refusé. Un lot qui a un porteur
     n'est déplacé que par lui ou celui qui lui a délégué le lot, un humain, un
-    pilote, le bureau ou l'auditeur (escalades du §9) ; un relecteur désigné
+    pilote, l'avatar ou l'auditeur (escalades du §9) ; un relecteur désigné
     rend un lot en revue. L'entrée en `validated` reste ouverte : elle a sa
     porte, le quorum d'avis (`move`). Un lot sans porteur se prend d'abord,
     mais son déplacement n'est pas refusé ici. Une session liée agit en son nom :
@@ -5350,7 +5350,7 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     n'a rien à prouver ici (l'avertissement « inconnu » la dit au journal). Le
     chemin médié a déjà sa garde (`_require_assigned`) ; les moves internes
     (décisions, report de verdict) n'appellent pas ce contrôle."""
-    from . import identity, slo
+    from . import avatars, identity, slo
     from .work_reviewers import designated
 
     if storage.is_remote(db):
@@ -5368,11 +5368,12 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     if lifecycle.phase(item) in (*TO_VALIDATE, "validated") \
             and who in designated(item):
         return
-    if who in slo.CRITICAL_TARGETS or is_pilot(cfg, db, who) or is_auditor(cfg, db, who):
+    if (who in slo.CRITICAL_TARGETS or avatars.is_avatar(cfg, who)
+            or is_pilot(cfg, db, who) or is_auditor(cfg, db, who)):
         return
     raise WorkError(
         "move refused: lot %s is held by %s, not %s; nothing changed. Only its holder, "
-        "a designated reviewer, a human, a pilot, the bureau or the auditor moves it "
+        "a designated reviewer, a human, a pilot, an avatar or the auditor moves it "
         "(take it through the pilot, or say what you found: ameesh work note %s \"…\")"
         % (item_id, holder, who, item_id))
 
