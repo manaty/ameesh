@@ -1797,8 +1797,9 @@ def held_lots(db: Db, agents) -> dict[str, dict]:
 
 def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
     """#753 : l'acteur de la mesure post-déploiement d'un lot promu —
-    l'auditeur du registre (l'agent `auditeur`, ou celui dont la fiche Agent
-    du canon porte le rôle). Un auditeur arrêté ou mort n'est pas un acteur :
+    l'auditeur du registre (celui dont la fiche Agent, ou la projection `roles`
+    du registre sans canon, porte le rôle ; #7661 : jamais un titre de
+    persona). Un auditeur arrêté ou mort n'est pas un acteur :
     on ne réassigne pas un lot à un agent arrêté, ce serait le mal que ce lot
     corrige. Chaîne vide s'il n'y a aucun auditeur vivant, ou plusieurs sans
     choix évident : les lots promus restent alors en place. Jamais
@@ -5347,7 +5348,7 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     n'a rien à prouver ici (l'avertissement « inconnu » la dit au journal). Le
     chemin médié a déjà sa garde (`_require_assigned`) ; les moves internes
     (décisions, report de verdict) n'appellent pas ce contrôle."""
-    from . import avatars, identity, slo
+    from . import alert_briefs, avatars, identity, slo
     from .work_reviewers import designated
 
     if storage.is_remote(db):
@@ -5365,7 +5366,11 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     if lifecycle.phase(item) in (*TO_VALIDATE, "validated") \
             and who in designated(item):
         return
-    if (who in slo.CRITICAL_TARGETS or avatars.is_avatar(cfg, who)
+    # #7661 : les cibles critiques du §9 sont des rôles, pas des noms ; le
+    # titre `auditeur` ne donne pas le déplacement, `is_auditor` le lit sur la
+    # fiche. L'avatar du responsable (#7634) garde son geste.
+    targets = set(slo.CRITICAL_TARGETS) - set(alert_briefs.AUDITOR_ROLES)
+    if (who in targets or avatars.is_avatar(cfg, who)
             or is_pilot(cfg, db, who) or is_auditor(cfg, db, who)):
         return
     raise WorkError(
