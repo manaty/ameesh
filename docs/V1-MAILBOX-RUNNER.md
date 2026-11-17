@@ -488,6 +488,17 @@ Without a binding, the hook delivers nothing and writes nothing. `bind --import`
 the local bridge file (`external-session-bindings.json`), `unbind` revokes,
 `bindings` lists; every binding and revocation is written to the thread.
 
+**Never bind the watch sender.** `veille` is the identity that *emits* the
+automatic `ameesh watch` instruction; it has no read mailbox (mail addressed to
+it is refused, #3342). Binding a session to it would give that session a
+one-way voice. `ameesh mail bind veille …` is therefore refused (#7725) —
+`--force` does not lift it — and asks for the agent the session actually
+carries; an active binding created before that refusal no longer yields an
+identity, and `whoami` or the hook states why. A message explicitly sent as
+`veille` (the watch itself, a script) still leaves, but the sender is warned
+that replies are not delivered: write in the readable thread or to the relay
+of the request (pilot or orchestrator), never to `veille`.
+
 **Without a lease, never on the row of an `execute` agent (L46).** A hook without
 a lease (source `explicit` or `session`) only advances `last_seen` on the
 row of an `execute` agent: no host, harness, session, directory or
