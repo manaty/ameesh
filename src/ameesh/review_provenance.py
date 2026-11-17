@@ -504,6 +504,7 @@ def _binding_identity(db, row, *, cfg, actor: str = "", require_pid: bool = Fals
                 % (harness, ", ".join(sorted(families))))
     return {"actor": name, "turn": SESSION_TURN_PREFIX + session,
             "harness": harness, "session": session, "host": host,
+            "binding_ts": float(row.get("created_ts") or 0.0),
             "source": "session"}
 
 
@@ -519,7 +520,10 @@ def _bound_session(db, *, actor: str = "", cfg=None, environ=None) -> dict:
       `AMEESH_SESSION_ID`, …). C'est le cas d'une session native liée, dont
       l'outil Git ne descend pas du processus lié. La liaison est alors lue
       par (hôte, harnais, session) — la clé écrite par `ameesh mail bind` —
-      sans exiger un PID qu'une session native ne peut pas fournir.
+      sans exiger un PID qu'une session native ne peut pas fournir. Si la
+      liaison porte un PID, l'identifiant de session ne suffit jamais : le
+      processus doit en descendre (et le PID ne doit pas avoir été réutilisé),
+      sinon on retombe sur l'ascendance (B1 #7719).
 
     Dans les deux cas, l'agent doit être `externe` au registre, sans bail
     vivant, et le harnais de la liaison doit être celui que le registre lui
@@ -537,6 +541,7 @@ def _bound_session(db, *, actor: str = "", cfg=None, environ=None) -> dict:
     shell portant encore le nom annoncé masquait une liaison valide."""
     from . import config as config_mod
     from . import identity as identity_mod
+    from . import session_bindings
     cfg = cfg or getattr(db, "cfg", None) or config_mod.load()
     try:
         harness, session = session_from_env(environ)
@@ -547,8 +552,23 @@ def _bound_session(db, *, actor: str = "", cfg=None, environ=None) -> dict:
     if session:
         row = active_binding(db, cfg, session=session, harness=harness,
                              required=False)
+        if row is not None and row.get("pid"):
+            # B1 #7719 : une liaison à PID ne se revendique pas par le seul
+            # identifiant de session. Sans ce contrôle, un processus étranger
+            # poserait `CODEX_SESSION_ID` et écrirait au nom de la session
+            # liée, alors que la voie historique exigeait l'ascendance
+            # (L46/L63). `for_hook` vérifie aussi que le PID n'a pas été
+            # réutilisé (heure de démarrage). Sinon, on retombe sur
+            # l'ascendance : elle prouvera ou refusera.
+            _, why = session_bindings.for_hook(
+                cfg, db, str(row.get("harness") or ""),
+                str(row.get("session_id") or ""))
+            if why:
+                row = None
         if row is not None:
-            return _binding_identity(db, row, cfg=cfg, actor=actor)
+            return _binding_identity(
+                db, row, cfg=cfg, actor=actor,
+                require_pid=bool(row.get("pid")))
     try:
         binding = identity_mod.resolve_session_binding(cfg, db)
     except Exception as exc:  # noqa: BLE001 - liaison illisible : origine inconnue
@@ -1601,7 +1621,17 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
             "only the current worktree HEAD can be recorded (HEAD is %s, not %s)"
             % ((head or "?")[:12], full[:12]))
     if identity.get("source") == "session":
-        _refuse_foreign_committer(db, sha=full, cwd=cwd, actor=identity["actor"])
+        info = _refuse_foreign_committer(db, sha=full, cwd=cwd,
+                                         actor=identity["actor"])
+        # B1 #7719 : la voie des hooks applique la même borne de date que la
+        # voie explicite. Le commit doit être HEAD (donc porté par une réf) ;
+        # il ne peut pas dater d'avant la liaison qui le revendique.
+        created = float(identity.get("binding_ts") or 0.0)
+        if created and info["committer_ts"] + 1.0 < created:
+            raise ProvenanceError(
+                "commit %s was committed on %s, before its session binding "
+                "(%s): refused"
+                % (full[:12], _at_text(info["committer_ts"]), _at_text(created)))
     else:
         from .identity import GIT_EMAIL_DOMAIN
         committer = subprocess.run(
