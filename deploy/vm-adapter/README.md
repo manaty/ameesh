@@ -527,18 +527,37 @@ une PR inverse :
 
 ### Séquence R1 (plan de #6002, remplace l'étape « drain » de v3.4.1)
 
-1. Gardes d'entrée, hors coupure (10:00Z, 22:00Z) et hors CI de paquet,
-   avec le composeur suspendu. Aucun job guest d'offload vivant sur AG3
-   (`ameesh offload run`, compte `ameesh-guest` : aucun processus). Aucun
-   contrôle `draining`/`returning` sur AG3 (`ameesh host status
-   ameesh-agents-3`), et aucune retenue.
+Deux PR canon home sont préparées, relues par une autre famille que Claude
+et gelées avant le feu : « fenêtre » (manaty/home#297) et « R2 »
+(manaty/home#298), qui en est l'inverse exact (son revert, sans écart avec
+`main`). Le pilote fusionne #297 au feu et #298 à R2.
+
+**Hôtes au runner vivant** : AG1, AG2, AG3, manaty-mesh-1 et le serveur
+médié. pc-smichea (lost, éteint) est hors champ : il est consigné comme tel,
+sans vérification. S'il revient pendant la fenêtre, le feu s'arrête (sortie,
+étape 7).
+
+**Synchronisation prouvée** : après chaque fusion, lancer `ameesh canon
+sync --fetch --json` sur chaque hôte au runner vivant, puis consigner le
+champ `source` (`home @ <commit>`) qui nomme le commit fusionné. Un runner
+resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
+
+1. Gardes d'entrée, vérifiées et consignées au feu, hors coupure (10:00Z,
+   22:00Z) :
+   - composeur suspendu, aucune CI de paquet ;
+   - aucun job guest d'offload vivant sur AG3 (compte `ameesh-guest` : aucun
+     processus) ;
+   - aucun contrôle `draining`/`returning` sur AG3 (`ameesh host status
+     ameesh-agents-3`), aucune retenue ;
+   - `/home/ameesh/.local/share/ameesh/venv/bin/python` présent et
+     exécutable sur chaque hôte au runner vivant ;
+   - #297 et #298 gelées et relues.
 2. Le bureau active l'inscription (`enabled: true`, copie avant) et démarre
    le timer (R1 de D1). Le worker doit être vu (`vm_adapter_observations`)
    **avant** l'étape 3 : un hook sans worker laisse l'hôte fermé.
-3. Le pilote fusionne la PR fenêtre, puis vérifie sur un runner d'AG3 et sur
-   un runner d'un autre hôte que la carte synchronisée donne ce hook et
-   `runs_interface: none (Host card)` (`ameesh canon show`, projection
-   `ameesh hosts ameesh-agents-3`).
+3. Le pilote fusionne #297, puis fait la synchronisation prouvée. Sur AG3 et
+   sur un autre hôte, la projection (`ameesh hosts ameesh-agents-3`) donne
+   ce hook et `runs_interface: none (Host card)`.
 4. Le drainage frais vient **après** l'étape 3 : `ameesh host drain
    ameesh-agents-3 --for 3h`. Un drainage antérieur au hook a consommé une
    partie de `host_release_drain_bound` (2100 s) depuis son `requested_ts` :
@@ -549,16 +568,23 @@ une PR inverse :
    archivage, poweron, santé dans les 15 min. Relever T_halt, T_archive,
    T_restore et T_health.
 6. Clôture : une fois AG3 revenu (`available`, prises ouvertes, santé
-   verte), le pilote fusionne la PR inverse (lend rétabli, hook et `none`
-   retirés). Ensuite le bureau arrête le timer (R2) et remet `enabled: false`.
-   **Si AG3 est encore arrêté ou en retour, garder le hook** (« Contrôle et
-   retour arrière ») : sans lui, L232e rouvrirait les prises sur une VM
-   éteinte.
+   verte), le pilote fusionne #298, puis fait la synchronisation prouvée.
+   Ensuite le bureau arrête le timer (R2) et remet `enabled: false`.
+7. Sortie d'incident, en moins de 15 min (même borne que le retour par
+   poweron) :
+   - AG3 n'a pas été arrêté (`draining`, VM running) : fusionner #298, faire
+     la synchronisation prouvée, puis `ameesh host undrain ameesh-agents-3`.
+     Sans hook, L232e rouvre les prises.
+   - AG3 est arrêté ou en retour : d'abord le retour par poweron (busy,
+     santé, réconciliation), **en gardant le hook**. Sans lui, L232e
+     rouvrirait les prises sur une VM éteinte (« Contrôle et retour
+     arrière »). Ensuite seulement : #298, synchronisation, R2.
 
 Pendant la fenêtre, la prévalidation au gel est indisponible (son seul hôte
-est AG3). C'est un résultat non concluant, qui ne retient rien. Pour
-déclarer le hook en permanence, il faut une interface qui compte les jobs
-guest d'un hôte prêteur (C5). Ce lot ne la livre pas.
+est AG3). C'est un résultat non concluant, qui ne retient rien (§3). Pour
+déclarer le hook en permanence, et rendre un burst après 30 min sans
+travail hors fenêtre, il faut une interface qui compte les jobs guest d'un
+hôte prêteur (C5). C'est un lot de suite.
 
 ## Contrôle et retour arrière
 
