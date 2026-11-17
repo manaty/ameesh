@@ -110,6 +110,7 @@ title: alice-avatar
 responsible: human:alice
 team: alice
 releve: preference          # classement par l'ordre de la fiche Placement
+reveil: {}                  # #7632 : humain, urgent, demandes tout de suite ; le reste par 30 min
 avatar:
   conversation: portable   # local (défaut) | portable
   children: own-host       # own-host (défaut) | pod | none
