@@ -10,7 +10,7 @@ from .test_3498_hold_externe import event, item, run
 
 class ExternalCommaTest(unittest.TestCase):
     def test_comma_declares_executor_gesture_and_due(self):
-        for who in ("owner", "bureau"):
+        for who in ("owner", "avatar"):
             with self.subTest(who=who):
                 text = (f"hold: attente {who}, signer le go "
                         "(due 2026-10-25 12:00 UTC)")
@@ -20,8 +20,8 @@ class ExternalCommaTest(unittest.TestCase):
                 self.assertEqual(planned_waits.external_hold_warning(text), "")
 
     def test_comma_in_prose_does_not_declare_external_wait(self):
-        for text in ("hold: rebase, en attente du bureau",
-                     "hold: rebase, en attente du bureau, signer",
+        for text in ("hold: rebase, en attente de l'avatar",
+                     "hold: rebase, en attente de l'avatar, signer",
                      "hold: rebase; attente owner, signer",
                      "attente owner, signer", "hold: attente owner, "):
             with self.subTest(text=text):
@@ -29,15 +29,15 @@ class ExternalCommaTest(unittest.TestCase):
 
     def test_malformed_leading_wait_warns(self):
         for text in ("hold: attente owner signer le go",
-                     "hold: attente bureau", "hold: attente owner,",
+                     "hold: attente avatar", "hold: attente owner,",
                      "hold: attente owner :"):
             with self.subTest(text=text):
                 self.assertIn("external wait not recognized",
                               planned_waits.external_hold_warning(text))
 
     def test_valid_separators_and_ordinary_prose_do_not_warn(self):
-        for text in ("hold: attente bureau : signer", "hold: attente owner — signer",
-                     "hold: rebase, en attente du bureau", "unhold: attente owner",
+        for text in ("hold: attente avatar : signer", "hold: attente owner — signer",
+                     "hold: rebase, en attente de l'avatar", "unhold: attente owner",
                      "note: attente owner", "hold: attente ownership", None):
             with self.subTest(text=text):
                 self.assertEqual(planned_waits.external_hold_warning(text), "")

@@ -363,30 +363,29 @@ class ProvisioningTest(unittest.TestCase):
 
 
 class TenantAuthorityTest(unittest.TestCase):
-    """N2 (#7200) : liaison de tenant = humain ou bureau, jamais un agent.
+    """N2 (#7200) : liaison de tenant = humain ou avatar, jamais un agent.
 
     `work.corrector` accepte les orchestrateurs et les agents de conception ;
-    le geste d'infrastructure du design 5322 §3.4 est réservé au bureau, d'où
-    la garde propre `tenancy.operator` (`BUREAU_ROLES`).
+    le geste d'infrastructure du design 5322 §3.4 est réservé à l'avatar de
+    l'humain (#7634), d'où la garde propre `tenancy.operator`.
     """
 
     def test_un_agent_de_conception_est_refuse(self):
         binding = identity.Binding(name="mty-amh-impl-04", source="session", ok=True)
         with mock.patch.object(identity, "resolve_binding", return_value=binding), \
-                mock.patch.object(sous_utilisation, "role_orchestrators",
-                                  return_value=set()):
+                mock.patch("ameesh.avatars.is_avatar_in", return_value=False):
             with self.assertRaises(tenancy.TenancyError) as caught:
                 tenancy.operator(None, None)
-        self.assertEqual(caught.exception.code, "tenant-bureau-only")
-        self.assertIn("neither a human nor the bureau", str(caught.exception))
+        self.assertEqual(caught.exception.code, "tenant-avatar-only")
+        self.assertIn("neither a human nor an avatar", str(caught.exception))
 
     def test_le_bureau_est_accepte(self):
         binding = identity.Binding(name="bureau", source="session", ok=True)
         with mock.patch.object(identity, "resolve_binding", return_value=binding), \
-                mock.patch.object(sous_utilisation, "role_orchestrators",
-                                  return_value={"bureau"}) as roles:
+                mock.patch("ameesh.avatars.is_avatar_in",
+                           return_value=True) as roles:
             self.assertEqual(tenancy.operator(None, None), "bureau")
-        self.assertEqual(roles.call_args.args[1], tenancy.BUREAU_ROLES)
+        self.assertTrue(roles.called)
 
     def test_un_humain_reste_accepte(self):
         binding = identity.Binding(reason="unbound", source="none")
