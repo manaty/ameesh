@@ -591,7 +591,7 @@ def _release_tick(cfg, args, declared) -> int:
                         status = 1
                     # #7365 : un serveur reporté à chaque coupure est un
                     # retard de version, pas un état ; la garde le déclare au
-                    # pilote et au bureau une fois par release.
+                    # pilote et à l'avatar une fois par release.
                     from . import staging_deferred
                     try:
                         report["staging_deferred"] = staging_deferred.tick(cfg, db, project)
@@ -687,7 +687,7 @@ def _elected_tick(cfg, args):
         raise ReleaseError("release.role and packet_watch.role must agree")
     role = role or watch_role
     if not role:
-        return None  # compatibility until the bureau migrates host units
+        return None  # compatibility until the avatar migrates host units
     # Validate the independent staging route before acquiring an execution
     # lease: synchronous staging may restart the runner that owns this role.
     from . import release_cutoff
@@ -731,17 +731,17 @@ def _elected_tick(cfg, args):
 
 
 def _catchup_actor(cfg, db, explicit) -> str:
-    """#7372: only the bureau, or a human at a terminal, declares the gesture.
+    """#7372: only the avatar, or a human at a terminal, declares the gesture.
 
     An agent session must be *bound* (`identity.require_bound`: runner lease or
     session binding), never a bare `AGENT_MAIL_NAME`, which is self-declared
-    (#7372 B1); it then acts as itself and must be the bureau (its Agent card
-    names the role; `tenancy.operator` applies the same rule for infrastructure
+    (#7372 B1); it then acts as itself and must be the avatar (its Agent card
+    names the avatar block; `tenancy.operator` applies the same rule for infrastructure
     gestures). `--actor` never lets an agent act on behalf of another, and an
     unbound session may only name a known human. A root catch-up is not a
-    generic agent gesture: the owner's decision (#219407) names the bureau.
+    generic agent gesture: the owner's decision (#219407) names the avatar.
     """
-    from . import agent_names, canon, identity, release_cutoff, sous_utilisation
+    from . import agent_names, avatars, canon, identity, release_cutoff
     text = agent_names.resolve((explicit or "").strip(), db=db,
                                operation="release.catchup")
     binding = identity.resolve_binding(cfg, db)
@@ -762,13 +762,13 @@ def _catchup_actor(cfg, db, explicit) -> str:
                 % (name, text))
         try:
             canons = canon.load_configured(cfg) if cfg is not None else []
-            if name in sous_utilisation.role_orchestrators(canons, ("bureau",)):
+            if avatars.is_avatar_in(canons, name):
                 return name
         except Exception as exc:  # noqa: BLE001 - an unreadable authority refuses
             raise release_cutoff.ReleaseError(
-                "cannot read the bureau role of %s: %s" % (name, exc)) from exc
+                "cannot read the avatar of %s: %s" % (name, exc)) from exc
         raise release_cutoff.ReleaseError(
-            "%s is not the bureau: the root catch-up is the bureau's gesture "
+            "%s is not an avatar: the root catch-up is the avatar's gesture "
             "(#219407)" % name)
     if name:
         # A human name must come from a bound terminal. A bare
@@ -786,10 +786,10 @@ def _catchup_actor(cfg, db, explicit) -> str:
     if not text:
         raise release_cutoff.ReleaseError(
             "no bound session identity: a human at a terminal names itself with "
-            "--actor human:<id>; an agent session must be bound to the bureau")
+            "--actor human:<id>; an agent session must be bound to an avatar")
     if not text.startswith(work.HUMAN_PREFIX):
         raise release_cutoff.ReleaseError(
-            "an unbound session cannot declare as %r: only a bound bureau or a "
+            "an unbound session cannot declare as %r: only a bound avatar or a "
             "human terminal" % text)
     human = work.known_human(db, text[len(work.HUMAN_PREFIX):], cfg)
     if not human:
@@ -798,9 +798,9 @@ def _catchup_actor(cfg, db, explicit) -> str:
 
 
 def _catchup(cfg, args) -> int:
-    """`ameesh release catchup` (#7372): declare the bureau's root gesture.
+    """`ameesh release catchup` (#7372): declare the avatar's root gesture.
 
-    The four `vm.sh` steps stay the bureau's manual gesture; this command
+    The four `vm.sh` steps stay the avatar's manual gesture; this command
     records its outcome as a durable `staging.catchup` event, with the host,
     the active commit read from `controler`, the attested tag, the author and
     the owner right read from the project configuration. A declaration is a
@@ -1149,7 +1149,7 @@ def add_parser(sub, func) -> None:
     staging_p.add_argument("--project", default=None)
     staging_p.add_argument("--apply", action="store_true")
     staging_p.add_argument("--actor", default=None,
-                           help="identified pilot/bureau, or human:<id> at a human terminal")
+                           help="identified pilot/avatar, or human:<id> at a human terminal")
     staging_p.set_defaults(func=func)
     watch_p = rel.add_parser(
         "packet-watch", help="#2601: alert the composer and the pilot when a compiled "
@@ -1172,7 +1172,7 @@ def add_parser(sub, func) -> None:
     reason_p.add_argument("--actor", default="")
     reason_p.set_defaults(func=func)
     catchup_p = rel.add_parser(
-        "catchup", help="#7372: declare the bureau's root catch-up of a reported "
+        "catchup", help="#7372: declare the avatar's root catch-up of a reported "
                         "staging server (four vm.sh steps) in the trace and the "
                         "cutoff report")
     catchup_p.add_argument("--project", default="ameesh")
@@ -1185,7 +1185,7 @@ def add_parser(sub, func) -> None:
                            help="what happened, for a failure or a partial gesture")
     catchup_p.add_argument("--actor", default="",
                            help="a human terminal names itself (human:<id>); a bound "
-                                "session acts as itself and must be the bureau")
+                                "session acts as itself and must be an avatar")
     catchup_p.set_defaults(func=func)
     attest_p = rel.add_parser(
         "attest", help="#6020: the staging agent attests a handed-over Nexlink staging "

@@ -31,7 +31,7 @@ activity.
    attend `fix` de son assigné, pas `build`.
 
 #2511 : une fusion d'un lot du canon (branche `canon/…`, dépôt `manaty/home`)
-attend le **bureau**, qui fusionne ce dépôt ; aucun paquet ameesh ne le porte.
+attend son **avatar**, qui fusionne ce dépôt ; aucun paquet ameesh ne le porte.
 
 `waiting_for` (forme d'origine de L26, champ du même nom de `ameesh-alert/1`)
 en est le résumé en un mot : `verdict`, `correction`, `fusion`,
@@ -152,7 +152,7 @@ def _waiting(what: str, who) -> dict:
 
 
 #: #2511 : les lots du canon (dépôt `manaty/home`) nomment leur branche
-#: `canon/<lot>-…` ; leur fusion est celle du bureau, hors des paquets ameesh.
+#: `canon/<lot>-…` ; leur fusion est celle de l'avatar, hors des paquets ameesh.
 CANON_BRANCH_PREFIX = "canon/"
 
 
@@ -160,7 +160,7 @@ def canon_target(item: dict) -> bool:
     """#2511 : ce lot cible-t-il le dépôt du canon (manaty/home) ?
 
     Sa branche (ou sa cible) est alors `canon/<lot>-…` : aucun paquet ameesh
-    ne la porte, la fusion revient au bureau et non au pilote/composeur."""
+    ne la porte, la fusion revient à l'avatar et non au pilote/composeur."""
     return any(str(item.get(key) or "").startswith(CANON_BRANCH_PREFIX)
                for key in ("branch", "branch_target"))
 
@@ -169,7 +169,7 @@ def _merge_wait(actions: list[dict], responsible, assignee, *,
                 canon: bool = False) -> dict:
     """L'attente d'une fusion : la dernière action `git-merge` tranche (L26).
 
-    #2511 : un lot du canon (manaty/home) attend le bureau, qui fusionne son
+    #2511 : un lot du canon (manaty/home) attend l'avatar, qui fusionne son
     dépôt ; une approbation d'action ne change pas ce porteur."""
     merges = [a for a in actions if a.get("connector") == MERGE_CONNECTOR]
     last = merges[-1] if merges else None
@@ -179,7 +179,7 @@ def _merge_wait(actions: list[dict], responsible, assignee, *,
         if last.get("state") == "approved" and not canon:
             return _waiting("merge", last.get("proposed_by"))
     if canon:
-        return dict(_waiting("merge", "bureau"), canon=True)
+        return dict(_waiting("merge", "avatar"), canon=True)
     return _waiting("merge", responsible)
 
 
