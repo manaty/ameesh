@@ -21,7 +21,8 @@ from unittest import mock
 from ameesh import cose, jcs, p256, receipts, signing
 from ameesh import db as db_mod
 
-from .support import TEST_DSN, PgTestCase, apply_authenticators, scaled
+from .support import (TEST_DSN, PgTestCase, apply_authenticators, scaled,
+                      standing_limits)
 from .webauthn_soft import (
     ORIGIN, RP_ID, SoftDevice, SoftEd25519, SoftES256Key, SoftWebAuthn, b64u, cbor,
     make_receipt, make_request, new_action_id, sha,
@@ -33,6 +34,9 @@ CAROL = "human:carol"
 COMMIT = "a" * 40
 NEXT_COMMIT = "b" * 40
 POLICY = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,))
+#: #7629 : plafond PERMISSIF pour les tests de reçus (les cas de politique
+#: construisent la leur) ; le bénéficiaire reste optionnel comme avant.
+STANDING_LIMITS = standing_limits()
 
 
 def member(title: str, *entries: dict, commit: str = COMMIT) -> dict:
@@ -736,7 +740,7 @@ class SmallOrderEndToEndTest(ReceiptsBase):
         self.assertRefused(self.verify(receipt), receipts.KEY)
         # grant permanent forgé : rien n'est enregistré, aucun nonce consommé
         receipt = forged.receipt(make_request(ALICE, standing=standing()), signer=ForgedSigner())
-        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="x")
+        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="x", limits=STANDING_LIMITS)
         self.assertIsNone(grant)
         self.assertRefused(verdict, receipts.KEY)
         self.assertEqual(self.db.query(
@@ -883,7 +887,7 @@ class StandingBase(ReceiptsBase):
     def register(self, soft=None, approver=ALICE, **overrides):
         soft = soft or self.alice
         receipt = soft.receipt(make_request(approver, standing=standing(**overrides)))
-        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="porte")
+        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="porte", limits=STANDING_LIMITS)
         self.assertTrue(verdict.ok, verdict.reason)
         return grant, receipt
 
@@ -1053,7 +1057,7 @@ class StandingTest(StandingBase):
 
     def test_enregistrement_rejoue(self):
         grant, receipt = self.register()
-        verdict, again = receipts.register_standing(self.db, receipt, POLICY, registered_by="x")
+        verdict, again = receipts.register_standing(self.db, receipt, POLICY, registered_by="x", limits=STANDING_LIMITS)
         self.assertIsNone(again)
         self.assertRefused(verdict, receipts.REPLAY)
 
@@ -1069,7 +1073,7 @@ class StandingTest(StandingBase):
             try:
                 barrier.wait(timeout=30)
                 _verdict, grant = receipts.register_standing(db, receipt, POLICY,
-                                                             registered_by="porte")
+                                                             registered_by="porte", limits=STANDING_LIMITS)
             finally:
                 db.close()
             with lock:
@@ -1091,7 +1095,7 @@ class StandingTest(StandingBase):
         # un reçu standing déjà échu ne s'enregistre pas
         until = int(time.time()) + 60
         receipt = self.alice.receipt(make_request(ALICE, standing=standing(until=until)))
-        verdict, none = receipts.register_standing(self.db, receipt, POLICY, registered_by="x",
+        verdict, none = receipts.register_standing(self.db, receipt, POLICY, registered_by="x", limits=STANDING_LIMITS,
                                                    now=until + 1)
         self.assertIsNone(none)
         self.assertFalse(verdict.ok)
@@ -1177,7 +1181,7 @@ class StandingTest(StandingBase):
         receipt = self.alice.receipt(make_request(ALICE, standing=standing()))
         with self.revoking(self.alice.credential_id) as revocation:
             worker = Worker(self, lambda db: receipts.register_standing(
-                db, receipt, POLICY, registered_by="porte"))
+                db, receipt, POLICY, registered_by="porte", limits=STANDING_LIMITS))
             waited = revocation.blocked(worker)
             revocation.commit()
         verdict, grant = worker.result()
@@ -1190,7 +1194,7 @@ class StandingTest(StandingBase):
     def test_grant_trop_long(self):
         receipt = self.alice.receipt(make_request(
             ALICE, standing=standing(until=int(time.time()) + receipts.DEFAULT_MAX_STANDING + 60)))
-        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="x")
+        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="x", limits=STANDING_LIMITS)
         self.assertIsNone(grant)
         self.assertRefused(verdict, receipts.TTL)
 
@@ -1249,11 +1253,11 @@ class StandingTest(StandingBase):
         self.assertTrue(self.verify(standing_receipt, kind=None).ok)
         action_receipt = self.alice.receipt(make_request(ALICE))
         verdict, grant = receipts.register_standing(self.db, action_receipt, POLICY,
-                                                    registered_by="x")
+                                                    registered_by="x", limits=STANDING_LIMITS)
         self.assertIsNone(grant)
         self.assertRefused(verdict, receipts.KIND)
         deny = self.alice.receipt(make_request(ALICE, standing=standing(), decision="deny"))
-        verdict, grant = receipts.register_standing(self.db, deny, POLICY, registered_by="x")
+        verdict, grant = receipts.register_standing(self.db, deny, POLICY, registered_by="x", limits=STANDING_LIMITS)
         self.assertIsNone(grant)
         self.assertRefused(verdict, receipts.DECISION)
 
@@ -1272,7 +1276,7 @@ class StandingTest(StandingBase):
                                        "webauthn", self.alice.credential_id,
                                        self.alice.proof(b"\x00" * 32))
                 verdict, grant = receipts.register_standing(self.db, receipt, POLICY,
-                                                            registered_by="x")
+                                                            registered_by="x", limits=STANDING_LIMITS)
                 self.assertIsNone(grant)
                 self.assertRefused(verdict, receipts.FORMAT)
 
@@ -1394,7 +1398,7 @@ class DeadlineRaceTest(StandingBase):
             ALICE, iat=iat, ttl=ttl, standing=standing(until=until or iat + 3600)))
 
     def registering(self, receipt):
-        return lambda db: receipts.register_standing(db, receipt, POLICY, registered_by="porte")
+        return lambda db: receipts.register_standing(db, receipt, POLICY, registered_by="porte", limits=STANDING_LIMITS)
 
     def consuming(self, receipt):
         return lambda db: self.consume(receipt, db=db)
@@ -1541,7 +1545,7 @@ class DeadlineRaceTest(StandingBase):
             with self.subTest(label):
                 late = min(request["exp"], request["standing"]["until"]) - 1
                 verdict, grant = receipts.register_standing(
-                    self.db, self.alice.receipt(request), POLICY, registered_by="porte",
+                    self.db, self.alice.receipt(request), POLICY, registered_by="porte", limits=STANDING_LIMITS,
                     now=late)
                 self.assertIsNone(grant)
                 self.assertRefused(verdict, receipts.EXPIRED)
@@ -1559,7 +1563,7 @@ class DeadlineRaceTest(StandingBase):
         self.assertRefused(verdict, receipts.NOT_YET)
         request = make_request(ALICE, iat=int(ahead), standing=standing(until=int(ahead) + 3600))
         verdict, grant = receipts.register_standing(
-            self.db, self.alice.receipt(request), POLICY, registered_by="porte", now=ahead)
+            self.db, self.alice.receipt(request), POLICY, registered_by="porte", limits=STANDING_LIMITS, now=ahead)
         self.assertIsNone(grant)
         self.assertRefused(verdict, receipts.NOT_YET)
         self.assertNothingWritten()
