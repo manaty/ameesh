@@ -252,6 +252,8 @@
   ameesh show <agent>         detailed agent observability;
   ameesh staging-migrations --repo DIR --sha SHA --project P --file PATH
         read-only gate on the applicator's explicit pending SQL inventory;
+  ameesh standing register|list   standing approvals: register from a receipt,
+        list with operations, cap and expiry (spec §8.3, #7631);
   ameesh turn current [--local] [--expect-turn ID] [--json]
         read the calling turn; reuse requires its captured turn id;
   ameesh turn observe (--turn ID | --request ID) [--json]
@@ -343,7 +345,7 @@ EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
 #: adoption et reprise (L39, décision 0030)
 REPRISE_COMMANDS = ("adopt", "resume", "pause")
 #: sous-commandes des reçus d'approbation (receipts_cli)
-RECEIPT_COMMANDS = ("receipt", "authenticator")
+RECEIPT_COMMANDS = ("receipt", "authenticator", "standing")
 #: actions sous porte et file des décisions (actions_cli)
 ACTION_COMMANDS = ("action", "decisions")
 

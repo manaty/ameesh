@@ -13,6 +13,12 @@
         sign a request with a file key (facade ed25519); the receipt carries
         human authority only under a cited accord (`request.accord`), for an
         operation the canon names on that authenticator (#7631);
+  ameesh standing register <receipt.json> [--canon ID] [--by NAME] [--json]
+        register a standing approval (grant, spec §8.3) from a `standing`
+        receipt; a file-key receipt needs its accord (#7631);
+  ameesh standing list [--all] [--json]
+        grants with operations, cap, use and expiry; charter frame and accord
+        when the receipt carries them (#7631);
   ameesh authenticator list [--approver human:ID] [--all] [--expect-commit SHA]
                             [--canon ID] [--json]
         the authenticator registry (working copy of the canon).
@@ -126,6 +132,64 @@ def cmd_sign(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _env_policy(canon: str = "") -> receipts.Policy:
+    origins = [o.strip() for o in os.environ.get("AMEESH_APPROVE_ORIGINS", "").split(",")
+               if o.strip()]
+    return receipts.Policy(rp_id=os.environ.get("AMEESH_APPROVE_RP_ID", ""),
+                           origins=tuple(origins), canon=canon or "")
+
+
+def cmd_standing_register(cfg: Config, args: argparse.Namespace) -> int:
+    with open(args.file, "rb") as fh:
+        raw = fh.read()
+    by = args.by or os.environ.get("AGENT_MAIL_NAME") or "human:%s" % (
+        os.environ.get("USER") or "?")
+    db = _open(cfg)
+    try:
+        verdict, grant_id = receipts.register_standing(db, raw, _env_policy(args.canon),
+                                                       registered_by=by)
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(dict(verdict.as_dict(), grant_id=grant_id), ensure_ascii=False,
+                         indent=2))
+    elif grant_id is not None:
+        print("grant #%d registered: %s %s until %s%s" % (
+            grant_id, verdict.standing["connector"], ",".join(verdict.standing["operations"]),
+            _moment(verdict.standing["until"]),
+            ", accord %s#%d" % (verdict.accord["agent"], verdict.accord["seq"])
+            if verdict.accord else ""))
+    else:
+        print("grant REFUSED [%s]: %s" % (verdict.code, verdict.reason), file=sys.stderr)
+    return 0 if grant_id is not None else 1
+
+
+def cmd_standing_list(cfg: Config, args: argparse.Namespace) -> int:
+    db = _open(cfg)
+    try:
+        rows = receipts.list_standing(db, include_inactive=args.all)
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+        return 0
+    if not rows:
+        print("no %sstanding approval" % ("" if args.all else "active "))
+        return 0
+    for row in rows:
+        cap = ("%s/%s %s" % (row["consumed_amount"], row["max_amount"], row["currency"])
+               if row.get("currency") else "no amount")
+        charter = row.get("charter") or {}
+        accord = row.get("accord") or {}
+        print("#%d %s %s %s [%s] %s, %d use(s), until %s%s%s%s" % (
+            row["id"], row["approver"], row["connector"], ",".join(row["operations"] or []),
+            row["action_class"], cap, int(row.get("uses") or 0), _moment(row["until_ts"]),
+            " (revoked by %s)" % row.get("revoked_by") if row.get("revoked_ts") else "",
+            " — frame %s@%s" % (charter["frame"], charter["version"]) if charter else "",
+            " — accord %s#%s" % (accord.get("agent"), accord.get("seq")) if accord else ""))
+    return 0
+
+
 def cmd_authenticator_list(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
@@ -203,6 +267,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="credential_id of the key in the canon")
     p_sign.add_argument("--out", default=None, help="write the receipt here (0600)")
     p_sign.set_defaults(func=cmd_sign)
+
+    p_standing = sub.add_parser("standing", help="standing approvals (spec §8.3)")
+    standing_sub = p_standing.add_subparsers(dest="standing_command")
+    p_reg = standing_sub.add_parser("register", help="register a grant from its receipt")
+    p_reg.add_argument("file")
+    p_reg.add_argument("--canon", default="", metavar="ID",
+                       help="canon of the authenticator (L44; default: the default canon)")
+    p_reg.add_argument("--by", default=None, metavar="NAME")
+    p_reg.add_argument("--json", action="store_true")
+    p_reg.set_defaults(func=cmd_standing_register)
+    p_sl = standing_sub.add_parser("list", help="grants and their expiry")
+    p_sl.add_argument("--all", action="store_true", help="include revoked and expired ones")
+    p_sl.add_argument("--json", action="store_true")
+    p_sl.set_defaults(func=cmd_standing_list)
 
     p_auth = sub.add_parser("authenticator", help="authenticator registry")
     auth_sub = p_auth.add_subparsers(dest="authenticator_command")

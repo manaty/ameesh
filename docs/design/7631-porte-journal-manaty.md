@@ -43,13 +43,21 @@ d'exécution (`args.proof` ajoutée au résultat : URL de run, SHA, identifiant
 de ressource). L'action montre qui l'a proposée (`proposed_by`), le go
 (`accord` du reçu lié), le reçu, l'issue.
 
-## 3. « Go » permanent
+## 3. « Go » permanent (livré)
 
-Un mandat de nuit ou un go de production daté devient un grant (§8.3) signé
-par clé fichier sous accord ; `standing.operations` est borné par
-`accord_operations`. Commande à ajouter : `ameesh standing list [--active]`
-(opérations, plafond, cumul, échéance). Le lien bénéficiaire/cible du grant
-relève du lot §3.5 point 2 de la série.
+Un mandat de nuit, un go de production daté ou un cadre de la charte de
+l'avatar devient un grant (§8.3) signé par clé fichier sous accord (forme a) ;
+`standing.operations` est borné par `accord_operations`. La demande peut
+porter `standing.charter = {frame, version}` (signé) : le cadre de charte
+inscrit. `ameesh standing register <reçu>` l'enregistre ; `ameesh standing
+list [--all]` donne opérations, plafond, usage, échéance, cadre et accord.
+Le lien bénéficiaire/cible du grant relève du lot §3.5 point 2 de la série.
+
+Accord d'une décision (point 4, validé par le bureau le 17/11) : forme (a)
+`{agent, seq}`, ou forme (b) `{grant: id}`, un grant actif dont les
+opérations couvrent la signature. Les décisions sur la clé owner et les
+attestations de provenance relèvent de `decision-sign-key`, jamais couverte
+par un grant : forme (a) seulement.
 
 ## 4. Signature de décision
 

@@ -187,6 +187,8 @@ _LOGIN_FIELDS = _COMMON_FIELDS | {"login_id", "host", "provider", "account", "sc
 _ATTACH_FIELDS = _COMMON_FIELDS | {"attach_id", "agent", "host", "tenant", "device_key"}
 _STANDING_FIELDS = _COMMON_FIELDS | {"standing"}
 _STANDING_KEYS = frozenset({"connector", "operations", "class", "max_amount", "currency", "until"})
+#: #7631 : `standing.charter` (facultatif, signé) : le cadre de la charte de
+#: l'avatar qu'un grant inscrit, {frame, version}
 #: #7631 : référence d'accord — l'entrée du journal de conversation (L78) où
 #: l'humain a donné son « go » ; facultative, seulement pour une action ou un
 #: grant, et signée avec le reste de la demande
@@ -435,9 +437,16 @@ def _check_standing(standing, iat: int) -> None:
     if not isinstance(standing, dict):
         raise ReceiptError("standing: object expected")
     keys = set(standing)
-    if keys != _STANDING_KEYS:
+    expected = _STANDING_KEYS | ({"charter"} if "charter" in keys else set())
+    if keys != expected:
         raise ReceiptError("standing: missing fields %s, extra %s"
-                           % (sorted(_STANDING_KEYS - keys), sorted(keys - _STANDING_KEYS)))
+                           % (sorted(expected - keys), sorted(keys - expected)))
+    if "charter" in standing:
+        charter = standing["charter"]
+        if (not isinstance(charter, dict) or set(charter) != {"frame", "version"}
+                or not all(isinstance(charter[k], str) and _IDENT_RE.fullmatch(charter[k])
+                           for k in ("frame", "version"))):
+            raise ReceiptError("standing.charter: {frame, version} expected (identifiers)")
     if not isinstance(standing["connector"], str) or not _IDENT_RE.fullmatch(standing["connector"]):
         raise ReceiptError("standing.connector invalide")
     operations = standing["operations"]
@@ -1218,6 +1227,21 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
         if reserved:
             return reserved
     return None
+
+
+def list_standing(db: Db, *, include_inactive: bool = False) -> list[dict]:
+    """#7631 : les grants (actifs seulement par défaut), avec leur cadre de
+    charte et leur accord, relus du reçu enregistré."""
+    rows = storage.of(db).grants.listed(include_inactive=include_inactive)
+    for row in rows:
+        try:
+            request = parse_receipt(row.pop("receipt_json")).request
+        except (ReceiptError, TypeError, ValueError):
+            request = {}
+        row["charter"] = (request.get("standing") or {}).get("charter")
+        row["accord"] = request.get("accord")
+        row["facade"] = row.get("facade") or ""
+    return rows
 
 
 def revoke_standing(db: Db, grant_id: int, *, by: str) -> bool:

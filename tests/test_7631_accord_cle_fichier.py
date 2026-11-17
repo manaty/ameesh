@@ -199,3 +199,49 @@ class PorteTest(AccordBase):
                             policy=POLICY, by="bureau")
         self.assertEqual(caught.exception.code, receipts.ACCORD_OPERATION)
         self.assertEqual(actions.get(self.db, action["action_id"])["state"], "proposed")
+
+
+class GrantTest(AccordBase):
+    """Point 3 : un « go » permanent devient un grant borné, signé par clé
+    fichier sous accord, avec le cadre de charte qu'il inscrit."""
+
+    def standing(self, **extra) -> dict:
+        return dict({"connector": "journal", "operations": ["decision-sign"],
+                     "class": "irreversible", "max_amount": 0, "currency": None,
+                     "until": int(time.time()) + 7 * 86400}, **extra)
+
+    def test_cadre_de_charte_signe_et_borne(self):
+        request = make_request(ALICE, standing=self.standing(
+            charter={"frame": "sign-decisions", "version": "1"}))
+        self.assertEqual(receipts.check_request(request), "standing")
+        for bad in ({"frame": "sign-decisions"}, {"frame": "a b", "version": "1"},
+                    {"frame": "f", "version": 1}, "sign-decisions"):
+            with self.subTest(charter=bad):
+                with self.assertRaises(receipts.ReceiptError):
+                    receipts.check_request(make_request(
+                        ALICE, standing=self.standing(charter=bad)))
+
+    def test_inscrit_puis_liste(self):
+        accord = self.go()
+        receipt = self.receipt(accord, standing=self.standing(
+            charter={"frame": "sign-decisions", "version": "1"}))
+        verdict, grant_id = receipts.register_standing(self.db, receipt, POLICY,
+                                                       registered_by="bureau")
+        self.assertTrue(verdict.ok, verdict.reason)
+        rows = receipts.list_standing(self.db)
+        self.assertEqual([r["id"] for r in rows], [grant_id])
+        row = rows[0]
+        self.assertEqual(row["operations"], ["decision-sign"])
+        self.assertEqual(row["charter"], {"frame": "sign-decisions", "version": "1"})
+        self.assertEqual(row["accord"], accord)
+        self.assertEqual(row["facade"], "ed25519")
+        receipts.revoke_standing(self.db, grant_id, by="human:alice")
+        self.assertEqual(receipts.list_standing(self.db), [])
+        self.assertEqual(len(receipts.list_standing(self.db, include_inactive=True)), 1)
+
+    def test_grant_hors_operations_nommees_refuse(self):
+        receipt = self.receipt(self.go(), standing=self.standing(operations=["spend"]))
+        verdict, grant_id = receipts.register_standing(self.db, receipt, POLICY,
+                                                       registered_by="bureau")
+        self.assertIsNone(grant_id)
+        self.assertEqual(verdict.code, receipts.ACCORD_OPERATION, verdict.reason)

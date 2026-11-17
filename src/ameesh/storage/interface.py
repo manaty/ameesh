@@ -4165,6 +4165,11 @@ class Grants(Domain):
     def get(self, grant_id: int) -> dict | None:
         """Un grant, ou None."""
 
+    @abc.abstractmethod
+    def listed(self, *, include_inactive: bool = False) -> list[dict]:
+        """#7631 : les grants (actifs : ni révoqués ni échus, à l'heure de la
+        base), avec `receipt_json` et la façade de leur authentificateur."""
+
 
 # --------------------------------------------------------------------------
 # index des fils lisibles (`thread_index`)
