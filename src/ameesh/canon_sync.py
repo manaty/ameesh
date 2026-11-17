@@ -2860,8 +2860,13 @@ def parse_ttl(text: str | None) -> float:
 def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
           cwd: str | None = None, canon: "Canon | list[Canon] | None" = None,
           tools: list[str] | None = None, mcp: list[str] | None = None,
-          context: tuple[str, str] | None = None) -> dict:
+          context: tuple[str, str] | None = None,
+          caller_host: str | None = None) -> dict:
     """Crée un agent éphémère : responsable copié du créateur, capacités ⊆ {read, propose}.
+
+    `caller_host` (#7681) est l'hôte d'où le spawn est lancé ; `same-host` en
+    a besoin pour prouver que le workdir et l'UID de l'enfant sont ceux de
+    l'hôte de son parent. Les autres modes de `avatar.children` l'ignorent.
 
     L'insertion est atomique (INSERT … SELECT sur la ligne du créateur) : le
     responsable copié est celui du créateur au moment de la création. Un
@@ -2876,9 +2881,12 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
     #7107 (avatar B5, docs/design/5322-avatar-humain.md §3.6) : un avatar
     (`avatar.children`, défaut `own-host`) place son enfant sur un hôte propre,
     jamais sur l'hôte, l'UID ou le runner de sa lignée ; voir
-    `avatar_children.place_child`. `none` refuse (`spawn-forbidden`), `pod`
-    est hors lot (B5b, `spawn-pod-unsupported`), et sans placement propre
-    `spawn` refuse (`spawn-no-placement`) au lieu de replier sur le parent.
+    `avatar_children.place_child`. `same-host` (#7681) est le seul mode qui
+    partage explicitement l'hôte, l'UID et le runner du parent, avec ses
+    bornes propres (mesh à un seul humain, allowlist `tools`, spawn depuis
+    l'hôte du parent). `none` refuse (`spawn-forbidden`), `pod` est hors lot
+    (B5b, `spawn-pod-unsupported`), et sans placement propre `spawn` refuse
+    (`spawn-no-placement`) au lieu de replier sur le parent.
 
     #7034 : `tools`/`mcp` sont un sous-ensemble de la liste du parent, et
     `context` est `(texte, digest)` (déjà lu et borné par l'appelant). La
@@ -3008,7 +3016,8 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
         else:
             try:
                 placement = avatar_children.place_child(
-                    db, canon_obj, root_card, name, lineage_rows=lineage, cwd=cwd)
+                    db, canon_obj, root_card, name, lineage_rows=lineage, cwd=cwd,
+                    caller_host=caller_host)
             except avatar_children.PlacementError as exc:
                 raise SpawnError(str(exc)) from exc
     extra = {"profile": profile, "context": context_row}
@@ -3023,6 +3032,7 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
             credential_mode=placement.credential_mode,
             evaluated_profile=placement.evaluated_profile,
             evaluated_identity=placement.evaluated_identity,
+            same_host=placement.same_host,
             placement={"ok": placement.verdict.ok,
                        "diagnostic": placement.verdict.diagnostic,
                        "ref": placement.verdict.ref},

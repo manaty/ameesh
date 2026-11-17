@@ -3953,6 +3953,7 @@ class Ephemerals(Domain):
                placement: dict | None = None,
                evaluated_profile: dict | None = None,
                evaluated_identity: dict | None = None,
+               same_host: bool = False,
                profile: dict | None = None,
                context: dict | None = None) -> dict | None:
         """Crée l'éphémère atomiquement (INSERT … SELECT sur la ligne du
@@ -3974,7 +3975,10 @@ class Ephemerals(Domain):
         (`{host, responsible, created_by, lineage}`) est l'identité de lignée
         au moment du choix : l'INSERT refuse un parent déplacé, un responsable
         changé, un `created_by` modifié ou un ancêtre revenu sur l'hôte
-        d'arrivée.
+        d'arrivée. `same_host` (#7681) lève cette seule garde de lignée :
+        l'enfant est explicitement placé sur l'hôte de son parent, sous le
+        même UID et le même runner, avec un dossier neuf ; le mode est refusé
+        en amont sur un hôte partagé ou hors d'un mesh à un seul humain.
 
         #7034 : `profile` (outils/MCP, écrit dans `spawn_profiles`) et
         `context` (extrait borné, écrit dans `spawn_contexts`) sont posés dans

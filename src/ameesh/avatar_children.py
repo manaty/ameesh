@@ -6,7 +6,7 @@ option a : l'enfant est payé par le budget/compte du parent, hôte dédié pour
 la première tranche). Le pod (B5b) est hors de ce lot.
 
 Un avatar est une carte qui porte un bloc `avatar`. Son `avatar.children` vaut
-`own-host` (défaut), `none` ou `pod` :
+`own-host` (défaut), `same-host`, `none` ou `pod` :
 
 * `own-host` : `agent spawn --ttl` place l'enfant sur un hôte **autre** que
   ceux de sa lignée (le créateur immédiat et ses ancêtres), choisi dans
@@ -17,14 +17,22 @@ Un avatar est une carte qui porte un bloc `avatar`. Son `avatar.children` vaut
   placement de l'avatar sur cet hôte est réévalué (`placement.evaluate`) ;
   l'enfant reçoit ce verdict, son profil évalué, et `admitted_hosts` réduit à
   cet hôte.
+* `same-host` (#7681) : l'enfant est placé sur l'hôte **de son parent**, sous
+  le même UID et le même runner, avec un dossier neuf et `admitted_hosts`
+  réduit à cet hôte. Valeur explicite, jamais le défaut ; refusée sur un hôte
+  `policy.shared`, pour un autre `responsible` que celui de l'avatar, ou si
+  le `spawn` ne tourne pas sur l'hôte du parent. Aucune isolation d'UID n'est
+  promise : l'avatar doit déclarer une allowlist `tools` explicite et non
+  vide. C'est le mode d'un mesh à un seul humain, pas une frontière
+  multi-humain.
 * `none` : `spawn` refuse (`spawn-forbidden`).
 * `pod` : non implémenté ici (B5b) ; `spawn` refuse au lieu de replier
   silencieusement sur un autre mode (`spawn-pod-unsupported`).
 
-Rien n'est jamais replié sur l'hôte, l'UID ou le runner du parent : sans
-placement propre, `spawn` refuse (`spawn-no-placement`) et dit l'hôte/le
-tenant à provisionner. Aucun achat d'hôte n'est fait par ce lot : c'est une
-décision de dépense de l'owner.
+Hors le mode explicite `same-host` (#7681), rien n'est jamais replié sur
+l'hôte, l'UID ou le runner du parent : sans placement propre, `spawn` refuse
+(`spawn-no-placement`) et dit l'hôte/le tenant à provisionner. Aucun achat
+d'hôte n'est fait par ce lot : c'est une décision de dépense de l'owner.
 
 La garde d'exécution reste celle de #7106 : sur un hôte partagé, la base
 (`ameesh_tenant_claim_ok`) ne donne le bail qu'au runner lié au tenant
@@ -43,9 +51,11 @@ from .db import Db
 
 #: valeurs admises de `avatar.children`
 CHILDREN_OWN_HOST = "own-host"
+CHILDREN_SAME_HOST = "same-host"
 CHILDREN_NONE = "none"
 CHILDREN_POD = "pod"
-CHILDREN_POLICIES = (CHILDREN_OWN_HOST, CHILDREN_NONE, CHILDREN_POD)
+CHILDREN_POLICIES = (CHILDREN_OWN_HOST, CHILDREN_SAME_HOST, CHILDREN_NONE,
+                     CHILDREN_POD)
 CHILDREN_DEFAULT = CHILDREN_OWN_HOST
 
 CARD_SECTION = "avatar"
@@ -55,6 +65,9 @@ CARD_KEY = "children"
 SPAWN_FORBIDDEN = "spawn-forbidden"
 SPAWN_POD_UNSUPPORTED = "spawn-pod-unsupported"
 SPAWN_NO_PLACEMENT = "spawn-no-placement"
+SPAWN_SAME_HOST_REFUSED = "spawn-same-host-refused"
+SPAWN_SAME_HOST_UNBOUND = "spawn-same-host-unbound"
+SPAWN_SAME_HOST_FOREIGN = "spawn-same-host-foreign"
 SPAWN_POLICY_INVALID = "spawn-policy-invalid"
 SPAWN_CANON_UNREADABLE = "spawn-canon-unreadable"
 SPAWN_LINEAGE_BROKEN = "spawn-lineage-broken"
@@ -91,11 +104,14 @@ class ChildPlacement:
     #: du parent et noms de la lignée. L'INSERT les re-vérifie pour qu'un
     #: déplacement ou un changement de tenant dans la fenêtre refuse l'écriture.
     evaluated_identity: dict
+    #: #7681 : placement `same-host` — même hôte, même UID et même runner que
+    #: le parent ; aucune isolation d'UID n'est promise par ce mode.
+    same_host: bool = False
 
     def describe(self) -> dict:
         return {"host": self.host, "cwd": self.cwd, "tenant": self.tenant,
                 "unix_user": self.unix_user, "uid": self.uid,
-                "runner": self.runner_id}
+                "runner": self.runner_id, "same_host": self.same_host}
 
 
 def policy_of(card: Any) -> tuple[str | None, str]:
@@ -303,13 +319,87 @@ def _failure(root_card: Any, policy: str, admitted: list[str],
            ", ".join(excluded) or "none", ", ".join(admitted) or "none", details)))
 
 
+def _same_host(db: Db, canon, root_card: Any, child: str, *,
+               lineage_rows: list[dict], parent: dict, evaluated: dict,
+               identity: dict, caller_host: str | None) -> ChildPlacement:
+    """Placement `same-host` (#7681) : l'hôte du parent, même UID, dossier neuf.
+
+    Ce mode n'est pas un repli de `own-host` : il est refusé hors d'un mesh à
+    un seul humain (l'hôte doit appartenir au `responsible` de l'avatar et ne
+    pas être `policy.shared`) et exige une allowlist `tools` explicite. Le
+    spawn doit tourner sur l'hôte du parent : c'est la seule preuve que le
+    workdir et l'UID calculés sont bien ceux de cet hôte."""
+    host = str(parent.get("host") or "")
+    if not host:
+        raise PlacementError(SPAWN_SAME_HOST_REFUSED, (
+            "parent %s has no host: `avatar.children: same-host` has no host to "
+            "place its child on" % (parent.get("name") or "?")))
+    if not caller_host:
+        raise PlacementError(SPAWN_SAME_HOST_UNBOUND, (
+            "`avatar.children: same-host` needs the spawn to run on the parent's "
+            "host, but the caller host is unknown (AMEESH_HOST): run `ameesh agent "
+            "spawn` from %s" % host))
+    if caller_host != host:
+        raise PlacementError(SPAWN_SAME_HOST_FOREIGN, (
+            "parent %s runs on host %s, this spawn runs on %s: a same-host child is "
+            "placed on its parent's host only; run the spawn from %s"
+            % (parent.get("name") or "?", host, caller_host, host)))
+    host_card = canon.host(host)
+    if host_card is None:
+        raise PlacementError(SPAWN_NO_PLACEMENT, (
+            "host %s has no Host card: unknown policy" % host))
+    responsible = parent.get("responsible")
+    if getattr(host_card, "responsible", None) != responsible:
+        raise PlacementError(SPAWN_SAME_HOST_REFUSED, (
+            "host %s belongs to %s, not to the avatar's responsible %s: `same-host` "
+            "is reserved for a single-human mesh"
+            % (host, getattr(host_card, "responsible", None) or "?", responsible or "?")))
+    if storage.of(db).tenancy.policy(host).get("shared"):
+        raise PlacementError(SPAWN_SAME_HOST_REFUSED, (
+            "host %s is shared (`policy.shared`): use `own-host` with a tenant runner, "
+            "not `same-host`" % host))
+    tools = getattr(root_card, "tools", None) or []
+    if not tools:
+        raise PlacementError(SPAWN_SAME_HOST_REFUSED, (
+            "avatar %s declares `avatar.children: same-host` but no `tools` allowlist: "
+            "a child on the parent's UID would inherit every tool of the parent; "
+            "declare `tools: [...]` on the avatar" % root_card.title))
+    verdict = placement.evaluate(canon, root_card.title, host)
+    if verdict.ok is not True:
+        raise PlacementError(SPAWN_NO_PLACEMENT, (
+            "placement refused: %s" % (verdict.diagnostic or "not admitted")))
+    workdir, why = child_workdir(host_card, root_card, child)
+    if not workdir:
+        raise PlacementError(SPAWN_NO_PLACEMENT, why)
+    workdir = os.path.expanduser(workdir)
+    if not os.path.isabs(workdir):
+        raise PlacementError(SPAWN_SAME_HOST_REFUSED, (
+            "work directory %r is not absolute" % workdir))
+    for row in lineage_rows:
+        if _inside(workdir, row.get("cwd")):
+            raise PlacementError(SPAWN_SAME_HOST_REFUSED, (
+                "work directory %s is inside the worktree of %s"
+                % (workdir, row.get("name"))))
+    if verdict.credential_mode is None:
+        raise PlacementError(SPAWN_SAME_HOST_REFUSED, (
+            "no credential mode admitted on host %s" % host))
+    return ChildPlacement(
+        host=host, cwd=workdir, credential_mode=verdict.credential_mode,
+        tenant=_tenant_of(responsible), unix_user="", uid=os.getuid(), runner_id="",
+        verdict=verdict, evaluated_profile=dict(evaluated),
+        evaluated_identity=dict(identity), same_host=True)
+
+
 def place_child(db: Db, canon, root_card: Any, child: str, *,
-                lineage_rows: list[dict], cwd: str | None = None) -> ChildPlacement | None:
+                lineage_rows: list[dict], cwd: str | None = None,
+                caller_host: str | None = None) -> ChildPlacement | None:
     """Placement propre de `child` sous `root_card`, ou None (pas un avatar).
 
     Refuse (`PlacementError`) sur `avatar.children: none|pod`, politique
     illisible, `--cwd` explicite (le worktree doit être choisi sur l'hôte
-    d'arrivée), ou absence de placement propre."""
+    d'arrivée), ou absence de placement propre. `caller_host` (#7681) est
+    l'hôte courant du spawn, requis par `same-host` pour refuser un lancement
+    depuis un autre hôte que celui du parent."""
     policy, problem = policy_of(root_card)
     if policy is None and problem:
         raise PlacementError(SPAWN_POLICY_INVALID, problem)
@@ -356,6 +446,10 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
             "a profile that was never evaluated (%s)"
             % (parent.get("name") or "?", actual, evaluated,
                "docs/design/5322-avatar-humain.md §3.6")))
+    if policy == CHILDREN_SAME_HOST:
+        return _same_host(db, canon, root_card, child, lineage_rows=lineage_rows,
+                          parent=parent, evaluated=evaluated, identity=identity,
+                          caller_host=caller_host)
     admission = placement.admission_of(canon, root_card.title)
     if admission is None:
         raise PlacementError(SPAWN_NO_PLACEMENT, (

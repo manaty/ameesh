@@ -44,7 +44,7 @@ def shared_children_host(**overrides) -> str:
                      **{key: value for key, value in policy.items() if value is not None})
 
 
-def avatar_card(children: str | None = "own-host") -> str:
+def avatar_card(children: str | None = "own-host", tools=None) -> str:
     lines = [
         "---",
         "type: Persona",
@@ -57,6 +57,8 @@ def avatar_card(children: str | None = "own-host") -> str:
         "provider: anthropic",
         "credential_mode: api-key",
     ]
+    if tools is not None:
+        lines.append("tools: [%s]" % ", ".join(tools))
     if children is not None:
         lines += ["avatar:", "  children: %s" % children]
     lines += ["---", "", "# avatar", ""]
@@ -337,3 +339,116 @@ class ChildrenPlacementTest(test_canon._CanonDbCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class SameHostPlacementTest(test_canon._CanonDbCase):
+    """#7681 : `avatar.children: same-host`, explicite et borné.
+
+    Le parent tourne sur `chez-alice`, un hôte du même humain que l'avatar ;
+    l'enfant reste sur cet hôte, avec un dossier neuf et le même UID. Le mode
+    est refusé hors de ces bornes (autre hôte, hôte partagé, autre humain,
+    allowlist absente)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        write(self.root, "hotes/chez-alice.md", self.host_card())
+        write(self.root, "agents/avatar.md",
+              avatar_card("same-host", tools=["Read", "Grep"]))
+        write(self.root, "placements/avatar.md", fiche(
+            type="Placement", title="avatar@chez-alice", agent="avatar",
+            hosts=["chez-alice"], credential_mode="api-key"))
+        loaded = self.load()
+        findings = canon.validate(loaded)
+        self.assertEqual(codes(findings, canon.ERROR), set(), findings)
+        canon_sync.sync(self.db, loaded, "chez-alice")
+
+    def host_card(self, **overrides):
+        policy = dict(workspaces='{roots: {acme-web: "~/work/{agent}"}}',
+                      max_agents="4")
+        policy.update(overrides)
+        return host_card("chez-alice", ALICE, **policy)
+
+    def spawn(self, name: str = "enfant1", **kwargs):
+        kwargs.setdefault("caller_host", "chez-alice")
+        return canon_sync.spawn(self.db, name, "avatar", 600,
+                                canon=self.load(), **kwargs)
+
+    def test_enfant_sur_l_hote_du_parent_avec_un_dossier_neuf(self):
+        row = self.spawn()
+        parent = self.row("avatar")
+        self.assertEqual(row["host"], "chez-alice")
+        self.assertTrue(row["placement"]["same_host"])
+        full = self.row("enfant1")
+        self.assertEqual(full["admitted_hosts"], ["chez-alice"])
+        self.assertEqual(row["placement"]["uid"], os.getuid())
+        self.assertNotEqual(row["cwd"], parent["cwd"])
+        self.assertEqual(row["cwd"], os.path.expanduser("~/work/enfant1"))
+        self.assertTrue(row["placement_ok"], row["placement_diagnostic"])
+        # le même UID/runner que le parent : aucune isolation d'UID promise
+        self.assertEqual(row["placement"]["unix_user"], "")
+        self.assertEqual(row["placement"]["runner"], "")
+
+    def test_refuse_sans_hote_appelant(self):
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            self.spawn(caller_host=None)
+        self.assertIn("spawn-same-host-unbound", str(ctx.exception))
+        self.assertIn("AMEESH_HOST", str(ctx.exception))
+        self.assertIsNone(self.row("enfant1"))
+
+    def test_refuse_depuis_un_autre_hote_que_le_parent(self):
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            self.spawn(caller_host="ailleurs")
+        self.assertIn("spawn-same-host-foreign", str(ctx.exception))
+        self.assertIn("chez-alice", str(ctx.exception))
+        self.assertIsNone(self.row("enfant1"))
+
+    def test_refuse_un_hote_partage(self):
+        storage.of(self.db).tenancy.write_policy(
+            "chez-alice", "canon:test", shared=True, tenants=[ALICE],
+            canon_ref="test")
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            self.spawn()
+        self.assertIn("spawn-same-host-refused", str(ctx.exception))
+        self.assertIn("policy.shared", str(ctx.exception))
+        self.assertIsNone(self.row("enfant1"))
+
+    def test_refuse_un_hote_d_un_autre_humain(self):
+        write(self.root, "hotes/chez-alice.md", host_card(
+            "chez-alice", "human:bruno",
+            workspaces='{roots: {acme-web: "~/work/{agent}"}}', max_agents="4"))
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            self.spawn()
+        self.assertIn("spawn-same-host-refused", str(ctx.exception))
+        self.assertIn("human:bruno", str(ctx.exception))
+        self.assertIsNone(self.row("enfant1"))
+
+    def test_refuse_sans_allowlist_tools(self):
+        write(self.root, "agents/avatar.md", avatar_card("same-host"))
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            self.spawn()
+        self.assertIn("spawn-same-host-refused", str(ctx.exception))
+        self.assertIn("no `tools` allowlist", str(ctx.exception))
+        self.assertIsNone(self.row("enfant1"))
+
+    def test_refuse_un_dossier_partage_entre_enfants(self):
+        write(self.root, "hotes/chez-alice.md", self.host_card(
+            workspaces="{roots: {acme-web: /srv/acme/acme-web}}"))
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            self.spawn()
+        self.assertIn("spawn-no-placement", str(ctx.exception))
+        self.assertIn("no per-child work directory", str(ctx.exception))
+        self.assertIsNone(self.row("enfant1"))
+
+    def test_cwd_explicite_refuse(self):
+        with self.assertRaises(canon_sync.SpawnError) as ctx:
+            self.spawn(cwd=os.path.join(tempfile.gettempdir(), "partage"))
+        self.assertIn("spawn-cwd-refused", str(ctx.exception))
+        self.assertIsNone(self.row("enfant1"))
+
+    def test_petit_enfant_same_host_reste_sur_le_meme_hote(self):
+        self.spawn()
+        grand = canon_sync.spawn(self.db, "petit1", "enfant1", 600,
+                                 canon=self.load(), caller_host="chez-alice")
+        self.assertEqual(grand["host"], "chez-alice")
+        self.assertTrue(grand["placement"]["same_host"])
+        self.assertEqual(grand["cwd"], os.path.expanduser("~/work/petit1"))

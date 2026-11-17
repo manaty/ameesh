@@ -798,7 +798,7 @@ class Ephemerals(interface.Ephemerals):
     def create(self, name, creator, *, cwd, ttl_seconds, host=None,
                admitted_hosts=None, credential_mode=None,
                placement=None, evaluated_profile=None,
-               evaluated_identity=None, profile=None,
+               evaluated_identity=None, same_host=False, profile=None,
                context=None) -> dict | None:
         """Insertion atomique (INSERT … SELECT sur la ligne du créateur).
 
@@ -819,7 +819,10 @@ class Ephemerals(interface.Ephemerals):
         `evaluated_identity` (`{host, responsible, created_by, lineage}`)
         ferme la course de la fenêtre choix → INSERT : un parent déplacé, un
         responsable changé, un `created_by` modifié ou un ancêtre revenu sur
-        l'hôte d'arrivée n'écrit rien.
+        l'hôte d'arrivée n'écrit rien. `same_host` (#7681) lève la seule garde
+        de lignée : l'enfant est explicitement placé sur l'hôte de son parent,
+        sous le même UID et le même runner ; le mode est refusé en amont sur
+        un hôte partagé ou hors d'un mesh à un seul humain.
 
         #7034 : le profil d'outils/MCP (et les serveurs MCP filtrés) et
         l'extrait de contexte sont écrits dans la MÊME transaction que
@@ -856,9 +859,10 @@ class Ephemerals(interface.Ephemerals):
                 "\n               AND c.host IS NOT DISTINCT FROM %s"
                 "\n               AND c.responsible IS NOT DISTINCT FROM %s"
                 "\n               AND c.created_by IS NOT DISTINCT FROM %s"
-                "\n               AND NOT EXISTS (SELECT 1 FROM agent_registry a"
+                "\n               AND (%s::boolean OR NOT EXISTS (SELECT 1 FROM "
+                "agent_registry a"
                 "\n                                WHERE a.name = ANY(%s::text[])"
-                "\n                                  AND a.host = %s)")
+                "\n                                  AND a.host = %s))")
             params.extend([host, cwd, credential_mode])
             params.extend([ttl_seconds, ttl_seconds])
             params.extend(admitted_hosts)
@@ -892,7 +896,8 @@ class Ephemerals(interface.Ephemerals):
                            evaluated_identity.get("host"),
                            evaluated_identity.get("responsible"),
                            evaluated_identity.get("created_by"),
-                           evaluated_identity.get("lineage") or [], host])
+                           bool(same_host), evaluated_identity.get("lineage") or [],
+                           host])
         with self.db.transaction() as tx:
             created = tx.query(
                 """

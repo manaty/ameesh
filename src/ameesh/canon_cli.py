@@ -945,7 +945,8 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
         name = args.name or _generated_name(
             canon[0].naming if canon else None, args.role, args.project, canon, db)
         row = canon_sync.spawn(db, name, args.by, ttl, cwd=args.cwd, canon=canon,
-                               tools=args.tool, mcp=args.mcp, context=context)
+                               tools=args.tool, mcp=args.mcp, context=context,
+                               caller_host=cfg.host)
         if args.prompt:
             registry.set_pending_prompt(db, name, args.prompt)
     except canon_sync.SpawnError as exc:
@@ -967,7 +968,14 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
               time.strftime("%Y-%m-%d %H:%M", time.localtime(row["ephemeral_expires_ts"])),
               restriction))
     placed = row.get("placement")
-    if placed:
+    if placed and placed.get("same_host"):
+        # #7681 : le mode same-host ne promet aucune isolation d'UID ; le dire
+        # à la création, au lieu de laisser croire à un placement propre.
+        print("same-host placement: host %s, workdir %s (same UID %s and runner as "
+              "the parent: no UID isolation)"
+              % (placed.get("host") or "—", placed.get("cwd") or "—",
+                 placed.get("uid") if placed.get("uid") is not None else "—"))
+    elif placed:
         # #7107 (avatar B5) : le placement propre, pas seulement l'hôte — le
         # runner et l'UID du tenant sont la preuve que l'enfant n'est pas sur
         # ceux du parent.
