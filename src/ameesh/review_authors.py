@@ -1301,6 +1301,7 @@ def _is_ancestor(repo: str, before: str, after: str, cache=None) -> Optional[boo
 
 
 def _present_commits(repo: str, shas: Sequence[str], *,
+                     non_commits: Optional[set[str]] = None,
                      timeout: Optional[float] = None) -> Optional[dict[str, str]]:
     """Les SHA de commits présents **localement**, en une seule commande git.
 
@@ -1308,6 +1309,8 @@ def _present_commits(repo: str, shas: Sequence[str], *,
     reçu ; 500 reçus prenaient ~40 s, au-delà du budget de 60 s du balayage en
     CI. `cat-file --batch-check` lit la présence des objets en un passage, sans
     fetch paresseux (magasin sans remote), et rend `{sha: sha complet}`.
+    `non_commits`, si fourni, reçoit les objets résolus de type blob, tree
+    ou tag (#7618) ; les objets absents ou ambigus restent non concluants.
     `None` quand la lecture échoue : la preuve locale reste non concluante.
     """
     wanted = list(dict.fromkeys(str(sha).lower() for sha in shas or ()
@@ -1332,6 +1335,9 @@ def _present_commits(repo: str, shas: Sequence[str], *,
         fields = line.split()
         if len(fields) == 2 and fields[1] == "commit":
             present[rev] = fields[0].lower()
+        elif (len(fields) == 2 and fields[1] in {"blob", "tree", "tag"}
+              and non_commits is not None):
+            non_commits.add(rev)
     return present
 
 
@@ -5664,7 +5670,9 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         if not cited:
             return {}
         check()
-        present = _present_commits(repo, sorted(cited), timeout=remaining())
+        non_commits: set[str] = set()
+        present = _present_commits(repo, sorted(cited),
+                                   non_commits=non_commits, timeout=remaining())
         check()
         found: dict[str, dict] = {}
 
@@ -5688,6 +5696,12 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             full = (_read_local_commit(repo, token) if present is None
                     else present.get(token))
             if not full:
+                # #7618 : un objet explicitement non commit ne prouve aucun
+                # correctif. Un nombre seul absent du magasin est un identifiant
+                # (par exemple de run), pas une citation Git illisible. Un
+                # hexadécimal mixte absent garde le traitement prudent ci-dessous.
+                if token in non_commits or token.isdecimal():
+                    continue
                 # #7252 B/P2 auditeur : le commit réécrit a disparu du clone
                 # (push forcé). La forge le résout par l'abrégé, puis sert
                 # l'objet exact pour les contrôles de topologie. Forge muette :

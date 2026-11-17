@@ -360,6 +360,24 @@ class _Fixture:
 class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
     """Les témoins #7252, sur la lecture et la sélection du gel."""
 
+    def test_strict_reading_ignores_non_commit_objects_and_run_numbers(self):
+        blob = self.repo.git("rev-parse", "HEAD:src/ameesh/mail.py")
+        tree = self.repo.git("rev-parse", "HEAD^{tree}")
+        for token in (blob[:8], tree[:12], "43969930787"):
+            for fetch in (False, True):
+                with self.subTest(token=token, fetch=fetch):
+                    self.repo.git("reset", "--hard", self.head_a)
+                    self.repo.write("src/ameesh/mail.py", token + "\n")
+                    head = self.repo.commit("author: reference (%s)" % token,
+                                            agent="author")
+                    self._receipt("author", "deepseek", [head])
+                    with mock.patch.object(review_authors, "_forge_commit") as forge:
+                        (_authors, unknown, correctors), _freeze = self._reading(
+                            head, strict=True, fetch=fetch)
+                    self.assertEqual(unknown, [])
+                    self.assertEqual(correctors, [])
+                    forge.assert_not_called()
+
     def test_strict_reading_ignores_explicit_checksums(self):
         for label in ("checksum", "sha256", "SHA256"):
             with self.subTest(label=label):
