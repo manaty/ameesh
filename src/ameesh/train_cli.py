@@ -14,6 +14,12 @@ it writes the gate's audited commit to every configuration file that declares
 ``--lot``. A rules diff requires ``--reviewed --review milestone:<id>`` with
 exact canon opinions, including a pilot's. A bound bureau may execute this
 reviewed move on the train host while the pilot records opinions elsewhere.
+#7751: ``--request`` records the same reviewed move from any host, without a
+lease or a configuration write. A host without the train block states the
+exact pin with ``--pin`` (and, if it cannot read the audited gate, ``--gate``).
+The live train service holder applies it at its next pass with the same review
+guards and traces it on the cited lot; a request whose pin or gate moved is
+refused and named.
 
 A persisted plan that was never fired has no receipt to withdraw: ``abandon``
 is its terminal gesture. It refuses an active/uncertain fire (withdraw or
@@ -124,6 +130,11 @@ def execute(cfg, db, project, action, *, manifest=None, receipt=None, reason=Non
             result["abandoned"] = state["abandoned"]
         if state.get("abandon_request"):
             result["abandon_request"] = state["abandon_request"]
+        # #7751: the holder applies a recorded reviewed requalification at its
+        # next pass; name the pending one until then.
+        requests = ledger.ops.train_requalify_requests(project.name)
+        if requests:
+            result["requalify_requests"] = requests
         return result
     if action not in ("give", "withdraw", "abandon"):
         raise TrainError("train command: show | give | withdraw | abandon expected")
@@ -155,6 +166,17 @@ def main(argv=None):
                            help="qualify a reviewed canon diff, including rule files")
     requalify.add_argument("--review", action="append", default=[],
                            help="exact ok verdict reference: milestone:<id> (repeatable)")
+    requalify.add_argument(
+        "--request", action="store_true",
+        help="persist the reviewed move for the live train holder to apply (#7751)")
+    requalify.add_argument(
+        "--pin",
+        help="exact canon pin the request moves (required when this host has no "
+             "train configuration; --request only)")
+    requalify.add_argument(
+        "--gate",
+        help="exact audited gate commit the request targets (default: read it; "
+             "--request only)")
     for action in ("give", "withdraw", "abandon"):
         command = commands.add_parser(action)
         command.add_argument("--manifest", required=True,
@@ -170,18 +192,30 @@ def main(argv=None):
         if args.action == "requalify":
             db = db_mod.open_db(cfg)
             try:
-                extra = {}
-                if args.reviewed:
-                    from . import train_requalify_review
+                if args.request:
+                    if not args.reviewed:
+                        raise TrainError("--request requires --reviewed")
+                    from . import train_requalify_request, train_requalify_review
                     actor = train_requalify_review.actor(cfg, db)
-                    extra = dict(reviewed=True, reviews=args.review)
+                    result = train_requalify_request.request(
+                        cfg, db, args.project, lot=args.lot,
+                        reviews=args.review, actor=actor, dry_run=args.dry_run,
+                        pin=args.pin, gate=args.gate)
                 else:
-                    if args.review:
-                        raise TrainError("--review requires --reviewed")
-                    actor = _pilot(cfg, db, "train requalify")
-                result = train_requalify.execute(
-                    cfg, db, args.project, lot=args.lot, actor=actor,
-                    dry_run=args.dry_run, **extra)
+                    if args.pin or args.gate:
+                        raise TrainError("--pin and --gate require --request")
+                    extra = {}
+                    if args.reviewed:
+                        from . import train_requalify_review
+                        actor = train_requalify_review.actor(cfg, db)
+                        extra = dict(reviewed=True, reviews=args.review)
+                    else:
+                        if args.review:
+                            raise TrainError("--review requires --reviewed")
+                        actor = _pilot(cfg, db, "train requalify")
+                    result = train_requalify.execute(
+                        cfg, db, args.project, lot=args.lot, actor=actor,
+                        dry_run=args.dry_run, **extra)
             finally:
                 db.close()
             print(json.dumps(result, ensure_ascii=False, indent=2))
