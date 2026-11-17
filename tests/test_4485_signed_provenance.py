@@ -350,16 +350,20 @@ class SignedProvenanceTest(PgTestCase):
         self.bind(session="s-codex-1", harness="codex")
         head = self.commit()
         with self.assertRaises(prov.ProvenanceError) as raised:
-            self.sign(head, session="s-codex-1", harness="claude")
+            self.sign(head, session="s-codex-1", harness="claude",
+                      host=self.cfg.host)
         self.assertIn("bound under", str(raised.exception))
         self.assertIn("codex", str(raised.exception))
 
     def test_a_revoked_binding_of_the_session_still_fixes_identity(self):
-        """#5756 : une liaison révoquée de la session compte encore."""
+        """#5756/#7741 : une liaison révoquée compte pour l'intervalle où elle
+        était active. Le commit doit être fait pendant la liaison ; un commit
+        postérieur au unbind n'est plus attribuable (témoin #7741)."""
         self.bind(session=SESSION, harness="claude")
-        self.unbind(session=SESSION, harness="claude")
         head = self.commit()
-        row = self.sign(head, session=SESSION, harness="claude")
+        self.unbind(session=SESSION, harness="claude")
+        row = self.sign(head, session=SESSION, harness="claude",
+                        host=self.cfg.host)
         self.assertTrue(row["recorded"])
         self.assertEqual(prov.receipt_for_commit(self.db, head)["harness"],
                          "claude")
@@ -371,7 +375,8 @@ class SignedProvenanceTest(PgTestCase):
         self.bind(agent="autre", session="s-autre-1", harness="codex")
         head = self.commit()
         with self.assertRaises(prov.ProvenanceError) as raised:
-            self.sign(head, session="s-autre-1", harness="codex")
+            self.sign(head, session="s-autre-1", harness="codex",
+                      host=self.cfg.host)
         self.assertIn("bound to autre", str(raised.exception))
 
     def test_the_current_harness_writes_no_extra_meta(self):
