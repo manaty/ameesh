@@ -22,6 +22,7 @@ from ameesh import db as db_mod
 from ameesh import events, fil, notify, registry, runner, serve, storage, work
 from ameesh import actions
 
+from . import canon_staging
 from .support import PgTestCase
 from .test_l84_serve import TOKEN, ServerMixin
 
@@ -316,8 +317,8 @@ class EventLogPgTest(PgTestCase):
         data = {"schema": "ameesh-staging-actif/1", "sha": sha,
                 "sha_court": sha[:9], "date": "2026-10-27T14:00:00Z",
                 "hotes": {hote: {"actif": sha, "etapes": {"sante": "ok"}}
-                          for hote in release_cutoff.STAGING_VMS},
-                "reportes": {release_cutoff.STAGING_POSTE: {"raison": "poste absent"}},
+                          for hote in canon_staging.VMS},
+                "reportes": {canon_staging.WORKSTATION: {"raison": "poste absent"}},
                 "lots": [3981], "rapporteurs": ["mesh-design"]}
         storage.of(self.db).events.record(
             "staging.attested", "staging:%s" % sha, "ameesh", data)

@@ -162,6 +162,9 @@ admins: [human:alice]            # administrateurs : règle de visibilité (L31)
 occupants: [human:anna]          # accès physique sans administrer (L110) ; absent = aucun
 indisponible_jusqu_au: 2026-10-30 # appareil indisponible, jour inclus (#3070, canon §12)
 indisponible_motif: "en déplacement"
+staging:                         # #7662 : séquence staging du mesh (canon §14)
+  order: 50                      # rang croissant ; le poste vient en dernier
+  kind: workstation              # agents (VM toujours requise) | server | workstation
 policy:
   harnesses: [claude, codex, deepseek]   # absent = tous
   providers: [anthropic, openai, deepseek]
@@ -190,6 +193,20 @@ physique sans agent (Mac, PC de recette) a sa fiche `hotes/` avec
 (`host-unavailable-invalid`) qui ne déclare rien ; un motif sans date, un
 avertissement ; une date passée, une information (`host-unavailable-past`) :
 la règle a cessé d'elle-même.
+
+**Séquence staging** (#7662, canon §14) : les fiches `Host` sont la seule
+source de la séquence de déploiement staging. `staging.order` (entier positif
+ou nul) donne le rang croissant ; `staging.kind` vaut `agents` (VM d'agents,
+toujours requise), `server` (serveur sans exécutant, reportable) ou
+`workstation` (poste, mis à jour à son retour, reportable, **toujours en
+dernier**). Une fiche sans
+bloc `staging` n'est pas un hôte de staging : un canon nu ne déclare aucune
+séquence, et le cœur ne connaît aucun nom d'hôte. `canon check` refuse une
+séquence sans VM `agents` (`host-staging-no-agents`), deux `server` ou deux
+`workstation` (`host-staging-duplicate`) et un poste placé avant une autre fiche
+(`host-staging-order`) ; `staging` mal formé ou `kind` inconnu est une erreur
+`host-staging-invalid`, une clé inconnue un avertissement
+(`host-staging-unknown`).
 
 **Dossier de travail d'un agent sur l'hôte** (L31, 0029 ; L35) : c'est un
 réglage de l'hôte, jamais de la persona. Ordre de résolution, le premier qui

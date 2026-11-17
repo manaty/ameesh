@@ -18,6 +18,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from ameesh import release, release_cutoff, staging_deferred
+from tests import canon_staging
 
 SHA = "a" * 40
 OLD = "b" * 40
@@ -56,7 +57,8 @@ def attestation(sha, *, reportes=None, hotes=None, date="2026-11-15T22:31:37Z"):
 def project(name="ameesh", repo="/nowhere", rights=RIGHTS):
     return release_cutoff.ProjectRelease(
         name=name, repo=repo, target="main", remote="origin",
-        report="human", github="manaty/%s" % name, staging_rights=rights)
+        report="human", github="manaty/%s" % name, staging_rights=rights,
+        staging_topology=canon_staging.topology())
 
 
 def active(**extra):

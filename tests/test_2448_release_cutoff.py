@@ -27,6 +27,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from ameesh import config, release_cutoff
+from tests import canon_staging
 
 FEDERATION = """federation: "0.1"
 id: manaty
@@ -187,8 +188,10 @@ class ReleaseFixtureMixin:
         self.canon_commit = self.commit("canon", repo=self.canon)
         self.git(self.origin, "symbolic-ref", "HEAD", "refs/heads/main")
         self.git(self.root, "clone", "-q", str(self.origin), str(self.clone))
-        fake_canon = types.SimpleNamespace(sources=[types.SimpleNamespace(
-            mode="git", repo=str(self.canon), commit=self.canon_commit)])
+        fake_canon = types.SimpleNamespace(
+            sources=[types.SimpleNamespace(
+                mode="git", repo=str(self.canon), commit=self.canon_commit)],
+            hosts=canon_staging.host_cards())
         self.load_canon = mock.patch.object(
             release_cutoff.canon_mod, "load_configured", return_value=[fake_canon])
         self.load_canon.start()
@@ -202,6 +205,9 @@ class ReleaseFixtureMixin:
             release={"host": "pc-smichea",
                      "projects": {"ameesh": {"repo": str(self.clone), "target": "main",
                                              "github": "manaty/ameesh"}}})
+        # #7662 : la coupure lit la séquence staging du canon, jamais un nom
+        # d'hôte codé dans le cœur.
+        self.project = release_cutoff.with_staging_topology(self.cfg, self.project)
         FakeGh.calls = []
         self.gh = mock.patch.object(release_cutoff.plan_github, "Gh", FakeGh)
         self.gh.start()
@@ -282,11 +288,12 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         folder.mkdir(parents=True)
         path = folder / ("actif-%s.json" % sha[:12])
         data = {"sha": sha, "date": "2026-10-18T09:00:00Z",
-                "hotes": {hote: {"actif": sha} for hote in release_cutoff.STAGING_VMS},
-                "reportes": {"pc-smichea": {"raison": "poste absent",
-                                            "mise_a_jour": "a son retour"}}}
+                "hotes": {hote: {"actif": sha} for hote in canon_staging.VMS},
+                "reportes": {canon_staging.WORKSTATION: {
+                    "raison": "poste absent", "mise_a_jour": "a son retour"}}}
         path.write_text(json.dumps(data))
-        self.assertEqual(release_cutoff.read_attestation(sha)["reportes"],
+        self.assertEqual(release_cutoff.read_attestation(
+            sha, topology=canon_staging.topology())["reportes"],
                          data["reportes"])
         # depuis une VM, le poste serait encore reporte : pas de relance a vide
         with mock.patch.dict(os.environ, {"HOTE_LOCAL": "ameesh-agents-1"}), \
@@ -316,9 +323,9 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         lecteurs locaux (`staging_pending`, chemin du rapport)."""
         sha = self.git(self.clone, "rev-parse", "origin/main")
         data = {"sha": sha, "date": "2026-10-18T09:00:00Z",
-                "hotes": {hote: {"actif": sha} for hote in release_cutoff.STAGING_VMS},
-                "reportes": {"pc-smichea": {"raison": "poste absent",
-                                            "mise_a_jour": "a son retour"}}}
+                "hotes": {hote: {"actif": sha} for hote in canon_staging.VMS},
+                "reportes": {canon_staging.WORKSTATION: {
+                    "raison": "poste absent", "mise_a_jour": "a son retour"}}}
 
         class FakeDb:
             def __init__(self, rows):
@@ -333,8 +340,8 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         db = FakeDb([{"data": data}])
         path = Path(release_cutoff.attestation_path(sha))
         self.assertFalse(path.exists())
-        self.assertEqual(release_cutoff.read_attestation(sha, db)["reportes"],
-                         data["reportes"])
+        self.assertEqual(release_cutoff.read_attestation(
+            sha, db, canon_staging.topology())["reportes"], data["reportes"])
         self.assertIn("ameesh_staging_attestations", db.sql)
         self.assertEqual(db.params[0], release_cutoff.STAGING_EVENT)
         self.assertEqual(db.params[2], "staging:%s" % sha)
@@ -365,16 +372,17 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         folder = Path(release_cutoff.attestation_path(sha)).parent
         folder.mkdir(parents=True, exist_ok=True)
         local = {"sha": sha, "date": "2026-10-18T10:00:00Z",
-                 "hotes": {hote: {"actif": sha} for hote in release_cutoff.STAGING_HOSTS}}
+                 "hotes": {hote: {"actif": sha} for hote in canon_staging.HOSTS}}
         Path(release_cutoff.attestation_path(sha)).write_text(json.dumps(local))
         shared = {"sha": sha, "date": "2026-10-18T11:00:00Z",
-                  "hotes": {hote: {"actif": sha} for hote in release_cutoff.STAGING_VMS},
-                  "reportes": {"pc-smichea": {"raison": "poste absent"}}}
+                  "hotes": {hote: {"actif": sha} for hote in canon_staging.VMS},
+                  "reportes": {canon_staging.WORKSTATION: {"raison": "poste absent"}}}
         with mock.patch.object(release_cutoff, "stored_attestations",
                                return_value=[shared, {"sha": "b" * 40}]):
-            attestation = release_cutoff.read_attestation(sha, db=object())
+            attestation = release_cutoff.read_attestation(
+                sha, db=object(), topology=canon_staging.topology())
         self.assertNotIn("reportes", attestation)
-        self.assertEqual(set(attestation["hotes"]), set(release_cutoff.STAGING_HOSTS))
+        self.assertEqual(set(attestation["hotes"]), set(canon_staging.HOSTS))
 
     def test_reported_server_attestation_is_complete(self):
         """#147558 : sans acces root, le serveur peut etre reporte ; les deux
@@ -385,19 +393,21 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         path = folder / ("actif-%s.json" % sha[:12])
         data = {"sha": sha, "date": "2026-10-18T09:00:00Z",
                 "hotes": {hote: {"actif": sha} for hote in (
-                    *release_cutoff.STAGING_AGENTS, release_cutoff.STAGING_POSTE)},
-                "reportes": {"manaty-mesh-1": {"raison": "sans-acces root"}}}
+                    *canon_staging.AGENTS, canon_staging.WORKSTATION)},
+                "reportes": {canon_staging.SERVER: {"raison": "sans-acces root"}}}
         path.write_text(json.dumps(data))
-        self.assertIsNotNone(release_cutoff.read_attestation(sha))
+        self.assertIsNotNone(release_cutoff.read_attestation(
+            sha, topology=canon_staging.topology()))
         with mock.patch.object(release_cutoff, "run_staging") as stage:
             out = release_cutoff.maybe_staging(self.project, sha, [], self.cfg.state_dir)
         stage.assert_not_called()
         self.assertEqual(out["skipped"], "already attested")
         # poste reporte en plus : la relance reste due pour son retour
-        data["reportes"]["pc-smichea"] = {"raison": "poste absent"}
-        data["hotes"].pop("pc-smichea")
+        data["reportes"][canon_staging.WORKSTATION] = {"raison": "poste absent"}
+        data["hotes"].pop(canon_staging.WORKSTATION)
         path.write_text(json.dumps(data))
-        self.assertIsNotNone(release_cutoff.read_attestation(sha))
+        self.assertIsNotNone(release_cutoff.read_attestation(
+            sha, topology=canon_staging.topology()))
         with mock.patch.dict(os.environ, {"HOTE_LOCAL": "pc-smichea"}), \
                 mock.patch.object(release_cutoff, "run_staging",
                                   return_value={"exit": 0}) as stage:
@@ -427,24 +437,29 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         folder = self.home / ".local/state/ameesh/mise-a-jour"
         folder.mkdir(parents=True)
         path = folder / ("actif-%s.json" % sha[:12])
-        vms = {hote: {"actif": sha} for hote in release_cutoff.STAGING_VMS}
+        vms = {hote: {"actif": sha} for hote in canon_staging.VMS}
         cas = {
             'trois VM sans report': {"sha": sha, "hotes": vms},
             'deux VM seulement': {"sha": sha,
                                   "hotes": {k: vms[k] for k in list(vms)[:2]},
-                                  "reportes": {"pc-smichea": {"raison": "absent"}}},
+                                  "reportes": {canon_staging.WORKSTATION:
+                                               {"raison": "absent"}}},
             'hote reporte inconnu': {"sha": sha, "hotes": vms,
                                      "reportes": {"ailleurs": {"raison": "absent"}}},
             'raison vide': {"sha": sha, "hotes": vms,
-                            "reportes": {"pc-smichea": {"raison": ""}}},
+                            "reportes": {canon_staging.WORKSTATION:
+                                         {"raison": ""}}},
             'actif sans rapport': {"sha": sha,
-                                   "hotes": {**vms, "pc-smichea": {"actif": "b" * 40}},
-                                   "reportes": {"pc-smichea": {"raison": "absent"}}},
+                                   "hotes": {**vms, canon_staging.WORKSTATION:
+                                             {"actif": "b" * 40}},
+                                   "reportes": {canon_staging.WORKSTATION:
+                                                {"raison": "absent"}}},
         }
         for nom, contenu in cas.items():
             with self.subTest(nom):
                 path.write_text(json.dumps(contenu))
-                self.assertIsNone(release_cutoff.read_attestation(sha))
+                self.assertIsNone(release_cutoff.read_attestation(
+                    sha, topology=canon_staging.topology()))
 
     def test_tag_recent_is_reconciled_without_second_version(self):
         first = self.execute()
@@ -1218,7 +1233,8 @@ class StagingTimeoutTest(unittest.TestCase):
         proc = FakeProc()
         project = release_cutoff.ProjectRelease(
             name="ameesh", repo=str(Path(tmp.name) / "repo"), target="main",
-            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh")
+            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh",
+            staging_topology=canon_staging.topology())
         with mock.patch.object(release_cutoff, "_worktree",
                                return_value=(tmp.name, str(worktree))), \
              mock.patch.object(release_cutoff, "_drop_worktree"), \
@@ -1262,7 +1278,8 @@ class StagingTimeoutTest(unittest.TestCase):
 
         project = release_cutoff.ProjectRelease(
             name="ameesh", repo=str(Path(tmp.name) / "repo"), target="main",
-            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh")
+            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh",
+            staging_topology=canon_staging.topology())
         with mock.patch.object(release_cutoff, "_worktree",
                                return_value=(tmp.name, str(worktree))), \
              mock.patch.object(release_cutoff, "_drop_worktree"), \
@@ -1361,7 +1378,8 @@ class StagingTimeoutUnitsTest(unittest.TestCase):
     def run_timeout(self, grace=0.6, **env):
         project = release_cutoff.ProjectRelease(
             name="ameesh", repo=str(self.root / "repo"), target="main",
-            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh")
+            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh",
+            staging_topology=canon_staging.topology())
         at_drop = []
         started = time.monotonic()
         with mock.patch.dict(os.environ, {**self.env, **env}), \
@@ -1619,7 +1637,8 @@ class SynchronousStopGuardTest(unittest.TestCase):
 
         project = release_cutoff.ProjectRelease(
             name="ameesh", repo=str(self.root / "repo"), target="main",
-            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh")
+            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh",
+            staging_topology=canon_staging.topology())
         with mock.patch.object(release_cutoff, "_worktree",
                                return_value=(str(self.root), str(self.worktree))), \
              mock.patch.object(release_cutoff, "_drop_worktree"), \

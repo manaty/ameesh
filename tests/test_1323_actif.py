@@ -1614,15 +1614,20 @@ raise SystemExit(subprocess.run(args[index:], cwd=cwd, env=env).returncode)
 
 
 class HotesPartagesTest(unittest.TestCase):
-    """#3965 : la coupure relit l'attestation avec les memes hotes qu'actif.py."""
+    """#3965 : la coupure relit l'attestation avec les memes hotes qu'actif.py.
+
+    #7662 : le cœur ne porte plus de nom d'hôte ; la séquence vient des fiches
+    Host du canon. Ce test garde la parité avec `actif.py` (qui reste le script
+    de l'hôte) sur la fixture Manaty du canon."""
 
     def test_release_cutoff_et_actif_listent_les_memes_hotes(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-        from ameesh import release_cutoff
+        from tests import canon_staging
         actif = charger_actif()
-        self.assertEqual(release_cutoff.STAGING_AGENTS, actif.HOTES_AGENTS)
-        self.assertEqual(release_cutoff.STAGING_VMS, actif.HOTES_VMS)
-        self.assertEqual(release_cutoff.STAGING_HOSTS, actif.HOTES_CANON)
+        topology = canon_staging.topology()
+        self.assertEqual(topology.agents, actif.HOTES_AGENTS)
+        self.assertEqual(topology.vms, actif.HOTES_VMS)
+        self.assertEqual(topology.hosts, actif.HOTES_CANON)
 
 
 if __name__ == '__main__':

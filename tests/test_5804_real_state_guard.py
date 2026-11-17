@@ -20,10 +20,11 @@ import unittest
 
 from . import state_guard, support
 
-#: Le geste du 27/10, réduit : la fixture de `test_2448_release_cutoff`
-#: (date 2026-10-18T09:00:00Z, trois VM d'agents + serveur prouvés, poste
-#: reporté) matérialisée par `read_attestation()` avec un faux journal.
+#: Le geste du 27/10, réduit : une preuve partagée valide pour la séquence
+#: staging déclarée (un hôte requis, #7662) matérialisée par
+#: `read_attestation()` avec un faux journal.
 LEAK = '''
+from ameesh import canon
 from ameesh import release_cutoff as rc
 
 
@@ -36,10 +37,10 @@ class FakeDb:
 
 
 sha = "a" * 40
+topology = canon.StagingTopology(hosts=("vm",), agents=("vm",))
 data = {"sha": sha, "date": "2026-10-18T09:00:00Z",
-        "hotes": {hote: {"actif": sha} for hote in rc.STAGING_VMS},
-        "reportes": {"pc-smichea": {"raison": "poste absent"}}}
-rc.read_attestation(sha, FakeDb([{"data": data}]))
+        "hotes": {"vm": {"actif": sha}}}
+rc.read_attestation(sha, FakeDb([{"data": data}]), topology)
 print(rc.attestation_path(sha))
 '''
 
@@ -123,5 +124,5 @@ class RealStateGuardTest(unittest.TestCase):
             with open(path, encoding="utf-8") as stream:
                 data = json.load(stream)
             self.assertEqual(data["sha"], "a" * 40)
-            self.assertEqual(data["reportes"], {"pc-smichea": {"raison": "poste absent"}})
+            self.assertEqual(data["hotes"], {"vm": {"actif": "a" * 40}})
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
