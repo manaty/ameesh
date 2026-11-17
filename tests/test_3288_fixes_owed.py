@@ -310,14 +310,16 @@ class BlockedFreezeSLOTest(_Base):
                          (2, ("pilot",)))
         line = self.line(age=6 * H)
         self.assertEqual((line["level"], tuple(line["targets"])),
-                         (3, ("bureau", "auditeur")))
+                         (3, ("avatar", "auditeur")))
 
     def test_p1_is_one_hour(self):
         line = self.line(priority=1, age=H)
         self.assertEqual(line["level"], 1)
         self.assertEqual(line["target_s"], 3600)
+        # #7634 : le rôle humain du palier s'appelle `avatar` ; le nom du
+        # desk est résolu à la remise, jamais dans le cœur.
         self.assertEqual(tuple(line["targets"]),
-                         ("assignee", "bureau", "auditeur"))
+                         ("assignee", "avatar", "auditeur"))
 
     def test_a_closed_lot_owes_no_fix(self):
         self.blocked()
@@ -347,7 +349,9 @@ class BlockedFreezeSLOTest(_Base):
         self.assertIn("same family", text)
         self.assertIn("ameesh work assign %d" % lot, text)
         text = alert_briefs._slo_breach(dict(alert, level=3))
-        self.assertIn("bureau or auditor:", text)
+        # #7634 : le cœur nomme le rôle `avatar` ; la remise le réécrit avec
+        # le nom du desk déclaré (couvert par test_7634).
+        self.assertIn("avatar or auditor:", text)
         # #3487 : le porteur porte le correctif ; le niveau 3 ne le réassigne pas.
         self.assertIn("do not reassign the holder", text)
         self.assertIn("carries the fix", text)
