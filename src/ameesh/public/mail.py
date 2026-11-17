@@ -13,7 +13,8 @@ What the core owns here:
   ``sender = actor``; a caller cannot name another sender, and the core's own
   sender identities (``ameesh``, ``veille``, the canon's role-holding
   Agent/Persona names, human and chat prefixes) are refused before alias
-  resolution or deposit;
+  resolution or deposit; a canon that is configured but cannot be read
+  completely refuses the call rather than dropping its roles;
 * **idempotency** is scoped to ``(actor, recipient)``: the same key with the
   same content reuses the durable message id, the same key with another
   content refuses, and concurrent retries end on one durable row (the unique
@@ -317,6 +318,17 @@ class ScopeRefused(PublicMailError, PermissionError):
     code = "refused"
 
 
+class CanonInventoryUnavailable(ScopeRefused):
+    """The configured canon inventory cannot be read completely.
+
+    A canon that is configured but unreadable, partially loaded or invalid
+    could omit a governance role: the surface refuses instead of treating the
+    missing names as ordinary service identities.
+    """
+
+    code = "refused"
+
+
 class RecipientRefused(PublicMailError):
     """The recipient is unknown or retired; nothing is deposited."""
 
@@ -373,14 +385,12 @@ def _resolve(db: Db, name: str, operation: str) -> str:
     return agent_names.resolve(name, db=db, cfg=cfg, operation=operation)
 
 
-def _canon_key(cfg) -> tuple:
+def _canon_key(entries) -> tuple:
     """Identity of the configured canons, for the short read cache."""
-    from .. import canon as canon_mod
-
     return tuple((str(getattr(entry, "path", "")),
                   str(getattr(entry, "ref", "")),
                   bool(getattr(entry, "untrusted", False)))
-                 for entry in canon_mod.configured(cfg))
+                 for entry in entries)
 
 
 def _canon_actor_names(db: Db) -> frozenset[str]:
@@ -390,34 +400,57 @@ def _canon_actor_names(db: Db) -> frozenset[str]:
     declares ``roles:`` is a governed identity, whatever its labels are
     (orchestrator, auditor, bureau, pilot, composer, watch...).  Reading the
     cards therefore covers a role added later or declared by another canon.
-    The read is reused for a short window; an absent or unreadable canon
-    leaves only the static :data:`RESERVED_ACTORS` and the prefixes.
+
+    No configured canon is an explicit absence: only the static
+    :data:`RESERVED_ACTORS` and the prefixes apply.  A canon that **is**
+    configured but cannot be read completely is not an absence of roles: the
+    read is refused with :class:`CanonInventoryUnavailable`, because guessing
+    an empty inventory would admit an omitted governance name as a service
+    identity.  Only a complete, readable inventory is cached.
     """
     cfg = getattr(db, "cfg", None)
     if cfg is None:
         return frozenset()
+    from .. import canon as canon_mod
+
     try:
-        key = _canon_key(cfg)
-    except Exception:  # noqa: BLE001 - illisible : le garde statique suffit
+        entries = canon_mod.configured(cfg)
+    except Exception as exc:  # noqa: BLE001 - refus explicite, pas une absence
+        raise CanonInventoryUnavailable(
+            "the configured canon inventory cannot be listed: %s" % exc) from exc
+    if not entries:
         return frozenset()
+    key = _canon_key(entries)
     now = time.monotonic()
     cached = _CANON_ACTORS.get(key)
     if cached is not None and now - cached[0] < _CANON_ACTORS_TTL_S:
         return cached[1]
-    from .. import canon as canon_mod
-
     try:
         canons = canon_mod.load_configured(cfg)
-    except Exception:  # noqa: BLE001 - canon illisible : le garde statique reste
-        names = frozenset()
-    else:
-        names = frozenset(
-            name for name in (
-                str(getattr(card, "title", "") or "").strip().casefold()
-                for canon in canons
-                for card in getattr(canon, "agents", ()) or ()
-                if getattr(card, "roles", None))
-            if name)
+    except Exception as exc:  # noqa: BLE001 - refus explicite, pas une absence
+        raise CanonInventoryUnavailable(
+            "the configured canon inventory cannot be read: %s" % exc) from exc
+    if len(canons) != len(entries):
+        raise CanonInventoryUnavailable(
+            "the configured canon inventory is incomplete: %d of %d canon(s) "
+            "read" % (len(canons), len(entries)))
+    for canon in canons:
+        if not getattr(canon, "readable", False):
+            raise CanonInventoryUnavailable(
+                "the configured canon %s is unreadable"
+                % (getattr(canon, "root", "") or "?"))
+        broken = canon_mod.errors(getattr(canon, "load_findings", ()) or ())
+        if broken:
+            raise CanonInventoryUnavailable(
+                "the configured canon %s is invalid (%s)"
+                % (getattr(canon, "root", "") or "?", broken[0].code))
+    names = frozenset(
+        name for name in (
+            str(getattr(card, "title", "") or "").strip().casefold()
+            for canon in canons
+            for card in getattr(canon, "agents", ()) or ()
+            if getattr(card, "roles", None))
+        if name)
     _CANON_ACTORS[key] = (now, names)
     return names
 
@@ -427,7 +460,9 @@ def reserved_actors(db: Db) -> frozenset[str]:
 
     The static system senders plus the role-holding Agent/Persona titles of
     the configured canon, case-folded.  The reserved **prefixes** are separate
-    and listed by :data:`RESERVED_ACTOR_PREFIXES`.
+    and listed by :data:`RESERVED_ACTOR_PREFIXES`.  Raises
+    :class:`CanonInventoryUnavailable` (a :class:`ScopeRefused`) when a canon
+    is configured but its complete, readable inventory cannot be established.
     """
     return frozenset(RESERVED_ACTORS | _canon_actor_names(db))
 

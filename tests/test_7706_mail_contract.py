@@ -14,6 +14,7 @@ Postgres réel.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import types
 import unittest
@@ -28,11 +29,33 @@ from ameesh.public.mail import (
 from .support import PgTestCase
 
 
-def fake_canon(*cards) -> types.SimpleNamespace:
+def fake_canon(*cards, readable=True, findings=()) -> types.SimpleNamespace:
     """Un canon minimal : des fiches Agent/Persona (titre, rôles)."""
     return types.SimpleNamespace(
         agents=[types.SimpleNamespace(title=title, roles=list(roles))
-                for title, roles in cards])
+                for title, roles in cards],
+        readable=readable,
+        root="/canon-test",
+        load_findings=list(findings))
+
+
+def canon_entry(path: str = "/canon-test", ref: str = "",
+                untrusted: bool = False) -> types.SimpleNamespace:
+    return types.SimpleNamespace(path=path, ref=ref, untrusted=untrusted)
+
+
+@contextlib.contextmanager
+def canon_configured(*cards, entries=None, canons=None, readable=True):
+    """Un canon configuré pour la durée du bloc (les deux lectures patchées)."""
+    if entries is None:
+        entries = (canon_entry(),)
+    if canons is None:
+        canons = [fake_canon(*cards, readable=readable)]
+    with mock.patch("ameesh.canon.configured",
+                    return_value=tuple(entries)), \
+         mock.patch("ameesh.canon.load_configured",
+                    return_value=list(canons)):
+        yield canons
 
 
 class PublicMailBase(PgTestCase):
@@ -117,8 +140,7 @@ class ReservedActorTest(PublicMailBase):
         self.assertEqual(self.rows(), [])
 
     def test_reserved_actor_is_refused_through_find_history_and_batch(self):
-        canon = fake_canon(("sonde", ["orchestrateur"]))
-        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+        with canon_configured(("sonde", ["orchestrateur"])):
             for actor in ("ameesh", "veille", "sonde"):
                 with self.subTest(actor=actor):
                     with self.assertRaises(ScopeRefused):
@@ -160,8 +182,7 @@ class ReservedActorTest(PublicMailBase):
 
     def test_a_canon_role_holder_is_refused(self):
         """A role declared only by the canon is reserved, with no core literal."""
-        canon = fake_canon(("sonde-orchestrateur", ["orchestrateur"]))
-        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+        with canon_configured(("sonde-orchestrateur", ["orchestrateur"])):
             for actor in ("sonde-orchestrateur", "SONDE-ORCHESTRATEUR"):
                 with self.subTest(actor=actor):
                     with self.assertRaises(ScopeRefused):
@@ -173,8 +194,7 @@ class ReservedActorTest(PublicMailBase):
         self.db.execute(
             "UPDATE agent_registry SET aliases = ARRAY['zulu']"
             " WHERE name = 'sonde'")
-        canon = fake_canon(("sonde", ["auditeur"]))
-        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+        with canon_configured(("sonde", ["auditeur"])):
             with self.assertRaises(ScopeRefused):
                 public_mail.submit(self.db, "zulu", self.submission())
         self.assertEqual(self.rows(), [])
@@ -190,13 +210,12 @@ class ReservedActorTest(PublicMailBase):
         # No mesh role is written in the core: they are read from the canon.
         for name in (alert_briefs.AUDITOR_NAME, "bureau"):
             self.assertNotIn(name, public_mail.RESERVED_ACTORS)
-        canon = fake_canon(
+        with canon_configured(
             (alert_briefs.AUDITOR_NAME, list(alert_briefs.AUDITOR_ROLES)),
             ("bureau", ["bureau"]),
             ("pilote-nexlink", ["pilote"]),
             ("agent-sans-role", []),
-        )
-        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+        ):
             names = public_mail.reserved_actors(self.db)
         self.assertIn(alert_briefs.AUDITOR_NAME, names)
         self.assertIn("bureau", names)
@@ -207,11 +226,58 @@ class ReservedActorTest(PublicMailBase):
         self.assertNotIn("ima-service", names)
 
     def test_a_canon_card_without_roles_still_submits(self):
-        canon = fake_canon(("agent-sans-role", []))
-        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+        with canon_configured(("agent-sans-role", [])):
             receipt = public_mail.submit(
                 self.db, "agent-sans-role", self.submission())
         self.assertGreater(receipt.id, 0)
+
+    def test_an_unreadable_canon_refuses_instead_of_an_empty_inventory(self):
+        """Un canon configuré mais illisible ne vaut pas « aucun rôle ».
+
+        Le nom d'un rôle de gouvernance omis ne doit pas passer comme identité
+        de service : la surface refuse, et ne met pas l'ensemble vide en cache.
+        """
+        canon = fake_canon(("sonde-orchestrateur", ["orchestrateur"]),
+                           readable=False)
+        with canon_configured(canons=[canon]):
+            with self.assertRaisesRegex(ScopeRefused, "canon"):
+                public_mail.submit(self.db, "pilote", self.submission())
+            with self.assertRaises(ScopeRefused):
+                public_mail.reserved_actors(self.db)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_canon_read_error_refuses_instead_of_an_empty_inventory(self):
+        """Une exception de lecture ne devient pas « aucun rôle »."""
+        from ameesh import canon as canon_mod
+
+        with mock.patch("ameesh.canon.configured",
+                        return_value=(canon_entry(),)), \
+             mock.patch("ameesh.canon.load_configured",
+                        side_effect=canon_mod.CanonError("boom")):
+            with self.assertRaisesRegex(ScopeRefused, "cannot be read"):
+                public_mail.submit(self.db, "pilote", self.submission())
+        self.assertEqual(self.rows(), [])
+
+    def test_a_partial_canon_load_refuses_instead_of_dropping_roles(self):
+        """Un chargement partiel (un canon écarté) n'est pas un inventaire."""
+        entries = (canon_entry("/canon-a"), canon_entry("/canon-b"))
+        canons = [fake_canon(("sonde-orchestrateur", ["orchestrateur"]))]
+        with canon_configured(entries=entries, canons=canons):
+            with self.assertRaisesRegex(ScopeRefused, "incomplete"):
+                public_mail.submit(self.db, "pilote", self.submission())
+            with self.assertRaises(ScopeRefused):
+                public_mail.reserved_actors(self.db)
+        self.assertEqual(self.rows(), [])
+
+    def test_an_invalid_canon_refuses_instead_of_dropping_roles(self):
+        finding = types.SimpleNamespace(code="frontmatter-invalid",
+                                        severity="error")
+        canon = fake_canon(("sonde-orchestrateur", ["orchestrateur"]),
+                           findings=[finding])
+        with canon_configured(canons=[canon]):
+            with self.assertRaisesRegex(ScopeRefused, "canon"):
+                public_mail.submit(self.db, "pilote", self.submission())
+        self.assertEqual(self.rows(), [])
 
 
 class ModulePayloadNamespaceTest(PublicMailBase):

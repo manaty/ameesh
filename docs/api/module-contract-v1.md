@@ -294,7 +294,7 @@ compatible later minor. A consumer written against the 1.1 draft applies the
 | `Receipt(id, actor, recipient, kind, created_ts, reused)` | `id` is the durable mailbox row id, stable across retries; `request_id` is that id for a `request` and `None` otherwise; `reused` says this call returned an existing deposit. |
 | `HistoryEntry` and `HistoryPage` | One message (`id`, `sender`, `recipient`, `body`, `kind`, `payload`, `work_item_id`, `created_ts`, `delivered_ts`) and a page (`entries`, `next_cursor`, `has_more`). The stored `payload` keeps the module object under `payload.module`; a 1.1-draft row is returned as stored, never rewritten. `next_cursor` is the last returned id, or the supplied cursor for an empty page; pass it back as `after_id`. `delivered_ts` is observation only and never a lease claim. |
 | `SubmissionResult` and `BatchResult` | Ordered batch outcomes (`index`, `receipt`, `error`, `detail`) and the batch (`results`, `ok`). The value objects expose `as_dict()` for JSON clients. |
-| Errors | `InvalidSubmission` (code `invalid`), `IdempotencyConflict` (`conflict`), `ScopeRefused` or `RecipientRefused` (`refused`), `UnsupportedStorage` (`unsupported`). A reserved sender identity raises `ScopeRefused` before any deposit. A batch reports the same codes in `SubmissionResult.error`. |
+| Errors | `InvalidSubmission` (code `invalid`), `IdempotencyConflict` (`conflict`), `ScopeRefused` or `RecipientRefused` (`refused`), `UnsupportedStorage` (`unsupported`). A reserved sender identity raises `ScopeRefused` before any deposit; so does a configured canon whose complete inventory cannot be read. A batch reports the same codes in `SubmissionResult.error`. |
 
 ### Reserved sender identities
 
@@ -319,8 +319,13 @@ checks both the supplied spelling and its resolved primary:
 runner identity may submit under any other non-reserved service name; the
 database credential remains its trust boundary. The exported `RESERVED_ACTORS`
 and `RESERVED_ACTOR_PREFIXES` constants name the static names and the prefixes;
-the canon part is read per deployment. When no canon is configured or it cannot
-be read, only the static names and prefixes apply.
+the canon part is read per deployment. **No configured canon** is an explicit
+absence: only the static names and prefixes apply. A canon that *is* configured
+but unreadable, only partially loaded, or carrying load errors is not an absence
+of roles: the call is refused with `ScopeRefused` before any deposit, rather
+than admitting an omitted governance name under a guessed empty inventory;
+`reserved_actors(db)` raises the same refusal instead of returning an inventory
+it cannot establish completely.
 
 Idempotency is scoped to `(actor, recipient)`. The content is the body, the
 kind, the module payload and the work item. The same key with the same content
