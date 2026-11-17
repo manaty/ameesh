@@ -8,6 +8,8 @@
                                          [--project-repo PROJET=CHEMIN] : tout fichier
                                          suivi non léger a un nombre d'avis (#5191)
   ameesh canon show [--json]             fiches lues, et d'où (commit)
+  ameesh canon snapshot --expect-commit SHA [--json]
+                                         public immutable directory; read-only, no DB
   ameesh canon sync [--host H] [--json] [--bootstrap-ref BRANCHE]
                      [--allow-rewind]
                                          canon → registre de l'hôte (§4.4) ; enregistre
@@ -1295,7 +1297,7 @@ def _add_agent_parsers(parent, *, move: bool = False) -> None:
 
 def add_parsers(sub) -> None:
     """Branche `canon …` (dont `canon agent …`), `placement …` et `agent …`."""
-    p_canon = sub.add_parser("canon", help="OKF canon: check, show, sync")
+    p_canon = sub.add_parser("canon", help="OKF canon: check, show, snapshot, sync")
     canon_sub = p_canon.add_subparsers(dest="canon_command")
     p_check = canon_sub.add_parser("check", help="validate the canon (§4.3)")
     _canon_options(p_check)
@@ -1311,6 +1313,19 @@ def add_parsers(sub) -> None:
     p_cshow = canon_sub.add_parser("show", help="cards read and their source")
     _canon_options(p_cshow)
     p_cshow.set_defaults(func=cmd_show)
+    from .canon_snapshot import cmd_snapshot
+    p_snapshot = canon_sub.add_parser(
+        "snapshot", help="immutable public canon/directory snapshot (read-only, JSON)")
+    _canon_options(p_snapshot)
+    p_snapshot.add_argument("--expect-commit", required=True, metavar="SHA",
+                            help="trusted full commit expected for the selected canon root")
+    p_snapshot.add_argument("--previous-commit", metavar="SHA",
+                            help="previous root commit that must be an ancestor of the snapshot")
+    p_snapshot.add_argument("--expect-scope", metavar="DIR",
+                            help="required root scope (refuse an absent or broader scope)")
+    p_snapshot.add_argument("--single-source", action="store_true",
+                            help="refuse federation sources beyond the selected root")
+    p_snapshot.set_defaults(func=cmd_snapshot)
     p_sync = canon_sub.add_parser("sync", help="canon → host registry (§4.4)")
     _canon_options(p_sync)
     p_sync.add_argument("--host", default=None, help="host (otherwise AMEESH_HOST / this machine)")
