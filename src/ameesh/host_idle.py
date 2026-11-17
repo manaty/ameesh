@@ -29,6 +29,11 @@ RUNS_INVALID = 'invalid'
 #: a lending host (`policy.lend`, L159b) whose card did not declare `guest`:
 #: guest jobs offloaded from other hosts run there, and their count is unknown
 RUNS_LENDING = 'lending'
+#: #7727: a host that admits no agent is outside the reserved-capacity
+#: projection: neither a baseline reserve nor a burst candidate.
+CAPACITY_NONE = 'none'
+#: the capacity classes an idle host can be counted in by the alerts
+CAPACITY_CLASSES = ('baseline', 'burst')
 
 
 def runs_interface(cfg, canons, host):
@@ -303,20 +308,52 @@ def cost_states(cards):
             'problem': problem}
 
 
+def no_agent_reason(cards):
+    """#7727: why these Host cards say no agent is admitted, or None.
+
+    `policy.max_agents: 0` retires a host (the mesh server, for instance) and
+    `staging.kind: server` marks the server of the staging sequence. The
+    strictest `max_agents` wins across cards, as in `resources.host_limits`:
+    one zero is enough, never averaged away by another card. An explicit
+    `capacity: none` is accepted as well for a host that wants to opt out
+    without changing its policy."""
+    reason = None
+    for card in cards or ():
+        if not isinstance(card, dict):
+            continue
+        if card.get('capacity') == CAPACITY_NONE:
+            reason = reason or 'capacity: none'
+        policy = card.get('policy')
+        if isinstance(policy, dict):
+            value = policy.get('max_agents')
+            if isinstance(value, int) and not isinstance(value, bool) and value == 0:
+                reason = 'max_agents: 0'
+        staging = card.get('staging')
+        if isinstance(staging, dict) and staging.get('kind') == 'server':
+            reason = reason or 'staging.kind: server'
+    return reason
+
+
 def capacities(canons, names, *, protected=(), baseline_hosts=2):
     """Explicit cards plus critical elected leaders/reserves when underspecified.
+
+    A host that admits no agent (#7727) is `none`, outside the count: it can
+    neither fill the baseline nor be proposed as a burst candidate.
 
     `costs` maps each host to its `cost_states` (None when unpriced)."""
     out, costs = {}, {}
     for name in names:
         cards = [host.fiche.data for canon in canons for host in canon.hosts
                  if host.title == name]
-        out[name] = ('baseline' if any(c.get('capacity') == 'baseline' for c in cards)
-                     else 'burst')
+        if no_agent_reason(cards):
+            out[name] = CAPACITY_NONE
+        else:
+            out[name] = ('baseline' if any(c.get('capacity') == 'baseline' for c in cards)
+                         else 'burst')
         costs[name] = cost_states(cards)
     if sum(v == 'baseline' for v in out.values()) < baseline_hosts:
         for name in protected:
-            if name in out:
+            if name in out and out[name] != CAPACITY_NONE:
                 out[name] = 'baseline'
     return out, costs
 

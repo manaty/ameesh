@@ -437,6 +437,35 @@ class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
         self.assertFalse(plan_git._history_complete(shallow))
 
 
+class ResolutionInventoryProvenanceTest(_RewriteFixture):
+    def test_prior_freeze_in_pair_resolution_needs_no_supersedes(self):
+        from ameesh import packet_candidates
+        old = self.head_a
+        tree = self.repo.git("rev-parse", old + "^{tree}")
+        head = self.squash(tree, self.base, "rewritten branch")
+        self.repo.git("reset", "--hard", head)
+        mark = self.freeze(head)
+        bare = os.path.join(self.tmp, "origin.git")
+        self.repo.git("init", "--bare", "-q", bare)
+        self.repo.git("remote", "add", "origin", bare)
+        self.repo.git("push", "-q", "origin", "HEAD:refs/heads/main",
+                      "%s:refs/ameesh/resolutions/7706/7674" % old)
+        clone = os.path.join(self.tmp, "inventory-clone")
+        self.repo.git("clone", "-q", "--bare", bare, clone)
+        self.assertIsNot(plan_git.ref_reachable(clone, old), True)
+        found, error = packet_candidates.list_remises(
+            self.repo.root, clone, [self.lot], "main")
+        self.assertEqual((found, error), ({}, ""))
+        authors, unknown, _ = review_authors.reading(
+            self.db, self.lot_item(),
+            {"id": int(mark["id"]), "sha": head, "actor": "impl",
+             "at_ts": mark.get("at_ts")},
+            review_authors._commits_between(clone, self.base, head),
+            clone, FAMILIES, base=self.base, head=head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual({r["name"] for r in authors}, {"impl", "cx3"})
+
+
 class ForcePushSupersedesKeepsCorrectorTest(_RewriteFixture):
     """#3399 (auditeur) : le correcteur connu du gel pendant reste auteur.
 

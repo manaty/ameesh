@@ -55,6 +55,27 @@ from .config import Config, mask_dsn
 #: sonde de connexion ET de schéma (L61) : une seule requête pour les deux
 _SCHEMA_PROBE = "SELECT to_regclass('agent_registry') IS NOT NULL AS ok"
 _SQL_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+#: modes de transaction acceptés par `transaction(isolation=…, read_only=…)`.
+#: Liste fermée : aucune valeur d'appelant n'entre dans le SQL de `BEGIN`.
+_ISOLATION_LEVELS = frozenset((
+    "SERIALIZABLE", "REPEATABLE READ", "READ COMMITTED", "READ UNCOMMITTED"))
+
+
+def transaction_modes(*, isolation: str | None = None,
+                      read_only: bool = False) -> str:
+    """Les modes d'une transaction (`BEGIN ISOLATION LEVEL … READ ONLY`).
+
+    `isolation` est validé contre une liste fermée ; une valeur inconnue lève
+    `ValueError`. Rend '' quand aucun mode n'est demandé."""
+    modes = []
+    if isolation is not None:
+        level = str(isolation).strip().upper()
+        if level not in _ISOLATION_LEVELS:
+            raise ValueError("unknown transaction isolation level: %r" % (isolation,))
+        modes.append("ISOLATION LEVEL " + level)
+    if read_only:
+        modes.append("READ ONLY")
+    return ", ".join(modes)
 _NOTIFY_RE = re.compile(
     r'^Asynchronous notification "([^"]+)" with payload "(.*)" received from server process'
 )
@@ -828,10 +849,16 @@ class PsqlDriver:
         if proc.returncode != 0:
             raise self._fail(proc)
 
-    def transaction(self) -> "_PsqlTransaction":
+    def transaction(self, *, isolation: str | None = None,
+                    read_only: bool = False) -> "_PsqlTransaction":
         """Transaction explicite sur une session psql persistante (voir
-        `_PsqlTransaction`) ; à utiliser en `with db.transaction() as tx:`."""
-        return _PsqlTransaction(self)
+        `_PsqlTransaction`) ; à utiliser en `with db.transaction() as tx:`.
+
+        `isolation`/`read_only` posent les modes dans le `BEGIN` lui-même :
+        le pilote psql ajoute un `SELECT` témoin après chaque instruction, donc
+        un `SET TRANSACTION` séparé arriverait après une première requête et
+        serait refusé par Postgres."""
+        return _PsqlTransaction(self, isolation=isolation, read_only=read_only)
 
     def listen(self, channels: Iterable[str]) -> "Listener":
         return _PsqlListener(self, list(channels))
@@ -866,8 +893,11 @@ class _PsqlTransaction:
     #: une transaction n'ouvre pas d'écouteur : le runner sonde alors
     supports_listen = False
 
-    def __init__(self, driver: PsqlDriver):
+    def __init__(self, driver: PsqlDriver, *, isolation: str | None = None,
+                 read_only: bool = False):
         self.driver = driver
+        #: modes du `BEGIN` (validés une fois, avant toute instruction)
+        self._modes = transaction_modes(isolation=isolation, read_only=read_only)
         self.cfg = driver.cfg
         self.proc: subprocess.Popen | None = None
         self._err = None
@@ -894,7 +924,7 @@ class _PsqlTransaction:
             for line in self.driver._bootstrap.splitlines():
                 if line.strip():
                     self._run(line)
-            self._run("BEGIN")
+            self._run("BEGIN" + (" " + self._modes if self._modes else ""))
         except BaseException:
             self._close(abort=True)
             raise
@@ -913,7 +943,10 @@ class _PsqlTransaction:
         self._close(abort=exc_type is not None)
         return False
 
-    def transaction(self) -> "_PsqlTransaction":
+    def transaction(self, *, isolation: str | None = None,
+                    read_only: bool = False) -> "_PsqlTransaction":
+        if isolation is not None or read_only:
+            raise DbError("transaction modes require the outer transaction")
         return self
 
     def _close(self, abort: bool) -> None:
@@ -1442,7 +1475,8 @@ class PsycopgDriver:
             raise _map_error(exc) from exc
 
     @contextlib.contextmanager
-    def transaction(self):
+    def transaction(self, *, isolation: str | None = None,
+                    read_only: bool = False):
         """Transaction explicite sur la connexion (BEGIN … COMMIT, ROLLBACK sur
         exception) ; rend le pilote lui-même, dont les requêtes passent par
         cette connexion. Imbriquée : un point de sauvegarde.
@@ -1453,16 +1487,25 @@ class PsycopgDriver:
         refusait les deux COMMIT (« wrong nesting level ») et la session
         restait dans une transaction ouverte, verrous gardés ; et un verrou
         consultatif de transaction, réentrant dans une session, ne
-        sérialisait pas deux fils du même exécuteur."""
+        sérialisait pas deux fils du même exécuteur.
+
+        `isolation`/`read_only` ne s'appliquent qu'à la transaction extérieure
+        (un point de sauvegarde ne peut pas changer l'isolation) ; les
+        demander imbriqué lève `DbError` plutôt que de les ignorer."""
+        modes = transaction_modes(isolation=isolation, read_only=read_only)
         with self._tx_lock:
             self._live()
             if self._schema_missing:
                 raise SchemaMissing(_schema_message(self))
             if self._schema_pending:
                 self._settle_schema()
+            if modes and self._tx_depth:
+                raise DbError("transaction modes require the outer transaction")
             self._tx_depth += 1
             try:
                 with self.conn.transaction():
+                    if modes:
+                        self.conn.execute("SET TRANSACTION " + modes)
                     yield self
             except self._psycopg.Error as exc:
                 raise _map_error(exc) from exc
@@ -2012,9 +2055,9 @@ class _Replay:
         self._cut()
         return self._db.script(sql)
 
-    def transaction(self):
+    def transaction(self, **kwargs):
         self._cut()
-        return self._db.transaction()
+        return self._db.transaction(**kwargs)
 
     def close(self) -> None:
         if self._owns:

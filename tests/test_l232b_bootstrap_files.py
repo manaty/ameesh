@@ -62,6 +62,43 @@ class BootstrapFilesTest(unittest.TestCase):
         self.engine.readiness=None
         with self.assertRaises(files.FileError): self.perform('enable')
 
+    def test_authority_diagnostics_distinguish_refusals(self):
+        request=self.request('enable')
+        self.ready=False
+        with self.assertRaisesRegex(files.FileError,'rejected: readiness'):
+            self.engine.approved(request)
+        self.ready=True
+        machine=self.root/'etc/machine-id'
+        machine.write_text('b'*32)
+        with self.assertRaisesRegex(files.FileError,'rejected: machine identity'):
+            self.engine.approved(request)
+        machine.write_text(self.bundle['machine_id'])
+        self.authority.denied.add('enable')
+        with self.assertRaisesRegex(files.FileError,'rejected: validation'):
+            self.engine.approved(request)
+        self.authority.denial_reason='signed bootstrap window expired'
+        with self.assertRaisesRegex(files.FileError,'rejected: signed bootstrap window expired'):
+            self.engine.approved(request)
+        self.assertFalse(self.path(files.KEY).exists())
+
+    def test_authority_diagnostics_chain_gate_exceptions(self):
+        request=self.request('enable')
+        for gate in ['readiness','validation','machine trust','machine identity']:
+            error=OSError('fixture failure')
+            if gate=='readiness':
+                patch=mock.patch.object(self.engine,'readiness',side_effect=error)
+            elif gate=='validation':
+                patch=mock.patch.object(self.authority,'validate',side_effect=error)
+            elif gate=='machine trust':
+                patch=mock.patch.object(files.runtime,'trusted',side_effect=error)
+            else:
+                patch=mock.patch.object(Path,'read_text',side_effect=error)
+            with self.subTest(gate=gate), patch:
+                with self.assertRaisesRegex(files.FileError,'unavailable: '+gate) as held:
+                    self.engine.approved(request)
+                self.assertIs(held.exception.__cause__,error)
+        self.assertFalse(self.path(files.KEY).exists())
+
     def test_lost_file_journal_reply_reconciles_already_published_contents(self):
         original=files.protocol.save; lost=[False]
         def fail(path,record):

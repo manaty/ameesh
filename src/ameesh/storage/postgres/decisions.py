@@ -244,6 +244,11 @@ class Decisions(interface.Decisions):
             if not old_view or old_view["state"] != "answered":
                 raise decisions.DecisionError("supersedes requires an answered decision; pending uses withdraw")
             decisions.require_current(tx, old_view)
+            from ... import prod_go
+            try:
+                prod_go.require_unlocked(old_view)
+            except prod_go.ProdGoError as exc:
+                raise decisions.DecisionError(str(exc)) from exc
             answer = view["answer"]
             # Journal first: the #4995 marker trigger only accepts a marker
             # whose logged replacement is already visible in this transaction.
