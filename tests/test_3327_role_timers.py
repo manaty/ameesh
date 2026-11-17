@@ -30,8 +30,8 @@ def settings(*, projects=True, interval=900):
 
 
 def row(*, releve="election", host="agents-a", candidates=("agents-a", "agents-b")):
-    return {"name": "mesh-design", "releve": releve, "host": host,
-            "candidats": list(candidates) if candidates else None}
+    return {"name": "mesh-design", "roles": ["conception"], "releve": releve,
+            "host": host, "candidats": list(candidates) if candidates else None}
 
 
 class PlanTest(unittest.TestCase):

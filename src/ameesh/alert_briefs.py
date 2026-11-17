@@ -28,9 +28,11 @@ envoyé par le notificateur (ce serait le disparu qui parle) : la passe du
 runner hors du poste le porte (`notify_gap.brief_once`), et
 `NOTIFIER_EXCLUDED` l'en écarte côté `ameesh notify`.
 
-#5563 : `host_disk_soon_full` et `host_unsampled` vont à mesh-design et au
-bureau (fil pour un bureau externe), avec filtre des destinataires vivants.
-Le silence du relevé et le passage du disque au critique sont urgents.
+#5563 : `host_disk_soon_full` et `host_unsampled` vont au rôle de conception
+(#7661 : l'agent dont la fiche du canon déclare `conception`/`design`, jamais
+un nom) et au bureau (fil pour un bureau externe), avec filtre des
+destinataires vivants. Le silence du relevé et le passage du disque au
+critique sont urgents.
 
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
@@ -117,10 +119,9 @@ LEASE_GRACE_S = 90.0
 #: #6642 : un SLO de niveau 1 ordinaire n'est briefé qu'après ce retard ;
 #: 62 des 78 L1 du 09/11 étaient en retard de 0 à 4 min (auditeur #206650)
 SLO_L1_GRACE_S = 300
-#: rôles d'une fiche Agent du canon qui désignent l'auditeur
+#: rôles d'une fiche Agent du canon qui désignent l'auditeur ; le rôle se lit
+#: sur la fiche (`roles:`), jamais sur le nom de la persona
 AUDITOR_ROLES = ("auditeur", "auditor")
-#: nom de la persona de l'auditeur (docs/AUDITEUR.md, « Mise en service »)
-AUDITOR_NAME = "auditeur"
 
 
 def claims_closed_hosts(db) -> set:
@@ -289,7 +290,7 @@ def _desk_names(alert: dict, by_name: dict, avatar_names=(),
     names = [str(n) for n in desk_names or () if n in by_name]
     if names:
         return list(dict.fromkeys(names))
-    known = {"assignee", "pilot", AUDITOR_NAME, "avatar"}
+    known = {"assignee", "pilot", AUDITOR_ROLES[0], "avatar"}
     return [str(role) for role in alert.get("targets") or ()
             if role not in known and role in by_name]
 
@@ -311,13 +312,21 @@ def _fallback_avatar(by_name: dict, text: str, names=()) -> dict:
 
 
 def auditors(listing: list, canons=None, *, explicit_only=False) -> list:
-    """Les auditeurs du registre : l'agent `auditeur`, et ceux dont la fiche
-    Agent du canon porte `roles: [auditeur]` (ou `auditor`, `role:`).
-    `explicit_only` exige ce rôle, sans autorisation implicite par le nom."""
+    """Les auditeurs du registre : ceux dont la fiche Agent du canon porte
+    `roles: [auditeur]` (ou `auditor`, `role:`), jamais un nom de persona.
+
+    Le rôle est lu sur la fiche, pas sur le titre : une persona renommée qui
+    le déclare reste auditrice, une persona nommée `auditeur` qui ne le
+    déclare pas ne l'est plus. Sans canon chargé, la projection du registre
+    (`roles`, copiée de la carte par `canon sync`) est la seule déclaration
+    disponible ; avec un canon, c'est lui qui fait foi. `explicit_only` est
+    conservé pour les appelants qui exigeaient le rôle sans repli par le nom :
+    c'est désormais la seule règle."""
     names = {row["name"] for row in listing}
     found = sous_utilisation.role_orchestrators(canons or [], AUDITOR_ROLES)
-    if not explicit_only:
-        found.add(AUDITOR_NAME)
+    if not canons:
+        found |= {row["name"] for row in listing
+                  if sous_utilisation.row_has_role(row, AUDITOR_ROLES)}
     return sorted(n for n in found if n in names)
 
 
@@ -635,7 +644,7 @@ def _desk_label(alert: dict, avatar_names=()) -> str:
     for name in avatar_names or ():
         if name:
             return str(name)
-    known = {"assignee", "pilot", AUDITOR_NAME, "avatar"}
+    known = {"assignee", "pilot", AUDITOR_ROLES[0], "avatar"}
     for role in alert.get("targets") or ():
         if role not in known:
             return str(role)
@@ -1439,7 +1448,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     if live:
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
-    known = {"assignee", "pilot", AUDITOR_NAME, "avatar"}
+    known = {"assignee", "pilot", AUDITOR_ROLES[0], "avatar"}
     current = (3 if roles & {"avatar", "auditeur"} or any(r not in known for r in roles)
                else 2 if "pilot" in roles else 1)
     for next_level in range(current + 1, 4):
@@ -1533,8 +1542,8 @@ def _mail_undeliverable_briefs(alert: dict, by_name: dict, auditor_names,
 
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
            auditor_names=(), *, orchestrator_names=(),
-           closed_hosts=(), dead_out: dict | None = None, covered=(),
-           avatar_names=(), desk_names=()) -> dict:
+           observation_names=(), closed_hosts=(), dead_out: dict | None = None,
+           covered=(), avatar_names=(), desk_names=()) -> dict:
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
@@ -1557,6 +1566,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     `plan_underused` se replie sur l'auditeur (#3036). Un agent à la fois
     orchestrateur et auditeur reçoit un seul texte.
 
+    `observation_names` (#7661) : les agents dont la fiche déclare le rôle de
+    conception, destinataires des alertes d'hôte (`host_disk_soon_full`,
+    `host_unsampled`) ; vide, l'alerte retombe sur le bureau comme avant, sans
+    nom d'agent deviné.
+
     #3036 : `closed_hosts` (les hôtes de `claims_closed_hosts`) et le champ
     `lease_live` des lignes du registre écartent les destinataires qui ne
     liront pas ; un `slo_breach` sans vivant au palier passe au palier suivant
@@ -1576,13 +1590,14 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     desks = _desk_names(alert, by_name, avatar_names, desk_names)
     if kind in ("host_disk_soon_full", "host_unsampled"):
         # #5563 : opérateurs du mesh, sans diffusion aux pilotes produit.
-        # Le bureau externe lit le fil, pas sa boîte.
+        # Le bureau externe lit le fil, pas sa boîte. #7661 : l'opérateur est
+        # l'agent dont la fiche déclare le rôle de conception, jamais un nom.
         text = alert["detail"]
         if kind == "host_unsampled":
             text += (" Check the host sampler: ameesh-releve-hote.timer (system) "
                      "or ameesh-host-publish.timer (user, publish@); verify that "
                      "a fresh reading appears in ameesh hosts.")
-        out = {"mesh-design": text} if "mesh-design" in by_name else {}
+        out = {name: text for name in observation_names if name in by_name}
         out.update(_fallback_avatar(by_name, text, desks))
         live, dead = _split_live(out, by_name, closed)
         if dead_out is not None:

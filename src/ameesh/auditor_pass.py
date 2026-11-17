@@ -42,7 +42,7 @@ from . import config as config_mod
 from . import db as db_mod
 from . import events, mail, storage
 from . import work as work_mod
-from .role_timers import AUDITOR_INTERVAL_S, AUDITOR_MAIL, AUDITOR_ROLE
+from .role_timers import AUDITOR_INTERVAL_S, AUDITOR_MAIL
 
 #: the journal type of one tick (played or skipped); see `events.TYPES`
 EVENT = "auditor.pass"
@@ -324,8 +324,11 @@ def send_pass_mail(db, agent: str, *, started_ts: float) -> int:
 
 
 def _agent_name(args) -> str:
-    return (args.agent or os.environ.get("AMEESH_ROLE")
-            or AUDITOR_ROLE).strip()
+    """Nom explicite (`--agent`, `AMEESH_ROLE`) ; vide = résolu sur la fiche.
+
+    #7661 : le rôle d'auditeur se lit sur la carte, pas sur un titre de
+    persona. L'appelant sans nom laisse donc la résolution au registre."""
+    return (args.agent or os.environ.get("AMEESH_ROLE") or "").strip()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -334,7 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="the auditor's hourly short pass: mail only when the mesh moved "
                     "(#6643)")
     parser.add_argument("--agent", default="",
-                        help="role name to wake (default: AMEESH_ROLE, else auditeur)")
+                        help="role name to wake (default: AMEESH_ROLE, else the "
+                             "unique agent whose card declares the auditor role)")
     parser.add_argument("--dry-run", action="store_true",
                         help="decide and print, without mail or journal event")
     parser.add_argument("--json", action="store_true", help="machine-readable report")
@@ -367,6 +371,24 @@ def main(argv: list | None = None) -> int:
         return 1
     try:
         db_mod.require_schema(db, defer=True)
+        if not agent:
+            # #7661 : sans nom explicite, l'auditeur est l'unique agent dont
+            # la fiche déclare le rôle ; un mesh sans ce rôle n'a pas de passe.
+            try:
+                from . import alert_briefs, registry
+                holders = alert_briefs.auditors(registry.overview(db))
+            except Exception as exc:  # noqa: BLE001 - un registre illisible échoue
+                print("ameesh auditor tick: cannot resolve the auditor role: %s"
+                      % exc, file=sys.stderr)
+                return 1
+            if len(holders) > 1:
+                print("ameesh auditor tick: several agents declare the auditor "
+                      "role: %s; pass --agent" % ", ".join(holders), file=sys.stderr)
+                return 2
+            if not holders:
+                print("ameesh auditor tick: no auditor role on this mesh, nothing to do")
+                return 0
+            agent = holders[0]
         now = float(db.query(
             "select extract(epoch from clock_timestamp())::float8 as ts")[0]["ts"])
         started_ts = now

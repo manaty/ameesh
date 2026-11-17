@@ -3723,6 +3723,11 @@ class Notifier:
             from . import sous_utilisation
             module_orchestrators = sous_utilisation.role_orchestrators(canons)
             avatars_by_human = avatars.from_canons(canons)
+            # #7661 : les alertes d'hôte visent le rôle de conception déclaré
+            # à la fiche, jamais un nom d'agent ; sans canon, la projection du
+            # registre (`roles`) est la déclaration disponible.
+            observers = sous_utilisation.declared_holders(
+                canons, listing, sous_utilisation.DESIGN_ROLES)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
@@ -3781,6 +3786,7 @@ class Notifier:
                     alert, listing, titles,
                     module_auditors if kind == "module_deviation" else auditors,
                     orchestrator_names=module_orchestrators,
+                    observation_names=observers,
                     closed_hosts=closed, dead_out=dead, covered=covered,
                     avatar_names=(avatar,) if avatar else (), desk_names=desks)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
@@ -3805,7 +3811,7 @@ class Notifier:
                                 else [])
                 thread_desks += [str(name) for name in human_targets
                                  if name not in ("assignee", "pilot",
-                                                 alert_briefs.AUDITOR_NAME, "avatar")]
+                                                 alert_briefs.AUDITOR_ROLES[0], "avatar")]
                 for name in dict.fromkeys(thread_desks):
                     row = by_name.get(name)
                     if row is None or row.get("mode") != "externe":

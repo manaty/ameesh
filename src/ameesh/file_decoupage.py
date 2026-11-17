@@ -552,26 +552,33 @@ def _created_since(db, lots: list, project: str, split: dict, waits: dict) -> li
 
 
 def _fallback(db, project: str, split: dict, created: list, now: float, *,
-              actor: str) -> dict | None:
-    """Repli (§2.2, 3) : un seul courrier à l'auditeur, marqué sur le lot."""
-    from . import mail
-    from .alert_briefs import AUDITOR_NAME
+              actor: str, listing: list, canons=None) -> dict | None:
+    """Repli (§2.2, 3) : un seul courrier à l'auditeur, marqué sur le lot.
+
+    #7661 : l'auditeur est l'agent dont la fiche du canon déclare le rôle
+    (`roles: [auditeur]`), jamais un nom de persona. Sans ce rôle, le repli
+    n'a pas de destinataire : rien n'est inventé et rien n'est marqué."""
+    from . import alert_briefs, mail
     lot = int(split["id"])
     if created or now - float(split.get("created_ts") or now) < FALLBACK_S:
         return None
     if work.events_noted(db, lot, FALLBACK_MARK):
         return None
+    names = alert_briefs.auditors(listing, canons)
+    if not names:
+        return None
+    auditor = names[0]
     body = ("Repli du lot de découpage #%d (#3256 A, canon §4) : créé il y a %s, il n'a "
             "donné lieu à aucun lot démarrable de %s. Geste de niveau 1 : créez vous-même "
             "les lots démarrables (au plus une journée chacun, classe du §1), sans toucher "
             "au code ni à la priorité des lots du pilote ; puis notez-les sur #%d."
             % (lot, su._duration(now - float(split["created_ts"])), project, lot))
-    mail.send(db, actor, AUDITOR_NAME, body, work_item_id=str(lot),
+    mail.send(db, actor, auditor, body, work_item_id=str(lot),
               idempotency_key="file-decoupage-repli-%d" % lot)
     work.note(db, lot, "%s : aucun lot démarrable créé en %s, %s prévenu"
               % (FALLBACK_MARK, su._duration(now - float(split["created_ts"])),
-                 AUDITOR_NAME), actor=actor)
-    return {"lot": lot, "auditor": AUDITOR_NAME}
+                 auditor), actor=actor)
+    return {"lot": lot, "auditor": auditor}
 
 
 def _owner_of(rows: list) -> str | None:
@@ -1547,7 +1554,8 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
         if split.get("created_ts") is None or dry_run:
             continue
         done = _fallback(db, project, split,
-                         _created_since(db, lots, project, split, waits), now, actor=actor)
+                         _created_since(db, lots, project, split, waits), now,
+                         actor=actor, listing=listing, canons=canons)
         if done:
             out.append(dict(done, kind="fallback", project=project))
     return out

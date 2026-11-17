@@ -241,17 +241,19 @@ class PassTest(PgTestCase):
         self.assertEqual(self.split_lots(), [])
 
     def test_fallback_mails_the_auditor_once_after_an_hour(self):
-        self.run_pass(0)
-        self.run_pass(1800)
+        # #7661 : le repli vise l'agent dont la fiche déclare le rôle.
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
         lot = int(self.split_lots()[0]["id"])
-        self.assertEqual(self.run_pass(1800 + 1200), [])
-        out = self.run_pass(1800 + 3700)
+        self.assertEqual(self.run_pass(1800 + 1200, listing), [])
+        out = self.run_pass(1800 + 3700, listing)
         self.assertEqual([g["kind"] for g in out], ["fallback"])
         mails = self.db.query("SELECT recipient FROM agent_mailbox WHERE work_item_id = %s",
                               (str(lot),))
         self.assertEqual([m["recipient"] for m in mails], ["auditeur"])
         self.assertTrue(any(n.startswith(fd.FALLBACK_MARK) for n in self.notes(lot)))
-        self.assertEqual(self.run_pass(1800 + 4000), [])
+        self.assertEqual(self.run_pass(1800 + 4000, listing), [])
 
     def test_no_fallback_when_a_startable_lot_was_created(self):
         self.run_pass(0)
@@ -262,13 +264,14 @@ class PassTest(PgTestCase):
         self.assertNotIn("fallback", [g["kind"] for g in out])
 
     def test_a_lot_created_already_assigned_is_not_a_startable_arrival(self):
-        self.run_pass(0)
-        self.run_pass(1800)
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
         registry.upsert(self.db, "devb9", harness="deepseek", host=self.cfg.host, cwd=self.tmp)
         with mock.patch("ameesh.pilot_gesture.gate", return_value=None):
             work.add(self.db, title="déjà confié", app="ameesh", actor="pilote",
                      assignee="devb9")
-        out = self.run_pass(1800 + 3700)
+        out = self.run_pass(1800 + 3700, listing)
         self.assertEqual([g["kind"] for g in out], ["fallback"])
 
     def test_exhausted_roadmap_sleeps_idle_executors_alerts_and_wakes(self):
@@ -276,7 +279,7 @@ class PassTest(PgTestCase):
         self.run_pass(1800)
         lot = int(self.split_lots()[0]["id"])
         work.note(self.db, lot, "roadmap: épuisée ameesh (docs/ROADMAP.md)", actor="pilote")
-        listing = self.listing() + [agent("auditeur")]
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
         out = self.run_pass(1900, listing)
         self.assertEqual([g["kind"] for g in out], ["sleep"])
         self.assertEqual(sorted(a["agent"] for a in out[0]["agents"] if a["slept"]),

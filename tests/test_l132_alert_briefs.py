@@ -35,14 +35,20 @@ class BriefsTest(unittest.TestCase):
     def setUp(self):
         self.listing = _listing(("orch", "a"), ("orch-b", "b"), ("dev1", "a"),
                                 ("dev2", "b"), ("auditeur", ""))
+        # #7661 : le rôle se lit sur la fiche / la projection du registre.
+        for row in self.listing:
+            row["roles"] = (["auditeur"] if row["name"] == "auditeur" else [])
 
     def test_host_alerts_reach_mesh_operators(self):
-        listing = self.listing + _listing(("mesh-design", ""), ("bureau", ""))
+        listing = self.listing + [dict(name="mesh-design", team="",
+                                       roles=["conception"]),
+                                  dict(name="bureau", team="", roles=["bureau"])]
         for kind in ("host_disk_soon_full", "host_unsampled"):
             with self.subTest(kind=kind):
                 alert = {"type": kind, "host": "central", "detail": "host central: act",
                          "orchestrators": ["orch", "orch-b"]}
                 briefs = alert_briefs.briefs(alert, listing, auditor_names=["auditeur"],
+                                             observation_names=["mesh-design"],
                                              avatar_names=("bureau",))
                 self.assertEqual(set(briefs), {"mesh-design", "bureau"})
                 self.assertIn("host central: act", briefs["mesh-design"])
@@ -52,12 +58,14 @@ class BriefsTest(unittest.TestCase):
                 external = [dict(row, mode="externe") if row["name"] == "bureau"
                             else row for row in listing]
                 self.assertEqual(set(alert_briefs.briefs(
-                    alert, external, avatar_names=("bureau",))),
+                    alert, external, observation_names=["mesh-design"],
+                    avatar_names=("bureau",))),
                                  {"mesh-design", "thread:bureau"})
                 dead = {}
                 lost = [dict(row, lease_live=False) if row["name"] == "mesh-design"
                         else row for row in listing]
                 remaining = alert_briefs.briefs(alert, lost, dead_out=dead,
+                                                observation_names=["mesh-design"],
                                                 avatar_names=("bureau",))
                 self.assertEqual(set(remaining), {"bureau"})
                 self.assertIn("mesh-design", dead)
@@ -251,6 +259,9 @@ class NotifierBriefsTest(PgTestCase):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
             self.db.execute("UPDATE agent_registry SET team = %s WHERE name = %s",
                             (team, name))
+        # #7661 : l'auditeur est reconnu par le rôle projeté au registre.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur'] "
+                        "WHERE name = 'auditeur'")
         # #3036 : le brief n'est plus déposé à un agent sans bail vivant ;
         # ces agents simulent un runner qui les tient (le régime normal).
         self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
@@ -262,8 +273,11 @@ class NotifierBriefsTest(PgTestCase):
                              " WHERE recipient = %s ORDER BY id", (name,))
 
     def test_host_alert_briefs_urgent_once_per_severity(self):
-        for name in ("mesh-design", "bureau"):
+        for name, roles in (("mesh-design", ["orchestrateur", "conception"]),
+                            ("bureau", ["bureau"])):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+            self.db.execute("UPDATE agent_registry SET roles = %s WHERE name = %s",
+                            (roles, name))
         self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
                         " lease_expires_at = now() + interval '1 hour'")
         notifier = notify.Notifier(self.cfg, notify.parse_config(

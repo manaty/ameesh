@@ -17534,16 +17534,15 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                 tenant=tenant, device=device, human=human, attach_id=attach_id,
                 epoch=epoch, session=(agent.get("session_id") or ""))
         log_async("[%s] interactive session: %s" % (name, " ".join(argv)))
-        from . import alert_briefs, auditor as auditor_mod, canon as canon_mod
+        from . import auditor as auditor_mod, canon as canon_mod
         from .platform import child_environment
-        # #6287 : l'agent auditeur — la persona, ou un rôle auditeur du canon
-        # propriétaire — reçoit son propre DSN en lecture seule ; la variable
-        # n'existe que sur l'unité qui la pose, et le canon n'est chargé que
-        # dans ce cas.
-        auditeur = bool(os.environ.get("AUDITEUR_DSN")) and (
-            name == alert_briefs.AUDITOR_NAME
-            or auditor_mod.is_auditor(
-                db, name, canon_mod.load_configured(cfg), agent))
+        # #6287 : l'agent dont la fiche du canon propriétaire déclare le rôle
+        # auditeur reçoit son propre DSN en lecture seule ; la variable n'existe
+        # que sur l'unité qui la pose, et le canon n'est chargé que dans ce cas.
+        # #7661 : le nom de la persona ne suffit plus, seule la fiche décide ;
+        # sans canon chargé, la projection `roles` du registre fait foi.
+        auditeur = bool(os.environ.get("AUDITEUR_DSN")) and auditor_mod.is_auditor(
+            db, name, canon_mod.load_configured(cfg), agent)
         launched = time.monotonic()
         proc = subprocess.Popen(argv, cwd=cwd, env=child_environment.harness(
                                     env, harness_revendique, compte,

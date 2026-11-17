@@ -21,8 +21,8 @@ from ameesh import role_timers
 
 
 def row(candidates=("agents-a", "agents-b")):
-    return {"name": "auditeur", "releve": "election", "host": "agents-a",
-            "candidats": list(candidates)}
+    return {"name": "auditeur", "roles": ["auditeur"], "releve": "election",
+            "host": "agents-a", "candidats": list(candidates)}
 
 
 def plan(host="agents-a"):
