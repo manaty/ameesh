@@ -582,6 +582,17 @@ reste réservé à l'élection) — la préférence vient de l'ordre du `Placeme
   (`profiles`, `harnais/compte`, migration 0576), jamais un chemin ni un
   secret : c'est la preuve lisible à distance du préflight de déplacement.
 
+**Q2 amendée (décision signée #224052, issue manaty/ameesh#5901).** Un hôte
+partagé accepte par défaut les seules clés d'organisation. Il peut aussi
+accepter `subscription` si sa fiche Host déclare simultanément
+`policy.allow_subscription: true` et `policy.require_isolation: true`.
+L'opt-in est refusé sans isolation et sur un hôte non partagé ; l'agent doit
+avoir pour `responsible` un tenant déclaré. Cette règle est identique pour une
+VM et un pod. Elle remplace Q2 #213954 a. Elle ne dispense ni du compte Unix,
+du home 0700 et du dossier de comptes par tenant, ni de la garde SQL
+`ameesh_tenant_claim_ok`. La connexion OAuth du runner est refusée si son UID
+ou son dossier de compte ne correspond pas à son home de tenant.
+
 **Superviseur d'hôte.** Un service d'hôte (utilisateur système dédié, sans
 harnais d'agent) possède l'état **machine** : `host_resources`,
 `host_lifecycle`, les portes, la capacité et le ménage. Les runners de tenant
@@ -973,6 +984,11 @@ droits. Recommandation entre parenthèses.
    comptes personnels (abonnement, dossier 0700) ou seulement les clés
    d'organisation (recommandé : clés d'organisation sur le cloud, abonnement
    personnel sur le poste) ? Qui paie et qui audite ?
+   **Tranché puis amendé (#224052, option a, signée le 17/11/2026, issue
+   manaty/ameesh#5901)** : abonnement personnel admis sur un hôte partagé
+   uniquement avec `allow_subscription` et `require_isolation` explicites ;
+   sans ces deux drapeaux, les clés d'organisation restent seules admises.
+   Cette décision remplace #213954 a.
 3. **Q3 — Attach distant.** Qui peut autoriser : le `responsible` seul, ses
    deputies, le pilote du projet, une liste de cartes `Member` (recommandé :
    `responsible` + liste explicite, le deputy sous sa propre identité) ?
