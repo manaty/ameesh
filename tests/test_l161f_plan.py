@@ -1024,6 +1024,7 @@ class MapTest(unittest.TestCase):
             'test_6011_contrat_ecrivains_isoles',
             'test_6090_work_add_unique_ref',
             'test_7630_avatar_tools',
+            'test_7726_prod_go',
             'test_987_relance_hosted',
             'test_cluster',
             'test_contract_registry_ameesh',

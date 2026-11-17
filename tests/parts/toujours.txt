@@ -61,3 +61,5 @@ test_l50_group_orphan_work_items  # #749: orphan work items of a group reattache
 test_l72_panne_de_base  # database outage and reconnection
 test_migrations  # migrations: application, idempotence, immuabilité (contrat, L1211)
 test_migrations_additives  # #6147: contrat additif du staging (§11 bis) : une migration non additive est refusée
+
+test_7726_prod_go  # #7726: signed production authority and supersession locks

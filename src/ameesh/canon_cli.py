@@ -1189,7 +1189,8 @@ def _canon_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
 
 
-def _add_agent_parsers(parent, *, move: bool = False) -> None:
+def _add_agent_parsers(parent, *, move: bool = False,
+                        observe: bool = False) -> None:
     """`agent spawn|name` (L243, #468), branché aux DEUX endroits.
 
     `ameesh canon agent …` est la place canonique (le nommage est une
@@ -1228,6 +1229,13 @@ def _add_agent_parsers(parent, *, move: bool = False) -> None:
     p_name.add_argument("--project", action="append", default=None,
                         help="project the agent works on; repeat for a multi-project agent")
     p_name.set_defaults(func=cmd_agent_name)
+
+    if observe:
+        from .agent_observe import add_arguments as _add_observe
+        p_obs = agent_sub.add_parser(
+            "observe", help="admitted profile, lease, bounds and redacted "
+                            "budget of an agent, read-only (contract E1b)")
+        _add_observe(p_obs)
 
     if move:
         p_move = agent_sub.add_parser(
@@ -1350,4 +1358,4 @@ def add_parsers(sub) -> None:
     p_pcheck.add_argument("--agent", default=None, help="a single agent (otherwise all)")
     p_pcheck.set_defaults(func=cmd_placement_check)
 
-    _add_agent_parsers(sub, move=True)
+    _add_agent_parsers(sub, move=True, observe=True)

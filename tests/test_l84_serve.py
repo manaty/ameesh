@@ -332,6 +332,8 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/agents": "/api/v1/agents",
             "/api/v1/agents/{agent}": "/api/v1/agents/a1",
             "/api/v1/agents/{agent}/peek": "/api/v1/agents/a1/peek",
+            "/api/v1/agents/{agent}/observation":
+                "/api/v1/agents/a1/observation?account_profile=absent",
             "/api/v1/agents/{agent}/chat": "/api/v1/agents/a1/chat?limit=5",
             "/api/v1/lots": "/api/v1/lots?state=build&limit=10",
             "/api/v1/lots/{id}": "/api/v1/lots/" + lot,
@@ -484,7 +486,9 @@ class ServePgTest(ServerMixin, PgTestCase):
             self.assertIsNone(data["agent"]["footprint"])
 
     def test_unknown_objects_are_404(self):
-        for path in ("/api/v1/agents/nobody", "/api/v1/lots/999999", "/api/v1/hosts/nowhere",
+        for path in ("/api/v1/agents/nobody",
+                     "/api/v1/agents/nobody/observation",
+                     "/api/v1/lots/999999", "/api/v1/hosts/nowhere",
                      "/api/v1/threads/nothing", "/api/v1/turns/" + "0" * 32,
                      "/api/v1/requests/999999"):
             status, data = self.get_json(path)

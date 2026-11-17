@@ -2672,8 +2672,11 @@ class WorkItems(interface.WorkItems):
         from ... import merge_queue
         item = self.get(item_id) if item is None else item
         marks = self.milestones(item_id, None) if marks is None else marks
+        # #7677 : la cible fraîche, comme la désignation au gel ; un fetch
+        # n'entre jamais dans une transaction.
         gate = merge_queue.review_gate_for_item(
-            self.db, getattr(self.db, "cfg", None), item, marks)
+            self.db, getattr(self.db, "cfg", None), item, marks,
+            refresh_target=not in_transaction(self.db))
         return gate
 
     def sync_validations(self) -> list[dict]:

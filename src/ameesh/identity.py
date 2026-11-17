@@ -218,23 +218,33 @@ def _session_binding(cfg: Config, db, harness: str | None,
                      session_id: str | None) -> Binding:
     """L41 (0030) : identité d'une session externe, par sa liaison explicite.
 
+    #7725 : une liaison vers une identité d'ÉMISSION sans boîte lue
+    (`watch.SENDER`, « veille ») ne donne plus d'identité : elle ne recevrait
+    jamais les réponses. La raison le dit et demande l'agent que la session
+    porte vraiment ; `bind` refuse d'ailleurs d'en créer une.
+
     Jamais d'exception : une base sans la table (migration 0034 non appliquée)
     ou injoignable revient à « non lié »."""
     if db is None:
         return Binding(reason=_UNBOUND)
     from . import session_bindings as sb  # import tardif : identity ne dépend pas de la base
     try:
+        why = ""
         if session_id is not None or harness is not None:
             row, why = sb.for_hook(cfg, db, harness or "", session_id or "")
             if row is None:
                 return Binding(reason="AGENT_MAIL_NAME not set and " + why)
-            if why:
-                return Binding(name=row["agent"], source="session", session=row,
-                               reason=why)
         else:
             row = sb.by_ancestry(cfg, db)
             if row is None:
                 return Binding(reason=_UNBOUND)
+        refusal = sb.no_read_mailbox_refusal(row["agent"])
+        if refusal:
+            return Binding(name=row["agent"], source="session", session=row,
+                           reason=refusal)
+        if why:
+            return Binding(name=row["agent"], source="session", session=row,
+                           reason=why)
         holder = sb.lease_holder(db, row["agent"])
     except Exception as exc:  # table absente, base en panne : rien n'est lié
         if getattr(db, "_schema_missing", False):

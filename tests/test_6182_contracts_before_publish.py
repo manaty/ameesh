@@ -81,7 +81,13 @@ class PublicationTest(unittest.TestCase):
             'test': name, 'status': 'probable', 'units': [{
                 'lot': 6179, 'best': 6, 'evidence': [{
                     'kind': 'migration', 'file': 'src/ameesh/migrations/test.sql'}]}]}]}
-        with mock.patch.object(auto, 'verify_contract_scope'), \
+        # #7692 : la composition de ce témoin porte des SHA factices ; le rejeu
+        # de préfixe (#7239) ne peut pas y ouvrir de worktree. On injecte son
+        # résultat — rouge au préfixe de l'unité désignée — pour que le retrait
+        # #3801 soit confirmé, au lieu de le laisser non concluant.
+        prefix = ({6179: [{'test': name}]}, '', [])
+        with mock.patch.object(auto, 'prefix_failures', return_value=prefix), \
+                mock.patch.object(auto, 'verify_contract_scope'), \
                 mock.patch.object(auto, 'unit_test_modules', return_value=[]), \
                 mock.patch.object(auto, 'contract_modules', side_effect=AssertionError('duplicate plan')), \
                 mock.patch.object(auto, 'run_tests', side_effect=AssertionError('duplicate tests')):

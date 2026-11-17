@@ -5230,8 +5230,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                 "designates the reviewer)" % (item_id, why, item_id))
     if state == "validated":
         from . import merge_queue
+        from .db import in_transaction
+        # #7677 : la cible fraîche, comme la désignation au gel (hors
+        # transaction seulement : jamais de fetch sous un verrou).
         gate = merge_queue.review_gate_for_item(
-            db, getattr(db, "cfg", None), item, milestones(db, item_id))
+            db, getattr(db, "cfg", None), item, milestones(db, item_id),
+            refresh_target=not in_transaction(db))
         if not gate or not gate.get("ok"):
             raise WorkError(
                 "transition to validated requires the review quorum on the current frozen head; "

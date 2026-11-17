@@ -75,6 +75,7 @@ SCHEMA_KEYS = (
     "repair_policy.rules",
     "schema",
     "timezone",
+    "prod_go_max_hours",
     "cutoffs",
     "packets.cutoffs",
     "build.max_in_build",
@@ -159,6 +160,7 @@ BINDINGS = {
     "paused_family_min_hours": "reviews.paused_family_min_hours",
     "cutoffs": "cutoffs",
     "timezone": "timezone",
+    "prod_go_max_hours": "prod_go_max_hours",
     "classes": "prevalidation.classes",
     "contracts": "prevalidation.contracts",
     "hosts": "prevalidation.hosts",
@@ -528,6 +530,8 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "reviews.light_reviews":
         # §2 (#2642) : 0 n'est admis que le temps de la PR home, 1 au canon.
         return type(value) is int and value in (0, 1)
+    if key == "prod_go_max_hours":
+        return type(value) is int and value > 0
     if key == "reviews.paused_family_min_hours":
         # #6990 : un délai de reprise en heures, strictement positif ; 0 est
         # l'absence documentée de repli, pas un seuil recopié.

@@ -154,18 +154,39 @@ EXECUTE_REFUSAL = ("agent driven by the runner; an external session would steal 
                    "its mail")
 
 
+def no_read_mailbox_refusal(agent: str) -> str:
+    """#7725 : le refus de lier une session externe à une identité d'ÉMISSION
+    sans boîte lue (`watch.SENDER`, « veille ») — elle n'a pas de lecteur, une
+    session liée n'y recevrait jamais la réponse qu'elle attend.
+
+    Rend le refus, ou '' si la liaison est permise. Le contrôle est aussi
+    appliqué à la RÉSOLUTION (`identity._session_binding`) : une liaison
+    créée avant ce refus ne donne plus d'identité, au lieu de laisser la
+    session écrire à sens unique. Le nom vient déjà résolu par `bind` ; la
+    comparaison est exacte, comme celle de `undeliverable.watch_sender`."""
+    from . import undeliverable
+    if not undeliverable.watch_sender(agent):
+        return ""
+    return ("%s is the sender of the `ameesh watch` instruction: it has no read "
+            "mailbox, so a session bound to it would never receive the replies. "
+            "Bind this session to the agent it carries instead (`ameesh mail bind "
+            "<agent> --session … --harness …`). A message sent as %s says that "
+            "replies are not delivered." % (agent, agent))
+
+
 def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
          pid=None, by: str, force: bool = False) -> BindResult:
     """L41 (0030) : lie une session externe de CET hôte à `agent`.
 
-    Lève `BindError` (rien n'est écrit) si l'agent détient un bail vivant ou
-    si la session est déjà liée à un autre agent. Même agent : idempotent
-    (le PID est mis à jour s'il change).
+    Lève `BindError` (rien n'est écrit) si l'agent détient un bail vivant, si
+    c'est une identité d'émission sans boîte lue (#7725 : `veille`, qui ne
+    recevrait jamais de réponse) ou si la session est déjà liée à un autre
+    agent. Même agent : idempotent (le PID est mis à jour s'il change).
 
     L46 : un agent `execute` (mené par l'exécuteur, même sans bail vivant à
     l'instant) est refusé sauf `force` — entre deux tours, la session externe
     prendrait le courrier destiné à son prochain tour. `force` ne lève jamais
-    le refus du bail vivant."""
+    le refus du bail vivant, ni celui d'une identité sans boîte lue."""
     from .agent_names import resolve as resolve_agent_name
     agent = resolve_agent_name(agent, db=db, operation="session_bindings.bind")
     by = resolve_agent_name(by, db=db, operation="session_bindings.bind")
@@ -174,6 +195,9 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
     check_harness(harness)
     check_session(session_id)
     pid = check_pid(pid)
+    refusal = no_read_mailbox_refusal(agent)
+    if refusal:
+        raise BindError(refusal)
     holder = lease_holder(db, agent)
     if holder:
         raise BindError(

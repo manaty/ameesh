@@ -295,6 +295,39 @@ class InventoryTest(unittest.TestCase):
     def by_id(self, payload):
         return {entry["work_item"]: entry for entry in payload["candidates"]}
 
+    def test_resolution_refresh_failure_refuses_the_inventory(self):
+        with mock.patch.object(packet_candidates, "list_remises",
+                               return_value=({}, "resolution fetch failed")):
+            with self.assertRaisesRegex(packet_candidates.CandidateError,
+                                        "resolution fetch failed"):
+                self.inventory()
+
+    def test_stale_pair_resolution_keeps_prior_freeze_readable(self):
+        # #7737: both branches move, but their old resolution still retains
+        # the old freeze on origin. It is provenance, not a target remise.
+        old = self.tips[1]
+        ref = "refs/ameesh/resolutions/1/5"
+        _git(self.repo, "push", "-q", "origin", "%s:%s" % (old, ref))
+        for lot in (1, 5):
+            _git(self.repo, "switch", "-q", self.branches[lot])
+            _git(self.repo, "reset", "--hard", "main")
+            _write(self.repo, "rebased%d.py" % lot, "rebased\n")
+            head = _commit(self.repo, "rebased #%d" % lot)
+            self.tips[lot] = head
+            for mark in self.marks[lot]:
+                mark["sha"] = head
+            _git(self.repo, "push", "-q", "--force", "origin", self.branches[lot])
+        _git(self.repo, "switch", "-q", "main")
+        report = self.inventory()
+        from ameesh import plan_git
+        self.assertTrue(plan_git.ref_reachable(self.clone.path, old))
+        self.assertTrue(self.by_id(report)[1]["ready"])
+        self.assertEqual(self.by_id(report)[1]["remises"], [])
+        # A deleted remote resolution must not remain as a stale local proof.
+        _git(self.repo, "push", "-q", "origin", ":" + ref)
+        self.inventory()
+        self.assertFalse(plan_git.ref_reachable(self.clone.path, old))
+
     def test_validated_lot_is_a_candidate_with_the_same_review_gate(self):
         row = next(row for row in self.rows if row["id"] == 1)
         row["state"] = "validated"
