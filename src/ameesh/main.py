@@ -115,6 +115,7 @@
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
+  ameesh host reattach SOURCE AGENT --to NEW_HOST
         durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
@@ -519,7 +520,7 @@ def _dispatch(argv: list[str] | None) -> int:
         # #7106 (avatar B3) : tenants d'un hôte partagé, geste d'infrastructure
         from . import tenancy
         return tenancy.main(rest[1:])
-    if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
+    if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "reattach", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
     if command == "role":

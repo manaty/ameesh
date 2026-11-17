@@ -965,3 +965,30 @@ may share one window but never one holder.
 
 For wheel installation, the secret-free canary, protected enrollment manifest
 and rollback procedure, see [HANDOFF-STAGING](HANDOFF-STAGING.md).
+
+## Returning a lost host after permanent moves
+
+A host without a runner publishes through `ameesh-host-publish.timer`
+(or the server `ameesh-releve-hote.timer`) every 60 seconds, with at most
+10 seconds of jitter and 1 second of timer coalescing. Install the updated
+timer and reload the systemd manager; allow readings to cover a full detection
+window (at least 180 seconds with default configuration), then run
+`ameesh host reconcile SOURCE`. A single heartbeat does not prove return.
+`ameesh host status SOURCE` and a refused reconciliation include `next_action`.
+
+When an agent has permanently left the lost host, an authorized human or
+governance corrector accepts its **existing** destination explicitly:
+
+```sh
+ameesh host reattach SOURCE AGENT --to NEW_HOST
+ameesh host reconcile SOURCE
+```
+
+`reattach` checks that SOURCE is lost and AGENT is already registered on
+NEW_HOST, unfenced and without an active handoff. It retires only the current
+generation's return obligation and records actor, source, destination,
+generation and the original obligation in `host.agent_reattached`. This also
+removes that agent's completed recovery from the return proof. It does not
+move or stop a process, cancel an operation, change the registered host or
+clear a fence. Finish an incomplete recovery before accepting the new home.
+Ordinary moves without this acceptance retain the existing return guards.
