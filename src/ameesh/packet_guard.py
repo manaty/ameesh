@@ -256,7 +256,7 @@ def declare(db, lot, exception: str, reason: str, sha: str, *, actor: str = "") 
 
 
 def _outside_why(ident: str) -> str:
-    return ("repository %s is a configured canon, merged by the bureau (#2511), "
+    return ("repository %s is a configured canon, merged by its avatar (#2511), "
             "outside the packets of canon §11 bis" % ident)
 
 

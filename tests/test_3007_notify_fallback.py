@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import io
 import os
 import time
@@ -256,8 +257,13 @@ class AlertesTest(PgTestCase):
                 "UPDATE agent_registry SET lease_owner = NULL,"
                 " lease_expires_at = NULL WHERE name = %s", (name,))
         registry.upsert(self.db, "bureau", harness="claude", host=self.cfg.host)
-        self.db.execute("UPDATE agent_registry SET mode = 'externe'"
-                        " WHERE name = 'bureau'")
+        self.db.execute("UPDATE agent_registry SET mode = 'externe',"
+                        " responsible = 'human:alice' WHERE name = 'bureau'")
+        # #7634 : sans avatar au canon, la route d'un humain est celle que la
+        # configuration de release nomme et que le registre dit responsable de
+        # cet humain ; le mode `externe` seul ne fait plus une route (B1).
+        self.cfg = dataclasses.replace(
+            self.cfg, release={"projects": {"ameesh": {"report": "bureau"}}})
         report = notify_gap.brief_once(self.cfg, self.db, now=now)
         self.assertEqual([e["recipient"] for e in report["sent"]], ["thread:bureau"])
         self.assertEqual(

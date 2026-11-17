@@ -284,6 +284,8 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
         except Exception:  # noqa: BLE001 — sans canon, l'auditeur par son nom suffit
             canons = []
         auditors = alert_briefs.auditors(listing, canons)
+        from . import avatars as avatars_mod
+        avatars_by_human = avatars_mod.from_canons(canons)
         # #3036 : un agent sans bail vivant ou sur un hôte aux claims fermés
         # ne lira pas le brief ; `briefs` l'écarte et replie sur le fil du
         # bureau au lieu de compter une remise perdue (N1 dev1/cx1).
@@ -300,10 +302,14 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
         since = now - alert_briefs.REMIND_AFTER_S
         for gap in gaps:
             alert = alert_of(gap, orchestrators)
+            avatar = avatars_by_human.get(gap["human"])
+            desks = () if avatar else tuple(avatars_mod.configured_desks(
+                cfg, gap["human"], listing))
             texts = alert_briefs.briefs(
                 alert, listing, auditor_names=auditors,
                 orchestrator_names=set(orchestrators),
-                closed_hosts=closed)
+                closed_hosts=closed,
+                avatar_names=(avatar,) if avatar else (), desk_names=desks)
             for recipient, text in sorted(texts.items()):
                 claim = storage.of(db).notify_liveness.claim_brief(
                     recipient, gap["human"], since=since, now=now)
@@ -316,12 +322,12 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
                            "decisions": list(gap["decisions"]),
                            "reason": gap["reason"]}
                 try:
-                    if recipient == "thread:bureau":
+                    if recipient.startswith("thread:"):
                         # #3036 : plus aucun agent vivant à joindre — la route
                         # humaine est le fil lisible, pas une boîte fictive
-                        # (B1 dev1/cx1 : `thread:bureau` n'est pas un agent).
+                        # (B1 dev1/cx1 : `thread:<nom>` n'est pas un agent).
                         if fil.record(cfg, db, sender=work.SYSTEM_SENDER,
-                                      recipients=["bureau"], text=body,
+                                      recipients=[recipient.split(":", 1)[1]], text=body,
                                       project=getattr(cfg, "project", None),
                                       meta=payload) is None:
                             raise RuntimeError(

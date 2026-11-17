@@ -491,7 +491,7 @@ def packet_watch_lines(cfg, run=_systemctl) -> list[str]:
             "(%s): if this host is a candidate, the takeover has no release tick here"
             % (role, RELEASE_TIMER, state),
             "             ameesh role timers --role %s --install (a host-pinned cutter "
-            "elsewhere is migrated by the bureau first: one cutter)" % role,
+            "elsewhere is migrated by its avatar first: one cutter)" % role,
         ]
     return [
         "warning    : packet_watch is declared for this host but %s is not active "
