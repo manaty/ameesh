@@ -34,6 +34,15 @@ from .git_merge import GitMergeConnector
 
 NAME = "dev"
 
+#: P1a #7649 (étude #7616 §4.2) : nom logique du schéma des tables de
+#: développement. Le nom physique est dérivé du schéma noyau par le runner
+#: (`<schéma_noyau>__dev`, Q8) puis inscrit dans `module_schemas` ; aucune
+#: table n'est déplacée par P1a. Les migrations du module arrivent avec P2
+#: (#7651) : tant que `MIGRATIONS` est None, le runner ne crée aucun schéma.
+SCHEMA = "dev"
+MIGRATIONS = None
+REQUIRES = ()
+
 #: Capabilities this module provides (see ``registry.CAPABILITIES``).
 CAPABILITIES = ("cli", "workspaces", "audit")
 

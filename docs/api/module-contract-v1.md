@@ -1,6 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.1, 17 November 2026** (additive E1a snapshot). Scope: an installed external
+Contract revision: **1.2, 17 November 2026** (additive module schema and migrations
+snapshot). Scope: an installed external
 module and its client processes. Reference: [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
@@ -45,7 +46,7 @@ release's `--help`. These entry points cover the module integration:
 | Entry point | Purpose and result contract |
 | --- | --- |
 | `ameesh --version` | Installed package version; it does not prove the running process uses that installation. |
-| `ameesh modules --json` | Discovered module descriptions and refused entries. A refused entry is not an active provider. |
+| `ameesh modules --json` | Discovered module descriptions and refused entries. Additive since 1.2: `schema`, `requires`, `migrations` (`applied` and `schema_actual` when the database is readable). A refused entry is not an active provider. |
 | `ameesh module list` and `ameesh module NAME …` | Installation evidence and dispatch to the named module's CLI. `list` is reserved. The module owns the arguments after its name. |
 | `ameesh canon check`, `ameesh canon sync` | Validate and admit configured canon through the core's authority checks. |
 | `ameesh canon snapshot --expect-commit SHA --json` | [E1a immutable canon/directory snapshot](canon-snapshot-v1.md), available in the release containing #7669 / #5862. No database access or registry admission; profile/lease preparation remains E1b. |
@@ -107,6 +108,7 @@ base class or a required superclass of the installed implementation.
 | Element | Version 1 baseline contract |
 | --- | --- |
 | `NAME` | Unique installed name, matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; reserved or duplicate names are refused. |
+| `SCHEMA`, `MIGRATIONS`, `REQUIRES` | Optional storage facts, additive since 1.2. `SCHEMA` is the logical schema name (the module name by default); `MIGRATIONS` is a folder of `NNNN_name.sql` files **inside the installed package**, or None; `REQUIRES` lists modules whose schema must exist first. A module without `MIGRATIONS` declares no schema. Migration SQL is installed code reviewed as sensitive SQL; the canon never supplies an executable path. The runner derives `<core schema>__<module>`, applies the module's migrations in the core migration transaction and records them in `module_schema_migrations`. Every `SECURITY DEFINER` routine must set `search_path` in its own definition: the runner refuses a routine without it, and refuses a migration whose dynamic SQL or uncertain parse prevents that proof. |
 | `descriptor(options=None)` | Returns exactly `types`, `schemas`, `rules`: unique type-name list, schema mapping, list of rule mappings. The baseline requires an external lifecycle module to have a type. |
 | `CAPABILITIES` | Optional unique names among `lifecycle`, `cli`, `audit`, `workspaces`, backed by the corresponding implementation. |
 | `main(db, argv, *, actor)` | Optional CLI callback. Receives the resolved actor and a core-owned connection for ordinary dispatch. Help can receive `db=None`, `actor=""`; do not query in that case. Return an exit status. |
@@ -115,7 +117,8 @@ base class or a required superclass of the installed implementation.
 
 The discovery record's public fields are `name`, `version`, `source`,
 `capabilities`, `cli`, `storage`, `distribution`, `entry_point`,
-`descriptor_sha256`, `card_ref`. `storage` on the Python record is a tuple of
+`descriptor_sha256`, `card_ref`, and — additive since 1.2 — `schema`,
+`migrations`, `requires`. `storage` on the Python record is a tuple of
 types; `as_dict()` represents it as `{"types": [...]}`. These are different
 representations of the same declared types.
 

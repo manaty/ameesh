@@ -93,6 +93,38 @@ audit's finding format (`type: module_deviation`, `module`, `rule`,
 `project`, `lot`, `reason`, `detail`, `action`, and the relevant evidence facts) and keep the hook read-only. Declare `audit` only when providing
 that callable; the hello example has no audit hook.
 
+## 2b. Declare storage migrations (optional)
+
+A module that owns tables may declare three additional facts on its
+implementation:
+
+```python
+NAME = "hello"
+SCHEMA = "hello"          # logical name; defaults to NAME
+MIGRATIONS = "migrations" # folder inside your package, or None
+REQUIRES = ()             # modules whose schema must exist first
+```
+
+`MIGRATIONS` is resolved relative to the installed module file and may not
+leave its package. Files are `NNNN_name.sql`, numbered inside the module
+(`hello/0001_…` does not collide with a core migration). `ameesh migrate`
+creates `<core schema>__<module>`, applies the files in version order inside
+the core migration transaction and records them in `module_schema_migrations`.
+`REQUIRES` orders module schemas; a cycle, an unknown module or a required
+module without a schema is refused before anything is applied.
+
+Migration SQL is installed code reviewed as sensitive SQL, like a core
+migration: keep it additive when the previous code still runs against the same
+database, declare `-- ameesh: non-additive` when it is not, and qualify core
+objects explicitly (the runner sets `search_path` to
+`<module schema>, <core schema>, pg_temp`). `ameesh migrate --additive-only`
+refuses the whole pass if either the core or a module has a non-additive
+migration. Every `SECURITY DEFINER` routine must set `search_path` in its own
+definition; the runner refuses one that does not, and refuses a migration
+whose dynamic SQL or uncertain parse prevents that proof. `ameesh modules
+--json` reports the declared schema, requirements and migrations, and `ameesh
+doctor` reports each module schema's state.
+
 ## 3. Install, discover and trust
 
 Install the package into the **same Python environment as ameesh**, on every

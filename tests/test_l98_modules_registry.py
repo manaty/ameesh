@@ -207,6 +207,8 @@ class RegistryTest(unittest.TestCase):
             "capabilities": ["lifecycle"], "cli": None, "storage": {"types": ["docs"]},
             "distribution": "ameesh-sample-module", "entry_point": "sample_module",
             "descriptor_sha256": rows["sample"]["descriptor_sha256"],
+            # P1a #7649 : champs additifs du schéma et des migrations de module
+            "schema": None, "migrations": [], "requires": [],
             "card_ref": None})
 
     def test_declared_capabilities_are_checked_against_the_module(self):

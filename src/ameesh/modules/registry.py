@@ -43,6 +43,11 @@ class Module:
     descriptor_sha256: str = ""
     card_ref: str | None = None      # L103 T2: canon_ref of a Pipeline card
     action_connectors: tuple[str, ...] = ()
+    #: P1a #7649: logical schema name, declared migrations and schema
+    #: requirements. A module without a migrations folder has no schema.
+    schema: str | None = None
+    migrations: tuple = ()
+    requires: tuple[str, ...] = ()
 
     def as_dict(self):
         result = {"name": self.name, "version": self.version, "source": self.source,
@@ -50,7 +55,10 @@ class Module:
                 "storage": {"types": list(self.storage)},
                 "distribution": self.distribution, "entry_point": self.entry_point,
                 "descriptor_sha256": self.descriptor_sha256,
-                "card_ref": self.card_ref}
+                "card_ref": self.card_ref,
+                "schema": self.schema,
+                "migrations": [migration.as_dict() for migration in self.migrations],
+                "requires": list(self.requires)}
         if self.action_connectors:
             result["action_connectors"] = list(self.action_connectors)
         return result
@@ -122,12 +130,19 @@ def _capabilities(name, module):
 def _describe(name, module, compiled, *, source, version, distribution=None,
               entry_point=None):
     capabilities = _capabilities(name, module)
+    # P1a #7649 : faits de schéma et de migrations, lus sur le descripteur
+    # installé (aucun import du module par le cœur).
+    from .. import migrations as migrations_mod
+    declaration = migrations_mod.module_metadata(name, module)
     return Module(name=name, version=version, source=source,
                   capabilities=capabilities,
                   cli=("ameesh module %s" % name) if "cli" in capabilities else None,
                   storage=tuple(compiled["types"]), distribution=distribution,
                   entry_point=entry_point, descriptor_sha256=_digest(compiled),
-                  action_connectors=tuple(sorted(getattr(module, "ACTION_CONNECTORS", {}))))
+                  action_connectors=tuple(sorted(getattr(module, "ACTION_CONNECTORS", {}))),
+                  schema=declaration["schema"],
+                  migrations=declaration["migrations"],
+                  requires=declaration["requires"])
 
 
 def _core_version():
@@ -387,6 +402,38 @@ def _canon_registry():
     return Registry(discovery[1], discovery[2])
 
 
+def _annotate_module_rows(rows, modules):
+    """P1a #7649: `schema_actual` and per-migration `applied` when the base is
+    readable. Read-only; without a database the declared fields stand alone."""
+    if not any(getattr(module, "migrations", ()) for module in modules):
+        return
+    import sys
+    from .. import config, db as db_mod, migrations as migrations_mod
+    try:
+        cfg = config.load()
+        db = db_mod.connect(cfg, writer=False)
+    except (db_mod.Unavailable, OSError, ValueError) as exc:
+        print("warning: database not reachable (%s); applied module migrations "
+              "unknown" % (" ".join(str(exc).split())[:160],), file=sys.stderr)
+        return
+    try:
+        schemas = migrations_mod.module_schemas(modules, cfg.schema)
+        state = migrations_mod.check_modules(db, schemas)
+        checks = {check.module: check for check in state.checks}
+        for row in rows:
+            check = checks.get(row["name"])
+            if check is None:
+                continue
+            row["schema_actual"] = check.registered_schema
+            for migration in row["migrations"]:
+                migration["applied"] = migration["version"] in check.applied
+    except (db_mod.DbError, ValueError) as exc:
+        print("warning: module schemas unreadable (%s)"
+              % (" ".join(str(exc).split())[:160],), file=sys.stderr)
+    finally:
+        db.close()
+
+
 def main(argv):
     """`ameesh modules [--json] [--active] [--no-canon]` — discovered or active
     modules."""
@@ -430,7 +477,9 @@ def main(argv):
         return 0
     registry = discover() if args.no_canon else _canon_registry()
     if args.json:
-        print(json.dumps({"modules": [module.as_dict() for module in registry.modules],
+        rows = [module.as_dict() for module in registry.modules]
+        _annotate_module_rows(rows, registry.modules)
+        print(json.dumps({"modules": rows,
                           "refused": list(registry.refused)},
                          ensure_ascii=False, indent=2, sort_keys=True))
     else:
