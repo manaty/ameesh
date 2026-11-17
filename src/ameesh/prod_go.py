@@ -139,9 +139,11 @@ def check_release_merge(cfg, db, lot, source, target, sha, *, repo="", gh=None):
     project = project_view.name
     document = mechanics.configured(cfg)
     override = document.override(project)
-    if override is None:
-        raise ProdGoError("release project is not declared in compiled canon")
-    production = override.production_branch
+    production = project_view.production_branch
+    if not production:
+        if override is None:
+            raise ProdGoError("release project is not declared in compiled canon")
+        production = override.production_branch
     if not production:
         return  # repository project explicitly has no production branch
     if target != production:

@@ -177,6 +177,43 @@ class ReleaseMergeTest(unittest.TestCase):
                 packet_guard.check_merge(None, 7, 'release/11x', 'main', SHA,
                                          exception='incident', reason='target red')
 
+    def test_production_branch_from_radar_or_compiled_canon(self):
+        from ameesh import work
+        pr = {'body': 'Production decision: #123', 'headRefOid': SHA,
+              'headRefName': 'release/11x', 'baseRefName': 'main'}
+        for radar_branch, canon_block in (
+                ('main', ''),
+                ('', '\nprojects:\n  acme:\n    production:\n      branch: main\n')):
+            cfg = SimpleNamespace(radar={'projects': {'acme': {
+                'repo': '/fixture/acme', 'github': 'acme/app',
+                'production_branch': radar_branch}}})
+            document = mechanics.compile_document(
+                MECHANICS.replace("projects: {}", canon_block.strip()) if canon_block else MECHANICS)
+            if radar_branch:
+                self.assertIsNone(document.override('acme'))
+            gh = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps([pr])))
+            with self.subTest(radar_branch=radar_branch), mock.patch.object(work, 'get', return_value={'app': 'acme'}), mock.patch.object(mechanics, 'configured', return_value=document), mock.patch.object(prod_go, 'authorize') as authorize:
+                prod_go.check_release_merge(cfg, object(), 7, 'release/11x', 'main', SHA,
+                                            repo='acme/app', gh=gh)
+                authorize.assert_called_once_with(cfg, mock.ANY, '123', project='acme', sha=SHA, operation='release')
+                authorize.reset_mock()
+                gh.reset_mock()
+                prod_go.check_release_merge(cfg, object(), 7, 'release/11x', 'develop', SHA,
+                                            repo='acme/app', gh=gh)
+                gh.assert_not_called()
+                authorize.assert_not_called()
+
+    def test_missing_production_configuration_refuses_without_authorizing(self):
+        from ameesh import work
+        cfg = SimpleNamespace(radar={'projects': {'acme': {
+            'repo': '/fixture/acme', 'github': 'acme/app'}}})
+        document = mechanics.compile_document(MECHANICS)
+        with mock.patch.object(work, 'get', return_value={'app': 'acme'}), mock.patch.object(mechanics, 'configured', return_value=document), mock.patch.object(prod_go, 'authorize') as authorize:
+            with self.assertRaisesRegex(prod_go.ProdGoError, 'not declared'):
+                prod_go.check_release_merge(cfg, object(), 7, 'release/11x', 'main', SHA,
+                                            repo='acme/app')
+            authorize.assert_not_called()
+
     def test_missing_or_ambiguous_open_pr_refuses(self):
         from ameesh import work
         cfg = SimpleNamespace(radar={'projects': {'acme': {'repo': '/fixture/acme', 'github': 'acme/app'}}})
