@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import unittest
 from unittest import mock
 
@@ -46,7 +45,7 @@ class SequenceTest(_TmpMixin, unittest.TestCase):
         self.host("ameesh-agents-2", 20, "agents")
         self.host("ameesh-agents-3", 30, "agents")
         self.host("ameesh-agents-1", 10, "agents")
-        return release_cutoff.canon_mod.staging_topology([self.loaded()])
+        return canon.staging_topology([self.loaded()])
 
     def test_manaty_sequence_is_computed_from_the_host_cards(self):
         topology = self.manaty()
@@ -66,7 +65,7 @@ class SequenceTest(_TmpMixin, unittest.TestCase):
                           "ameesh-agents-3", "manaty-mesh-1"))
 
     def test_a_bare_canon_declares_no_staging_host_at_all(self):
-        topology = release_cutoff.canon_mod.staging_topology([self.loaded()])
+        topology = canon.staging_topology([self.loaded()])
         self.assertEqual(topology.hosts, ())
         self.assertEqual(topology.agents, ())
         self.assertIsNone(topology.server)
@@ -129,7 +128,7 @@ staging:
         project = release_cutoff.ProjectRelease(
             name="ameesh", repo=self.root, target="main")
         cfg = mock.Mock()
-        with mock.patch.object(release_cutoff.canon_mod, "load_configured",
+        with mock.patch.object(canon, "load_configured",
                                return_value=[self.loaded()]):
             filled = release_cutoff.with_staging_topology(cfg, project)
         self.assertEqual(filled.staging_topology, topology)
