@@ -990,7 +990,14 @@ class GhApi:
         now = float(self.clock())
         self.last_read = None
         if self.reads is None:
-            value = _json(self.gh, ["api", path])
+            status, _headers, body = gh_api_response(self.gh, path)
+            if status >= 400:
+                raise GithubError("GitHub %s: HTTP %d" % (path, status),
+                                  status=status, body=body)
+            try:
+                value = json.loads(body) if body.strip() else None
+            except ValueError as exc:
+                raise GithubError("gh api %s: unreadable response" % path) from exc
             self.last_read = ReadMeta(now, False, "network")
             return value
         entry = self.reads.cached(path)

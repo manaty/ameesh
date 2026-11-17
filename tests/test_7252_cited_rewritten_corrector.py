@@ -430,6 +430,31 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
 
 
 class ForgeCitationResolutionTest(unittest.TestCase):
+    def test_gh_without_shared_reads_preserves_commit_absence(self):
+        from ameesh import plan_github
+
+        sha = "a" * 40
+        for status, payload, expected in (
+                (422, {"message": "No commit found for SHA: 43969930787"}, None),
+                (404, {"message": "Not Found"}, ""),
+                (403, {"message": "No commit found for SHA: 43969930787"}, ""),
+                (200, {"sha": sha}, sha)):
+            with self.subTest(status=status):
+                gh = mock.Mock()
+                gh.run.return_value = (
+                    1 if status >= 400 else 0,
+                    "HTTP/2.0 %d Failure\r\nContent-Type: application/json\r\n\r\n%s"
+                    % (status, json.dumps(payload)),
+                    "gh: request failed" if status >= 400 else "")
+                api = plan_github.GhApi(gh, reads=None)
+                with mock.patch.object(review_authors, "_repository_slug",
+                                       return_value="owner/repo"), \
+                        mock.patch.object(plan_github, "client", return_value=api):
+                    self.assertEqual(review_authors._forge_commit(
+                        "repo", "43969930787"), expected)
+                gh.run.assert_called_once_with(
+                    ["api", "repos/owner/repo/commits/43969930787", "-i"])
+
     def test_only_explicit_commit_absence_is_definitive(self):
         from ameesh import plan_github
 
