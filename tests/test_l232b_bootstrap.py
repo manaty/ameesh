@@ -56,6 +56,26 @@ class BootstrapTest(unittest.TestCase):
         return bootstrap.run(self.root,operation,review or self.bundle,
                              authority=self.authority,adapter=self.host)
 
+    def test_authority_exception_keeps_cause_without_exposing_it_in_message(self):
+        error=OSError('private authority diagnostic')
+        with mock.patch.object(self.authority,'validate',side_effect=error):
+            with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                        'authority unavailable at preflight') as held:
+                self.run_bootstrap()
+        self.assertIs(held.exception.__cause__,error)
+        self.assertNotIn('private authority diagnostic',str(held.exception))
+        self.assertEqual(self.host.effects,[])
+
+    def test_authority_refusal_keeps_reason_and_step(self):
+        self.authority.denied={'preflight'}
+        with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                    'authority rejected at preflight'):
+            self.run_bootstrap()
+        self.authority.denial_reason='signed approval expired'
+        with self.assertRaisesRegex(bootstrap.BootstrapError,'signed approval expired'):
+            self.run_bootstrap()
+        self.assertEqual(self.host.effects,[])
+
     def test_enable_is_last_and_complete_replay_has_no_effects(self):
         self.assertEqual(self.run_bootstrap(),'installed')
         self.assertEqual(self.host.effects,list(bootstrap.STEPS))
@@ -211,12 +231,17 @@ class SignedBootstrapTest(support.PgTestCase):
     def test_original_approval_expiry_deadline_and_revocation_are_live(self):
         self.sign(); self.assertTrue(self.valid())
         self.now+=601; self.assertFalse(self.valid())
-        self.now-=601; authority.revoke_key(self.db,'fixture-owner'); self.assertFalse(self.valid())
+        self.assertEqual(self.adapter.denial_reason,'signed bootstrap window expired')
+        self.now-=601; self.assertTrue(self.valid())
+        self.assertIsNone(self.adapter.denial_reason)
+        authority.revoke_key(self.db,'fixture-owner'); self.assertFalse(self.valid())
+        self.assertEqual(self.adapter.denial_reason,'signed bootstrap proof unavailable or expired')
 
     def test_approval_dying_before_the_declared_window_has_no_authority(self):
         # The signed approval covers the whole declared window (P2): a shorter
         # ttl never authorises the bootstrap it declares.
         self.sign(ttl=50); self.assertFalse(self.valid())
+        self.assertEqual(self.adapter.denial_reason,'signed bootstrap proof unavailable or expired')
 
     def test_unsigned_decline_tampered_bundle_and_later_deadline_have_no_authority(self):
         self.sign(); original=decisions.get(self.db,self.view['id'])
