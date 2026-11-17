@@ -430,7 +430,7 @@ def main(argv=None):
             for row in result:
                 if row and row.get("mode") == "lost":
                     row["next_action"] = recovery_hint(row["host"], cfg.resource_interval)
-        elif args.command == "reconcile" and not result.get("reconciled"):
+        elif args.command == "reconcile" and result.get("mode") == "lost" and not result.get("reconciled"):
             result["next_action"] = recovery_hint(args.host, cfg.resource_interval)
         print(json.dumps(result, ensure_ascii=False))
         if args.command == "reconcile" and not (
