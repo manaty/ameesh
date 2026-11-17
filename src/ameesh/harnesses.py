@@ -77,7 +77,7 @@ REFUSAL_SCHEMAS = ("ameesh-refusal/1",)
 REFUSAL_KEYS = ("schema", "exit_code")
 #: #7034 : contrat d'application des outils/MCP restreints d'un enfant
 SPAWN_CONTRACTS = ("ameesh-spawn-tools/1",)
-SPAWN_KEYS = ("contract", "tools", "mcp")
+SPAWN_KEYS = ("contract", "tools", "mcp", "deny")
 #: known keys of `ameesh.interactive_permission` (L223: permission mode of an
 #: interactive session, `ameesh attach` and `ameesh chat`); `modes` maps a mode
 #: to fixed arguments for a harness whose flag carries no `{mode}` (L685: codex
@@ -967,7 +967,7 @@ def _check_spawn(value: Any, path: str) -> list[Finding]:
         findings.append(Finding("harness-spawn-invalid", ERROR,
                                 "`ameesh.spawn.contract`: %s expected"
                                 % " | ".join(SPAWN_CONTRACTS), path))
-    for key in ("tools", "mcp"):
+    for key in ("tools", "mcp", "deny"):
         block = value.get(key)
         if block is None:
             continue

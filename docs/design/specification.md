@@ -151,6 +151,42 @@ roles: [reviewer, domain-expert] # held roles (0033 §8 foundation and canon rol
 A `harness` outside `harnesses` produces a warning (`agent-harness-outside-list`);
 a listed harness without a descriptor is an error (`agent-harness-unknown`).
 
+**Avatar tool policy** (spec avatars §3.5, #7630). An avatar's `tools`
+list applies to its own harness on every host, including resident sessions and
+local or remote attach. `mcp:<server>` selects an MCP server from the host's
+project `.mcp.json`; other servers are excluded. `tools: []` disables all tools
+and all MCP servers. Optional `deny_tools` contains harness-native deny rules:
+
+```yaml
+avatar:
+  conversation: portable
+tools: [Read, mcp:transport-readonly]
+deny_tools: ["Bash(curl *)"]
+```
+
+The harness descriptor must apply both the tool allow-list and strict MCP
+configuration, including empty lists. A declared deny rule requires the
+corresponding descriptor support. A harness without these mechanisms refuses
+the session; the packaged Claude descriptor supplies them. At each launch,
+`agent.tools` records the card reference, allowed tool and MCP names, deny
+rules and configuration digest, without MCP credentials. A changed policy
+restarts the resident before its next turn. Attach rereads the card after
+waiting for the resident to release the session.
+
+The mesh's `federation.yaml` can require an explicit avatar list:
+
+```yaml
+action_gate:
+  mode: enforce                 # journal | enforce; omitted: journal
+```
+
+In `enforce` mode, `canon check` and session preparation refuse an avatar
+without `tools`. In `journal` mode an omitted list keeps historical behavior;
+a declared list is still applied. Invalid lists and unknown modes are refused.
+This setting declares the requirement for tools; the actions gate implements
+action authorization separately. Clone allow-lists retain their existing
+parent-subset checks.
+
 **`type: Host`**
 
 ```yaml
