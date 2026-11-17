@@ -313,7 +313,7 @@ class HoldsAndWakesTest(unittest.TestCase):
                 report = run(
                     items=[item(6800, assignee="codex1", app="nexlink")],
                     events=[event(6800, 1, T - 3 * H,
-                                  "hold: attente bureau sur " + address)])
+                                  "hold: attente avatar sur " + address)])
                 self.assertEqual(report["undeployed_holds"], [])
                 self.assertEqual(report["totals"]["holds"], 1)
 

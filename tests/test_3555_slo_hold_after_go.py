@@ -91,7 +91,8 @@ class Temoin3496Test(unittest.TestCase):
         self.assertEqual(row["started_ts"], T0 + SLOT)
         self.assertEqual(row["elapsed_s"], int(NOW - SLOT))
         self.assertEqual(row["level"], 3)
-        self.assertEqual(row["targets"], ("bureau", "auditeur"))
+        # #7634 : le rôle humain du palier s'appelle `avatar`.
+        self.assertEqual(row["targets"], ("avatar", "auditeur"))
         self.assertEqual([r["step"] for r in slo.breaches(rows)],
                          ["verdict_merge"])
 

@@ -76,8 +76,10 @@ class BlockedFreezeHoldTest(unittest.TestCase):
 
     def test_without_a_hold_the_block_still_escalates(self):
         [line] = _steps("qa", [_ev(1, "qa", 7 * H)])
+        # #7634 : le palier 3 vise le rôle humain `avatar` ; le desk réel est
+        # résolu à la remise.
         self.assertEqual((line["level"], tuple(line["targets"])),
-                         (3, ("bureau", "auditeur")))
+                         (3, ("avatar", "auditeur")))
 
 
 class BlockedFreezeHoldPassTest(_Base):

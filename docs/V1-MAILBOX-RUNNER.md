@@ -499,6 +499,15 @@ identity, and `whoami` or the hook states why. A message explicitly sent as
 that replies are not delivered: write in the readable thread or to the relay
 of the request (pilot or orchestrator), never to `veille`.
 
+**Repairing a binding to the watch sender.** A session linked to `veille`
+before #7725 is repaired, not edited: `ameesh mail unbind --session … --harness
+…`, then `ameesh mail bind <agent> --session … --harness …` to the agent the
+session really carries (it must declare the session's harness, #7004). A
+repair changes the identity for the following commits only: a provenance
+receipt (#7719) covers a commit made while the session was bound to that
+agent, and a commit made under `veille` stays without a receipt (the owner's
+signed attestation covers it).
+
 **Without a lease, never on the row of an `execute` agent (L46).** A hook without
 a lease (source `explicit` or `session`) only advances `last_seen` on the
 row of an `execute` agent: no host, harness, session, directory or
