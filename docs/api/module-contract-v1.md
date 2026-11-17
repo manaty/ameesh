@@ -211,13 +211,16 @@ migration 0497 is the authority, so the guarantee holds across processes, not
 only within one caller.
 
 The module payload supports role, document and Memoria data under its own
-namespace without core business fields. Core delivery and accounting markers
-(`idempotency_key`, `report`, `report_fingerprint`, `urgent`, `ack`, `info`,
-`cc`, `broadcast`, `radar`, `ci_passif`, `human`, `human_account`, `verdict`,
-`arbitration`, `reassigned`, `request_expires_ts`) are reserved and refused.
-`payload.attribution` is the one admitted core key: it is validated with the
-closed caller-attribution schema and remains data, never admission, budget or
-authorization.
+namespace without core business fields. Core control markers — delivery and
+accounting (`idempotency_key`, `report`, `report_fingerprint`, `urgent`, `ack`,
+`info`, `cc`, `broadcast`, `radar`, `ci_passif`, `human`, `human_account`,
+`verdict`, `arbitration`, `reassigned`, `request_expires_ts`), review
+(`review_designation`, `review_request`), decisions (`decision`,
+`decision_answer`) and operations (`pass`, `ci`, `staging_actif`) — are
+reserved and refused before any deposit. A payload key never selects a core
+delivery, review, decision or accounting path. `payload.attribution` is the one
+admitted core key: it is validated with the closed caller-attribution schema
+and remains data, never admission, budget or authorization.
 
 Published bounds: body at most 64 KiB UTF-8, serialized payload at most
 256 KiB, 50 submissions per batch, 200 history entries per page. Bodies must be

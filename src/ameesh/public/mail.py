@@ -60,9 +60,10 @@ _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 #: unique index that carries idempotency in the core mailbox (migration 0497)
 _IDEMPOTENCY_INDEX = "agent_mailbox_idempotency_key_idx"
 
-#: payload keys the core reads for delivery, accounting or threading.  A
-#: module writes its own data under its own namespace; ``attribution`` is the
-#: one core key admitted here, and it is validated, never authority.
+#: payload keys the core reads for delivery, review, decisions, accounting or
+#: threading.  A module writes its own data under its own namespace;
+#: ``attribution`` is the one core key admitted here, and it is validated,
+#: never authority.
 RESERVED_PAYLOAD_KEYS = frozenset((
     "idempotency_key",
     "report",
@@ -80,6 +81,19 @@ RESERVED_PAYLOAD_KEYS = frozenset((
     "arbitration",
     "reassigned",
     "request_expires_ts",
+    # Core control markers reaching beyond delivery: the mailbox chooses a
+    # review-request rewrite on `review_designation`/`review_request`
+    # (`Mailbox.send`/`_send_review`), a decision is recognised and closed on
+    # `decision`/`decision_answer`, and the auditor pass, the CI queue and the
+    # staging emission are keyed by `pass`, `ci` and `staging_actif`.  A
+    # module payload is data: it may never select one of those core paths.
+    "review_designation",
+    "review_request",
+    "decision",
+    "decision_answer",
+    "pass",
+    "ci",
+    "staging_actif",
 ))
 
 
@@ -398,9 +412,6 @@ def _payload(value: Any) -> dict:
     for key in value:
         if not isinstance(key, str) or not key:
             raise InvalidSubmission("payload keys must be non-empty strings")
-        if key in RESERVED_PAYLOAD_KEYS:
-            raise InvalidSubmission(
-                "payload key %r is reserved by the core" % key)
     try:
         text = _canonical(dict(value))
     except (TypeError, ValueError) as exc:
@@ -410,6 +421,13 @@ def _payload(value: Any) -> dict:
         raise InvalidSubmission(
             "payload is larger than %d bytes" % MAX_PAYLOAD_BYTES)
     payload = json.loads(text)
+    # Validate the serialized object, not only the caller's mapping: a custom
+    # Mapping could hide a reserved key from iteration while ``dict()`` keeps
+    # it, and the core reads the stored JSON, never the caller's object.
+    for key in payload:
+        if key in RESERVED_PAYLOAD_KEYS:
+            raise InvalidSubmission(
+                "payload key %r is reserved by the core" % key)
     attribution = payload.get("attribution")
     if attribution is not None:
         try:
