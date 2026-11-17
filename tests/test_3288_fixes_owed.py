@@ -310,14 +310,16 @@ class BlockedFreezeSLOTest(_Base):
                          (2, ("pilot",)))
         line = self.line(age=6 * H)
         self.assertEqual((line["level"], tuple(line["targets"])),
-                         (3, ("bureau", "auditeur")))
+                         (3, ("avatar", "auditeur")))
 
     def test_p1_is_one_hour(self):
         line = self.line(priority=1, age=H)
         self.assertEqual(line["level"], 1)
         self.assertEqual(line["target_s"], 3600)
+        # #7634 : le rôle humain du palier s'appelle `avatar` ; le nom du
+        # desk est résolu à la remise, jamais dans le cœur.
         self.assertEqual(tuple(line["targets"]),
-                         ("assignee", "bureau", "auditeur"))
+                         ("assignee", "avatar", "auditeur"))
 
     def test_a_closed_lot_owes_no_fix(self):
         self.blocked()
