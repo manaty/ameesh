@@ -4074,11 +4074,14 @@ def designated_prefix(worktree: Path, composition: Composition,
     * vert sur tous les préfixes jusqu'à la tête : le test est instable
       (#4221), consigné non concluant, sans retrait.
 
-    Un rejeu non concluant (worktree impossible, délai, run illisible) garde
-    le retrait #3801 : c'est le geste antérieur, comme `earlier_red`. Les
-    retraits d'une autre preuve passent inchangés. Rend `(retraits, tests
-    instables, pourquoi)` ; `pourquoi` non vide signale un rejeu non concluant
-    dont le retrait a été gardé.
+    #7692 : un rejeu non concluant (worktree impossible, délai, run illisible)
+    ne confirme pas le retrait #3801 : il n'est **pas appliqué** (canon §3, un
+    non-concluant ne retient rien). L'unité reste dans la composition et la
+    ci-full tranche ; le test est consigné non concluant. Les retraits d'une
+    autre preuve passent inchangés. Rend `(retraits, tests instables,
+    pourquoi)` ; `pourquoi` non vide signale un rejeu non concluant dont le
+    retrait a été abandonné (l'appelant consigne les tests qu'il n'a pas
+    confirmés).
     """
     subjects: list[Removal] = []
     untouched: list[Removal] = []
@@ -4107,9 +4110,11 @@ def designated_prefix(worktree: Path, composition: Composition,
         group = groups[position]
         limit = series_timeout(timeout, deadline)
         if limit is None:
-            confirmed.extend(group)
             why = ("borne totale atteinte avant le préfixe de #%d"
                    % group[0].lot)
+            log("tests ciblés : rejeu du préfixe de #%d NON CONCLUANT (%s) — "
+                "retrait #3801 NON appliqué (canon §3), l'unité reste"
+                % (group[0].lot, why))
             continue
         if guard is not None:
             guard()
@@ -4126,17 +4131,15 @@ def designated_prefix(worktree: Path, composition: Composition,
                 [{"test": name} for name in names], timeout=timeout,
                 start=position, log=log, **bounds)
         except BudgetSpent as spent:
-            confirmed.extend(group)
             why = str(spent)
             log("tests ciblés : rejeu du préfixe de #%d NON CONCLUANT (%s) — "
-                "retrait #3801 gardé (geste antérieur)"
+                "retrait #3801 NON appliqué (canon §3), l'unité reste"
                 % (group[0].lot, spent))
             continue
         if group_why:
-            confirmed.extend(group)
             why = group_why
             log("tests ciblés : rejeu du préfixe de #%d NON CONCLUANT (%s) — "
-                "retrait #3801 gardé (geste antérieur)"
+                "retrait #3801 NON appliqué (canon §3), l'unité reste"
                 % (group[0].lot, group_why))
             continue
         # `found` est indexé par numéro de lot, pas par position (#7239 B) :
@@ -4158,8 +4161,14 @@ def designated_prefix(worktree: Path, composition: Composition,
                 elif test in flaky_names:
                     flaky.append({"test": test})
                 else:
-                    # ni confirmé ni situé : garder le retrait antérieur.
-                    keep.append(test)
+                    # ni confirmé ni situé : aucune preuve, aucun retrait
+                    # (canon §3) ; l'appelant le consigne non concluant.
+                    why = why or ("test %s ni confirmé ni situé sur les "
+                                  "préfixes" % test)
+                    log("tests ciblés : #%d désignée (#3801) mais %s ni "
+                        "confirmé ni situé sur les préfixes — retrait non "
+                        "appliqué (canon §3), l'unité reste"
+                        % (removal.lot, test))
             if keep:
                 confirmed.append(Removal(
                     lot=removal.lot, tests=keep,
@@ -4393,8 +4402,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     préfixe de l'unité puis au-delà (`designated_prefix`, injectable par
     `confirm`). Préfixe vert = unité innocente (le premier préfixe rouge
     suivant est retiré à sa place) ; vert partout = instable consigné
-    (#4221) ; rouge dès son préfixe = retrait confirmé. Un rejeu non concluant
-    garde le retrait #3801 (geste antérieur).
+    (#4221) ; rouge dès son préfixe = retrait confirmé. #7692 : un rejeu non
+    concluant ne confirme pas le retrait — il n'est pas appliqué (canon §3),
+    l'unité reste et le test est consigné non concluant ; la ci-full tranche.
 
     #4025 : la série d'une unité joue aussi ses modules voisins
     (`neighbor_modules`, injectable par `select`). Dans le geste antérieur,
@@ -4757,6 +4767,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             log("tests contrats : rouge non attribuable (%s) — retrait des "
                 "unités aux tests propres rouges, puis recomposition"
                 % (why or "attribution incertaine"))
+    designated_before = [(removal.lot, test)
+                         for removal in removals
+                         if removal.proof == "3801"
+                         for test in removal.tests]
     if any(removal.proof == "3801" for removal in removals):
         # #7239 : le préfixe de l'unité désignée par la couverture tranche.
         if guard is not None:
@@ -4771,22 +4785,74 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         except BudgetSpent as spent:
             flaky_designated = []
             designation_why = str(spent)
+            # #7692 : sans rejeu concluant, aucun retrait #3801 n'est appliqué.
+            removals = [removal for removal in removals
+                        if removal.proof != "3801"]
+        flaky_names = sorted({_failure_name(failure)
+                              for failure in flaky_designated
+                              if _failure_name(failure)})
         if designation_why:
             log("tests ciblés : rejeu du préfixe de l'unité NON CONCLUANT "
-                "(%s) — retrait #3801 gardé (geste antérieur)"
+                "(%s) — retrait #3801 NON appliqué (canon §3), l'unité reste"
                 % designation_why)
-        if flaky_designated:
-            flaky_names = sorted({_failure_name(failure)
-                                  for failure in flaky_designated
-                                  if _failure_name(failure)})
-            if flaky_names:
-                log("tests ciblés : %d test(s) rouge(s) sur la tête mais "
-                    "vert(s) au rejeu des préfixes (instable) : %s — "
-                    "consigné(s) non concluant(s), le paquet continue"
-                    % (len(flaky_names), ", ".join(flaky_names[:5])))
-                red = _consign_flaky(red, runs, flaky_names)
-                if not red and not removals:
-                    return runs, [], []
+        # #7692 : quand le retrait #3801 tombe et qu'aucune autre preuve ne
+        # reste, le repli du rouge propre (geste antérieur) s'applique encore :
+        # le module de l'unité a réellement rougi sur la tête. Un test vert au
+        # rejeu (instable) est exclu : il ne retire rien (#4221).
+        if not removals and own:
+            fallback: list[Removal] = []
+            for lot, found in own.items():
+                tests = [_failure_name(failure) for failure in found
+                         if _failure_name(failure) not in flaky_names]
+                if tests:
+                    fallback.append(Removal(lot=lot, tests=tests))
+            removals = _merge_removals(removals, fallback)
+            if removals:
+                log("tests ciblés : repli sur les rouges propres : retrait de "
+                    "%s" % ", ".join("#%d" % removal.lot
+                                     for removal in removals))
+        # #7692 : les tests dont le retrait #3801 n'a pas été confirmé (rejeu
+        # non concluant, ni confirmé ni situé) ne retirent rien (canon §3) ;
+        # ils sont consignés non concluants et la ci-full tranche.
+        returned_tests = {test for removal in removals
+                          for test in removal.tests}
+        unconfirmed = sorted({test for _lot, test in designated_before
+                              if test not in returned_tests
+                              and test not in flaky_names})
+        if unconfirmed:
+            log("tests ciblés : %d test(s) non confirmé(s) sur les préfixes "
+                "(#3801) : %s — consigné(s) non concluant(s), la ci-full "
+                "tranche" % (len(unconfirmed), ", ".join(unconfirmed[:5])))
+            runs.append(TestRun(
+                label="préfixes (#3801 non confirmé)",
+                modules=list(unconfirmed), returncode=None,
+                output="rejeu du préfixe non concluant : %s ; retrait #3801 "
+                       "non appliqué (canon §3), l'unité reste ; la ci-full "
+                       "tranche"
+                       % (designation_why or "test ni confirmé ni situé"),
+                seconds=0.0, timed_out=True))
+            # #7692 (relecture B) : un échec non confirmé ne retient pas le
+            # paquet (canon §3) ; il sort de `red`. Un contrat rouge
+            # indépendant, lui, reste bloquant : seuls les noms non confirmés
+            # sont retirés.
+            unconfirmed_set = set(unconfirmed)
+            kept_red: list[tuple[TestRun, list[dict]]] = []
+            for run, found in red:
+                left = [failure for failure in found
+                        if _failure_name(failure) not in unconfirmed_set]
+                if left:
+                    kept_red.append((run, left))
+            red = kept_red
+            contract_left = [found for run, found in red if run is contract]
+            contract_red = bool(contract_left and contract_left[0])
+        if flaky_names:
+            log("tests ciblés : %d test(s) rouge(s) sur la tête mais "
+                "vert(s) au rejeu des préfixes (instable) : %s — "
+                "consigné(s) non concluant(s), le paquet continue"
+                % (len(flaky_names), ", ".join(flaky_names[:5])))
+            red = _consign_flaky(red, runs, flaky_names)
+            if not red and not removals:
+                return runs, [], []
     if len(removals) > 1:
         if guard is not None:
             guard()
