@@ -12,6 +12,7 @@ paramètres viennent du bloc `file` du canon.
 from __future__ import annotations
 
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -42,6 +43,19 @@ def team(idle: int, busy: int, project="ameesh", prefix="dev"):
                for i in range(busy)])
 
 
+class _Canon:
+    """Canon minimal (#7661) : les fiches des agents, rôles déclarés."""
+
+    readable = True
+    federation: dict = {}
+
+    def __init__(self, cards):
+        self.agents = [
+            types.SimpleNamespace(
+                title=name, fiche=types.SimpleNamespace(data={"roles": roles}))
+            for name, roles in cards.items()]
+
+
 def _footprint(db, item, *paths):
     """#4717 : l'empreinte déclarée du lot, comme `work assign` la lit."""
     storage.of(db).work_footprints.replace(int(item["id"]), "manual",
@@ -49,19 +63,25 @@ def _footprint(db, item, *paths):
 
 
 class MeasureTest(unittest.TestCase):
-    def measures(self, listing, lots=(), waits=None, footprint=None):
-        return fd.measure(listing, list(lots), waits or {}, 1000.0, [],
-                          configured=False, footprint=footprint)
+    def measures(self, listing, lots=(), waits=None, footprint=None, *,
+                 canons=(), configured=False):
+        return fd.measure(listing, list(lots), waits or {}, 1000.0, list(canons),
+                          configured=configured, footprint=footprint)
 
     def test_critical_external_and_ephemeral_agents_are_not_wakeable(self):
-        listing = team(1, 1) + [agent("auditeur"), agent("chat", mode="externe"),
+        # #7661 : la criticité se lit sur le rôle déclaré, pas sur le nom ;
+        # une persona nommée `auditeur` sans ce rôle reste une capacité.
+        listing = team(1, 1) + [agent("auditeur"),
+                                agent("veille", roles=["auditeur"]),
+                                agent("chat", mode="externe"),
                                 agent("probe", ephemeral=True),
                                 agent("dormeur", operator_paused=True),
                                 agent("retraite", retired_ts=900.0),
                                 agent("sans_executeur", lease_live=False)]
-        item = self.measures(listing)["ameesh"]
-        self.assertEqual(item.wakeable, ["dev0", "devb0"])
-        self.assertEqual(item.idle, ["dev0"])
+        item = self.measures(listing, canons=[_Canon({"veille": ["auditeur"]})],
+                             configured=True)["ameesh"]
+        self.assertEqual(item.wakeable, ["auditeur", "dev0", "devb0"])
+        self.assertEqual(item.idle, ["auditeur", "dev0"])
 
     def test_startable_lots_are_counted_per_project_and_waits_excluded(self):
         lots = [{"id": 1, "state": "intake", "app": "ameesh", "type": "evolution"},
