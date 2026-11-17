@@ -71,6 +71,48 @@ class CapacityAlertsTest(unittest.TestCase):
         fps['extra']['idle_since'] = NOW - 1700
         self.assertEqual(self.alerts(fps), [])
 
+    def test_hosts_admitting_no_agent_are_outside_both_alerts(self):
+        # #7727: a server (or a retired host) is idle and paid for, but holds
+        # no agent place: no reserved-idle alert, no baseline count.
+        self.assertEqual(self.alerts({'server': self.footprint(capacity='none')}), [])
+        fps = {'server': self.footprint(capacity='none'),
+               'retired': self.footprint(capacity='none'),
+               'vm': self.footprint(), 'vm2': self.footprint()}
+        out = self.alerts(fps, baseline_hosts=1)
+        group, = [a for a in out if a['type'] == 'baseline_oversized']
+        self.assertEqual(group['hosts'], ['vm', 'vm2'])
+        self.assertNotIn('server', group['hosts'])
+        self.assertNotIn('retired', group['burst_candidates'])
+
+    def test_cards_classify_server_and_retired_hosts_out_of_capacity(self):
+        store = mock.MagicMock()
+        store.work.activity.return_value = {}
+        store.hosts.since.side_effect = lambda host, since: [
+            dict(self.reading(), sampled_ts=t) for t in range(7600, NOW + 1, 60)]
+        canon = NS(hosts=[
+            NS(title='server', fiche=NS(data={'staging': {'order': 1, 'kind': 'server'}})),
+            NS(title='retired', fiche=NS(data={'policy': {'max_agents': 0}})),
+            NS(title='vm', fiche=NS(data={})),
+        ])
+        readings = {h: self.reading() for h in ('server', 'retired', 'vm')}
+        store.host_lifecycle.listing.return_value = []
+        with mock.patch.object(storage, 'of', return_value=store), \
+                mock.patch('ameesh.host_lifecycle.critical_names', return_value=set()):
+            footprints = host_idle.snapshot(config.Config(resource_interval=60), 'db',
+                                             [canon], readings, now=NOW, listing=[])
+        self.assertEqual({h: fp['capacity'] for h, fp in footprints.items()},
+                         {'server': 'none', 'retired': 'none', 'vm': 'burst'})
+        alerts = subject.project(footprints, [], now=NOW)
+        self.assertEqual([(a['type'], a['host']) for a in alerts],
+                         [('host_idle_reserved', 'vm')])
+        # The alert pass itself keeps the two no-agent hosts quiet.
+        with mock.patch.object(storage, 'of', return_value=store), \
+                mock.patch('ameesh.host_lifecycle.critical_names', return_value=set()):
+            alerts = subject.alerts(config.Config(resource_interval=60), 'db', [], NOW,
+                                    canons=[canon], readings=readings)
+        self.assertEqual([(a['type'], a.get('host')) for a in alerts],
+                         [('host_idle_reserved', 'vm')])
+
     def test_full_baseline_still_protects_elected_burst_leader(self):
         store = mock.MagicMock()
         store.work.activity.side_effect = lambda names, limit=1000: {
