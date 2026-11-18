@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -37,7 +38,8 @@ def parse_since(value):
         raise Refused("--since must be an ISO timestamp with timezone") from exc
 
 
-def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *, cfg=None):
+def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
+            request_id="", cfg=None):
     """Read the journal and mailbox and record a receipt in one transaction."""
     item = tx.query("SELECT state, extract(epoch from now())::float8 AS now_ts "
                     "FROM work_items WHERE id = %s FOR NO KEY UPDATE", (lot,))
@@ -105,15 +107,102 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *, cfg=Non
 
     note = "pre-act: kind=%s actor=%s since=%s" % (kind, actor, since)
     pregeste_id = pregeste_id or str(uuid.uuid4())
-    evidence = json.dumps({"type": "pre-act/1", "kind": kind, "lot": lot,
-                           "actor": actor, "target": target,
-                           "pregeste_id": pregeste_id})
+    record = {"type": "pre-act/1", "kind": kind, "lot": lot,
+              "actor": actor, "target": target, "pregeste_id": pregeste_id}
+    if request_id:
+        record["request_id"] = request_id
+    evidence = json.dumps(record, sort_keys=True)
     tx.execute("INSERT INTO work_item_events "
                "(work_item_id, state, note, actor, evidence, created_at) "
                "VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp())",
                (lot, item[0]["state"], note, actor, evidence))
     tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (lot,))
     return pregeste_id
+
+
+#: Evidence written by the imposed credential path (#7767): the receipt above
+#: proves the check, these two events prove the act it guarded. A start without
+#: an end is an interrupted or unrecorded act, which the audit reports.
+EFFECT_TYPE = "pre-act/2"
+EFFECT_SCHEMA = "pre-act-effect/1"
+
+
+def _state_of(tx, lot):
+    rows = tx.query("SELECT state FROM work_items WHERE id = %s", (lot,))
+    if not rows:
+        raise Refused("lot not found")
+    return rows[0]["state"]
+
+
+def _record_effect(tx, lot, actor, evidence):
+    state = _state_of(tx, lot)
+    phase = evidence.get("phase", "?")
+    note = "pre-act effect: %s kind=%s" % (phase, evidence.get("kind", "?"))
+    tx.execute("INSERT INTO work_item_events "
+               "(work_item_id, state, note, actor, evidence, created_at) "
+               "VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp())",
+               (lot, state, note, actor, json.dumps(evidence, sort_keys=True)))
+
+
+def _argv_digest(argv):
+    return hashlib.sha256(json.dumps(list(argv), separators=(",", ":"),
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def record_effect_start(tx, lot, actor, pregeste_id, request_id, kind, target,
+                        rule, argv, started):
+    """Write the start of a guarded act, tied to its receipt.
+
+    Only a digest and a short, bounded head of the command are kept: the
+    argument list can name a file and is not needed to audit the act.
+    """
+    if not pregeste_id or not request_id:
+        raise Refused("a receipt and a request id are required")
+    evidence = {
+        "type": EFFECT_TYPE,
+        "schema": EFFECT_SCHEMA,
+        "phase": "start",
+        "pregeste_id": pregeste_id,
+        "request_id": request_id,
+        "kind": kind,
+        "lot": lot,
+        "actor": actor,
+        "target": target,
+        "rule": rule,
+        "argv_sha256": _argv_digest(argv),
+        "argv_head": [str(arg)[:120] for arg in list(argv)[:4]],
+        "started": started,
+    }
+    _record_effect(tx, lot, actor, evidence)
+
+
+def record_effect_end(tx, lot, actor, pregeste_id, request_id, kind, target,
+                      exit_code, timed_out, started, finished,
+                      stdout_sha256=None, stderr_sha256=None):
+    """Write the end of a guarded act; the start must already be recorded."""
+    if not pregeste_id or not request_id:
+        raise Refused("a receipt and a request id are required")
+    evidence = {
+        "type": EFFECT_TYPE,
+        "schema": EFFECT_SCHEMA,
+        "phase": "end",
+        "pregeste_id": pregeste_id,
+        "request_id": request_id,
+        "kind": kind,
+        "lot": lot,
+        "actor": actor,
+        "target": target,
+        "exit": exit_code,
+        "timed_out": bool(timed_out),
+        "started": started,
+        "finished": finished,
+        "duration_ms": int(round((float(finished) - float(started)) * 1000)),
+    }
+    if stdout_sha256 is not None:
+        evidence["stdout_sha256"] = stdout_sha256
+    if stderr_sha256 is not None:
+        evidence["stderr_sha256"] = stderr_sha256
+    _record_effect(tx, lot, actor, evidence)
 
 
 def main(argv=None):
