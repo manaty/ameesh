@@ -46,6 +46,8 @@ _HEX = "0123456789abcdefABCDEF"
 #: demoted primary (#6869); it is added only when the DSN lists several hosts
 TARGET_SESSION_ATTRS = "target_session_attrs"
 READ_WRITE = "read-write"
+#: a database name that needs neither quoting nor percent-encoding
+_DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class DsnError(ValueError):
@@ -137,6 +139,41 @@ def primary(dsn: str, environ: Mapping[str, str] | None = None) -> str:
         return _with_parameter(dsn, TARGET_SESSION_ATTRS, READ_WRITE)
     except DsnError:
         return dsn   # libpq refuses it later, with its own message
+
+
+def with_database(dsn: str, name: str) -> str:
+    """The same connection string with another database name.
+
+    A URI keeps its userinfo, authority, query and fragment; key/value pairs
+    lose their ``dbname`` entry and gain the new one; a bare database name is
+    replaced. The name must be a plain identifier, so libpq reads it without
+    quoting or percent-encoding (#7701: the public fixture creates a fresh
+    ``ameesh_fixture_*`` database and derives its DSN)."""
+    if not _DB_NAME.fullmatch(name or ""):
+        raise DsnError("invalid database name")
+    if dsn.startswith(_URI_PREFIXES):
+        prefix = next(part for part in _URI_PREFIXES if dsn.startswith(part))
+        body = dsn[len(prefix):]
+        start = 0
+        while start < len(body) and body[start] not in "@/?":
+            start += 1
+        if start < len(body) and body[start] == "@":
+            start += 1
+        path_start = start
+        while path_start < len(body) and body[path_start] not in "/?#":
+            path_start += 1
+        if path_start < len(body) and body[path_start] == "/":
+            end = path_start + 1
+            while end < len(body) and body[end] not in "?#":
+                end += 1
+            result = prefix + body[:path_start + 1] + name + body[end:]
+        else:
+            result = prefix + body[:path_start] + "/" + name + body[path_start:]
+        # A query `dbname` would win over the path: drop it, the path is the name.
+        return _without_uri_parameter(result, "dbname") if _has_parameter(dsn, "dbname") else result
+    if "=" in dsn:
+        return _with_parameter(_without_keyword(dsn, "dbname"), "dbname", name)
+    return name
 
 
 # -- URI ---------------------------------------------------------------------

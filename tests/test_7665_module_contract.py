@@ -38,10 +38,11 @@ from ameesh import (accounts, auth_failure, budget, canon, db as db_mod,
                     resources, serve)
 from ameesh.modules import registry
 from ameesh.modules.storage import ModuleStore
-from ameesh.public import mail
+from ameesh.public import fixture, mail
 
 ROOT = Path(__file__).resolve().parents[1]
 WITNESS = ROOT / "examples" / "modules" / "contract-witness"
+FIXTURE = ROOT / "examples" / "fixtures" / "public-fixture-witness"
 CONTRACT = ROOT / "docs" / "api" / "module-contract-v1.md"
 SURFACE_FILE = ROOT / "docs" / "api" / "module-contract-v1.surface.json"
 COVERAGE = ROOT / "docs" / "api" / "module-contract-v1-coverage.md"
@@ -135,6 +136,42 @@ def signature_breaks(frozen, signature):
     breaks += ["%s: added without a default" % name for name, after in new.items()
                if name not in old and after.default is kinds.empty
                and after.kind not in (kinds.VAR_POSITIONAL, kinds.VAR_KEYWORD)]
+    return breaks
+
+
+_MISSING = object()
+
+
+def fixture_breaks(module):
+    """Incompatibilities of a fixture surface candidate against revision 1.5.
+
+    One list for the deliberate-break witness of #7701: a removed parameter, a
+    renamed or changed constant, an error code or a removed public operation is
+    named here. The surface module is passed, so a mutated copy proves the
+    comparator itself detects a break."""
+    spec = SURFACE["python"]["fixture"]
+    breaks = []
+    for name, frozen in sorted(spec["signatures"].items()):
+        target = module.Fixture if name == "Fixture" else getattr(
+            module.Fixture, name, _MISSING)
+        if target is _MISSING:
+            breaks.append("%s: removed" % name)
+            continue
+        breaks += ["%s: %s" % (name, reason) for reason in signature_breaks(
+            frozen_signature(frozen), inspect.signature(target))]
+    for name, expected in sorted(spec["constants"].items()):
+        actual = getattr(module, name, _MISSING)
+        if isinstance(expected, list) and isinstance(actual, (list, tuple)):
+            actual = list(actual)
+        if actual != expected:
+            breaks.append("%s: %r → %r" % (name, expected, actual))
+    for name, code in sorted(spec["errors"].items()):
+        actual = getattr(module, name, _MISSING)
+        if actual is _MISSING:
+            breaks.append("%s: removed" % name)
+        elif getattr(actual, "code", None) != code:
+            breaks.append("%s: code %r → %r" % (name, code,
+                                                getattr(actual, "code", None)))
     return breaks
 
 
@@ -653,8 +690,37 @@ class PythonMailContractTest(unittest.TestCase):
 
     def test_the_served_contract_version_is_frozen(self):
         self.assertEqual(mail.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.mail.CONTRACT_VERSION, mail.CONTRACT_VERSION)
+        self.assertEqual(public.CONTRACT_VERSION, SURFACE["contract"])
+
+
+class PythonFixtureContractTest(unittest.TestCase):
+    """The 1.5 fixture surface: signatures, constants, error codes."""
+
+    spec = SURFACE["python"]["fixture"]
+
+    def test_the_public_fixture_signatures_and_constants_are_frozen(self):
+        self.assertEqual(fixture_breaks(fixture), [])
+
+    def test_the_published_error_codes_are_frozen(self):
+        for name, code in sorted(self.spec["errors"].items()):
+            with self.subTest(name):
+                self.assertEqual(getattr(fixture, name).code, code)
+
+    def test_the_served_contract_version_is_frozen(self):
+        self.assertEqual(fixture.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.fixture.CONTRACT_VERSION, fixture.CONTRACT_VERSION)
         self.assertEqual(public.CONTRACT_VERSION, self.spec["contract_version"])
-        self.assertEqual(public.mail.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.CONTRACT_VERSION, SURFACE["contract"])
+
+    def test_the_external_fixture_witness_is_its_own_distribution(self):
+        self.assertNotIn(ROOT / "src", FIXTURE.parents)
+        self.assertNotIn(ROOT / "tests", FIXTURE.parents)
+        parser = configparser.ConfigParser()
+        parser.read(FIXTURE / "pyproject.toml")
+        project = {key: json.loads(value) for key, value in parser["project"].items()}
+        self.assertEqual(project["name"], "ameesh-public-fixture-witness")
+        self.assertEqual(project["version"], "1.5.0")
 
 
 class HttpContractTest(unittest.TestCase):
