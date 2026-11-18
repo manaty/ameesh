@@ -392,6 +392,8 @@ class ConfinementTest(unittest.TestCase):
             acp._open_root(os.path.join(lien, "sous"))
 
     @unittest.skipIf(os.geteuid() == 0, "root lit tout dossier : pas de refus à observer")
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "traversal of a --x ancestor relies on O_PATH (Linux)")
     def test_ancetre_traversable_sans_lecture_admis(self):
         """#6061 : un ancêtre `--x` (`/srv/ameesh-guest` du guest, un `$HOME`
         en 711) se traverse ; seul le dossier de travail est ouvert en lecture."""

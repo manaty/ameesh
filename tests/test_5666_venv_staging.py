@@ -571,22 +571,25 @@ class ArbreTest(unittest.TestCase):
                          module._normaliser_record(droite, entrees))
 
     def test_entree_normalisee_directe_et_shell(self):
-        for lanceur in ('#!/tmp/venv-a/bin/python3\nprint(1)\n',
-                        '#!/tmp/venv-b/bin/python3\nprint(1)\n'):
-            info = module._entree_normalisee(
-                lanceur.encode(), '/tmp/venv-a' if 'venv-a' in lanceur
-                else '/tmp/venv-b', 0o755)
+        # `_entree_normalisee` compares the launcher with the RESOLVED venv
+        # path (that resolve is the path-escape guard): macOS resolves /tmp to
+        # /private/tmp, so build the fake launchers from the resolved path.
+        venv_a = str(Path('/tmp/venv-a').resolve())
+        venv_b = str(Path('/tmp/venv-b').resolve())
+        premier = '#!%s/bin/python3\nprint(1)\n' % venv_a
+        for venv in (venv_a, venv_b):
+            lanceur = '#!%s/bin/python3\nprint(1)\n' % venv
+            info = module._entree_normalisee(lanceur.encode(), venv, 0o755)
             self.assertEqual(info['launcher'], 'direct')
             self.assertEqual(info['sha256'], module._entree_normalisee(
-                b'#!/tmp/venv-a/bin/python3\nprint(1)\n',
-                '/tmp/venv-a', 0o755)['sha256'])
-        shell = (b'#!/bin/sh\n'
-                 b"'''exec' \"/tmp/venv-a/bin/python3\" \"$0\" \"$@\"\n"
-                 b"' '''\nprint(1)\n")
-        info = module._entree_normalisee(shell, '/tmp/venv-a', 0o755)
+                premier.encode(), venv_a, 0o755)['sha256'])
+        shell = ('#!/bin/sh\n'
+                 "'''exec' \"%s/bin/python3\" \"$0\" \"$@\"\n" % venv_a
+                 + "' '''\nprint(1)\n").encode()
+        info = module._entree_normalisee(shell, venv_a, 0o755)
         self.assertEqual(info['launcher'], 'sh-preamble')
         self.assertNotEqual(info['sha256'], module._entree_normalisee(
-            shell, '/tmp/venv-a', 0o700)['sha256'])
+            shell, venv_a, 0o700)['sha256'])
         with self.assertRaises(module.Ecart):
             module._entree_normalisee(b'print(1)\n', '/tmp/venv-a', 0o755)
 
@@ -642,6 +645,8 @@ class SondeTest(unittest.TestCase):
         self.assertNotIn('PYTHONPATH', env)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "production venv proof requires a root-owned interpreter home")
 class ProductionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -847,6 +852,8 @@ class ProductionTest(unittest.TestCase):
             'verifier', '--manifeste', str(mauvais), '--venv', str(self.venv)]), 2)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "production venv proof requires a root-owned interpreter home")
 class ManifesteTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

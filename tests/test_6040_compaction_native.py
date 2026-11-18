@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import unittest
 
 from ameesh import adapters, cost, exploitation, harnesses, registry
@@ -24,7 +25,7 @@ DRAPEAU = "model_auto_compact_token_limit=120000"
 
 
 def _adaptateur(path: str) -> adapters.HarnessAdapter:
-    return adapters.HarnessAdapter(harnesses.load(path, source="test"), "/bin/true")
+    return adapters.HarnessAdapter(harnesses.load(path, source="test"), sys.executable)
 
 
 class DescripteurTest(unittest.TestCase):
