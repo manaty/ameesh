@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from ..work_dependencies import WorkDependencies as Contract
 from ... import work_lifecycle as lifecycle
+from ...db import DbError
 
 _DONE = lifecycle.COMPLETED
 _DONE_SQL = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
 _LOCK = "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':work_dependencies', 0))"
+#: SQLSTATE `insufficient_privilege` (rôle sans SELECT sur une table lue).
+_INSUFFICIENT_PRIVILEGE = "42501"
 
 #: #1922 : un lot pinné sur une révision Process ne bouge que par le registre
 #: (`process_registry`), qui vérifie la garde serveur avant d'écrire. Les
@@ -257,8 +260,14 @@ class WorkDependencies(Contract):
         # DELIVERED) : seul l'affichage change.
         # #7760 : `start_on` dit qu'un prérequis `validated` que le dépendant
         # chevauche ne retient plus le démarrage (la fusion, elle, attend).
+        # #6881 : la connexion limitée du bureau n'a pas SELECT sur
+        # `work_item_footprints` (liste exacte de `_bureau-droits.sql`) ; or
+        # `work show` lit ces arêtes pour l'affichage. On dégrade alors en
+        # `false` — l'attente « blocking » est la lecture prudente, et les
+        # gardes qui décident du démarrage lisent les empreintes avec un rôle
+        # qui y a droit. Pas de GRANT : ce lot reste hors classe droits SQL.
         from .work_footprints import start_on_sql
-        return self.db.query("""
+        head = ("""
             SELECT d.work_item_id, d.blocker_id, d.created_by,
                    extract(epoch FROM d.created_at)::float8 AS created_ts,
                    coalesce(to_jsonb(w)->>'legacy_state', w.state) AS blocker_state,
@@ -267,12 +276,20 @@ class WorkDependencies(Contract):
                      WHERE m.work_item_id = w.id AND m.kind = 'frozen'
                      ORDER BY m.at DESC, m.id DESC LIMIT 1) AS blocker_frozen_sha,
                    NOT """ + not_blocking("w") + """ AS blocking,
-                   """ + start_on_sql("i", "w") + """ AS start_on
+                   """)
+        tail = ("""
             FROM work_item_dependencies d
             JOIN work_items w ON w.id = d.blocker_id
             JOIN work_items i ON i.id = d.work_item_id
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
-            " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
+            " ORDER BY d.work_item_id, d.blocker_id")
+        try:
+            return self.db.query(head + start_on_sql("i", "w") + " AS start_on" + tail,
+                                 tuple(ids))
+        except DbError as exc:
+            if exc.sqlstate != _INSUFFICIENT_PRIVILEGE:
+                raise
+            return self.db.query(head + "false AS start_on" + tail, tuple(ids))
 
     # ------------------------------------------------------------------
     # #4167 : liens typés (duplicates, supersedes, part_of, conflicts_with)

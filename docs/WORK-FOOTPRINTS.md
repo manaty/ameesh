@@ -258,7 +258,10 @@ on, with the exact `git rebase --onto <frozen head> <current base> <branch>`
 to run. An unreadable repository or commit adds no refusal (doubt, as for the
 stacked-copies guard). `ameesh work footprint` shows `starts on #N
 (validated, frozen <sha>)` for such a lot, and `ameesh work dependencies`
-labels the edge `starts on, frozen <sha> (merge still waits)`.
+labels the edge `starts on, frozen <sha> (merge still waits)`. On the limited
+bureau connection, which has no `SELECT` on `work_item_footprints` (#6881),
+that display-only label degrades to the plain `blocking` one instead of
+failing `work show`; the start guard itself runs under the roles that decide.
 
 Footprint writes take the same lock, so a footprint never changes between
 a check and the attribution it guards. Footprints set or refreshed on lots
