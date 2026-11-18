@@ -90,15 +90,28 @@ class SelectByDeltaTest(unittest.TestCase):
             {seat["family"] for seat in out["manual"] + out["reviewers"]},
             {"claude", "codex", "deepseek"})
 
+    def test_one_eligible_family_is_designated_while_waiting(self):
+        # #2447 : un harnais emprunté ne change pas la famille du delta, et
+        # une seule famille indépendante est pourvue tout de suite (#3596),
+        # le second avis attendant. Le gel ne rend pas une liste vide.
+        out = self.select(("claude-r",), authors=(CODEX,),
+                          deltas=[{"codex"}])
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual([seat["name"] for seat in out["reviewers"]],
+                         ["claude-r"])
+        self.assertEqual(out["missing"], 1)
+
     def test_a_global_family_covers_no_delta(self):
         # Commit réattribué (#7324) : codex et deepseek ont tous deux écrit le
-        # seul delta (familles globales), seul claude reste recevable.
+        # seul delta (familles globales), seul claude reste recevable ; il
+        # est pourvu en attendant (#3596) mais ne couvre pas les deux avis.
         out = self.select(("claude-r", "codex-r", "deepseek-r"),
                           deltas=[{"codex", "deepseek"}],
                           global_families={"codex", "deepseek"})
         self.assertEqual(out["state"], rd.WAITING, out)
         self.assertEqual(out["missing"], 1)
-        self.assertEqual(out["reviewers"], [])
+        self.assertEqual([seat["name"] for seat in out["reviewers"]],
+                         ["claude-r"])
 
     def test_an_unknown_author_family_still_waits(self):
         out = self.select(("claude-r", "codex-r", "deepseek-r"),

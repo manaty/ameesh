@@ -978,6 +978,12 @@ def _by_delta_select(*, required: int, authors, candidates, families, already,
     available = [str(candidate.family or "").strip().lower() for candidate in ordered]
     target = review_deltas.minimal_seats(
         deltas, available, required, already=seat_families)
+    if target is None:
+        # #3596/#2447 : la couverture complète est hors de portée, mais les
+        # familles présentes sont pourvues tout de suite (au plus les sièges
+        # requis) ; le gel attend le reste au lieu de ne rien désigner. Un
+        # harnais emprunté ne doit pas écarter la seule famille indépendante.
+        target = available[:max(required - len(seat_families), 0)]
     chosen = [best[family] for family in (target or ()) if family in best]
     reviewers = [dict(row) for row in kept]
     reviewers.extend({"name": c.name, "family": c.family} for c in chosen)
