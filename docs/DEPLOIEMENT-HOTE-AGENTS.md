@@ -1243,7 +1243,10 @@ candidat qui n'a **jamais** complété de passe, par hôte, contre le commit de
 la dernière passe complétée de sa clé ; `staging_canon_stale` fait de même
 pour son `canon_ref`. Un exécutant en retard sur un candidat n'est donc plus
 invisible : il est nommé avec son hôte, sa version lancée et la cause
-(`unconfigured`, `refused`, etc.).
+(`unconfigured`, `refused`, etc.). Un tick écrit **avant** la passe
+complétée qui a nommé le déploiement n'est pas encore lu (#7818) : il ne
+pouvait pas voir ce commit, seul le tick suivant le peut ; l'alerte attend
+donc ce tick au lieu de paraître à chaque coupure.
 
 **Garde de démarrage du staging (#6806).** Le service de l'exécutant élu
 n'est admis que si son contexte et son environnement public sont ceux de

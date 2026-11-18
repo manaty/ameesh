@@ -976,7 +976,10 @@ def executor_version_findings(records, *, now: float, attested=(),
     #7750: a candidate that never completed a pass has no `completed` row at
     all, so it was invisible here. Its newest tick is read against the commit
     the key's last completed pass deployed; an `ahead` or freshly refreshed
-    venv is not stale. The alert names the host."""
+    venv is not stale. The alert names the host.
+    #7818: the tick that predates that completed pass is not read at all: it
+    could not yet have seen the deployment, and only the next tick can. One
+    refresh interval no longer raises a false stale alert at each cutoff."""
     ticks = ticks or {}
     newest = None
     for row in attested or ():
@@ -986,6 +989,7 @@ def executor_version_findings(records, *, now: float, attested=(),
             newest = (int(row.get("id") or 0), sha)
     out = []
     deployed = {}
+    deployed_ids = {}
     covered = set()
     for key, row in records:
         data = row.get("data") or {}
@@ -994,7 +998,12 @@ def executor_version_findings(records, *, now: float, attested=(),
         if host:
             covered.add((key, host))
         if sha:
-            deployed.setdefault(key, sha)
+            # Newest completed record wins: its id places the deployment in
+            # the shared log, and orders it against a candidate's tick.
+            row_id = int(row.get("id") or 0)
+            if key not in deployed_ids or row_id >= deployed_ids[key]:
+                deployed[key] = sha
+                deployed_ids[key] = row_id
         version = data.get("executor_venv")
         live = str(version.get("live") or "") if isinstance(version, dict) else ""
         source = PASS_SOURCE
@@ -1073,6 +1082,11 @@ def executor_version_findings(records, *, now: float, attested=(),
             continue
         sha = deployed.get(key)
         if not sha:
+            continue
+        # #7818: a tick written before the pass that named this deployment
+        # could not have read it; wait for the next tick, the first able to.
+        tick_id, pass_id = int(tick.get("id") or 0), deployed_ids.get(key) or 0
+        if tick_id and pass_id and tick_id <= pass_id:
             continue
         data = tick.get("data") or {}
         if not _tick_fresh(tick, data, host, now):
