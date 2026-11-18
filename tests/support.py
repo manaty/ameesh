@@ -965,6 +965,24 @@ def _bench_satellites(db) -> None:
               % len(result.dropped), file=sys.stderr)
 
 
+def _bench_roles(cfg) -> None:
+    """Use the canonical test database for the cluster-wide role lock."""
+    if os.environ.get("AMEESH_BENCH_UPKEEP", "1").lower() in ("0", "false", "no", "off"):
+        return
+    db = None
+    try:
+        db = db_mod.connect(dataclasses.replace(cfg, dsn=TEST_DSN))
+        result = bench_mod.purge_test_roles(db)
+        if result.dropped:
+            print("banc : %d rôle(s) orphelin(s) purgé(s)" % len(result.dropped),
+                  file=sys.stderr)
+    except Exception:  # noqa: BLE001 — upkeep must not fail the test
+        pass
+    finally:
+        if db is not None:
+            db.close()
+
+
 #: #5641 : un nom de table ou de trigger passé à `PgTestCase.fill` (composé
 #: dans l'ALTER TABLE, jamais un paramètre lié).
 _FILL_IDENT = re.compile(r"[a-z_][a-z0-9_]*\Z")
@@ -1196,6 +1214,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
                 raise AssertionError(message) from exc
             raise unittest.SkipTest(message) from exc
         _bench_upkeep(cls.db)
+        _bench_roles(cls.cfg)
         # #7756 : à chaque classe — un résidu frais d'une suite tuée casse la
         # classe suivante, avant même que `_bench_upkeep` (une fois par
         # processus) ne le voie.
