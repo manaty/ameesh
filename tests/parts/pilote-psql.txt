@@ -87,6 +87,7 @@ test_6534_export_v0_garde  # stockage : export-v0 refuse un mesh vivant sans `--
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)
 test_711_migration_reservations  # storage: atomic scoped migration batches, legacy projection, SHA fencing and lifecycle (#711)
+test_7630_avatar_tools  # #7630: avatar tool restrictions and durable proof across resident and attach launches
 test_789_slo_alerts  # storage: niveaux d'alerte SLO, priorité SQL, attentes planifiées et livraison Notifier (#789 t2)
 test_800_reviewer_family_warning  # stockage : avertissement (indicatif) quand le relecteur désigné partage le harnais de l'auteur (#800)
 test_802_canon_sync_concurrency  # storage/driver : N syncs concurrents d'un même canon, statement_timeout réel des deux pilotes (#802)
@@ -186,5 +187,6 @@ test_7535_stacked_delivery  # stockage : livraison et alerte des lots empilés d
 test_7628_module_connectors  # applied module action policy and real entry-point CLI gate
 test_7623_late_dispatch  # durable missing-part intent and cross-watcher packet lock
 test_3035_host_reconcile  # permanent attachment and lost-host proof transactions (#7654)
+test_7649_schema_modules  # P1a : registres, schémas et migrations de module, doctor (#7649)
 
 test_7726_prod_go  # #7726: signed production authority and supersession locks

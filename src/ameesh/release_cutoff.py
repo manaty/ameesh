@@ -1224,6 +1224,9 @@ class ProjectRelease:
     #: compiled here: the gesture, beneficiary, host, lot, decision and date
     #: come from the configuration.
     staging_rights: tuple = ()
+    #: #7666: this project publishes the weekly stable channel at the tick
+    #: (`ameesh.stable_channel`); off by default, nothing client-specific here
+    stable_channel: bool = False
     #: #7662: the staging sequence read from the canon Host cards. Empty on a
     #: bare profile (never a default host), filled by `with_staging_topology`
     #: where a canon is available.
@@ -1237,7 +1240,8 @@ class ProjectRelease:
         unknown = set(entry) - {"repo", "target", "remote", "staging", "report",
                                 "github", "window_s", "staging_timeout_s", "staging_executor",
                                 "lock_ttl_s", "lock_wait_s", "version_bump", "model",
-                                "staging_handoff", "attestation_timeout_s", "staging_rights"}
+                                "staging_handoff", "attestation_timeout_s", "staging_rights",
+                                "stable_channel"}
         if unknown:
             raise ReleaseError("release.projects.%s: unknown key(s) %s"
                                % (name, ", ".join(sorted(unknown))))
@@ -1270,6 +1274,10 @@ class ProjectRelease:
             # without the registry (which the tick reads before any tag).
             handoff = canonical_handoff(cfg, None, handoff)
         rights = _staging_rights(name, entry.get("staging_rights", []))
+        stable = entry.get("stable_channel", False)
+        if not isinstance(stable, bool) or (stable and model != "semver"):
+            raise ReleaseError("release.projects.%s.stable_channel: a boolean, semver model only"
+                               % name)
         elected_role = ((getattr(cfg, "release", None) or {}).get("role")
                         or (getattr(cfg, "packet_watch", None) or {}).get("role"))
         executor = entry.get("staging_executor")
@@ -1307,7 +1315,7 @@ class ProjectRelease:
             lock_ttl_s=number("lock_ttl_s", LOCK_TTL_S),
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
             suite_tolerated=tolerated, model=model, staging_handoff=handoff or "",
-            staging_rights=rights,
+            staging_rights=rights, stable_channel=stable,
             attestation_timeout_s=number("attestation_timeout_s", ATTESTATION_TIMEOUT_S))
 
 

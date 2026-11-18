@@ -180,6 +180,10 @@ def _external(entry):
                          % (name, exc)) from exc
     _validate_descriptor(name, compiled, allow_empty=bool(getattr(module, "ACTION_CONNECTORS", {})))
     _check_types(name, module, compiled)
+    # P1a #7649 : un schéma ou un dossier de migrations impossible à appliquer
+    # est un refus d'entrée installée, jamais un schéma à moitié créé.
+    from ..migrations import module_metadata
+    module_metadata(name, module)
     from .registry import _action_declarations
     _action_declarations({name: module})
     return module, compiled

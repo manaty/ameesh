@@ -1220,6 +1220,18 @@ class ClaimRuleTest(_TmpMixin, PgTestCase):
         de son hôte, un agent du canon n'est pas réclamé."""
         cwd = os.path.join(self.tmp, "work")
         os.makedirs(cwd, exist_ok=True)
+        # #7630 : un agent canonique doit avoir une fiche lisible au lancement.
+        root = self.example_copy()
+        write(root, "agents/canonique.md", fiche(
+            type="Agent", title="canonique", responsible="human:alice",
+            harness="claude", team="acme-web", provider="anthropic",
+            credential_mode="subscription"))
+        write(root, "hotes/h-canon.md", fiche(
+            type="Host", title="h-canon", responsible="human:alice",
+            policy="{work_roots: {acme-web: %s}}" % cwd))
+        write(root, "placements/canonique-h-canon.md", fiche(
+            type="Placement", title="canonique@h-canon", agent="canonique",
+            hosts=["h-canon"], credential_mode="subscription"))
         env = self.env(AMEESH_HOST="h-canon")
         proc = self.runner("register", "canonique", "claude", "--cwd", cwd,
                            "--prompt", "tour", env=env)
@@ -1238,7 +1250,8 @@ class ClaimRuleTest(_TmpMixin, PgTestCase):
         self.runner("--once", "--agents", "canonique", env=env)
         self.assertEqual(self.turns(), [])
         canon_sync.record_state(self.db, "h-canon", canon_sync.CANON_OK, "")
-        proc = self.runner("--once", "--agents", "canonique", env=env)
+        proc = self.runner("--once", "--agents", "canonique", env={
+            **env, "AMEESH_CANON": root, "AMEESH_CANON_UNTRUSTED": "1"})
         self.assertEqual([t["harness"] for t in self.turns()], ["claude"], proc.stdout)
 
 

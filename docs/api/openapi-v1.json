@@ -2004,6 +2004,7 @@
               "agent.updated",
               "agent.moved",
               "agent.attach",
+              "agent.tools",
               "host.memory_unavailable",
               "cost.recorded",
               "thread.entry",
@@ -3135,6 +3136,120 @@
             },
             "required": [],
             "type": "object"
+          },
+          "deferral": {
+            "properties": {
+              "age_s": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "queue": {
+                "properties": {
+                  "capacity": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "critical": {
+                    "type": "boolean"
+                  },
+                  "detail": {
+                    "type": "string"
+                  },
+                  "host": {
+                    "type": "string"
+                  },
+                  "queued_s": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "const": "pressure",
+                    "type": "string"
+                  },
+                  "retry_s": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "scope": {
+                    "enum": [
+                      "own_cgroup",
+                      "host"
+                    ]
+                  },
+                  "state": {
+                    "const": "queued",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "state",
+                  "reason",
+                  "host",
+                  "scope",
+                  "critical",
+                  "detail",
+                  "queued_s",
+                  "retry_s",
+                  "capacity"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "operator",
+                  "pressure",
+                  "authentication",
+                  "provider_credits",
+                  "budget",
+                  "account",
+                  "account_window",
+                  "session",
+                  "database",
+                  "host",
+                  "workdir",
+                  "shutdown",
+                  "restart",
+                  "other"
+                ]
+              },
+              "schema": {
+                "const": "ameesh-deferral/1",
+                "type": "string"
+              },
+              "since_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "deferred"
+                ]
+              }
+            },
+            "required": [
+              "schema",
+              "state",
+              "reason",
+              "since_ts",
+              "age_s"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "lease": {
             "properties": {

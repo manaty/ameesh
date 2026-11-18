@@ -39,6 +39,7 @@ import uuid
 from urllib.parse import urlsplit
 
 from ameesh import actions, approve_client, approve_check
+from ameesh import bench as bench_mod
 from ameesh import db as db_mod
 from ameesh import migrations, receipts
 from ameesh.approve import config as approve_config
@@ -345,6 +346,9 @@ class EquipesTest(PgTestCase):
         cls.schema_b = cls.schema + "_b"
         cls.db_b = db_mod.connect(dataclasses.replace(cls.cfg, schema=cls.schema_b))
         migrations.migrate(cls.db_b, log=None)
+        # #7756 : l'annexe porte sa preuve de propriété, pour qu'un kill de la
+        # classe ne laisse pas un schéma sans détenteur.
+        bench_mod.claim_owner(cls.db_b, cls.schema_b)
 
     @classmethod
     def tearDownClass(cls) -> None:

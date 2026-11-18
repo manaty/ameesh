@@ -1017,7 +1017,7 @@ export interface components {
             project: string | null;
             ts: number;
             /** @enum {unknown} */
-            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "agent.attach" | "host.memory_unavailable" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "git.lock_removed" | "mail.export" | "packet.pause" | "auditor.pass" | "packet.client_types";
+            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "agent.attach" | "agent.tools" | "host.memory_unavailable" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "git.lock_removed" | "mail.export" | "packet.pause" | "auditor.pass" | "packet.client_types";
         };
         "ameesh-host-1": {
             history: Record<string, never>[];
@@ -1260,6 +1260,30 @@ export interface components {
                 request?: number | null;
                 turn?: string | null;
             };
+            deferral?: {
+                age_s: number | null;
+                queue?: {
+                    capacity: string | null;
+                    critical: boolean;
+                    detail: string;
+                    host: string;
+                    queued_s: number | null;
+                    /** @constant */
+                    reason: "pressure";
+                    retry_s: number | null;
+                    /** @enum {unknown} */
+                    scope: "own_cgroup" | "host";
+                    /** @constant */
+                    state: "queued";
+                } | null;
+                /** @enum {unknown} */
+                reason: "operator" | "pressure" | "authentication" | "provider_credits" | "budget" | "account" | "account_window" | "session" | "database" | "host" | "workdir" | "shutdown" | "restart" | "other";
+                /** @constant */
+                schema: "ameesh-deferral/1";
+                since_ts: number | null;
+                /** @enum {unknown} */
+                state: "deferred";
+            } | null;
             lease: {
                 epoch: number | null;
                 expires_ts: number | null;
