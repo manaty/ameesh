@@ -248,11 +248,14 @@ Règles de construction :
 - sélection **par tours entiers**, du plus récent au plus ancien, jusqu'à un
   budget de 24 Ko UTF-8 (paramètre compilé, jamais une variable cachée) ;
   jamais un demi-tour ; si un tour dépasse le budget, on garde sa question
-  humaine et sa réponse finale, et on marque `truncated_before_seq` ;
-- seuls `human_message`, `text` et `turn_end` portent du texte ; les `tool`
-  sont rendus en une ligne compacte (`outil test: terminé`, sans argument ni
-  sortie) ; `input` de mail n'est inclus que s'il est nécessaire à la
-  compréhension et jamais avec un secret ;
+  (humaine ou courrier d'agents) et sa réponse finale, et on marque
+  `truncated_before_seq` ;
+- les entrées porteuses de texte sont `human_message`, `text` et `turn_end`,
+  plus un `input` de courrier réduit aux messages d'agents qu'il a remis (id,
+  expéditeur, date, corps), sans le texte d'habillage du runner et sans les
+  messages humains déjà journalisés en `human_message` ; les `tool` sont
+  rendus en une ligne compacte (`outil test: terminé`, sans argument ni
+  sortie) ; jamais de secret ;
 - aucun texte du segment n'est réinséré dans `conversation_log` : l'entrée de
   déplacement est un `state` avec `meta={action: "move", move_id, from_seq,
   to_seq, digest}` ; le segment n'est pas un nouveau message humain ;
@@ -276,12 +279,16 @@ avant A2. Précisions du contrat :
   gardé, ses textes tronqués (`truncated: true`) si même sa forme réduite
   dépasse ;
 - la lecture est une fenêtre des 500 dernières entrées ; si elle commence au
-  milieu d'un tour (tour de plus de 500 entrées), ses messages humains sont
-  relus à rebours jusqu'au `turn_end` précédent et ce tour n'est gardé que
-  réduit ; le fil n'est alors pas consulté ;
-- les entrées `input` et `state` ne sont jamais incluses (le courrier est
-  relu par le tour lui-même) ; un `tool` ne garde que `meta.{tool, status}`,
-  nom filtré par `safe_tool_name` ;
+  milieu d'un tour (tour de plus de 500 entrées), ses messages humains et son
+  `input` de courrier sont relus à rebours jusqu'au `turn_end` précédent et ce
+  tour n'est gardé que réduit ; le fil n'est alors pas consulté ;
+- un `input` n'est inclus que réduit aux messages d'agents qu'il a remis
+  (en-tête expéditeur/id/date conservé, corps sans les `>` de citation), jamais
+  le prompt du runner ni un message humain déjà journalisé ; les entrées
+  `state` ne sont jamais incluses ; un `tool` ne garde que
+  `meta.{tool, status}`, nom filtré par `safe_tool_name`.  Le courrier
+  d'agents n'existe que dans le détail `input`, jamais dans le fil R12 : il
+  n'est donc recouvré que tant que cette ligne de détail est retenue ;
 - repli sur le fil : quand le détail retenu ne commence pas à la séquence 1,
   les copies R12 (`meta.conversation.{agent, seq}`) antérieures à la première
   entrée retenue fournissent les messages humains et les réponses finales
