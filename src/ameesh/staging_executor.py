@@ -1652,7 +1652,7 @@ def tick(db, cfg, options) -> dict:
                                 "reason": request.get("blocked_reason")
                                 or "retour apres arret interrompu"}
                     _release_cutoff._manual_return_mail(
-                        db, tree, request.get("notify") or "mesh-design",
+                        db, tree, request.get("notify"),
                         "superviseur interrompu avant la fin du retour")
                     reason = ("retour apres arret interrompu: marche manuelle "
                               "remise au pilote; sources kept")
@@ -1824,7 +1824,7 @@ def tick(db, cfg, options) -> dict:
                             "run": attempt["run"]}
                 if not retour["ok"] and not retour["mailed"]:
                     release_cutoff._manual_return_mail(
-                        db, tree, attempt.get("notify") or "mesh-design",
+                        db, tree, attempt.get("notify"),
                         retour["note"])
                 monitor.stop(reason)
                 result = dict(attempt, state="failed", exit=code, reason=reason)

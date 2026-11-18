@@ -53,6 +53,7 @@ from . import cost as cost_mod
 from . import db as db_mod
 from . import planned_waits
 from . import storage
+from .roles import CRITICAL_ROLES, DESIGN_ROLES, ORCHESTRATOR_ROLES, ROLE_SYNONYMS
 
 UNDERUSE_TYPES = ("host_idle_reserved", "baseline_oversized", "plan_underused", "idle_capacity", "orchestrator_held", "host_underused",
                   "backlog_empty", "roadmap_exhausted")
@@ -115,17 +116,11 @@ WAITING_LOT_STATES = lifecycle.ACTIVE
 #: humain, autre lot) ; l'agent qui n'a que ceux-là est libre pour un lot
 #: d'équipe et compte dans `idle_capacity`
 LOTS_WAITING_ON_OTHERS = lifecycle.WAITING_ON_OTHERS
-#: mots qui désignent un orchestrateur dans `roles`/`role` d'une fiche Agent
-ORCHESTRATOR_ROLES = ("orchestrateur", "orchestrator")
-#: L165b : rôles de l'agent de conception, prévenu aussi d'`idle_capacity`
-DESIGN_ROLES = ("conception", "design")
-#: L242c : rôles qui rendent un agent critique (jamais en pause budget tant
-#: qu'un compte a de la marge), par défaut ; une organisation les règle par
-#: `critical_roles` dans son federation.yaml (manaty/home#25)
-CRITICAL_ROLES = ("orchestrateur", "conception", "auditeur", "relecture")
-#: L242c : les autres noms reconnus d'un rôle dans `roles`/`role` d'une fiche
-ROLE_SYNONYMS = {"orchestrateur": ("orchestrator",), "conception": ("design",),
-                 "auditeur": ("auditor",), "relecture": ("review", "reviewer")}
+#: Les rôles, leurs synonymes et les rôles critiques sont le vocabulaire de
+#: `roles.py` (#7792) : les lecteurs l'importent, ils ne le recopient pas.
+#: L165b : `DESIGN_ROLES` prévient aussi l'agent de conception d'`idle_capacity`.
+#: L242c : `CRITICAL_ROLES` est le défaut ; une organisation le règle par
+#: `critical_roles` dans son federation.yaml (manaty/home#25).
 _ROLE_OF = {alias: role for role, aliases in ROLE_SYNONYMS.items() for alias in aliases}
 #: L242c (#424 r2) : constats de chargement qui laissent un canon lu en partie
 #: (fiche ou manifeste illisible) — ses rôles ne sont alors pas connus

@@ -2771,8 +2771,28 @@ def _return_after_stop(tree: str, sha: str, *, env: dict, budget: float) -> dict
             "drop": settled, "pid": proc.pid}
 
 
-def _manual_return_mail(db, tree: str, notify: str, reason: str) -> bool:
-    """#5450: the manual fallback when the bounded return did not conclude."""
+def _design_recipient(db) -> str:
+    """#7792 : le porteur du rôle de conception, lu sur la projection `roles`
+    du registre (celle que `canon sync` écrit de la fiche). Aucun nom de
+    persona n'est deviné : sans porteur déclaré, le journal garde la trace et
+    le courrier n'est pas envoyé."""
+    try:
+        from . import registry, sous_utilisation
+        holders = sous_utilisation.declared_holders(
+            [], registry.overview(db), sous_utilisation.DESIGN_ROLES)
+    except Exception:  # noqa: BLE001 - une lecture ne bloque pas le journal
+        return ""
+    return holders[0] if holders else ""
+
+
+def _manual_return_mail(db, tree: str, notify: str | None, reason: str) -> bool:
+    """#5450: the manual fallback when the bounded return did not conclude.
+
+    #7792: `notify` absent désigne le porteur du rôle de conception, résolu au
+    registre ; sans porteur, rien n'est inventé."""
+    notify = notify or _design_recipient(db)
+    if not notify:
+        return False
     state = _return_state(tree)
     host = state.get("host") or "?"
     step = state.get("step") or "?"
@@ -2964,7 +2984,7 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                     drop = retour["drop"]
                     if not retour["ok"] and not retour["mailed"]:
                         if db is not None:
-                            _manual_return_mail(db, worktree, "mesh-design",
+                            _manual_return_mail(db, worktree, None,
                                                 retour["note"])
                 if read["output"] is None:
                     wait(STAGING_DRAIN_S)
