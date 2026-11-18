@@ -96,12 +96,12 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(size(sealed), size(doc) + S.DIGEST_BYTES)
         self.assertLessEqual(size(sealed), S.BUDGET_BYTES)
 
-    def test_tools_keep_name_and_status_only_input_and_state_dropped(self):
+    def test_tools_keep_name_and_status_only_non_mail_input_and_state_dropped(self):
         rows = turn(1, "q", "r", tools=1)
         rows[1]["text"] = "curl -H 'Authorization: x'"
         rows[1]["meta"] = {"tool": "curl -H secret", "status": "completed", "args": "x"}
         rows.insert(0, {"seq": 0, "kind": "input", "author": "agent:x", "ts": 1.0,
-                        "text": "mail body", "meta": {}})
+                        "text": "prompt without a delivered message", "meta": {}})
         rows.append({"seq": 99, "kind": "state", "author": "agent:avatar", "ts": 9.0,
                      "text": "dropped", "meta": {}})
         doc = S.select(rows, agent="avatar")
@@ -109,7 +109,7 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(tool, {"seq": 2, "kind": "tool", "author": "agent:avatar",
                                 "ts": 1001.0, "meta": {"tool": "tool", "status": "completed"}})
         text = S.canonical(doc)
-        for absent in ("mail body", "dropped", "curl", "cost_usd"):
+        for absent in ("prompt without", "dropped", "curl", "cost_usd"):
             self.assertNotIn(absent, text)
 
     def test_thread_rows_used_only_before_retained_detail(self):
