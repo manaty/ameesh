@@ -46,13 +46,18 @@ def cards(listing, canons):
     Seule une fiche qui déclare le rôle compte : une persona sans fiche, ou
     dont la fiche ne le déclare pas, n'est pas auditrice. Une fiche en conflit
     dans un autre canon ne donne jamais de rôle ni de permission au nom déjà
-    au registre.
+    au registre. Sans canon chargé (installation historique, hôte sans dépôt),
+    la projection `roles` du registre — copiée de la carte par `canon sync` —
+    est la déclaration : le nom est reconnu, sans fiche (None) (#7661).
     """
+    from . import sous_utilisation as su
     found = {}
     for row in listing:
         card = owned_card(row, canons, AUDITOR_ROLES)
         if card is not None:
             found[row["name"]] = card
+        elif not canons and su.row_has_role(row, AUDITOR_ROLES):
+            found[row["name"]] = None
     return found
 
 

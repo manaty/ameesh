@@ -102,6 +102,13 @@ class AuditorsTest(unittest.TestCase):
         self.assertFalse(auditor.is_auditor(
             None, "auditeur", [], agent=row("auditeur")))
 
+    def test_cards_read_the_registry_without_a_canon(self):
+        # Sans canon, la projection `roles` est la déclaration de la prise :
+        # l'auditeur garde ses lots protégés, même sans fiche chargée.
+        self.assertEqual(auditor.cards([row("veille", ["auditeur"]),
+                                        row("auditeur")], []),
+                         {"veille": None})
+
     def test_bare_profile_has_no_role_critical_agent(self):
         self.assertEqual(su.critical_verdict({"name": "auditeur"}, [],
                                              configured=False),
