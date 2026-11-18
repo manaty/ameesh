@@ -773,6 +773,14 @@ class Watcher:
                 self.log("GitHub watch %s: failed; cursor retained: %s" %
                          (sub.repo, plan_github._one_line(exc)))
         if not self.dry_run:
+            from . import pre_act_audit
+            try:
+                if self.api is None:
+                    self.api = plan_github.client(cache_dir=self.cfg.state_dir, caller="github-watch")
+                if self.api is not None:
+                    pre_act_audit.tick(db, self.cfg, now, declared, self.api, self.log)
+            except Exception as exc:
+                self.log("pre-act audit failed; cursors retained: %s" % str(exc))
             from . import repair_observation
             for project in sorted({sub.project for sub in declared}):
                 repair_observation.observe(db, project=project,

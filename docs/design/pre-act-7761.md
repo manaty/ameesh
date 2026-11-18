@@ -3,8 +3,10 @@
 Chaque reçu comporte un `pregeste_id` UUID. Pour un dispatch direct
 `gh workflow run` de type prod, le préfixe ajoute l'entrée
 `-f pregeste=<pregeste_id>` ; le workflow doit publier cet identifiant dans
-son titre. Le collecteur et son alerte restent à intégrer : ce reçu seul ne
-constitue pas encore un contrôle détectif.
+son titre. La passe élue `github-watch` collecte les runs des workflows
+inventoriés dans `projects.<projet>.production.workflows` du canon appliqué,
+pour les dépôts déclarés par les agents de veille de ce projet. Aucun projet
+ni fichier de workflow n'est inscrit dans le code du collecteur.
 
 La commande `ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO`
 relit le journal et le courrier puis écrit un reçu sur le lot si aucun motif
@@ -45,8 +47,8 @@ n'exécute pas la commande.
 Le reçu écrit une preuve structurée `pre-act/1` (lot, acteur, type de geste,
 cible) et utilise l'horloge de la base pour sa date. `--target` est obligatoire
 pour un geste prod. La convention de cible permettant la corrélation avec un
-run GitHub et la correspondance entre identités mesh et GitHub restent à
-définir : le contrôle détectif n'est pas encore intégré. Les audits KMS/IAM
+run GitHub est l'UUID exact présent dans le titre `pregeste=<UUID>` : aucun
+rapprochement par acteur ou proximité temporelle n'est effectué. Les audits KMS/IAM
 restent hors de cette tranche (#225809), à traiter dans #7767.
 
 Selon bureau (courrier #225756, 18/11), p2a et la sauvegarde sont jetables
@@ -59,3 +61,32 @@ fenêtre pour la première tranche (#225799) ; l'accès imposé aux identifiants
 relève du lot compagnon #7767, avec décision owner. La garde refuse de lancer
 la commande si plus de 30 secondes se sont écoulées depuis le début du
 contrôle, borne conservatrice par rapport à l'écriture du reçu.
+
+Le premier passage enregistre l'activation en base, séparément pour chaque
+projet, dépôt et workflow : aucune reprise historique. La lecture attend cinq
+minutes pour l'indexation GitHub puis recommence au plus toutes les quinze
+minutes (ou à la cadence de veille déclarée si elle est plus courte). Elle
+relit depuis l'activation : une relance conserve la date de création initiale.
+Les fenêtres saturées à 1 000 résultats sont divisées en sous-fenêtres. Une
+réponse incomplète, périmée ou illisible conserve le curseur précédent.
+Ce premier lecteur échange un coût de lecture croissant avec l'historique
+contre la détection des relances ; les runs créés avant l'activation, y compris
+leurs relances, restent hors de son périmètre sans reprise historique.
+
+L'état partagé (`pre_act_audit_cursors`, `pre_act_audit_runs`, migration 0593)
+survit aux redémarrages et changements d'hôte. Le contrôle traite séparément
+chaque tentative d'un run, y compris les tentatives intermédiaires lorsque
+plusieurs relances ont eu lieu entre deux passes. La consommation de l'UUID
+est unique entre dépôts et workflows. Les reçus absents, invalides, inconnus,
+ambigus ou déjà consommés déclenchent un courrier à l'agent portant le rôle
+canonique `auditeur`. La consommation, le run, l'alerte et le curseur sont
+validés dans une transaction ; un échec d'envoi annule cet ensemble.
+
+Seuls les workflows déclarés dans `production.mode_marked_workflows`
+(sous-ensemble de l'inventaire) peuvent être exclus selon les marqueurs du
+titre : `environment=staging` ou `observe_only=true`, tous deux explicites et
+non ambigus. Le mode mutateur est `environment=production observe_only=false`.
+Un marqueur absent, inconnu ou dupliqué déclenche une alerte de mode. Les
+workflows prod ordinaires sont tous contrôlés, quelle que soit leur branche.
+Le lecteur compatible et la migration additive doivent être déployés avant
+l'activation de la déclaration canonique (proposition home#304).

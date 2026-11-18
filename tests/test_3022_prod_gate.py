@@ -33,6 +33,17 @@ class ProductionMechanicsTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(mechanics.MechanicsError):
                 mechanics.compile_document(NEXLINK.replace("branch: main", "branch: main\n      workflows: " + bad))
 
+    def test_mode_marked_workflows_require_an_explicit_inventory_subset(self):
+        text = NEXLINK.replace("branch: main", "branch: main\n      workflows: [deploy.yml]\n      mode_marked_workflows: [deploy.yml]")
+        self.assertEqual(mechanics.compile_document(text).override("nexlink").production_mode_marked_workflows,
+                         ("deploy.yml",))
+        for bad in ("[unknown.yml]", "[deploy.yml, deploy.yml]", "false", "{}"):
+            with self.subTest(bad=bad), self.assertRaises(mechanics.MechanicsError):
+                mechanics.compile_document(text.replace("mode_marked_workflows: [deploy.yml]",
+                                                         "mode_marked_workflows: " + bad))
+        with self.assertRaises(mechanics.MechanicsError):
+            mechanics.compile_document(NEXLINK.replace("branch: main", "branch: main\n      mode_marked_workflows: []"))
+
     def test_la_branche_de_prod_est_compilee_par_projet(self):
         document = mechanics.compile_document(NEXLINK)
         self.assertEqual(document.production_branch("nexlink"), "main")
