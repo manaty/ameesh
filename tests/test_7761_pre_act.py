@@ -18,7 +18,8 @@ class Transaction:
         if "FROM work_items" in sql:
             return [{"state": self.state, "now_ts": 200}]
         if "FROM work_item_events" in sql:
-            return self.events
+            return [dict({"work_item_id": 5772, "state": "build", "created_ts": e.get("ts", 0)}, **e)
+                    for e in self.events]
         if "FROM agent_mailbox" in sql:
             return self.messages
         raise AssertionError(sql)
@@ -29,7 +30,8 @@ class Transaction:
 
 class PreActTest(unittest.TestCase):
     def check(self, tx):
-        return pre_act.inspect(tx, 5772, "bureau", 100, "kms")
+        with mock.patch.object(pre_act.planned_waits, "lift_authority", return_value=lambda who: False):
+            return pre_act.inspect(tx, 5772, "bureau", 100, "kms")
 
     def test_stop_delivered_during_wait_refuses_without_receipt(self):
         tx = Transaction(messages=[{"id": 42, "recipient": "bureau", "unread": False,
@@ -86,6 +88,24 @@ class PreActTest(unittest.TestCase):
         sleep.assert_called_once_with(60)
         execute.assert_called_once_with("true", ["true"])
         self.assertIn("since=100", tx.writes[0][1][2])
+
+    def test_unhold_only_clears_its_author(self):
+        tx = Transaction(events=[
+            {"id": 1, "actor": "other", "note": "hold: STOP A", "ts": 10},
+            {"id": 2, "actor": "orchestrateur", "note": "hold: STOP B", "ts": 20},
+            {"id": 3, "actor": "other", "note": "unhold: A levé", "ts": 30},
+        ])
+        with self.assertRaisesRegex(pre_act.Refused, "orchestrateur"):
+            self.check(tx)
+        self.assertFalse(tx.writes)
+
+    def test_state_change_clears_ordinary_stop_hold(self):
+        tx = Transaction(events=[
+            {"id": 1, "actor": "other", "state": "intake", "note": "hold: STOP A", "ts": 10},
+            {"id": 2, "actor": "other", "state": "build", "note": "reprise", "ts": 20},
+        ])
+        self.check(tx)
+        self.assertTrue(tx.writes)
 
     def test_clear_check_records_receipt(self):
         tx = Transaction(events=[{"id": 1, "note": "préparation", "ts": 90}])

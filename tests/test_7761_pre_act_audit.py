@@ -179,3 +179,20 @@ class DurableAuditTest(PgTestCase):
             value = pre_act.inspect(tx, item, "auditor", since, "prod", "acme/app/deploy.yml")
         self.assertIn(value, {row["evidence"]["pregeste_id"] for row in self.db.query(
             "SELECT evidence FROM work_item_events WHERE work_item_id=%s", (item,))})
+
+    def test_real_pre_act_sql_preserves_another_authors_stop_hold(self):
+        from ameesh import pre_act
+        from unittest import mock
+        item = int(self.db.query("SELECT id FROM work_items LIMIT 1")[0]["id"])
+        for actor, note in [("agent-a", "hold: STOP A"),
+                            ("agent-b", "hold: STOP B"),
+                            ("agent-a", "unhold: A")]:
+            self.db.execute("INSERT INTO work_item_events (work_item_id,state,actor,note)"
+                            " VALUES (%s,'build',%s,%s)", (item, actor, note))
+        # The authority reader is isolated; the events and transaction are real.
+        with mock.patch.object(pre_act.planned_waits, "lift_authority", return_value=lambda who: False):
+            with self.db.transaction() as tx:
+                # Use the database's present as the observation start.
+                now = tx.query("SELECT extract(epoch from now())::float8 AS ts")[0]["ts"]
+                with self.assertRaisesRegex(pre_act.Refused, "agent-b"):
+                    pre_act.inspect(tx, item, "auditor", float(now), "kms")

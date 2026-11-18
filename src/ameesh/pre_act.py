@@ -37,7 +37,7 @@ def parse_since(value):
         raise Refused("--since must be an ISO timestamp with timezone") from exc
 
 
-def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None):
+def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *, cfg=None):
     """Read the journal and mailbox and record a receipt in one transaction."""
     item = tx.query("SELECT state, extract(epoch from now())::float8 AS now_ts "
                     "FROM work_items WHERE id = %s FOR NO KEY UPDATE", (lot,))
@@ -48,23 +48,26 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None):
     if item[0]["state"] in ("blocked", "waiting_human"):
         raise Refused("lot is %s" % item[0]["state"])
     events = tx.query(
-        "SELECT id, note, actor, extract(epoch from created_at)::float8 AS ts "
+        "SELECT id, work_item_id, state, note, actor, "
+        "extract(epoch from created_at)::float8 AS created_ts "
         "FROM work_item_events WHERE work_item_id = %s ORDER BY id", (lot,))
-    active_hold = None
+    # Keep every state transition, even one written by the actor. Ignore that
+    # actor's own hold, lift and STOP text, but retain the event's state.
+    hold_events = []
     for event in events:
         note = event.get("note") or ""
-        if (event.get("actor") or "").removeprefix("agent:") == actor.removeprefix("agent:"):
+        own = (event.get("actor") or "").removeprefix("agent:") == actor.removeprefix("agent:")
+        hold_events.append(dict(event, note="" if own else note))
+        if own:
             continue
         stop_hold = planned_waits.is_hold_note(note) and bool(_STOP.search(note))
-        if stop_hold:
-            active_hold = event["id"]
-        elif planned_waits.is_lift_note(note):
-            active_hold = None
-        if float(event["ts"]) >= since and (stop_hold or (not planned_waits.is_hold_note(note)
-                                                             and _STOP.search(note))):
+        if float(event["created_ts"]) >= since and (stop_hold or (not planned_waits.is_hold_note(note)
+                                                                  and _STOP.search(note))):
             raise Refused("hold or STOP in lot event #%s" % event["id"])
-    if active_hold is not None:
-        raise Refused("active hold in lot event #%s" % active_hold)
+    holds = planned_waits.active_holds(tx, hold_events, cfg=cfg, strict=True).get(lot, {})
+    for hold in holds.values():
+        if _STOP.search(hold.get("note") or ""):
+            raise Refused("active STOP hold by %s" % hold.get("by"))
 
     # Include both structured lot mail and prose references, and inspect STOPs
     # even when delivered: a session may have consumed mail during the wait.
@@ -153,7 +156,7 @@ def main(argv=None):
             raise Refused("valid agent identity required")
         check_started = time.monotonic()
         with db.transaction(isolation="READ COMMITTED") as tx:
-            pregeste_id = inspect(tx, args.lot, binding.name, since, args.kind, args.target.strip())
+            pregeste_id = inspect(tx, args.lot, binding.name, since, args.kind, args.target.strip(), cfg=cfg)
         db.close()
         db = None
         print("pre-act: receipt recorded for lot #%d (%s), pregeste=%s" %
