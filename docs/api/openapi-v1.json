@@ -2004,6 +2004,7 @@
               "agent.updated",
               "agent.moved",
               "agent.attach",
+              "agent.tools",
               "host.memory_unavailable",
               "cost.recorded",
               "thread.entry",

@@ -50,6 +50,7 @@
     "spawn": {
       "contract": "ameesh-spawn-tools/1",
       "tools": {"flag": ["--tools"]},
+      "deny": {"flag": ["--disallowedTools"]},
       "mcp": {"flag": ["--mcp-config", "{path}", "--strict-mcp-config"], "source": ".mcp.json"}
     },
     "install": {"note": "binaire `claude` installé par l'hôte ; distribution signée en L17"}
