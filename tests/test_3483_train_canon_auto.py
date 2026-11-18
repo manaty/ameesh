@@ -179,7 +179,7 @@ class AutomaticCanonTest(unittest.TestCase):
                 cfg, root, base, profile = self.host('refusal-%s' % index)
                 raw = self.read(base)
                 raw['train']['projects']['nexlink'] = dict(
-                    raw['train']['projects']['ameesh'], ci_contract='nexlink')
+                    raw['train']['projects']['ameesh'])
                 with open(base, 'w') as out:
                     json.dump(raw, out)
                 cfg = config.load({'AMEESH_CONFIG': profile})

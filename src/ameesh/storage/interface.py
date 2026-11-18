@@ -532,6 +532,16 @@ class Leases(Domain):
         (`live`), ou None."""
 
     @abc.abstractmethod
+    def fence(self, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+        """#7672 : le bail, verrouillé (`FOR UPDATE`) puis recontrôlé.
+
+        Même verdict que `registry.lease_agent`, mais la ligne du registre est
+        tenue jusqu'au commit : un changement de détenteur, d'epoch ou une
+        expiration ne peut pas glisser entre le contrôle et l'écriture de
+        l'appelant. Rend (ok, raison, ligne) ; une ligne absente rend
+        (False, raison, None)."""
+
+    @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
         """Prolonge le bail sans raccourcir son échéance ; rend la nouvelle
         échéance, None si on ne le détient plus."""
@@ -1743,6 +1753,21 @@ class Mailbox(Domain):
         (`sender_project`, `recipient_project`) des deux agents."""
 
     @abc.abstractmethod
+    def send_reply(self, sender: str, recipient: str, body: str, *, host: str | None,
+                   kind: str, payload: dict | None, work_item_id: str | None,
+                   signature: str | None, signature_key: str | None,
+                   signed_payload: str | None, nonce: str | None,
+                   created_us: int | None, expires_us: int | None,
+                   in_reply_to: int) -> dict:
+        """#7672 : dépose une réponse corrélée à la demande `in_reply_to`.
+
+        Même dépôt que `send`, plus la corrélation que l'index unique partiel
+        0594 rend unique : une seconde réponse à la même demande est refusée.
+        Réservé au chemin public de réponse (bail et tour vérifiés) ; jamais
+        servi à l'exécuteur médié, qui ne peut donc pas marquer une demande
+        répondue sans tenir le bail."""
+
+    @abc.abstractmethod
     def unread(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis, du plus ancien au plus récent, avec leur lot
         (`work_item_id`, #794 : le brief d'un lot ne montre que son fil)."""
@@ -1860,6 +1885,38 @@ class Mailbox(Domain):
         surnuméraire prouve qu'une page suivante existe, l'appelant la retire.
         `limit` est borné à 200 par le pilote. Lecture seule, sans remise.
         """
+
+    @abc.abstractmethod
+    def pending_requests(self, recipient: str, owner: str, epoch: int, *,
+                         sender: str | None = None, limit: int = 50) -> list[dict]:
+        """Contrat public 1.3 (E2b) : demandes tenues par ce bail et ce tour.
+
+        Demandes (`kind = 'request'`) encore sans réponse corrélée
+        (`in_reply_to`), réservées comme consigne du tour courant
+        (`meta.consigne.runner`/`epoch`/`turn`), avec un marqueur comptable
+        (`spend_pending`) de ce destinataire portant le MÊME `turn_id`, et
+        remises dans la fenêtre du marqueur (`delivered_at` nul ou postérieur
+        à `spend_pending.created_at`). Le bail est revérifié dans la même
+        requête (détenteur, epoch, échéance avec `clock_timestamp()`), et le
+        marqueur reste l'autorité du tour. `sender` restreint à un expéditeur.
+        Rend au plus `limit + 1` lignes, du plus ancien au plus récent par id :
+        la ligne surnuméraire prouve une page suivante. Lecture seule."""
+
+    @abc.abstractmethod
+    def reply_target(self, request_id: int) -> dict | None:
+        """#7672 : la demande à répondre et ses réponses corrélées, verrouillées.
+
+        La ligne de la demande est lue `FOR SHARE` (un retrait attend la
+        réponse) ; son marqueur comptable `spend_pending` est lu `FOR SHARE`
+        dans la même transaction, donc il ne peut être ni effacé ni remplacé
+        avant le commit de la réponse (B #7672 : le tour qui a autorisé la
+        remise reste vivant jusqu'à l'écriture). Les réponses déjà corrélées
+        sont lues sous le même verrou. Rend
+        `{request: {...}, replies: [...]}` ou None si la demande n'existe pas ;
+        `request.marker_present` et les champs `marker_*` décrivent le
+        marqueur verrouillé. Aucune règle d'autorisation ici : l'appelant
+        contrôle le bail, le destinataire et le tour, puis écrit la réponse
+        dans la transaction."""
 
     @abc.abstractmethod
     def staging_emission(self, recipient: str, sender: str, key: str) -> int | None:
@@ -2583,8 +2640,10 @@ class WorkItems(Domain):
         records the exact reading (``project``, ``pin``, ``gate``), the review
         references and the trace lot, together with the bound requester. It is
         idempotent for the same pending reading and evidence set: a repeated
-        call returns the existing row instead of stacking duplicates. Returns
-        the pending row, or None when the request cannot be stored.
+        call returns the existing row instead of stacking duplicates. #7806: a
+        new deposit emits a project-scoped train wake-up in the same
+        transaction; a retry that finds the existing row emits nothing.
+        Returns the pending row, or None when the request cannot be stored.
         """
 
     @abc.abstractmethod

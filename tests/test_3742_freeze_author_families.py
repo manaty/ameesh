@@ -9,6 +9,8 @@ Le gel doit refuser avant d'écrire le jalon, en nommant les commits à renvoyer
 """
 from __future__ import annotations
 
+import dataclasses
+import os
 import types
 import unittest
 
@@ -17,14 +19,16 @@ from ameesh import review_designation_activation as act
 from ameesh import work
 
 from .support import PgTestCase
-from .test_2447_review_designation_activation import _ActivationFixture
+from .test_2447_review_designation_activation import (
+    MECHANICS, _ActivationFixture, _Canon)
 
 FAMILIES = ("claude", "codex", "deepseek")
 
 
 def _inputs(*, authors=(), correctors=(), required=2, families=FAMILIES,
             exclude=True, distinct=True, seats=(), commits=None, unknown=(),
-            assignee="author", risk="sensitive"):
+            assignee="author", risk="sensitive", commit_families=None,
+            global_families=()):
     return types.SimpleNamespace(
         policy=types.SimpleNamespace(
             required=required, families=families, risk=risk,
@@ -32,6 +36,8 @@ def _inputs(*, authors=(), correctors=(), required=2, families=FAMILIES,
         authors=list(authors), correctors=list(correctors),
         manual_seats=list(seats), unknown_authors=list(unknown),
         author_commits=dict(commits or {}),
+        commit_families=dict(commit_families or {}),
+        global_families=set(global_families),
         item={"assignee": assignee})
 
 
@@ -175,6 +181,72 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(verdict["state"], "ok")
 
 
+class AssessByDeltaTest(unittest.TestCase):
+    """#7745 : la lecture par delta d'auteur, quand la provenance la fournit."""
+
+    def families(self, *pairs):
+        return {sha * 40: {family} for sha, family in pairs}
+
+    def test_two_author_families_are_covered_by_three(self):
+        verdict = ff.assess(_inputs(
+            authors=[{"name": "author", "family": "codex"},
+                     {"name": "r1", "family": "deepseek"}],
+            commit_families=self.families(("a", "codex"), ("b", "deepseek"))))
+        self.assertEqual(verdict["state"], "ok", verdict)
+        self.assertEqual(verdict["forbidden"], [])
+        self.assertEqual([row["families"] for row in verdict["deltas"]],
+                         [["codex"], ["deepseek"]])
+        # Trois sièges sont à désigner (un par famille qui couvre les deltas),
+        # pas deux : chaque delta en exige deux.
+        self.assertEqual(verdict["need"], 3)
+
+    def test_two_policy_families_leave_one_delta_short(self):
+        verdict = ff.assess(_inputs(
+            authors=[{"name": "author", "family": "codex"},
+                     {"name": "r1", "family": "deepseek"}],
+            families=("claude", "codex"),
+            commit_families=self.families(("a", "codex"), ("b", "deepseek"))))
+        self.assertEqual(verdict["state"], "short", verdict)
+        self.assertEqual(verdict["need"], 1)
+        self.assertIn("delta 1 (codex): 1 missing", verdict["why"])
+
+    def test_a_global_family_closes_the_only_delta(self):
+        # #7324 : la famille du gel est globale, elle ne couvre aucun delta.
+        verdict = ff.assess(_inputs(
+            authors=[{"name": "author", "family": "deepseek"},
+                     {"name": "r1", "family": "codex"}],
+            commit_families=self.families(("a", "deepseek")),
+            global_families=("codex",)))
+        self.assertEqual(verdict["state"], "short", verdict)
+        self.assertEqual(verdict["forbidden"], ["codex", "deepseek"])
+        self.assertEqual(verdict["deltas"][0]["families"], ["codex", "deepseek"])
+
+    def test_a_manual_seat_of_another_delta_counts(self):
+        verdict = ff.assess(_inputs(
+            authors=[{"name": "author", "family": "codex"},
+                     {"name": "r1", "family": "deepseek"}],
+            seats=[{"name": "r2", "family": "claude"}],
+            commit_families=self.families(("a", "codex"), ("b", "deepseek"))))
+        self.assertEqual(verdict["state"], "ok", verdict)
+        # Le siège claude est déjà pourvu ; il reste codex et deepseek.
+        self.assertEqual(verdict["need"], 2)
+
+    def test_the_refusal_names_only_the_uncovered_delta(self):
+        text = ff.message(_inputs(
+            authors=[{"name": "author", "family": "codex"},
+                     {"name": "r1", "family": "deepseek"}],
+            families=("claude", "codex"),
+            commits={"author": ["a" * 40], "r1": ["b" * 40]},
+            commit_families=self.families(("a", "codex"), ("b", "deepseek"))))
+        self.assertIn("per delta", text)
+        self.assertIn("delta aaaaaaaaaaaa (codex): 1 independent review(s)"
+                      " missing", text)
+        # Le delta deepseek est couvert : son auteur n'a pas à refaire son
+        # commit.
+        self.assertIn("aaaaaaaaaaaa", text)
+        self.assertNotIn("bbbbbbbbbbbb", text)
+
+
 class MessageTest(unittest.TestCase):
     """Le refus nomme les commits, les familles et l'assigné (§2)."""
 
@@ -249,18 +321,16 @@ class FreezeRefusalTest(_ActivationFixture, PgTestCase):
         return [row for row in work.milestones(self.db, self.lot)
                 if row["kind"] == "frozen"]
 
-    def test_three_families_and_two_reviews_refuse_the_freeze(self):
+    def test_three_families_and_two_reviews_freeze(self):
+        # #7745 : chaque delta deepseek/claude/codex est couvert par les deux
+        # autres familles ; le gel passe, la désignation attend une capacité
+        # indépendante (les trois agents écrits sont auteurs d'un delta).
         self._head([("author", "deepseek"), ("r1", "claude"), ("r2", "codex")])
-        with self.assertRaises(work.WorkError) as caught:
-            self.freeze()
-        text = str(caught.exception)
-        self.assertIn("freeze refused (author-families)", text)
-        self.assertIn("assignee author", text)
-        for sha in self.repo.git("rev-list", "--no-merges",
-                                 "%s..%s" % (self.base, self.frozen)).split():
-            self.assertIn(sha[:12], text)
-        self.assertEqual(self._frozen_marks(), [])
-        self.assertEqual(self.mailbox(), [])
+        mark, out = self.freeze()
+        self.assertIn(mark["id"], [row["id"] for row in self._frozen_marks()])
+        self.assertIn(out.get("state"), ("waiting", "designated"), out)
+        if out.get("state") == "waiting":
+            self.assertIn("by author delta", out["why"])
 
     def test_one_author_family_leaves_the_freeze_legal(self):
         self._head([("author", "deepseek"), ("author", "deepseek")])
@@ -268,23 +338,44 @@ class FreezeRefusalTest(_ActivationFixture, PgTestCase):
         self.assertIn(mark["id"], [row["id"] for row in self._frozen_marks()])
         self.assertEqual(out["state"], "designated")
 
-    def test_a_corrector_that_consumes_the_last_free_family_refuses(self):
+    def test_a_corrector_leaves_the_designation_waiting(self):
         self._head([("author", "deepseek"), ("r1", "claude")])
         # r1 est le relecteur désigné du gel précédent : son commit est un
         # correctif de relecteur, pas un commit d'auteur ordinaire.
         self.db.execute("UPDATE work_items SET reviewers = ARRAY['r1'] WHERE id = %s",
                         (self.lot,))
+        # #7745 : la politique garde trois familles, chaque delta reste
+        # structurellement couvrable ; la désignation, elle, n'a que claude et
+        # codex disponibles (r1 correcteur exclu par son nom) et le delta
+        # claude n'a que codex : elle attend.
+        mark, out = self.freeze()
+        self.assertIn(mark["id"], [row["id"] for row in self._frozen_marks()])
+        self.assertEqual(out["state"], "waiting", out)
+        self.assertIn("1 missing", out["why"])
+
+    def _two_family_canon(self):
+        """Une politique à deux familles : le delta claude n'a que codex."""
+        text = MECHANICS.replace("families: [claude, codex, deepseek]",
+                                 "families: [claude, codex]")
+        self.canon = _Canon(os.path.join(self.tmp,
+                                        "canon-2-" + self._testMethodName),
+                            mechanics=text)
+        self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root,
+                                       canon_ref="HEAD")
+
+    def test_two_policy_families_refuse_the_freeze(self):
+        self._two_family_canon()
+        self._head([("author", "deepseek"), ("r1", "claude")])
         with self.assertRaises(work.WorkError) as caught:
             self.freeze()
         text = str(caught.exception)
-        self.assertIn("r1", text)
-        self.assertIn("reviewer correction", text)
-        # codex reste la seule famille : insuffisant pour deux avis.
-        self.assertIn("1 eligible family", text)
+        self.assertIn("freeze refused (author-families)", text)
+        self.assertIn("delta", text)
         self.assertEqual(self._frozen_marks(), [])
 
     def test_the_default_hook_refuses_too(self):
-        self._head([("author", "deepseek"), ("r1", "claude"), ("r2", "codex")])
+        self._two_family_canon()
+        self._head([("author", "deepseek"), ("r1", "claude")])
         db = self.connect(canon=self.canon.root, canon_ref="HEAD")
         try:
             with self.assertRaises(work.WorkError):
@@ -297,7 +388,8 @@ class FreezeRefusalTest(_ActivationFixture, PgTestCase):
     def test_the_deferred_hook_still_refuses(self):
         # #5481 : la désignation est repoussée après le report, mais le refus
         # #3742 reste un fait du gel : le jalon ne doit pas être écrit.
-        self._head([("author", "deepseek"), ("r1", "claude"), ("r2", "codex")])
+        self._two_family_canon()
+        self._head([("author", "deepseek"), ("r1", "claude")])
         db = self.connect(canon=self.canon.root, canon_ref="HEAD")
         try:
             with self.assertRaises(work.WorkError):

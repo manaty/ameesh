@@ -29,7 +29,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import cli, config, notify
-from ameesh import nexlink_alerts as nx
+from ameesh.modules.nexlink import alerts as nx
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy"
@@ -57,7 +57,7 @@ class ActivationTest(unittest.TestCase):
     """Le contrôle d'activation : rouge sans crypto, vert avec (ou repli)."""
 
     def activation(self, raw, env=None):
-        return notify.nexlink_activation(SimpleNamespace(notify=raw),
+        return notify.channel_activation(SimpleNamespace(notify=raw),
                                          env={} if env is None else env)
 
     def test_sans_crypto_le_canal_est_refuse_et_nomme(self):

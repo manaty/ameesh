@@ -4875,7 +4875,7 @@ class _Loader:
             if not isinstance(value, dict) or not all(caps.values()):
                 self.add("host-policy-invalid", ERROR,
                          "`policy.resources.agent_memory_max_by_agent`: mapping "
-                         "{agent: size} expected (e.g. mesh-design: 8G)", **where, **subject)
+                         "{agent: size} expected (e.g. <agent>: 8G)", **where, **subject)
                 continue
             parsed[key] = caps
         for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)

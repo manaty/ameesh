@@ -1,0 +1,35 @@
+[Unit]
+Description=ameesh credential gate broker (KMS/IAM and GitHub production, #7767)
+Documentation=file:/usr/share/doc/ameesh/pre-act-credentials-7767.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ameesh-gate
+Group=ameesh-gate
+RuntimeDirectory=ameesh-gate
+RuntimeDirectoryMode=0755
+Environment=HOME=/var/lib/ameesh-gate
+Environment=AMEESH_CONFIG=/etc/ameesh-gate/config.json
+Environment=AMEESH_CREDENTIAL_GATE=/etc/ameesh-gate/broker.json
+ExecStart=/var/lib/ameesh-gate/venv/bin/ameesh gate broker serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/ameesh-gate /run/ameesh-gate
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native

@@ -325,24 +325,21 @@ def mesh_headers(secret, body: bytes, *, key_id: str = MESH_ALERT_KEY_ID,
             "X-Mesh-Signature": mesh_signature(secret, key_id, timestamp, body)}
 
 
-#: espace de noms fixe des `alert_id` du canal (UUIDv5, jamais un UUIDv4 :
-#: la même alerte garde la même ligne après un redémarrage).
-ALERT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "ameesh:mesh-alert:v1")
-
-
 def alert_id_for(identity: str) -> str:
-    """`alert_id` : UUIDv5 déterministe de l'identité de registre (#2395).
+    """`alert_id` : l'identité générique du cœur (`notify.alert_id_for`).
 
     L'API #3537 stocke `alert_id` en colonne `uuid` ; une même identité
-    (clé, sévérité, humain, `since`) donne donc toujours le même UUID.
-    """
-    return str(uuid.uuid5(ALERT_NAMESPACE, str(identity)))
+    (clé, sévérité, humain, `since`) donne donc toujours le même UUID. Le
+    cœur porte l'algorithme (UUIDv5, #2395) ; l'import est paresseux pour que
+    ce module de cryptographie reste utilisable seul."""
+    from ... import notify
+    return notify.alert_id_for(identity)
 
 
 def delivery_key(event: str, alert_id: str) -> str:
     """Clé d'idempotence d'un envoi : l'`alert_id`, comme l'exige #3537.
 
-    Une résolution n'est pas poussée au hub en v1 (`_nexlink` la saute) : il
-    n'y a donc qu'un envoi par alerte, et le serveur déduplique par cette clé.
+    Une résolution n'est pas poussée au hub en v1 (`send` la saute) : il n'y
+    a donc qu'un envoi par alerte, et le serveur déduplique par cette clé.
     """
     return str(alert_id)

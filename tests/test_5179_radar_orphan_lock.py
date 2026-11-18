@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import os
 import subprocess
+import sys
 import time
 import unittest
 from unittest import mock
@@ -39,6 +40,8 @@ class _Clone(_Land):
         return path
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "lock proofs read /proc and Linux git lock semantics")
 class SweepTest(_Clone):
     def test_each_kind_of_orphan_lock_is_removed_and_journaled(self):
         clone = self.clone()
@@ -142,6 +145,8 @@ class SweepTest(_Clone):
             self.assertFalse(os.path.exists(path))
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "lock proofs read /proc and Linux git lock semantics")
 class LandTest(_Clone):
     def test_an_orphan_lock_no_longer_stops_the_landing(self):
         self.queued(4)
@@ -165,6 +170,8 @@ class LandTest(_Clone):
                          and n.endswith(":" + path)], notes)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "lock proofs read /proc and Linux git lock semantics")
 class FetchTest(_Clone):
     """B1 de la relecture : `fetch_fresh` écrit `refs/ameesh/queue/**` hors du
     verrou de clone."""

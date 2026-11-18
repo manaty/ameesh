@@ -1,0 +1,44 @@
+{
+  "schema": "ameesh-credential-gate/1",
+  "socket": "/run/ameesh-gate/broker.sock",
+  "socket_group": "ameesh-gate-client",
+  "agent": "bureau",
+  "callers": {
+    "uids": [],
+    "groups": ["ameesh-gate-client"]
+  },
+  "env": {
+    "CLOUDSDK_CONFIG": "/var/lib/ameesh-gate/gcloud",
+    "GH_CONFIG_DIR": "/var/lib/ameesh-gate/gh"
+  },
+  "max_wait_seconds": 86400,
+  "command_timeout_seconds": 900,
+  "max_output_bytes": 1048576,
+  "rules": [
+    {
+      "id": "kms-keyring-describe",
+      "kind": "kms",
+      "exe": "/usr/bin/gcloud",
+      "argv": ["kms", "keyrings", "describe"],
+      "targets": ["nexlink-messages"],
+      "fixed": {"--project": "nexlink-prod", "--location": "asia-southeast1"}
+    },
+    {
+      "id": "kms-keys-list",
+      "kind": "kms",
+      "exe": "/usr/bin/gcloud",
+      "argv": ["kms", "keys", "list"],
+      "fixed": {"--project": "nexlink-prod", "--location": "asia-southeast1",
+                "--keyring": "nexlink-messages"}
+    },
+    {
+      "id": "prod-workflow-run",
+      "kind": "prod",
+      "exe": "/usr/bin/gh",
+      "argv": ["workflow", "run"],
+      "project": "nexlink",
+      "repo": "manaty/nexlink",
+      "inputs": []
+    }
+  ]
+}

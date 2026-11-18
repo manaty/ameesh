@@ -171,6 +171,8 @@ MOTIF_N1 = ('aucun tag de release atteignable (clone sans tags)' if not TAG else
             % (TAG, VERSION or 'illisible'))
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "previous-release CLI harness fakes Linux ssh/systemd and /proc")
 @unittest.skipUnless(REQUIS or (TAG and TAG_FIABLE), MOTIF_N1)
 class PreflightCliPrecedentTest(VmAgentsHarness):
     cli = TAG  # la release dont le code est le CLI installé

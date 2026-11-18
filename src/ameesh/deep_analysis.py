@@ -27,6 +27,7 @@ import re
 import time
 
 from . import storage
+from .roles import AUDITOR_ROLES
 
 #: déclencheurs connus → libellé du courrier (`%s` : qui a déclenché) ; le
 #: cœur ne porte que `bug_p1`, les modules ajoutent les leurs
@@ -202,10 +203,10 @@ def message(item: dict, why: str) -> str:
         "record it on the lot: which lot delivered the defect (commit, PR), which "
         "review let it pass (verdict, reviewer), which gate was missing; end with one "
         "follow-up lot per missing gate. First report on the lot within %d min, "
-        "measured: ameesh work note %d \"Deep analysis: …\". Method: docs/AUDITEUR.md, "
+        "measured: ameesh work note %d \"Deep analysis: …\". Method: docs/%s.md, "
         "« Analyse profonde »."
         % (why, int(item["id"]), item.get("title") or "?", int(DEADLINE_S // 60),
-           int(item["id"])))
+           int(item["id"]), AUDITOR_ROLES[0].upper()))
 
 
 def _auditors(db, cfg, listing=None) -> list[str]:

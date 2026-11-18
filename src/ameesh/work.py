@@ -42,6 +42,7 @@ from urllib.parse import quote
 
 from . import storage
 from .db import Db, DbError, is_unique_violation
+from .roles import DESIGN_ROLES, ORCHESTRATOR_ROLES
 from .storage import interface
 from .storage.postgres import work as _pg
 
@@ -102,7 +103,7 @@ def development_transitions() -> dict:
 
 
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
-CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
+CORRECTOR_ROLES = ORCHESTRATOR_ROLES + DESIGN_ROLES
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
 #: portée par la note de la dernière attribution du lot (jamais une exemption
 #: silencieuse de qui a assigné le lot).
@@ -502,8 +503,8 @@ def publisher(cfg, db, explicit: str | None = None) -> str:
         raise WorkError("--publish refused: invalid session identity (%s)"
                         % (binding.reason or "unbound identity"))
     refus = ("--publish refused: %s is not the auditor; the reference table (L157b) "
-             "is the auditor's pass (the auditeur role on its Agent card in the canon); "
-             "work estimates without --publish reads it")
+             "is the auditor's pass (the declared audit role on its Agent card in "
+             "the canon); work estimates without --publish reads it")
     if binding.name:
         if text and text != binding.name:
             raise WorkError("--publish refused: this session belongs to %s, it does "

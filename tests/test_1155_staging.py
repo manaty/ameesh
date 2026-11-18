@@ -91,6 +91,12 @@ if grep -qx "ko=$host:$action" "$state/scenario" 2>/dev/null; then
   echo "echec injecte : $host $action" >&2
   exit 1
 fi
+# #7785 : la sante demande les unites runner desactivees de cet hote ; le
+# scenario les declare en `unite-desactivee=<hote>:<persona>`.
+if [ "$action" = unites-desactivees ]; then
+  sed -n "s/^unite-desactivee=$host://p" "$state/scenario" 2>/dev/null || true
+  exit 0
+fi
 if [ "$action" = installer ]; then
   printf '%s' "${2:0:7}" > "$state/venv-$host"
   if [ "$host" = pc-smichea ]; then
@@ -827,14 +833,17 @@ class StagingTest(unittest.TestCase):
             ('ameesh-agents-1', 'redemarrer'),
             ('ameesh-agents-1', 'timers'),
             ('ameesh-agents-1', 'controler'),
+            ('ameesh-agents-1', 'unites-desactivees'),
             ('ameesh-agents-2', 'installer'),
             ('ameesh-agents-2', 'redemarrer'),
             ('ameesh-agents-2', 'timers'),
             ('ameesh-agents-2', 'controler'),
+            ('ameesh-agents-2', 'unites-desactivees'),
             ('ameesh-agents-3', 'installer'),
             ('ameesh-agents-3', 'redemarrer'),
             ('ameesh-agents-3', 'timers'),
             ('ameesh-agents-3', 'controler'),
+            ('ameesh-agents-3', 'unites-desactivees'),
             ('manaty-mesh-1', 'installer'),
             ('manaty-mesh-1', 'redemarrer'),
             ('manaty-mesh-1', 'controler'),
@@ -843,6 +852,7 @@ class StagingTest(unittest.TestCase):
             ('pc-smichea', 'redemarrer'),
             ('pc-smichea', 'timers'),
             ('pc-smichea', 'controler'),
+            ('pc-smichea', 'unites-desactivees'),
         ])
         self.assertIn('venv-ameesh doctor --harness', self.calls())
         # #4050 : le clone des migrations n'est exige que du chemin sans poste ;
@@ -1829,6 +1839,50 @@ class StagingTest(unittest.TestCase):
         sondes = [l for l in self.calls() if 'sante-courrier.py' in l]
         self.assertTrue(sondes, self.calls())
         self.assertIn('--attente-cible 300', sondes[0])
+
+    def test_7785_sante_recoit_les_unites_desactivees_de_chaque_hote(self):
+        """#7785 : les noms lus par le script de l'hote (vm.sh / poste.sh)
+        arrivent a sante-courrier.py en `--unite-desactivee` ; le serveur, qui
+        n'a pas ces unites, n'en demande pas et n'en recoit pas."""
+        (self.state / 'scenario').write_text(
+            'unite-desactivee=ameesh-agents-1:dev8\n'
+            'unite-desactivee=ameesh-agents-1:dev9\n'
+            'unite-desactivee=pc-smichea:poste-eteint\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        sondes = [l for l in self.calls()
+                  if l.startswith('venv-python ') and 'sante-courrier.py' in l]
+        vm = [l for l in sondes if '--hote ameesh-agents-1' in l]
+        self.assertEqual(len(vm), 1, sondes)
+        self.assertIn('--unite-desactivee dev8', vm[0])
+        self.assertIn('--unite-desactivee dev9', vm[0])
+        poste = [l for l in sondes if '--hote pc-smichea' in l]
+        self.assertEqual(len(poste), 1, sondes)
+        self.assertIn('--unite-desactivee poste-eteint', poste[0])
+        serveur = [l for l in sondes if '--hote manaty-mesh-1' in l]
+        self.assertEqual(len(serveur), 1, sondes)
+        self.assertNotIn('--unite-desactivee', serveur[0])
+        self.assertIn(('ameesh-agents-1', 'unites-desactivees'), self.actions())
+        self.assertNotIn(('manaty-mesh-1', 'unites-desactivees'), self.actions())
+
+    def test_7785_lecture_des_unites_en_echec_laisse_la_sante_stricte(self):
+        """Une lecture en echec n'est pas devinee : avertissement, sante sans
+        tolerance, et l'hote ne devient pas malsain pour autant."""
+        (self.state / 'scenario').write_text(
+            'ko=ameesh-agents-2:unites-desactivees\n'
+            'unite-desactivee=ameesh-agents-2:dev8\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertIn('unites desactivees de ameesh-agents-2 : lecture non'
+                      ' concluante', p.stderr)
+        sondes = [l for l in self.calls()
+                  if l.startswith('venv-python ') and 'sante-courrier.py' in l
+                  and '--hote ameesh-agents-2' in l]
+        self.assertEqual(len(sondes), 1, self.calls())
+        self.assertNotIn('--unite-desactivee', sondes[0])
+        self.assertTrue(any(t['hote'] == 'ameesh-agents-2'
+                            and t['etape'] == 'sante' and t['verdict'] == 'ok'
+                            for t in self.traces()))
 
     def test_outside_main_is_refused_without_override(self):
         self.repo.joinpath('marque').write_text('y\n')

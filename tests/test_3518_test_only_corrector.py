@@ -95,7 +95,18 @@ class TestOnlyCorrectorTest(PgTestCase):
         self.freeze(["tests/test_product.py", "src/ameesh/work.py"])
         out = self.gate()
         self.assertFalse(out["ok"], out)
-        self.assertEqual([row["actor"] for row in out["accepted"]], ["dev1"])
+        # #7745 : l'exclusion de famille se lit par delta. cx2/codex a écrit un
+        # delta produit : codex ne relit pas ce delta, qui n'a qu'un avis
+        # (dev1/claude) et laisse la porte fermée. L'avis de cx3/codex reste
+        # retenu pour le delta de l'auteur (deepseek), qu'il n'a pas écrit.
+        self.assertEqual({row["actor"] for row in out["accepted"]},
+                         {"cx3", "dev1"})
+        codex_delta = [row for row in out["deltas"]
+                       if "codex" in row["families"]]
+        self.assertEqual(len(codex_delta), 1, out["deltas"])
+        self.assertFalse(codex_delta[0]["covered"])
+        self.assertEqual(codex_delta[0]["missing"], 1)
+        self.assertNotIn("codex", codex_delta[0]["eligible"])
 
     def test_ci_plan_correction_excludes_family(self):
         self.freeze(["tests/parts/always.txt"])
@@ -133,14 +144,21 @@ class TestOnlyCorrectorTest(PgTestCase):
 
     def test_nexlink_sensitive_specs_with_product_file_exclude_family(self):
         # Témoin #3577 : un seul fichier produit sous le même chemin sensible
-        # suffit à exclure la famille du correcteur.
+        # suffit à exclure la famille du correcteur **de son delta** (#7745).
+        # La porte reste fermée : le delta produit n'a que l'avis claude.
         self.set_app("nexlink")
         self.freeze(["backend/src/modules/licoin/licoin.service.spec.ts",
                      "backend/test/licoin.e2e-spec.ts",
                      "backend/src/modules/licoin/licoin.service.ts"])
         out = self.gate()
         self.assertFalse(out["ok"], out)
-        self.assertEqual([row["actor"] for row in out["accepted"]], ["dev1"])
+        self.assertEqual({row["actor"] for row in out["accepted"]},
+                         {"cx3", "dev1"})
+        codex_delta = [row for row in out["deltas"]
+                       if "codex" in row["families"]]
+        self.assertEqual(len(codex_delta), 1, out["deltas"])
+        self.assertFalse(codex_delta[0]["covered"])
+        self.assertEqual(codex_delta[0]["missing"], 1)
 
     def test_unknown_policy_does_not_grant_an_exception(self):
         self.freeze(["tests/test_product.py"])

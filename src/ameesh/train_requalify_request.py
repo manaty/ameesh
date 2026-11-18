@@ -69,6 +69,11 @@ def request(cfg, db, project, *, lot, reviews, actor, dry_run=False,
     :func:`ameesh.train_requalify_review.actor` before calling this function,
     and the authority of the move remains the pilot opinion checked by
     ``qualify`` on the holder.
+
+    #7806: the durable insert also emits a project-scoped ``ameesh_train``
+    wake-up in the same transaction. The live holder applies the request at
+    once instead of waiting for the next hourly passage; the hint carries no
+    authority, and an idempotent retry emits no second signal.
     """
     references = _references(reviews)
     raw = getattr(cfg, "train", None) or {}
