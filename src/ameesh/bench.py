@@ -509,8 +509,8 @@ def _local_fqdn() -> str:
 
     `socket.getfqdn()` peut bloquer des dizaines de secondes (DNS/mDNS macOS) :
     il n'est donc appelé que pour un hôte qui n'est ni une adresse de boucle
-    locale ni le nom court de la machine. Le cache évite de payer la résolution
-    à chaque classe de test (`_bench_roles`/`_bench_satellites`).
+    locale ni le nom rendu par `socket.gethostname()`. Le cache évite de payer
+    la résolution à chaque classe de test (`_bench_roles`/`_bench_satellites`).
     """
     global _LOCAL_FQDN
     if _LOCAL_FQDN is None:
@@ -536,8 +536,11 @@ def _local_dsn(dsn: str) -> bool:
     if host in ("127.0.0.1", "localhost", "::1"):
         return True
     nom = socket.gethostname().lower().rstrip(".")
-    if host in (nom, nom.split(".", 1)[0]):
+    if host == nom:
         return True
+    # Jamais le premier label d'un nom qualifié (`bench` pour `bench.local`) :
+    # il peut résoudre ailleurs, et ces purges utilisent un PID local comme
+    # preuve de propriété. Seul le FQDN rendu par la résolution fait foi.
     return host == _local_fqdn()
 
 

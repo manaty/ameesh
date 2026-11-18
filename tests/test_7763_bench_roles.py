@@ -19,7 +19,7 @@ class LocalDsnTest(unittest.TestCase):
     macOS, ce qui faisait dépasser le plafond des parts nocturnes.
     """
 
-    def test_loopback_and_short_host_never_resolve(self):
+    def test_loopback_and_hostname_never_resolve(self):
         with mock.patch.object(bench.socket, "getfqdn",
                                side_effect=AssertionError("DNS lookup")), \
                 mock.patch.object(bench.socket, "gethostname",
@@ -27,9 +27,28 @@ class LocalDsnTest(unittest.TestCase):
             for dsn in ("",
                         "postgresql://ameesh@127.0.0.1:5432/ameesh",
                         "postgresql://ameesh@localhost/ameesh",
-                        "postgresql://ameesh@bench.local/ameesh",
-                        "postgresql://ameesh@bench/ameesh"):
+                        "postgresql://ameesh@bench.local/ameesh"):
                 self.assertTrue(bench._local_dsn(dsn), dsn)
+
+    def test_first_label_of_a_qualified_hostname_is_not_local(self):
+        # B #7802 : `bench` ne doit pas valoir `bench.local` sans résolution.
+        # La purge des rôles/schémas prend un PID local comme preuve de
+        # propriété : l'accepter ferait supprimer sur une base distante.
+        with mock.patch.object(bench.socket, "gethostname",
+                               return_value="bench.local"), \
+                mock.patch.object(bench, "_local_fqdn",
+                                  return_value="bench.local") as fqdn:
+            self.assertFalse(bench._local_dsn(
+                "postgresql://ameesh@bench/ameesh"))
+            fqdn.assert_called_once()
+        # Un nom non qualifié, lui, reste accepté : c'est exactement ce que
+        # rend gethostname(), sans résolution.
+        with mock.patch.object(bench.socket, "gethostname",
+                               return_value="bench"), \
+                mock.patch.object(bench, "_local_fqdn",
+                                  side_effect=AssertionError("DNS lookup")):
+            self.assertTrue(bench._local_dsn(
+                "postgresql://ameesh@bench/ameesh"))
 
     def test_fqdn_is_resolved_once_for_a_remote_shaped_name(self):
         with mock.patch.object(bench.socket, "gethostname",
