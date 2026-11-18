@@ -13,19 +13,33 @@ import hashlib
 import json
 import math
 import os
-import re
 import sys
 import time
 import uuid
 
 from . import config, db as db_mod, identity, planned_waits, storage
 
-_STOP = re.compile(r"\b(?:stop|arr[êe]t|suspend(?:re|u|ue|us|ues|ez|ons)?|"
-                   r"annul(?:er|e|é|ée|ez)|halt)\b", re.I)
-
 
 class Refused(Exception):
     pass
+
+
+def database_now(db):
+    """La borne de lecture lue sur l'horloge de la base (#7775).
+
+    Les `created_at` du journal et du courrier sont écrits par la base ; une
+    borne prise sur l'horloge de l'hôte peut donc manquer un STOP (hôte en
+    retard) ou en inventer un (hôte en avance). On lit `now()` dans la même
+    horloge que les événements, avant l'attente, puis on ferme la connexion.
+    """
+    rows = db.query("SELECT extract(epoch from now())::float8 AS now_ts")
+    try:
+        value = float(rows[0]["now_ts"])
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise Refused("database clock unavailable") from exc
+    if not math.isfinite(value):
+        raise Refused("database clock unreadable")
+    return value
 
 
 def parse_since(value):
@@ -62,20 +76,21 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
         hold_events.append(dict(event, note="" if own else note))
         if own:
             continue
-        stop_hold = planned_waits.is_hold_note(note) and bool(_STOP.search(note))
-        if float(event["created_ts"]) >= since and (stop_hold or (not planned_waits.is_hold_note(note)
-                                                                  and _STOP.search(note))):
+        stop_hold = planned_waits.is_stop_hold(note)
+        if float(event["created_ts"]) >= since and (
+                stop_hold or (not planned_waits.is_hold_note(note)
+                              and planned_waits.contains_stop(note))):
             raise Refused("hold or STOP in lot event #%s" % event["id"])
     def preserve_stop(event, hold):
         who = (event.get("actor") or "").removeprefix("agent:")
         author = (hold.get("by") or "").removeprefix("agent:")
         return (who == actor.removeprefix("agent:") and author != who
-                and bool(_STOP.search(hold.get("note") or "")))
+                and planned_waits.is_stop_hold(hold.get("note") or ""))
 
     holds = planned_waits.active_holds(
         tx, hold_events, cfg=cfg, strict=True, preserve_on_transition=preserve_stop).get(lot, {})
     for hold in holds.values():
-        if _STOP.search(hold.get("note") or ""):
+        if planned_waits.is_stop_hold(hold.get("note") or ""):
             raise Refused("active STOP hold by %s" % hold.get("by"))
 
     # Include both structured lot mail and prose references, and inspect STOPs
@@ -93,7 +108,8 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
             continue
         if message.get("recipient") == actor and message.get("unread"):
             raise Refused("unread lot mail #%s" % message["id"])
-        if float(message["ts"]) >= since and _STOP.search(message.get("body") or ""):
+        if float(message["ts"]) >= since and planned_waits.contains_stop(
+                message.get("body") or ""):
             raise Refused("STOP in lot mail #%s" % message["id"])
         if message.get("decision_state") == "withdrawn":
             try:
@@ -235,15 +251,24 @@ def main(argv=None):
             if not command:
                 raise Refused("--wait-until requires a command after --")
             deadline = parse_since(args.wait_until)
-            since = time.time()
+        else:
+            since = parse_since(args.since)
+        cfg = config.load()
+        if args.wait_until:
+            # The reading bound must share the clock of the created_at it is
+            # compared to. Read it in the database, before waiting, then close
+            # the connection: the check reopens a fresh one (#7775).
+            db = db_mod.open_db(cfg)
+            if storage.is_remote(db):
+                raise Refused("transactional database connection required")
+            since = database_now(db)
+            db.close()
+            db = None
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
                 time.sleep(remaining)
-        else:
-            since = parse_since(args.since)
-        cfg = config.load()
         db = db_mod.open_db(cfg)
         if storage.is_remote(db):
             raise Refused("transactional database connection required")

@@ -90,6 +90,20 @@ HOLD_NOTE_PATTERNS = (_HOLD.pattern, _LIFT.pattern)
 #: ordinaire, comme le veut le motif exact.
 _HOLD_LIKE = re.compile(r"^hold(?=[\s:(])", re.I)
 
+#: #7775 : les mots d'arrêt d'un hold. La forme **structurée** d'un hold
+#: d'arrêt est `hold: STOP …` : le motif s'ouvre sur l'un de ces mots. Le même
+#: vocabulaire reconnaît un mot d'arrêt dans un texte libre (note ou courrier),
+#: où il compte n'importe où dans le texte (#7761).
+_STOP_WORD = re.compile(
+    r"\b(?:stop|arr[êe]t|suspend(?:re|u|ue|us|ues|ez|ons)?|"
+    r"annul(?:er|e|é|ée|ez)|halt)\b", re.I)
+#: #7775 : le hold d'arrêt structuré. Un hold ordinaire (« hold: aucun geste
+#: avant le go owner ») ne bloque pas un acte, même si son texte cite un arrêt
+#: plus loin : le garde ne lit que la tête du motif.
+_STOP_HOLD = re.compile(
+    "^" + re.escape(LotSessions.HOLD_PREFIX) + "[" + HOLD_NOTE_WHITESPACE + "]*"
+    r"(?:" + _STOP_WORD.pattern + ")", re.I)
+
 #: #5484 : une note qui annonce en **prose** la levée d'un hold (« le hold du
 #: staging est levé », « holds lifted ») ne lève rien : le journal ne lit que
 #: la forme exacte `_LIFT`. Le chemin d'écriture prévient quand un hold est
@@ -181,6 +195,21 @@ def is_hold_note(text) -> bool:
     celui du réveil (règle 1) ; seule la retenue d'un pilote compte pour la
     stagnation (`pilot_holds`)."""
     return bool(_HOLD.match(str(text or "").strip()))
+
+
+def is_stop_hold(text) -> bool:
+    """#7775 : la forme structurée d'un hold d'arrêt (`hold: STOP …`).
+
+    Un hold ne vaut arrêt que si son motif s'ouvre sur un mot d'arrêt. Un hold
+    ordinaire (« hold: aucun geste avant le go owner ») ne bloque pas un acte,
+    même si le texte cite un arrêt plus loin ; la graphie `hold: STOP` est la
+    forme écrite et testée du hold d'arrêt."""
+    return bool(_STOP_HOLD.match(str(text or "").strip()))
+
+
+def contains_stop(text) -> bool:
+    """#7761/#7775 : un mot d'arrêt dans un texte libre (note ou courrier)."""
+    return bool(_STOP_WORD.search(str(text or "")))
 
 
 def ready_hold_warning(db, item_id: int, text: str) -> str:
