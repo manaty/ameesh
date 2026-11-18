@@ -78,10 +78,15 @@ class PressionTest(PgTestCase):
             worker.watchdog_stop.set()
         super().tearDown()
 
-    def _worker(self, name: str, prompt: str | None = "travail") -> AgentWorker:
+    def _worker(self, name: str, prompt: str | None = "travail", *,
+                roles=None) -> AgentWorker:
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
         self.register(name, "claude", cwd=cwd, prompt=prompt)
+        if roles is not None:
+            # #7661 : le rôle se lit sur la fiche, jamais sur le nom.
+            self.db.execute("UPDATE agent_registry SET roles = %s WHERE name = %s",
+                            (list(roles), name))
         lease = registry.claim(self.db, name, self.executeur.runner_id, 3600)
         self.assertIsNotNone(lease)
         worker = AgentWorker(self.executeur, registry.get(self.db, name), lease)
@@ -112,7 +117,7 @@ class PressionTest(PgTestCase):
         self.assertTrue(ouvrier._held_by_pressure(NON_CRITIQUE))
 
     def test_auditeur_passe_et_leve_une_ancienne_pause_de_charge(self):
-        auditeur = self._worker("auditeur")
+        auditeur = self._worker("auditeur", roles=["auditeur"])
         # Le scope mémoire de L234 n'existe que sous Linux ; le sujet ici est
         # la décision de l'exécuteur, pas le lancement de systemd-run (couvert
         # par test_l234_auditor). On pose donc sa disponibilité.

@@ -256,7 +256,7 @@ class PriseDeLotTest(_Lots):
         self.assertTrue(db_mod.is_deadlock(errors[0]), errors[0].sqlstate)
 
     def test_auditeur_ne_prend_que_les_bugs_hors_instructions_protegees(self):
-        self.agent("auditeur", team="ameesh")
+        self.agent("auditeur", team="ameesh", roles=("auditeur",))
         evolution = self.lot("Évolution de la surveillance", app="ameesh", type="evolution")
         protected = self.lot("Bug de docs/AUDITEUR.md", app="ameesh", type="bug")
         bug = self.lot("Crash du runner", app="ameesh", type="bug")

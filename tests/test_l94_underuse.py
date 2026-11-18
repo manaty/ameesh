@@ -277,6 +277,9 @@ class IdleCapacityTest(_Base):
         réveillabilité du débit (`file_decoupage.wakeable`) ; l'alerte ne le
         compte pas, même quand un lot démarrable attend."""
         self.agent("auditeur")
+        # #7661 : le rôle se lit sur la fiche, pas sur le nom de la persona.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                        " WHERE name = 'auditeur'")
         work.add(self.db, title="à prendre")
         self.assertEqual(self.alertes(), [])
         self.assertEqual(sous_utilisation.idle_capacity(

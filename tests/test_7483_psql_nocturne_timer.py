@@ -121,7 +121,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertLessEqual(nocturne.END_HOUR * 60 + job["timeout-minutes"], 7 * 60)
 
     def test_daily_timer_installed_under_elected_role_only(self):
-        from tests.test_6777_carte_role_timer import plan
+        from tests.test_6777_carte_role_timer import plan, row
         report = plan()
         item = next(t for t in report["timers"] if t["name"] == "psql-nocturne")
         self.assertEqual(item["unit"], "ameesh-psql-nocturne")
@@ -131,7 +131,9 @@ class WorkflowTest(unittest.TestCase):
                          role_timers.render_timer(spec))
         self.assertEqual((REPO / "deploy/systemd/ameesh-psql-nocturne.service").read_text(),
                          role_timers.render_service(spec, role="mesh-design"))
-        self.assertNotIn("psql-nocturne", [t["name"] for t in plan(role="auditeur")["timers"]])
+        self.assertNotIn("psql-nocturne", [t["name"] for t in plan(
+            role="auditeur",
+            row_value=dict(row(), name="auditeur", roles=["auditeur"]))["timers"]])
         self.assertNotIn("psql-nocturne", [t["name"] for t in plan(projects={})["timers"]])
         with tempfile.TemporaryDirectory() as directory:
             role_timers.install(report, directory=Path(directory), apply=False, bin_path="/opt/ameesh/bin/ameesh")
