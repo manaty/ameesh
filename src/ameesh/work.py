@@ -4674,11 +4674,12 @@ def _deliver_document(db: Db, item_id: int, *, evidence: dict, actor: str = "",
 
 
 def _deliver_done(db: Db, item_id: int, *, evidence: dict, actor: str = "",
-                  note: str = "") -> dict:
+                  note: str = "", fresh: bool = False) -> dict:
     """Connecteur `done` : livré sans fusion (un avis, une analyse, #1280)."""
     if evidence:
         raise WorkError("done: takes no evidence, not %s" % ", ".join(sorted(evidence)))
-    return _close(db, item_id, done=True, note=note, actor=actor, connector="done")
+    return _close(db, item_id, done=True, note=note, actor=actor, connector="done",
+                  fresh=fresh)
 
 
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
@@ -4739,9 +4740,72 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
                   note=note, actor=actor)
 
 
+def _moment_utc(ts) -> str:
+    """Un instant epoch en UTC lisible (une preuve, pas un âge relatif)."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(float(ts)))
+    except (TypeError, ValueError, OverflowError):
+        return "?"
+
+
+def fresh_closure_refusal(db: Db, item: dict) -> str | None:
+    """#7782 : pourquoi ce lot n'est pas **vierge** pour une clôture par preuve.
+
+    La passe de cohérence #4172 ne ferme un constat `already_done` que sur un
+    lot encore intact. Un lot revenu en `intake` après un début de travail
+    garde son début mesuré (`started_ts`, L157) : une citation Git ne prouve
+    pas que la sous-étape restante est livrée. Une retenue active (`hold:`,
+    #1664/#3219) dit de même qu'un geste est attendu, quelle que soit la
+    citation. Rend la raison vérifiable (début daté, auteurs de la retenue),
+    ou None si le lot est vierge.
+
+    Lecture seule ; `close_fresh` refait ce contrôle sous le verrou de ligne
+    du lot, avec l'état, la branche et la PR relus : un début ou une retenue
+    concurrents ne se glissent pas entre le constat et la fermeture.
+    """
+    state = str(item.get("state") or "")
+    if state not in (lifecycle.REQUESTED, lifecycle.BLOCKED):
+        return "state %s is not closable" % state
+    if str(item.get("branch") or "").strip() or str(item.get("pr_ref") or "").strip():
+        return "lot carries a branch or a PR"
+    started = item.get("started_ts")
+    if started is not None:
+        return "lot already started (%s)" % _moment_utc(started)
+    holds = _active_holds(db, int(item["id"]))
+    if holds:
+        since = min(float(hold.get("since") or 0.0)
+                    for hold in holds.values())
+        return ("lot has an active hold by %s (since %s)"
+                % (_hold_holders(holds), _moment_utc(since)))
+    return None
+
+
+def close_fresh(db: Db, item_id: int, *, note: str = "",
+                actor: str = "") -> dict:
+    """#7782 : clôture `done` réservée à un lot **vierge**.
+
+    Même porte que `close --done`, mais l'état, l'absence de branche/PR, le
+    début mesuré et les retenues actives sont relus sous le verrou de ligne du
+    lot (`work.lock`, celui de `note`/`move`/`mark_started`) : un démarrage ou
+    un `hold:` concurrent ne peut plus passer entre le contrôle et l'écriture.
+    Un lot démarré ou retenu est refusé par un `WorkError` qui nomme la preuve,
+    sans rien écrire. La clôture manuelle (`close --done`) reste ouverte à un
+    opérateur : la garde est celle de la passe automatique de cohérence.
+    """
+    if storage.is_remote(db):
+        # #7782 : le journal des retenues n'est pas au contrat médié et aucun
+        # verrou de ligne ne tient d'une requête à l'autre : refuser plutôt
+        # que fermer sur une précondition qu'on ne peut pas prouver.
+        raise WorkError("close_fresh: start and hold preconditions are not "
+                        "readable on a mediated connection")
+    return deliver(db, item_id, connector="done", evidence={}, actor=actor,
+                   note=note, fresh=True)
+
+
 def _close(db: Db, item_id: int, *, abandoned: bool = False,
            superseded_by: int | None = None, delivered: bool = False, done: bool = False,
-           sha: str = "", note: str = "", actor: str = "", connector: str = "") -> dict:
+           sha: str = "", note: str = "", actor: str = "", connector: str = "",
+           fresh: bool = False) -> dict:
     """Le corps de `close` : une porte, déjà choisie et validée par l'appelant
     (`close`, ou les connecteurs `document` et `done` de `deliver`)."""
     head = (sha or "").strip().lower()
@@ -4810,6 +4874,20 @@ def _close(db: Db, item_id: int, *, abandoned: bool = False,
     threads: list = []
     with db.transaction() as tx:
         work_dependencies.lock(tx)
+        if fresh:
+            # #7782 : le contrôle et l'écriture sous le MÊME verrou de ligne
+            # que `note` (hold/levée), `move` et `mark_started` ; la ligne
+            # relue après l'attente du verrou porte l'état, la branche, la PR
+            # et le début mesuré à jour. Un démarrage concurrent qui a gagné
+            # le verrou est vu ici et refuse ; celui qui l'attend écrit après
+            # la fermeture et ne peut plus démarrer un lot clos.
+            locked = storage.of(tx).work.lock(item_id)
+            if locked is None:
+                raise WorkError("lot %s not found" % item_id)
+            refusal = fresh_closure_refusal(tx, locked)
+            if refusal:
+                raise WorkError(refusal)
+            state = str(locked["state"])
         row = storage.of(tx).work.close(
             item_id, current=state, reason=reason,
             superseded_by=int(superseded_by) if superseded_by is not None else None,

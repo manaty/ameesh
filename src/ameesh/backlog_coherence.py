@@ -44,6 +44,10 @@ Safety rules, learned from the false positives of an intake check:
   "non vérifié" and only the textual duplicate/contradiction checks run;
 * a lot with a branch or a PR is never closed: its work may be real, so the
   finding is left to the PO;
+* a lot that has started (`started_ts`) or carries an active hold is never
+  closed: a citation proves a merged change, not the sub-step still owed
+  (#7782). The guard is reread under the lot's row lock, so a start or a
+  `hold:` committed while the pass waits refuses instead of closing;
 * only `intake` and `blocked` lots are closed (never `build`, `qa` or
   `waiting_human`);
 * the digest is idempotent: its body is stable while the findings do not
@@ -75,8 +79,6 @@ MAX_COMMITS = 5000
 SLACK_S = 300.0
 #: git calls are bounded; `git log -L` is the expensive one
 GIT_TIMEOUT = 30.0
-#: the pass closes only lots that have not started
-CLOSABLE_STATES = (lifecycle.REQUESTED, lifecycle.BLOCKED)
 
 #: verbs that ask for a presence (a lot whose title starts with one of these
 #: and another whose title starts with the opposite verb contradict each other)
@@ -723,11 +725,12 @@ def apply_report(db, report: dict, *, cfg=None, actor: str = ACTOR,
                  digest: bool = True) -> dict:
     """Apply the deterministic closures and send the one digest.
 
-    Only `intake`/`blocked` lots without a branch or a PR are closed. Every
-    closure (or refusal) is journaled in the report; the digest is sent only
-    for the non-deterministic findings and for deterministic findings whose
-    closure was refused. The call is idempotent: a second pass over the same
-    findings sends no second message (the body is stable and `mail.send`
+    Only `intake`/`blocked` lots that are still **fresh** are closed: no
+    branch or PR, no measured start (`started_ts`), no active hold (#7782).
+    Every closure (or refusal) is journaled in the report; the digest is sent
+    only for the non-deterministic findings and for deterministic findings
+    whose closure was refused. The call is idempotent: a second pass over the
+    same findings sends no second message (the body is stable and `mail.send`
     deduplicates on its `idempotency_key`).
     """
     project = report.get("project") or ""
@@ -745,14 +748,20 @@ def apply_report(db, report: dict, *, cfg=None, actor: str = ACTOR,
             refused.append(entry)
             report["closures"].append(entry)
             continue
-        state = str(item.get("state") or "")
-        if state not in CLOSABLE_STATES:
-            entry = _refused(finding, "state %s is not closable" % state)
+        if storage.is_remote(db):
+            # #7782 : sur une connexion d'exécuteur médié, le journal des
+            # retenues n'est pas au contrat (`progress`) et aucun verrou de
+            # ligne ne tient d'une requête à l'autre. On ne ferme pas sur une
+            # précondition qu'on ne peut pas relire : la passe tourne sur
+            # l'hôte, avec la base directe.
+            entry = _refused(finding, "start and hold preconditions are not "
+                                      "readable on a mediated connection")
             refused.append(entry)
             report["closures"].append(entry)
             continue
-        if str(item.get("branch") or "").strip() or str(item.get("pr_ref") or "").strip():
-            entry = _refused(finding, "lot carries a branch or a PR")
+        refusal = work.fresh_closure_refusal(db, item)
+        if refusal:
+            entry = _refused(finding, refusal)
             refused.append(entry)
             report["closures"].append(entry)
             continue
@@ -762,8 +771,11 @@ def apply_report(db, report: dict, *, cfg=None, actor: str = ACTOR,
             report["closures"].append(entry)
             continue
         try:
-            work.close(db, lot_id, done=True, note=_note(finding, report),
-                       actor=actor)
+            # #7782 : la garde est répétée sous le verrou de ligne du lot ;
+            # un début ou un hold concurrent refuse la clôture au lieu de la
+            # laisser passer entre la lecture et l'écriture.
+            work.close_fresh(db, lot_id, note=_note(finding, report),
+                             actor=actor)
             reason = "done"
         except work.WorkError as exc:
             entry = _refused(finding, str(exc))
