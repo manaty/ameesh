@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import re
 
+from ....db import DbError
 from ....storage import interface
 
 #: Une ligne de `module_schemas` (écrite par le runner de migrations).
@@ -70,47 +71,62 @@ def _core_schema(db) -> str:
     return schema or "public"
 
 
-def _registry_readable(db, core: str) -> bool:
-    """Le registre ``module_schemas`` est-il présent et lisible, sans lever ?
+def _registry_probe(db, core: str) -> tuple[bool, bool]:
+    """``(présent, lisible)`` du registre ``module_schemas``, sans jamais lever.
 
     La sonde est **dans la transaction du mouvement** : une requête qui échoue
     l'avarie (psql termine la session, psycopg refuse toute instruction
-    suivante), et l'attraper ne la répare pas. Une base d'avant P1a n'a pas
-    ``module_schemas`` ; un rôle peut aussi n'y avoir aucun droit de lecture.
-    On interroge donc les catalogues, qui ne demandent aucun droit sur le
-    schéma applicatif et ne résolvent aucun nom par le search_path : dans ces
-    deux cas la réponse est ``false``, jamais une erreur.
+    suivante), et l'attraper ne la répare pas. On interroge donc les
+    catalogues, qui ne demandent aucun droit sur le schéma applicatif et ne
+    résolvent aucun nom par le search_path.
 
-    ``to_regclass`` ne suffit pas : sans ``USAGE`` sur le schéma, il lève
-    « permission denied for schema » au lieu de rendre NULL.
+    La lecture est dite possible si le rôle a ``USAGE`` sur le schéma **et**
+    ``SELECT`` sur la relation : sans ``USAGE``, la lecture lèverait
+    « permission denied for schema ». ``to_regclass`` ne suffit pas pour la
+    même raison.
     """
-    rows = _raw(db).query(
-        "SELECT EXISTS ("
+    clauses = (
         "  SELECT 1 FROM pg_catalog.pg_class c"
         "  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
         "  WHERE n.nspname = %s AND c.relname = 'module_schemas'"
+    )
+    rows = _raw(db).query(
+        "SELECT"
+        "  EXISTS (%s) AS present,"
+        "  EXISTS (%s"
         "    AND c.relkind IN ('r', 'p', 'v', 'm', 'f')"
-        "    AND has_table_privilege(c.oid, 'SELECT')) AS readable",
-        (core,))
-    return bool(rows and rows[0].get("readable"))
+        "    AND has_schema_privilege(n.oid, 'USAGE')"
+        "    AND has_table_privilege(c.oid, 'SELECT')) AS readable"
+        % (clauses, clauses),
+        (core, core))
+    row = rows[0] if rows else {}
+    return bool(row.get("present")), bool(row.get("readable"))
 
 
 def schema_name(db) -> str:
     """Le schéma physique des tables du module, lu dans ``module_schemas``.
 
     Lecture unique par connexion (cache positif ET négatif : le registre ne
-    change qu'avec les exécuteurs arrêtés). Une base d'avant P1a, un registre
-    illisible ou un nom hors forme retombent sur le schéma noyau : le code
-    fonctionne avant P2 exactement comme avant le lot.
+    change qu'avec les exécuteurs arrêtés). Une base d'avant P1a ou un nom
+    hors forme retombent sur le schéma noyau : le code fonctionne avant P2
+    exactement comme avant le lot. Un registre **présent mais illisible** est
+    refusé explicitement : retomber sur le noyau par doute écrirait au mauvais
+    endroit après P2 (constat #43584).
     """
     connection = _connection(db)
     cached = getattr(connection, "_ameesh_dev_schema", None)
     if cached is not None:
         return cached
     core = _core_schema(db)
+    present, readable = _registry_probe(db, core)
+    if present and not readable:
+        raise DbError(
+            "module registry %s.module_schemas is present but not readable; "
+            "refusing to guess the dev schema (grant USAGE on the schema and "
+            "SELECT on the registry)" % _quote(core))
     found = core
     rows = []
-    if _registry_readable(db, core):
+    if readable:
         # la connexion brute : passe par `ModuleDb` rappellerait `qualify`,
         # qui rappellerait `schema_name` (récursion).
         rows = _raw(db).query(

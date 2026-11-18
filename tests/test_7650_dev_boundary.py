@@ -157,7 +157,8 @@ class DevBoundaryTest(unittest.TestCase):
             def query(self, sql, params=()):
                 self.seen.append((sql, params))
                 if "pg_catalog.pg_class" in sql:
-                    return [{"readable": self.schema_name is not None}]
+                    present = self.schema_name is not None
+                    return [{"present": present, "readable": present}]
                 if self.schema_name is None:
                     return []
                 return [{"schema_name": self.schema_name}]
@@ -192,7 +193,7 @@ class DevBoundaryTest(unittest.TestCase):
         # la sonde de présence ne résout aucun nom par le search_path : le
         # schéma configuré est un paramètre, jamais retombé sur `public`.
         self.assertIn("pg_catalog.pg_class", db.seen[0][0])
-        self.assertEqual(db.seen[0][1], ("Mesh_$1",))
+        self.assertEqual(db.seen[0][1], ("Mesh_$1", "Mesh_$1"))
 
         class _EmptyCfg:
             schema = ""
@@ -203,8 +204,8 @@ class DevBoundaryTest(unittest.TestCase):
         self.assertEqual(schema.relation(_EmptyDb(), "ci_runs"),
                          '"public"."ci_runs"')
 
-    def test_absent_or_unreadable_registry_is_never_queried(self):
-        """La sonde garde la lecture : aucun SELECT n'avarie la transaction."""
+    def test_absent_registry_is_never_queried(self):
+        """Le registre absent retombe sur le noyau : aucun SELECT qui avarie."""
         from ameesh.modules.dev.storage import schema
 
         class _Cfg:
@@ -218,12 +219,36 @@ class DevBoundaryTest(unittest.TestCase):
 
             def query(self, sql, params=()):
                 self.seen.append((sql, params))
-                return [{"readable": False}]
+                return [{"present": False, "readable": False}]
 
         db = _Db()
         self.assertEqual(schema.relation(db, "ci_runs"), '"public"."ci_runs"')
         self.assertEqual(len(db.seen), 1)
         self.assertIn("pg_catalog.pg_class", db.seen[0][0])
+        self.assertNotIn("FROM \"public\".module_schemas", db.seen[0][0])
+
+    def test_present_but_unreadable_registry_is_refused(self):
+        """#43584 : présent sans droit de lecture ne devient pas « absent »."""
+        from ameesh import db as db_mod
+        from ameesh.modules.dev.storage import schema
+
+        class _Cfg:
+            schema = "public"
+
+        class _Db:
+            cfg = _Cfg()
+
+            def __init__(self):
+                self.seen = []
+
+            def query(self, sql, params=()):
+                self.seen.append((sql, params))
+                return [{"present": True, "readable": False}]
+
+        db = _Db()
+        with self.assertRaisesRegex(db_mod.DbError, "present but not readable"):
+            schema.relation(db, "ci_runs")
+        self.assertEqual(len(db.seen), 1)
         self.assertNotIn("FROM \"public\".module_schemas", db.seen[0][0])
 
     def test_qualify_rewrites_tables_but_not_literals_or_comments(self):
@@ -237,7 +262,7 @@ class DevBoundaryTest(unittest.TestCase):
 
             def query(self, sql, params=()):
                 if "pg_catalog.pg_class" in sql:
-                    return [{"readable": True}]
+                    return [{"present": True, "readable": True}]
                 return [{"schema_name": "t_x__dev"}]
 
         sql = ("SELECT ci_runs FROM ci_runs -- ci_runs\n"
