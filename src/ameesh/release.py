@@ -599,6 +599,16 @@ def _release_tick(cfg, args, declared) -> int:
                         print("staging-deferred %s: %s" % (name, exc), file=sys.stderr)
                         report["staging_deferred"] = {"result": "unreadable", "error": str(exc)}
                         status = 1
+                    # #7666 : la stable de la semaine, désignée et publiée
+                    # une fois ; elle ne défait jamais la coupure.
+                    if project.stable_channel:
+                        from . import stable_channel
+                        try:
+                            report["stable"] = stable_channel.tick(cfg, db, project, now=now)
+                        except Exception as exc:
+                            print("stable %s: %s" % (name, exc), file=sys.stderr)
+                            report["stable"] = {"result": "error", "error": str(exc)}
+                            status = 1
             except release_cutoff.TransientReleaseError as exc:
                 print("%s: %s" % (name, exc), file=sys.stderr)
                 # #6014: a transient failure is still a cutoff not done; say
@@ -626,6 +636,49 @@ def _release_tick(cfg, args, declared) -> int:
         return status
     finally:
         db.close()
+
+
+def _stable(cfg, args) -> int:
+    """#7666: `release stable designate|publish|pin|verify`."""
+    from . import release_cutoff, stable_channel
+    command = args.stable_command
+    try:
+        if command in ("pin", "verify"):
+            # the consumer side: any clone of the project, no release block
+            repo = os.path.abspath(os.path.expanduser(args.repo))
+            if command == "pin":
+                sys.stdout.write(stable_channel.pin(repo, args.remote, args.week))
+                return 0
+            with open(args.file, encoding="utf-8") as stream:
+                text = stream.read()
+            installed = None
+            if args.installed:
+                from importlib import metadata
+                installed = metadata.version("ameesh")
+            manifest = stable_channel.verify(text, repo, args.remote, installed=installed)
+            print("%s: stable %s = %s (%s)%s"
+                  % (args.file, manifest["week"], manifest["tag"], manifest["commit"][:12],
+                     ", installed" if installed else ""))
+            return 0
+        declared = release_cutoff.projects(cfg)
+        if args.project not in declared:
+            raise release_cutoff.ReleaseError(
+                "project %r is not declared under release.projects" % args.project)
+        project = declared[args.project]
+        now = time.time() if args.now is None else float(args.now)
+        from .db import open_db
+        db = open_db(cfg)
+        try:
+            report = stable_channel.tick(cfg, db, project, now=now,
+                                         decision=getattr(args, "decision", None),
+                                         dry_run=command == "designate")
+        finally:
+            db.close()
+    except (release_cutoff.ReleaseError, OSError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    return 0 if report.get("result") not in ("error",) else 1
 
 
 def _packet_watch(cfg, args) -> int:
@@ -1032,6 +1085,8 @@ def run(cfg, args) -> int:
     """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest|abandon`."""
     from . import release_cutoff
     command = args.release_command
+    if command == "stable":
+        return _stable(cfg, args)
     if command == "catchup":
         return _catchup(cfg, args)
     if command == "attest":
@@ -1235,3 +1290,35 @@ def add_parser(sub, func) -> None:
                                 "gesture" % ABANDON_NOW_WINDOW_S)
     abandon_p.add_argument("--json", action="store_true")
     abandon_p.set_defaults(func=func)
+    stable_p = rel.add_parser(
+        "stable", help="#7666: weekly stable channel (designation, publication) and the "
+                       "consumer's single pin file (%s)" % "ameesh-stable.json")
+    stable = stable_p.add_subparsers(dest="stable_command", required=True)
+    designate_p = stable.add_parser(
+        "designate", help="print the due week's designation; no tag, no push")
+    publish_p = stable.add_parser(
+        "publish", help="designate and publish the due week (tag stable/<week>); the "
+                        "first one needs a signed owner decision")
+    publish_p.add_argument("--decision", type=int, default=None,
+                           help="owner decision approving the first public stable "
+                                "(option publish)")
+    for each in (designate_p, publish_p):
+        each.add_argument("--project", required=True)
+        each.add_argument("--now", type=float, default=None,
+                          help="epoch seconds (default: now)")
+        each.set_defaults(func=func)
+    pin_p = stable.add_parser(
+        "pin", help="print the pin file of a published stable week (default: the latest)")
+    pin_p.add_argument("--week", default=None, help="YYYY-Www")
+    verify_p = stable.add_parser(
+        "verify", help="check a pin file against the published channel")
+    verify_p.add_argument("file", help="the pin file (ameesh-stable.json)")
+    verify_p.add_argument("--installed", action="store_true",
+                          help="also require the running ameesh installation's version")
+    for each in (pin_p, verify_p):
+        each.add_argument("--repo", default=".",
+                          help="any git clone of the project (default: .)")
+        each.add_argument("--remote", default="origin",
+                          help="the publishing repository: a remote of --repo or a "
+                               "URL (default: origin)")
+        each.set_defaults(func=func)

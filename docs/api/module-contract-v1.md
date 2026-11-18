@@ -44,11 +44,14 @@ The revision 1.1 elements (#7669 E1a, #7670 E1b) and revision 1.2 elements
 that carries those lots; at the 1.0 baseline they are absent, and a consumer
 must still treat their absence as "unknown", never as permission.
 
-The weekly stable channel and single consumer pin are specified by
-[#7666 / #5858](https://github.com/manaty/ameesh/issues/5858).
-Until that work supplies a released channel, retain an immutable upstream tag
-and peeled commit in one consumer manifest; derive image, tests and diagnostics
-from it. Never track a moving construction branch as a stable version.
+External modules follow the [weekly stable channel](stable-channel.md)
+([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
+pin file, `ameesh-stable.json`, from which image, tests and diagnostics derive.
+A deprecation announced for stable followers must have been part of at least
+one published stable before its removal. Construction tags cut twice a day do
+not count toward that notice. Until the first stable is published, keep an
+immutable upstream tag and peeled commit in that same single file. Never track
+a moving construction branch as a stable version.
 
 ## CLI boundary
 
