@@ -9,8 +9,8 @@ distribution, outside `src/`, which imports neither ameesh nor `tests`.
 `tests.test_7665_module_contract.CoverageTableTest` checks that every element
 has exactly one row and that every cited test exists.
 
-The surface freezes revision 1.2; its baseline commit stays the revision 1.0
-comparison point, and the elements that revisions 1.1 and 1.2 add are now
+The surface freezes revision 1.3; its baseline commit stays the revision 1.0
+comparison point, and the elements that revisions 1.1, 1.2 and 1.3 add are now
 listed. The comparison is additive-compatible, as the contract's compatibility
 rule states:
 
@@ -74,14 +74,15 @@ rule states:
 | `canon:session-policy` | `tests.test_7665_module_contract.CanonPolicyContractTest.test_the_frozen_session_keys_are_the_declared_policy`, `tests.test_7674_politique_declarative.DeclaredPolicyCardTest.test_politique_lue_et_serialisee` |
 | `canon:resource-policy` | `tests.test_7665_module_contract.CanonPolicyContractTest.test_the_frozen_resource_keys_are_native_thresholds`, `tests.test_7675_qualification.PressureTest.test_cpu_used_is_the_ima_cpu_gate_and_needs_the_new_key`, `tests.test_7675_qualification.PressureTest.test_throttled_periods_and_wall_time_are_distinct_and_both_kept`, `tests.test_7675_qualification.PressureTest.test_the_new_keys_accept_fractions_like_the_other_ceilings` |
 | `deferral` | `tests.test_7665_module_contract.DeferralContractTest.test_the_frozen_block_shape_and_closed_enums`, `tests.test_7675_deferral.MappingTest.test_the_block_validates_against_the_public_schema`, `tests.test_7675_deferral.PublicViewsTest.test_show_json_carries_the_block`, `tests.test_7675_deferral.PublicViewsTest.test_list_json_carries_the_same_block` |
-| `python:mail` | `tests.test_7665_module_contract.PythonMailContractTest.test_the_public_mail_signatures_are_frozen`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_value_objects_keep_their_frozen_fields`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_published_bounds_enums_and_errors_are_frozen`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_served_contract_version_is_frozen`, `tests.test_7671_mail_contract.ContractSurfaceTest.test_version_and_exported_surface`, `tests.test_7671_mail_contract.BatchTest.test_a_batch_is_bounded_before_any_deposit`, `tests.test_7671_mail_contract.HistoryTest.test_cursor_is_bounded_and_stable_under_new_mail`, `tests.test_7706_mail_contract.ReservedActorTest.test_core_sender_identities_are_refused_before_deposit` |
+| `python:mail` | `tests.test_7665_module_contract.PythonMailContractTest.test_the_public_mail_signatures_are_frozen`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_value_objects_keep_their_frozen_fields`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_published_bounds_enums_and_errors_are_frozen`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_served_contract_version_is_frozen`, `tests.test_7671_mail_contract.ContractSurfaceTest.test_version_and_exported_surface`, `tests.test_7671_mail_contract.BatchTest.test_a_batch_is_bounded_before_any_deposit`, `tests.test_7671_mail_contract.HistoryTest.test_cursor_is_bounded_and_stable_under_new_mail`, `tests.test_7706_mail_contract.ReservedActorTest.test_core_sender_identities_are_refused_before_deposit`, `tests.test_7672_pending_reply_contract.ContractSurfaceTest.test_version_and_exported_surface`, `tests.test_7672_pending_reply_contract.ContractSurfaceTest.test_values_are_json_ready`, `tests.test_7672_pending_reply_contract.PendingTest.test_pending_lists_the_current_turn_request`, `tests.test_7672_pending_reply_contract.ReplyTest.test_reply_is_correlated_addressed_and_inherits_the_lot`, `tests.test_7672_pending_reply_contract.ReplyTest.test_another_body_or_payload_is_a_deterministic_conflict`, `tests.test_7672_pending_reply_contract.ConcurrencyTest.test_concurrent_identical_replies_make_one_durable_row` |
 | `view:agent_mesh_overview` | `tests.test_7665_module_contract.StoreAndViewsTest.test_named_views_keep_their_admitted_columns`, `tests.test_cluster.ContratDesColonnesTest` |
 | `view:mesh_keys` | `tests.test_7665_module_contract.StoreAndViewsTest.test_named_views_keep_their_admitted_columns`, `tests.test_cluster.ContratDesColonnesTest` |
 | `view:mesh_approvals_status` | `tests.test_7665_module_contract.StoreAndViewsTest.test_named_views_keep_their_admitted_columns`, `tests.test_cluster.ContratDesColonnesTest` |
 | `fixture` | Not covered yet: the published fixture kit (consumer-owned disposable database, no `tests.support`) is lot #7701 ([#5902](https://github.com/manaty/ameesh/issues/5902)). |
 | `stable-pin` | `tests.test_7666_stable_channel.StableChannelTest.test_witness_moves_from_one_stable_to_the_next_by_its_pin_alone`, `tests.test_7666_stable_channel.StableChannelTest.test_verify_refuses_an_edited_pin_or_another_installation` ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) |
 
-The 1.1 elements (E1a snapshot, E1b observation) and the 1.2 elements (module
-schema/migrations, E2a mail, E3a session policy, E3b bounded deferral) are
-released and have their rows above (mapping,
+The 1.1 elements (E1a snapshot, E1b observation), the 1.2 elements (module
+schema/migrations, E2a mail, E3a session policy, E3b bounded deferral) and the
+1.3 elements (E2b pending requests and correlated replies) are frozen in the
+same surface and have their rows above (mapping,
 [IMA public contract](../design/ima-public-contract-mapping.md)).

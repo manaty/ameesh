@@ -617,7 +617,7 @@ class DeferralContractTest(unittest.TestCase):
 
 
 class PythonMailContractTest(unittest.TestCase):
-    """The 1.2 Python surface: signatures, records, published bounds and codes."""
+    """The 1.2/1.3 Python surface: signatures, records, published bounds and codes."""
 
     spec = SURFACE["python"]["mail"]
 

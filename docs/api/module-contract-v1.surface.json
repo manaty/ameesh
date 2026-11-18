@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.2",
+  "contract": "1.3",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -4922,17 +4922,19 @@
   "python": {
     "mail": {
       "module": "ameesh.public.mail",
-      "contract_version": "1.2",
+      "contract_version": "1.3",
       "signatures": {
         "reserved_actors": "(db)",
         "submit": "(db, actor, submission)",
         "submit_many": "(db, actor, submissions)",
         "find": "(db, actor, recipient, idempotency_key)",
-        "history": "(db, actor, *, peer=None, after_id=None, limit=100, since_ts=None, until_ts=None, kind=None)"
+        "history": "(db, actor, *, peer=None, after_id=None, limit=100, since_ts=None, until_ts=None, kind=None)",
+        "pending": "(db, actor, lease, *, sender=None, limit=50)",
+        "reply": "(db, actor, request_id, answer, *, lease)"
       },
       "records": {
         "Submission": ["recipient", "body", "kind", "payload", "work_item_id", "thread", "idempotency_key"],
-        "Receipt": ["id", "actor", "recipient", "kind", "created_ts", "reused"],
+        "Receipt": ["id", "actor", "recipient", "kind", "created_ts", "reused", "in_reply_to"],
         "HistoryEntry": [
           "id",
           "sender",
@@ -4942,9 +4944,24 @@
           "payload",
           "work_item_id",
           "created_ts",
-          "delivered_ts"
+          "delivered_ts",
+          "in_reply_to"
         ],
         "HistoryPage": ["entries", "next_cursor", "has_more"],
+        "Lease": ["owner", "epoch"],
+        "Reply": ["body", "payload", "thread"],
+        "PendingRequest": [
+          "id",
+          "sender",
+          "recipient",
+          "body",
+          "payload",
+          "work_item_id",
+          "created_ts",
+          "delivered_ts",
+          "turn_id"
+        ],
+        "PendingPage": ["entries", "has_more"],
         "SubmissionResult": ["index", "receipt", "error", "detail"],
         "BatchResult": ["results"]
       },
@@ -4953,7 +4970,9 @@
         "MAX_PAYLOAD_BYTES": 262144,
         "MAX_BATCH": 50,
         "MAX_HISTORY": 200,
-        "DEFAULT_HISTORY": 100
+        "DEFAULT_HISTORY": 100,
+        "MAX_PENDING": 200,
+        "DEFAULT_PENDING": 50
       },
       "kinds": ["request", "reply", "notify", "event"],
       "module_payload_key": "module",
@@ -4988,6 +5007,7 @@
       "errors": {
         "InvalidSubmission": "invalid",
         "IdempotencyConflict": "conflict",
+        "ReplyConflict": "conflict",
         "ScopeRefused": "refused",
         "CanonInventoryUnavailable": "refused",
         "RecipientRefused": "refused",
