@@ -454,6 +454,9 @@ FERMEES = {
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
 HORS_CONTRAT = {
+    # #7761 : curseurs et corrélations internes, fermés au superviseur.
+    "pre_act_audit_cursors": {"project", "repo", "workflow", "activated_at", "scanned_through"},
+    "pre_act_audit_runs": {"repo", "run_id", "attempt", "workflow", "pregeste_id", "reason"},
     # #7565 (0583): narrow bureau catch-up views, closed to both supervisor
     # roles. Decision proofs include signature material; no GRANT added.
     "ameesh_staging_attestations": {"id", "type", "object", "project", "data",

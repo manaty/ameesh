@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ameesh-contract-witness"
+version = "1.0.0"
+description = "External module witness of the ameesh module contract v1"
+requires-python = ">=3.9"
+
+[project.entry-points."ameesh.modules"]
+contract-witness = "ameesh_contract_witness"
+
+[tool.setuptools]
+py-modules = ["ameesh_contract_witness", "contract_witness_client"]

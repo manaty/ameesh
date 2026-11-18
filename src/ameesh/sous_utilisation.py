@@ -568,17 +568,44 @@ def _bare(name: str) -> str:
     return name[len("agent:"):] if name.startswith("agent:") else name
 
 
+def role_holders(canons, roles=None) -> list:
+    """Les agents dont la fiche Agent du canon nomme l'un des `roles` (ou
+    `role`), dans l'ordre du canon (L242c : un rôle se lit sur la fiche, jamais
+    sur le nom de l'agent ; synonymes ramenés au rôle).
+
+    Ordre stable, sans doublon : le premier porteur est le choix déterministe
+    des passes qui n'en admettent qu'un (`role_timers`), et `role_orchestrators`
+    rend le même ensemble. Un canon absent ou illisible ne rend aucun porteur,
+    jamais un nom deviné."""
+    wanted = {_canonical(r) for r in (roles or ORCHESTRATOR_ROLES)}
+    found: list = []
+    for canon in canons or []:
+        for agent in getattr(canon, "agents", None) or []:
+            title = getattr(agent, "title", None)
+            if title and title not in found and wanted & set(_card_roles(agent)):
+                found.append(title)
+    return found
+
+
 def role_orchestrators(canons, roles=None) -> set:
     """Les agents dont la fiche Agent du canon nomme un rôle d'orchestrateur
     (`roles` ou `role` : `orchestrateur`, `orchestrator`), ou l'un des
     `roles` donnés (synonymes dans les deux sens, L242c)."""
-    wanted = {_canonical(r) for r in (roles or ORCHESTRATOR_ROLES)}
-    found = set()
-    for canon in canons or []:
-        for agent in getattr(canon, "agents", None) or []:
-            if wanted & set(_card_roles(agent)):
-                found.add(agent.title)
-    return found
+    return set(role_holders(canons, roles))
+
+
+def declared_holders(canons, listing, roles) -> list:
+    """Les porteurs déclarés d'un rôle, lus là où la déclaration est visible.
+
+    Canon chargé : la fiche Agent fait foi (`role_holders`). Sans canon — un
+    lecteur qui ne lit pas de dépôt (minuterie, #3327 B/P1) ou un canon
+    illisible — la projection `roles` du registre, copiée de la carte par
+    `canon sync`, est la seule déclaration ; rien n'est deviné depuis un nom.
+    Liste triée, sans doublon."""
+    if canons:
+        return sorted(set(role_holders(canons, roles)))
+    return sorted({row.get("name") for row in listing or []
+                   if row.get("name") and row_has_role(row, roles)})
 
 
 def _canonical(role) -> str:
@@ -606,6 +633,34 @@ def _card_roles(agent) -> list:
         single = data.get("role")
         named = [single] if isinstance(single, str) else []
     return [role for role in (_canonical(r) for r in named) if role]
+
+
+def row_roles(row) -> list:
+    """Les rôles déclarés par la fiche d'un agent, lus sur sa ligne du registre
+    (`roles`, sinon `role`) — la projection que `canon sync` copie de la carte.
+
+    Sert aux lecteurs qui n'ont pas chargé le canon (une minuterie de rôle ne
+    lit pas un dépôt, #3327 B/P1). Même contrat que `_card_roles` : une valeur
+    illisible ne donne aucun rôle, jamais un rôle supposé."""
+    named = (row or {}).get("roles")
+    if isinstance(named, str):
+        named = [named]
+    elif isinstance(named, (list, tuple)) \
+            and all(isinstance(role, str) for role in named):
+        # même contrat que `_card_roles` : `roles: []` ne masque pas `role:`
+        named = list(named) or None
+    else:
+        named = None
+    if named is None:
+        single = (row or {}).get("role")
+        named = [single] if isinstance(single, str) else []
+    return [role for role in (_canonical(r) for r in named) if role]
+
+
+def row_has_role(row, roles) -> bool:
+    """La fiche de `row` (lue au registre) nomme-t-elle l'un des `roles` ?"""
+    wanted = {_canonical(role) for role in roles}
+    return bool(wanted & set(row_roles(row)))
 
 
 def roles_declared(canons) -> bool:
@@ -847,22 +902,18 @@ def remember_critical(cfg, name: str, verdict: bool) -> bool:
 
 def critical_by_role(row, canons) -> bool | None:
     """L242c : l'agent du registre `row` porte-t-il un rôle critique de son
-    organisation, dans la fiche de son canon propriétaire ? La persona
-    `auditeur` l'est sans fiche tant que le rôle auditeur est critique.
+    organisation, dans la fiche de son canon propriétaire ? Le rôle se lit sur
+    la fiche (`roles:`), jamais sur le nom de la persona : un agent qui
+    s'appelle `auditeur` sans ce rôle n'est pas critique, et un auditeur
+    renommé qui le déclare l'est.
     None (#424 r1) : son canon propriétaire n'est pas chargé ou illisible —
     inconnu, jamais « non » (`critical_verdict`) ; de même s'il n'a été lu
     qu'en partie (#424 r2, `fully_read`)."""
-    from .alert_briefs import AUDITOR_NAME
     owners = _owners(row, canons)
     if not owners or not all(fully_read(c) for c in owners):
         return None
-    for canon in owners:
-        roles = critical_roles(canon)
-        if row.get("name") == AUDITOR_NAME and "auditeur" in roles:
-            return True
-        if card_role(row, [canon], roles):
-            return True
-    return False
+    return any(card_role(row, [canon], critical_roles(canon))
+               for canon in owners)
 
 
 #: #424 r7 : les agents d'un canon étranger déjà signalés par ce processus
@@ -897,14 +948,15 @@ def warn_foreign(name: str) -> bool:
 
 def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
     """L242c : (critique ?, inconnu ?) pour l'agent `row`. Sans canon sur
-    l'hôte : la persona auditeur seule (rôles par défaut). Canon propriétaire
-    illisible (#424 r1) : le dernier verdict lu (`known`, `remembered`) ;
-    sinon — perdu, invalide, jamais lu (#424 r6) — critique (fail-safe).
-    Jamais une baisse silencieuse ; la surcharge `critical_agents` se juge
-    avant."""
-    from .alert_briefs import AUDITOR_NAME
+    l'hôte, la projection `roles` du registre — copiée de la carte par
+    `canon sync` — est la déclaration disponible (#7661) : une ligne sans rôle
+    n'est pas critique (connu), le titre de la persona ne compte pas, et la
+    surcharge `critical_agents` se juge avant. Canon propriétaire illisible
+    (#424 r1) : le dernier verdict lu (`known`, `remembered`) ; sinon — perdu,
+    invalide, jamais lu (#424 r6) — critique (fail-safe). Jamais une baisse
+    silencieuse."""
     if not configured and not canons:
-        return row.get("name") == AUDITOR_NAME, False
+        return row_has_role(row, CRITICAL_ROLES), False
     verdict = critical_by_role(row, canons)
     if verdict is not None:
         return verdict, False
@@ -916,8 +968,7 @@ def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
 def critical_candidates(canons) -> set:
     """Les noms qui PEUVENT être critiques par leur rôle (toute fiche, tout
     canon) : un nom hors de cet ensemble évite la lecture du registre."""
-    from .alert_briefs import AUDITOR_NAME
-    found = {AUDITOR_NAME}
+    found: set = set()
     for canon in canons or []:
         roles = critical_roles(canon)
         if roles:

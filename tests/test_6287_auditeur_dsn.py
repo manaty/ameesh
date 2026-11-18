@@ -81,6 +81,10 @@ class AuditeurDsnTurnTest(PgTestCase):
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
         self.register(name, "claude", cwd=cwd)
+        if name == "auditeur":
+            # #7661 : sans canon chargé, la fiche se lit sur le registre.
+            self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                            " WHERE name = 'auditeur'")
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         self.assertIsNotNone(lease)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
