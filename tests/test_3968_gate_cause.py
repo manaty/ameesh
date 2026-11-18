@@ -163,7 +163,7 @@ class GateCauseTest(PgTestCase):
                          {"orchestrateur", "codex1"}, out)
 
     def test_a_verdict_excluded_by_an_author_family_is_named(self):
-        """Un vrai auteur codex exclut l'avis codex, et le refus le dit."""
+        """Un auteur codex ferme son delta, pas la tête entière (#7745)."""
         self.repo.write("src/ameesh/merge_queue.py", "base\na\nb\nc\n")
         self.frozen = self.repo.commit("codex2: c", agent="codex2")
         self.receipt("codex2", "codex", [self.frozen])
@@ -173,10 +173,16 @@ class GateCauseTest(PgTestCase):
         out = self.gate()
         self.assertFalse(out["ok"], out)
         self.assertEqual(out["author_families"], ["codex", "deepseek"], out)
+        # L'avis codex n'est plus écarté en bloc : il ne couvre pas le delta
+        # codex, mais il couvre le delta deepseek. Le refus nomme le delta qui
+        # manque, pas une famille « interdite » sur toute la tête.
         self.assertEqual([row["actor"] for row in out["accepted"]],
-                         ["orchestrateur"], out)
-        self.assertIn("author families of this head: codex, deepseek", out["why"])
-        self.assertIn("codex1 (codex): family of an author of the head", out["why"])
+                         ["orchestrateur", "codex1"], out)
+        self.assertIn("delta(s) without the required independent review", out["why"])
+        self.assertIn(self.frozen[:12], out["why"])
+        self.assertIn("1 missing", out["why"])
+        self.assertNotIn("codex1 (codex): family of an author of the head",
+                         out["why"])
 
     def test_the_early_refusal_names_the_author_reading_it_was_given(self):
         """La file #3928 ne lit plus « no author reading » après avoir lu."""

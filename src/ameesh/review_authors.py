@@ -5994,6 +5994,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             recover=None, admitted_heads=(),
             exclusions_out: Optional[list] = None,
             commits_out: Optional[dict] = None,
+            commit_families_out: Optional[dict] = None,
+            global_families_out: Optional[set] = None,
             fetch: bool = True,
             milestone_proof: Optional[Mapping] = None,
             doubts_out: Optional[list] = None) -> tuple[list, list, list]:
@@ -6024,6 +6026,19 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     antérieurs qui ont porté sa famille jusqu'à cette tête. Il ne sert qu'à
     nommer les commits d'un refus de gel ; aucune décision ne le lit, et son
     absence ne change rien.
+
+    `commit_families_out` (#7745) reçoit, pour chaque commit de la plage
+    courante, l'ensemble des familles prouvées de ses auteurs. C'est la lecture
+    de l'indépendance **par delta d'auteur** : la famille d'un commit n'exclut
+    pas un relecteur des autres commits de la tête. Une entrée vide est un
+    commit sans famille d'agent (un humain, une adaptation de tests seule) et
+    n'exclut personne. `global_families_out` reçoit les familles qu'aucun
+    commit de la tête ne porte : la famille du gel quand un commit sans reçu
+    exact a été réattribué (#7324) et celle d'un auteur d'un gel antérieur dont
+    le contenu a été réécrit (#2924). Ces familles restent exclues de **tous**
+    les deltas : on ne lave pas une provenance en découpant la tête. Un commit
+    de la plage que cette lecture n'attribue pas devient un inconnu : la porte
+    échoue fermé, la désignation attend.
 
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
     du titulaire de référence reste le sien ; un relecteur désigné reste
@@ -6174,9 +6189,32 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # #3805 : les copies d'une même réémission partagent la liste des commits
     # candidats d'un auteur (une seule recherche `git log --all` par auteur).
     patch_receipt_cache: dict = {}
+    #: #7745 : les acteurs attribués à chaque commit de la plage courante. La
+    #: famille finale se lit dans `by_name` après les fusions (correcteurs
+    #: promus, gels antérieurs, gel #7324) ; un acteur retiré de `by_name`
+    #: (adaptation de tests seule) laisse le commit sans famille.
+    commit_actors: dict[str, set[str]] = {}
+    #: #7745/#2924 : les acteurs qui **écrivent** un commit de la plage
+    #: courante (un correcteur de tests seuls n'écrit pas la tête). Seul un
+    #: auteur porteur d'un commit courant est rattaché ; un auteur d'un gel
+    #: antérieur dont le contenu survit sous une autre écriture garde une
+    #: famille globale, même s'il a par ailleurs une correction de tests dans
+    #: la plage.
+    authoring: dict[str, set[str]] = {}
+    skipped: set[str] = set()
+    freezer_global: set[str] = set()
+
+    def record_actor(actor: str, sha: str) -> None:
+        """#7745 : le commit est attribué à cet acteur, famille encore inconnue."""
+        if not actor or not sha:
+            return
+        commit_actors.setdefault(sha, set()).add(actor)
 
     def record_commit(actor: str, sha: str) -> None:
         """#3742 : le commit attribué à un acteur, pour nommer un refus de gel."""
+        record_actor(actor, sha)
+        if actor and sha:
+            authoring.setdefault(actor.casefold(), set()).add(sha)
         if commits_out is None or not actor or not sha:
             return
         key = next((name for name in commits_out
@@ -6190,6 +6228,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         if not sha:
             continue
         if packet and _manifest_commit(repo, sha):
+            skipped.add(sha)
             continue                      # composition mécanique du composeur (#2803)
         try:
             receipt = _commit_receipt(provider, db, sha, strict=strict)
@@ -6221,6 +6260,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                         (sha, row["family"]))
                     review_families.setdefault(actor, {}).setdefault(
                         sha, set()).update(values)
+                    record_actor(actor, sha)
                 else:
                     by_name.setdefault(actor, set()).update(values)
                     if row["role"] == "third":
@@ -6241,6 +6281,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             # sa correction est un contenu de la tête (#2888) ; le seuil ne
             # décide que de la trace « correcteur de premier tour »
             review_commits.setdefault(actor, []).append((sha, proven))
+            record_actor(actor, sha)
         else:
             by_name.setdefault(actor, set()).add(proven)
             third_commits.setdefault(actor, []).append(sha)
@@ -6262,6 +6303,12 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                     # sa famille vient du reçu du gel, pas du repli #2721 :
                     # aucune trace `proof: turn-journal` pour lui.
                     by_name.setdefault(name, set()).add(family)
+                    # #7745 : la famille du gel ne se rattache à aucun commit
+                    # précis (celui qui a réécrit l'identité a pu choisir
+                    # n'importe quel nom) : elle reste exclue de tous les
+                    # deltas, sinon un relecteur de sa famille couvrirait le
+                    # commit réattribué.
+                    freezer_global.add(str(family).strip().lower())
                 else:
                     head_sha = str(head or (milestone or {}).get("sha") or "")
                     if head_sha[:12] and head_sha[:12] not in unknown:
@@ -6387,6 +6434,44 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         # doit jamais effacer l'autre famille.
         by_name.setdefault(str(row["name"]), set()).update(
             str(value) for value in values if str(value or "").strip())
+    # #7745 : la lecture par delta d'auteur. La famille de chaque commit est
+    # celle de ses acteurs dans la lecture finale (correcteurs promus et gels
+    # antérieurs compris) ; un acteur sans commit de la plage courante — le gel
+    # d'un commit réattribué (#7324), un auteur de gel antérieur réécrit
+    # (#2924) — garde une famille globale, exclue de tous les deltas.
+    if commit_families_out is not None or global_families_out is not None:
+        # L'ordre de `commits` est celui de la tête : la porte en dérive les
+        # deltas contigus, un ensemble le rendrait non déterministe.
+        current = list(dict.fromkeys(
+            str(value).strip() for value in commits or () if str(value).strip()))
+        # #7745 : seuls les commits **écrits** rattachent leur acteur. Une
+        # correction de tests seuls (jamais promue auteur) ne rattache pas un
+        # auteur de gel antérieur : sa famille reste globale (#2924/#3518).
+        attached = set(authoring)
+        glob = {str(value).strip().lower() for value in freezer_global
+                if str(value).strip()}
+        for actor, proven in by_name.items():
+            if str(actor).casefold() not in attached:
+                glob.update(str(value).strip().lower() for value in proven
+                            if str(value).strip())
+        if commit_families_out is not None:
+            for sha in current:
+                if sha in skipped:
+                    continue          # composition mécanique, hors delta (#2803)
+                values: set[str] = set()
+                for actor in commit_actors.get(sha, ()):
+                    values.update(str(value) for value in by_name.get(actor, ())
+                                  if str(value).strip())
+                commit_families_out[sha] = values
+        if global_families_out is not None:
+            global_families_out.update(glob)
+        # Un commit que cette lecture n'attribue pas n'a pas de famille
+        # prouvée : inconnu, jamais une famille supposée (canon §2). Le commit
+        # de manifeste d'un véhicule est hors delta et déjà écarté.
+        for sha in [sha for sha in current
+                    if sha not in commit_actors and sha not in skipped]:
+            if sha[:12] not in unknown:
+                unknown.append(sha[:12])
     out = []
     for actor in sorted(by_name):
         proven = {value for value in by_name[actor] if value}

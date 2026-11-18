@@ -225,7 +225,11 @@ class AmbiguousCoauthorFamilyTest(_Fixture):
         out = self.gate(self.klass(path="src/ameesh/mail.py"))
         self.assertTrue(out["ok"], out)
         self.assertEqual(out["author_families"], ["claude", "codex"])
-        self.assertEqual([row["actor"] for row in out["accepted"]], ["qa"])
+        # #7745 : le coauteur ambigu ferme ses deux deltas à claude et codex ;
+        # qa (deepseek) les couvre, et dev1 (claude) reste recevable sur le
+        # delta mesh-design (codex), d'où son avis retenu.
+        self.assertEqual([row["actor"] for row in out["accepted"]],
+                         ["qa", "dev1"])
 
     def test_a_caller_entry_without_families_keeps_the_proven_set(self):
         # #3658 : l'appelant passe le coauteur sans `families` ; la porte ne
@@ -241,7 +245,10 @@ class AmbiguousCoauthorFamilyTest(_Fixture):
             authors=[{"name": "other", "family": ""}])
         self.assertTrue(out["ok"], out)
         self.assertEqual(out["author_families"], ["claude", "codex"])
-        self.assertEqual([row["actor"] for row in out["accepted"]], ["qa"])
+        # #7745 : même lecture par delta que le témoin précédent ; l'ensemble
+        # prouvé ferme les deltas du coauteur, pas le delta de la référence.
+        self.assertEqual([row["actor"] for row in out["accepted"]],
+                         ["qa", "dev1"])
 
 
 class FreezeReceiptFallbackTest(_Fixture):
