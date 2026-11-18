@@ -7,17 +7,26 @@ tête A2, donc la plage `main..A3` contient encore le commit retiré. Le gel A3
 était refusé `author-families` : ce commit, tiers pour A3 (r1 n'y est pas
 relecteur désigné), était compté comme auteur et la famille claude devenait
 inéligible. La porte doit lire la survie du contenu pour un tiers comme pour un
-correcteur (#3335) : le contenu retiré ne ferme plus sa famille, une
-contribution qui survit la ferme toujours.
+correcteur (#3335) : le contenu retiré ne ferme plus sa famille.
+
+#7745 : une contribution qui survit ferme sa famille pour **son** delta, pas
+pour toute la tête. La règle globale « le tiers qui survit exclut sa famille
+partout » est remplacée par la règle par delta d'auteur ; le commit survivant
+reste un auteur et exige deux avis des autres familles.
 """
 from __future__ import annotations
 
-from ameesh import review_authors, review_designation as rd
+import dataclasses
+import os
+
+from ameesh import review_authors, review_deltas
+from ameesh import review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import work
 
 from .support import PgTestCase
-from .test_2447_review_designation_activation import _ActivationFixture
+from .test_2447_review_designation_activation import (
+    _ActivationFixture, _Canon, MECHANICS, register_agent)
 
 FAMILIES = ("claude", "codex", "deepseek")
 
@@ -89,7 +98,16 @@ class RemovedThirdPartyTest(_ThirdPartyFixture, PgTestCase):
 
 
 class SurvivingThirdPartyTest(_ThirdPartyFixture, PgTestCase):
-    """La contribution tiers qui survit garde sa famille exclue (porte fermée)."""
+    """La contribution tiers qui survit ferme **son** delta, pas la tête.
+
+    #7745 : r1/claude reste auteur (son contenu survit dans la tête), donc
+    aucun avis claude ne couvre son commit ; mais la famille claude redevient
+    éligible pour les autres commits, comme le canon §2 l'exige (« chaque
+    commit … deux avis de familles distinctes de la sienne »). Une tête à
+    deux familles d'auteurs (claude + deepseek) est donc validable avec trois
+    familles : le gel désigne claude, codex et deepseek, chacun relisant les
+    deux deltas qu'il n'a pas écrits.
+    """
 
     def setUp(self):
         super().setUp()
@@ -107,7 +125,49 @@ class SurvivingThirdPartyTest(_ThirdPartyFixture, PgTestCase):
         self.assertIn("r1", {row["name"] for row in inputs.authors})
         self.assertIn("r1", inputs.author_commits)
 
-    def test_the_freeze_is_still_refused(self):
+    def test_the_freeze_designates_the_three_families(self):
+        # Des relecteurs deepseek et claude disponibles (r1/claude est auteur,
+        # donc exclu par son nom ; le pilote n'est pas un siège de relecture) :
+        # la tête se couvre par les trois familles. Sans eux, le gel
+        # désignerait les familles présentes et attendrait la capacité — un
+        # manque d'agent, jamais un refus.
+        for name, harness in (("r3", "deepseek"), ("r4", "claude")):
+            register_agent(self.db, name, harness=harness, host=self.cfg.host,
+                           cwd=self.repo.root, status="idle")
+            self.db.execute("UPDATE agent_registry SET team = 'ameesh' "
+                            "WHERE name = %s", (name,))
+        mark, out = self.freeze()
+        self.assertEqual(out.get("state"), rd.DESIGNATED, out)
+        self.assertEqual({row["family"] for row in out["reviewers"]},
+                         {"claude", "codex", "deepseek"})
+        self.assertNotIn("r1", {row["name"] for row in out["reviewers"]})
+        self.assertIn(mark["id"], [row["id"] for row in self.db.query(
+            "SELECT id FROM work_item_milestones WHERE work_item_id = %s"
+            " AND kind = 'frozen'", (self.lot,))])
+        # Le delta écrit par r1 n'est pas couvert par claude : ses deux avis
+        # viennent de codex et deepseek.
+        inputs = self.inputs()
+        self.assertIsInstance(inputs, act.Inputs, inputs)
+        deltas = review_deltas.delta_families(
+            list(inputs.commit_families), inputs.commit_families,
+            inputs.global_families)
+        index = list(inputs.commit_families).index(self.third)
+        self.assertEqual(review_deltas.eligible_families(
+            deltas[index], [row["family"] for row in out["reviewers"]]),
+            ["codex", "deepseek"])
+        self.assertEqual(inputs.commit_families[self.third], {"claude"})
+
+    def test_two_families_cannot_cover_a_head_with_two_author_families(self):
+        # La règle est par delta, pas une dispense : si la politique ne
+        # déclare que claude et deepseek, chaque delta n'a qu'une famille
+        # relisante possible et le gel reste refusé. Le contenu tiers
+        # survivant ferme bien son delta.
+        mechanics = MECHANICS.replace("families: [claude, codex, deepseek]",
+                                      "families: [claude, deepseek]")
+        self.canon = _Canon(os.path.join(self.tmp, "canon-2"),
+                            mechanics=mechanics)
+        self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root,
+                                       canon_ref="HEAD")
         with self.assertRaises(work.WorkError) as caught:
             self.freeze()
         text = str(caught.exception)
