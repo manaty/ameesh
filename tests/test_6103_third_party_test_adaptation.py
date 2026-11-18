@@ -63,6 +63,9 @@ class ThirdPartyTestAdaptationTest(base.TestOnlyCorrectorTest):
         self.assertEqual(claude_deltas[0]["missing"], 1)
         self.assertNotIn("claude", claude_deltas[0]["eligible"])
         self.assertNotIn("md", {row["actor"] for row in out["accepted"]})
+        # Le verdict de dev1/claude reste retenu : il porte sur le delta de
+        # l'auteur (deepseek), pas sur celui de md.
+        self.assertIn("dev1", {row["actor"] for row in out["accepted"]})
 
     def test_carried_adaptation_from_a_prior_freeze_keeps_family_eligible(self):
         self.freeze_at(self.adapt(["tests/test_product.py"]))
