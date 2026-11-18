@@ -988,8 +988,13 @@ class StagingTest(unittest.TestCase):
         p = self.run_staging('--hotes', 'ameesh-agents-2', '--sans-sonde')
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertNotIn(('ameesh-agents-2', 'retour'), self.actions())
-        self.assertTrue(any(t['hote'] == 'ameesh-agents-2' and t['etape'] == 'sante'
-                            and t['verdict'] == 'non-concluant' for t in self.traces()))
+        trace = next(t for t in self.traces() if t['hote'] == 'ameesh-agents-2'
+                     and t['etape'] == 'sante')
+        self.assertEqual(trace['verdict'], 'non-concluant')
+        # #4126 : actif.py lit le rapport de la trace ; sans hote ni sha, il le
+        # rejette comme preuve etrangere et n'emet aucune attestation.
+        self.assertEqual(trace['rapport']['hote'], 'ameesh-agents-2')
+        self.assertEqual(trace['rapport']['sha'], self.sha)
 
     def test_term_on_same_sha_host_leaves_no_return_to_the_supervisor(self):
         """#6778 : l'arret surveille d'un hote deja au commit vise ne laisse

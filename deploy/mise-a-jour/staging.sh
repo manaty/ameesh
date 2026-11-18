@@ -926,7 +926,7 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   SANTE_RC=""
   venv=$(sha_venv_agents "$nom") || rc_venv=$?
   if [ "$rc_venv" = 0 ] && ! sha_cible "$venv"; then
-      SANTE_DETAIL=$(python3 -c 'import json,sys; print(json.dumps({"verdict":"ko", "pourquoi":"venv vivant %s, attendu %s" % tuple(sys.argv[1:])}))' "$venv" "$SHA_TRAVE")
+      SANTE_DETAIL=$(python3 -c 'import json,sys; print(json.dumps({"hote":sys.argv[1], "sha":sys.argv[2], "verdict":"ko", "pourquoi":"venv vivant %s, attendu %s" % tuple(sys.argv[3:])}))' "$nom" "$SHA" "$venv" "$SHA_TRAVE")
       printf '%s\n' "$SANTE_DETAIL"
       return 1
   fi
@@ -960,7 +960,7 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   case "$(verdict_sonde "$rc" "$sortie")" in
     ok) if [ "$rc_venv" != 0 ]; then
       SANTE_RC=3
-      SANTE_DETAIL=$(python3 -c 'import json; print(json.dumps({"verdict":"non-concluant", "pourquoi":"venv vivant illisible"}))')
+      SANTE_DETAIL=$(python3 -c 'import json,sys; print(json.dumps({"hote":sys.argv[1], "sha":sys.argv[2], "verdict":"non-concluant", "pourquoi":"venv vivant illisible"}))' "$nom" "$SHA")
       return 3
     fi; return 0 ;;
     ko) return 1 ;;
