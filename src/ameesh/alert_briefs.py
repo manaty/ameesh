@@ -51,6 +51,7 @@ import re
 import time
 
 from . import sous_utilisation, vocab, work_lifecycle as lifecycle
+from .roles import AUDITOR_ROLES
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
@@ -120,8 +121,8 @@ LEASE_GRACE_S = 90.0
 #: 62 des 78 L1 du 09/11 étaient en retard de 0 à 4 min (auditeur #206650)
 SLO_L1_GRACE_S = 300
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur ; le rôle se lit
-#: sur la fiche (`roles:`), jamais sur le nom de la persona
-AUDITOR_ROLES = ("auditeur", "auditor")
+#: sur la fiche (`roles:`), jamais sur le nom de la persona. Le jeton est dans
+#: `roles.py` (#7792), comme tous les rôles de gouvernance.
 
 
 def claims_closed_hosts(db) -> set:
@@ -1381,7 +1382,7 @@ def _target_names(role: str, alert: dict, by_name: dict, orchestras, teams: set,
     if role == "avatar":
         return [name for name in dict.fromkeys(str(n) for n in avatar_names or ())
                 if name in by_name and not _external(by_name, name)]
-    if role == "auditeur":
+    if role == AUDITOR_ROLES[0]:
         return [name for name in auditor_names or ()
                 if name in by_name and not _external(by_name, name)]
     if role in by_name:
@@ -1457,7 +1458,8 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
     known = {"assignee", "pilot", AUDITOR_ROLES[0], "avatar"}
-    current = (3 if roles & {"avatar", "auditeur"} or any(r not in known for r in roles)
+    current = (3 if roles & {"avatar", AUDITOR_ROLES[0]}
+               or any(r not in known for r in roles)
                else 2 if "pilot" in roles else 1)
     for next_level in range(current + 1, 4):
         next_text = _slo_breach(alert, level=next_level)
@@ -1467,7 +1469,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         else:
             names = (_target_names("avatar", alert, by_name, orchestras, teams,
                                    auditor_names, avatar_names)
-                     + _target_names("auditeur", alert, by_name, orchestras, teams,
+                     + _target_names(AUDITOR_ROLES[0], alert, by_name, orchestras, teams,
                                      auditor_names, avatar_names))
             if not names:
                 names = list(desk)

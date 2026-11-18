@@ -2771,9 +2771,72 @@ def _return_after_stop(tree: str, sha: str, *, env: dict, budget: float) -> dict
             "drop": settled, "pid": proc.pid}
 
 
-def _manual_return_mail(db, tree: str, notify: str, reason: str) -> bool:
-    """#5450: the manual fallback when the bounded return did not conclude."""
+def _role_recipient(db, roles) -> tuple[str, str]:
+    """#7792 : premier porteur déclaré d'un rôle, lu sur la projection `roles`
+    du registre (celle que `canon sync` écrit de la fiche Agent). Le motif
+    d'absence est rendu, jamais effacé : un lecteur ne devine pas un nom."""
+    try:
+        from . import registry, sous_utilisation
+        holders = sous_utilisation.declared_holders([], registry.overview(db), roles)
+    except Exception as exc:  # noqa: BLE001 - le motif est rendu à l'appelant
+        return "", "lecture des rôles impossible (%s)" % exc
+    if not holders:
+        return "", "aucun porteur déclaré"
+    return holders[0], ""
+
+
+def _return_recipient(db, notify: str | None) -> tuple[str, str]:
+    """#7792 B : qui reçoit la marche manuelle du retour de staging.
+
+    La demande (`notify`) d'abord, puis le porteur déclaré du rôle de
+    conception, puis celui du rôle orchestrateur. Sans porteur, le motif est
+    rendu : l'état bloqué que l'appelant consigne porte alors l'alerte
+    `staging_interrupted` de `ameesh alerts`, et la trace est écrite au
+    journal du staging par `_manual_return_mail`."""
+    if notify:
+        return notify, ""
+    from .roles import DESIGN_ROLES, ORCHESTRATOR_ROLES
+    reasons = []
+    for roles in (DESIGN_ROLES, ORCHESTRATOR_ROLES):
+        holder, why = _role_recipient(db, roles)
+        if holder:
+            return holder, ""
+        reasons.append("%s : %s" % (roles[0], why))
+    return "", "; ".join(reasons)
+
+
+def _manual_return_trace(state: dict, text: str) -> None:
+    """#7792 B : une marche manuelle non remise laisse une trace nommée.
+
+    Elle est écrite au journal du staging que le lanceur a gardé, et sur la
+    sortie d'erreur ; `_manual_return_mail` ne rend donc jamais `False` en
+    silence."""
+    print("release: " + text, file=sys.stderr)
+    path = state.get("journal") or ""
+    if not path:
+        return
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (stamp, text))
+    except OSError:
+        pass
+
+
+def _manual_return_mail(db, tree: str, notify: str | None, reason: str) -> bool:
+    """#5450: the manual fallback when the bounded return did not conclude.
+
+    #7792: `notify` absent désigne le porteur déclaré du rôle de conception,
+    puis celui du rôle orchestrateur ; sans porteur, la trace est écrite au
+    journal du staging et l'état bloqué consigné par l'appelant porte l'alerte
+    `staging_interrupted`. Aucun nom de persona n'est inventé, et un échec
+    n'est jamais silencieux."""
     state = _return_state(tree)
+    notify, why = _return_recipient(db, notify)
+    if not notify:
+        _manual_return_trace(
+            state, "marche manuelle non remise : %s" % (why or "destinataire absent"))
+        return False
     host = state.get("host") or "?"
     step = state.get("step") or "?"
     precedent = state.get("precedent") or "previous-sha"
@@ -2792,7 +2855,9 @@ def _manual_return_mail(db, tree: str, notify: str, reason: str) -> bool:
                   "%s\n\n%s" % (subject, body), kind="event",
                   payload={"urgent": True, "staging": {"sujet": subject}})
         return True
-    except Exception:  # noqa: BLE001 - the journal and the failure remain
+    except Exception as exc:  # noqa: BLE001 - la trace et l'alerte restent
+        _manual_return_trace(
+            state, "marche manuelle non remise à %s : %s" % (notify, exc))
         return False
 
 
@@ -2964,7 +3029,7 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                     drop = retour["drop"]
                     if not retour["ok"] and not retour["mailed"]:
                         if db is not None:
-                            _manual_return_mail(db, worktree, "mesh-design",
+                            _manual_return_mail(db, worktree, None,
                                                 retour["note"])
                 if read["output"] is None:
                     wait(STAGING_DRAIN_S)

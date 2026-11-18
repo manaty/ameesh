@@ -43,6 +43,7 @@ from dataclasses import dataclass, field, replace
 
 from .context_metrics import (DERIVED, FALLBACK, MEASURED, PARTIAL, REQUESTED,
                               UNKNOWN)
+from .roles import AUDITOR_ROLES, ORCHESTRATOR_ROLES
 
 SCHEMA = "ameesh-context/1"
 
@@ -101,16 +102,14 @@ ROLES = (ROLE_PILOT, ROLE_REVIEW, ROLE_AUDIT, ROLE_BUILD, ROLE_DOCS,
 #: premier rôle déclaré au canon → classe de politique. Une valeur inconnue
 #: ne devient jamais une supposition : elle retombe sur ``other`` (§3.6).
 ROLE_BY_CANON = {
-    "orchestrateur": ROLE_PILOT,
-    "orchestrator": ROLE_PILOT,
+    **{role: ROLE_PILOT for role in ORCHESTRATOR_ROLES},
     "pilote": ROLE_PILOT,
     "pilot": ROLE_PILOT,
     "relecture": ROLE_REVIEW,
     "review": ROLE_REVIEW,
     "reviewer": ROLE_REVIEW,
     "qa": ROLE_REVIEW,
-    "auditeur": ROLE_AUDIT,
-    "auditor": ROLE_AUDIT,
+    **{role: ROLE_AUDIT for role in AUDITOR_ROLES},
     "audit": ROLE_AUDIT,
     "implementation": ROLE_BUILD,
     "implémentation": ROLE_BUILD,

@@ -56,6 +56,7 @@ import time
 
 from . import db as db_mod
 from . import fastmail, fil, registry, storage
+from .roles import ORCHESTRATOR_ROLES
 
 #: `mail_undeliverable` : courrier en attente depuis 15 min
 DEFAULT_THRESHOLD_S = 900.0
@@ -134,7 +135,7 @@ def role_of(name: str) -> str | None:
     « orch ») : l'envoi vise alors l'orchestrateur de l'équipe."""
     low = (name or "").strip().lower()
     if low.startswith("orchestr") or low == "orch":
-        return "orchestrateur"
+        return ORCHESTRATOR_ROLES[0]
     return None
 
 

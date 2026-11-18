@@ -5753,7 +5753,7 @@ def _manual_reseat_alert(db, item: Mapping, freeze: Mapping, recipient: str,
                 lines.append("  Reprise annoncée : %s%s." % (resume, qualifier))
     body = "\n".join([
         "Unreachable manual reviewer seat past its review deadline (canon §2, §9;"
-        " #4757, decision mesh-design 30/10).",
+        " #4757, decision of the design role, 30/10).",
         "",
         "Lot: #%s \"%s\"" % (lot, " ".join(str((item or {}).get("title") or "").split())),
         "- Freeze: frozen milestone %s." % _freeze_label(freeze),

@@ -10036,8 +10036,8 @@ class AgentWorker(threading.Thread):
                 self.preempting.clear()
         preempt_thread.start()
         from .platform import audit_guard
-        auditeur = self.runner.is_auditor(self.name, self.agent)
-        audit_exempt = auditeur and self.runner.host_pressure().get("blocked")
+        auditor = self.runner.is_auditor(self.name, self.agent)
+        audit_exempt = auditor and self.runner.host_pressure().get("blocked")
         self._audit_guard_error = ""
         audit_seconds = min(audit_guard.WALL_SECONDS,
                             self.turn_max_seconds() or audit_guard.WALL_SECONDS)
@@ -10048,7 +10048,7 @@ class AgentWorker(threading.Thread):
         from .platform import child_environment
         # #6287 : le rôle auditeur reçoit en plus son propre DSN en lecture
         # seule ; aucun autre agent, aucune liste blanche par nom d'exécutable.
-        env = child_environment.harness(env, harness, compte, auditor=auditeur)
+        env = child_environment.harness(env, harness, compte, auditor=auditor)
         # #5529 : preuve de refus avant tout appel fournisseur. Le squelette du
         # tour est privé (0600) et son jeton ne part JAMAIS dans l'environnement
         # (`child_environment` filtre les variables en `*_TOKEN`) ; seul le
@@ -17670,8 +17670,10 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         # que sur l'unité qui la pose, et le canon n'est chargé que dans ce cas.
         # #7661 : le nom de la persona ne suffit plus, seule la fiche décide ;
         # sans canon chargé, la projection `roles` du registre fait foi.
-        auditeur = bool(os.environ.get("AUDITEUR_DSN")) and auditor_mod.is_auditor(
-            db, name, canon_mod.load_configured(cfg), agent)
+        dsn_name = next(iter(child_environment.AUDITOR_CREDENTIALS), "")
+        auditor = bool(dsn_name and os.environ.get(dsn_name)) \
+            and auditor_mod.is_auditor(
+                db, name, canon_mod.load_configured(cfg), agent)
         try:
             avatar_tools.record(db, name, avatar_applied, "attach")
         except (db_mod.DbError, spawn_policy.SpawnToolsError) as exc:
@@ -17679,7 +17681,7 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         launched = time.monotonic()
         proc = subprocess.Popen(argv, cwd=cwd, env=child_environment.harness(
                                     env, harness_revendique, compte,
-                                    auditor=auditeur),
+                                    auditor=auditor),
                                 start_new_session=True)
         # Course de publication (même correctif que B5a-P) : le veilleur a pu
         # conclure pendant que ce Popen n'était pas encore publié.
