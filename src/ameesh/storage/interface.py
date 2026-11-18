@@ -2640,8 +2640,10 @@ class WorkItems(Domain):
         records the exact reading (``project``, ``pin``, ``gate``), the review
         references and the trace lot, together with the bound requester. It is
         idempotent for the same pending reading and evidence set: a repeated
-        call returns the existing row instead of stacking duplicates. Returns
-        the pending row, or None when the request cannot be stored.
+        call returns the existing row instead of stacking duplicates. #7806: a
+        new deposit emits a project-scoped train wake-up in the same
+        transaction; a retry that finds the existing row emits nothing.
+        Returns the pending row, or None when the request cannot be stored.
         """
 
     @abc.abstractmethod

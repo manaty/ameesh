@@ -74,6 +74,27 @@ class TrainEventRoutingTest(unittest.TestCase):
         service.stop.set()
         self.assertFalse(train_events.receive(service, self.notification()))
 
+    def test_requalification_request_wakes_its_project_without_a_target(self):
+        """#7806: the deposit hint names a project, not a target or a verdict.
+
+        The requester may run on a host without the train configuration, so the
+        hint cannot carry a target. It still schedules only that project's
+        passage, and the existing malformed/authority-bearing envelope checks
+        apply unchanged.
+        """
+        service = self.service()
+        item = self.notification(kind="requalification-request", target="")
+        self.assertTrue(train_events.receive(service, item))
+        self.assertEqual(service.pending, {0})
+        service.pending.clear()
+        for fields in (dict(project="other"), dict(kind="requalification-request",
+                                                   target="release/x"),
+                       dict(kind="requalification-request", target="main", verdict="ok")):
+            with self.subTest(fields=repr(fields)[:100]):
+                self.assertFalse(train_events.receive(
+                    service, self.notification(**fields)))
+        self.assertEqual(service.pending, set())
+
     def test_malformed_unrelated_and_authority_bearing_payloads_do_not_schedule(self):
         service = self.service()
         cases = [None, {}, dict(channel="agent_mail", payload="{}")]
@@ -248,6 +269,44 @@ class TrainEventTransactionTest(PgTestCase):
         service.pending.clear()
         self.assertFalse(train_events.receive(service, item))
         self.assertEqual(service.pending, set())
+
+    def test_requalification_deposit_wakes_after_commit_once_and_not_on_rollback(self):
+        """#7806: the request and its wake-up share one transaction.
+
+        A new request wakes the live holder before the next hourly passage; a
+        retry that hits the unique index is not a new deposit and stays silent;
+        a rollback abandons the request and the hint together. The envelope
+        carries no authority, only the project (target is empty).
+        """
+        item = work.add(self.db, title="requalification fixture", app="event-test",
+                        source="fixture", estimate=5, estimate_source="fixture",
+                        actor="fixture")
+        listener = self.listener()
+        args = ("event-test", "a" * 40, "b" * 40, ["milestone:1"],
+                item["id"], "pilot")
+        with self.db.transaction() as tx:
+            row = storage.of(tx).work.train_requalify_request(*args)
+            self.assertIsNotNone(row)
+            self.assertIsNone(listener.wait(0.1), "hint escaped before commit")
+        signal = json.loads(listener.wait(3)["payload"])
+        self.assertEqual((signal["schema"], signal["namespace"], signal["kind"],
+                          signal["project"], signal["target"]),
+                         (train_events.SCHEMA, self.cfg.schema,
+                          "requalification-request", "event-test", ""))
+        self.assertEqual(set(signal), set(train_events.FIELDS))
+        # The same pending reading is one request and one signal.
+        again = storage.of(self.db).work.train_requalify_request(*args)
+        self.assertEqual(again["id"], row["id"])
+        self.assertIsNone(listener.wait(0.1), "idempotent deposit emitted a hint")
+        with self.assertRaisesRegex(RuntimeError, "rollback"):
+            with self.db.transaction() as tx:
+                storage.of(tx).work.train_requalify_request(
+                    "event-test", "a" * 40, "c" * 40, ["milestone:1"],
+                    item["id"], "pilot")
+                raise RuntimeError("rollback")
+        self.assertIsNone(listener.wait(0.1), "rolled-back request emitted a hint")
+        rows = storage.of(self.db).work.train_requalify_requests("event-test")
+        self.assertEqual([entry["id"] for entry in rows], [row["id"]])
 
     def test_verdict_producer_commits_hint_with_milestone_and_rollback_loses_both(self):
         item = work.add(self.db, title="event fixture", app="event-test", source="fixture",

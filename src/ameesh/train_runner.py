@@ -17,8 +17,9 @@ import uuid
 from dataclasses import replace
 
 from . import (merge_queue, radar, resolutions, storage, train, train_admissions,
-               train_candidates, train_ci, train_fire, train_git, train_history,
-               train_migrations, train_policy, train_runtime, train_store)
+               train_candidates, train_ci, train_events, train_fire, train_git,
+               train_history, train_migrations, train_policy, train_runtime,
+               train_store)
 
 #: #2446: one host executes the train service. The lease is independent of the
 #: per-target packet reservation; it is renewed while the service runs and
@@ -476,12 +477,20 @@ class Service:
 
         Transport/producer registration is intentionally separate. A terminal
         CI event, historical verdict or fire change never supplies authority.
+        #7806: a requalification request names only its project, so its hint is
+        selected by project; the optional target still narrows it when known.
         """
-        if kind not in ("ci-terminal", "verdict", "fire") or self.stop.is_set():
+        if kind not in train_events.KINDS or self.stop.is_set():
             return False
-        selected = {i for i, p in enumerate(self.passages)
-                    if (p.project.name, merge_queue._remote_branch(p.project.target))
-                    == (project, target)}
+        if kind in train_events.PROJECT_ONLY:
+            selected = {i for i, p in enumerate(self.passages)
+                        if p.project.name == project
+                        and (not target
+                             or merge_queue._remote_branch(p.project.target) == target)}
+        else:
+            selected = {i for i, p in enumerate(self.passages)
+                        if (p.project.name, merge_queue._remote_branch(p.project.target))
+                        == (project, target)}
         if not selected:
             return False
         with self.condition:

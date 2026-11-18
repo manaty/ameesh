@@ -168,6 +168,19 @@ class TrainServiceTest(unittest.TestCase):
         service.stop.set()
         self.assertFalse(service.event(kind="fire", project="p", target="main"))
 
+    def test_requalification_event_selects_its_project_without_a_target(self):
+        """#7806: the deposit hint is project-scoped, and still narrows by target."""
+        passage = types.SimpleNamespace(project=types.SimpleNamespace(name="p", target="main"))
+        service = self.service(passage)
+        service.pending.clear()
+        self.assertFalse(service.event(kind="requalification-request",
+                                       project="other", target=""))
+        self.assertFalse(service.event(kind="requalification-request",
+                                       project="p", target="release/x"))
+        self.assertTrue(service.event(kind="requalification-request",
+                                      project="p", target=""))
+        self.assertEqual(service.pending, {0})
+
     def test_event_arriving_during_passage_is_not_lost(self):
         passage = types.SimpleNamespace(project=types.SimpleNamespace(name="p", target="main"))
         service = self.service(passage, clock=lambda: 100)
