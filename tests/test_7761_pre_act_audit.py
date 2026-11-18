@@ -162,3 +162,18 @@ class DurableAuditTest(PgTestCase):
             api.get.return_value = dict(total_count=1, workflow_runs=[dict(run(1, "pregeste=" + ID), run_attempt=2)])
             audit.tick(self.db, self.cfg, 2000, [self.sub], api, lambda _: None)
             self.assertEqual(len(self.messages()), 1)
+
+    def test_real_pre_act_sql_refuses_stop_after_wait_and_records_nominal_receipt(self):
+        from ameesh import pre_act
+        item = int(self.db.query("SELECT id FROM work_items LIMIT 1")[0]["id"])
+        since = float(self.db.query("SELECT extract(epoch from now())::float8 AS ts")[0]["ts"]) - 1
+        self.db.execute("INSERT INTO work_item_events (work_item_id,state,note)"
+                        " VALUES (%s,'build','STOP pendant attente')", (item,))
+        with self.db.transaction() as tx:
+            with self.assertRaisesRegex(pre_act.Refused, "STOP"):
+                pre_act.inspect(tx, item, "auditor", since, "kms")
+        self.db.execute("DELETE FROM work_item_events WHERE note='STOP pendant attente'")
+        with self.db.transaction() as tx:
+            value = pre_act.inspect(tx, item, "auditor", since, "prod", "acme/app/deploy.yml")
+        self.assertIn(value, {row["evidence"]["pregeste_id"] for row in self.db.query(
+            "SELECT evidence FROM work_item_events WHERE work_item_id=%s", (item,))})
