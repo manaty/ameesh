@@ -309,9 +309,15 @@ def release_blocker(control, listing, reading, *, footprint, cfg, now, adapter_w
         return "stale host reading"
     if reading.get("turns_in_progress") != 0:
         return "a turn is still in progress"
-    if any(a.get("host") == control.get("host") and a.get("lease_live")
-           for a in listing or ()):
-        return "a lease is still held"
+    # #7799: name the holders. This is the R1 entry guard: the operator sees
+    # which placed agents still keep a lease after the withdrawal delay
+    # instead of an anonymous refusal, and the sequence must not halt on it.
+    # A runner at rest now returns its lease between turns; a busy one
+    # finishes its turn first (its `turns_in_progress` is the earlier gate).
+    held = sorted(str(a.get("name") or "?") for a in listing or ()
+                  if a.get("host") == control.get("host") and a.get("lease_live"))
+    if held:
+        return "a lease is still held: %s" % ", ".join(held)
     return None
 
 

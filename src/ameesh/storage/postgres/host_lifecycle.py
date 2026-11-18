@@ -214,6 +214,12 @@ class HostLifecycle(interface.HostLifecycle):
     def listing(self):
         return self.db.query("SELECT " + _ROW + " FROM host_lifecycle ORDER BY host", ())
 
+    def claims_open(self, host, agent):
+        rows = self.db.query(
+            "SELECT ameesh_agent_claims_open(%s, %s) AS claims_open",
+            (host, agent))
+        return bool(rows and rows[0]["claims_open"])
+
     def drain(self, host, *, actor, duration=None, critical=(), automatic=False,
               close_claims=False):
         if not isinstance(automatic, bool):

@@ -5211,6 +5211,7 @@
     "agents",
     "begin_transition",
     "claim_release_scan",
+    "claims_open",
     "close_claims",
     "complete_return",
     "demand",

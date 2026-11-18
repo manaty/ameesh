@@ -535,6 +535,8 @@ class EntryPointRefusalTest(unittest.TestCase):
         worker._moved_before_turn.return_value = False
         worker.placed_elsewhere.return_value = None
         worker.admission_withdrawn.return_value = None
+        # #7799: no withdrawn host either; an unset MagicMock is truthy.
+        worker.host_claims_closed.return_value = False
         worker._election_handover.return_value = None
         worker.retry_remaining.return_value = 0
         worker.rotation_stopped = False  # #5503 : disjoncteur de rotation
