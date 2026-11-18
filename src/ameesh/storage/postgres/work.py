@@ -566,8 +566,9 @@ def _unknown_marker(tx, item, footprint, unknown):
     (`footprint_policy`) ; sous `repository`, le marqueur `.` (dépôt entier)."""
     paths = list(footprint or ())
     if unknown:
-        from .work_footprints import unknown_policy_sql
-        item["footprint_policy"] = unknown_policy_sql(tx, item["id"])
+        # Le SQL des politiques nomme des tables du module : port `DevWork`
+        # sur la transaction de création (revue B de #7650).
+        item["footprint_policy"] = DevWork(tx).unknown_policy(item["id"])
         if not paths and item["footprint_policy"] == "repository":
             paths = ["."]
     return paths
@@ -833,8 +834,10 @@ class WorkItems(interface.WorkItems):
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             if footprint_unknown:
-                from .work_footprints import unknown_policy_sql
-                item["footprint_policy"] = unknown_policy_sql(tx, item["id"])
+                # Port du module sur la transaction de création (revue B de
+                # #7650) : le SQL des politiques n'est pas qualifié par le noyau.
+                item["footprint_policy"] = self._dev.unknown_policy(
+                    item["id"], tx)
                 if not footprint and item["footprint_policy"] == "repository":
                     footprint = ["."]
             if footprint:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from ....storage.provenance import Provenance as Contract
-from .schema import DevDomain
+from .schema import DevDomain, ModuleDb
 
 _COLUMNS = """
     subject, sha, actor, session, turn, harness, work_item_id,
@@ -147,6 +147,9 @@ class Provenance(DevDomain, Contract):
         P1b #7650 : `storage.postgres.work.add_milestone` garde la transaction
         et lève les jalons ; l'écriture de la preuve vit ici, avec sa table.
         """
+        # La transaction vient du noyau (brute) : la qualifier (revue B de
+        # #7650 — `provenance_receipts` est une table du module).
+        tx = ModuleDb(tx)
         tx.execute(
             "INSERT INTO provenance_receipts"
             "       (subject, sha, actor, session, turn, harness, work_item_id)"
@@ -164,6 +167,7 @@ class Provenance(DevDomain, Contract):
 
     def carry_milestone(self, tx, milestone_id, *, sha, source_id) -> None:
         """#2928 : la preuve d'un verdict reporté suit le nouveau jalon."""
+        tx = ModuleDb(tx)
         tx.execute(
             "INSERT INTO provenance_receipts"
             "       (subject, sha, actor, session, turn, harness, work_item_id)"

@@ -30,7 +30,8 @@ from .work_footprints import (cap_reached_sql as footprint_cap_sql,
                               overlap_exists_sql as footprint_overlap_sql,
                               overlap_rows_sql as footprint_overlap_rows_sql,
                               start_blocking as footprint_start_blocking,
-                              start_on_sql as footprint_start_on_sql)
+                              start_on_sql as footprint_start_on_sql,
+                              unknown_policy_sql as footprint_unknown_policy_sql)
 
 #: L160d (0057) : les colonnes d'une ligne de file de fusion. Le fragment
 #: nomme `integration_train_queue_receipts`, une table du module : le noyau
@@ -275,6 +276,7 @@ class DevWork(DevDomain):
 
     def release_slots(self, tx, item_id, *, slot=None, number=None) -> None:
         """Rend tout ou partie des créneaux réservés d'un lot."""
+        tx = ModuleDb(tx)
         sql = ("UPDATE work_migration_reservations SET status = 'released',"
                "       updated_at = now()"
                " WHERE work_item_id = %s AND status = 'reserved'")
@@ -289,6 +291,7 @@ class DevWork(DevDomain):
 
     def next_number(self, tx, repo, floor) -> int:
         """Le prochain numéro libre du dépôt, au moins `floor`."""
+        tx = ModuleDb(tx)
         row = tx.query(
             "SELECT greatest(%s,"
             " (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
@@ -300,6 +303,7 @@ class DevWork(DevDomain):
         return int(row["n"])
 
     def add_legacy_slot(self, tx, item_id, slot, number, project, repo) -> None:
+        tx = ModuleDb(tx)
         tx.execute(
             "INSERT INTO work_migration_reservations"
             " (work_item_id, slot, number, project, target_repo,"
@@ -1735,6 +1739,17 @@ class DevWork(DevDomain):
             " JOIN work_items i ON i.id = d.work_item_id"
             " WHERE d.work_item_id = %s AND " + footprint_start_blocking("i", "b")
             + " LIMIT 1", (int(item_id),)))
+
+    def unknown_policy(self, item_id, db=None) -> str:
+        """#4818 : la politique d'empreinte inconnue du lot.
+
+        `db` : la transaction de l'appelant quand le noyau garde la
+        transaction (création, intake), sinon la connexion du domaine. Le SQL
+        nomme `repository_footprint_policies` et `work_item_footprints` —
+        tables du module, donc qualifiées ici (revue B de #7650).
+        """
+        return footprint_unknown_policy_sql(
+            self.db if db is None else ModuleDb(db), item_id)
 
     def start_on_pairs(self, item_ids) -> set[tuple[int, int]]:
         """#7760 : les couples (dépendant, prérequis) en « démarrage sur ».

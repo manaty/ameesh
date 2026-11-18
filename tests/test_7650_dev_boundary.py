@@ -105,9 +105,10 @@ def scan_to_regclass_literals() -> dict[tuple[str, str], list[int]]:
 #: importe pas — il passerait par un port du module ; un appel sur sa
 #: connexion brute casserait après P2 (revue B1 de #7760).
 _DEV_SQL_BUILDERS = frozenset({
-    "start_on_sql", "start_blocking", "footprints_overlap_sql",
-    "overlap_rows_sql", "overlap_exists_sql", "held_sql", "cap_rows_sql",
-    "cap_reached_sql", "in_flight_sql", "occupying_sql",
+    "start_on_sql", "start_blocking", "unknown_policy_sql",
+    "footprints_overlap_sql", "overlap_rows_sql", "overlap_exists_sql",
+    "held_sql", "cap_rows_sql", "cap_reached_sql", "in_flight_sql",
+    "occupying_sql",
 })
 
 

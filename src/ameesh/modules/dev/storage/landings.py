@@ -8,13 +8,16 @@ SQL de la table.
 """
 from __future__ import annotations
 
-from .schema import DevDomain
+from .schema import DevDomain, ModuleDb
 
 
 class Landings(DevDomain):
     """`work_landings` : quel lot atterrit sur quel véhicule, à quelle tête."""
 
     def set(self, tx, item_id, vehicle_id, *, pinned_sha, until_on, actor) -> None:
+        # La transaction vient du noyau (brute) : la qualifier ici, une fois
+        # (revue B de #7650 — `work_landings` est une table du module).
+        tx = ModuleDb(tx)
         tx.execute(
             "INSERT INTO work_landings(work_item_id, vehicle_id, pinned_sha, until_on, created_by)"
             " VALUES (%s, %s, %s, %s, %s)"
@@ -28,6 +31,7 @@ class Landings(DevDomain):
 
     def clear(self, tx, item_id):
         """Retire la déclaration ; rend le véhicule retiré, ou None."""
+        tx = ModuleDb(tx)
         rows = tx.query(
             "DELETE FROM work_landings WHERE work_item_id = %s"
             " RETURNING vehicle_id", (int(item_id),))
