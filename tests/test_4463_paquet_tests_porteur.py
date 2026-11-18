@@ -188,8 +188,13 @@ class BorneTotaleTest(unittest.TestCase):
         # #7195 : une série `heavy` garde sa borne d'exécution (`timeout`) ;
         # l'attente du créneau reste dans l'échéance totale (temps restant).
         # #7740 : la série directe garde elle aussi sa borne entière.
+        # #7766 : horloge figée — la part exacte (480 s) ne doit pas dépendre
+        # du temps réel écoulé entre l'échéance et le calcul de la part (la
+        # CI lisait 479 s une fois la seconde entamée).
         local = LocalTests()
-        local.run(parallel=4, which="/bin/ameesh", deadline=time.monotonic() + 600)
+        with mock.patch.object(paquet_auto.time, "monotonic",
+                               return_value=1000.0):
+            local.run(parallel=4, which="/bin/ameesh", deadline=1000.0 + 600)
         timeouts = dict(local.calls)
         walls = {label: wall for (label, _timeout), wall
                  in zip(local.calls, local.walls)}
@@ -197,24 +202,27 @@ class BorneTotaleTest(unittest.TestCase):
         self.assertEqual([timeouts["unité #%d" % lot] for lot in (1, 2, 3)],
                          [900, 900, 900])
         self.assertEqual(timeouts["contrats"], 480)
-        self.assertTrue(all(595 <= walls["unité #%d" % lot] <= 600
-                            for lot in (1, 2, 3)), walls)
+        self.assertEqual([walls["unité #%d" % lot] for lot in (1, 2, 3)],
+                         [600, 600, 600])
         # avec créneau, le temps mural des contrats reste l'échéance totale.
-        self.assertTrue(595 <= walls["contrats"] <= 600, walls)
+        self.assertEqual(walls["contrats"], 600)
 
     def test_serie_directe_garde_sa_borne_entiere(self) -> None:
         # #7740 : la série directe ne prend plus une part de la borne totale ;
         # seule la borne murale la coupe. Les contrats gardent leur part.
+        # #7766 : horloge figée, comme le témoin parallèle ci-dessus.
         local = LocalTests()
-        local.run(deadline=time.monotonic() + 600)
+        with mock.patch.object(paquet_auto.time, "monotonic",
+                               return_value=1000.0):
+            local.run(deadline=1000.0 + 600)
         timeouts = dict(local.calls)
         walls = {label: wall for (label, _timeout), wall
                  in zip(local.calls, local.walls)}
         self.assertEqual([timeouts["unité #%d" % lot] for lot in (1, 2, 3)],
                          [900, 900, 900])
         self.assertEqual(timeouts["contrats"], 480)
-        self.assertTrue(all(595 <= walls["unité #%d" % lot] <= 600
-                            for lot in (1, 2, 3)), walls)
+        self.assertEqual([walls["unité #%d" % lot] for lot in (1, 2, 3)],
+                         [600, 600, 600])
         self.assertEqual(walls["contrats"], 480)
 
     def test_sans_borne_totale_inchange(self) -> None:
