@@ -16,6 +16,7 @@ import contextlib
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -413,6 +414,8 @@ class PinnedCanonTest(unittest.TestCase):
         self.assertNotIn("next completed pass", alert["detail"])
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "production venv proof requires a root-owned interpreter home")
 class DeriverTest(unittest.TestCase):
     """La dérivation sur le banc synthétique de #5666, sans réseau."""
 
