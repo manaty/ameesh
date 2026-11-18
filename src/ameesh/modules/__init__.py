@@ -72,8 +72,9 @@ def profile():
 def _builtin():
     if profile() == "bare":
         return {}
-    from . import dev, it, work_types
-    return {dev.NAME: dev, it.NAME: it, work_types.NAME: work_types}
+    from . import dev, it, nexlink, work_types
+    return {dev.NAME: dev, it.NAME: it, nexlink.NAME: nexlink,
+            work_types.NAME: work_types}
 
 
 def always_active():

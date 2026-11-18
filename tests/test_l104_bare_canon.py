@@ -58,8 +58,8 @@ class BareCanonTest(PgTestCase):
         installed = json.loads(self.run_ok("modules", "--json"))
         builtin = {row["name"] for row in installed["modules"]
                    if row["source"] == "builtin"}
-        self.assertEqual(builtin, {"dev", "it", "work-types"})
-        self.assertEqual(modules.always_active(), ("dev",))
+        self.assertEqual(builtin, {"dev", "it", "nexlink", "work-types"})
+        self.assertEqual(modules.always_active(), ("dev", "nexlink"))
         self.assertIsNotNone(registry.get("dev"))
         active = json.loads(self.run_ok("modules", "--active", "--json"))
         self.assertEqual(active["active"], [])

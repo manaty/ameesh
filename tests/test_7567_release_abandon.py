@@ -11,7 +11,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ameesh import nexlink_release as nx, release_cutoff as rc
+from ameesh import release_cutoff as rc
+from ameesh.modules.nexlink import release as nx
 
 SHA = "a" * 40
 BASE = "b" * 40
