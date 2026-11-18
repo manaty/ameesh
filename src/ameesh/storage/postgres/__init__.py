@@ -50,6 +50,9 @@ from .progress import Progress
 from .projects import Projects
 from .provenance import Provenance
 from .attach_grants import AttachGrants
+from .agent_columns import AgentColumns
+from .reports import EvaluationReport
+from .reviews import ReviewFindings, ReviewWithdrawals
 from .roadmap import Roadmap
 from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
@@ -129,3 +132,8 @@ class PostgresStorage(interface.Storage):
         self.prevalidation = PrevalidationReports(db)
         self.conversations = Conversations(db)
         self.conversation_moves = ConversationMoves(db)
+        # P1b #7650 : les domaines du module `dev` (SQL qualifié au registre)
+        self.review_findings = ReviewFindings(db)
+        self.review_withdrawals = ReviewWithdrawals(db)
+        self.agent_columns = AgentColumns(db)
+        self.evaluation_report = EvaluationReport(db)

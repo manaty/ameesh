@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..work_dependencies import WorkDependencies as Contract
+from .landings import Landings
 from ... import work_lifecycle as lifecycle
 
 _DONE = lifecycle.COMPLETED
@@ -172,8 +173,11 @@ def not_blocking(alias: str) -> str:
 
 
 class WorkDependencies(Contract):
+
     def __init__(self, db):
         self.db = db
+        # P1b #7650 : les landings sont une table du module `dev`.
+        self._landings = Landings(db)
 
     def lock(self):
         # Les fermetures de lot appellent ce verrou avec la TRANSACTION
@@ -412,16 +416,8 @@ class WorkDependencies(Contract):
             if not freezes:
                 return {"error": "no_freeze"}
             pinned = freezes[0]["sha"].strip()
-            tx.execute("""
-                INSERT INTO work_landings(work_item_id, vehicle_id, pinned_sha, until_on, created_by)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (work_item_id) DO UPDATE
-                    SET vehicle_id = EXCLUDED.vehicle_id,
-                        pinned_sha = EXCLUDED.pinned_sha,
-                        until_on = EXCLUDED.until_on,
-                        created_by = EXCLUDED.created_by,
-                        created_at = clock_timestamp()
-                """, (item_id, vehicle_id, pinned, until_on, actor))
+            self._landings.set(tx, item_id, vehicle_id, pinned_sha=pinned,
+                               until_on=until_on, actor=actor)
             self._landing_journal(
                 tx, item_id,
                 "Landing declared: vehicle #%d until %s (frozen %s)"
@@ -431,22 +427,16 @@ class WorkDependencies(Contract):
     def clear_landing(self, item_id, *, actor):
         with self.db.transaction() as tx:
             tx.execute(_LOCK)                 # #2171 N1 : même verrou, dans la transaction
-            removed = tx.query("DELETE FROM work_landings WHERE work_item_id = %s"
-                               " RETURNING vehicle_id", (item_id,))
-            if not removed:
+            vehicle_id = self._landings.clear(tx, item_id)
+            if vehicle_id is None:
                 return False
             self._landing_journal(
-                tx, item_id, "Landing cleared: vehicle #%d" % int(removed[0]["vehicle_id"]), actor)
+                tx, item_id, "Landing cleared: vehicle #%d" % int(vehicle_id), actor)
             return True
 
     def landings_on_vehicle(self, vehicle_id):
         """#3641 : les déclarations épinglées à ce véhicule (lecture groupée)."""
-        return self.db.query("""
-            SELECT work_item_id, vehicle_id, pinned_sha,
-                   until_on::text AS until_on, created_by
-              FROM work_landings
-             WHERE vehicle_id = %s
-             ORDER BY work_item_id""", (int(vehicle_id),))
+        return self._landings.on_vehicle(vehicle_id)
 
     @staticmethod
     def _current_freeze(tx, vehicle_id):
@@ -474,26 +464,13 @@ class WorkDependencies(Contract):
                        (int(vehicle_id),))
             if self._current_freeze(tx, vehicle_id) != frozen_sha:
                 return False
-            rows = tx.query(
-                "SELECT pinned_sha FROM work_landings"
-                " WHERE work_item_id = %s AND vehicle_id = %s",
-                (int(item_id), int(vehicle_id)))
-            return bool(rows) and (rows[0]["pinned_sha"] or "").strip() == pinned_sha
+            return self._landings.pinned(item_id, vehicle_id) == pinned_sha
 
     def landings_for(self, item_ids):
         ids = sorted({int(i) for i in item_ids})
         if not ids:
             return []
-        return self.db.query(f"""
-            SELECT l.work_item_id, l.vehicle_id, l.pinned_sha,
-                   l.until_on::text AS until_on,
-                   l.created_by,
-                   extract(epoch FROM l.created_at)::float8 AS created_ts,
-                   w.state AS vehicle_state,
-                   w.state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}') AS open
-            FROM work_landings l JOIN work_items w ON w.id = l.vehicle_id
-            WHERE l.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
-            " ORDER BY l.work_item_id", tuple(ids))
+        return self._landings.for_items(ids)
 
     def release_unassigned(self, item_ids, *, actor):
         """#1668 : un dépendant NON ASSIGNÉ dont la dernière attente vient de

@@ -18,6 +18,8 @@ stretch the grace.
 """
 from __future__ import annotations
 
+from . import storage
+
 
 def entrust(db, role: str, host: str, *, lock_key: str, owner: str,
             epoch: int) -> bool:
@@ -37,23 +39,10 @@ def entrust(db, role: str, host: str, *, lock_key: str, owner: str,
     Returns False when the lease is gone (another host may run), when the
     handover is unchanged, or when the statement did not write.
     """
-    rows = db.query(
-        """
-        WITH held AS (
-            SELECT 1
-              FROM merge_locks
-             WHERE target = %s AND owner = %s AND epoch = %s
-               AND expires_at > clock_timestamp()
-        )
-        INSERT INTO alerts_delegations (role, host, entrusted_at)
-        SELECT %s, %s, clock_timestamp() FROM held
-        ON CONFLICT (role) DO UPDATE
-           SET host = excluded.host,
-               entrusted_at = excluded.entrusted_at
-         WHERE alerts_delegations.host IS DISTINCT FROM excluded.host
-        RETURNING role
-        """, (lock_key, owner, int(epoch), role, host))
-    return bool(rows)
+    # #7650 : `merge_locks` est une table du module `dev` ; le SQL du bail y
+    # vit, le noyau ne garde que la lecture de sa propre table.
+    return storage.of(db).work.alerts_entrust(
+        role, host, lock_key=lock_key, owner=owner, epoch=epoch)
 
 
 def latest(db, role: str) -> dict | None:
