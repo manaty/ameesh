@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Nexlink release module (#7663, #7637 tranche 4).
+"""Nexlink tooling module (#7663 and #7793, #7637 tranches 3b and 4).
 
-The Nexlink release domain lives outside the generic core: the cutoff engine,
-its closed workflow lists and the release vocabulary are in
-:mod:`ameesh.modules.nexlink.release`. The core reaches them only through the
-Module interface (``registry.release_model``), the same way it reaches the
-development tooling through ``registry.get("dev")``: no direct import.
+The Nexlink domain lives outside the generic core: the cutoff engine, its
+closed workflow lists and the release vocabulary are in
+:mod:`ameesh.modules.nexlink.release`; the `nexlink` alert channel, its crypto
+envelope and its signed transport are in :mod:`ameesh.modules.nexlink.notify`
+and :mod:`ameesh.modules.nexlink.alerts`. The core reaches them only through
+the Module interface (``registry.release_model`` and
+``registry.notify_channel``), the same way it reaches the development tooling
+through ``registry.get("dev")``: no direct import.
 
 ``nexlink`` is always-active tooling, like ``dev``: it declares no work item
 type and gets no ``project_modules`` row. The bare profile
 (``AMEESH_MODULES=bare``) has no built-in module and therefore no ``nexlink``
-release model.
+release model and no ``nexlink`` notification channel.
 
-``RELEASE_MODELS`` names the release models this module provides; the engine
-is imported lazily by :func:`release_model`, so discovery does not load it.
+``RELEASE_MODELS`` and ``NOTIFY_CHANNELS`` name the providers this module
+supplies; each implementation is imported lazily by its getter, so discovery
+does not load it.
 """
 from __future__ import annotations
 
@@ -27,6 +31,10 @@ ALWAYS_ACTIVE = True
 
 #: Release model names this module provides, read by ``registry.release_model``.
 RELEASE_MODELS = ("nexlink",)
+
+#: Notification channel kinds this module provides, read by
+#: ``registry.notify_channel`` (#7793).
+NOTIFY_CHANNELS = ("nexlink",)
 
 #: #6020: notes reserved to ``ameesh release attest``. They live here, not in
 #: the core: ``work.note`` reads the list through ``registry``.
@@ -53,3 +61,15 @@ def release_model(name):
         raise ValueError("nexlink module does not provide release model %r" % (name,))
     from . import release
     return release
+
+
+def notify_channel(kind):
+    """The provider object of one notification channel, imported on first use.
+
+    Same lazy contract as :func:`release_model`: discovery reads
+    ``NOTIFY_CHANNELS`` without importing the channel implementation."""
+    if kind not in NOTIFY_CHANNELS:
+        raise ValueError("nexlink module does not provide notification channel %r"
+                         % (kind,))
+    from . import notify
+    return notify

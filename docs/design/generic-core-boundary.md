@@ -139,6 +139,20 @@ like `dev` and declares no work item type; the bare profile has no built-in
 module, hence no `nexlink` release model and no direct import of the engine.
 The configuration names the model; the core never names the module package.
 
+#7637 tranche 3b (#7793) moves the `nexlink` alert channel into that same
+built-in tooling module. A module declares `NOTIFY_CHANNELS`; the core merges
+those kinds with its own (`desktop`, `ntfy`, `slack`, `app`) and reads one
+through `registry.notify_channel(kind)`, which imports the provider lazily.
+The provider owns its configuration checks (`OPTIONS`, `validate`), its
+sender (`send`, `receipt`), its remote-push and doctor checks
+(`push_problem`, `activation_problem`) and its fallback contract
+(`FALLBACK`, `FALLBACK_KINDS`, `FALLBACK_PREFIX`). The generic `Sender` hands
+each provider a per-sender `channel_state`; the core keeps routing, retry,
+rate summary and the `notified`/`fallback` registries.
+`ameesh.modules.nexlink.alerts` holds the crypto envelope and the signed
+transport (formerly `ameesh.nexlink_alerts`). The bare profile has no
+built-in module, hence no `nexlink` channel and no import of either file.
+
 L100 tranche 1 (#4382) moves the development merge paths into the built-in
 `dev` provider. The `git-merge` action connector lives in
 `modules/dev/git_merge.py`; `connectors.get("git-merge")` reads it through

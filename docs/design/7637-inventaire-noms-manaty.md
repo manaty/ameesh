@@ -529,6 +529,12 @@ même nom sur la même ligne.
    `release_cutoff.py` (0) et `work.py` (0) ne l'importent plus. La dette `#7663` du test descend
    de 228 à 134 ; les 129 occurrences hors empreinte restent, surtout le canal d'alertes de
    `notify.py` (78), à ouvrir en lot séparé.
+   **Tranche 3b faite (#7793)** : le canal d'alertes de `notify.py` (78 occurrences) est porté
+   par `src/ameesh/modules/nexlink/notify.py`, avec l'enveloppe et le transport signé dans
+   `src/ameesh/modules/nexlink/alerts.py` (ex-`src/ameesh/nexlink_alerts.py`) ; le cœur lit le
+   canal par `registry.notify_channel(kind)`. `notify.py` ne porte plus aucun nom du lexique ; la
+   dette `#7663` du test descend de 134 à 55 (dont `cli.py` 8, le reste hors empreinte). Le
+   tableau par fichier ci-dessus reste l'instantané initial de l'inventaire, comme pour #7663.
 5. **`manaty` n'a aucune tranche** : 9 occurrences dans 4 fichiers (migrations.py 3,
    alert_briefs.py 2, incident.py 2, packet_guard.py 2). `manaty/ameesh` est le dépôt du cœur,
    `manaty/home` le canon, `manaty/nexlink` un dépôt de projet. Recommandation : les traiter
