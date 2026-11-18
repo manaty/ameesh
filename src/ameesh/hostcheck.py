@@ -29,7 +29,6 @@ import shutil
 import subprocess
 
 from . import adapters, harness_versions, harnesses, platform, registry
-from .roles import DESIGN_ROLES
 
 #: modèle d'unité d'exécuteur par agent (docs/BASCULE.md, deploy/systemd)
 RUNNER_TEMPLATE = "ameesh-runner-agent@%s.service"
@@ -545,11 +544,11 @@ def paquet_horaire_lines(cfg, run=_systemctl) -> list[str]:
         detail = " (%s)" % "; ".join(errors)
     return [
         "warning    : %s is active but %s%s: a takeover of the "
-        "%s role's lease would compose without a declared project on this host"
-        % (PAQUET_HORAIRE_TIMER, subject, detail, DESIGN_ROLES[0]),
-        "             declare packet_watch.projects.<p>.repo with \"role\": "
-        "\"%s\", or radar.projects.<p>.repo (stop the timer on a host "
-        "that is not a candidate)" % DESIGN_ROLES[0],
+        "elected role's lease would compose without a declared project on this host"
+        % (PAQUET_HORAIRE_TIMER, subject, detail),
+        "             declare packet_watch.projects.<p>.repo with its configured "
+        "elected role (packet_watch.role), or radar.projects.<p>.repo (stop the "
+        "timer on a host that is not a candidate)",
     ]
 
 
