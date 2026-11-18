@@ -52,6 +52,10 @@ BENCH_ENV_VARS = frozenset((
     "AMEESH_MODULES",
     # #5629 : facteur des bornes murales des tests (`scaled`)
     "AMEESH_TEST_TIME_SCALE",
+    # #3735/#7756 : AMEESH_BENCH_UPKEEP=0 désactive le ménage du banc (orphelins
+    # et annexes) ; sans cette entrée, l'import de ce module retirait le réglage
+    # et le document promettait une désactivation inopérante.
+    "AMEESH_BENCH_UPKEEP",
 ))
 #: L73/L142 : les caches de gestionnaires de paquets que le ménage redirige
 #: (`menage.CACHES`, `menage.XDG_CACHE`) sont un « choix de l'hôte » que le
@@ -937,6 +941,29 @@ def _bench_upkeep(db) -> None:
               % len(invalid.dropped), file=sys.stderr)
 
 
+def _bench_satellites(db) -> None:
+    """Purge les schémas annexes laissés par une classe de test morte (#7756).
+
+    Appelée à chaque `setUpClass`, pas une fois par processus comme
+    `_bench_upkeep` : un résidu frais d'une suite tuée empoisonne la classe
+    suivante. Une vue `<schéma>_closed_extension` lisible par PUBLIC suffit à
+    faire échouer `_contrat-superviseur.sql` et `_contrat-vm-probe.sql`, qui
+    auditent toute la base. `purge_satellites` ne retire que les annexes dont
+    la base de classe a disparu ou dont le propriétaire est prouvé mort ;
+    jamais un schéma sans preuve (#3735 B/P1). Même désactivation que
+    `_bench_upkeep`, et un ménage de banc ne juge jamais un test.
+    """
+    if os.environ.get("AMEESH_BENCH_UPKEEP", "1").lower() in ("0", "false", "no", "off"):
+        return
+    try:
+        result = bench_mod.purge_satellites(db)
+    except Exception:  # noqa: BLE001 — un ménage de banc ne juge jamais un test
+        return
+    if result.dropped:
+        print("banc : %d schéma(s) annexe(s) orphelin(s) purgé(s)"
+              % len(result.dropped), file=sys.stderr)
+
+
 #: #5641 : un nom de table ou de trigger passé à `PgTestCase.fill` (composé
 #: dans l'ALTER TABLE, jamais un paramètre lié).
 _FILL_IDENT = re.compile(r"[a-z_][a-z0-9_]*\Z")
@@ -1140,6 +1167,9 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
         # `tearDownClass` ne rouvrira pas la base fermée (B/P1 pilote #3735).
         cls._schema_dropped = False
         cls.addClassCleanup(cls._drop_schema)
+        # #7756 : LIFO — ce cleanup passe AVANT `_drop_schema`, donc avec la
+        # connexion encore ouverte, quand `setUpClass`/`tearDownClass` échoue.
+        cls.addClassCleanup(cls._drop_satellite_schemas)
         cls.state = os.path.join(cls.tmp, "state")
         cls.v0state = os.path.join(cls.tmp, "v0state")
         cls.conf = os.path.join(cls.tmp, "conf")
@@ -1165,6 +1195,10 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
                 raise AssertionError(message) from exc
             raise unittest.SkipTest(message) from exc
         _bench_upkeep(cls.db)
+        # #7756 : à chaque classe — un résidu frais d'une suite tuée casse la
+        # classe suivante, avant même que `_bench_upkeep` (une fois par
+        # processus) ne le voie.
+        _bench_satellites(cls.db)
         # #3752 : clone du gabarit migré une fois par base, sinon migrate()
         gabarit.preparer(cls.db, cls.schema)
         # #3735 : preuve de propriété durable du schéma — le processus de la
@@ -1180,6 +1214,40 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
                 cls._carte_tables = table_stats(cls.db, cls.schema)
             except Exception:
                 cls._carte_tables = None
+
+    @classmethod
+    def _drop_satellite_schemas(cls) -> None:
+        """Retire les schémas annexes ``<schéma de classe>_*`` (#7756).
+
+        `_drop_schema` ne connaît que le schéma de la classe. Un test qui crée
+        un schéma à côté — ``<schéma>_closed_extension`` avec un GRANT SELECT
+        à PUBLIC, par exemple — et meurt avant son propre ``finally`` laisse un
+        résidu que `_contrat-superviseur.sql` et `_contrat-vm-probe.sql`
+        voient : ils auditent toute la base et PUBLIC donne le droit à chaque
+        rôle. Enregistré en cleanup de classe **après** `_drop_schema` : en
+        LIFO il passe donc avant lui quand `setUpClass` échoue, connexion
+        encore ouverte. `tearDownClass` l'appelle aussi avant la fermeture ;
+        le drapeau `_schema_dropped` évite de rouvrir une connexion après
+        elle (B/P1 #3735).
+        """
+        if cls.__dict__.get("_schema_dropped", False):
+            return
+        db = cls.__dict__.get("db")
+        if db is None:
+            return
+        prefix = cls.schema + "_"
+        try:
+            rows = db.query(
+                "SELECT nspname FROM pg_namespace WHERE left(nspname, %s) = %s",
+                (len(prefix), prefix))
+        except Exception:  # noqa: BLE001 — cleanup : ne masque pas l'erreur d'origine
+            return
+        for row in rows:
+            try:
+                db.execute("DROP SCHEMA IF EXISTS %s CASCADE"
+                           % db_mod.quote_ident(str(row["nspname"])))
+            except Exception:  # noqa: BLE001 — un schéma ne bloque pas les autres
+                pass
 
     @classmethod
     def _drop_schema(cls) -> None:
@@ -1212,6 +1280,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
         try:
             noter_tables(cls)
             try:
+                cls._drop_satellite_schemas()
                 cls._drop_schema()
             finally:
                 shutil.rmtree(cls.tmp, ignore_errors=True)
