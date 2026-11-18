@@ -372,17 +372,28 @@ def check_first_decision(db, project, decision_id: int | None) -> int:
 def publish(project, manifest: dict, *, push: bool = True) -> str:
     """Create `stable/<week>` with the manifest and push it; idempotent.
 
-    An existing tag with the same manifest is success; any other content is a
-    refusal (a published week never moves).
+    An existing tag with the same manifest is success; a tag the remote
+    publishes with another content is a refusal (a published week never
+    moves). A local tag the remote does not carry is a leftover from an
+    interrupted or refused push: it is replaced, so that it cannot block the
+    week (#7703).
     """
     week = manifest["week"]
     name = TAG_PREFIX + week
+    ref = "refs/tags/%s" % name
     text = render(parse(render(manifest)))
-    if rc._git(project.repo, "rev-parse", "--verify", "-q", "refs/tags/%s" % name).returncode == 0:
+    exists = rc._git(project.repo, "rev-parse", "--verify", "-q", ref).returncode == 0
+    if exists:
         existing = read_tag(project.repo, week)
         if render(existing) != text:
-            raise StableError("%s already exists with another manifest" % name)
-    else:
+            # The remote is the fact: only a tag it already publishes forbids
+            # another manifest. An unpublished local tag is our own leftover.
+            if push and rc.remote_tag(project.repo, project.remote, name) is None:
+                _git(project.repo, "tag", "-d", name)
+                exists = False
+            else:
+                raise StableError("%s already exists with another manifest" % name)
+    if not exists:
         fd, path = tempfile.mkstemp(prefix="stable-", suffix=".json")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -394,7 +405,14 @@ def publish(project, manifest: dict, *, push: bool = True) -> str:
     if push:
         remote = rc.remote_tag(project.repo, project.remote, name)
         if remote is None:
-            _git(project.repo, "push", project.remote, "refs/tags/%s" % name, timeout=300.0)
+            proc = rc._git(project.repo, "push", project.remote, ref, timeout=300.0)
+            if proc.returncode:
+                detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
+                # Never leave an unpublished local tag behind: the next
+                # designation must be able to build its own tag.
+                if rc.remote_tag(project.repo, project.remote, name) is None:
+                    rc._git(project.repo, "tag", "-d", name)
+                raise StableError("git push: %s" % (detail or "failed"))
         elif remote != manifest["commit"]:
             raise StableError("%s on %s points at %s" % (name, project.remote, remote[:12]))
     return name
