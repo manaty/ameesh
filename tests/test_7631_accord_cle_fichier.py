@@ -48,11 +48,13 @@ class AccordBase(PgTestCase):
             entry["accord_operations"] = operations
         return apply_authenticators(self.db, [member("alice", entry, self.passkey.entry())])
 
-    def go(self, *, author: str = ALICE, kind: str = "human_message", age: float = 0) -> dict:
+    def go(self, *, author: str = ALICE, kind: str = "human_message", age: float = 0,
+           text: str = "go prod-deploy", project: str = "ameesh",
+           lot: str | None = None) -> dict:
         entry = storage.of(self.db).conversations.append(
             agent=AVATAR, session=None, turn=None, kind=kind, author=author,
-            text="go pour la mise en production", truncated=False, meta={},
-            event_id=None, project="ameesh", lot=None, thread_text=None)
+            text=text, truncated=False, meta={},
+            event_id=None, project=project, lot=lot, thread_text=None)
         if age:
             self.db.execute("UPDATE conversation_log SET created_at = now() - make_interval("
                             "secs => %s) WHERE agent = %s AND seq = %s",
@@ -156,6 +158,32 @@ class VerificationTest(AccordBase):
         late = self.receipt(accord, iat=int(time.time()) - 600, ttl=1200)
         self.assertRefused(self.verify(late), receipts.ACCORD)
 
+    def test_go_doit_etre_explicite(self):
+        """B cx2 : une question, un refus ou un message sans rapport ne vaut
+        pas accord, même récent et écrit par l'humain lui-même."""
+        cases = {
+            "question": "faut-il y aller ?",
+            "refus": "non, pas de go prod-deploy",
+            "sans rapport": "le temps est beau aujourd'hui",
+            "go d'un autre geste": "go spend",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.assertRefused(self.verify(self.receipt(self.go(text=text))),
+                                   receipts.ACCORD)
+        # le geste nommé par l'opération attendue suffit
+        self.assertTrue(self.verify(self.receipt(self.go(text="go prod-deploy"))).ok)
+        # ou par l'identifiant signé de l'action
+        request = make_request(ALICE)
+        request["accord"] = self.go(text="go %s" % request["action_id"])
+        self.assertTrue(self.verify(self.key.receipt(request)).ok)
+
+    def test_go_sans_reference_de_geste_refuse(self):
+        """Un « go » qui ne nomme ni l'action, ni l'opération, ni la cible ne
+        rattache pas le message au geste signé."""
+        self.assertRefused(self.verify(self.receipt(self.go(text="go pour la mise en production"))),
+                           receipts.ACCORD)
+
     def test_grant_borne_aux_operations_nommees(self):
         until = int(time.time()) + 3600
         standing = {"connector": "shell-noop", "operations": ["prod-deploy"],
@@ -230,7 +258,7 @@ class GrantTest(AccordBase):
                         ALICE, standing=self.standing(charter=bad)))
 
     def test_inscrit_puis_liste(self):
-        accord = self.go()
+        accord = self.go(text="go decision-sign")
         receipt = self.receipt(accord, standing=self.standing(
             charter={"frame": "sign-decisions", "version": "1"}))
         verdict, grant_id = receipts.register_standing(
@@ -259,7 +287,7 @@ class GrantTest(AccordBase):
     def test_grant_sans_charte_du_canon_refuse(self):
         """#7629 : le plafond du canon exige la ligne et la version de charte ;
         le cadre `{frame, version}` de #7631 ne les remplace pas."""
-        receipt = self.receipt(self.go(), standing=self.standing(
+        receipt = self.receipt(self.go(text="go decision-sign"), standing=self.standing(
             charter_line=None, charter_version=None))
         verdict, grant_id = receipts.register_standing(
             self.db, receipt, POLICY, registered_by="bureau", limits=self.LIMITS)

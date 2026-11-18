@@ -1169,8 +1169,9 @@ def check_accord(db, view: dict, human: str, accord: dict, *, now: float) -> str
                             "cover a decision signature (it must go through the gate with "
                             "reservation); cite the human's go: --accord AGENT#SEQ"
                             % (accord["grant"], kind))
-    code, reason = receipts.check_accord_entry(db, accord, human, int(now),
-                                               receipts.Policy())
+    code, reason = receipts.check_accord_entry(
+        db, accord, human, int(now), receipts.Policy(),
+        references=(str(view.get("id") or ""),), lot=view.get("lot"))
     if code:
         raise DecisionError(reason)
     return "%s#%d" % (accord["agent"], accord["seq"])

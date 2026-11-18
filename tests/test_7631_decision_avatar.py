@@ -25,11 +25,11 @@ class AvatarDecisionTest(_Base):
         authority.register_human_key(self.db, ALICE, signing.read_public(public),
                                      role="owner")
 
-    def go(self, author=ALICE) -> dict:
+    def go(self, decision_id, author=ALICE) -> dict:
         entry = storage.of(self.db).conversations.append(
             agent=AVATAR, session=None, turn=None, kind="human_message", author=author,
-            text="go", truncated=False, meta={}, event_id=None, project="ameesh", lot=None,
-            thread_text=None)
+            text="go %d" % int(decision_id), truncated=False, meta={}, event_id=None,
+            project="ameesh", lot=None, thread_text=None)
         return {"agent": AVATAR, "seq": int(entry["seq"])}
 
     def avatar(self, accord) -> dict:
@@ -46,8 +46,8 @@ class AvatarDecisionTest(_Base):
         self.assertEqual(self.meta(owner)["signed_by"], "owner")
         self.assertTrue(decisions.verify_proof(self.db, owner["decision"])[0])
 
-        accord = self.go()
         view = self.ask(needs_signature=True)
+        accord = self.go(view["id"])
         signed = self.answer(view["id"], "a", key_path=self.private,
                              signer=self.avatar(accord))
         answer = signed["decision"]["answer"]
@@ -63,7 +63,8 @@ class AvatarDecisionTest(_Base):
 
     def test_accord_absent_ou_d_un_autre_refuse(self):
         view = self.ask(needs_signature=True)
-        for accord in ({"agent": AVATAR, "seq": 999}, self.go(author="human:bob")):
+        for accord in ({"agent": AVATAR, "seq": 999},
+                       self.go(view["id"], author="human:bob")):
             with self.subTest(accord=accord):
                 with self.assertRaises(DecisionError):
                     self.answer(view["id"], "a", key_path=self.private,
@@ -71,8 +72,9 @@ class AvatarDecisionTest(_Base):
         self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
 
     def test_avatar_signe_avec_la_cle(self):
+        view = self.ask()
         with self.assertRaises(DecisionError):
-            self.answer(self.ask()["id"], "a", signer=self.avatar(self.go()))
+            self.answer(view["id"], "a", signer=self.avatar(self.go(view["id"])))
 
     def test_grant_refuse_tant_que_la_porte_ne_reserve_pas(self):
         """Relecture cx2 (B) : un grant, même actif et à son nom, ne couvre pas
@@ -91,7 +93,8 @@ class AvatarDecisionTest(_Base):
         with self.assertRaises(DecisionError):
             decisions.check_accord(self.db, key, ALICE, {"grant": 7}, now=time.time())
         # forme (a) : couvre aussi la clé et la provenance
-        self.assertEqual(decisions.check_accord(self.db, key, ALICE, self.go(),
+        self.assertEqual(decisions.check_accord(self.db, key, ALICE,
+                                                self.go(key["id"]),
                                                 now=time.time())[:len(AVATAR)], AVATAR)
 
     def test_reclassement_vers_cle_seulement(self):
@@ -121,8 +124,9 @@ class AvatarDecisionTest(_Base):
         from ameesh import reserved_gestures
         since = time.time() - 1
         self.answer(self.ask(needs_signature=True)["id"], "a", key_path=self.private)
-        accord = self.go()
-        self.answer(self.ask(needs_signature=True)["id"], "a", key_path=self.private,
+        second = self.ask(needs_signature=True)
+        accord = self.go(second["id"])
+        self.answer(second["id"], "a", key_path=self.private,
                     signer=self.avatar(accord))
         # une signature d'avant #7631 : meta sans signed_by
         legacy = self.ask(needs_signature=True)
@@ -137,9 +141,9 @@ class AvatarDecisionTest(_Base):
                          [(reserved_gestures.UNRECORDED_SIGNER, legacy["id"])])
 
     def test_go_d_une_autre_session_refuse(self):
-        accord = self.go()
-        other = {"by": decisions.SIGNED_BY_AVATAR, "agent": "autre-avatar", "accord": accord}
         view = self.ask(needs_signature=True)
+        accord = self.go(view["id"])
+        other = {"by": decisions.SIGNED_BY_AVATAR, "agent": "autre-avatar", "accord": accord}
         with self.assertRaises(DecisionError):
             self.answer(view["id"], "a", key_path=self.private, signer=other)
         self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")

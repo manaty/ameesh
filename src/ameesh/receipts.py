@@ -1012,7 +1012,9 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
     # 4 bis. #7631 : l'accord cité est une entrée du journal de conversation,
     #    écrite par l'approbateur lui-même, avant la signature et récente
     if accord is not None:
-        code, reason = check_accord_entry(db, accord, request["approver"], iat, policy)
+        references, lot = _gesture_references(db, request, expected_operation)
+        code, reason = check_accord_entry(db, accord, request["approver"], iat, policy,
+                                          references=references, lot=lot)
         if code:
             return refuse(code, reason)
         ctx.update(accord={"agent": accord["agent"], "seq": accord["seq"]},
@@ -1044,11 +1046,62 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         request["decision"], approver, parsed.facade), **ctx), parsed
 
 
+#: #7631 (B cx2) : un « go » est explicite — le message commence par `go`
+#: (mot isolé, pas `golang`), puis nomme le geste signé. Une question ou un
+#: refus ne le nomme pas : il ne peut donc plus être cité comme accord.
+_GO_RE = re.compile(r"^\s*go(?![0-9A-Za-z])", re.IGNORECASE)
+#: les mots du message, pour y retrouver une référence de geste
+_GO_TOKEN_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z_.:#/-]*")
+
+
+def _gesture_references(db: Db, request: dict, expected_operation: str | None
+                        ) -> tuple[list[str], int | None]:
+    """Les références qui rattachent l'accord au geste signé (#7631, B cx2).
+
+    L'identifiant d'action, l'opération attendue, la cible et le lot de
+    l'action ; pour un grant, le connecteur et ses opérations. Le message de
+    l'humain doit en nommer une, sinon l'accord n'est pas rattaché au geste.
+    Une lecture ratée de l'action ne prouve rien : elle laisse seulement les
+    références déjà connues par la demande signée.
+    """
+    refs: list[str] = []
+    lot = None
+    action_id = request.get("action_id")
+    if isinstance(action_id, str) and action_id:
+        refs.append(action_id)
+        try:
+            action = storage.of(db).actions.get(action_id, with_receipts=False)
+        except Exception:  # noqa: BLE001 - une lecture ratée ne prouve rien
+            action = None
+        if action:
+            lot = action.get("work_item")
+            for key in ("operation", "target"):
+                value = str(action.get(key) or "").strip()
+                if value:
+                    refs.append(value)
+            if lot is not None:
+                refs.append(str(lot))
+    if expected_operation:
+        refs.append(str(expected_operation))
+    standing = request.get("standing")
+    if isinstance(standing, dict):
+        connector = str(standing.get("connector") or "").strip()
+        if connector:
+            refs.append(connector)
+        refs.extend(str(value) for value in standing.get("operations") or ()
+                    if str(value or "").strip())
+    return list(dict.fromkeys(refs)), lot
+
+
 def check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
-                        policy: Policy) -> tuple[str, str]:
-    """("", "") si l'entrée (agent, seq) du journal L78 porte l'accord de
-    `approver` : message humain de confiance, de cet humain, écrit au plus
-    `clock_skew` après `iat` et au plus `max_ttl` avant ; sinon (code, raison)."""
+                       policy: Policy, *, references=(), lot=None) -> tuple[str, str]:
+    """("", "") si l'entrée (agent, seq) du journal L78 porte un accord de
+    `approver` rattaché au geste : message humain de confiance, de cet humain,
+    commençant par un « go » explicite et nommant une des `references` du
+    geste (identifiant d'action, opération, cible, lot, décision, opérations
+    du mandat) ; écrit au plus `clock_skew` après `iat` et au plus `max_ttl`
+    avant. `lot` : quand le message le porte, il doit être celui du geste.
+    Sinon (code, raison) — le refus dit quoi citer."""
     where = "%s#%d" % (accord["agent"], accord["seq"])
     entry = storage.of(db).conversations.entry(accord["agent"], accord["seq"])
     if entry is None:
@@ -1062,6 +1115,23 @@ def check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
     if ts < iat - policy.max_ttl:
         return ACCORD, ("accord %s: older than %d s before the signature (a lasting go "
                         "is a standing approval)" % (where, policy.max_ttl))
+    text = str(entry.get("text") or "")
+    if not _GO_RE.match(text):
+        return ACCORD, ("accord %s: not an explicit go (the human message must start "
+                        "with \"go\" and name the gesture)" % where)
+    tokens = {str(value).casefold() for value in _GO_TOKEN_RE.findall(text)}
+    wanted = [str(value).strip() for value in references or ()
+              if str(value or "").strip()]
+    if not wanted:
+        return ACCORD, "accord %s: no gesture reference to check" % where
+    if not any(value.casefold() in tokens for value in wanted):
+        return ACCORD, ("accord %s: the message names none of the gesture references "
+                        "(%s); reply \"go <action id|operation|lot>\""
+                        % (where, ", ".join(sorted(set(wanted)))))
+    if (lot not in (None, "") and entry.get("lot") not in (None, "")
+            and str(entry["lot"]) != str(lot)):
+        return ACCORD, "accord %s: written for lot %s, not %s" % (
+            where, entry["lot"], lot)
     return "", ""
 
 
