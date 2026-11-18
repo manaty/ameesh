@@ -1061,6 +1061,11 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
       si `repo` est fourni et que le delta du lot est **mécaniquement
       constant** entre la tête relue et la tête gelée (`rebase_identity`,
       #1905), l'avis est porté sur la tête gelée, note `mechanical-rebase` ;
+    * si le dépôt et le gel déclaré sont lisibles, un avis nommant un autre
+      commit absent du dépôt est écarté de la sélection (sa trace reste dans
+      la frise), note `verdict-unresolved-in-lot-repository` ; le lecteur doit
+      encore confronter le candidat à la tête publiée ; sans dépôt lisible,
+      cette vérification ne peut pas être faite ;
     * sans gel déclaré : le SHA de l'avis favorable ;
     * avis sans commit : il ne vaut que par l'instant, le gel déclaré (s'il
       existe) reste candidat, note `verdict-names-no-commit` ;
@@ -1090,6 +1095,26 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
 
     f_sha = commit_id((freeze or {}).get("sha"))
     f_at = float((freeze or {}).get("at_ts") or 0)
+    # #7764 : un avis sur un dépôt compagnon reste dans la frise, mais ne
+    # peut ni déplacer le gel ni masquer les avis du dépôt du lot. Ne filtrer
+    # qu'avec un dépôt lisible et un gel vérifié : sinon conserver le refus
+    # habituel, jamais transformer une lecture impossible en preuve de gel.
+    # Sans dépôt, les lecteurs non composeurs (dont slo_delivery) gardent
+    # leur comportement historique, sans refus non concluant ni filtre.
+    foreign_verdicts = []
+    if repo and f_sha and _commit(repo, f_sha, timeout=PROBE_TIMEOUT_S):
+        resolved = {}
+        applicable = []
+        for verdict in verdicts:
+            sha = commit_id(verdict.get("sha"))
+            if sha and not same_commit(sha, f_sha):
+                if sha not in resolved:
+                    resolved[sha] = _commit(repo, sha, timeout=PROBE_TIMEOUT_S)
+                if not resolved[sha]:
+                    foreign_verdicts.append(verdict)
+                    continue
+            applicable.append(verdict)
+        verdicts = applicable
     # #1767 : un avis ok postérieur au gel sur un commit que la frise nommait
     # déjà avant ce gel (ancienne tête) est tardif : il ne déclasse pas le gel.
     # Un commit jamais nommé avant le gel reste lu comme un rebase relu.
@@ -1120,6 +1145,8 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
             last = returned
     out = {"sha": "", "origin": "", "declared": _freeze_mark(freeze),
            "verdict": _freeze_mark(last), "causes": [], "notes": []}
+    if foreign_verdicts:
+        out["notes"].append("verdict-unresolved-in-lot-repository")
     if returned is not None:
         out["notes"].append("returned-to-reviewed-head")
     if any(late(v) for v in verdicts):
