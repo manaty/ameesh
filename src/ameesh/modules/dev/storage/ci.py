@@ -188,7 +188,7 @@ class CiResults(DevDomain, interface.CiResults):
             """ % (RUN_COLUMNS, FOLLOWS_BASE), (json.dumps(sorted(branches)),))
 
     def conclude(self, repo, run_id, status) -> bool:
-        from ... import merge_queue, train_events
+        from .... import merge_queue, train_events
         with self.db.transaction() as tx:
             rows = tx.query(
                 """
