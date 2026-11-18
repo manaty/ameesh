@@ -5,71 +5,122 @@
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
     "ameesh --version": [],
-    "ameesh modules": [
-      "--json",
-      "--active",
-      "--no-canon"
-    ],
-    "ameesh module": [],
-    "ameesh canon check": [
-      "--canon",
-      "--ref",
-      "--host"
-    ],
+    "ameesh modules": ["--active", "--help", "--json", "--no-canon"],
+    "ameesh module": ["--help"],
+    "ameesh canon check": ["--canon", "--fetch", "--help", "--host", "--json", "--project-repo", "--ref"],
     "ameesh canon sync": [
-      "--host"
-    ],
-    "ameesh turn current": [
+      "--allow-rewind",
+      "--bootstrap-ref",
+      "--canon",
+      "--fetch",
+      "--help",
+      "--host",
       "--json",
-      "--expect-turn",
-      "--local"
+      "--ref"
     ],
-    "ameesh turn observe": [
+    "ameesh turn current": ["--expect-turn", "--help", "--json", "--local"],
+    "ameesh turn observe": ["--help", "--json", "--request", "--turn"],
+    "ameesh migrate": ["--additive-only", "--allow-live-executors", "--dry-run", "--help"],
+    "ameesh action propose": [
+      "--amount",
+      "--approver",
+      "--args",
+      "--args-file",
+      "--by",
+      "--class",
+      "--connector",
+      "--currency",
+      "--help",
       "--json",
-      "--turn",
-      "--request"
+      "--noop-dir",
+      "--operation",
+      "--policy-version",
+      "--project",
+      "--receipt-class",
+      "--target",
+      "--timeout",
+      "--work-item"
     ],
-    "ameesh migrate": [
-      "--dry-run",
-      "--additive-only"
+    "ameesh action approve": [
+      "--allow-facade",
+      "--by",
+      "--help",
+      "--json",
+      "--level",
+      "--origin",
+      "--receipt",
+      "--rp-id",
+      "--standing"
     ],
-    "ameesh action propose": [],
-    "ameesh action approve": [],
-    "ameesh action execute": [],
-    "ameesh action reconcile": [],
+    "ameesh action execute": [
+      "--allow-facade",
+      "--by",
+      "--help",
+      "--json",
+      "--level",
+      "--noop-dir",
+      "--origin",
+      "--rp-id",
+      "--timeout"
+    ],
+    "ameesh action reconcile": ["--by", "--force", "--help", "--json", "--noop-dir", "--timeout"],
     "agent-runner": [
-      "--agents-file"
+      "--agents",
+      "--agents-file",
+      "--balance-hours",
+      "--balance-min",
+      "--balance-window",
+      "--budget",
+      "--chantier",
+      "--cwd",
+      "--dry-run",
+      "--help",
+      "--host",
+      "--idle-nudge",
+      "--lease-ttl",
+      "--max-turns",
+      "--migrate",
+      "--model",
+      "--once",
+      "--poll",
+      "--prompt",
+      "--runner-id",
+      "--session",
+      "--take-idle",
+      "--take-interval",
+      "--take-lot-idle",
+      "--take-lot-max-per-hour",
+      "--take-max-per-hour",
+      "--take-review-max-per-hour",
+      "--wait"
     ],
-    "agent-mail send": [],
+    "agent-mail send": [
+      "--ack",
+      "--app",
+      "--assign",
+      "--attribution",
+      "--cc",
+      "--estimate",
+      "--force",
+      "--from",
+      "--info",
+      "--lot",
+      "--new-lot",
+      "--queue",
+      "--request-expires",
+      "--stdin",
+      "--urgent"
+    ],
     "agent-mail show": []
   },
   "module": {
     "name_pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-    "reserved_names": [
-      "list"
-    ],
-    "descriptor_keys": [
-      "schemas",
-      "rules",
-      "types"
-    ],
-    "capabilities": [
-      "lifecycle",
-      "cli",
-      "audit",
-      "workspaces"
-    ],
-    "callbacks": {
-      "main": "(db, argv, *, actor)",
-      "audit": "(store, project)"
-    },
+    "reserved_names": ["list"],
+    "descriptor_keys": ["schemas", "rules", "types"],
+    "capabilities": ["lifecycle", "cli", "audit", "workspaces"],
+    "callbacks": {"main": "(db, argv, *, actor)", "audit": "(store, project)"},
     "discover": "(*, builtin=True, canon=None)",
-    "registry": [
-      "modules",
-      "refused",
-      "names",
-      "get"
-    ],
+    "registry": ["modules", "refused", "names", "get"],
     "record_fields": [
       "name",
       "version",
@@ -96,1050 +147,4112 @@
     }
   },
   "http": {
-    "unauthenticated": [
-      "/.well-known/ameesh",
-      "/api/v1/openapi.json"
-    ],
+    "unauthenticated": ["/.well-known/ameesh", "/api/v1/openapi.json"],
     "operations": {
       "GET /.well-known/ameesh": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [],
-        "required_parameters": [],
-        "response_properties": [
-          "api",
-          "approve_url",
-          "languages",
-          "mode",
-          "oidc_issuer",
-          "openapi",
-          "organisation",
-          "schema",
-          "version",
-          "versions",
-          "vocabulary"
-        ],
-        "response_required": [
-          "api",
-          "approve_url",
-          "languages",
-          "mode",
-          "oidc_issuer",
-          "openapi",
-          "organisation",
-          "schema",
-          "version",
-          "versions"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {
+                  "type": ["object"],
+                  "required": [
+                    "api",
+                    "approve_url",
+                    "languages",
+                    "mode",
+                    "oidc_issuer",
+                    "openapi",
+                    "organisation",
+                    "schema",
+                    "version",
+                    "versions"
+                  ]
+                },
+                "api": {"type": ["string"]},
+                "approve_url": {"type": ["null", "string"]},
+                "languages": {"type": ["array"]},
+                "languages[]": {"type": ["string"]},
+                "mode": {"type": ["string"]},
+                "oidc_issuer": {"type": ["null", "string"]},
+                "openapi": {"type": ["string"]},
+                "organisation": {"type": ["null", "string"]},
+                "schema": {"type": ["string"], "const": "ameesh-discovery/1"},
+                "version": {"type": ["string"]},
+                "versions": {"type": ["array"]},
+                "versions[]": {"type": ["string"]},
+                "vocabulary": {"type": ["object"]},
+                "vocabulary.definite": {"type": ["string"]},
+                "vocabulary.definite_plural": {"type": ["string"]},
+                "vocabulary.elides": {"type": ["boolean"]},
+                "vocabulary.gender": {"type": ["string"]},
+                "vocabulary.indefinite": {"type": ["string"]},
+                "vocabulary.indefinite_plural": {"type": ["string"]},
+                "vocabulary.of": {"type": ["string"]},
+                "vocabulary.of_plural": {"type": ["string"]},
+                "vocabulary.plural": {"type": ["string"]},
+                "vocabulary.singular": {"type": ["string"]},
+                "vocabulary.title": {"type": ["string"]},
+                "vocabulary.title_plural": {"type": ["string"]},
+                "vocabulary.to": {"type": ["string"]},
+                "vocabulary.to_plural": {"type": ["string"]}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/agents": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [],
-        "required_parameters": [],
-        "response_properties": [
-          "agents",
-          "schema"
-        ],
-        "response_required": [
-          "agents",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["agents", "schema"]},
+                "agents": {"type": ["array"]},
+                "agents[]": {"type": ["object"], "required": ["name"]},
+                "agents[].name": {"type": ["string"]},
+                "agents[].sandbox": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "agent",
+                    "canon_ref",
+                    "completed_ts",
+                    "counters",
+                    "deadline_ts",
+                    "epoch",
+                    "job",
+                    "owner",
+                    "placement_ref",
+                    "profile_ref",
+                    "receipt",
+                    "refusal",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "started_ts",
+                    "state",
+                    "tranche",
+                    "turn_id",
+                    "verdict"
+                  ]
+                },
+                "agents[].sandbox.agent": {"type": ["string"]},
+                "agents[].sandbox.canon_ref": {"type": ["string"]},
+                "agents[].sandbox.completed_ts": {"type": ["null", "number"]},
+                "agents[].sandbox.counters": {
+                  "type": ["null", "object"],
+                  "required": ["model_calls", "seconds", "tool_calls", "turns"]
+                },
+                "agents[].sandbox.counters.model_calls": {"type": ["integer"]},
+                "agents[].sandbox.counters.seconds": {"type": ["integer"]},
+                "agents[].sandbox.counters.tool_calls": {"type": ["integer"]},
+                "agents[].sandbox.counters.turns": {"type": ["integer"]},
+                "agents[].sandbox.deadline_ts": {"type": ["number"]},
+                "agents[].sandbox.epoch": {"type": ["integer"]},
+                "agents[].sandbox.job": {"type": ["object"], "required": ["name", "namespace", "phase", "uid"]},
+                "agents[].sandbox.job.name": {"type": ["string"]},
+                "agents[].sandbox.job.namespace": {"type": ["string"]},
+                "agents[].sandbox.job.phase": {"type": ["null", "string"]},
+                "agents[].sandbox.job.uid": {"type": ["null", "string"]},
+                "agents[].sandbox.owner": {"type": ["string"]},
+                "agents[].sandbox.placement_ref": {"type": ["string"]},
+                "agents[].sandbox.profile_ref": {"type": ["string"]},
+                "agents[].sandbox.receipt": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "epoch",
+                    "job",
+                    "replayed",
+                    "result_id",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "turn_id"
+                  ]
+                },
+                "agents[].sandbox.receipt.epoch": {"type": ["integer"]},
+                "agents[].sandbox.receipt.job": {"type": ["object"]},
+                "agents[].sandbox.receipt.replayed": {"type": ["boolean"]},
+                "agents[].sandbox.receipt.result_id": {"type": ["string"]},
+                "agents[].sandbox.receipt.result_sha256": {"type": ["string"]},
+                "agents[].sandbox.receipt.schema": {"type": ["string"], "const": "ameesh-sandbox-receipt/1"},
+                "agents[].sandbox.receipt.scope": {"type": ["object"]},
+                "agents[].sandbox.receipt.scope_digest": {"type": ["string"]},
+                "agents[].sandbox.receipt.source": {"type": ["object"]},
+                "agents[].sandbox.receipt.turn_id": {"type": ["string"]},
+                "agents[].sandbox.refusal": {"type": ["null", "string"]},
+                "agents[].sandbox.result_sha256": {"type": ["null", "string"]},
+                "agents[].sandbox.schema": {"type": ["string"], "const": "ameesh-sandbox-turn/1"},
+                "agents[].sandbox.scope": {"type": ["object"]},
+                "agents[].sandbox.scope_digest": {"type": ["string"]},
+                "agents[].sandbox.source": {"type": ["object"]},
+                "agents[].sandbox.started_ts": {"type": ["number"]},
+                "agents[].sandbox.state": {
+                  "type": ["string"],
+                  "enum": [
+                    "bound",
+                    "cancelled",
+                    "cancelling",
+                    "created",
+                    "expired",
+                    "failed",
+                    "intent",
+                    "lost",
+                    "orphaned",
+                    "running",
+                    "succeeded"
+                  ]
+                },
+                "agents[].sandbox.tranche": {
+                  "type": ["null", "object"],
+                  "required": ["kept_usd", "reserved_usd", "settled_usd", "state", "tranche_id"]
+                },
+                "agents[].sandbox.tranche.kept_usd": {"type": ["null", "number"]},
+                "agents[].sandbox.tranche.reserved_usd": {"type": ["number"]},
+                "agents[].sandbox.tranche.settled_usd": {"type": ["null", "number"]},
+                "agents[].sandbox.tranche.state": {"enum": ["kept", "open", "released", "settled"]},
+                "agents[].sandbox.tranche.tranche_id": {"type": ["string"]},
+                "agents[].sandbox.turn_id": {"type": ["string"]},
+                "agents[].sandbox.verdict": {"type": ["null", "string"]},
+                "schema": {"type": ["string"], "const": "ameesh-agents/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/agents/{agent}": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:agent"
-        ],
-        "required_parameters": [
-          "path:agent"
-        ],
-        "response_properties": [
-          "agent",
-          "schema"
-        ],
-        "response_required": [
-          "agent",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {"path:agent": {"required": true, "fields": {"": {"type": ["string"]}}}},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["agent", "schema"]},
+                "agent": {"type": ["object"], "required": ["key_ready", "name"]},
+                "agent.key_ready": {"type": ["boolean"]},
+                "agent.name": {"type": ["string"]},
+                "agent.sandbox": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "agent",
+                    "canon_ref",
+                    "completed_ts",
+                    "counters",
+                    "deadline_ts",
+                    "epoch",
+                    "job",
+                    "owner",
+                    "placement_ref",
+                    "profile_ref",
+                    "receipt",
+                    "refusal",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "started_ts",
+                    "state",
+                    "tranche",
+                    "turn_id",
+                    "verdict"
+                  ]
+                },
+                "agent.sandbox.agent": {"type": ["string"]},
+                "agent.sandbox.canon_ref": {"type": ["string"]},
+                "agent.sandbox.completed_ts": {"type": ["null", "number"]},
+                "agent.sandbox.counters": {
+                  "type": ["null", "object"],
+                  "required": ["model_calls", "seconds", "tool_calls", "turns"]
+                },
+                "agent.sandbox.counters.model_calls": {"type": ["integer"]},
+                "agent.sandbox.counters.seconds": {"type": ["integer"]},
+                "agent.sandbox.counters.tool_calls": {"type": ["integer"]},
+                "agent.sandbox.counters.turns": {"type": ["integer"]},
+                "agent.sandbox.deadline_ts": {"type": ["number"]},
+                "agent.sandbox.epoch": {"type": ["integer"]},
+                "agent.sandbox.job": {"type": ["object"], "required": ["name", "namespace", "phase", "uid"]},
+                "agent.sandbox.job.name": {"type": ["string"]},
+                "agent.sandbox.job.namespace": {"type": ["string"]},
+                "agent.sandbox.job.phase": {"type": ["null", "string"]},
+                "agent.sandbox.job.uid": {"type": ["null", "string"]},
+                "agent.sandbox.owner": {"type": ["string"]},
+                "agent.sandbox.placement_ref": {"type": ["string"]},
+                "agent.sandbox.profile_ref": {"type": ["string"]},
+                "agent.sandbox.receipt": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "epoch",
+                    "job",
+                    "replayed",
+                    "result_id",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "turn_id"
+                  ]
+                },
+                "agent.sandbox.receipt.epoch": {"type": ["integer"]},
+                "agent.sandbox.receipt.job": {"type": ["object"]},
+                "agent.sandbox.receipt.replayed": {"type": ["boolean"]},
+                "agent.sandbox.receipt.result_id": {"type": ["string"]},
+                "agent.sandbox.receipt.result_sha256": {"type": ["string"]},
+                "agent.sandbox.receipt.schema": {"type": ["string"], "const": "ameesh-sandbox-receipt/1"},
+                "agent.sandbox.receipt.scope": {"type": ["object"]},
+                "agent.sandbox.receipt.scope_digest": {"type": ["string"]},
+                "agent.sandbox.receipt.source": {"type": ["object"]},
+                "agent.sandbox.receipt.turn_id": {"type": ["string"]},
+                "agent.sandbox.refusal": {"type": ["null", "string"]},
+                "agent.sandbox.result_sha256": {"type": ["null", "string"]},
+                "agent.sandbox.schema": {"type": ["string"], "const": "ameesh-sandbox-turn/1"},
+                "agent.sandbox.scope": {"type": ["object"]},
+                "agent.sandbox.scope_digest": {"type": ["string"]},
+                "agent.sandbox.source": {"type": ["object"]},
+                "agent.sandbox.started_ts": {"type": ["number"]},
+                "agent.sandbox.state": {
+                  "type": ["string"],
+                  "enum": [
+                    "bound",
+                    "cancelled",
+                    "cancelling",
+                    "created",
+                    "expired",
+                    "failed",
+                    "intent",
+                    "lost",
+                    "orphaned",
+                    "running",
+                    "succeeded"
+                  ]
+                },
+                "agent.sandbox.tranche": {
+                  "type": ["null", "object"],
+                  "required": ["kept_usd", "reserved_usd", "settled_usd", "state", "tranche_id"]
+                },
+                "agent.sandbox.tranche.kept_usd": {"type": ["null", "number"]},
+                "agent.sandbox.tranche.reserved_usd": {"type": ["number"]},
+                "agent.sandbox.tranche.settled_usd": {"type": ["null", "number"]},
+                "agent.sandbox.tranche.state": {"enum": ["kept", "open", "released", "settled"]},
+                "agent.sandbox.tranche.tranche_id": {"type": ["string"]},
+                "agent.sandbox.turn_id": {"type": ["string"]},
+                "agent.sandbox.verdict": {"type": ["null", "string"]},
+                "schema": {"type": ["string"], "const": "ameesh-agent-detail/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/agents/{agent}/chat": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:agent",
-          "query:after",
-          "query:limit"
-        ],
-        "required_parameters": [
-          "path:agent"
-        ],
-        "response_properties": [
-          "agent",
-          "entries",
-          "gap",
-          "last_seq",
-          "more",
-          "next_seq",
-          "oldest_seq",
-          "schema"
-        ],
-        "response_required": [
-          "agent",
-          "entries",
-          "gap",
-          "last_seq",
-          "more",
-          "next_seq",
-          "oldest_seq",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:agent": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "query:after": {"required": false, "fields": {"": {"type": ["integer"], "minimum": 0}}},
+          "query:limit": {
+            "required": false,
+            "fields": {"": {"type": ["integer"], "minimum": 1, "maximum": 500}}
+          }
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {
+                  "type": ["object"],
+                  "required": [
+                    "agent",
+                    "entries",
+                    "gap",
+                    "last_seq",
+                    "more",
+                    "next_seq",
+                    "oldest_seq",
+                    "schema"
+                  ]
+                },
+                "agent": {"type": ["string"]},
+                "entries": {"type": ["array"]},
+                "entries[]": {"type": ["object"], "required": ["author", "kind", "seq", "text", "ts"]},
+                "entries[].author": {"type": ["string"]},
+                "entries[].event_id": {"type": ["null", "string"]},
+                "entries[].kind": {"type": ["string"]},
+                "entries[].lot": {"type": ["null", "string"]},
+                "entries[].meta": {"type": ["object"]},
+                "entries[].project": {"type": ["string"]},
+                "entries[].seq": {"type": ["integer"]},
+                "entries[].session": {"type": ["null", "string"]},
+                "entries[].text": {"type": ["string"]},
+                "entries[].truncated": {"type": ["boolean"]},
+                "entries[].ts": {"type": ["number"]},
+                "entries[].turn": {"type": ["null", "string"]},
+                "gap": {"type": ["boolean"]},
+                "last_seq": {"type": ["integer"]},
+                "more": {"type": ["boolean"]},
+                "next_seq": {"type": ["integer"]},
+                "oldest_seq": {"type": ["integer", "null"]},
+                "schema": {"type": ["string"], "const": "ameesh-conversation/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/agents/{agent}/peek": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:agent",
-          "query:limit"
-        ],
-        "required_parameters": [
-          "path:agent"
-        ],
-        "response_properties": [
-          "agent",
-          "captured_ts",
-          "events",
-          "host",
-          "lot",
-          "schema",
-          "stale",
-          "workspace"
-        ],
-        "response_required": [
-          "agent",
-          "captured_ts",
-          "events",
-          "host",
-          "lot",
-          "schema",
-          "stale",
-          "workspace"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:agent": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "query:limit": {
+            "required": false,
+            "fields": {"": {"type": ["integer"], "minimum": 1, "maximum": 50}}
+          }
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {
+                  "type": ["object"],
+                  "required": [
+                    "agent",
+                    "captured_ts",
+                    "events",
+                    "host",
+                    "lot",
+                    "schema",
+                    "stale",
+                    "workspace"
+                  ]
+                },
+                "agent": {"type": ["string"]},
+                "captured_ts": {"type": ["null", "number"]},
+                "events": {"type": ["array"]},
+                "events[]": {"type": ["object"]},
+                "host": {"type": ["string"]},
+                "lot": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-agent-peek/1"},
+                "stale": {"type": ["boolean"]},
+                "workspace": {"type": ["object"]}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/alerts": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [],
-        "required_parameters": [],
-        "response_properties": [
-          "alerts",
-          "schema"
-        ],
-        "response_required": [
-          "alerts",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["alerts", "schema"]},
+                "alerts": {"type": ["array"]},
+                "alerts[]": {"type": ["object"], "required": ["acknowledged", "key", "schema", "type"]},
+                "alerts[].acknowledged": {"type": ["boolean"]},
+                "alerts[].acknowledgement": {"type": ["null", "object"]},
+                "alerts[].key": {"type": ["string"], "pattern": "^[0-9a-f]{64}$"},
+                "alerts[].schema": {"type": ["string"], "const": "ameesh-alert/1"},
+                "alerts[].type": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-alerts/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/budget": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [],
-        "required_parameters": [],
-        "response_properties": [
-          "limits",
-          "schema"
-        ],
-        "response_required": [
-          "limits",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["limits", "schema"]},
+                "limits": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-budget/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/decisions": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "query:all"
-        ],
-        "required_parameters": [],
-        "response_properties": [
-          "approvals",
-          "prose",
-          "requests",
-          "schema"
-        ],
-        "response_required": [
-          "approvals",
-          "prose",
-          "requests",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "query:all": {"required": false, "fields": {"": {"type": ["string"], "enum": ["0", "1"]}}}
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["approvals", "prose", "requests", "schema"]},
+                "approvals": {"type": ["array"]},
+                "approvals[]": {"type": ["object"]},
+                "prose": {"type": ["array"]},
+                "prose[]": {"type": ["object"]},
+                "requests": {"type": ["array"]},
+                "requests[]": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-decisions/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/events": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "header:Last-Event-ID"
-        ],
-        "required_parameters": [],
-        "response_properties": [],
-        "response_required": [],
-        "response_types": [
-          "text/event-stream"
-        ]
+        "parameters": {
+          "header:Last-Event-ID": {
+            "required": false,
+            "fields": {
+              "": {
+                "type": ["string"],
+                "pattern": "^[0-9]{1,20}-[0-9]{1,19}-([0-9a-f]{1,16}t[0-9a-f]{8}|none)$"
+              }
+            }
+          }
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "text/event-stream": {
+                "": {"type": ["string"]},
+                "@data": {
+                  "type": ["object"],
+                  "required": ["data", "id", "object", "project", "ts", "type"]
+                },
+                "@data.data": {"type": ["object"]},
+                "@data.id": {"type": ["integer"]},
+                "@data.object": {"type": ["string"]},
+                "@data.project": {"type": ["null", "string"]},
+                "@data.ts": {"type": ["number"]},
+                "@data.type": {
+                  "enum": [
+                    "action.updated",
+                    "agent.attach",
+                    "agent.moved",
+                    "agent.updated",
+                    "alert.raised",
+                    "alert.resolved",
+                    "approval.recorded",
+                    "auditor.pass",
+                    "cost.recorded",
+                    "decision.closed",
+                    "decision.created",
+                    "git.lock_removed",
+                    "lot.updated",
+                    "mail.export",
+                    "packet.client_types",
+                    "packet.pause",
+                    "pilot.gesture",
+                    "receipt.attached",
+                    "staging.attested",
+                    "staging.request",
+                    "staging.sequence",
+                    "thread.entry",
+                    "turn.context",
+                    "turn.ended",
+                    "turn.stages",
+                    "turn.started"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/hosts": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [],
-        "required_parameters": [],
-        "response_properties": [
-          "hosts",
-          "schema"
-        ],
-        "response_required": [
-          "hosts",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["hosts", "schema"]},
+                "hosts": {"type": ["array"]},
+                "hosts[]": {
+                  "type": ["object"],
+                  "required": ["history", "host", "limits", "pressure", "schema"]
+                },
+                "hosts[].history": {"type": ["array"]},
+                "hosts[].history[]": {"type": ["object"]},
+                "hosts[].host": {"type": ["string"]},
+                "hosts[].limits": {"type": ["object"]},
+                "hosts[].schema": {"type": ["string"], "const": "ameesh-host/1"},
+                "schema": {"type": ["string"], "const": "ameesh-hosts/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/hosts/{host}": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:host"
-        ],
-        "required_parameters": [
-          "path:host"
-        ],
-        "response_properties": [
-          "history",
-          "host",
-          "limits",
-          "schema"
-        ],
-        "response_required": [
-          "history",
-          "host",
-          "limits",
-          "pressure",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {"path:host": {"required": true, "fields": {"": {"type": ["string"]}}}},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {
+                  "type": ["object"],
+                  "required": ["history", "host", "limits", "pressure", "schema"]
+                },
+                "history": {"type": ["array"]},
+                "history[]": {"type": ["object"]},
+                "host": {"type": ["string"]},
+                "limits": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-host/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/lots": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "query:assignee",
-          "query:limit",
-          "query:state"
-        ],
-        "required_parameters": [],
-        "response_properties": [
-          "lots",
-          "schema"
-        ],
-        "response_required": [
-          "lots",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "query:state": {"required": false, "fields": {"": {"type": ["string"]}}},
+          "query:assignee": {"required": false, "fields": {"": {"type": ["string"]}}},
+          "query:limit": {
+            "required": false,
+            "fields": {"": {"type": ["integer"], "minimum": 1, "maximum": 500}}
+          }
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["lots", "schema"]},
+                "lots": {"type": ["array"]},
+                "lots[]": {"type": ["object"], "required": ["delays", "id", "state", "title"]},
+                "lots[].id": {"type": ["integer"]},
+                "lots[].state": {"type": ["string"]},
+                "lots[].title": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-lots/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/lots/{id}": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:id"
-        ],
-        "required_parameters": [
-          "path:id"
-        ],
-        "response_properties": [
-          "lot",
-          "schema"
-        ],
-        "response_required": [
-          "lot",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {"path:id": {"required": true, "fields": {"": {"type": ["integer"]}}}},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["lot", "schema"]},
+                "lot": {
+                  "type": ["object"],
+                  "required": ["estimate", "events", "id", "milestones", "planned", "state", "title"]
+                },
+                "lot.events": {"type": ["array"]},
+                "lot.events[]": {"type": ["object"]},
+                "lot.id": {"type": ["integer"]},
+                "lot.milestones": {"type": ["array"]},
+                "lot.milestones[]": {"type": ["object"]},
+                "lot.planned": {"type": ["object"]},
+                "lot.state": {"type": ["string"]},
+                "lot.title": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-lot/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/me": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [],
-        "required_parameters": [],
-        "response_properties": [
-          "deputyships",
-          "human",
-          "language",
-          "mode",
-          "organisation",
-          "roles",
-          "schema"
-        ],
-        "response_required": [
-          "deputyships",
-          "human",
-          "language",
-          "mode",
-          "organisation",
-          "roles",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {
+                  "type": ["object"],
+                  "required": [
+                    "deputyships",
+                    "human",
+                    "language",
+                    "mode",
+                    "organisation",
+                    "roles",
+                    "schema"
+                  ]
+                },
+                "deputyships": {"type": ["array"]},
+                "deputyships[]": {"type": ["string"]},
+                "human": {"type": ["string"]},
+                "language": {"type": ["string"]},
+                "mode": {"enum": ["local"]},
+                "organisation": {"type": ["null", "string"]},
+                "roles": {"type": ["array"]},
+                "roles[]": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-me/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/openapi.json": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [],
-        "required_parameters": [],
-        "response_properties": [],
-        "response_required": [],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {},
+        "request": {"required": false, "content": {}},
+        "responses": {"200": {"headers": [], "content": {"application/json": {"": {"type": ["object"]}}}}}
       },
       "GET /api/v1/projects": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "query:project"
-        ],
-        "required_parameters": [],
-        "response_properties": [
-          "projects",
-          "schema"
-        ],
-        "response_required": [
-          "projects",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {"query:project": {"required": false, "fields": {"": {"type": ["string"]}}}},
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["projects", "schema"]},
+                "projects": {"type": ["array"]},
+                "projects[]": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-projects/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/projects/{project}/progress": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:project",
-          "query:since"
-        ],
-        "required_parameters": [
-          "path:project"
-        ],
-        "response_properties": [
-          "generated_ts",
-          "lots",
-          "schema"
-        ],
-        "response_required": [
-          "generated_ts",
-          "lots",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:project": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "query:since": {"required": false, "fields": {"": {"type": ["string"]}}}
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["generated_ts", "lots", "schema"]},
+                "generated_ts": {"type": ["number"]},
+                "lots": {"type": ["array"]},
+                "lots[]": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-progress/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/projects/{project}/timeline": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:project",
-          "query:since"
-        ],
-        "required_parameters": [
-          "path:project"
-        ],
-        "response_properties": [
-          "generated_ts",
-          "lots",
-          "schema",
-          "truncated",
-          "window"
-        ],
-        "response_required": [
-          "generated_ts",
-          "lots",
-          "schema",
-          "window"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:project": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "query:since": {"required": false, "fields": {"": {"type": ["string"]}}}
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["generated_ts", "lots", "schema", "window"]},
+                "generated_ts": {"type": ["number"]},
+                "lots": {"type": ["array"]},
+                "lots[]": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-timeline/1"},
+                "truncated": {"type": ["object"]},
+                "window": {"type": ["object"]}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/requests/{request}": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:request"
-        ],
-        "required_parameters": [
-          "path:request"
-        ],
-        "response_properties": [
-          "accounting",
-          "agent",
-          "by",
-          "lease",
-          "observed_ts",
-          "quiescent",
-          "request",
-          "sandbox",
-          "schema",
-          "turn"
-        ],
-        "response_required": [
-          "accounting",
-          "agent",
-          "by",
-          "lease",
-          "observed_ts",
-          "quiescent",
-          "request",
-          "schema",
-          "turn"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:request": {"required": true, "fields": {"": {"type": ["integer"], "minimum": 1}}}
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {
+                  "type": ["object"],
+                  "required": [
+                    "accounting",
+                    "agent",
+                    "by",
+                    "lease",
+                    "observed_ts",
+                    "quiescent",
+                    "request",
+                    "schema",
+                    "turn"
+                  ]
+                },
+                "accounting": {
+                  "type": ["object"],
+                  "required": ["ledger", "marker", "reservation", "spend_key", "state"]
+                },
+                "accounting.ledger": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "billing_account",
+                    "model",
+                    "recorded_ts",
+                    "source",
+                    "spend_key",
+                    "turn_id",
+                    "usd"
+                  ]
+                },
+                "accounting.ledger.billing_account": {"type": ["null", "string"]},
+                "accounting.ledger.model": {"type": ["null", "string"]},
+                "accounting.ledger.recorded_ts": {"type": ["number"]},
+                "accounting.ledger.source": {"type": ["null", "string"]},
+                "accounting.ledger.spend_key": {"type": ["null", "string"]},
+                "accounting.ledger.turn_id": {"type": ["null", "string"]},
+                "accounting.ledger.usd": {"type": ["number"]},
+                "accounting.marker": {"type": ["null", "object"], "required": ["created_ts", "model", "turn_id"]},
+                "accounting.marker.created_ts": {"type": ["number"]},
+                "accounting.marker.model": {"type": ["null", "string"]},
+                "accounting.marker.turn_id": {"type": ["null", "string"]},
+                "accounting.reservation": {
+                  "type": ["null", "object"],
+                  "required": ["billing_account", "period", "state", "usd"]
+                },
+                "accounting.reservation.billing_account": {"type": ["string"]},
+                "accounting.reservation.period": {"type": ["string"]},
+                "accounting.reservation.state": {"type": ["string"]},
+                "accounting.reservation.usd": {"type": ["number"]},
+                "accounting.spend_key": {"type": ["null", "string"]},
+                "accounting.state": {"enum": ["kept", "none", "pending", "released", "settled", "unknown"]},
+                "agent": {
+                  "type": ["object"],
+                  "required": [
+                    "budget_usd",
+                    "harness",
+                    "last_turn_ts",
+                    "model",
+                    "name",
+                    "session_id",
+                    "spent_usd",
+                    "status",
+                    "status_since_ts",
+                    "status_text",
+                    "turn_in_progress",
+                    "turns"
+                  ]
+                },
+                "agent.budget_usd": {"type": ["null", "number"]},
+                "agent.harness": {"type": ["null", "string"]},
+                "agent.last_turn_ts": {"type": ["null", "number"]},
+                "agent.model": {"type": ["null", "string"]},
+                "agent.name": {"type": ["string"]},
+                "agent.session_id": {"type": ["null", "string"]},
+                "agent.spent_usd": {"type": ["null", "number"]},
+                "agent.status": {"type": ["string"]},
+                "agent.status_since_ts": {"type": ["null", "number"]},
+                "agent.status_text": {"type": ["null", "string"]},
+                "agent.turn_in_progress": {"type": ["boolean"]},
+                "agent.turns": {"type": ["integer"]},
+                "by": {"type": ["object"], "required": []},
+                "by.request": {"type": ["integer", "null"]},
+                "by.turn": {"type": ["null", "string"]},
+                "lease": {"type": ["object"], "required": ["epoch", "expires_ts", "live", "owner"]},
+                "lease.epoch": {"type": ["integer", "null"]},
+                "lease.expires_ts": {"type": ["null", "number"]},
+                "lease.live": {"type": ["boolean"]},
+                "lease.owner": {"type": ["null", "string"]},
+                "observed_ts": {"type": ["number"]},
+                "quiescent": {"type": ["boolean"]},
+                "request": {
+                  "type": ["null", "object"],
+                  "required": ["agent", "created_ts", "delivered_ts", "delivered_turn_id", "id", "state"]
+                },
+                "request.agent": {"type": ["string"]},
+                "request.created_ts": {"type": ["number"]},
+                "request.delivered_ts": {"type": ["null", "number"]},
+                "request.delivered_turn_id": {"type": ["null", "string"]},
+                "request.id": {"type": ["integer"]},
+                "request.state": {"enum": ["delivered", "pending", "withdrawn"]},
+                "sandbox": {
+                  "type": ["object"],
+                  "required": [
+                    "agent",
+                    "canon_ref",
+                    "completed_ts",
+                    "counters",
+                    "deadline_ts",
+                    "epoch",
+                    "job",
+                    "owner",
+                    "placement_ref",
+                    "profile_ref",
+                    "receipt",
+                    "refusal",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "started_ts",
+                    "state",
+                    "tranche",
+                    "turn_id",
+                    "verdict"
+                  ]
+                },
+                "sandbox.agent": {"type": ["string"]},
+                "sandbox.canon_ref": {"type": ["string"]},
+                "sandbox.completed_ts": {"type": ["null", "number"]},
+                "sandbox.counters": {
+                  "type": ["null", "object"],
+                  "required": ["model_calls", "seconds", "tool_calls", "turns"]
+                },
+                "sandbox.counters.model_calls": {"type": ["integer"]},
+                "sandbox.counters.seconds": {"type": ["integer"]},
+                "sandbox.counters.tool_calls": {"type": ["integer"]},
+                "sandbox.counters.turns": {"type": ["integer"]},
+                "sandbox.deadline_ts": {"type": ["number"]},
+                "sandbox.epoch": {"type": ["integer"]},
+                "sandbox.job": {"type": ["object"], "required": ["name", "namespace", "phase", "uid"]},
+                "sandbox.job.name": {"type": ["string"]},
+                "sandbox.job.namespace": {"type": ["string"]},
+                "sandbox.job.phase": {"type": ["null", "string"]},
+                "sandbox.job.uid": {"type": ["null", "string"]},
+                "sandbox.owner": {"type": ["string"]},
+                "sandbox.placement_ref": {"type": ["string"]},
+                "sandbox.profile_ref": {"type": ["string"]},
+                "sandbox.receipt": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "epoch",
+                    "job",
+                    "replayed",
+                    "result_id",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "turn_id"
+                  ]
+                },
+                "sandbox.receipt.epoch": {"type": ["integer"]},
+                "sandbox.receipt.job": {"type": ["object"]},
+                "sandbox.receipt.replayed": {"type": ["boolean"]},
+                "sandbox.receipt.result_id": {"type": ["string"]},
+                "sandbox.receipt.result_sha256": {"type": ["string"]},
+                "sandbox.receipt.schema": {"type": ["string"], "const": "ameesh-sandbox-receipt/1"},
+                "sandbox.receipt.scope": {"type": ["object"]},
+                "sandbox.receipt.scope_digest": {"type": ["string"]},
+                "sandbox.receipt.source": {"type": ["object"]},
+                "sandbox.receipt.turn_id": {"type": ["string"]},
+                "sandbox.refusal": {"type": ["null", "string"]},
+                "sandbox.result_sha256": {"type": ["null", "string"]},
+                "sandbox.schema": {"type": ["string"], "const": "ameesh-sandbox-turn/1"},
+                "sandbox.scope": {"type": ["object"]},
+                "sandbox.scope_digest": {"type": ["string"]},
+                "sandbox.source": {"type": ["object"]},
+                "sandbox.started_ts": {"type": ["number"]},
+                "sandbox.state": {
+                  "type": ["string"],
+                  "enum": [
+                    "bound",
+                    "cancelled",
+                    "cancelling",
+                    "created",
+                    "expired",
+                    "failed",
+                    "intent",
+                    "lost",
+                    "orphaned",
+                    "running",
+                    "succeeded"
+                  ]
+                },
+                "sandbox.tranche": {
+                  "type": ["null", "object"],
+                  "required": ["kept_usd", "reserved_usd", "settled_usd", "state", "tranche_id"]
+                },
+                "sandbox.tranche.kept_usd": {"type": ["null", "number"]},
+                "sandbox.tranche.reserved_usd": {"type": ["number"]},
+                "sandbox.tranche.settled_usd": {"type": ["null", "number"]},
+                "sandbox.tranche.state": {"enum": ["kept", "open", "released", "settled"]},
+                "sandbox.tranche.tranche_id": {"type": ["string"]},
+                "sandbox.turn_id": {"type": ["string"]},
+                "sandbox.verdict": {"type": ["null", "string"]},
+                "schema": {"type": ["string"], "const": "ameesh-turn-observation/1"},
+                "turn": {
+                  "type": ["null", "object"],
+                  "required": ["ended_ts", "id", "started_ts", "state", "work_item_id"]
+                },
+                "turn.ended_ts": {"type": ["null", "number"]},
+                "turn.id": {"type": ["string"]},
+                "turn.started_ts": {"type": ["null", "number"]},
+                "turn.state": {"enum": ["ended", "orphan", "running", "starting", "unknown"]},
+                "turn.work_item_id": {"type": ["null", "string"]}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/sandbox/turns": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "query:agent",
-          "query:limit",
-          "query:scope",
-          "query:state"
-        ],
-        "required_parameters": [],
-        "response_properties": [
-          "schema",
-          "turns"
-        ],
-        "response_required": [
-          "schema",
-          "turns"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "query:agent": {"required": false, "fields": {"": {"type": ["string"]}}},
+          "query:state": {
+            "required": false,
+            "fields": {
+              "": {
+                "type": ["string"],
+                "enum": [
+                  "bound",
+                  "cancelled",
+                  "cancelling",
+                  "created",
+                  "expired",
+                  "failed",
+                  "intent",
+                  "lost",
+                  "orphaned",
+                  "running",
+                  "succeeded"
+                ]
+              }
+            }
+          },
+          "query:scope": {"required": false, "fields": {"": {"type": ["string"]}}},
+          "query:limit": {
+            "required": false,
+            "fields": {"": {"type": ["integer"], "minimum": 1, "maximum": 1000}}
+          }
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["schema", "turns"]},
+                "schema": {"type": ["string"], "const": "ameesh-sandbox-turns/1"},
+                "turns": {"type": ["array"]},
+                "turns[]": {
+                  "type": ["object"],
+                  "required": [
+                    "agent",
+                    "canon_ref",
+                    "completed_ts",
+                    "counters",
+                    "deadline_ts",
+                    "epoch",
+                    "job",
+                    "owner",
+                    "placement_ref",
+                    "profile_ref",
+                    "receipt",
+                    "refusal",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "started_ts",
+                    "state",
+                    "tranche",
+                    "turn_id",
+                    "verdict"
+                  ]
+                },
+                "turns[].agent": {"type": ["string"]},
+                "turns[].canon_ref": {"type": ["string"]},
+                "turns[].completed_ts": {"type": ["null", "number"]},
+                "turns[].counters": {
+                  "type": ["null", "object"],
+                  "required": ["model_calls", "seconds", "tool_calls", "turns"]
+                },
+                "turns[].counters.model_calls": {"type": ["integer"]},
+                "turns[].counters.seconds": {"type": ["integer"]},
+                "turns[].counters.tool_calls": {"type": ["integer"]},
+                "turns[].counters.turns": {"type": ["integer"]},
+                "turns[].deadline_ts": {"type": ["number"]},
+                "turns[].epoch": {"type": ["integer"]},
+                "turns[].job": {"type": ["object"], "required": ["name", "namespace", "phase", "uid"]},
+                "turns[].job.name": {"type": ["string"]},
+                "turns[].job.namespace": {"type": ["string"]},
+                "turns[].job.phase": {"type": ["null", "string"]},
+                "turns[].job.uid": {"type": ["null", "string"]},
+                "turns[].owner": {"type": ["string"]},
+                "turns[].placement_ref": {"type": ["string"]},
+                "turns[].profile_ref": {"type": ["string"]},
+                "turns[].receipt": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "epoch",
+                    "job",
+                    "replayed",
+                    "result_id",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "turn_id"
+                  ]
+                },
+                "turns[].receipt.epoch": {"type": ["integer"]},
+                "turns[].receipt.job": {"type": ["object"]},
+                "turns[].receipt.replayed": {"type": ["boolean"]},
+                "turns[].receipt.result_id": {"type": ["string"]},
+                "turns[].receipt.result_sha256": {"type": ["string"]},
+                "turns[].receipt.schema": {"type": ["string"], "const": "ameesh-sandbox-receipt/1"},
+                "turns[].receipt.scope": {"type": ["object"]},
+                "turns[].receipt.scope_digest": {"type": ["string"]},
+                "turns[].receipt.source": {"type": ["object"]},
+                "turns[].receipt.turn_id": {"type": ["string"]},
+                "turns[].refusal": {"type": ["null", "string"]},
+                "turns[].result_sha256": {"type": ["null", "string"]},
+                "turns[].schema": {"type": ["string"], "const": "ameesh-sandbox-turn/1"},
+                "turns[].scope": {"type": ["object"]},
+                "turns[].scope_digest": {"type": ["string"]},
+                "turns[].source": {"type": ["object"]},
+                "turns[].started_ts": {"type": ["number"]},
+                "turns[].state": {
+                  "type": ["string"],
+                  "enum": [
+                    "bound",
+                    "cancelled",
+                    "cancelling",
+                    "created",
+                    "expired",
+                    "failed",
+                    "intent",
+                    "lost",
+                    "orphaned",
+                    "running",
+                    "succeeded"
+                  ]
+                },
+                "turns[].tranche": {
+                  "type": ["null", "object"],
+                  "required": ["kept_usd", "reserved_usd", "settled_usd", "state", "tranche_id"]
+                },
+                "turns[].tranche.kept_usd": {"type": ["null", "number"]},
+                "turns[].tranche.reserved_usd": {"type": ["number"]},
+                "turns[].tranche.settled_usd": {"type": ["null", "number"]},
+                "turns[].tranche.state": {"enum": ["kept", "open", "released", "settled"]},
+                "turns[].tranche.tranche_id": {"type": ["string"]},
+                "turns[].turn_id": {"type": ["string"]},
+                "turns[].verdict": {"type": ["null", "string"]}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/sandbox/turns/{turn}": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:turn"
-        ],
-        "required_parameters": [
-          "path:turn"
-        ],
-        "response_properties": [
-          "agent",
-          "canon_ref",
-          "completed_ts",
-          "counters",
-          "deadline_ts",
-          "epoch",
-          "job",
-          "owner",
-          "placement_ref",
-          "profile_ref",
-          "receipt",
-          "refusal",
-          "result_sha256",
-          "schema",
-          "scope",
-          "scope_digest",
-          "source",
-          "started_ts",
-          "state",
-          "tranche",
-          "turn_id",
-          "verdict"
-        ],
-        "response_required": [
-          "agent",
-          "canon_ref",
-          "completed_ts",
-          "counters",
-          "deadline_ts",
-          "epoch",
-          "job",
-          "owner",
-          "placement_ref",
-          "profile_ref",
-          "receipt",
-          "refusal",
-          "result_sha256",
-          "schema",
-          "scope",
-          "scope_digest",
-          "source",
-          "started_ts",
-          "state",
-          "tranche",
-          "turn_id",
-          "verdict"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:turn": {"required": true, "fields": {"": {"type": ["string"], "pattern": "^[0-9a-f]{32}$"}}}
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {
+                  "type": ["object"],
+                  "required": [
+                    "agent",
+                    "canon_ref",
+                    "completed_ts",
+                    "counters",
+                    "deadline_ts",
+                    "epoch",
+                    "job",
+                    "owner",
+                    "placement_ref",
+                    "profile_ref",
+                    "receipt",
+                    "refusal",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "started_ts",
+                    "state",
+                    "tranche",
+                    "turn_id",
+                    "verdict"
+                  ]
+                },
+                "agent": {"type": ["string"]},
+                "canon_ref": {"type": ["string"]},
+                "completed_ts": {"type": ["null", "number"]},
+                "counters": {
+                  "type": ["null", "object"],
+                  "required": ["model_calls", "seconds", "tool_calls", "turns"]
+                },
+                "counters.model_calls": {"type": ["integer"]},
+                "counters.seconds": {"type": ["integer"]},
+                "counters.tool_calls": {"type": ["integer"]},
+                "counters.turns": {"type": ["integer"]},
+                "deadline_ts": {"type": ["number"]},
+                "epoch": {"type": ["integer"]},
+                "job": {"type": ["object"], "required": ["name", "namespace", "phase", "uid"]},
+                "job.name": {"type": ["string"]},
+                "job.namespace": {"type": ["string"]},
+                "job.phase": {"type": ["null", "string"]},
+                "job.uid": {"type": ["null", "string"]},
+                "owner": {"type": ["string"]},
+                "placement_ref": {"type": ["string"]},
+                "profile_ref": {"type": ["string"]},
+                "receipt": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "epoch",
+                    "job",
+                    "replayed",
+                    "result_id",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "turn_id"
+                  ]
+                },
+                "receipt.epoch": {"type": ["integer"]},
+                "receipt.job": {"type": ["object"]},
+                "receipt.replayed": {"type": ["boolean"]},
+                "receipt.result_id": {"type": ["string"]},
+                "receipt.result_sha256": {"type": ["string"]},
+                "receipt.schema": {"type": ["string"], "const": "ameesh-sandbox-receipt/1"},
+                "receipt.scope": {"type": ["object"]},
+                "receipt.scope_digest": {"type": ["string"]},
+                "receipt.source": {"type": ["object"]},
+                "receipt.turn_id": {"type": ["string"]},
+                "refusal": {"type": ["null", "string"]},
+                "result_sha256": {"type": ["null", "string"]},
+                "schema": {"type": ["string"], "const": "ameesh-sandbox-turn/1"},
+                "scope": {"type": ["object"]},
+                "scope_digest": {"type": ["string"]},
+                "source": {"type": ["object"]},
+                "started_ts": {"type": ["number"]},
+                "state": {
+                  "type": ["string"],
+                  "enum": [
+                    "bound",
+                    "cancelled",
+                    "cancelling",
+                    "created",
+                    "expired",
+                    "failed",
+                    "intent",
+                    "lost",
+                    "orphaned",
+                    "running",
+                    "succeeded"
+                  ]
+                },
+                "tranche": {
+                  "type": ["null", "object"],
+                  "required": ["kept_usd", "reserved_usd", "settled_usd", "state", "tranche_id"]
+                },
+                "tranche.kept_usd": {"type": ["null", "number"]},
+                "tranche.reserved_usd": {"type": ["number"]},
+                "tranche.settled_usd": {"type": ["null", "number"]},
+                "tranche.state": {"enum": ["kept", "open", "released", "settled"]},
+                "tranche.tranche_id": {"type": ["string"]},
+                "turn_id": {"type": ["string"]},
+                "verdict": {"type": ["null", "string"]}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/threads/{project}": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:project",
-          "query:since"
-        ],
-        "required_parameters": [
-          "path:project"
-        ],
-        "response_properties": [
-          "entries",
-          "lot",
-          "project",
-          "schema"
-        ],
-        "response_required": [
-          "entries",
-          "lot",
-          "project",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:project": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "query:since": {"required": false, "fields": {"": {"type": ["string"]}}}
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["entries", "lot", "project", "schema"]},
+                "entries": {"type": ["array"]},
+                "entries[]": {"type": ["object"], "required": ["author", "id", "recipient", "text", "ts"]},
+                "entries[].author": {"type": ["string"]},
+                "entries[].id": {"type": ["null", "string"]},
+                "entries[].meta": {"type": ["object"]},
+                "entries[].recipient": {"type": ["string"]},
+                "entries[].text": {"type": ["string"]},
+                "entries[].ts": {"type": ["number"]},
+                "lot": {"type": ["null", "string"]},
+                "project": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-thread/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/threads/{project}/{lot}": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:lot",
-          "path:project",
-          "query:since"
-        ],
-        "required_parameters": [
-          "path:lot",
-          "path:project"
-        ],
-        "response_properties": [
-          "entries",
-          "lot",
-          "project",
-          "schema"
-        ],
-        "response_required": [
-          "entries",
-          "lot",
-          "project",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:project": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "path:lot": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "query:since": {"required": false, "fields": {"": {"type": ["string"]}}}
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["entries", "lot", "project", "schema"]},
+                "entries": {"type": ["array"]},
+                "entries[]": {"type": ["object"], "required": ["author", "id", "recipient", "text", "ts"]},
+                "entries[].author": {"type": ["string"]},
+                "entries[].id": {"type": ["null", "string"]},
+                "entries[].meta": {"type": ["object"]},
+                "entries[].recipient": {"type": ["string"]},
+                "entries[].text": {"type": ["string"]},
+                "entries[].ts": {"type": ["number"]},
+                "lot": {"type": ["null", "string"]},
+                "project": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-thread/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "GET /api/v1/turns/{turn}": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "path:turn"
-        ],
-        "required_parameters": [
-          "path:turn"
-        ],
-        "response_properties": [
-          "accounting",
-          "agent",
-          "by",
-          "lease",
-          "observed_ts",
-          "quiescent",
-          "request",
-          "sandbox",
-          "schema",
-          "turn"
-        ],
-        "response_required": [
-          "accounting",
-          "agent",
-          "by",
-          "lease",
-          "observed_ts",
-          "quiescent",
-          "request",
-          "schema",
-          "turn"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:turn": {"required": true, "fields": {"": {"type": ["string"], "pattern": "^[0-9a-f]{32}$"}}}
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {
+                  "type": ["object"],
+                  "required": [
+                    "accounting",
+                    "agent",
+                    "by",
+                    "lease",
+                    "observed_ts",
+                    "quiescent",
+                    "request",
+                    "schema",
+                    "turn"
+                  ]
+                },
+                "accounting": {
+                  "type": ["object"],
+                  "required": ["ledger", "marker", "reservation", "spend_key", "state"]
+                },
+                "accounting.ledger": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "billing_account",
+                    "model",
+                    "recorded_ts",
+                    "source",
+                    "spend_key",
+                    "turn_id",
+                    "usd"
+                  ]
+                },
+                "accounting.ledger.billing_account": {"type": ["null", "string"]},
+                "accounting.ledger.model": {"type": ["null", "string"]},
+                "accounting.ledger.recorded_ts": {"type": ["number"]},
+                "accounting.ledger.source": {"type": ["null", "string"]},
+                "accounting.ledger.spend_key": {"type": ["null", "string"]},
+                "accounting.ledger.turn_id": {"type": ["null", "string"]},
+                "accounting.ledger.usd": {"type": ["number"]},
+                "accounting.marker": {"type": ["null", "object"], "required": ["created_ts", "model", "turn_id"]},
+                "accounting.marker.created_ts": {"type": ["number"]},
+                "accounting.marker.model": {"type": ["null", "string"]},
+                "accounting.marker.turn_id": {"type": ["null", "string"]},
+                "accounting.reservation": {
+                  "type": ["null", "object"],
+                  "required": ["billing_account", "period", "state", "usd"]
+                },
+                "accounting.reservation.billing_account": {"type": ["string"]},
+                "accounting.reservation.period": {"type": ["string"]},
+                "accounting.reservation.state": {"type": ["string"]},
+                "accounting.reservation.usd": {"type": ["number"]},
+                "accounting.spend_key": {"type": ["null", "string"]},
+                "accounting.state": {"enum": ["kept", "none", "pending", "released", "settled", "unknown"]},
+                "agent": {
+                  "type": ["object"],
+                  "required": [
+                    "budget_usd",
+                    "harness",
+                    "last_turn_ts",
+                    "model",
+                    "name",
+                    "session_id",
+                    "spent_usd",
+                    "status",
+                    "status_since_ts",
+                    "status_text",
+                    "turn_in_progress",
+                    "turns"
+                  ]
+                },
+                "agent.budget_usd": {"type": ["null", "number"]},
+                "agent.harness": {"type": ["null", "string"]},
+                "agent.last_turn_ts": {"type": ["null", "number"]},
+                "agent.model": {"type": ["null", "string"]},
+                "agent.name": {"type": ["string"]},
+                "agent.session_id": {"type": ["null", "string"]},
+                "agent.spent_usd": {"type": ["null", "number"]},
+                "agent.status": {"type": ["string"]},
+                "agent.status_since_ts": {"type": ["null", "number"]},
+                "agent.status_text": {"type": ["null", "string"]},
+                "agent.turn_in_progress": {"type": ["boolean"]},
+                "agent.turns": {"type": ["integer"]},
+                "by": {"type": ["object"], "required": []},
+                "by.request": {"type": ["integer", "null"]},
+                "by.turn": {"type": ["null", "string"]},
+                "lease": {"type": ["object"], "required": ["epoch", "expires_ts", "live", "owner"]},
+                "lease.epoch": {"type": ["integer", "null"]},
+                "lease.expires_ts": {"type": ["null", "number"]},
+                "lease.live": {"type": ["boolean"]},
+                "lease.owner": {"type": ["null", "string"]},
+                "observed_ts": {"type": ["number"]},
+                "quiescent": {"type": ["boolean"]},
+                "request": {
+                  "type": ["null", "object"],
+                  "required": ["agent", "created_ts", "delivered_ts", "delivered_turn_id", "id", "state"]
+                },
+                "request.agent": {"type": ["string"]},
+                "request.created_ts": {"type": ["number"]},
+                "request.delivered_ts": {"type": ["null", "number"]},
+                "request.delivered_turn_id": {"type": ["null", "string"]},
+                "request.id": {"type": ["integer"]},
+                "request.state": {"enum": ["delivered", "pending", "withdrawn"]},
+                "sandbox": {
+                  "type": ["object"],
+                  "required": [
+                    "agent",
+                    "canon_ref",
+                    "completed_ts",
+                    "counters",
+                    "deadline_ts",
+                    "epoch",
+                    "job",
+                    "owner",
+                    "placement_ref",
+                    "profile_ref",
+                    "receipt",
+                    "refusal",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "started_ts",
+                    "state",
+                    "tranche",
+                    "turn_id",
+                    "verdict"
+                  ]
+                },
+                "sandbox.agent": {"type": ["string"]},
+                "sandbox.canon_ref": {"type": ["string"]},
+                "sandbox.completed_ts": {"type": ["null", "number"]},
+                "sandbox.counters": {
+                  "type": ["null", "object"],
+                  "required": ["model_calls", "seconds", "tool_calls", "turns"]
+                },
+                "sandbox.counters.model_calls": {"type": ["integer"]},
+                "sandbox.counters.seconds": {"type": ["integer"]},
+                "sandbox.counters.tool_calls": {"type": ["integer"]},
+                "sandbox.counters.turns": {"type": ["integer"]},
+                "sandbox.deadline_ts": {"type": ["number"]},
+                "sandbox.epoch": {"type": ["integer"]},
+                "sandbox.job": {"type": ["object"], "required": ["name", "namespace", "phase", "uid"]},
+                "sandbox.job.name": {"type": ["string"]},
+                "sandbox.job.namespace": {"type": ["string"]},
+                "sandbox.job.phase": {"type": ["null", "string"]},
+                "sandbox.job.uid": {"type": ["null", "string"]},
+                "sandbox.owner": {"type": ["string"]},
+                "sandbox.placement_ref": {"type": ["string"]},
+                "sandbox.profile_ref": {"type": ["string"]},
+                "sandbox.receipt": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "epoch",
+                    "job",
+                    "replayed",
+                    "result_id",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "turn_id"
+                  ]
+                },
+                "sandbox.receipt.epoch": {"type": ["integer"]},
+                "sandbox.receipt.job": {"type": ["object"]},
+                "sandbox.receipt.replayed": {"type": ["boolean"]},
+                "sandbox.receipt.result_id": {"type": ["string"]},
+                "sandbox.receipt.result_sha256": {"type": ["string"]},
+                "sandbox.receipt.schema": {"type": ["string"], "const": "ameesh-sandbox-receipt/1"},
+                "sandbox.receipt.scope": {"type": ["object"]},
+                "sandbox.receipt.scope_digest": {"type": ["string"]},
+                "sandbox.receipt.source": {"type": ["object"]},
+                "sandbox.receipt.turn_id": {"type": ["string"]},
+                "sandbox.refusal": {"type": ["null", "string"]},
+                "sandbox.result_sha256": {"type": ["null", "string"]},
+                "sandbox.schema": {"type": ["string"], "const": "ameesh-sandbox-turn/1"},
+                "sandbox.scope": {"type": ["object"]},
+                "sandbox.scope_digest": {"type": ["string"]},
+                "sandbox.source": {"type": ["object"]},
+                "sandbox.started_ts": {"type": ["number"]},
+                "sandbox.state": {
+                  "type": ["string"],
+                  "enum": [
+                    "bound",
+                    "cancelled",
+                    "cancelling",
+                    "created",
+                    "expired",
+                    "failed",
+                    "intent",
+                    "lost",
+                    "orphaned",
+                    "running",
+                    "succeeded"
+                  ]
+                },
+                "sandbox.tranche": {
+                  "type": ["null", "object"],
+                  "required": ["kept_usd", "reserved_usd", "settled_usd", "state", "tranche_id"]
+                },
+                "sandbox.tranche.kept_usd": {"type": ["null", "number"]},
+                "sandbox.tranche.reserved_usd": {"type": ["number"]},
+                "sandbox.tranche.settled_usd": {"type": ["null", "number"]},
+                "sandbox.tranche.state": {"enum": ["kept", "open", "released", "settled"]},
+                "sandbox.tranche.tranche_id": {"type": ["string"]},
+                "sandbox.turn_id": {"type": ["string"]},
+                "sandbox.verdict": {"type": ["null", "string"]},
+                "schema": {"type": ["string"], "const": "ameesh-turn-observation/1"},
+                "turn": {
+                  "type": ["null", "object"],
+                  "required": ["ended_ts", "id", "started_ts", "state", "work_item_id"]
+                },
+                "turn.ended_ts": {"type": ["null", "number"]},
+                "turn.id": {"type": ["string"]},
+                "turn.started_ts": {"type": ["null", "number"]},
+                "turn.state": {"enum": ["ended", "orphan", "running", "starting", "unknown"]},
+                "turn.work_item_id": {"type": ["null", "string"]}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/actions/{action}/approval-request": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:action"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:action"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:action": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {"": {"type": ["object"], "additionalProperties": false, "required": []}}
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/agents/{agent}/chat": {
-        "body_properties": [
-          "lot",
-          "text"
-        ],
-        "body_required": [
-          "text"
-        ],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:agent": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["text"]},
+              "lot": {"type": ["integer", "null"], "minimum": 1},
+              "text": {"type": ["string"], "minLength": 1, "maxLength": 8000}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/agents/{agent}/interrupt": {
-        "body_properties": [
-          "text"
-        ],
-        "body_required": [
-          "text"
-        ],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:agent": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["text"]},
+              "text": {"type": ["string"], "minLength": 1, "maxLength": 8000}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/agents/{agent}/messages": {
-        "body_properties": [
-          "lot",
-          "text",
-          "urgent"
-        ],
-        "body_required": [
-          "text"
-        ],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:agent": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["text"]},
+              "lot": {"type": ["integer", "null"], "minimum": 1},
+              "text": {"type": ["string"], "minLength": 1, "maxLength": 8000},
+              "urgent": {"type": ["boolean"]}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/agents/{agent}/pause": {
-        "body_properties": [
-          "indefinite",
-          "reason",
-          "until"
-        ],
-        "body_required": [
-          "reason"
-        ],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:agent": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["reason"]},
+              "indefinite": {"type": ["boolean"]},
+              "reason": {"type": ["string"], "minLength": 1, "maxLength": 2000},
+              "until": {"type": ["number"], "exclusiveMinimum": 0}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/agents/{agent}/resume": {
-        "body_properties": [
-          "reason"
-        ],
-        "body_required": [
-          "reason"
-        ],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:agent": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["reason"]},
+              "reason": {"type": ["string"], "minLength": 1, "maxLength": 2000}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/agents/{agent}/stop": {
-        "body_properties": [
-          "reason"
-        ],
-        "body_required": [
-          "reason"
-        ],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:agent"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:agent": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["reason"]},
+              "reason": {"type": ["string"], "minLength": 1, "maxLength": 500}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/alerts/{key}/ack": {
-        "body_properties": [],
-        "body_required": [],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:key"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:key"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:key": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {"": {"type": ["object"], "additionalProperties": false, "required": []}}
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/budget/caps": {
-        "body_properties": [
-          "agent",
-          "usd",
-          "window"
-        ],
-        "body_required": [
-          "usd",
-          "window"
-        ],
-        "parameters": [
-          "header:Idempotency-Key"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["usd", "window"]},
+              "agent": {"type": ["null", "string"]},
+              "usd": {"type": ["number"], "exclusiveMinimum": 0},
+              "window": {"enum": ["day", "hour"]}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/hosts/{host}/drain": {
-        "body_properties": [
-          "duration_s"
-        ],
-        "body_required": [],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:host"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:host"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:host": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": []},
+              "duration_s": {"type": ["integer", "null"], "minimum": 30, "maximum": 604800}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/lots/{id}/assign": {
-        "body_properties": [
-          "assignee"
-        ],
-        "body_required": [
-          "assignee"
-        ],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:id"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:id"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:id": {"required": true, "fields": {"": {"type": ["integer"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["assignee"]},
+              "assignee": {"type": ["string"]}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/threads/{project}": {
-        "body_properties": [
-          "text"
-        ],
-        "body_required": [
-          "text"
-        ],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:project"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:project"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:project": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["text"]},
+              "text": {"type": ["string"], "minLength": 1, "maxLength": 8000}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       },
       "POST /api/v1/threads/{project}/{lot}": {
-        "body_properties": [
-          "text"
-        ],
-        "body_required": [
-          "text"
-        ],
-        "parameters": [
-          "header:Idempotency-Key",
-          "path:lot",
-          "path:project"
-        ],
-        "required_parameters": [
-          "header:Idempotency-Key",
-          "path:lot",
-          "path:project"
-        ],
-        "response_properties": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_required": [
-          "action",
-          "by",
-          "for",
-          "result",
-          "schema"
-        ],
-        "response_types": [
-          "application/json"
-        ]
+        "parameters": {
+          "path:project": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "path:lot": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "header:Idempotency-Key": {
+            "required": true,
+            "fields": {"": {"type": ["string"], "pattern": "^[A-Za-z0-9_-]{8,128}$"}}
+          }
+        },
+        "request": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "": {"type": ["object"], "additionalProperties": false, "required": ["text"]},
+              "text": {"type": ["string"], "minLength": 1, "maxLength": 8000}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["action", "by", "for", "result", "schema"]},
+                "action": {"type": ["string"]},
+                "by": {"type": ["string"]},
+                "for": {"type": ["string"]},
+                "result": {"type": ["object"]},
+                "schema": {"type": ["string"], "const": "ameesh-action/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "403": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "409": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "413": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "415": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "422": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
       }
     }
   },

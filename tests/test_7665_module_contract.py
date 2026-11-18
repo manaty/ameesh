@@ -96,6 +96,43 @@ def command(name):
     return EXECUTABLES[words[0]], words[1:]
 
 
+def frozen_signature(text):
+    """The inspect.Signature of a frozen `(a, b=1, *, c)` text of the surface."""
+    return inspect.signature(eval("lambda %s: None" % text[1:-1]))  # noqa: S307 (repo file)
+
+
+def signature_breaks(frozen, signature):
+    """Incompatible changes from a frozen call signature to the candidate one.
+
+    Every frozen call keeps working: each parameter stays, positional ones at
+    their place, keyword-only may become positional-or-keyword, a default stays
+    the same; an added parameter has a default (additive is compatible)."""
+    kinds = inspect.Parameter
+    positional = (kinds.POSITIONAL_ONLY, kinds.POSITIONAL_OR_KEYWORD)
+    old, new = frozen.parameters, signature.parameters
+    old_order = [name for name, p in old.items() if p.kind in positional]
+    new_order = [name for name, p in new.items() if p.kind in positional]
+    breaks = []
+    for name, before in old.items():
+        after = new.get(name)
+        if after is None:
+            breaks.append("%s: removed" % name)
+            continue
+        if after.kind != before.kind and not (before.kind == kinds.KEYWORD_ONLY
+                                              and after.kind == kinds.POSITIONAL_OR_KEYWORD):
+            breaks.append("%s: kind %s → %s" % (name, before.kind, after.kind))
+        elif before.kind in positional and new_order.index(name) != old_order.index(name):
+            breaks.append("%s: moved" % name)
+        if before.default is not kinds.empty and after.default is kinds.empty:
+            breaks.append("%s: newly required" % name)
+        elif before.default is not kinds.empty and after.default != before.default:
+            breaks.append("%s: default %r → %r" % (name, before.default, after.default))
+    breaks += ["%s: added without a default" % name for name, after in new.items()
+               if name not in old and after.default is kinds.empty
+               and after.kind not in (kinds.VAR_POSITIONAL, kinds.VAR_KEYWORD)]
+    return breaks
+
+
 class _EntryPoints(list):
     """Python 3.9 has no importlib.metadata.EntryPoints; ameesh supports 3.9."""
 
@@ -139,8 +176,9 @@ class CompatibilityTest(unittest.TestCase):
     """Baseline surface → candidate: additive is compatible, a removal is not."""
 
     def test_the_surface_names_the_contract_revision(self):
+        # The frozen revision stays named by the document its later revisions extend.
         text = CONTRACT.read_text(encoding="utf-8")
-        self.assertIn("Contract revision: **%s," % SURFACE["contract"], text)
+        self.assertRegex(text, r"\b[Rr]evision %s\b" % re.escape(SURFACE["contract"]))
         self.assertIn(SURFACE["baseline"], text)
 
     def test_the_served_openapi_keeps_every_baseline_operation(self):
@@ -149,21 +187,66 @@ class CompatibilityTest(unittest.TestCase):
 
     def test_the_comparator_tells_additions_from_breaks(self):
         baseline = SURFACE["http"]["operations"]
+        ok = "application/json"
+
+        def fields(surface, key, status="200"):
+            return surface[key]["responses"][status]["content"][ok]
         candidate = copy.deepcopy(baseline)
         candidate["GET /api/v1/witness-new"] = candidate["GET /api/v1/me"]
-        candidate["GET /api/v1/me"]["response_properties"].append("added_field")
-        candidate["GET /api/v1/lots"]["parameters"].append("query:added")
+        fields(candidate, "GET /api/v1/me")["added_field"] = {"type": ["string"]}
+        fields(candidate, "GET /api/v1/me")["mode"]["enum"].append("remote")
+        fields(candidate, "GET /api/v1/me")["organisation"]["type"] = ["string"]
+        candidate["GET /api/v1/me"]["responses"]["429"] = candidate["GET /api/v1/me"][
+            "responses"]["400"]
+        lots = candidate["GET /api/v1/lots"]["parameters"]
+        lots["query:added"] = {"required": False, "fields": {"": {"type": ["string"]}}}
+        lots["query:limit"]["fields"][""]["maximum"] = 1000
+        lots["query:limit"]["fields"][""]["type"] = ["number"]
         self.assertEqual(client.openapi_breaks(baseline, candidate), [])
         broken = copy.deepcopy(baseline)
         del broken["GET /api/v1/hosts"]
-        broken["GET /api/v1/me"]["response_properties"].remove("human")
-        broken["GET /api/v1/lots"]["required_parameters"].append("query:limit")
-        broken["POST /api/v1/budget/caps"]["body_required"].append("added")
+        me = fields(broken, "GET /api/v1/me")
+        del me["roles[]"]
+        me["human"]["type"] = ["integer"]
+        me[""]["required"].remove("language")
+        me["schema"]["const"] = "ameesh-me/2"
+        del broken["GET /api/v1/me"]["responses"]["503"]
+        lots = broken["GET /api/v1/lots"]["parameters"]
+        lots["query:limit"]["required"] = True
+        lots["query:limit"]["fields"][""]["maximum"] = 100
+        lots["query:state"]["fields"][""]["enum"] = ["intake"]
+        del lots["query:assignee"]
+        lots["query:new"] = {"required": True, "fields": {"": {"type": ["string"]}}}
+        caps = broken["POST /api/v1/budget/caps"]["request"]["content"][ok]
+        caps[""]["required"].append("added")
+        caps["agent"]["pattern"] = "^[a-z]+$"
+        caps["window"]["enum"] = ["day"]
         self.assertEqual(client.openapi_breaks(baseline, broken), [
             "GET /api/v1/hosts: operation removed",
-            "GET /api/v1/lots: parameter newly required: query:limit",
-            "GET /api/v1/me: response field removed: human",
-            "POST /api/v1/budget/caps: request field newly required: added"])
+            "GET /api/v1/lots: parameter query:assignee: removed",
+            "GET /api/v1/lots: parameter query:limit: newly required",
+            "GET /api/v1/lots: parameter query:limit (root): accepted values changed: "
+            '{"maximum": 500, "minimum": 1, "type": ["integer"]} → '
+            '{"maximum": 100, "minimum": 1, "type": ["integer"]}',
+            "GET /api/v1/lots: parameter query:state (root): accepted values changed: "
+            '{"type": ["string"]} → {"enum": ["intake"], "type": ["string"]}',
+            "GET /api/v1/lots: parameter query:new: newly required",
+            "GET /api/v1/me: response 200 application/json (root): field no longer "
+            "required: language",
+            "GET /api/v1/me: response 200 application/json human: result values changed: "
+            '{"type": ["string"]} → {"type": ["integer"]}',
+            "GET /api/v1/me: response 200 application/json roles[]: field removed",
+            "GET /api/v1/me: response 200 application/json schema: result values changed: "
+            '{"const": "ameesh-me/1", "type": ["string"]} → '
+            '{"const": "ameesh-me/2", "type": ["string"]}',
+            "GET /api/v1/me: response 503: removed",
+            "POST /api/v1/budget/caps: request application/json (root): field newly "
+            "required: added",
+            "POST /api/v1/budget/caps: request application/json agent: accepted values "
+            'changed: {"type": ["null", "string"]} → '
+            '{"pattern": "^[a-z]+$", "type": ["null", "string"]}',
+            "POST /api/v1/budget/caps: request application/json window: accepted values "
+            'changed: {"enum": ["day", "hour"]} → {"enum": ["day"]}'])
 
 
 class CliContractTest(unittest.TestCase):
@@ -186,7 +269,10 @@ class CliContractTest(unittest.TestCase):
     def ameesh(self, *args, env=None):
         return client.run(EXECUTABLES["ameesh"], args, env=env or self.env)
 
-    def test_every_documented_option_is_in_the_help(self):
+    def test_the_help_documents_exactly_the_frozen_options(self):
+        """A frozen option missing from `--help` is a break; an option the help
+        documents beyond the surface is compatible, but it is a public element as
+        soon as it is released: the surface must list it (no silent growth)."""
         for name, options in sorted(SURFACE["cli"].items()):
             with self.subTest(name):
                 if name == "ameesh --version":
@@ -195,10 +281,13 @@ class CliContractTest(unittest.TestCase):
                     self.assertRegex(out, r"^ameesh \d+\.\d+\.\d+")
                     continue
                 prefix, args = command(name)
-                found, text = client.help_options(prefix, args, env=self.env)
-                self.assertLessEqual(set(options), found)
-                if name.startswith("agent-mail "):
-                    self.assertIn(name, text)
+                shared = name.startswith("agent-mail ")  # one help page for every command
+                found, _ = client.help_options(prefix, args, env=self.env,
+                                               section=name if shared else None)
+                self.assertEqual(sorted(set(options) - found), [], "break: option removed")
+                self.assertEqual(sorted(found - set(options)), [],
+                                 "added option(s): list them under cli in %s"
+                                 % SURFACE_FILE.relative_to(ROOT))
 
     def test_modules_json_describes_the_installed_witness(self):
         code, document = client.run_json(EXECUTABLES["ameesh"], ["modules", "--no-canon",
@@ -286,13 +375,15 @@ class ModuleInterfaceTest(unittest.TestCase):
 
     def test_discover_signature_and_registry_record(self):
         spec = SURFACE["module"]
-        self.assertEqual(str(inspect.signature(registry.discover)), spec["discover"])
+        self.assertEqual(signature_breaks(frozen_signature(spec["discover"]),
+                                          inspect.signature(registry.discover)), [])
         found = self.discover()
         for name in spec["registry"]:
             self.assertTrue(hasattr(found, name), name)
         self.assertEqual((found.names(), found.refused), ([witness.NAME], ()))
         module = found.get(witness.NAME)
-        self.assertEqual(sorted(module.as_dict()), sorted(spec["record_fields"]))
+        # Frozen fields stay; a field added since (1.2: schema, migrations…) is additive.
+        client.require_fields(module.as_dict(), spec["record_fields"], "Module.as_dict()")
         for name in spec["record_fields"]:
             self.assertTrue(hasattr(module, name), name)
         # Two representations of the same declared types.
@@ -349,7 +440,35 @@ class ModuleInterfaceTest(unittest.TestCase):
             with self.subTest(name):
                 method = getattr(ModuleStore, name)
                 parameters = list(inspect.signature(method).parameters.values())[1:]
-                self.assertEqual(str(inspect.Signature(parameters)), signature)
+                self.assertEqual(signature_breaks(frozen_signature(signature),
+                                                  inspect.Signature(parameters)), [])
+
+    def test_the_interface_comparators_tell_additions_from_breaks(self):
+        record = {name: None for name in SURFACE["module"]["record_fields"]}
+        client.require_fields(dict(record, added_field=1), record, "added")
+        with self.assertRaisesRegex(client.ContractError, "missing field.s. card_ref"):
+            client.require_fields({k: v for k, v in record.items() if k != "card_ref"},
+                                  record, "removed")
+        frozen = frozen_signature(SURFACE["module"]["store_operations"]["record"])
+        for candidate, expected in (
+                ("(item_id, module, kind, subject, payload, *, actor, binding_id=None, "
+                 "added=None)", []),
+                ("(item_id, module, kind, subject, payload, actor, binding_id=None)", []),
+                ("(item_id, module, kind, subject, payload, *, actor, binding_id=None, "
+                 "added)", ["added: added without a default"]),
+                ("(item_id, module, kind, payload, subject, *, actor, binding_id=None)",
+                 ["subject: moved", "payload: moved"]),
+                ("(item_id, module, kind, subject, payload, *, actor, binding_id)",
+                 ["binding_id: newly required"]),
+                ("(item_id, module, kind, subject, payload, *, actor, binding_id=0)",
+                 ["binding_id: default None → 0"]),
+                ("(item_id, module, kind, subject, *, payload, actor, binding_id=None)",
+                 ["payload: kind POSITIONAL_OR_KEYWORD → KEYWORD_ONLY"]),
+                ("(item_id, module, kind, subject, payload, *, binding_id=None)",
+                 ["actor: removed"])):
+            with self.subTest(candidate):
+                self.assertEqual(signature_breaks(frozen, frozen_signature(candidate)),
+                                 expected)
 
 
 class HttpContractTest(unittest.TestCase):
@@ -399,8 +518,9 @@ class HttpContractTest(unittest.TestCase):
         status, _, me = client.http_json(self.port, "/api/v1/me", token=TOKEN,
                                          headers={"Host": "127.0.0.1:%d" % self.port})
         self.assertEqual(status, 200)
-        expected = SURFACE["http"]["operations"]["GET /api/v1/me"]
-        client.require_fields(me, expected["response_required"], "/api/v1/me")
+        fields = SURFACE["http"]["operations"]["GET /api/v1/me"]["responses"]["200"][
+            "content"]["application/json"]
+        client.require_fields(me, fields[""]["required"], "/api/v1/me")
 
 
 class StoreAndViewsTest(PgTestCase):
@@ -493,21 +613,28 @@ class CoverageTableTest(unittest.TestCase):
         return names
 
     @classmethod
-    def rows(cls):
-        rows = {}
+    def table(cls):
+        """[(element, cited tests)] in the order of the table, duplicates kept."""
+        rows = []
         for line in COVERAGE.read_text(encoding="utf-8").splitlines():
             cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
             if len(cells) >= 2 and cells[0].startswith("`"):
-                rows[cells[0].strip("`")] = re.findall(r"`(tests\.test_[\w.]+)`", cells[1])
+                rows.append((cells[0].strip("`"),
+                             re.findall(r"`(tests\.test_[\w.]+)`", cells[1])))
         return rows
 
+    @classmethod
+    def rows(cls):
+        return dict(cls.table())
+
     def test_every_contract_element_has_one_row(self):
-        self.assertEqual(set(self.rows()), self.elements())
+        elements = [element for element, _ in self.table()]
+        self.assertEqual(sorted(elements), sorted(self.elements()))
 
     def test_every_cited_test_exists(self):
         for element, names in sorted(self.rows().items()):
             with self.subTest(element):
-                self.assertTrue(names or element in ("fixture", "stable-pin"), element)
+                self.assertTrue(names or element == "fixture", element)
                 for name in names:
                     loader = unittest.TestLoader()
                     suite = loader.loadTestsFromName(name)
