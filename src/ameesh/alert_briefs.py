@@ -277,7 +277,9 @@ def _desk_names(alert: dict, by_name: dict, avatar_names=(),
                 desk_names=()) -> list[str]:
     """Les agents qui portent la route humaine d'une alerte, dans l'ordre.
 
-    L'avatar déclaré au canon de l'humain visé d'abord ; à défaut, la route
+    L'avatar déclaré au canon de l'humain visé d'abord, quand l'appelant l'a
+    reconnu vivant (#7749 : un avatar sans destinataire vivant n'est pas
+    passé ici — la route configurée prend sa place) ; à défaut, la route
     explicitement configurée pour cet humain (`desk_names`, lue au registre
     par l'appelant) ; à défaut, un rôle du `targets` qui nomme un agent
     (compatibilité des alertes écrites avant #7634). Aucun agent n'est deviné
@@ -1388,6 +1390,12 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     la route humaine (copie au fil du bureau). Le brief dit toujours qui
     manquait (« No live recipient: X (no live lease). ») et le texte du geste
     est celui du palier qui reçoit, pas celui du palier muet.
+
+    #7749 : l'appelant met dans `avatar_names` la route humaine effective —
+    avatar vivant, sinon route configurée de l'humain — et non un avatar en
+    pause budget, arrêté ou sans bail. Sans route configurée, le fil de
+    l'avatar mort reste la trace lisible ; l'auditeur, présent au palier des
+    P1 et du niveau 3, porte le geste.
 
     #3057 (route voulue) : un lot sans assigné, ou assigné au bureau
     `externe` qui ne lit pas sa boîte, n'a personne au palier 1 ; il part au

@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#4304 — la branche de paquet est poussée dès la composition (canon §6).
+"""#4304/#7740 — le manifeste précède les tests, la poussée les suit.
 
-Constat h-07 (28/10) : `paquet-auto.py` ne poussait `integration/paquet-*`
-qu'après les tests par unité (20 min à plus d'une heure) ; la branche restait
-invisible et la CI complète ne partait pas. Désormais, dès les freeze-checks
-et l'inclusion verts : poussée, PR, gel du porteur et demande ci-full, puis les
-tests par unité, en parallèle de la CI. Un rouge retire l'unité : la tête
-recomposée remplace la poussée. Le manifeste poussé avant les tests dispense
-toujours de la prévalidation (#4136), sinon le gel relancerait l'offload.
+#4304 avait poussé la branche de paquet dès les freeze-checks, pour que la CI
+complète parte pendant les tests par unité. #7740 renverse ce point : chaque
+série directe joue **avant la poussée**, sur le préfixe composé de son unité,
+pour voir un conflit de sens avec une unité antérieure. Le manifeste et le gel
+du porteur n'existent donc qu'après les contrats et les séries, et un rouge
+recompose **sans rien pousser** : le composeur ne remplace plus une tête
+poussée par ce lancement. Le manifeste, écrit avant les tests, déclare la
+série sur préfixe et dispense toujours de la prévalidation (#4136).
 """
 from __future__ import annotations
 
@@ -210,30 +211,33 @@ class PousseePrecoceTest(unittest.TestCase):
             discarded=[], head="f" * 40)
         self.none = paquet_auto.Composition(units=[], discarded=[], head="a" * 40)
 
-    def test_poussee_gel_et_ci_full_avant_le_premier_test_d_unite(self) -> None:
+    def test_les_tests_directs_precedent_la_poussee_et_la_ci(self) -> None:
         flux = Flux(self, tests=[([green()], [], [])], compositions=[self.two])
         self.assertEqual(flux.run(), 0)
         names = flux.names()
         first_test = names.index("tests")
-        for gesture in ("freeze-checks", "manifest", "inclusion", "push", "pr",
-                        "freeze", "ci-full"):
+        for gesture in ("freeze-checks", "manifest", "inclusion", "contracts"):
             self.assertLess(names.index(gesture), first_test, (gesture, names))
-        self.assertEqual(names[:first_test],
-                         ["freeze-checks", "manifest", "inclusion", "contracts", "note", "push", "pr",
-                          "freeze", "ci-full"])
+        # #7740 : la poussée, la PR, le gel et la ci-full viennent après les
+        # séries directes, jamais avant.
+        for gesture in ("push", "pr", "freeze", "ci-full"):
+            self.assertGreater(names.index(gesture), first_test, (gesture, names))
         head = flux.calls("manifest")[0][1][0]
         self.assertEqual(flux.calls("freeze")[0][1][2], head)
         self.assertEqual(flux.calls("ci-full")[0][1][2], head)
-        self.assertIn("tests par unité en cours", flux.calls("freeze")[0][1][3])
-        # le manifeste poussé ne prétend aucun test ; la PR finale les porte
+        self.assertIn("après les contrats et les séries directes",
+                      flux.calls("freeze")[0][1][3])
+        # le manifeste écrit avant les tests ne prétend aucun résultat ; la PR
+        # et le courrier, après, portent la table des modules directs
         self.assertEqual(flux.manifests, [None])
-        self.assertEqual(len(flux.calls("pr")), 2)
-        self.assertIn("Tests par unité : en cours", flux.calls("pr")[0][1][4])
-        self.assertIn("Tests locaux : 1 séries", flux.calls("pr")[1][1][4])
-        self.assertEqual(names[-2:], ["note", "mail"])
         self.assertEqual(len(flux.calls("push")), 1)
+        self.assertEqual(len(flux.calls("pr")), 2)
+        for event in flux.calls("pr"):
+            self.assertIn("Modules directs par lot (#4887, #7740)",
+                          event[1][4])
+        self.assertEqual(names[-2:], ["note", "mail"])
 
-    def test_rouge_d_unite_recompose_et_remplace_la_poussee(self) -> None:
+    def test_rouge_d_unite_recompose_avant_toute_poussee(self) -> None:
         removal = paquet_auto.Removal(2, tests=["tests.test_x.T.test_y"], attributed=True)
         red = paquet_auto.TestRun("unité #2", ["tests.test_x"], 1,
                                   "FAIL: test_y (tests.test_x.T.test_y)\n", 0.1)
@@ -241,51 +245,46 @@ class PousseePrecoceTest(unittest.TestCase):
                     compositions=[self.two, self.one])
         self.assertEqual(flux.run(), 0)
         pushes = flux.calls("push")
-        self.assertEqual(len(pushes), 2)
+        # le rouge n'a rien poussé : une seule poussée, celle de la
+        # composition verte, sans bail à remplacer.
+        self.assertEqual(len(pushes), 1)
         first, second = [event[1][0] for event in flux.calls("manifest")]
         self.assertIsNone(pushes[0][2]["force_lease"])
-        # la recomposition remplace la tête que ce lancement a poussée
-        self.assertEqual(pushes[1][2]["force_lease"], first)
-        self.assertEqual([event[1][2] for event in flux.calls("freeze")], [first, second])
-        self.assertEqual([event[1][2] for event in flux.calls("ci-full")], [first, second])
-        names = flux.names()
-        # la PR est relue avant de pousser la recomposition
-        second_push = [i for i, name in enumerate(names) if name == "push"][1]
-        self.assertEqual(names[second_push - 1], "state")
+        self.assertNotEqual(first, second)
+        self.assertEqual([event[1][2] for event in flux.calls("freeze")], [second])
+        self.assertEqual([event[1][2] for event in flux.calls("ci-full")], [second])
         self.assertEqual(flux.manifests, [None, None])
+        self.assertEqual([event[0] for event in flux.events].count("state"), 1)
 
-    def test_recomposition_du_meme_composeur_dit_la_tete_poussee(self) -> None:
-        """#4501 : la liaison d'une recomposition nomme la tête qu'elle remplace.
-
-        Le composeur qui a poussé la tête détient son bail (`lease`) : la
-        première liaison ne remplace rien (`expect_pushed` vide), la seconde
-        dit la tête poussée du même lancement, que `packet record` reconnaît.
-        """
+    def test_aucune_tete_poussee_a_remplacer_par_la_recomposition(self) -> None:
+        """#4501 : le bail ne sert plus à remplacer une tête poussée avant les
+        tests, puisque #7740 ne pousse qu'après eux."""
         removal = paquet_auto.Removal(2, tests=["tests.test_x.T.test_y"], attributed=True)
         red = paquet_auto.TestRun("unité #2", ["tests.test_x"], 1,
                                   "FAIL: test_y (tests.test_x.T.test_y)\n", 0.1)
         flux = Flux(self, tests=[([red], [2], [removal]), ([green()], [], [])],
                     compositions=[self.two, self.one], record=True)
         self.assertEqual(flux.run(), 0)
-        first, second = [event[1][0] for event in flux.calls("manifest")]
-        self.assertEqual([event[2].get("expect_pushed") for event in flux.calls("record")],
-                         ["", first])
-        self.assertEqual(flux.calls("recompose")[0][2]["expect_pushed"], first)
-        self.assertNotEqual(second, first)
+        self.assertEqual([event[2].get("expect_pushed")
+                          for event in flux.calls("record")], ["", ""])
+        self.assertEqual(flux.calls("recompose")[0][2]["expect_pushed"], "")
 
-    def test_pr_close_pendant_les_tests_rien_n_est_recompose(self) -> None:
-        # #4322 : l'état de la PR est lu avant toute recomposition (la fusion
-        # au vert pendant les tests est couverte par test_4322)
-        removal = paquet_auto.Removal(2, tests=["t"], attributed=True)
-        red = paquet_auto.TestRun("unité #2", ["tests.test_x"], 1, "FAIL: t\n", 0.1)
-        flux = Flux(self, tests=[([red], [2], [removal])],
-                    compositions=[self.two, self.one], states=("CLOSED",))
-        with self.assertRaisesRegex(paquet_auto.PaquetAutoError, "closed"):
-            flux.run()
+    def test_pr_closee_apres_la_poussee_ne_recompose_pas(self) -> None:
+        # #4322 : la PR ne peut plus se fermer « pendant les tests » puisqu'elle
+        # naît après eux ; lue close après la poussée, le corps n'est pas mis à
+        # jour et rien n'est recomposé.
+        flux = Flux(self, tests=[([green()], [], [])],
+                    compositions=[self.two], states=("CLOSED",))
+        out = []
+        with mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(
+                " ".join(str(x) for x in a))):
+            self.assertEqual(flux.run(), 0)
         self.assertEqual(len(flux.calls("push")), 1)
         self.assertEqual(len(flux.calls("manifest")), 1)
+        self.assertEqual(flux.calls("recompose"), [])
+        self.assertTrue(any("corps non mis à jour" in line for line in out), out)
 
-    def test_plus_aucune_unite_apres_poussee_retire_le_paquet(self) -> None:
+    def test_plus_aucune_unite_avant_poussee_ne_retire_rien(self) -> None:
         removal = paquet_auto.Removal(1, tests=["t"], attributed=True)
         red = paquet_auto.TestRun("unité #1", ["tests.test_x"], 1, "FAIL: t\n", 0.1)
         flux = Flux(self, tests=[([red], [1], [removal])],
@@ -294,11 +293,10 @@ class PousseePrecoceTest(unittest.TestCase):
         with mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(
                 " ".join(str(x) for x in a))):
             self.assertEqual(flux.run(), 0)
-        withdraw = flux.calls("withdraw")
-        self.assertEqual(len(withdraw), 1)
-        self.assertEqual(withdraw[0][1][1:3], (4304, 3281))
+        # rien n'a été poussé : il n'y a ni PR ni paquet à retirer.
+        self.assertEqual(flux.calls("withdraw"), [])
+        self.assertEqual(flux.calls("push"), [])
         # #6561 : paquet-horaire ne lit plus cette ligne comme « rien composé »
-        # (le porteur reste ouvert à son pilote) ; paquet-auto dit le retrait.
         self.assertTrue(any(line.startswith("aucune unité après recomposition")
                             for line in out), out)
         self.assertEqual(flux.calls("mail"), [])
@@ -320,12 +318,25 @@ class ManifesteTest(unittest.TestCase):
             composition=composition, table="## Composition\n", tests=None,
             freeze_seconds=1.0)
 
-    def test_le_manifeste_dit_les_tests_en_parallele(self) -> None:
+    def test_le_manifeste_declare_la_serie_directe_sur_prefixe(self) -> None:
         text = self.manifest()
         self.assertIn(paquet_auto.TESTS_PARALLEL_LINE, text)
+        self.assertIn("avant la poussée (#7740)", text)
         self.assertNotIn("tests exécutés", text)
 
-    def test_la_prevalidation_dispense_le_manifeste_pousse_avant_les_tests(self) -> None:
+    def test_les_deux_marqueurs_de_manifeste_restent_reconnus(self) -> None:
+        # #7740 : les manifestes déjà poussés portent l'ancienne ligne (#4304) ;
+        # les nouveaux la remplacent. Prévalidation et instantané lisent les deux.
+        from ameesh import packet_snapshot
+        old = ("- Tests locaux : joués par le composeur après la poussée, en "
+               "parallèle de la CI complète (#4304) ; résultat à la PR.")
+        new = paquet_auto.TESTS_PARALLEL_LINE
+        for line in (old, new):
+            self.assertIsNotNone(calls.COMPOSER_PARALLEL_RE.search(line), line)
+            self.assertIsNotNone(packet_snapshot.PARALLEL_TESTS_RE.search(line),
+                                 line)
+
+    def test_la_prevalidation_dispense_le_manifeste_des_tests_avant_poussee(self) -> None:
         root = tempfile.mkdtemp(prefix="ameesh-4304-")
         self.addCleanup(shutil.rmtree, root, True)
         env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
@@ -346,7 +357,8 @@ class ManifesteTest(unittest.TestCase):
                                     head, repo=root)
         self.assertEqual(got, {"manifest": paquet_auto.manifest_rel(NAME), "sha": head,
                                "tests": 0, "parallel": True})
-        self.assertIn("in parallel with the full CI", calls.skipped_text(got))
+        self.assertIn("tested by its composer before the push",
+                      calls.skipped_text(got))
 
 
 if __name__ == "__main__":
