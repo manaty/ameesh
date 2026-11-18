@@ -115,14 +115,14 @@ class ClassificationTest(unittest.TestCase):
         drop the engine, the module contract or the provider registry from the
         release chain and silently fall back to the project default; this
         witness makes that a red test (#7663, blocking verdicts from auditeur
-        and ameesh-cx2)."""
+        and ameesh-cx2). The old path stays declared until the lot lands
+        (auditeur N), then a canon cleanup removes it."""
         policy = json.loads((ROOT / "scripts" / "alias-review-classes.json").read_text())
         moved = (
             "src/ameesh/modules/nexlink/release.py",
             "src/ameesh/modules/nexlink/__init__.py",
             "src/ameesh/modules/registry.py",
         )
-        old = "src/ameesh/nexlink_release.py"
         release_entries = [entry for entry in policy["classes"].values()
                            if "src/ameesh/release.py" in entry["rule"]]
         self.assertTrue(release_entries)
@@ -132,7 +132,6 @@ class ClassificationTest(unittest.TestCase):
             for path in moved:
                 self.assertTrue(any(regex.match(path) for regex in regexes),
                                 "%s not covered by %r" % (path, entry["rule"]))
-            self.assertFalse(any(regex.match(old) for regex in regexes))
 
 
 class CoreImportTest(unittest.TestCase):
