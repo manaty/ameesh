@@ -33,7 +33,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/nexlink_release.py",
+        "src/ameesh/modules/nexlink/release.py",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -68,7 +68,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/nexlink_release.py",
+        "src/ameesh/modules/nexlink/release.py",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -107,7 +107,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/nexlink_release.py",
+        "src/ameesh/modules/nexlink/release.py",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -142,7 +142,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/nexlink_release.py",
+        "src/ameesh/modules/nexlink/release.py",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -194,7 +194,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/nexlink_release.py",
+        "src/ameesh/modules/nexlink/release.py",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -229,7 +229,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/nexlink_release.py",
+        "src/ameesh/modules/nexlink/release.py",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -281,7 +281,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/nexlink_release.py",
+        "src/ameesh/modules/nexlink/release.py",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -316,14 +316,14 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/nexlink_release.py",
+        "src/ameesh/modules/nexlink/release.py",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
       ]
     }
   },
-  "policy_ref": "6ae77af96c18e0a57b6b933ae87590cf3ea26ab5",
+  "policy_ref": "f735569e0650e65aa4b8507c62445930ee0b3d55",
   "project": "ameesh",
   "version": 1
 }

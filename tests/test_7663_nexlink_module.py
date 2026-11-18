@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -104,6 +105,26 @@ class ConfigurationTest(unittest.TestCase):
             with self.assertRaisesRegex(release_cutoff.ReleaseError, "not provided"):
                 release_cutoff.ProjectRelease.from_config(
                     cfg, "nexlink", {"repo": ".", "model": "unknown"})
+
+
+class ClassificationTest(unittest.TestCase):
+    def test_the_moved_engine_keeps_the_sensitive_release_rule(self):
+        """The pinned policy (generated from the canon) must follow the move.
+
+        A future regeneration from a canon that still names the old path would
+        drop the engine from the release chain and silently fall back to the
+        project default; this witness makes that a red test (#7663, blocking
+        verdict from ameesh-cx2)."""
+        policy = json.loads((ROOT / "scripts" / "alias-review-classes.json").read_text())
+        moved = "src/ameesh/modules/nexlink/release.py"
+        old = "src/ameesh/nexlink_release.py"
+        release_entries = [entry for entry in policy["classes"].values()
+                           if "src/ameesh/release.py" in entry["rule"]]
+        self.assertTrue(release_entries)
+        self.assertEqual({entry["class"] for entry in release_entries}, {"sensitive"})
+        for entry in release_entries:
+            self.assertIn(moved, entry["rule"])
+            self.assertNotIn(old, entry["rule"])
 
 
 class CoreImportTest(unittest.TestCase):
