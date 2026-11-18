@@ -47,14 +47,27 @@ def _run(label, modules, **_kwargs):
 
 
 class LocalTests:
-    """`check_local_tests` en série, `run_tests` remplacé et consigné."""
+    """`check_local_tests` en série, `run_tests` remplacé et consigné.
 
-    def __init__(self, lots=(1, 2, 3), run=_run):
+    `now` fige `time.monotonic` pendant l'appel (#7748) : la part des contrats
+    et les bornes murales ne dépendent plus du temps réellement écoulé sur un
+    runner chargé. Les témoins qui ont besoin d'une horloge qui avance la
+    posent eux-mêmes (`test_chaque_serie_bornee_au_temps_restant`).
+    """
+
+    def __init__(self, lots=(1, 2, 3), run=_run, now=None):
         self.composition = _composition(lots)
         self.calls: list[tuple[str, int]] = []
         self.walls: list[int | None] = []
         self.lines: list[str] = []
         self.run_fn = run
+        self.now = now
+
+    def deadline(self, seconds: int = 600) -> float:
+        """Échéance posée sur l'horloge figée du témoin, jamais sur la réelle."""
+        if self.now is None:
+            raise AssertionError("témoin sans horloge figée : passer now=…")
+        return self.now + seconds
 
     def run(self, parallel=1, which=None, **kwargs):
         def fake(_worktree, label, modules, *, timeout, heavy=False, wall=None):
@@ -62,12 +75,20 @@ class LocalTests:
             self.walls.append(wall)
             return self.run_fn(label, modules, timeout=timeout)
 
-        with mock.patch.object(paquet_auto, "unit_test_modules",
-                               side_effect=lambda _w, unit: ["tests.test_u%d" % unit.lot]), \
-                mock.patch.object(paquet_auto, "contract_modules",
-                                  return_value=["tests.test_contrat"]), \
-                mock.patch.object(paquet_auto.shutil, "which", return_value=which), \
-                mock.patch.object(paquet_auto, "run_tests", side_effect=fake):
+        patchers = [
+            mock.patch.object(paquet_auto, "unit_test_modules",
+                              side_effect=lambda _w, unit: ["tests.test_u%d" % unit.lot]),
+            mock.patch.object(paquet_auto, "contract_modules",
+                              return_value=["tests.test_contrat"]),
+            mock.patch.object(paquet_auto.shutil, "which", return_value=which),
+            mock.patch.object(paquet_auto, "run_tests", side_effect=fake),
+        ]
+        if self.now is not None:
+            patchers.append(mock.patch.object(paquet_auto.time, "monotonic",
+                                              new=lambda: self.now))
+        with contextlib.ExitStack() as stack:
+            for patcher in patchers:
+                stack.enter_context(patcher)
             return paquet_auto.check_local_tests(
                 pathlib.Path("."), self.composition, timeout=900, parallel=parallel,
                 select=lambda *_: ({}, ""), log=self.lines.append, **kwargs)
@@ -188,8 +209,9 @@ class BorneTotaleTest(unittest.TestCase):
         # #7195 : une série `heavy` garde sa borne d'exécution (`timeout`) ;
         # l'attente du créneau reste dans l'échéance totale (temps restant).
         # #7740 : la série directe garde elle aussi sa borne entière.
-        local = LocalTests()
-        local.run(parallel=4, which="/bin/ameesh", deadline=time.monotonic() + 600)
+        # #7748 : horloge figée — un runner chargé ne doit pas changer la part.
+        local = LocalTests(now=1000.0)
+        local.run(parallel=4, which="/bin/ameesh", deadline=local.deadline())
         timeouts = dict(local.calls)
         walls = {label: wall for (label, _timeout), wall
                  in zip(local.calls, local.walls)}
@@ -205,8 +227,9 @@ class BorneTotaleTest(unittest.TestCase):
     def test_serie_directe_garde_sa_borne_entiere(self) -> None:
         # #7740 : la série directe ne prend plus une part de la borne totale ;
         # seule la borne murale la coupe. Les contrats gardent leur part.
-        local = LocalTests()
-        local.run(deadline=time.monotonic() + 600)
+        # #7748 : horloge figée — un runner chargé ne doit pas changer la part.
+        local = LocalTests(now=1000.0)
+        local.run(deadline=local.deadline())
         timeouts = dict(local.calls)
         walls = {label: wall for (label, _timeout), wall
                  in zip(local.calls, local.walls)}
