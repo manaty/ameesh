@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import math
 import os
 import re
@@ -35,7 +36,7 @@ def parse_since(value):
         raise Refused("--since must be an ISO timestamp with timezone") from exc
 
 
-def inspect(tx, lot, actor, since, kind):
+def inspect(tx, lot, actor, since, kind, target=""):
     """Read the journal and mailbox and record a receipt in one transaction."""
     item = tx.query("SELECT state, extract(epoch from now())::float8 AS now_ts "
                     "FROM work_items WHERE id = %s FOR NO KEY UPDATE", (lot,))
@@ -87,8 +88,12 @@ def inspect(tx, lot, actor, since, kind):
                 raise Refused("withdrawn decision #%s" % message["id"])
 
     note = "pre-act: kind=%s actor=%s since=%s" % (kind, actor, since)
-    tx.execute("INSERT INTO work_item_events (work_item_id, state, note, actor) "
-               "VALUES (%s, %s, %s, %s)", (lot, item[0]["state"], note, actor))
+    evidence = json.dumps({"type": "pre-act/1", "kind": kind, "lot": lot,
+                           "actor": actor, "target": target})
+    tx.execute("INSERT INTO work_item_events "
+               "(work_item_id, state, note, actor, evidence, created_at) "
+               "VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp())",
+               (lot, item[0]["state"], note, actor, evidence))
     tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (lot,))
 
 
@@ -98,6 +103,7 @@ def main(argv=None):
     parser.add_argument("--kind", choices=("kms", "key", "prod"), required=True)
     parser.add_argument("--since", required=True,
                         help="ISO timestamp with timezone captured before waiting")
+    parser.add_argument("--target", default="", help="target of the effect")
     parser.add_argument("command", nargs=argparse.REMAINDER,
                         help="optional command after --, executed immediately after the check")
     args = parser.parse_args(argv)
@@ -110,6 +116,8 @@ def main(argv=None):
     try:
         if args.lot <= 0:
             raise Refused("invalid lot")
+        if args.kind == "prod" and not args.target.strip():
+            raise Refused("--target is required for prod")
         since = parse_since(args.since)
         cfg = config.load()
         db = db_mod.open_db(cfg)
@@ -120,7 +128,7 @@ def main(argv=None):
             raise Refused("valid agent identity required")
         check_started = time.monotonic()
         with db.transaction(isolation="READ COMMITTED") as tx:
-            inspect(tx, args.lot, binding.name, since, args.kind)
+            inspect(tx, args.lot, binding.name, since, args.kind, args.target.strip())
         db.close()
         db = None
         print("pre-act: receipt recorded for lot #%d (%s)" % (args.lot, args.kind))

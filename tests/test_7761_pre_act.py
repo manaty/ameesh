@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import unittest
+import json
 from contextlib import nullcontext
 from unittest import mock
 
@@ -42,6 +43,16 @@ class PreActTest(unittest.TestCase):
         self.check(tx)
         self.assertIn("INSERT INTO work_item_events", tx.writes[0][0])
         self.assertIn("kind=kms actor=bureau", tx.writes[0][1][2])
+        evidence = json.loads(tx.writes[0][1][4])
+        self.assertEqual(evidence, {"type": "pre-act/1", "kind": "kms",
+                                    "lot": 5772, "actor": "bureau", "target": ""})
+
+    def test_prod_requires_target_before_database_access(self):
+        with mock.patch.object(pre_act.db_mod, "open_db") as open_db:
+            result = pre_act.main(["--lot", "5772", "--kind", "prod", "--since",
+                                   "2026-11-18T01:00:00Z", "--", "true"])
+        self.assertEqual(result, 1)
+        open_db.assert_not_called()
 
     def test_unread_lot_mail_blocks_even_before_window(self):
         tx = Transaction(messages=[{"id": 4, "recipient": "bureau", "unread": True,
