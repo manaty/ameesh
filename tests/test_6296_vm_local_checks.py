@@ -40,7 +40,9 @@ class SshPolicyTest(unittest.TestCase):
                 'user=vm-operator,host=localhost,addr=127.0.0.1'],
                 capture_output=True, text=True, timeout=5)
             self.assertEqual(effective.returncode, 0, effective.stderr)
-            lines = effective.stdout.splitlines()
+            # #7781 : OpenSSH 10.5 rend les mots-clés de sshd -T en casse mixte
+            # (PermitUserEnvironment) ; seule la valeur effective compte.
+            lines = effective.stdout.lower().splitlines()
             for expected in ('permituserenvironment no', 'allowagentforwarding no',
                              'allowstreamlocalforwarding no', 'allowtcpforwarding no',
                              'permittunnel no', 'permitlisten none'):
