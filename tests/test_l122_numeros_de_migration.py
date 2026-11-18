@@ -265,6 +265,20 @@ class NumerosDuDepotTest(unittest.TestCase):
         self.assertEqual(AMEESH.file(378), "src/ameesh/migrations/0378_<name>.sql")
         self.assertIsNone(migrations.layout_for("manaty/inconnu"))
 
+    def test_packet_watch_sans_radar_nomme_le_clone(self):
+        """#7795 B : le composeur n'a pas de bloc `radar` ; la disposition se
+        lit quand même dans `packet_watch.projects.<p>.repo`, clone réel."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _depot(os.path.join(tmp, "nexlink"), "manaty/nexlink",
+                          NEXLINK.directory, ["375_a.sql"])
+            cfg = types.SimpleNamespace(
+                radar=None, release=None,
+                packet_watch={"projects": {"nexlink": {"repo": repo,
+                                                       "target": "develop"}}})
+            layout = migrations.layout_for("manaty/nexlink", cfg)
+        self.assertEqual(layout.directory, NEXLINK.directory)
+        self.assertEqual(layout.width, 3)
+
     def test_largeur_declaree(self):
         """#4750 : un dépôt déclaré à la configuration (pas en dur) porte sa
         largeur ; `014_x.sql` se lit sur 3 chiffres, défaut 4, valeur vérifiée."""
@@ -506,7 +520,10 @@ class ReservationTest(MeshConfigMixin, PgTestCase):
         unknown = self._lot("x", "manaty/inconnu")
         with self.assertRaises(work.WorkError) as ctx:
             work.reserve_migration(self.db, unknown["id"], repo=self.ameesh)
-        self.assertIn("migrations directory unknown", str(ctx.exception))
+        # #7795 : le clone explicite est vérifié avant la disposition ; il est
+        # celui d'ameesh, pas de `manaty/inconnu` — refus nommé, jamais deviné.
+        self.assertIn("clone of manaty/ameesh, not of manaty/inconnu",
+                      str(ctx.exception))
         self.assertIsNone(work.get(self.db, nx["id"])["migration"])
 
     def test_cle_de_depot_en_minuscules(self):

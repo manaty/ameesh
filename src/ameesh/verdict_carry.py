@@ -760,7 +760,7 @@ def renumbering_of(cfg, row: Mapping, repo: str) -> Renumbering | None:
     slug = migrations.repo_key(plan_git._repo_slug(repo) or row.get("migration_repo") or "")
     if not slug:
         return None
-    layout = migrations.layout_for(slug, cfg)
+    layout = migrations.layout_for(slug, cfg) or migrations.inferred_layout(repo, slug)
     if layout is None or not layout.directory:
         return None
     reserved = frozenset(

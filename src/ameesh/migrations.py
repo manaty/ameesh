@@ -15,6 +15,7 @@ import functools
 import json
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -588,9 +589,10 @@ class Layout:
         return "%s/%s_<name>.sql" % (self.directory, self.label(number))
 
 
-#: dépôts déclarés : `radar.projects.<p>` (`github`, `migrations`,
-#: `migrations_width`) de la configuration de l'hôte ; le dépôt du paquet se
-#: lit à son `origin` (`package_repo`, #7795), aucun slug n'est compilé.
+#: dépôts déclarés : `radar.projects.<p>`, puis `release.projects.<p>` et
+#: `packet_watch.projects.<p>` (`github`, `repo`, `migrations`,
+#: `migrations_width`) ; le dépôt du paquet se lit à son `origin`
+#: (`package_repo`, #7795), aucun slug n'est compilé.
 
 
 def repo_key(repo: str | None) -> str:
@@ -601,59 +603,172 @@ def repo_key(repo: str | None) -> str:
 
 @functools.lru_cache(maxsize=1)
 def package_repo() -> str | None:
-    """#7795 : le dépôt du paquet, lu à l'`origin` de son propre clone.
+    """#7795 : le dépôt du paquet, lu à l'`origin` de son propre arbre.
 
     Aucun nom de forge n'est compilé : le dépôt qui porte ce code est celui de
-    l'arbre d'où il tourne. Un paquet installé hors clone (wheel, venv scellé)
-    ne déclare pas de dépôt — l'appelant qui en a besoin le lit alors dans la
-    configuration (`radar.projects`)."""
+    l'arbre d'où il tourne. Hors clone (roue dans un venv scellé), le clone de
+    déploiement voisin (`~/.local/share/ameesh/src`, `src-<sha7>`) porte le
+    même `origin` ; sans lui, aucun dépôt n'est déclaré et l'appelant qui en a
+    besoin le lit dans les déclarations de l'hôte (`radar`, `release`,
+    `packet_watch`)."""
     root = toplevel(os.path.dirname(os.path.abspath(__file__)))
-    return origin_repo(root) if root else None
+    if root:
+        return origin_repo(root)
+    prefix = os.path.realpath(sys.prefix)
+    name = os.path.basename(prefix).rstrip(os.sep)
+    if not name.startswith("venv-"):
+        return None
+    parent = os.path.dirname(prefix)
+    for candidate in (os.path.join(parent, "src"),
+                      os.path.join(parent, "src-" + name[len("venv-"):])):
+        root = toplevel(candidate)
+        if root:
+            slug = origin_repo(root)
+            if slug:
+                return slug
+    return None
 
 
 def package_layout() -> Layout | None:
     """#7795 : la disposition du dépôt du paquet lui-même, ou None."""
     repo = package_repo()
-    return Layout(repo, REPO_PATH, 4) if repo else None
+    if not repo:
+        return None
+    try:
+        names = os.listdir(MIGRATIONS_DIR)
+    except OSError:
+        names = []
+    widths = [len(match.group(1)) for name in names
+              if (match := _REPO_FILE_RE.match(os.path.basename(name)))]
+    width = max(set(widths), key=widths.count) if widths else 4
+    return Layout(repo, REPO_PATH, width)
+
+
+def _project_value(project, key: str, default=None):
+    """Une clé d'une déclaration de projet, objet (`radar.Project`) ou dict
+    brut (`release.projects`, `packet_watch.projects`)."""
+    if isinstance(project, dict):
+        return project.get(key, default)
+    return getattr(project, key, default)
+
+
+def _declared_projects(cfg) -> list:
+    """Les déclarations qui nomment un dépôt et son clone, dans l'ordre de
+    lecture : `radar.projects` (validé), puis `release.projects`, puis
+    `packet_watch.projects`.
+
+    #7795 : un runner peut n'avoir que `packet_watch` (le composeur) ; le
+    dépôt de la disposition ne doit pas dépendre du seul bloc `radar`. Un bloc
+    absent ou mal formé n'ajoute rien ; la lecture fermée reste aux appelants.
+    """
+    projects = list(_radar_projects(cfg))
+    if cfg is None:
+        return projects
+    for key in ("release", "packet_watch"):
+        block = getattr(cfg, key, None)
+        declared = block.get("projects") if isinstance(block, dict) else None
+        if not isinstance(declared, dict):
+            continue
+        projects.extend(entry for entry in declared.values()
+                        if isinstance(entry, dict))
+    return projects
 
 
 def layout_for(repo: str, cfg=None) -> Layout | None:
     """La disposition des migrations du dépôt `owner/repo`, ou None.
 
-    #7795 : un dépôt se lit dans `radar.projects.<p>` de la configuration de
-    l'hôte (`github`, `migrations`, `migrations_width`). Le dépôt du paquet
-    lui-même se reconnaît à l'`origin` de son clone (`package_repo`) ; le
-    répertoire `src/ameesh/migrations` d'un clone déclaré le nomme aussi quand
-    la configuration ne le précise pas. Aucun `owner/repo` n'est compilé."""
+    #7795 : un dépôt se lit dans les déclarations de l'hôte
+    (`radar.projects`, puis `release.projects` et `packet_watch.projects` :
+    `github`, `repo`, `migrations`, `migrations_width`). Le clone déclaré
+    nomme le répertoire par ses fichiers quand la configuration ne le précise
+    pas. Le dépôt du paquet lui-même se reconnaît à l'`origin` de son arbre
+    (`package_repo`) ; le répertoire `src/ameesh/migrations` d'un clone
+    déclaré le nomme aussi. Aucun `owner/repo` n'est compilé."""
     repo = repo_key(repo)
-    for project in _radar_projects(cfg):
-        if repo_key(project.github) != repo:
+    if not repo:
+        return None
+    for project in _declared_projects(cfg):
+        github = str(_project_value(project, "github", "") or "").strip()
+        checkout = str(_project_value(project, "repo", "") or "").strip()
+        checkout = os.path.expanduser(checkout) if checkout else ""
+        if not github and checkout:
+            github = origin_repo(checkout) or ""
+        if repo_key(github) != repo:
             continue
-        directory = (getattr(project, "migrations", "") or "").strip().strip("/")
-        checkout = str(getattr(project, "repo", "") or "")
+        directory = str(_project_value(project, "migrations", "")
+                        or "").strip().strip("/")
         if not directory and checkout and os.path.isdir(
-                os.path.join(os.path.expanduser(checkout), REPO_PATH)):
+                os.path.join(checkout, REPO_PATH)):
             directory = REPO_PATH
         if directory:
             known = Layout(repo, directory, 4)
-            return Layout(repo, directory, width_of(project, known))
+            return Layout(repo, directory, width_of(project, known, checkout=checkout))
+        if checkout:
+            inferred = inferred_layout(checkout, repo)
+            if inferred is not None:
+                return inferred
     if repo and repo == repo_key(package_repo() or ""):
         return package_layout()
     return None
 
 
-def width_of(project, known: Layout | None = None) -> int:
+#: dossiers jamais parcourus pour inférer une disposition de migrations
+_INFER_SKIP = frozenset({".git", ".hg", ".svn", "node_modules", "vendor", "dist",
+                         "build", "venv", ".venv", "__pycache__"})
+
+
+def inferred_layout(checkout: str, repo: str = "") -> Layout | None:
+    """#7795 : la disposition lue dans un clone quand la configuration ne la
+    nomme pas — le clone du dépôt du lot porte ses fichiers.
+
+    Un dossier `migrations` (à quatre niveaux au plus, hors dépendances) qui
+    contient des fichiers numérotés désigne le répertoire et sa largeur. Un
+    seul candidat fait foi ; plusieurs sans `src/ameesh/migrations` sont un
+    doute, jamais un choix : None (l'appelant refuse). Aucun nom de dépôt ni
+    de dossier n'est compilé."""
+    if not checkout or not os.path.isdir(checkout):
+        return None
+    candidates: list[tuple[str, list[int]]] = []
+    base_depth = checkout.rstrip(os.sep).count(os.sep)
+    for root, dirs, files in os.walk(checkout):
+        depth = root.rstrip(os.sep).count(os.sep) - base_depth
+        if depth >= 4:
+            dirs[:] = []
+            continue
+        dirs[:] = sorted(d for d in dirs if d not in _INFER_SKIP)
+        if os.path.basename(root) != "migrations":
+            continue
+        widths = [len(match.group(1)) for name in files
+                  if (match := _REPO_FILE_RE.match(os.path.basename(name)))]
+        if widths:
+            relative = os.path.relpath(root, checkout).replace(os.sep, "/")
+            candidates.append((relative, widths))
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        preferred = [item for item in candidates if item[0] == REPO_PATH]
+        if len(preferred) != 1:
+            return None
+        candidates = preferred
+    directory, widths = candidates[0]
+    width = max(set(widths), key=widths.count)
+    return Layout(repo or "", directory, width)
+
+
+def width_of(project, known: Layout | None = None, *, checkout: str | None = None) -> int:
     """#4750 : la largeur déclarée (`migrations_width`), sinon celle lue dans
     les fichiers du dépôt (#7795), sinon celle de `known`, sinon 4."""
-    declared = getattr(project, "migrations_width", 0) or 0
+    declared = _project_value(project, "migrations_width", 0) or 0
     if declared:
         return declared
-    directory = ((getattr(project, "migrations", "") or "").strip().strip("/")
+    directory = (str(_project_value(project, "migrations", "") or "").strip().strip("/")
                  or (known.directory if known else ""))
-    checkout = str(getattr(project, "repo", "") or "")
+    if checkout is None:
+        checkout = str(_project_value(project, "repo", "") or "")
+        checkout = os.path.expanduser(checkout) if checkout else ""
     if directory and checkout:
         try:
-            names = os.listdir(os.path.join(os.path.expanduser(checkout), directory))
+            names = os.listdir(os.path.join(checkout, directory))
         except OSError:
             names = []
         widths = [len(match.group(1)) for name in names
@@ -675,10 +790,19 @@ def _radar_projects(cfg) -> list:
 
 
 def checkout_for(repo: str, cfg=None) -> str | None:
-    """Un clone local de `repo` déclaré à l'hôte (`radar.projects.<p>.repo`)."""
-    for project in _radar_projects(cfg):
-        if repo_key(project.github) == repo_key(repo) and os.path.isdir(project.repo):
-            return project.repo
+    """Un clone local de `repo` déclaré à l'hôte (`radar.projects`, puis
+    `release.projects` et `packet_watch.projects`), ou None."""
+    wanted = repo_key(repo)
+    if not wanted:
+        return None
+    for project in _declared_projects(cfg):
+        github = str(_project_value(project, "github", "") or "").strip()
+        checkout = str(_project_value(project, "repo", "") or "").strip()
+        checkout = os.path.expanduser(checkout) if checkout else ""
+        if not github and checkout:
+            github = origin_repo(checkout) or ""
+        if repo_key(github) == wanted and checkout and os.path.isdir(checkout):
+            return checkout
     return None
 
 

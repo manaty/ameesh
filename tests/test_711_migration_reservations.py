@@ -2,6 +2,7 @@
 """#711: target-only floors, atomic slots, legacy coexistence and lifecycle."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import threading
@@ -25,6 +26,11 @@ class ScopedReservationsTest(PgTestCase):
         # `develop` (pas d'`origin/HEAD`), la cible est déclarée comme sur un
         # clone réel de nexlink.
         _git(self.repo, 'config', 'ameesh.target', 'develop')
+        # #7795 : la disposition du dépôt se lit à la configuration de l'hôte.
+        self.cfg = dataclasses.replace(self.cfg, radar={"projects": {"nexlink": {
+            "repo": self.repo, "github": "manaty/nexlink",
+            "migrations": NEXLINK.directory}}})
+        self.db.cfg = self.cfg
         self.sha = reservations._git(self.repo, 'rev-parse', 'HEAD')
         self.a = self.lot('a')
         self.b = self.lot('b')

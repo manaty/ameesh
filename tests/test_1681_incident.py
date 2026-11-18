@@ -588,6 +588,30 @@ class _Full:
         self.ci, self.work = ci_store, work_store
 
 
+class IntegrationsTest(unittest.TestCase):
+    """#7795 B : la table d'intégration se lit à la configuration du runner,
+    jamais dans la table compilée retirée."""
+
+    def test_packet_watch_only_keeps_the_watch(self):
+        cfg = types.SimpleNamespace(
+            release={}, radar=None,
+            packet_watch={"projects": {"ameesh": {"repo": "/clone", "target": "main"}}})
+        with mock.patch("ameesh.migrations.origin_repo", return_value="manaty/ameesh"):
+            self.assertEqual(incident.integrations(cfg),
+                             {"manaty/ameesh": ("main", "ameesh")})
+
+    def test_release_then_radar(self):
+        cfg = types.SimpleNamespace(
+            release={"projects": {"nexlink": {"github": "manaty/nexlink",
+                                              "target": "develop"}}},
+            radar={"projects": {"ameesh": {"repo": "/clone", "target": "main"}}},
+            packet_watch=None)
+        with mock.patch("ameesh.migrations.origin_repo", return_value="manaty/ameesh"):
+            self.assertEqual(incident.integrations(cfg), {
+                "manaty/nexlink": ("develop", "nexlink"),
+                "manaty/ameesh": ("main", "ameesh")})
+
+
 class TestConsommateur(unittest.TestCase):
     """`incident.consume` : la source courante, la même tête, une fois."""
 

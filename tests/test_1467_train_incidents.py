@@ -141,3 +141,57 @@ class PacketFactsTest(unittest.TestCase):
         impact.reset_mock()
         self.assertIsNone(self.facts.links_for("other/repo", self.plan["head"]))
         impact.assert_not_called()
+
+
+class TrainIncidentsConsumeTest(unittest.TestCase):
+    """#7795 B : le consommateur d'incidents du train ne dépend pas d'un bloc
+    `release` ; un passage couvert sans déclaration garde sa cible."""
+
+    class Reader:
+        repo = "manaty/ameesh"
+        target = "main"
+        project = types.SimpleNamespace(name="ameesh")
+
+        def lands(self, repo, head):
+            return []
+
+        def diagnoses(self, repo, head):
+            return None
+
+        def links_for(self, repo, head):
+            return None
+
+    class Passage:
+        policy = types.SimpleNamespace(enabled=True)
+
+        def incident_facts(self, db, fallback=None):
+            return TrainIncidentsConsumeTest.Reader()
+
+    class Consumer:
+        def __init__(self, table=None):
+            self.table = table or {}
+            self.seen = None
+
+        def integrations(self, cfg):
+            return dict(self.table)
+
+        def consume(self, db, *, integration, lands, diagnoses, links_for):
+            self.seen = dict(integration)
+            return []
+
+    def _db(self):
+        return types.SimpleNamespace(
+            cfg=types.SimpleNamespace(release={}, radar=None, packet_watch=None))
+
+    def test_passage_without_declaration_watches_its_target(self):
+        consumer = self.Consumer()
+        self.assertEqual(train_incidents.consume(
+            self._db(), (self.Passage(),), consumer=consumer), [])
+        self.assertEqual(consumer.seen,
+                         {"manaty/ameesh": ("main", "ameesh")})
+
+    def test_declared_other_target_is_refused(self):
+        consumer = self.Consumer({"manaty/ameesh": ("develop", "ameesh")})
+        with self.assertRaisesRegex(train.TrainError, "exact integration target"):
+            train_incidents.consume(
+                self._db(), (self.Passage(),), consumer=consumer)

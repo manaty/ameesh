@@ -160,17 +160,21 @@ def consume(db, passages, *, consumer):
         return consumer.consume(db)
     from . import ci
     # #7795 : la table d'intégration se lit à la configuration de l'hôte,
-    # jamais dans un nom compilé ; sans configuration, la cible déclarée par
-    # le passage du train fait foi.
+    # jamais dans un nom compilé. Un dépôt couvert par un passage du train
+    # mais absent de la configuration n'est pas ignoré : la cible du passage
+    # fait foi (c'est celle sur laquelle la CI a tourné). Une cible déclarée
+    # différente reste une contradiction refusée.
     cfg = getattr(db, "cfg", None)
-    table = consumer.integrations(cfg)
+    table = dict(consumer.integrations(cfg))
     readers = {}
     for passage in passages:
         reader = passage.incident_facts(db, fallback=ci.landed_commits)
+        if not reader.repo or not reader.target:
+            raise TrainError("one exact integration target per incident repository required")
         spec = table.get(reader.repo)
         if spec is None:
-            if cfg is not None:
-                raise TrainError("one exact integration target per incident repository required")
+            name = str(getattr(getattr(reader, "project", None), "name", "") or "").strip()
+            table[reader.repo] = (reader.target, name or reader.repo.rsplit("/", 1)[-1])
         else:
             branch = spec[0] if isinstance(spec, tuple) else spec
             if branch != reader.target:
