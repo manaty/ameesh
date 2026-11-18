@@ -9,7 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ameesh import nexlink_release as nx, release_cutoff as rc
+from ameesh import release_cutoff as rc
+from ameesh.modules.nexlink import release as nx
 
 SUBJECT = ("Merge #3654 « Nexlink package 180 on develop — #3645 (AM-0) » "
            "(integration/paquet-180-nexlink)")

@@ -39,6 +39,7 @@ from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENC
 from .work_dependencies import current_verdict as _current_verdict
 from .work_dependencies import last_freeze_sha as _last_freeze_sha
 from .work_dependencies import not_blocking as _not_blocking
+from .work_dependencies import start_blocking as _start_blocking
 from .work_dependencies import start_defers as _start_defers
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
@@ -1447,12 +1448,14 @@ class WorkItems(interface.WorkItems):
             # `unassigned_lots` (une seule règle).
             if self.db.query("SELECT 1 FROM work_item_dependencies d"
                              " JOIN work_items b ON b.id = d.blocker_id"
-                             " WHERE d.work_item_id = %s AND NOT " + _not_blocking("b") +
+                             " JOIN work_items i ON i.id = d.work_item_id"
+                             " WHERE d.work_item_id = %s AND " + _start_blocking("i", "b") +
                              " LIMIT 1", (int(item_id),)):
                 return None
             ready_state = item["state"]
             if ready_state == lifecycle.REQUESTED and (
-                    self._footprint_overlaps(item_id) or self._footprint_cap(item_id)):
+                    self._footprint_overlaps(item_id, start_on=True)
+                    or self._footprint_cap(item_id)):
                 return None
         else:
             ready_state = None
@@ -1462,7 +1465,7 @@ class WorkItems(interface.WorkItems):
                 # attributions concurrentes de lots chevauchants décident
                 # l'une après l'autre.
                 self.db.execute(_DEPENDENCIES_LOCK)
-                self._footprint_guard(item_id, free_only=True)
+                self._footprint_guard(item_id, free_only=True, start_on=True)
         behind = None
         if (queued_note is not None or take) and assignee:
             lot = self.db.query("SELECT started_at IS NULL AS fresh FROM work_items"
@@ -1479,12 +1482,14 @@ class WorkItems(interface.WorkItems):
             row["forced_behind" if forced_note else "queued_behind"] = behind
         return row
 
-    def _footprint_overlaps(self, item_id, *, free_only=False):
+    def _footprint_overlaps(self, item_id, *, free_only=False,
+                            start_on=False) -> list[dict]:
         """#4173, sous le verrou du graphe : les chevauchements de l'empreinte
-                du lot avec celle d'un lot occupant de son dépôt (requête POSTÉRIEURE
-                au verrou, comme le contrôle des dépendances). `free_only` : vide si
-                le lot occupe déjà son empreinte (réattribution d'un lot démarré)."""
-        return self._dev._footprint_overlaps(item_id, free_only=free_only)
+        du lot avec celle d'un lot occupant de son dépôt (requête POSTÉRIEURE
+        au verrou, comme le contrôle des dépendances). `free_only` : vide si
+        le lot occupe déjà son empreinte (réattribution d'un lot démarré)."""
+        return self._dev._footprint_overlaps(item_id, free_only=free_only,
+                                             start_on=start_on)
 
     def _footprint_cap(self, item_id, *, free_only=False):
         """#4818, sous le verrou du graphe : `{cap, in_flight}` si le dépôt du
@@ -1492,11 +1497,13 @@ class WorkItems(interface.WorkItems):
                 None si le lot occupe déjà son empreinte (il est déjà compté)."""
         return self._dev._footprint_cap(item_id, free_only=free_only)
 
-    def _footprint_guard(self, item_id, *, free_only=False) -> None:
+    def _footprint_guard(self, item_id, *, free_only=False,
+                         start_on=False) -> None:
         """La garde d'attribution d'un lot libre : `FootprintOverlap` s'il
         chevauche un lot occupant, `RepositoryCapReached` si son dépôt est au
         plafond (#4818). Rien n'est écrit ; l'appelant tient le verrou."""
-        overlaps = self._footprint_overlaps(item_id, free_only=free_only)
+        overlaps = self._footprint_overlaps(item_id, free_only=free_only,
+                                            start_on=start_on)
         if overlaps:
             raise interface.FootprintOverlap(overlaps)
         cap = self._footprint_cap(item_id, free_only=free_only)

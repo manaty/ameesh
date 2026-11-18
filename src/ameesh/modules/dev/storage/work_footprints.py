@@ -38,13 +38,51 @@ def occupying_sql(alias: str) -> str:
     return _OCCUPYING.format(o=alias)
 
 
+def footprints_overlap_sql(left: str, right: str) -> str:
+    """Vrai si les empreintes de deux lots se chevauchent, dans un même dépôt
+    et hors chemins partagés (mêmes règles que `_PATHS_OVERLAP`/`_SHARED`).
+
+    Les deux alias doivent porter `id` et `app` (`work_items`)."""
+    return ("(btrim(" + left + ".app) = btrim(" + right + ".app)"
+            " AND NOT coalesce(btrim(" + left + ".app), '') = ''"
+            " AND EXISTS (SELECT 1 FROM work_item_footprints fa"
+            "  JOIN work_item_footprints fb ON " + _PATHS_OVERLAP.format(a="fa", b="fb") +
+            "  WHERE fa.work_item_id = " + left + ".id"
+            "    AND fb.work_item_id = " + right + ".id"
+            "    AND NOT " + _SHARED.format(app=left + ".app", p="fa") +
+            "    AND NOT " + _SHARED.format(app=left + ".app", p="fb") + "))")
+
+
+def start_on_sql(dependent: str, occupant: str = "o") -> str:
+    """#7760 : le couple (dépendant, occupant) est un « démarrage sur » —
+    l'occupant est `validated` (gelé, relu, sans bloquant) et le dépendant
+    déclare la dépendance. Un tel chevauchement ne retient plus le démarrage ;
+    la fusion reste retenue (`not_blocking`), le composeur les prend ensemble.
+
+    `dependent` et `occupant` sont des alias de `work_items`."""
+    return ("(" + occupant + ".state = '" + lifecycle.VALIDATED + "' AND EXISTS ("
+            "SELECT 1 FROM work_item_dependencies sd"
+            " WHERE sd.work_item_id = " + dependent + ".id"
+            "   AND sd.blocker_id = " + occupant + ".id) AND "
+            + footprints_overlap_sql(dependent, occupant) + ")")
+
+
 # `items` is a trusted SQL relation name, like `alias`, never user input.
 # A snapshot may supply a CTE containing all non-terminal lots; the canonical
 # predicates below still decide which of those lots occupy an individual app.
-def overlap_rows_sql(alias: str, *, items: str = "work_items") -> str:
+def overlap_rows_sql(alias: str, *, items: str = "work_items",
+                     start_on: bool = False) -> str:
     """Les paires (chemin du lot `alias`, chemin d'un lot occupant du même
-    dépôt) qui se chevauchent — corps de `overlapping` et de la garde."""
-    return ("SELECT o.id, o.state, o.assignee, mine.path, theirs.path AS other_path"
+    dépôt) qui se chevauchent — corps de `overlapping` et de la garde.
+
+    `start_on=True` (: #7760) écarte les paires « démarrage sur » (#7760) :
+    reste ce qui retient vraiment le démarrage. Sans lui, chaque paire porte
+    `start_on` et `other_frozen_sha` pour l'affichage."""
+    rows = ("SELECT o.id, o.state, o.assignee, mine.path, theirs.path AS other_path,"
+            "       " + start_on_sql(alias, "o") + " AS start_on,"
+            "       (SELECT m.sha FROM work_item_milestones m"
+            "         WHERE m.work_item_id = o.id AND m.kind = 'frozen'"
+            "         ORDER BY m.at DESC, m.id DESC LIMIT 1) AS other_frozen_sha"
             "  FROM work_item_footprints mine"
             "  JOIN work_item_footprints theirs"
             "    ON theirs.work_item_id <> mine.work_item_id"
@@ -56,14 +94,19 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items") -> str:
             "   AND " + occupying_sql("o") +
             "   AND NOT " + _SHARED.format(app=alias + ".app", p="mine") +
             "   AND NOT " + _SHARED.format(app=alias + ".app", p="theirs"))
+    if start_on:
+        rows += "   AND NOT " + start_on_sql(alias, "o")
+    return rows
 
 
-def overlap_exists_sql(alias: str, *, items: str = "work_items") -> str:
+def overlap_exists_sql(alias: str, *, items: str = "work_items",
+                       start_on: bool = False) -> str:
     """Vrai si le lot `alias` chevauche un lot occupant de son dépôt.
 
     `unassigned_lots` (sélection) et `_assign_locked` (sous le verrou du
-    graphe) appliquent ce même prédicat : une seule règle."""
-    return "EXISTS (" + overlap_rows_sql(alias, items=items) + ")"
+    graphe) appliquent ce même prédicat : une seule règle. `start_on=True`
+    ignore les occupants validés dont le lot déclare la dépendance (#7760)."""
+    return "EXISTS (" + overlap_rows_sql(alias, items=items, start_on=start_on) + ")"
 
 
 #: #4667 : un véhicule de paquet (`integration/**`) n'a pas de delta propre ;
@@ -115,12 +158,14 @@ def cap_reached_sql(alias: str, *, items: str = "work_items") -> str:
     return "EXISTS (" + cap_rows_sql(alias, items=items) + ")"
 
 
-def held_sql(alias: str) -> str:
+def held_sql(alias: str, *, start_on: bool = False) -> str:
     """Vrai si la garde retient le lot `alias` : son empreinte chevauche celle
     d'un lot occupant de son dépôt, ou le dépôt a atteint son plafond de lots
     en vol (#4818). Le prédicat commun de la prise, de l'attribution et du
-    plan de dispatch."""
-    return "(" + overlap_exists_sql(alias) + " OR " + cap_reached_sql(alias) + ")"
+    plan de dispatch. `start_on=True` : garde de DÉMARRAGE, qui laisse passer
+    un lot sur les lots validés dont il déclare la dépendance (#7760)."""
+    return ("(" + overlap_exists_sql(alias, start_on=start_on) + " OR "
+            + cap_reached_sql(alias) + ")")
 
 
 def unknown_policy_sql(tx, item_id) -> str:

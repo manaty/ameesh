@@ -1194,6 +1194,29 @@ def _staging_rights(project: str, raw) -> tuple:
     return tuple(out)
 
 
+#: Release models the core itself implements. Any other model must be
+#: provided by an installed module through the Module interface (#7663); the
+#: bare profile has no such module and refuses the model.
+CORE_RELEASE_MODELS = ("semver",)
+
+
+def release_provider(model):
+    """The module provider of a release model, or ``None`` for the core.
+
+    The core never imports a release implementation: the provider is the
+    module object declared in ``RELEASE_MODELS`` and returned lazily by the
+    registry. A non-core model with no installed provider is a configuration
+    error, never a silent fallback to the semver engine."""
+    if model in CORE_RELEASE_MODELS:
+        return None
+    from .modules import registry
+    provider = registry.release_model(model)
+    if provider is None:
+        raise ReleaseError("release model %r is not provided by an installed module"
+                           % (model,))
+    return provider
+
+
 @dataclasses.dataclass(frozen=True)
 class ProjectRelease:
     name: str
@@ -1258,30 +1281,31 @@ class ProjectRelease:
                       if h.strip()]
             report = humans[0] if humans else "smichea"
         model = entry.get("model", "semver")
-        if model not in ("semver", "nexlink"):
-            raise ReleaseError("release model: semver | nexlink expected")
-        if model == "nexlink" and (name != "nexlink" or target != "develop"
-                                    or "staging" in entry):
-            raise ReleaseError("nexlink model requires project nexlink, target develop, "
-                               "and its closed staging workflow list (no staging script)")
+        provider = release_provider(model)
+        if provider is not None:
+            validate = getattr(provider, "validate_project", None)
+            if validate is not None:
+                validate(name, entry, target)
         handoff = entry.get("staging_handoff", "")
-        if handoff and (model != "nexlink" or not isinstance(handoff, str)
+        if handoff and (provider is None
+                        or not getattr(provider, "SUPPORTS_HANDOFF", False)
+                        or not isinstance(handoff, str)
                         or not config.NAME_RE.fullmatch(handoff)):
             raise ReleaseError("release.projects.%s.staging_handoff: an agent name, "
-                               "nexlink model only" % name)
+                               "a module release model with handoff only" % name)
         if handoff:
             # #6039 N4: canonicalize an alias as early as the configuration,
             # without the registry (which the tick reads before any tag).
             handoff = canonical_handoff(cfg, None, handoff)
         rights = _staging_rights(name, entry.get("staging_rights", []))
         stable = entry.get("stable_channel", False)
-        if not isinstance(stable, bool) or (stable and model != "semver"):
+        if not isinstance(stable, bool) or (stable and model not in CORE_RELEASE_MODELS):
             raise ReleaseError("release.projects.%s.stable_channel: a boolean, semver model only"
                                % name)
         elected_role = ((getattr(cfg, "release", None) or {}).get("role")
                         or (getattr(cfg, "packet_watch", None) or {}).get("role"))
         executor = entry.get("staging_executor")
-        if (elected_role and model != "nexlink"
+        if (elected_role and model in CORE_RELEASE_MODELS
                 and (not isinstance(executor, str) or not executor.strip())):
             raise ReleaseError("release.projects.%s.staging_executor is required under an "
                                "elected role: synchronous staging can restart its pilot" % name)
@@ -1357,12 +1381,10 @@ def canonical_handoff(cfg, db, name: str) -> str:
 
 def child_credentials(project) -> frozenset[str]:
     """Credentials needed by the selected release model's guarded child."""
-    if getattr(project, "model", "semver") == "nexlink":
-        if getattr(project, "staging_handoff", ""):
-            return frozenset()  # #6020: the bureau holds staging credentials
-        from . import nexlink_release
-        return nexlink_release.CHILD_CREDENTIALS
-    return frozenset()
+    model = getattr(project, "model", "semver")
+    if model in CORE_RELEASE_MODELS:
+        return frozenset()
+    return release_provider(model).child_credentials(project)
 
 
 def projects(cfg) -> dict[str, ProjectRelease]:
@@ -1752,10 +1774,9 @@ def tree_proof_text(head: str, proof: dict) -> str:
 
 def build_plan(cfg, project: ProjectRelease, *, now: float,
                version: str | None = None, db=None, state=None) -> Plan:
-    if project.model == "nexlink":
-        from . import nexlink_release
-        return nexlink_release.plan(cfg, project, now=now, version=version,
-                                    state=state)
+    provider = release_provider(project.model)
+    if provider is not None:
+        return provider.plan(cfg, project, now=now, version=version, state=state)
     rules, source = compiled_rules(cfg, project.name)
     cutoff_at, cutoff_label = cutoff_slot(rules, now)
     fetch(project.repo, project.remote, project.target)
@@ -3187,10 +3208,10 @@ def execute(cfg, db, project: ProjectRelease, *, now: float | None = None,
             version: str | None = None) -> dict:
     """One release attempt; the report is the durable answer."""
     now = time.time() if now is None else float(now)
-    if project.model == "nexlink":
-        from . import nexlink_release
-        return nexlink_release.execute(cfg, db, project, now=now, force=force,
-                                       no_staging=no_staging, version=version)
+    provider = release_provider(project.model)
+    if provider is not None:
+        return provider.execute(cfg, db, project, now=now, force=force,
+                                no_staging=no_staging, version=version)
     state = load_state(cfg)
     state_slot = project_state(state, project.name)
     rules, source = compiled_rules(cfg, project.name)

@@ -1447,7 +1447,7 @@ class DevWork(DevDomain):
             "             ORDER BY b.id) AS open_conflicts,"
             "       (pd.lot IS NOT NULL) AS pending_decision,"
             # Match the intake footprint guard used by dispatch (#4173).
-            "       (w.state = 'intake' AND " + footprint_overlap_sql("w", items="plan_open_items") + ")"
+            "       (w.state = 'intake' AND " + footprint_overlap_sql("w", items="plan_open_items", start_on=True) + ")"
             "         AS footprint_overlap,"
             # #4818 : plafond de lots en vol du dépôt, et ce qu'il faut au plan
             # pour choisir un ensemble aux empreintes disjointes deux à deux
@@ -1699,7 +1699,8 @@ class DevWork(DevDomain):
             "SELECT " + self._MEASURE_COLUMNS + " FROM work_item_measures"
             " WHERE work_item_id = %s", (int(item_id),))
         return rows[0] if rows else None
-    def _footprint_overlaps(self, item_id, *, free_only=False) -> list[dict]:
+    def _footprint_overlaps(self, item_id, *, free_only=False,
+                            start_on=False) -> list[dict]:
         """#4173, sous le verrou du graphe : les chevauchements de l'empreinte
         du lot avec celle d'un lot occupant de son dépôt (requête POSTÉRIEURE
         au verrou, comme le contrôle des dépendances). `free_only` : vide si
@@ -1707,7 +1708,7 @@ class DevWork(DevDomain):
         guard = (" AND NOT " + footprint_occupying_sql("c")) if free_only else ""
         return self.db.query(
             "SELECT DISTINCT x.* FROM work_items c, LATERAL ("
-            + footprint_overlap_rows_sql("c") + ") x WHERE c.id = %s" + guard +
+            + footprint_overlap_rows_sql("c", start_on=start_on) + ") x WHERE c.id = %s" + guard +
             " ORDER BY x.id, x.path", (int(item_id),))
     def _footprint_cap(self, item_id, *, free_only=False) -> dict | None:
         """#4818, sous le verrou du graphe : `{cap, in_flight}` si le dépôt du
@@ -1749,14 +1750,14 @@ class DevWork(DevDomain):
                "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
                "                             JOIN work_items b ON b.id = d.blocker_id"
                "                            WHERE d.work_item_id = work_items.id"
-               "                              AND NOT " + self._core()._not_blocking("b") + ")"
+               "                              AND " + self._core()._start_blocking("work_items", "b") + ")"
                # #4173 : un lot `intake` dont l'empreinte chevauche celle d'un
                # lot occupant du même dépôt attend sa fusion (un lot `build`
                # rendu à la file occupe déjà la sienne) ; même prédicat que la
                # garde de `_assign_locked`, avant le LIMIT.
                # #4818 : et le plafond de lots en vol de son dépôt (`held_sql`).
                f"           AND (state <> '{lifecycle.REQUESTED}' OR NOT "
-               + footprint_held_sql("work_items") + ")) w"
+               + footprint_held_sql("work_items", start_on=True) + ")) w"
                "  LEFT JOIN work_packages k ON k.id = w.package_id"
                "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
                f" ORDER BY coalesce(w.priority, 2), (w.state = '{lifecycle.IN_PROGRESS}') DESC,"

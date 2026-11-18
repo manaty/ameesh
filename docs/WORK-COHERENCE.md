@@ -7,16 +7,18 @@ looks for the four families the owner described in manaty/ameesh#3185:
 
 | Family | What is detected | Outcome |
 |---|---|---|
-| already done | a merged change of the base ref references the lot (`ameesh-work: <id>`, `lot/<id>-…` merge) | **closed** (reason `done`) with the proof in the lot journal |
+| already done | a merged change of the base ref references the lot (`ameesh-work: <id>`, `lot/<id>-…` merge) | **closed** (reason `done`) with the proof in the lot journal, if the lot is still fresh (#7782) |
 | probably done | a merged change touches the code the lot cites (same line, or the whole file when no line is cited) | **digest** to the project's PO: a touch is not a proof |
 | probably obsolete | every cited path is absent from the base ref and at least one was removed by a merged change | **digest** to the project's PO: an absence or a deletion is not a proof |
 | duplicate | two open lots have the same normalised title, or the same non-empty issue reference and at least two significant title words in common | **digest** to the project's PO |
 | contradiction | two open lots cite the same path and their titles start with opposite verbs (`add`/`remove`, `ajouter`/`supprimer`, …) | **digest** to the project's PO |
 
-Only `already done` is deterministic. A closure is a normal `work.close`
-gesture: it takes the same locks and releases the same dependents. The
-probably-done and probably-obsolete lots, the duplicate and the contradiction
-are **never** closed by the pass; the PO answers with a typed link
+Only `already done` is deterministic, and only for a lot that is still fresh:
+no branch or PR, no measured start, no active hold (#7782). A closure takes
+the same locks, releases the same dependents and is journaled like a normal
+`work.close --done` (`work.close_fresh`). The probably-done and
+probably-obsolete lots, the duplicate and the contradiction are **never**
+closed by the pass; the PO answers with a typed link
 (`ameesh work links <lot> --add <other> --kind duplicates|conflicts_with`,
 #4167) or with a justified closure.
 
@@ -72,6 +74,14 @@ The JSON output is one object:
 * **Only `intake` and `blocked` lots are closed.** A lot in `build`, `qa` or
   `waiting_human`, or one carrying a branch or a PR, is left to the PO; a
   refused closure appears in the digest with its reason.
+* **A started or held lot is not a fresh lot.** A lot that has started
+  (`started_ts`, its first move to `build` or `qa`) or carries an active
+  `hold:` is never closed by the citation, even after it returned to
+  `intake`: the commit proves a merged change, not the sub-step still owed
+  (#7782). The check is repeated under the lot's row lock, so a start or a
+  hold committed while the pass waits on the lock refuses the closure instead
+  of losing the race. A pristine lot and a manual `work close` keep their
+  normal path.
 * **A moved component is not obsolete.** If the cited path is gone but a file
   with the same basename exists elsewhere in the base ref, the lot is not
   closed: the move is not a proof that the component disappeared.

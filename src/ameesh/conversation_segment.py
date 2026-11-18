@@ -14,11 +14,16 @@ Construction rules:
   `turn_end` yet) is left out, its input stays queued;
 - budget `BUDGET_BYTES` UTF-8 bytes on the canonical JSON of the document
   (compiled constant); a turn that does not fit whole is kept reduced to its
-  human messages and final answer, then selection stops; the newest turn is
-  always kept, its texts clipped if even the reduced form is too large;
-- only `human_message`, `text` and `turn_end` carry text; `tool` entries keep
-  the tool name and status, never arguments or output; `input` and `state`
-  entries are left out;
+  opening messages (human or mail) and final answer, then selection stops;
+  the newest turn is always kept, its texts clipped if even the reduced form
+  is too large;
+- only `human_message`, `text` and `turn_end` carry text, plus an `input`
+  entry reduced to the mail it delivered (the agent messages of the turn's
+  prompt: id, sender, date and body, without the runner's wrapper; a human
+  sender is left to its own `human_message` entry); `tool` entries keep the
+  tool name and status, never arguments or output; `state` entries are left
+  out.  Agent mail exists only in the `input` detail row, never in the
+  readable thread: it is recovered while that row is retained;
 - once the retained detail is exhausted (retention, 90 days), older human
   messages and final answers come from the readable thread R12 (`fil`), whose
   conversation entries carry `meta.conversation.{agent, seq, turn}`; the
@@ -42,8 +47,10 @@ channel (resident pipe, stdin or a ``0600`` file), never in ``argv``.
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
+import re
 from typing import Iterable, Sequence
 
 from . import conversation, fil, storage, turn_context
@@ -57,7 +64,18 @@ READ_LIMIT = 500
 #: canonical bytes added by the `digest` field after selection (",digest":"…")
 DIGEST_BYTES = len(',"digest":"' + "0" * 64 + '"')
 TEXT_KINDS = frozenset(("human_message", "text", "turn_end"))
-KINDS = TEXT_KINDS | {"tool"}
+INPUT_KIND = "input"
+KINDS = TEXT_KINDS | {"tool", INPUT_KIND}
+#: a delivered message as `mail._block` writes it in a turn's prompt: an
+#: unindented header (id, sender, local date, optional nature/notes) followed
+#: by body lines quoted one level.  The runner's wrapper (mail header,
+#: authority note, footer, resume preface) carries no such header and is
+#: therefore never reproduced.  The body is quoted, so a message that itself
+#: contains this header cannot be mistaken for a new block.
+_MESSAGE_HEAD = re.compile(
+    r"^— message #(?P<id>\d+) from (?P<sender>\S+), (?P<date>\S+)(?: .*)?:$")
+#: senders whose mail the runner already journals as `human_message`
+_HUMAN_SENDERS = ("human:", "chat-")
 REDACTED = "[secret retiré]"
 CLIPPED = "\n[… texte tronqué]"
 OPENING = "[ameesh — conversation continue]"
@@ -108,6 +126,48 @@ def _redact(text: str, secrets: Sequence[str]) -> str:
     return text
 
 
+def _mail_date(text: str) -> float:
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _delivered_messages(text: str) -> list[dict]:
+    """Agent messages delivered in one `input` prompt, runner wrapper excluded.
+
+    The runner writes the whole prompt of a mail turn (mail header, authority
+    note, messages, footer and notes) as the `input` entry; only the message
+    blocks carry the conversation.  Each block keeps its own header (id,
+    sender, date) and its unquoted body.  Human senders are skipped there:
+    their message is journaled as `human_message` by `_journal_humans`, and
+    keeping both copies would spend the budget twice.
+    """
+    lines = str(text or "").splitlines()
+    messages: list[dict] = []
+    index = 0
+    while index < len(lines):
+        match = _MESSAGE_HEAD.match(lines[index])
+        if match is None:
+            index += 1
+            continue
+        index += 1
+        body = []
+        while index < len(lines) and lines[index].startswith(">"):
+            line = lines[index]
+            body.append(line[2:] if line.startswith("> ")
+                        else "" if line == ">" else line[1:])
+            index += 1
+        sender = match.group("sender")
+        if sender.startswith(_HUMAN_SENDERS):
+            continue
+        body_text = "\n".join(body)
+        messages.append({"id": int(match.group("id")), "sender": sender,
+                         "ts": _mail_date(match.group("date")),
+                         "text": match.group(0) + ("\n" + body_text if body_text else "")})
+    return messages
+
+
 def _entry(row: dict, secrets: Sequence[str], *, source: str | None = None) -> dict | None:
     kind = row.get("kind")
     if kind not in KINDS:
@@ -118,6 +178,18 @@ def _entry(row: dict, secrets: Sequence[str], *, source: str | None = None) -> d
     if kind == "tool":
         out["meta"] = {"tool": conversation.safe_tool_name(meta.get("tool") or row.get("text")),
                        "status": str(meta.get("status") or "")[:32]}
+        return out
+    if kind == INPUT_KIND:
+        messages = _delivered_messages(str(row.get("text") or ""))
+        if not messages:
+            return None
+        out["author"] = ", ".join(message["sender"] for message in messages)[:256]
+        out["ts"] = messages[0]["ts"] or out["ts"]
+        out["text"] = _redact("\n\n".join(message["text"] for message in messages), secrets)
+        if row.get("truncated"):
+            out["truncated"] = True
+        if source:
+            out["source"] = source
         return out
     out["text"] = _redact(str(row.get("text") or ""), secrets)
     if kind == "turn_end" and isinstance(meta.get("status"), str):
@@ -141,7 +213,7 @@ def turns(entries: Iterable[dict]) -> tuple[list[list[dict]], list[dict]]:
 
 
 def _reduced(turn: list[dict]) -> list[dict]:
-    return [e for e in turn if e["kind"] in ("human_message", "turn_end")]
+    return [e for e in turn if e["kind"] in ("human_message", INPUT_KIND, "turn_end")]
 
 
 def _clip(text: str, keep: int) -> str:
@@ -176,7 +248,7 @@ def select(detail: Iterable[dict], thread: Iterable[dict] = (), *, agent: str,
 
     `detail`: `conversation_log` rows (seq, kind, author, ts, text, meta,
     truncated); `thread`: rows of the same shape rebuilt from R12 entries,
-    used before the first retained detail row and to restore the human
+    used before the first retained detail row and to restore the opening
     messages of a partial head turn.  `head_complete=False` when the first
     turn of `detail` lacks entries (a window that starts inside a turn): that
     turn can only be kept reduced.  `older_thread=False` completes the head
@@ -293,12 +365,14 @@ def thread_rows(entries: Iterable[fil.Entry], agent: str) -> list[dict]:
 
 
 def _turn_head(store, agent: str, first: int) -> tuple[list[dict], bool]:
-    """Human messages of the turn that contains entry `first`, read backwards
+    """Opening rows of the turn that contains entry `first`, read backwards
     until the previous `turn_end` or the start of the retained detail.
 
-    Returns (messages, whole): `whole` when `first` is already a turn start
-    (seq 1, or the entry just before it is a `turn_end`).  There is no page
-    cap: a turn may span more than `READ_LIMIT` entries (#7049 review N)."""
+    The opening is the human messages and, for a mail turn, the `input` prompt
+    (reduced later to its delivered agent messages).  Returns (messages,
+    whole): `whole` when `first` is already a turn start (seq 1, or the entry
+    just before it is a `turn_end`).  There is no page cap: a turn may span
+    more than `READ_LIMIT` entries (#7049 review N)."""
     if first <= 1:
         return [], True
     messages: list[dict] = []
@@ -312,7 +386,7 @@ def _turn_head(store, agent: str, first: int) -> tuple[list[dict], bool]:
             if row["kind"] == "turn_end":
                 return messages, nearest
             nearest = False
-            if row["kind"] == "human_message":
+            if row["kind"] in ("human_message", INPUT_KIND):
                 messages.insert(0, row)
         hi = lo + 1
     return messages, False
@@ -432,8 +506,8 @@ def render(document: dict) -> str:
             out.append("- outil %s : %s" % (meta.get("tool", "tool"),
                                             _STATUS_FR.get(meta.get("status"), meta.get("status") or "?")))
             continue
-        label = {"human_message": "Message de", "text": "Texte de",
-                 "turn_end": "Réponse finale de"}[entry["kind"]]
+        label = {"human_message": "Message de", INPUT_KIND: "Courrier de",
+                 "text": "Texte de", "turn_end": "Réponse finale de"}[entry["kind"]]
         out += ["", "**%s %s** — %s%s" % (label, entry["author"], when, origin),
                 _quoted(entry.get("text") or "")]
         if entry["kind"] == "turn_end":
