@@ -72,6 +72,16 @@ Read-only checks, then one real delivery probe:
   one replacement probe within the remaining budget; the report retains the
   first message and the replacement reason (#5034).
 * dead letters (recipient stopped or unknown) are reported, never blocking.
+* deliberately stopped units: `--unite-desactivee NAME` (repeatable) names an
+  agent whose runner unit is disabled or masked on the probed host. The host
+  check supplies those names (`vm.sh agents unites-desactivees`, `poste.sh
+  unites-desactivees`), so the health does not guess from observed silence.
+  Such an agent's active mail is a warning in
+  `sans_executeur_desactive`, never a KO and never a probe target: no executor
+  is expected there, and a staging must not roll back for a removal the
+  operator chose (#7785). The permanent removal still goes through the
+  registry: the warning names `ameesh agent retire NAME`, and a name retired
+  meanwhile is dropped by the same re-read as everywhere.
 
 The JSON report (`--json`) is the structured proof consumed by `actif.py`
 (#1323): it names the host and the commit, and carries the probe message, its
@@ -301,6 +311,32 @@ def sans_executeur(db, rows: list[dict], souffrance: float, now: float) -> list[
                     "dernier_tour_s": (round(now - dernier_tour, 1)
                                        if dernier_tour else None),
                     "motif": motif})
+    return out
+
+
+def courrier_desactive(db, rows: list[dict], souffrance: float,
+                       now: float) -> list[dict]:
+    """Pending mail at deliberately disabled units, as warnings (#7785).
+
+    No executor is expected there, so this is never a KO, even while a stale
+    lease still makes the row look driven: the runner is stopped on purpose
+    and its lease may only expire later. The bound and the redelivery filter
+    stay those of the delivery checks; the caller rewrites the motif with the
+    permanent-removal gesture.
+    """
+    out = []
+    for row in rows:
+        if row.get("retired_ts") or humain_sans_executeur(row):
+            continue
+        messages = [m for m in mail.unread_active(db, row["name"])
+                    if not mail.maybe_redelivered(m)
+                    and now - float(m.get("created_ts") or now) >= souffrance]
+        if not messages:
+            continue
+        oldest = max(now - float(m.get("created_ts") or now) for m in messages)
+        out.append({"destinataire": row["name"], "n": len(messages),
+                    "plus_ancien_s": round(oldest, 1),
+                    "statut": row.get("status") or "idle"})
     return out
 
 
@@ -901,6 +937,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--attente-cible", type=float, default=DEFAULT_ATTENTE_CIBLE,
                         help="attente d'une cible nommee occupee avant une remplacante")
     parser.add_argument("--sha", default="", help="commit en cours d'installation")
+    parser.add_argument("--unite-desactivee", action="append", default=[],
+                        metavar="NOM",
+                        help="agent dont l'unite runner est desactivee ou masquee "
+                        "sur l'hote sonde : son courrier en attente est un "
+                        "avertissement, jamais un KO (repeter par agent)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -908,6 +949,7 @@ def main(argv: list[str] | None = None) -> int:
     # sort en JSON KO, jamais en trace vide (#2190).
     rapport = {"hote": args.hote, "verdict": "ko", "personas": 0,
                "sha": args.sha, "souffrance": [], "sans_executeur": [],
+               "sans_executeur_desactive": [],
                "boites_mortes": [], "canal_humain": [],
                "sonde": None, "pourquoi": None, "remplacement": None,
                "attente_s": args.attente,
@@ -934,14 +976,28 @@ def main(argv: list[str] | None = None) -> int:
         if erreur_base is not None:
             raise erreur_base
         now = time.time()
+        # #7785 : un agent dont l'unite runner a ete volontairement desactivee
+        # ou masquee sur cet hote n'attend aucun executeur. Son courrier est un
+        # avertissement nomme avec le geste de retrait definitif, pas un KO :
+        # le staging ne doit pas revenir en arriere pour un retrait choisi.
+        desactivees = {n for n in (args.unite_desactivee or []) if n}
         rows = personas(conn, args.hote)
         rapport["personas"] = len(rows)
-        souffrance = sans_retires(conn, stuck(conn, rows, args.souffrance, now))
-        sans = sans_retires(conn, sans_executeur(conn, rows, args.souffrance, now))
+        menables = [r for r in rows if r["name"] not in desactivees]
+        tolerees = [r for r in rows if r["name"] in desactivees]
+        souffrance = sans_retires(conn, stuck(conn, menables, args.souffrance, now))
+        sans = sans_retires(conn, sans_executeur(conn, menables, args.souffrance, now))
+        sans_desactive = sans_retires(
+            conn, courrier_desactive(conn, tolerees, args.souffrance, now))
+        for constat in sans_desactive:
+            constat["motif"] = (
+                "unite d'executeur desactivee ou masquee sur cet hote : aucun "
+                "executeur attendu ; si le retrait est definitif, "
+                "ameesh agent retire %s" % constat["destinataire"])
         toutes = toutes_personas(conn, args.hote)
         mortes = dead_letters(conn, args.hote, toutes)
         canal = canal_humain(conn, args.hote, now, toutes)
-        pool = rows
+        pool = menables
         try:
             if args.serveur and not rows:
                 # le serveur sans executant n'a aucune persona locale : sa chaine
@@ -950,9 +1006,16 @@ def main(argv: list[str] | None = None) -> int:
                 pool = [r for r in personas(conn) if r.get("host") != args.hote]
                 cible, pourquoi, remplacement = selection(
                     conn, pool, args.sonde, args.attente_cible, now, croise=True)
+            elif (args.sonde not in ("auto", "jamais", "siege")
+                  and args.sonde in desactivees):
+                # une cible nommee dont l'unite est volontairement eteinte ne
+                # peut pas ouvrir de tour : non concluant, jamais un KO.
+                cible, remplacement = None, None
+                pourquoi = ("cible nommee %s : unite desactivee ou masquee sur "
+                            "cet hote, aucun tour possible" % args.sonde)
             else:
                 cible, pourquoi, remplacement = selection(
-                    conn, rows, args.sonde, args.attente_cible, now)
+                    conn, pool, args.sonde, args.attente_cible, now)
         except SystemExit as exc:
             # une cible nommee absente est une erreur de sonde, pas une trace
             # vide : le rapport KO la porte (#2190).
@@ -972,7 +1035,9 @@ def main(argv: list[str] | None = None) -> int:
         elif resultat is None:
             verdict = "sans-sonde"
         rapport.update(verdict=verdict, souffrance=souffrance,
-                       sans_executeur=sans, boites_mortes=mortes,
+                       sans_executeur=sans,
+                       sans_executeur_desactive=sans_desactive,
+                       boites_mortes=mortes,
                        canal_humain=canal, sonde=resultat, pourquoi=pourquoi,
                        remplacement=remplacement)
     except SystemExit:
@@ -997,6 +1062,15 @@ def main(argv: list[str] | None = None) -> int:
                  rapport["sans_executeur"] or "aucun",
                  rapport["boites_mortes"] or "aucune",
                  rapport["canal_humain"] or "aucun"))
+        if rapport["sans_executeur_desactive"]:
+            print("courrier %s : unite desactivee ou masquee sur cet hote "
+                  "(avertissement, pas un KO) : %s"
+                  % (args.hote, ", ".join(
+                      "%s (%d message(s) en attente, retrait definitif : "
+                      "ameesh agent retire %s)" % (
+                          constat["destinataire"], constat["n"],
+                          constat["destinataire"])
+                      for constat in rapport["sans_executeur_desactive"])))
         if rapport.get("erreur"):
             print("courrier %s : KO sonde (%s)" % (args.hote, rapport["erreur"]))
         elif resultat is None:
