@@ -59,13 +59,28 @@ class Migration:
     path: str
     sql: str
     checksum: str
+    #: module propriétaire (P1a #7649) ; None pour une migration du noyau
+    module: str | None = None
 
     @property
     def label(self) -> str:
+        if self.module:
+            return "%s/%04d_%s" % (self.module, self.version, self.name)
         return "%04d_%s" % (self.version, self.name)
 
+    def as_dict(self) -> dict:
+        """Description additive, pour `ameesh modules --json`."""
+        return {"module": self.module, "version": self.version, "name": self.name,
+                "label": self.label, "checksum": self.checksum}
 
-def discover(directory: str = MIGRATIONS_DIR) -> list[Migration]:
+
+def discover(directory: str = MIGRATIONS_DIR, *, module: str | None = None,
+             ) -> list[Migration]:
+    """Les migrations `NNNN_nom.sql` d'un dossier, en ordre croissant.
+
+    `module` étiquette chaque fichier : le registre et le libellé d'une
+    migration de module sont locaux au module (`dev/0001_…`), et son numéro
+    n'entre pas en collision avec celui du noyau."""
     found: dict[int, Migration] = {}
     for filename in sorted(os.listdir(directory)):
         match = _FILE_RE.match(filename)
@@ -83,10 +98,464 @@ def discover(directory: str = MIGRATIONS_DIR) -> list[Migration]:
             path=path,
             sql=sql,
             checksum=hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            module=module,
         )
     if not found:
         raise DbError("no migration in %s" % directory)
     return [found[v] for v in sorted(found)]
+
+
+# --------------------------------------------------------------------------
+# schémas et migrations de module (P1a, étude #7616 §4.1–4.5)
+# --------------------------------------------------------------------------
+
+#: forme d'un nom de module (même règle que `modules.NAME`)
+MODULE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+#: forme d'un nom de schéma physique (contrainte de `module_schemas`)
+SCHEMA_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+#: séparateur entre le schéma noyau et le slug du module (Q8)
+MODULE_SCHEMA_SEP = "__"
+#: étude #7616 §4.5 : une fonction SECURITY DEFINER de module doit fixer son
+#: search_path ; sans cela, elle s'exécuterait avec le search_path de
+#: l'appelant et pourrait résoudre un objet d'un autre schéma.
+_SECURITY_DEFINER = re.compile(r"\bsecurity\s+definer\b", re.IGNORECASE)
+_SET_SEARCH_PATH = re.compile(r"\bset\s+search_path\b", re.IGNORECASE)
+_ROUTINE = re.compile(r"\b(?:create\s+(?:or\s+replace\s+)?|alter\s+)"
+                      r"(?:function|procedure)\b", re.IGNORECASE)
+
+
+def module_sql_problems(migration: Migration) -> list[str]:
+    """Raisons de refuser le SQL d'une migration de module (lecture prudente).
+
+    Le texte est lu par `_lex` : commentaires retirés, corps `$$` et littéraux
+    remplacés par des jetons. `SECURITY DEFINER` se juge donc **par routine**,
+    dans l'instruction qui la définit : un `SET search_path` écrit dans le
+    corps d'une fonction, dans un littéral ou dans une autre instruction ne
+    couvre rien. Un `SECURITY DEFINER` dans un corps ou un littéral peut être
+    exécuté par SQL dynamique, et un lecteur incertain ne prouve rien : ces
+    cas sont refusés."""
+    strings, code, sure, _source = _lex(migration.sql)
+    declared = _SECURITY_DEFINER.search(code)
+    dynamic = _SECURITY_DEFINER.search("\n".join(strings))
+    if not declared and not dynamic:
+        return []
+    if dynamic or not sure:
+        return ["SECURITY DEFINER cannot be verified"]
+    problems = []
+    for statement in code.split(";"):
+        if not _SECURITY_DEFINER.search(statement):
+            continue
+        if not _ROUTINE.search(statement):
+            problems.append("SECURITY DEFINER outside a routine definition")
+        if not _SET_SEARCH_PATH.search(statement):
+            problems.append("SECURITY DEFINER without SET search_path")
+    return list(dict.fromkeys(problems))
+
+
+def module_metadata(name: str, implementation) -> dict:
+    """Les faits de schéma déclarés par un module installé (P1a #7649).
+
+    Lit ``SCHEMA`` (nom logique, optionnel), ``MIGRATIONS`` (dossier relatif au
+    paquet, ou None) et ``REQUIRES`` (dépendances de schéma), sans importer ni
+    exécuter le module. Le dossier de migrations est local au module : il ne
+    peut pas sortir de son paquet ou de sa distribution (étude §4.3).
+
+    Lève ValueError, comme le refus d'une entrée installée : une déclaration
+    impossible à appliquer n'est jamais un schéma à moitié créé."""
+    if not isinstance(name, str) or not MODULE_NAME.fullmatch(name):
+        raise ValueError("installed module %r: invalid module name" % (name,))
+    logical = getattr(implementation, "SCHEMA", None)
+    folder = getattr(implementation, "MIGRATIONS", None)
+    requires = getattr(implementation, "REQUIRES", ())
+    if logical is not None:
+        logical = logical.strip() if isinstance(logical, str) else logical
+        if not isinstance(logical, str) or not logical or len(logical) > 63:
+            raise ValueError("installed module %r: SCHEMA must be a non-empty name of "
+                             "at most 63 characters" % name)
+    if folder is None:
+        # Un module sans migration ne crée pas de schéma (étude §4.2) ; le nom
+        # logique déclaré reste lisible dans `ameesh modules --json`.
+        return {"schema": logical, "migrations": (), "requires": (),
+                "directory": None}
+    if not isinstance(folder, str) or not folder.strip() or os.path.isabs(folder):
+        raise ValueError("installed module %r: MIGRATIONS must be a relative folder" % name)
+    source = getattr(implementation, "__file__", None)
+    if not source:
+        raise ValueError("installed module %r: MIGRATIONS needs an installed package file"
+                         % name)
+    package = os.path.realpath(os.path.dirname(os.path.abspath(source)))
+    directory = os.path.realpath(os.path.join(package, folder))
+    try:
+        inside = os.path.commonpath([package, directory]) == package
+    except ValueError:  # chemins de lecteurs différents (Windows)
+        inside = False
+    if not inside:
+        raise ValueError("installed module %r: MIGRATIONS escapes its package (%s)"
+                         % (name, folder))
+    if not os.path.isdir(directory):
+        raise ValueError("installed module %r: MIGRATIONS folder not found: %s"
+                         % (name, folder))
+    migrations = tuple(discover(directory, module=name))
+    for migration in migrations:
+        problems = module_sql_problems(migration)
+        if problems:
+            raise ValueError("installed module %r: migration %s: %s"
+                             % (name, migration.label, "; ".join(problems)))
+    return {"schema": logical or name, "migrations": migrations,
+            "requires": _requirements(name, requires), "directory": directory}
+
+
+def _requirements(name: str, declared) -> tuple[str, ...]:
+    """Les `REQUIRES` d'un module : noms uniques, jamais lui-même."""
+    if declared is None:
+        return ()
+    if isinstance(declared, str) or not isinstance(declared, (list, tuple)):
+        raise ValueError("installed module %r: REQUIRES must be a list of module names"
+                         % name)
+    out = []
+    for required in declared:
+        if not isinstance(required, str) or not MODULE_NAME.fullmatch(required):
+            raise ValueError("installed module %r: invalid REQUIRES entry %r"
+                             % (name, required))
+        if required == name:
+            raise ValueError("installed module %r: REQUIRES names itself" % name)
+        if required in out:
+            raise ValueError("installed module %r: duplicate REQUIRES entry %r"
+                             % (name, required))
+        out.append(required)
+    return tuple(out)
+
+
+def schema_name(core_schema: str, module: str) -> str:
+    """Le nom physique du schéma d'un module : `<schéma_noyau>__<slug>` (Q8).
+
+    Le slug est le nom du module en minuscules, `[a-z0-9_]` ; au-delà de 63
+    octets, la fin est remplacée par un suffixe SHA-256, comme le nom logique
+    reste celui du descripteur. Le nom physique n'est jamais deviné par le
+    code appelant : il est inscrit dans `module_schemas` et relu là."""
+    slug = re.sub(r"[^a-z0-9_]", "_", module.lower())
+    if not slug or not (slug[0].isalpha() or slug[0] == "_"):
+        slug = "_" + slug
+    full = core_schema + MODULE_SCHEMA_SEP + slug
+    encoded = full.encode("utf-8")
+    if len(encoded) > 63:
+        digest = hashlib.sha256(encoded).hexdigest()[:8]
+        room = 63 - len(digest) - 1
+        head = encoded[:room].decode("utf-8", "ignore") if room > 0 else ""
+        full = head + "_" + digest
+    if not SCHEMA_NAME.fullmatch(full):
+        raise DbError("schema %r cannot host a module schema (derived %r)"
+                      % (core_schema, full))
+    return full
+
+
+def schema_identity(module: str, schema: str) -> str:
+    """L'empreinte de l'identité de schéma : (module, nom logique) seulement.
+
+    Les migrations ont leurs propres empreintes dans
+    `module_schema_migrations` ; un ajout de migration ne change donc pas
+    l'identité du schéma (étude §4.1)."""
+    payload = json.dumps({"module": module, "schema": schema}, sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ModuleSchema:
+    """Un schéma de module à créer/migrer, dans l'ordre topologique."""
+    module: str
+    schema: str            # nom logique déclaré (ou nom du module)
+    schema_name: str       # nom physique `<noyau>__<slug>`
+    schema_sha256: str
+    requires: tuple[str, ...]
+    migrations: tuple[Migration, ...]
+
+
+def module_schemas(modules, core_schema: str) -> list[ModuleSchema]:
+    """Les schémas des modules découverts, dépendances d'abord.
+
+    `modules` sont les descripteurs de `registry.Module` (ou un `Registry`) :
+    seuls ceux qui déclarent un dossier de migrations ont un schéma. Un
+    `REQUIRES` inconnu, un module requis sans schéma, un doublon de nom ou un
+    cycle sont refusés avant toute application (étude §4.2)."""
+    rows = tuple(getattr(modules, "modules", modules) or ())
+    by_name = {}
+    for module in rows:
+        if module.name in by_name:
+            raise DbError("duplicate module: %r" % module.name)
+        by_name[module.name] = module
+    with_schema = {name: module for name, module in by_name.items()
+                   if getattr(module, "migrations", ())}
+    for name, module in with_schema.items():
+        for required in getattr(module, "requires", ()):
+            if required not in by_name:
+                raise DbError("module %s requires unknown module %s" % (name, required))
+            if required not in with_schema:
+                raise DbError("module %s requires module %s, which declares no schema"
+                              % (name, required))
+    order: list[ModuleSchema] = []
+    done: set[str] = set()
+    visiting: list[str] = []
+
+    def visit(name: str) -> None:
+        if name in done:
+            return
+        if name in visiting:
+            cycle = " -> ".join(visiting[visiting.index(name):] + [name])
+            raise DbError("module schema dependency cycle: %s" % cycle)
+        visiting.append(name)
+        module = with_schema[name]
+        for required in getattr(module, "requires", ()):
+            visit(required)
+        visiting.pop()
+        done.add(name)
+        logical = getattr(module, "schema", None) or name
+        order.append(ModuleSchema(
+            module=name, schema=logical,
+            schema_name=schema_name(core_schema, name),
+            schema_sha256=schema_identity(name, logical),
+            requires=tuple(getattr(module, "requires", ())),
+            migrations=tuple(module.migrations)))
+
+    for name in sorted(with_schema):
+        visit(name)
+    return order
+
+
+def installed_modules() -> tuple:
+    """Les modules installés, lus par la façade du registre (jamais importés)."""
+    from .modules import registry
+    return registry.discover().modules
+
+
+def _module_rows(modules) -> tuple:
+    return tuple(getattr(modules, "modules", modules) or ())
+
+
+def _relation_present(db, name: str) -> bool:
+    return bool(db.query("SELECT to_regclass(%s) IS NOT NULL AS ok", (name,))[0]["ok"])
+
+
+def _schema_present(db, name: str) -> bool:
+    return bool(db.query("SELECT 1 AS ok FROM pg_namespace WHERE nspname = %s", (name,)))
+
+
+def _module_schema_rows(db) -> dict[str, dict]:
+    """Les lignes de `module_schemas`, vide si la migration 0591 n'est pas là."""
+    if not _relation_present(db, "module_schemas"):
+        return {}
+    return {row["module"]: row for row in db.query(
+        "SELECT module, schema_name, schema_sha256, created_at "
+        "FROM module_schemas ORDER BY module")}
+
+
+def applied_module(db, module: str) -> dict[int, str]:
+    """Version → empreinte des migrations appliquées d'un module (lecture seule)."""
+    if not _relation_present(db, "module_schema_migrations"):
+        return {}
+    return {int(row["version"]): row["checksum"] for row in db.query(
+        "SELECT version, checksum FROM module_schema_migrations "
+        "WHERE module = %s ORDER BY version", (module,))}
+
+
+def _verify_module_schema(db, schema: ModuleSchema, registered: dict[str, dict],
+                          *, require_schema: bool) -> None:
+    """Une ligne de registre existante doit désigner ce schéma, pas un autre."""
+    row = registered.get(schema.module)
+    if row is None:
+        return
+    if (row["schema_name"] != schema.schema_name
+            or row["schema_sha256"] != schema.schema_sha256):
+        raise DbError(
+            "module %s: registry names schema %s (%s), this code expects %s (%s); "
+            "a registered module schema is never rewritten"
+            % (schema.module, row["schema_name"], row["schema_sha256"][:12],
+               schema.schema_name, schema.schema_sha256[:12]))
+    if require_schema and not _schema_present(db, schema.schema_name):
+        raise DbError("module %s: schema %s is recorded but missing"
+                      % (schema.module, schema.schema_name))
+
+
+def _pending_for(db, schema: ModuleSchema, registered: dict[str, dict],
+                 *, require_schema: bool) -> list[Migration]:
+    _verify_module_schema(db, schema, registered, require_schema=require_schema)
+    done = applied_module(db, schema.module)
+    out = []
+    for migration in schema.migrations:
+        if migration.version not in done:
+            out.append(migration)
+        elif done[migration.version] != migration.checksum:
+            raise DbError(
+                "module migration %s modified after being applied (checksum %s != %s): "
+                "an applied migration is immutable, add a new one"
+                % (migration.label, done[migration.version][:12],
+                   migration.checksum[:12]))
+    return out
+
+
+def pending_modules(db, schemas) -> list[Migration]:
+    """Les migrations de module manquantes, dans l'ordre topologique des schémas.
+
+    Lecture seule comme `doctor` : une empreinte modifiée est une erreur, pas
+    une réécriture. Un schéma inscrit au registre mais absent de la base est
+    une erreur (migration de module non appliquée ou retour arrière partiel)."""
+    registered = _module_schema_rows(db)
+    out = []
+    for schema in schemas:
+        out.extend(_pending_for(db, schema, registered, require_schema=True))
+    return out
+
+
+@dataclass(frozen=True)
+class ModuleCheck:
+    """État d'un schéma de module, en lecture seule (`doctor`, `--json`)."""
+    module: str
+    schema: str
+    schema_name: str
+    schema_sha256: str
+    schema_present: bool
+    registered: bool
+    registered_schema: str | None
+    registered_sha256: str | None
+    migrations: tuple[Migration, ...]
+    applied: frozenset[int]
+    missing: tuple[Migration, ...]
+    modified: tuple[Migration, ...]
+    unknown: tuple[int, ...]
+
+    @property
+    def mismatch(self) -> bool:
+        return bool(self.registered and (
+            self.registered_schema != self.schema_name
+            or self.registered_sha256 != self.schema_sha256))
+
+
+@dataclass(frozen=True)
+class ModuleState:
+    """Tous les schémas de module et ce que la base en dit."""
+    checks: tuple[ModuleCheck, ...] = ()
+    unknown_modules: tuple[dict, ...] = ()
+    unknown_schemas: tuple[str, ...] = ()
+
+
+def check_modules(db, schemas) -> ModuleState:
+    """État des schémas et migrations de module, **sans rien écrire**."""
+    registered = _module_schema_rows(db)
+    checks = []
+    for schema in schemas:
+        row = registered.get(schema.module)
+        done = applied_module(db, schema.module) if row or _relation_present(
+            db, "module_schema_migrations") else {}
+        known = {migration.version for migration in schema.migrations}
+        missing = tuple(m for m in schema.migrations if m.version not in done)
+        modified = tuple(m for m in schema.migrations
+                         if m.version in done and done[m.version] != m.checksum)
+        unknown = tuple(sorted(version for version in done if version not in known))
+        checks.append(ModuleCheck(
+            module=schema.module, schema=schema.schema, schema_name=schema.schema_name,
+            schema_sha256=schema.schema_sha256,
+            schema_present=_schema_present(db, schema.schema_name),
+            registered=row is not None,
+            registered_schema=row["schema_name"] if row else None,
+            registered_sha256=row["schema_sha256"] if row else None,
+            migrations=schema.migrations, applied=frozenset(done),
+            missing=missing, modified=modified, unknown=unknown))
+    expected = {schema.module for schema in schemas}
+    unknown_modules = tuple(row for name, row in sorted(registered.items())
+                            if name not in expected)
+    unknown_schemas: tuple[str, ...] = ()
+    if _relation_present(db, "module_schemas"):
+        prefix = db.cfg.schema + MODULE_SCHEMA_SEP
+        rows = db.query("SELECT nspname FROM pg_namespace "
+                        "WHERE left(nspname, %s) = %s ORDER BY nspname",
+                        (len(prefix), prefix))
+        known_names = {schema.schema_name for schema in schemas}
+        unknown_schemas = tuple(row["nspname"] for row in rows
+                                if row["nspname"] not in known_names)
+    return ModuleState(tuple(checks), unknown_modules, unknown_schemas)
+
+
+@dataclass(frozen=True)
+class SchemaCheck:
+    """Le contrôle combiné des deux registres (`doctor --probe`)."""
+    missing: tuple[Migration, ...]
+    modified: tuple[Migration, ...]
+    unknown: tuple[int, ...]
+    modules: ModuleState
+
+
+def check_all(db, directory: str = MIGRATIONS_DIR, *, modules=None,
+              core_schema: str | None = None) -> SchemaCheck:
+    """`check` du noyau + état des schémas et migrations de module."""
+    missing, modified, unknown = check(db, directory)
+    schemas = module_schemas(_module_rows(modules), core_schema or db.cfg.schema)
+    return SchemaCheck(tuple(missing), tuple(modified), tuple(unknown),
+                       check_modules(db, schemas))
+
+
+def module_doctor_lines(db, core_schema: str | None = None, modules=None,
+                        ) -> tuple[bool, list[str]]:
+    """Les lignes `schemas` du doctor complet ; (ok, lignes).
+
+    Un schéma inscrit qui manque, une identité qui ne correspond plus ou une
+    empreinte modifiée sont des KO ; une migration en attente est dite (WARN
+    si elle est non additive), un schéma orphelin est un WARN."""
+    try:
+        schemas = module_schemas(_module_rows(modules) if modules is not None
+                                 else installed_modules(),
+                                 core_schema or db.cfg.schema)
+        state = check_modules(db, schemas)
+    except (DbError, ValueError) as exc:
+        return False, ["schemas    : KO — %s" % exc]
+    lines, ok = [], True
+    for check in state.checks:
+        total = len(check.migrations)
+        applied = total - len(check.missing)
+        if check.mismatch:
+            ok = False
+            lines.append("schemas    : KO — module %s: registry names %s, this code "
+                         "expects %s" % (check.module, check.registered_schema,
+                                         check.schema_name))
+            continue
+        if check.registered and not check.schema_present:
+            ok = False
+            lines.append("schemas    : KO — module %s: schema %s is recorded but missing"
+                         % (check.module, check.schema_name))
+            continue
+        if check.modified:
+            ok = False
+            lines.append("schemas    : KO — module %s: %s modified after being applied"
+                         % (check.module,
+                            ", ".join(migration.label for migration in check.modified)))
+        where = (("schema %s" % check.schema_name) if check.schema_present
+                 else "schema %s absent" % check.schema_name)
+        lines.append("schemas    : module %s — %s, %d/%d migration(s) applied"
+                     % (check.module, where, applied, total))
+        for migration in check.missing:
+            reasons = non_additive(migration)
+            if reasons:
+                lines.append("schemas    : WARNING — module %s: non-additive migration "
+                             "%s pending (%s)" % (check.module, migration.label,
+                                                  "; ".join(reasons)))
+        if any(not non_additive(migration) for migration in check.missing):
+            lines.append("schemas    : module %s: %d pending migration(s): %s"
+                         % (check.module,
+                            sum(1 for m in check.missing if not non_additive(m)),
+                            ", ".join(m.label for m in check.missing
+                                      if not non_additive(m))))
+        if check.unknown:
+            lines.append("schemas    : WARNING — module %s: database newer than this "
+                         "code (versions %s)" % (
+                             check.module,
+                             ",".join("%04d" % version for version in check.unknown)))
+    for row in state.unknown_modules:
+        lines.append("schemas    : WARNING — module %s is registered in schema %s but "
+                     "not discovered by this code"
+                     % (row["module"], row["schema_name"]))
+    for name in state.unknown_schemas:
+        lines.append("schemas    : WARNING — orphan module schema %s (no discovered "
+                     "module)" % name)
+    return ok, lines
 
 
 # --------------------------------------------------------------------------
@@ -397,7 +866,9 @@ class NonAdditiveMigration(DbError):
 
 
 def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
-            log=None, *, additive_only: bool = False, allow_live_executors: str | None = None) -> list[Migration]:
+            log=None, *, additive_only: bool = False,
+            allow_live_executors: str | None = None,
+            modules=None) -> list[Migration]:
     """Elect one database worker, re-read inventory and commit the whole pass.
 
     PostgreSQL scopes the existing lock key to the actual database, regardless
@@ -406,9 +877,15 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
     workers must still be upgraded before relying on inventory reconciliation.
     A separate lock connection could disappear while its writer continued;
     this transaction owns both the lock and every migration write instead.
+
+    P1a #7649 : la même transaction et le même verrou appliquent le noyau puis
+    les schémas de module, dans l'ordre topologique de leurs `REQUIRES`. Les
+    migrations de module sont locales au module (`module_schema_migrations`),
+    et `--additive-only` couvre les deux flux avant d'écrire quoi que ce soit.
     """
     if allow_live_executors is not None and not allow_live_executors.strip():
         raise ValueError('--allow-live-executors requires a nonempty reason')
+    schemas = module_schemas(_module_rows(modules), db.cfg.schema)
     with db.transaction() as tx:
         # The lease snapshot must be taken after the relation lock, even if
         # the operator's connection defaults to REPEATABLE READ.
@@ -423,17 +900,28 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
         # consultatif : celui-ci doit pouvoir attendre son tour aussi longtemps
         # que la migration qui le tient (LOCK_TIMEOUT ne le borne donc pas).
         tx.execute("SET LOCAL lock_timeout = '%s'" % LOCK_TIMEOUT)
+        original_path = tx.query(
+            "SELECT current_setting('search_path') AS path")[0]["path"]
         if db.cfg.schema != "public":
             tx.execute("CREATE SCHEMA IF NOT EXISTS %s" % quote_ident(db.cfg.schema))
         todo = pending(tx, directory)
-        if additive_only and any(non_additive(migration) for migration in todo):
+        registered = _module_schema_rows(tx)
+        module_todo = {schema.module: _pending_for(tx, schema, registered,
+                                                   require_schema=True)
+                       for schema in schemas}
+        everything = todo + [migration for schema in schemas
+                             for migration in module_todo[schema.module]]
+        if additive_only and any(non_additive(migration) for migration in everything):
             raise NonAdditiveMigration("nothing applied (--additive-only)")
-        if any(non_additive(migration) for migration in todo):
-            _exclude_live_executors(tx, todo, allow_live_executors)
+        if any(non_additive(migration) for migration in everything):
+            _exclude_live_executors(tx, everything, allow_live_executors)
         for migration in todo:
             tx.script(migration.sql)
             tx.execute("INSERT INTO schema_migrations (version, name, checksum) VALUES (%s,%s,%s)",
                        (migration.version, migration.name, migration.checksum))
+        # Les migrations de module après le noyau : leur registre et leurs
+        # dépendances de schéma existent alors dans la même transaction.
+        _apply_module_migrations(tx, schemas, module_todo, original_path)
         # Backfill historical non-additive migrations as soon as the additive
         # marker migration is present. Future non-additive markers commit in
         # the SAME transaction as their SQL, under the exclusive worker lock.
@@ -446,9 +934,53 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
                         (migration.version, migration.name, migration.checksum))
     # Neither a failed SQL statement nor an uncertain COMMIT publishes success.
     if log:
-        for migration in todo:
+        for migration in everything:
             log("%s applied" % migration.label)
-    return todo
+    return everything
+
+
+def _apply_module_migrations(tx, schemas, todo, original_path: str) -> None:
+    """Crée les schémas et applique leurs migrations, dépendances d'abord.
+
+    `search_path` de chaque migration : `<schéma_module>, <schéma_noyau>,
+    pg_temp` (étude #7616 §4.3) ; le noyau touché est qualifié explicitement
+    par la migration. Le `search_path` d'origine est restauré après chaque
+    module pour que les écritures du noyau qui suivent restent non ambiguës."""
+    core_schema = tx.cfg.schema
+    for schema in schemas:
+        pending = todo.get(schema.module) or []
+        if not pending:
+            continue
+        registered = _module_schema_rows(tx)
+        _verify_module_schema(tx, schema, registered, require_schema=True)
+        tx.execute("CREATE SCHEMA IF NOT EXISTS %s" % quote_ident(schema.schema_name))
+        if schema.module not in registered:
+            tx.execute(
+                "INSERT INTO module_schemas (module, schema_name, schema_sha256) "
+                "VALUES (%s,%s,%s)",
+                (schema.module, schema.schema_name, schema.schema_sha256))
+        search_path = "%s, %s, pg_temp" % (quote_ident(schema.schema_name),
+                                           quote_ident(core_schema))
+        for migration in pending:
+            problems = module_sql_problems(migration)
+            if problems:
+                raise DbError("module migration %s: %s"
+                              % (migration.label, "; ".join(problems)))
+            tx.query("SELECT set_config('search_path', %s, true)", (search_path,))
+            tx.script(migration.sql)
+            tx.execute(
+                "INSERT INTO module_schema_migrations "
+                "(module, version, name, checksum) VALUES (%s,%s,%s,%s)",
+                (migration.module, migration.version, migration.name,
+                 migration.checksum))
+            if non_additive(migration):
+                tx.execute(
+                    "INSERT INTO module_schema_non_additive_migrations "
+                    "(module, version, name, checksum) VALUES (%s,%s,%s,%s) "
+                    "ON CONFLICT (module, version) DO NOTHING",
+                    (migration.module, migration.version, migration.name,
+                     migration.checksum))
+        tx.query("SELECT set_config('search_path', %s, true)", (original_path,))
 
 
 def _lit(text: str) -> str:
@@ -487,6 +1019,13 @@ _NON_ADDITIVE = (
     (re.compile(r"\bdelete\s+from\b"), "row deletion (delete)"),
     (re.compile(r"\badd\s+column\s+(if\s+not\s+exists\s+)?[^,;]*?\bnot\s+null\b(?![^,;]*\bdefault\b)"),
      "mandatory column without default (add column ... not null)"),
+    # P1a #7649 : `ALTER TABLE|SEQUENCE … SET SCHEMA` est un déplacement
+    # d'objet, pas un ajout (étude #7616 §5.2). Visé sur le texte entier, donc
+    # aussi quand le DDL est exécuté depuis un bloc DO.
+    (re.compile(r"\balter\s+(?:table|sequence|view|materialized\s+view|index|"
+                r"function|procedure|type|domain)\s+(?:if\s+exists\s+)?(?:only\s+)?"
+                r"[^;]*?\bset\s+schema\b"),
+     "object moved to another schema (set schema)"),
 )
 #: une vue ou une fonction supprimée puis recréée dans la même migration
 #: (`r.*` figé à la création d'une vue) reste additive
@@ -540,13 +1079,22 @@ _TRIGGER_MARKER = re.compile(r"--\s*ameesh\s*:\s*trigger\s+compatible\s+with\s+p
 def non_additive(migration: Migration) -> list[str]:
     """Raisons pour lesquelles `migration` casserait le code d'avant ; vide si
     elle ne fait qu'ajouter (tables, colonnes nullables ou avec défaut, index,
-    contraintes déclarées sans resserrement, triggers déclarés compatibles)."""
+    contraintes déclarées sans resserrement, triggers déclarés compatibles).
+
+    Une migration de module n'a pas d'historique de classement à préserver :
+    toutes les règles s'appliquent, y compris celles nées après 0528/0529."""
+    version = migration.version if migration.module is None else None
+    return non_additive_sql(migration.sql, version=version)
+
+
+def non_additive_sql(sql: str, *, version: int | None = None) -> list[str]:
+    """`non_additive` sur un texte SQL, noyau (`version`) ou module (None)."""
     reasons = []
-    if _MARKER.search(migration.sql):
+    if _MARKER.search(sql):
         reasons.append("marked non-additive")
     # commentaires retirés : une explication qui cite « drop » ne compte pas ;
     # PostgreSQL finit un commentaire de ligne au LF comme au CR seul
-    text = re.sub(r"--[^\n\r]*", " ", migration.sql)
+    text = re.sub(r"--[^\n\r]*", " ", sql)
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
     text = re.sub(r"\s+", " ", text.lower())
     for pattern, label in _NON_ADDITIVE:
@@ -559,10 +1107,10 @@ def non_additive(migration: Migration) -> list[str]:
                                % (r"\s+".join(kind.split()), re.escape(name)))
         if not recreated.search(text, match.end()):
             reasons.append("removal (drop %s %s)" % (kind, name))
-    if migration.version > _PRIVILEGES_CHECKED_AFTER:
-        reasons.extend(_privilege_reasons(migration.sql))
-    if migration.version > _GUARDS_CHECKED_AFTER:
-        reasons.extend(_guard_reasons(migration.sql))
+    if version is None or version > _PRIVILEGES_CHECKED_AFTER:
+        reasons.extend(_privilege_reasons(sql))
+    if version is None or version > _GUARDS_CHECKED_AFTER:
+        reasons.extend(_guard_reasons(sql))
     return reasons
 
 

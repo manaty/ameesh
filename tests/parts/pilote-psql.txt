@@ -187,5 +187,6 @@ test_7535_stacked_delivery  # stockage : livraison et alerte des lots empilés d
 test_7628_module_connectors  # applied module action policy and real entry-point CLI gate
 test_7623_late_dispatch  # durable missing-part intent and cross-watcher packet lock
 test_3035_host_reconcile  # permanent attachment and lost-host proof transactions (#7654)
+test_7649_schema_modules  # P1a : registres, schémas et migrations de module, doctor (#7649)
 
 test_7726_prod_go  # #7726: signed production authority and supersession locks

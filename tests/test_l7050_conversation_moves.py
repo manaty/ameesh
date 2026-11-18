@@ -334,6 +334,7 @@ class WorkerTest(Base):
             _resume_drop=lambda: None, _installe_hook_preuve=lambda cwd: None,
             write_session_file=lambda sid: None)
         for name in ("_open_move_turn", "_finish_move_turn", "current_session",
+                     "declared_policy", "fresh_session", "_fresh_session_reset",
                      "_note_session", "_note_move_launched", "_conversation_move_open"):
             setattr(w, name, getattr(AgentWorker, name).__get__(w))
         return w

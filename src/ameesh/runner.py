@@ -1154,6 +1154,28 @@ class AgentWorker(threading.Thread):
         except OSError:
             return None
 
+    def declared_policy(self) -> dict:
+        """#7674 (E3a) : la politique de session déclarée par la carte du
+        canon, `{}` si aucune. Elle vient de la ligne du registre écrite par
+        `canon sync` ; une valeur non-objet ne déclare rien."""
+        value = (self.agent or {}).get("declared_policy")
+        return value if isinstance(value, dict) else {}
+
+    def fresh_session(self) -> bool:
+        """#7674 (E3a) : la fiche demande-t-elle une session neuve par tour ?"""
+        return self.declared_policy().get("fresh_session") is True
+
+    def _fresh_session_reset(self) -> None:
+        """#7674 (E3a) : une session neuve par tour reprend des compteurs neufs.
+
+        `session_turns`, `session_tokens`, la relu et le contexte mesurent la
+        session ouverte. Quand aucune session n'est reprise, celle du tour
+        précédent est close : ses compteurs ne doivent ni peser sur la
+        suivante, ni lui faire sauter le bloc de règles du canon, que
+        `_ouverture` réinjecte à chaque tour d'une session neuve."""
+        if self.fresh_session() and self.current_session() is None:
+            self._reset_session_counts()
+
     def current_session(self) -> str | None:
         """La session à reprendre : celle du registre, sinon le fichier local.
 
@@ -1168,11 +1190,18 @@ class AgentWorker(threading.Thread):
         #1898 N4 : la comparaison porte sur deux horloges (mtime de l'hôte,
         `session_reset_at` de la base) ; `SESSION_RESET_SKEW_S` couvre leur
         dérive, et dans la fenêtre on tranche pour l'oubli (voir la constante).
+
+        #7674 : `fresh_session: true` sur la carte du canon rend toujours
+        None — chaque tour ouvre une session neuve, l'id du registre n'est
+        jamais repris (la session native d'un déplacement de conversation en
+        cours reste, elle, la cible explicite du déplacement).
         """
         if self._move_turn is not None:
             # #7050 (5322 §2.3) : la session native de la cible est neuve ; le
             # registre garde celle de la source jusqu'à `verified`
             return self._move_turn.session
+        if self.fresh_session():
+            return None
         session = (self.agent or {}).get("session_id")
         if session:
             return session
@@ -2603,10 +2632,12 @@ class AgentWorker(threading.Thread):
 
     # -- rotation de session (0018) ----------------------------------------
     def session_policy(self) -> str:
-        """Politique de session effective (0025, L26) : réglage de l'agent
-        (`ameesh set session_policy=…`), sinon défaut de l'exécuteur."""
-        return ((self.agent or {}).get("session_policy") or "").strip() \
-            or self.cfg.session_policy
+        """Politique de session effective (0025, L26 ; #7674) : carte du canon,
+        puis réglage de l'agent (`ameesh set session_policy=…`), puis défaut de
+        l'exécuteur. Une carte `fresh_session: true` vaut `jamais` : il n'y a
+        pas de session à faire tourner."""
+        from .exploitation import effective_policy
+        return effective_policy(self.cfg, self.agent or {})
 
     def session_max_tokens(self, harness: str | None = None) -> float:
         """Seuil de rotation sur la taille (L11) d'une session, par harnais.
@@ -7867,8 +7898,8 @@ class AgentWorker(threading.Thread):
     def _ouverture(self) -> str:
         """Ce qui ouvre la consigne du prochain tour : le résumé de rotation
         (règles relues) quand il y en a un, sinon les règles de travail du canon
-        pour une session neuve ordinaire (premier démarrage) ; "" quand la
-        session reprend.
+        pour une session neuve (premier démarrage, ou chacun des tours d'une
+        fiche `fresh_session`) ; "" quand la session reprend.
 
         #538 : `_budget_courrier` réserve ces octets — le bloc de première
         session ne se paie pas sur le courrier (verdict codex #510 r2, P2)."""
@@ -7881,7 +7912,10 @@ class AgentWorker(threading.Thread):
             return ""
         if self.resume_summary:
             return self._resume_prompt()
-        if self.session_turns:
+        # #7674 (E3a) : une fiche `fresh_session` rouvre une session à chaque
+        # tour ; les règles du canon ouvrent donc chacun d'eux, jamais
+        # seulement le premier (les compteurs du tour précédent ne comptent pas).
+        if self.session_turns and not self.fresh_session():
             return ""
         from . import reprise
         bloc = reprise.process_rules_block(
@@ -9394,6 +9428,9 @@ class AgentWorker(threading.Thread):
             if not adopted and (not lot or not self._switch_lot(
                     str(self.agent.get("session_work_item") or ""), str(lot))):
                 return False
+        # #7674 (E3a) : une session neuve déclarée par la fiche est rouverte à
+        # chaque tour ; les compteurs de la précédente ne mesurent pas celle-ci.
+        self._fresh_session_reset()
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
         harness = self.turn_harness()
@@ -11276,15 +11313,22 @@ class AgentWorker(threading.Thread):
 
         #1270 : pour un épisode de débit/quota, c'est le temps **restant**
         jusqu'à l'échéance durable (`retry at`) — jamais un délai repoussé par
-        un réveil ; L48 n'arrête jamais un débit passager, un quota si."""
+        un réveil ; L48 n'arrête jamais un débit passager, un quota si.
+
+        #7674 (E3a) : la carte du canon peut déclarer un **plancher**
+        (`failure_wait_min`) pour les échecs ordinaires ; l'attente reste
+        bornée en haut par `failure_backoff_max`, et l'échéance durable d'un
+        débit/quota reste seule juge (le plancher ne la repousse pas)."""
         if self.rate_limit:
             return self.retry_remaining()
         base = self.runner.failure_backoff
         n = max(self.fast_failures, self.failure_streak)
-        if n <= 1:
-            return base
+        attente = base if n <= 1 else min(self.runner.failure_backoff_max,
+                                          base * (2 ** (n - 1)))
+        from .exploitation import declared_failure_wait_min
+        # le plancher déclaré ne perce jamais le plafond de l'exécuteur
         return min(self.runner.failure_backoff_max,
-                   base * (2 ** (n - 1)))
+                   max(attente, declared_failure_wait_min(self.agent)))
 
     def _memory_unavailable(self, reason: str) -> None:
         """Publish a memory-unavailable host defect, once per cause.

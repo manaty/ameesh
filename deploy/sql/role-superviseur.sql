@@ -267,6 +267,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #7632 (0588) : cadence de réveil déclarée par la fiche (des natures
         -- et une durée, pas de contenu) — lue avec la ligne, comme `releve`
         'reveil',
+        -- #7674 (0590) : politique de session déclarée par la fiche (une
+        -- nature, un booléen et des nombres, pas de contenu) — lue avec la
+        -- ligne, comme `reveil` et les réglages `session_policy`/`context_max_tokens`
+        'declared_policy',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
         'workstream',
         -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,
@@ -337,6 +341,18 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('schema_non_additive_migrations', ARRAY['version', 'name', 'checksum']),
     ('schema_migrations', ARRAY[
         'version', 'name', 'checksum', 'applied_at'
+    ]),
+    -- #7649 (0591) : schémas et migrations de module, même état de schéma que
+    -- les deux registres du noyau ci-dessus ; noms, versions et empreintes,
+    -- aucun contenu d'agent.
+    ('module_schemas', ARRAY[
+        'module', 'schema_name', 'schema_sha256', 'created_at'
+    ]),
+    ('module_schema_migrations', ARRAY[
+        'module', 'version', 'name', 'checksum', 'applied_at'
+    ]),
+    ('module_schema_non_additive_migrations', ARRAY[
+        'module', 'version', 'name', 'checksum'
     ]),
     ('spend_pending', ARRAY[
         'agent', 'start_index', 'turn', 'model', 'created_at',

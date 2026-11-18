@@ -526,6 +526,10 @@ IGNORED = {
     # system identity that can never collide with an agent (`NAME_RE` forbids
     # the colon); a rename never moves it.
     "external_executors.name",
+    # #7649 (0591): the per-module migration registry labels a migration
+    # (`0001_init`), never an agent; a rename never moves it.
+    "module_schema_migrations.name",
+    "module_schema_non_additive_migrations.name",
 }
 
 
