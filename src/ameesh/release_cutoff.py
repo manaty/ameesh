@@ -1429,10 +1429,11 @@ def projects(cfg) -> dict[str, ProjectRelease]:
 def default_project(cfg) -> str:
     """The project a release command without ``--project`` works on (#7813).
 
-    The host configuration names it (``release.default_project``); without that
-    declaration, the only project under ``release.projects`` is the obvious
-    default. With several declared projects and no configured default, the
-    caller must choose: the core compiles no client project name.
+    The host configuration must name it (``release.default_project``). A sole
+    project under ``release.projects`` is deliberately not inferred: the old
+    commands defaulted to one client project, and silently choosing the only
+    project of the host could write that client's release for another one
+    (#7813 B2). Without the explicit key, the caller passes ``--project``.
     """
     declared = projects(cfg)
     block = getattr(cfg, "release", None) or {}
@@ -1444,13 +1445,10 @@ def default_project(cfg) -> str:
                 "release.default_project %r is not declared under release.projects"
                 % configured)
         return configured
-    if len(declared) == 1:
-        return next(iter(declared))
     if not declared:
         raise ReleaseError("--project is required: release.projects declares no project "
                            "on this host")
-    raise ReleaseError("--project is required: release.default_project is not set and "
-                       "release.projects declares %d projects" % len(declared))
+    raise ReleaseError("--project is required: release.default_project is not set")
 
 
 def staging_topology_of(cfg) -> canon_mod.StagingTopology:

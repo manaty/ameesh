@@ -268,8 +268,9 @@ class ProfilStrictTest(unittest.TestCase):
         for rp_id in ("equipe-a.pages.example.test", "equipe-a.approve.pages.example.test"):
             self.assertEqual(self.config(rp_id=rp_id, origins=("https://" + rp_id,),
                                          **values).rp_id, rp_id)
-        # décision 0026 : le déploiement Manaty déclare sa zone et son apex ;
-        # une zone déclarée reste réservée, aucune configuration ne la rend RP ID
+        # décision 0026 : le module Nexlink déclare sa zone et son apex, la
+        # configuration du déploiement peut les redéclarer ; un nom déclaré
+        # reste réservé, aucune configuration ne le rend RP ID
         manaty = dict(reserved_zones=("nexlink.ph",),
                       reserved_hosts=("ameesh.nexlink.ph",))
         for rp_id in ("nexlink.ph", "ameesh.nexlink.ph"):
@@ -277,9 +278,11 @@ class ProfilStrictTest(unittest.TestCase):
         self.assertEqual(self.config(rp_id="equipe-a.nexlink.ph",
                                      origins=("https://equipe-a.nexlink.ph",),
                                      **manaty).rp_id, "equipe-a.nexlink.ph")
-        # profil nu : sans déclaration, le cœur ne réserve plus aucun nom
-        self.assertEqual(self.config(rp_id="nexlink.ph",
-                                     origins=("https://nexlink.ph",)).rp_id, "nexlink.ph")
+        # profil nu : aucun module, aucune déclaration → aucun nom réservé
+        with unittest.mock.patch.dict(os.environ, {"AMEESH_MODULES": "bare"}):
+            self.assertEqual(self.config(rp_id="nexlink.ph",
+                                         origins=("https://nexlink.ph",)).rp_id,
+                             "nexlink.ph")
         self.refused("unreadable reserved name", reserved_zones=("Zone Invalide",))
 
     def test_chargement_json_et_environnement(self):

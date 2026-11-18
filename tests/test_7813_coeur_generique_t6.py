@@ -3,8 +3,9 @@
 
 The core reads the generic schemas and names; the historical Nexlink page and
 dispatch-plan names are aliases declared by the module, its application and its
-repository planner stay unchanged. The bare profile has neither the aliases nor
-a compiled project name.
+repository planner stay unchanged. The decision 0026 reserved names are
+declared by the module too, never compiled by the core. The bare profile has
+neither the aliases, the reserved names, nor a compiled project name.
 """
 from __future__ import annotations
 
@@ -124,9 +125,10 @@ class ReleaseDefaultProjectTest(unittest.TestCase):
         return types.SimpleNamespace(host="host", release=release_block,
                                      humans="", radar={})
 
-    def test_the_only_declared_project_is_the_default(self):
-        self.assertEqual(release_cutoff.default_project(self.cfg(
-            {"host": "host", "projects": {"only": self.BASE}})), "only")
+    def test_a_sole_project_is_not_inferred(self):
+        with self.assertRaisesRegex(release_cutoff.ReleaseError, "--project is required"):
+            release_cutoff.default_project(self.cfg(
+                {"host": "host", "projects": {"only": self.BASE}}))
 
     def test_the_configured_default_wins(self):
         self.assertEqual(release_cutoff.default_project(self.cfg(
@@ -146,10 +148,14 @@ class ReleaseDefaultProjectTest(unittest.TestCase):
 
     def test_the_handler_reads_the_configuration(self):
         cfg = self.cfg({"host": "host", "projects": {"only": self.BASE}})
-        self.assertEqual(release._project_name(cfg, types.SimpleNamespace(project=None)),
-                         "only")
+        with self.assertRaisesRegex(release_cutoff.ReleaseError, "--project is required"):
+            release._project_name(cfg, types.SimpleNamespace(project=None))
         self.assertEqual(release._project_name(cfg, types.SimpleNamespace(project="x")),
                          "x")
+        cfg = self.cfg({"host": "host", "default_project": "only",
+                        "projects": {"only": self.BASE}})
+        self.assertEqual(release._project_name(cfg, types.SimpleNamespace(project=None)),
+                         "only")
 
     def test_attest_and_abandon_take_no_compiled_project(self):
         parser = argparse.ArgumentParser()
@@ -180,10 +186,31 @@ class ApproveReservedNamesTest(unittest.TestCase):
         self.assertEqual(self.config("equipe-a.nexlink.ph", **self.MANATY).rp_id,
                          "equipe-a.nexlink.ph")
 
+    def test_the_module_keeps_the_decision_0026_names_reserved(self):
+        with mock.patch.dict(os.environ, {"AMEESH_MODULES": "default"}):
+            self.assertEqual(registry.reserved_zones(), ("nexlink.ph",))
+            self.assertEqual(registry.reserved_hosts(), ("ameesh.nexlink.ph",))
+            for rp_id, fragment in (("nexlink.ph", "reserved zone"),
+                                    ("ameesh.nexlink.ph", "reserved host")):
+                with self.subTest(rp_id=rp_id):
+                    with self.assertRaisesRegex(approve_config.ApproveConfigError, fragment):
+                        self.config(rp_id)
+
+    def test_a_config_file_without_reserved_names_still_refuses_the_apex(self):
+        with tempfile.TemporaryDirectory(prefix="7813-approve-") as folder:
+            path = os.path.join(folder, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"rp_id": "nexlink.ph",
+                           "origins": ["https://nexlink.ph"]}, fh)
+            with mock.patch.dict(os.environ, {"AMEESH_MODULES": "default"}):
+                with self.assertRaisesRegex(approve_config.ApproveConfigError, "reserved"):
+                    approve_config.load({}, path=path)
+
     def test_the_bare_profile_compiles_no_reserved_name(self):
-        self.assertFalse(hasattr(approve_config, "BUILTIN_RESERVED_ZONES"))
-        self.assertFalse(hasattr(approve_config, "BUILTIN_RESERVED_HOSTS"))
-        self.assertEqual(self.config("nexlink.ph").rp_id, "nexlink.ph")
+        with mock.patch.dict(os.environ, {"AMEESH_MODULES": "bare"}):
+            self.assertFalse(hasattr(approve_config, "BUILTIN_RESERVED_ZONES"))
+            self.assertFalse(hasattr(approve_config, "BUILTIN_RESERVED_HOSTS"))
+            self.assertEqual(self.config("nexlink.ph").rp_id, "nexlink.ph")
 
 
 class PricesPathTest(unittest.TestCase):

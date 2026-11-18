@@ -906,9 +906,9 @@ def _catchup(cfg, args) -> int:
 def _project_name(cfg, args) -> str:
     """The project named by ``--project``, else the configured default (#7813).
 
-    The core compiles no client project name: ``release.default_project`` names
-    it, or the only project under ``release.projects`` is the default, and
-    otherwise the caller must choose."""
+    The core compiles no client project name: the explicit ``--project`` wins,
+    else ``release.default_project`` must name it, else the caller must choose
+    (#7813 B2: a sole project is not inferred)."""
     from . import release_cutoff
     if args.project:
         return args.project
@@ -1270,7 +1270,7 @@ def add_parser(sub, func) -> None:
                        "attestation lot; --skip: the pilot stops waiting")
     attest_p.add_argument("--project", default=None,
                           help="release project; default: release.default_project, "
-                               "else the only project under release.projects")
+                               "else required")
     attest_p.add_argument("--version", required=True)
     attest_p.add_argument("--sha", default=None, help="the tagged commit")
     attest_p.add_argument("--run", action="append", default=[],
@@ -1290,7 +1290,7 @@ def add_parser(sub, func) -> None:
                         "host")
     abandon_p.add_argument("--project", default=None,
                            help="release project; default: release.default_project, "
-                                "else the only project under release.projects")
+                                "else required")
     abandon_p.add_argument("--reason", required=True)
     abandon_p.add_argument("--actor", default=None,
                            help="at a human terminal: human:<id>")

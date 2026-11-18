@@ -50,6 +50,13 @@ TRAIN_CONTRACTS = ("nexlink",)
 FINGERPRINT_SCHEMAS = ("nexlink-fingerprints/1",)
 DISPATCH_PLAN_SCHEMAS = ("nexlink-dispatch-due-parts/1",)
 
+#: #7813: the decision 0026 names (the team-host zone and the approval apex)
+#: stay reserved in the Nexlink deployment; the core compiles neither, and
+#: ameesh-approve reads them through ``registry.reserved_zones`` and
+#: ``registry.reserved_hosts``. A declared name is never an RP ID (#7813 B1).
+RESERVED_ZONES = ("nexlink.ph",)
+RESERVED_HOSTS = ("ameesh.nexlink.ph",)
+
 #: #6020: notes reserved to ``ameesh release attest``. They live here, not in
 #: the core: ``work.note`` reads the list through ``registry``.
 ATTEST_PREFIX = "release-attest:"
