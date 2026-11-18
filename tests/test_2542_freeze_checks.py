@@ -491,12 +491,14 @@ class FreezeBudgetTest(unittest.TestCase):
     def before(self, deadline):
         seen = {}
 
-        def run(where, commit, *, gate=None, timeout=freeze_checks.TIMEOUT, paths=None):
+        def run(where, commit, *, gate=None, timeout=freeze_checks.TIMEOUT,
+                paths=None, renames=None):
             seen["timeout"] = timeout
             return {"result": "green", "seconds": 0.0, "output": ""}
 
         with mock.patch("ameesh.work.get", return_value={"id": 4073}), \
                 mock.patch.object(freeze_checks, "gate_paths", return_value=None), \
+                mock.patch.object(freeze_checks, "renamed_paths", return_value=[]), \
                 mock.patch.object(freeze_checks, "run", side_effect=run):
             freeze_checks.before_freeze(None, None, 4073, self.sha,
                                         repo=self.repo.root, deadline=deadline)
@@ -513,6 +515,7 @@ class FreezeBudgetTest(unittest.TestCase):
         deadline = Deadline(0.0)
         with mock.patch("ameesh.work.get", return_value={"id": 4073}), \
                 mock.patch.object(freeze_checks, "gate_paths", return_value=None), \
+                mock.patch.object(freeze_checks, "renamed_paths", return_value=[]), \
                 mock.patch.object(freeze_checks, "run") as run:
             with self.assertRaises(freeze_checks.Refused) as caught:
                 freeze_checks.before_freeze(None, None, 4073, self.sha,
