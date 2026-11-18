@@ -4884,7 +4884,7 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_note = work_sub.add_parser(
         "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated",
         epilog="#3498: a pilot hold may declare an external wait — "
-               "\"hold: attente bureau : <geste>\" (or owner), with an optional "
+               "\"hold: attente avatar : <geste>\" (or owner), with an optional "
                "\"(due 2026-10-25 12:00 UTC)\"; ameesh debit lists it as an "
                "external wait, not an agent wait. #3773: it may also declare "
                "a third party — \"hold: attente externe : revue Apple\". #4235: "

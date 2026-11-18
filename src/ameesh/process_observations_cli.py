@@ -221,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     show.set_defaults(func=_cmd_show)
 
     revoke = sub.add_parser(
-        "revoke", help="revoquer une observation (bureau-goal)")
+        "revoke", help="revoquer une observation (hôte de l'avatar)")
     revoke.add_argument("--config", help="fichier JSON de configuration")
     revoke.add_argument("--id", required=True)
     revoke.add_argument("--reason", required=True)

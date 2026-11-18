@@ -135,11 +135,13 @@ class FamilyPausedTest(unittest.TestCase):
                                       families=FAMILIES, now=T), [])
 
     def test_brief_goes_to_pilot_and_bureau(self):
+        # #7634 : la route humaine est l'avatar déclaré au canon, pas un nom
+        # du cœur ; le bureau du mesh Manaty est l'avatar de Sébastien.
         from ameesh import alert_briefs
         alert = dict(self.alerts()[0], orchestrators=["pilot"])
         listing = registry() + [dict(agent_row("pilot"), lease_live=True),
                                 dict(agent_row("bureau"), lease_live=True)]
-        briefs = alert_briefs.briefs(alert, listing)
+        briefs = alert_briefs.briefs(alert, listing, avatar_names=("bureau",))
         self.assertEqual(set(briefs), {"pilot", "bureau"})
         self.assertIn("primary", briefs["pilot"])
         self.assertIn("decision", briefs["bureau"])
