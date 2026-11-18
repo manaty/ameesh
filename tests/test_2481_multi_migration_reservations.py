@@ -9,6 +9,8 @@ réservation principale pour les lecteurs d'avant #2481.
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import unittest
 from unittest import mock
@@ -25,11 +27,26 @@ class MultiReservationTest(PgTestCase):
         super().setUp()
         self.repo = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                            NEXLINK.directory, ["527_base.sql"])
+        # #7795 : le dépôt du banc est déclaré à la configuration, comme sur un
+        # hôte réel ; le CLI lancé par `mesh` lit la même.
+        radar_block = {"projects": {"nexlink": {
+            "repo": self.repo, "github": "manaty/nexlink",
+            "migrations": NEXLINK.directory}}}
+        self.cfg = dataclasses.replace(self.cfg, radar=radar_block)
+        self.db.cfg = self.cfg
+        self.mesh_config = os.path.join(self.tmp, "mesh-config.json")
+        with open(self.mesh_config, "w", encoding="utf-8") as handle:
+            json.dump({"radar": radar_block}, handle)
         # #2620 : le numéro exact se lit sur la cible ; le dépôt du banc est
         # sur `develop`, sans `origin/HEAD` — déclarer la cible du lot.
         self.lot = work.add(self.db, title="CIV-3", issue_ref="manaty/nexlink#589",
                             app="nexlink", actor="mesh-design",
                             branch="lot/civ-3", branch_target="develop")
+
+    def mesh(self, *args, env=None, timeout=60.0):
+        env = dict(env or self.env())
+        env["AMEESH_CONFIG"] = self.mesh_config
+        return super().mesh(*args, env=env, timeout=timeout)
 
     def reserve(self, number=None, **kwargs):
         return work.reserve_migration(self.db, self.lot["id"], number,
@@ -149,13 +166,18 @@ class ImportMultiReservationTest(PgTestCase):
     """L160g : deux lignes du registre historique peuvent viser le même lot."""
 
     def test_import_two_numbers_to_one_lot(self):
+        repo = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
+                      NEXLINK.directory, ["527_base.sql"])
+        cfg = dataclasses.replace(self.cfg, radar={"projects": {"nexlink": {
+            "repo": repo, "github": "manaty/nexlink",
+            "migrations": NEXLINK.directory}}})
         lot = work.add(self.db, title="legacy", issue_ref="manaty/nexlink#589",
                        app="nexlink", actor="mesh-design")
         rows = [{"number": 323, "label": "Billing", "who": "a", "status": "reserved"},
                 {"number": 324, "label": "Billing 2", "who": "a", "status": "reserved"}]
         out = reservations.import_reservations(
             self.db, rows, {"323": lot["id"], "324": lot["id"]},
-            repo="manaty/nexlink", apply=True, actor="orch")
+            repo="manaty/nexlink", apply=True, actor="orch", cfg=cfg)
         self.assertEqual([row["action"] for row in out], ["reserved", "reserved"])
         item = work.get(self.db, lot["id"])
         self.assertEqual([row["number"] for row in item["migrations"]], [323, 324])

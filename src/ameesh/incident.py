@@ -31,7 +31,7 @@ Ce module porte la règle seule :
   sinon invisible ;
 * `consume` est le **consommateur de l'événement CI terminal** : il lit la
   source courante du veilleur (`ci.latest_concluded`) sur la branche
-  d'intégration de chaque dépôt (`INTEGRATION`), ignore une tête remplacée, et
+  d'intégration de chaque dépôt (`integrations(cfg)`), ignore une tête remplacée, et
   ouvre l'incident. L'atterrissage lui est fourni par `lands(repo, head_sha)`
   (`[{sha, lot, author, summary, files}]`), par défaut `ci.landed_commits` (la
   comparaison GitHub du client du veilleur). C'est le contrat demandé au train
@@ -57,6 +57,7 @@ par exécution, les passages suivants restant idempotents par `issue_ref` et par
 """
 from __future__ import annotations
 
+import os
 import posixpath
 import re
 from typing import Iterable, Optional
@@ -755,13 +756,39 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
     return out
 
 
-#: la branche d'intégration de chaque dépôt et le projet correspondant (canon
-#: §11 bis : la suite complète tourne sur la branche d'intégration ; Nexlink
-#: `develop`, ameesh `main`). Un dépôt absent n'est pas surveillé ici.
-INTEGRATION = {
-    "manaty/ameesh": ("main", "ameesh"),
-    "manaty/nexlink": ("develop", "nexlink"),
-}
+def integrations(cfg) -> dict:
+    """#7795 : les branches d'intégration que cet hôte surveille, lues à sa
+    configuration.
+
+    Trois blocs, dans cet ordre de priorité : `release.projects`,
+    `radar.projects`, puis `packet_watch.projects` — le composeur d'un runner
+    n'a pas toujours de bloc release (#7795 B). Un projet sans `github` prend
+    le slug de son clone (`origin_repo`). Le cœur ne nomme aucun dépôt : un
+    projet sans dépôt ni cible déclarés n'est pas surveillé ici, et une
+    configuration absente ne surveille rien. La branche est `target`, le
+    projet son nom."""
+    if cfg is None:
+        return {}
+    from . import migrations
+    out = {}
+    for key in ("release", "radar", "packet_watch"):
+        block = getattr(cfg, key, None)
+        projects = block.get("projects") if isinstance(block, dict) else None
+        if not isinstance(projects, dict):
+            continue
+        for name, entry in sorted(projects.items()):
+            if not isinstance(entry, dict):
+                continue
+            repo = str(entry.get("github") or "").strip().lower()
+            if not repo:
+                path = str(entry.get("repo") or "").strip()
+                if path:
+                    repo = migrations.repo_key(migrations.origin_repo(
+                        os.path.abspath(os.path.expanduser(path))) or "")
+            target = str(entry.get("target") or "").strip()
+            if repo and target and repo not in out:
+                out[repo] = (target, str(name))
+    return out
 
 
 def _qualified_card(links_for, repo: str, head_sha: str):
@@ -795,9 +822,10 @@ def consume(db, *, integration=None, lands=None, links=None, links_for=None,
 
     `lands(repo, head_sha)` rend les commits de l'atterrissage
     (`[{sha, lot, author, summary, files}]`) : par défaut `ci.landed_commits`
-    (comparaison GitHub par le client du veilleur). `integration` remplace la
-    table `INTEGRATION` (`{repo: (branche, projet)}`), pour un hôte qui déclare
-    d'autres dépôts. `links` est le port `test→fichiers` qualifié
+    (comparaison GitHub par le client du veilleur). Sans `integration`, la
+    table est lue à la configuration de l'hôte (`integrations(cfg)`,
+    #7795) ; `integration` la remplace (`{repo: (branche, projet)}`). `links`
+    est le port `test→fichiers` qualifié
     (`links_of(carte)`) : sans carte sur l'hôte, l'attribution est `unknown` et
     aucun lot n'est désigné.
 
@@ -819,7 +847,8 @@ def consume(db, *, integration=None, lands=None, links=None, links_for=None,
     Rend une ligne par exécution examinée, ne lève jamais.
     """
     st = storage.of(db)
-    table = dict(integration or INTEGRATION)
+    table = dict(integration if integration is not None
+                 else integrations(getattr(db, "cfg", None)))
     if lands is None:
         from . import ci
         lands = ci.landed_commits

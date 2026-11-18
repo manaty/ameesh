@@ -212,8 +212,18 @@ def _check_migration_coverage(db, entry, *, repo, origin_repo, base, target, cfg
     """#4430: added migration files require this lot's active reservation."""
     from . import migration_reservations, migrations
     slug = migrations.origin_repo(origin_repo)
-    layout = migrations.layout_for(slug, cfg) if slug else None
+    layout = (migrations.layout_for(slug, cfg) if slug else None) or (
+        migrations.inferred_layout(origin_repo, slug) if slug else None)
     if layout is None:
+        # #7795 (B1) : un dépôt de migrations inconnu ne fait pas passer un
+        # ajout de migration en silence ; le doute refuse le candidat, même
+        # quand l'`origin` du clone est illisible.
+        numbered = [path for path in entry['files']
+                    if migration_reservations._NUMBER.fullmatch(os.path.basename(path))]
+        if numbered:
+            raise CandidateError(
+                'repository %s: migrations layout unknown, cannot check added '
+                'migration(s) %s' % (slug or 'unknown', ', '.join(numbered[:3])))
         return
     paths = [path for path in entry['files']
              if os.path.dirname(path) == layout.directory.rstrip('/')
@@ -1094,7 +1104,8 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
                    cfg=cfg, canons=canons)
     from . import migrations
     slug = migrations.origin_repo(repo)
-    layout = migrations.layout_for(slug, cfg) if slug else None
+    layout = (migrations.layout_for(slug, cfg) if slug else None) or (
+        migrations.inferred_layout(repo, slug) if slug else None)
     open_heads = None
     for entry in candidates:
         entry["conflicts_with"] = sorted({

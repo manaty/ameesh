@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Public mail surface, contract v1.3 (tranches E2a/E2b, #7636/#5827/#7706).
+"""Public mail surface, contract v1.4 (tranches E2a/E2b/E2c, #7636/#5827/#7706).
 
 An installed external module already trusted with a database identity submits
 typed mail, reads its own bounded history, lists the requests a live turn is
@@ -55,7 +55,7 @@ from ..config import NAME_RE
 from ..db import Db, DbError, is_unique_violation
 
 #: revision of the written contract implemented by this module
-CONTRACT_VERSION = "1.3"
+CONTRACT_VERSION = "1.4"
 
 #: maximum size of one body, in UTF-8 bytes
 MAX_BODY_BYTES = 64 * 1024

@@ -110,7 +110,13 @@ def import_reservations(db, rows, mapping: dict, *, repo: str, apply=False,
     whose SQL may already exist in a branch. No SQL migrations are executed.
     """
     slug = migrations.repo_key(repo)
-    if not slug or migrations.layout_for(slug, cfg) is None:
+    if not slug:
+        raise work.WorkError("repository %s: migrations layout unknown" % slug)
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    checkout = repo if os.path.isdir(repo) else migrations.checkout_for(slug, cfg)
+    layout = migrations.layout_for(slug, cfg) or (
+        migrations.inferred_layout(checkout, slug) if checkout else None)
+    if layout is None:
         raise work.WorkError("repository %s: migrations layout unknown" % slug)
     if not isinstance(mapping, dict) or any(
             not re.fullmatch(r"[0-9]{1,4}", str(n)) or not isinstance(lot, int)
@@ -263,7 +269,7 @@ def update(db, item_id, slots, *, target_branch, target_sha, repo=None, action='
     else:
         slug = work.lot_repository(item, cfg)
     checkout = work._checkout(slug, repo, cfg)
-    layout = migrations.layout_for(slug, cfg)
+    layout = migrations.layout_for(slug, cfg) or migrations.inferred_layout(checkout, slug)
     if layout is None:
         raise work.WorkError('repository migrations directory unknown')
     branch = merge_queue._remote_branch(target_branch)
