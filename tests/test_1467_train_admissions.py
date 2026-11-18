@@ -630,7 +630,9 @@ class PacketAllocationTest(PgTestCase):
         self.eject_for_want_of_ci()
         other = self.connect()
         self.addCleanup(other.close)
-        read, raced_once = self.ops._queue_row, []
+        # #7650 : `queue_add` lit la file depuis le stockage du module `dev`
+        # (le délégué `WorkItems._queue_row` n'est plus le point de lecture).
+        read, raced_once = self.ops._dev._queue_row, []
         def raced(db, item_id):
             current = read(db, item_id)
             if not raced_once:
@@ -640,7 +642,7 @@ class PacketAllocationTest(PgTestCase):
                     item_id, state="ejected", note="radar landing", actor="radar",
                     reason="stacked trial: conflict"))
             return current
-        with mock.patch.object(self.ops, "_queue_row", side_effect=raced):
+        with mock.patch.object(self.ops._dev, "_queue_row", side_effect=raced):
             self.assertIsNone(self.allocate(actor="next-cutoff"))
         self.assertEqual(raced_once[0]["reason"], "stacked trial: conflict")
         (current,) = self.ops.queue(None)

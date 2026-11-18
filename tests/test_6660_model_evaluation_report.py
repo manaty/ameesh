@@ -274,7 +274,18 @@ class ReadOnlyReadTest(unittest.TestCase):
 
     def test_le_journal_des_resolutions_est_lu_s_il_existe(self):
         tx = self.FakeTx()
-        tx.query = lambda sql, params=(): [{"present": True}]
+
+        def query(sql, params=()):
+            # #7650 : la qualification du schéma `dev` sonde le registre
+            # (`module_schemas`) avant de nommer une table. Le double ne simule
+            # que la table du journal, présente sur le schéma noyau ; un
+            # `present=True` à toute requête décrirait un registre présent mais
+            # illisible, que le stockage refuse à juste titre.
+            if "AS readable" in sql:
+                return [{"present": False, "readable": False}]
+            return [{"present": True}]
+
+        tx.query = query
         report.read(self.FakeDb(tx), project="ameesh",
                     now=END, start="2026-10-27T00:00:00Z",
                     end="2026-11-10T00:00:00Z")

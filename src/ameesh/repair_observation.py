@@ -307,16 +307,8 @@ def scan(db, project, source, *, environment=ENVIRONNEMENT, now=None,
         if alerts != PROJECT:
             raise ValueError('unsupported alert subset')
         after = json.loads(cursor) if cursor is not None else ['', '', 0]
-        rows = db.query(
-            "SELECT p.repo,p.kind,p.object_id,p.issue_ref,p.delivered_at,"
-            " (SELECT w.id FROM work_items w"
-            " WHERE w.app=p.project AND lower(w.issue_ref)=lower(p.issue_ref)"
-            " AND (p.kind='issue' OR w.created_at>=to_timestamp(p.delivered_at))"
-            " ORDER BY w.id LIMIT 1) AS lot"
-            " FROM github_watch_pending p WHERE p.project=%s"
-            " AND (p.repo,p.kind,p.object_id)>(%s,%s,%s)"
-            " ORDER BY p.repo,p.kind,p.object_id LIMIT %s",
-            (project, *after, BATCH))
+        # #7650 : le SQL de `github_watch_pending` vit avec le module `dev`.
+        rows = storage.of(db).github_watch.pending_page(project, after, BATCH)
         inputs = []
         for row in rows:
             item = {'key': [row['repo'], row['kind'], row['object_id']],

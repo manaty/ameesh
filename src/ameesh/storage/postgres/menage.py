@@ -11,6 +11,7 @@ import json
 from typing import Any
 
 from .. import interface
+from .worktrees import Worktrees
 
 LOG_COLUMNS = (
     "id, host, extract(epoch from at)::float8 AS at_ts, actor, kind, action, path,"
@@ -116,6 +117,11 @@ def _latest_by_path_sql(kind: str, *, host: str | None = None,
 
 
 class Housekeeping(interface.Housekeeping):
+
+    def __init__(self, db):
+        super().__init__(db)
+        # P1b #7650 : les worktrees suivis appartiennent au module `dev`.
+        self._worktrees = Worktrees(db)
 
     def log(self, host, entries, *, actor) -> int:
         count = 0
@@ -224,45 +230,23 @@ class Housekeeping(interface.Housekeeping):
 
     def register_worktree(self, *, host, path, repo, agent, lot, turn_id, branch,
                           head) -> dict | None:
-        rows = self.db.query(
-            "INSERT INTO managed_worktrees"
-            " (host, path, repo, agent, lot, turn_id, branch, head)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
-            " ON CONFLICT (host, path) WHERE status IN ('active', 'kept') DO NOTHING"
-            " RETURNING " + WORKTREE_COLUMNS,
-            (host or "", path, repo or "", agent, None if lot is None else str(lot),
-             turn_id, branch or "", head or ""))
-        return rows[0] if rows else None
+        """Enregistre un worktree suivi (P1b #7650 : SQL dans le module `dev`)."""
+        return self._worktrees.register(
+            host=host, path=path, repo=repo, agent=agent, lot=lot,
+            turn_id=turn_id, branch=branch, head=head)
 
     def worktrees(self, host, statuses=None, limit=500) -> list[dict]:
-        clauses, params = [], []  # type: list[str], list[Any]
-        if host:
-            clauses.append("host = %s")
-            params.append(host)
-        if statuses:
-            clauses.append("status IN (SELECT jsonb_array_elements_text(%s::jsonb))")
-            params.append(json.dumps(list(statuses)))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        bound = ""
-        if limit is not None:
-            bound = " LIMIT %s"
-            params.append(int(limit))
-        return self.db.query(
-            "SELECT " + WORKTREE_COLUMNS + " FROM managed_worktrees" + where +
-            " ORDER BY created_at, id" + bound, tuple(params))
+        """Les worktrees suivis d'un hôte (P1b #7650 : SQL dans `dev`)."""
+        return self._worktrees.worktrees(host, statuses=statuses, limit=limit)
+
+    def worktrees_for_lot(self, host, lot) -> list[str]:
+        """#6984 : les chemins des worktrees actifs de ce lot sur cet hôte."""
+        return self._worktrees.for_lot(host, lot)
 
     def set_worktree_status(self, worktree_id, status, detail) -> dict | None:
-        rows = self.db.query(
-            "UPDATE managed_worktrees SET status = %s, detail = %s, checked_at = now(),"
-            " ended_at = CASE WHEN %s IN ('removed', 'gone') THEN now() ELSE ended_at END"
-            " WHERE id = %s RETURNING " + WORKTREE_COLUMNS,
-            (status, detail or "", status, int(worktree_id)))
-        return rows[0] if rows else None
+        """Met à jour l'état d'un worktree suivi (P1b #7650 : SQL dans `dev`)."""
+        return self._worktrees.set_status(worktree_id, status, detail)
 
     def set_worktree_attribution(self, worktree_id, agent, lot, detail) -> dict | None:
-        rows = self.db.query(
-            "UPDATE managed_worktrees SET agent = %s, lot = %s, detail = %s,"
-            " checked_at = now() WHERE id = %s RETURNING " + WORKTREE_COLUMNS,
-            (agent or "", None if lot is None else str(lot), detail or "",
-             int(worktree_id)))
-        return rows[0] if rows else None
+        """Réattribue un worktree suivi (P1b #7650 : SQL dans `dev`)."""
+        return self._worktrees.set_attribution(worktree_id, agent, lot, detail)

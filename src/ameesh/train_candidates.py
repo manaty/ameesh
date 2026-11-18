@@ -300,9 +300,10 @@ class Enrollment:
                        str(current.get("frozen_sha") or "")[:12],
                        ", reason: " + reason[:160] if reason else "", lot))
         try:
-            kinds = {receipt["kind"] for receipt in self.preparation.history.db.query(
-                "SELECT kind FROM integration_train_queue_receipts WHERE work_item_id = %s"
-                " AND frozen_id IS NOT DISTINCT FROM %s", (int(lot), subject.get("frozen_id")))}
+            # #7650 : les reçus de file sont une table du module `dev`.
+            kinds = set(storage.of(self.preparation.history.db).work
+                        .train_receipt_kinds(int(lot), subject.get("frozen_id"),
+                                             exact=True))
         except Exception:  # noqa: BLE001 - unreadable receipts: the generic cause
             kinds = None
         if kinds:
