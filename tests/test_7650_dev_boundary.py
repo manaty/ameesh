@@ -7,6 +7,9 @@ Deux garanties, sans base :
   table SQL (``FROM``, ``JOIN``, ``UPDATE``, ``INSERT INTO``, ``DELETE FROM``,
   ``TRUNCATE``, ``ALTER TABLE``), hors docstrings ; une exception doit être
   datée, motivée, et disparaît quand le site est corrigé (liste décroissante) ;
+* aucune sonde ``to_regclass('…')`` ne nomme une table `dev` en littéral :
+  ``qualify()`` laisse les littéraux intacts, donc après P2 la sonde lirait le
+  search_path noyau et rendrait NULL sans erreur (revue B1 de #7650) ;
 * le résolveur ``relation``/``qualify`` rend le nom du schéma noyau avant P2
   et le schéma ``<noyau>__dev`` lu dans ``module_schemas`` après P2, sans
   toucher aux littéraux SQL ni aux commentaires.
@@ -71,6 +74,28 @@ def scan_source() -> dict[tuple[str, str], list[int]]:
     return found
 
 
+#: `to_regclass` sur un littéral nommant une table `dev` (revue B1 de #7650).
+#: Le module lui-même est scruté : c'est là que la sonde doit passer par
+#: ``relation(self.db, …)`` pour que ``qualify()`` la réécrive après P2.
+_TO_REGCLASS_LITERAL = re.compile(
+    r"\bto_regclass\s*\(\s*(['\"])(?:\"?[A-Za-z_][A-Za-z0-9_]*\"?\.)?"
+    r"(?P<table>%s)\1" % "|".join(sorted((re.escape(name) for name in TABLES),
+                                        key=len, reverse=True)),
+    re.IGNORECASE)
+
+
+def scan_to_regclass_literals() -> dict[tuple[str, str], list[int]]:
+    """Les `to_regclass('table dev')` littéraux, par (fichier, table)."""
+    found: dict[tuple[str, str], list[int]] = {}
+    for path in sorted(SOURCE.rglob("*.py")):
+        tree = ast.parse(path.read_text(), str(path))
+        for node in _string_constants(tree):
+            for match in _TO_REGCLASS_LITERAL.finditer(node.value):
+                key = (str(path.relative_to(SOURCE)), match.group("table"))
+                found.setdefault(key, []).append(node.lineno)
+    return found
+
+
 class DevBoundaryTest(unittest.TestCase):
 
     def test_core_never_names_a_dev_table_in_sql(self):
@@ -88,6 +113,12 @@ class DevBoundaryTest(unittest.TestCase):
                 self.assertRegex(lot, r"^#\d+$")
                 self.assertRegex(declared_on, r"^\d{4}-\d{2}-\d{2}$")
                 self.assertTrue(reason)
+
+    def test_no_to_regclass_literal_names_a_dev_table(self):
+        found = scan_to_regclass_literals()
+        self.assertFalse(found,
+                         "to_regclass littéral sur une table `dev` : %s"
+                         % sorted(found))
 
     def test_core_does_not_import_the_module_storage(self):
         """Seuls les alias datés et les déclarations de `dev` sont importés."""
@@ -136,6 +167,36 @@ class DevBoundaryTest(unittest.TestCase):
         self.assertEqual(schema.relation(after, "ci_runs"), '"t_x__dev"."ci_runs"')
         self.assertEqual(schema.relation(after, "work_landings"),
                          '"t_x__dev"."work_landings"')
+
+    def test_core_schema_is_taken_as_configured_not_fallen_back_to_public(self):
+        """B2 de #7650 : un schéma noyau valide (majuscule, `$`) reste le sien."""
+        from ameesh.modules.dev.storage import schema
+
+        class _Cfg:
+            schema = "Mesh_$1"
+
+        class _Db:
+            cfg = _Cfg()
+
+            def __init__(self):
+                self.seen = []
+
+            def query(self, sql, params=()):
+                self.seen.append((sql, params))
+                return []
+
+        db = _Db()
+        self.assertEqual(schema.relation(db, "ci_runs"), '"Mesh_$1"."ci_runs"')
+        self.assertIn('"Mesh_$1".module_schemas', db.seen[0][0])
+
+        class _EmptyCfg:
+            schema = ""
+
+        class _EmptyDb(_Db):
+            cfg = _EmptyCfg()
+
+        self.assertEqual(schema.relation(_EmptyDb(), "ci_runs"),
+                         '"public"."ci_runs"')
 
     def test_qualify_rewrites_tables_but_not_literals_or_comments(self):
         from ameesh.modules.dev.storage import schema

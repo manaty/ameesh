@@ -57,9 +57,17 @@ def _connection(db):
 
 
 def _core_schema(db) -> str:
+    """Le schéma noyau configuré, tel quel (cité par :func:`_quote`).
+
+    `config.SCHEMA_RE` accepte les majuscules et `$` ; ne pas retomber
+    silencieusement sur ``public`` quand le schéma configuré est valide mais
+    hors de la forme stricte de ``module_schemas`` (revue B2 de #7650). La
+    forme stricte ne sert qu'au nom physique dérivé d'un module, pas au
+    schéma noyau.
+    """
     cfg = getattr(_raw(db), "cfg", None)
     schema = str(getattr(cfg, "schema", "") or "")
-    return schema if SCHEMA_NAME.fullmatch(schema) else "public"
+    return schema or "public"
 
 
 def schema_name(db) -> str:

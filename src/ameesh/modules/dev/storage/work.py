@@ -134,9 +134,10 @@ class DevWork(DevDomain):
             pass
         if getattr(raw, "_has_migration_slots", False):
             return True
-        found = bool(db.query(
+        rows = db.query(
             "SELECT to_regclass(%s) IS NOT NULL AS present",
-            (relation(db, "work_migration_reservations"),)))
+            (relation(db, "work_migration_reservations"),))
+        found = bool(rows and rows[0]["present"])
         if found:
             try:
                 raw._has_migration_slots = True
@@ -744,7 +745,7 @@ class DevWork(DevDomain):
             # #3532: read under the lot row lock that `queue_remove` takes
             # first, so a take-out cannot slip between this check and insertion.
             # #3550: the take-out only binds the target and freeze it names.
-            if withdrawn_after is not None and self.queue_withdrawn_since(
+            if withdrawn_after is not None and DevWork(tx).queue_withdrawn_since(
                     item_id, withdrawn_after, target=target,
                     frozen_id=frozen_id) is not None:
                 return None
@@ -1022,7 +1023,7 @@ class DevWork(DevDomain):
                     or (current.get("plan") or {}).get("id") != plan_id \
                     or not isinstance(request, dict) or request.get("plan") != plan_id:
                 return None
-            fire = self.train_fire_read(key, plan_id)
+            fire = DevWork(tx).train_fire_read(key, plan_id)
             if fire and fire.get("state") in ("active", "promoting", "landed"):
                 return None
             tx.execute("UPDATE integration_trains SET document = jsonb_set(document,"
@@ -1055,7 +1056,7 @@ class DevWork(DevDomain):
             if phase in ("landed", "empty", "invalidated") or phase == "promoting" \
                     or (current.get("plan") or {}).get("id") != plan_id:
                 return None
-            fire = self.train_fire_read(key, plan_id)
+            fire = DevWork(tx).train_fire_read(key, plan_id)
             if fire and fire.get("state") in ("active", "promoting", "landed"):
                 return None
             if (document.get("plan") or {}).get("id") != plan_id:
@@ -1144,6 +1145,7 @@ class DevWork(DevDomain):
                            " document = %s::jsonb, updated_at = clock_timestamp()"
                            " WHERE target_key = %s", (json.dumps(document), key))
             return {"epoch": epoch, "previous_owner": before[0], "previous_epoch": before[1]}
+    @staticmethod
     def _train_fire(rows):
         if not rows:
             return None
@@ -1219,7 +1221,7 @@ class DevWork(DevDomain):
             tx.execute("UPDATE integration_train_fires SET state = %s, changed_by = %s,"
                        " owner = %s, epoch = %s, updated_at = clock_timestamp() WHERE id = %s",
                        (state, actor, owner, epoch, int(fire_id)))
-            return self.train_fire_read(key, document["plan"]["id"])
+            return DevWork(tx).train_fire_read(key, document["plan"]["id"])
     def queue(self, target=None) -> list[dict]:
         return self.db.query(
             "SELECT %s FROM merge_queue q JOIN work_items w ON w.id = q.work_item_id"
@@ -1313,7 +1315,7 @@ class DevWork(DevDomain):
                      head_sha, unit["unit_sha"], unit.get("source_sha") or "",
                      unit.get("frozen_sha") or "", actor or ""))
             self._event(tx, int(package_id), rows[0]["state"], note, actor)
-            return self.packet_members(package_ids=[int(package_id)])
+            return DevWork(tx).packet_members(package_ids=[int(package_id)])
     def record_packet_snapshot(self, *, repository, target, package_id, branch,
                                head_sha, base_sha, payload, actor, lease_key,
                                lease_owner, lease_epoch) -> dict:
@@ -1341,7 +1343,7 @@ class DevWork(DevDomain):
                 " ON CONFLICT (repository, target, package_id, head_sha) DO NOTHING",
                 (repository, target, int(package_id), branch, head_sha, base_sha,
                  json.dumps(payload), actor or "", lease_owner, int(lease_epoch)))
-            receipt = self.packet_snapshots(
+            receipt = DevWork(tx).packet_snapshots(
                 repository=repository, target=target, package_id=package_id,
                 head_sha=head_sha)[0]
             if (receipt["branch"] != branch or receipt["base_sha"] != base_sha
@@ -1356,7 +1358,8 @@ class DevWork(DevDomain):
         # During additive rollout an older database has no new receipts.
         # Query errors after the prerequisite are not treated as absence.
         ready = prerequisite_query(self.db,
-            "SELECT to_regclass('work_packet_snapshots') IS NOT NULL AS ready")
+            "SELECT to_regclass(%s) IS NOT NULL AS ready",
+            (relation(self.db, "work_packet_snapshots"),))
         if not ready or not ready[0]["ready"]:
             return []
         repository = str(repository or "").strip().lower()
