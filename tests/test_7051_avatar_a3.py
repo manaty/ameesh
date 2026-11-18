@@ -270,7 +270,7 @@ class MoveCase(PgTestCase):
             agent=dict(agent if agent is not None else self.row()),
             _move_turn=None, _path=lambda leaf: os.path.join(self.state, leaf),
             read_session_file=lambda: None)
-        for name in ("current_session",):
+        for name in ("current_session", "declared_policy", "fresh_session"):
             setattr(worker, name, getattr(AgentWorker, name).__get__(worker))
         return worker
 
