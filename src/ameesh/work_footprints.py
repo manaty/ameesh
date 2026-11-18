@@ -912,6 +912,16 @@ def run(cfg, db, args) -> int:
         if int(row["id"]) in seen:
             continue
         seen.add(int(row["id"]))
+        if row.get("start_on"):
+            # #7760 : la dépendance déclarée sur un lot validé permet de
+            # démarrer sur sa tête gelée ; ce n'est pas une attente de fusion
+            # pour le démarrage.
+            print("starts on #%d (%s%s, frozen %s): %s ~ %s" % (
+                int(row["id"]), row["state"],
+                ", %s" % row["assignee"] if row.get("assignee") else "",
+                (row.get("other_frozen_sha") or "?")[:12],
+                _path_label(row["path"]), _path_label(row["other_path"])))
+            continue
         print("overlaps #%d (%s%s): %s ~ %s" % (
             int(row["id"]), row["state"],
             ", %s" % row["assignee"] if row.get("assignee") else "",

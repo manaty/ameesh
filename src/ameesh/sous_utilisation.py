@@ -1209,13 +1209,27 @@ def footprint_blockers(db, waiting_lots: list, lots: list, *,
     for row in store.work_footprints.for_items(
             [int(lot["id"]) for lot in lots]):
         paths.setdefault(int(row["work_item_id"]), []).append(str(row["path"]))
+    # #7760 : les dépendances déclarées sur un lot validé permettent de
+    # démarrer sur sa tête gelée ; le prérequis ne retient plus le démarrage.
+    # Une lecture en panne ne devine pas d'exception : les bloquants restent.
+    declared: dict = {}
+    try:
+        edges = getattr(store, "work_dependencies", None)
+        if edges is not None:
+            for edge in edges.for_items([int(lot["id"]) for lot in waiting_lots]):
+                if (edge or {}).get("start_on"):
+                    declared.setdefault(int(edge["work_item_id"]), set()).add(
+                        int(edge["blocker_id"]))
+    except Exception:  # noqa: BLE001 — lecture en panne : garde inchangée
+        declared = {}
     # #4818 : chemins partagés et plafond de lots en vol de chaque dépôt
     from . import work_footprints
     policies = work_footprints.policies_of(
         db, {str(lot.get("app") or "") for lot in waiting_lots})
     out: dict = {}
     for lot in waiting_lots:
-        blockers = slo.footprint_blockers(lot, lots, paths, policies)
+        blockers = slo.footprint_blockers(
+            lot, lots, paths, policies, declared.get(int(lot["id"]), ()))
         if blockers:
             out[int(lot["id"])] = blockers
     return out
