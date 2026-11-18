@@ -29,6 +29,7 @@ import sys
 import tempfile
 import unittest
 from importlib import util
+from unittest import mock
 
 from tests import support  # isolate host config before product imports
 from tests.test_7665_module_contract import fixture_breaks
@@ -77,6 +78,9 @@ class DatabaseNameTest(unittest.TestCase):
         self.assertEqual(dsn_mod.with_database(
             "postgresql://user@host:5432?sslmode=require", self.NAME),
             "postgresql://user@host:5432/%s?sslmode=require" % self.NAME)
+        self.assertEqual(dsn_mod.with_database(
+            "postgresql:///old?host=/var/run/postgresql", self.NAME),
+            "postgresql:///%s?host=/var/run/postgresql" % self.NAME)
 
     def test_a_query_dbname_cannot_win_over_the_derived_path(self):
         self.assertEqual(dsn_mod.with_database(
@@ -148,6 +152,69 @@ class FixtureBoundaryTest(unittest.TestCase):
         other._database = "ameesh_fixture_bcde"
         with self.assertRaises(fixture_mod.FixtureRefused):
             other._drop()
+
+    def test_the_prefix_keeps_the_full_name_inside_the_postgres_limit(self):
+        # PostgreSQL truncates identifiers at 63 bytes; the random suffix is
+        # 16 bytes, so a 47-byte prefix is the longest one that keeps the
+        # name the fixture later validates and drops.
+        longest = "ameesh_fixture_" + "a" * (fixture_mod._MAX_DB_NAME - 16
+                                             - len("ameesh_fixture_"))
+        self.assertEqual(len(longest), 47)
+        fixture_mod.Fixture(self.dsn, prefix=longest)
+        with self.assertRaises(fixture_mod.FixtureRefused):
+            fixture_mod.Fixture(self.dsn, prefix=longest + "a")
+        bounded = fixture_mod.Fixture(self.dsn, prefix=longest)
+        bounded._database = longest + "b" * 16
+        self.assertEqual(len(bounded._database), 63)
+        bounded._database = longest + "b" * 17  # 64 bytes: never emitted
+        with self.assertRaises(fixture_mod.FixtureRefused):
+            bounded._drop()
+
+    def test_a_failed_migration_drops_the_database_it_created(self):
+        fixture = self.rooted()
+        statements = []
+        fixture._admin = statements.append
+        fixture._migrate = lambda: (_ for _ in ()).throw(
+            fixture_mod.FixtureError("migration failed"))
+        with self.assertRaises(fixture_mod.FixtureError):
+            fixture.create()
+        self.assertEqual(len(statements), 2)
+        self.assertIn("CREATE DATABASE", statements[0])
+        self.assertIn("DROP DATABASE", statements[1])
+        self.assertFalse(fixture._created)
+        self.assertLessEqual(len(fixture._database), 63)
+
+    def test_close_finishes_cleanup_when_the_drop_fails(self):
+        fixture = fixture_mod.Fixture(self.dsn)
+        root = tempfile.mkdtemp(prefix="w7701-owned-")
+        fixture._root = root
+        fixture._owns_root = True
+        fixture._created = True
+        fixture._database = "ameesh_fixture_abcdefgh"
+        fixture._drop = lambda: (_ for _ in ()).throw(
+            fixture_mod.FixtureError("drop failed"))
+        with self.assertRaises(fixture_mod.FixtureError):
+            fixture.close()
+        self.assertTrue(fixture._closed)
+        self.assertFalse(os.path.exists(root))
+        fixture.close()  # idempotent: the failure is not replayed
+
+    def test_the_psql_fallback_keeps_the_password_out_of_argv(self):
+        fixture = fixture_mod.Fixture(
+            "postgresql://user:secret@db.example:5432/old")
+        seen = {}
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="",
+                                           stderr="")
+
+        def fake_run(argv, **kwargs):
+            seen["argv"], seen["env"] = argv, kwargs.get("env")
+            return done
+
+        with mock.patch("subprocess.run", fake_run):
+            fixture._admin_psql('CREATE DATABASE "ameesh_fixture_abcdefgh"')
+        self.assertNotIn("secret", " ".join(seen["argv"]))
+        self.assertEqual(seen["env"]["PGPASSWORD"], "secret")
+        self.assertIn("postgresql://user@db.example:5432/old", seen["argv"])
 
     def test_a_path_cannot_leave_the_private_root(self):
         fixture = self.rooted()

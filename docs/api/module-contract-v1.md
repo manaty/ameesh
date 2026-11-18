@@ -490,8 +490,11 @@ The fixture's safety boundary is part of the contract:
 
 - it creates and drops only `ameesh_fixture_*` names; `close()` refuses any
   other name, so a wrong string cannot drop a consumer's database;
+- `prefix` is bounded so the generated name (prefix plus 16 random bytes) stays
+  within PostgreSQL's 63-byte identifier limit and is never silently truncated;
 - the admin DSN is never printed and reaches only the disposable database; the
-  child environment never inherits the host's canon, DSN or runner identity;
+  child environment never inherits the host's canon, DSN or runner identity,
+  and the `psql` fallback passes a password through `PGPASSWORD`, never argv;
 - the schema is applied only by the documented `ameesh migrate` command, and
   core data is written only through admitted commands, HTTP or callbacks;
 - the named read views, with explicit columns, are the only SQL the fixture

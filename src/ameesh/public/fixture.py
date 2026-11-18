@@ -60,6 +60,10 @@ _STRIPPED_PREFIXES = ("AMEESH_", "AGENT_MESH_", "AGENT_MAIL_")
 
 #: identifiers accepted for a view or a column (never a SQL fragment)
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
+#: PostgreSQL truncates an identifier at NAMEDATALEN-1 bytes
+_MAX_DB_NAME = 63
+#: bytes of randomness appended to the prefix (16 hex characters)
+_NAME_TOKEN_BYTES = 8
 #: database names the fixture is willing to create and drop
 _DB_NAME = re.compile(r"^ameesh_fixture_[a-z0-9_]{4,64}$")
 
@@ -98,6 +102,10 @@ class Fixture:
             raise FixtureRefused(
                 "prefix must start with ameesh_fixture_ and be a plain identifier: %r"
                 % (prefix,))
+        if len(prefix) + 2 * _NAME_TOKEN_BYTES > _MAX_DB_NAME:
+            raise FixtureRefused(
+                "prefix %r leaves no room for the random name inside PostgreSQL's "
+                "%d-byte identifier limit" % (prefix, _MAX_DB_NAME))
         self.admin_dsn = admin_dsn
         self.prefix = prefix
         self.keep = bool(keep)
@@ -129,7 +137,7 @@ class Fixture:
         self._write_config()
         last = None
         for _attempt in range(3):
-            name = self.prefix + secrets.token_hex(8)
+            name = self.prefix + secrets.token_hex(_NAME_TOKEN_BYTES)
             try:
                 self._admin("CREATE DATABASE \"%s\"" % name)
             except FixtureError as exc:
@@ -151,6 +159,8 @@ class Fixture:
 
     def close(self) -> None:
         """Close the connections and drop the disposable database (idempotent)."""
+        if self._closed:
+            return
         if self._db is not None:
             try:
                 self._db.close()
@@ -163,12 +173,14 @@ class Fixture:
             except Exception:  # noqa: BLE001
                 pass
         self._connections = []
-        if self._created and not self.keep:
-            self._drop()
-        if self._owns_root and self._root:
-            shutil.rmtree(self._root, ignore_errors=True)
-        self._db = None
-        self._closed = True
+        try:
+            if self._created and not self.keep:
+                self._drop()
+        finally:
+            if self._owns_root and self._root:
+                shutil.rmtree(self._root, ignore_errors=True)
+            self._db = None
+            self._closed = True
 
     def __enter__(self) -> "Fixture":
         return self.create()
@@ -391,10 +403,20 @@ class Fixture:
 
     def _admin_psql(self, statement: str) -> None:
         try:
+            password, dsn = dsn_mod.split_password(self.admin_dsn)
+        except dsn_mod.DsnError as exc:
+            raise FixtureError("admin DSN cannot be passed to psql safely: %s"
+                               % exc) from exc
+        env = dict(os.environ)
+        if password:
+            # The DSN is a secret: psql reads the password from PGPASSWORD, so
+            # it never appears in argv (ps, /proc/<pid>/cmdline).
+            env["PGPASSWORD"] = password
+        try:
             done = subprocess.run(
-                ["psql", "-w", "-v", "ON_ERROR_STOP=1", "-d", self.admin_dsn,
+                ["psql", "-w", "-v", "ON_ERROR_STOP=1", "-d", dsn,
                  "-c", statement],
-                capture_output=True, text=True, timeout=60, env=dict(os.environ))
+                capture_output=True, text=True, timeout=60, env=env)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise FixtureError("psql admin statement failed to run: %s" % exc) from exc
         if done.returncode != 0:
@@ -403,7 +425,8 @@ class Fixture:
 
     def _drop(self) -> None:
         name = (self._database or "").strip()
-        if not _DB_NAME.match(name) or not name.startswith(self.prefix):
+        if (len(name) > _MAX_DB_NAME or not _DB_NAME.match(name)
+                or not name.startswith(self.prefix)):
             raise FixtureRefused("refusing to drop a database this fixture did not create: %r"
                                  % (name,))
         try:
