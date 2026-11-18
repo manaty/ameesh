@@ -1677,6 +1677,17 @@ def _delta_reading(commit_families, global_families=()):
         list(commit_families), commit_families, global_families or ())
 
 
+def _input_deltas(inputs):
+    """#6661/#7745 : les deltas d'un `Inputs`, ou None s'il ne les porte pas.
+
+    Un appelant de test peut simuler les entrées par un objet minimal
+    (`types.SimpleNamespace`) : l'absence de la lecture par commit garde le
+    chemin historique, jamais une `AttributeError` au milieu du gel.
+    """
+    return _delta_reading(getattr(inputs, "commit_families", None),
+                          getattr(inputs, "global_families", ()))
+
+
 def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
                   authors: Sequence[Mapping], families, *,
                   correctors: Sequence[Mapping] = (),
@@ -1776,7 +1787,7 @@ def _manual_covers(inputs: Inputs) -> bool:
         return True
     if inputs.unknown_authors or rd.unknown_families(inputs.authors):
         return False
-    deltas = _delta_reading(inputs.commit_families, inputs.global_families)
+    deltas = _input_deltas(inputs)
     if deltas is not None:
         # #7745 : la couverture se juge par delta, comme la porte du gel.
         from . import review_deltas
@@ -3244,8 +3255,8 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
             candidates=inputs.candidates, families=families,
             already=list(inputs.manual_seats), fixers=inputs.correctors,
             advances=inputs.advances, automatic=previous,
-            deltas=_delta_reading(inputs.commit_families, inputs.global_families),
-            global_families=inputs.global_families)
+            deltas=_input_deltas(inputs),
+            global_families=getattr(inputs, "global_families", ()))
         # La même sélection sur le vivier réveillé : elle nomme les sièges que
         # le sommeil retient, sans en réveiller plus que nécessaire. Le vivier
         # de base est celui du gel (retraits compris) ; on n'y remplace que
@@ -3288,8 +3299,8 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
             families=families, already=list(inputs.manual_seats),
             fixers=inputs.correctors, advances=inputs.advances,
             automatic=list(current.get("reviewers") or ()),
-            deltas=_delta_reading(inputs.commit_families, inputs.global_families),
-            global_families=inputs.global_families)
+            deltas=_input_deltas(inputs),
+            global_families=getattr(inputs, "global_families", ()))
     except Exception:  # noqa: BLE001 - pas de prévision : comportement d'avant
         return inputs
     if current.get("state") != rd.WAITING:
@@ -3399,8 +3410,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False,
         fixers=inputs.correctors, held=held, doubts=inputs.doubts,
         answered=inputs.answered,
         required=inputs.policy.required, advances=inputs.advances,
-        deltas=_delta_reading(inputs.commit_families, inputs.global_families),
-        global_families=inputs.global_families)
+        deltas=_input_deltas(inputs),
+        global_families=getattr(inputs, "global_families", ()))
 
 
 def carried_plan(cfg, db, lot: int, sha: str, *,
@@ -3675,8 +3686,10 @@ def _fresh_prepared(cfg, tx, item: Mapping, freeze: Mapping,
                                    correctors=inputs.correctors,
                                    closed_hosts=alert_briefs.claims_closed_hosts(tx),
                                    answered=answered,
-                                   commit_families=inputs.commit_families,
-                                   global_families=inputs.global_families))
+                                   commit_families=getattr(
+                                       inputs, "commit_families", None),
+                                   global_families=getattr(
+                                       inputs, "global_families", ())))
 
 
 def _unavailable_in_transaction(cfg, tx, item: Mapping, freeze: Mapping,
