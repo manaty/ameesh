@@ -102,6 +102,7 @@
   ameesh export-v0            export to the v0 file mailbox;
   ameesh fil list | show <project> [<lot>] [--last N] | tail <project> [<lot>]
         readable threads: every message that went through ameesh, in clear (R12);
+  ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO  check before an act;
   ameesh github gestes [--since 24h] [--agent A] [--match 'run cancel'] [--json]
         | identity <agent> [--json]
         the gh commands run by agents, journaled per turn (who cancelled,
@@ -200,7 +201,6 @@
         record --signed : hors runner (bureau/owner), attestation signée par une
         clé owner (#4485), sans PID local ni ameesh sur l'hôte du commit ;
   ameesh psql-nocturne dispatch       daily bounded psql workflow dispatch (#7483);
-  ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO  check before an act;
   ameesh receipt verify       approval receipts (spec §8);
   ameesh refusal emit --reason "…"   #5529 : preuve positive qu'un harnais a
         refusé le tour avant tout appel fournisseur (ameesh-refusal/1), lue

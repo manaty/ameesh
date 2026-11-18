@@ -180,6 +180,7 @@ def deliver(db, sub, workflow, runs, until, auditor, *, mode_marked=False):
 def tick(db, cfg, now, subscriptions, api, log):
     """Called by the elected GitHub watcher, using the applied canon inventory."""
     from . import canon, mechanics, storage
+    from .role_timers import AUDITOR_ROLE
     document = mechanics.configured(cfg)
     watched = [(sub, document.override(sub.project)) for sub in subscriptions]
     watched = [(sub, spec) for sub, spec in watched
@@ -187,7 +188,7 @@ def tick(db, cfg, now, subscriptions, api, log):
     if not watched:
         return
     auditors = {agent.title for bundle in canon.load_configured(cfg) for agent in bundle.agents
-                if "auditeur" in (getattr(agent, "roles", None) or ())}
+                if AUDITOR_ROLE in (getattr(agent, "roles", None) or ())}
     if len(auditors) != 1:
         raise ValueError("pre-act audit requires one declared auditor")
     auditor = auditors.pop()
