@@ -38,9 +38,9 @@ Règles de sûreté vérifiées ici, au démarrage :
   `http://localhost`, contexte sûr pour WebAuthn), et son hôte est le RP ID
   ou un de ses sous-domaines ; plusieurs origines admises ;
 * dans les deux profils, le RP ID n'est jamais une zone ou un hôte réservés
-  (`reserved_zones`, `reserved_hosts`, plus ceux de la décision 0026, toujours
-  réservés), ni un de leurs parents : un RP ID parent couvrirait les hôtes de
-  toutes les équipes de la zone ;
+  (`reserved_zones`, `reserved_hosts` : ceux de la décision 0026 sont déclarés
+  par la configuration du déploiement), ni un de leurs parents : un RP ID
+  parent couvrirait les hôtes de toutes les équipes de la zone ;
 * le jeton de service est lu dans un fichier régulier, appartenant à
   l'utilisateur du service, en `0600` (refusé s'il est lisible par d'autres) ;
 * le dossier d'état est privé (`0700`, même propriétaire).
@@ -80,10 +80,10 @@ PROFILES = (PROFILE_STRICT, PROFILE_COMPATIBLE)
 LOGIN_API_CLOSED = "closed"
 LOGIN_API_OPEN = "open"
 LOGIN_APIS = (LOGIN_API_CLOSED, LOGIN_API_OPEN)
-#: toujours réservés, quelle que soit la configuration (décision 0026) : la
-#: zone des hôtes d'équipe et son apex d'approbation ne sont jamais un RP ID
-BUILTIN_RESERVED_ZONES = ("nexlink.ph",)
-BUILTIN_RESERVED_HOSTS = ("ameesh.nexlink.ph",)
+#: #7813 : la zone des hôtes d'équipe et son apex d'approbation ne sont plus
+#: compilés ici ; le déploiement les déclare (`reserved_zones`,
+#: `reserved_hosts`). La propriété de la décision 0026 demeure : un nom
+#: déclaré reste réservé, aucune configuration ne le rend RP ID.
 
 _RP_ID_RE = re.compile(
     r"^(localhost|[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)$")
@@ -221,10 +221,9 @@ class ApproveConfig:
 
     @property
     def reserved(self) -> tuple:
-        """Noms jamais admis comme RP ID (ni leurs parents) : configurés + 0026."""
+        """Noms jamais admis comme RP ID (ni leurs parents) : ceux de la configuration."""
         names: list = []
-        for name in (BUILTIN_RESERVED_ZONES + BUILTIN_RESERVED_HOSTS
-                     + _names(self.reserved_zones) + _names(self.reserved_hosts)):
+        for name in _names(self.reserved_zones) + _names(self.reserved_hosts):
             if name not in names:
                 names.append(name)
         return tuple(names)
@@ -234,7 +233,7 @@ class ApproveConfig:
         return bool(self.tls_cert and self.tls_key)
 
     def _check_reserved(self) -> None:
-        zones = set(BUILTIN_RESERVED_ZONES + _names(self.reserved_zones))
+        zones = set(_names(self.reserved_zones))
         for name in self.reserved:
             if not _RP_ID_RE.fullmatch(name):
                 raise ApproveConfigError("unreadable reserved name: %r (lowercase domain)"

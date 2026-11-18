@@ -269,7 +269,7 @@ def cmd_show(cfg: Config, db, args) -> int:
         print("  exécuteur %s : %s, enrôlé %s par %s, dernier contact %s%s" % (
             row["id"], row["state"], _moment(row["enrolled_ts"]), row["enrolled_by"],
             _moment(row.get("last_seen_ts")),
-            ", appareil Nexlink lié" if row.get("device_key_sha256") else ""))
+            ", appareil lié" if row.get("device_key_sha256") else ""))
         if row.get("revoked_ts"):
             print("    révoqué %s par %s : %s" % (_moment(row["revoked_ts"]), row["revoked_by"],
                                                   row.get("revoked_why") or ""))
@@ -505,7 +505,8 @@ def _parser() -> argparse.ArgumentParser:
         if name == "enroll":
             d.add_argument("--label", default="")
             d.add_argument("--attestation", default=None,
-                           help="fichier JSON ameesh-device-attestation/1 (Nexlink)")
+                           help="fichier JSON ameesh-device-attestation/1 (attestation "
+                                "d'appareil)")
     d = dsub.add_parser("show")
     d.add_argument("--home", default=None)
     d.add_argument("--json", action="store_true")

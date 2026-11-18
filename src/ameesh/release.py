@@ -903,6 +903,20 @@ def _catchup(cfg, args) -> int:
     return 0
 
 
+def _project_name(cfg, args) -> str:
+    """The project named by ``--project``, else the configured default (#7813).
+
+    The core compiles no client project name: ``release.default_project`` names
+    it, or the only project under ``release.projects`` is the default, and
+    otherwise the caller must choose."""
+    from . import release_cutoff
+    if args.project:
+        return args.project
+    if cfg is None:
+        raise release_cutoff.ReleaseError("--project is required")
+    return release_cutoff.default_project(cfg)
+
+
 def _attest(cfg, args) -> int:
     """`ameesh release attest` (#6020): a reserved note on the attestation lot.
 
@@ -915,9 +929,10 @@ def _attest(cfg, args) -> int:
     from .db import open_db
     db = open_db(cfg)
     try:
+        name = _project_name(cfg, args)
         declared = release_cutoff.projects(cfg) if cfg is not None else {}
-        project = declared.get(args.project)
-        model = project.model if project is not None else args.project
+        project = declared.get(name)
+        model = project.model if project is not None else name
         provider = release_cutoff.release_provider(model)
         if provider is None:
             raise release_cutoff.ReleaseError(
@@ -930,7 +945,7 @@ def _attest(cfg, args) -> int:
                 raise release_cutoff.ReleaseError("--skip requires --reason")
             actor = work.corrector(cfg, db, args.actor, what="release attest --skip",
                                    history=False)
-            text = provider.skip_text(args.project, args.version, args.reason)
+            text = provider.skip_text(name, args.version, args.reason)
         else:
             if args.actor:
                 raise release_cutoff.ReleaseError(
@@ -944,14 +959,14 @@ def _attest(cfg, args) -> int:
             if not args.sha or not re.fullmatch(r"[0-9a-f]{40}", args.sha):
                 raise release_cutoff.ReleaseError("--sha: the full tagged commit is required")
             text = provider.attestation_text(
-                args.project, args.version, sha=args.sha,
+                name, args.version, sha=args.sha,
                 runs=provider.parse_runs(args.run),
                 migrations=provider.parse_migrations(args.migration))
-        lot = provider.write_decision(db, args.project, args.version,
+        lot = provider.write_decision(db, name, args.version,
                                       "skipped" if args.skip else "attested",
                                       text, actor)
         print("release %s %s: %s noted on lot #%d by %s; the release tick checks it"
-              % (args.project, args.version, "skip" if args.skip else "attestation",
+              % (name, args.version, "skip" if args.skip else "attestation",
                  lot, actor))
         return 0
     except (work.WorkError, release_cutoff.ReleaseError) as exc:
@@ -1042,7 +1057,7 @@ def _abandon(cfg, args) -> int:
     db = None
     try:
         declared = release_cutoff.projects(cfg)
-        name = args.project or "nexlink"
+        name = _project_name(cfg, args)
         if name not in declared:
             raise release_cutoff.ReleaseError(
                 "project %r is not declared under release.projects" % name)
@@ -1253,7 +1268,9 @@ def add_parser(sub, func) -> None:
         "attest", help="#6020: the staging agent attests a handed-over release staging "
                        "(migrations, then the staging dispatches) on the cutoff's "
                        "attestation lot; --skip: the pilot stops waiting")
-    attest_p.add_argument("--project", default="nexlink")
+    attest_p.add_argument("--project", default=None,
+                          help="release project; default: release.default_project, "
+                               "else the only project under release.projects")
     attest_p.add_argument("--version", required=True)
     attest_p.add_argument("--sha", default=None, help="the tagged commit")
     attest_p.add_argument("--run", action="append", default=[],
@@ -1271,7 +1288,9 @@ def add_parser(sub, func) -> None:
                         "whose final-tree CI part is conclusively red; no tag, no "
                         "staging, no deployment; #7584: only on the elected release "
                         "host")
-    abandon_p.add_argument("--project", default="nexlink")
+    abandon_p.add_argument("--project", default=None,
+                           help="release project; default: release.default_project, "
+                                "else the only project under release.projects")
     abandon_p.add_argument("--reason", required=True)
     abandon_p.add_argument("--actor", default=None,
                            help="at a human terminal: human:<id>")

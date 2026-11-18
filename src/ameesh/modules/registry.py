@@ -359,6 +359,31 @@ def _providers(declared, getter_name, what):
     return found
 
 
+def _declared_schemas(declared, what):
+    """`tuple` of schema names a built-in module declares (#7813).
+
+    A schema name is a contract string (``nexlink-fingerprints/1``), not a
+    provider: the core reads it to accept an old name beside its own generic
+    one. Only built-in tooling modules are read here, like ``_providers``: the
+    bare profile declares no alias. A name declared twice is refused rather
+    than silently ordered."""
+    found = {}
+    for provider, module in sorted(_builtin().items()):
+        names = getattr(module, declared, ()) or ()
+        if (not isinstance(names, (list, tuple)) or any(
+                not isinstance(name, str) or not name.strip()
+                or any(char.isspace() for char in name) for name in names)
+                or len(set(names)) != len(names)):
+            raise ValueError("module %r: %s must be unique non-empty schema names"
+                             % (provider, declared))
+        for name in names:
+            if name in found:
+                raise ValueError("duplicate %s: %r (modules %s and %s)"
+                                 % (what, name, found[name], provider))
+            found[name] = provider
+    return tuple(sorted(found))
+
+
 def _release_providers():
     """`{model: (module_name, getter)}` of the built-in release providers."""
     return _providers("RELEASE_MODELS", "release_model", "release model")
@@ -427,6 +452,24 @@ def train_contract(name):
         return None
     _provider, getter = found
     return getter(name)
+
+
+def fingerprint_schemas():
+    """Historical fingerprint page schemas the built-in modules declare (#7813).
+
+    The core reads its generic ``ameesh-fingerprints/1`` page; a module whose
+    application still serves an older name declares it here, so that page stays
+    read without changing the application."""
+    return _declared_schemas("FINGERPRINT_SCHEMAS", "fingerprint page schema")
+
+
+def dispatch_plan_schemas():
+    """Historical CI dispatch-plan schemas the built-in modules declare (#7813).
+
+    The core expects its generic ``ameesh-dispatch-due-parts/1`` plan; a module
+    whose repository planner still emits an older name declares it here, so the
+    planner stays unchanged on its side."""
+    return _declared_schemas("DISPATCH_PLAN_SCHEMAS", "dispatch plan schema")
 
 
 def release_reserved_prefixes():

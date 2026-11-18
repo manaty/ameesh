@@ -26,9 +26,9 @@
     tour — les relevés natifs de la même tranche ne sont pas recomptés.
 
 Le barème est un fichier JSON (USD par million de jetons, entrée
-`[entrée, entrée en cache, sortie]`), lu dans `$AMEESH_PRICES` ou au chemin par
-défaut du poste de travail ; les modèles qu'il ne nomme pas retombent sur les
-défauts ci-dessous. Il est modifiable sans migration.
+`[entrée, entrée en cache, sortie]`), lu dans `$AMEESH_PRICES` ou à
+`~/.config/ameesh/prices.json` ; les modèles qu'il ne nomme pas retombent sur
+les défauts ci-dessous. Il est modifiable sans migration.
 
 **Garde-fou de rythme** : un forfait avance trop vite quand son utilisation
 atteint `min(90 %, part écoulée de la fenêtre + 10 points)`. La marge de dix
@@ -118,6 +118,11 @@ DEFAULT_PRICES = {
     "claude-haiku-5-5": [0.50, 0.05, 2.50],
     "claude-haiku-4-5": [1.0, 0.10, 5.0],
 }
+
+#: #7813 : chemin par défaut du barème, sous la configuration d'ameesh. Le
+#: cœur ne lit plus l'ancien chemin d'un client : un déploiement qui garde son
+#: fichier ailleurs le déclare lui-même (`AMEESH_PRICES`, ou son profil).
+DEFAULT_PRICES_FILE = "~/.config/ameesh/prices.json"
 
 #: L225 : modèles facturés selon la longueur de l'invite de CHAQUE requête
 #: (entrée + cache relu + cache écrit) : jusqu'au seuil, le palier bas ;
@@ -1193,7 +1198,7 @@ class CostBook:
     ) -> None:
         self.state_dir = state_dir if state_dir is not None else config_mod.load().state_dir
         self.prices_path = prices_path if prices_path is not None else os.environ.get(
-            "AMEESH_PRICES") or os.path.expanduser("~/.config/nexlink-agents/prices.json")
+            "AMEESH_PRICES") or os.path.expanduser(DEFAULT_PRICES_FILE)
         # sessions Codex : argument > AMEESH_CODEX_SESSIONS (surcharge explicite)
         # > $CODEX_HOME/sessions (comme Codex lui-même) > ~/.codex/sessions
         self.codex_sessions = codex_sessions if codex_sessions is not None else (

@@ -137,6 +137,7 @@ from datetime import datetime
 from urllib.parse import quote
 
 from . import packet_guard, role_run, storage
+from .modules import registry
 
 #: workflows suivis par défaut (nom du fichier), quand le dépôt publie le
 #: workflow des tests L161 : comportement historique, compatible ameesh.
@@ -252,6 +253,10 @@ EXCERPT_LINES = 40
 #: échecs détaillés au plus dans un message (les autres : leur nom)
 DETAILED = 3
 STATUS_SCHEMA = "ameesh-ci-status/1"
+#: #7813 : schéma du plan de dispatch CI que le dépôt produit lui-même
+#: (`scripts/ci/dispatch-due-parts.mjs`). Le cœur lit ce schéma générique ;
+#: un module peut déclarer l'ancien nom de son planificateur en alias.
+DISPATCH_PLAN_SCHEMA = "ameesh-dispatch-due-parts/1"
 #: #845 (arbitrage A du pilote, 14/10) : le relevé « runner busy sans job »
 #: coûte un appel par exécution non conclue (en plus des listes par état et de
 #: celle des runners) : il est mené au plus toutes les `GUARD_SCAN_S` secondes,
@@ -3427,13 +3432,14 @@ def render_status(report: dict) -> list[str]:
                          "run %d --full --reason …`" % (sha, lot))
         else:
             # #3614 : le journal ne dit pas si la forge impose des checks à la
-            # cible ; sans check imposé (Nexlink), le feu atterrit le porteur
+            # cible ; sans check imposé, le feu atterrit le porteur
             # (`fire._carrier_gap`) — la ligne reste conditionnelle.
             lines.append("  packet carrier: no ci-full request on the frozen head %s — if the "
                          "target's forge requires checks (ameesh: `tests` on main), a push run "
                          "of the packet workflow does not produce them and nothing merges it: "
                          "open its PR if none, then `ameesh ci run %d --full --reason …` "
-                         "(#2813); without required checks (Nexlink), the fire lands it. The "
+                         "(#2813); without required checks (a target that imposes none), the "
+                         "fire lands it. The "
                          "journal alone does not tell which: the fire reads the protection and "
                          "answers `not-ready` with this cause when it applies (#3611)"
                          % (sha, lot))
@@ -3848,7 +3854,8 @@ def _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha):
         if proc.returncode:
             raise GelError("repository CI planner refused: " + proc.stderr[-500:])
         report = json.loads(proc.stdout)
-        if (report.get("schema") != "nexlink-dispatch-due-parts/1"
+        schemas = (DISPATCH_PLAN_SCHEMA,) + registry.dispatch_plan_schemas()
+        if (report.get("schema") not in schemas
                 or report.get("ref") != branch or report.get("head") != sha
                 or report.get("dryRun") is not True or report.get("failures")):
             raise GelError("repository CI planner returned an invalid dispatch plan")

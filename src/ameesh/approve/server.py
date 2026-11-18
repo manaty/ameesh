@@ -281,7 +281,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
         service.faults.record(route, exc, subject=service.subject_of(kind or "", token))
 
     def _fingerprints(self, raw_path: str) -> None:
-        """`GET /fingerprints[?since=N]` : une page `nexlink-fingerprints/1`,
+        """`GET /fingerprints[?since=N]` : une page `ameesh-fingerprints/1`,
         au seul porteur du jeton de lecture (route fermée sans lui)."""
         if self.headers.get("Origin") is not None:
             raise ApproveError(403, "origin", "fingerprints: no browser allowed")
