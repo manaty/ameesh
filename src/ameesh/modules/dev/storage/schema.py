@@ -70,13 +70,27 @@ def _core_schema(db) -> str:
     return schema or "public"
 
 
+def _registry_present(db, core: str) -> bool:
+    """Le registre ``module_schemas`` existe-t-il dans le schéma noyau ?
+
+    ``to_regclass`` rend NULL pour une relation absente au lieu de lever :
+    sur une base d'avant P1a, la transaction de l'appelant reste utilisable
+    (relecture cx2 #226204). Le registre présent mais illisible, lui, lève :
+    on ne simule pas un repli que PostgreSQL a déjà invalidé.
+    """
+    rows = _raw(db).query(
+        "SELECT to_regclass(%s) IS NOT NULL AS present",
+        ("%s.module_schemas" % _quote(core),))
+    return bool(rows and (rows[0] or {}).get("present"))
+
+
 def schema_name(db) -> str:
     """Le schéma physique des tables du module, lu dans ``module_schemas``.
 
     Lecture unique par connexion (cache positif ET négatif : le registre ne
-    change qu'avec les exécuteurs arrêtés). Une base d'avant P1a, un registre
-    illisible ou un nom hors forme retombent sur le schéma noyau : le code
-    fonctionne avant P2 exactement comme avant le lot.
+    change qu'avec les exécuteurs arrêtés). Une base d'avant P1a et un nom
+    hors forme retombent sur le schéma noyau ; un registre présent mais
+    illisible lève, sans repli silencieux.
     """
     connection = _connection(db)
     cached = getattr(connection, "_ameesh_dev_schema", None)
@@ -84,18 +98,16 @@ def schema_name(db) -> str:
         return cached
     core = _core_schema(db)
     found = core
-    try:
-        # la connexion brute : passe par `ModuleDb` rappellerait `qualify`,
+    if _registry_present(db, core):
+        # la connexion brute : passer par `ModuleDb` rappellerait `qualify`,
         # qui rappellerait `schema_name` (récursion).
         rows = _raw(db).query(
             "SELECT schema_name FROM %s.module_schemas WHERE module = %%s"
             % _quote(core), (MODULE,))
-    except Exception:  # noqa: BLE001 - registre absent : avant P1a/P2
-        rows = []
-    if rows:
-        candidate = str((rows[0] or {}).get("schema_name") or "")
-        if SCHEMA_NAME.fullmatch(candidate):
-            found = candidate
+        if rows:
+            candidate = str((rows[0] or {}).get("schema_name") or "")
+            if SCHEMA_NAME.fullmatch(candidate):
+                found = candidate
     try:
         connection._ameesh_dev_schema = found
     except Exception:  # noqa: BLE001 - proxy sans attributs : on relira

@@ -17,11 +17,15 @@ Deux garanties, sans base :
 from __future__ import annotations
 
 import ast
+import dataclasses
 from pathlib import Path
 import re
 import unittest
 
+from ameesh import db as db_mod
 from ameesh.modules.dev.tables import TABLES
+
+from . import support
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src" / "ameesh"
@@ -156,12 +160,15 @@ class DevBoundaryTest(unittest.TestCase):
 
             def query(self, sql, params=()):
                 self.seen.append((sql, params))
-                if self.schema_name is None:
-                    return []
+                if "to_regclass" in sql:
+                    return [{"present": self.schema_name is not None}]
                 return [{"schema_name": self.schema_name}]
 
         before = _Db()
         self.assertEqual(schema.relation(before, "ci_runs"), '"public"."ci_runs"')
+        # avant P1a, le registre n'est même pas lu : la transaction survit
+        self.assertEqual(len(before.seen), 1)
+        self.assertIn("to_regclass", before.seen[0][0])
         after = _Db("t_x__dev")
         # le nom physique suit la ligne du registre, sans second changement
         self.assertEqual(schema.relation(after, "ci_runs"), '"t_x__dev"."ci_runs"')
@@ -187,7 +194,8 @@ class DevBoundaryTest(unittest.TestCase):
 
         db = _Db()
         self.assertEqual(schema.relation(db, "ci_runs"), '"Mesh_$1"."ci_runs"')
-        self.assertIn('"Mesh_$1".module_schemas', db.seen[0][0])
+        # la sonde passe le nom du registre en paramètre, jamais en littéral
+        self.assertIn('"Mesh_$1".module_schemas', db.seen[0][1][0])
 
         class _EmptyCfg:
             schema = ""
@@ -208,6 +216,8 @@ class DevBoundaryTest(unittest.TestCase):
             cfg = _Cfg()
 
             def query(self, sql, params=()):
+                if "to_regclass" in sql:
+                    return [{"present": True}]
                 return [{"schema_name": "t_x__dev"}]
 
         sql = ("SELECT ci_runs FROM ci_runs -- ci_runs\n"
@@ -232,6 +242,44 @@ class DevBoundaryTest(unittest.TestCase):
         for column in tuple(REWRITTEN) + tuple(KEPT):
             table = column.split(".", 1)[0]
             self.assertIn(table, TABLES, column)
+
+
+class MissingRegistryDbTest(support.PgTestCase):
+    """cx2 #226204 : avant P1a, sonder le registre ne condamne pas la transaction.
+
+    Un ``SELECT … module_schemas`` sur une base qui n'a pas encore la
+    migration 0591 lève et invalide la transaction (psql ferme même son
+    processus sous ``ON_ERROR_STOP``). Le résolveur doit sonder la relation
+    avec ``to_regclass`` avant de la lire, sur les deux pilotes réels.
+    """
+
+    def test_relation_before_p1a_leaves_the_transaction_usable(self):
+        from ameesh.modules.dev.storage import schema
+
+        name = self.schema + "_noreg"
+        self.create_schema(name)
+        self.addCleanup(self.db.execute,
+                        'DROP SCHEMA IF EXISTS "%s" CASCADE' % name)
+        tried = []
+        for driver in ("psql", "psycopg"):
+            try:
+                conn = db_mod.connect(
+                    dataclasses.replace(self.cfg, schema=name),
+                    driver=driver, writer=False)
+            except db_mod.Unavailable:
+                continue
+            tried.append(driver)
+            self.addCleanup(conn.close)
+            table = "probe_%s" % driver
+            with conn.transaction() as tx:
+                self.assertEqual(schema.relation(tx, "work_items"),
+                                 '"%s"."work_items"' % name)
+                tx.execute('CREATE TABLE "%s".%s (id int)' % (name, table))
+                tx.execute('INSERT INTO "%s".%s VALUES (1)' % (name, table))
+            self.assertEqual(
+                conn.query('SELECT count(*) AS n FROM "%s".%s' % (name, table))[0]["n"],
+                1, driver)
+        self.assertTrue(tried, "aucun pilote Postgres réel disponible")
 
 
 if __name__ == "__main__":
