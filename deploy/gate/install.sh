@@ -247,9 +247,9 @@ run install -d -m 0700 -o "$GATE_USER" -g "$GATE_GROUP" "$ROOT/gcloud" "$ROOT/gh
 say "gate venv"
 if [ -z "$WHEEL" ]; then
   # pip runs the build backend of the source tree as root: every path
-  # component and every entry must be root-owned and non-writable by the
-  # client, and no symlink or mount may carry client content (review N2/B of
-  # #7767). A wheel is the safer path.
+  # component and every entry must be root-owned and carry no group or other
+  # write bit, and no symlink or mount may carry client content (review N2/B
+  # of #7767). A wheel is the safer path.
   path=$SRC
   while [ "$path" != / ]; do
     [ "$(stat -c '%u' "$path")" = 0 ] || \
@@ -260,7 +260,7 @@ if [ -z "$WHEEL" ]; then
     fi
     path=$(dirname "$path")
   done
-  unsafe=$(find "$SRC" \( ! -user 0 -o -type l -o -perm -022 \) -print -quit) || \
+  unsafe=$(find "$SRC" \( ! -user 0 -o -type l -o -perm /022 \) -print -quit) || \
     die "source tree $SRC cannot be fully checked; use --wheel FILE"
   [ -z "$unsafe" ] || \
     die "source tree $SRC has an unsafe entry (not root-owned, symlink or writable): $unsafe; use --wheel FILE"

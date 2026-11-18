@@ -2,6 +2,8 @@
 import json
 import os
 import grp
+import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -632,6 +634,49 @@ class CheckPolicyTest(unittest.TestCase):
         cfg = SimpleNamespace(canon="", extra_canons=())
         with self.assertRaisesRegex(gate.PolicyError, "applied canon"):
             gate._check_policy(policy, cfg)
+
+
+class InstallerTreeCheck(unittest.TestCase):
+    """Le contrôle de l'arbre source avant le pip root (B de la revue).
+
+    `find -perm -022` exige g+w ET o+w : un fichier root:groupe-client en 0664
+    passait, alors que pip exécute ensuite son backend de build en root. Le
+    test lit l'expression exacte d'install.sh et la rejoue sur un arbre
+    temporaire ; seul le bras de propriété est neutralisé, faute de root dans
+    le test, pour que le mode décide.
+    """
+
+    def _command(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, "deploy", "gate", "install.sh")
+        with open(path, encoding="utf-8") as handle:
+            script = handle.read()
+        match = re.search(r'unsafe=\$\((find .*?)\) \|\|', script)
+        self.assertIsNotNone(match, "install.sh: arbre source non vérifié")
+        return match.group(1).replace("! -user 0", "! -user %d" % os.geteuid())
+
+    def _unsafe_entry(self, directory):
+        result = subprocess.run(
+            ["bash", "-c", self._command()],
+            env=dict(os.environ, SRC=directory),
+            capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+
+    def test_a_group_only_writable_entry_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "backend.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("import os\n")
+            os.chmod(path, 0o664)
+            self.assertEqual(self._unsafe_entry(directory), path)
+
+    def test_a_root_private_entry_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "backend.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("import os\n")
+            os.chmod(path, 0o644)
+            self.assertEqual(self._unsafe_entry(directory), "")
 
 
 if __name__ == "__main__":
