@@ -125,6 +125,11 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #7672 (0594) : `in_reply_to` est l'identifiant interne de corrélation
+    # d'une réponse à sa demande, lu par la surface publique de réponse et le
+    # protocole de tour, jamais par un rôle superviseur ; colonne fermée aux
+    # deux rôles, aucun GRANT modifié.
+    "agent_mailbox": {"in_reply_to"},
     # #7518 (0581): internal monetary ledger, read through the budget API.
     # No supervisor reader is required; source/pricing stay private too.
     "credit_cycles": {"id", "billing_account", "credit_micro", "cap_micro",
