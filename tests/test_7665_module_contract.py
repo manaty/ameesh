@@ -13,6 +13,7 @@ red, never the production of a module.
 from __future__ import annotations
 
 import ast
+import atexit
 import configparser
 import copy
 import dataclasses
@@ -23,6 +24,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -78,8 +80,61 @@ def package():
     return project, entries
 
 
-def install(directory, entries=None, name=None, version=None):
-    """Install a distribution's metadata in `directory`, as pip would."""
+#: The witness as pip installs it, built once per test process; install() hands
+#: each test its own copy of this site (#7704 N3: a real distribution, not
+#: synthetic metadata, and code loaded from the installed wheel).
+_WITNESS_SITE = None
+
+
+def _pip(*args):
+    """Run pip in this interpreter; a missing pip leaves the test non-conclusive."""
+    if util.find_spec("pip") is None:
+        raise unittest.SkipTest("pip absent: the witness wheel cannot be built")
+    result = subprocess.run([PY, "-m", "pip", "--disable-pip-version-check",
+                             "--no-input"] + list(args),
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise AssertionError("pip %s failed:\n%s%s"
+                             % (args[0], result.stdout, result.stderr))
+    return result
+
+
+def _built_site():
+    """Build the witness wheel and install it, from a copy outside the repository.
+
+    The copy is what a consumer gets: building in place would let files that
+    `examples/` keeps beside the sources hide a packaging defect. Pip builds
+    with the backend and requirements declared by the witness's [build-system],
+    then installs the wheel the distribution actually ships."""
+    global _WITNESS_SITE
+    if _WITNESS_SITE is None:
+        build = Path(tempfile.mkdtemp(prefix="w7665-build-"))
+        atexit.register(shutil.rmtree, build, True)
+        source = build / "source"
+        shutil.copytree(WITNESS, source,
+                        ignore=shutil.ignore_patterns("__pycache__", "build", "*.egg-info"))
+        wheels = build / "wheels"
+        wheels.mkdir()
+        # Pas de --no-build-isolation : le venv de test ne porte pas
+        # setuptools ; pip fournit le backend déclaré, comme chez un consommateur.
+        _pip("wheel", "--no-deps", "--wheel-dir", str(wheels), str(source))
+        (wheel,) = wheels.glob("*.whl")
+        _WITNESS_SITE = build / "site"
+        _pip("install", "--no-deps", "--no-index", "--target", str(_WITNESS_SITE), str(wheel))
+    return _WITNESS_SITE
+
+
+def install(directory):
+    """Install the witness distribution into `directory`, from its built wheel."""
+    shutil.copytree(_built_site(), directory)
+    return directory
+
+
+def fake_installation(directory, entries=None, name=None, version=None):
+    """Write distribution metadata by hand: the refusal paths only.
+
+    A real witness build never declares a reserved or mismatched entry point,
+    so those tests need arbitrary metadata, not the shipped distribution."""
     project, declared = package()
     name, version = name or project["name"], version or project["version"]
     info = Path(directory) / ("%s-%s.dist-info" % (name.replace("-", "_"), version))
@@ -92,7 +147,7 @@ def install(directory, entries=None, name=None, version=None):
 
 
 def witness_path(site):
-    return os.pathsep.join([str(site), str(WITNESS), support.SRC])
+    return os.pathsep.join([str(site), support.SRC])
 
 
 def command(name):
@@ -274,6 +329,22 @@ class CliContractTest(unittest.TestCase):
     def ameesh(self, *args, env=None):
         return client.run(EXECUTABLES["ameesh"], args, env=env or self.env)
 
+    def test_the_witness_is_installed_from_its_built_wheel(self):
+        """#7704 N3: no source shortcut — pip built the wheel from a copy outside
+        the repository and the executable imports the installed distribution."""
+        self.assertNotIn(str(WITNESS), self.env["PYTHONPATH"].split(os.pathsep))
+        (record,) = self.site.glob("ameesh_contract_witness-*.dist-info/RECORD")
+        recorded = {line.split(",")[0]
+                    for line in record.read_text(encoding="utf-8").splitlines()}
+        self.assertLessEqual({"ameesh_contract_witness.py", "contract_witness_client.py"},
+                             recorded)
+        probe = subprocess.run(
+            [PY, "-c", "import ameesh_contract_witness as m; print(m.__file__)"],
+            env=self.env, capture_output=True, text=True)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(Path(probe.stdout.strip()),
+                         self.site / "ameesh_contract_witness.py")
+
     def test_the_help_documents_exactly_the_frozen_options(self):
         """A frozen option missing from `--help` is a break; an option the help
         documents beyond the surface is compatible, but it is a public element as
@@ -338,7 +409,7 @@ class CliContractTest(unittest.TestCase):
         self.assertEqual([row["name"] for row in document["modules"]], [witness.NAME])
 
     def test_a_reserved_or_mismatched_entry_point_is_refused(self):
-        site = install(self.tmp / "refused", entries={
+        site = fake_installation(self.tmp / "refused", entries={
             "list": "ameesh_contract_witness", "other-name": "ameesh_contract_witness"},
             name="ameesh-witness-refused")
         env = dict(self.env, PYTHONPATH=os.pathsep.join([str(site), self.env["PYTHONPATH"]]))
@@ -371,9 +442,9 @@ class ModuleInterfaceTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.site = install(Path(tmp.name))
+        self.site = install(Path(tmp.name) / "site")
         self.addCleanup(sys.modules.pop, "ameesh_contract_witness", None)
-        patcher = mock.patch.object(sys, "path", [str(WITNESS)] + sys.path)
+        patcher = mock.patch.object(sys, "path", [str(self.site)] + sys.path)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -436,7 +507,7 @@ class ModuleInterfaceTest(unittest.TestCase):
                 entries = {name: "ameesh_contract_witness"}
                 tmp = tempfile.TemporaryDirectory()
                 self.addCleanup(tmp.cleanup)
-                site = install(Path(tmp.name), entries=entries, name="ameesh-witness-n")
+                site = fake_installation(Path(tmp.name), entries=entries, name="ameesh-witness-n")
                 with mock.patch.object(witness, "NAME", name), \
                         mock.patch.dict(sys.modules, {"ameesh_contract_witness": witness}), \
                         installed_points(site):
