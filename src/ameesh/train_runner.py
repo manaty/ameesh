@@ -37,6 +37,13 @@ ROLE_RETRY_S = 60.0
 #: #3366: how long the service waits after a canon-pin reload refusal (an
 #: unreadable or invalid configuration): it retries instead of composing.
 RELOAD_RETRY_S = 60.0
+#: #7803: a failed passage (an exception of `scheduled_step`, typically a
+#: connection closed mid-pass) is replayed after this delay. Without it the
+#: passage's deadline was dropped for good: the lease stayed renewed while
+#: durable requalification requests waited for an external event that no
+#: producer owed them. The retry re-enters `pass_once`, so it also applies the
+#: pending requests within this bound; it never polls CI or widens authority.
+PASSAGE_RETRY_S = 60.0
 #: #3134: how long the runner's shutdown waits for a train effect still in
 #: flight (push, promotion, SQL write) before releasing the lease. Far below
 #: the runner units' `TimeoutStopSec`; past it the lease expires with its TTL.
@@ -442,7 +449,8 @@ class Service:
     """One independent runner task: startup, canon cutoffs and explicit events.
 
     No timer polls CI or reviews. A producer supplies explicit ``event`` hints;
-    a failed passage waits for a new event rather than retrying by itself.
+    a failed passage is replayed once after ``PASSAGE_RETRY_S`` (#7803), so a
+    transient failure never leaves the durable work without a future passage.
     Connections and runtime ports never survive a passage.
     """
     def __init__(self, cfg, passages, *, stop, report, clock=time.time, lease=None,
@@ -551,7 +559,10 @@ class Service:
             return deadline
         except Exception as exc:
             self.report("train passage failed (%s: %s)" % (type(exc).__name__, exc))
-            return None
+            # #7803: keep a future passage. `None` dropped this index's
+            # deadline for good, while the service lease kept renewing: the
+            # durable requalification queue then waited for an external event.
+            return self.clock() + PASSAGE_RETRY_S
         finally:
             db.close()
 
