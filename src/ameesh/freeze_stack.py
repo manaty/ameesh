@@ -38,7 +38,7 @@ from ameesh import work_lifecycle as lifecycle
 
 from typing import Iterable, Mapping, Sequence
 
-from . import plan_git, work
+from . import plan_git, storage, work
 
 #: un lot terminé ne peut plus être un parent d'empilement
 DONE_STATES = lifecycle.COMPLETED
@@ -372,3 +372,71 @@ def guard(db, item, head: str, *, repo: str | None = None,
     if fence is None:
         return ""
     raise work.WorkError(message(fence))
+
+
+#: cause du refus de base de démarrage (#7760), même forme que ci-dessus
+START_BASE = "start-base"
+
+
+def _commit_known(repo: str, sha: str) -> bool:
+    """Le commit est-il lisible dans ce clone ? Illisible = pas de preuve."""
+    if not repo or not sha:
+        return False
+    try:
+        return plan_git._git(repo, "cat-file", "-e", sha + "^{commit}").returncode == 0
+    except Exception:  # noqa: BLE001 - lecture impossible : le doute ne refuse pas
+        return False
+
+
+def start_pairs(db, lot: int) -> list[dict]:
+    """#7760 : les lots sur lesquels `lot` DÉMARRE — occupants `validated`
+    dont il chevauche l'empreinte et dont il déclare la dépendance, avec leur
+    tête gelée. Un lecteur en panne ou un occupant sans gel ne fabrique aucune
+    paire : le doute n'ajoute pas de refus (comme `candidates`)."""
+    try:
+        rows = storage.of(db).work_footprints.overlapping(int(lot))
+    except Exception:  # noqa: BLE001 - empreintes illisibles : aucune preuve
+        return []
+    found: dict[int, str] = {}
+    for row in rows or ():
+        if not (row or {}).get("start_on"):
+            continue
+        try:
+            other = int((row or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not other or other == int(lot):
+            continue
+        frozen = _sha((row or {}).get("other_frozen_sha")) or _freeze_sha(db, other)
+        if frozen:
+            found.setdefault(other, frozen)
+    return [{"lot": other, "frozen": frozen}
+            for other, frozen in sorted(found.items())]
+
+
+def guard_start_base(db, item, head: str, *, repo: str | None = None) -> str:
+    """#7760 : refuse de geler un lot qui ne démarre pas sur la tête gelée du
+    lot validé qu'il chevauche et dont il déclare la dépendance.
+
+    Le démarrage a été permis sur cette tête (#7760) : la branche doit la
+    contenir, sinon le dépendant fusionnerait une base antérieure à celle qui
+    a été relue. Un commit absent du clone ou un gel illisible ne refuse pas
+    (le doute ne bloque pas, règle de `guard`). Rend `""` quand tout est
+    prouvé ; lève `work.WorkError` sinon. Aucune écriture.
+    """
+    lot = int((item or {}).get("id") or 0)
+    frozen_head = _sha(head)
+    if not repo or not frozen_head or not lot:
+        return ""
+    for pair in start_pairs(db, lot):
+        parent, frozen = int(pair["lot"]), pair["frozen"]
+        if not _commit_known(repo, frozen):
+            continue
+        if _is_ancestor(repo, frozen, frozen_head):
+            continue
+        raise work.WorkError(
+            "freeze refused (%s): lot #%d starts on validated lot #%d, whose "
+            "frozen head %s is not in %s. Rebase the branch onto that head "
+            "(`git rebase --onto %s <current base> <branch>`), then freeze again"
+            % (START_BASE, lot, parent, frozen[:12], frozen_head[:12], frozen[:12]))
+    return ""

@@ -171,6 +171,21 @@ def not_blocking(alias: str) -> str:
     return "(%s.state IN %s)" % (alias, _DONE_SQL)
 
 
+def start_blocking(dependent: str, blocker: str = "b") -> str:
+    """#7760 : prédicat SQL « ce prérequis retient le DÉMARRAGE du dépendant ».
+
+    La règle de fusion ne bouge pas (`not_blocking` : fusionné seulement).
+    Au démarrage, un prérequis `validated` dont le dépendant chevauche
+    l'empreinte et dont il déclare la dépendance ne retient plus : il démarre
+    sur sa tête gelée, et le composeur les prend ensemble. Tout autre
+    prérequis non fusionné retient, comme avant (#2252).
+
+    `dependent` et `blocker` sont des alias de `work_items`."""
+    from .work_footprints import start_on_sql
+    return ("(NOT " + not_blocking(blocker) + " AND NOT "
+            + start_on_sql(dependent, blocker) + ")")
+
+
 class WorkDependencies(Contract):
     def __init__(self, db):
         self.db = db
@@ -240,6 +255,9 @@ class WorkDependencies(Contract):
         # (`merged`/`promoted`), comme les états de policy, pas le core
         # `delivered`. Le prédicat `blocking` garde sa définition (lifecycle
         # DELIVERED) : seul l'affichage change.
+        # #7760 : `start_on` dit qu'un prérequis `validated` que le dépendant
+        # chevauche ne retient plus le démarrage (la fusion, elle, attend).
+        from .work_footprints import start_on_sql
         return self.db.query("""
             SELECT d.work_item_id, d.blocker_id, d.created_by,
                    extract(epoch FROM d.created_at)::float8 AS created_ts,
@@ -248,8 +266,11 @@ class WorkDependencies(Contract):
                    (SELECT m.sha FROM work_item_milestones m
                      WHERE m.work_item_id = w.id AND m.kind = 'frozen'
                      ORDER BY m.at DESC, m.id DESC LIMIT 1) AS blocker_frozen_sha,
-                   NOT """ + not_blocking("w") + """ AS blocking
-            FROM work_item_dependencies d JOIN work_items w ON w.id = d.blocker_id
+                   NOT """ + not_blocking("w") + """ AS blocking,
+                   """ + start_on_sql("i", "w") + """ AS start_on
+            FROM work_item_dependencies d
+            JOIN work_items w ON w.id = d.blocker_id
+            JOIN work_items i ON i.id = d.work_item_id
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
             " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
 

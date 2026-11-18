@@ -1024,6 +1024,11 @@ def milestone(
         freeze_stack.guard(
             db, item, sha, repo=repo or str(freeze_info.get("repo") or ""),
             target=str(item.get("branch_target") or ""))
+        # #7760 : un lot démarré sur la tête gelée d'un lot validé qu'il
+        # chevauche (dépendance déclarée) ne gèle pas une base antérieure à
+        # cette tête : le gel prouve le démarrage sur la tête relue.
+        freeze_stack.guard_start_base(
+            db, item, sha, repo=repo or str(freeze_info.get("repo") or ""))
         # #5216 : le canon n'a pas de CI ; le contrôle de `canon check` (#5191)
         # refuse ici le lot qui laisse un chemin non léger sans nombre d'avis.
         coverage_note = _canon_review_coverage(
