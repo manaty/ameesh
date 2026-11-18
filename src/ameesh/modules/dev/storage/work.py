@@ -134,9 +134,12 @@ class DevWork(DevDomain):
             pass
         if getattr(raw, "_has_migration_slots", False):
             return True
+        # N (#7650) : une ligne revient toujours ; c'est sa colonne qui dit si
+        # la table existe (l'ancienne requête ne rendait aucune ligne quand
+        # elle manquait).
         found = bool(db.query(
             "SELECT to_regclass(%s) IS NOT NULL AS present",
-            (relation(db, "work_migration_reservations"),)))
+            (relation(db, "work_migration_reservations"),))[0]["present"])
         if found:
             try:
                 raw._has_migration_slots = True
@@ -327,6 +330,10 @@ class DevWork(DevDomain):
         porte sur la cible (réservation à numéro exact, `target_numbers`) ou
         sur une branche (allocation du prochain libre, `repo_numbers`). Tous
         les créneaux réservés du lot sont rendus, pas seulement le scalaire."""
+        # le noyau appelle avec sa transaction brute : la qualification est la
+        # responsabilité du module (il n'importe pas `ModuleDb`), et
+        # `ModuleDb` est idempotent quand la transaction l'est déjà.
+        tx = ModuleDb(tx)
         numbers = sorted({int(item["number"]) for item in (row.get("migrations") or ())
                           if item.get("number") is not None})
         if row.get("migration") is not None and int(row["migration"]) not in numbers:
@@ -362,6 +369,7 @@ class DevWork(DevDomain):
         `work_items_migration_slot_sync` réécrit alors le créneau `default`
         sans rencontrer le doublon du créneau promu. Les slots nommés restent
         intacts : leur identité ne devient jamais `default` (#4430)."""
+        tx = ModuleDb(tx)
         numbers = sorted({int(row["number"]) for row in slots})
         if scalar is not None and int(scalar) not in numbers:
             numbers.append(int(scalar))
@@ -1346,8 +1354,12 @@ class DevWork(DevDomain):
                          branch=None, head_sha=None) -> list[dict]:
         # During additive rollout an older database has no new receipts.
         # Query errors after the prerequisite are not treated as absence.
+        # B1 (#7650) : le nom est passé en paramètre par `relation`, jamais en
+        # littéral — `qualify` laisse les littéraux intacts et la lecture
+        # retomberait sur le `search_path` noyau après P2.
         ready = prerequisite_query(self.db,
-            "SELECT to_regclass('work_packet_snapshots') IS NOT NULL AS ready")
+            "SELECT to_regclass(%s) IS NOT NULL AS ready",
+            (relation(self.db, "work_packet_snapshots"),))
         if not ready or not ready[0]["ready"]:
             return []
         repository = str(repository or "").strip().lower()

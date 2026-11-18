@@ -2843,8 +2843,7 @@ class WorkItems(interface.WorkItems):
                 porte sur la cible (réservation à numéro exact, `target_numbers`) ou
                 sur une branche (allocation du prochain libre, `repo_numbers`). Tous
                 les créneaux réservés du lot sont rendus, pas seulement le scalaire."""
-        from ...modules.dev.storage.schema import ModuleDb as _ModuleDb
-        return self._dev._release_migration(_ModuleDb(tx), item_id, row, why=why, actor=actor)
+        return self._dev._release_migration(tx, item_id, row, why=why, actor=actor)
 
 
     def _release_migration_rows(self, tx, item_id, *, slots, scalar, number, note, actor, state, repo=None):
@@ -2856,8 +2855,7 @@ class WorkItems(interface.WorkItems):
                 `work_items_migration_slot_sync` réécrit alors le créneau `default`
                 sans rencontrer le doublon du créneau promu. Les slots nommés restent
                 intacts : leur identité ne devient jamais `default` (#4430)."""
-        from ...modules.dev.storage.schema import ModuleDb as _ModuleDb
-        return self._dev._release_migration_rows(_ModuleDb(tx), item_id, slots=slots, scalar=scalar, number=number, note=note, actor=actor, state=state, repo=repo)
+        return self._dev._release_migration_rows(tx, item_id, slots=slots, scalar=scalar, number=number, note=note, actor=actor, state=state, repo=repo)
 
     @_retry_deadlock
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor, issue_ref, release=False, release_number=None):
