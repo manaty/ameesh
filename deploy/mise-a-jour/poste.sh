@@ -552,7 +552,17 @@ installer() {
         || { echo "ancienne base pas prête pour $court (ligne ci-dessus) : « $0 migrer $ref » d'abord" >&2; exit 1; }
     fi
   fi
-  [ -L "$PARTAGE/src-current" ] && readlink "$PARTAGE/src-current" > "$TRAVAIL/precedent"
+  # Le venv vivant peut être en retard sur src-current après une passe interrompue.
+  # Le retour doit rétablir le code qui servait réellement les agents.
+  local vivant
+  vivant=$(readlink "$PARTAGE/venv-courant" 2>/dev/null || true)
+  vivant=${vivant##*/}; vivant=${vivant#venv-}
+  if [[ $vivant =~ ^[0-9a-fA-F]{7}$ ]]; then
+    [ -d "$PARTAGE/src-$vivant" ] || { echo "instantané du venv vivant src-$vivant absent : installation refusée, retour impossible" >&2; exit 1; }
+    printf 'src-%s\n' "$vivant" > "$TRAVAIL/precedent"
+  elif [ -L "$PARTAGE/src-current" ]; then
+    readlink "$PARTAGE/src-current" > "$TRAVAIL/precedent"
+  fi
   echo "version précédente : $(cat "$TRAVAIL/precedent" 2>/dev/null || echo '?')"
   if [ -s "$TRAVAIL/precedent" ]; then
     precedent_court=$(basename "$(cat "$TRAVAIL/precedent")"); precedent_court=${precedent_court#src-}
