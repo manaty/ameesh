@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import unittest
+from unittest import mock
 
 from ameesh import pre_act
 
@@ -81,3 +82,16 @@ class PreActTest(unittest.TestCase):
             self.check(Transaction(state="blocked"))
         with self.assertRaises(pre_act.Refused):
             pre_act.inspect(Transaction(), 5772, "bureau", 201, "kms")
+
+    def test_unavailable_database_refuses(self):
+        with mock.patch.object(pre_act.config, "load", return_value=object()), \
+             mock.patch.object(pre_act.db_mod, "open_db", side_effect=OSError("offline")):
+            result = pre_act.main(["--lot", "5772", "--kind", "kms", "--since",
+                                   "2026-11-18T01:00:00Z"])
+        self.assertEqual(result, 1)
+
+    def test_hold_on_act_lot_5772_refuses(self):
+        tx = Transaction(events=[{"id": 8, "note": "hold: séance suspendue", "ts": 150}])
+        with self.assertRaises(pre_act.Refused):
+            pre_act.inspect(tx, 5772, "bureau", 100, "kms")
+        self.assertFalse(tx.writes)
