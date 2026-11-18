@@ -15,7 +15,7 @@ from unittest import mock
 
 from ameesh import model_evaluation_report as report
 
-from .support import PgTestCase
+from .support import PgTestCase, registry_absent
 
 END = datetime(2026, 11, 10, tzinfo=timezone.utc).timestamp()
 START = END - 14 * 86400
@@ -278,11 +278,10 @@ class ReadOnlyReadTest(unittest.TestCase):
         def query(sql, params=()):
             # #7650 : la qualification du schéma `dev` sonde le registre
             # (`module_schemas`) avant de nommer une table. Le double ne simule
-            # que la table du journal, présente sur le schéma noyau ; un
-            # `present=True` à toute requête décrirait un registre présent mais
-            # illisible, que le stockage refuse à juste titre.
-            if "AS readable" in sql:
-                return [{"present": False, "readable": False}]
+            # que la table du journal, présente sur le schéma noyau.
+            probe = registry_absent(sql)
+            if probe is not None:
+                return probe
             return [{"present": True}]
 
         tx.query = query

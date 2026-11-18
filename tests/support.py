@@ -237,6 +237,25 @@ def attendu(texte: str) -> str:
                      for ligne in texte.splitlines())
 
 
+#: #7650 : la qualification du schéma `dev` sonde le registre
+#: `module_schemas` (catalogues, colonne calculée `readable`) au premier
+#: `relation()` d'une connexion. Un double qui refuse toute lecture imprévue,
+#: ou qui répond la même chose à toute requête, reconnaît cette sonde avec
+#: cet assistant et répond « registre absent » : la production retombe alors
+#: sur le schéma noyau, comme avant P1a.
+REGISTRY_PROBE_MARK = "AS readable"
+
+
+def registry_absent(sql: str):
+    """La réponse « registre absent » si `sql` est la sonde de `schema_name`.
+
+    Rend `None` pour toute autre requête : le double garde son propre
+    traitement (refus, réponse constante, lecture réelle)."""
+    if "module_schemas" in sql and REGISTRY_PROBE_MARK in sql:
+        return [{"present": False, "readable": False}]
+    return None
+
+
 def apply_authenticators(db, members, **kwargs) -> dict:
     """CONTEXTE DE TEST EXPLICITE (tests de L6, sans canon git) : écrit le
     registre des authentificateurs depuis une liste de membres.

@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from unittest import mock
 
 from ameesh import pre_act
+from tests import support
 
 
 class Transaction:
@@ -15,6 +16,9 @@ class Transaction:
         self.writes = []
 
     def query(self, sql, params):
+        probe = support.registry_absent(sql)
+        if probe is not None:
+            return probe
         if "FROM work_items" in sql:
             return [{"state": self.state, "now_ts": 200}]
         if "FROM work_item_events" in sql:
