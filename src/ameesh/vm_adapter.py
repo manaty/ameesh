@@ -270,14 +270,17 @@ def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, tar
     """Only necessary capacity: immediate work, scheduled wake or enrolled release."""
     if host in holds:
         return False
-    known = {h for a in listing for h in a.get('admitted_hosts', ())}
+    # #7769: `admitted_hosts` is declarative and nullable (0029). A row outside
+    # `canon sync` carries NULL, which `get` returns as-is: NULL means no
+    # declared admission, as every other reader already treats it.
+    known = {h for a in listing for h in (a.get('admitted_hosts') or ())}
     if host_release.return_targets(control, listing, controls, known_hosts=known, holds=holds):
         return True
     available = host_release._open_hosts(controls, known, holds)
     eligible = {a['name'] for a in listing
-                if host in a.get('admitted_hosts', ()) and a.get('releve') not in ('election', 'preference')
+                if host in (a.get('admitted_hosts') or ()) and a.get('releve') not in ('election', 'preference')
                 and a.get('mode') in (None, 'execute') and a.get('status') != 'stopped'
-                and not (set(a.get('admitted_hosts', ())) - {host}) & available}
+                and not (set(a.get('admitted_hosts') or ()) - {host}) & available}
     if any(lot.get('assignee') in eligible and lot.get('state') not in host_idle.DONE
            and isinstance(lot.get('wake_ts'), (float, int))
            and now <= lot['wake_ts'] <= now + horizon for lot in lots):
