@@ -259,6 +259,14 @@ class Mailbox(interface.Mailbox):
         # (`retire` la prend en exclusif) : un retrait committé après un
         # précontrôle gagne, un retrait en cours attend ce dépôt. Un nom hors
         # du registre (humain, service) n'a pas de ligne et reste déposé.
+        #
+        # #7672/#6881 : le courrier ordinaire ne NOMME pas `in_reply_to`.
+        # Postgres contrôle une colonne nommée dans l'INSERT même quand sa
+        # valeur est NULL, et le droit d'INSERT par colonne du bureau ne
+        # l'inclut pas (aucun GRANT élargi pour un détail de corrélation).
+        # Seul `send_reply` nomme la colonne ; le chemin ordinaire ne la lit
+        # pas non plus dans son RETURNING.
+        reply = in_reply_to is not None
         rows = self.db.query(
             """
             WITH registered AS (
@@ -266,25 +274,28 @@ class Mailbox(interface.Mailbox):
                  WHERE name = %s OR %s = ANY(aliases) FOR SHARE)
             INSERT INTO agent_mailbox
                 (sender, recipient, body, host, kind, payload, work_item_id,
-                 in_reply_to,
-                 signature, signature_key, signed_payload, nonce,
+                 __REPLY_COLUMN__signature, signature_key, signed_payload, nonce,
                  created_at, signature_expires_at)
-            SELECT %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s,
+            SELECT %s, %s, %s, %s, %s, %s::jsonb, %s, __REPLY_VALUE__%s, %s, %s, %s,
                    coalesce(to_timestamp(%s::bigint / 1000000.0), now()),
                    to_timestamp(%s::bigint / 1000000.0)
              WHERE NOT EXISTS (SELECT 1 FROM registered WHERE retired_at IS NOT NULL)
             RETURNING id, extract(epoch from created_at)::float8 AS created_ts,
-                      in_reply_to,
-                      (__SENDER_PROJECT__) AS sender_project,
+                      __REPLY_RETURN__(__SENDER_PROJECT__) AS sender_project,
                       (__RECIPIENT_PROJECT__) AS recipient_project
-            """.replace("__SENDER_PROJECT__", PROJECT_SQL % "agent_mailbox.sender")
+            """.replace("__REPLY_COLUMN__",
+                        "in_reply_to,\n                 " if reply else "")
+               .replace("__REPLY_VALUE__", "%s, " if reply else "")
+               .replace("__REPLY_RETURN__",
+                        "in_reply_to,\n                      " if reply else "")
+               .replace("__SENDER_PROJECT__", PROJECT_SQL % "agent_mailbox.sender")
                .replace("__RECIPIENT_PROJECT__", PROJECT_SQL % "agent_mailbox.recipient"),
             # #4299: the stored names, which 0516 maps from an alias.
             (recipient, recipient, sender, recipient, body, host, kind,
-             json.dumps(payload or {}, ensure_ascii=False), work_item_id,
-             None if in_reply_to is None else int(in_reply_to),
-             signature, signature_key, signed_payload, nonce,
-             created_us, expires_us),
+             json.dumps(payload or {}, ensure_ascii=False), work_item_id)
+            + (() if in_reply_to is None else (int(in_reply_to),))
+            + (signature, signature_key, signed_payload, nonce,
+               created_us, expires_us),
         )
         if not rows:
             raise interface.RecipientRetired(
