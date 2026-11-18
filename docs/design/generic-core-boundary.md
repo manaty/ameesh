@@ -126,6 +126,19 @@ same verb, with a third `git-merge` evidence `{seen: <source>, sha, pr}`; a
 test refuses any new direct call to `work.close_merged` outside the
 `git-merge` connector and `work.record_merge`.
 
+#7637 tranche 4 (#7663) moves the Nexlink release engine into the built-in
+`nexlink` tooling module. The core keeps the `semver` engine
+(`CORE_RELEASE_MODELS`) and reads any other release model through
+`registry.release_model(name)`, which returns the module object declared in
+the Module's `RELEASE_MODELS` (`release` capability). The provider supplies
+`plan`, `execute`, `child_credentials`, the attestation vocabulary and,
+optionally, `abandon`, `validate_project`, `plan_text`, `error_body` and
+`abandon_text`; `work.note` reads the module's `RESERVED_PREFIXES` through
+`registry.release_reserved_prefixes()`. `nexlink` is always-active tooling
+like `dev` and declares no work item type; the bare profile has no built-in
+module, hence no `nexlink` release model and no direct import of the engine.
+The configuration names the model; the core never names the module package.
+
 L100 tranche 1 (#4382) moves the development merge paths into the built-in
 `dev` provider. The `git-merge` action connector lives in
 `modules/dev/git_merge.py`; `connectors.get("git-merge")` reads it through

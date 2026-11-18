@@ -14,8 +14,9 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import alert_briefs, exploitation, nexlink_release as nx
+from ameesh import alert_briefs, exploitation
 from ameesh import release, release_cutoff as rc
+from ameesh.modules.nexlink import release as nx
 
 
 class SendReportThreadTest(unittest.TestCase):

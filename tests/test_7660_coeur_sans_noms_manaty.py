@@ -123,7 +123,7 @@ EXCEPTIONS = {
     ("migrations/0364_key_holders.sql", "smichea"): 2,
     ("release_cutoff.py", "smichea"): 2,
     ("storage/postgres/authority.py", "smichea"): 1,
-    # -- release et canal Nexlink dans le module Nexlink (#7663) : 228
+    # -- release Nexlink dans le module Nexlink (#7663) : 134
     ("approve/config.py", "nexlink"): 2,
     ("ci.py", "nexlink"): 2,
     ("cli.py", "nexlink"): 9,
@@ -132,15 +132,12 @@ EXCEPTIONS = {
     ("host_cli.py", "nexlink"): 2,
     ("incident.py", "nexlink"): 2,
     ("migrations.py", "nexlink"): 2,
-    ("nexlink_release.py", "nexlink"): 51,
     ("notify.py", "nexlink"): 78,
-    ("release.py", "nexlink"): 26,
-    ("release_cutoff.py", "nexlink"): 18,
+    ("release.py", "nexlink"): 3,
     ("role_timers.py", "nexlink"): 1,
     ("server_faults.py", "nexlink"): 1,
     ("train_assembly.py", "nexlink"): 2,
     ("train_contracts.py", "nexlink"): 28,
-    ("work.py", "nexlink"): 2,
     # -- aucune tranche annoncée : organisation Manaty, à décider : 9
     ("alert_briefs.py", "manaty"): 2,
     ("incident.py", "manaty"): 2,

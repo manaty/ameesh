@@ -524,6 +524,11 @@ même nom sur la même ligne.
    `nexlink` de `notify.py` relève de la même décision que la release (spec §5 : « release et
    alertes Nexlink »), mais le corps de #7663 ne cite que la release. Décider : étendre #7663 ou
    ouvrir un lot « alertes Nexlink ».
+   **Tranche 4 faite (#7663)** : le moteur `nexlink_release.py` (51 occurrences) est passé dans
+   `src/ameesh/modules/nexlink/`, hors du scan du cœur ; `release.py` (3 restants),
+   `release_cutoff.py` (0) et `work.py` (0) ne l'importent plus. La dette `#7663` du test descend
+   de 228 à 134 ; les 129 occurrences hors empreinte restent, surtout le canal d'alertes de
+   `notify.py` (78), à ouvrir en lot séparé.
 5. **`manaty` n'a aucune tranche** : 9 occurrences dans 4 fichiers (migrations.py 3,
    alert_briefs.py 2, incident.py 2, packet_guard.py 2). `manaty/ameesh` est le dépôt du cœur,
    `manaty/home` le canon, `manaty/nexlink` un dépôt de projet. Recommandation : les traiter

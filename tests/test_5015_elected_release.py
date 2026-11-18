@@ -51,7 +51,7 @@ class ElectionTest(unittest.TestCase):
 import io, os, tempfile
 from types import SimpleNamespace
 from unittest import mock
-from ameesh import nexlink_release as nx
+from ameesh.modules.nexlink import release as nx
 expected = __import__('sys').argv[1] == 'yes'
 assert ('SUPABASE_ACCESS_TOKEN' in os.environ) == expected
 assert 'OPENAI_API_KEY' not in os.environ
