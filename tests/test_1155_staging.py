@@ -995,6 +995,7 @@ class StagingTest(unittest.TestCase):
         # rejette comme preuve etrangere et n'emet aucune attestation.
         self.assertEqual(trace['rapport']['hote'], 'ameesh-agents-2')
         self.assertEqual(trace['rapport']['sha'], self.sha)
+        self.assertEqual(json.loads(trace['detail']), trace['rapport'])
 
     def test_term_on_same_sha_host_leaves_no_return_to_the_supervisor(self):
         """#6778 : l'arret surveille d'un hote deja au commit vise ne laisse

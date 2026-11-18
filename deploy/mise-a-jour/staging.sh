@@ -1137,7 +1137,7 @@ Trace : $JOURNAL"
 sonde_non_concluante() {  # nom
   local nom=$1 detail
   detail="sante non concluante (code ${SANTE_RC:-?}) : lecture ou sonde non concluante, aucun retour"
-  trace "$nom" sante non-concluant "$detail" "$SANTE_DETAIL"
+  trace "$nom" sante non-concluant "${SANTE_DETAIL:-$detail}" "$SANTE_DETAIL"
   NON_CONCLUANTS+=("$nom")
   echo "!! $nom : $detail ; $nom reste sur $SHA_TRAVE, la sequence continue (mention dans l'attestation)" >&2
   notifier "staging : sante de $nom non concluante, sequence poursuivie sans retour" \
