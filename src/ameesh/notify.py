@@ -1735,7 +1735,11 @@ def empty_state() -> dict:
             #: #7572 B1 : remises à zéro déjà re-briefées après leur passage
             #: (clé de brief → échéance), pour ne pas rouvrir l'épisode à
             #: chaque passe tant que la pause dure.
-            "reset_rebriefed": {}}
+            "reset_rebriefed": {},
+            #: #7749 : avatars sans destinataire vivant déjà journalisés pour
+            #: un brief (clé de brief → raison), pour un seul repli par
+            #: épisode et non un journal à chaque passe.
+            "avatar_brief_fallback": {}}
 
 
 #: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
@@ -3342,6 +3346,32 @@ class Notifier:
             return True
         return bool(row.get("lease_live", True))
 
+    def _brief_avatar_dead(self, name: str, by_name: dict, closed: set) -> str:
+        """Pourquoi un avatar ne lira pas un brief d'alerte ("" s'il peut).
+
+        Mêmes preuves que `alert_briefs._split_live` : pause budget ou
+        opérateur, exécuteur arrêté, hôte aux claims fermés, bail rendu. Un
+        avatar `externe` (session humaine) lit son fil sans bail : seule une
+        ligne arrêtée le rend absent. Un nom hors registre ne reçoit rien.
+        La décision est prise sur le registre de la passe, sans attendre
+        `AVATAR_FALLBACK_S` : un courrier d'alerte qui attendrait un avatar
+        déjà en pause n'aurait aucun détenteur (#7749)."""
+        row = by_name.get(str(name))
+        if row is None:
+            return "not in the registry"
+        if row.get("mode") in ("stopped", "off"):
+            return "executor %s" % row.get("mode")
+        if row.get("mode") == "externe":
+            status = str(row.get("status") or "")
+            if status in ("stopped", "dead", "paused", "error"):
+                return "status %s" % status
+            return ""
+        live, dead = alert_briefs._split_live(
+            {str(name): ""}, {str(name): row}, closed, respect_pause=True)
+        if live:
+            return ""
+        return dead.get(str(name), "unavailable")
+
     def _deliver_avatar(self, entry: dict, avatar: str, human: str,
                         now: float, db) -> bool:
         """Dépose l'alerte dans la boîte de l'avatar (#7634).
@@ -3656,6 +3686,11 @@ class Notifier:
                 # #7572 : l'épisode est clos ; le marqueur d'une remise à
                 # zéro déjà re-briefée ne doit pas suivre une pause ultérieure.
                 (self.state.get("reset_rebriefed") or {}).pop(key, None)
+        # #7749 : un épisode de repli d'avatar se referme avec son alerte.
+        fallback_journal = self.state.get("avatar_brief_fallback") or {}
+        for key in list(fallback_journal):
+            if key not in alive:
+                del fallback_journal[key]
         due = []
         dead_only = set()
         for key, alert in alive.items():
@@ -3739,8 +3774,40 @@ class Notifier:
                 except Exception as exc:  # noqa: BLE001 - brief par rôles quand même
                     self.log("[%s] human route unreadable (%s)" % (kind, exc))
             avatar = avatars_by_human.get(human) if human else None
-            desks = () if avatar else tuple(avatars.configured_desks(
-                self.cfg, human, listing, alert.get("project")))
+            avatar_name, avatar_dead = avatar, ""
+            if avatar:
+                # #7749 : un avatar déclaré mais sans destinataire vivant
+                # (pause budget, exécuteur arrêté, bail rendu) ne prend pas
+                # la route humaine ; la route configurée de l'humain reprend,
+                # puis l'auditeur. Le repli se dit une fois par épisode.
+                avatar_dead = self._brief_avatar_dead(avatar, by_name, closed)
+                if avatar_dead:
+                    avatar = None
+            if avatar:
+                desks = ()
+                route_names = ()
+            else:
+                desks = tuple(avatars.configured_desks(
+                    self.cfg, human, listing, alert.get("project")))
+                # L'avatar mort garde son fil lisible en dernier recours
+                # (#3036), seulement quand aucune route configurée n'existe :
+                # sinon le texte nommerait l'avatar absent au lieu du bureau.
+                route_names = desks or ((avatar_name,) if avatar_dead else ())
+            if avatar_dead:
+                journal = self.state.setdefault("avatar_brief_fallback", {})
+                if journal.get(key) != avatar_dead:
+                    journal[key] = avatar_dead
+                    if desks:
+                        route = "configured desk %s" % ", ".join(desks)
+                    elif route_names:
+                        route = "readable thread %s" % ", ".join(route_names)
+                    else:
+                        route = "auditor"
+                    self.log("[%s] avatar %s not live (%s): human route by %s"
+                             % (kind, avatars_by_human.get(human), avatar_dead, route))
+                    self._event(db, "avatar.brief_fallback", key, alert)
+            else:
+                (self.state.get("avatar_brief_fallback") or {}).pop(key, None)
             # #3036 : les destinataires écartés par la vivacité, pour que les
             # passes suivantes sachent qu'il reste quelqu'un à remettre.
             dead: dict = {}
@@ -3782,7 +3849,7 @@ class Notifier:
                     module_auditors if kind == "module_deviation" else auditors,
                     orchestrator_names=module_orchestrators,
                     closed_hosts=closed, dead_out=dead, covered=covered,
-                    avatar_names=(avatar,) if avatar else (), desk_names=desks)
+                    avatar_names=(avatar,) if avatar else (), desk_names=route_names)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 unevaluated.add(key)
@@ -3795,14 +3862,18 @@ class Notifier:
             if kind == "slo_breach":
                 # #7634 : la copie de la route humaine externe va au fil
                 # lisible, sans boîte que personne ne réveille. L'avatar
-                # résolu par le routeur d'abord ; un target qui nomme
-                # directement un agent externe (alertes écrites avant #7634,
-                # état repris au déploiement) garde sa copie au fil, sans nom
-                # d'avatar en dur. Aucune exception `home` (#2640) : les lots
-                # du canon sont `app=ameesh` (#2511).
+                # résolu par le routeur d'abord ; #7749 : quand il est sans
+                # destinataire vivant, la route configurée de l'humain
+                # (`desks`) prend sa place, avec la même copie au fil si elle
+                # est `externe`. Un target qui nomme directement un agent
+                # externe (alertes écrites avant #7634, état repris au
+                # déploiement) garde sa copie au fil, sans nom d'avatar en
+                # dur. Aucune exception `home` (#2640) : les lots du canon
+                # sont `app=ameesh` (#2511).
                 human_targets = alert.get("targets") or ()
-                thread_desks = ([str(avatar)] if avatar and "avatar" in human_targets
-                                else [])
+                route = ([str(avatar)] if avatar
+                         else [str(name) for name in route_names])
+                thread_desks = (route if "avatar" in human_targets else [])
                 thread_desks += [str(name) for name in human_targets
                                  if name not in ("assignee", "pilot",
                                                  alert_briefs.AUDITOR_NAME, "avatar")]
