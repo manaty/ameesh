@@ -246,12 +246,24 @@ run install -d -m 0700 -o "$GATE_USER" -g "$GATE_GROUP" "$ROOT/gcloud" "$ROOT/gh
 
 say "gate venv"
 if [ -z "$WHEEL" ]; then
-  # pip runs the build backend of the source tree as root: the tree must not
-  # be writable by the client account (review N2 of #7767).
-  [ "$(stat -c '%u' "$SRC")" = 0 ] || \
-    die "source tree $SRC is not root-owned; pip would run its build backend as root. Use a root-owned checkout or --wheel FILE"
-  writable=$(find "$SRC" -xdev -perm -022 -print -quit 2>/dev/null || true)
-  [ -z "$writable" ] || die "source tree $SRC has a group/world-writable entry: $writable; use --wheel FILE"
+  # pip runs the build backend of the source tree as root: every path
+  # component and every entry must be root-owned and non-writable by the
+  # client, and no symlink or mount may carry client content (review N2/B of
+  # #7767). A wheel is the safer path.
+  path=$SRC
+  while [ "$path" != / ]; do
+    [ "$(stat -c '%u' "$path")" = 0 ] || \
+      die "source path component $path is not root-owned; pip would run its build backend as root. Use --wheel FILE"
+    mode=$(stat -c '%a' "$path")
+    if (( (8#$mode) & 022 )); then
+      die "source path component $path is writable by group or others; use --wheel FILE"
+    fi
+    path=$(dirname "$path")
+  done
+  unsafe=$(find "$SRC" \( ! -user 0 -o -type l -o -perm -022 \) -print -quit) || \
+    die "source tree $SRC cannot be fully checked; use --wheel FILE"
+  [ -z "$unsafe" ] || \
+    die "source tree $SRC has an unsafe entry (not root-owned, symlink or writable): $unsafe; use --wheel FILE"
 fi
 if [ ! -x "$VENV/bin/pip" ]; then
   run "$PYTHON" -m venv "$VENV"

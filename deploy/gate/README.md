@@ -74,9 +74,10 @@ sudo systemctl enable --now ameesh-gate.service
 ```
 
 Without `--wheel`, the installer builds from this checkout, whose build
-backend then runs as root: the source tree must be root-owned and free of
-group/world-writable entries, otherwise the installer refuses (review N2).
-A root-owned checkout is acceptable; a wheel is the safer path.
+backend then runs as root: the tree, every path component above it and every
+entry must be root-owned and non-writable by group/others, with no symlink;
+otherwise the installer refuses (review N2/B). A root-owned checkout under a
+root-owned path is acceptable; a wheel is the safer path.
 
 `--client` adds an existing account to `ameesh-gate-client`; add only the
 bureau account, never an agent. `--pgpass` installs the gate's `.pgpass`

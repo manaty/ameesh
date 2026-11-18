@@ -345,9 +345,11 @@ owner ; il ne se fait pas sous un STOP.
 - **Pas de limite de débit par lot** : plusieurs actes admis restent possibles
   après un contrôle propre. Le frein est la rareté des lots de production, pas
   le courtier.
-- **Installeur et source root (N2 de la revue).** Sans `--wheel`, l'installeur
-  refuse un arbre source non root-owned ou writable par le groupe, car pip
-  exécute son backend en root. La roue est la voie recommandée.
+- **Installeur et source root (N2/B de la revue).** Sans `--wheel`,
+  l'installeur exige que l'arbre source, chaque composant de son chemin et
+  chaque entrée soient root-owned, non writables par le groupe ou les autres,
+  sans lien symbolique : pip exécute le backend de build en root. La roue est
+  la voie recommandée.
 - **Le courtier n'est pas HA** : s'il tombe, les actes KMS/prod sont bloqués
   (fail-closed). Le retour à la main de l'owner est une décision, pas un
   automatisme.
