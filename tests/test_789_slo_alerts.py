@@ -51,6 +51,10 @@ class _Base(PgTestCase):
         super().setUp()
         for name in ("orch", "dev1", "bureau", "auditeur"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        # #7661 : l'auditeur se lit sur sa déclaration (ici la projection du
+        # registre, sans canon chargé), jamais sur le nom de la persona.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                        " WHERE name = 'auditeur'")
         # #3036 : un brief n'est plus déposé à un destinataire sans bail
         # vivant ; ces agents simulent un runner qui les tient (régime normal).
         self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
