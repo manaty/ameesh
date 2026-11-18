@@ -948,13 +948,15 @@ def warn_foreign(name: str) -> bool:
 
 def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
     """L242c : (critique ?, inconnu ?) pour l'agent `row`. Sans canon sur
-    l'hôte, aucun rôle n'est déclaré : la criticité par rôle est fausse
-    (connue), la surcharge `critical_agents` se jugeant avant. Canon
-    propriétaire illisible (#424 r1) : le dernier verdict lu (`known`,
-    `remembered`) ; sinon — perdu, invalide, jamais lu (#424 r6) — critique
-    (fail-safe). Jamais une baisse silencieuse."""
+    l'hôte, la projection `roles` du registre — copiée de la carte par
+    `canon sync` — est la déclaration disponible (#7661) : une ligne sans rôle
+    n'est pas critique (connu), le titre de la persona ne compte pas, et la
+    surcharge `critical_agents` se juge avant. Canon propriétaire illisible
+    (#424 r1) : le dernier verdict lu (`known`, `remembered`) ; sinon — perdu,
+    invalide, jamais lu (#424 r6) — critique (fail-safe). Jamais une baisse
+    silencieuse."""
     if not configured and not canons:
-        return False, False
+        return row_has_role(row, CRITICAL_ROLES), False
     verdict = critical_by_role(row, canons)
     if verdict is not None:
         return verdict, False

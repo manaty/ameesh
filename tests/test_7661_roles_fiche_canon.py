@@ -106,6 +106,11 @@ class AuditorsTest(unittest.TestCase):
         self.assertEqual(su.critical_verdict({"name": "auditeur"}, [],
                                              configured=False),
                          (False, False))
+        # Sans canon, la projection `roles` du registre reste la déclaration :
+        # un auditeur renommé qui la porte est critique, pas le titre.
+        self.assertEqual(su.critical_verdict(
+            {"name": "veille", "roles": ["auditeur"]}, [], configured=False),
+            (True, False))
 
 
 class RoleTimersTest(unittest.TestCase):
