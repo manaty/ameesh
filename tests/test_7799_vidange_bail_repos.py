@@ -11,15 +11,19 @@ bail vit encore.
 from __future__ import annotations
 
 import dataclasses
+import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import host_release, registry, storage, vm_adapter
 from ameesh import runner as runner_mod
 from ameesh.config import Config
+from ameesh.mediated_executor import contract as C
 from ameesh.runner import AgentWorker, Runner
 
+from . import exec_fake
 from .support import PgTestCase
 
 
@@ -166,6 +170,56 @@ class IdleRunnerReleasesLeaseTest(PgTestCase):
         self.assertEqual((control["release_state"], control["hook_state"]),
                          ("idle-drained", "idle-drained"))
         self.assertFalse(control["claims_open"])
+
+
+class MediatedClaimsReadTest(unittest.TestCase):
+    """La lecture médiée des prises (contrat 1.13, #7799).
+
+    Un worker médié déjà détenteur et au repos n'a pas de lecture locale de
+    l'hôte : le prédicat passe par `host_lifecycle.claims_open`, la même
+    fonction serveur que `begin_turn`, avec l'hôte forcé et l'agent borné à
+    l'admission de l'exécuteur."""
+
+    def mediator(self, claims_open=None):
+        case = exec_fake.golden("host_lifecycle")["cases"][0]
+        host, agent = case["request"]["body"]["args"]
+        transport = exec_fake.GoldenTransport()
+        if claims_open is not None:
+            transport.responder.script["host_lifecycle.claims_open"] = claims_open
+        worker = object.__new__(AgentWorker)
+        threading.Thread.__init__(worker, name=agent)
+        worker.db = exec_fake.make_db(transport)
+        worker.runner = SimpleNamespace(host=host, mediated=True)
+        return worker, transport
+
+    def test_closed_claims_release_the_dormant_mediated_lease(self):
+        worker, transport = self.mediator(claims_open=False)
+        self.assertTrue(worker.host_claims_closed())
+        self.assertEqual(transport.ops()[-1], "host_lifecycle.claims_open")
+        request = transport.calls[-1][1]
+        self.assertEqual(request["args"], [worker.runner.host, worker.name])
+
+    def test_open_claims_keep_the_lease(self):
+        worker, _transport = self.mediator(claims_open=True)
+        self.assertFalse(worker.host_claims_closed())
+
+    def test_an_old_server_does_not_make_the_worker_conclude(self):
+        worker, _transport = self.mediator(
+            claims_open=C.NotSupportedRemotely("old server"))
+        with mock.patch.object(runner_mod, "log_async") as journal:
+            self.assertFalse(worker.host_claims_closed())
+            self.assertFalse(worker.host_claims_closed())
+        journal.assert_called_once()
+        self.assertIn("old executor server", journal.call_args.args[0])
+
+    def test_the_contract_admits_the_read_on_the_executor_host(self):
+        op = C.load().get("host_lifecycle.claims_open")
+        self.assertFalse(op.write)
+        self.assertEqual(op.transport, "op")
+        self.assertEqual(op.agent_param, "agent")
+        self.assertEqual(op.forced, {"host": "executor_host"})
+        self.assertEqual(set(op.scope), {"A", "H"})
+        self.assertEqual(op.result, {"type": "boolean"})
 
 
 if __name__ == "__main__":

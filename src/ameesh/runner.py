@@ -2139,15 +2139,26 @@ class AgentWorker(threading.Thread):
         nommée du verrou. Entre deux tours, un runner au repos n'a donc plus
         rien à garder : il rend son bail pour que la vidange puisse prouver
         `idle-drained` (sans cela, `host_release.release_blocker` refuse
-        indéfiniment : « a lease is still held »). Un exécuteur médié n'a pas
-        cette lecture locale : le serveur juge l'admission à chaque bail,
-        comme dans `admission_withdrawn`. Une lecture impossible lève
+        indéfiniment : « a lease is still held »).
+
+        Un exécuteur médié lit le même prédicat par le contrat
+        (`host_lifecycle.claims_open`, portée A/H, hôte forcé) : la fonction
+        serveur est celle de `begin_turn`, donc le même verdict. Un ancien
+        serveur ne sert pas cette lecture (`NotSupportedRemotely`) : on ne
+        conclut pas, le bail est conservé et le cas est journalisé une fois
+        (comportement d'avant #7799). Une lecture impossible lève
         (`db_mod.Unavailable`), la boucle la traite en panne de base et le
         bail est conservé."""
-        if getattr(self.runner, "mediated", False):
+        from .mediated_executor.contract import NotSupportedRemotely
+        try:
+            return not storage.of(self.db).host_lifecycle.claims_open(
+                self.runner.host, self.name)
+        except NotSupportedRemotely as exc:
+            if not getattr(self, "_claims_read_unavailable", False):
+                self._claims_read_unavailable = True
+                log_async("[%s] host claims read unavailable (%s): old executor "
+                          "server, lease kept between turns" % (self.name, exc))
             return False
-        return not storage.of(self.db).host_lifecycle.claims_open(
-            self.runner.host, self.name)
 
     def peek(self) -> bool:
         agent = registry.get(self.db, self.name)

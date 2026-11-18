@@ -139,7 +139,11 @@ runner dont l'agent est au repos (aucun tour en cours) cesse de renouveler et
 rend son bail entre deux tours ; un runner dont un tour court le finit, puis
 rend son bail. Aucun agent n'est déplacé et aucun runner n'est arrêté par
 cette voie. Le bail rendu, l'agent est réclamé de nouveau à la réouverture des
-prises (`returning`/`available`), par le même exécuteur ou un autre.
+prises (`returning`/`available`), par le même exécuteur ou un autre. Un
+exécuteur médié lit le même prédicat par le contrat
+(`host_lifecycle.claims_open`, contrat 1.13, hôte forcé, agent borné à
+l'admission) : serveur d'abord, exécuteurs ensuite ; un ancien serveur ne sert
+pas la lecture et l'exécuteur conserve alors son bail, journalisé une fois.
 
 Garde : `host_release.release_blocker` refuse `idle-drained` tant qu'un agent
 placé tient un bail, et son motif nomme les agents (`a lease is still held:
