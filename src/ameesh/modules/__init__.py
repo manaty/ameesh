@@ -181,6 +181,13 @@ def _external(entry):
                          % (name, exc)) from exc
     _validate_descriptor(name, compiled, allow_empty=bool(getattr(module, "ACTION_CONNECTORS", {})))
     _check_types(name, module, compiled)
+    # #7784 (suite de #7663) : la capacité release reste aux modules intégrés ;
+    # le contrat v1 ne la publie pas, un module installé ne peut pas la déclarer.
+    declared = getattr(module, "CAPABILITIES", None)
+    if (getattr(module, "RELEASE_MODELS", None)
+            or (isinstance(declared, (list, tuple)) and "release" in declared)):
+        raise ValueError("installed module %r: the release capability is reserved "
+                         "to built-in modules (not in module contract v1)" % name)
     # P1a #7649 : un schéma ou un dossier de migrations impossible à appliquer
     # est un refus d'entrée installée, jamais un schéma à moitié créé.
     from ..migrations import module_metadata

@@ -427,6 +427,22 @@ class ModuleInterfaceTest(unittest.TestCase):
         self.assertEqual(found.names(), [])
         self.assertIn("declares workspaces without providing it", found.refused[0]["error"])
 
+    def test_release_capability_is_refused_to_an_external_module(self):
+        # #7784: `release` is built-in only; contract v1 does not publish it.
+        self.assertNotIn("release", SURFACE["module"]["capabilities"])
+        provider = lambda name: object()
+        for patches in ({"CAPABILITIES": ("lifecycle", "release")},
+                        {"RELEASE_MODELS": ("nexlink-train",), "release_model": provider},
+                        {"RELEASE_MODELS": ("nexlink-train",), "release_model": provider,
+                         "CAPABILITIES": ("lifecycle", "release")}):
+            with self.subTest(sorted(patches)), \
+                    mock.patch.multiple(witness, create=True, **patches), \
+                    mock.patch.dict(sys.modules, {"ameesh_contract_witness": witness}):
+                found = self.discover()
+                self.assertEqual(found.names(), [])
+                self.assertIn("release capability is reserved to built-in modules",
+                              found.refused[0]["error"])
+
     def test_names_follow_the_published_pattern(self):
         pattern = re.compile(SURFACE["module"]["name_pattern"])
         for name, valid in (("a" * 64, True), ("a" * 65, False), ("w.it_-1", True),
