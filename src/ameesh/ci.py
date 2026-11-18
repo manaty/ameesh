@@ -3814,9 +3814,10 @@ def _dispatch_plan(db, cfg, item, api, repo, branch, sha) -> dict:
 def _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha):
     """Read the planner at the frozen tree, then run only its dry-run path.
 
-    Mirrors nexlink_release.ci_plan: a detached worktree prevents the caller's
-    checkout from substituting a planner. Absence permits generic suites;
-    presence with an unreadable/invalid plan fails before any dispatch.
+    Mirrors the Nexlink release module's `ci_plan`: a detached worktree
+    prevents the caller's checkout from substituting a planner. Absence permits
+    generic suites; presence with an unreadable/invalid plan fails before any
+    dispatch.
     """
     import json
     import os

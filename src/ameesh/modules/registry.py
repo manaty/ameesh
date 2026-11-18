@@ -26,7 +26,7 @@ from . import (NAME, RESERVED_NAMES, _builtin, _check_types, _digest,
                _distribution, _entry_points, _external, _validate_descriptor)
 
 #: Capabilities a module may declare in ``CAPABILITIES``.
-CAPABILITIES = ("lifecycle", "cli", "audit", "workspaces")
+CAPABILITIES = ("lifecycle", "cli", "audit", "workspaces", "release")
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,8 @@ class Module:
     descriptor_sha256: str = ""
     card_ref: str | None = None      # L103 T2: canon_ref of a Pipeline card
     action_connectors: tuple[str, ...] = ()
+    #: #7663: release model names the module provides through ``release_model``.
+    release_models: tuple[str, ...] = ()
     #: P1a #7649: logical schema name, declared migrations and schema
     #: requirements. A module without a migrations folder has no schema.
     schema: str | None = None
@@ -61,6 +63,8 @@ class Module:
                 "requires": list(self.requires)}
         if self.action_connectors:
             result["action_connectors"] = list(self.action_connectors)
+        if self.release_models:
+            result["release_models"] = list(self.release_models)
         return result
 
 
@@ -112,6 +116,14 @@ def _capabilities(name, module):
         # L101 T4 (#4357): a tooling module owns the workspaces façade; the core
         # reads it through the registry, never by importing the implementation.
         provided.append("workspaces")
+    release_models = getattr(module, "RELEASE_MODELS", None) or ()
+    if release_models:
+        # #7663: a module that provides release models must return their
+        # provider object lazily; the core never imports the engine.
+        if not callable(getattr(module, "release_model", None)):
+            raise ValueError("installed module %r: RELEASE_MODELS without "
+                             "release_model(name)" % name)
+        provided.append("release")
     declared = getattr(module, "CAPABILITIES", None)
     if declared is None:
         return tuple(provided)
@@ -140,6 +152,7 @@ def _describe(name, module, compiled, *, source, version, distribution=None,
                   storage=tuple(compiled["types"]), distribution=distribution,
                   entry_point=entry_point, descriptor_sha256=_digest(compiled),
                   action_connectors=tuple(sorted(getattr(module, "ACTION_CONNECTORS", {}))),
+                  release_models=tuple(sorted(getattr(module, "RELEASE_MODELS", ()) or ())),
                   schema=declaration["schema"],
                   migrations=declaration["migrations"],
                   requires=declaration["requires"])
@@ -315,6 +328,66 @@ def delivery_connectors():
                 raise ValueError("duplicate delivery connector: %r" % (name,))
             found[name] = (provider, deliver)
     return found
+
+
+def _release_providers():
+    """`{model: (module_name, getter)}` of the built-in release providers.
+
+    Release is a core runtime path, like the delivery and merge connectors:
+    only built-in tooling modules are read here. An installed entry point is
+    loaded by discovery and selected by the canon, never by this path. A model
+    declared twice is refused rather than silently ordered."""
+    found = {}
+    for provider, module in sorted(_builtin().items()):
+        models = getattr(module, "RELEASE_MODELS", ()) or ()
+        if not isinstance(models, (list, tuple)) or any(
+                not isinstance(model, str) or not NAME.fullmatch(model) for model in models):
+            raise ValueError("module %r: RELEASE_MODELS must be unique names" % provider)
+        if len(set(models)) != len(models):
+            raise ValueError("module %r: RELEASE_MODELS must be unique names" % provider)
+        getter = getattr(module, "release_model", None)
+        if models and not callable(getter):
+            raise ValueError("module %r: RELEASE_MODELS without release_model(name)"
+                             % provider)
+        for model in models:
+            if model in found:
+                raise ValueError("duplicate release model: %r (modules %s and %s)"
+                                 % (model, found[model][0], provider))
+            found[model] = (provider, getter)
+    return found
+
+
+def release_models():
+    """Names of the release models the built-in modules provide, sorted."""
+    return tuple(sorted(_release_providers()))
+
+
+def release_model(name):
+    """The provider object of one release model, or ``None`` when no module
+    provides it (#7663).
+
+    The module returns its implementation lazily; importing this function never
+    imports a release engine, so the bare profile and discovery stay light. The
+    core only knows the model name from its configuration (``ProjectRelease``)
+    and reads the provider here, never by importing ``ameesh.modules.nexlink``."""
+    found = _release_providers().get(name)
+    if found is None:
+        return None
+    _provider, getter = found
+    return getter(name)
+
+
+def release_reserved_prefixes():
+    """Note prefixes reserved to a module's release commands (`work.note`)."""
+    prefixes = set()
+    for provider, module in sorted(_builtin().items()):
+        declared = getattr(module, "RESERVED_PREFIXES", ()) or ()
+        if not isinstance(declared, (list, tuple)) or any(
+                not isinstance(prefix, str) or not prefix for prefix in declared):
+            raise ValueError("module %r: RESERVED_PREFIXES must be non-empty strings"
+                             % provider)
+        prefixes.update(declared)
+    return tuple(sorted(prefixes))
 
 
 def merge_connector():

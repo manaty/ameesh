@@ -2861,9 +2861,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 from .work_dependencies import wait_label
                 print("planned  : %s" % wait_label(item["planned_wait"]))
             for edge in item.get("dependencies", []):
+                if edge["blocking"] and edge.get("start_on"):
+                    # #7760 : démarrage sur la tête gelée validée ; la fusion
+                    # attend toujours celle du prérequis.
+                    label = "starts on, frozen %s (merge waits)" % (
+                        (edge.get("blocker_frozen_sha") or "?")[:12])
+                else:
+                    label = "blocking" if edge["blocking"] else "satisfied"
                 print("depends  : #%d (%s, %s)" % (
-                    edge["blocker_id"], edge["blocker_state"],
-                    "blocking" if edge["blocking"] else "satisfied"))
+                    edge["blocker_id"], edge["blocker_state"], label))
             if item.get("queue"):
                 q = item["queue"]
                 print("queue    : %s to %s, rank %s, frozen %s%s" % (

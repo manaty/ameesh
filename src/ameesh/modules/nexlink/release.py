@@ -16,7 +16,14 @@ import json
 import os
 import re
 
-from . import release_cutoff as rc
+from ... import release_cutoff as rc
+from . import ATTEST_PREFIX, RESERVED_PREFIXES, SKIP_PREFIX
+
+#: #7663: the Module provider contract read by the core through the registry.
+#: A module release model may use the durable preview state (a frozen candidate
+#: the next tick settles) and accepts the generic `staging_handoff` option.
+STATEFUL = True
+SUPPORTS_HANDOFF = True
 
 # #6020: the real sequence (release-11ac … release-11as, after release/11z)
 # counts its letters like spreadsheet columns: 11z → 11aa, 11az → 11ba; the
@@ -84,7 +91,7 @@ def ci_plan(project, pending):
 
 
 def validate_staging(project, sha, workflow):
-    from .canon import load_yaml, YamlError
+    from ...canon import load_yaml, YamlError
     if workflow not in STAGING_SERVICES:
         raise rc.ReleaseError("Staging workflow is not in the closed list or YAML unavailable")
     text = rc._git(project.repo, "show", sha + ":.github/workflows/" + workflow,
@@ -129,7 +136,7 @@ def staging_jobs(project, sha, workflow):
     A green run whose deploy job was skipped (`test_only`) deployed nothing:
     the attestation must show each of these jobs successful. A name built
     from an expression cannot be matched and is refused."""
-    from .canon import load_yaml, YamlError
+    from ...canon import load_yaml, YamlError
     validate_staging(project, sha, workflow)
     text = rc._git(project.repo, "show", sha + ":.github/workflows/" + workflow,
                    check=True).stdout
@@ -434,6 +441,25 @@ def plan(cfg, project, *, now, version=None, state=None):
                    tree_green=proof, skipped=skipped, skipped_empty=skipped_empty)
 
 
+def plan_text(plan):
+    """The human dry-run line of this release model (#7663).
+
+    The core prints what the provider returns; it no longer spells the Nexlink
+    vocabulary in its own code."""
+    if plan.skipped and plan.skipped_empty:
+        # #6243: the frozen candidate has nothing to publish (no tag ever).
+        return ("créneau sauté : coupe vide, aucun contenu nouveau à publier "
+                "(release-%s non posée) — skipped, aucun tag ni branche"
+                % plan.skipped)
+    if plan.skipped:
+        # #6152: a manual cutoff already tagged the base; no second cut.
+        return ("créneau sauté : tête déjà coupée en release-%s (%s) — skipped, "
+                "aucun tag ni branche" % (plan.skipped, plan.base[:12]))
+    return ("Nexlink %s — develop %s + main %s ; CI arbre final à produire%s"
+            % (plan.version, plan.base[:12], plan.previous["commit"][:12],
+               " ; delta vide : branche créée sans staging" if plan.empty else ""))
+
+
 def merge_candidate(project, base, main):
     folder, path = rc._worktree(project.repo, base)
     try:
@@ -644,10 +670,24 @@ def publish(project, pending):
 # is the session's bound identity, never an `--actor`. The release host
 # reads it, checks each run on GitHub and the migrations against its own Git
 # delta, and never reads a staging credential.
-ATTEST_PREFIX = "release-attest:"
-SKIP_PREFIX = "release-skip:"
-RESERVED_PREFIXES = (ATTEST_PREFIX, SKIP_PREFIX)
 _SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def validate_project(name, entry, target):
+    """The closed project shape of the Nexlink release model (#7663)."""
+    if name != "nexlink" or target != "develop" or "staging" in entry:
+        raise rc.ReleaseError("nexlink model requires project nexlink, target develop, "
+                              "and its closed staging workflow list (no staging script)")
+
+
+def child_credentials(project):
+    """Credentials needed by this model's guarded child.
+
+    A handoff project leaves the staging credentials with its recipient: the
+    release child itself only reads the migration ledger."""
+    if getattr(project, "staging_handoff", ""):
+        return frozenset()
+    return CHILD_CREDENTIALS
 
 
 def handoff_source(project_name, version):
@@ -734,7 +774,7 @@ def open_handoff_lot(db, project, pending):
     Written through storage, like the split lot (#3256 A): the reservation
     is the release configuration's (`staging_handoff`), not a session's
     gesture. The advisory lock and the source make a retry find it again."""
-    from . import storage, work
+    from ... import storage, work
     source = handoff_source(project.name, pending["version"])
     executor = work.check_external_executor(db, project.staging_handoff)
     handoff = pending["handoff"]
@@ -765,7 +805,7 @@ DECISION_SCHEMA = "ameesh-release-handoff/1"
 
 def write_decision(db, project_name, version, kind, text, actor):
     """Write a decision note, with its proof, on the open attestation lot."""
-    from . import work, work_lifecycle
+    from ... import work, work_lifecycle
     item = work.open_with_source(db, handoff_source(project_name, version))
     if item is None:
         raise rc.ReleaseError("no open attestation lot for %s %s" % (project_name, version))
@@ -885,7 +925,7 @@ def staging_migration_preflight(project, pending, required):
     No staging or ameesh proof-store access is made from this handoff reader.
     The applicator uses `ameesh staging-migrations` for the blocking check.
     """
-    from . import staging_migrations as sm
+    from ... import staging_migrations as sm
     if not required:
         return []
     try:
@@ -1202,6 +1242,37 @@ def abandon(cfg, db, project, *, now, reason, actor):
                     delivery=delivery)
 
 
+def abandon_text(report, project_name):
+    """The human line printed after a successful abandon (#7663)."""
+    return ("Nexlink %s : coupure abandonnée (%s). Aucun tag, aucun staging ; "
+            "branche %s %s. Recoupe : ameesh release cutoff --project %s --force. "
+            "Trace : %s."
+            % (report["version"],
+               ", ".join("ci/%s run %s" % (row["workflow"], row["run"] or "?")
+                         for row in report["failures"]),
+               report.get("integration") or "?",
+               "retirée" if report.get("integration_dropped")
+               else ("déplacée par un tiers" if report.get("integration_moved")
+                     else "à retirer (%s)" % report.get("drop_error")),
+               project_name, report.get("report_path") or "état local"))
+
+
+def error_body(slot, text, transient):
+    """The refusal/transient body of a Nexlink cutoff (#7663).
+
+    A frozen candidate is a resumable state; a closed pending (refused
+    preflight, unknown handoff agent) is not, and the body never says it is."""
+    if slot.get("pending_nexlink"):
+        return ("Coupe Nexlink en attente%s : %s. État de reprise conservé ; "
+                "consulter pending_nexlink pour les branches, tags et runs "
+                "déjà créés."
+                % (" (erreur transitoire)" if transient else "", text))
+    return ("Coupe Nexlink NON faite%s : %s. Aucun tag ni déploiement "
+            "n'a été posé pour cette coupure ; corriger la cause, puis "
+            "la relancer si elle reste due."
+            % (" (erreur transitoire)" if transient else "", text))
+
+
 def _handoff_body(pending):
     """The durable command sent to the bureau, with its lot when opened."""
     handoff = pending["handoff"]
@@ -1254,8 +1325,8 @@ def _handoff_open(cfg, db, project, pending, now, save):
                               instructions=instructions)
     save()
     if db is not None:
-        from . import work
-        from .db import DbError
+        from ... import work
+        from ...db import DbError
         try:
             pending["handoff"]["lot"] = open_handoff_lot(db, project, pending)
         except (work.WorkError, DbError) as exc:
@@ -1296,7 +1367,7 @@ def _handoff_resolution(cfg, db, project, pending, save):
 
     An attestation whose runs are still running waits, but later notes are
     still read: a skip, or a newer valid attestation, is never held behind it."""
-    from . import work
+    from ... import work
     handoff = pending["handoff"]
     rejected = handoff.setdefault("rejected", {})
     if db is None:
@@ -1350,8 +1421,8 @@ def _handoff_resolution(cfg, db, project, pending, save):
 def _handoff_resolution_guarded(cfg, db, project, pending, save):
     """B2 impl-03: a read failure (GitHub, journal, lot) is said once per
     distinct error and never skips the deadline and held-cutoff announcements."""
-    from . import work
-    from .db import DbError
+    from ... import work
+    from ...db import DbError
     handoff = pending["handoff"]
     try:
         outcome = _handoff_resolution(cfg, db, project, pending, save)
@@ -1398,7 +1469,7 @@ def _handoff_waiting(cfg, db, project, pending, at, label, now, save):
 
 
 def _close_handoff_lot(db, pending, note):
-    from . import work
+    from ... import work
     lot = (pending.get("handoff") or {}).get("lot")
     if db is None or not lot:
         return
@@ -1436,7 +1507,7 @@ def _train_pause(db, project, now):
         return ""
     key = "%s:%s" % (project.name, project.target)
     try:
-        from . import storage
+        from ... import storage
         state = storage.of(db).work.train_read(key)
     except Exception:  # noqa: BLE001 - a cause is a bonus, never a second failure
         return ""

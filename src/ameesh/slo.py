@@ -638,7 +638,8 @@ def _footprint_exact_release(named: Iterable[int],
 
 
 def footprint_blockers(item: dict, lots: Iterable[dict],
-                       paths_by_lot: dict, policies: dict | None = None) -> list[dict]:
+                       paths_by_lot: dict, policies: dict | None = None,
+                       declared: Iterable[int] = ()) -> list[dict]:
     """Les lots qui retiennent `item` par la garde d'empreinte (#3185, #4561).
 
     Même règle que la garde d'attribution : un lot du même dépôt (`app`), qui
@@ -650,7 +651,12 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
     #4818 : `policies` (`{app: politique}`) porte les chemins partagés du
     dépôt (ignorés) et son plafond de lots en vol : sans chevauchement, un
     dépôt au plafond retient le lot par tous ses occupants (`reason: cap`,
-    lots exemptés exceptés : `work_footprints.is_exempt`). Le marqueur `.` chevauche tout."""
+    lots exemptés exceptés : `work_footprints.is_exempt`). Le marqueur `.` chevauche tout.
+
+    #7760 : `declared` nomme les bloquants dont `item` a déclaré la dépendance.
+    Un occupant `validated` déclaré ne retient plus le DÉMARRAGE (il démarre
+    sur sa tête gelée) ; il compte toujours dans le plafond de lots en vol,
+    et la fusion, elle, attend toujours sa fusion."""
     if str(item.get("state") or "") != lifecycle.REQUESTED:
         return []
     if str(item.get("assignee") or "").strip():
@@ -660,6 +666,8 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
     if not app:
         return []
     from . import work_footprints
+
+    starts_on = {int(ident) for ident in declared or ()}
 
     policy = (policies or {}).get(app) or {}
     shared = policy.get("shared_paths") or ()
@@ -683,6 +691,10 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
                "last_activity_ts": other.get("last_activity_ts")}
         if not work_footprints.is_exempt(other):
             occupants.append(row)
+        if state == lifecycle.VALIDATED and other_id in starts_on:
+            # #7760 : la paire démarre sur la tête gelée du validé ; seule la
+            # fusion l'attend encore.
+            continue
         theirs = paths_by_lot.get(other_id) or ()
         if not mine or not theirs:
             continue

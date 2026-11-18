@@ -4,9 +4,10 @@ A lot's **footprint** is the set of files or modules (directories) it is
 expected to touch, relative to the root of its repository (`app`). The
 scheduler never runs two lots of the same repository whose footprints
 overlap: the second one waits for the first one's merge, and so starts on the
-updated base. A footprint that is too broad costs one lot of waiting; one that
-is too narrow (or unknown) does not hold anything back, so the diff refresh
-matters.
+updated base — unless every occupying lot is `validated` and the dependent
+declares the dependency and starts on its frozen head (#7760, below). A
+footprint that is too broad costs one lot of waiting; one that is too narrow
+(or unknown) does not hold anything back, so the diff refresh matters.
 
 ```sh
 ameesh work footprint 212                      # show it, its impact analysis, the overlaps
@@ -222,6 +223,45 @@ All three paths take the same advisory lock before checking, so two
 concurrent attributions or creations of overlapping lots decide one after
 the other. When the occupying lot merges, the waiting lot becomes takeable at
 the next pass.
+
+### Starting on a validated lot (#7760)
+
+A lot may start on a footprint held by another lot when **all** of these hold:
+
+1. every occupying lot it overlaps is `validated` — frozen with its review
+   quorum, no current blocker (`qa`, `build`, `blocked`, `waiting_human` do
+   not qualify, and one such occupant is enough to hold the start);
+2. the lot **declares** the dependency on each of them
+   (`ameesh work dependencies <lot> --add <validated lot>`);
+3. its branch **starts on** their frozen head, and its own frozen head
+   contains it.
+
+The guard then reads the pair as "starts on", not as an overlap: the lot is
+offered by `unassigned_lots`, accepted by `ameesh work assign`, and the
+dispatch plan does not mark it as waiting. The rule is dynamic: if the
+prerequisite leaves `validated` (back to `build`, a new freeze, a blocker),
+the pair blocks the start again at once; removing the dependency has the same
+effect.
+
+The **merge gate does not change**: a dependency is satisfied by a merge only.
+The composer takes the dependent **with** its prerequisite, the prerequisite
+first in the ready order, so both are merged in the same packet. If the
+prerequisite leaves the packet — retrograded, conflicting, red unit, migration
+collision, `--exclude` — the dependent is dropped with it
+(`dependency-unready` at candidate time, `contains-discarded` at composition):
+its branch carries the prerequisite's commits, and it must never be composed
+alone.
+
+The freeze gate proves condition 3: `freeze refused (start-base)` when the
+frozen head does not contain the frozen head of a prerequisite the lot starts
+on, with the exact `git rebase --onto <frozen head> <current base> <branch>`
+to run. An unreadable repository or commit adds no refusal (doubt, as for the
+stacked-copies guard). `ameesh work footprint` shows `starts on #N
+(validated, frozen <sha>)` for such a lot, and `ameesh work dependencies`
+labels the edge `starts on, frozen <sha> (merge still waits)`. On the limited
+bureau connection, which has no `SELECT` on `work_item_footprints` (#6881),
+that display-only label degrades to the plain `blocking` one instead of
+failing `work show`; the start guard itself runs under the roles that decide.
 
 Footprint writes take the same lock, so a footprint never changes between
 a check and the attribution it guards. Footprints set or refreshed on lots
