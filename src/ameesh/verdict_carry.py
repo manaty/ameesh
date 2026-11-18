@@ -1695,7 +1695,7 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
                 # (même acteur/session/tour, tête du nouveau jalon).
                 # #7650 : `provenance_receipts` est une table du module `dev`.
                 storage.of(tx).provenance.carry_milestone(
-                    int(copied[0]["id"]), sha=frozen, source_id=int(mark["id"]))
+                    tx, int(copied[0]["id"]), sha=frozen, source_id=int(mark["id"]))
                 carried.append(_entry(mark, reviewed))
         if carried:
             try:

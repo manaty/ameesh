@@ -296,5 +296,5 @@ class Progress(interface.Progress):
     def ci_suite(self, *, since_ts, limit) -> list[dict]:
         # #1476 : le SQL de `ci_runs` vit avec le module `dev` (#7650) ;
         # la vue d'avancement ne fait que déléguer au port du stockage.
-        from .. import storage
+        from ... import storage
         return storage.of(self.db).ci.suite(since_ts=since_ts, limit=limit)
