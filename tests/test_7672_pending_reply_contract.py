@@ -527,7 +527,7 @@ class ConcurrencyTest(PendingReplyBase):
 
 class ContractSurfaceTest(unittest.TestCase):
     def test_version_and_exported_surface(self):
-        self.assertEqual(public_mail.CONTRACT_VERSION, "1.3")
+        self.assertEqual(public_mail.CONTRACT_VERSION, "1.4")
         self.assertEqual(public_mail.MAX_PENDING, 200)
         self.assertEqual(public_mail.DEFAULT_PENDING, 50)
         for name in ("Lease", "Reply", "PendingRequest", "PendingPage",

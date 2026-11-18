@@ -599,9 +599,10 @@ class HistoryTest(PublicMailBase):
 
 class ContractSurfaceTest(unittest.TestCase):
     def test_version_and_exported_surface(self):
-        # Contract 1.3 (E2b, #7672) is additive over this E2a surface: the
-        # same elements stay exported, the revision only moves forward.
-        self.assertEqual(public_mail.CONTRACT_VERSION, "1.3")
+        # Contracts 1.3 (E2b, #7672) and 1.4 (E2c, #7673) are additive over
+        # this E2a surface: the same elements stay exported, the revision
+        # only moves forward.
+        self.assertEqual(public_mail.CONTRACT_VERSION, "1.4")
         self.assertEqual(public_mail.MAX_BATCH, 50)
         self.assertEqual(public_mail.MAX_HISTORY, 200)
         for name in ("Submission", "Receipt", "HistoryEntry", "HistoryPage",

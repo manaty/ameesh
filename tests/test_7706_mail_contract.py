@@ -400,7 +400,7 @@ class ContractVersionTest(unittest.TestCase):
     def test_the_package_and_mail_surface_agree_on_1_3(self):
         from ameesh import public
 
-        self.assertEqual(public.CONTRACT_VERSION, "1.3")
+        self.assertEqual(public.CONTRACT_VERSION, "1.4")
         self.assertEqual(public_mail.CONTRACT_VERSION, public.CONTRACT_VERSION)
         self.assertEqual(public_mail.ADMITTED_PAYLOAD_KEYS,
                          frozenset(("module", "attribution")))

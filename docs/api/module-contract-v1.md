@@ -1,7 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.3, 18 November 2026** (additive E2b lease-fenced pending
-requests and correlated replies on the Python mail surface). Scope: an
+Contract revision: **1.4, 18 November 2026** (additive E2c core-owned requeue
+of the requests of an interrupted turn). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -17,6 +17,9 @@ module schema/migrations snapshot; all are additive to revision 1.1.
 Revision 1.3 adds the lease-fenced pending request and correlated reply
 operations to the same Python mail surface (tranche E2b, #7672); it is additive
 to revision 1.2.
+Revision 1.4 adds no name: the core puts the requests of a turn it interrupted
+back in the queue, under the captured lease (tranche E2c, #7673); it is
+additive to revision 1.3.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -54,13 +57,14 @@ lists it in this contract. Clients check that version before enabling it.
 In particular, the baseline here is ameesh commit
 `aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007`; an open PR is not an installed feature.
 The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
-(#7671 E2a, #7674 E3a, #7675 E3b) and the revision 1.3 element (#7672 E2b) are
+(#7671 E2a, #7674 E3a, #7675 E3b), the revision 1.3 element (#7672 E2b) and the
+revision 1.4 element (#7673 E2c) are
 available only in a released version that carries those lots; at the 1.0
 baseline they are absent, and a consumer must still treat their absence as
 "unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
 [coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2 and 1.3
-elements from the release that implements them; the surface keeps the 1.0
+elements from the release that implements them, and freeze revision 1.4; the surface keeps the 1.0
 commit as its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
@@ -253,9 +257,9 @@ core's responsibility. The optional `harness` argument of the internal
 applies to every harness.
 
 IMA's per-document fresh-session policy is covered by this declarative
-surface. The remaining gap is the lease-bound replay requirement (tranche
-E2c), inventoried in the mapping and not available as a runner hook. Until it
-is delivered, IMA's remaining adaptation stays tracked by its
+surface. The lease-bound replay requirement (tranche E2c) is a core behavior,
+not a runner hook: see [interrupted requests](#requests-of-an-interrupted-turn-e2c-7673)
+(revision 1.4). IMA's removal of its shutdown subclass stays tracked by its
 [#1803](https://github.com/thepackengers/issue-manager-agent/issues/1803),
 rather than acquiring compatibility guarantees for private methods.
 
@@ -290,7 +294,8 @@ long as that name is not one the core reserves (below). Mediated executor
 connections are refused — their contract is separate.
 
 Enable the surface only when `ameesh.public.CONTRACT_VERSION` is `"1.3"` or a
-compatible later minor. A consumer written against the 1.1 draft applies the
+compatible later minor; rely on the requeue of interrupted requests only from
+`"1.4"`. A consumer written against the 1.1 draft applies the
 `payload.module` migration above before treating 1.2 as compatible.
 
 | Element | Contract |
@@ -382,6 +387,31 @@ Native accounting stays authoritative: neither `pending` nor `reply` reserves,
 settles, spends or changes a turn, its marker or its reservation. The
 `/requests/{request}` and `turn observe` observations remain the read-only
 surfaces for turn, accounting and quiescence.
+
+### Requests of an interrupted turn (E2c, #7673)
+
+From revision 1.4 the core, not the module, puts back in the queue the
+requests of a turn it interrupted. A mail turn marks its messages delivered
+when the harness starts; if the core then cuts the turn — runner shutdown or
+drain, host withdrawal (outside the safe point), `ameesh restart`, priority
+preemption, or a lost lease — each `request` that turn carried and that has no
+correlated reply becomes unread again. It is delivered to a later turn of the
+same agent, under that turn's own reservation, flagged as possibly redelivered,
+and appears in `pending` for that turn only. A module therefore needs no
+shutdown subclass and writes no restored prompt.
+
+| Guarantee | Contract |
+| --- | --- |
+| Exact captured set | Only the requests of the interrupted turn: the ids it served, still reserved under its runner, epoch, reservation token and native turn id. Another turn's request, a message reserved since by another reservation, and other kinds (`notify`, `event`, `reply`) are not touched. Human messages keep their own end-of-turn settlement. |
+| Lease guard | The registry row is locked first. Nothing is written once another holder has taken the lease since the captured epoch; the requeue proceeds only while the lease is still `(owner, epoch)` (live or expired but not reclaimed) or after that owner released it with no claim since. A refused requeue is logged; the request then stays delivered. |
+| Already-replied exclusion | A request with a correlated reply (`in_reply_to`) stays answered and is not delivered again. |
+| Race with `reply` | `reply` and the requeue lock the same registry row, so they serialize. A reply committed first is seen by the requeue, which leaves that request answered; a reply that comes after the requeue finds a request that is no longer the current turn's prompt and raises `ScopeRefused`. One request never ends both answered and queued again. |
+| Pending prompt | `pending_prompt` and its identity are never modified: an unrelated instruction queued during the turn stays as it was. |
+| No duplicate | The requeue removes the turn's reservation in the same write, so the next turn reserves the request once; no second reply is possible (unique `in_reply_to`), and no reservation, spend marker or ledger row is created or changed. |
+
+A turn that ends because its harness failed is not a core interruption: its
+requests are not delivered again, so that a request that makes the harness fail
+cannot loop. A mediated executor does not requeue (its behavior is unchanged).
 
 The module payload supports role, document and Memoria data, and is confined
 to `payload.module`, a JSON object (at most 256 KiB serialized). The namespace
