@@ -16,7 +16,7 @@ from ameesh import train, train_migrations, work
 
 from .support import PgTestCase
 from .test_l160b_radar import _git, _write
-from .test_l122_numeros_de_migration import NEXLINK, _commit, _depot
+from .test_l122_numeros_de_migration import NEXLINK, _commit, _declare, _depot
 
 
 class Recorder:
@@ -39,8 +39,10 @@ class RewriteTest(unittest.TestCase):
         _git(self.repo, "add", ".")
         _git(self.repo, "commit", "-qm", "base 516")
         self.base = _git(self.repo, "rev-parse", "HEAD")
+        # #7795 : la largeur se lit dans le dépôt déclaré, plus dans une
+        # table compilée de dépôts.
         self.project = types.SimpleNamespace(
-            migrations="supabase/migrations", github="manaty/nexlink")
+            migrations="supabase/migrations", github="manaty/nexlink", repo=self.repo)
         self.layout = train_migrations.layout(self.project)
         self.row = dict(work_item_id=1, branch="lot/1", generation=1, target="main",
                         frozen_id=1, frozen_sha="0" * 40, source="github.com/o/r")
@@ -231,7 +233,10 @@ class AllocatorTest(PgTestCase):
         with open(os.path.join(self.repo, NEXLINK.directory, "525_stale.sql"), "w") as fh:
             fh.write("-- 525\n")
         self.layout = train_migrations.layout(types.SimpleNamespace(
-            migrations=NEXLINK.directory, github="manaty/nexlink"))
+            migrations=NEXLINK.directory, github="manaty/nexlink", repo=self.repo))
+        # #7795 : le dépôt se déclare à l'hôte, plus dans une table compilée.
+        self.cfg = _declare(self.db, self.cfg,
+                            nexlink=(self.repo, "manaty/nexlink", NEXLINK.directory))
         self.lot = work.add(self.db, title="lot 9", issue_ref="manaty/nexlink#2400",
                             actor="test", branch="lot/9-migration",
                             branch_target="develop")

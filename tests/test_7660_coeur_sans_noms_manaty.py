@@ -12,8 +12,8 @@ and JavaScript/HTML comments are excluded. It fails in two directions:
   delete the entry; never raise one to make a new occurrence pass.
 
 Each exception belongs to one tranche: ``#7634`` for ``bureau``, ``#7661`` for
-roles, ``#7662`` for hosts and persons, ``#7663`` for the Nexlink module.
-``manaty`` has no announced tranche yet; it is recorded as such on purpose.
+roles, ``#7662`` for hosts and persons, ``#7663`` for the Nexlink module,
+``#7795`` for the last ``manaty`` organisation names.
 The scanner is the search method of the inventory: keep both in step.
 """
 from __future__ import annotations
@@ -68,7 +68,7 @@ TRANCHE = {
     "bureau-goal": "#7662",
     "smichea": "#7662",
     "nexlink": "#7663",
-    "manaty": None,
+    "manaty": "#7795",
 }
 
 #: Historical ceiling of the exception list, per tranche, frozen. A tranche
@@ -117,30 +117,21 @@ EXCEPTIONS = {
     ("unrecorded.py", "orchestrateur"): 1,
     ("work.py", "auditeur"): 1,
     ("work.py", "orchestrateur"): 1,
-    # -- hôtes et personnes lus au canon (#7662) : 5
+    # -- migration déjà appliquée : le nom y est figé (#7662) : 2
     ("migrations/0364_key_holders.sql", "smichea"): 2,
-    ("release_cutoff.py", "smichea"): 2,
-    ("storage/postgres/authority.py", "smichea"): 1,
-    # -- release Nexlink dans le module Nexlink (#7663) : 134
+    # -- release Nexlink dans le module Nexlink (#7663) : 130
     ("approve/config.py", "nexlink"): 2,
     ("ci.py", "nexlink"): 2,
     ("cli.py", "nexlink"): 9,
     ("cost.py", "nexlink"): 1,
     ("fingerprints.py", "nexlink"): 1,
     ("host_cli.py", "nexlink"): 2,
-    ("incident.py", "nexlink"): 2,
-    ("migrations.py", "nexlink"): 2,
     ("notify.py", "nexlink"): 78,
     ("release.py", "nexlink"): 3,
     ("role_timers.py", "nexlink"): 1,
     ("server_faults.py", "nexlink"): 1,
     ("train_assembly.py", "nexlink"): 2,
     ("train_contracts.py", "nexlink"): 28,
-    # -- aucune tranche annoncée : organisation Manaty, à décider : 9
-    ("alert_briefs.py", "manaty"): 2,
-    ("incident.py", "manaty"): 2,
-    ("migrations.py", "manaty"): 3,
-    ("packet_guard.py", "manaty"): 2,
 }
 
 _FILE_SUFFIXES = (".py", ".sql", ".html", ".js", ".cjs")

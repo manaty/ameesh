@@ -562,10 +562,8 @@ def module_doctor_lines(db, core_schema: str | None = None, modules=None,
 # numéros réservés (L122)
 # --------------------------------------------------------------------------
 
-#: chemin des migrations dans le dépôt ameesh
+#: chemin des migrations du paquet, dans son propre dépôt
 REPO_PATH = "src/ameesh/migrations"
-#: le dépôt d'ameesh lui-même : seul à compter aussi les migrations du paquet
-AMEESH_REPO = "manaty/ameesh"
 #: un numéro pris dans un dépôt : tout nom qui commence par des chiffres et `_`,
 #: quel que soit le reste (`377_receipt+fix.sql`, `360_restore.sql`)
 _REPO_FILE_RE = re.compile(r"^(\d+)_")
@@ -590,12 +588,9 @@ class Layout:
         return "%s/%s_<name>.sql" % (self.directory, self.label(number))
 
 
-#: dépôts connus ; un autre se déclare dans `radar.projects.<p>` (`github`,
-#: `migrations`, `migrations_width`) de la configuration de l'hôte
-LAYOUTS = {
-    AMEESH_REPO: Layout(AMEESH_REPO, REPO_PATH, 4),
-    "manaty/nexlink": Layout("manaty/nexlink", "supabase/migrations", 3),
-}
+#: dépôts déclarés : `radar.projects.<p>` (`github`, `migrations`,
+#: `migrations_width`) de la configuration de l'hôte ; le dépôt du paquet se
+#: lit à son `origin` (`package_repo`, #7795), aucun slug n'est compilé.
 
 
 def repo_key(repo: str | None) -> str:
@@ -604,20 +599,68 @@ def repo_key(repo: str | None) -> str:
     return (repo or "").strip().lower()
 
 
+@functools.lru_cache(maxsize=1)
+def package_repo() -> str | None:
+    """#7795 : le dépôt du paquet, lu à l'`origin` de son propre clone.
+
+    Aucun nom de forge n'est compilé : le dépôt qui porte ce code est celui de
+    l'arbre d'où il tourne. Un paquet installé hors clone (wheel, venv scellé)
+    ne déclare pas de dépôt — l'appelant qui en a besoin le lit alors dans la
+    configuration (`radar.projects`)."""
+    root = toplevel(os.path.dirname(os.path.abspath(__file__)))
+    return origin_repo(root) if root else None
+
+
+def package_layout() -> Layout | None:
+    """#7795 : la disposition du dépôt du paquet lui-même, ou None."""
+    repo = package_repo()
+    return Layout(repo, REPO_PATH, 4) if repo else None
+
+
 def layout_for(repo: str, cfg=None) -> Layout | None:
-    """La disposition des migrations du dépôt `owner/repo`, ou None."""
+    """La disposition des migrations du dépôt `owner/repo`, ou None.
+
+    #7795 : un dépôt se lit dans `radar.projects.<p>` de la configuration de
+    l'hôte (`github`, `migrations`, `migrations_width`). Le dépôt du paquet
+    lui-même se reconnaît à l'`origin` de son clone (`package_repo`) ; le
+    répertoire `src/ameesh/migrations` d'un clone déclaré le nomme aussi quand
+    la configuration ne le précise pas. Aucun `owner/repo` n'est compilé."""
     repo = repo_key(repo)
-    known = LAYOUTS.get(repo)
     for project in _radar_projects(cfg):
-        if repo_key(project.github) == repo and project.migrations:
-            return Layout(repo, project.migrations, width_of(project, known))
-    return known
+        if repo_key(project.github) != repo:
+            continue
+        directory = (getattr(project, "migrations", "") or "").strip().strip("/")
+        checkout = str(getattr(project, "repo", "") or "")
+        if not directory and checkout and os.path.isdir(
+                os.path.join(os.path.expanduser(checkout), REPO_PATH)):
+            directory = REPO_PATH
+        if directory:
+            known = Layout(repo, directory, 4)
+            return Layout(repo, directory, width_of(project, known))
+    if repo and repo == repo_key(package_repo() or ""):
+        return package_layout()
+    return None
 
 
 def width_of(project, known: Layout | None = None) -> int:
-    """#4750 : la largeur déclarée (`migrations_width`), sinon celle du dépôt
-    connu, sinon 4."""
-    return (getattr(project, "migrations_width", 0) or (known.width if known else 4))
+    """#4750 : la largeur déclarée (`migrations_width`), sinon celle lue dans
+    les fichiers du dépôt (#7795), sinon celle de `known`, sinon 4."""
+    declared = getattr(project, "migrations_width", 0) or 0
+    if declared:
+        return declared
+    directory = ((getattr(project, "migrations", "") or "").strip().strip("/")
+                 or (known.directory if known else ""))
+    checkout = str(getattr(project, "repo", "") or "")
+    if directory and checkout:
+        try:
+            names = os.listdir(os.path.join(os.path.expanduser(checkout), directory))
+        except OSError:
+            names = []
+        widths = [len(match.group(1)) for name in names
+                  if (match := _REPO_FILE_RE.match(os.path.basename(name)))]
+        if widths:
+            return max(set(widths), key=widths.count)
+    return known.width if known else 4
 
 
 def _radar_projects(cfg) -> list:
@@ -749,7 +792,13 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
                 found.setdefault(int(match.group(1)), []).append(
                     "%s:%s" % (where, os.path.basename(name)))
 
-    if layout.repo == AMEESH_REPO and os.path.isdir(package):
+    # #7795 : le dépôt qui range ses migrations à `REPO_PATH` est celui du
+    # paquet ; le paquet installé peut être plus récent que le clone. Un autre
+    # dépôt au même chemin n'emprunte pas ces numéros ; hors clone (roue), le
+    # dépôt du paquet n'est pas lisible et le chemin suffit.
+    own = repo_key(package_repo() or "")
+    if (layout.directory == REPO_PATH and os.path.isdir(package)
+            and (not own or repo_key(layout.repo) == own)):
         add(os.listdir(package), "package")
     names = {name for name in (skip_branch, *also_skip) if name}
     skip = {"refs/heads/" + name for name in names}

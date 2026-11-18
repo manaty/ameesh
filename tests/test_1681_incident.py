@@ -16,6 +16,7 @@ lot rendu à la file sinon.
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 import types
 import unittest
@@ -602,8 +603,16 @@ class TestConsommateur(unittest.TestCase):
         return row
 
     def _db(self, ci_store, work_store):
-        return mock.patch.object(incident.storage, "of",
-                                 return_value=_Full(ci_store, work_store))
+        # #7795 : la table d'intégration se lit à la configuration de l'hôte ;
+        # le banc ([`object()`] sans `cfg`) la pose explicitement.
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(
+            incident.storage, "of", return_value=_Full(ci_store, work_store)))
+        stack.enter_context(mock.patch.object(
+            incident, "integrations",
+            return_value={"manaty/nexlink": ("develop", "nexlink"),
+                          "manaty/ameesh": ("main", "ameesh")}))
+        return stack
 
     def test_rouge_candidat_et_ouverture(self):
         store = _Store()

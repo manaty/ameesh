@@ -731,9 +731,14 @@ def _slo_breach(alert: dict, *, level: int | None = None,
     holder = " --if-holder %s" % who if who else ""
     waiting = alert.get("waiting") or {}
     what = waiting.get("what") if isinstance(waiting, dict) else None
-    # #2511 : le lot cible le dépôt canon (manaty/home) ; un paquet ameesh ne
-    # le porte pas, la fusion est celle du bureau.
+    # #2511 : le lot cible le dépôt du canon ; un paquet ameesh ne le porte
+    # pas, la fusion est celle du bureau. #7795 : le dépôt se lit à la
+    # configuration et voyage dans l'alerte (`canon_repo`) ; sans lui, le
+    # texte dit « le dépôt du canon », jamais un nom compilé.
     canon = bool(isinstance(waiting, dict) and waiting.get("canon"))
+    canon_repo = str(alert.get("canon_repo") or "").strip()
+    canon_where = ("the canon repository (%s)" % canon_repo if canon_repo
+                   else "the canon repository")
     # #2378 : une demande ouverte et échue (sinon le lot serait en attente
     # prévue) ; les cibles sont passées au pilote à toute étape
     # (`exploitation._slo_targets`), le brief les suit. Sans demande,
@@ -754,14 +759,14 @@ def _slo_breach(alert: dict, *, level: int | None = None,
     if what in ("merge", "merge-approval", "merge-outcome"):
         if canon:
             if level >= 3:
-                move = ("avatar: merge it directly — its `canon/…` branch targets the canon "
-                        "repository (manaty/home), which an ameesh package does not carry; "
+                move = ("avatar: merge it directly — its `canon/…` branch targets %s, "
+                        "which an ameesh package does not carry; "
                         "auditor: see that the avatar does it, do not reassign or nudge the "
-                        "holder")
+                        "holder" % canon_where)
             else:
-                move = ("avatar: merge it directly — its `canon/…` branch targets the canon "
-                        "repository (manaty/home), outside the ameesh package; the "
-                        "pilot/composer cannot carry it, do not wait for them")
+                move = ("avatar: merge it directly — its `canon/…` branch targets %s, "
+                        "outside the ameesh package; the "
+                        "pilot/composer cannot carry it, do not wait for them" % canon_where)
         elif cause and cause.get("code") and cause.get("owner") == "author":
             author = who or alert.get("responsible") or "the author"
             code = str(cause["code"])

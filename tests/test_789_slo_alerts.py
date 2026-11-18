@@ -1393,6 +1393,8 @@ class AttentePorteurTest(_Base):
         alert = alerts[0]
         self.assertEqual((alert["waiting"] or {}).get("what"), "merge")
         self.assertTrue((alert["waiting"] or {}).get("canon"))
+        # #7795 : le dépôt nommé au brief est lu à la configuration, pas compilé.
+        alert = dict(alert, canon_repo="manaty/home")
         out = self.briefs(alert)
         self.assertEqual(sorted(out), ["bureau"])
         self.assertIn("merge it directly", out["bureau"])

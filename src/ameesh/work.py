@@ -1381,6 +1381,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     `issue reference changed meanwhile, retry`), jamais écrite en silence."""
     from . import migrations
 
+    # #7795 : la disposition du dépôt se lit à la configuration de l'hôte,
+    # comme les autres lectures ; l'appelant peut la remplacer.
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -4165,6 +4168,9 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
            announce=None, pr: str | None = None) -> dict:
     """`ameesh work merged` : la livraison `git-merge` de `deliver` (L99 T2),
     preuve `{sha, pr}` ; voir `record_merge`."""
+    # #7795 : le libellé d'un numéro atterri se lit à la configuration de
+    # l'hôte, comme la réservation ; l'appelant peut la remplacer.
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     evidence = {"sha": sha}
     if pr is not None:
         evidence["pr"] = pr
@@ -4216,6 +4222,9 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
     d'un lot léger ne s'ouvrait jamais. Le même dépôt rejoue une relecture
     manquante sur un lot déjà fusionné (dans les bornes du rattrapage).
 
+    #7795 : même défaut que `merged`, le libellé du numéro atterri se lit à
+    # la configuration de l'hôte.
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     #6826 : sur un lot déjà livré, le clone explicite fait autorité pour
     l'intervalle de relecture, même si son origin diffère du dépôt du ticket.
     La classe doit toujours prouver un delta Git ; une première livraison
