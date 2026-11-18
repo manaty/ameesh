@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from ameesh import plan_git
 
@@ -281,6 +282,67 @@ class RebaseIdentityTest(unittest.TestCase):
 
     def _rev(self, rev: str) -> str:
         return _git(self.depot, "rev-parse", rev).stdout.strip()
+
+    def test_avis_compagnon_ne_change_pas_le_gel_effectif(self) -> None:
+        with tempfile.TemporaryDirectory() as other:
+            _git(other, "init", "-q", "-b", "main")
+            _git(other, "config", "user.name", "t")
+            _git(other, "config", "user.email", "t@t")
+            _git(other, "commit", "--allow-empty", "-qm", "companion")
+            foreign = _git(other, "rev-parse", "HEAD").stdout.strip()
+            rows = [frozen(self.frozen, 10),
+                    verdict(self.frozen, 11, id=2, actor="reviewer1"),
+                    verdict(self.frozen, 12, id=3, actor="reviewer2"),
+                    verdict(foreign, 13, id=4, actor="reviewer1")]
+            out = plan_git.freeze_candidate(rows, repo=self.depot, target="main")
+            self.assertEqual(out["sha"], self.frozen)
+            self.assertEqual(out["origin"], "frozen")
+            self.assertEqual(out["causes"], [])
+            self.assertIn("verdict-unresolved-in-lot-repository", out["notes"])
+            self.assertEqual(out["verdict"]["id"], 3)
+
+    def test_le_composeur_garde_le_lot_revu_pret(self) -> None:
+        from ameesh import packet_candidates
+        foreign = "f" * 40
+        rows = [frozen(self.frozen, 10),
+                verdict(self.frozen, 11, id=2, actor="reviewer1"),
+                verdict(self.frozen, 12, id=3, actor="reviewer2"),
+                verdict(foreign, 13, id=4, actor="reviewer1")]
+        item = {"id": 42, "branch": "lot", "branch_target": "main"}
+        with mock.patch.object(packet_candidates.lot_class, "of_lot", return_value={"class": "sensitive"}), \
+             mock.patch.object(packet_candidates.merge_queue, "review_gate", return_value={"ok": True}), \
+             mock.patch.object(packet_candidates, "merge_tree", return_value={"state": "clean"}), \
+             mock.patch.object(packet_candidates, "_ancestor", return_value=False):
+            result = packet_candidates._candidate(
+                None, item, target_branch="main", tips={"lot": self.frozen},
+                where=self.depot, package_base="main", marks=rows)
+        self.assertTrue(result["ready"], result)
+        self.assertEqual(result["frozen_sha"], self.frozen)
+        self.assertEqual(result["causes"], [])
+
+    def test_avis_compagnon_ne_masque_pas_un_blocage_du_lot(self) -> None:
+        rows = [frozen(self.frozen, 10),
+                verdict(self.frozen, 11, actor="reviewer", kind="blocked"),
+                verdict("f" * 40, 12, id=3, actor="reviewer")]
+        out = plan_git.freeze_candidate(rows, repo=self.depot, target="main")
+        self.assertEqual(out["sha"], "")
+        self.assertIn("blocked-verdict", out["causes"])
+
+    def test_sans_depot_avis_compagnon_reste_candidat(self) -> None:
+        foreign = "f" * 40
+        rows = [frozen(self.frozen, 10), verdict(self.frozen, 11),
+                verdict(foreign, 12, id=3)]
+        out = plan_git.freeze_candidate(rows)
+        self.assertEqual(out["sha"], foreign)
+        self.assertEqual(out["origin"], "verdict")
+        self.assertNotIn("verdict-unresolved-in-lot-repository", out["notes"])
+
+    def test_nouvelle_tete_connue_du_depot_reste_effective(self) -> None:
+        rows = [frozen(self.reviewed, 10), verdict(self.reviewed, 11),
+                verdict(self.frozen, 12, id=3)]
+        out = plan_git.freeze_candidate(rows, repo=self.depot, target="main")
+        self.assertEqual(out["sha"], self.frozen)
+        self.assertEqual(out["origin"], "verdict")
 
     def test_rebase_mecanique_est_reconnu(self) -> None:
         self.assertNotEqual(self.reviewed, self.frozen)

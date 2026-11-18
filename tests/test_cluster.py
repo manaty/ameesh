@@ -467,6 +467,12 @@ HORS_CONTRAT = {
     "host_release_fences": {"operation", "probe", "created_at"},
     "host_release_fence_receipts": {"action_id", "operation", "step", "receipt",
                                     "completed_at"},
+    # #7751: persisted train requalification requests (requester, cited
+    # opinions, trace lot) are internal to the live train service; only the
+    # holder reads and resolves them. No supervisor GRANT added.
+    "integration_train_requalifications": {
+        "id", "project", "pin", "gate", "reviews", "lot", "requester",
+        "requested_at", "state", "resolved_at", "resolved_by", "error"},
 }
 EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
            | FERMEES.get(rel, set()) | HORS_CONTRAT.get(rel, set())

@@ -2573,6 +2573,36 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def train_requalify_request(self, project: str, pin: str, gate: str,
+                                reviews: list[str], lot: int,
+                                requester: str) -> dict | None:
+        """#7751: durably ask the live train service holder to apply a reviewed
+        canon requalification with exactly the cited milestone opinions.
+
+        No lease is taken and no configuration is written: the request only
+        records the exact reading (``project``, ``pin``, ``gate``), the review
+        references and the trace lot, together with the bound requester. It is
+        idempotent for the same pending reading and evidence set: a repeated
+        call returns the existing row instead of stacking duplicates. Returns
+        the pending row, or None when the request cannot be stored.
+        """
+
+    @abc.abstractmethod
+    def train_requalify_requests(self, project: str) -> list[dict]:
+        """#7751: pending requalification requests of ``project``, oldest
+        first. The live train service holder reads them at each pass."""
+
+    @abc.abstractmethod
+    def train_requalify_resolve(self, request_id: int, state: str, *,
+                                actor: str, error: str = "") -> dict | None:
+        """#7751: compare-and-set one pending requalification request to
+        ``applied`` or ``refused``, naming the resolving host and the refusal.
+
+        Only a request still in ``state = 'requested'`` moves. Returns the
+        resolved row, or None when another pass already resolved it.
+        """
+
+    @abc.abstractmethod
     def train_adopt(self, key: str, owner: str, *, revision: int,
                     previous: tuple | None, service: tuple, ttl_s: float) -> dict | None:
         """#3142: the train service's current holder takes over the target
