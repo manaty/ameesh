@@ -268,8 +268,16 @@ class VehicleDeltaTest(PgTestCase):
         self.assertFalse(out["ok"], out["why"])
         accepted = [row["actor"] for row in out["accepted"]]
         self.assertNotIn("r_codex", accepted)
-        self.assertNotIn("r_other", accepted)   # same codex family, author now
-        self.assertEqual(accepted, ["r_claude"])
+        # #7745 : r_other/codex ne relit pas le delta écrit par r_codex, mais
+        # son avis reste retenu pour le delta de l'auteur (deepseek) ; le delta
+        # codex n'a que l'avis claude et laisse la porte fermée (missing 1).
+        self.assertIn("r_other", accepted)
+        self.assertEqual(accepted, ["r_other", "r_claude"])
+        codex_delta = [row for row in out["deltas"]
+                       if "codex" in row["families"]]
+        self.assertEqual(len(codex_delta), 1, out["deltas"])
+        self.assertFalse(codex_delta[0]["covered"])
+        self.assertEqual(codex_delta[0]["missing"], 1)
 
 
 class NoExactReadingTest(TestCase):
