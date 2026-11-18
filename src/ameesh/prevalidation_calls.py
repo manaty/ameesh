@@ -26,10 +26,10 @@ classes, contrats, hôtes, délai, lanceur de part) :
 #4136 : un véhicule composé par ``scripts/paquet-auto.py`` porte à sa tête un
 manifeste qui consigne ses tests locaux (unités, voisins, contrats) ; ni le
 gel ni ``ci run --full`` ne le prévalident une seconde fois
-(``composer_tested``). #4304 : paquet-auto pousse et gèle avant ses tests par
-unité, qui tournent en parallèle de la CI complète ; son manifeste le dit et
-dispense de même (la prévalidation rejouerait les mêmes tests ciblés). Un lot
-ordinaire, ou un véhicule composé à la main sans ce manifeste, garde sa
+(``composer_tested``). #4304/#7740 : le manifeste de paquet-auto déclare ses
+tests locaux, joués sur le préfixe composé de chaque unité avant la poussée ;
+il dispense de même (la prévalidation rejouerait les mêmes tests ciblés). Un
+lot ordinaire, ou un véhicule composé à la main sans ce manifeste, garde sa
 prévalidation.
 
 Les hôtes viennent du bloc canon ; un hôte **local déclaré au canon** est
@@ -1184,11 +1184,15 @@ COMPOSER_MARK = "Composeur : `scripts/paquet-auto.py`"
 #: #4136 : la ligne de ses tests locaux (`_tests_summary` de paquet-auto)
 COMPOSER_TESTS_RE = re.compile(
     r"^- Tests locaux : .*?(\d+) tests exécutés, (\d+) échec\(s\)", re.MULTILINE)
-#: #4304 : la ligne d'un manifeste poussé avant les tests par unité
-#: (`TESTS_PARALLEL_LINE` de paquet-auto) ; ses tests tournent pendant la CI.
+#: #4304/#7740 : la ligne d'un manifeste de paquet-auto déclarant ses tests
+#: locaux (`TESTS_PARALLEL_LINE`). #7740 : ils sont joués avant la poussée,
+#: sur le préfixe composé de chaque unité ; l'ancienne formulation (#4304,
+#: après la poussée, en parallèle de la CI) reste reconnue pour les
+#: manifestes déjà poussés.
 COMPOSER_PARALLEL_RE = re.compile(
-    r"^- Tests locaux : joués par le composeur après la poussée, en parallèle "
-    r"de la CI complète \(#4304\)", re.MULTILINE)
+    r"^- Tests locaux : (?:joués par le composeur sur le préfixe composé de "
+    r"chaque unité, avant la poussée \(#7740\)|joués par le composeur après "
+    r"la poussée, en parallèle de la CI complète \(#4304\))", re.MULTILINE)
 
 
 def composer_tested(cfg, db, item, head: str, *, repo: str = "") -> dict | None:
@@ -1196,9 +1200,10 @@ def composer_tested(cfg, db, item, head: str, *, repo: str = "") -> dict | None:
 
     Rend ``{"manifest": chemin, "sha": tête, "tests": n}`` quand le lot porte
     une branche ``integration/**`` et que sa tête publie le manifeste de
-    paquet-auto avec des tests locaux exécutés, sans échec — ou joués en
-    parallèle de la CI (#4304, ``"parallel": True``, ``tests`` 0) —, et que la
-    tête est le commit de ce manifeste ; sinon ``None``.
+    paquet-auto avec des tests locaux exécutés, sans échec — ou déclarés joués
+    avant la poussée sur le préfixe de chaque unité (#7740,
+    ``"parallel": True``, ``tests`` 0, clé gardée pour compatibilité) —, et
+    que la tête est le commit de ce manifeste ; sinon ``None``.
     Un doute (arbre absent, manifeste illisible, autre composeur, aucun test,
     un échec) ne dispense de rien : la prévalidation reste due.
     """
@@ -1250,7 +1255,7 @@ def composer_tested(cfg, db, item, head: str, *, repo: str = "") -> dict | None:
 
 def skipped_text(tested: dict) -> str:
     """#4136 : la ligne de journal d'un véhicule dispensé (ni rouge ni indisponible)."""
-    how = ("tested by its composer in parallel with the full CI"
+    how = ("tested by its composer before the push"
            if tested.get("parallel") else "tested by the composer")
     return "%s skipped: vehicle %s (manifest %s)" % (
         JOURNAL_PREFIX, how, str(tested.get("sha") or "")[:12])

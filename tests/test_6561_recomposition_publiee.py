@@ -29,8 +29,12 @@ WITHDRAWN = ("tests ciblés : retrait de #3801 (attribution)\n"
              "recomposition : retrait de #3801\n"
              "aucune unité après recomposition : #3801\n")
 EMPTY = "aucun lot prêt : rien à composer\n"
-EARLY_PUSH = ("paquet h-20261027-04 poussé par scripts/paquet-auto.py dès la "
-              "composition (canon §6, #4304) : 1 unité")
+EARLY_PUSH_4304 = ("paquet h-20261027-04 poussé par scripts/paquet-auto.py dès "
+                   "la composition (canon §6, #4304) : 1 unité")
+#: #7740 : la poussée suit les contrats et les séries directes sur préfixe.
+EARLY_PUSH = ("paquet h-20261027-04 poussé par scripts/paquet-auto.py après "
+              "les contrats et les séries directes sur leur préfixe "
+              "(canon §6, #4304, #7740) : 1 unité")
 
 
 class Shell(FakeShell):
@@ -81,6 +85,12 @@ class Horaire(Base):
 
 
 class PublieeTest(Horaire):
+    def test_les_deux_notes_de_poussee_du_composeur_sont_reconnues(self):
+        # #7740 : la note a changé (poussée après les séries directes) ; les
+        # manifestes et gels déjà posés gardent l'ancienne formulation.
+        for note in (EARLY_PUSH, EARLY_PUSH_4304):
+            self.assertIsNotNone(ph.EARLY_PUSH_RE.match(note), note)
+
     def test_retrait_apres_publication_n_est_pas_rien_compose(self):
         item = self.item()
         self.shell.heads[REF] = HEAD2

@@ -329,6 +329,8 @@ class NotificationTest(unittest.TestCase):
         _recipient, _lot, body, _sender = send.call_args.args
         self.assertIn("apparaît pour la première fois au préfixe", body)
         self.assertNotIn("la lecture #3801 désigne", body)
+        # #7740 : le rouge direct est vu sur le préfixe, pas sur la tête.
+        self.assertNotIn("tête composée", body)
 
 
 class ComposePacketPilotMailTest(unittest.TestCase):

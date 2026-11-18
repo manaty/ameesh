@@ -215,9 +215,12 @@ MERGED_CLOSE_REASONS = ("delivered", "done")
 #: #4506 : la note de fusion automatique du porteur porte la tête publiée
 MERGED_NOTE_RE = re.compile(
     r"^auto-merge merged repo=\S+ pr=\d+ sha=(?P<sha>[0-9a-f]{40})\b")
-#: #4506 : `paquet-auto` gèle lui-même la tête poussée dès la composition (#4304)
+#: #4506/#7740 : `paquet-auto` gèle lui-même la tête qu'il vient de pousser ;
+#: #7740, la poussée suit les contrats et les séries directes sur préfixe.
+#: L'ancienne note (#4304, « dès la composition ») reste reconnue.
 EARLY_PUSH_RE = re.compile(
-    r"^paquet \S+ poussé par scripts/paquet-auto\.py dès la composition\b")
+    r"^paquet \S+ poussé par scripts/paquet-auto\.py (?:dès la composition"
+    r"|après les contrats et les séries directes)\b")
 MARK = "paquet-horaire: "
 MARK_CI = MARK + "ci demandée "
 MARK_RED = MARK + "rouge consigné "
