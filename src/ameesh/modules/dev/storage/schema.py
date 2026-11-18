@@ -70,6 +70,31 @@ def _core_schema(db) -> str:
     return schema or "public"
 
 
+def _registry_readable(db, core: str) -> bool:
+    """Le registre ``module_schemas`` est-il présent et lisible, sans lever ?
+
+    La sonde est **dans la transaction du mouvement** : une requête qui échoue
+    l'avarie (psql termine la session, psycopg refuse toute instruction
+    suivante), et l'attraper ne la répare pas. Une base d'avant P1a n'a pas
+    ``module_schemas`` ; un rôle peut aussi n'y avoir aucun droit de lecture.
+    On interroge donc les catalogues, qui ne demandent aucun droit sur le
+    schéma applicatif et ne résolvent aucun nom par le search_path : dans ces
+    deux cas la réponse est ``false``, jamais une erreur.
+
+    ``to_regclass`` ne suffit pas : sans ``USAGE`` sur le schéma, il lève
+    « permission denied for schema » au lieu de rendre NULL.
+    """
+    rows = _raw(db).query(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM pg_catalog.pg_class c"
+        "  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+        "  WHERE n.nspname = %s AND c.relname = 'module_schemas'"
+        "    AND c.relkind IN ('r', 'p', 'v', 'm', 'f')"
+        "    AND has_table_privilege(c.oid, 'SELECT')) AS readable",
+        (core,))
+    return bool(rows and rows[0].get("readable"))
+
+
 def schema_name(db) -> str:
     """Le schéma physique des tables du module, lu dans ``module_schemas``.
 
@@ -84,14 +109,13 @@ def schema_name(db) -> str:
         return cached
     core = _core_schema(db)
     found = core
-    try:
+    rows = []
+    if _registry_readable(db, core):
         # la connexion brute : passe par `ModuleDb` rappellerait `qualify`,
         # qui rappellerait `schema_name` (récursion).
         rows = _raw(db).query(
             "SELECT schema_name FROM %s.module_schemas WHERE module = %%s"
             % _quote(core), (MODULE,))
-    except Exception:  # noqa: BLE001 - registre absent : avant P1a/P2
-        rows = []
     if rows:
         candidate = str((rows[0] or {}).get("schema_name") or "")
         if SCHEMA_NAME.fullmatch(candidate):
