@@ -377,6 +377,52 @@ def release_model(name):
     return getter(name)
 
 
+def _notify_providers():
+    """`{kind: (module_name, getter)}` of the built-in notification channels.
+
+    Notification delivery is a core runtime path, like the release, delivery
+    and merge providers: only built-in tooling modules are read here. A kind
+    declared twice is refused rather than silently ordered (#7793)."""
+    found = {}
+    for provider, module in sorted(_builtin().items()):
+        kinds = getattr(module, "NOTIFY_CHANNELS", ()) or ()
+        if not isinstance(kinds, (list, tuple)) or any(
+                not isinstance(kind, str) or not NAME.fullmatch(kind) for kind in kinds):
+            raise ValueError("module %r: NOTIFY_CHANNELS must be unique names" % provider)
+        if len(set(kinds)) != len(kinds):
+            raise ValueError("module %r: NOTIFY_CHANNELS must be unique names" % provider)
+        getter = getattr(module, "notify_channel", None)
+        if kinds and not callable(getter):
+            raise ValueError("module %r: NOTIFY_CHANNELS without notify_channel(kind)"
+                             % provider)
+        for kind in kinds:
+            if kind in found:
+                raise ValueError("duplicate notification channel: %r (modules %s and %s)"
+                                 % (kind, found[kind][0], provider))
+            found[kind] = (provider, getter)
+    return found
+
+
+def notify_channel_kinds():
+    """Names of the notification channel kinds the built-in modules provide."""
+    return tuple(sorted(_notify_providers()))
+
+
+def notify_channel(kind):
+    """The provider object of one notification channel kind, or ``None``
+    (#7793).
+
+    The module returns its implementation lazily; importing this function never
+    imports a channel implementation, so the bare profile and discovery stay
+    light. The core reads channel configuration and sends through this provider,
+    never by importing a module package."""
+    found = _notify_providers().get(kind)
+    if found is None:
+        return None
+    _provider, getter = found
+    return getter(kind)
+
+
 def release_reserved_prefixes():
     """Note prefixes reserved to a module's release commands (`work.note`)."""
     prefixes = set()

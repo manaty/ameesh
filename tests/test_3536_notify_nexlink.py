@@ -41,7 +41,7 @@ requires_cryptography = unittest.skipUnless(
     "cryptography absente de cet environnement (parts psql sans "
     "ameesh[crypto], #3609) : cas de crypto sauté")
 
-from ameesh import nexlink_alerts as nx  # noqa: E402
+from ameesh.modules.nexlink import alerts as nx  # noqa: E402
 from ameesh import notify, role_timers  # noqa: E402
 
 ACCOUNT = "b1e3c612-4825-4716-abe9-194ab3acde43"

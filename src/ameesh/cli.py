@@ -2550,7 +2550,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     nexlink_ko = False
     try:
         from . import notify as notify_mod
-        nexlink_ok, nexlink_lines = notify_mod.nexlink_activation(cfg)
+        nexlink_ok, nexlink_lines = notify_mod.channel_activation(cfg)
         nexlink_ko = not nexlink_ok
     except Exception as exc:  # a reading never breaks the doctor
         nexlink_lines = ["not checked (%s)" % (" ".join(str(exc).split())[:120],)]
