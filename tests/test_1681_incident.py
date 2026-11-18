@@ -16,6 +16,7 @@ lot rendu à la file sinon.
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 import types
 import unittest
@@ -587,6 +588,30 @@ class _Full:
         self.ci, self.work = ci_store, work_store
 
 
+class IntegrationsTest(unittest.TestCase):
+    """#7795 B : la table d'intégration se lit à la configuration du runner,
+    jamais dans la table compilée retirée."""
+
+    def test_packet_watch_only_keeps_the_watch(self):
+        cfg = types.SimpleNamespace(
+            release={}, radar=None,
+            packet_watch={"projects": {"ameesh": {"repo": "/clone", "target": "main"}}})
+        with mock.patch("ameesh.migrations.origin_repo", return_value="manaty/ameesh"):
+            self.assertEqual(incident.integrations(cfg),
+                             {"manaty/ameesh": ("main", "ameesh")})
+
+    def test_release_then_radar(self):
+        cfg = types.SimpleNamespace(
+            release={"projects": {"nexlink": {"github": "manaty/nexlink",
+                                              "target": "develop"}}},
+            radar={"projects": {"ameesh": {"repo": "/clone", "target": "main"}}},
+            packet_watch=None)
+        with mock.patch("ameesh.migrations.origin_repo", return_value="manaty/ameesh"):
+            self.assertEqual(incident.integrations(cfg), {
+                "manaty/nexlink": ("develop", "nexlink"),
+                "manaty/ameesh": ("main", "ameesh")})
+
+
 class TestConsommateur(unittest.TestCase):
     """`incident.consume` : la source courante, la même tête, une fois."""
 
@@ -602,8 +627,16 @@ class TestConsommateur(unittest.TestCase):
         return row
 
     def _db(self, ci_store, work_store):
-        return mock.patch.object(incident.storage, "of",
-                                 return_value=_Full(ci_store, work_store))
+        # #7795 : la table d'intégration se lit à la configuration de l'hôte ;
+        # le banc ([`object()`] sans `cfg`) la pose explicitement.
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(
+            incident.storage, "of", return_value=_Full(ci_store, work_store)))
+        stack.enter_context(mock.patch.object(
+            incident, "integrations",
+            return_value={"manaty/nexlink": ("develop", "nexlink"),
+                          "manaty/ameesh": ("main", "ameesh")}))
+        return stack
 
     def test_rouge_candidat_et_ouverture(self):
         store = _Store()
