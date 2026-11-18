@@ -6191,6 +6191,13 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     #: promus, gels antérieurs, gel #7324) ; un acteur retiré de `by_name`
     #: (adaptation de tests seule) laisse le commit sans famille.
     commit_actors: dict[str, set[str]] = {}
+    #: #7745/#2924 : les acteurs qui **écrivent** un commit de la plage
+    #: courante (un correcteur de tests seuls n'écrit pas la tête). Seul un
+    #: auteur porteur d'un commit courant est rattaché ; un auteur d'un gel
+    #: antérieur dont le contenu survit sous une autre écriture garde une
+    #: famille globale, même s'il a par ailleurs une correction de tests dans
+    #: la plage.
+    authoring: dict[str, set[str]] = {}
     skipped: set[str] = set()
     freezer_global: set[str] = set()
 
@@ -6203,6 +6210,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     def record_commit(actor: str, sha: str) -> None:
         """#3742 : le commit attribué à un acteur, pour nommer un refus de gel."""
         record_actor(actor, sha)
+        if actor and sha:
+            authoring.setdefault(actor.casefold(), set()).add(sha)
         if commits_out is None or not actor or not sha:
             return
         key = next((name for name in commits_out
@@ -6432,8 +6441,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         # deltas contigus, un ensemble le rendrait non déterministe.
         current = list(dict.fromkeys(
             str(value).strip() for value in commits or () if str(value).strip()))
-        attached = {str(actor).casefold() for sha in current
-                    for actor in commit_actors.get(sha, ())}
+        # #7745 : seuls les commits **écrits** rattachent leur acteur. Une
+        # correction de tests seuls (jamais promue auteur) ne rattache pas un
+        # auteur de gel antérieur : sa famille reste globale (#2924/#3518).
+        attached = set(authoring)
         glob = {str(value).strip().lower() for value in freezer_global
                 if str(value).strip()}
         for actor, proven in by_name.items():
