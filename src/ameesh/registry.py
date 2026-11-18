@@ -256,6 +256,17 @@ def lease_agent(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, d
     return True, "", row
 
 
+def lease_agent_locked(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+    """#7672 : `lease_agent`, mais la ligne du registre reste verrouillée.
+
+    À appeler DANS la transaction qui écrit sous le bail : le contrôle et
+    l'écriture voient la même version de la ligne, et un changement de
+    détenteur ou d'epoch attend le commit. Doit donc être suivi d'un commit
+    (ou rollback) rapide ; jamais d'appel hors transaction.
+    """
+    return storage.of(db).leases.fence(name, owner, epoch)
+
+
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:
     """Le bail est-il vivant et détenu par ce runner à cet epoch ?
 

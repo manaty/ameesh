@@ -4894,6 +4894,7 @@
    "leases": [
     "adopt_session_origin",
     "attach_claim",
+    "fence",
     "hold_note",
     "release_hold",
     "turn_in_progress"
@@ -4910,7 +4911,10 @@
     "lock_recipient",
     "pending_recipients",
     "pending_recipients_sorted",
+    "pending_requests",
+    "reply_target",
     "review_requests",
+    "send_reply",
     "staging_emission",
     "unread_active",
     "unread_counts",
