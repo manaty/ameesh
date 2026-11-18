@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+import uuid
 
 from . import config, db as db_mod, identity, planned_waits, storage
 
@@ -36,7 +37,7 @@ def parse_since(value):
         raise Refused("--since must be an ISO timestamp with timezone") from exc
 
 
-def inspect(tx, lot, actor, since, kind, target=""):
+def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None):
     """Read the journal and mailbox and record a receipt in one transaction."""
     item = tx.query("SELECT state, extract(epoch from now())::float8 AS now_ts "
                     "FROM work_items WHERE id = %s FOR NO KEY UPDATE", (lot,))
@@ -88,13 +89,16 @@ def inspect(tx, lot, actor, since, kind, target=""):
                 raise Refused("withdrawn decision #%s" % message["id"])
 
     note = "pre-act: kind=%s actor=%s since=%s" % (kind, actor, since)
+    pregeste_id = pregeste_id or str(uuid.uuid4())
     evidence = json.dumps({"type": "pre-act/1", "kind": kind, "lot": lot,
-                           "actor": actor, "target": target})
+                           "actor": actor, "target": target,
+                           "pregeste_id": pregeste_id})
     tx.execute("INSERT INTO work_item_events "
                "(work_item_id, state, note, actor, evidence, created_at) "
                "VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp())",
                (lot, item[0]["state"], note, actor, evidence))
     tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (lot,))
+    return pregeste_id
 
 
 def main(argv=None):
@@ -118,6 +122,10 @@ def main(argv=None):
             raise Refused("invalid lot")
         if args.kind == "prod" and not args.target.strip():
             raise Refused("--target is required for prod")
+        dispatch = args.kind == "prod" and command[:3] == ["gh", "workflow", "run"]
+        if dispatch and any(arg == "pregeste" or arg.startswith("pregeste=")
+                            for arg in command[3:]):
+            raise Refused("dispatch must not supply a pregeste input")
         since = parse_since(args.since)
         cfg = config.load()
         db = db_mod.open_db(cfg)
@@ -128,14 +136,17 @@ def main(argv=None):
             raise Refused("valid agent identity required")
         check_started = time.monotonic()
         with db.transaction(isolation="READ COMMITTED") as tx:
-            inspect(tx, args.lot, binding.name, since, args.kind, args.target.strip())
+            pregeste_id = inspect(tx, args.lot, binding.name, since, args.kind, args.target.strip())
         db.close()
         db = None
-        print("pre-act: receipt recorded for lot #%d (%s)" % (args.lot, args.kind))
+        print("pre-act: receipt recorded for lot #%d (%s), pregeste=%s" %
+              (args.lot, args.kind, pregeste_id))
         if command:
             sys.stdout.flush()
             if time.monotonic() - check_started > 30:
                 raise Refused("pre-act check took more than 30 seconds")
+            if dispatch:
+                command += ["-f", "pregeste=" + pregeste_id]
             os.execvp(command[0], command)
         return 0
     except Exception as exc:  # fail closed on unavailable or unreadable data

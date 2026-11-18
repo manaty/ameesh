@@ -40,12 +40,32 @@ class PreActTest(unittest.TestCase):
 
     def test_clear_check_records_receipt(self):
         tx = Transaction(events=[{"id": 1, "note": "préparation", "ts": 90}])
-        self.check(tx)
+        receipt_id = self.check(tx)
         self.assertIn("INSERT INTO work_item_events", tx.writes[0][0])
         self.assertIn("kind=kms actor=bureau", tx.writes[0][1][2])
         evidence = json.loads(tx.writes[0][1][4])
         self.assertEqual(evidence, {"type": "pre-act/1", "kind": "kms",
-                                    "lot": 5772, "actor": "bureau", "target": ""})
+                                    "lot": 5772, "actor": "bureau", "target": "",
+                                    "pregeste_id": receipt_id})
+
+    def test_prod_dispatch_carries_the_recorded_id(self):
+        tx = Transaction()
+        db = mock.Mock()
+        db.transaction.return_value = nullcontext(tx)
+        binding = mock.Mock(ok=True)
+        binding.name = "bureau"
+        with mock.patch.object(pre_act.config, "load", return_value=object()), \
+             mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
+             mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
+             mock.patch.object(pre_act.identity, "resolve_binding", return_value=binding), \
+             mock.patch.object(pre_act.os, "execvp") as execute:
+            result = pre_act.main(["--lot", "5772", "--kind", "prod", "--target", "nexlink",
+                                   "--since", "1970-01-01T00:01:40Z", "--",
+                                   "gh", "workflow", "run", "deploy.yml"])
+        self.assertEqual(result, 0)
+        receipt_id = json.loads(tx.writes[0][1][4])["pregeste_id"]
+        execute.assert_called_once_with("gh", ["gh", "workflow", "run", "deploy.yml",
+                                               "-f", "pregeste=" + receipt_id])
 
     def test_prod_requires_target_before_database_access(self):
         with mock.patch.object(pre_act.db_mod, "open_db") as open_db:

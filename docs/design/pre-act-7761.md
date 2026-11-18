@@ -1,5 +1,11 @@
 # Pré-geste : prototype #7761
 
+Chaque reçu comporte un `pregeste_id` UUID. Pour un dispatch direct
+`gh workflow run` de type prod, le préfixe ajoute l'entrée
+`-f pregeste=<pregeste_id>` ; le workflow doit publier cet identifiant dans
+son titre. Le collecteur et son alerte restent à intégrer : ce reçu seul ne
+constitue pas encore un contrôle détectif.
+
 La commande `ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO`
 relit le journal et le courrier puis écrit un reçu sur le lot si aucun motif
 de refus n'est trouvé. `--since` est un horodatage ISO avec fuseau, capturé
