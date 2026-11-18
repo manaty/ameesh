@@ -16,12 +16,17 @@ date future, une identité absente, une base illisible ou une écriture de reçu
 impossible refusent le passage. La commande ne remplace pas les autorisations
 requises pour le geste.
 
-Le contrôle détecte les notes `hold:`, les mots d'arrêt dans les notes et les
+Le contrôle détecte les holds explicites contenant un mot d'arrêt (par exemple
+`hold: STOP`), les mots d'arrêt dans les autres notes et les
 messages associés au lot, les messages non livrés à l'agent dont le lot est
-référencé, et les décisions retirées pendant la fenêtre. Un hold ancien non
-levé est également bloquant. Le texte libre est reconnu de façon prudente,
+référencé, et les décisions retirées pendant la fenêtre. Un hold d'arrêt ancien
+non levé est également bloquant ; un hold d'attente ordinaire ne bloque pas.
+Les notes et courriers de l'acteur lui-même sont ignorés. Le texte libre est
+reconnu de façon prudente,
 mais une formulation imprévue peut échapper à cette détection ; une référence
 prose doit contenir `#ID` si le courrier ne porte pas le champ lot structuré.
+Un courrier de session mentionnant seulement « MP-2 », tel que #225697, ne
+sera pas détecté sans association structurée ou référence au lot : limite connue.
 
 Le reçu constate une lecture ponctuelle : il ne verrouille ni les nouveaux
 messages ni le service externe. Un STOP peut arriver entre la lecture et
@@ -39,9 +44,11 @@ l'annulation du run et la tenue de `prod-deploy` pendant la fenêtre signée.
 
 Un appel peut placer la commande d'effet après `--` : le processus de garde
 enregistre le reçu, ferme la connexion puis exécute directement cette
-commande, sans interpréteur ajouté. La borne `--since` reste celle capturée
-avant l'attente. Il faut placer l'attente avant cet appel : une attente ou un
-autre travail à l'intérieur de la commande relance la même faille. Un refus
+commande, sans interpréteur ajouté. Pour toute attente programmée, utiliser
+`--wait-until ISO -- commande` : le garde capture lui-même la borne avant
+d'attendre, puis contrôle et exécute. `--since` reste réservé aux scripts qui
+ont capturé la borne avant leur attente. Une attente ou un autre travail à
+l'intérieur de la commande relance la même faille. Un refus
 n'exécute pas la commande.
 
 Le reçu écrit une preuve structurée `pre-act/1` (lot, acteur, type de geste,

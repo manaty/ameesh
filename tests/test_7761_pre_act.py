@@ -38,6 +38,55 @@ class PreActTest(unittest.TestCase):
             self.check(tx)
         self.assertEqual(tx.writes, [])
 
+    def test_ordinary_hold_and_actor_notes_do_not_block(self):
+        tx = Transaction(events=[
+            {"id": 1, "actor": "orchestrateur", "note": "hold: on attend ses reçus", "ts": 150},
+            {"id": 2, "actor": "bureau", "note": "Arrêt au premier échec", "ts": 151},
+        ], messages=[{"id": 3, "sender": "bureau", "recipient": "bureau", "unread": True,
+                      "body": "STOP #5772", "ts": 152}])
+        self.check(tx)
+        self.assertTrue(tx.writes)
+
+    def test_wait_until_detects_stop_before_executing(self):
+        tx = Transaction(events=[{"id": 2, "actor": "owner", "note": "STOP", "ts": 150}])
+        db = mock.Mock()
+        db.transaction.return_value = nullcontext(tx)
+        binding = mock.Mock(ok=True, name="bureau")
+        binding.name = "bureau"
+        with mock.patch.object(pre_act.time, "time", side_effect=[100, 100, 160]), \
+             mock.patch.object(pre_act.time, "sleep") as sleep, \
+             mock.patch.object(pre_act.config, "load", return_value=object()), \
+             mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
+             mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
+             mock.patch.object(pre_act.identity, "resolve_binding", return_value=binding), \
+             mock.patch.object(pre_act.os, "execvp") as execute:
+            result = pre_act.main(["--lot", "5772", "--kind", "kms", "--wait-until",
+                                   "1970-01-01T00:02:40Z", "--", "true"])
+        self.assertEqual(result, 1)
+        sleep.assert_called_once_with(60)
+        execute.assert_not_called()
+        self.assertFalse(tx.writes)
+
+    def test_wait_until_clear_executes_after_wait(self):
+        tx = Transaction()
+        db = mock.Mock()
+        db.transaction.return_value = nullcontext(tx)
+        binding = mock.Mock(ok=True)
+        binding.name = "bureau"
+        with mock.patch.object(pre_act.time, "time", side_effect=[100, 100, 160]), \
+             mock.patch.object(pre_act.time, "sleep") as sleep, \
+             mock.patch.object(pre_act.config, "load", return_value=object()), \
+             mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
+             mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
+             mock.patch.object(pre_act.identity, "resolve_binding", return_value=binding), \
+             mock.patch.object(pre_act.os, "execvp") as execute:
+            result = pre_act.main(["--lot", "5772", "--kind", "kms", "--wait-until",
+                                   "1970-01-01T00:02:40Z", "--", "true"])
+        self.assertEqual(result, 0)
+        sleep.assert_called_once_with(60)
+        execute.assert_called_once_with("true", ["true"])
+        self.assertIn("since=100", tx.writes[0][1][2])
+
     def test_clear_check_records_receipt(self):
         tx = Transaction(events=[{"id": 1, "note": "préparation", "ts": 90}])
         receipt_id = self.check(tx)
@@ -84,7 +133,7 @@ class PreActTest(unittest.TestCase):
     def test_old_active_hold_and_new_hold_both_block(self):
         for timestamp in (10, 150):
             with self.subTest(timestamp=timestamp):
-                tx = Transaction(events=[{"id": 2, "note": "hold: owner", "ts": timestamp}])
+                tx = Transaction(events=[{"id": 2, "note": "hold: STOP owner", "ts": timestamp}])
                 with self.assertRaises(pre_act.Refused):
                     self.check(tx)
                 self.assertFalse(tx.writes)

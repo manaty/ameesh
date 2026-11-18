@@ -48,17 +48,20 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None):
     if item[0]["state"] in ("blocked", "waiting_human"):
         raise Refused("lot is %s" % item[0]["state"])
     events = tx.query(
-        "SELECT id, note, extract(epoch from created_at)::float8 AS ts "
+        "SELECT id, note, actor, extract(epoch from created_at)::float8 AS ts "
         "FROM work_item_events WHERE work_item_id = %s ORDER BY id", (lot,))
     active_hold = None
     for event in events:
         note = event.get("note") or ""
-        if planned_waits.is_hold_note(note):
+        if (event.get("actor") or "").removeprefix("agent:") == actor.removeprefix("agent:"):
+            continue
+        stop_hold = planned_waits.is_hold_note(note) and bool(_STOP.search(note))
+        if stop_hold:
             active_hold = event["id"]
         elif planned_waits.is_lift_note(note):
             active_hold = None
-        if float(event["ts"]) >= since and (planned_waits.is_hold_note(note)
-                                              or _STOP.search(note)):
+        if float(event["ts"]) >= since and (stop_hold or (not planned_waits.is_hold_note(note)
+                                                             and _STOP.search(note))):
             raise Refused("hold or STOP in lot event #%s" % event["id"])
     if active_hold is not None:
         raise Refused("active hold in lot event #%s" % active_hold)
@@ -67,13 +70,15 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None):
     # even when delivered: a session may have consumed mail during the wait.
     reference = r"(^|[^0-9])#%s([^0-9]|$)" % lot
     messages = tx.query(
-        "SELECT id, recipient, body, delivered_at IS NULL AS unread, "
+        "SELECT id, sender, recipient, body, delivered_at IS NULL AS unread, "
         "extract(epoch from created_at)::float8 AS ts, "
         "payload->'decision'->>'state' AS decision_state, "
         "payload->'decision'->'withdrawn'->>'ts' AS withdrawn_ts "
         "FROM agent_mailbox WHERE work_item_id = %s OR body ~ %s ORDER BY id",
         (str(lot), reference))
     for message in messages:
+        if (message.get("sender") or "").removeprefix("agent:") == actor.removeprefix("agent:"):
+            continue
         if message.get("recipient") == actor and message.get("unread"):
             raise Refused("unread lot mail #%s" % message["id"])
         if float(message["ts"]) >= since and _STOP.search(message.get("body") or ""):
@@ -105,8 +110,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="ameesh gate pre-act")
     parser.add_argument("--lot", type=int, required=True)
     parser.add_argument("--kind", choices=("kms", "key", "prod"), required=True)
-    parser.add_argument("--since", required=True,
-                        help="ISO timestamp with timezone captured before waiting")
+    window = parser.add_mutually_exclusive_group(required=True)
+    window.add_argument("--since", help="ISO timestamp with timezone captured before waiting")
+    window.add_argument("--wait-until", help="wait until ISO timestamp, then check and execute")
     parser.add_argument("--target", default="", help="target of the effect")
     parser.add_argument("command", nargs=argparse.REMAINDER,
                         help="optional command after --, executed immediately after the check")
@@ -126,7 +132,18 @@ def main(argv=None):
         if dispatch and any(arg == "pregeste" or arg.startswith("pregeste=")
                             for arg in command[3:]):
             raise Refused("dispatch must not supply a pregeste input")
-        since = parse_since(args.since)
+        if args.wait_until:
+            if not command:
+                raise Refused("--wait-until requires a command after --")
+            deadline = parse_since(args.wait_until)
+            since = time.time()
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(remaining)
+        else:
+            since = parse_since(args.since)
         cfg = config.load()
         db = db_mod.open_db(cfg)
         if storage.is_remote(db):
