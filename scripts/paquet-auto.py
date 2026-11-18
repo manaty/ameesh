@@ -195,6 +195,14 @@ Seul un déplacement (`behind`, `diverged`) relance aussitôt : une référence
 illisible (`absent`, `dirty`, `unknown`) sort en 1 avec sa cause. Des contrats
 rouges restent le verdict même si la cible a bougé pendant eux (rc 5).
 
+#7754 : après la poussée, la PR existe. La lecture `gh pr view` du corps final
+(GraphQL) peut tomber sous la limite de débit du compte partagé : elle est
+relue par l'API REST (`gh api`, bucket `core`, distinct du bucket GraphQL),
+dans `ensure_pull_request` comme dans `pull_request_state`. Une mise à jour
+finale du corps qui échoue encore (écriture refusée, repli REST indisponible)
+n'arrête plus le paquet : sa cause part à la note du porteur et au courrier,
+rc 0 — la poussée, le gel et la ci-full sont déjà faits.
+
 Modes :
 
 * normal : composition réelle, poussée, PR, gel, ci-full, tests et courrier ;
@@ -5475,16 +5483,103 @@ def _gh(cwd: Path, *args: str, timeout: int = GIT_TIMEOUT
     return run_command(["gh", *args], cwd=cwd, timeout=timeout)
 
 
-def ensure_pull_request(worktree: Path, branch: str, target: str,
-                        title: str, body: str) -> tuple[int | None, str]:
-    """Ouvre ou met à jour la PR ; rend `(numéro, url)`."""
+#: #7754 : marques d'un refus de quota GitHub dans la sortie de `gh` (le
+#: message GraphQL dit « API rate limit exceeded », le REST peut dire
+#: « secondary rate limit »).
+GH_QUOTA_MARKS = ("rate limit", "rate-limit", "quota")
+
+
+def _gh_quota_refused(text: str) -> bool:
+    """#7754 : la sortie de `gh` dit-elle un refus de débit ?"""
+    lowered = text.casefold()
+    return any(mark in lowered for mark in GH_QUOTA_MARKS)
+
+
+def _pull_request_rest(worktree: Path, branch: str) -> dict | None:
+    """#7754 : la PR de la branche par l'API REST (`gh api`).
+
+    Le bucket REST `core` est distinct du bucket GraphQL : un `gh pr view`
+    refusé pour quota reste lisible ici. Rend None quand la branche n'a pas
+    de PR. Le corps de l'endpoint est celui du diagnostic : le filtre `head`
+    porte `owner:branche`, `state=all` pour voir aussi une PR fusionnée ou
+    fermée.
+    """
+    endpoint = "repos/{owner}/{repo}/pulls?head={owner}:%s&state=all" % branch
+    proc = _gh(worktree, "api", endpoint)
+    if proc.returncode != 0:
+        raise PaquetAutoError(
+            "gh api %s a échoué : %s" % (endpoint, _tail(_output(proc))))
+    try:
+        items = json.loads(_decode(proc.stdout))
+    except (ValueError, TypeError) as exc:
+        raise PaquetAutoError(
+            "gh api %s : réponse illisible (%s)" % (endpoint, exc)) from exc
+    if not isinstance(items, list):
+        raise PaquetAutoError(
+            "gh api %s : réponse inattendue (liste attendue)" % endpoint)
+    if not items:
+        return None
+    item = items[0]
+    if not isinstance(item, dict):
+        raise PaquetAutoError("gh api %s : PR illisible" % endpoint)
+    state = str(item.get("state") or "").upper()
+    if item.get("merged_at") or state == "MERGED":
+        state = "MERGED"
+    elif state not in ("OPEN", "CLOSED"):
+        state = ""
+    return {"number": item.get("number"),
+            "url": str(item.get("html_url") or ""),
+            "state": state}
+
+
+def _pull_request(worktree: Path, branch: str) -> dict | None:
+    """#7754 : la PR de la branche, sans confondre un refus avec « absente ».
+
+    `gh pr view` (GraphQL) est lu d'abord ; s'il échoue, l'API REST prend le
+    relais : un refus de quota GraphQL n'est ni « not found », ni silencieux,
+    ni fatal à la lecture. Rend None quand la branche n'a pas de PR.
+    """
     view = _gh(worktree, "pr", "view", branch,
                "--json", "number,url,state")
-    number: int | None = None
-    url = ""
     if view.returncode == 0:
         try:
             data = json.loads(_decode(view.stdout))
+        except (ValueError, TypeError) as exc:
+            raise PaquetAutoError(
+                "gh pr view : réponse illisible (%s)" % exc) from exc
+        if not isinstance(data, dict):
+            raise PaquetAutoError("gh pr view : réponse inattendue")
+        return data
+    text = _output(view)
+    lowered = text.casefold()
+    if "no pull requests found" in lowered or "not found" in lowered:
+        return None
+    cause = _tail(text)
+    quota = _gh_quota_refused(text)
+    if quota:
+        print("gh pr view %s : limite de débit GraphQL ; lecture REST (#7754)"
+              % branch, flush=True)
+    try:
+        return _pull_request_rest(worktree, branch)
+    except PaquetAutoError as fallback:
+        raise PaquetAutoError(
+            "gh pr view %s a échoué%s : %s ; repli REST : %s"
+            % (branch, " (limite de débit)" if quota else "", cause, fallback)
+        ) from fallback
+
+
+def ensure_pull_request(worktree: Path, branch: str, target: str,
+                        title: str, body: str) -> tuple[int | None, str]:
+    """Ouvre ou met à jour la PR ; rend `(numéro, url)`.
+
+    La lecture passe par `_pull_request` : un refus de quota GraphQL est relu
+    par l'API REST au lieu d'être pris pour « pas de PR » (#7754).
+    """
+    data = _pull_request(worktree, branch)
+    number: int | None = None
+    url = ""
+    if data is not None:
+        try:
             number, url = int(data["number"]), str(data.get("url") or "")
             state = str(data.get("state") or "").upper()
         except (ValueError, KeyError, TypeError) as exc:
@@ -5494,12 +5589,6 @@ def ensure_pull_request(worktree: Path, branch: str, target: str,
                 "PR #%d pour %s est %s, pas ouverte : choisir un autre --name "
                 "(un paquet fusionné ou fermé ne se réécrit pas)"
                 % (number, branch, state))
-    else:
-        text = _output(view)
-        if "no pull requests found" not in text.lower() \
-                and "not found" not in text.lower():
-            raise PaquetAutoError(
-                "gh pr view %s a échoué : %s" % (branch, _tail(text)))
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md",
                                      delete=False, dir=str(temporary_parent())) as handle:
         handle.write(body)
@@ -5519,15 +5608,38 @@ def ensure_pull_request(worktree: Path, branch: str, target: str,
                 "gh pr create : %s" % _tail(_output(proc)))
         url = _output(proc)
         if url.startswith("http"):
-            view = _gh(worktree, "pr", "view", branch, "--json", "number")
-            if view.returncode == 0:
+            try:
+                created = _pull_request(worktree, branch)
+            except PaquetAutoError:
+                created = None
+            if created:
                 try:
-                    number = int(json.loads(_decode(view.stdout))["number"])
+                    number = int(created["number"])
                 except (ValueError, KeyError, TypeError):
                     number = None
         return number, url
     finally:
         body_path.unlink(missing_ok=True)
+
+
+def update_pull_request_body(worktree: Path, branch: str, target: str,
+                             title: str, body: str,
+                             pr_number: int | None = None,
+                             pr_url: str = "") -> tuple[int | None, str, str]:
+    """#7754 : met le corps de la PR finale à jour sans perdre le paquet.
+
+    À ce stade la PR existe depuis la poussée. Une lecture encore refusée
+    (même après le repli REST) ou une écriture refusée est dite, pas fatale :
+    la poussée, le gel et la ci-full sont déjà faits. Rend
+    `(numéro, url, échec)` ; `échec` est vide quand le corps est à jour,
+    sinon « corps de PR non mis à jour : <cause> ».
+    """
+    try:
+        number, url = ensure_pull_request(worktree, branch, target, title, body)
+    except (OSError, PaquetAutoError) as error:
+        return (pr_number, pr_url,
+                "corps de PR non mis à jour : %s" % _one_line(error))
+    return number, url, ""
 
 
 def freeze_carrier(worktree: Path, carrier: int, head: str, note: str) -> str:
@@ -5574,14 +5686,18 @@ def note_carrier(worktree: Path, carrier: int, note: str) -> str:
 
 
 def pull_request_state(worktree: Path, branch: str) -> str:
-    """L'état de la PR de la branche (OPEN, MERGED, CLOSED), "" si illisible."""
-    view = _gh(worktree, "pr", "view", branch, "--json", "state")
-    if view.returncode != 0:
-        return ""
+    """L'état de la PR de la branche (OPEN, MERGED, CLOSED), "" si illisible.
+
+    #7754 : un refus de quota GraphQL est relu par l'API REST ; l'état n'est
+    vide que si les deux lectures échouent (les tests continuent, #4463).
+    """
     try:
-        return str(json.loads(_decode(view.stdout)).get("state") or "").upper()
-    except (ValueError, AttributeError):
+        data = _pull_request(worktree, branch)
+    except PaquetAutoError:
         return ""
+    if not data:
+        return ""
+    return str(data.get("state") or "").upper()
 
 
 def withdraw_packet(worktree: Path, carrier: int, pr_number: int | None,
@@ -5907,12 +6023,16 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
 def mail_body(*, name: str, target: str, base_sha: str, carrier: int,
               head: str, branch: str, composition: Composition,
               tests: list[TestRun], inclusion_rc: int, pr_number: int | None,
-              pr_url: str, report_info: bool = False) -> str:
+              pr_url: str, pr_note: str = "",
+              report_info: bool = False) -> str:
     units = ", ".join("#%d" % unit.lot for unit in composition.units) or "aucun"
     discarded = "; ".join(
         "#%d (%s)" % (item.lot, item.reason) for item in composition.discarded
     ) or "aucun"
     pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
+    if pr_note:
+        # #7754 : la cause d'une mise à jour finale refusée est dite au pilote.
+        pr += " ; " + pr_note
     inconclusive = _inconclusive_lines(tests)
     non_section = ("Non concluants (canon §3, consignés) :\n"
                    + "\n".join("  " + line for line in inconclusive)) \
@@ -6337,7 +6457,9 @@ def publish_tested(args: argparse.Namespace) -> int:
         state = pull_request_state(worktree, branch)
         pr_number: int | None = None
         pr_url = ""
+        body_failure = ""
         if state and state != "OPEN":
+            body_failure = "corps de PR non mis à jour (PR %s)" % state.lower()
             print("PR %s : corps non mis à jour" % state.lower(), flush=True)
         else:
             body = "\n".join([
@@ -6354,18 +6476,24 @@ def publish_tested(args: argparse.Namespace) -> int:
                                      target=args.target, carrier=args.carrier), "",
                 "Porteur : #%d. « Verdict non requis » et CI complète restent au pilote."
                 % args.carrier, ""])
-            pr_number, pr_url = ensure_pull_request(
+            pr_number, pr_url, body_failure = update_pull_request_body(
                 worktree, branch, args.target,
                 "Paquet %s — %d unités sur %s %s" % (
                     args.name, len(specs), args.target, base_sha[:12]), body)
-        print(note_carrier(
-            worktree, args.carrier,
-            "paquet %s : fin publiée par scripts/paquet-auto.py --publish (#4237) "
-            "sur la tête poussée %s, tests par unité non rejoués (qualification au journal d'origine) ; "
-            "instantané du porteur" % (args.name, head[:12])), flush=True)
+            if body_failure:
+                print(body_failure, flush=True)
+        note = ("paquet %s : fin publiée par scripts/paquet-auto.py --publish (#4237) "
+                "sur la tête poussée %s, tests par unité non rejoués (qualification "
+                "au journal d'origine) ; instantané du porteur"
+                % (args.name, head[:12]))
+        if body_failure:
+            note += " ; " + body_failure
+        print(note_carrier(worktree, args.carrier, note), flush=True)
         check_pause(worktree, getattr(args, "pause_project", "") or "", args.target)
         print(request_full_ci(worktree, args.carrier, head), flush=True)
         pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
+        if body_failure:
+            pr += " ; " + body_failure
         mail = "\n".join([
             "Paquet %s publié sans retester : tête `%s` sur %s `%s` (branche `%s`, %s)."
             % (args.name, head, args.target, base_sha[:12], branch, pr), "",
@@ -6947,27 +7075,33 @@ def compose_packet(args: argparse.Namespace) -> int:
             success = True
             return 0
         state = pull_request_state(worktree, branch)
+        body_failure = ""
         if state == "MERGED":
             success = True
             return merged_during_tests(args, worktree, head, runs, [], branch, rel)
         if state and state != "OPEN":
+            body_failure = "corps de PR non mis à jour (PR %s)" % state.lower()
             print("PR %s pendant les tests par unité : corps non mis à jour"
                   % state.lower(), flush=True)
         else:
-            pr_number, pr_url = ensure_pull_request(
-                worktree, branch, args.target, title(), body(runs))
-        print(note_carrier(
-            worktree, args.carrier,
-            "paquet %s : tests directs (préfixe composé) et contrats %s avant "
-            "la poussée de %s (%s) ; %s ; inclusion verte ; instantané %s"
-            % (args.name, tests_note, head[:12], _tests_summary(runs),
-               _direct_note(composition, runs), head)),
-            flush=True)
+            pr_number, pr_url, body_failure = update_pull_request_body(
+                worktree, branch, args.target, title(), body(runs),
+                pr_number, pr_url)
+            if body_failure:
+                print(body_failure, flush=True)
+        note = ("paquet %s : tests directs (préfixe composé) et contrats %s avant "
+                "la poussée de %s (%s) ; %s ; inclusion verte ; instantané %s"
+                % (args.name, tests_note, head[:12], _tests_summary(runs),
+                   _direct_note(composition, runs), head))
+        if body_failure:
+            note += " ; " + body_failure
+        print(note_carrier(worktree, args.carrier, note), flush=True)
         mail = mail_body(name=args.name, target=args.target, base_sha=base_sha,
                          carrier=args.carrier, head=head, branch=branch,
                          composition=composition, tests=runs,
                          inclusion_rc=inclusion_rc, pr_number=pr_number,
-                         pr_url=pr_url, report_info=getattr(args, "report_info", False))
+                         pr_url=pr_url, pr_note=body_failure,
+                         report_info=getattr(args, "report_info", False))
         try:
             send_mail(args.pilot, args.carrier, mail, getattr(args, "sender", None),
                       info=getattr(args, "report_info", False))

@@ -510,10 +510,31 @@ class Service:
                            str(change.get("pin") or "")[:12] or "?"))
         return None
 
+    def _apply_requalification_requests(self):
+        """#7751: the live service lease holder applies pending reviewed
+        requalification requests on its own host before reloading the pin.
+
+        A standby host never calls this method: `run` only reaches `pass_once`
+        while it holds the role and the service lease. The application is an
+        effect of this lease (`effect`), fenced like every train effect.
+        """
+        if self.lease is None or self.lease.epoch is None:
+            return []
+        from . import train_requalify_request
+        try:
+            with self.lease.effect():
+                return train_requalify_request.apply_holder(
+                    self.cfg, report=self.report)
+        except Exception as exc:  # noqa: BLE001 - the passage keeps its own work
+            self.report("requalification requests not applied (%s: %s)"
+                        % (type(exc).__name__, exc))
+            return []
+
     def pass_once(self, index, now):
         from .scoped_db import ScopedDb
         if self.stop.is_set():
             return None
+        self._apply_requalification_requests()
         retry = self._reload_pin()
         if retry is not None:
             return retry
