@@ -1054,6 +1054,17 @@ def attach_profile(cfg, db, harness: str, *, row: dict | None = None):
               % (harness, profile.name, "; ".join(problems)), file=sys.stderr)
         _propose_fresh(cfg, db, harness, items, row)
         return False, None
+    # #7676 : un compte Claude jamais passé par l'accueil interactif ouvre le
+    # choix du thème au premier attach, et le premier message de l'humain part
+    # dans ce menu. On refuse en disant le geste (l'accueil se fait une fois,
+    # par un humain) plutôt que de lancer une session qui n'est pas la sienne.
+    interactive = accounts.interactive_problem(profile)
+    if interactive:
+        print("attach: account %s/%s not ready for an interactive session: %s"
+              % (harness, profile.name, interactive), file=sys.stderr)
+        print("attach: %s" % accounts.interactive_init_hint(profile),
+              file=sys.stderr)
+        return False, None
     return True, profile
 
 
