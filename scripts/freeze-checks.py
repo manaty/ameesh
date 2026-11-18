@@ -45,6 +45,15 @@ périmètre à l'inventaire des types clients (#4887) : `scripts/garde-types-cli
 refuse une spec OpenAPI changée sans le schéma généré (`gen-api --check` quand
 `node` et les modules du cache sont là, garde statique sinon).
 
+#7777 : `scripts/garde-renommages-classe.py` lit les renommages du diff gelé
+(variable [`RENAMES_ENV`], paires `git diff -M` posées par
+`ameesh.freeze_checks`) et refuse un déplacement dont le nouveau chemin est
+classé plus bas que l'ancien : sans cela, #7663 a fait tomber le moteur de
+release Nexlink de `sensitive` à `light` en le déplaçant dans le module, et le
+canon a dû être complété après le gel. Hors gel (composition d'un paquet,
+lancement manuel), la variable est absente et le contrôle s'inactive en le
+disant ; le gel, lui, refuse un diff de renommages illisible.
+
 Usage : scripts/freeze-checks.py   (à la racine d'un arbre ameesh)
 Sortie : 0 tous verts, 1 au moins un rouge, 2 hors d'un arbre ameesh.
 """
@@ -127,6 +136,14 @@ CHECKS = (
     ("alias de module #4521 (politique épinglée)",
      ["scripts/garde-alias-classe.py", "--root", ".",
       "--check-policy", "scripts/alias-review-classes.json"]),
+    # #7777 : un renommage ne fait pas tomber un chemin sensible en classe
+    # légère quand le canon ne nomme pas le nouveau chemin (#7663 : le moteur
+    # de release Nexlink passé dans le module, classé light après le
+    # déplacement). Le garde du gel pose les couples `git diff -M` dans
+    # `AMEESH_FREEZE_RENAMES` ; absent (lancement hors gel), la garde s'inactive
+    # en le disant.
+    ("renommages de classe #7777",
+     ["scripts/garde-renommages-classe.py"]),
 ) + COHERENCE_CHECKS
 #: #5427 : les contrôles qui **avertissent sans bloquer** le gel. Le lint
 #: d'herméticité tourne sur les tests que le lot change quand le garde
@@ -141,6 +158,9 @@ WARN_CHECKS = (
 )
 #: #5427 : les chemins du diff gelé, en JSON, posés par le garde du gel
 PATHS_ENV = "AMEESH_FREEZE_PATHS"
+#: #7777 : les renommages du diff gelé, paires `[ancien, nouveau]` en JSON,
+#: posés par le garde du gel ; absent hors du gel (garde inactive)
+RENAMES_ENV = "AMEESH_FREEZE_RENAMES"
 #: #3687 : les modules de contrat de la porte de fusion (avis, auteurs, feu,
 #: désignation, report des verdicts) ; seules leurs classes sans base tournent
 GATE_CONTRACTS = (
