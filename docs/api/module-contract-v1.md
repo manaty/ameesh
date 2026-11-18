@@ -1,8 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.2, 17 November 2026** (additive E1a snapshot, E1b
-observation, E2a mail submission and history, E3a session policy, E3b bounded
-deferral observation, module schema and migrations snapshot). Scope: an
+Contract revision: **1.3, 18 November 2026** (additive E2b lease-fenced pending
+requests and correlated replies on the Python mail surface). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -15,6 +14,9 @@ identities and confines module data to the imposed `payload.module` namespace �
 the declarative per-agent session policy (tranche E3a, #7674), the bounded
 deferral observation and native qualification (tranche E3b, #7675) and the
 module schema/migrations snapshot; all are additive to revision 1.1.
+Revision 1.3 adds the lease-fenced pending request and correlated reply
+operations to the same Python mail surface (tranche E2b, #7672); it is additive
+to revision 1.2.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -51,10 +53,11 @@ surface becomes available only in a released version that implements it and
 lists it in this contract. Clients check that version before enabling it.
 In particular, the baseline here is ameesh commit
 `aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007`; an open PR is not an installed feature.
-The revision 1.1 elements (#7669 E1a, #7670 E1b) and revision 1.2 elements
-(#7671 E2a, #7674 E3a, #7675 E3b) are available only in a released version
-that carries those lots; at the 1.0 baseline they are absent, and a consumer
-must still treat their absence as "unknown", never as permission.
+The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
+(#7671 E2a, #7674 E3a, #7675 E3b) and the revision 1.3 element (#7672 E2b) are
+available only in a released version that carries those lots; at the 1.0
+baseline they are absent, and a consumer must still treat their absence as
+"unknown", never as permission.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
@@ -267,20 +270,22 @@ when the ledger is ambiguous. The native admission lock is qualified as-is: no
 permanent document priority class and no `_tx_lock` replacement are part of
 this contract.
 
-## Mail submission and history (Python)
+## Mail submission, history, pending requests and replies (Python)
 
 Contract 1.2 adds the first write surface for a module that already holds the
 deployment's database identity: `ameesh.public.mail`. This is the replacement
-for direct `agent_mailbox` submission and history SQL (mapping E2a); the
-governed `agent-mail` commands and the HTTP boundary above remain the public
-surfaces for an ordinary caller. This Python surface does not authenticate a
+for direct `agent_mailbox` submission, history, pending-request and reply SQL
+(mapping E2a/E2b); the governed `agent-mail` commands and the HTTP boundary
+above remain the public surfaces for an ordinary caller. Contract 1.3 adds the
+lease-fenced pending request and correlated reply operations to the same
+surface (tranche E2b, #7672). This Python surface does not authenticate a
 remote client: the database credential remains the trust boundary. A process
 that runs under a mesh runner must use the identity that runner verified; a
 module service with no declared runner identity keeps the actor it names, as
 long as that name is not one the core reserves (below). Mediated executor
 connections are refused — their contract is separate.
 
-Enable the surface only when `ameesh.public.CONTRACT_VERSION` is `"1.2"` or a
+Enable the surface only when `ameesh.public.CONTRACT_VERSION` is `"1.3"` or a
 compatible later minor. A consumer written against the 1.1 draft applies the
 `payload.module` migration above before treating 1.2 as compatible.
 
@@ -291,10 +296,15 @@ compatible later minor. A consumer written against the 1.1 draft applies the
 | `submit_many(db, actor, submissions) -> BatchResult` | Deposit up to 50 submissions in input order. Each item commits or is refused on its own; a refusal appears in its `SubmissionResult` and does not hide later outcomes. A larger batch is refused before anything is deposited. |
 | `find(db, actor, recipient, idempotency_key) -> Receipt \| None` | The durable receipt already deposited under this `(actor, recipient, key)`, or `None`. |
 | `history(db, actor, *, peer=None, after_id=None, limit=100, since_ts=None, until_ts=None, kind=None) -> HistoryPage` | Bounded history of the messages where `actor` is sender or recipient, oldest first by durable id, strictly after `after_id`. `peer` restricts the page to the two-party conversation with that agent; `kind` filters the nature; `since_ts`/`until_ts` bound the creation time. `limit` is between 1 and 200. |
-| `Receipt(id, actor, recipient, kind, created_ts, reused)` | `id` is the durable mailbox row id, stable across retries; `request_id` is that id for a `request` and `None` otherwise; `reused` says this call returned an existing deposit. |
-| `HistoryEntry` and `HistoryPage` | One message (`id`, `sender`, `recipient`, `body`, `kind`, `payload`, `work_item_id`, `created_ts`, `delivered_ts`) and a page (`entries`, `next_cursor`, `has_more`). The stored `payload` keeps the module object under `payload.module`; a 1.1-draft row is returned as stored, never rewritten. `next_cursor` is the last returned id, or the supplied cursor for an empty page; pass it back as `after_id`. `delivered_ts` is observation only and never a lease claim. |
+| `Lease(owner, epoch)` | The native lease the caller acts under: the runner id and epoch read from `ameesh turn current --json` (`lease.owner`, `lease.epoch`). It is a claim the core rechecks against the registry; it never grants authority by itself. |
+| `pending(db, actor, lease, *, sender=None, limit=50) -> PendingPage` | The requests held by `actor`'s live lease and current native turn, oldest first. Only a request reserved as the current turn's prompt (`meta.consigne`) under the same live `(owner, epoch)` lease and the current accounting marker (`spend_pending`, same `turn_id`, delivery in its window) is pending; an unanswered request delivered in an earlier turn is not current and never appears. A stale, replaced or expired lease raises `ScopeRefused`; an absent current-turn marker yields an empty page. `sender` restricts the page to one sender; `limit` is between 1 and 200. This call never reserves, settles or spends. |
+| `reply(db, actor, request_id, reply, *, lease) -> Receipt` | Answer one pending request under the same lease fence. The request must be addressed to `actor` and be the current native turn's prompt; the lease row is locked and rechecked in the transaction that reads the request and writes the reply, so an expired or replaced owner/epoch refuses. The reply is deposited to the request's sender (never a caller-named recipient) and linked to the request's lot. One request accepts one reply; an identical retry returns the durable receipt with `reused=True`, another body or payload raises `ReplyConflict`. |
+| `Reply(body, payload=None, thread=True)` | The content of one answer. The payload is validated like a submission's; `thread=False` keeps the answer out of the readable project thread. The recipient and the lot are the request's, not chosen here. |
+| `PendingRequest` and `PendingPage` | One request (`id`, `sender`, `recipient`, `body`, `payload`, `work_item_id`, `created_ts`, `delivered_ts`, `turn_id`) and a page (`entries`, `has_more`). `turn_id` is the native turn that reserved it; `delivered_ts` is observation only and never a lease claim. `has_more` says another pending request exists; there is no cursor because pending is a live set. The value objects expose `as_dict()` for JSON clients. |
+| `Receipt(id, actor, recipient, kind, created_ts, reused, in_reply_to=None)` | `id` is the durable mailbox row id, stable across retries; `request_id` is that id for a `request` and `None` otherwise; `in_reply_to` is the answered request id for a `reply` and `None` otherwise; `reused` says this call returned an existing deposit. |
+| `HistoryEntry` and `HistoryPage` | One message (`id`, `sender`, `recipient`, `body`, `kind`, `payload`, `work_item_id`, `created_ts`, `delivered_ts`, `in_reply_to`) and a page (`entries`, `next_cursor`, `has_more`). The stored `payload` keeps the module object under `payload.module`; a 1.1-draft row is returned as stored, never rewritten. `in_reply_to` is the answered request id for a reply and `None` otherwise. `next_cursor` is the last returned id, or the supplied cursor for an empty page; pass it back as `after_id`. `delivered_ts` is observation only and never a lease claim. |
 | `SubmissionResult` and `BatchResult` | Ordered batch outcomes (`index`, `receipt`, `error`, `detail`) and the batch (`results`, `ok`). The value objects expose `as_dict()` for JSON clients. |
-| Errors | `InvalidSubmission` (code `invalid`), `IdempotencyConflict` (`conflict`), `ScopeRefused` or `RecipientRefused` (`refused`), `UnsupportedStorage` (`unsupported`). A reserved sender identity raises `ScopeRefused` before any deposit; so does a configured canon whose complete inventory cannot be read. A batch reports the same codes in `SubmissionResult.error`. |
+| Errors | `InvalidSubmission` (code `invalid`), `IdempotencyConflict` or `ReplyConflict` (`conflict`), `ScopeRefused` or `RecipientRefused` (`refused`), `UnsupportedStorage` (`unsupported`). A reserved sender identity raises `ScopeRefused` before any deposit; so does a configured canon whose complete inventory cannot be read. A batch reports the same codes in `SubmissionResult.error`. |
 
 ### Reserved sender identities
 
@@ -335,32 +345,68 @@ core stores the key in `payload.idempotency_key`; the unique index of
 migration 0497 is the authority, so the guarantee holds across processes, not
 only within one caller.
 
-The module payload is confined to `payload.module`, a JSON object (at most
-256 KiB serialized). The namespace belongs to the calling actor: the module
-submits under its own identity, so `payload.module` is already scoped by that
-name. Admission is an allow-list: the only admitted top-level
-keys are `module` and `attribution`. Every other top-level key is core-owned and
-refused before any deposit, so a core control marker added in a later release is
-closed to modules by default instead of becoming open through a deny-list that
-did not know it yet. The exported `ADMITTED_PAYLOAD_KEYS` states the list;
-`RESERVED_PAYLOAD_KEYS` lists the known core markers for diagnostics only.
-Core control markers — delivery and accounting (`idempotency_key`, `report`,
-`report_fingerprint`, `urgent`, `ack`, `info`, `cc`, `broadcast`, `radar`,
-`ci_passif`, `human`, `human_account`, `verdict`, `arbitration`, `reassigned`,
-`request_expires_ts`), review (`review_designation`, `review_request`),
-decisions (`decision`, `decision_answer`) and operations (`pass`, `ci`,
-`staging_actif`) — are never available at the top level. A key with one of
-those names is ordinary data when it is nested inside `payload.module`: it does
-not select a core delivery, review, decision or accounting path.
-`payload.attribution` is the one admitted core key: it is validated with the
-closed caller-attribution schema and remains data, never admission, budget or
-authorization.
+A request is pending only for the native turn that holds it. The
+`spend_pending` marker and the request's reserved prompt (`meta.consigne`:
+`runner`, `epoch`, `turn`) are the authority; this surface reads them, never
+writes them. A request reserved for an older turn, an unanswered request that
+arrived outside the turn's prompt, a withdrawn request, or one already answered
+is not pending. The actor must be the request's recipient. An absent marker
+makes the page empty: absence is never permission to answer.
+
+The lease is not minted by this surface. `pending` and `reply` take the
+`owner`/`epoch` of the native turn (`ameesh turn current --json`) and the core
+rechecks them against the live registry row. `reply` locks that row before it
+reads the request and writes the answer, so a lease that expired, changed
+hands or advanced to another epoch refuses instead of writing under a stale
+identity. It also holds the current accounting marker `FOR SHARE` until commit,
+so a concurrent clear or replacement of `spend_pending` waits instead of ending
+the turn between the decision and the write. Pending rechecks the same facts
+inside its read query; a lease that looks live in an earlier read cannot make
+an old request current.
+
+Reply correlation is held by `agent_mailbox.in_reply_to` (migration 0594,
+additive). The unique partial index `agent_mailbox_in_reply_to_idx` is the
+authority for one reply per request, so concurrent retries end on one durable
+row. An identical retry (same body and payload) returns the durable receipt
+with `reused=True`; a different body or payload raises `ReplyConflict`; the
+request row itself is not rewritten. The reply is ordinary two-party mail:
+visible in the history of the request's sender and of the actor, in the
+readable project thread unless `thread=False`, and nowhere else through this
+surface. It inherits the request's lot and never names its own recipient.
+
+Native accounting stays authoritative: neither `pending` nor `reply` reserves,
+settles, spends or changes a turn, its marker or its reservation. The
+`/requests/{request}` and `turn observe` observations remain the read-only
+surfaces for turn, accounting and quiescence.
+
+The module payload supports role, document and Memoria data, and is confined
+to `payload.module`, a JSON object (at most 256 KiB serialized). The namespace
+belongs to the calling actor: the module submits under its own identity, so
+`payload.module` is already scoped by that name. Admission is an allow-list:
+the only admitted top-level keys are `module` and `attribution`. Every other
+top-level key is core-owned and refused before any deposit, so a core control
+marker added in a later release is closed to modules by default instead of
+becoming open through a deny-list that did not know it yet. The exported
+`ADMITTED_PAYLOAD_KEYS` states the list; `RESERVED_PAYLOAD_KEYS` lists the
+known core markers for diagnostics only. Core control markers — delivery and
+accounting (`idempotency_key`, `report`, `report_fingerprint`, `urgent`, `ack`,
+`info`, `cc`, `broadcast`, `radar`, `ci_passif`, `human`, `human_account`,
+`verdict`, `arbitration`, `reassigned`, `request_expires_ts`), review
+(`review_designation`, `review_request`), decisions (`decision`,
+`decision_answer`) and operations (`pass`, `ci`, `staging_actif`) — are never
+available at the top level. A key with one of those names is ordinary data when
+it is nested inside `payload.module`: it does not select a core delivery,
+review, decision or accounting path. This applies to a submission and to a
+reply alike. `payload.attribution` is the one admitted core key: it is
+validated with the closed caller-attribution schema and remains data, never
+admission, budget or authorization.
 
 Published bounds: body at most 64 KiB UTF-8, serialized payload at most
-256 KiB, 50 submissions per batch, 200 history entries per page. Bodies must be
-readable text (the thread rule). Signatures, request deadlines, urgent wake-up,
-acknowledgements and copies are not part of this surface; a consumer that needs
-them uses the governed command or HTTP boundary.
+256 KiB, 50 submissions per batch, 200 history entries per page, 200 pending
+requests per page (default 50). Bodies must be readable text (the thread rule).
+Signatures, request deadlines, urgent wake-up, acknowledgements and copies are
+not part of this surface; a consumer that needs them uses the governed command
+or HTTP boundary.
 
 ## Named SQL read views
 

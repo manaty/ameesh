@@ -13,7 +13,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import nexlink_alerts, notify, role_run
+from ameesh import notify, role_run
+from ameesh.modules.nexlink import alerts as nexlink_alerts
 from ameesh.platform import child_environment as E
 
 
@@ -109,6 +110,7 @@ class RoleNotifyCredentialsTest(unittest.TestCase):
         script = '''
 import os,subprocess,sys
 from ameesh import notify
+from ameesh.modules.nexlink import notify as nxnotify
 from ameesh.platform import child_environment as E
 E.install()
 assert 'OPENAI_API_KEY' not in os.environ
@@ -116,7 +118,7 @@ assert os.environ['CUSTOM_VALUE'] == 'synthetic-secret'
 E.notify_credentials({'channels': {'primary': {'token_env': 'CUSTOM_VALUE'}}})
 subprocess.run([sys.executable, '-c', "import os; assert 'CUSTOM_VALUE' not in os.environ"], check=True)
 channel = notify.Channel('primary', 'nexlink', {'url': %r, 'token_env': 'CUSTOM_VALUE'})
-notify.Sender()._nexlink_call(channel, 'POST', '/mesh/alerts', {'title': 'role alert'}, 5)
+nxnotify.signed_call(notify.Sender(), channel, 'POST', '/mesh/alerts', {'title': 'role alert'}, 5)
 ''' % url
         try:
             with tempfile.TemporaryDirectory() as root:

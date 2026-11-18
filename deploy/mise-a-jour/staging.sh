@@ -920,8 +920,26 @@ raise SystemExit(0 if isinstance(rapport, dict) and rapport.get("verdict") == "k
     echo non-concluant
   fi
 }
+# #7785 : les personas dont l'unité runner est désactivée ou masquée sur
+# l'hôte, lues par le script de déploiement de cet hôte (vm.sh agents /
+# poste.sh). C'est une preuve d'intention lue dans systemd, pas une supposition
+# sur le silence : la santé ne tolère que les noms rendus ici. Une lecture en
+# échec laisse la santé stricte (jamais un KO masqué) et se nomme.
+unites_desactivees_hote() {  # nom → lignes « --unite-desactivee » et le nom
+  local nom=$1 sortie rc=0 ligne
+  [ "$(mode_de "$nom")" = serveur ] && return 0
+  sortie=$(exec_hote "$nom" unites-desactivees) || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "unites desactivees de $nom : lecture non concluante (code $rc), la sante reste stricte" >&2
+    return 0
+  fi
+  while IFS= read -r ligne; do
+    [ -n "$ligne" ] || continue
+    printf '%s\n' --unite-desactivee "$ligne"
+  done <<<"$sortie"
+}
 sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
-  local nom=$1 sans=${2:-} cible_sonde var sortie rc venv rc_venv=0 args_hote=() args_sonde=()
+  local nom=$1 sans=${2:-} cible_sonde var sortie rc venv rc_venv=0 args_hote=() args_sonde=() args_unites=()
   SANTE_DETAIL=""
   SANTE_RC=""
   venv=$(sha_venv_agents "$nom") || rc_venv=$?
@@ -942,6 +960,7 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   if [ "$(mode_de "$nom")" = serveur ]; then
     args_hote=(--serveur)
   fi
+  mapfile -t args_unites < <(unites_desactivees_hote "$nom")
   if [ "$SONDE" = 1 ] && [ "$sans" != jamais ]; then
     etape "courrier de $nom (sonde de remise reelle)"
     args_sonde=(--sonde "${cible_sonde:-auto}" --attente "$ATTENTE_COURRIER"
@@ -953,7 +972,8 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   rc=0
   sortie=$(py_sequence "$SONDE_PY" --hote "$nom" "${args_sonde[@]}" \
     --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json \
-    ${args_hote[@]+"${args_hote[@]}"}) || rc=$?
+    ${args_hote[@]+"${args_hote[@]}"} \
+    ${args_unites[@]+"${args_unites[@]}"}) || rc=$?
   printf '%s\n' "$sortie"
   SANTE_DETAIL=$sortie
   # 3 : la sonde n'a pas pu tourner ou conclure (non concluant), jamais un hote malsain

@@ -16,7 +16,8 @@ from __future__ import annotations
 import unittest
 
 from ameesh import freeze_families as ff
-from ameesh import registry, review_designation_activation as act
+from ameesh import registry, review_designation as rd
+from ameesh import review_designation_activation as act
 from ameesh import storage, work, work_dependencies
 from ameesh.work_reviewers import designated
 
@@ -110,24 +111,32 @@ class StackedParentTest(_ActivationFixture, PgTestCase):
         self.db.execute("DELETE FROM work_item_dependencies"
                         " WHERE work_item_id = %s AND blocker_id = %s",
                         (self.lot, self.parent))
-        with self.assertRaises(work.WorkError) as caught:
-            self.freeze()
-        text = str(caught.exception)
-        self.assertIn("freeze refused (author-families)", text)
-        self.assertIn("claude", text)
-        self.assertIn("deepseek", text)
-        self.assertEqual([row for row in work.milestones(self.db, self.lot)
-                          if row["kind"] == "frozen"], [])
+        # #7745 : la règle par delta remplace le refus global. Les commits du
+        # parent restent des auteurs (claude et deepseek), donc chaque delta
+        # doit être relu par les deux **autres** familles : le delta claude n'a
+        # que codex (r2) parmi les sièges disponibles et attend un deepseek.
+        mark, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        self.assertEqual(out["missing"], 1)
+        self.assertEqual({row["name"]: row["family"] for row in out["authors"]},
+                         {"author": "deepseek", "parent-author": "claude"})
+        self.assertIn(mark["id"], [row["id"] for row in
+                                   work.milestones(self.db, self.lot)])
 
     def test_a_parent_head_outside_the_childs_history_hides_nothing(self):
         # Le prérequis est déclaré, mais sa tête gelée n'est pas un ancêtre :
-        # elle ne prouve rien du contenu de l'enfant.
+        # elle ne prouve rien du contenu de l'enfant. #7745 : le contenu du
+        # parent reste un auteur (claude) et son delta attend un second avis
+        # hors de sa famille ; le gel n'est plus refusé globalement.
         self._stack(side_parent=True)
-        with self.assertRaises(work.WorkError) as caught:
-            self.freeze()
-        self.assertIn("freeze refused (author-families)", str(caught.exception))
-        self.assertEqual([row for row in work.milestones(self.db, self.lot)
-                          if row["kind"] == "frozen"], [])
+        mark, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual(out["missing"], 1)
+        self.assertEqual({row["name"]: row["family"] for row in out["authors"]},
+                         {"author": "deepseek", "parent-author": "claude"})
+        self.assertIn(mark["id"], [row["id"] for row in
+                                   work.milestones(self.db, self.lot)])
 
 
 if __name__ == "__main__":  # pragma: no cover

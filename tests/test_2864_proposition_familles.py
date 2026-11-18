@@ -110,23 +110,29 @@ class _Stacked(_ActivationFixture):
 
 class PropositionFamillesTest(_Stacked, PgTestCase):
     def freeze_sans_siege(self):
-        """Gèle le lot sans siège : le seul relecteur indépendant (r1, claude)
-        est indisponible au gel, puis rendu au repos.
+        """Gèle le lot sans siège : aucun relecteur non auteur n'est disponible
+        au gel (r1 claude et r2 codex), puis les deux sont rendus au repos.
 
-        Sans cela, la désignation partielle de #3596 pourvoit r1 au gel et la
-        garde SQL de `review_proposals` (`reviewer` non vide, postgres/work.py)
+        Sans cela, la désignation partielle de #3596 pourvoit un siège au gel et
+        la garde SQL de `review_proposals` (`reviewer` non vide, postgres/work.py)
         écarte le lot avant toute lecture des marques : les témoins négatifs de
-        #2864 passeraient sans rien prouver. Ici la colonne reste vide, `take()`
-        lit la marque, et la proposition est la seule à pouvoir désigner r1."""
+        #2864 passeraient sans rien prouver. Depuis #7745, r2 (codex) n'est plus
+        exclu de toute la tête : il peut relire le delta deepseek et serait
+        pourvu ; il faut donc l'écarter aussi pour que le gel reste sans siège.
+        Ici la colonne reste vide, `take()` lit la marque, et la proposition
+        (règle globale de #2864) est la seule à pouvoir désigner r1."""
         self.db.execute(
-            "UPDATE agent_registry SET status = 'dead' WHERE name = 'r1'")
+            "UPDATE agent_registry SET status = 'dead'"
+            " WHERE name IN ('r1', 'r2')")
         _row, outcome = self.freeze()
         self.assertEqual(outcome["state"], rd.WAITING, outcome)
         self.assertEqual(outcome["reviewers"], [], outcome)
         self.assertEqual(self.mails("r1"), [], "aucun siège pourvu au gel")
+        self.assertEqual(self.mails("r2"), [], "aucun siège pourvu au gel")
         self.db.execute(
             "UPDATE agent_registry SET status = 'idle',"
-            " status_since = now() - interval '2 hours' WHERE name = 'r1'")
+            " status_since = now() - interval '2 hours'"
+            " WHERE name IN ('r1', 'r2')")
         return outcome
 
     def test_le_lot_empile_propose_la_famille_independante(self):

@@ -768,8 +768,8 @@ def _elected_tick(cfg, args):
         min_left=0, dry_run=False, json=False), credentials=credentials)
 
 
-def _catchup_actor(cfg, db, explicit) -> str:
-    """#7372: only the avatar, or a human at a terminal, declares the gesture.
+def _catchup_actor(cfg, db, explicit, right=None) -> str:
+    """#7372: the right's holder, the avatar, or a human at a terminal declares.
 
     An agent session must be *bound* (`identity.require_bound`: runner lease or
     session binding), never a bare `AGENT_MAIL_NAME`, which is self-declared
@@ -777,7 +777,10 @@ def _catchup_actor(cfg, db, explicit) -> str:
     names the avatar block; `tenancy.operator` applies the same rule for infrastructure
     gestures). `--actor` never lets an agent act on behalf of another, and an
     unbound session may only name a known human. A root catch-up is not a
-    generic agent gesture: the owner's decision (#219407) names the avatar.
+    generic agent gesture: the owner's decision (#219407 a) names its holder.
+    #7788: the bound session that is the beneficiary of the active ``right``
+    (`staging_deferred.active_right`: signed grant, scope, expiry, revocation)
+    declares as itself; an expired or revoked right names nobody.
     """
     from . import agent_names, avatars, canon, identity, release_cutoff
     text = agent_names.resolve((explicit or "").strip(), db=db,
@@ -798,6 +801,9 @@ def _catchup_actor(cfg, db, explicit) -> str:
             raise release_cutoff.ReleaseError(
                 "this session belongs to %s; it does not declare on behalf of %s"
                 % (name, text))
+        if (right and right.get("active")
+                and str(right.get("beneficiary") or "") == name):
+            return name
         try:
             canons = canon.load_configured(cfg) if cfg is not None else []
             if avatars.is_avatar_in(canons, name):
@@ -806,8 +812,8 @@ def _catchup_actor(cfg, db, explicit) -> str:
             raise release_cutoff.ReleaseError(
                 "cannot read the avatar of %s: %s" % (name, exc)) from exc
         raise release_cutoff.ReleaseError(
-            "%s is not an avatar: the root catch-up is the avatar's gesture "
-            "(#219407)" % name)
+            "%s is neither the holder of an active root right on this host "
+            "nor an avatar (#219407 a)" % name)
     if name:
         # A human name must come from a bound terminal. A bare
         # `AGENT_MAIL_NAME=human:…` is self-declared like any agent name; the
@@ -882,7 +888,7 @@ def _catchup(cfg, args) -> int:
                        % (right.get("decision"), right.get("why") or "inactive")
                        if right else "none configured in release.projects.%s."
                        "staging_rights" % project.name))
-            actor = _catchup_actor(cfg, db, args.actor)
+            actor = _catchup_actor(cfg, db, args.actor, right)
             row = staging_deferred.declare(
                 db, project, host, args.sha, base, args.result, actor, args.note)
         finally:
@@ -1240,7 +1246,8 @@ def add_parser(sub, func) -> None:
                            help="what happened, for a failure or a partial gesture")
     catchup_p.add_argument("--actor", default="",
                            help="a human terminal names itself (human:<id>); a bound "
-                                "session acts as itself and must be an avatar")
+                                "session acts as itself and must hold the active root "
+                                "right (#7788) or be an avatar")
     catchup_p.set_defaults(func=func)
     attest_p = rel.add_parser(
         "attest", help="#6020: the staging agent attests a handed-over release staging "

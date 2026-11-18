@@ -219,6 +219,7 @@ def send(
     idempotency_key: str | None = None,
     report: str | None = None,
     report_fingerprint: str | None = None,
+    in_reply_to: int | None = None,
 ) -> int | None:
     """Dépose un message pour UN destinataire, l'écrit dans son fil. Renvoie son id.
 
@@ -256,6 +257,11 @@ def send(
     (`payload.report` et `payload.report_fingerprint`) est posé par ce module.
     `idempotency_key` l'emporte : un envoi déjà dédoublonné par sa clé n'est
     pas réévalué.
+
+    #7672 : `in_reply_to`, réservé à la surface publique de réponse, nomme la
+    demande (`agent_mailbox.id`, `kind = 'request'`) à laquelle ce message
+    répond. L'index unique partiel 0594 en fait l'autorité de l'unicité ; le
+    dépôt ordinaire ne le pose jamais.
     """
     from .agent_names import resolve as resolve_agent_name
     sender = resolve_agent_name(sender, db=db, operation="mail.send")
@@ -290,11 +296,18 @@ def send(
             raise ValueError("payload.idempotency_key does not match the key")
         payload["idempotency_key"] = idempotency_key
     fil.ensure_readable(body, allow_structured)
-    row = storage.of(db).mailbox.send(
-        sender, recipient, body, host=host, kind=kind, payload=payload,
-        work_item_id=work_item_id, signature=signature, signature_key=signature_key,
-        signed_payload=signed_payload, nonce=nonce, created_us=created_us,
-        expires_us=expires_us)
+    mailbox = storage.of(db).mailbox
+    args = dict(host=host, kind=kind, payload=payload,
+                work_item_id=work_item_id, signature=signature,
+                signature_key=signature_key, signed_payload=signed_payload,
+                nonce=nonce, created_us=created_us, expires_us=expires_us)
+    if in_reply_to is None:
+        row = mailbox.send(sender, recipient, body, **args)
+    else:
+        # #7672 : la corrélation a son propre dépôt, refusé à l'exécuteur
+        # médié ; le chemin ordinaire ne change pas de signature.
+        row = mailbox.send_reply(sender, recipient, body,
+                                 in_reply_to=in_reply_to, **args)
     message_id = int(row["id"])
     # #1689 (N1) : tout dépôt local réveille le chemin rapide du destinataire
     # (#1604), pas seulement `mail send` : approbations, exécuteur, veille,
