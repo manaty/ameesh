@@ -535,6 +535,11 @@ même nom sur la même ligne.
    canal par `registry.notify_channel(kind)`. `notify.py` ne porte plus aucun nom du lexique ; la
    dette `#7663` du test descend de 134 à 55 (dont `cli.py` 8, le reste hors empreinte). Le
    tableau par fichier ci-dessus reste l'instantané initial de l'inventaire, comme pour #7663.
+   **Tranche 3c faite (#7794)** : le contrat CI dynamique du train Nexlink (`train_contracts.py`,
+   28 occurrences) est porté par `src/ameesh/modules/nexlink/packet_ci.py` ; le cœur le lit par
+   `registry.train_contract(name)` (`train_assembly.contracts()`, 2 occurrences retirées) et le
+   doctor (`cli.py`, 8) nomme le canal de module sans nom de projet. La dette `#7663` du test
+   descend de 55 à 17.
 5. **`manaty` n'a aucune tranche** : 9 occurrences dans 4 fichiers (migrations.py 3,
    alert_briefs.py 2, incident.py 2, packet_guard.py 2). `manaty/ameesh` est le dépôt du cœur,
    `manaty/home` le canon, `manaty/nexlink` un dépôt de projet. Recommandation : les traiter

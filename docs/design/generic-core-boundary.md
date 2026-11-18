@@ -153,6 +153,14 @@ rate summary and the `notified`/`fallback` registries.
 transport (formerly `ameesh.nexlink_alerts`). The bare profile has no
 built-in module, hence no `nexlink` channel and no import of either file.
 
+#7637 tranche 3c (#7794) moves the dynamic Nexlink packet CI contract of the
+train (#2503) into that module (`ameesh.modules.nexlink.packet_ci`). A module
+declares `TRAIN_CONTRACTS` and a lazy `train_contract(name)` returning the
+contract factory; `train_assembly.contracts()` merges them with the core's
+`ameesh` contract and refuses a name both declare. The host configuration
+still selects the contract by its exact name (`ci_contract`); the bare
+profile has no `nexlink` contract and refuses that name as unknown.
+
 L100 tranche 1 (#4382) moves the development merge paths into the built-in
 `dev` provider. The `git-merge` action connector lives in
 `modules/dev/git_merge.py`; `connectors.get("git-merge")` reads it through
