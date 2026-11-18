@@ -50,9 +50,10 @@ import re
 import time
 from typing import Any, Mapping, Sequence
 
-from .. import agent_names, cost_attribution, fil, mail, registry, storage
+from .. import (agent_names, cost_attribution, fastmail, fil, mail, registry,
+               storage)
 from ..config import NAME_RE
-from ..db import Db, DbError, is_unique_violation
+from ..db import Db, DbError, is_deadlock, is_unique_violation
 
 #: revision of the written contract implemented by this module
 CONTRACT_VERSION = "1.4"
@@ -83,6 +84,11 @@ _IDEMPOTENCY_INDEX = "agent_mailbox_idempotency_key_idx"
 
 #: unique index that carries reply correlation (migration 0594, E2b)
 _REPLY_INDEX = "agent_mailbox_in_reply_to_idx"
+#: #7778 : essais d'une réponse victime d'un interblocage (40P01). Deux agents
+#: qui se répondent en même temps tiennent chacun leur ligne du registre
+#: (`fence`) et attendent celle de l'autre (`_insert`, FOR SHARE) ; le serveur
+#: annule l'une des deux, rejouée ici en entier une seule fois.
+_REPLY_ATTEMPTS = 2
 
 #: known payload keys the core reads for delivery, review, decisions,
 #: accounting or threading.  They are listed for diagnostics and for the
@@ -1175,6 +1181,40 @@ def _check_reply_scope(request: dict, name: str, claim: Lease) -> None:
             "request %s was delivered before the current turn" % ident)
 
 
+def _reply_once(db: Db, name: str, claim: Lease, ident: int,
+                prepared: _PreparedReply, cfg: Any, threads: list) -> Receipt:
+    """One reply transaction; ``threads`` receives the deferred thread write."""
+    with db.transaction() as tx:
+        ok, reason, _row = registry.lease_agent_locked(
+            tx, name, claim.owner, claim.epoch)
+        if not ok:
+            raise ScopeRefused(
+                "lease refused for %s: %s" % (name, reason))
+        target = storage.of(tx).mailbox.reply_target(ident)
+        if target is None:
+            raise ScopeRefused(
+                "request %s is not pending for %s" % (ident, name))
+        request = target["request"]
+        _check_reply_scope(request, name, claim)
+        if target["replies"]:
+            return _correlated(target["replies"], prepared)
+        try:
+            message_id = mail.send(
+                tx, name, str(request.get("sender") or ""), prepared.body,
+                host=getattr(cfg, "host", None), kind="reply",
+                payload=prepared.payload,
+                work_item_id=(request.get("work_item_id") or None),
+                thread=prepared.thread, in_reply_to=ident,
+                after_commit=threads)
+        except storage.RecipientRetired as exc:
+            raise RecipientRefused(str(exc)) from exc
+        except fil.UnreadableBody as exc:
+            raise InvalidSubmission(str(exc)) from exc
+        if message_id is None:
+            raise PublicMailError("the core mailbox refused the reply")
+        return _receipt(_row_of(tx, int(message_id)), reused=False)
+
+
 def reply(db: Db, actor: str, request_id: int, answer: Reply, *,
           lease: Lease) -> Receipt:
     """Answer one pending request under the caller's live lease.
@@ -1187,7 +1227,9 @@ def reply(db: Db, actor: str, request_id: int, answer: Reply, *,
     request accepts one reply.  An identical retry returns the durable
     receipt with ``reused=True``; another body or payload raises
     :class:`ReplyConflict`.  The native spend marker and reservation remain
-    authoritative: this surface never reserves or settles spend.
+    authoritative: this surface never reserves or settles spend.  Two agents
+    answering each other at once never see the server's deadlock: the victim
+    is replayed once.  The thread entry is written after the commit only.
     """
     _direct(db)
     name = _actor(db, actor)
@@ -1195,38 +1237,23 @@ def reply(db: Db, actor: str, request_id: int, answer: Reply, *,
     ident = _request_id(request_id)
     prepared = _prepare_reply(answer)
     cfg = getattr(db, "cfg", None)
-    try:
-        with db.transaction() as tx:
-            ok, reason, _row = registry.lease_agent_locked(
-                tx, name, claim.owner, claim.epoch)
-            if not ok:
-                raise ScopeRefused(
-                    "lease refused for %s: %s" % (name, reason))
-            target = storage.of(tx).mailbox.reply_target(ident)
-            if target is None:
-                raise ScopeRefused(
-                    "request %s is not pending for %s" % (ident, name))
-            request = target["request"]
-            _check_reply_scope(request, name, claim)
-            if target["replies"]:
-                return _correlated(target["replies"], prepared)
-            try:
-                message_id = mail.send(
-                    tx, name, str(request.get("sender") or ""), prepared.body,
-                    host=getattr(cfg, "host", None), kind="reply",
-                    payload=prepared.payload,
-                    work_item_id=(request.get("work_item_id") or None),
-                    thread=prepared.thread, in_reply_to=ident)
-            except storage.RecipientRetired as exc:
-                raise RecipientRefused(str(exc)) from exc
-            except fil.UnreadableBody as exc:
-                raise InvalidSubmission(str(exc)) from exc
-            if message_id is None:
-                raise PublicMailError("the core mailbox refused the reply")
-            return _receipt(_row_of(tx, int(message_id)), reused=False)
-    except DbError as exc:
-        if not is_unique_violation(exc, _REPLY_INDEX):
-            raise
+    for attempt in range(_REPLY_ATTEMPTS):
+        # #7778 : le fil et le réveil du destinataire attendent le commit ;
+        # une réponse annulée n'en laisse aucune trace.
+        threads: list = []
+        try:
+            receipt = _reply_once(db, name, claim, ident, prepared, cfg, threads)
+        except DbError as exc:
+            if is_deadlock(exc) and attempt + 1 < _REPLY_ATTEMPTS:
+                continue
+            if not is_unique_violation(exc, _REPLY_INDEX):
+                raise
+            break
+        for record in threads:
+            record(cfg, db)
+        if cfg is not None and not receipt.reused:
+            fastmail.bump(cfg, receipt.recipient)
+        return receipt
     # A concurrent writer committed the one reply between our read and our
     # insert.  Re-read outside the aborted transaction: identical content
     # reuses its id, different content is the deterministic conflict.
