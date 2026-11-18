@@ -6296,6 +6296,35 @@ class GithubWatch(Domain):
     """#2845: transactional GitHub intake; notifier host only."""
 
     @abc.abstractmethod
+    def audit_activate(self, project, repo, workflow, now):
+        """Persist initial activation once and return the audit cursor."""
+
+    @abc.abstractmethod
+    def audit_lock(self):
+        """Serialize receipt consumption across workflows and repositories."""
+
+    @abc.abstractmethod
+    def audit_receipts(self, ids):
+        """Structured pre-act evidence for exact candidate identifiers."""
+
+    @abc.abstractmethod
+    def audit_known(self, repo, runs):
+        """Already processed (run ID, attempt) pairs."""
+
+    @abc.abstractmethod
+    def audit_consumed(self, ids):
+        """Candidate receipts already matched to a production attempt."""
+
+    @abc.abstractmethod
+    def audit_record(self, repo, workflow, run, pregeste_id, reason):
+        """Persist one attempt and its correlation outcome."""
+
+    @abc.abstractmethod
+    def audit_advance(self, project, repo, workflow, until):
+        """Advance only after audit outcomes and alerts have committed."""
+
+
+    @abc.abstractmethod
     def cursor(self, project: str, repo: str) -> float | None:
         """Last completed scan, absent before bootstrap."""
 

@@ -211,6 +211,9 @@ class LivenessFixture:
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
             self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
                             " WHERE name = %s", (name,))
+        # #7661 : l'auditeur se lit sur le rôle projeté, pas sur son nom.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                        " WHERE name = 'auditeur'")
         self.lease("dev1", "orch", "bureau", "auditeur")
         self.now = time.time()
 
@@ -227,6 +230,12 @@ class LivenessFixture:
             fh.write("---\ntype: Agent\ntitle: bureau\n"
                      "responsible: human:smichea\nroles: [bureau]\n"
                      "avatar:\n  conversation: portable\n---\n")
+        # #7661 : le canon fait foi quand il est chargé ; l'auditeur doit y
+        # déclarer son rôle, comme sur le canon réel du mesh.
+        with open(os.path.join(root, "agents", "auditeur.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("---\ntype: Agent\ntitle: auditeur\n"
+                     "responsible: human:smichea\nroles: [auditeur]\n---\n")
         return root
 
     def lease(self, *names):

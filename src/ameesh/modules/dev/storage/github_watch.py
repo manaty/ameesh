@@ -136,3 +136,44 @@ class GithubWatch(DevDomain, interface.GithubWatch):
                 " AND delivered_at=%s",
                 (float(now), entry["project"], entry["repo"], entry["kind"],
                  int(entry["object_id"]), float(entry["delivered_at"])))
+
+    # -- #7761: pre-act audit storage, ported from the core shim --------------
+    def audit_activate(self, project, repo, workflow, now):
+        self.db.execute(
+            "INSERT INTO pre_act_audit_cursors VALUES (%s,%s,%s,%s,%s)"
+            " ON CONFLICT DO NOTHING", (project, repo, workflow, now, now))
+        return self.db.query(
+            "SELECT activated_at, scanned_through FROM pre_act_audit_cursors"
+            " WHERE project=%s AND repo=%s AND workflow=%s",
+            (project, repo, workflow))[0]
+
+    def audit_lock(self):
+        # One common lock: receipts are single-use across all subscriptions.
+        self.db.query("SELECT pg_advisory_xact_lock(7761, 1)")
+
+    def audit_receipts(self, ids):
+        return [row["evidence"] for row in self.db.query(
+            "SELECT evidence FROM work_item_events WHERE evidence->>'type'='pre-act/1'"
+            " AND evidence->>'pregeste_id'=ANY(%s::text[])", (list(ids),))]
+
+    def audit_known(self, repo, runs):
+        return {(int(r["run_id"]), int(r["attempt"])) for r in self.db.query(
+            "SELECT run_id, attempt FROM pre_act_audit_runs WHERE repo=%s"
+            " AND run_id=ANY(%s::bigint[])", (repo, [int(r["id"]) for r in runs]))}
+
+    def audit_consumed(self, ids):
+        return {row["pregeste_id"] for row in self.db.query(
+            "SELECT pregeste_id FROM pre_act_audit_runs WHERE reason=''"
+            " AND pregeste_id=ANY(%s::text[])", (list(ids),))}
+
+    def audit_record(self, repo, workflow, run, pregeste_id, reason):
+        self.db.execute(
+            "INSERT INTO pre_act_audit_runs VALUES (%s,%s,%s,%s,%s,%s)",
+            (repo, int(run["id"]), int(run.get("run_attempt", 1)), workflow,
+             pregeste_id, reason))
+
+    def audit_advance(self, project, repo, workflow, until):
+        self.db.execute(
+            "UPDATE pre_act_audit_cursors SET scanned_through=GREATEST(scanned_through,%s)"
+            " WHERE project=%s AND repo=%s AND workflow=%s",
+            (until, project, repo, workflow))

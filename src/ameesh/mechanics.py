@@ -139,7 +139,7 @@ _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "re
                   "paquet", "packet_tests", "file", "session", "auto_take", "projects", "prod_go_max_hours")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
                   "contract_selection", "repair_policy", "prevalidation")
-_PRODUCTION_KEYS = ("branch",)
+_PRODUCTION_KEYS = ("branch", "workflows", "mode_marked_workflows")
 _CONTRACT_SELECTION_KEYS = ("registry", "publish", "attestation_max_age_seconds")
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
 #: ni fin en `/`, `.` ou `.lock` — jamais une ref arbitraire ni un commit
@@ -241,6 +241,8 @@ class ProjectOverride:
     ci_faulty_lot: str | None = None
     #: #3022 : la branche de prod du projet (`production.branch`)
     production_branch: str | None = None  # "": explicit production: none; None: undeclared
+    production_workflows: tuple[str, ...] | None = None
+    production_mode_marked_workflows: tuple[str, ...] = ()
     contract_selection: ContractSelection | None = None
     repair_policy: repair_policy.Policy | None = None
     #: #6915 : le bloc `prevalidation` du projet, qui remplace le bloc global
@@ -1071,6 +1073,26 @@ def _production(value, where: str) -> str:
     return branch
 
 
+def _production_workflows(value, where: str) -> tuple[str, ...] | None:
+    if value == "none":
+        return None
+    if "workflows" not in value:
+        if "mode_marked_workflows" in value:
+            raise MechanicsError(where + ".mode_marked_workflows requires workflows")
+        return None
+    workflows = value["workflows"]
+    if not isinstance(workflows, list) or not workflows:
+        raise MechanicsError(where + ".workflows: a non-empty list is required")
+    if any(not isinstance(w, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml", w)
+           for w in workflows) or len(set(workflows)) != len(workflows):
+        raise MechanicsError(where + ".workflows: unique workflow filenames are required")
+    marked = value.get("mode_marked_workflows", [])
+    if (not isinstance(marked, list) or any(w not in workflows for w in marked)
+            or len(set(marked)) != len(marked)):
+        raise MechanicsError(where + ".mode_marked_workflows: a unique subset of workflows is required")
+    return tuple(workflows)
+
+
 def _families(value, where: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise MechanicsError("%s: a non-empty list of families is required" % where)
@@ -1099,7 +1121,8 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
         packet_cutoffs = None
         max_in_build = None
         packet = label = environment = faulty = None
-        production = None
+        production = production_workflows = None
+        mode_marked_workflows = ()
         if "timezone" in data:
             timezone = _timezone(data["timezone"], scope + ".timezone")
         if "cutoffs" in data:
@@ -1115,6 +1138,9 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
             packet, label, environment, faulty = _ci(data["ci"], scope + ".ci")
         if "production" in data:
             production = _production(data["production"], scope + ".production")
+            production_workflows = _production_workflows(data["production"], scope + ".production")
+            if isinstance(data["production"], dict):
+                mode_marked_workflows = tuple(data["production"].get("mode_marked_workflows", []))
         out.append(ProjectOverride(name=name, timezone=timezone, cutoffs=cutoffs,
                                    packet_cutoffs=packet_cutoffs,
                                    max_in_build=max_in_build, ci_packet=packet,
@@ -1122,6 +1148,8 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
                                    ci_environment_red=environment,
                                    ci_faulty_lot=faulty,
                                    production_branch=production,
+                                   production_workflows=production_workflows,
+                                   production_mode_marked_workflows=mode_marked_workflows,
                                    repair_policy=(repair_policy.compile_policy(
                                        data["repair_policy"], project=name)
                                        if "repair_policy" in data else None),

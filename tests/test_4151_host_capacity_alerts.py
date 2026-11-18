@@ -248,6 +248,10 @@ class CapacityNotifierTest(PgTestCase):
         from ameesh import registry
         for name in ('orch', 'auditeur'):
             registry.upsert(self.db, name, harness='claude', host=self.cfg.host)
+        # #7661 : l'auditeur se lit sur sa déclaration (ici la projection du
+        # registre, sans canon chargé), jamais sur le nom de la persona.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur'] "
+                        " WHERE name = 'auditeur'")
         self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name, "
                         "lease_expires_at = now() + interval '1 hour'")
         ncfg = notify.parse_config(dict(default_human='human:owner', default=['desktop']))

@@ -29,7 +29,8 @@ def settings():
 
 
 def row():
-    return {"name": "mesh-design", "releve": "election", "host": "agents-a",
+    return {"name": "mesh-design", "roles": ["conception"], "releve": "election",
+            "host": "agents-a",
             "candidats": ["agents-a", "agents-b", "poste"]}
 
 
@@ -202,7 +203,7 @@ class AlertsTimerTest(unittest.TestCase):
                                   return_value=([], "no github_watch declaration")), \
                 mock.patch.object(role_timers, "check", side_effect=keep), \
                 mock.patch("sys.stdout"):
-            self.assertEqual(role_timers.main(["--check", "--no-apply"]), 0)
+            self.assertEqual(role_timers.main(["--role", "mesh-design", "--check", "--no-apply"]), 0)
         alerts = next(item for item in captured["timers"] if item["name"] == "alerts")
         self.assertEqual((alerts["blocked"], alerts["detail"]), ("", "reaches human:owner"))
 

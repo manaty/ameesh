@@ -385,7 +385,10 @@ an updatable view or a caller-built transaction on core tables.
 ## Consumer qualification and delivery
 
 [#7665](https://github.com/manaty/ameesh/issues/5857) supplies the external
-witness, public fixture interface and compatibility CI. Existing evidence is
+witness ([contract-witness](../../examples/modules/contract-witness)), the
+frozen [surface](module-contract-v1.surface.json) and the compatibility CI; the
+element → test table is [module-contract-v1-coverage.md](module-contract-v1-coverage.md).
+The public fixture interface is a follow-up. Existing evidence is
 in `test_l84_serve`, `test_l98_modules_registry`, `test_l104_bare_canon`,
 `test_l2894_turn_observe`, and `test_l2894_turn_context`; it is not yet the complete
 external-module qualification required by #5827. The exact follow-up coverage

@@ -576,7 +576,7 @@ def lift_authority(db, cfg=None, *, strict: bool = False):
 
 
 def active_holds(db, events, *, cfg=None,
-                 strict: bool = False) -> dict[int, dict[str, dict]]:
+                 strict: bool = False, preserve_on_transition=None) -> dict[int, dict[str, dict]]:
     """#3219 : les retenues actives de chaque lot, par auteur.
 
     Les holds d'un lot forment un **ensemble**, pas une pile dont on ne lirait
@@ -609,6 +609,8 @@ def active_holds(db, events, *, cfg=None,
                                                        int(e.get("id") or 0))):
             state = event.get("state")
             if previous is not None and state != previous:
+                preserved = {who: hold for who, hold in held.items()
+                             if preserve_on_transition and preserve_on_transition(event, hold)}
                 if is_automatic_transition(event):
                     # #5758 : l'outillage n'a pas repris le lot. Une retenue
                     # ordinaire suit tout changement d'état (règle 1), celle
@@ -617,6 +619,7 @@ def active_holds(db, events, *, cfg=None,
                             if hold.get("pilot")}
                 else:
                     held = {}               # le lot a repris : tout est fini
+                held.update(preserved)
             previous = state
             text = str(event.get("note") or "").strip()
             if not text:

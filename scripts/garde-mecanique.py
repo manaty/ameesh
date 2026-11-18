@@ -119,6 +119,8 @@ SCHEMA_KEYS = (
     "session.max_tokens_by_harness",
     "session.by_role",
     "production.branch",
+    "production.workflows",
+    "production.mode_marked_workflows",
     "contract_selection.registry",
     "contract_selection.publish",
     "contract_selection.attestation_max_age_seconds",
@@ -183,6 +185,8 @@ BINDINGS = {
     "repos_s": "file.repos_s",
     "wake_mail_s": "file.wake_mail_s",
     "production_branch": "production.branch",
+    "production_workflows": "production.workflows",
+    "production_mode_marked_workflows": "production.mode_marked_workflows",
     "repair_policy": "repair_policy",
     "repair_policy_schema": "repair_policy.schema",
     "repair_policy_paused": "repair_policy.paused",
@@ -613,6 +617,8 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
         return type(value) is int and value > 0
     if key == "contract_selection.registry":
         return isinstance(value, str) and bool(value.strip())
+    if key in ("production.workflows", "production.mode_marked_workflows"):
+        return isinstance(value, tuple)
     if key == "production.branch":
         # #3022 : la branche de prod d'un projet se lit dans le canon
         # (`projects.<projet>.production.branch`), jamais recopiée en dur.

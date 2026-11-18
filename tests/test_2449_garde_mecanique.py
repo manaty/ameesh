@@ -161,6 +161,8 @@ POSITIVE = {
         'SESSION_BY_ROLE = {"review": {"compact_tokens": 100000}}\n',
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',
     "production.branch": 'production_branch = "main"\n',
+    "production.workflows": 'production_workflows = ["deploy.yml"]\n',
+    "production.mode_marked_workflows": 'production_mode_marked_workflows = ["mixed.yml"]\n',
     "contract_selection.publish": 'contract_publication = "legacy"\n',
     "contract_selection.attestation_max_age_seconds": 'attestation_max_age_seconds = 3600\n',
     "contract_selection.registry":

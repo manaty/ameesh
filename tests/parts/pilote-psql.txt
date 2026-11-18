@@ -190,3 +190,5 @@ test_3035_host_reconcile  # permanent attachment and lost-host proof transaction
 test_7649_schema_modules  # P1a : registres, schémas et migrations de module, doctor (#7649)
 
 test_7726_prod_go  # #7726: signed production authority and supersession locks
+
+test_7761_pre_act_audit  # stockage : collecte et garde de pré-geste (#7761)
