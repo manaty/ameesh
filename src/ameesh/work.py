@@ -4822,6 +4822,12 @@ def _close(db: Db, item_id: int, *, abandoned: bool = False,
         if get(db, superseded_by) is None:
             raise WorkError("superseding lot %s not found" % superseded_by)
     state = item["state"]
+    if fresh and state not in (lifecycle.REQUESTED, lifecycle.BLOCKED):
+        # #7782 : la clôture automatique ne touche ni un lot déjà clos, ni un
+        # lot avancé. Ce refus précède `_rectify_done` : sinon une clôture
+        # manuelle `superseded by` son parent, relue `closed` entre le constat
+        # et l'écriture, serait réécrite `done` par la passe.
+        raise WorkError("state %s is not closable" % state)
     review, parent = _review_parent(item)
     if state == lifecycle.CLOSED:
         row = _rectify_done(db, item, review=review, parent=parent, done=done,

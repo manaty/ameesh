@@ -16,8 +16,9 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
-from ameesh import backlog_coherence, config, db as db_mod, work
+from ameesh import backlog_coherence, config, db as db_mod, registry, storage, work
 
 from .support import PgTestCase
 
@@ -326,6 +327,50 @@ class CoherenceTest(PgTestCase):
         self.assertIn("hold", refused[0]["reason"])
         self.assertIn("test", refused[0]["reason"])
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_a_concurrent_manual_closure_is_not_rectified(self):
+        """#7782: a manual `superseded` closure of a review mission stays so.
+
+        The pass may read the mission while it is still in intake; a manual
+        closure then commits before `close_fresh` reloads it. `done` used to
+        rewrite the review's `superseded by` its parent into `done` (the
+        `_rectify_done` path) before the fresh guard ran. The automatic pass
+        must refuse, not regularise a manual gesture.
+        """
+        parent = self.lot("Lot relu par la passe")
+        registry.upsert(self.db, "relecteur", harness="claude",
+                        host=self.cfg.host, cwd=self.tmp, mode="execute")
+        review = work.add(
+            self.db,
+            title="R1 Codex #%d : reprise du suivi CI" % int(parent["id"]),
+            source="mail", issue_ref="manaty/ameesh#941", app="p",
+            assignee="relecteur")
+        storage.of(self.db).work.add_milestone(
+            parent["id"], "verdict", sha="e" * 40, actor="relecteur",
+            verdict="blocked", note="")
+        self._cite(review["id"])
+        report = backlog_coherence.scan(self.db, "p", cfg=self.test_cfg,
+                                        repo=self.repo)
+        real_close_fresh = work.close_fresh
+
+        def close_manually_then_apply(db, item_id, **kwargs):
+            work.close(db, item_id, superseded_by=parent["id"], actor="qa",
+                       note="clôture administrative du suivi de revue")
+            return real_close_fresh(db, item_id, **kwargs)
+
+        with mock.patch.object(work, "close_fresh",
+                               side_effect=close_manually_then_apply):
+            applied = backlog_coherence.apply_report(
+                self.db, report, cfg=self.test_cfg, digest=False)
+        refused = [row for row in applied["closures"]
+                   if row["lot"] == review["id"]]
+        self.assertEqual(len(refused), 1, applied["closures"])
+        self.assertEqual(refused[0]["result"], "refused")
+        self.assertIn("not closable", refused[0]["reason"])
+        after = work.get(self.db, review["id"])
+        self.assertEqual((after["state"], after["close_reason"]),
+                         ("closed", "superseded"))
+        self.assertEqual(int(after["superseded_by"]), int(parent["id"]))
 
     def _cfg_with_recipients(self, recipients):
         return dataclasses.replace(
