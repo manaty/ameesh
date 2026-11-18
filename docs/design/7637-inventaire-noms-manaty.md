@@ -41,7 +41,11 @@ l'organisation `manaty`.
 - **Tests, docstrings, commentaires, notes, `COMMENT ON` SQL** : le corps du lot exclut les
   notes. Le scan lit le code exécutable, pas les explications.
 - **`deploy/`, `scripts/`, `docs/`, `.json`, `.css`, `.md`** : hors du périmètre `src/ameesh/`
-  ou non exécutables.
+  ou non exécutables, sauf les consignes (#7796, ci-dessous).
+- **Consignes lues par les agents (`src/ameesh/consignes/*.md`)** : lues en entier par la
+  garde (#7796). Leurs noms viennent du canon (variable `$staging_hosts` de `veille.md`,
+  lue à la séquence staging des fiches Host) ou de mots génériques ; seule exception
+  justifiée : le chemin `docs/ORCHESTRATEUR.md`, nom d'un document du dépôt.
 
 ## 2. Méthode de recherche
 
@@ -50,8 +54,10 @@ Le scan est celui de `tests/test_7660_coeur_sans_noms_manaty.py` ; l'inventaire 
 1. Fichiers : `src/ameesh/**` de suffixe `.py`, `.sql`, `.html`, `.js`, `.cjs`, sauf
    `src/ameesh/modules/**`.
 2. Python : `ast.parse` ; sont lus les littéraux de chaîne hors docstrings,
-   les identifiants (`Name`, `Attribute`, `arg`, `keyword`), les noms de
-   fonctions/classes et les imports (module et alias). Un littéral multi-ligne
+   les identifiants (`Name`, `Attribute`, `arg`, `keyword`, et depuis #7796
+   `Global`, `Nonlocal`), les noms de fonctions/classes et les imports (module
+   et alias). Un identifiant est lu `_` → `-` : `bureau_goal` est l'hôte
+   `bureau-goal`, jamais le rôle `bureau`. Un littéral multi-ligne
    qui ressemble à du SQL voit ses commentaires `--` retirés avant lecture. La
    ligne est celle du littéral, décalage des multi-lignes compris.
 3. SQL : commentaires `--`, `/* */` et instructions `COMMENT ON …;` retirés (notes de base) ;

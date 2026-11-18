@@ -15,6 +15,12 @@ Each exception belongs to one tranche: ``#7634`` for ``bureau``, ``#7661`` for
 roles, ``#7662`` for hosts and persons, ``#7663`` for the Nexlink module.
 ``manaty`` has no announced tranche yet; it is recorded as such on purpose.
 The scanner is the search method of the inventory: keep both in step.
+
+#7796: the instructions the core hands to agents (``consignes/*.md``) are read
+as code, whole: their names come from the canon or from template variables.
+An identifier is read with ``_`` as ``-``, so ``bureau_goal`` is the host
+``bureau-goal``, never the role ``bureau``; ``global`` and ``nonlocal`` names
+are identifiers too.
 """
 from __future__ import annotations
 
@@ -141,6 +147,14 @@ EXCEPTIONS = {
     ("incident.py", "manaty"): 2,
     ("migrations.py", "manaty"): 3,
     ("packet_guard.py", "manaty"): 2,
+}
+
+#: #7796: (instruction file relative to src/ameesh, name) -> allowed
+#: occurrences, each with its written reason. Same rules as EXCEPTIONS.
+INSTRUCTION_EXCEPTIONS = {
+    # The path of a document of the repository (docs/ORCHESTRATEUR.md), not a
+    # role: the bare profile ships the same document under the same name.
+    ("consignes/veille.md", "orchestrateur"): 1,
 }
 
 _FILE_SUFFIXES = (".py", ".sql", ".html", ".js", ".cjs")
@@ -323,6 +337,14 @@ def _strip_script_comments(text: str) -> str:
     return re.sub(r"(?is)(<script[^>]*>)(.*?)(</script>)", blank, text)
 
 
+def _identifier(name: str) -> str:
+    """An identifier as the lexicon spells it: ``bureau_goal`` → ``bureau-goal``.
+
+    Same length, so offsets stay valid; the longer name then masks the
+    shorter one, as in ``_find``."""
+    return name.replace("_", "-")
+
+
 def _python_matches(source: str) -> list:
     """``(line, name, family, actual word, kind)`` in executable Python."""
     tree = ast.parse(source)
@@ -341,14 +363,19 @@ def _python_matches(source: str) -> list:
                     text, re.I):
                 text = _strip_sql_comments(text)
         elif isinstance(node, (ast.Name, ast.Attribute, ast.arg)):
-            text = (node.id if isinstance(node, ast.Name)
-                    else node.attr if isinstance(node, ast.Attribute)
-                    else node.arg)
+            text = _identifier(node.id if isinstance(node, ast.Name)
+                               else node.attr if isinstance(node, ast.Attribute)
+                               else node.arg)
         elif isinstance(node, ast.keyword) and node.arg:
-            text = node.arg
+            text = _identifier(node.arg)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
                                ast.ClassDef)):
-            text = node.name
+            text = _identifier(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                for canonical, family, actual, _ in _find(_identifier(name)):
+                    rows.append((base_line, canonical, family, actual,
+                                 "identifier"))
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             names = []
             if isinstance(node, ast.ImportFrom) and node.module:
@@ -356,7 +383,7 @@ def _python_matches(source: str) -> list:
             for alias in node.names:
                 names.extend(name for name in (alias.name, alias.asname) if name)
             for name in names:
-                for canonical, family, actual, _ in _find(name):
+                for canonical, family, actual, _ in _find(_identifier(name)):
                     rows.append((base_line, canonical, family, actual, "import"))
         if text is None:
             continue
@@ -408,6 +435,20 @@ def _sql_occurrences(path: Path) -> list:
 def _script_occurrences(path: Path, html: bool = False) -> list:
     return _rows(path.relative_to(SOURCE).as_posix(),
                  _script_matches(path.read_text(), html=html))
+
+
+def instruction_occurrences() -> list:
+    """Every Manaty name of the instructions handed to agents (#7796).
+
+    The text is read whole: an instruction is what the agent obeys."""
+    rows = []
+    for path in sorted((SOURCE / "consignes").glob("*.md")):
+        relative = path.relative_to(SOURCE).as_posix()
+        for line_number, line_text in enumerate(path.read_text().splitlines(), 1):
+            for canonical, family, actual, _ in _find(line_text):
+                rows.append((relative, line_number, canonical, family, actual,
+                             "instruction"))
+    return rows
 
 
 @lru_cache(maxsize=1)
@@ -519,6 +560,36 @@ class CoreWithoutManatyNamesTest(unittest.TestCase):
             (2, "mesh-design", "role", "mesh-design", "script"),
             (4, "bureau", "role", "bureau", "script"),
         ])
+
+    def test_instructions_name_no_manaty_name(self):
+        found = Counter((row[0], row[2]) for row in instruction_occurrences())
+        new = found - Counter(INSTRUCTION_EXCEPTIONS)
+        self.assertFalse(new, "Manaty name(s) in an agent instruction; use a "
+                         "template variable read from the canon, or generic "
+                         "words:\n%s" % _detail(
+                             row for row in instruction_occurrences()
+                             if (row[0], row[2]) in new))
+        stale = Counter(INSTRUCTION_EXCEPTIONS) - found
+        self.assertFalse(stale, "Obsolete instruction exception(s): %s"
+                         % sorted(stale))
+        for (path, name), count in INSTRUCTION_EXCEPTIONS.items():
+            self.assertTrue((SOURCE / path).is_file(), path)
+            self.assertIn(name, TRANCHE)
+
+    def test_identifiers_global_and_nonlocal_are_read(self):
+        python = ("def f():\n"
+                  "    global mesh_design\n"
+                  "    def g():\n"
+                  "        nonlocal_value = 1\n"
+                  "        nonlocal nexlink_state\n"
+                  "bureau_goal = 1\n")
+        self.assertEqual(_python_matches(python), [
+            (2, "mesh-design", "role", "mesh-design", "identifier"),
+            (5, "nexlink", "project", "nexlink", "identifier"),
+            (6, "bureau-goal", "host", "bureau-goal", "identifier"),
+        ])
+        self.assertNotIn("bureau", [row[1] for row in _python_matches(
+            "def bureau_goal_of(bureau_goal):\n    return bureau_goal.x\n")])
 
     def test_inventory_is_exhaustive_for_the_declared_lexicon(self):
         self.assertEqual(set(TRANCHE),
