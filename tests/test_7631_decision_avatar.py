@@ -20,16 +20,17 @@ class AvatarDecisionTest(_Base):
         super().setUp()
         self.db.execute("DELETE FROM conversation_log WHERE agent = %s", (AVATAR,))
         self.db.execute("DELETE FROM conversation_heads WHERE agent = %s", (AVATAR,))
+        self.db.execute("TRUNCATE accord_claims")
         self.private, public, _fp = signing.write_keypair(
             os.path.join(self.tmp, "keys-alice"), "alice")
         authority.register_human_key(self.db, ALICE, signing.read_public(public),
                                      role="owner")
 
-    def go(self, decision_id, author=ALICE) -> dict:
+    def go(self, decision_id, author=ALICE, text=None) -> dict:
         entry = storage.of(self.db).conversations.append(
             agent=AVATAR, session=None, turn=None, kind="human_message", author=author,
-            text="go %d" % int(decision_id), truncated=False, meta={}, event_id=None,
-            project="ameesh", lot=None, thread_text=None)
+            text=text or ("go %d a" % int(decision_id)), truncated=False, meta={},
+            event_id=None, project="ameesh", lot=None, thread_text=None)
         return {"agent": AVATAR, "seq": int(entry["seq"])}
 
     def avatar(self, accord) -> dict:
@@ -70,6 +71,20 @@ class AvatarDecisionTest(_Base):
                     self.answer(view["id"], "a", key_path=self.private,
                                 signer=self.avatar(accord))
         self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
+
+    def test_go_doit_nommer_l_option_signee(self):
+        """Auditeur : « go <id> B » ne laisse pas signer A ; le go nomme
+        l'option que l'avatar signe."""
+        view = self.ask(needs_signature=True)
+        other = self.go(view["id"], text="go %d b" % view["id"])
+        with self.assertRaises(DecisionError):
+            self.answer(view["id"], "a", key_path=self.private,
+                        signer=self.avatar(other))
+        self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
+        # le go qui nomme l'option signée passe
+        signed = self.answer(view["id"], "a", key_path=self.private,
+                             signer=self.avatar(self.go(view["id"])))
+        self.assertEqual(signed["decision"]["answer"]["by"], ALICE)
 
     def test_avatar_signe_avec_la_cle(self):
         view = self.ask()

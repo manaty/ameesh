@@ -8,7 +8,22 @@
 -- condition que le reçu cite l'entrée du journal de conversation (agent, seq)
 -- où l'humain a donné son accord. Liste vide (défaut) : refus, comme avant.
 --
--- Additive : une colonne avec défaut ; l'ancien code ne la lit ni ne l'écrit.
+-- `accord_claims` : un accord (agent, seq) ne cite qu'UN geste (kind, ref) —
+-- la clé primaire tranche la course entre deux reçus. Une réutilisation est
+-- refusée (`accord_ref`), pas seulement visible : le « go » de l'humain est
+-- ponctuel, sauf le grant qu'il nomme lui-même comme mandat.
+--
+-- Additive : une colonne avec défaut et une table neuve ; l'ancien code ne
+-- les lit ni ne les écrit.
 set local lock_timeout = '5s';
 alter table authenticators
     add column if not exists accord_operations jsonb not null default '[]'::jsonb;
+
+create table if not exists accord_claims (
+    agent      text not null,
+    seq        bigint not null,
+    kind       text not null check (kind in ('action', 'standing', 'decision')),
+    ref        text not null,
+    claimed_at timestamptz not null default clock_timestamp(),
+    primary key (agent, seq)
+);

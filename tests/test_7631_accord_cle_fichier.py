@@ -5,6 +5,9 @@ La façade `ed25519` reste refusée pour une autorité humaine (spec §8.1), sau
 si le canon nomme, sur CET authentificateur, l'opération approuvée et que le
 reçu cite l'entrée du journal de conversation (agent, seq) où l'humain a
 donné son accord. Sans `accord_operations` au canon : rien ne change.
+
+Le go est explicite et affirmatif et nomme le geste signé ; un accord ne cite
+qu'un reçu (`accord_claims`), une réutilisation est refusée.
 """
 from __future__ import annotations
 
@@ -34,8 +37,8 @@ class AccordBase(PgTestCase):
         super().setUp()
         self.db.execute(
             "TRUNCATE actions, action_attempts, action_events, authenticators, "
-            "standing_approvals, standing_reservations, mesh_consumed_nonces "
-            "RESTART IDENTITY CASCADE")
+            "standing_approvals, standing_reservations, mesh_consumed_nonces, "
+            "accord_claims RESTART IDENTITY CASCADE")
         self.db.execute("DELETE FROM conversation_log WHERE agent = %s", (AVATAR,))
         self.db.execute("DELETE FROM conversation_heads WHERE agent = %s", (AVATAR,))
         self.key = SoftEd25519()
@@ -49,7 +52,7 @@ class AccordBase(PgTestCase):
         return apply_authenticators(self.db, [member("alice", entry, self.passkey.entry())])
 
     def go(self, *, author: str = ALICE, kind: str = "human_message", age: float = 0,
-           text: str = "go prod-deploy", project: str = "ameesh",
+           text: str = "go action", project: str = "ameesh",
            lot: str | None = None) -> dict:
         entry = storage.of(self.db).conversations.append(
             agent=AVATAR, session=None, turn=None, kind=kind, author=author,
@@ -66,6 +69,14 @@ class AccordBase(PgTestCase):
         if accord is not None:
             request["accord"] = accord
         return self.key.receipt(request)
+
+    def receipt_with_go(self, text: str | None = None, **kwargs):
+        """Un reçu et l'accord qui nomme son action signée (identifiant)."""
+        request = make_request(ALICE, **kwargs)
+        if text is None:
+            text = "go %s" % request["action_id"]
+        request["accord"] = self.go(text=text)
+        return self.key.receipt(request), request["accord"]
 
     def verify(self, receipt, operation="prod-deploy", **kwargs):
         return receipts.verify_receipt(self.db, receipt, POLICY,
@@ -113,8 +124,8 @@ class FormeTest(AccordBase):
 
 class VerificationTest(AccordBase):
     def test_accepte_sous_accord_pour_une_operation_nommee(self):
-        accord = self.go()
-        verdict = self.verify(self.receipt(accord))
+        receipt, accord = self.receipt_with_go()
+        verdict = self.verify(receipt)
         self.assertTrue(verdict.ok, verdict.reason)
         self.assertEqual(verdict.accord, accord)
         self.assertTrue(verdict.file_key)
@@ -124,72 +135,87 @@ class VerificationTest(AccordBase):
         self.assertRefused(self.verify(self.receipt()), receipts.FACADE)
 
     def test_operation_non_nommee_refusee(self):
-        self.assertRefused(self.verify(self.receipt(self.go()), operation="spend"),
+        receipt, _ = self.receipt_with_go()
+        self.assertRefused(self.verify(receipt, operation="spend"),
                            receipts.ACCORD_OPERATION)
 
     def test_operation_absente_refusee(self):
-        self.assertRefused(self.verify(self.receipt(self.go()), operation=None),
-                           receipts.UNBOUND)
+        receipt, _ = self.receipt_with_go()
+        self.assertRefused(self.verify(receipt, operation=None), receipts.UNBOUND)
 
     def test_canon_sans_politique_rien_ne_change(self):
         """TPK : aucun `accord_operations` → la clé fichier ne vaut jamais."""
+        receipt, _ = self.receipt_with_go()
         self.assertEqual(self.sync(None)["errors"], [])
-        self.assertRefused(self.verify(self.receipt(self.go())), receipts.ACCORD_OPERATION)
+        self.assertRefused(self.verify(receipt), receipts.ACCORD_OPERATION)
 
     def test_retrait_au_canon_applique(self):
-        accord = self.go()
-        self.assertTrue(self.verify(self.receipt(accord)).ok)
+        receipt, _ = self.receipt_with_go()
+        self.assertTrue(self.verify(receipt).ok)
         result = self.sync(["decision-sign"])
         self.assertEqual(len(result["updated"]), 1, result)
-        self.assertRefused(self.verify(self.receipt(accord)), receipts.ACCORD_OPERATION)
+        self.assertRefused(self.verify(receipt), receipts.ACCORD_OPERATION)
 
     def test_entree_de_journal_verifiee(self):
+        def receipt_for_entry(**go_kwargs):
+            request = make_request(ALICE)
+            request["accord"] = self.go(text="go %s" % request["action_id"], **go_kwargs)
+            return self.key.receipt(request)
+
         cases = {
-            "absente": {"agent": AVATAR, "seq": 999},
-            "autre humain": self.go(author="human:bob"),
-            "pas un message humain": self.go(kind="turn_end"),
-            "trop ancienne": self.go(age=receipts.DEFAULT_MAX_TTL + 60),
+            "absente": self.receipt({"agent": AVATAR, "seq": 999}),
+            "autre humain": receipt_for_entry(author="human:bob"),
+            "pas un message humain": receipt_for_entry(kind="turn_end"),
+            "trop ancienne": receipt_for_entry(age=receipts.DEFAULT_MAX_TTL + 60),
         }
-        for label, accord in cases.items():
+        for label, receipt in cases.items():
             with self.subTest(label):
-                self.assertRefused(self.verify(self.receipt(accord)), receipts.ACCORD)
+                self.assertRefused(self.verify(receipt), receipts.ACCORD)
         # écrite après la signature
-        accord = self.go()
-        late = self.receipt(accord, iat=int(time.time()) - 600, ttl=1200)
+        late = self.receipt_with_go(iat=int(time.time()) - 600, ttl=1200)[0]
         self.assertRefused(self.verify(late), receipts.ACCORD)
 
     def test_go_doit_etre_explicite(self):
-        """B cx2 : une question, un refus ou un message sans rapport ne vaut
-        pas accord, même récent et écrit par l'humain lui-même."""
+        """B cx2/dev3/auditeur : une question, un refus ou un message sans
+        rapport ne vaut pas accord, même récent et écrit par l'humain."""
         cases = {
-            "question": "faut-il y aller ?",
-            "refus": "non, pas de go prod-deploy",
+            "question": "go {action} ?",
+            "refus": "go {action}, non, pas ce soir",
+            "négation": "go {action}; je ne déploie pas",
             "sans rapport": "le temps est beau aujourd'hui",
             "go d'un autre geste": "go spend",
+            "opération seule": "go prod-deploy",
+            "cible seule": "go prod:ameesh",
         }
-        for label, text in cases.items():
+        for label, template in cases.items():
             with self.subTest(label):
-                self.assertRefused(self.verify(self.receipt(self.go(text=text))),
-                                   receipts.ACCORD)
-        # le geste nommé par l'opération attendue suffit
-        self.assertTrue(self.verify(self.receipt(self.go(text="go prod-deploy"))).ok)
-        # ou par l'identifiant signé de l'action
-        request = make_request(ALICE)
-        request["accord"] = self.go(text="go %s" % request["action_id"])
-        self.assertTrue(self.verify(self.key.receipt(request)).ok)
+                request = make_request(ALICE)
+                text = template.format(action=request["action_id"])
+                request["accord"] = self.go(text=text)
+                self.assertRefused(self.verify(self.key.receipt(request)), receipts.ACCORD)
+        # le geste nommé par l'identifiant signé de l'action suffit
+        receipt, _ = self.receipt_with_go()
+        self.assertTrue(self.verify(receipt).ok)
 
     def test_go_sans_reference_de_geste_refuse(self):
-        """Un « go » qui ne nomme ni l'action, ni l'opération, ni la cible ne
-        rattache pas le message au geste signé."""
-        self.assertRefused(self.verify(self.receipt(self.go(text="go pour la mise en production"))),
-                           receipts.ACCORD)
+        """Un « go » qui ne nomme ni l'action, ni la cible ET l'opération, ni
+        le lot ne rattache pas le message au geste signé."""
+        receipt, _ = self.receipt_with_go(text="go pour la mise en production")
+        self.assertRefused(self.verify(receipt), receipts.ACCORD)
+
+    def test_go_ponctuation_finale_acceptee(self):
+        """N auditeur : « go prod-deploy. » vaut « go prod-deploy » ; la
+        référence reste l'identifiant de l'action."""
+        request = make_request(ALICE)
+        request["accord"] = self.go(text="go %s." % request["action_id"])
+        self.assertTrue(self.verify(self.key.receipt(request)).ok)
 
     def test_grant_borne_aux_operations_nommees(self):
         until = int(time.time()) + 3600
         standing = {"connector": "shell-noop", "operations": ["prod-deploy"],
                     "class": "irreversible", "max_amount": 0, "currency": None,
                     "until": until}
-        accord = self.go()
+        accord = self.go(text="go mandat shell-noop prod-deploy")
         ok = self.receipt(accord, standing=standing)
         self.assertTrue(receipts.verify_receipt(self.db, ok, POLICY, kind="standing").ok)
         wide = self.receipt(accord, standing=dict(standing,
@@ -203,14 +229,16 @@ class PorteTest(AccordBase):
         super().setUp()
         self.noop = ShellNoopConnector(os.path.join(self.tmp, "noop"), timeout=10.0)
 
-    def propose(self, operation: str) -> dict:
+    def propose(self, operation: str, *, target: str = "prod:ameesh",
+                args: dict | None = None, work_item: int | None = None) -> dict:
         return actions.propose(self.db, self.noop, operation=operation, project="demo",
-                               proposed_by="agent:bureau", target="prod:ameesh",
-                               args={"version": "1.58.0"}, action_class="irreversible")
+                               proposed_by="agent:bureau", target=target,
+                               args=args or {"version": "1.58.0"},
+                               action_class="irreversible", work_item=work_item)
 
     def test_mise_en_production_approuvee_sous_accord(self):
         action = self.propose("prod-deploy")
-        accord = self.go()
+        accord = self.go(text="go prod:ameesh prod-deploy")
         request = actions.approval_request(action, ALICE, accord=accord)
         bound = actions.approve(self.db, action["action_id"], self.key.receipt(request),
                                 policy=POLICY, by="bureau")
@@ -219,14 +247,64 @@ class PorteTest(AccordBase):
                       " ".join(e.get("note") or "" for e in actions.events(
                           self.db, action["action_id"])))
 
+    def test_action_nommee_par_son_identifiant(self):
+        action = self.propose("prod-deploy")
+        accord = self.go(text="go %s" % action["action_id"])
+        request = actions.approval_request(action, ALICE, accord=accord)
+        bound = actions.approve(self.db, action["action_id"], self.key.receipt(request),
+                                policy=POLICY, by="bureau")
+        self.assertEqual(bound["state"], "approved")
+
+    def test_action_nommee_par_son_lot(self):
+        """Auditeur : le lot est une référence propre au geste ; un go qui le
+        nomme rattache l'action (une seule, la réutilisation restant refusée)."""
+        from ameesh import work
+        lot = work.add(self.db, title="RT-7631 : lot du go", actor="agent:bureau")
+        action = self.propose("prod-deploy", work_item=lot["id"])
+        accord = self.go(text="go %s" % lot["id"])
+        request = actions.approval_request(action, ALICE, accord=accord)
+        bound = actions.approve(self.db, action["action_id"], self.key.receipt(request),
+                                policy=POLICY, by="bureau")
+        self.assertEqual(bound["state"], "approved")
+
     def test_porte_refuse_une_operation_non_nommee(self):
         action = self.propose("spend")
-        request = actions.approval_request(action, ALICE, accord=self.go())
+        request = actions.approval_request(
+            action, ALICE, accord=self.go(text="go %s" % action["action_id"]))
         with self.assertRaises(ActionError) as caught:
             actions.approve(self.db, action["action_id"], self.key.receipt(request),
                             policy=POLICY, by="bureau")
         self.assertEqual(caught.exception.code, receipts.ACCORD_OPERATION)
         self.assertEqual(actions.get(self.db, action["action_id"])["state"], "proposed")
+
+    def test_go_d_une_autre_cible_refuse(self):
+        """Auditeur : la cible et l'opération vont ensemble ; une autre cible
+        ne rattache pas le go au geste."""
+        action = self.propose("prod-deploy")
+        accord = self.go(text="go prod:autre prod-deploy")
+        request = actions.approval_request(action, ALICE, accord=accord)
+        with self.assertRaises(ActionError) as caught:
+            actions.approve(self.db, action["action_id"], self.key.receipt(request),
+                            policy=POLICY, by="bureau")
+        self.assertEqual(caught.exception.code, receipts.ACCORD)
+        self.assertEqual(actions.get(self.db, action["action_id"])["state"], "proposed")
+
+    def test_reutilisation_refusee(self):
+        """Auditeur : un go cité par un reçu ne peut pas en autoriser un autre.
+        Les deux actions partagent la cible et l'opération que le go nomme ;
+        la première réclame l'accord, la seconde est refusée."""
+        first = self.propose("prod-deploy", args={"version": "1.58.0"})
+        second = self.propose("prod-deploy", args={"version": "1.59.0"})
+        accord = self.go(text="go prod:ameesh prod-deploy")
+        request = actions.approval_request(first, ALICE, accord=accord)
+        actions.approve(self.db, first["action_id"], self.key.receipt(request),
+                        policy=POLICY, by="bureau")
+        request = actions.approval_request(second, ALICE, accord=accord)
+        with self.assertRaises(ActionError) as caught:
+            actions.approve(self.db, second["action_id"], self.key.receipt(request),
+                            policy=POLICY, by="bureau")
+        self.assertEqual(caught.exception.code, receipts.ACCORD)
+        self.assertEqual(actions.get(self.db, second["action_id"])["state"], "proposed")
 
 
 class GrantTest(AccordBase):
@@ -258,7 +336,7 @@ class GrantTest(AccordBase):
                         ALICE, standing=self.standing(charter=bad)))
 
     def test_inscrit_puis_liste(self):
-        accord = self.go(text="go decision-sign")
+        accord = self.go(text="go mandat journal decision-sign")
         receipt = self.receipt(accord, standing=self.standing(
             charter={"frame": "sign-decisions", "version": "1"}))
         verdict, grant_id = receipts.register_standing(
@@ -278,7 +356,8 @@ class GrantTest(AccordBase):
         self.assertEqual(len(receipts.list_standing(self.db, include_inactive=True)), 1)
 
     def test_grant_hors_operations_nommees_refuse(self):
-        receipt = self.receipt(self.go(), standing=self.standing(operations=["spend"]))
+        receipt = self.receipt(self.go(text="go mandat journal decision-sign"),
+                               standing=self.standing(operations=["spend"]))
         verdict, grant_id = receipts.register_standing(
             self.db, receipt, POLICY, registered_by="bureau", limits=self.LIMITS)
         self.assertIsNone(grant_id)
@@ -287,13 +366,41 @@ class GrantTest(AccordBase):
     def test_grant_sans_charte_du_canon_refuse(self):
         """#7629 : le plafond du canon exige la ligne et la version de charte ;
         le cadre `{frame, version}` de #7631 ne les remplace pas."""
-        receipt = self.receipt(self.go(text="go decision-sign"), standing=self.standing(
-            charter_line=None, charter_version=None))
+        receipt = self.receipt(self.go(text="go mandat journal decision-sign"),
+                               standing=self.standing(
+                                   charter_line=None, charter_version=None))
         verdict, grant_id = receipts.register_standing(
             self.db, receipt, POLICY, registered_by="bureau", limits=self.LIMITS)
         self.assertIsNone(grant_id)
         self.assertEqual(verdict.code, receipts.POLICY, verdict.reason)
         self.assertIn("charter", verdict.reason)
+
+    def test_grant_sans_mot_mandat_refuse(self):
+        """Auditeur : un go qui nomme le connecteur et les opérations mais pas
+        le mandat ne suffit pas à inscrire un grant."""
+        receipt = self.receipt(self.go(text="go journal decision-sign"),
+                               standing=self.standing())
+        verdict, grant_id = receipts.register_standing(
+            self.db, receipt, POLICY, registered_by="bureau", limits=self.LIMITS)
+        self.assertIsNone(grant_id)
+        self.assertEqual(verdict.code, receipts.ACCORD, verdict.reason)
+
+    def test_grant_reutilise_refuse(self):
+        """Auditeur : un go cité par un reçu de grant ne vaut pas pour un
+        second grant ; le second reçu a un autre challenge."""
+        accord = self.go(text="go mandat journal decision-sign")
+        first = self.receipt(accord, standing=self.standing())
+        verdict, grant_id = receipts.register_standing(
+            self.db, first, POLICY, registered_by="bureau", limits=self.LIMITS)
+        self.assertTrue(verdict.ok, verdict.reason)
+        self.assertIsNotNone(grant_id)
+        second = self.receipt(accord, standing=self.standing(
+            until=int(time.time()) + 3600))
+        verdict, grant_id = receipts.register_standing(
+            self.db, second, POLICY, registered_by="bureau", limits=self.LIMITS)
+        self.assertIsNone(grant_id)
+        self.assertEqual(verdict.code, receipts.ACCORD, verdict.reason)
+        self.assertIn("already cited", verdict.reason)
 
 
 class JournalTest(AccordBase):
@@ -310,7 +417,7 @@ class JournalTest(AccordBase):
                                  args={"version": "1.58.0"}, action_class="irreversible")
         other = actions.propose(self.db, self.noop, operation="send", project="demo",
                                 proposed_by="agent:bureau", target="client:1", args={})
-        accord = self.go()
+        accord = self.go(text="go %s" % action["action_id"])
         request = actions.approval_request(action, ALICE, accord=accord)
         actions.approve(self.db, action["action_id"], self.key.receipt(request),
                         policy=POLICY, by="bureau")
@@ -347,25 +454,35 @@ class MigrationTest(AccordBase):
                 "current_schema() AND table_name = 'authenticators' "
                 "AND column_name = 'accord_operations'"))
 
+        def has_claims(tx) -> bool:
+            return bool(tx.query(
+                "SELECT 1 AS x FROM information_schema.tables WHERE table_schema = "
+                "current_schema() AND table_name = 'accord_claims'"))
+
         class Undo(Exception):
             pass
 
         with self.assertRaises(Undo):
             with self.db.transaction() as tx:
                 self.assertTrue(has_column(tx))
+                self.assertTrue(has_claims(tx))
                 tx.execute(restore)
                 self.assertFalse(has_column(tx))
+                self.assertFalse(has_claims(tx))
                 tx.execute(forward)
                 self.assertTrue(has_column(tx))
+                self.assertTrue(has_claims(tx))
                 raise Undo()
         self.assertTrue(has_column(self.db))
+        self.assertTrue(has_claims(self.db))
 
 
 class CompatibiliteN1Test(AccordBase):
     """CONTRIBUTING « Compatibilité N-1 » : un écrivain N-1 du registre
     (`storage.postgres.authenticators.insert` d'avant 0586) ignore
     `accord_operations` ; le défaut `'[]'` suffit et le nouveau lecteur
-    refuse la clé fichier, comme avant."""
+    refuse la clé fichier, comme avant. La table `accord_claims` est neuve :
+    l'ancien code ne la lit ni ne l'écrit."""
 
     def test_ligne_ecrite_par_n1(self):
         import hashlib
@@ -380,9 +497,11 @@ class CompatibiliteN1Test(AccordBase):
         }, added=["accord_operations"])
         row = receipts.list_authenticators(self.db)[0]
         self.assertEqual(row["accord_operations"], [])
-        accord = self.go()
-        self.assertRefused(self.verify(self.receipt(accord)), receipts.ACCORD_OPERATION)
+        request = make_request(ALICE)
+        request["accord"] = self.go(text="go %s" % request["action_id"])
+        receipt = self.key.receipt(request)
+        self.assertRefused(self.verify(receipt), receipts.ACCORD_OPERATION)
         self.assertRefused(self.verify(self.receipt()), receipts.FACADE)
         # le nouveau code sur la ligne N-1 : une resynchronisation l'ouvre
         self.assertEqual(self.sync(["prod-deploy"])["errors"], [])
-        self.assertTrue(self.verify(self.receipt(accord)).ok)
+        self.assertTrue(self.verify(receipt).ok)

@@ -182,6 +182,29 @@ class Authenticators(interface.Authenticators):
             (reason, canon_ref, int(authenticator_id)))
         return bool(rows)
 
+    # -- #7631 : un « go » du journal ne cite qu'un geste -------------------
+    def accord_claim(self, agent, seq):
+        rows = self.db.query(
+            "SELECT kind, ref FROM accord_claims WHERE agent = %s AND seq = %s",
+            (str(agent), int(seq)))
+        return rows[0] if rows else None
+
+    def claim_accord(self, agent, seq, kind, ref):
+        """INSERT … ON CONFLICT : la ligne existe déjà pour ce même geste
+        (relecture du même reçu) ou elle est créée ; un autre geste ne rend
+        aucune ligne. Une seule instruction, donc atomique entre deux reçus."""
+        rows = self.db.query(
+            """
+            INSERT INTO accord_claims (agent, seq, kind, ref)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (agent, seq) DO UPDATE SET agent = EXCLUDED.agent
+              WHERE accord_claims.kind = EXCLUDED.kind
+                AND accord_claims.ref = EXCLUDED.ref
+            RETURNING agent
+            """,
+            (str(agent), int(seq), str(kind), str(ref)))
+        return bool(rows)
+
     def insert(self, record) -> bool:
         rows = self.db.query(
             """

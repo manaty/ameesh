@@ -4242,6 +4242,18 @@ class Authenticators(Domain):
         """Niveau, aaguid, provenance et opérations sous accord (#7631) d'une
         ligne active (même clé)."""
 
+    # -- #7631 : un « go » du journal ne cite qu'un geste -------------------
+    @abc.abstractmethod
+    def accord_claim(self, agent: str, seq: int) -> dict | None:
+        """Le geste qui a déjà cité l'accord (agent, seq), ou None : `kind`,
+        `ref`."""
+
+    @abc.abstractmethod
+    def claim_accord(self, agent: str, seq: int, kind: str, ref: str) -> bool:
+        """Réclame l'accord (agent, seq) pour le geste (`kind`, `ref`) — vrai
+        s'il est libre ou déjà réclamé par CE geste, faux s'il est cité par un
+        autre. La clé primaire tranche la course entre deux reçus."""
+
     @abc.abstractmethod
     def revoke(self, authenticator_id: int, *, reason: str, canon_ref: str | None) -> bool:
         """Révoque une ligne active, en notant le commit qui le constate."""

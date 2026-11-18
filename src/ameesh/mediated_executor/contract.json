@@ -4701,9 +4701,11 @@
     "recent"
    ],
    "authenticators": [
+    "accord_claim",
     "active_holders",
     "append_sync",
     "canon_refs",
+    "claim_accord",
     "for_approver",
     "insert",
     "journal_head",

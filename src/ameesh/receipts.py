@@ -1012,9 +1012,10 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
     # 4 bis. #7631 : l'accord cité est une entrée du journal de conversation,
     #    écrite par l'approbateur lui-même, avant la signature et récente
     if accord is not None:
-        references, lot = _gesture_references(db, request, expected_operation)
+        gesture = _gesture_references(db, request, expected_operation, parsed.kind)
         code, reason = check_accord_entry(db, accord, request["approver"], iat, policy,
-                                          references=references, lot=lot)
+                                          gesture=gesture, kind=parsed.kind,
+                                          ref=parsed.challenge.hex())
         if code:
             return refuse(code, reason)
         ctx.update(accord={"agent": accord["agent"], "seq": accord["seq"]},
@@ -1046,62 +1047,160 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         request["decision"], approver, parsed.facade), **ctx), parsed
 
 
-#: #7631 (B cx2) : un « go » est explicite — le message commence par `go`
-#: (mot isolé, pas `golang`), puis nomme le geste signé. Une question ou un
-#: refus ne le nomme pas : il ne peut donc plus être cité comme accord.
-_GO_RE = re.compile(r"^\s*go(?![0-9A-Za-z])", re.IGNORECASE)
-#: les mots du message, pour y retrouver une référence de geste
-_GO_TOKEN_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z_.:#/-]*")
+#: #7631 (B cx2, dev3, auditeur) : un « go » est explicite et AFFIRMATIF — le
+#: message commence par `go` (mot isolé, pas `golang`), ne pose pas de question
+#: et ne porte aucune négation. Il nomme ensuite le geste signé : identifiant
+#: d'action, ou cible ET opération, ou lot pour une action ; le connecteur,
+#: TOUTES ses opérations et le mot « mandat » pour un grant ; l'identifiant de
+#: la décision ET l'option signée pour `decide`. L'opération seule, une autre
+#: cible, une question ou un refus ne suffisent jamais.
+_GO_RE = re.compile(r"^\s*go(?![0-9A-Za-z])(?P<rest>.*)$",
+                    re.IGNORECASE | re.DOTALL)
+#: les mots du message, ponctuation finale retirée (`prod-deploy.` vaut
+#: `prod-deploy`, N de la relecture auditeur) ; les lettres accentuées comptent
+#: pour les libellés d'option.
+_GO_TOKEN_RE = re.compile(r"\w[\w.:#/@-]*", re.UNICODE)
+#: une question ou une négation ne vaut jamais accord, même commençant par go
+_NEGATIONS = frozenset({
+    "non", "pas", "jamais", "aucun", "aucune", "nul", "nulle", "rien",
+    "refus", "refuse", "refusé", "refusee", "refusée", "ne", "n",
+    "no", "not", "never", "none", "nope",
+})
+#: un grant ne s'inscrit que sur un go qui le nomme comme mandat
+_MANDATE_WORDS = frozenset({
+    "mandat", "mandate", "grant", "standing", "permanent", "permanente",
+    "approbation",
+})
 
 
-def _gesture_references(db: Db, request: dict, expected_operation: str | None
-                        ) -> tuple[list[str], int | None]:
-    """Les références qui rattachent l'accord au geste signé (#7631, B cx2).
+def _go_tokens(text: str) -> dict[str, int]:
+    """Les mots du message (casés) et leur première position ; la ponctuation
+    finale ne fait pas partie du jeton, ni le préfixe `#`/`@` d'une cible."""
+    tokens: dict[str, int] = {}
+    for match in _GO_TOKEN_RE.finditer(text):
+        token = _token_key(match.group(0).rstrip(".,;:!?)]}\"'"))
+        if token:
+            tokens.setdefault(token, match.start())
+    return tokens
 
-    L'identifiant d'action, l'opération attendue, la cible et le lot de
-    l'action ; pour un grant, le connecteur et ses opérations. Le message de
-    l'humain doit en nommer une, sinon l'accord n'est pas rattaché au geste.
-    Une lecture ratée de l'action ne prouve rien : elle laisse seulement les
-    références déjà connues par la demande signée.
+
+def _token_key(value) -> str:
+    """La forme comparée d'un jeton : casée, sans `#`/`@` de tête."""
+    return str(value or "").strip().lstrip("#@").casefold()
+
+
+def _phrase_in(text: str, phrase: str) -> bool:
+    """Le libellé d'option, espaces normalisés, apparaît dans le message."""
+    wanted = " ".join(str(phrase or "").split()).casefold()
+    return len(wanted) >= 2 and wanted in " ".join(text.casefold().split())
+
+
+def _gesture_references(db: Db, request: dict, expected_operation: str | None,
+                        kind: str) -> dict:
+    """Le geste signé, sous la forme que `check_accord_entry` confronte au
+    message : action (identifiant, cible, opération, lot) ou grant (connecteur,
+    opérations).
+
+    Une lecture ratée de l'action ne prouve rien : elle laisse l'identifiant
+    signé, qui suffit à rattacher le go ; la cible et l'opération ne sont
+    opposées que lorsqu'elles sont connues.
     """
-    refs: list[str] = []
-    lot = None
-    action_id = request.get("action_id")
-    if isinstance(action_id, str) and action_id:
-        refs.append(action_id)
+    if kind == "standing":
+        standing = request.get("standing") or {}
+        return {
+            "kind": "standing",
+            "connector": str(standing.get("connector") or "").strip(),
+            "operations": [str(value).strip() for value in standing.get("operations") or ()
+                           if str(value or "").strip()],
+        }
+    action_id = str(request.get("action_id") or "")
+    gesture = {"kind": "action", "action_id": action_id, "operation": "",
+               "target": "", "lot": None}
+    if action_id:
         try:
             action = storage.of(db).actions.get(action_id, with_receipts=False)
         except Exception:  # noqa: BLE001 - une lecture ratée ne prouve rien
             action = None
         if action:
+            gesture["operation"] = str(action.get("operation") or "").strip()
+            gesture["target"] = str(action.get("target") or "").strip()
             lot = action.get("work_item")
-            for key in ("operation", "target"):
-                value = str(action.get(key) or "").strip()
-                if value:
-                    refs.append(value)
-            if lot is not None:
-                refs.append(str(lot))
+            gesture["lot"] = str(lot) if lot not in (None, "") else None
     if expected_operation:
-        refs.append(str(expected_operation))
-    standing = request.get("standing")
-    if isinstance(standing, dict):
-        connector = str(standing.get("connector") or "").strip()
+        gesture["operation"] = gesture["operation"] or str(expected_operation)
+    return gesture
+
+
+def _gesture_match(gesture: dict, tokens: dict[str, int],
+                   text: str) -> tuple[bool, list[str]]:
+    """(le message nomme le geste, références attendues). Une seule référence
+    suffit ; `target` et `operation` vont ensemble, jamais l'un sans l'autre.
+    """
+    kind = gesture.get("kind")
+    expected: list[str] = []
+    if kind == "action":
+        action_id = str(gesture.get("action_id") or "").strip()
+        target = str(gesture.get("target") or "").strip()
+        operation = str(gesture.get("operation") or "").strip()
+        lot = gesture.get("lot")
+        if action_id:
+            expected.append(action_id)
+            if _token_key(action_id) in tokens:
+                return True, expected
+        if target and operation:
+            expected.append("%s %s" % (target, operation))
+            if _token_key(target) in tokens and _token_key(operation) in tokens:
+                return True, expected
+        if lot not in (None, ""):
+            expected.append(str(lot))
+            if _token_key(lot) in tokens:
+                return True, expected
+        return False, expected
+    if kind == "standing":
+        connector = str(gesture.get("connector") or "").strip()
+        operations = [str(value).strip() for value in gesture.get("operations") or ()
+                      if str(value or "").strip()]
         if connector:
-            refs.append(connector)
-        refs.extend(str(value) for value in standing.get("operations") or ()
-                    if str(value or "").strip())
-    return list(dict.fromkeys(refs)), lot
+            expected.append(connector)
+        expected.extend(operations)
+        expected.append("mandat")
+        named = bool(connector and operations)
+        named = named and _token_key(connector) in tokens
+        named = named and all(_token_key(value) in tokens for value in operations)
+        named = named and any(word in tokens for word in _MANDATE_WORDS)
+        return named, expected
+    if kind == "decision":
+        decision_id = str(gesture.get("decision_id") or "").strip()
+        option = str(gesture.get("option") or "").strip()
+        label = str(gesture.get("option_label") or "").strip()
+        if decision_id:
+            expected.append(decision_id)
+        if option:
+            expected.append(option)
+            if label and label.casefold() != option.casefold():
+                expected.append(label)
+        if not decision_id or _token_key(decision_id) not in tokens:
+            return False, expected
+        if not option:
+            return True, expected
+        if _token_key(option) in tokens:
+            return True, expected
+        return bool(label and _phrase_in(text, label)), expected
+    expected = [str(value) for value in gesture.get("references") or ()]
+    return any(_token_key(value) in tokens for value in expected), expected
 
 
 def check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
-                       policy: Policy, *, references=(), lot=None) -> tuple[str, str]:
+                       policy: Policy, *, gesture: dict, kind: str = "",
+                       ref: str = "") -> tuple[str, str]:
     """("", "") si l'entrée (agent, seq) du journal L78 porte un accord de
     `approver` rattaché au geste : message humain de confiance, de cet humain,
-    commençant par un « go » explicite et nommant une des `references` du
-    geste (identifiant d'action, opération, cible, lot, décision, opérations
-    du mandat) ; écrit au plus `clock_skew` après `iat` et au plus `max_ttl`
-    avant. `lot` : quand le message le porte, il doit être celui du geste.
-    Sinon (code, raison) — le refus dit quoi citer."""
+    commençant par un « go » explicite et affirmatif, qui nomme le geste signé
+    (voir `_gesture_match`) ; écrit au plus `clock_skew` après `iat` et au plus
+    `max_ttl` avant. `kind`/`ref` : le reçu qui cite l'accord ; un accord déjà
+    cité par un autre geste est refusé. Sinon (code, raison) — le refus dit
+    quoi citer.
+    """
     where = "%s#%d" % (accord["agent"], accord["seq"])
     entry = storage.of(db).conversations.entry(accord["agent"], accord["seq"])
     if entry is None:
@@ -1119,20 +1218,47 @@ def check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
     if not _GO_RE.match(text):
         return ACCORD, ("accord %s: not an explicit go (the human message must start "
                         "with \"go\" and name the gesture)" % where)
-    tokens = {str(value).casefold() for value in _GO_TOKEN_RE.findall(text)}
-    wanted = [str(value).strip() for value in references or ()
-              if str(value or "").strip()]
-    if not wanted:
+    if "?" in text:
+        return ACCORD, ("accord %s: a question cannot be an accord (the go is "
+                        "affirmative)" % where)
+    tokens = _go_tokens(text)
+    if any(token in _NEGATIONS for token in tokens):
+        return ACCORD, ("accord %s: a negation cannot be an accord (the go is "
+                        "affirmative)" % where)
+    if not isinstance(gesture, dict):
         return ACCORD, "accord %s: no gesture reference to check" % where
-    if not any(value.casefold() in tokens for value in wanted):
+    named, expected = _gesture_match(gesture, tokens, text)
+    if not expected:
+        return ACCORD, "accord %s: no gesture reference to check" % where
+    if not named:
         return ACCORD, ("accord %s: the message names none of the gesture references "
-                        "(%s); reply \"go <action id|operation|lot>\""
-                        % (where, ", ".join(sorted(set(wanted)))))
+                        "(%s); reply \"go <action id, target and operation, lot, "
+                        "mandate, or decision and option>\""
+                        % (where, ", ".join(sorted(set(expected)))))
+    lot = gesture.get("lot")
     if (lot not in (None, "") and entry.get("lot") not in (None, "")
             and str(entry["lot"]) != str(lot)):
         return ACCORD, "accord %s: written for lot %s, not %s" % (
             where, entry["lot"], lot)
+    if kind and ref:
+        claim = storage.of(db).authenticators.accord_claim(accord["agent"],
+                                                           int(accord["seq"]))
+        if claim is not None and (str(claim.get("kind") or ""),
+                                  str(claim.get("ref") or "")) != (kind, ref):
+            return ACCORD, ("accord %s: already cited by another gesture (%s); a go "
+                            "authorizes one receipt" % (where, claim.get("kind") or "?"))
     return "", ""
+
+
+def claim_accord(db: Db, accord: dict, *, kind: str, ref: str) -> bool:
+    """Réclame l'accord (agent, seq) pour le geste (`kind`, `ref`) ; faux si un
+    autre geste l'a déjà cité. La clé primaire d'`accord_claims` tranche la
+    course entre deux reçus, là où la seule lecture de `check_accord_entry` ne
+    prouverait rien."""
+    if not isinstance(accord, dict) or "agent" not in accord or "seq" not in accord:
+        raise ReceiptError("accord {agent, seq} expected")
+    return storage.of(db).authenticators.claim_accord(
+        str(accord["agent"]), int(accord["seq"]), str(kind), str(ref))
 
 
 def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
@@ -1262,6 +1388,12 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
     if scope is None:
         return dataclasses.replace(verdict, ok=False, code=POLICY,
                                    reason=reason), None
+    if verdict.accord is not None and not claim_accord(
+            db, verdict.accord, kind="standing", ref=verdict.challenge):
+        return dataclasses.replace(
+            verdict, ok=False, code=ACCORD,
+            reason="accord %s#%d already cited by another gesture: a go authorizes "
+                   "one receipt" % (verdict.accord["agent"], verdict.accord["seq"])), None
     try:
         grant_id = storage.of(db).grants.register(
             approver=verdict.approver, nonce=verdict.nonce, challenge=verdict.challenge,

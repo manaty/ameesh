@@ -1012,7 +1012,7 @@ class RoleApproveTest(PgTestCase):
     def test_lit_exactement_le_contrat(self):
         self.assertEqual(self.readable(), _contract())
         self.assertEqual(set(_contract()), {"actions", "authenticators",
-                                            "mesh_consumed_nonces"})
+                                            "mesh_consumed_nonces", "accord_claims"})
 
     def test_le_contrat_suit_le_code(self):
         """Toute colonne que le service lit est au contrat, et réciproquement :
@@ -1027,6 +1027,8 @@ class RoleApproveTest(PgTestCase):
         self.assertEqual(contract["authenticators"], auth_cols)
         self.assertEqual(contract["mesh_consumed_nonces"],
                          {"approver", "nonce", "consumed_by", "consumed_at"})
+        # #7631 (0586) : l'accord déjà cité, lu sans son horodatage
+        self.assertEqual(contract["accord_claims"], {"agent", "seq", "kind", "ref"})
         # jamais le matériel de reçu de l'action
         self.assertFalse({"auth_receipt", "auth_nonce", "auth_challenge", "replace_receipt",
                           "replace_nonce", "last_note"} & contract["actions"])

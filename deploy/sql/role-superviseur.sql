@@ -62,6 +62,8 @@
 --       provenance_receipts.* (#1465, 0445, préalable du train)
 --       provenance_revocations.* (#6873, 0566 : autorité de porte liée au
 --       reçu, raison susceptible de citer un diagnostic interne)
+--       accord_claims.* (#7631, 0586 : l'accord déjà cité par un geste —
+--       autorité interne à la porte, sans lecteur superviseur)
 --   * #4867 (0520) : autorité interne des tours sandbox, admissions, résultats
 --     et reçus applicatifs ; fermés aux DEUX rôles dans S1, sans nouveau
 --     GRANT. La projection de lecture est une tranche ultérieure (S5) :

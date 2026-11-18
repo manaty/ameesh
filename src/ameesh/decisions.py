@@ -1148,10 +1148,13 @@ def parse_accord(text: str | None) -> dict | None:
                         "(a standing approval) expected, not %r" % text)
 
 
-def check_accord(db, view: dict, human: str, accord: dict, *, now: float) -> str:
+def check_accord(db, view: dict, human: str, accord: dict, *, now: float,
+                 option: str | None = None, ref: str | None = None) -> str:
     """#7631 : l'accord d'une signature d'avatar ; rend une ligne lisible, ou
     DecisionError. Forme (a) : message de `human` au journal L78, au plus
-    24 h avant ; elle couvre aussi une décision sur la clé owner ou la
+    24 h avant ; il nomme la décision ET l'option signée (`option`), et ne
+    cite qu'une réponse (`ref`, l'empreinte de la réponse quand l'appelant la
+    connaît). Elle couvre aussi une décision sur la clé owner ou la
     provenance.
 
     Forme (b) (`grant:ID`) : REFUSÉE dans cette tranche (relecture cx2 de
@@ -1169,11 +1172,23 @@ def check_accord(db, view: dict, human: str, accord: dict, *, now: float) -> str
                             "cover a decision signature (it must go through the gate with "
                             "reservation); cite the human's go: --accord AGENT#SEQ"
                             % (accord["grant"], kind))
+    gesture = {
+        "kind": "decision",
+        "decision_id": str(view.get("id") or ""),
+        "option": option or "",
+        "option_label": _option_label(view, option) or "",
+        "lot": view.get("lot"),
+    }
+    claim_ref = ref or "decision:%s:%s" % (view.get("id"), option or "")
     code, reason = receipts.check_accord_entry(
-        db, accord, human, int(now), receipts.Policy(),
-        references=(str(view.get("id") or ""),), lot=view.get("lot"))
+        db, accord, human, int(now), receipts.Policy(), gesture=gesture,
+        kind="decision", ref=claim_ref)
     if code:
         raise DecisionError(reason)
+    if not receipts.claim_accord(db, accord, kind="decision", ref=claim_ref):
+        raise DecisionError("accord %s#%d already cited by another answer: a go "
+                            "authorizes one receipt"
+                            % (accord["agent"], accord["seq"]))
     return "%s#%d" % (accord["agent"], accord["seq"])
 
 
@@ -1605,7 +1620,9 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
             raise DecisionError("accord %s#%s: the go was given in the session of %s, not "
                                 "of %s" % (accord.get("agent"), accord.get("seq"),
                                            accord.get("agent"), signer.get("agent")))
-        check_accord(db, view, human, accord, now=now)
+        check_accord(db, view, human, accord, now=now, option=option,
+                     ref="decision:%s:%s" % (
+                         view["id"], answer_digest(view, text, option, human, signer)))
     if signed_requested:
         if channel == "chat":
             raise DecisionError("a signed answer is given in your terminal, not in the "
