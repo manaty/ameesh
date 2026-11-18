@@ -1101,13 +1101,17 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     # habituel, jamais transformer une lecture impossible en preuve de gel.
     # Sans dépôt, les lecteurs non composeurs (dont slo_delivery) gardent
     # leur comportement historique, sans refus non concluant ni filtre.
+    # #7765 : seul un avis favorable est écarté. Un `blocked` sur un SHA
+    # que le clone ne résout pas (tête du lot pas encore récupérée, sonde
+    # expirée) garde son refus : l'état du clone ne lève jamais un blocage.
     foreign_verdicts = []
     if repo and f_sha and _commit(repo, f_sha, timeout=PROBE_TIMEOUT_S):
         resolved = {}
         applicable = []
         for verdict in verdicts:
             sha = commit_id(verdict.get("sha"))
-            if sha and not same_commit(sha, f_sha):
+            if (sha and not same_commit(sha, f_sha)
+                    and (verdict.get("verdict") or "ok") == "ok"):
                 if sha not in resolved:
                     resolved[sha] = _commit(repo, sha, timeout=PROBE_TIMEOUT_S)
                 if not resolved[sha]:

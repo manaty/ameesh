@@ -328,6 +328,18 @@ class RebaseIdentityTest(unittest.TestCase):
         self.assertEqual(out["sha"], "")
         self.assertIn("blocked-verdict", out["causes"])
 
+    def test_blocage_sur_sha_inconnu_du_clone_refuse(self) -> None:
+        # #7765 : tête poussée sans regel, pas encore récupérée par le clone
+        # du composeur ; son blocage n'est pas un avis compagnon.
+        rows = [frozen(self.frozen, 10),
+                verdict(self.frozen, 11, id=2, actor="reviewer1"),
+                verdict(self.frozen, 12, id=3, actor="reviewer2"),
+                verdict("e" * 40, 13, id=4, actor="reviewer1", kind="blocked")]
+        out = plan_git.freeze_candidate(rows, repo=self.depot, target="main")
+        self.assertEqual(out["sha"], "")
+        self.assertIn("blocked-verdict", out["causes"])
+        self.assertNotIn("verdict-unresolved-in-lot-repository", out["notes"])
+
     def test_sans_depot_avis_compagnon_reste_candidat(self) -> None:
         foreign = "f" * 40
         rows = [frozen(self.frozen, 10), verdict(self.frozen, 11),
