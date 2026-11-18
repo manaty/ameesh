@@ -17,7 +17,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import storage, train_cli, train_requalify as rq
+from ameesh import storage, train_cli, train_events, train_requalify as rq
 from ameesh import train_requalify_request as requests
 from ameesh import train_requalify_review as review
 from ameesh.train import TrainError
@@ -220,6 +220,24 @@ class RequestApplicationTest(_CanonFixture, PgTestCase):
             " WHERE id = %s", (row["id"],))[0]
         self.assertEqual((applied["state"], applied["resolved_by"], applied["error"]),
                          ("applied", "host-a", None))
+
+    def test_a_deposit_wakes_the_live_holder_without_waiting_for_a_pass(self):
+        """#7806: the request path itself emits the project-scoped hint."""
+        from .test_1467_train_events import OwnNamespaceListener
+        listener = storage.of(self.db).wakeups.subscribe([train_events.CHANNEL])
+        self.assertIsNotNone(listener, "LISTEN is required for the wake-up proof")
+        self.addCleanup(listener.close)
+        listener = OwnNamespaceListener(listener, self.cfg.schema)
+        row = self.record(self.c1)
+        item = listener.wait(3)
+        self.assertIsNotNone(item, "the requalification deposit emitted no hint")
+        signal = json.loads(item["payload"])
+        self.assertEqual((signal["schema"], signal["kind"], signal["project"],
+                          signal["target"]),
+                         (train_events.SCHEMA, "requalification-request",
+                          "ameesh", ""))
+        self.assertEqual(set(signal), set(train_events.FIELDS))
+        self.assertEqual(row["state"], "requested")
 
     def test_an_interruption_between_the_move_and_its_resolution_is_recovered(self):
         """#7751 B: the journal proves a completed move after a crash.

@@ -63,12 +63,29 @@ SCHEMA = "ameesh-train-host/1"
 MODES = ("shadow", "active")
 #: named providers. A name is an explicit selection, not a hint: an unknown
 #: name refuses and no adapter is inferred from the project or the registry.
-CONTRACTS = {"ameesh": train_contracts.ameesh,
-             "nexlink": train_contracts.nexlink}
+#: #7794: the core declares ameesh's own contract; a project contract is
+#: provided by its module (``registry.train_contract``), read by `contracts`.
+CONTRACTS = {"ameesh": train_contracts.ameesh}
 PROVENANCE = {"review_provenance": review_provenance}
 RESERVATIONS = {"packet_reservation": packet_reservation}
 #: compiled adapters named by the configuration for the candidate inventory
 INITIAL_HISTORY = {"activation-boundary": train_initial.Boundary}
+
+
+def contracts():
+    """`{name: factory}` of the CI contracts: the core's, then the modules'.
+
+    A module contract is still selected by its exact name; a name both the
+    core and a module declare is refused rather than shadowed (#7794)."""
+    from .modules import registry
+    table = dict(CONTRACTS)
+    for name in registry.train_contract_names():
+        if name in table:
+            raise ConfigurationError("CI contract %r is declared by the core and a module"
+                                     % name)
+        table[name] = registry.train_contract(name)
+    return table
+
 
 _FULL_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _GITHUB = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -187,7 +204,7 @@ def _project(name, raw):
     if branch.startswith("integration/"):
         raise ConfigurationError("`%s.target`: a train cannot target an integration branch"
                                  % where)
-    for key, table in (("ci_contract", CONTRACTS), ("provenance", PROVENANCE),
+    for key, table in (("ci_contract", contracts()), ("provenance", PROVENANCE),
                        ("reservation", RESERVATIONS)):
         value = _text(raw[key], "%s.%s" % (where, key))
         if value not in table:
@@ -661,7 +678,7 @@ def _passage(cfg, spec: ProjectConfig, mode, report):
     project = radar.Project(name=spec.name, repo=repo, target=spec.target,
                             github=spec.github)
     try:
-        workflows = CONTRACTS[spec.ci_contract]()
+        workflows = contracts()[spec.ci_contract]()
     except (TypeError, ValueError) as exc:
         raise ConfigurationError("`%s.ci_contract`: invalid audited contract: %s"
                                  % (where, exc)) from exc

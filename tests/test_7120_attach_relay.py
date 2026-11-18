@@ -16,6 +16,7 @@ import os
 import socket
 import ssl
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -387,6 +388,8 @@ class ChannelTest(unittest.TestCase):
         self.assertTrue(small.can_send)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "process-group proof reads /proc (Linux)")
 class PtyTest(unittest.TestCase):
     def test_code_de_sortie_et_sortie(self):
         code, out = attach_pty.run(["/bin/sh", "-c", "printf ready; exit 3"], timeout=3)

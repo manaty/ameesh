@@ -873,6 +873,8 @@ class RunnerTest(PgTestCase):
         # l'epoch en base, donc on compare au bail du moment, pas à l'après.
         self.assertEqual(int(env["AMEESH_LEASE_EPOCH"]), 1)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "real executor turn (venv shims, cgroup) is Linux")
     def test_tour_sans_shims_ne_rouvre_pas_le_path_de_production(self):
         """#2772 : un échec d'écriture des shims ne rouvre pas le PATH du tour.
 

@@ -57,7 +57,11 @@ The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
 (#7671 E2a, #7674 E3a, #7675 E3b) and the revision 1.3 element (#7672 E2b) are
 available only in a released version that carries those lots; at the 1.0
 baseline they are absent, and a consumer must still treat their absence as
-"unknown", never as permission.
+"unknown", never as permission. The frozen
+[surface](module-contract-v1.surface.json) and its
+[coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2 and 1.3
+elements from the release that implements them; the surface keeps the 1.0
+commit as its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one

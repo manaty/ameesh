@@ -7,7 +7,9 @@ temporary HOME. No network, no host, no database.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import json
 import os
 import shlex
@@ -26,7 +28,7 @@ from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from ameesh import config, release_cutoff
+from ameesh import config, registry, release_cutoff
 from tests import canon_staging
 
 FEDERATION = """federation: "0.1"
@@ -1765,6 +1767,51 @@ class PureReleaseTest(unittest.TestCase):
 
         at, label = release_cutoff.cutoff_slot(Rules(), _paris(12))
         self.assertEqual((at, label), (_paris(11), "11:00"))
+
+
+class ManualReturnRecipientTest(unittest.TestCase):
+    """#7792 B : le courrier de marche manuelle, sans nom de persona.
+
+    Le rôle se lit au registre : conception, puis orchestrateur ; sans porteur,
+    la trace est écrite et l'échec n'est pas silencieux."""
+
+    def test_design_role_absent_falls_back_to_the_orchestrator(self):
+        listing = [{"name": "pilote-x", "roles": ["orchestrateur"]}]
+        with mock.patch.object(registry, "overview", return_value=listing), \
+             mock.patch.object(release_cutoff, "_return_state", return_value={}), \
+             mock.patch.object(release_cutoff.mail, "send") as send:
+            sent = release_cutoff._manual_return_mail(
+                object(), "/nonexistent", None, "retour non conclu")
+        self.assertTrue(sent)
+        self.assertEqual(send.call_args.args[2], "pilote-x")
+
+    def test_design_holder_wins_over_the_orchestrator(self):
+        listing = [{"name": "conception-x", "roles": ["conception"]},
+                   {"name": "pilote-x", "roles": ["orchestrateur"]}]
+        with mock.patch.object(registry, "overview", return_value=listing), \
+             mock.patch.object(release_cutoff, "_return_state", return_value={}), \
+             mock.patch.object(release_cutoff.mail, "send") as send:
+            sent = release_cutoff._manual_return_mail(
+                object(), "/nonexistent", None, "retour non conclu")
+        self.assertTrue(sent)
+        self.assertEqual(send.call_args.args[2], "conception-x")
+
+    def test_no_declared_holder_writes_a_trace_without_mail(self):
+        with tempfile.TemporaryDirectory() as root:
+            journal = os.path.join(root, "journal")
+            with mock.patch.object(registry, "overview", return_value=[]), \
+                 mock.patch.object(release_cutoff, "_return_state",
+                                   return_value={"journal": journal}), \
+                 mock.patch.object(release_cutoff.mail, "send") as send, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                sent = release_cutoff._manual_return_mail(
+                    object(), "/nonexistent", None, "retour non conclu")
+            with open(journal, encoding="utf-8") as fh:
+                trace = fh.read()
+        self.assertFalse(sent)
+        send.assert_not_called()
+        self.assertIn("marche manuelle non remise", trace)
+        self.assertIn("marche manuelle non remise", err.getvalue())
 
 
 if __name__ == "__main__":

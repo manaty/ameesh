@@ -345,7 +345,9 @@ donc **pas** les 23 suites : il épingle seulement le sélecteur
 (`scripts/ci/lot-plan.mjs`) et les workflows partagés de plan et de statut
 (`.github/workflows/lot-plan.yml`, `.github/workflows/lot-status.yml`), ainsi
 que leur helper `scripts/ci/git-fetch-retry.sh`, au commit
-`NEXLINK_AUDIT_COMMIT` (`c1277f06`, #7246). Le
+`NEXLINK_AUDIT_COMMIT` (`c1277f06`, #7246), déclarés par le module Nexlink
+(`src/ameesh/modules/nexlink/packet_ci.py`, lu par `registry.train_contract`,
+#7794). Le
 sélecteur de la cible est vérifié au commit de base (une modification exige un
 nouveau contrat) ; `ci_parts.due` (bac à sable `bwrap`, aucun repli) rend les
 contextes `lot/<suite>` dus. Le même sélecteur audité tourne sur **deux

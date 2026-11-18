@@ -4,6 +4,8 @@ import os
 import signal
 import threading
 import time
+import sys
+import unittest
 from dataclasses import replace
 from types import SimpleNamespace as NS
 from unittest import mock
@@ -168,6 +170,8 @@ class SelectionTest(card_fixture.SandboxCase):
                 runtime.credentials(worker, row)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "signalling a sandbox process group is Linux (killpg EPERM on macOS)")
 class RunnerSandboxTest(PgTestCase):
     def setUp(self):
         super().setUp()

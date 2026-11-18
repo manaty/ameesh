@@ -14,6 +14,8 @@ import re
 import subprocess
 from collections.abc import Mapping
 
+from ..roles import AUDITOR_ROLES
+
 # Transport credentials, not provider/account credentials. A CLI needs only its
 # own authentication. Python/shell wrappers inherit no blanket exemption.
 GITHUB_CREDENTIALS = frozenset({"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
@@ -39,7 +41,8 @@ DECLARED_CREDENTIALS: set[str] = set()
 SECRET_SUFFIXES = ("_KEY", "_DSN", "_DATABASE_URL")
 #: #6287: the auditor role's own read-only connection string. It is granted to
 #: that role's harness alone, never through an executable name or a global list.
-AUDITOR_CREDENTIALS = frozenset({"AUDITEUR_DSN"})
+#: #7792: the variable name follows the role token in `roles.py`.
+AUDITOR_CREDENTIALS = frozenset({AUDITOR_ROLES[0].upper() + "_DSN"})
 
 
 class GrantedEnvironment(dict):

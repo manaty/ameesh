@@ -6,6 +6,7 @@ import io
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -22,6 +23,8 @@ SHA = '02dff619c640' + 'a' * 28
 NOW = dt.datetime(2026, 11, 16, tzinfo=dt.timezone.utc)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "real root-owned paths: /etc is a symlink on macOS")
 class BoundariesTest(unittest.TestCase):
     def test_one_strict_tag_and_expiry(self):
         self.assertEqual(r3.request([TAG], NOW), TAG)

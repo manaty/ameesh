@@ -15,6 +15,7 @@ import importlib.util
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -33,6 +34,8 @@ PYTHON = '#!/usr/bin/env bash\n' \
     'if [ "$1" = - ]; then cat > /dev/null; printf "%s\\t%s\\n" "$0" "$2" >> "$FAUX/python"; fi\n'
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "probe runs a bash venv launcher with Linux paths (bash 4)")
 class VenvVivantTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="5743-")

@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.0",
+  "contract": "1.3",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -18,8 +18,22 @@
       "--json",
       "--ref"
     ],
+    "ameesh canon snapshot": [
+      "--canon",
+      "--expect-commit",
+      "--expect-scope",
+      "--fetch",
+      "--help",
+      "--json",
+      "--previous-commit",
+      "--ref",
+      "--single-source"
+    ],
     "ameesh turn current": ["--expect-turn", "--help", "--json", "--local"],
     "ameesh turn observe": ["--help", "--json", "--request", "--turn"],
+    "ameesh agent observe": ["--account-profile", "--help", "--json"],
+    "ameesh list": ["--help", "--json"],
+    "ameesh show": ["--help", "--json"],
     "ameesh migrate": ["--additive-only", "--allow-live-executors", "--dry-run", "--help"],
     "ameesh action propose": [
       "--amount",
@@ -131,8 +145,12 @@
       "distribution",
       "entry_point",
       "descriptor_sha256",
-      "card_ref"
+      "card_ref",
+      "schema",
+      "migrations",
+      "requires"
     ],
+    "storage_attributes": ["SCHEMA", "MIGRATIONS", "REQUIRES"],
     "selection_scopes": [
       "extensions.ameesh.modules",
       "extensions.ameesh.teams.TEAM.modules",
@@ -580,6 +598,447 @@
                 "next_seq": {"type": ["integer"]},
                 "oldest_seq": {"type": ["integer", "null"]},
                 "schema": {"type": ["string"], "const": "ameesh-conversation/1"}
+              }
+            }
+          },
+          "400": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "401": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "404": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          },
+          "503": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {"type": ["object"], "required": ["error", "message", "schema"]},
+                "error": {"type": ["string"]},
+                "message": {"type": ["string"]},
+                "schema": {"type": ["string"], "const": "ameesh-error/1"}
+              }
+            }
+          }
+        }
+      },
+      "GET /api/v1/agents/{agent}/observation": {
+        "parameters": {
+          "path:agent": {"required": true, "fields": {"": {"type": ["string"]}}},
+          "query:account_profile": {"required": false, "fields": {"": {"type": ["string"]}}}
+        },
+        "request": {"required": false, "content": {}},
+        "responses": {
+          "200": {
+            "headers": [],
+            "content": {
+              "application/json": {
+                "": {
+                  "type": ["object"],
+                  "required": [
+                    "admission",
+                    "agent",
+                    "budget",
+                    "canon",
+                    "lease",
+                    "limits",
+                    "missing",
+                    "native",
+                    "observed_ts",
+                    "placement",
+                    "profile",
+                    "schema"
+                  ]
+                },
+                "admission": {
+                  "type": ["object"],
+                  "required": ["admitted", "claim_predicate", "governed", "reasons", "responsible_required"]
+                },
+                "admission.admitted": {"type": ["boolean", "null"]},
+                "admission.claim_predicate": {"type": ["boolean"]},
+                "admission.governed": {"type": ["boolean"]},
+                "admission.reasons": {"type": ["array"]},
+                "admission.reasons[]": {
+                  "type": ["string"],
+                  "enum": [
+                    "canon_ref_mismatch",
+                    "canon_stale",
+                    "canon_state_missing",
+                    "canon_state_not_ok",
+                    "claim_predicate",
+                    "ephemeral_expired",
+                    "handoff_fenced",
+                    "host_claims_closed",
+                    "mode_externe",
+                    "placement_missing",
+                    "placement_profile_diverged",
+                    "placement_refused",
+                    "responsible_missing",
+                    "responsible_policy_unavailable",
+                    "retired"
+                  ]
+                },
+                "admission.responsible_required": {"type": ["boolean", "null"]},
+                "agent": {
+                  "type": ["object"],
+                  "required": [
+                    "ephemeral",
+                    "ephemeral_expires_ts",
+                    "mode",
+                    "name",
+                    "retired",
+                    "status",
+                    "status_since_ts",
+                    "status_text",
+                    "stop_reason"
+                  ]
+                },
+                "agent.ephemeral": {"type": ["boolean"]},
+                "agent.ephemeral_expires_ts": {"type": ["null", "number"]},
+                "agent.mode": {"enum": ["execute", "externe"]},
+                "agent.name": {"type": ["string"]},
+                "agent.retired": {"type": ["boolean"]},
+                "agent.status": {"type": ["string"]},
+                "agent.status_since_ts": {"type": ["null", "number"]},
+                "agent.status_text": {"type": ["null", "string"]},
+                "agent.stop_reason": {"type": ["null", "string"]},
+                "budget": {
+                  "type": ["object"],
+                  "required": [
+                    "account_profile",
+                    "admitted",
+                    "available",
+                    "billing_account",
+                    "kept_usd",
+                    "limit_usd",
+                    "period",
+                    "reason",
+                    "remaining_usd",
+                    "reserve_usd",
+                    "reserved_usd",
+                    "reset_ts",
+                    "settled_usd",
+                    "timezone",
+                    "used_usd"
+                  ]
+                },
+                "budget.account_profile": {"type": ["null", "string"]},
+                "budget.admitted": {"type": ["boolean", "null"]},
+                "budget.available": {"type": ["boolean"]},
+                "budget.billing_account": {"type": ["null", "string"]},
+                "budget.kept_usd": {"type": ["null", "number"]},
+                "budget.limit_usd": {"type": ["null", "number"]},
+                "budget.period": {"type": ["null", "string"]},
+                "budget.reason": {
+                  "type": ["null", "string"],
+                  "enum": [
+                    "account_config_unreadable",
+                    "ambiguous_account_profile",
+                    "exhausted",
+                    "foreign_host",
+                    "no_account_envelope",
+                    "no_account_profile",
+                    "no_billing_account",
+                    "unknown_account_profile",
+                    null
+                  ]
+                },
+                "budget.remaining_usd": {"type": ["null", "number"]},
+                "budget.reserve_usd": {"type": ["null", "number"]},
+                "budget.reserved_usd": {"type": ["null", "number"]},
+                "budget.reset_ts": {"type": ["null", "number"]},
+                "budget.settled_usd": {"type": ["null", "number"]},
+                "budget.timezone": {"type": ["null", "string"]},
+                "budget.used_usd": {"type": ["null", "number"]},
+                "canon": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "age_s",
+                    "checked_ts",
+                    "diagnostic",
+                    "fresh",
+                    "last_good_commit",
+                    "max_age_s",
+                    "name",
+                    "ref_commit",
+                    "ref_matches",
+                    "state"
+                  ]
+                },
+                "canon.age_s": {"type": ["null", "number"]},
+                "canon.checked_ts": {"type": ["null", "number"]},
+                "canon.diagnostic": {"type": ["null", "string"]},
+                "canon.fresh": {"type": ["boolean"]},
+                "canon.last_good_commit": {"type": ["null", "string"]},
+                "canon.max_age_s": {"type": ["number"]},
+                "canon.name": {"type": ["string"]},
+                "canon.ref_commit": {"type": ["null", "string"]},
+                "canon.ref_matches": {"type": ["boolean"]},
+                "canon.state": {"type": ["null", "string"], "enum": ["invalid", "ok", "unreadable", null]},
+                "lease": {
+                  "type": ["object"],
+                  "required": ["epoch", "expires_ts", "live", "owner", "since_ts", "turn_in_progress"]
+                },
+                "lease.epoch": {"type": ["integer", "null"]},
+                "lease.expires_ts": {"type": ["null", "number"]},
+                "lease.live": {"type": ["boolean"]},
+                "lease.owner": {"type": ["null", "string"]},
+                "lease.since_ts": {"type": ["null", "number"]},
+                "lease.turn_in_progress": {"type": ["boolean"]},
+                "limits": {"type": ["object"], "required": ["available", "declared", "effective", "host"]},
+                "limits.available": {"type": ["boolean"]},
+                "limits.declared": {
+                  "type": ["object"],
+                  "required": [
+                    "compact_tokens",
+                    "context_max_tokens",
+                    "session_max_tokens",
+                    "session_policy",
+                    "session_reread_budget",
+                    "turn_grace_seconds",
+                    "turn_mail_max",
+                    "turn_max_seconds",
+                    "turn_reread_budget"
+                  ]
+                },
+                "limits.declared.compact_tokens": {"type": ["integer", "null"]},
+                "limits.declared.context_max_tokens": {"type": ["integer", "null"]},
+                "limits.declared.session_max_tokens": {"type": ["integer", "null"]},
+                "limits.declared.session_policy": {"type": ["null", "string"]},
+                "limits.declared.session_reread_budget": {"type": ["integer", "null"]},
+                "limits.declared.turn_grace_seconds": {"type": ["integer", "null"]},
+                "limits.declared.turn_mail_max": {"type": ["integer", "null"]},
+                "limits.declared.turn_max_seconds": {"type": ["integer", "null"]},
+                "limits.declared.turn_reread_budget": {"type": ["integer", "null"]},
+                "limits.effective": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "compact_tokens",
+                    "context_max_tokens",
+                    "session_max_tokens",
+                    "session_policy",
+                    "session_reread_budget",
+                    "turn_grace_seconds",
+                    "turn_mail_max",
+                    "turn_max_seconds",
+                    "turn_reread_budget"
+                  ]
+                },
+                "limits.effective.compact_tokens": {"type": ["integer", "null"]},
+                "limits.effective.context_max_tokens": {"type": ["integer"]},
+                "limits.effective.session_max_tokens": {"type": ["integer", "null"]},
+                "limits.effective.session_policy": {"type": ["string"]},
+                "limits.effective.session_reread_budget": {"type": ["integer"]},
+                "limits.effective.turn_grace_seconds": {"type": ["integer"]},
+                "limits.effective.turn_mail_max": {"type": ["integer"]},
+                "limits.effective.turn_max_seconds": {"type": ["integer"]},
+                "limits.effective.turn_reread_budget": {"type": ["integer"]},
+                "limits.host": {"type": ["null", "string"]},
+                "missing": {"type": ["array"]},
+                "missing[]": {
+                  "type": ["string"],
+                  "enum": [
+                    "account_envelope",
+                    "budget_headroom",
+                    "canon_state",
+                    "limits",
+                    "responsible_policy"
+                  ]
+                },
+                "native": {"type": ["object"], "required": ["sandbox", "turn"]},
+                "native.sandbox": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "agent",
+                    "canon_ref",
+                    "completed_ts",
+                    "counters",
+                    "deadline_ts",
+                    "epoch",
+                    "job",
+                    "owner",
+                    "placement_ref",
+                    "profile_ref",
+                    "receipt",
+                    "refusal",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "started_ts",
+                    "state",
+                    "tranche",
+                    "turn_id",
+                    "verdict"
+                  ]
+                },
+                "native.sandbox.agent": {"type": ["string"]},
+                "native.sandbox.canon_ref": {"type": ["string"]},
+                "native.sandbox.completed_ts": {"type": ["null", "number"]},
+                "native.sandbox.counters": {
+                  "type": ["null", "object"],
+                  "required": ["model_calls", "seconds", "tool_calls", "turns"]
+                },
+                "native.sandbox.counters.model_calls": {"type": ["integer"]},
+                "native.sandbox.counters.seconds": {"type": ["integer"]},
+                "native.sandbox.counters.tool_calls": {"type": ["integer"]},
+                "native.sandbox.counters.turns": {"type": ["integer"]},
+                "native.sandbox.deadline_ts": {"type": ["number"]},
+                "native.sandbox.epoch": {"type": ["integer"]},
+                "native.sandbox.job": {
+                  "type": ["object"],
+                  "required": ["name", "namespace", "phase", "uid"]
+                },
+                "native.sandbox.job.name": {"type": ["string"]},
+                "native.sandbox.job.namespace": {"type": ["string"]},
+                "native.sandbox.job.phase": {"type": ["null", "string"]},
+                "native.sandbox.job.uid": {"type": ["null", "string"]},
+                "native.sandbox.owner": {"type": ["string"]},
+                "native.sandbox.placement_ref": {"type": ["string"]},
+                "native.sandbox.profile_ref": {"type": ["string"]},
+                "native.sandbox.receipt": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "epoch",
+                    "job",
+                    "replayed",
+                    "result_id",
+                    "result_sha256",
+                    "schema",
+                    "scope",
+                    "scope_digest",
+                    "source",
+                    "turn_id"
+                  ]
+                },
+                "native.sandbox.receipt.epoch": {"type": ["integer"]},
+                "native.sandbox.receipt.job": {"type": ["object"]},
+                "native.sandbox.receipt.replayed": {"type": ["boolean"]},
+                "native.sandbox.receipt.result_id": {"type": ["string"]},
+                "native.sandbox.receipt.result_sha256": {"type": ["string"]},
+                "native.sandbox.receipt.schema": {"type": ["string"], "const": "ameesh-sandbox-receipt/1"},
+                "native.sandbox.receipt.scope": {"type": ["object"]},
+                "native.sandbox.receipt.scope_digest": {"type": ["string"]},
+                "native.sandbox.receipt.source": {"type": ["object"]},
+                "native.sandbox.receipt.turn_id": {"type": ["string"]},
+                "native.sandbox.refusal": {"type": ["null", "string"]},
+                "native.sandbox.result_sha256": {"type": ["null", "string"]},
+                "native.sandbox.schema": {"type": ["string"], "const": "ameesh-sandbox-turn/1"},
+                "native.sandbox.scope": {"type": ["object"]},
+                "native.sandbox.scope_digest": {"type": ["string"]},
+                "native.sandbox.source": {"type": ["object"]},
+                "native.sandbox.started_ts": {"type": ["number"]},
+                "native.sandbox.state": {
+                  "type": ["string"],
+                  "enum": [
+                    "bound",
+                    "cancelled",
+                    "cancelling",
+                    "created",
+                    "expired",
+                    "failed",
+                    "intent",
+                    "lost",
+                    "orphaned",
+                    "running",
+                    "succeeded"
+                  ]
+                },
+                "native.sandbox.tranche": {
+                  "type": ["null", "object"],
+                  "required": ["kept_usd", "reserved_usd", "settled_usd", "state", "tranche_id"]
+                },
+                "native.sandbox.tranche.kept_usd": {"type": ["null", "number"]},
+                "native.sandbox.tranche.reserved_usd": {"type": ["number"]},
+                "native.sandbox.tranche.settled_usd": {"type": ["null", "number"]},
+                "native.sandbox.tranche.state": {"enum": ["kept", "open", "released", "settled"]},
+                "native.sandbox.tranche.tranche_id": {"type": ["string"]},
+                "native.sandbox.turn_id": {"type": ["string"]},
+                "native.sandbox.verdict": {"type": ["null", "string"]},
+                "native.turn": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "created_ts",
+                    "ledger_ambiguous",
+                    "model",
+                    "spend_key",
+                    "turn_id",
+                    "work_item_id"
+                  ]
+                },
+                "native.turn.created_ts": {"type": ["null", "number"]},
+                "native.turn.ledger_ambiguous": {"type": ["boolean"]},
+                "native.turn.model": {"type": ["null", "string"]},
+                "native.turn.spend_key": {"type": ["null", "string"]},
+                "native.turn.turn_id": {"type": ["null", "string"]},
+                "native.turn.work_item_id": {"type": ["null", "string"]},
+                "observed_ts": {"type": ["number"]},
+                "placement": {
+                  "type": ["object"],
+                  "required": ["current", "diagnostic", "ok", "profile", "profile_ok", "ref"]
+                },
+                "placement.current": {"type": ["null", "string"]},
+                "placement.diagnostic": {"type": ["null", "string"]},
+                "placement.ok": {"type": ["boolean", "null"]},
+                "placement.profile": {"type": ["null", "string"]},
+                "placement.profile_ok": {"type": ["boolean", "null"]},
+                "placement.ref": {"type": ["null", "string"]},
+                "profile": {
+                  "type": ["object"],
+                  "required": [
+                    "canon",
+                    "canon_ref",
+                    "capabilities",
+                    "credential_mode",
+                    "harness",
+                    "host",
+                    "model",
+                    "provider",
+                    "responsible",
+                    "session"
+                  ]
+                },
+                "profile.canon": {"type": ["null", "string"]},
+                "profile.canon_ref": {"type": ["null", "string"]},
+                "profile.capabilities": {"type": ["array"]},
+                "profile.capabilities[]": {"type": ["string"]},
+                "profile.credential_mode": {"type": ["null", "string"]},
+                "profile.harness": {"type": ["null", "string"]},
+                "profile.host": {"type": ["null", "string"]},
+                "profile.model": {"type": ["null", "string"]},
+                "profile.provider": {"type": ["null", "string"]},
+                "profile.responsible": {"type": ["null", "string"]},
+                "profile.session": {"type": ["null", "object"], "required": ["account", "harness", "id"]},
+                "profile.session.account": {"type": ["null", "string"]},
+                "profile.session.harness": {"type": ["null", "string"]},
+                "profile.session.id": {"type": ["null", "string"]},
+                "schema": {"type": ["string"], "const": "ameesh-agent-observation/1"}
               }
             }
           },
@@ -1583,6 +2042,55 @@
                 "by": {"type": ["object"], "required": []},
                 "by.request": {"type": ["integer", "null"]},
                 "by.turn": {"type": ["null", "string"]},
+                "deferral": {
+                  "type": ["null", "object"],
+                  "required": ["age_s", "reason", "schema", "since_ts", "state"]
+                },
+                "deferral.age_s": {"type": ["integer", "null"]},
+                "deferral.queue": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "capacity",
+                    "critical",
+                    "detail",
+                    "host",
+                    "queued_s",
+                    "reason",
+                    "retry_s",
+                    "scope",
+                    "state"
+                  ]
+                },
+                "deferral.queue.capacity": {"type": ["null", "string"]},
+                "deferral.queue.critical": {"type": ["boolean"]},
+                "deferral.queue.detail": {"type": ["string"]},
+                "deferral.queue.host": {"type": ["string"]},
+                "deferral.queue.queued_s": {"type": ["integer", "null"]},
+                "deferral.queue.reason": {"type": ["string"], "const": "pressure"},
+                "deferral.queue.retry_s": {"type": ["integer", "null"]},
+                "deferral.queue.scope": {"enum": ["host", "own_cgroup"]},
+                "deferral.queue.state": {"type": ["string"], "const": "queued"},
+                "deferral.reason": {
+                  "enum": [
+                    "account",
+                    "account_window",
+                    "authentication",
+                    "budget",
+                    "database",
+                    "host",
+                    "operator",
+                    "other",
+                    "pressure",
+                    "provider_credits",
+                    "restart",
+                    "session",
+                    "shutdown",
+                    "workdir"
+                  ]
+                },
+                "deferral.schema": {"type": ["string"], "const": "ameesh-deferral/1"},
+                "deferral.since_ts": {"type": ["null", "number"]},
+                "deferral.state": {"enum": ["deferred"]},
                 "lease": {"type": ["object"], "required": ["epoch", "expires_ts", "live", "owner"]},
                 "lease.epoch": {"type": ["integer", "null"]},
                 "lease.expires_ts": {"type": ["null", "number"]},
@@ -2354,6 +2862,55 @@
                 "by": {"type": ["object"], "required": []},
                 "by.request": {"type": ["integer", "null"]},
                 "by.turn": {"type": ["null", "string"]},
+                "deferral": {
+                  "type": ["null", "object"],
+                  "required": ["age_s", "reason", "schema", "since_ts", "state"]
+                },
+                "deferral.age_s": {"type": ["integer", "null"]},
+                "deferral.queue": {
+                  "type": ["null", "object"],
+                  "required": [
+                    "capacity",
+                    "critical",
+                    "detail",
+                    "host",
+                    "queued_s",
+                    "reason",
+                    "retry_s",
+                    "scope",
+                    "state"
+                  ]
+                },
+                "deferral.queue.capacity": {"type": ["null", "string"]},
+                "deferral.queue.critical": {"type": ["boolean"]},
+                "deferral.queue.detail": {"type": ["string"]},
+                "deferral.queue.host": {"type": ["string"]},
+                "deferral.queue.queued_s": {"type": ["integer", "null"]},
+                "deferral.queue.reason": {"type": ["string"], "const": "pressure"},
+                "deferral.queue.retry_s": {"type": ["integer", "null"]},
+                "deferral.queue.scope": {"enum": ["host", "own_cgroup"]},
+                "deferral.queue.state": {"type": ["string"], "const": "queued"},
+                "deferral.reason": {
+                  "enum": [
+                    "account",
+                    "account_window",
+                    "authentication",
+                    "budget",
+                    "database",
+                    "host",
+                    "operator",
+                    "other",
+                    "pressure",
+                    "provider_credits",
+                    "restart",
+                    "session",
+                    "shutdown",
+                    "workdir"
+                  ]
+                },
+                "deferral.schema": {"type": ["string"], "const": "ameesh-deferral/1"},
+                "deferral.since_ts": {"type": ["null", "number"]},
+                "deferral.state": {"enum": ["deferred"]},
                 "lease": {"type": ["object"], "required": ["epoch", "expires_ts", "live", "owner"]},
                 "lease.epoch": {"type": ["integer", "null"]},
                 "lease.expires_ts": {"type": ["null", "number"]},
@@ -4287,6 +4844,175 @@
       "key_matches": "boolean",
       "expires_ts": "double precision",
       "key_is_owner": "boolean"
+    }
+  },
+  "canon": {
+    "session_policy": {
+      "fresh_session": {"type": "boolean", "default": false},
+      "session_policy": {"values": ["par-lot", "taille", "jamais"]},
+      "context_max_tokens": {
+        "type": "integer",
+        "minimum": 0,
+        "suffixes": ["k", "M"],
+        "zero": "disables the cap"
+      },
+      "failure_wait_min": {"type": "duration", "minimum": 0, "units": ["s", "m"], "examples": ["60s", "1m"]}
+    },
+    "resource_policy": {
+      "max_cgroup_cpu_used": {
+        "type": "fraction",
+        "minimum_exclusive": 0,
+        "maximum": 1,
+        "sample": "90%",
+        "value": 0.9
+      },
+      "max_cgroup_throttled_periods": {
+        "type": "fraction",
+        "minimum_exclusive": 0,
+        "maximum": 1,
+        "sample": "25%",
+        "value": 0.25
+      }
+    }
+  },
+  "deferral": {
+    "schema": "ameesh-deferral/1",
+    "states": ["deferred"],
+    "reasons": [
+      "operator",
+      "pressure",
+      "authentication",
+      "provider_credits",
+      "budget",
+      "account",
+      "account_window",
+      "session",
+      "database",
+      "host",
+      "workdir",
+      "shutdown",
+      "restart",
+      "other"
+    ],
+    "fields": ["schema", "state", "reason", "since_ts", "age_s", "queue"],
+    "required_fields": ["schema", "state", "reason", "since_ts", "age_s"],
+    "queue_fields": [
+      "state",
+      "reason",
+      "host",
+      "scope",
+      "critical",
+      "detail",
+      "queued_s",
+      "retry_s",
+      "capacity"
+    ],
+    "queue_required_fields": [
+      "state",
+      "reason",
+      "host",
+      "scope",
+      "critical",
+      "detail",
+      "queued_s",
+      "retry_s",
+      "capacity"
+    ]
+  },
+  "python": {
+    "mail": {
+      "module": "ameesh.public.mail",
+      "contract_version": "1.3",
+      "signatures": {
+        "reserved_actors": "(db)",
+        "submit": "(db, actor, submission)",
+        "submit_many": "(db, actor, submissions)",
+        "find": "(db, actor, recipient, idempotency_key)",
+        "history": "(db, actor, *, peer=None, after_id=None, limit=100, since_ts=None, until_ts=None, kind=None)",
+        "pending": "(db, actor, lease, *, sender=None, limit=50)",
+        "reply": "(db, actor, request_id, answer, *, lease)"
+      },
+      "records": {
+        "Submission": ["recipient", "body", "kind", "payload", "work_item_id", "thread", "idempotency_key"],
+        "Receipt": ["id", "actor", "recipient", "kind", "created_ts", "reused", "in_reply_to"],
+        "HistoryEntry": [
+          "id",
+          "sender",
+          "recipient",
+          "body",
+          "kind",
+          "payload",
+          "work_item_id",
+          "created_ts",
+          "delivered_ts",
+          "in_reply_to"
+        ],
+        "HistoryPage": ["entries", "next_cursor", "has_more"],
+        "Lease": ["owner", "epoch"],
+        "Reply": ["body", "payload", "thread"],
+        "PendingRequest": [
+          "id",
+          "sender",
+          "recipient",
+          "body",
+          "payload",
+          "work_item_id",
+          "created_ts",
+          "delivered_ts",
+          "turn_id"
+        ],
+        "PendingPage": ["entries", "has_more"],
+        "SubmissionResult": ["index", "receipt", "error", "detail"],
+        "BatchResult": ["results"]
+      },
+      "bounds": {
+        "MAX_BODY_BYTES": 65536,
+        "MAX_PAYLOAD_BYTES": 262144,
+        "MAX_BATCH": 50,
+        "MAX_HISTORY": 200,
+        "DEFAULT_HISTORY": 100,
+        "MAX_PENDING": 200,
+        "DEFAULT_PENDING": 50
+      },
+      "kinds": ["request", "reply", "notify", "event"],
+      "module_payload_key": "module",
+      "admitted_payload_keys": ["attribution", "module"],
+      "reserved_payload_keys": [
+        "ack",
+        "arbitration",
+        "broadcast",
+        "cc",
+        "ci",
+        "ci_passif",
+        "decision",
+        "decision_answer",
+        "human",
+        "human_account",
+        "idempotency_key",
+        "info",
+        "pass",
+        "radar",
+        "reassigned",
+        "report",
+        "report_fingerprint",
+        "request_expires_ts",
+        "review_designation",
+        "review_request",
+        "staging_actif",
+        "urgent",
+        "verdict"
+      ],
+      "reserved_actors": ["ameesh", "inconnu", "veille"],
+      "reserved_actor_prefixes": ["human:", "chat-"],
+      "errors": {
+        "InvalidSubmission": "invalid",
+        "IdempotencyConflict": "conflict",
+        "ReplyConflict": "conflict",
+        "ScopeRefused": "refused",
+        "CanonInventoryUnavailable": "refused",
+        "RecipientRefused": "refused",
+        "UnsupportedStorage": "unsupported"
+      }
     }
   }
 }

@@ -544,11 +544,11 @@ def paquet_horaire_lines(cfg, run=_systemctl) -> list[str]:
         detail = " (%s)" % "; ".join(errors)
     return [
         "warning    : %s is active but %s%s: a takeover of the "
-        "mesh-design lease would compose without a declared project on this host"
+        "elected role's lease would compose without a declared project on this host"
         % (PAQUET_HORAIRE_TIMER, subject, detail),
-        "             declare packet_watch.projects.<p>.repo with \"role\": "
-        "\"mesh-design\", or radar.projects.<p>.repo (stop the timer on a host "
-        "that is not a candidate)",
+        "             declare packet_watch.projects.<p>.repo with its configured "
+        "elected role (packet_watch.role), or radar.projects.<p>.repo (stop the "
+        "timer on a host that is not a candidate)",
     ]
 
 

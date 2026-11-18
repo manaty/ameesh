@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import configparser
 import copy
+import dataclasses
 from importlib import metadata, util
 import inspect
 import json
@@ -25,15 +26,19 @@ import shutil
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from unittest import mock
 
 from tests import support  # isolate host config before product imports
 from tests.support import PgTestCase
 from tests.test_canon import commit_all, publish, write
-from ameesh import db as db_mod, serve
+from ameesh import (accounts, auth_failure, budget, canon, db as db_mod,
+                    deferral_observation, migrations, provider_credits, public,
+                    resources, serve)
 from ameesh.modules import registry
 from ameesh.modules.storage import ModuleStore
+from ameesh.public import mail
 
 ROOT = Path(__file__).resolve().parents[1]
 WITNESS = ROOT / "examples" / "modules" / "contract-witness"
@@ -305,6 +310,9 @@ class CliContractTest(unittest.TestCase):
                           "distribution": "ameesh-contract-witness",
                           "entry_point": "ameesh_contract_witness", "card_ref": None})
         self.assertRegex(row["descriptor_sha256"], r"^[0-9a-f]{64}$")
+        # Revision 1.2 storage facts: the witness declares no migrations.
+        self.assertEqual((row["schema"], row["migrations"], row["requires"]),
+                         (None, [], []))
 
     def test_module_list_is_reserved_installation_evidence(self):
         code, rows = client.run_json(EXECUTABLES["ameesh"], ["module", "list"], env=self.env)
@@ -389,6 +397,9 @@ class ModuleInterfaceTest(unittest.TestCase):
         # Two representations of the same declared types.
         self.assertEqual(module.storage, witness.TYPES)
         self.assertEqual(module.as_dict()["storage"], {"types": list(witness.TYPES)})
+        # Revision 1.2 storage facts, absent on the witness distribution.
+        self.assertEqual((module.schema, module.migrations, module.requires),
+                         (None, (), ()))
 
     def test_descriptor_keys_and_options(self):
         self.assertEqual(sorted(witness.descriptor()), sorted(SURFACE["module"]["descriptor_keys"]))
@@ -471,6 +482,179 @@ class ModuleInterfaceTest(unittest.TestCase):
             with self.subTest(candidate):
                 self.assertEqual(signature_breaks(frozen, frozen_signature(candidate)),
                                  expected)
+
+
+def policy_card(**fields):
+    """A minimal Agent card declaring the given top-level fields (E3a)."""
+    lines = ["---", "type: Agent", "title: doc", "responsible: human:alice",
+             "team: acme", "capabilities: [read]"]
+    for key, value in fields.items():
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        lines.append("%s: %s" % (key, value))
+    return "\n".join(lines + ["---", "", "# doc", ""])
+
+
+class CanonPolicyContractTest(unittest.TestCase):
+    """The declarative per-agent policy keys frozen by revision 1.1/1.2."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="w7665-policy-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        os.makedirs(os.path.join(self.root, "agents"))
+        with open(os.path.join(self.root, "index.md"), "w", encoding="utf-8") as handle:
+            handle.write("---\ntype: Index\ntitle: x\n---\n")
+
+    def test_the_frozen_session_keys_are_the_declared_policy(self):
+        spec = SURFACE["canon"]["session_policy"]
+        declared = {"session_policy": "jamais", "fresh_session": "true",
+                    "context_max_tokens": "15M", "failure_wait_min": "60s"}
+        self.assertEqual(sorted(spec), sorted(declared))
+        write(self.root, "agents/doc.md", policy_card(**declared))
+        policy = canon.load(self.root, untrusted=True).agent("doc").declared_policy()
+        self.assertEqual(sorted(policy), sorted(spec))
+        self.assertEqual(policy, {"session_policy": "jamais", "fresh_session": True,
+                                  "context_max_tokens": 15_000_000,
+                                  "failure_wait_min": 60})
+
+    def test_the_frozen_resource_keys_are_native_thresholds(self):
+        spec = SURFACE["canon"]["resource_policy"]
+        for key, item in sorted(spec.items()):
+            with self.subTest(key):
+                self.assertIn(key, resources.THRESHOLD_KEYS)
+                limits = resources.thresholds({"resources": {key: item["sample"]}})
+                self.assertEqual(limits[key], item["value"])
+
+
+class ModuleStorageContractTest(unittest.TestCase):
+    """SCHEMA, MIGRATIONS and REQUIRES are read from the installed descriptor."""
+
+    def test_the_frozen_storage_attributes_are_the_module_declaration(self):
+        names = SURFACE["module"]["storage_attributes"]
+        self.assertEqual(names, ["SCHEMA", "MIGRATIONS", "REQUIRES"])
+        values = {"SCHEMA": "witness-schema", "MIGRATIONS": "migrations",
+                  "REQUIRES": ["core"]}
+        with tempfile.TemporaryDirectory() as directory:
+            package = os.path.join(directory, "package")
+            os.makedirs(os.path.join(package, "migrations"))
+            source = os.path.join(package, "sample.py")
+            with open(source, "w", encoding="utf-8") as handle:
+                handle.write("")
+            with open(os.path.join(package, "migrations", "0001_init.sql"),
+                      "w", encoding="utf-8") as handle:
+                handle.write("create table sample (id int);")
+            module = types.ModuleType("sample")
+            module.__file__ = source
+            for name in names:
+                setattr(module, name, values[name])
+            declaration = migrations.module_metadata("sample", module)
+        self.assertEqual(declaration["schema"], "witness-schema")
+        self.assertEqual([migration.label for migration in declaration["migrations"]],
+                         ["sample/0001_init"])
+        self.assertEqual(declaration["requires"], ("core",))
+
+
+class DeferralContractTest(unittest.TestCase):
+    """The bounded `ameesh-deferral/1` block of `list --json`, `show --json`."""
+
+    def cases(self):
+        """One row per closed reason, so the enum cannot grow unnoticed."""
+        return (
+            ("operator", {"status": "blocked", "operator_paused": True,
+                          "operator_pause_ts": 100.0}),
+            ("pressure", {"status": "queued", "status_text": (
+                "waiting: pressure on host h1 (own cgroup) — memory pressure "
+                "(PSI some 60 s, own cgroup); queued 42 s; capacity requested; "
+                "retry in 10 s")}),
+            ("authentication", {"status": "blocked",
+                                "status_text": auth_failure.STATUS_PREFIX + " x"}),
+            ("provider_credits", {"status": "blocked",
+                                  "status_text": provider_credits.STATUS_PREFIX + " x"}),
+            ("budget", {"status": "blocked",
+                        "status_text": budget.PAUSE_PREFIX + "hourly budget reached"}),
+            ("account", {"status": "blocked",
+                         "status_text": accounts.CONFIG_BLOCK_PREFIX + "no valid account"}),
+            ("account_window", {"status": "blocked",
+                                "status_text": "account window: short-window cooldown"}),
+            ("session", {"status": "blocked",
+                         "status_text": deferral_observation.SESSION_STATUS + " on h1"}),
+            ("database", {"status": "blocked",
+                          "status_text": deferral_observation.DATABASE_STATUS + " : refused"}),
+            ("host", {"status": "blocked",
+                      "status_text": deferral_observation.HOST_STATUS + " : missing"}),
+            ("workdir", {"status": "blocked",
+                         "status_text": deferral_observation.WORKDIR_STATUS + " : /missing"}),
+            ("shutdown", {"status": "queued", "status_text": (
+                deferral_observation.SHUTDOWN_PREFIX + " put back in the queue")}),
+            ("restart", {"status": "queued", "status_text": (
+                deferral_observation.RESTART_PREFIX + " put back in the queue")}),
+            ("other", {"status": "blocked", "status_text": "turn context unavailable"}),
+        )
+
+    def test_the_frozen_block_shape_and_closed_enums(self):
+        spec = SURFACE["deferral"]
+        self.assertEqual(deferral_observation.SCHEMA, spec["schema"])
+        self.assertEqual(list(deferral_observation.STATES), spec["states"])
+        self.assertEqual(list(deferral_observation.REASONS), spec["reasons"])
+        seen = set()
+        for reason, row in self.cases():
+            with self.subTest(reason):
+                block = deferral_observation.classify(row, now=1000.0)
+                self.assertIsNotNone(block)
+                self.assertEqual(block["reason"], reason)
+                self.assertIn(block["state"], spec["states"])
+                self.assertLessEqual(set(block), set(spec["fields"]))
+                self.assertLessEqual(set(spec["required_fields"]), set(block))
+                self.assertTrue(block["age_s"] is None or isinstance(block["age_s"], int))
+                self.assertTrue(block["since_ts"] is None
+                                or isinstance(block["since_ts"], (int, float)))
+                if "queue" in block:
+                    queue = block["queue"]
+                    self.assertLessEqual(set(queue), set(spec["queue_fields"]))
+                    self.assertLessEqual(set(spec["queue_required_fields"]), set(queue))
+                seen.add(reason)
+        self.assertEqual(seen, set(spec["reasons"]))
+
+
+class PythonMailContractTest(unittest.TestCase):
+    """The 1.2/1.3 Python surface: signatures, records, published bounds and codes."""
+
+    spec = SURFACE["python"]["mail"]
+
+    def test_the_public_mail_signatures_are_frozen(self):
+        for name, frozen in sorted(self.spec["signatures"].items()):
+            with self.subTest(name):
+                self.assertEqual(signature_breaks(
+                    frozen_signature(frozen),
+                    inspect.signature(getattr(mail, name))), [])
+
+    def test_the_value_objects_keep_their_frozen_fields(self):
+        for name, fields in sorted(self.spec["records"].items()):
+            with self.subTest(name):
+                self.assertEqual([field.name for field in
+                                  dataclasses.fields(getattr(mail, name))], fields)
+
+    def test_the_published_bounds_enums_and_errors_are_frozen(self):
+        for name, value in sorted(self.spec["bounds"].items()):
+            with self.subTest(name):
+                self.assertEqual(getattr(mail, name), value)
+        self.assertEqual(list(mail.KINDS), self.spec["kinds"])
+        self.assertEqual(mail.MODULE_PAYLOAD_KEY, self.spec["module_payload_key"])
+        self.assertEqual(sorted(mail.ADMITTED_PAYLOAD_KEYS),
+                         self.spec["admitted_payload_keys"])
+        self.assertEqual(sorted(mail.RESERVED_PAYLOAD_KEYS),
+                         self.spec["reserved_payload_keys"])
+        self.assertEqual(sorted(mail.RESERVED_ACTORS), self.spec["reserved_actors"])
+        self.assertEqual(list(mail.RESERVED_ACTOR_PREFIXES),
+                         self.spec["reserved_actor_prefixes"])
+        for name, code in sorted(self.spec["errors"].items()):
+            with self.subTest(name):
+                self.assertEqual(getattr(mail, name).code, code)
+
+    def test_the_served_contract_version_is_frozen(self):
+        self.assertEqual(mail.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.mail.CONTRACT_VERSION, self.spec["contract_version"])
 
 
 class HttpContractTest(unittest.TestCase):
@@ -608,9 +792,13 @@ class CoverageTableTest(unittest.TestCase):
         names.update("cli:" + name for name in SURFACE["cli"])
         names.update("module:" + name for name in SURFACE["module"])
         names.update({"http:discovery", "http:operations", "http:authentication",
-                      "http:idempotency", "http:events", "http:schemas"})
+                      "http:idempotency", "http:events", "http:schemas",
+                      "http:agent-observation"})
         names.update({"runner:agents-file", "runner:turn-context", "runner:turn-observation"})
         names.update("view:" + name for name in SURFACE["views"])
+        names.update({"deferral"})
+        names.update("canon:" + name.replace("_", "-") for name in SURFACE["canon"])
+        names.update("python:" + name for name in SURFACE["python"])
         names.update({"fixture", "stable-pin"})
         return names
 

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import stat
 import struct
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -12,6 +13,8 @@ from unittest.mock import patch
 from ameesh import vm_adapter as vm
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "credential ACL is read with os.getxattr (Linux)")
 class CredentialTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

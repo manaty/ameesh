@@ -1651,11 +1651,19 @@ def tick(db, cfg, options) -> dict:
                         return {"state": "blocked",
                                 "reason": request.get("blocked_reason")
                                 or "retour apres arret interrompu"}
-                    _release_cutoff._manual_return_mail(
-                        db, tree, request.get("notify") or "mesh-design",
+                    remise = _release_cutoff._manual_return_mail(
+                        db, tree, request.get("notify"),
                         "superviseur interrompu avant la fin du retour")
-                    reason = ("retour apres arret interrompu: marche manuelle "
-                              "remise au pilote; sources kept")
+                    if remise:
+                        reason = ("retour apres arret interrompu: marche manuelle "
+                                  "remise au pilote; sources kept")
+                    else:
+                        # #7792 B : le motif consigné ne peut pas affirmer une
+                        # remise qui n'a pas eu lieu ; l'alerte
+                        # `staging_interrupted` reprend ce texte.
+                        reason = ("retour apres arret interrompu: marche manuelle "
+                                  "NON remise (aucun destinataire ou envoi en "
+                                  "echec); alerte staging_interrupted, sources kept")
                     _record(db, options["key"],
                             dict(request, blocked_reason=reason,
                                  return_recovery=True), lease=lease)
@@ -1822,12 +1830,20 @@ def tick(db, cfg, options) -> dict:
                                  return_pid=retour.get("pid")), lease=lease)
                     return {"state": "blocked", "reason": guard,
                             "run": attempt["run"]}
+                remise = True
                 if not retour["ok"] and not retour["mailed"]:
-                    release_cutoff._manual_return_mail(
-                        db, tree, attempt.get("notify") or "mesh-design",
+                    remise = release_cutoff._manual_return_mail(
+                        db, tree, attempt.get("notify"),
                         retour["note"])
                 monitor.stop(reason)
                 result = dict(attempt, state="failed", exit=code, reason=reason)
+                if not remise:
+                    # #7792 B : l'échec porte la non-remise, pas la trace
+                    # locale seule ; l'alerte `staging_interrupted` la relaie.
+                    result["manual_return_unmailed"] = True
+                    result["reason"] = ("%s ; marche manuelle NON remise "
+                                        "(aucun destinataire ou envoi en echec)"
+                                        % (reason or "echec"))
                 if note:
                     result["unit_note"] = note
                 if retour["note"]:

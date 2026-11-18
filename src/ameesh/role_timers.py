@@ -113,6 +113,7 @@ from . import db as db_mod
 from . import fingerprints
 from . import plan_github
 from . import registry
+from .roles import AUDITOR_ROLES, DESIGN_ROLES
 
 #: #7661 : le rôle d'observation n'est plus un nom de persona. L'agent dont la
 #: fiche déclare le rôle de conception (`conception`/`design`, lus au registre
@@ -120,7 +121,7 @@ from . import registry
 #: mesh sans ce rôle n'installe rien et ne lève aucune alerte de rôle manquant.
 #: (repris de `sous_utilisation.DESIGN_ROLES` pour ne pas importer tout le
 #: module au chargement)
-OBSERVATION_ROLES = ("conception", "design")
+OBSERVATION_ROLES = DESIGN_ROLES
 #: installed layout of the command, as the systemd units spell it
 DEFAULT_BIN = "%h/.local/share/ameesh/venv/bin/ameesh"
 #: override for tests and isolated hosts
@@ -182,13 +183,16 @@ NOCTURNE_DESCRIPTION = "ameesh — daily psql dispatch in its window (#7483)"
 #: the wall clock, the minute of the hand copy it replaces.
 #: #7661: `AUDITOR_ROLE` is the ROLE class token (what a card declares), not a
 #: persona name; the holder is resolved by its card, under any name.
-AUDITOR_ROLE = "auditeur"
-AUDITOR_PASS = "auditeur-court"
-AUDITOR_UNIT = "ameesh-auditeur-court"
+#: #7792: the token is the one in `roles.py`; the unit and mail names stay the
+#: same, they are derived from it.
+AUDITOR_ROLE = AUDITOR_ROLES[0]
+AUDITOR_PASS = AUDITOR_ROLE + "-court"
+AUDITOR_UNIT = "ameesh-" + AUDITOR_PASS
 AUDITOR_INTERVAL_S = 3600
 AUDITOR_CALENDAR = "*-*-* *:15:00"
 AUDITOR_DESCRIPTION = "ameesh — auditor short pass, hourly, under the elected role lease (#5863)"
-AUDITOR_MAIL = "Passage court (chaque heure). Consigne : ameesh/docs/AUDITEUR.md, à jour."
+AUDITOR_MAIL = ("Passage court (chaque heure). Consigne : ameesh/docs/%s.md, à jour."
+                % AUDITOR_ROLE.upper())
 #: #6643: the unit runs `ameesh auditor tick`, not the blind mail. `vm.sh`
 #: probes this attribute with the CLI it is about to control: a rollback to a
 #: CLI that predates it re-poses the unit with that CLI before checking it,
@@ -433,7 +437,6 @@ def _role_set(roles) -> set:
 
 
 def _auditor_roles() -> tuple:
-    from .alert_briefs import AUDITOR_ROLES
     return AUDITOR_ROLES
 
 
