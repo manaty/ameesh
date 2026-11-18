@@ -11,23 +11,32 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import io
+import json
 import os
 import time
 import uuid
 from unittest import mock
 
-from ameesh import account_turn, registry, storage
+from ameesh import accounts, account_turn, registry, storage
 from ameesh.runner import run_attach
 
 from .support import FAKEBIN, PgTestCase
 
 
-def _account(path: str, *, creds: str = ".credentials.json") -> str:
+def _account(path: str, *, creds: str = ".credentials.json",
+             interactive: bool = False) -> str:
     os.makedirs(path, exist_ok=True)
     os.chmod(path, 0o700)
     with open(os.path.join(path, creds), "w", encoding="utf-8"):
         pass
     os.chmod(os.path.join(path, creds), 0o600)
+    # #7676 : un compte Claude déclaré n'ouvre une session interactive
+    # qu'après l'accueil ; les cas d'attache le posent comme déjà fait.
+    if interactive:
+        config = os.path.join(path, ".claude.json")
+        with open(config, "w", encoding="utf-8") as handle:
+            json.dump({accounts.CLAUDE_INTERACTIVE_FLAG: True}, handle)
+        os.chmod(config, 0o600)
     return path
 
 
@@ -35,8 +44,10 @@ class AttachSessionAccountTest(PgTestCase):
     def setUp(self):
         super().setUp()
         self.register("att7644", "claude", cwd=self.tmp)
-        self.primaire = _account(os.path.join(self.tmp, "comptes", "claude-1"))
-        self.secondaire = _account(os.path.join(self.tmp, "comptes", "claude-2"))
+        self.primaire = _account(os.path.join(self.tmp, "comptes", "claude-1"),
+                                 interactive=True)
+        self.secondaire = _account(os.path.join(self.tmp, "comptes", "claude-2"),
+                                   interactive=True)
         self.cfg = dataclasses.replace(self.cfg, accounts={"claude": [
             {"name": "primaire", "path": self.primaire},
             {"name": "secondaire", "path": self.secondaire},

@@ -150,6 +150,7 @@ from __future__ import annotations
 
 import getpass
 import hashlib
+import json
 import math
 import os
 import re
@@ -420,6 +421,68 @@ class Profile:
             return "API key → %s (%s)" % (
                 self.env or default_key_env_of(self.harness) or "?", source)
         return "dir %s" % (self.path or "default")
+
+
+#: #7676 : ce que Claude Code écrit à la fin de son accueil interactif. Tant
+#: qu'il manque, la première session interactive s'ouvre sur le choix du thème
+#: et le premier message de l'humain part dans ce menu.
+CLAUDE_INTERACTIVE_FLAG = "hasCompletedOnboarding"
+
+
+def interactive_config_file(profile: Profile) -> str:
+    """#7676 : le `.claude.json` que Claude Code lit pour ce profil.
+
+    `CLAUDE_CONFIG_DIR` posé (dossier déclaré) : `$CLAUDE_CONFIG_DIR/.claude.json`.
+    Compte déclaré sans dossier : Claude lit `~/.claude.json`, **hors** de
+    `~/.claude` — d'où ce chemin distinct de `Profile.home()`. Un profil
+    synthétique suit le dossier de l'environnement de l'exécuteur.
+    """
+    if profile.path:
+        return os.path.join(profile.path, ".claude.json")
+    if profile.declared:
+        return os.path.join(_expand_home("~"), ".claude.json")
+    inherited = os.environ.get(config_env_of(profile.harness)) or ""
+    if inherited:
+        return os.path.join(_expand_home(inherited), ".claude.json")
+    return os.path.join(_expand_home("~"), ".claude.json")
+
+
+def interactive_problem(profile: Profile) -> str:
+    """#7676 : "" si le profil peut ouvrir une session interactive, sinon la raison.
+
+    Seuls les profils `claude` `config_dir` **déclarés** sont jugés : un compte
+    `api_key_env` n'a pas d'accueil interactif, et un profil synthétique (hôte
+    sans comptes) suit l'environnement de l'exécuteur, pas une déclaration.
+    Le fichier n'est que lu ; le drapeau n'est jamais réécrit ici (le geste
+    appartient à l'humain qui fait l'accueil, une fois).
+    """
+    if not (profile.declared and profile.harness == "claude"
+            and profile.kind == "config_dir"):
+        return ""
+    path = interactive_config_file(profile)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return "%s is missing" % path
+    except OSError as exc:
+        return "%s unreadable (%s)" % (path, exc.strerror or exc)
+    except ValueError as exc:
+        return "%s unreadable (%s)" % (path, getattr(exc, "msg", exc))
+    if not isinstance(data, dict) or data.get(CLAUDE_INTERACTIVE_FLAG) is not True:
+        return "%s does not record `%s: true`" % (path, CLAUDE_INTERACTIVE_FLAG)
+    return ""
+
+
+def interactive_init_hint(profile: Profile) -> str:
+    """#7676 : le geste humain, une fois, qui rend le profil interactif."""
+    variable = config_env_of(profile.harness)
+    prefix = ("%s=%s " % (variable, profile.path)
+              if variable and profile.path else "")
+    return ("initialize it once in a terminal: `%sclaude`, complete the "
+            "onboarding (theme), then quit; `%s` must then read `%s: true`"
+            % (prefix, interactive_config_file(profile),
+               CLAUDE_INTERACTIVE_FLAG))
 
 
 # --------------------------------------------------------------------------

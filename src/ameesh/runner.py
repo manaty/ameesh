@@ -16981,6 +16981,39 @@ def attach_owner(host: str) -> str:
     return "attach:%s@%s" % (getpass.getuser(), host)
 
 
+def attach_move_refusal(db, name: str) -> str:
+    """#7676: pourquoi un attach est refusé pendant un déplacement ouvert, "" sinon.
+
+    L'attach reprend `agent_registry.session_id`. Entre la bascule (`switched`)
+    et le premier tour de la cible, cette session est encore celle de l'hôte
+    source : la lancer ici serait un `--resume` d'un identifiant absent de cet
+    hôte. La cible ouvre sa session neuve dans `conversation_move.open_first_turn`
+    (premier tour piloté) ; l'attach refuse donc en le disant, plutôt que de
+    reprendre la session d'un autre hôte. Avant la bascule, il refuse aussi :
+    un bail d'attach vivant empêcherait `switch` de rendre la source.
+    """
+    try:
+        move = storage.of(db).conversation_moves.open_for(name)
+    except db_mod.DbError as exc:
+        return ("agent %s: cannot read its conversation move (%s); attach refused"
+                % (name, db_mod.explain(exc)))
+    if move is None:
+        return ""
+    state = move.get("state") or "?"
+    source = move.get("source_host") or "?"
+    target = move.get("target_host") or "?"
+    if state in ("switched", "recovered", "rehydrating"):
+        return ("agent %s has a conversation move %s from %s to %s (state %s): "
+                "the first turn on this host opens the new native session and "
+                "delivers the conversation segment; attaching now would resume "
+                "the source session. Wait for that first turn, then attach."
+                % (name, move.get("move_id") or "?", source, target, state))
+    return ("agent %s has a conversation move %s to %s in progress (state %s): "
+            "attach refused so the move can switch at the turn boundary; retry "
+            "after it moved."
+            % (name, move.get("move_id") or "?", target, state))
+
+
 def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
                 harness: str = "", human: str = "") -> dict:
     """L'identité que le harnais interactif transmet à ses hooks."""
@@ -17261,13 +17294,16 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         return 1
     max_seconds = attach_mod.DEFAULT_MAX if max_seconds is None else max_seconds
     attach_mod.Deadline(max_seconds)  # validate before taking a lock or lease
-    #: #7121 : une coupure du relais ferme le PTY (SIGTERM/SIGHUP). Le wrapper
-    #: doit rendre le bail et arrêter le harnais avant d'être tué : ces
-    #: signaux posent l'arrêt, la boucle coupe le groupe et le `finally`
-    #: rend le bail. Jamais installé hors du fil principal (tests, workers).
+    #: #7121/#7676 : une coupure du relais ferme le PTY, et un terminal local
+    #: fermé (SIGHUP) ou un timeout (SIGTERM) doit aussi rendre le bail. Sans
+    #: ces gestionnaires, le processus sortait sans passer par le `finally` :
+    #: l'avatar restait « running (session interactive (attach)) » et
+    #: injoignable jusqu'à l'expiration de son bail. Ces signaux posent
+    #: l'arrêt, la boucle coupe le groupe et le `finally` rend le bail. Jamais
+    #: installé hors du fil principal (tests, workers).
     stop_event = threading.Event()
     previous_signals: dict = {}
-    if remote and threading.current_thread() is threading.main_thread():
+    if threading.current_thread() is threading.main_thread():
         def _stop_attach(_signum, _frame):
             stop_event.set()
         for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -17457,6 +17493,19 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
             return refuse("account_unavailable", "")
         lease = registry.attach_claim(db, name, lease_owner, ttl)
         if lease:
+            # #7676 : vérifié APRÈS la prise du bail, sous le verrou de la
+            # session. Une bascule concurrente est soit déjà visible ici, soit
+            # refusée par `switch` tant que ce bail d'attach est vivant : la
+            # course entre le contrôle et le `--resume` est fermée. Un bail
+            # pris pour rien est rendu avant le refus.
+            refusal = attach_move_refusal(db, name)
+            if refusal:
+                try:
+                    registry.release(db, name, lease_owner,
+                                     int(lease["lease_epoch"]))
+                except db_mod.DbError:
+                    pass
+                return refuse("conversation_move", refusal, 3)
             break
         from . import host_holds
         hold = host_holds.live(db).get(agent.get("host") or "")
