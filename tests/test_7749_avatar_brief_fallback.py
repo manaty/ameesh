@@ -37,6 +37,15 @@ def _card(title: str, human: str = "smichea") -> str:
     ])
 
 
+def _role_card(title: str, role: str, human: str = "smichea") -> str:
+    """Une fiche Agent de gouvernance : un rôle déclaré, pas un avatar."""
+    return "\n".join([
+        "---", "type: Agent", "title: " + title,
+        "responsible: human:" + human,
+        "roles: [" + role + "]", "---", "",
+    ])
+
+
 #: la pause réelle d'`avatar-essai` au moment du constat (17/11, 21:15Z)
 BUDGET_PAUSE = ("budget : pause (account tertiaire, seven_day 54 % reset) "
                 "until 18/11 06:00@1794981600")
@@ -63,6 +72,10 @@ class AvatarBriefFallbackTest(PgTestCase):
                "---\ntype: Member\ntitle: smichea\n---\n")
         _write(os.path.join(self.root, "agents", "avatar-essai.md"),
                _card("avatar-essai"))
+        # #7661 : l'auditeur se reconnaît à la fiche, pas à son nom ; le canon
+        # de test déclare donc son rôle, comme le canon réel (sans avatar).
+        _write(os.path.join(self.root, "agents", "auditeur.md"),
+               _role_card("auditeur", "auditeur"))
         self.cfg = dataclasses.replace(
             self.cfg, canon=self.root, canon_untrusted=True, canon_ref="",
             release={"projects": {"ameesh": {"report": "bureau"}}})
