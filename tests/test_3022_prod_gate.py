@@ -24,6 +24,15 @@ NEXLINK = MECHANICS.replace("projects: {}", """projects:
 
 
 class ProductionMechanicsTest(unittest.TestCase):
+    def test_workflow_inventory_is_strict_and_optional(self):
+        text = NEXLINK.replace("branch: main", "branch: main\n      workflows: [deploy-prod.yml, promote-prod.yaml]")
+        document = mechanics.compile_document(text)
+        project = next(p for p in document.overrides if p.name == "nexlink")
+        self.assertEqual(project.production_workflows, ("deploy-prod.yml", "promote-prod.yaml"))
+        for bad in ("[]", "[../bad.yml]", "[same.yml, same.yml]", "[bad.txt]"):
+            with self.subTest(bad=bad), self.assertRaises(mechanics.MechanicsError):
+                mechanics.compile_document(NEXLINK.replace("branch: main", "branch: main\n      workflows: " + bad))
+
     def test_la_branche_de_prod_est_compilee_par_projet(self):
         document = mechanics.compile_document(NEXLINK)
         self.assertEqual(document.production_branch("nexlink"), "main")
