@@ -41,6 +41,8 @@ sur bureau-goal ; les déploiements utilisent des appels directs à `gh` et les
 migrations `scripts/migrate.sh` dans Nexlink. Le préfixe est donc volontaire :
 il ne bloque pas les appels directs, ni un STOP entre contrôle et effet, ni
 un STOP après le dispatch. Son adoption ne constitue pas une barrière imposée
-aux identifiants KMS, à GitHub ou à la base. Il faut identifier et mettre en
-place une voie d'exécution imposable, couvrir les chemins directs et les
-attentes, puis qualifier ces courses avant de considérer l'intégration finie.
+aux identifiants KMS, à GitHub ou à la base. L'orchestrateur accepte cette
+fenêtre pour la première tranche (#225799) ; l'accès imposé aux identifiants
+relève du lot compagnon #7767, avec décision owner. La garde refuse de lancer
+la commande si plus de 30 secondes se sont écoulées depuis le début du
+contrôle, borne conservatrice par rapport à l'écriture du reçu.

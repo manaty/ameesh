@@ -122,3 +122,19 @@ class PreActTest(unittest.TestCase):
                                    "2026-11-18T01:00:00Z", "--", "true"])
         self.assertEqual(result, 1)
         execute.assert_not_called()
+
+    def test_stale_receipt_never_executes_command(self):
+        db = mock.Mock()
+        db.transaction.return_value = nullcontext(Transaction())
+        binding = mock.Mock(ok=True)
+        binding.name = "bureau"
+        with mock.patch.object(pre_act.config, "load", return_value=object()), \
+             mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
+             mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
+             mock.patch.object(pre_act.identity, "resolve_binding", return_value=binding), \
+             mock.patch.object(pre_act.time, "monotonic", side_effect=[100, 131]), \
+             mock.patch.object(pre_act.os, "execvp") as execute:
+            result = pre_act.main(["--lot", "5772", "--kind", "kms", "--since",
+                                   "1970-01-01T00:01:40Z", "--", "true"])
+        self.assertEqual(result, 1)
+        execute.assert_not_called()

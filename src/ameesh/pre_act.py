@@ -13,6 +13,7 @@ import math
 import os
 import re
 import sys
+import time
 
 from . import config, db as db_mod, identity, planned_waits, storage
 
@@ -117,6 +118,7 @@ def main(argv=None):
         binding = identity.resolve_binding(cfg, db)
         if not binding.ok or not binding.name:
             raise Refused("valid agent identity required")
+        check_started = time.monotonic()
         with db.transaction(isolation="READ COMMITTED") as tx:
             inspect(tx, args.lot, binding.name, since, args.kind)
         db.close()
@@ -124,6 +126,8 @@ def main(argv=None):
         print("pre-act: receipt recorded for lot #%d (%s)" % (args.lot, args.kind))
         if command:
             sys.stdout.flush()
+            if time.monotonic() - check_started > 30:
+                raise Refused("pre-act check took more than 30 seconds")
             os.execvp(command[0], command)
         return 0
     except Exception as exc:  # fail closed on unavailable or unreadable data
