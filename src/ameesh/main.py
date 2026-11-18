@@ -200,6 +200,7 @@
         record --signed : hors runner (bureau/owner), attestation signée par une
         clé owner (#4485), sans PID local ni ameesh sur l'hôte du commit ;
   ameesh psql-nocturne dispatch       daily bounded psql workflow dispatch (#7483);
+  ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO  check before an act;
   ameesh receipt verify       approval receipts (spec §8);
   ameesh refusal emit --reason "…"   #5529 : preuve positive qu'un harnais a
         refusé le tour avant tout appel fournisseur (ameesh-refusal/1), lue
@@ -404,6 +405,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "staging-migrations":
         from . import staging_migrations
         return staging_migrations.main(rest)
+    if command == "gate" and rest[:1] == ["pre-act"]:
+        from . import pre_act
+        return pre_act.main(rest[1:])
     from . import db as db_mod
     db_mod.set_command_application(command)  # #5976
     if command == "role" and rest[:1] == ["run"]:

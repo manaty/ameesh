@@ -1,0 +1,30 @@
+# Pré-geste : prototype #7761
+
+La commande `ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO`
+relit le journal et le courrier puis écrit un reçu sur le lot si aucun motif
+de refus n'est trouvé. `--since` est un horodatage ISO avec fuseau, capturé
+avant la planification ou l'attente, puis conservé jusqu'au contrôle. Une
+date future, une identité absente, une base illisible ou une écriture de reçu
+impossible refusent le passage. La commande ne remplace pas les autorisations
+requises pour le geste.
+
+Le contrôle détecte les notes `hold:`, les mots d'arrêt dans les notes et les
+messages associés au lot, les messages non livrés à l'agent dont le lot est
+référencé, et les décisions retirées pendant la fenêtre. Un hold ancien non
+levé est également bloquant. Le texte libre est reconnu de façon prudente,
+mais une formulation imprévue peut échapper à cette détection ; une référence
+prose doit contenir `#ID` si le courrier ne porte pas le champ lot structuré.
+
+Le reçu constate une lecture ponctuelle : il ne verrouille ni les nouveaux
+messages ni le service externe. Un STOP peut arriver entre la lecture et
+l'effet. Une intégration doit effectuer la vérification immédiatement avant
+l'effet, arrêter sur tout code non nul, et ne jamais remettre à zéro la borne
+après une attente. Pour une garantie contre cette course, il faut un protocole
+commun de sérialisation avec les producteurs d'arrêt et le service qui agit.
+
+Ce prototype ne modifie pas les scripts du bureau ni les dispatchs de
+production. Les runners de production vérifient `prod-go/1` hors ligne sans
+accès à la base du mesh (voir `docs/prod-go.md`) ; l'appel de cette commande
+doit donc être placé sur le poste de dispatch, avant l'envoi, et ses autres
+chemins d'accès doivent être examinés. Une fois le run envoyé, un STOP exige
+l'annulation du run et la tenue de `prod-deploy` pendant la fenêtre signée.
