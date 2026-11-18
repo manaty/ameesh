@@ -39,6 +39,17 @@ puis démarrage, venv prouvé, sans drain ni bail exigé. Sans cela, le candidat
 `mesh-design` d'agents-2 est resté 13 h sur l'ancien code, puis a repris le
 bail sur ce code (staging du 28/10/2026, #4248).
 
+`agents unites-desactivees` rend, une par ligne, les personas du registre (ni
+arrêtées ni retirées) dont l’unité est `disabled` ou `masked` sur l’hôte.
+`staging.sh` passe ces noms à la santé du courrier (`--unite-desactivee`) : le
+courrier en attente d’un exécuteur volontairement retiré y est un
+**avertissement** nommant `ameesh agent retire`, jamais un KO qui fait revenir
+l’hôte en arrière (#7785). Une déactivation temporaire (pause budget, essai)
+n’est donc pas un échec de staging ; le retrait définitif reste un geste du
+registre, et `poste.sh unites-desactivees` suit la même règle sur le poste. Une
+unité dont l’état est illisible n’est pas devinée : elle n’est pas listée et la
+santé reste stricte pour cette persona.
+
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
 exact de l’hôte dans le registre :

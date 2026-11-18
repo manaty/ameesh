@@ -8,6 +8,7 @@
 #
 #   deploy/mise-a-jour/vm.sh <étape> [REF]
 #   deploy/mise-a-jour/vm.sh agents verifier|installer|timers|redemarrer|controler|retour [REF]
+#     ou `agents unites-desactivees` (une persona par ligne, voir plus bas)
 #     AGENTS_SSH=root@cible, HOTE_AGENTS=nom du registre dans BASCULE_ENV —
 #     un BASCULE_ENV par VM d'agents ; unités utilisateur sous ameesh, liste
 #     du registre lue sur la VM. Voir docs/DEPLOIEMENT-HOTE-AGENTS.md.
@@ -36,6 +37,13 @@
 #                manque (#3327) ; sans effet sur un hôte non candidat
 #   controler    unités actives, journal récent, venv du MainPID vivant,
 #                ameesh doctor et minuteries de rôle sur le serveur
+#   unites-desactivees  une persona par ligne : celles du registre (ni
+#                arrêtées ni retirées) dont l'unité runner est désactivée ou
+#                masquée sur cet hôte. La santé staging les reçoit et tient
+#                leur courrier pour un avertissement, jamais un KO (#7785) :
+#                un exécuteur volontairement retiré ne fait pas revenir un
+#                déploiement en arrière. Le retrait définitif, lui, passe par
+#                `ameesh agent retire`, nommé dans l'avertissement.
 #   (agents)     redemarrer et controler partagent un seul périmètre (#4437) :
 #                agents du registre menés (activité, bail et venv exigés) ;
 #                persona arrêtée ou unité désactivée : aucune activité ni bail
@@ -92,8 +100,8 @@ if [ "${1:-}" = agents ]; then MODE=agents; shift; fi
 ACTION=${1:-}
 if [ "$MODE" = agents ]; then
   case "$ACTION" in
-    redemarrer|controler|verifier|installer|timers|retour) ;;
-    *) echo "mode agents : verifier, installer, timers, redemarrer, controler ou retour attendu" >&2; exit 2 ;;
+    redemarrer|controler|verifier|installer|timers|retour|unites-desactivees) ;;
+    *) echo "mode agents : verifier, installer, timers, redemarrer, controler, unites-desactivees ou retour attendu" >&2; exit 2 ;;
   esac
   : "${AGENTS_SSH:?AGENTS_SSH manquant dans $BASCULE_ENV}" "${HOTE_AGENTS:?HOTE_AGENTS manquant dans $BASCULE_ENV}"
   [[ $AGENTS_SSH =~ ^[a-zA-Z0-9_.@:-]+$ && $AGENTS_SSH != -* ]] || { echo "AGENTS_SSH invalide" >&2; exit 2; }
@@ -744,6 +752,29 @@ unite_agents() { printf 'ameesh-runner-agent@%s.service' "$1"; }
 etat_unite_agents() {  # persona → UnitFileState
   utilisateur_agents systemctl --user show -p UnitFileState --value \
     "$(unite_agents "$1")" 2>/dev/null
+}
+# #7785 : personas du registre (ni arrêtées ni retirées) dont l'unité runner est
+# désactivée ou masquée sur cet hôte, une par ligne. La santé staging reçoit
+# ces noms : leur courrier est un avertissement nommant `agent retire`, jamais
+# un KO de déploiement — le retrait volontaire d'un exécuteur ne doit pas faire
+# revenir un staging en arrière. Une unité illisible n'est pas devinée : elle
+# n'est pas listée, et la santé reste stricte pour cette persona. Un hôte sans
+# agent n'est pas une erreur.
+unites_desactivees() {
+  local noms p etat rc=0
+  noms=$(agents_du_registre) || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;  # aucun agent à mener sur cet hôte
+    *) return "$rc" ;;
+  esac
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    etat=$(etat_unite_agents "$p") || continue
+    case "$etat" in
+      disabled|masked) printf '%s\n' "$p" ;;
+    esac
+  done <<<"$noms"
 }
 # #4248 : un rôle élu (§11) a un exécuteur sur chaque hôte candidat, mais le
 # registre ne porte que l'hôte du bail : agents_du_registre ne voit pas ici le
@@ -2691,6 +2722,7 @@ if [ "$MODE" = agents ]; then
     verifier|controler) controler_agents ;;
     installer) installer_agents "${2:-HEAD}" ;;
     timers) timers_agents ;;
+    unites-desactivees) unites_desactivees ;;
     retour) retour_agents ;;
   esac
   exit

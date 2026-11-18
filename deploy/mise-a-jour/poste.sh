@@ -54,6 +54,10 @@
 #                le venv réellement exécuté par le MainPID de notify et de
 #                chaque exécuteur (#2950, #3311), et les minuteries de rôle
 #                (EP5) vérifiées par `role timers --check`
+#   unites-desactivees  une persona par ligne : celles du registre (ni arrêtées
+#                ni retirées) dont l'unité runner est désactivée ou masquée sur
+#                ce poste. La santé staging les reçoit (#7785) : leur courrier
+#                est un avertissement nommant `agent retire`, jamais un KO.
 #   retour       bascule en arrière vers le venv précédent conservé (sans pip),
 #                puis redémarre (sans toucher aux bases : 0041 à 0047 sont
 #                additives)
@@ -1128,6 +1132,34 @@ controler_executeurs() {
   [ "$echec" = 0 ]
 }
 
+# #7785 : personas du registre (ni arrêtées ni retirées, mode execute) dont
+# l'unité runner est désactivée ou masquée sur ce poste, une par ligne. La
+# santé staging reçoit ces noms : leur courrier est un avertissement nommant
+# `agent retire`, jamais un KO — un exécuteur volontairement retiré ne fait pas
+# revenir un déploiement en arrière. Une unité dont la persona ou l'état du
+# registre est illisible n'est pas devinée : elle n'est pas listée.
+unites_desactivees() {
+  local u p etat
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    p=$(persona_de "$u") || continue
+    [ -n "$p" ] || continue
+    etat=$("$AMEESH" show "$p" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    row = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(1)
+if row.get("retired_ts") or row.get("status") == "stopped" \
+        or (row.get("mode") or "execute") != "execute":
+    print("hors")
+' 2>/dev/null) || continue
+    [ -n "$etat" ] || printf '%s\n' "$p"
+  done < <(systemctl --user list-unit-files 'ameesh-runner-agent@*.service' \
+             --plain --no-legend 2>/dev/null \
+           | awk '$2 == "disabled" || $2 == "masked" {print $1}')
+}
+
 timers() {
   # #3327 : le poste est candidat du rôle élu ; ses minuteries mécaniques
   # remplacent les passes GitHub du service complet, limité aux alertes.
@@ -1408,6 +1440,7 @@ case "${1:-}" in
   timers) timers ;;
   redemarrer) redemarrer ;;
   controler) controler ;;
+  unites-desactivees) unites_desactivees ;;
   retour) retour ;;
   *) sed -n '4,35p' "$0" >&2; exit 2 ;;
 esac

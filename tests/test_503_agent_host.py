@@ -911,6 +911,28 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('dev9 : unité masquée encore active — arrêtée, aucun'
                       ' exécuteur actif exigé', p.stdout)
 
+    def test_unites_desactivees_lists_only_deliberately_stopped_personas(self):
+        """#7785 : la santé reçoit les noms dont l'unité runner est désactivée
+        ou masquée sur cet hôte. Le périmètre est celui du registre local (pas
+        l'autre hôte, pas un mode observe, pas un agent arrêté) et une unité
+        simplement activée n'est jamais listée."""
+        (self.state / 'disabled-dev8').touch()
+        (self.state / 'masked-dev9').touch()
+        (self.state / 'disabled-stopped').touch()
+        (self.state / 'disabled-observer').touch()
+        (self.state / 'disabled-elsewhere').touch()
+        p = self.run_vm('unites-desactivees')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.split(), ['dev8', 'dev9'])
+        # aucune unité désactivée : sortie vide, pas une erreur (hôte sans
+        # exécuteur volontairement éteint n'est pas un échec de lecture).
+        for nom in ('dev8', 'dev9'):
+            (self.state / ('disabled-' + nom)).unlink(missing_ok=True)
+            (self.state / ('masked-' + nom)).unlink(missing_ok=True)
+        p = self.run_vm('unites-desactivees')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout, '')
+
     def test_restart_stops_proves_then_starts(self):
         """#1152 : l'arrêt (SIGTERM, drainage) précède la preuve du point sûr
         (ActiveState=inactive ET MainPID=0), elle-même avant le démarrage ;
