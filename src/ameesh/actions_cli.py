@@ -55,7 +55,8 @@ import os
 import sys
 import time
 
-from . import actions, approve_client, config as config_mod, connectors, db as db_mod
+from . import actions, activity, approve_client, canon as canon_mod
+from . import config as config_mod, connectors, db as db_mod
 from . import jcs, receipts
 from .config import Config
 from .db import Db
@@ -174,6 +175,10 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             return 1
         action["attempts_detail"] = actions.attempts(db, args.id)
         action["events"] = actions.events(db, args.id)
+        # #7629 : quelle approbation permanente a couvert l'action, pour quel
+        # bénéficiaire et quelle ligne de charte.
+        action["grant"] = (receipts.get_standing(db, int(action["auth_grant_id"]))
+                           if action.get("auth_grant_id") else None)
     finally:
         db.close()
     if args.json:
@@ -198,8 +203,23 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     if action.get("replaced_by"):
         print("replaced  : by %s" % action["replaced_by"])
     if action.get("auth_kind"):
-        print("authorized: %s %s" % (action["auth_kind"], action.get("auth_approver") or (
-            "grant #%s" % action["auth_grant_id"] if action.get("auth_grant_id") else "")))
+        if action["auth_kind"] == "standing" and action.get("auth_grant_id"):
+            line = "authorized: standing grant #%s by %s" % (
+                action["auth_grant_id"], action.get("auth_approver") or "?")
+        else:
+            line = "authorized: %s %s" % (action["auth_kind"], action.get("auth_approver") or (
+                "grant #%s" % action["auth_grant_id"] if action.get("auth_grant_id") else ""))
+        grant = action.get("grant")
+        if action["auth_kind"] == "standing" and grant:
+            beneficiary = grant.get("beneficiary") or "no named beneficiary"
+            if grant.get("beneficiary_kind") == "avatar":
+                beneficiary += " (avatar, clones included)"
+            line += " for %s" % beneficiary
+            if grant.get("charter_line") or grant.get("charter_version"):
+                line += "; charter %s%s" % (
+                    grant.get("charter_line") or "?",
+                    " (%s)" % grant["charter_version"] if grant.get("charter_version") else "")
+        print(line)
     if action.get("last_error"):
         print("error     : %s" % action["last_error"])
     print("created   : %s   updated: %s" % (_moment(action.get("created_ts")),
@@ -268,6 +288,125 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     for row in rows:
         print(_line(row))
+    return 0
+
+
+def _epoch(text: str) -> float:
+    """Une date de la CLI : epoch, `YYYY-MM-DD` ou `YYYY-MM-DD HH:MM:SS`."""
+    text = (text or "").strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(text, fmt))
+        except ValueError:
+            continue
+    raise ValueError("invalid date: %r (epoch seconds or YYYY-MM-DD[ HH:MM:SS])" % text)
+
+
+def cmd_recap(cfg: Config, args: argparse.Namespace) -> int:
+    """#7629 : les actions d'un avatar, rangées par issue de la charte."""
+    now = time.time()
+    since = now - activity.parse_since(args.since)
+    until = _epoch(args.until) if args.until else now
+    db = _open(cfg)
+    try:
+        view = actions.recap(db, avatar=args.avatar, since=since, until=until,
+                             project=args.project)
+    finally:
+        db.close()
+    if args.json:
+        _dump(view)
+        return 0
+    print("avatar %s, from %s to %s" % (view["avatar"], _moment(view["since"]),
+                                        _moment(view["until"])))
+    for issue in actions.RECAP_ISSUES:
+        rows = view["issues"][issue]
+        print("%s (%d):" % (issue, len(rows)))
+        for row in rows:
+            money = ("" if row.get("amount") is None
+                     else " %s %s" % (row["amount"], row.get("currency")))
+            print("  %s  %-10s %-12s %-10s %s%s" % (
+                row["action_id"], row["state"], row["connector"][:12],
+                row["operation"][:10], (row.get("target") or "—")[:40], money))
+    return 0
+
+
+def _canon(cfg: Config, wanted: str | None):
+    """Le canon demandé, sinon le canon par défaut ; None s'il est illisible."""
+    canons = [canon for canon in canon_mod.load_configured(cfg)
+              if getattr(canon, "readable", False)]
+    if wanted:
+        for canon in canons:
+            if canon.id == wanted:
+                return canon
+        return None
+    return canons[0] if canons else None
+
+
+def cmd_standing_register(cfg: Config, args: argparse.Namespace) -> int:
+    """#7629 : enregistre un grant sous le plafond du canon.
+
+    Le reçu est vérifié (façade, authentificateur du canon choisi, preuve,
+    échéances), puis la politique `extensions.ameesh.standing_approvals` du
+    canon est appliquée : durée, montant, bénéficiaire, cibles et charte. Un
+    grant hors plafond est refusé avant toute écriture, nonce compris.
+    """
+    raw = _read_receipt(args.receipt)
+    try:
+        parsed = receipts.parse_receipt(raw)
+    except receipts.ReceiptError as exc:
+        print("refused [%s]: %s" % (receipts.FORMAT, exc), file=sys.stderr)
+        return 1
+    if parsed.kind != "standing":
+        print("refused [%s]: a standing receipt is required, not %s"
+              % (receipts.KIND, parsed.kind), file=sys.stderr)
+        return 1
+    approver = parsed.request["approver"]
+    canon = _canon(cfg, args.canon)
+    if canon is None:
+        print("refused [%s]: no readable canon%s" % (
+            receipts.CANON, " %s" % args.canon if args.canon else ""), file=sys.stderr)
+        return 1
+    limits = canon.standing_policy()
+    card = canon.avatar_of(approver)
+    base = _policy(args)
+    policy = receipts.Policy(
+        rp_id=base.rp_id, origins=base.origins, allow_facades=base.allow_facades,
+        level=base.level, clock_skew=base.clock_skew, max_ttl=base.max_ttl,
+        max_standing=base.max_standing, canon_commit=base.canon_commit,
+        canon=canon.state_key)
+    db = _open(cfg)
+    try:
+        verdict, grant = receipts.register_standing(
+            db, raw, policy, registered_by=_actor(args), limits=limits,
+            avatar=card.title if card else None)
+        grant_row = receipts.get_standing(db, grant) if grant else None
+    finally:
+        db.close()
+    if not verdict.ok or grant is None:
+        print("refused [%s]: %s" % (verdict.code, verdict.reason), file=sys.stderr)
+        return 1
+    if args.json:
+        _dump({"grant": grant_row, "verdict": verdict.as_dict()})
+        return 0
+    print("grant #%d registered: %s" % (grant, verdict.reason))
+    if grant_row:
+        print("approver  : %s" % grant_row["approver"])
+        print("beneficiary: %s%s" % (
+            grant_row.get("beneficiary") or "none",
+            " (avatar, clones included)" if grant_row.get("beneficiary_kind") == "avatar"
+            else ""))
+        print("operations: %s %s, class %s, max %s %s" % (
+            grant_row["connector"], ", ".join(grant_row.get("operations") or []),
+            grant_row["action_class"], grant_row["max_amount"],
+            grant_row.get("currency") or ""))
+        if grant_row.get("charter_line") or grant_row.get("charter_version"):
+            print("charter   : %s (%s)" % (grant_row.get("charter_line") or "?",
+                                           grant_row.get("charter_version") or "?"))
+        print("targets   : %s" % (", ".join(grant_row.get("targets") or []) or "no bound"))
     return 0
 
 
@@ -543,7 +682,8 @@ def cmd_recover(cfg: Config, args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 def decisions_view(db, *, human: str | None = None, include_closed: bool = False,
-                   now: float | None = None, viewer: str | None = None) -> dict:
+                   now: float | None = None, viewer: str | None = None,
+                   cfg=None) -> dict:
     """The object of `ameesh decisions --json` (also `GET /api/v1/decisions`,
     L84): the queue of `human` (all when None); `viewer`, when given, only
     sees the prose decisions addressed to the mesh or to them."""
@@ -555,9 +695,8 @@ def decisions_view(db, *, human: str | None = None, include_closed: bool = False
     # L233: decisions written in prose in mail, not filed as requests
     prose = decisions_mod.prose_decisions(db, now)
     if viewer:
-        prose = [p for p in prose
-                 if p["recipient"] in decisions_mod.PROSE_RECIPIENTS
-                 + (viewer, decisions_mod.OWNER_ANY)]
+        allowed = decisions_mod.prose_route(viewer, db, cfg=cfg)
+        prose = [p for p in prose if p["recipient"] in allowed]
     queue["requests"] = requests["pending"]
     queue["prose"] = prose
     if include_closed:
@@ -576,6 +715,7 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
         queue = decisions_view(db, human=args.for_human, include_closed=args.all, now=now,
+                               cfg=cfg,
                                viewer=viewer)
         # #3007 : la file ne prouve pas que l'humain a été joint. Les
         # battements partagés des notificateurs disent si un vivant le couvre ;
@@ -683,7 +823,7 @@ def build_parser() -> argparse.ArgumentParser:
     act = p_action.add_subparsers(dest="action_command")
 
     p = act.add_parser("propose")
-    p.add_argument("--connector", required=True, choices=list(connectors.NAMES))
+    p.add_argument("--connector", required=True)
     p.add_argument("--operation", required=True)
     p.add_argument("--project", required=True)
     p.add_argument("--target", required=True, help="targeted account or object")
@@ -721,6 +861,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=50)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_list)
+
+    p = act.add_parser("recap", help="an avatar's actions by charter issue (#7629)")
+    p.add_argument("--avatar", required=True, metavar="AGENT",
+                   help="agent:<name> or the agent name")
+    p.add_argument("--since", default="30d", help="duration (30m, 24h, 7d) before now")
+    p.add_argument("--until", default=None, help="end: epoch or YYYY-MM-DD[ HH:MM:SS]")
+    p.add_argument("--project", default=None)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_recap)
+
+    p_standing = act.add_parser("standing", help="bounded standing approvals (#7629)")
+    standing_sub = p_standing.add_subparsers(dest="standing_command")
+    p = standing_sub.add_parser("register", help="register a standing receipt as a grant")
+    p.add_argument("--receipt", required=True)
+    p.add_argument("--canon", default=None, metavar="ID",
+                   help="canon whose authenticator signed and whose policy applies "
+                        "(default: the default canon)")
+    p.add_argument("--by", default=None)
+    p.add_argument("--json", action="store_true")
+    _verify_options(p)
+    p.set_defaults(func=cmd_standing_register)
 
     p = act.add_parser("request", help="approval request (ameesh-approve)")
     p.add_argument("id")

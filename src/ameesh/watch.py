@@ -137,10 +137,31 @@ class WatchError(Exception):
     """A refused or failed watch command (exit 1)."""
 
 
-def instruction(agent: str) -> str:
-    """The instruction sent to `agent`, from the versioned text."""
+class _ReportJustSent(Exception):
+    """#7625 : le dépôt a été dédoublonné dans la fenêtre des comptes rendus."""
+
+
+def staging_hosts_text(topology=None) -> str:
+    """#7796: the staging hosts named by the instruction, read from the canon.
+
+    The bare profile declares none: the text says so instead of naming the
+    hosts of one mesh."""
+    hosts = tuple(getattr(topology, "hosts", ()) or ())
+    if not hosts:
+        return "none declared by the canon yet"
+    workstation = getattr(topology, "workstation", None)
+    return ", ".join("%s (workstation)" % host if host == workstation else host
+                     for host in hosts)
+
+
+def instruction(agent: str, topology=None) -> str:
+    """The instruction sent to `agent`, from the versioned text.
+
+    `topology` is the canon's staging sequence (`release_cutoff.
+    staging_topology_of`); without it the text names no host (#7796)."""
     with open(CONSIGNE_PATH, encoding="utf-8") as fh:
-        return string.Template(fh.read()).safe_substitute(agent=agent).strip()
+        return string.Template(fh.read()).safe_substitute(
+            agent=agent, staging_hosts=staging_hosts_text(topology)).strip()
 
 
 #: L148 (stage 2c): old spelling kept for the callers not yet renamed.
@@ -939,18 +960,41 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
             # turn is older sends the instruction.
             return ("watch of %s: changed, but a turn within %d min: nothing sent "
                     "(change kept pending)" % (agent, RECENT_TURN_S // 60))
-    text = UNCHANGED_TEXT % agent if passive else instruction(agent)
+    if passive:
+        text = UNCHANGED_TEXT % agent
+    else:
+        from . import release_cutoff
+        text = instruction(agent, release_cutoff.staging_topology_of(cfg))
     payload = {"info": True} if passive else None
+    report_fp = mail.report_digest(text) if passive else None
+    if passive:
+        # #7625 : le compte rendu « rien n'a changé » est identique à chaque
+        # relève. Il n'est pas redéposé avant `mail.REPORT_REMIND_S` (6 h) ;
+        # la veille elle-même n'est pas muette pour autant, un changement de
+        # lecture part toujours (sa propre empreinte, cas passif ci-dessous).
+        if not mail.report_due(db, SENDER, agent, "info", report_fp, now=now):
+            return ("watch of %s: unchanged, the same note was sent less than %d h "
+                    "ago: nothing sent" % (agent, int(mail.REPORT_REMIND_S // 3600)))
     if mail_send is None:
-        def mail_send(tx, recipient: str, body: str) -> int:
+        def mail_send(tx, recipient: str, body: str) -> int | None:
             return mail.send(tx, SENDER, recipient, body, host=host,
-                             thread=False, payload=payload)
+                             thread=False, payload=payload,
+                             report="info" if passive else None,
+                             report_fingerprint=report_fp)
     sent: list[int] = []
 
     def deliver(tx) -> None:
-        sent.append(mail_send(tx, agent, text))
+        message_id = mail_send(tx, agent, text)
+        if message_id is None:
+            # #7625 : un autre envoi a déposé le même compte rendu entre le
+            # contrôle et le dépôt ; la transaction est annulée, rien n'est
+            # marqué remis et la relève suivante réévalue.
+            raise _ReportJustSent()
+        sent.append(message_id)
     try:
         row = storage.of(db).watches.deliver(agent, host, deliver, reading=digest)
+    except _ReportJustSent:
+        return ("watch of %s: the same report was just sent: nothing sent" % agent)
     except WatchError:
         raise
     except Exception as exc:  # noqa: BLE001 — the unit fails, nothing was dropped

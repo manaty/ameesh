@@ -99,7 +99,7 @@ class DiscoveryTest(unittest.TestCase):
     def test_without_a_canon_nothing_changes(self):
         self.assertIsNone(registry.discover().get("livraison"))
         self.assertEqual([m.source for m in registry.discover().modules],
-                         ["builtin", "builtin", "builtin"])
+                         ["builtin", "builtin", "builtin", "builtin"])
 
     def test_the_bare_profile_stays_empty_and_imports_nothing(self):
         with mock.patch("ameesh.modules.registry._builtin", return_value={}):
@@ -129,12 +129,14 @@ class DiscoveryTest(unittest.TestCase):
 
     def test_installed_adds_the_cards_as_pipeline_modules(self):
         found = modules.installed(canon_with(card("livraison")))
-        self.assertEqual(sorted(found), ["dev", "it", "livraison", "work-types"])
+        self.assertEqual(sorted(found),
+                         ["dev", "it", "livraison", "nexlink", "work-types"])
         self.assertEqual(found["livraison"].descriptor({}),
                          {"types": [], "schemas": {}, "rules": []})
         self.assertEqual(found["livraison"].CARD_REF,
                          "acme:pipelines/livraison.md@%s" % ("a" * 40))
-        self.assertEqual(sorted(modules.installed()), ["dev", "it", "work-types"])
+        self.assertEqual(sorted(modules.installed()),
+                         ["dev", "it", "nexlink", "work-types"])
 
     def test_the_reserved_list_name_never_becomes_a_module(self):
         # #4968/N4: `ameesh module list` keeps that name for the installation
@@ -247,7 +249,8 @@ class ModulesCommandTest(unittest.TestCase):
         code, out, _err = self.run_modules(["--json"], [c])
         self.assertEqual(code, 0)
         rows = {row["name"]: row for row in json.loads(out)["modules"]}
-        self.assertEqual(sorted(rows), ["dev", "it", "livraison", "support", "work-types"])
+        self.assertEqual(sorted(rows),
+                         ["dev", "it", "livraison", "nexlink", "support", "work-types"])
         self.assertEqual((rows["support"]["source"], rows["support"]["storage"],
                           rows["support"]["card_ref"]),
                          ("canon", {"types": []},
@@ -261,7 +264,7 @@ class ModulesCommandTest(unittest.TestCase):
                                            [canon_with(card("livraison"))])
         self.assertEqual(code, 0)
         self.assertEqual([row["name"] for row in json.loads(out)["modules"]],
-                         ["dev", "it", "work-types"])
+                         ["dev", "it", "nexlink", "work-types"])
 
     def test_an_unreadable_canon_only_warns(self):
         out, err = io.StringIO(), io.StringIO()
@@ -273,7 +276,7 @@ class ModulesCommandTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("canon not read (git down)", err.getvalue())
         self.assertEqual([row["name"] for row in json.loads(out.getvalue())["modules"]],
-                         ["dev", "it", "work-types"])
+                         ["dev", "it", "nexlink", "work-types"])
 
 
 class DeclarativeStorageTest(PgTestCase):

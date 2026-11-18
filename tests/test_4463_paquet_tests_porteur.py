@@ -18,11 +18,13 @@ Aucune base, aucun réseau.
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import os
 import pathlib
 import stat
+import sys
 import tempfile
 import time
 import unittest
@@ -46,14 +48,27 @@ def _run(label, modules, **_kwargs):
 
 
 class LocalTests:
-    """`check_local_tests` en série, `run_tests` remplacé et consigné."""
+    """`check_local_tests` en série, `run_tests` remplacé et consigné.
 
-    def __init__(self, lots=(1, 2, 3), run=_run):
+    `now` fige `time.monotonic` pendant l'appel (#7748) : la part des contrats
+    et les bornes murales ne dépendent plus du temps réellement écoulé sur un
+    runner chargé. Les témoins qui ont besoin d'une horloge qui avance la
+    posent eux-mêmes (`test_chaque_serie_bornee_au_temps_restant`).
+    """
+
+    def __init__(self, lots=(1, 2, 3), run=_run, now=None):
         self.composition = _composition(lots)
         self.calls: list[tuple[str, int]] = []
         self.walls: list[int | None] = []
         self.lines: list[str] = []
         self.run_fn = run
+        self.now = now
+
+    def deadline(self, seconds: int = 600) -> float:
+        """Échéance posée sur l'horloge figée du témoin, jamais sur la réelle."""
+        if self.now is None:
+            raise AssertionError("témoin sans horloge figée : passer now=…")
+        return self.now + seconds
 
     def run(self, parallel=1, which=None, **kwargs):
         def fake(_worktree, label, modules, *, timeout, heavy=False, wall=None):
@@ -61,12 +76,20 @@ class LocalTests:
             self.walls.append(wall)
             return self.run_fn(label, modules, timeout=timeout)
 
-        with mock.patch.object(paquet_auto, "unit_test_modules",
-                               side_effect=lambda _w, unit: ["tests.test_u%d" % unit.lot]), \
-                mock.patch.object(paquet_auto, "contract_modules",
-                                  return_value=["tests.test_contrat"]), \
-                mock.patch.object(paquet_auto.shutil, "which", return_value=which), \
-                mock.patch.object(paquet_auto, "run_tests", side_effect=fake):
+        patchers = [
+            mock.patch.object(paquet_auto, "unit_test_modules",
+                              side_effect=lambda _w, unit: ["tests.test_u%d" % unit.lot]),
+            mock.patch.object(paquet_auto, "contract_modules",
+                              return_value=["tests.test_contrat"]),
+            mock.patch.object(paquet_auto.shutil, "which", return_value=which),
+            mock.patch.object(paquet_auto, "run_tests", side_effect=fake),
+        ]
+        if self.now is not None:
+            patchers.append(mock.patch.object(paquet_auto.time, "monotonic",
+                                              new=lambda: self.now))
+        with contextlib.ExitStack() as stack:
+            for patcher in patchers:
+                stack.enter_context(patcher)
             return paquet_auto.check_local_tests(
                 pathlib.Path("."), self.composition, timeout=900, parallel=parallel,
                 select=lambda *_: ({}, ""), log=self.lines.append, **kwargs)
@@ -88,9 +111,12 @@ class FusionDuPorteurTest(unittest.TestCase):
         # la première série a tourné ; la deuxième n'est jamais partie
         self.assertEqual([label for label, _ in local.calls], ["unité #1"])
 
-    def test_porteur_fusionne_pendant_les_tests_ligne_au_porteur(self) -> None:
+    def test_porteur_fusionne_avant_la_fin_de_paquet_dit_et_arrete(self) -> None:
+        # #7740 : la PR n'existe qu'après les séries directes ; elle est donc
+        # lue une fois la tête poussée. Fusionnée à cet instant, ses unités
+        # sont sur la cible : rien n'est recomposé, la sortie dit MERGED.
         flux = Flux(self, tests=[self._guarded], compositions=[_composition((1, 2))],
-                    states=("OPEN", "MERGED"))
+                    states=("MERGED",))
         out = io.StringIO()
         with mock.patch.object(paquet_auto, "pull_request_merge_sha",
                                return_value=MERGE_SHA), \
@@ -98,28 +124,32 @@ class FusionDuPorteurTest(unittest.TestCase):
             rc = flux.run()
         self.assertEqual(rc, 0)
         notes = [call[1][2] for call in flux.calls("note")]
-        # E records the contracts completed before the guarded unit tests.
+        # E records the contracts completed before the direct series.
         notes = [note for note in notes if not note.startswith("paquet-auto: contrats ")]
         self.assertEqual(len(notes), 1)
-        self.assertIn("tests par unité interrompus : porteur fusionné à "
-                      "3c16763c9cc5", notes[0])
+        self.assertIn("PR fusionnée au vert pendant les tests par unité",
+                      notes[0])
         # ni recomposition, ni retrait, ni courrier ; paquet-horaire ne publie pas
         self.assertEqual(flux.calls("mail"), [])
         self.assertEqual(flux.calls("withdraw"), [])
         self.assertEqual(len(flux.calls("push")), 1)
         last = out.getvalue().strip().splitlines()[-1]
         self.assertTrue(last.startswith(paquet_auto.MERGED_LINE), last)
-        self.assertIn("interrompus", last)
+        self.assertIn("tests par unité verts", last)
 
     def test_porteur_clos_pendant_les_tests_dit_et_arrete(self) -> None:
-        flux = Flux(self, tests=[self._guarded], compositions=[_composition((1, 2))],
-                    states=("OPEN", "CLOSED"))
-        with contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()), \
+        # #4463 garde son geste pour une tête déjà poussée (reprise) : la PR
+        # close arrête les séries et le dit au porteur. La lecture directe
+        # couvre le chemin, que le flux nominal ne peut plus atteindre.
+        args = argparse.Namespace(name="h-test", carrier=4463)
+        with mock.patch.object(paquet_auto, "note_carrier",
+                               return_value="note") as note, \
+                contextlib.redirect_stdout(io.StringIO()), \
                 self.assertRaises(paquet_auto.PaquetAutoError):
-            flux.run()
-        notes = [call[1][2] for call in flux.calls("note")]
-        self.assertTrue(any("interrompus : PR closed" in note for note in notes), notes)
+            paquet_auto.interrupted_by_carrier(
+                args, pathlib.Path("."), "integration/paquet-h-test",
+                "d" * 40, "CLOSED")
+        self.assertIn("interrompus : PR closed", note.call_args.args[2])
 
     @staticmethod
     def _guarded(**kwargs):
@@ -133,7 +163,8 @@ class FusionDuPorteurTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(flux.run(), 0)
         notes = [call[1][2] for call in flux.calls("note")]
-        self.assertTrue(any("tests par unité verts" in note for note in notes), notes)
+        self.assertTrue(any("tests directs (préfixe composé) et contrats verts"
+                            in note for note in notes), notes)
         self.assertFalse(any("interrompus" in note for note in notes))
         self.assertEqual(len(flux.calls("mail")), 1)
 
@@ -166,36 +197,49 @@ class BorneTotaleTest(unittest.TestCase):
         local = LocalTests(run=slow)
         with mock.patch.object(paquet_auto.time, "monotonic", side_effect=lambda: clock[0]):
             runs, faulty, _ = local.run(deadline=1000.0 + 600)
-        # #4887 : 4 séries, une à la fois, 120 s réservés aux rejeux : chacune
-        # reçoit sa part (480/4 puis 80/3) ; la 1re consomme 400 s, la 2e
-        # dépasse l'échéance, ensuite plus rien. La borne reste le temps
-        # restant, resserrée par la part et la réserve.
-        self.assertEqual(local.calls, [("unité #1", 120), ("unité #2", 26)])
+        # #7740 : chaque série directe part avec `--tests-timeout` (900 s) et
+        # n'est coupée que par le temps mural restant (600 s puis 200 s). La
+        # troisième et les contrats ne partent plus à l'échéance.
+        self.assertEqual(local.calls, [("unité #1", 900), ("unité #2", 900)])
+        self.assertEqual(local.walls, [600, 200])
         self.assertEqual(faulty, [])
         self.assertEqual([run.inconclusive for run in runs],
                          [False, False, True, True])
 
     def test_en_parallele_l_attente_ne_consomme_pas_la_part(self) -> None:
-        # #7195 : une série `heavy` garde sa part d'exécution (`timeout`) ;
+        # #7195 : une série `heavy` garde sa borne d'exécution (`timeout`) ;
         # l'attente du créneau reste dans l'échéance totale (temps restant).
-        local = LocalTests()
-        local.run(parallel=4, which="/bin/ameesh", deadline=time.monotonic() + 600)
+        # #7740 : la série directe garde elle aussi sa borne entière.
+        # #7748 : horloge figée — un runner chargé ne doit pas changer la part.
+        local = LocalTests(now=1000.0)
+        local.run(parallel=4, which="/bin/ameesh", deadline=local.deadline())
+        timeouts = dict(local.calls)
+        walls = {label: wall for (label, _timeout), wall
+                 in zip(local.calls, local.walls)}
         self.assertEqual(len(local.walls), 4)
-        self.assertEqual([timeout for _label, timeout in local.calls],
-                         [480, 480, 480, 480])
-        self.assertTrue(all(wall is not None and 595 <= wall <= 600
-                            for wall in local.walls), local.walls)
-        self.assertTrue(all(wall > timeout for wall, (_label, timeout)
-                            in zip(local.walls, local.calls)))
+        self.assertEqual([timeouts["unité #%d" % lot] for lot in (1, 2, 3)],
+                         [900, 900, 900])
+        self.assertEqual(timeouts["contrats"], 480)
+        self.assertTrue(all(595 <= walls["unité #%d" % lot] <= 600
+                            for lot in (1, 2, 3)), walls)
+        # avec créneau, le temps mural des contrats reste l'échéance totale.
+        self.assertTrue(595 <= walls["contrats"] <= 600, walls)
 
-    def test_serie_directe_bornee_par_sa_part(self) -> None:
-        # #7195 : sans créneau à attendre, la part borne aussi le temps mural
-        # (les séries parties rendent leur part : 120, 160, 240 puis 480 s).
-        local = LocalTests()
-        local.run(deadline=time.monotonic() + 600)
-        self.assertEqual([timeout for _label, timeout in local.calls],
-                         [120, 160, 240, 480])
-        self.assertEqual(local.walls, [120, 160, 240, 480])
+    def test_serie_directe_garde_sa_borne_entiere(self) -> None:
+        # #7740 : la série directe ne prend plus une part de la borne totale ;
+        # seule la borne murale la coupe. Les contrats gardent leur part.
+        # #7748 : horloge figée — un runner chargé ne doit pas changer la part.
+        local = LocalTests(now=1000.0)
+        local.run(deadline=local.deadline())
+        timeouts = dict(local.calls)
+        walls = {label: wall for (label, _timeout), wall
+                 in zip(local.calls, local.walls)}
+        self.assertEqual([timeouts["unité #%d" % lot] for lot in (1, 2, 3)],
+                         [900, 900, 900])
+        self.assertEqual(timeouts["contrats"], 480)
+        self.assertTrue(all(595 <= walls["unité #%d" % lot] <= 600
+                            for lot in (1, 2, 3)), walls)
+        self.assertEqual(walls["contrats"], 480)
 
     def test_sans_borne_totale_inchange(self) -> None:
         local = LocalTests()
@@ -312,6 +356,8 @@ def _killpg(pgid: int) -> None:
         os.killpg(pgid, 9)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "process-tree proof reads /proc (Linux)")
 class ArbreHeavyTest(unittest.TestCase):
     """Relectures cx3 (#161273) et dev3 (jalon 24994) : `ameesh heavy` place
     sa série dans son propre groupe ; tuer la session du wrapper la laissait

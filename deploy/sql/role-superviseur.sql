@@ -265,6 +265,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #7004 (0573) : harnais admis d'une identité (des noms de harnais,
         -- pas de contenu) — même nature que `harness` et `session_harness`
         'harnesses',
+        -- #7632 (0588) : cadence de réveil déclarée par la fiche (des natures
+        -- et une durée, pas de contenu) — lue avec la ligne, comme `releve`
+        'reveil',
+        -- #7674 (0590) : politique de session déclarée par la fiche (une
+        -- nature, un booléen et des nombres, pas de contenu) — lue avec la
+        -- ligne, comme `reveil` et les réglages `session_policy`/`context_max_tokens`
+        'declared_policy',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
         'workstream',
         -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,
@@ -336,6 +343,18 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('schema_migrations', ARRAY[
         'version', 'name', 'checksum', 'applied_at'
     ]),
+    -- #7649 (0591) : schémas et migrations de module, même état de schéma que
+    -- les deux registres du noyau ci-dessus ; noms, versions et empreintes,
+    -- aucun contenu d'agent.
+    ('module_schemas', ARRAY[
+        'module', 'schema_name', 'schema_sha256', 'created_at'
+    ]),
+    ('module_schema_migrations', ARRAY[
+        'module', 'version', 'name', 'checksum', 'applied_at'
+    ]),
+    ('module_schema_non_additive_migrations', ARRAY[
+        'module', 'version', 'name', 'checksum'
+    ]),
     ('spend_pending', ARRAY[
         'agent', 'start_index', 'turn', 'model', 'created_at',
         -- #796 (0423) : lot et tour du marqueur comptable, gardés pour la
@@ -350,7 +369,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'approver', 'authenticator_id', 'connector', 'operations',
         'action_class', 'max_amount', 'currency', 'consumed_amount', 'uses',
         'valid_until', 'registered_by', 'created_at', 'last_used_at',
-        'revoked_at', 'revoked_by'
+        'revoked_at', 'revoked_by',
+        -- #7629 (0585) : portée du grant, non secrète et nécessaire à la
+        -- supervision (bénéficiaire, cibles, ligne et version de charte)
+        'beneficiary_kind', 'beneficiary', 'beneficiary_clones', 'targets',
+        'charter_line', 'charter_version'
     ]),
     ('standing_reservations', ARRAY[
         'id', 'grant_id', 'action_id', 'amount', 'connector', 'operation',
@@ -475,6 +498,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L159d (0061): shared host measure, numbers only
         'mem_total_bytes', 'psi_cpu_some', 'psi_mem_some', 'psi_mem_full',
         'psi_io_some', 'app_cpu', 'guest_cpu', 'cpu_window_s', 'guest_mem_bytes',
+        -- #7687 (0589): live offloaded jobs of a lending host, a number
+        'guest_jobs',
         'lendable_cpu', 'lendable_memory_bytes', 'lendable_disk_bytes',
         -- #246 (0067): btrfs allocation, numbers only
         'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes',

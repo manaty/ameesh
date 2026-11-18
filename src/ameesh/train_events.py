@@ -13,7 +13,11 @@ from . import config, merge_queue, plan_git, storage
 
 CHANNEL = "ameesh_train"
 SCHEMA = "ameesh-train-wakeup/1"
-KINDS = ("ci-terminal", "verdict", "fire")
+KINDS = ("ci-terminal", "verdict", "fire", "requalification-request")
+#: #7806: a requalification request names only its project (the requester may
+#: run on a host that carries no train configuration, so no target is known
+#: there). This hint is project-scoped and deliberately carries no target.
+PROJECT_ONLY = ("requalification-request",)
 MAX_BYTES = 4096
 FIELDS = frozenset(("schema", "namespace", "kind", "project", "target"))
 
@@ -29,6 +33,8 @@ def _validate(signal):
             or not config.NAME_RE.fullmatch(signal["project"]):
         raise ValueError("explicit SQL namespace and project required")
     target = signal["target"]
+    if signal["kind"] in PROJECT_ONLY and target == "":
+        return
     if plan_git.check_ref(target, "train wake-up target") != target \
             or merge_queue._remote_branch(target) != target:
         raise ValueError("canonical train wake-up target required")

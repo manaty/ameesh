@@ -53,6 +53,15 @@ inscrit. `ameesh standing register <reçu>` l'enregistre ; `ameesh standing
 list [--all]` donne opérations, plafond, usage, échéance, cadre et accord.
 Le lien bénéficiaire/cible du grant relève du lot §3.5 point 2 de la série.
 
+Le grant passe aussi le plafond du canon de #7629
+(`extensions.ameesh.standing_approvals`) : connecteur et opérations,
+approbateurs, durée, montant/devise, bénéficiaire, cibles, et — quand la règle
+l'exige — `charter_line`/`charter_version`. Le cadre `{frame, version}` de
+#7631 est une référence signée supplémentaire : il ne remplace pas la ligne
+et la version de charte exigées par la politique. `ameesh action standing
+register <reçu>` suit le même chemin (avec le plafond du canon) ; les deux
+commandes enregistrent le même grant.
+
 Accord d'une décision (point 4, validé par le bureau le 17/11) : forme (a)
 `{agent, seq}` ; la forme (b) `{grant: id}` est reportée (voir §4).
 

@@ -238,7 +238,9 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
     from . import release_cutoff
     # #6243: the preview settles the pending exactly as the tick would, so a
     # dry-run never announces a cut that `execute` only skips.
-    state = release_cutoff.load_state(cfg) if project.model == "nexlink" else None
+    provider = release_cutoff.release_provider(project.model)
+    state = (release_cutoff.load_state(cfg)
+             if getattr(provider, "STATEFUL", False) else None)
     plan = release_cutoff.build_plan(cfg, project, now=now, version=version,
                                      state=state)
     report = {
@@ -263,20 +265,8 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
-    elif project.model == "nexlink":
-        if plan.skipped and plan.skipped_empty:
-            # #6243: the frozen candidate has nothing to publish (no tag ever).
-            print("créneau sauté : coupe vide, aucun contenu nouveau à publier "
-                  "(release-%s non posée) — skipped, aucun tag ni branche"
-                  % plan.skipped)
-        elif plan.skipped:
-            # #6152: a manual cutoff already tagged the base; no second cut.
-            print("créneau sauté : tête déjà coupée en release-%s (%s) — skipped, "
-                  "aucun tag ni branche" % (plan.skipped, plan.base[:12]))
-        else:
-            print("Nexlink %s — develop %s + main %s ; CI arbre final à produire%s"
-                  % (plan.version, plan.base[:12], plan.previous["commit"][:12],
-                     " ; delta vide : branche créée sans staging" if plan.empty else ""))
+    elif getattr(provider, "plan_text", None) is not None:
+        print(provider.plan_text(plan))
     elif plan.kept_active:
         print("actif conservé — candidate %s plus ancienne ou divergente : aucun tag, "
               "aucun déploiement" % plan.base[:12])
@@ -366,7 +356,7 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
             # A missing calendar can itself be the failure being reported.
             # Keep the previous once-per-error behavior until it is readable.
             cutoff_at, _label = None, ""
-        if project.model != "nexlink":
+        if project.model in release_cutoff.CORE_RELEASE_MODELS:
             # #6520: before alarming, read the cutoff's tag and who holds the
             # staging door. A tag published at/after the cutoff is a durable
             # fact: never say "aucun tag" again, and a lock held by that tag's
@@ -470,19 +460,14 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
         slot["last_error_at"] = now
         release_cutoff.save_state(cfg, state)
         if db is not None:
-            if project.model == "nexlink":
-                if slot.get("pending_nexlink"):
-                    body = ("Coupe Nexlink en attente%s : %s. État de reprise conservé ; "
-                            "consulter pending_nexlink pour les branches, tags et runs "
-                            "déjà créés."
-                            % (" (erreur transitoire)" if transient else "", text))
-                else:
-                    # #6039 N8: a closed pending (refused preflight, unknown
-                    # handoff agent) is not a resumable state; never say it is.
-                    body = ("Coupe Nexlink NON faite%s : %s. Aucun tag ni déploiement "
-                            "n'a été posé pour cette coupure ; corriger la cause, puis "
-                            "la relancer si elle reste due."
-                            % (" (erreur transitoire)" if transient else "", text))
+            provider = None
+            if project.model not in release_cutoff.CORE_RELEASE_MODELS:
+                try:
+                    provider = release_cutoff.release_provider(project.model)
+                except release_cutoff.ReleaseError:
+                    provider = None       # the model itself is the reported error
+            if getattr(provider, "error_body", None) is not None:
+                body = provider.error_body(slot, text, transient)
             else:
                 body = ("Release %s NON faite%s : %s\n\nAucun tag, aucun déploiement. "
                         "Corrige la cause ; le prochain tick réessaiera tant que la "
@@ -591,7 +576,7 @@ def _release_tick(cfg, args, declared) -> int:
                         status = 1
                     # #7365 : un serveur reporté à chaque coupure est un
                     # retard de version, pas un état ; la garde le déclare au
-                    # pilote et au bureau une fois par release.
+                    # pilote et à l'avatar une fois par release.
                     from . import staging_deferred
                     try:
                         report["staging_deferred"] = staging_deferred.tick(cfg, db, project)
@@ -599,6 +584,16 @@ def _release_tick(cfg, args, declared) -> int:
                         print("staging-deferred %s: %s" % (name, exc), file=sys.stderr)
                         report["staging_deferred"] = {"result": "unreadable", "error": str(exc)}
                         status = 1
+                    # #7666 : la stable de la semaine, désignée et publiée
+                    # une fois ; elle ne défait jamais la coupure.
+                    if project.stable_channel:
+                        from . import stable_channel
+                        try:
+                            report["stable"] = stable_channel.tick(cfg, db, project, now=now)
+                        except Exception as exc:
+                            print("stable %s: %s" % (name, exc), file=sys.stderr)
+                            report["stable"] = {"result": "error", "error": str(exc)}
+                            status = 1
             except release_cutoff.TransientReleaseError as exc:
                 print("%s: %s" % (name, exc), file=sys.stderr)
                 # #6014: a transient failure is still a cutoff not done; say
@@ -626,6 +621,49 @@ def _release_tick(cfg, args, declared) -> int:
         return status
     finally:
         db.close()
+
+
+def _stable(cfg, args) -> int:
+    """#7666: `release stable designate|publish|pin|verify`."""
+    from . import release_cutoff, stable_channel
+    command = args.stable_command
+    try:
+        if command in ("pin", "verify"):
+            # the consumer side: any clone of the project, no release block
+            repo = os.path.abspath(os.path.expanduser(args.repo))
+            if command == "pin":
+                sys.stdout.write(stable_channel.pin(repo, args.remote, args.week))
+                return 0
+            with open(args.file, encoding="utf-8") as stream:
+                text = stream.read()
+            installed = None
+            if args.installed:
+                from importlib import metadata
+                installed = metadata.version("ameesh")
+            manifest = stable_channel.verify(text, repo, args.remote, installed=installed)
+            print("%s: stable %s = %s (%s)%s"
+                  % (args.file, manifest["week"], manifest["tag"], manifest["commit"][:12],
+                     ", installed" if installed else ""))
+            return 0
+        declared = release_cutoff.projects(cfg)
+        if args.project not in declared:
+            raise release_cutoff.ReleaseError(
+                "project %r is not declared under release.projects" % args.project)
+        project = declared[args.project]
+        now = time.time() if args.now is None else float(args.now)
+        from .db import open_db
+        db = open_db(cfg)
+        try:
+            report = stable_channel.tick(cfg, db, project, now=now,
+                                         decision=getattr(args, "decision", None),
+                                         dry_run=command == "designate")
+        finally:
+            db.close()
+    except (release_cutoff.ReleaseError, OSError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    return 0 if report.get("result") not in ("error",) else 1
 
 
 def _packet_watch(cfg, args) -> int:
@@ -687,7 +725,7 @@ def _elected_tick(cfg, args):
         raise ReleaseError("release.role and packet_watch.role must agree")
     role = role or watch_role
     if not role:
-        return None  # compatibility until the bureau migrates host units
+        return None  # compatibility until the avatar migrates host units
     # Validate the independent staging route before acquiring an execution
     # lease: synchronous staging may restart the runner that owns this role.
     from . import release_cutoff
@@ -730,18 +768,21 @@ def _elected_tick(cfg, args):
         min_left=0, dry_run=False, json=False), credentials=credentials)
 
 
-def _catchup_actor(cfg, db, explicit) -> str:
-    """#7372: only the bureau, or a human at a terminal, declares the gesture.
+def _catchup_actor(cfg, db, explicit, right=None) -> str:
+    """#7372: the right's holder, the avatar, or a human at a terminal declares.
 
     An agent session must be *bound* (`identity.require_bound`: runner lease or
     session binding), never a bare `AGENT_MAIL_NAME`, which is self-declared
-    (#7372 B1); it then acts as itself and must be the bureau (its Agent card
-    names the role; `tenancy.operator` applies the same rule for infrastructure
+    (#7372 B1); it then acts as itself and must be the avatar (its Agent card
+    names the avatar block; `tenancy.operator` applies the same rule for infrastructure
     gestures). `--actor` never lets an agent act on behalf of another, and an
     unbound session may only name a known human. A root catch-up is not a
-    generic agent gesture: the owner's decision (#219407) names the bureau.
+    generic agent gesture: the owner's decision (#219407 a) names its holder.
+    #7788: the bound session that is the beneficiary of the active ``right``
+    (`staging_deferred.active_right`: signed grant, scope, expiry, revocation)
+    declares as itself; an expired or revoked right names nobody.
     """
-    from . import agent_names, canon, identity, release_cutoff, sous_utilisation
+    from . import agent_names, avatars, canon, identity, release_cutoff
     text = agent_names.resolve((explicit or "").strip(), db=db,
                                operation="release.catchup")
     binding = identity.resolve_binding(cfg, db)
@@ -760,16 +801,19 @@ def _catchup_actor(cfg, db, explicit) -> str:
             raise release_cutoff.ReleaseError(
                 "this session belongs to %s; it does not declare on behalf of %s"
                 % (name, text))
+        if (right and right.get("active")
+                and str(right.get("beneficiary") or "") == name):
+            return name
         try:
             canons = canon.load_configured(cfg) if cfg is not None else []
-            if name in sous_utilisation.role_orchestrators(canons, ("bureau",)):
+            if avatars.is_avatar_in(canons, name):
                 return name
         except Exception as exc:  # noqa: BLE001 - an unreadable authority refuses
             raise release_cutoff.ReleaseError(
-                "cannot read the bureau role of %s: %s" % (name, exc)) from exc
+                "cannot read the avatar of %s: %s" % (name, exc)) from exc
         raise release_cutoff.ReleaseError(
-            "%s is not the bureau: the root catch-up is the bureau's gesture "
-            "(#219407)" % name)
+            "%s is neither the holder of an active root right on this host "
+            "nor an avatar (#219407 a)" % name)
     if name:
         # A human name must come from a bound terminal. A bare
         # `AGENT_MAIL_NAME=human:…` is self-declared like any agent name; the
@@ -786,10 +830,10 @@ def _catchup_actor(cfg, db, explicit) -> str:
     if not text:
         raise release_cutoff.ReleaseError(
             "no bound session identity: a human at a terminal names itself with "
-            "--actor human:<id>; an agent session must be bound to the bureau")
+            "--actor human:<id>; an agent session must be bound to an avatar")
     if not text.startswith(work.HUMAN_PREFIX):
         raise release_cutoff.ReleaseError(
-            "an unbound session cannot declare as %r: only a bound bureau or a "
+            "an unbound session cannot declare as %r: only a bound avatar or a "
             "human terminal" % text)
     human = work.known_human(db, text[len(work.HUMAN_PREFIX):], cfg)
     if not human:
@@ -798,9 +842,9 @@ def _catchup_actor(cfg, db, explicit) -> str:
 
 
 def _catchup(cfg, args) -> int:
-    """`ameesh release catchup` (#7372): declare the bureau's root gesture.
+    """`ameesh release catchup` (#7372): declare the avatar's root gesture.
 
-    The four `vm.sh` steps stay the bureau's manual gesture; this command
+    The four `vm.sh` steps stay the avatar's manual gesture; this command
     records its outcome as a durable `staging.catchup` event, with the host,
     the active commit read from `controler`, the attested tag, the author and
     the owner right read from the project configuration. A declaration is a
@@ -815,24 +859,38 @@ def _catchup(cfg, args) -> int:
         if project is None:
             raise release_cutoff.ReleaseError(
                 "project %r is not declared under release.projects" % args.project)
+        # #7662: `projects(cfg)` starts from the bare profile, whose empty
+        # `StagingTopology()` exists but has no host. Fill it from the canon
+        # before reading the default server, as the other release paths do.
+        project = release_cutoff.with_staging_topology(cfg, project)
         db = open_db(cfg)
         try:
-            base = staging_deferred.baseline(db, project, args.host)
+            host = getattr(args, "host", None)
+            if not host:
+                topology = getattr(project, "staging_topology", None)
+                if topology is None or not topology.hosts:
+                    topology = release_cutoff.topology_for(db)
+                host = topology.server
+            if not host:
+                raise release_cutoff.ReleaseError(
+                    "no --host and the canon declares no staging server: name "
+                    "the reported host explicitly")
+            base = staging_deferred.baseline(db, project, host)
             if base is None:
                 print("%s: %s is not reported by the latest tagged staging "
-                      "attestation; nothing to declare" % (project.name, args.host))
+                      "attestation; nothing to declare" % (project.name, host))
                 return 0
-            right = staging_deferred.active_right(db, project, args.host)
+            right = staging_deferred.active_right(db, project, host)
             if args.result == "ok" and (right is None or not right.get("active")):
                 raise release_cutoff.ReleaseError(
                     "no active owner root right covers %s: %s"
-                    % (args.host, "decision #%s %s"
+                    % (host, "decision #%s %s"
                        % (right.get("decision"), right.get("why") or "inactive")
                        if right else "none configured in release.projects.%s."
                        "staging_rights" % project.name))
-            actor = _catchup_actor(cfg, db, args.actor)
+            actor = _catchup_actor(cfg, db, args.actor, right)
             row = staging_deferred.declare(
-                db, project, args.host, args.sha, base, args.result, actor, args.note)
+                db, project, host, args.sha, base, args.result, actor, args.note)
         finally:
             db.close()
     except (release_cutoff.ReleaseError, ValueError) as exc:
@@ -853,11 +911,18 @@ def _attest(cfg, args) -> int:
     agent's), a verified pilot for `--skip` (`work.corrector`). `--actor` is
     never an author: it only names the human at a terminal for `--skip`.
     """
-    from . import identity, nexlink_release, release_cutoff
+    from . import identity, release_cutoff
     from .db import open_db
     db = open_db(cfg)
     try:
-        nexlink_release.version_key(args.version)
+        declared = release_cutoff.projects(cfg) if cfg is not None else {}
+        project = declared.get(args.project)
+        model = project.model if project is not None else args.project
+        provider = release_cutoff.release_provider(model)
+        if provider is None:
+            raise release_cutoff.ReleaseError(
+                "release attest is not provided by release model %r" % model)
+        provider.version_key(args.version)
         if args.skip:
             if args.sha or args.run or args.migration:
                 raise release_cutoff.ReleaseError("--skip takes no --sha, --run or --migration")
@@ -865,7 +930,7 @@ def _attest(cfg, args) -> int:
                 raise release_cutoff.ReleaseError("--skip requires --reason")
             actor = work.corrector(cfg, db, args.actor, what="release attest --skip",
                                    history=False)
-            text = nexlink_release.skip_text(args.project, args.version, args.reason)
+            text = provider.skip_text(args.project, args.version, args.reason)
         else:
             if args.actor:
                 raise release_cutoff.ReleaseError(
@@ -878,13 +943,13 @@ def _attest(cfg, args) -> int:
             actor = binding.name
             if not args.sha or not re.fullmatch(r"[0-9a-f]{40}", args.sha):
                 raise release_cutoff.ReleaseError("--sha: the full tagged commit is required")
-            text = nexlink_release.attestation_text(
+            text = provider.attestation_text(
                 args.project, args.version, sha=args.sha,
-                runs=nexlink_release.parse_runs(args.run),
-                migrations=nexlink_release.parse_migrations(args.migration))
-        lot = nexlink_release.write_decision(db, args.project, args.version,
-                                             "skipped" if args.skip else "attested",
-                                             text, actor)
+                runs=provider.parse_runs(args.run),
+                migrations=provider.parse_migrations(args.migration))
+        lot = provider.write_decision(db, args.project, args.version,
+                                      "skipped" if args.skip else "attested",
+                                      text, actor)
         print("release %s %s: %s noted on lot #%d by %s; the release tick checks it"
               % (args.project, args.version, "skip" if args.skip else "attestation",
                  lot, actor))
@@ -967,11 +1032,12 @@ def _abandon(cfg, args) -> int:
     gesture takes the release lock, runs only on the host that holds the
     release role's live lease (#7584: the release state is local), proves the
     pilot through `work.corrector` (a human terminal names itself with
-    `--actor human:<id>`), then lets `nexlink_release.abandon` refuse an
-    already published tag, a staging handover or a non-conclusive CI part
-    before writing the durable trace and announcing to the release recipients.
+    `--actor human:<id>`), then lets the selected module provider's `abandon`
+    refuse an already published tag, a staging handover or a non-conclusive CI
+    part before writing the durable trace and announcing to the release
+    recipients.
     """
-    from . import nexlink_release, release_cutoff
+    from . import release_cutoff
     from .db import open_db
     db = None
     try:
@@ -981,15 +1047,16 @@ def _abandon(cfg, args) -> int:
             raise release_cutoff.ReleaseError(
                 "project %r is not declared under release.projects" % name)
         project = declared[name]
-        if project.model != "nexlink":
+        provider = release_cutoff.release_provider(project.model)
+        if provider is None or not callable(getattr(provider, "abandon", None)):
             raise release_cutoff.ReleaseError(
-                "release abandon applies to the nexlink model only")
+                "release abandon is not provided by release model %r" % project.model)
         moment = _abandon_moment(args)
         db = open_db(cfg)
         _require_elected_release_host(cfg, db)
         actor = work.corrector(cfg, db, args.actor, what="release abandon",
                                history=False)
-        report = nexlink_release.abandon(
+        report = provider.abandon(
             cfg, db, project, now=moment, reason=args.reason, actor=actor)
     except (work.WorkError, release_cutoff.ReleaseError) as exc:
         print("error: %s" % exc, file=sys.stderr)
@@ -999,18 +1066,8 @@ def _abandon(cfg, args) -> int:
             db.close()
     if args.json:
         print(json.dumps(report, ensure_ascii=False, default=str))
-    else:
-        print("Nexlink %s : coupure abandonnée (%s). Aucun tag, aucun staging ; "
-              "branche %s %s. Recoupe : ameesh release cutoff --project %s --force. "
-              "Trace : %s."
-              % (report["version"],
-                 ", ".join("ci/%s run %s" % (row["workflow"], row["run"] or "?")
-                           for row in report["failures"]),
-                 report.get("integration") or "?",
-                 "retirée" if report.get("integration_dropped")
-                 else ("déplacée par un tiers" if report.get("integration_moved")
-                       else "à retirer (%s)" % report.get("drop_error")),
-                 project.name, report.get("report_path") or "état local"))
+    elif getattr(provider, "abandon_text", None) is not None:
+        print(provider.abandon_text(report, project.name))
     return 0
 
 
@@ -1018,6 +1075,8 @@ def run(cfg, args) -> int:
     """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest|abandon`."""
     from . import release_cutoff
     command = args.release_command
+    if command == "stable":
+        return _stable(cfg, args)
     if command == "catchup":
         return _catchup(cfg, args)
     if command == "attest":
@@ -1149,7 +1208,7 @@ def add_parser(sub, func) -> None:
     staging_p.add_argument("--project", default=None)
     staging_p.add_argument("--apply", action="store_true")
     staging_p.add_argument("--actor", default=None,
-                           help="identified pilot/bureau, or human:<id> at a human terminal")
+                           help="identified pilot/avatar, or human:<id> at a human terminal")
     staging_p.set_defaults(func=func)
     watch_p = rel.add_parser(
         "packet-watch", help="#2601: alert the composer and the pilot when a compiled "
@@ -1172,11 +1231,13 @@ def add_parser(sub, func) -> None:
     reason_p.add_argument("--actor", default="")
     reason_p.set_defaults(func=func)
     catchup_p = rel.add_parser(
-        "catchup", help="#7372: declare the bureau's root catch-up of a reported "
+        "catchup", help="#7372: declare the avatar's root catch-up of a reported "
                         "staging server (four vm.sh steps) in the trace and the "
                         "cutoff report")
     catchup_p.add_argument("--project", default="ameesh")
-    catchup_p.add_argument("--host", default="manaty-mesh-1")
+    catchup_p.add_argument("--host", default=None,
+                           help="reported staging server; defaults to the server "
+                                "declared by the canon's Host cards (#7662)")
     catchup_p.add_argument("--sha", required=True,
                            help="the host's active commit after the gesture (full 40 hex, "
                                 "read from vm.sh controler)")
@@ -1185,10 +1246,11 @@ def add_parser(sub, func) -> None:
                            help="what happened, for a failure or a partial gesture")
     catchup_p.add_argument("--actor", default="",
                            help="a human terminal names itself (human:<id>); a bound "
-                                "session acts as itself and must be the bureau")
+                                "session acts as itself and must hold the active root "
+                                "right (#7788) or be an avatar")
     catchup_p.set_defaults(func=func)
     attest_p = rel.add_parser(
-        "attest", help="#6020: the staging agent attests a handed-over Nexlink staging "
+        "attest", help="#6020: the staging agent attests a handed-over release staging "
                        "(migrations, then the staging dispatches) on the cutoff's "
                        "attestation lot; --skip: the pilot stops waiting")
     attest_p.add_argument("--project", default="nexlink")
@@ -1205,7 +1267,7 @@ def add_parser(sub, func) -> None:
                           help="--skip at a human terminal: human:<id>")
     attest_p.set_defaults(func=func)
     abandon_p = rel.add_parser(
-        "abandon", help="#7567: the verified pilot abandons a frozen Nexlink cutoff "
+        "abandon", help="#7567: the verified pilot abandons a frozen release cutoff "
                         "whose final-tree CI part is conclusively red; no tag, no "
                         "staging, no deployment; #7584: only on the elected release "
                         "host")
@@ -1219,3 +1281,35 @@ def add_parser(sub, func) -> None:
                                 "gesture" % ABANDON_NOW_WINDOW_S)
     abandon_p.add_argument("--json", action="store_true")
     abandon_p.set_defaults(func=func)
+    stable_p = rel.add_parser(
+        "stable", help="#7666: weekly stable channel (designation, publication) and the "
+                       "consumer's single pin file (%s)" % "ameesh-stable.json")
+    stable = stable_p.add_subparsers(dest="stable_command", required=True)
+    designate_p = stable.add_parser(
+        "designate", help="print the due week's designation; no tag, no push")
+    publish_p = stable.add_parser(
+        "publish", help="designate and publish the due week (tag stable/<week>); the "
+                        "first one needs a signed owner decision")
+    publish_p.add_argument("--decision", type=int, default=None,
+                           help="owner decision approving the first public stable "
+                                "(option publish)")
+    for each in (designate_p, publish_p):
+        each.add_argument("--project", required=True)
+        each.add_argument("--now", type=float, default=None,
+                          help="epoch seconds (default: now)")
+        each.set_defaults(func=func)
+    pin_p = stable.add_parser(
+        "pin", help="print the pin file of a published stable week (default: the latest)")
+    pin_p.add_argument("--week", default=None, help="YYYY-Www")
+    verify_p = stable.add_parser(
+        "verify", help="check a pin file against the published channel")
+    verify_p.add_argument("file", help="the pin file (ameesh-stable.json)")
+    verify_p.add_argument("--installed", action="store_true",
+                          help="also require the running ameesh installation's version")
+    for each in (pin_p, verify_p):
+        each.add_argument("--repo", default=".",
+                          help="any git clone of the project (default: .)")
+        each.add_argument("--remote", default="origin",
+                          help="the publishing repository: a remote of --repo or a "
+                               "URL (default: origin)")
+        each.set_defaults(func=func)

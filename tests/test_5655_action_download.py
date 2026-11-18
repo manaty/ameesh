@@ -227,6 +227,8 @@ class ArchiveCacheTest(unittest.TestCase):
                 self.module.actions(tmp)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "native systemd units and GNU install (/dev/stdin)")
 class NativeInstallationTest(unittest.TestCase):
     def test_install_check_refresh_and_remove_native_units_without_touching_guest(self):
         installer = ROOT / 'deploy/ci-flotte/install-action-cache.sh'

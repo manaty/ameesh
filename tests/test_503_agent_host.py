@@ -797,6 +797,19 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('contrôles verts', p.stdout)
 
     @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_controler_accepts_a_paused_agent_without_a_lease(self):
+        """#7717 : le contrôle d'un agent en pause porte sur le venv vivant, pas
+        sur un bail qu'aucun tour ne peut reprendre (même règle que redemarrer)."""
+        agent = dict(self.agents[0], status='blocked',
+                     status_text='budget : per-hour cap reached',
+                     paused_on_budget=True)
+        p = self.run_vm('controler', 'expired', agents=[agent])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('MainPID vivant sur le venv courant', p.stdout)
+        self.assertIn('WARNING dev9: non vérifiée : pause budget', p.stdout)
+        self.assertIn('contrôles verts', p.stdout)
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_controler_refuse_un_runner_reste_sur_l_ancien_venv(self):
         """#3311, panne d'agents-2 : venv-courant à jour, exécuteur vivant sur
         l'ancien venv — l'hôte n'est pas sain et le dit."""
@@ -897,6 +910,28 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn('--user start ameesh-runner-agent@dev9.service', self.starts())
         self.assertIn('dev9 : unité masquée encore active — arrêtée, aucun'
                       ' exécuteur actif exigé', p.stdout)
+
+    def test_unites_desactivees_lists_only_deliberately_stopped_personas(self):
+        """#7785 : la santé reçoit les noms dont l'unité runner est désactivée
+        ou masquée sur cet hôte. Le périmètre est celui du registre local (pas
+        l'autre hôte, pas un mode observe, pas un agent arrêté) et une unité
+        simplement activée n'est jamais listée."""
+        (self.state / 'disabled-dev8').touch()
+        (self.state / 'masked-dev9').touch()
+        (self.state / 'disabled-stopped').touch()
+        (self.state / 'disabled-observer').touch()
+        (self.state / 'disabled-elsewhere').touch()
+        p = self.run_vm('unites-desactivees')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.split(), ['dev8', 'dev9'])
+        # aucune unité désactivée : sortie vide, pas une erreur (hôte sans
+        # exécuteur volontairement éteint n'est pas un échec de lecture).
+        for nom in ('dev8', 'dev9'):
+            (self.state / ('disabled-' + nom)).unlink(missing_ok=True)
+            (self.state / ('masked-' + nom)).unlink(missing_ok=True)
+        p = self.run_vm('unites-desactivees')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout, '')
 
     def test_restart_stops_proves_then_starts(self):
         """#1152 : l'arrêt (SIGTERM, drainage) précède la preuve du point sûr
@@ -1554,6 +1589,57 @@ class AgentHostTest(unittest.TestCase):
                 # agents en échec sont nommés à la fin, pas un arrêt au premier.
                 self.assertNotIn('dev8 : redémarré', p.stdout)
                 self.assertIn('2 agent(s) sans bail repris : dev8 dev9', p.stdout)
+
+    def test_restart_exempts_a_budget_paused_agent_from_the_lease_proof(self):
+        """#7717 : en pause budget, aucun tour ne peut reprendre le bail.
+
+        Le runner reste vivant sur le code installé (unité active) : le
+        redémarrage ne doit ni échouer ni attendre la fenêtre de reprise ; la
+        persona est nommée « non vérifiée : pause budget ».
+        """
+        agent = dict(self.agents[0], status='blocked',
+                     status_text='budget : per-hour cap reached',
+                     paused_on_budget=True)
+        p = self.run_vm('redemarrer', 'stale-lease', agents=[agent])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('--user start ameesh-runner-agent@dev9.service', self.starts())
+        self.assertIn('dev9 : redémarré (était blocked) — non vérifiée : pause budget',
+                      p.stdout)
+        self.assertIn('WARNING: 1 persona(s) non vérifiée(s) : pause budget', p.stdout)
+        self.assertNotIn('bail non repris', p.stderr)
+
+    def test_restart_reads_a_budget_pause_from_the_status_prefix_too(self):
+        """#7717 : le retour à un CLI antérieur au champ `paused_on_budget`
+        garde la même lecture (`blocked` + préfixe `budget : `) : pas d'échec."""
+        agent = dict(self.agents[0], status='blocked',
+                     status_text='budget : per-hour cap reached')
+        p = self.run_vm('redemarrer', 'stale-lease', agents=[agent])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('dev9 : redémarré (était blocked) — non vérifiée : pause budget',
+                      p.stdout)
+        self.assertNotIn('bail non repris', p.stderr)
+
+    def test_restart_exempts_an_operator_paused_agent_from_the_lease_proof(self):
+        """#7717 : même règle pour une pause opérateur déclarée (étrangère au
+        drain) : aucun tour, donc aucun bail à reprendre."""
+        (self.state / 'pause-dev9').write_text('')
+        (self.state / 'motif-dev9').write_text('operator declared pause')
+        p = self.run_vm('redemarrer', 'stale-lease', agents=[self.agents[0]])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('--user start ameesh-runner-agent@dev9.service', self.starts())
+        self.assertIn('dev9 : redémarré (était idle) — non vérifiée : pause opérateur',
+                      p.stdout)
+        self.assertIn('WARNING: 1 persona(s) non vérifiée(s) : pause opérateur',
+                      p.stdout)
+
+    def test_restart_still_fails_a_lost_lease_without_a_pause(self):
+        """#7717 témoin (2) : sans pause lisible, un bail non repris reste un
+        échec — l'exemption ne couvre que les personas qui ne peuvent pas
+        commencer de tour."""
+        p = self.run_vm('redemarrer', 'stale-lease', agents=[self.agents[0]])
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('active, mais bail non repris', p.stderr)
+        self.assertNotIn('non vérifiée', p.stdout)
 
     def test_restart_retries_a_lease_taken_back_on_the_next_read(self):
         """#5734 : la fenêtre de reprise du bail est relue ; un bail qui revient

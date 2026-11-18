@@ -75,9 +75,16 @@ def metadata(value):
 
 class Log:
     def __init__(self, db, cfg, *, agent, project=None, lot=None):
+        """One agent's journal; `project` also names its readable R12 thread.
+
+        Without a project there is no project feed: the entries stay in
+        `conversation_log` (a lot's thread is chosen by the caller through
+        `fil.conversation_project`). The executor's default project is never
+        a fallback here — an avatar or an agent without a declared project
+        has a private conversation (#7668, vie privée)."""
         self.db, self.cfg = db, cfg
         self.agent = identifier(agent)
-        self.project = identifier(project or fil.project_for(cfg))
+        self.project = identifier(project, optional=True)
         self.lot = identifier(str(lot) if lot is not None else None, optional=True)
         self.store = storage.of(db).conversations
 
@@ -99,6 +106,10 @@ class Log:
             thread_text = text
         short, cut = bounded(text)
         full, thread_cut = bounded(thread_text, THREAD_LIMIT)
+        if self.project is None:
+            # A private conversation has no R12 copy: nothing is queued, so
+            # `drain_threads` cannot later publish it to a project feed.
+            full, thread_cut = None, False
         if thread_cut:
             full = full[:THREAD_LIMIT - 40] + "\n[conversation text truncated]"
         return self.store.append(
@@ -111,7 +122,17 @@ class Log:
 
     def drain_threads(self, *, limit=32):
         """At-least-once delivery; a failed post remains pending past detail
-        retention, until thread retention (`prune`)."""
+        retention, until thread retention (`prune`).
+
+        A private log (no project) publishes nothing: pending copies left by
+        an earlier, project-bound writer are acknowledged without a post, so
+        they are never replayed into a project feed (#7668)."""
+        if self.project is None:
+            with self.db.transaction() as tx:
+                store = storage.of(tx).conversations
+                for row in store.pending_threads(self.agent, limit=limit):
+                    store.thread_delivered(self.agent, int(row["seq"]), "")
+            return 0
         done = 0
         with self.db.transaction() as tx:
             store = storage.of(tx).conversations

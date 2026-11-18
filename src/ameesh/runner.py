@@ -61,18 +61,19 @@ import threading
 import time
 import uuid
 
-from . import account_budget, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
+from . import account_budget, account_rotation, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import cost_attribution
 from . import context_metrics, context_profile
 from . import conversation_move
+from . import reveil as reveil_mod
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, refusal, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import account_window
 from . import provider_credits
 from . import persona_memory as memory_mod
 from . import spawn as spawn_policy
-from . import child_reports
+from . import child_reports, avatar_tools
 from . import train_events
 from . import migrations
 from . import turn_context
@@ -1153,6 +1154,28 @@ class AgentWorker(threading.Thread):
         except OSError:
             return None
 
+    def declared_policy(self) -> dict:
+        """#7674 (E3a) : la politique de session déclarée par la carte du
+        canon, `{}` si aucune. Elle vient de la ligne du registre écrite par
+        `canon sync` ; une valeur non-objet ne déclare rien."""
+        value = (self.agent or {}).get("declared_policy")
+        return value if isinstance(value, dict) else {}
+
+    def fresh_session(self) -> bool:
+        """#7674 (E3a) : la fiche demande-t-elle une session neuve par tour ?"""
+        return self.declared_policy().get("fresh_session") is True
+
+    def _fresh_session_reset(self) -> None:
+        """#7674 (E3a) : une session neuve par tour reprend des compteurs neufs.
+
+        `session_turns`, `session_tokens`, la relu et le contexte mesurent la
+        session ouverte. Quand aucune session n'est reprise, celle du tour
+        précédent est close : ses compteurs ne doivent ni peser sur la
+        suivante, ni lui faire sauter le bloc de règles du canon, que
+        `_ouverture` réinjecte à chaque tour d'une session neuve."""
+        if self.fresh_session() and self.current_session() is None:
+            self._reset_session_counts()
+
     def current_session(self) -> str | None:
         """La session à reprendre : celle du registre, sinon le fichier local.
 
@@ -1167,11 +1190,18 @@ class AgentWorker(threading.Thread):
         #1898 N4 : la comparaison porte sur deux horloges (mtime de l'hôte,
         `session_reset_at` de la base) ; `SESSION_RESET_SKEW_S` couvre leur
         dérive, et dans la fenêtre on tranche pour l'oubli (voir la constante).
+
+        #7674 : `fresh_session: true` sur la carte du canon rend toujours
+        None — chaque tour ouvre une session neuve, l'id du registre n'est
+        jamais repris (la session native d'un déplacement de conversation en
+        cours reste, elle, la cible explicite du déplacement).
         """
         if self._move_turn is not None:
             # #7050 (5322 §2.3) : la session native de la cible est neuve ; le
             # registre garde celle de la source jusqu'à `verified`
             return self._move_turn.session
+        if self.fresh_session():
+            return None
         session = (self.agent or {}).get("session_id")
         if session:
             return session
@@ -2602,10 +2632,12 @@ class AgentWorker(threading.Thread):
 
     # -- rotation de session (0018) ----------------------------------------
     def session_policy(self) -> str:
-        """Politique de session effective (0025, L26) : réglage de l'agent
-        (`ameesh set session_policy=…`), sinon défaut de l'exécuteur."""
-        return ((self.agent or {}).get("session_policy") or "").strip() \
-            or self.cfg.session_policy
+        """Politique de session effective (0025, L26 ; #7674) : carte du canon,
+        puis réglage de l'agent (`ameesh set session_policy=…`), puis défaut de
+        l'exécuteur. Une carte `fresh_session: true` vaut `jamais` : il n'y a
+        pas de session à faire tourner."""
+        from .exploitation import effective_policy
+        return effective_policy(self.cfg, self.agent or {})
 
     def session_max_tokens(self, harness: str | None = None) -> float:
         """Seuil de rotation sur la taille (L11) d'une session, par harnais.
@@ -3816,7 +3848,7 @@ class AgentWorker(threading.Thread):
             from . import conversation, fil as fil_mod
             log = conversation.Log(
                 self.db, self.cfg, agent=self.name,
-                project=fil_mod.project_for(self.cfg, fil_mod.agent_project(self.agent)))
+                project=fil_mod.conversation_project(self.db, self.cfg, self.agent))
             log.append("state", text, session=session, meta=meta)
         except Exception as exc:  # noqa: BLE001
             log_async("[%s] conversation state not recorded (%s)" % (self.name, exc))
@@ -5353,10 +5385,14 @@ class AgentWorker(threading.Thread):
             # un budget — bloqué sous `CONFIG_BLOCK_PREFIX` (alerte
             # `account_config_invalid`), sans échéance de pause
             config = raison.startswith(accounts_mod.NO_VALID_PREFIX)
+            # #7712 : un refus de coordination de vague n'est pas une pause
+            # budget — le statut garde `WAVE_PREFIX` (alerte
+            # `account_wave_coordination`), sans marque critique de budget.
+            vague = raison.startswith(account_rotation.WAVE_PREFIX)
             marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) \
-                and not config else ""
+                and not config and not vague else ""
             registry.set_status(self.db, self.name, "blocked",
-                                status_text=(raison if fenetre_courte
+                                status_text=(raison if fenetre_courte or vague
                                              else "%s%s%s" % (
                                                  accounts_mod.CONFIG_BLOCK_PREFIX
                                                  if config
@@ -5375,6 +5411,11 @@ class AgentWorker(threading.Thread):
                                    "the host configuration is fixed (ameesh doctor)."
                                    % raison,
                                    meta={"action": "account_config", "raison": raison})
+                elif vague:
+                    self._fil_note("Account wave coordination: %s. No turn until the "
+                                   "wave settles; the next turn retries on its own."
+                                   % raison[len(account_rotation.WAVE_PREFIX):],
+                                   meta={"action": "account_wave", "raison": raison})
                 elif not account_window.is_short_window(raison):
                     self._fil_note("Budget pause: %s. No turn until the gauge goes "
                                    "back down." % raison,
@@ -5392,8 +5433,11 @@ class AgentWorker(threading.Thread):
         # #5783 : une pause de fenêtre courte s'écrit désormais sans le préfixe
         # budget ; elle se lève comme lui, sinon un agent idle resterait
         # `blocked` avec une raison de quelques secondes.
+        # #7712 : même chose pour un refus de coordination de vague, qui se
+        # lève au tour suivant quand la vague s'est posée.
         if agent.get("status") != "blocked" or not (
-                texte.startswith(("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX))
+                texte.startswith(("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX,
+                                  account_rotation.WAVE_PREFIX))
                 or account_window.is_short_window(texte)):
             return
         issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
@@ -6092,16 +6136,12 @@ class AgentWorker(threading.Thread):
         ses tours sont courts, et c'est lui qui distribue le travail des autres
         (2026-10-10 : charge jusqu'à 43 pour 12 CPU, plus aucun tour, pas même
         le sien, et personne pour répartir). L234 exempte les auditeurs,
-        y compris sous pression critique ; leur harnais a une priorité réduite."""
-        if not pressure.get("blocked"):
-            return False
-        # L234 : la surveillance reste active, même sous pression critique.
-        if self.runner.is_auditor(self.name, self.agent):
-            from .platform import audit_guard
-            return not audit_guard.available()
-        if pressure.get("critical") or not self.runner.is_orchestrator(self.name):
-            return True
-        return any(b.get("power") for b in pressure.get("breaches") or ())
+        y compris sous pression critique ; leur harnais a une priorité réduite.
+
+        #7680 : la règle est portée par `Runner.pressure_holds_turn`, que la
+        réclamation d'un avatar (`claim_wait` → reclaim différé) consulte aussi.
+        """
+        return self.runner.pressure_holds_turn(self.agent, pressure)
 
     def _host_pressure_note(self, pressure: dict) -> None:
         """Trace la contre-pression (L31, 0028) ; en critique, met en pause.
@@ -7572,24 +7612,52 @@ class AgentWorker(threading.Thread):
           un redémarrage ne remet pas la fenêtre à zéro ;
         * passifs (accusé, copie, diffusion à tous : `mail.passive_reason`) :
           jamais dus ; lus au tour suivant, ou par le hook pendant un tour.
+
+        #7632 : une fiche qui déclare `reveil` remplace les deux premières
+        règles par la sienne (`_reveil_due`) : ses natures immédiates ouvrent
+        un tour tout de suite, le reste (événements compris) attend la fin de
+        sa fenêtre. Sans déclaration, rien ne change.
         """
         passive = [m for m in messages if mail.passive_reason(m)]
         active = [m for m in messages if not mail.passive_reason(m)]
         self._marque_vu(active)
         events = [m for m in active if mail.is_event(m)]
         others = [m for m in active if not mail.is_event(m)]
-        mail_due = bool(others) and self._mail_due(others)
+        policy = reveil_mod.of(self.agent)
+        if policy is not None:
+            mail_due = bool(active) and self._reveil_due(policy, active)
+            events_due = False
+        else:
+            mail_due = bool(others) and self._mail_due(others)
+            events_due = bool(events) and self._events_due(events)
         if others and any(self._from_human(m) for m in others):
             # L81 (étude §6.3) : tant qu'un message humain attend, l'entretien
             # d'une session résidente lui laisse la place (fenêtre de calme).
             self._dernier_humain = time.monotonic()
-        if not mail_due and not (events and self._events_due(events)):
+        if not mail_due and not events_due:
             return None  # regroupement en cours, ou rien que du courrier passif
         if events:
             registry.mark_event_wake(self.db, self.name)
         rows = active + passive
         return self._courrier_spec(
             "event" if all(mail.is_event(m) for m in rows) else "mail", rows)
+
+    def _reveil_due(self, policy: dict, rows: list[dict]) -> bool:
+        """#7632 : le courrier actif en attente ouvre-t-il un tour sous la
+        cadence déclarée ? Oui si l'un des messages est d'une nature
+        immédiate (l'humain toujours ; un événement urgent seulement d'un
+        expéditeur habilité, comme `_events_due`), sinon à la fin de la
+        fenêtre, comptée comme celle de `_mail_due`."""
+        for row in rows:
+            human = self._from_human(row)
+            if mail.is_event(row) and mail.is_urgent(row) and not human \
+                    and not self.interrupt_allowed(row):
+                found = reveil_mod.natures(row) - {"urgent"}
+                if found & set(policy["immediat"]):
+                    return True
+            elif reveil_mod.immediate(policy, row, human=human):
+                return True
+        return self._window_elapsed(rows, float(policy["fenetre_s"]))
 
     def _events_due(self, events: list[dict]) -> bool:
         """Les événements en attente ouvrent-ils un tour ? (C9)"""
@@ -7644,6 +7712,14 @@ class AgentWorker(threading.Thread):
         """
         window = self.mail_batch()
         if window <= 0 or any(mail.is_urgent(m) or self._from_human(m) for m in rows):
+            return True
+        return self._window_elapsed(rows, window)
+
+    def _window_elapsed(self, rows: list[dict], window: float) -> bool:
+        """L125/#3451 : le plus ancien de `rows` attend-il depuis au moins
+        `window` (depuis son arrivée et depuis la fin du dernier tour) ?
+        Sinon, l'échéance est retenue pour le réveil (#3218)."""
+        if window <= 0:
             return True
         now, mono = time.time(), time.monotonic()
         seen = getattr(self, "_batch_seen", {})
@@ -7822,8 +7898,8 @@ class AgentWorker(threading.Thread):
     def _ouverture(self) -> str:
         """Ce qui ouvre la consigne du prochain tour : le résumé de rotation
         (règles relues) quand il y en a un, sinon les règles de travail du canon
-        pour une session neuve ordinaire (premier démarrage) ; "" quand la
-        session reprend.
+        pour une session neuve (premier démarrage, ou chacun des tours d'une
+        fiche `fresh_session`) ; "" quand la session reprend.
 
         #538 : `_budget_courrier` réserve ces octets — le bloc de première
         session ne se paie pas sur le courrier (verdict codex #510 r2, P2)."""
@@ -7836,7 +7912,10 @@ class AgentWorker(threading.Thread):
             return ""
         if self.resume_summary:
             return self._resume_prompt()
-        if self.session_turns:
+        # #7674 (E3a) : une fiche `fresh_session` rouvre une session à chaque
+        # tour ; les règles du canon ouvrent donc chacun d'eux, jamais
+        # seulement le premier (les compteurs du tour précédent ne comptent pas).
+        if self.session_turns and not self.fresh_session():
             return ""
         from . import reprise
         bloc = reprise.process_rules_block(
@@ -8438,8 +8517,11 @@ class AgentWorker(threading.Thread):
             author = sender if sender.startswith(("human:", "chat-")) \
                 else "human:" + sender
             try:
-                entry = conversation.Log(self.db, cfg, agent=self.name,
-                                         lot=row.get("lot_id"))
+                entry = conversation.Log(
+                    self.db, cfg, agent=self.name,
+                    project=fil.conversation_project(self.db, cfg, self.agent,
+                                                     row.get("lot_id")),
+                    lot=row.get("lot_id"))
                 written = entry.append("human_message", text=row.get("body") or "",
                                        author=author, event_id="mail:%d" % int(mid),
                                        meta={"messages": [int(mid)]})
@@ -8653,6 +8735,11 @@ class AgentWorker(threading.Thread):
         de lancement, compté parmi les harnais, publié tout de suite (un arrêt
         pendant la poignée de main le trouve)."""
         from . import resident
+        applied = getattr(self, "_avatar_tools", None)
+        if applied is not None:
+            offset = getattr(self, "_avatar_tools_offset", 1)
+            argv = [*argv[:offset], *applied.args, *argv[offset:]]
+            avatar_tools.record(self.db, self.name, applied, "resident")
         with self.runner.launch_lock:
             # jamais moissonné hors de l'arrêt de son groupe (codex r2, #417)
             proc = resident.spawn_leader(argv, **kwargs)
@@ -9341,6 +9428,9 @@ class AgentWorker(threading.Thread):
             if not adopted and (not lot or not self._switch_lot(
                     str(self.agent.get("session_work_item") or ""), str(lot))):
                 return False
+        # #7674 (E3a) : une session neuve déclarée par la fiche est rouverte à
+        # chaque tour ; les compteurs de la précédente ne mesurent pas celle-ci.
+        self._fresh_session_reset()
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
         harness = self.turn_harness()
@@ -9404,8 +9494,16 @@ class AgentWorker(threading.Thread):
                 if activation or not session:
                     journal_id = "session-" + uuid.uuid4().hex
                     memory_preface = memory_mod.preface(path, self.name, journal_id)
+                # The transport works again: a later failure is a new episode.
+                self.__dict__.pop("_memory_unavailable_code", None)
             except (memory_mod.MemoryError, db_mod.DbError, OSError, subprocess.SubprocessError) as exc:
-                log("[%s] persona memory unavailable for this turn: %s" % (self.name, exc))
+                reason = str(exc)
+                log("[%s] persona memory unavailable for this turn: %s" % (self.name, reason))
+                # A silent degradation is not acceptable: the persona must know
+                # its memory is missing, and the host defect is published to
+                # the responsible (thread + event log), once per cause.
+                memory_preface = memory_mod.unavailable_preface(reason)
+                self._memory_unavailable(reason)
         resume += memory_preface
         # #6040 : seuil de compaction native (Codex : en cours de tour) ; un
         # compte emprunté garde les défauts de son harnais, comme l'effort.
@@ -9473,6 +9571,18 @@ class AgentWorker(threading.Thread):
             except db_mod.DbError as exc:
                 self.fail_turn("spawn policy unavailable",
                                "spawn profile/context not read: %s" % exc)
+                return False
+        self._avatar_tools = None
+        self._avatar_tools_offset = 1 + len((getattr(adapter.descriptor, "resident", None) or {}).get("launcher") or ())
+        if spawn_profile is None:
+            try:
+                self._avatar_tools = avatar_tools.prepare(
+                    self.cfg, self.agent, self.state_dir, cwd, harness=harness)
+                if self._avatar_tools is not None:
+                    spawn_args = list(self._avatar_tools.args)
+            except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+                self._close_resident("avatar tool policy unavailable")
+                self.fail_turn("avatar tool policy unavailable", str(exc))
                 return False
         if spawn_profile is not None:
             try:
@@ -9688,6 +9798,8 @@ class AgentWorker(threading.Thread):
         # par tous les worktrees : un `user.name` écrit par un agent valait
         # pour les autres, incident du 13/10/2026).
         identite.update(identity.git_identity(self.name))
+        if self._avatar_tools is not None:
+            identite["AMEESH_AVATAR_TOOLS_DIGEST"] = self._avatar_tools.proof["digest"]
         env.update(identite)
         # #1645 : chaque geste gh du tour est consigné (agent, tour, lot), et
         # le tour porte le jeton de son rôle GitHub quand il est configuré.
@@ -9924,8 +10036,8 @@ class AgentWorker(threading.Thread):
                 self.preempting.clear()
         preempt_thread.start()
         from .platform import audit_guard
-        auditeur = self.runner.is_auditor(self.name, self.agent)
-        audit_exempt = auditeur and self.runner.host_pressure().get("blocked")
+        auditor = self.runner.is_auditor(self.name, self.agent)
+        audit_exempt = auditor and self.runner.host_pressure().get("blocked")
         self._audit_guard_error = ""
         audit_seconds = min(audit_guard.WALL_SECONDS,
                             self.turn_max_seconds() or audit_guard.WALL_SECONDS)
@@ -9936,7 +10048,7 @@ class AgentWorker(threading.Thread):
         from .platform import child_environment
         # #6287 : le rôle auditeur reçoit en plus son propre DSN en lecture
         # seule ; aucun autre agent, aucune liste blanche par nom d'exécutable.
-        env = child_environment.harness(env, harness, compte, auditor=auditeur)
+        env = child_environment.harness(env, harness, compte, auditor=auditor)
         # #5529 : preuve de refus avant tout appel fournisseur. Le squelette du
         # tour est privé (0600) et son jeton ne part JAMAIS dans l'environnement
         # (`child_environment` filtre les variables en `*_TOKEN`) ; seul le
@@ -10080,6 +10192,7 @@ class AgentWorker(threading.Thread):
                                 commande = self.runner.audit_command(
                                     self.name, argv, self.agent, exempt=audit_exempt,
                                     seconds=audit_seconds)
+                            avatar_tools.record(self.db, self.name, self._avatar_tools, "turn")
                             proc = subprocess.Popen(
                                 commande,
                                 cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
@@ -10184,10 +10297,14 @@ class AgentWorker(threading.Thread):
             # for SQL or the readable thread. ResidentWorker uses the same sink.
             if getattr(self.db, "driver", "") != "mediated":
                 from .conversation import Recorder
+                # #7668 : une conversation privée (avatar, fiche sans projet)
+                # ne publie que dans le fil du lot qu'elle traite ; le projet
+                # par défaut de l'exécuteur n'est jamais un repli.
+                feed_lot = lot_du_tour if fil.private_conversation(self.agent) else None
                 conversation_recorder = Recorder(
                     self.cfg, agent=self.name, turn=turn_id, session=session,
-                    project=fil.project_for(self.cfg, fil.agent_project(self.agent)),
-                    reader=adapter.reader, warn=log_async)
+                    project=fil.conversation_project(self.db, self.cfg, self.agent, feed_lot),
+                    lot=feed_lot, reader=adapter.reader, warn=log_async)
                 conversation_recorder.append("input", spec.get("prompt") or "",
                                              author="ameesh:runner")
             # CTX-02b : l'observation se collecte sur le MÊME flux que les
@@ -11196,15 +11313,50 @@ class AgentWorker(threading.Thread):
 
         #1270 : pour un épisode de débit/quota, c'est le temps **restant**
         jusqu'à l'échéance durable (`retry at`) — jamais un délai repoussé par
-        un réveil ; L48 n'arrête jamais un débit passager, un quota si."""
+        un réveil ; L48 n'arrête jamais un débit passager, un quota si.
+
+        #7674 (E3a) : la carte du canon peut déclarer un **plancher**
+        (`failure_wait_min`) pour les échecs ordinaires ; l'attente reste
+        bornée en haut par `failure_backoff_max`, et l'échéance durable d'un
+        débit/quota reste seule juge (le plancher ne la repousse pas)."""
         if self.rate_limit:
             return self.retry_remaining()
         base = self.runner.failure_backoff
         n = max(self.fast_failures, self.failure_streak)
-        if n <= 1:
-            return base
+        attente = base if n <= 1 else min(self.runner.failure_backoff_max,
+                                          base * (2 ** (n - 1)))
+        from .exploitation import declared_failure_wait_min
+        # le plancher déclaré ne perce jamais le plafond de l'exécuteur
         return min(self.runner.failure_backoff_max,
-                   base * (2 ** (n - 1)))
+                   max(attente, declared_failure_wait_min(self.agent)))
+
+    def _memory_unavailable(self, reason: str) -> None:
+        """Publish a memory-unavailable host defect, once per cause.
+
+        The agent already receives a visible line in its turn; this trace and
+        the `host.memory_unavailable` event let the responsible see the defect
+        without reading the runner log. A repeated cause (the same turn loop)
+        is not republished; a success clears the marker. Never fails a turn.
+        """
+        code = memory_mod.failure_code(reason)
+        if self.__dict__.get("_memory_unavailable_code") == code:
+            return
+        self.__dict__["_memory_unavailable_code"] = code
+        detail = " ".join(str(reason or "").split())[:240]
+        host = getattr(self.cfg, "host", "") or "this host"
+        self._fil_note(
+            "Persona memory unavailable on %s (%s): %s — the turn runs without "
+            "memory; fix the host configuration (SSH repository and "
+            "persona_memory.ssh_key, `ameesh canon check`)."
+            % (host, code, detail),
+            meta={"action": "memoire_indisponible", "cause": code})
+        try:
+            from . import events
+            events.record(self.db, "host.memory_unavailable", "agent:%s" % self.name,
+                          agent=self.name, host=getattr(self.cfg, "host", "") or "",
+                          cause=code)
+        except Exception as exc:  # noqa: BLE001 - a publication never fails a turn
+            log("[%s] memory unavailable event not recorded: %s" % (self.name, exc))
 
     def _sync_memory(self) -> None:
         """Transport the persona session's memory changes at turn end, in the background."""
@@ -11216,6 +11368,7 @@ class AgentWorker(threading.Thread):
             memory_mod.require_isolation(self.cfg, self.db, self.name)
         except (memory_mod.MemoryError, db_mod.DbError) as exc:
             log_async("[%s] persona memory disabled: %s" % (self.name, exc))
+            self._memory_unavailable(str(exc))
             return
         path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
         if not os.path.isdir(os.path.join(path, ".git")):
@@ -11792,6 +11945,9 @@ class Runner:
         #: #7052 : `{rôle: échéance monotone}` — après un plan ou un reclaim
         #: d'avatar qui n'a pas abouti, ne pas réessayer à chaque passe.
         self._preference_plan_next: dict[str, float] = {}
+        #: #7680 : `{rôle: échéance monotone}` — un déplacement de reprise
+        #: planifié sans bascule immédiate n'est pas replanifié à chaque passe.
+        self._preference_recovery_next: dict[str, float] = {}
         #: #7052 : cadence de la passe de retour, et dernier diagnostic (même
         #: règle que `_role_error` : une panne ne casse pas l'exécuteur).
         self._preference_next = 0.0
@@ -12236,18 +12392,17 @@ class Runner:
         due mais le brief n'a pas pu être construit ; l'appelant ne réclame
         pas — jamais de tour sans briefing. Construit APRÈS la porte de rang
         d'EP2, juste avant le CAS : le brief décrit l'état au plus près.
+
+        #7680 : un agent `releve: preference` ne traverse JAMAIS un hôte sur
+        un `election_brief` (le brief remet la session à zéro). Une ligne
+        encore sur un autre hôte sans déplacement ouvert fait planifier ici
+        le déplacement de reprise, avec son segment ; la réclamation attend
+        que `advance` ait basculé la ligne sur cet hôte.
         """
         if not canon_mod.cross_host(agent.get("releve")):
             return None
         if (agent.get("releve") or "") == "preference":
-            # #7052 : tant qu'un déplacement porte la conversation, l'avatar ne
-            # se relève pas par brief — sa session suit par `conversation_moves`
-            # (rehydratation, A2 #7050) et un brief la remettrait à zéro. Sans
-            # déplacement ouvert (source disparue avant tout plan), le brief
-            # reste le dernier recours de reprise, comme pour un rôle élu.
-            from . import conversation_move
-            if conversation_move.holds(self.db, agent["name"]):
-                return None
+            return self._preference_claim_or_recovery(agent)
         previous = agent.get("previous_host")
         if not previous or previous == self.host:
             return None
@@ -12268,6 +12423,45 @@ class Runner:
                       % agent.get("name"))
             return ""
         return brief
+
+    def _preference_claim_or_recovery(self, agent: dict) -> str | None:
+        """#7680 : une réclamation de préférence ne se fait que sur place.
+
+        `None` quand la ligne est déjà sur cet hôte : la réclamation locale
+        garde la session (ou la tentative `conversation_moves` qui l'a
+        basculée). `""` sinon : aucune réclamation cette passe. Sans
+        déplacement ouvert, cet hôte planifie le déplacement de reprise (le
+        segment sera bâti depuis le journal au premier tour cible) ; avec un
+        déplacement ouvert, il attend la bascule. Jamais d'`election_brief`
+        ici : il remettrait la conversation à zéro.
+        """
+        name = agent["name"]
+        nexts = getattr(self, "_preference_recovery_next", None)
+        if nexts is None:
+            nexts = self._preference_recovery_next = {}
+        if agent.get("host") == self.host:
+            nexts.pop(name, None)
+            return None
+        from . import conversation_move
+        try:
+            if conversation_move.holds(self.db, name):
+                return ""  # la tentative ouverte porte déjà la conversation
+            now = self.clock.monotonic()
+            if now < nexts.get(name, 0.0):
+                return ""
+            nexts[name] = now + 20.0
+            move = conversation_move.plan(
+                self.db, name, self.host, requested_by=self.runner_id,
+                reason="preference")
+            if move is not None and move.get("created"):
+                log_async("[%s] preference recovery: no move open; conversation "
+                          "move planned from %s to %s"
+                          % (name, move.get("source_host") or "?",
+                             move.get("target_host") or self.host))
+        except Exception as exc:  # noqa: BLE001 - un avatar ne bloque pas l'hôte
+            log_async("preference recovery for %s not planned (%s): no claim "
+                      "this pass" % (name, db_mod.brief(exc)))
+        return ""
 
     def preference_return_pass(self) -> list:
         """#7052 (5322 §3.2, avatar B2) : ramène la conversation sur son hôte
@@ -12596,11 +12790,20 @@ class Runner:
                         None)
         since = self._election_free_since.setdefault(name, now)
         try:
-            verdict = election.claim_wait(self.db, agent, self.host, since, now=now)
+            # #7680 : un hôte dont la pression retient les tours ne referme pas
+            # une bascule abandonnée (il annoncerait un retour qu'il ne peut
+            # pas servir) ; la tentative reste ouverte à sa cible.
+            hold_turns = ((agent.get("releve") or "") == "preference"
+                          and self.pressure_holds_turn(agent))
+            verdict = election.claim_wait(self.db, agent, self.host, since, now=now,
+                                          hold_turns=hold_turns)
+            if (not verdict[0]
+                    and verdict[1].startswith("preference reclaim deferred")):
+                self._note_unleased(agent, verdict[1])
             if (not verdict[0] and verdict[1].startswith("not ready")
                     and self._republish_reserved(name, now)):
                 verdict = election.claim_wait(self.db, agent, self.host, since,
-                                              now=now)
+                                              now=now, hold_turns=hold_turns)
             if (not verdict[0] and (agent.get("releve") or "") == "preference"
                     and verdict[1].startswith("preference reclaim:")):
                 # #7052 : l'hôte préféré n'a pas réclamé dans la marge. Cet
@@ -12614,12 +12817,17 @@ class Runner:
                         holdoff_s=election.PREFERENCE_HOLDOFF_S + delay)
                     if closed is not None:
                         self._preference_plan_next.pop(name, None)
+                        kind = ("manual move"
+                                if (closed.get("reason") or "") == "manual"
+                                else "preference")
                         log_async(
-                            "[%s] preference reclaim: %s did not claim; the "
+                            "[%s] %s reclaim: %s did not claim; the "
                             "conversation returns to %s" % (
-                                name, closed.get("target_host") or "?", self.host))
+                                name, kind, closed.get("target_host") or "?",
+                                self.host))
                         verdict = election.claim_wait(self.db, agent, self.host,
-                                                      since, now=now)
+                                                      since, now=now,
+                                                      hold_turns=hold_turns)
                     else:
                         self._preference_plan_next[name] = now + 5.0
             return verdict
@@ -14220,7 +14428,8 @@ class Runner:
         return False
 
     def retry_review_designations(self) -> None:
-        """#2561: retry the freezes whose automatic designation was journaled
+        """#7624: recheck in-flight seats against the synced audited canon.
+        #2561: retry the freezes whose automatic designation was journaled
         unavailable. A canon publication/sync (or a worktree that became
         readable) can lift the cause after the freeze; the freeze is kept, so
         the same head is replayed, never a newer one. #3328: the same pass
@@ -14238,12 +14447,16 @@ class Runner:
             from .scoped_db import ScopedDb
             db = ScopedDb(self.cfg, family="runner.scoped.review_retry")
             try:
+                from . import review_canon_refresh
+                refreshed = review_canon_refresh.after_sync(self.cfg, db)
                 report = activation.retry_pending(self.cfg, db)
                 # #3328 : a seat whose reviewer's host vanished is reattributed
                 # on the same pass, on the same freeze. Bounded and never fatal.
                 moved = activation.reassign_unreachable(self.cfg, db)
             finally:
                 db.close()
+            if refreshed.get("refreshed") or refreshed.get("errors"):
+                log_async("review canon refresh: %s" % refreshed)
             if report.get("attempted") or report.get("errors"):
                 detail = "" if not report.get("errors") else (
                     " (%d error(s): %s)" % (len(report["errors"]), report["errors"][0]))
@@ -15583,6 +15796,26 @@ class Runner:
         """Le moteur de conteneurs de l'hôte, ou None (L31, 0028)."""
         return getattr(self, "_container_runtime", None)
 
+    def pressure_holds_turn(self, agent: dict, pressure: dict | None = None) -> bool:
+        """L31 (0028), #7680 : la pression retient-elle le prochain tour de `agent` ?
+
+        Même règle que `AgentWorker._held_by_pressure` (qui délègue ici pour
+        que la réclamation d'un avatar ne se juge pas avec une autre règle) :
+        toute brèche retient le tour, sauf un orchestrateur sous une pression
+        NON critique et hors batterie basse ; un auditeur passe tant que son
+        scope gardé est disponible (L234).
+        """
+        pressure = self.host_pressure() if pressure is None else pressure
+        if not pressure.get("blocked"):
+            return False
+        name = str((agent or {}).get("name") or "")
+        if self.is_auditor(name, agent):
+            from .platform import audit_guard
+            return not audit_guard.available()
+        if pressure.get("critical") or not self.is_orchestrator(name):
+            return True
+        return any(b.get("power") for b in pressure.get("breaches") or ())
+
     def host_pressure(self, now: float | None = None) -> dict:
         """Verdict de pression de l'hôte (L31, 0028), cache court.
 
@@ -16748,6 +16981,39 @@ def attach_owner(host: str) -> str:
     return "attach:%s@%s" % (getpass.getuser(), host)
 
 
+def attach_move_refusal(db, name: str) -> str:
+    """#7676: pourquoi un attach est refusé pendant un déplacement ouvert, "" sinon.
+
+    L'attach reprend `agent_registry.session_id`. Entre la bascule (`switched`)
+    et le premier tour de la cible, cette session est encore celle de l'hôte
+    source : la lancer ici serait un `--resume` d'un identifiant absent de cet
+    hôte. La cible ouvre sa session neuve dans `conversation_move.open_first_turn`
+    (premier tour piloté) ; l'attach refuse donc en le disant, plutôt que de
+    reprendre la session d'un autre hôte. Avant la bascule, il refuse aussi :
+    un bail d'attach vivant empêcherait `switch` de rendre la source.
+    """
+    try:
+        move = storage.of(db).conversation_moves.open_for(name)
+    except db_mod.DbError as exc:
+        return ("agent %s: cannot read its conversation move (%s); attach refused"
+                % (name, db_mod.explain(exc)))
+    if move is None:
+        return ""
+    state = move.get("state") or "?"
+    source = move.get("source_host") or "?"
+    target = move.get("target_host") or "?"
+    if state in ("switched", "recovered", "rehydrating"):
+        return ("agent %s has a conversation move %s from %s to %s (state %s): "
+                "the first turn on this host opens the new native session and "
+                "delivers the conversation segment; attaching now would resume "
+                "the source session. Wait for that first turn, then attach."
+                % (name, move.get("move_id") or "?", source, target, state))
+    return ("agent %s has a conversation move %s to %s in progress (state %s): "
+            "attach refused so the move can switch at the turn boundary; retry "
+            "after it moved."
+            % (name, move.get("move_id") or "?", target, state))
+
+
 def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
                 harness: str = "", human: str = "") -> dict:
     """L'identité que le harnais interactif transmet à ses hooks."""
@@ -17028,13 +17294,16 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         return 1
     max_seconds = attach_mod.DEFAULT_MAX if max_seconds is None else max_seconds
     attach_mod.Deadline(max_seconds)  # validate before taking a lock or lease
-    #: #7121 : une coupure du relais ferme le PTY (SIGTERM/SIGHUP). Le wrapper
-    #: doit rendre le bail et arrêter le harnais avant d'être tué : ces
-    #: signaux posent l'arrêt, la boucle coupe le groupe et le `finally`
-    #: rend le bail. Jamais installé hors du fil principal (tests, workers).
+    #: #7121/#7676 : une coupure du relais ferme le PTY, et un terminal local
+    #: fermé (SIGHUP) ou un timeout (SIGTERM) doit aussi rendre le bail. Sans
+    #: ces gestionnaires, le processus sortait sans passer par le `finally` :
+    #: l'avatar restait « running (session interactive (attach)) » et
+    #: injoignable jusqu'à l'expiration de son bail. Ces signaux posent
+    #: l'arrêt, la boucle coupe le groupe et le `finally` rend le bail. Jamais
+    #: installé hors du fil principal (tests, workers).
     stop_event = threading.Event()
     previous_signals: dict = {}
-    if remote and threading.current_thread() is threading.main_thread():
+    if threading.current_thread() is threading.main_thread():
         def _stop_attach(_signum, _frame):
             stop_event.set()
         for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -17106,10 +17375,11 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     name = resolve(name, db=db, operation="lease.attach")
 
     def refuse(code: str, message: str, status: int = 1) -> int:
-        print(message, file=sys.stderr)
+        if message:
+            print(message, file=sys.stderr)
         if remote:
             attach_session_mod.record_event(
-                db, name, outcome="refused", code=code, reason=message,
+                db, name, outcome="refused", code=code, reason=message or code,
                 owner=lease_owner, host=cfg.host, tenant=tenant, device=device,
                 human=human, attach_id=attach_id)
         return status
@@ -17151,13 +17421,18 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         # ayant réveillé l'agent pour rien. Un harnais sans session interactive
         # doit refuser d'emblée, sans toucher au bail ni à la session.
         adapter.require_interactive()
+        avatar_applied = avatar_tools.prepare(
+            cfg, agent, cfg.agent_dir(name), agent.get("cwd"),
+            harness=agent.get("harness"))
+    except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+        return refuse("avatar_tools_unavailable", "attach: %s" % exc)
     except adapters.HarnessMissing as exc:
         return refuse("harness_missing", "attach: %s" % exc)
-    # L30 : la session interactive prend le compte actif du harnais ; un profil
-    # inutilisable est refusé AVANT de prendre le bail.
-    ok, compte = account_turn.attach_profile(cfg, db, agent.get("harness") or "")
-    if not ok:
-        return refuse("account_unavailable", "attach: no usable account for %s" % name)
+    # #7644 : le compte de la session est résolu après l'attente du tour et
+    # la relecture du registre (une rotation a pu changer `session_account`),
+    # et avant la prise du bail. `attach_profile` explique lui-même un compte
+    # inutilisable.
+    compte = None
     if ttl is None:
         # §5.4 : le bail distant est court (coupure du poste) ; le local garde
         # le TTL de l'exécuteur.
@@ -17210,9 +17485,27 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         if ((finished.get("harness") or "") == (agent.get("harness") or "")
                 and agent_incarnation(finished) == agent_incarnation(agent)):
             agent = dict(agent, session_id=finished.get("session_id"),
+                         session_account=finished.get("session_account"),
                          pending_prompt=finished.get("pending_prompt"))
+        ok, compte = account_turn.attach_profile(
+            cfg, db, agent.get("harness") or "", row=agent)
+        if not ok:
+            return refuse("account_unavailable", "")
         lease = registry.attach_claim(db, name, lease_owner, ttl)
         if lease:
+            # #7676 : vérifié APRÈS la prise du bail, sous le verrou de la
+            # session. Une bascule concurrente est soit déjà visible ici, soit
+            # refusée par `switch` tant que ce bail d'attach est vivant : la
+            # course entre le contrôle et le `--resume` est fermée. Un bail
+            # pris pour rien est rendu avant le refus.
+            refusal = attach_move_refusal(db, name)
+            if refusal:
+                try:
+                    registry.release(db, name, lease_owner,
+                                     int(lease["lease_epoch"]))
+                except db_mod.DbError:
+                    pass
+                return refuse("conversation_move", refusal, 3)
             break
         from . import host_holds
         hold = host_holds.live(db).get(agent.get("host") or "")
@@ -17331,10 +17624,21 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         thread.start()
         veille.start()
         inputs.start()
+        # A wait for the resident to hand back its session may outlive a canon
+        # publication. Re-read the card immediately before constructing argv.
+        try:
+            avatar_applied = avatar_tools.prepare(
+                cfg, agent, cfg.agent_dir(name), agent.get("cwd"),
+                harness=agent.get("harness"))
+        except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+            return refuse("avatar_tools_unavailable", "attach: %s" % exc)
         argv = adapter.interactive_command(
             agent.get("session_id"),
             permission_mode=_attach_permission_mode(
                 cfg, name, harness_revendique, mode_incarnation))
+        if avatar_applied is not None:
+            offset = 1 + len(adapter.spec.launcher)
+            argv = [*argv[:offset], *avatar_applied.args, *argv[offset:]]
         env = _attach_env(cfg, name, lease_owner, epoch,
                           agent.get("harness") or "", human=human)
         env.update(adapter.env())
@@ -17359,19 +17663,25 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                 tenant=tenant, device=device, human=human, attach_id=attach_id,
                 epoch=epoch, session=(agent.get("session_id") or ""))
         log_async("[%s] interactive session: %s" % (name, " ".join(argv)))
-        from . import alert_briefs, auditor as auditor_mod, canon as canon_mod
+        from . import auditor as auditor_mod, canon as canon_mod
         from .platform import child_environment
-        # #6287 : l'agent auditeur — la persona, ou un rôle auditeur du canon
-        # propriétaire — reçoit son propre DSN en lecture seule ; la variable
-        # n'existe que sur l'unité qui la pose, et le canon n'est chargé que
-        # dans ce cas.
-        auditeur = bool(os.environ.get("AUDITEUR_DSN")) and (
-            name == alert_briefs.AUDITOR_NAME
-            or auditor_mod.is_auditor(
-                db, name, canon_mod.load_configured(cfg), agent))
+        # #6287 : l'agent dont la fiche du canon propriétaire déclare le rôle
+        # auditeur reçoit son propre DSN en lecture seule ; la variable n'existe
+        # que sur l'unité qui la pose, et le canon n'est chargé que dans ce cas.
+        # #7661 : le nom de la persona ne suffit plus, seule la fiche décide ;
+        # sans canon chargé, la projection `roles` du registre fait foi.
+        dsn_name = next(iter(child_environment.AUDITOR_CREDENTIALS), "")
+        auditor = bool(dsn_name and os.environ.get(dsn_name)) \
+            and auditor_mod.is_auditor(
+                db, name, canon_mod.load_configured(cfg), agent)
+        try:
+            avatar_tools.record(db, name, avatar_applied, "attach")
+        except (db_mod.DbError, spawn_policy.SpawnToolsError) as exc:
+            return refuse("avatar_tools_unavailable", "attach: tool policy proof not recorded: %s" % exc)
+        launched = time.monotonic()
         proc = subprocess.Popen(argv, cwd=cwd, env=child_environment.harness(
                                     env, harness_revendique, compte,
-                                    auditor=auditeur),
+                                    auditor=auditor),
                                 start_new_session=True)
         # Course de publication (même correctif que B5a-P) : le veilleur a pu
         # conclure pendant que ce Popen n'était pas encore publié.
@@ -17386,6 +17696,13 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                 break
             time.sleep(0.2)
         code = proc.wait()
+        if (code and not expired.is_set() and not perdu.is_set()
+                and not stop_event.is_set()
+                and time.monotonic() - launched < attach_mod.EARLY_FAILURE_S):
+            for line in attach_mod.early_failure_lines(
+                    cfg, name, agent, compte,
+                    time.monotonic() - launched, code):
+                print(line, file=sys.stderr)
         if stop_event.is_set() and not perdu.is_set():
             # Coupure du relais ou SIGTERM de l'hôte : la session se ferme
             # proprement (bail rendu), un code négatif de groupe tué n'est pas

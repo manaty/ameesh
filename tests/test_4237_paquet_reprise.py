@@ -225,8 +225,8 @@ class EpochLostTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--expect-pushed") + 1], "c" * 40)
 
     def compose(self, refuse_after_tests):
-        """#4304 : poussée, gel et ci-full avant les tests par unité ; la garde
-        refuse (`EpochLost`) avant les tests ou après des tests verts."""
+        """#7740 : la garde refuse (`EpochLost`) avant les tests, ou après la
+        poussée de la tête verte (il ne reste alors que la note et le courrier)."""
         tmp = tempfile.TemporaryDirectory(prefix="paquet-4237-")
         self.addCleanup(tmp.cleanup)
         worktree = pathlib.Path(tmp.name) / "wt"
@@ -242,9 +242,13 @@ class EpochLostTest(unittest.TestCase):
             pilot="mesh-design", sender="mesh-design", exclude=[3801],
             exclude_reason=[])
         tested = []
+        published = []
 
         def guard(*_args):
-            if tested or not refuse_after_tests:
+            # #7740 : après les tests, la garde de la boucle précède la poussée ;
+            # le refus de fin n'est simulé qu'une fois la tête publiée, sinon il
+            # n'y a rien à garder pour le détenteur suivant.
+            if not refuse_after_tests or (tested and published):
                 raise auto.EpochLost(REFUSAL)
 
         def tests(*_args, **_kwargs):
@@ -274,6 +278,7 @@ class EpochLostTest(unittest.TestCase):
                 mock.patch.object(auto, "keep_tested") as keep:
             for key, value in patches.items():
                 mocks[key].return_value = value
+            push.side_effect = lambda *_args, **_kwargs: published.append(True)
             # #4329 : le verrou de composition exige un dépôt git réel ; ce
             # témoin monte un dépôt factice et mocke déjà tous les gestes git.
             mocks["PackageLock"].return_value = mock.MagicMock()
@@ -282,15 +287,15 @@ class EpochLostTest(unittest.TestCase):
                 auto.compose_packet(args)
         return tmp, keep, push, mocks
 
-    def test_refus_apres_tests_verts_garde_la_tete_testee(self):
-        """La passe 4189d : tests verts, geste suivant refusé → tête gardée."""
+    def test_refus_apres_poussee_garde_la_tete_testee(self):
+        """La passe 4189d : tests verts, tête poussée, note finale refusée → tête gardée."""
         tmp, keep, push, mocks = self.compose(refuse_after_tests=True)
         keep.assert_called_once()
         self.assertEqual(keep.call_args.args, (pathlib.Path(tmp.name).resolve(), 4000,
                                                NAME, "e" * 40, "d" * 40))
         self.assertIn("verts", keep.call_args.kwargs["tests"])
         self.assertEqual(keep.call_args.kwargs["sender"], "mesh-design")
-        # #4304 : la tête était poussée et gelée avant ses tests ; la fin est due
+        # #7740 : la poussée a lieu après les séries vertes ; la fin est due.
         push.assert_called_once()
         mocks["freeze_carrier"].assert_called_once()
         mocks["send_mail"].assert_not_called()

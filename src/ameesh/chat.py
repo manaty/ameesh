@@ -240,7 +240,9 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
     après le courrier laisse le message délivré et l'erreur dite : le
     courrier est la délivrance, l'entrée son reflet. L'entrée est rangée dans
     le projet de la copie R12 : celui du lot quand un lot est posé
-    (`fil.lot_project`, la règle de `mail.send`), sinon celui de l'agent.
+    (`fil.lot_project`, la règle de `mail.send`), sinon celui de l'agent. Un
+    avatar (ou un agent dont la fiche ne déclare aucun projet) n'a pas de
+    copie R12 hors lot : son reflet reste dans son journal (#7668).
 
     `event_id` est stable (`mail:<id>` par défaut) : un rejeu après la
     délivrance ne crée pas de seconde entrée.
@@ -315,8 +317,7 @@ def _reflect_human_message(cfg: Config, db, *, row, human: str, agent: str, text
     from . import conversation, fil
     work_item_id = None if lot is None else str(lot)
     log = conversation.Log(db, cfg, agent=agent,
-                           project=fil.project_for(cfg, fil.lot_project(db, work_item_id),
-                                                   fil.agent_project(row)),
+                           project=fil.conversation_project(db, cfg, row, work_item_id),
                            lot=work_item_id)
     entry = log.append("human_message", text, author=human,
                        event_id=event_id or "mail:%d" % message_id, thread=False)
@@ -1483,8 +1484,9 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
             else os.path.join(session_dir(cfg), name)
         waiting = decisions.pending(db, human=human)
         # L233: decisions written in prose in mail, to offer converting them
+        allowed = decisions.prose_route(human, db, cfg=cfg)
         prose = [p for p in decisions.prose_decisions(db)
-                 if p["recipient"] in decisions.PROSE_RECIPIENTS + (human, decisions.OWNER_ANY)]
+                 if p["recipient"] in allowed]
         prompt = instruction(human, name)
         pid = os.getpid()
         env = chat_env(cfg, name, pid)

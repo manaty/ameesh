@@ -42,6 +42,12 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   réellement actionnable, pas seulement un lot assigné. #5151 : le sommeil
   nomme aussi au journal les lots attribués qu'une attente planifiée écarte
   (« sleep set aside: <agent>: #N (planned start …) »).
+  #7658 : un agent dont la fiche porte un bloc `avatar` n'est jamais endormi :
+  son humain le joint par courrier, et un courrier ordinaire ne lèverait pas
+  le sommeil (#4610). La pause automatique déjà posée sur un avatar est levée
+  à la passe suivante, y compris hors de son équipe ; le motif est journalisé
+  sur le lot de découpage, comme pour un relecteur (#4525) ou le veilleur
+  GitHub (#7476).
   #6575 : un agent qui doit encore un geste sur un travail engagé n'est pas
   endormi, et le dormeur qui en reçoit un est levé : correction due après un
   verdict bloquant (`due_fixes`, la lecture de `work fixes-owed`), lot ouvert
@@ -80,13 +86,14 @@ from . import planned_waits, storage
 from . import sous_utilisation as su
 from . import work
 from .agent_pause import FILE_DECOUPAGE_ACTOR as SLEEP_ACTOR
+from .roles import AUDITOR_ROLES
 
 #: identité du lot de découpage d'un projet (un seul ouvert)
 SOURCE_PREFIX = "file-decoupage:"
 #: repli de l'auditeur : une heure après la création (§2.2, 3)
 FALLBACK_S = 3600.0
 #: marque du repli, posée une fois sur le lot de découpage
-FALLBACK_MARK = "repli auditeur"
+FALLBACK_MARK = "repli " + AUDITOR_ROLES[0]
 #: la note du pilote (§1, « Feuille de route épuisée »)
 EXHAUSTED_PREFIX = "roadmap: épuisée"
 EXHAUSTED_RE = re.compile(r"^\s*roadmap\s*:\s*épuisée\s+(\S+)", re.IGNORECASE)
@@ -426,7 +433,8 @@ def body_of(project: str, item: Measure, since_ts: float, now: float,
         "prochain lot démarrable, l'owner reçoit une alerte). Pour rouvrir : notez "
         "« %s %s » sur ce lot, le sommeil est levé à la passe suivante." % (
             len(item.idle), EXHAUSTED_PREFIX, project, REOPENED_PREFIX, project),
-        "Repli : sans lot démarrable créé dans l'heure, l'auditeur crée les lots.",
+        "Repli : sans lot démarrable créé dans l'heure, l'%s crée les lots."
+        % AUDITOR_ROLES[0],
     ]
     return "\n".join(lines)
 
@@ -546,26 +554,33 @@ def _created_since(db, lots: list, project: str, split: dict, waits: dict) -> li
 
 
 def _fallback(db, project: str, split: dict, created: list, now: float, *,
-              actor: str) -> dict | None:
-    """Repli (§2.2, 3) : un seul courrier à l'auditeur, marqué sur le lot."""
-    from . import mail
-    from .alert_briefs import AUDITOR_NAME
+              actor: str, listing: list, canons=None) -> dict | None:
+    """Repli (§2.2, 3) : un seul courrier à l'auditeur, marqué sur le lot.
+
+    #7661 : l'auditeur est l'agent dont la fiche du canon déclare le rôle
+    (`roles: [auditeur]`), jamais un nom de persona. Sans ce rôle, le repli
+    n'a pas de destinataire : rien n'est inventé et rien n'est marqué."""
+    from . import alert_briefs, mail
     lot = int(split["id"])
     if created or now - float(split.get("created_ts") or now) < FALLBACK_S:
         return None
     if work.events_noted(db, lot, FALLBACK_MARK):
         return None
+    names = alert_briefs.auditors(listing, canons)
+    if not names:
+        return None
+    auditor = names[0]
     body = ("Repli du lot de découpage #%d (#3256 A, canon §4) : créé il y a %s, il n'a "
             "donné lieu à aucun lot démarrable de %s. Geste de niveau 1 : créez vous-même "
             "les lots démarrables (au plus une journée chacun, classe du §1), sans toucher "
             "au code ni à la priorité des lots du pilote ; puis notez-les sur #%d."
             % (lot, su._duration(now - float(split["created_ts"])), project, lot))
-    mail.send(db, actor, AUDITOR_NAME, body, work_item_id=str(lot),
+    mail.send(db, actor, auditor, body, work_item_id=str(lot),
               idempotency_key="file-decoupage-repli-%d" % lot)
     work.note(db, lot, "%s : aucun lot démarrable créé en %s, %s prévenu"
               % (FALLBACK_MARK, su._duration(now - float(split["created_ts"])),
-                 AUDITOR_NAME), actor=actor)
-    return {"lot": lot, "auditor": AUDITOR_NAME}
+                 auditor), actor=actor)
+    return {"lot": lot, "auditor": auditor}
 
 
 def _owner_of(rows: list) -> str | None:
@@ -1031,6 +1046,27 @@ def _github_watchers(canons) -> set[tuple[str, str]]:
     return {(sub.agent, sub.project) for sub in github_watch.subscriptions(canons or ())}
 
 
+def _avatar_agents(canons) -> set[str]:
+    """#7658 : les agents dont la fiche porte un bloc `avatar`.
+
+    Le bloc n'est pas persisté au registre : il est lu dans le canon qui
+    gouverne l'agent, comme les autres champs de la fiche. Un canon absent ou
+    illisible ne produit aucun nom (le sommeil garde alors son comportement
+    d'avant) ; un bloc vide (`avatar:` sans valeur) n'est pas un avatar.
+    """
+    out = set()
+    for card in canons or ():
+        for agent in getattr(card, "agents", ()) or ():
+            fiche = getattr(agent, "fiche", None)
+            data = getattr(fiche, "data", None) or {}
+            if not data.get("avatar"):
+                continue
+            name = str(getattr(agent, "title", "") or "").strip()
+            if name:
+                out.add(name)
+    return out
+
+
 def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
            split_id=None, lots=(), listing=(), cfg=None, canons=None,
            mail_window_s=None, waits=None, since_ts: float = 0.0) -> list:
@@ -1049,6 +1085,7 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
     out = []
     reason = SLEEP_REASON % project
     watchers = _github_watchers(canons)
+    avatars = _avatar_agents(canons)
     pending, keep, unreadable = _reviewer_spares(
         db, project, lots, listing, cfg=cfg, canons=canons)
     if unreadable:
@@ -1072,6 +1109,11 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
             out.append({"agent": name, "slept": False, "why": why})
         return out
     for name in item.idle:
+        if name in avatars:
+            why = "avatar card, never slept (#7658)"
+            out.append({"agent": name, "slept": False, "why": why})
+            _journal_exemption(db, split_id, name, why, since_ts=since_ts)
+            continue
         if (name, project) in watchers:
             why = "designated GitHub watcher for %s (#7476)" % project
             out.append({"agent": name, "slept": False, "why": why})
@@ -1319,11 +1361,16 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
     #6575 : le travail engagé dû (`owed_work` : correction, paquet ouvert,
     commande heavy ; #6734 : réveil programmé dû) lève aussi le dormeur ; une
     lecture en échec ne lève personne sur ce motif.
+
+    #7658 : la pause automatique d'un avatar est levée à toute passe, même
+    s'il a quitté son équipe (`_wake` ne parcourt que les agents du projet) :
+    son humain doit pouvoir le joindre par courrier.
     """
     #7476 : le siège de veille lève aussi un ancien sommeil automatique.
     from . import agent_pause
     woken: dict = {}
     watchers = _github_watchers(canons)
+    avatars = _avatar_agents(canons)
     sleepers = [str(row.get("name") or "").strip() for row in listing
                 if row.get("operator_paused")
                 and is_sleep_reason(str(row.get("operator_pause_reason") or ""))]
@@ -1335,7 +1382,9 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
             continue
         project = project_of_sleep_reason(reason)
         why = None
-        if (name, project) in watchers:
+        if name in avatars:
+            why = "avatar card, never kept asleep (#7658)"
+        elif (name, project) in watchers:
             why = "designated GitHub watcher for %s (#7476)" % project
         elif int(row.get("actionable_lots") or 0) > 0:
             # #4619 : le lot assigné le plus récemment touché n'est pas
@@ -1370,7 +1419,7 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
             continue
         if done.get("changed"):
             woken.setdefault(project, []).append(name)
-            if (name, project) in watchers:
+            if name in avatars or (name, project) in watchers:
                 try:
                     split = _open_split(db, project)
                     if split is not None:
@@ -1507,7 +1556,8 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
         if split.get("created_ts") is None or dry_run:
             continue
         done = _fallback(db, project, split,
-                         _created_since(db, lots, project, split, waits), now, actor=actor)
+                         _created_since(db, lots, project, split, waits), now,
+                         actor=actor, listing=listing, canons=canons)
         if done:
             out.append(dict(done, kind="fallback", project=project))
     return out

@@ -80,12 +80,12 @@ class CriticalNamesFallbackTest(unittest.TestCase):
                            canons=[canon], memory={"orch": False, "dev7": True}),
             {"orch"})
 
-    def test_l_auditeur_sans_fiche_reste_critique(self):
-        """La persona auditeur l'est sans fiche tant que le rôle est critique."""
+    def test_l_auditeur_sans_fiche_n_est_plus_critique(self):
+        """#7661 : sans fiche qui déclare le rôle, le titre ne rend pas critique."""
         canon = _Canon("home", {"orch": ["orchestrateur"]},
                        federation={"critical_roles": ["auditeur"]})
         self.assertEqual(
             critical_names([{"name": "auditeur", "canon": "home"},
                             {"name": "orch", "canon": "home"}],
                            canons=[canon], memory={}),
-            {"auditeur"})
+            set())

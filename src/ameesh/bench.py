@@ -27,6 +27,14 @@ depuis le 17/10). Cette maintenance :
   échanges aucun backend ne reste, la suite se reconnecte ensuite). Seul un
   opérateur, après avoir arrêté tout processus de suite, les admet
   explicitement (``python -m ameesh.bench purge --admit-unmarked``) ;
+* purge les **annexes** ``<schéma de classe>_<suffixe>`` d'une classe morte
+  (#7756) : un test crée parfois un schéma à côté de celui de sa classe (une
+  vue lisible par PUBLIC) ; `_drop_schema` ne connaît que le schéma de la
+  classe et le résidu fait échouer les contrats de rôle suivants. L'annexe
+  doit porter **sa propre** preuve de propriétaire (écrite par
+  `PgTestCase.create_schema` dans la transaction de création), morte, sans
+  âge minimal : un résidu frais empoisonne la classe suivante. Une annexe
+  sans preuve est gardée — une base disparue ne prouve rien (#43420) ;
 * purge les bases jetables laissées **invalides** (`datconnlimit = -2`) par un
   DROP DATABASE annulé pendant son checkpoint (#4822) : sans cela elles ne
   peuvent plus être ouvertes et l'autovacuum du banc s'arrête (#4680) ;
@@ -64,6 +72,18 @@ from . import platform as platform_mod
 SCHEMA_PREFIX = "t_"
 #: motif strict d'un nom de schéma purgé : jamais d'identifiant arbitraire
 SCHEMA_RE = re.compile(r"^t_[a-z0-9_]{1,58}$")
+
+#: #7756 : nom du schéma d'une classe de test (`tests/support.py: PgTestCase`).
+#: Un test peut créer des schémas **annexes** sous ce préfixe
+#: (`<schéma de classe>_<suffixe>`), hors du schéma que `_drop_schema` connaît.
+CLASS_SCHEMA_RE = re.compile(r"^t_[a-z0-9_]{1,18}_[0-9a-f]{8}$")
+
+#: #7756/#43420 : verrou consultatif de la preuve de propriété d'une annexe.
+#: `PgTestCase.create_schema` le prend dans la transaction qui crée le schéma
+#: **et** écrit son commentaire de propriétaire ; `purge_satellites` le reprend
+#: dans la transaction du DROP. Une création concurrente ne peut donc pas se
+#: glisser entre la relecture de la preuve et le DROP : elle attend le verrou.
+ANNEX_LOCK = "ameesh-test-schema-annex"
 
 #: #4822 : bases jetables créées par la suite et ses scripts (`scripts/test.sh`,
 #: `tests/test_l56_role_executor.py`, la restauration de sauvegarde). Seuls ces
@@ -383,6 +403,58 @@ def owner_alive(comment: str | None) -> bool:
     return owner_state(comment) == OWNER_ALIVE
 
 
+# Roles are cluster-wide; all users of this lock must connect to the same
+# canonical test database, even when their class uses another database.
+ROLE_RE = re.compile(r"^t_vm_(?:probe|native)_[0-9a-f]{10}(?:_writer)?$")
+ROLE_LOCK = "ameesh-test-owned-roles"
+
+
+def _role_lock(tx):
+    tx.execute("SET LOCAL lock_timeout = '5s'")
+    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (ROLE_LOCK,))
+
+
+def create_test_roles(db, role: str, writer: str) -> None:
+    """Atomically create and mark the two test roles on the canonical DB."""
+    if not _local_dsn(db.dsn) or not ROLE_RE.fullmatch(role) or writer != role + "_writer":
+        raise ValueError("invalid local test role pair")
+    marker = owner_marker().replace("'", "''")
+    with db.transaction() as tx:
+        _role_lock(tx)
+        for name, login in ((role, "LOGIN"), (writer, "NOLOGIN")):
+            tx.execute('CREATE ROLE "%s" %s NOINHERIT' % (name, login))
+            tx.execute('COMMENT ON ROLE "%s" IS \'%s\'' % (name, marker))
+
+
+def purge_test_roles(db, *, only=None) -> "Purge":
+    """Drop marked dead owners' roles only when no shared dependency remains."""
+    if not _local_dsn(db.dsn):
+        return Purge(0, (), (), unreadable="non-local test database")
+    dropped, kept = [], []
+    with db.transaction() as tx:
+        _role_lock(tx)
+        rows = tx.query("SELECT oid, rolname, shobj_description(oid, 'pg_authid') AS comment "
+                        "FROM pg_roles WHERE rolname LIKE 't_vm_%'")
+        scanned = 0
+        for row in rows:
+            name = str(row['rolname'])
+            if not ROLE_RE.fullmatch(name) or (only is not None and name not in only):
+                continue
+            scanned += 1
+            state = owner_state(row.get('comment'))
+            if state != OWNER_DEAD:
+                kept.append((name, 'owner ' + state))
+                continue
+            deps = tx.query("SELECT count(*) AS n FROM pg_shdepend "
+                            "WHERE refclassid = 'pg_authid'::regclass AND refobjid = %s", (row['oid'],))
+            if int(deps[0]['n']):
+                kept.append((name, 'shared dependencies remain'))
+                continue
+            tx.execute('DROP ROLE "%s"' % name)
+            dropped.append(name)
+    return Purge(scanned, tuple(dropped), tuple(kept))
+
+
 def claim_owner(db, schema: str, *, pid: int | None = None,
                 start: float | None = None) -> None:
     """Pose la preuve de propriété du schéma, tenue par toute la classe.
@@ -401,6 +473,19 @@ def claim_owner(db, schema: str, *, pid: int | None = None,
     db.execute('COMMENT ON SCHEMA "%s" IS %s' % (schema, literal))
 
 
+def lock_annexes(db) -> None:
+    """Sérialise création et purge des annexes, dans la transaction courante.
+
+    Le verrou est transactionnel : ``create_schema`` le prend pour écrire
+    ``CREATE SCHEMA`` et le commentaire de propriétaire ensemble, et
+    `purge_satellites` le reprend pour relire la preuve puis supprimer. Sans
+    lui, une création concurrente pourrait se glisser entre la lecture et le
+    DROP (#43420).
+    """
+    db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+               (ANNEX_LOCK,))
+
+
 def _owners(db) -> dict[str, str]:
     """Commentaire de chaque schéma t_* (vide si aucun)."""
     try:
@@ -416,6 +501,26 @@ def _owners(db) -> dict[str, str]:
             for row in rows if row["comment"]}
 
 
+_LOCAL_FQDN: str | None = None
+
+
+def _local_fqdn() -> str:
+    """FQDN de l'hôte, résolu une seule fois.
+
+    `socket.getfqdn()` peut bloquer des dizaines de secondes (DNS/mDNS macOS) :
+    il n'est donc appelé que pour un hôte qui n'est ni une adresse de boucle
+    locale ni le nom rendu par `socket.gethostname()`. Le cache évite de payer
+    la résolution à chaque classe de test (`_bench_roles`/`_bench_satellites`).
+    """
+    global _LOCAL_FQDN
+    if _LOCAL_FQDN is None:
+        try:
+            _LOCAL_FQDN = socket.getfqdn().lower().rstrip(".")
+        except OSError:
+            _LOCAL_FQDN = ""
+    return _LOCAL_FQDN
+
+
 def _local_dsn(dsn: str) -> bool:
     """La preuve de propriété est un PID de l'hôte : le banc doit être local."""
     if not dsn:
@@ -423,13 +528,20 @@ def _local_dsn(dsn: str) -> bool:
     if not dsn.startswith(("postgresql://", "postgres://")):
         return False  # forme mot-clé/hôte inconnu : refus conservateur
     try:
-        host = urlsplit(dsn).hostname
+        host = (urlsplit(dsn).hostname or "").lower().rstrip(".")
     except ValueError:
         return False
     if not host:
         return True  # socket local
-    return host in ("127.0.0.1", "localhost", "::1",
-                    socket.gethostname(), socket.getfqdn())
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return True
+    nom = socket.gethostname().lower().rstrip(".")
+    if host == nom:
+        return True
+    # Jamais le premier label d'un nom qualifié (`bench` pour `bench.local`) :
+    # il peut résoudre ailleurs, et ces purges utilisent un PID local comme
+    # preuve de propriété. Seul le FQDN rendu par la résolution fait foi.
+    return host == _local_fqdn()
 
 
 def _creation_rows(db) -> list[dict]:
@@ -562,6 +674,71 @@ def orphan_schemas(db, *, min_age_s: float | None = None,
     return out
 
 
+def _schema_comments(db) -> dict[str, str | None]:
+    """Nom et commentaire de chaque schéma ``t_*`` (commentaire absent = None)."""
+    try:
+        rows = db.query(
+            "SELECT n.nspname AS schema, "
+            "obj_description(n.oid, 'pg_namespace') AS comment "
+            "FROM pg_namespace n WHERE left(n.nspname, 2) = %s",
+            (SCHEMA_PREFIX,),
+        )
+    except db_mod.DbError as exc:
+        raise BenchError("bench satellites unreadable: %s" % exc) from exc
+    return {str(row["schema"]): (str(row["comment"])
+                                 if row["comment"] is not None else None)
+            for row in rows}
+
+
+def _satellite_bases(name: str) -> list[str]:
+    """Bases de classe possibles d'un nom d'annexe, de la plus courte à la plus longue.
+
+    Un schéma de classe est ``t_<classe>_<8 hex>`` ; ses annexes commencent
+    par ce nom suivi de ``_``. Le nom seul ne tranche pas toujours (un
+    suffixe peut avoir la forme d'une classe) : l'appelant garde l'annexe dès
+    qu'une base existante n'est pas prouvée morte.
+    """
+    return [name[:index] for index, char in enumerate(name)
+            if char == "_" and CLASS_SCHEMA_RE.match(name[:index])]
+
+
+def satellite_schemas(db, *,
+                      only: frozenset[str] | set[str] | None = None,
+                      ) -> list[str]:
+    """Annexes de classe de test dont la **propre** preuve est morte.
+
+    #7756 : `PgTestCase` ne supprime que son schéma ``t_<classe>_<hex>`` ; un
+    test qui crée ``<ce schéma>_<suffixe>`` (une vue lisible par PUBLIC, par
+    exemple) et meurt avant son ``finally`` laisse un résidu qui casse les
+    contrats de rôle suivants. Une annexe n'est retenue que si **elle-même**
+    porte une preuve de propriété (``claim_owner``), et que cette preuve est
+    **morte** : `create_schema` écrit la preuve dans la transaction qui crée
+    le schéma, donc elle est toujours présente, sauf pour un schéma créé hors
+    de ce chemin.
+
+    Une annexe sans preuve n'est **jamais** sélectionnée, même si sa base de
+    classe n'existe plus : l'absence d'une base déduite du nom ne prouve ni
+    la propriété ni la mort (#43420). Un schéma indépendant
+    ``t_foo_<8 hex>_import`` peut vivre sans base et sans marqueur ; il est
+    gardé, comme tout nom hors du motif d'annexe (#3735 B/P1 : seule la mort
+    prouvée autorise un DROP).
+    ``only`` borne la passe à ces noms (témoins : le banc est partagé).
+    """
+    schemas = _schema_comments(db)
+    out: list[str] = []
+    for name, comment in schemas.items():
+        if not SCHEMA_RE.match(name) or CLASS_SCHEMA_RE.match(name):
+            continue
+        if only is not None and name not in only:
+            continue
+        if not _satellite_bases(name):
+            continue
+        if comment is not None and owner_state(comment) == OWNER_DEAD:
+            out.append(name)
+    out.sort()
+    return out
+
+
 @dataclass(frozen=True)
 class Purge:
     """Résultat d'une passe : ce qui est parti, ce qui est gardé et pourquoi."""
@@ -658,6 +835,88 @@ def purge_orphans(db, *, min_age_s: float | None = None,
     freed = (max(0, before - after)
              if before is not None and after is not None else 0)
     return Purge(scanned=len(orphans), dropped=tuple(dropped), kept=tuple(kept),
+                 freed_bytes=freed)
+
+
+def purge_satellites(db, *, only: frozenset[str] | set[str] | None = None,
+                     dry_run: bool = False,
+                     budget_s: float = PURGE_BUDGET_S) -> Purge:
+    """Purge les annexes orphelines des schémas de classe de test (#7756).
+
+    Seule une annexe portant **sa propre** preuve de propriétaire morte est
+    candidate (`satellite_schemas`) : une base disparue ou un nom d'annexe ne
+    prouvent rien (#43420). Pas d'âge minimal : la preuve est la mort du
+    propriétaire, pas l'ancienneté — un résidu frais empoisonne la classe
+    suivante.
+
+    Mêmes gardes que `purge_orphans` : banc local seulement (la preuve est un
+    PID de l'hôte), aucune session ne nomme le schéma, verrou court. La
+    preuve est **relue** dans la transaction du DROP, sous `lock_annexes` :
+    une création concurrente, qui prend le même verrou, ne peut pas se glisser
+    entre la sélection et la suppression.
+    """
+    if not _local_dsn(getattr(getattr(db, "cfg", None), "dsn", "") or ""):
+        return Purge(scanned=0, dropped=(), kept=(),
+                     unreadable="bench is not local: owner proof is host-local")
+    try:
+        satellites = satellite_schemas(db, only=only)
+    except BenchError as exc:
+        return Purge(scanned=0, dropped=(), kept=(), unreadable=str(exc))
+    if not satellites:
+        # cas courant d'une suite saine : une seule lecture du catalogue, ni
+        # session, ni taille de base (la passe tourne à chaque classe).
+        return Purge(scanned=0, dropped=(), kept=(), dry_run=dry_run)
+    if dry_run:
+        return Purge(scanned=len(satellites), dropped=(),
+                     kept=tuple((name, "dry-run") for name in satellites),
+                     dry_run=True)
+    try:
+        used = _in_use(db)
+        own = _own_schema(db)
+        if own:
+            used.add(own)
+    except BenchError as exc:
+        return Purge(scanned=len(satellites), dropped=(), kept=(),
+                     unreadable=str(exc))
+    satellites = [name for name in satellites if name not in used]
+    before = _database_size(db)
+    started = time.monotonic()
+    dropped: list[str] = []
+    kept: list[tuple[str, str]] = []
+    for name in satellites:
+        if not SCHEMA_RE.match(name):  # defense in depth; never interpolate blindly
+            kept.append((name, "name refused"))
+            continue
+        if time.monotonic() - started > budget_s:
+            kept.append((name, "purge budget exceeded"))
+            continue
+        try:
+            with db.transaction() as tx:
+                tx.execute("SET LOCAL lock_timeout = '%dms'"
+                           % int(LOCK_TIMEOUT_S * 1000))
+                lock_annexes(tx)
+                # Relecture sous le verrou : la preuve peut avoir changé
+                # depuis la sélection (schéma recréé et marqué vivant).
+                fresh = _schema_comments(tx)
+                if name not in fresh:
+                    kept.append((name, "schema disappeared"))
+                    continue
+                comment = fresh.get(name)
+                if comment is None or owner_state(comment) != OWNER_DEAD:
+                    kept.append((name, "owner proof changed"))
+                    continue
+                if name in _in_use(tx):
+                    kept.append((name, "session holds the schema"))
+                    continue
+                tx.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % name)
+        except (db_mod.DbError, BenchError) as exc:
+            kept.append((name, _short_reason(exc)))
+            continue
+        dropped.append(name)
+    after = _database_size(db) if dropped else None
+    freed = (max(0, before - after)
+             if before is not None and after is not None else 0)
+    return Purge(scanned=len(satellites), dropped=tuple(dropped), kept=tuple(kept),
                  freed_bytes=freed)
 
 

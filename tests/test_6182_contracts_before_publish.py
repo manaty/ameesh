@@ -48,12 +48,15 @@ class PublicationTest(unittest.TestCase):
                     contract_result=run)
         self.assertEqual(flow.run(), 0)
         names = flow.names()
+        # #7740 : les contrats et les séries directes précèdent la poussée ;
+        # la ci-full la suit.
         for before, after in (('freeze-checks', 'contracts'), ('manifest', 'contracts'),
-                              ('contracts', 'push'), ('push', 'ci-full'), ('ci-full', 'tests')):
+                              ('contracts', 'tests'), ('tests', 'push'),
+                              ('push', 'ci-full')):
             self.assertLess(names.index(before), names.index(after))
         self.assertEqual(len(flow.calls('contracts')), 1)
 
-    def test_regressions_A_and_B_reach_existing_attribution_with_full_ci(self):
+    def test_regressions_A_and_B_reach_existing_attribution_before_push(self):
         for module, test in (('test_2449_garde_mecanique', 'test_the_guard_keys_are_the_reader_keys'),
                              ('test_l161f_plan', 'test_always_list_sorted_and_known')):
             with self.subTest(module=module):
@@ -67,9 +70,10 @@ class PublicationTest(unittest.TestCase):
                 with self.assertRaisesRegex(auto.PaquetAutoError, 'existing attribution attempted'):
                     flow.run()
                 names = flow.names()
-                for before, after in (('contracts', 'push'), ('push', 'ci-full'),
-                                      ('ci-full', 'tests')):
-                    self.assertLess(names.index(before), names.index(after))
+                # #7740 : un contrat rouge atteint l'attribution avant toute
+                # poussée ; aucune CI n'est consommée.
+                self.assertLess(names.index('contracts'), names.index('tests'))
+                self.assertEqual(flow.calls('push'), [])
                 self.assertEqual(len(flow.calls('contracts')), 1)
 
     def test_supplied_partial_red_report_still_removes_attributed_unit(self):
@@ -81,7 +85,13 @@ class PublicationTest(unittest.TestCase):
             'test': name, 'status': 'probable', 'units': [{
                 'lot': 6179, 'best': 6, 'evidence': [{
                     'kind': 'migration', 'file': 'src/ameesh/migrations/test.sql'}]}]}]}
-        with mock.patch.object(auto, 'verify_contract_scope'), \
+        # #7692 : la composition de ce témoin porte des SHA factices ; le rejeu
+        # de préfixe (#7239) ne peut pas y ouvrir de worktree. On injecte son
+        # résultat — rouge au préfixe de l'unité désignée — pour que le retrait
+        # #3801 soit confirmé, au lieu de le laisser non concluant.
+        prefix = ({6179: [{'test': name}]}, '', [])
+        with mock.patch.object(auto, 'prefix_failures', return_value=prefix), \
+                mock.patch.object(auto, 'verify_contract_scope'), \
                 mock.patch.object(auto, 'unit_test_modules', return_value=[]), \
                 mock.patch.object(auto, 'contract_modules', side_effect=AssertionError('duplicate plan')), \
                 mock.patch.object(auto, 'run_tests', side_effect=AssertionError('duplicate tests')):
@@ -90,7 +100,11 @@ class PublicationTest(unittest.TestCase):
                 select=lambda *_: ({}, ''), parallel=1,
                 contract_report=auto.ContractPass('a' * 40, 'b' * 40, run),
                 attribute=lambda *_: attribution, log=lambda *_: None)
-        self.assertEqual(runs, [run])
+        # #7740 : l'unité sans module direct est un non-concluant nommé ; le
+        # contrat, lui, reste le seul rouge.
+        self.assertEqual([run.label for run in runs], ['unité #6179', 'contrats'])
+        self.assertTrue(runs[0].inconclusive)
+        self.assertIs(runs[1], run)
         self.assertEqual(faulty, [6179])
         self.assertTrue(removals[0].attributed)
 

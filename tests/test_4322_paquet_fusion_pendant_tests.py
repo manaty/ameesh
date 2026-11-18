@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#4322 (panier #4304) — un paquet fusionné au vert pendant ses tests par unité.
+"""#4322 (panier #4304) — un paquet fusionné au vert après ses tests par unité.
 
-Depuis #4304, la ci-full part dès la poussée et arme la fusion automatique ; un
-porteur sans delta propre n'attend aucun verdict : la PR peut fusionner avant
-la fin des tests par unité (canon §11 bis, fusion dès le vert). paquet-auto ne
-recompose alors rien (les unités sont sur la cible), consigne le résultat au
-porteur, prévient le pilote d'un rouge et finit sur `MERGED_LINE` ;
-paquet-horaire ne publie pas (ni « verdict non requis » ni ci-full) sur cette
-ligne, ni sur un porteur déjà vu fusionné.
+Depuis #7740, la ci-full ne part qu'après les séries directes et la poussée :
+la PR ne peut plus fusionner *pendant* les tests. Lue fusionnée juste après la
+poussée, ses unités sont sur la cible : paquet-auto ne recompose alors rien,
+consigne le résultat au porteur et finit sur `MERGED_LINE` ; un rouge vu avant
+la poussée a déjà écarté son unité, donc le chemin fusionné ne rapporte que le
+vert restant, sans courrier « corriger en avant ou revert ». paquet-horaire ne
+publie pas (ni « verdict non requis » ni ci-full) sur cette ligne, ni sur un
+porteur déjà vu fusionné.
 """
 from __future__ import annotations
 
@@ -37,23 +38,31 @@ class FusionPendantLesTestsTest(unittest.TestCase):
             rc = flux.run()
         return rc, out.getvalue()
 
-    def test_rouge_apres_fusion_ne_recompose_rien_et_previent_le_pilote(self) -> None:
+    def test_rouge_avant_poussee_est_ecarte_et_la_fusion_dit_vert(self) -> None:
+        # #7740 : le rouge est vu avant la poussée, son unité est retirée de la
+        # composition ; seule la tête recomposée est poussée, puis fusionne au
+        # vert. Le pilote ne reçoit pas « corriger en avant ou revert » : le
+        # rouge n'a jamais atteint la cible.
         removal = paquet_auto.Removal(2, tests=["t"], attributed=True)
         red = paquet_auto.TestRun("unité #2", ["tests.test_x"], 1, "FAIL: t\n", 0.1)
-        flux = Flux(self, tests=[([red], [2], [removal])],
+        flux = Flux(self, tests=[([red], [2], [removal]), ([green()], [], [])],
                     compositions=[self.two, self.one], states=("MERGED",))
         rc, out = self.run_flux(flux)
         self.assertEqual(rc, 0)
+        # le rouge n'a rien poussé : une seule poussée, celle du vert recomposé
         self.assertEqual(len(flux.calls("push")), 1)
-        self.assertEqual(len(flux.calls("manifest")), 1)
+        self.assertEqual(len(flux.calls("recompose")), 1)
         self.assertEqual(flux.calls("withdraw"), [])
         note = next(call[1][2] for call in flux.calls("note")
                     if not call[1][2].startswith("paquet-auto: contrats "))
         self.assertIn("fusionnée au vert pendant les tests", note)
-        self.assertIn("rouges pour #2", note)
-        mails = flux.calls("mail")
-        self.assertEqual(len(mails), 1)
-        self.assertIn("corriger en avant ou revert", mails[0][1][2])
+        self.assertIn("tests par unité verts", note)
+        self.assertNotIn("rouges pour", note)
+        # le rouge est consigné au manifeste de la tête poussée, pas dans un
+        # courrier de rouge après fusion
+        self.assertIn("#2", flux.calls("pr")[0][1][4])
+        self.assertIn("tests ciblés rouges", flux.calls("pr")[0][1][4])
+        self.assertEqual(flux.calls("mail"), [])
         self.assertEqual(out.strip().splitlines()[-1].split(" : ")[0],
                          paquet_auto.MERGED_LINE)
 

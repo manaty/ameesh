@@ -100,11 +100,33 @@ finally:
 class BenchCataloguesTest(PgTestCase):
     """Le banc réel : âge, garde de session, purges, lecture et signaux."""
 
-    def _create(self, name: str) -> None:
+    def _create_schema(self, name: str) -> None:
         self.db.execute('CREATE SCHEMA "%s"' % name)
+        self.addCleanup(self._drop, name)
+
+    def _create(self, name: str) -> None:
+        self._create_schema(name)
         self.db.execute('CREATE TABLE "%s".x (id integer)' % name)
         self.db.execute('INSERT INTO "%s".x VALUES (1)' % name)
-        self.addCleanup(self._drop, name)
+
+    def _satellite(self, base: str, suffix: str = "_closed_extension",
+                   *, marked: bool = True) -> str:
+        """Le résidu du #7756 : une vue annexe lisible par PUBLIC.
+
+        `marked` : le schéma porte sa preuve de propriété (créé par
+        `create_schema`, le chemin des tests) ou non (schéma indépendant).
+        """
+        name = base + suffix
+        if marked:
+            self.create_schema(name)
+            self.addCleanup(self._drop, name)
+        else:
+            self._create_schema(name)
+        self.db.execute('CREATE VIEW "%s".extension_stats AS SELECT 1 AS calls'
+                        % name)
+        self.db.execute('GRANT SELECT ON "%s".extension_stats TO PUBLIC' % name)
+        self.db.execute('GRANT USAGE ON SCHEMA "%s" TO PUBLIC' % name)
+        return name
 
     def _drop(self, name: str) -> None:
         self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % name)
@@ -330,6 +352,125 @@ class BenchCataloguesTest(PgTestCase):
                                           only={name}, admit_unmarked=True)
         self.assertIn(name, dropped.dropped)
         self.assertFalse(self._exists(name))
+
+    def test_annex_with_a_dead_owner_is_purged(self) -> None:
+        """#7756/#43420 : la preuve propre de l'annexe, morte, suffit.
+
+        Une classe tuée laisse la preuve de son annexe (écrite par
+        `create_schema`) avec un PID mort ; la classe suivante la retire même
+        sans base et sans âge minimal.
+        """
+        base = _name("deadannex")
+        self._create(base)  # base sans preuve : elle ne sert pas de preuve
+        satellite = self._satellite(base)
+        bench_mod.claim_owner(self.db, satellite, pid=_dead_pid(), start=0)
+        self.assertEqual(bench_mod.satellite_schemas(
+            self.db, only={satellite}), [satellite])
+        result = bench_mod.purge_satellites(self.db, only={satellite})
+        self.assertIn(satellite, result.dropped)
+        self.assertFalse(self._exists(satellite))
+        self.assertTrue(self._exists(base))
+
+    def test_annex_with_a_live_owner_is_kept(self) -> None:
+        """Une preuve vivante garde l'annexe : jamais de DROP sur un doute."""
+        base = _name("liveannex")
+        self._create(base)
+        satellite = self._satellite(base)  # preuve du processus vivant
+        self.assertNotIn(satellite, bench_mod.satellite_schemas(
+            self.db, only={satellite}))
+        result = bench_mod.purge_satellites(self.db, only={satellite})
+        self.assertNotIn(satellite, result.dropped)
+        self.assertTrue(self._exists(satellite))
+
+    def test_marked_annex_stays_while_its_base_is_dead(self) -> None:
+        """La preuve de la base ne décide pas de l'annexe (#43420)."""
+        base = _name("deadbaseliveannex")
+        self._create(base)
+        satellite = self._satellite(base)  # preuve vivante
+        bench_mod.claim_owner(self.db, base, pid=_dead_pid(), start=0)
+        self.assertNotIn(satellite, bench_mod.satellite_schemas(
+            self.db, only={satellite}))
+        result = bench_mod.purge_satellites(self.db, only={satellite})
+        self.assertNotIn(satellite, result.dropped)
+        self.assertTrue(self._exists(satellite))
+
+    def test_unmarked_annex_with_a_dead_base_is_kept(self) -> None:
+        """#43420 : une base morte ne prouve pas la propriété de l'annexe.
+
+        Un schéma indépendant `t_foo_<8 hex>_import`, sans preuve, n'est pas
+        sélectionné, que sa base homonyme existe morte ou qu'elle manque.
+        """
+        base = _name("deadbase")
+        self._create(base)
+        satellite = self._satellite(base, marked=False)
+        bench_mod.claim_owner(self.db, base, pid=_dead_pid(), start=0)
+        self.assertNotIn(satellite, bench_mod.satellite_schemas(
+            self.db, only={satellite}))
+        result = bench_mod.purge_satellites(self.db, only={satellite})
+        self.assertNotIn(satellite, result.dropped)
+        self.assertTrue(self._exists(satellite))
+
+    def test_unmarked_annex_without_its_class_is_kept(self) -> None:
+        """Base disparue : sans preuve propre, le doute garde le schéma."""
+        base = _name("gonebase")
+        satellite = self._satellite(base, marked=False)  # pas de base
+        self.assertNotIn(satellite, bench_mod.satellite_schemas(
+            self.db, only={satellite}))
+        result = bench_mod.purge_satellites(self.db, only={satellite})
+        self.assertNotIn(satellite, result.dropped)
+        self.assertTrue(self._exists(satellite))
+
+    def test_marked_annex_without_its_class_is_purged(self) -> None:
+        """La preuve propre de l'annexe survit à la disparition de sa base."""
+        base = _name("gonebase2")
+        satellite = self._satellite(base)  # la base n'existe pas
+        bench_mod.claim_owner(self.db, satellite, pid=_dead_pid(), start=0)
+        self.assertIn(satellite, bench_mod.satellite_schemas(
+            self.db, only={satellite}))
+        result = bench_mod.purge_satellites(self.db, only={satellite})
+        self.assertIn(satellite, result.dropped)
+        self.assertFalse(self._exists(satellite))
+
+    def test_names_outside_a_class_schema_are_kept(self) -> None:
+        """Un nom sans base de classe n'est pas une annexe : aucun DROP."""
+        unknown = "t_unknown_%s" % uuid.uuid4().hex[:6]
+        self._create(unknown)
+        self.assertEqual(bench_mod._satellite_bases(unknown), [])
+        self.assertNotIn(unknown, bench_mod.satellite_schemas(
+            self.db, only={unknown}))
+        result = bench_mod.purge_satellites(self.db, only={unknown})
+        self.assertNotIn(unknown, result.dropped)
+        self.assertTrue(self._exists(unknown))
+
+    def test_next_class_purges_a_killed_class_satellite(self) -> None:
+        """Le témoin du lot : la classe suivante purge le résidu, puis la sienne.
+
+        Une classe tuée juste après le GRANT laisse `<base>_closed_extension`
+        lisible par PUBLIC, avec sa preuve de propriété. La classe suivante
+        doit la retirer à son `setUpClass` (sinon les contrats de rôle de toute
+        la base échouent), et son propre cleanup de classe doit retirer
+        l'annexe qu'elle laisse.
+        """
+        base = _name("witnessdead")
+        self._create(base)
+        satellite = self._satellite(base)
+        bench_mod.claim_owner(self.db, satellite, pid=_dead_pid(), start=0)
+        bench_mod.claim_owner(self.db, base, pid=_dead_pid(), start=0)
+        created: dict[str, str] = {}
+
+        class Witness(PgTestCase):
+            def test_creates_a_leftover(self) -> None:
+                created["schema"] = self.schema
+                self.db.execute('CREATE SCHEMA "%s"' % (self.schema + "_leftover"))
+
+        result = unittest.TestResult()
+        unittest.TestSuite([Witness("test_creates_a_leftover")]).run(result)
+        self.assertTrue(result.wasSuccessful(),
+                        "classe témoin : %r" % ((result.errors, result.failures),))
+        self.assertFalse(self._exists(satellite),
+                         "la classe suivante n'a pas purgé le résidu #7756")
+        self.assertFalse(self._exists(created["schema"] + "_leftover"),
+                         "le cleanup de classe n'a pas retiré l'annexe")
 
     def _client_connections(self) -> int:
         """Connexions TCP de CE processus vers la base (#3832).

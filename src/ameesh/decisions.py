@@ -131,11 +131,73 @@ LEASE_ENV = ("AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH")
 
 _TIME_RE = re.compile(r"^\s*(\d{1,2})[:h](\d{2})\s*$")
 
-#: L233: a decision written in prose in mail to the owner's desk or to a
+#: L233: a decision written in prose in mail to the owner's avatar or to a
 #: human never counts; `ameesh decisions` (and so `ameesh chat`) shows such
 #: mail and offers to convert it (`ameesh decide ask --from-mail <id>`).
-#: Recipients watched besides any `human:*`:
-PROSE_RECIPIENTS = ("bureau",)
+#: The recipients watched besides any `human:*` are the avatars declared at
+#: the canon (#7634): the core knows no avatar name.
+PROSE_RECIPIENTS = ()
+
+
+def prose_recipients(db=None) -> tuple:
+    """Les avatars des canons configurés, destinataires d'une prose L233.
+
+    À défaut d'avatar déclaré, la route humaine d'avant reste l'agent
+    `externe` du registre (une session que l'humain lit lui-même), **un
+    seul**, le premier dans l'ordre stable du registre : un humain sans
+    avatar garde le comportement actuel (#7634, point 4), un desk unique et
+    non une copie à chaque session externe. Un canon ou un registre illisible
+    ne devine aucun nom : la lecture humaine (`human:*`) reste couverte par
+    la requête."""
+    from . import avatars, config as config_mod
+    names = []
+    try:
+        names += list(avatars.configured(config_mod.load()).values())
+    except Exception:  # noqa: BLE001 — sans canon, la route humaine suffit
+        pass
+    if db is not None and not names:
+        try:
+            names += sorted(str(row["name"])
+                            for row in storage.of(db).operations.listing()
+                            if row.get("name") and row.get("mode") == "externe")[:1]
+        except Exception:  # noqa: BLE001 — registre illisible : aucun nom deviné
+            pass
+    return tuple(dict.fromkeys(names))
+
+
+def prose_route(human, db=None, cfg=None) -> tuple:
+    """Les destinataires de prose que ``human`` peut voir (#7634, cx1 B1).
+
+    Son propre courrier, l'owner, son avatar au canon, puis la route
+    explicitement configurée pour lui : le `report` d'un projet de release
+    dont le registre le dit `responsible`, ou à défaut un agent `externe` qui
+    lui est rattaché. Jamais l'avatar ou la session externe d'un autre humain :
+    un mode `externe` seul ne fait pas une autorité."""
+    from . import avatars, config as config_mod
+    allowed = [human, OWNER_ANY]
+    if cfg is None:
+        try:
+            cfg = config_mod.load()
+        except Exception:  # noqa: BLE001 — sans configuration, son courrier seul
+            cfg = None
+    rows = []
+    if db is not None:
+        try:
+            rows = list(storage.of(db).operations.listing())
+        except Exception:  # noqa: BLE001 — registre illisible : rien de deviné
+            rows = []
+    name = avatars.name_for(cfg, human) if cfg is not None and human else None
+    if name:
+        allowed.append(name)
+    elif cfg is not None:
+        allowed += avatars.configured_desks(cfg, human, rows)
+        if len(allowed) == 2:
+            allowed += [str(row["name"]) for row in rows
+                        if row.get("name") and row.get("mode") == "externe"
+                        and row.get("responsible") == str(human)]
+    return tuple(dict.fromkeys(n for n in allowed if n))
+
+
 #: how far back mail is read (seconds)
 PROSE_WINDOW_S = 24 * 3600.0
 #: at most this many candidate mails, the most recent
@@ -750,6 +812,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         repair_plan = clean_plan
 
     def body(db):
+        signature_required = needs_signature
         requester_row = registry.get(db, requester)
         if parent_lot is not None and new_lot is None:
             raise DecisionError("--parent-lot goes with --new-lot")
@@ -796,6 +859,12 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                                     "reference, or --new-lot \"title\"" % lot)
         owner, source = resolve_owner(cfg, db, requester_row, item)
         project = _project(db, item, requester_row)
+        from . import prod_go
+        try:
+            if prod_go.validate_request(cfg, question, opts, project, now=now):
+                signature_required = True
+        except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError) as exc:
+            raise DecisionError(str(exc)) from exc
         try:
             route = validations.routing(cfg, project, domain, owner or OWNER_ANY)
         except (ValueError, KeyError) as exc:
@@ -821,7 +890,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         decision = {
             "v": 1, "state": "pending", "question": question, "options": opts,
             "recommend": recommend, "why": why, "urgent": bool(urgent),
-            "due_ts": round(due, 3), "needs_signature": bool(needs_signature),
+            "due_ts": round(due, 3), "needs_signature": bool(signature_required),
             "validation": validation,
             "owner_source": source, "project": _project(db, item, requester_row),
             "lot": lot_id, "lot_title": item.get("title") or "", "previous_state": previous,
@@ -853,7 +922,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                        lot=lot_id, mailbox_ids=[decision_id],
                        meta={"kind": KIND, "decision": decision_id,
                              "urgent": True if urgent else None,
-                             "signature": "exigée" if needs_signature else None})
+                             "signature": "exigée" if signature_required else None})
             state = _hold_lot(tx, item, actor=requester,
                               note="decision #%d requested from %s: %s" % (
                                   decision_id, _owner_label(owner),
@@ -900,15 +969,17 @@ def prose_cues(text: str) -> list[str]:
 
 
 def prose_decisions(db, now: float | None = None, *, since_s: float = PROSE_WINDOW_S,
-                    recipients=PROSE_RECIPIENTS, limit: int = PROSE_LIMIT) -> list[dict]:
-    """Mail of the last `since_s` seconds in which an agent wrote to bureau
-    (`recipients`) or to a human something that reads as a decision expected
-    from the owner, and that no request names as its source. Oldest first:
+                    recipients=None, limit: int = PROSE_LIMIT) -> list[dict]:
+    """Mail of the last `since_s` seconds in which an agent wrote to an avatar
+    (`recipients`, the canon's avatars by default) or to a human something
+    that reads as a decision expected from the owner, and that no request
+    names as its source. Oldest first:
     `{id, sender, recipient, lot, created_ts, age_s, cues, excerpt, convert}`
     — `convert`, the command its author runs to file it as a request."""
     now = time.time() if now is None else float(now)
     rows = storage.of(db).decisions.prose_candidates(
-        recipients=list(recipients), since_ts=now - float(since_s), limit=int(limit))
+        recipients=list(prose_recipients(db) if recipients is None else recipients),
+        since_ts=now - float(since_s), limit=int(limit))
     out = []
     for row in rows:
         cues = prose_cues(row.get("body") or "")
@@ -944,12 +1015,16 @@ def format_prose(row: dict, now: float | None = None) -> list[str]:
 
 #: Les deux mentions que `signer-owner.sh` (manaty/home, #3443) ajoute à
 #: l'option d'une signature au nom de l'owner, décision #135142 b : la première
-#: sans source, la seconde avec la session d'origine. Elles sont figées dans le
-#: script : `match_option` ne reconnaît qu'elles, jamais un autre texte (#3454).
-BUREAU_MENTIONS = (
-    "— saisi par le bureau, délégation §10",
-    "— réponse de l'owner relayée par le bureau, source ",
-)
+#: sans source, la seconde avec la session d'origine. Le nom qui les porte est
+#: celui de l'avatar, lu au canon (#7634) : le cœur ne fige plus un nom, et
+#: `match_option` reconnaît la forme signée, jamais un autre texte (#3454).
+AVATAR_SAISI_RE = re.compile(
+    r"—\s*saisi par (?P<name>(?:le\s+|la\s+|l')?[A-Za-z0-9][A-Za-z0-9._@-]{0,127}),"
+    r"\s*délégation\s+§\s*10")
+AVATAR_RELAY_RE = re.compile(
+    r"—\s*réponse de l'owner relayée par "
+    r"(?P<name>(?:le\s+|la\s+|l')?[A-Za-z0-9][A-Za-z0-9._@-]{0,127}),"
+    r"\s*source\s+(?P<source>.*)")
 
 #: Le contrat de `--source` de `signer-owner.sh` : la session relayée est un mot
 #: de [A-Za-z0-9._:@-], sans tiret initial, 200 caractères au plus. Une mention
@@ -978,10 +1053,10 @@ def match_option(view: dict, text: str) -> str | None:
         if wanted[:len(head)].lower() != head.lower():
             continue
         mention = wanted[len(head):]
-        if mention == BUREAU_MENTIONS[0]:
+        if AVATAR_SAISI_RE.fullmatch(mention):
             return option["key"]
-        relay = BUREAU_MENTIONS[1]
-        if mention.startswith(relay) and RELAY_SOURCE_RE.fullmatch(mention[len(relay):]):
+        relay = AVATAR_RELAY_RE.fullmatch(mention)
+        if relay and RELAY_SOURCE_RE.fullmatch(relay.group("source")):
             return option["key"]
     return None
 
@@ -993,13 +1068,12 @@ def _option_label(view: dict, key: str | None) -> str | None:
     return None
 
 
-def answer_digest(view: dict, text: str, option: str | None, human: str,
-                  signer: dict | None = None) -> str:
+def answer_document(view: dict, text: str, option: str | None, human: str,
+                    signer: dict | None = None) -> dict:
     """L'empreinte que signe une réponse (sha256 hex) : la demande (numéro,
     demandeur, lot, question, options, heure), le plan de réparation (clé et
     empreinte de contenu) quand il y en a un, la réponse exacte, son auteur —
     et (#7631) qui a tenu la clé, `signer`, quand la réponse le dit."""
-    from . import authority
     document = {
         "v": 1, "kind": "ameesh-decision-answer", "decision": int(view["id"]),
         "request": {"requester": view.get("requester"), "lot": view.get("lot"),
@@ -1023,8 +1097,15 @@ def answer_digest(view: dict, text: str, option: str | None, human: str,
     # accord) ; une réponse de l'owner, ou d'avant, garde son document
     if signer and signer.get("by") == SIGNED_BY_AVATAR:
         document["signer"] = signer
-    return authority.hash_artifact(json.dumps(document, sort_keys=True, separators=(",", ":"),
-                                              ensure_ascii=False))
+    return document
+
+
+def answer_digest(view: dict, text: str, option: str | None, human: str,
+                  signer: dict | None = None) -> str:
+    from . import authority
+    return authority.hash_artifact(json.dumps(
+        answer_document(view, text, option, human, signer),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
 
 #: #7631 : qui a tenu la clé owner pour une réponse signée
@@ -1184,6 +1265,9 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
     from . import authority, signing
     digest = answer_digest(view, text, option, human, signer)
     signer = signer or {"by": SIGNED_BY_OWNER}
+    from . import prod_go
+    production = prod_go.parse(view.get("question"), view.get("options") or ())
+    ttl = max(SIGN_TTL_S, production["until"] - time.time() + 1) if production else SIGN_TTL_S
     if key_path:
         try:
             seed = signing.read_private(os.path.expanduser(key_path))
@@ -1192,7 +1276,7 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
         try:
             authority.create_approval(
                 db, seed, approver=_approver_of(human, approver), action=APPROVAL_ACTION,
-                artifact_kind=APPROVAL_KIND, artifact_hash=digest, ttl=SIGN_TTL_S,
+                artifact_kind=APPROVAL_KIND, artifact_hash=digest, ttl=ttl,
                 meta=dict({"decision": int(view["id"]), "by": human,
                            "signed_by": signer["by"]},
                           **({"agent": signer["agent"], "accord": signer["accord"]}
@@ -1204,6 +1288,10 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
     if row is None or not verdict.ok:
         raise DecisionError("signed answer rejected: %s\n%s" % (
             verdict.reason, signature_hint(view, text, option, human)))
+    if production:
+        signed = json.loads(row["signed_payload"].split("|", 2)[2])
+        if type(signed.get("expires")) is not int or production["until"] * 1e6 > signed["expires"]:
+            raise DecisionError("production until exceeds signed approval expiry")
     return {"approval_id": int(row["id"]), "approver": row.get("approver"),
             "signature_key": row.get("signature_key"), "digest": digest,
             "signed_by": signer["by"]}
@@ -1488,6 +1576,13 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     if reason:
         raise DecisionError("unreadable answer — %s" % reason)
     option = match_option(view, text)
+    from . import prod_go
+    try:
+        if prod_go.validate_request(cfg, view["question"], view["options"], view["project"], now=now):
+            if not (key_path or signed):
+                raise DecisionError("prod-go/1 requires the owner's signed answer")
+    except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError) as exc:
+        raise DecisionError(str(exc)) from exc
     if view["state"] != "pending":
         if validations.can_answer(db, decision_id, human):
             followup = validations.late_response(cfg, db, view, human=human,
@@ -1597,6 +1692,11 @@ def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | No
     view = get(db, decision_id, now)
     if view is None:
         raise DecisionError("decision #%s not found" % decision_id)
+    from . import prod_go
+    try:
+        prod_go.require_unlocked(view, now=now)
+    except prod_go.ProdGoError as exc:
+        raise DecisionError(str(exc)) from exc
     if view["state"] != "pending":
         raise DecisionError(_closed_reason(view))
     if view["requester"] != requester:
@@ -1809,7 +1909,8 @@ USAGE = ("usage: ameesh decide ask (--lot <id|ref> | --new-lot \"title\") --ques
          "        ameesh decide reclassify <id> key-provenance\n"
          "        ameesh decide withdraw <id> [--why \"…\"] [--json]\n"
          "        ameesh decide repair-forward <id> [--json]\n"
-         "        ameesh decide show <id> [--json]")
+         "        ameesh decide show <id> [--json]\n"
+         "        ameesh decide export <id> [--json]")
 
 
 def _decision_id(text) -> int | None:
@@ -2045,6 +2146,23 @@ def cmd_repair_forward(cfg: Config, argv: list[str]) -> int:
     return 0
 
 
+def cmd_export(cfg: Config, argv: list[str]) -> int:
+    from . import prod_go
+    parser = _parser("ameesh decide export")
+    parser.add_argument("id", type=int)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    db = _open(cfg)
+    try:
+        result = prod_go.export_proof(cfg, db, args.id)
+    except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError) as exc:
+        raise DecisionError(str(exc)) from exc
+    finally:
+        db.close()
+    _dump(result)
+    return 0
+
+
 def cmd_show(cfg: Config, argv: list[str]) -> int:
     parser = _parser("ameesh decide show")
     parser.add_argument("id")
@@ -2121,6 +2239,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_withdraw(cfg, rest)
         if command == "repair-forward":
             return cmd_repair_forward(cfg, rest)
+        if command == "export":
+            return cmd_export(cfg, rest)
         if command == "show":
             return cmd_show(cfg, rest)
         if command == "reclassify":

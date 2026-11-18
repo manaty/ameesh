@@ -151,6 +151,44 @@ roles: [reviewer, domain-expert] # held roles (0033 §8 foundation and canon rol
 A `harness` outside `harnesses` produces a warning (`agent-harness-outside-list`);
 a listed harness without a descriptor is an error (`agent-harness-unknown`).
 
+**Avatar tool policy** (spec avatars §3.5, #7630). An avatar's `tools`
+list applies to its own harness on every host, including resident sessions and
+local or remote attach. `mcp:<server>` selects an MCP server from the host's
+project `.mcp.json`; other servers are excluded. `tools: []` disables all tools
+and all MCP servers. Optional `deny_tools` contains harness-native deny rules:
+
+```yaml
+avatar:
+  conversation: portable
+tools: [Read, mcp:transport-readonly]
+deny_tools: ["Bash(curl *)"]
+```
+
+The harness descriptor must apply both the tool allow-list and strict MCP
+configuration, including empty lists. A declared deny rule requires the
+corresponding descriptor support. A harness without these mechanisms refuses
+the session; the packaged Claude descriptor supplies them. At each launch,
+`agent.tools` records the card reference, allowed tool and MCP names, deny
+rules and configuration digest, without MCP credentials. A changed policy
+restarts the resident before its next turn. Attach rereads the card after
+waiting for the resident to release the session.
+
+The mesh's `federation.yaml` can require an explicit avatar list:
+
+```yaml
+extensions:
+  ameesh:
+    action_gate:
+      mode: enforce                 # journal | enforce; omitted: journal
+```
+
+In `enforce` mode, `canon check` and session preparation refuse an avatar
+without `tools`. In `journal` mode an omitted list keeps historical behavior;
+a declared list is still applied. Invalid lists and unknown modes are refused.
+This setting declares the requirement for tools; the actions gate implements
+action authorization separately. Clone allow-lists retain their existing
+parent-subset checks.
+
 **`type: Host`**
 
 ```yaml
@@ -162,6 +200,9 @@ admins: [human:alice]            # administrateurs : règle de visibilité (L31)
 occupants: [human:anna]          # accès physique sans administrer (L110) ; absent = aucun
 indisponible_jusqu_au: 2026-10-30 # appareil indisponible, jour inclus (#3070, canon §12)
 indisponible_motif: "en déplacement"
+staging:                         # #7662 : séquence staging du mesh (canon §14)
+  order: 50                      # rang croissant ; le poste vient en dernier
+  kind: workstation              # agents (VM toujours requise) | server | workstation
 policy:
   harnesses: [claude, codex, deepseek]   # absent = tous
   providers: [anthropic, openai, deepseek]
@@ -190,6 +231,21 @@ physique sans agent (Mac, PC de recette) a sa fiche `hotes/` avec
 (`host-unavailable-invalid`) qui ne déclare rien ; un motif sans date, un
 avertissement ; une date passée, une information (`host-unavailable-past`) :
 la règle a cessé d'elle-même.
+
+**Séquence staging** (#7662, canon §14) : les fiches `Host` du **canon par
+défaut** (celui du mesh, L42 — un autre canon configuré n'ajoute pas d'hôte)
+sont la seule source de la séquence de déploiement staging. `staging.order`
+(entier positif ou nul) donne le rang croissant ; `staging.kind` vaut `agents`
+(VM d'agents, toujours requise), `server` (serveur sans exécutant, reportable)
+ou `workstation` (poste, mis à jour à son retour, reportable, **toujours en
+dernier**). Une fiche sans
+bloc `staging` n'est pas un hôte de staging : un canon nu ne déclare aucune
+séquence, et le cœur ne connaît aucun nom d'hôte. `canon check` refuse une
+séquence sans VM `agents` (`host-staging-no-agents`), deux `server` ou deux
+`workstation` (`host-staging-duplicate`) et un poste placé avant une autre fiche
+(`host-staging-order`) ; `staging` mal formé ou `kind` inconnu est une erreur
+`host-staging-invalid`, une clé inconnue un avertissement
+(`host-staging-unknown`).
 
 **Dossier de travail d'un agent sur l'hôte** (L31, 0029 ; L35) : c'est un
 réglage de l'hôte, jamais de la persona. Ordre de résolution, le premier qui
@@ -674,7 +730,9 @@ des nonces consommés (existant, `mesh_consumed_nonces`).
 ## 8.3 Approbations permanentes bornées (R8)
 
 Un reçu dont `request` porte `standing = {connector, operations, class,
-max_amount, currency, until}` au lieu d'un `action_id` crée un **grant**. Son
+max_amount, currency, until}` — et, depuis #7629, les champs facultatifs
+`beneficiary`, `targets`, `charter_line`, `charter_version` — au lieu d'un
+`action_id` crée un **grant**. Son
 nonce est consommé **une fois, à l'enregistrement du grant**. Ensuite, chaque
 tentative couverte ne consomme pas de nonce : elle **réserve atomiquement** son
 montant sur le plafond cumulé (`cumul + montant <= max_amount`, `until` non
@@ -682,6 +740,24 @@ dépassé, grant non révoqué) et la réservation est liée à l'`action_id` de
 tentative. Une réservation n'est libérée que sur un échec **certain**
 (`failed`), jamais sur `unknown`. Révocable par une entrée du canon ou
 `ameesh standing revoke` (qui exige elle-même un reçu).
+
+**Portée (#7629).** Un grant nomme son bénéficiaire : `agent:<nom>`, ou
+`avatar` (l'avatar de l'approbateur et ses clones, c'est-à-dire les éphémères
+dont la lignée `created_by` atteint cet agent ; une arête par un agent
+permanent rompt la lignée) ; sans bénéficiaire, il ne vaut
+que si le canon l'autorise explicitement. Il peut borner sa cible : `targets`
+est une liste de motifs (dépôt, branche, canal) où seuls `*` et `?` ont un
+sens ; une action hors cible n'est pas couverte. Le canon porte le plafond
+d'organisation (`federation.yaml`, bloc `extensions.ameesh.standing_approvals`,
+le schéma OKF n'admettant aucune clé libre à la racine) : par connecteur
+et opération, qui peut déléguer, jusqu'à quelle durée et quel montant, si un
+bénéficiaire peut manquer, si la charte et les cibles sont obligatoires. Un
+grant hors plafond est refusé à l'enregistrement (`policy`). Le grant garde la
+ligne et la version de charte ; l'action couverte recopie cette version dans
+`policy_version` et son empreinte est recalculée dans la même écriture.
+`ameesh action show` et le fil citent le grant, le bénéficiaire et la charte ;
+`ameesh action recap --avatar N --since 7d` range les actions de l'avatar par
+issue de la charte (fait seul, soumis, refusé).
 
 # 9. ameesh-approve (C8)
 

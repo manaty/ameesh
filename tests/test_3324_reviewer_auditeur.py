@@ -49,6 +49,9 @@ class ReviewerAuditorTest(PgTestCase):
 
     def test_l_auditeur_designe_puis_retire(self):
         self.register("auditeur", "claude", cwd=self.tmp)
+        # #7661 : le rôle se lit sur la fiche projetée au registre, pas sur le nom.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur'] "
+                        "WHERE name = 'auditeur'")
         lot = self._lot()
         self._qa(lot)
 
@@ -70,6 +73,9 @@ class ReviewerAuditorTest(PgTestCase):
         """La fiche autorise l'auditeur ; sa session n'a pas à déclarer un
         orchestrateur en plus (`--actor` absent)."""
         self.register("auditeur", "claude", cwd=self.tmp)
+        # #7661 : le rôle se lit sur la fiche projetée au registre, pas sur le nom.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur'] "
+                        "WHERE name = 'auditeur'")
         lot = self._lot()
         self._qa(lot)
 
@@ -96,6 +102,9 @@ class ReviewerAuditorTest(PgTestCase):
 
     def test_le_plancher_d_avis_reste_au_pilote(self):
         self.register("auditeur", "claude", cwd=self.tmp)
+        # #7661 : le rôle se lit sur la fiche projetée au registre, pas sur le nom.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur'] "
+                        "WHERE name = 'auditeur'")
         lot = self._lot()
         self._qa(lot)
 
@@ -111,6 +120,9 @@ class ReviewerAuditorTest(PgTestCase):
         """Même geste à l'entrée en `qa` (`work move … --reviewer`) : deux
         commandes, une seule autorité."""
         self.register("auditeur", "claude", cwd=self.tmp)
+        # #7661 : le rôle se lit sur la fiche projetée au registre, pas sur le nom.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur'] "
+                        "WHERE name = 'auditeur'")
         lot = self._lot()
         proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)

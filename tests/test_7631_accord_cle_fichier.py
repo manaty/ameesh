@@ -15,7 +15,7 @@ from ameesh import actions, receipts, storage
 from ameesh.actions import ActionError
 from ameesh.connectors.shell_noop import ShellNoopConnector
 
-from .support import PgTestCase, apply_authenticators
+from .support import PgTestCase, apply_authenticators, standing_limits
 from .webauthn_soft import ORIGIN, RP_ID, SoftEd25519, SoftWebAuthn, make_request
 
 ALICE = "human:alice"
@@ -205,10 +205,18 @@ class GrantTest(AccordBase):
     """Point 3 : un « go » permanent devient un grant borné, signé par clé
     fichier sous accord, avec le cadre de charte qu'il inscrit."""
 
+    #: #7629 : le plafond du canon s'applique aussi à un grant de #7631 ;
+    #: le reçu porte les deux formes de charte (cadre {frame, version} de
+    #: #7631, ligne/version du canon de #7629).
+    LIMITS = standing_limits(connectors=("journal",), operations=("decision-sign",),
+                             require_charter=True)
+
     def standing(self, **extra) -> dict:
         return dict({"connector": "journal", "operations": ["decision-sign"],
                      "class": "irreversible", "max_amount": 0, "currency": None,
-                     "until": int(time.time()) + 7 * 86400}, **extra)
+                     "until": int(time.time()) + 7 * 86400,
+                     "charter_line": "L12 : signer les décisions",
+                     "charter_version": "v3"}, **extra)
 
     def test_cadre_de_charte_signe_et_borne(self):
         request = make_request(ALICE, standing=self.standing(
@@ -225,14 +233,16 @@ class GrantTest(AccordBase):
         accord = self.go()
         receipt = self.receipt(accord, standing=self.standing(
             charter={"frame": "sign-decisions", "version": "1"}))
-        verdict, grant_id = receipts.register_standing(self.db, receipt, POLICY,
-                                                       registered_by="bureau")
+        verdict, grant_id = receipts.register_standing(
+            self.db, receipt, POLICY, registered_by="bureau", limits=self.LIMITS)
         self.assertTrue(verdict.ok, verdict.reason)
         rows = receipts.list_standing(self.db)
         self.assertEqual([r["id"] for r in rows], [grant_id])
         row = rows[0]
         self.assertEqual(row["operations"], ["decision-sign"])
         self.assertEqual(row["charter"], {"frame": "sign-decisions", "version": "1"})
+        self.assertEqual((row["charter_line"], row["charter_version"]),
+                         ("L12 : signer les décisions", "v3"))
         self.assertEqual(row["accord"], accord)
         self.assertEqual(row["facade"], "ed25519")
         receipts.revoke_standing(self.db, grant_id, by="human:alice")
@@ -241,10 +251,21 @@ class GrantTest(AccordBase):
 
     def test_grant_hors_operations_nommees_refuse(self):
         receipt = self.receipt(self.go(), standing=self.standing(operations=["spend"]))
-        verdict, grant_id = receipts.register_standing(self.db, receipt, POLICY,
-                                                       registered_by="bureau")
+        verdict, grant_id = receipts.register_standing(
+            self.db, receipt, POLICY, registered_by="bureau", limits=self.LIMITS)
         self.assertIsNone(grant_id)
         self.assertEqual(verdict.code, receipts.ACCORD_OPERATION, verdict.reason)
+
+    def test_grant_sans_charte_du_canon_refuse(self):
+        """#7629 : le plafond du canon exige la ligne et la version de charte ;
+        le cadre `{frame, version}` de #7631 ne les remplace pas."""
+        receipt = self.receipt(self.go(), standing=self.standing(
+            charter_line=None, charter_version=None))
+        verdict, grant_id = receipts.register_standing(
+            self.db, receipt, POLICY, registered_by="bureau", limits=self.LIMITS)
+        self.assertIsNone(grant_id)
+        self.assertEqual(verdict.code, receipts.POLICY, verdict.reason)
+        self.assertIn("charter", verdict.reason)
 
 
 class JournalTest(AccordBase):

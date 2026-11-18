@@ -7,9 +7,19 @@ qui n'en était pas un.
 """
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
+
 from ameesh import work
 
 from .support import PgTestCase
+
+
+def _write(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
 
 
 class MoveLotOfAnotherTest(PgTestCase):
@@ -17,11 +27,33 @@ class MoveLotOfAnotherTest(PgTestCase):
         super().setUp()
         for name in ("porteur", "tiers", "relecteur", "pilote", "auditeur", "bureau"):
             self.assertEqual(self.register(name, "codex").returncode, 0)
+        # #7661 : le titre `auditeur` ne suffit pas, la fiche déclare le rôle.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                        " WHERE name = 'auditeur'")
         self.lot = work.add(self.db, title="lot du porteur", assignee="porteur")["id"]
+        # #7634 : « bureau » ne tire plus aucun droit de son nom. Sa fiche
+        # d'avatar au canon (#7647) le fait route humaine de l'owner ; c'est
+        # cette fiche que le déplacement lit désormais.
+        self.canon = tempfile.mkdtemp(prefix="canon-5035-")
+        self.addCleanup(shutil.rmtree, self.canon, True)
+        _write(os.path.join(self.canon, "membres", "smichea.md"),
+               "---\ntype: Member\ntitle: smichea\n---\n")
+        _write(os.path.join(self.canon, "agents", "bureau.md"),
+               "---\ntype: Agent\ntitle: bureau\n"
+               "responsible: human:smichea\n"
+               "avatar:\n  conversation: portable\n---\n")
+        # #7661 : le canon chargé fait foi ; l'auditeur y déclare son rôle,
+        # comme sur le canon réel (le titre seul ne donne plus le droit).
+        _write(os.path.join(self.canon, "agents", "auditeur.md"),
+               "---\ntype: Agent\ntitle: auditeur\n"
+               "responsible: human:smichea\nroles: [auditeur]\n---\n")
 
     def _env(self, name=None, **extra):
         env = self.env(**extra)
         env.pop("AGENT_MAIL_NAME", None)
+        # le canon du test tient la fiche d'avatar du bureau (#7634)
+        env["AMEESH_CANON"] = self.canon
+        env["AMEESH_CANON_UNTRUSTED"] = "1"
         if name:
             env["AGENT_MAIL_NAME"] = name
         return env
@@ -92,6 +124,9 @@ class MoveLotOfAnotherTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_pilote_bureau_auditeur_passent(self):
+        # #7634 : le bureau passe par sa fiche d'avatar au canon, pas par son
+        # nom — sans cette fiche, le nom seul ne lui donne plus le droit de
+        # déplacer un lot d'autrui.
         proc = self.move("build", session="pilote",
                          AMEESH_ALERT_ORCHESTRATORS="pilote")
         self.assertEqual(proc.returncode, 0, proc.stderr)

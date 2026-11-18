@@ -16,6 +16,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -59,6 +60,8 @@ STUBS = {
 }
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "rootless Docker host script: GNU install, runuser, systemd")
 class DockerRootlessTest(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())

@@ -3,7 +3,8 @@
 
 Chaque exécuteur relève périodiquement l'état de son hôte — mémoire
 disponible, swap utilisé, charge CPU (1 minute), disque libre et allocation
-btrfs (#246) de chaque volume où l'hôte écrit (#253), tours en cours — et le publie
+btrfs (#246) de chaque volume où l'hôte écrit (#253), tours en cours, jobs
+déportés vivants d'un hôte prêteur (#7687) — et le publie
 en base (`host_resources`). `ameesh hosts` montre le dernier relevé de
 chaque hôte et l'historique court.
 
@@ -25,6 +26,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -172,7 +174,17 @@ DEFAULT_MAX_CGROUP_MEMORY_USED = 0.9
 #: tasks is real pressure even when the host load is low. Critical at
 #: halfway to 1.0.
 DEFAULT_MAX_CGROUP_THROTTLED = 0.5
-CGROUP_KEYS = ("max_cgroup_memory_used", "max_cgroup_throttled")
+#: #7675 (E3b): CPU consumed against the cgroup quota
+#: (`usage_usec` delta / wall time, divided by `cpu.max` quota/period). A
+#: container that runs at its quota without being throttled is visible here
+#: and nowhere else in the native guards. **No default**: a host that does
+#: not declare it keeps the previous behaviour (unwatched).
+#: #7675 (E3b): share of CPU periods with at least one throttled task
+#: (`nr_throttled` delta / `nr_periods` delta), the measure IMA's private
+#: gate used. Distinct from the wall-time `max_cgroup_throttled`: a single
+#: throttled microsecond counts a whole period. **No default** either.
+CGROUP_KEYS = ("max_cgroup_memory_used", "max_cgroup_throttled",
+               "max_cgroup_cpu_used", "max_cgroup_throttled_periods")
 #: seuils exprimés en PART (0 < x <= 1, ou texte « 80% ») et non en octets
 FRACTION_KEYS = ("max_tmpfs_used", "warn_disk_used", *CGROUP_KEYS)
 #: clés de seuil reconnues dans `policy.resources` (liste fermée)
@@ -752,34 +764,67 @@ def psi(base: str | None = None, window: str = "avg60") -> dict:
     return out
 
 
+def _cgroup_bases(root: str | None = None) -> tuple[list[str], list[str]]:
+    """(the cgroup v2 directories where systemd nests the host's slices, the
+    directories found but unreadable).
+
+    The bases are the hierarchy root (system units) and each user manager
+    (`user@<uid>.service`, user units of a workstation). A cgroup directory
+    also holds interface files (`cgroup.controllers`, …): they are skipped,
+    never opened as a directory. A *missing* tree is not a failure: a host
+    without cgroup v2 has no slices. An unreadable `user.slice`, user slice or
+    manager is reported instead of vanishing: a caller that counts what it
+    finds must not read it as « nothing there » (#7687)."""
+    root = root or os.environ.get(CGROUP_ROOT_ENV) or platform.CGROUP_ROOT
+    bases = [root]
+    unreadable: list[str] = []
+    users = os.path.join(root, "user.slice")
+    try:
+        entries = sorted(os.listdir(users))
+    except FileNotFoundError:
+        entries = []
+    except OSError:
+        entries = []
+        unreadable.append(users)
+    for user in entries:
+        user_dir = os.path.join(users, user)
+        try:
+            if not stat.S_ISDIR(os.stat(user_dir).st_mode):
+                continue
+        except OSError:
+            unreadable.append(user_dir)
+            continue
+        try:
+            managers = sorted(os.listdir(user_dir))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unreadable.append(user_dir)
+            continue
+        for manager in managers:
+            manager_dir = os.path.join(user_dir, manager)
+            if not (manager.startswith("user@") and manager.endswith(".service")):
+                continue
+            try:
+                if stat.S_ISDIR(os.stat(manager_dir).st_mode):
+                    bases.append(manager_dir)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                unreadable.append(manager_dir)
+    return bases, unreadable
+
+
 def host_cgroup_bases(root: str | None = None) -> list[str]:
     """The cgroup v2 directories where systemd nests the host's slices: the
     hierarchy root (system units) and each user manager (`user@<uid>.service`,
     user units of a workstation). A cgroup directory also holds interface
     files (`cgroup.controllers`, …): they are skipped, never opened as a
     directory. A missing or unreadable tree gives only the root, never an
-    error: a host without cgroup v2 measures nothing."""
-    root = root or os.environ.get(CGROUP_ROOT_ENV) or platform.CGROUP_ROOT
-    bases = [root]
-    users = os.path.join(root, "user.slice")
-    try:
-        entries = sorted(os.listdir(users))
-    except OSError:
-        entries = []
-    for user in entries:
-        user_dir = os.path.join(users, user)
-        if not os.path.isdir(user_dir):
-            continue
-        try:
-            managers = sorted(os.listdir(user_dir))
-        except OSError:
-            continue
-        for manager in managers:
-            manager_dir = os.path.join(user_dir, manager)
-            if manager.startswith("user@") and manager.endswith(".service") \
-                    and os.path.isdir(manager_dir):
-                bases.append(manager_dir)
-    return bases
+    error: a host without cgroup v2 measures nothing. [`_cgroup_bases`] also
+    tells the unreadable parts, for a count that must not turn them into
+    zero."""
+    return _cgroup_bases(root)[0]
 
 
 def guest_cgroups(root: str | None = None) -> list[str]:
@@ -940,7 +985,8 @@ class CgroupMeter:
             "cpu_some": None, "mem_some": None, "mem_full": None,
             "cpu_quota": None,
             "mem_current_bytes": None, "mem_max_bytes": None,
-            "mem_used": None, "throttled": None, "cpu_used": None,
+            "mem_used": None, "throttled": None, "throttled_periods": None,
+            "cpu_used": None, "cpu_used_ratio": None,
         }
         # VM reservation comes from machine CPU/MemTotal. Its runner may
         # have no delegated cpu controller, or no cgroup at all (macOS).
@@ -997,9 +1043,27 @@ class CgroupMeter:
                 and before.get("throttled_usec") is not None:
             delta = max(0, stat["throttled_usec"] - before["throttled_usec"])
             out["throttled"] = round(min(1.0, delta / (window * 1e6)), 4)
+        # #7675: the period ratio is a different fact from the wall-time one:
+        # one throttled microsecond makes a whole period count. Kept separate
+        # so a policy can watch either (IMA's gate is the period ratio).
+        periods = stat.get("nr_periods")
+        before_periods = before.get("nr_periods")
+        throttled = stat.get("nr_throttled")
+        before_throttled = before.get("nr_throttled")
+        if None not in (periods, before_periods, throttled, before_throttled) \
+                and periods > before_periods:
+            elapsed_periods = periods - before_periods
+            throttled_periods = max(0, throttled - before_throttled)
+            out["throttled_periods"] = round(
+                min(1.0, throttled_periods / elapsed_periods), 4)
         if stat.get("usage_usec") is not None and before.get("usage_usec") is not None:
             delta = max(0, stat["usage_usec"] - before["usage_usec"])
             out["cpu_used"] = round(delta / (window * 1e6), 4)
+            # The quota is `cpu.max` quota/period (CPUs). Without a finite
+            # quota the ratio is unknown — never a guessed 100 %.
+            if out["cpu_quota"]:
+                out["cpu_used_ratio"] = round(
+                    out["cpu_used"] / out["cpu_quota"], 4)
         return out
 
 
@@ -1016,6 +1080,151 @@ def guest_memory(cgroups: list[str] | None = None) -> int | None:
         return 0
     values = [cgroup_memory_bytes(path) for path in cgroups]
     return None if any(v is None for v in values) else sum(values)
+
+
+#: #7687: the installed offload shell of a lending host
+#: (`deploy/guest/install.sh`, `ameesh-offload-shell`), one process per guest
+#: job, alive from the SSH session's start to its end — before the job's first
+#: slice exists and in every executor mode. The forced command is the only
+#: process started with it as a whole argument; the count matches that whole
+#: argument, not a substring of a job's own command line.
+GUEST_SHELL = "ameesh-offload-shell"
+GUEST_SHELL_BYTES = GUEST_SHELL.encode("ascii")
+
+#: #7687: an offloaded job owns a transient slice
+#: `ameesh.slice/ameesh-job.slice/ameesh-job-<id>.slice` in the job's user
+#: manager (`platform.offload_shell.unit_names`) once its first phase starts;
+#: a populated slice is a live job, or the leftover of one whose shell died.
+GUEST_JOB_PARTS = ("ameesh.slice", "ameesh-job.slice")
+GUEST_JOB_PREFIX = "ameesh-job-"
+GUEST_JOB_SUFFIX = ".slice"
+
+
+def _cgroup_populated(path: str) -> bool | None:
+    """`populated` of a cgroup (`cgroup.events`), None when unreadable."""
+    try:
+        with open(os.path.join(path, "cgroup.events"), encoding="utf-8") as fh:
+            for line in fh:
+                key, _, value = line.partition(" ")
+                if key == "populated":
+                    return value.strip() == "1"
+    except OSError:
+        return None
+    return None
+
+
+def _guest_shells(proc_root: str) -> int | None:
+    """Live offload shells of the host, None when the table may hide one.
+
+    A process is one of them when an argument's basename is exactly
+    [`GUEST_SHELL`] (`python3 -I /usr/local/lib/ameesh-guest/ameesh-offload-shell
+    --config …`). The command line of another user is readable (checked on
+    ameesh-agents-3, 17/11: the job user read the guest shell's). A table
+    without PID 1 (`hidepid`, a container's own namespace), or an entry that
+    cannot be read, may hide a shell: with no shell found it is None, never a
+    zero; a positive count is kept because it already proves the runs
+    non-zero."""
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return None
+    pids = [name for name in entries if name.isdigit()]
+    if "1" not in pids:
+        return None
+    live = 0
+    unreadable = False
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as fh:
+                line = fh.read()
+        except OSError:
+            unreadable = True
+            continue
+        args = [arg for arg in line.split(b"\0") if arg]
+        if any(os.path.basename(arg) == GUEST_SHELL_BYTES for arg in args):
+            live += 1
+    # a positive count already proves the runs non-zero; an unreadable entry
+    # only matters when it could hide the last shell
+    if live:
+        return live
+    return None if unreadable else 0
+
+
+def _populated_job_slices(root: str | None = None) -> int | None:
+    """Populated job slices of the host, None when the tree is unreadable in
+    part: an unreadable user slice or manager may hold a live job."""
+    bases, unreadable = _cgroup_bases(root)
+    if unreadable:
+        return None
+    live = 0
+    for base in bases:
+        parent = os.path.join(base, *GUEST_JOB_PARTS)
+        try:
+            entries = os.listdir(parent)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        for name in entries:
+            if not (name.startswith(GUEST_JOB_PREFIX)
+                    and name.endswith(GUEST_JOB_SUFFIX)):
+                continue
+            path = os.path.join(parent, name)
+            if not os.path.isdir(path):
+                continue
+            populated = _cgroup_populated(path)
+            if populated is None:
+                return None
+            if populated:
+                live += 1
+    return live
+
+
+def guest_jobs(root: str | None = None, *,
+               proc_root: str | None = None) -> int | None:
+    """#7687: live offloaded jobs of this host, None when not provable.
+
+    A lending host (`policy.lend`, L159b) runs guest jobs offloaded from other
+    hosts. A job is seen by two independent witnesses, and the larger count
+    wins: its offload shell (one process per job, alive from the SSH session's
+    start, [`GUEST_SHELL`]) and its populated transient slice
+    ([`GUEST_JOB_PARTS`], alive from the first phase; an orphan whose shell
+    died is still a live job). The slice alone would miss the job before its
+    first phase — checkout, a long wait on the profile's cache lock, or an
+    executor without scopes — and the shell alone would miss an orphan.
+
+    Zero is returned only when the process table and the cgroup tree were both
+    read whole and neither witness found a job: the shell covers the job's
+    whole life, so no age guess is needed. An unreadable process table, or an
+    unreadable part of the cgroup tree (`user.slice`, a user slice, a manager,
+    a slice), is None, never a zero by default. A positive shell count is kept
+    when the cgroup tree alone is unreadable: it already proves the runs
+    non-zero, which is all the drain needs.
+
+    The count feeds the `guest` runs interface: the automatic drain of a
+    lending host and its `idle-drained` proof must see a known zero, or a
+    guest's job could be killed (#4147, #4148, #5905).
+    """
+    if proc_root is None:
+        shells = _host_guest_shells()
+    else:
+        shells = _guest_shells(proc_root)
+    if shells is None:
+        return None
+    slices = _populated_job_slices(root)
+    if slices is None:
+        return shells or None
+    return max(shells, slices)
+
+
+def _host_guest_shells() -> int | None:
+    """Live shells on the host, None when this process cannot witness them.
+
+    A runner inside a container sees its own process table, not the host's:
+    a zero there would hide every guest job, so the measure stays unknown."""
+    if platform.in_container():
+        return None
+    return _guest_shells(platform.PROC)
 
 
 #: #2022 (0455): the process counts of a reading
@@ -1266,6 +1475,8 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     out.update(psi())
     cgroups = guest_cgroups()
     out["guest_mem_bytes"] = guest_memory(cgroups)
+    # #7687: the live offloaded jobs of a lending host, for `runs_interface`
+    out["guest_jobs"] = guest_jobs()
     out.update(_CPU_METER.read(cgroups=cgroups))
     # #2814 : la mesure du cgroup de CE processus, publiée avec le relevé ;
     # elle sert l'admission (`own_cgroup`) et `ameesh hosts` sur un conteneur
@@ -1447,7 +1658,8 @@ def reading_pressure_scope(reading: dict | None) -> str:
 #: mesures d'un cgroup v2 qui rendent `own_cgroup` utile (#2825 N2)
 CGROUP_MEASURES = ("cpu_some", "mem_some", "mem_full", "cpu_quota",
                    "mem_current_bytes", "mem_max_bytes", "mem_used",
-                   "throttled", "cpu_used")
+                   "throttled", "throttled_periods", "cpu_used",
+                   "cpu_used_ratio")
 
 
 def cgroup_measured(reading: dict | None) -> bool:
@@ -1506,6 +1718,8 @@ def thresholds(policy=None, *, local: bool = True,
     mem_pressure = parse_percent(raw.get("max_mem_pressure"))
     cg_mem_used = parse_fraction(raw.get("max_cgroup_memory_used"))
     cg_throttled = parse_fraction(raw.get("max_cgroup_throttled"))
+    cg_cpu_used = parse_fraction(raw.get("max_cgroup_cpu_used"))
+    cg_throttled_periods = parse_fraction(raw.get("max_cgroup_throttled_periods"))
     unallocated = parse_bytes(raw.get("min_btrfs_unallocated"))
     headroom = parse_bytes(raw.get("min_btrfs_metadata_headroom"))
     zombies = parse_count(raw.get("max_zombies"))
@@ -1534,6 +1748,9 @@ def thresholds(policy=None, *, local: bool = True,
                                    if cg_mem_used is None else cg_mem_used),
         "max_cgroup_throttled": (DEFAULT_MAX_CGROUP_THROTTLED
                                  if cg_throttled is None else cg_throttled),
+        # #7675: no default; absent means "not watched", preserving behaviour
+        "max_cgroup_cpu_used": cg_cpu_used,
+        "max_cgroup_throttled_periods": cg_throttled_periods,
         # L159d: the offer (`policy.lend`) caps the lendable capacity; None:
         # the host lends nothing
         "lend": lend_offer(policy),
@@ -1953,6 +2170,21 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
                         "label": "cgroup CPU throttled (share of wall time)",
                         "value": throttled, "limit": limit,
                         "critical": throttled >= limit + (1.0 - limit) / 2.0})
+        # #7675 (E3b): the two measures IMA's private gate used. Same
+        # critical rule as the other cgroup ceilings.
+        used, limit = cg("cpu_used_ratio"), limits.get("max_cgroup_cpu_used")
+        if used is not None and limit is not None and used > limit:
+            out.append({"key": "max_cgroup_cpu_used",
+                        "label": "cgroup CPU used (usage / cpu.max quota)",
+                        "value": used, "limit": limit,
+                        "critical": used >= limit + (1.0 - limit) / 2.0})
+        periods, limit = cg("throttled_periods"), \
+            limits.get("max_cgroup_throttled_periods")
+        if periods is not None and limit is not None and periods > limit:
+            out.append({"key": "max_cgroup_throttled_periods",
+                        "label": "cgroup CPU throttled (share of periods)",
+                        "value": periods, "limit": limit,
+                        "critical": periods >= limit + (1.0 - limit) / 2.0})
     etat = power_state(reading, limits)
     if etat["state"] in ("low", "stop"):
         # L106 : jamais `critical` — la pause des agents peu prioritaires ne
@@ -2174,7 +2406,8 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None,
         "cgroup": {key: cgroup_value(key) for key in
                    ("path", "cpu_some", "mem_some", "mem_full", "cpu_quota",
                     "mem_current_bytes", "mem_max_bytes", "mem_used",
-                    "throttled", "cpu_used")},
+                    "throttled", "throttled_periods", "cpu_used",
+                    "cpu_used_ratio")},
     }
     if scope_fallback:
         verdict["scope_fallback"] = scope_fallback

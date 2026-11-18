@@ -26,14 +26,18 @@ class Grants(interface.Grants):
 
     def register(self, *, approver, nonce, challenge, authenticator_id, receipt_json,
                  connector, operations_json, action_class, max_amount, currency, exp, iat,
-                 until, clock_skew, registered_by) -> int | None:
+                 until, clock_skew, registered_by, beneficiary_kind="none", beneficiary="",
+                 beneficiary_clones=False, targets_json="[]", charter_line="",
+                 charter_version="") -> int | None:
         rows = self.db.query(
-            "SELECT ameesh_standing_register(%s::text, %s::text, %s::text, %s::bigint, "
+            "SELECT ameesh_standing_register_scoped(%s::text, %s::text, %s::text, %s::bigint, "
             "%s::text, %s::text, %s::jsonb, %s::text, %s::bigint, %s::text, %s::bigint, "
-            "%s::bigint, %s::bigint, %s::integer, %s::text) AS id",
+            "%s::bigint, %s::bigint, %s::integer, %s::text, %s::text, %s::text, "
+            "%s::boolean, %s::jsonb, %s::text, %s::text) AS id",
             (approver, nonce, challenge, authenticator_id, receipt_json, connector,
              operations_json, action_class, max_amount, currency, exp, iat, until,
-             int(clock_skew), registered_by),
+             int(clock_skew), registered_by, beneficiary_kind, beneficiary,
+             bool(beneficiary_clones), targets_json, charter_line, charter_version),
         )
         return rows[0].get("id") if rows else None
 
@@ -58,11 +62,12 @@ class Grants(interface.Grants):
             "AND released_at IS NULL ORDER BY id", (action_id,))
 
     def candidates(self, connector, operation, action_class, amount, currency,
-                   canon="") -> list[dict]:
+                   canon="", proposed_by="", target="") -> list[dict]:
         """Simple PRÉ-FILTRE, sans verrou : la décision (révocation, échéance
-        à l'heure réelle après le dernier verrou, cumul) est refaite par
-        `reserve` pour chaque candidat. L44 (0031) : seuls les grants dont
-        l'authentificateur est déclaré par `canon` (celui de l'action)."""
+        à l'heure réelle après le dernier verrou, bénéficiaire, cible, cumul)
+        est refaite par `reserve` pour chaque candidat. L44 (0031) : seuls les
+        grants dont l'authentificateur est déclaré par `canon` (celui de
+        l'action). #7629 : le bénéficiaire et la cible sont pré-filtrés ici."""
         return self.db.query(
             """
             SELECT s.id FROM standing_approvals s
@@ -71,11 +76,15 @@ class Grants(interface.Grants):
                AND s.valid_until > clock_timestamp()
                AND s.consumed_amount + %s::bigint <= s.max_amount
                AND (%s::bigint = 0 OR s.currency = %s)
+               AND ameesh_standing_beneficiary_ok(s.beneficiary_kind, s.beneficiary,
+                                                  %s::text)
+               AND ameesh_standing_target_ok(s.targets, %s::text)
                AND EXISTS (SELECT 1 FROM authenticators a
                             WHERE a.id = s.authenticator_id AND a.canon = %s)
              ORDER BY s.valid_until, s.id
             """,
-            (connector, operation, action_class, amount, amount, currency, canon),
+            (connector, operation, action_class, amount, amount, currency, proposed_by,
+             target, canon),
         )
 
     def revoke(self, grant_id, by) -> bool:
@@ -90,6 +99,8 @@ class Grants(interface.Grants):
                    s.max_amount, s.currency, s.consumed_amount, s.uses,
                    s.receipt AS receipt_json,
                    a.facade,
+                   s.beneficiary_kind, s.beneficiary, s.beneficiary_clones,
+                   s.targets, s.charter_line, s.charter_version,
                    extract(epoch from s.valid_until)::float8 AS until_ts,
                    extract(epoch from s.revoked_at)::float8  AS revoked_ts, s.revoked_by
               FROM standing_approvals s
@@ -105,6 +116,8 @@ class Grants(interface.Grants):
             """
             SELECT id, approver, nonce, authenticator_id, connector, operations, action_class,
                    max_amount, currency, consumed_amount, uses,
+                   beneficiary_kind, beneficiary, beneficiary_clones, targets,
+                   charter_line, charter_version,
                    extract(epoch from valid_until)::float8 AS until_ts,
                    extract(epoch from revoked_at)::float8  AS revoked_ts, revoked_by
               FROM standing_approvals WHERE id = %s

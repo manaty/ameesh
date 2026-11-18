@@ -57,6 +57,8 @@ AGENT_COLUMNS = """
     canon_ref, canon,
     -- L165 (EP1) : relève (`hote`/`election`) et hôtes candidats d'un rôle élu
     releve, candidats,
+    -- #7632 (0588) : cadence de réveil déclarée par la fiche
+    reveil,
     ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,
@@ -66,6 +68,8 @@ AGENT_COLUMNS = """
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
     canon, handoff_fenced, mode, stop_reason, session_account, context_max_tokens,
     turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake,
+    -- #7674 (0590) : politique de session déclarée par la carte du canon
+    declared_policy,
     -- #5250 (0531) : politique de contexte de cet agent, état du pilote
     session_max_tokens, turn_reread_budget, session_reread_budget, context_pilot,
     -- #6040 (0553) : seuil de compaction native du harnais
@@ -414,8 +418,8 @@ OVERVIEW_SQL = ("""
                    -- #3460 : retrait (la vue ne porte pas la colonne)
                    extract(epoch from (j.__row->>'retired_at')::timestamptz)::float8
                        AS retired_ts,
-                   chantier, harness, host, cwd, session_id, status, status_text,
-                   model,
+                   chantier, harness, host, cwd, session_id, session_account,
+                   status, status_text, model,
                    -- #4293 : colonne absente de la vue figée ; lue sur la ligne
                    j.__row->>'harness_bin' AS harness_bin,
                    budget_usd, spent_usd, turns, pending_prompt, last_error,
@@ -1072,7 +1076,10 @@ class Leases(interface.Leases):
         # L165 (EP3) : une relève n'est croisée que si la ligne était encore
         # chez un AUTRE hôte. Le brief ne peut alors pas être un reste d'un
         # tour local : la session de l'ancien hôte n'est jamais reprise ici.
-        takeover = """(p.brief IS NOT NULL AND r.releve IN ('election', 'preference')
+        # #7680 : seuls les rôles ÉLUS passent par un brief ; un agent
+        # `preference` ne change jamais d'hôte ainsi — sa conversation suit
+        # `conversation_moves` et la ligne est déjà chez la cible au claim.
+        takeover = """(p.brief IS NOT NULL AND r.releve = 'election'
                        AND verrou.host IS DISTINCT FROM __H__)"""
         r5 = """CASE
                            WHEN r.current_prompt IS NOT NULL
@@ -1159,7 +1166,10 @@ class Leases(interface.Leases):
                        ELSE r.current_prompt END,
                    -- L165 (EP3) : briefing persisté de la relève, consommé par
                    -- le nouveau détenteur ; aucune session ne traverse un hôte.
+                   -- #7680 : un agent `preference` n'a jamais de brief (un
+                   -- reste d'une ancienne version est effacé au claim).
                    election_brief   = CASE WHEN __TAKEOVER__ THEN p.brief
+                                           WHEN r.releve = 'preference' THEN NULL
                                            ELSE r.election_brief END,
                    -- L165 (EP3) : aucune session ne traverse un hôte. La
                    -- remise à zéro est durable (`session_reset_at`), donc un
@@ -1200,8 +1210,12 @@ class Leases(interface.Leases):
                -- jamais sans brief. Sans lui, la ligne changerait d'hôte en
                -- gardant la session et le compte de l'ancien (le contrat médié
                -- force le brief à null) : le CAS refuse, sans rien écrire.
-               AND (r.releve NOT IN ('election', 'preference') OR verrou.host = __H__
-                    OR p.brief IS NOT NULL)
+               -- #7680 : un agent `preference` ne se réclame JAMAIS de
+               -- l'autre hôte, brief compris ; le déplacement de conversation
+               -- a déjà mis la ligne chez la cible (`verrou.host = H`).
+               AND (r.releve NOT IN ('election', 'preference')
+                    OR verrou.host = __H__
+                    OR (r.releve = 'election' AND p.brief IS NOT NULL))
                -- #6134 : le même identifiant d'exécuteur ne reprend pas un
                -- tour EN COURS tant que son bail est vivant. L'ancien
                -- processus ne verrait la perte de son epoch qu'au battement
@@ -1321,6 +1335,40 @@ class Leases(interface.Leases):
             (name,),
         )
         return rows[0] if rows else None
+
+    def fence(self, name, owner, epoch) -> tuple[bool, str, dict | None]:
+        """#7672 : verrouille la ligne du registre, puis juge le bail.
+
+        Le verrou est pris AVANT la lecture des faits que l'appelant va
+        écrire : un changement de détenteur, d'epoch ou une expiration attend
+        le commit de cette transaction. Les raisons sont celles de
+        `registry.lease_agent` (mêmes mots), pour que le diagnostic ne dépende
+        pas du chemin. L'échéance est relue avec `clock_timestamp()` après
+        l'attente éventuelle du verrou.
+        """
+        rows = self.db.query(
+            """
+            SELECT name, lease_owner, lease_epoch, status,
+                   (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live
+              FROM agent_registry
+             WHERE name = (SELECT ameesh_resolve_agent_name(%s, 'registry.lease_fence'))
+             FOR UPDATE
+            """,
+            (name,),
+        )
+        if not rows:
+            return False, "agent %s not in the registry" % name, None
+        row = rows[0]
+        if row.get("status") == "stopped":
+            return False, "agent stopped", row
+        if (row.get("lease_owner") or "") != owner:
+            return False, "lease held by %s" % (row.get("lease_owner") or "nobody"), row
+        if int(row.get("lease_epoch") or 0) != int(epoch):
+            return (False, "epoch %s in the registry, %s in the session"
+                    % (row.get("lease_epoch"), epoch), row)
+        if not row.get("live"):
+            return False, "lease expired", row
+        return True, "", row
 
     def renew(self, name, owner, epoch, ttl_seconds) -> float | None:
         """Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()`

@@ -713,6 +713,29 @@ sha_installe() {
     serveur) ssh_lire "${CIBLE[$nom]}" "git -C /opt/ameesh/src rev-parse HEAD" 2>/dev/null ;;
   esac || true
 }
+# Code du venv vivant, indépendant du checkout et de l'exécutant staging.
+# Une lecture absente ou ambiguë ne prouve aucune divergence.
+sha_venv_agents() {
+  local nom=$1 brut lien
+  case "$(mode_de "$nom")" in
+    poste) brut=$(readlink "$PARTAGE/venv-courant" 2>/dev/null) || return 3
+      brut=${brut##*/}; brut=${brut#venv-} ;;
+    agents) brut=$(ssh_lire "${CIBLE[$nom]}" "runuser -u ameesh -- python3 -c 'import glob,json,os,sys,urllib.parse; p=\"/home/ameesh/.local/share/ameesh/venv-courant\"; paths=glob.glob(p+\"/lib/python*/site-packages/ameesh-*.dist-info/direct_url.json\"); assert os.path.islink(p) and len(paths)==1; url=json.load(open(paths[0])).get(\"url\",\"\"); print(os.path.basename(os.readlink(p)).removeprefix(\"venv-\")+\" \"+urllib.parse.unquote(url).rstrip(\"/\").rsplit(\"/src-\",1)[1])'" 2>/dev/null) || return 3 ;;
+    serveur) brut=$(ssh_lire "${CIBLE[$nom]}" 'readlink /opt/ameesh/venv-courant' 2>/dev/null) || return 3
+      brut=${brut##*/}; brut=${brut#venv-} ;;
+    *) return 3 ;;
+  esac
+  if [ "$(mode_de "$nom")" = agents ]; then
+    lien=${brut%% *}; brut=${brut#* }
+    [[ $lien =~ ^[0-9a-fA-F]{7,40}$ ]] || return 3
+    [[ $brut =~ ^[0-9a-fA-F]{7,40}$ ]] || return 3
+    # Signaler toute divergence, même si seul le nom du lien est incorrect.
+    sha_cible "$lien" || brut=$lien
+  fi
+  [[ $brut =~ ^[0-9a-fA-F]{7,40}$ ]] || return 3
+  printf '%s\n' "${brut,,}"
+}
+sha_cible() { [[ $1 =~ ^[0-9a-fA-F]{7,40}$ ]] && [ "${1,,}" = "${SHA:0:${#1}}" ]; }
 precedent_retour() {  # commit que « retour » reinstalle reellement
   local nom=$1
   case "$(mode_de "$nom")" in
@@ -897,10 +920,34 @@ raise SystemExit(0 if isinstance(rapport, dict) and rapport.get("verdict") == "k
     echo non-concluant
   fi
 }
+# #7785 : les personas dont l'unité runner est désactivée ou masquée sur
+# l'hôte, lues par le script de déploiement de cet hôte (vm.sh agents /
+# poste.sh). C'est une preuve d'intention lue dans systemd, pas une supposition
+# sur le silence : la santé ne tolère que les noms rendus ici. Une lecture en
+# échec laisse la santé stricte (jamais un KO masqué) et se nomme.
+unites_desactivees_hote() {  # nom → lignes « --unite-desactivee » et le nom
+  local nom=$1 sortie rc=0 ligne
+  [ "$(mode_de "$nom")" = serveur ] && return 0
+  sortie=$(exec_hote "$nom" unites-desactivees) || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "unites desactivees de $nom : lecture non concluante (code $rc), la sante reste stricte" >&2
+    return 0
+  fi
+  while IFS= read -r ligne; do
+    [ -n "$ligne" ] || continue
+    printf '%s\n' --unite-desactivee "$ligne"
+  done <<<"$sortie"
+}
 sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
-  local nom=$1 sans=${2:-} cible_sonde var sortie rc args_hote=() args_sonde=()
+  local nom=$1 sans=${2:-} cible_sonde var sortie rc venv rc_venv=0 args_hote=() args_sonde=() args_unites=()
   SANTE_DETAIL=""
   SANTE_RC=""
+  venv=$(sha_venv_agents "$nom") || rc_venv=$?
+  if [ "$rc_venv" = 0 ] && ! sha_cible "$venv"; then
+      SANTE_DETAIL=$(python3 -c 'import json,sys; print(json.dumps({"hote":sys.argv[1], "sha":sys.argv[2], "verdict":"ko", "pourquoi":"venv vivant %s, attendu %s" % tuple(sys.argv[3:])}))' "$nom" "$SHA" "$venv" "$SHA_TRAVE")
+      printf '%s\n' "$SANTE_DETAIL"
+      return 1
+  fi
   var=$(var_sonde_de "$nom")
   cible_sonde=${!var:-}
   if [ "$(mode_de "$nom")" = poste ]; then
@@ -913,6 +960,7 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   if [ "$(mode_de "$nom")" = serveur ]; then
     args_hote=(--serveur)
   fi
+  mapfile -t args_unites < <(unites_desactivees_hote "$nom")
   if [ "$SONDE" = 1 ] && [ "$sans" != jamais ]; then
     etape "courrier de $nom (sonde de remise reelle)"
     args_sonde=(--sonde "${cible_sonde:-auto}" --attente "$ATTENTE_COURRIER"
@@ -924,12 +972,17 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   rc=0
   sortie=$(py_sequence "$SONDE_PY" --hote "$nom" "${args_sonde[@]}" \
     --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json \
-    ${args_hote[@]+"${args_hote[@]}"}) || rc=$?
+    ${args_hote[@]+"${args_hote[@]}"} \
+    ${args_unites[@]+"${args_unites[@]}"}) || rc=$?
   printf '%s\n' "$sortie"
   SANTE_DETAIL=$sortie
   # 3 : la sonde n'a pas pu tourner ou conclure (non concluant), jamais un hote malsain
   case "$(verdict_sonde "$rc" "$sortie")" in
-    ok) return 0 ;;
+    ok) if [ "$rc_venv" != 0 ]; then
+      SANTE_RC=3
+      SANTE_DETAIL=$(python3 -c 'import json,sys; print(json.dumps({"hote":sys.argv[1], "sha":sys.argv[2], "verdict":"non-concluant", "pourquoi":"venv vivant illisible"}))' "$nom" "$SHA")
+      return 3
+    fi; return 0 ;;
     ko) return 1 ;;
     *) SANTE_RC=$rc; return 3 ;;
   esac
@@ -1103,12 +1156,12 @@ Trace : $JOURNAL"
 # au staging suivant.
 sonde_non_concluante() {  # nom
   local nom=$1 detail
-  detail="sonde de courrier non concluante (code ${SANTE_RC:-?}) : outil empeche ou tour non conclu, aucun retour"
-  trace "$nom" sante non-concluant "$detail" "$SANTE_DETAIL"
+  detail="sante non concluante (code ${SANTE_RC:-?}) : lecture ou sonde non concluante, aucun retour"
+  trace "$nom" sante non-concluant "${SANTE_DETAIL:-$detail}" "$SANTE_DETAIL"
   NON_CONCLUANTS+=("$nom")
   echo "!! $nom : $detail ; $nom reste sur $SHA_TRAVE, la sequence continue (mention dans l'attestation)" >&2
-  notifier "staging : sonde de $nom non concluante, sequence poursuivie sans retour" \
-    "Le staging $SHA_TRAVE a installe, redemarre et controle $nom, mais sa sonde de courrier n'a pas conclu ($detail). Non concluant (canon §3) : $nom n'est PAS remis en arriere et la sequence continue ; l'attestation portera « sonde non concluante » pour $nom, a reprendre au staging suivant. Sortie de la sonde : ${SANTE_DETAIL:-vide}. Trace : $JOURNAL"
+  notifier "staging : sante de $nom non concluante, sequence poursuivie sans retour" \
+    "Le staging $SHA_TRAVE a installe, redemarre et controle $nom, mais sa sante n'a pas conclu ($detail). Non concluant (canon §3) : $nom n'est PAS remis en arriere et la sequence continue ; l'attestation portera « sonde non concluante » pour $nom, a reprendre au staging suivant. Sortie de la sonde : ${SANTE_DETAIL:-vide}. Trace : $JOURNAL"
 }
 
 # --- plan -----------------------------------------------------------------
@@ -1563,10 +1616,11 @@ fi
 # --- sequence par hote ----------------------------------------------------
 for nom in "${HOTES[@]}"; do
   installe=$(sha_installe "$nom" || true)
+  vivant=$(sha_venv_agents "$nom" || true)
   DEJA_A_CIBLE[$nom]=0
   # le poste publie un nom court (src-<7>) ; les VM un SHA complet : comparer
   # le prefixe installe au prefixe correspondant de la cible.
-  if [ -n "$installe" ] && [ "$installe" = "${SHA:0:${#installe}}" ]; then
+  if sha_cible "$installe" && sha_cible "$vivant"; then
     # rien n'est reinstallé : « retour » rejouerait le previous-sha conserve,
     # pas la version courante (avis R1 N2).
     DEJA_A_CIBLE[$nom]=1
@@ -1575,10 +1629,18 @@ for nom in "${HOTES[@]}"; do
     trace "$nom" installer ok "deja installe (${installe:0:9})"
   else
     # l'installateur enregistre la version courante comme cible de retour.
-    PRECEDENT=$installe
+    PRECEDENT=${vivant:-$installe}
     etape "$nom : installer $SHA_TRAVE"
     debut_etape "$nom" installer
-    exec_hote "$nom" installer "$SHA" || echec_hote "$nom" installer "installation en echec"
+    if ! exec_hote "$nom" installer "$SHA"; then
+      if sha_cible "$installe"; then
+        trace "$nom" installer ko "installation en echec : checkout cible, venv vivant ${vivant:-illisible}"
+        notifier "staging : installation de $nom en echec, sans retour" "Le checkout est deja a la cible $SHA_TRAVE, mais le venv vivant est ${vivant:-illisible}. Installation en echec ; aucun retour automatique, intervention requise. Trace : $JOURNAL"
+        echo "installation en echec sur $nom : checkout cible, venv vivant ${vivant:-illisible} ; aucun retour" >&2
+        exit 1
+      fi
+      echec_hote "$nom" installer "installation en echec"
+    fi
     trace "$nom" installer ok "installe ${SHA_TRAVE} (precedent ${PRECEDENT:-inconnu})"
   fi
   if [ "$(mode_de "$nom")" = poste ]; then

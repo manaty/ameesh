@@ -745,6 +745,26 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         payload["ack"] = True
     if passif_info:
         payload["info"] = True
+    if not passif_info and not urgent and not sign:
+        # #7625 : `veille` est une identité d'émission de système (minuteries
+        # de veille, unités héritées). Ses messages sont des comptes rendus
+        # périodiques : le même texte au même destinataire ne repart pas avant
+        # `mail.REPORT_REMIND_S`, sinon la minuterie réveille l'agent pour
+        # rien. Un texte changé, une urgence ou un message signé passent.
+        from . import watch as watch_mod
+        if sender == watch_mod.SENDER:
+            payload.setdefault("report", "veille")
+    # Le dépôt garde la garde (course entre deux minuteries) ; ce contrôle
+    # évite seulement d'annoncer « delivered » pour un compte rendu supprimé.
+    if payload.get("report") and dest != "all" and bk.kind == "pg":
+        try:
+            if not mail.report_due(bk.db, sender, dest, payload["report"],
+                                   mail.report_digest(text)):
+                print("identical report to %s within %d h: not sent"
+                      % (dest, int(mail.REPORT_REMIND_S // 3600)))
+                return 0
+        except Exception:  # noqa: BLE001 — une lecture qui échoue ne retient rien
+            pass
     if request_expires is not None:
         # #2814 : échéance de REQUÊTE explicite, distincte de la TTL de
         # signature (`--expires`). Absolue en base, pour ne pas dépendre de
@@ -2168,7 +2188,15 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
     `--additive-only` : n'applique rien (code 3) si l'une d'elles n'est pas
     additive — c'est le garde de « migrer avant d'installer » (L151).
     #5692 : `--dry-run --additive-only` rend le même verdict (3) sans écrire,
-    pour que le préflight de staging constate le refus avant toute sauvegarde."""
+    pour que le préflight de staging constate le refus avant toute sauvegarde.
+
+    P1a #7649 : le noyau et les schémas de module sont lus et appliqués dans
+    la même passe ; `--additive-only` couvre les deux flux."""
+    try:
+        modules = migrations.installed_modules()
+    except (ValueError, OSError) as exc:
+        print("migration failed: %s" % exc, file=sys.stderr)
+        return 1
     try:
         db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
@@ -2176,13 +2204,22 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
         return 1
     try:
         if dry_run or additive_only:
-            missing, modified, _unknown = migrations.check(db)
+            # Lecture seule : `check` et `pending_modules` n'exécutent aucun
+            # DDL, contrairement à `pending` (qui crée le registre noyau).
+            try:
+                missing, modified, _unknown = migrations.check(db)
+                module_missing = migrations.pending_modules(
+                    db, migrations.module_schemas(modules, cfg.schema))
+            except db_mod.DbError as exc:
+                print("migration failed: %s" % exc, file=sys.stderr)
+                return 1
             if modified:
                 print("migration failed: %s modified after being applied"
                       % ",".join(m.label for m in modified), file=sys.stderr)
                 return 1
+            todo = missing + module_missing
             refused = []
-            for migration in missing:
+            for migration in todo:
                 reasons = migrations.non_additive(migration)
                 if reasons:
                     refused.append(migration)
@@ -2196,18 +2233,18 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
             # verdict du garde sans écrire ; `--dry-run` seul reste un
             # diagnostic (code 0) même avec des migrations non additives.
             if dry_run and not additive_only:
-                if not missing:
+                if not todo:
                     print("schema up to date: no migration to apply")
                 return 0
             if refused:
                 print("nothing applied (--additive-only)", file=sys.stderr)
                 return 3
             if dry_run:
-                if not missing:
+                if not todo:
                     print("schema up to date: no migration to apply")
                 return 0
         done = migrations.migrate(db, log=lambda line: print(line), additive_only=additive_only,
-                                  allow_live_executors=allow_live_executors)
+                                  allow_live_executors=allow_live_executors, modules=modules)
     except migrations.NonAdditiveMigration as exc:
         print(str(exc), file=sys.stderr)
         return 3
@@ -2221,6 +2258,31 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
     else:
         print("%d migration(s) applied" % len(done))
     return 0
+
+
+def _module_probe_problem(state) -> str | None:
+    """P1a #7649 : ce qui rend une sonde de déploiement KO côté modules."""
+    missing = [migration for check in state.checks for migration in check.missing]
+    modified = [migration for check in state.checks for migration in check.modified]
+    broken = [check.module for check in state.checks
+              if check.mismatch or (check.registered and not check.schema_present)]
+    if not (missing or modified or broken):
+        return None
+    parts = []
+    if broken:
+        parts.append("module schema(s) missing or mismatched: %s" % ", ".join(sorted(broken)))
+    if missing:
+        non_additive = [(migration, migrations.non_additive(migration))
+                        for migration in missing]
+        non_additive = [item for item in non_additive if item[1]]
+        parts.append("module migrations missing %s%s" % (
+            ",".join(migration.label for migration in missing),
+            ("; %d non-additive — `migrate --additive-only` refuses them"
+             % len(non_additive)) if non_additive else ""))
+    if modified:
+        parts.append("module migrations modified %s"
+                     % ",".join(migration.label for migration in modified))
+    return "; ".join(parts)
 
 
 def cmd_probe(cfg: Config, *, all_bases: bool = False) -> int:
@@ -2245,13 +2307,16 @@ def cmd_probe(cfg: Config, *, all_bases: bool = False) -> int:
         return 1
     try:
         db_mod.require_schema(db)
-        missing, modified, unknown = migrations.check(db)
+        check = migrations.check_all(db, modules=migrations.installed_modules(),
+                                     core_schema=cfg.schema)
+        missing, modified, unknown = check.missing, check.modified, check.unknown
+        module_state = check.modules
         migrations.require_compatible_writer(db)
     except db_mod.SchemaMissing:
         print("probe: KO — schema missing (%s, schema %s)"
               % (config_mod.mask_dsn(cfg.dsn), cfg.schema))
         return 1
-    except db_mod.DbError as exc:
+    except (db_mod.DbError, ValueError) as exc:
         print("probe: KO — %s" % exc)
         return 1
     finally:
@@ -2270,6 +2335,12 @@ def cmd_probe(cfg: Config, *, all_bases: bool = False) -> int:
              % (len(pending_na), migrations.describe_pending_non_additive(pending_na)))
             if pending_na else ""))
         return 1
+    # P1a #7649 : les schémas et migrations de module font partie de la même
+    # porte de déploiement que les migrations du noyau.
+    module_problem = _module_probe_problem(module_state)
+    if module_problem:
+        print("probe: KO — %s" % module_problem)
+        return 1
     # #5692 : avec `--all-bases` seulement, chaque base secondaire de l'hôte
     # est sondée en lecture seule avec le même verdict (le doctor complet la
     # dit toujours, lui). Une base secondaire injoignable y est un KO.
@@ -2279,7 +2350,11 @@ def cmd_probe(cfg: Config, *, all_bases: bool = False) -> int:
             other = config_mod.load_file(path)
             other_db = db_mod.connect(other, writer=False)
             db_mod.require_schema(other_db)
-            other_missing, other_modified, _other_unknown = migrations.check(other_db)
+            other_check = migrations.check_all(
+                other_db, modules=migrations.installed_modules(),
+                core_schema=other.schema)
+            other_missing, other_modified = other_check.missing, other_check.modified
+            other_modules = other_check.modules
             migrations.require_compatible_writer(other_db)
         except (Exception, SystemExit) as exc:  # une base dite, pas une trace
             print("probe: KO — %s: %s"
@@ -2306,8 +2381,18 @@ def cmd_probe(cfg: Config, *, all_bases: bool = False) -> int:
                     migrations.describe_pending_non_additive(other_pending)))
                 if other_pending else ""))
             return 1
+        other_module_problem = _module_probe_problem(other_modules)
+        if other_module_problem:
+            print("probe: KO — %s: %s" % (label, other_module_problem))
+            return 1
     extra = ("; database newer than this code (versions %s)"
              % ",".join("%04d" % v for v in unknown)) if unknown else ""
+    module_unknown = ["%s/%04d" % (module_check.module, version)
+                      for module_check in module_state.checks
+                      for version in module_check.unknown]
+    if module_unknown:
+        extra += "; module database newer than this code (versions %s)" % (
+            ",".join(module_unknown))
     print("probe: OK (driver %s, schema %s)%s" % (db.name, cfg.schema, extra))
     return 0
 
@@ -2458,18 +2543,18 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         print("profiles   : not checked (audit failed)")
     else:
         profile_ko = _print_profile_audit(audit)
-    # #3619 : un canal `nexlink` routé ne s'active pas sans l'extra `crypto`
-    # (l'installeur et la mise à jour des hôtes le posent). Contrôle sans
-    # base, avant tout envoi : le canal est refusé, fermé, et nommé ; un repli
-    # `ntfy`/`slack` utilisable le couvre (#3536).
-    nexlink_ko = False
+    # #3619 : un canal de module routé (`nexlink` : extra `crypto`, que
+    # l'installeur et la mise à jour des hôtes posent) peut refuser son
+    # activation. Contrôle sans base, avant tout envoi : le canal est refusé,
+    # fermé, et nommé ; un repli `ntfy`/`slack` utilisable le couvre (#3536).
+    channel_ko = False
     try:
         from . import notify as notify_mod
-        nexlink_ok, nexlink_lines = notify_mod.nexlink_activation(cfg)
-        nexlink_ko = not nexlink_ok
+        channel_ok, channel_lines = notify_mod.channel_activation(cfg)
+        channel_ko = not channel_ok
     except Exception as exc:  # a reading never breaks the doctor
-        nexlink_lines = ["not checked (%s)" % (" ".join(str(exc).split())[:120],)]
-    for line in nexlink_lines:
+        channel_lines = ["not checked (%s)" % (" ".join(str(exc).split())[:120],)]
+    for line in channel_lines:
         print("notify     : %s" % line)
     from . import persona_memory
     from . import canon as canon_mod
@@ -2487,6 +2572,15 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
                                  % ", ".join(exceptions) if exceptions else
                                  "UID isolation required; active host peers disable transport",
                                  memory_note))
+    # #7682 : un dépôt de mémoire de persona que cet hôte ne peut pas ouvrir
+    # (HTTPS, ou SSH sans persona_memory.ssh_key) — signalé, sans changer le
+    # verdict : l'exécuteur le dit à l'agent dans son tour et publie le défaut.
+    try:
+        from . import hostcheck as hostcheck_mod
+        for line in hostcheck_mod.memory_transport_lines(cfg, canons):
+            print(line)
+    except Exception as exc:  # noqa: BLE001 - un diagnostic ne casse jamais le doctor
+        print("memory     : repositories not checked (%s)" % exc)
     # #3103 : un pont Docker sur le réseau local de l'hôte (incident #3092) ;
     # lu avant la base, injoignable quand le réseau local est capté
     from . import netcheck
@@ -2576,6 +2670,18 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     pending_switch = migrations.pending_non_additive_from(known, done)
     if pending_switch:
         _print_pending_non_additive(pending_switch)
+    # P1a #7649 : les schémas et migrations de module, en lecture seule. Un
+    # schéma inscrit qui manque, une identité qui ne correspond plus ou une
+    # empreinte modifiée sont des KO ; l'attente et les schémas orphelins sont
+    # dits (WARN), comme pour le noyau.
+    schemas_ok = True
+    try:
+        schemas_ok, schema_lines = migrations.module_doctor_lines(db, cfg.schema)
+    except Exception as exc:  # une lecture ne casse jamais le doctor
+        schema_lines = ["schemas    : not checked (%s)"
+                        % (" ".join(str(exc).split())[:120],)]
+    for line in schema_lines:
+        print(line)
     # #5692 : la base secondaire de l'hôte (`config-ancienne-base.json`) n'était
     # sondée par aucun doctor. Elle l'est ici, en lecture seule, pour que le
     # signal existe avant le staging et pas seulement pendant `controler`.
@@ -2714,9 +2820,13 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             print(line)
     except db_mod.DbError:
         pass
-    verdict = 1 if nexlink_ko else 0
+    verdict = 1 if channel_ko else 0
     # L98 T2a: an active module that is not installed (or is refused) is a KO.
     if not modules_ok:
+        verdict = 1
+    # P1a #7649 : un schéma de module inscrit qui manque, une identité qui ne
+    # correspond plus ou une empreinte modifiée est un KO du doctor.
+    if not schemas_ok:
         verdict = 1
     # #3745 : un réglage de session que le pool local refuserait (ligne
     # déjà imprimée) casse chaque nouvelle session d'ameesh de l'hôte.

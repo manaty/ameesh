@@ -112,6 +112,9 @@ class FakeDb:
 roles = {r['name']: r for r in json.loads((state / 'roles.json').read_text())}
 db_mod.connect = lambda *a, **k: FakeDb()
 registry.get = lambda db, name: roles.get(name)
+# #7661 : `role timers` résout le rôle d'observation sur les fiches du
+# registre (`overview`), plus sur le nom par défaut ; le faux sert les lignes.
+registry.overview = lambda db, *a, **k: list(roles.values())
 argv = sys.argv[1:]
 with (state / 'cli-n1.log').open('a') as f:
     f.write(' '.join(argv).replace('\n', ' ') + '\n')
@@ -168,6 +171,8 @@ MOTIF_N1 = ('aucun tag de release atteignable (clone sans tags)' if not TAG else
             % (TAG, VERSION or 'illisible'))
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "previous-release CLI harness fakes Linux ssh/systemd and /proc")
 @unittest.skipUnless(REQUIS or (TAG and TAG_FIABLE), MOTIF_N1)
 class PreflightCliPrecedentTest(VmAgentsHarness):
     cli = TAG  # la release dont le code est le CLI installé
@@ -189,13 +194,14 @@ class PreflightCliPrecedentTest(VmAgentsHarness):
         (self.canon / 'agents/veilleur.md').write_text(CANON, encoding='utf-8')
         mesh_design = dict(name='mesh-design', releve='election', host='host-agents',
                            candidats=['host-agents', 'agents-autre'],
-                           responsible='human:test')
+                           responsible='human:test', roles=['conception'])
         if not self.mesh_design_candidat:
             mesh_design.update(host='agents-autre', candidats=['agents-autre'])
         (self.state / 'roles.json').write_text(json.dumps([
             mesh_design,
             dict(name='auditeur', releve='election', host='host-agents',
-                 candidats=['host-agents', 'agents-autre'], responsible='human:test')]))
+                 candidats=['host-agents', 'agents-autre'], responsible='human:test',
+                 roles=['auditeur'])]))
         config = self.vmhome / '.config/ameesh/config.json'
         config.write_text(json.dumps({
             'canon': str(self.canon),

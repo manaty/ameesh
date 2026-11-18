@@ -337,6 +337,7 @@ def inspect(cfg, db, project, *, now: float) -> dict:
 def apply(cfg, db, project, *, now: float, actor=None) -> dict:
     """Pilot/bureau gesture: the usual staging script, no version or tag."""
     from . import release_cutoff as rc, staging_watch, work
+    project = rc.with_staging_topology(cfg, project)
     work.corrector(cfg, db, actor, what="staging", history=False)
     started = time.monotonic()
     # Nonblocking lease: never wait through a cutoff then use an old plan.
@@ -399,7 +400,22 @@ def _notify(cfg, db, project, report):
         from . import sous_utilisation
         notify = sous_utilisation.alert_orchestrators(
             cfg, db, storage.of(db).operations.listing(), declared=())
-    targets = sorted(set(notify) | {"bureau"})
+    # #7634 : la route humaine est l'avatar du responsable du projet, lu au
+    # canon ; aucun nom d'avatar n'est connu du cœur. Sans avatar déclaré,
+    # l'agent configuré du projet (`report`) garde la route d'avant.
+    from . import avatars, staging_deferred
+    try:
+        rows = storage.of(db).operations.listing() if db is not None else ()
+    except Exception:  # noqa: BLE001 - sans registre lisible, la route d'avant
+        rows = ()
+    owner = staging_deferred.owner_human(cfg, db, project, rows)
+    avatar = avatars.name_for(cfg, owner) if owner else None
+    targets = set(notify)
+    if avatar:
+        targets.add(avatar)
+    elif project.report:
+        targets.add(str(project.report))
+    targets = sorted(targets)
     text = ("Staging %s : %d lots attendent des correctifs fusionnés non actifs : %s. "
             "Candidate verte : %s. Vérifier puis lancer ameesh release staging-needed "
             "--project %s --apply (sans tag/version)."

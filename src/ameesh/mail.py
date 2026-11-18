@@ -17,6 +17,7 @@ Le SQL est dans le stockage (`storage.of(db).mailbox`, spec §10).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -40,6 +41,90 @@ MAIL_COLUMNS = _pg.MAIL_COLUMNS
 #: #3892 : forme d'une clé d'idempotence d'envoi (stable, du client)
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 
+#: #7625 : fenêtre d'un compte rendu identique au même destinataire. Un
+#: compte rendu (rapport d'état, « rien à faire », note de veille) ne repart
+#: pas avant cette fenêtre ; au-delà, c'est un rappel.
+REPORT_REMIND_S = 6 * 3600.0
+#: #7625 : messages relus pour retrouver le compte rendu précédent. Une boîte
+#: plus chargée que cela en 6 h garde le comportement d'avant (un envoi).
+REPORT_SCAN = 200
+#: #7625 : forme d'une étiquette de compte rendu (`report`)
+_REPORT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,120}$")
+
+
+def report_digest(body: str) -> str:
+    """#7625 : l'empreinte du contenu d'un compte rendu (le texte exact)."""
+    return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+
+
+def report_last(db: Db, sender: str, recipient: str, report: str,
+                fingerprint: str, *, now: float | None = None,
+                limit: int = REPORT_SCAN) -> float | None:
+    """#7625 : l'heure du dernier compte rendu identique encore dans la fenêtre.
+
+    Un compte rendu est identifié par son étiquette (`report`, rangée dans
+    `payload.report`) et par l'empreinte de son contenu
+    (`payload.report_fingerprint`) : deux textes différents sont deux comptes
+    rendus différents, même sous la même étiquette. Rend l'heure du dernier
+    envoi s'il date de moins de `REPORT_REMIND_S`, sinon None (le compte
+    rendu est dû).
+
+    Lecture seule et tolérante : une source illisible ou un exécuteur médié
+    (contrat fermé) ne supprime jamais un envoi — None, comme un compte rendu
+    dû. La fenêtre est glissante : l'heure du message fait foi, pas une
+    tranche d'horloge, si bien qu'un rappel ne part jamais moins de six heures
+    après le précédent.
+    """
+    now = time.time() if now is None else float(now)
+    if not report or not fingerprint:
+        return None
+    from .agent_names import resolve as resolve_agent_name
+    try:
+        if storage.is_remote(db):
+            return None
+        sender = resolve_agent_name(sender, db=db, operation="mail.report")
+        recipient = resolve_agent_name(recipient, db=db, operation="mail.report")
+        rows = storage.of(db).mailbox.history(recipient, int(limit))
+    except Exception:  # noqa: BLE001 — une lecture qui échoue ne supprime rien
+        return None
+    last = None
+    for row in rows:
+        try:
+            ts = float(row.get("created_ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0 or ts < now - REPORT_REMIND_S:
+            continue
+        charge = row.get("payload")
+        if isinstance(charge, str):
+            try:
+                charge = json.loads(charge)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(charge, dict):
+            continue
+        if (str(row.get("sender") or "") == sender
+                and charge.get("report") == report
+                and charge.get("report_fingerprint") == fingerprint):
+            last = ts if last is None else max(last, ts)
+    return last
+
+
+def report_due(db: Db, sender: str, recipient: str, report: str,
+               fingerprint: str, *, now: float | None = None,
+               limit: int = REPORT_SCAN) -> bool:
+    """#7625 : ce compte rendu est-il dû (aucun identique dans la fenêtre) ?"""
+    return report_last(db, sender, recipient, report, fingerprint, now=now,
+                       limit=limit) is None
+
+
+def _report_label(report: str) -> str:
+    """Normalise et vérifie une étiquette de compte rendu (#7625)."""
+    label = str(report or "").strip()
+    if not _REPORT_LABEL_RE.match(label):
+        raise ValueError("invalid report label: %r" % (report,))
+    return label
+
 
 def _replay_id(mailbox, message_id: int, body: str, work_item_id: str | None,
                key: str) -> int:
@@ -58,6 +143,57 @@ def _replay_id(mailbox, message_id: int, body: str, work_item_id: str | None,
     if not (same_body and same_lot):
         raise ValueError("idempotency key %r already used for another message" % (key,))
     return int(message_id)
+
+
+#: #7668 : le canon n'a pas répondu sur un correspondant (non configuré,
+#: illisible, ou nom absent). L'inconnu est privé, jamais « pas un avatar ».
+_UNKNOWN_QUALIFICATION = object()
+
+
+def _canon_row(cfg, name: str):
+    """#7668 : carte du canon local pour `name`, ou `_UNKNOWN_QUALIFICATION`.
+
+    Repli d'une session médiée, à qui le contrat 1.1 ne sert pas `agents.get` :
+    le canon du poste reste la seule déclaration lisible. Seule une carte
+    effectivement lue est une réponse ; un canon absent ou illisible, ou un nom
+    qu'il ne déclare pas, reste une qualification inconnue. Aucune erreur ne
+    remonte (le courrier ne dépend pas de cette lecture)."""
+    try:
+        from . import canon as canon_mod
+        if cfg is None or not canon_mod.configured(cfg):
+            return _UNKNOWN_QUALIFICATION
+        for canon in canon_mod.from_config_all(cfg):
+            agent = canon.agent(name)
+            if agent is not None:
+                return {"name": agent.title, "team": agent.team,
+                        "releve": agent.releve}
+    except Exception:  # noqa: BLE001 — qualification indisponible, pas un refus
+        return _UNKNOWN_QUALIFICATION
+    return _UNKNOWN_QUALIFICATION
+
+
+def _avatar_correspondence(db, *agents) -> bool:
+    """#7668 : l'un des correspondants est-il un avatar (`releve: preference`) ?
+
+    Lecture faite au même point que la copie R12 (dans `record`, donc après le
+    COMMIT quand elle est différée). Le courrier n'est jamais retenu ; seule
+    sa copie lisible dépend de la réponse. Une panne de registre répond
+    « privé » : la copie est omise plutôt que de publier le corps d'un avatar
+    par défaut (B P2 ameesh-cx2). Un contrat médié qui ne sert pas `agents.get`
+    n'est pas une panne : le canon local qualifie encore les correspondants.
+    Seule une carte lue et ordinaire applique la règle historique du fil
+    (#515) ; une qualification inconnue reste privée (B P2 auditeur/cx2)."""
+    try:
+        from . import registry
+        rows = [registry.get(db, name) for name in agents]
+    except Exception as exc:  # noqa: BLE001 — décision ci-dessous
+        from .mediated_executor.contract import NotSupportedRemotely
+        if not isinstance(exc, NotSupportedRemotely):
+            return True
+        rows = [_canon_row(getattr(db, "cfg", None), name) for name in agents]
+        if any(row is _UNKNOWN_QUALIFICATION for row in rows):
+            return True
+    return any(fil.avatar_conversation(row) for row in rows)
 
 
 def send(
@@ -81,7 +217,10 @@ def send(
     thread_meta: dict | None = None,
     after_commit: list | None = None,
     idempotency_key: str | None = None,
-) -> int:
+    report: str | None = None,
+    report_fingerprint: str | None = None,
+    in_reply_to: int | None = None,
+) -> int | None:
     """Dépose un message pour UN destinataire, l'écrit dans son fil. Renvoie son id.
 
     Les champs `signed_*` viennent de `authority.sign_message` : un message
@@ -97,7 +236,9 @@ def send(
     quand le message est lié à un lot, sinon celui de l'expéditeur, sinon du
     destinataire — son équipe (`team`) s'il est gouverné par le canon, sinon
     son chantier —, sinon AMEESH_PROJECT, sinon `default` ; lot :
-    `work_item_id`.
+    `work_item_id`. Un courrier dont l'expéditeur ou le destinataire est un avatar
+    (`releve: preference`) n'a hors lot aucune copie R12 : il reste dans la
+    boîte et dans le journal (#7668).
 
     #3892 : `idempotency_key` (une chaîne stable du client, rangée dans
     `payload.idempotency_key`) rejoue un envoi dont la réponse s'est perdue.
@@ -107,10 +248,40 @@ def send(
     exécuteur médié qui n'a pas cette lecture préalable. Une clé réutilisée
     pour un autre corps ou un autre lot est refusée (`ValueError`), jamais
     rendue comme envoyée.
+
+    #7625 : un compte rendu (`report`, ou le marqueur `payload.report` posé
+    par son producteur) identique au précédent pour ce destinataire ne repart
+    pas avant `REPORT_REMIND_S` ; le message n'est alors pas déposé et le
+    rendu est None. L'empreinte est celle du contenu (`report_fingerprint`,
+    par défaut le corps) : un texte changé part tout de suite. Le marqueur
+    (`payload.report` et `payload.report_fingerprint`) est posé par ce module.
+    `idempotency_key` l'emporte : un envoi déjà dédoublonné par sa clé n'est
+    pas réévalué.
+
+    #7672 : `in_reply_to`, réservé à la surface publique de réponse, nomme la
+    demande (`agent_mailbox.id`, `kind = 'request'`) à laquelle ce message
+    répond. L'index unique partiel 0594 en fait l'autorité de l'unicité ; le
+    dépôt ordinaire ne le pose jamais.
     """
     from .agent_names import resolve as resolve_agent_name
     sender = resolve_agent_name(sender, db=db, operation="mail.send")
     recipient = resolve_agent_name(recipient, db=db, operation="mail.send")
+    if report is None and isinstance(payload, dict):
+        # Seul un producteur qui nomme son compte rendu est dédoublonné :
+        # `info` marque un courrier passif, pas forcément un état inchangé.
+        report = payload.get("report")
+    if report is not None:
+        report = _report_label(report)
+        fingerprint = str(
+            report_fingerprint
+            or (payload or {}).get("report_fingerprint")
+            or report_digest(body))
+        if idempotency_key is None and not report_due(
+                db, sender, recipient, report, fingerprint):
+            return None
+        payload = dict(payload or {})
+        payload["report"] = report
+        payload["report_fingerprint"] = fingerprint
     if idempotency_key is not None:
         idempotency_key = str(idempotency_key).strip()
         if not _IDEMPOTENCY_KEY_RE.match(idempotency_key):
@@ -125,11 +296,18 @@ def send(
             raise ValueError("payload.idempotency_key does not match the key")
         payload["idempotency_key"] = idempotency_key
     fil.ensure_readable(body, allow_structured)
-    row = storage.of(db).mailbox.send(
-        sender, recipient, body, host=host, kind=kind, payload=payload,
-        work_item_id=work_item_id, signature=signature, signature_key=signature_key,
-        signed_payload=signed_payload, nonce=nonce, created_us=created_us,
-        expires_us=expires_us)
+    mailbox = storage.of(db).mailbox
+    args = dict(host=host, kind=kind, payload=payload,
+                work_item_id=work_item_id, signature=signature,
+                signature_key=signature_key, signed_payload=signed_payload,
+                nonce=nonce, created_us=created_us, expires_us=expires_us)
+    if in_reply_to is None:
+        row = mailbox.send(sender, recipient, body, **args)
+    else:
+        # #7672 : la corrélation a son propre dépôt, refusé à l'exécuteur
+        # médié ; le chemin ordinaire ne change pas de signature.
+        row = mailbox.send_reply(sender, recipient, body,
+                                 in_reply_to=in_reply_to, **args)
     message_id = int(row["id"])
     # #1689 (N1) : tout dépôt local réveille le chemin rapide du destinataire
     # (#1604), pas seulement `mail send` : approbations, exécuteur, veille,
@@ -146,12 +324,20 @@ def send(
         if kind != "notify":
             meta["kind"] = kind
         meta.update(thread_meta or {})
+        # #7668 : le courrier d'un avatar (relève `preference`) reste dans son
+        # journal ; hors du lot qu'il traite, il n'est pas publié dans le fil
+        # d'un projet — jamais dans le projet par défaut de l'expéditeur ou de
+        # l'exécuteur. Un simple agent sans projet garde le fil de son
+        # correspondant : son journal est privé, pas le routage du courrier.
 
         def record(cfg=db.cfg, target=db) -> None:
+            lot_project = fil.lot_project(target, work_item_id)
+            if not lot_project and _avatar_correspondence(target, sender, recipient):
+                return
             fil.record(
                 cfg, target, sender=sender, recipients=[recipient], text=body,
                 ts=row.get("created_ts"),
-                project=fil.project_for(cfg, fil.lot_project(target, work_item_id),
+                project=fil.project_for(cfg, lot_project,
                                         row.get("sender_project"),
                                         row.get("recipient_project")),
                 lot=work_item_id, mailbox_ids=[message_id], meta=meta)

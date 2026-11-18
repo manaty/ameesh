@@ -7,13 +7,18 @@ TYPES = ('host_idle_reserved', 'baseline_oversized')
 
 def project(footprints, listing, *, now, idle_after_s=1800, baseline_hosts=2,
             held_hosts=(), draining_hosts=(), orchestrators=()):
-    """Alert projection over A2 evidence; no host lifecycle effects."""
+    """Alert projection over A2 evidence; no host lifecycle effects.
+
+    A host whose `capacity` is `none` admits no agent (#7727): it is outside
+    both the reserved-idle alert and the oversized-baseline count, even when
+    it is idle and paid for."""
     from .exploitation import _alert
     excluded = set(held_hosts) | set(draining_hosts)
     idle = {}
     for host, fp in sorted(footprints.items()):
         since = resources.finite_float(fp.get('idle_since'))
         if (host in excluded or fp.get('state') != 'idle' or fp.get('unknown')
+                or fp.get('capacity') not in host_idle.CAPACITY_CLASSES
                 or since is None or not idle_after_s <= now - since):
             continue
         idle[host] = fp

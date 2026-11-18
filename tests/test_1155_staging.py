@@ -91,6 +91,18 @@ if grep -qx "ko=$host:$action" "$state/scenario" 2>/dev/null; then
   echo "echec injecte : $host $action" >&2
   exit 1
 fi
+# #7785 : la sante demande les unites runner desactivees de cet hote ; le
+# scenario les declare en `unite-desactivee=<hote>:<persona>`.
+if [ "$action" = unites-desactivees ]; then
+  sed -n "s/^unite-desactivee=$host://p" "$state/scenario" 2>/dev/null || true
+  exit 0
+fi
+if [ "$action" = installer ]; then
+  printf '%s' "${2:0:7}" > "$state/venv-$host"
+  if [ "$host" = pc-smichea ]; then
+    ln -sfn "venv-${2:0:7}" "$HOME/.local/share/ameesh/venv-courant"
+  fi
+fi
 # #5692 : preflight des migrations du poste. Une base secondaire bloquee le
 # rend reportable (4) ; la base du mesh bloquee arrete la sequence (3).
 if [ "$host" = pc-smichea ] && [ "$action" = prevol ]; then
@@ -174,6 +186,16 @@ SSH = r'''#!/usr/bin/env bash
 printf 'stub %s %s\n' "$0" "$*" >> "${FAKE_STATE:?}/calls.log"
 printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 case "$*" in
+  *"venv-courant"*)
+    cible=$(printf '%s\n' "$*" | sed -n 's/.*root@\([0-9.]*\).*/\1/p' | head -1)
+    case "$cible" in 10.77.0.3) host=ameesh-agents-1;; 10.77.0.4) host=ameesh-agents-2;; 10.77.0.5) host=ameesh-agents-3;; *) host=manaty-mesh-1;; esac
+    if grep -qx "illisible=$host" "$FAKE_STATE/scenario" 2>/dev/null; then exit 1; fi
+    if grep -qx "fige=$host" "$FAKE_STATE/scenario" 2>/dev/null; then rm -f "$FAKE_STATE/venv-$host"; fi
+    vivant=$(cat "$FAKE_STATE/venv-$host" 2>/dev/null || sed -n "s/^venv-$cible=//p" "$FAKE_STATE/scenario" | head -1)
+    if [ -z "$vivant" ]; then vivant=$(sed -n "s/^deja-$cible=//p" "$FAKE_STATE/scenario" | head -1); fi
+    [ -n "$vivant" ] || exit 1
+    if [ "$host" = manaty-mesh-1 ]; then echo "venv-${vivant:0:7}"; else echo "${vivant:0:7} ${vivant:0:7}"; fi
+    exit 0 ;;
   *"rev-parse --verify HEAD"*)
     # #4050 : clone de travail des migrations (DEPOT_VM) ; absent par scenario,
     # comme sur un hote neuf avant le premier staging.
@@ -318,6 +340,50 @@ case "$1" in
   *) exec @CAT@ "$@" ;;
 esac
 '''.replace('@CAT@', REAL_CAT)
+
+
+class LiveVenvReadTest(unittest.TestCase):
+    def test_real_metadata_and_link_are_both_checked(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as temp:
+            root = Path(temp)
+            live = root / 'venv-abcdef0'
+            info = live / 'lib/python3.12/site-packages/ameesh-1.dist-info'
+            info.mkdir(parents=True)
+            (info / 'direct_url.json').write_text('{"url":"file:///home/ameesh/src-1234567"}')
+            (root / 'venv-courant').symlink_to(live.name)
+            source = (DEPLOY / 'staging.sh').read_text()
+            functions = source[source.index('sha_venv_agents() {'):source.index('precedent_retour() {')]
+            script = r"""
+mode_de() { echo agents; }
+ssh_lire() {
+  local command=${2/runuser -u ameesh -- /}
+  command=${command//\/home\/ameesh\/.local\/share\/ameesh/$REPLACE_BASE}
+  bash -c "$command"
+}
+declare -A CIBLE=([host]=ignored)
+SHA=1234567890123456789012345678901234567890
+""" + functions + '\nsha_venv_agents host\n'
+            env = dict(os.environ, REPLACE_BASE=str(root))
+            result = subprocess.run(['bash', '-c', script], env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), 'abcdef0')
+            (root / 'venv-courant').unlink()
+            (root / 'venv-1234567').symlink_to(live, target_is_directory=True)
+            (root / 'venv-courant').symlink_to('venv-1234567')
+            result = subprocess.run(['bash', '-c', script], env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), '1234567')
+            (info / 'direct_url.json').write_text('{"url":"file:///home/ameesh/src-abcdef0"}')
+            result = subprocess.run(['bash', '-c', script], env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), 'abcdef0')
+            (info / 'direct_url.json').unlink()
+            result = subprocess.run(['bash', '-c', script], env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 3, result.stderr)
 
 
 class StagingTest(unittest.TestCase):
@@ -767,14 +833,17 @@ class StagingTest(unittest.TestCase):
             ('ameesh-agents-1', 'redemarrer'),
             ('ameesh-agents-1', 'timers'),
             ('ameesh-agents-1', 'controler'),
+            ('ameesh-agents-1', 'unites-desactivees'),
             ('ameesh-agents-2', 'installer'),
             ('ameesh-agents-2', 'redemarrer'),
             ('ameesh-agents-2', 'timers'),
             ('ameesh-agents-2', 'controler'),
+            ('ameesh-agents-2', 'unites-desactivees'),
             ('ameesh-agents-3', 'installer'),
             ('ameesh-agents-3', 'redemarrer'),
             ('ameesh-agents-3', 'timers'),
             ('ameesh-agents-3', 'controler'),
+            ('ameesh-agents-3', 'unites-desactivees'),
             ('manaty-mesh-1', 'installer'),
             ('manaty-mesh-1', 'redemarrer'),
             ('manaty-mesh-1', 'controler'),
@@ -783,6 +852,7 @@ class StagingTest(unittest.TestCase):
             ('pc-smichea', 'redemarrer'),
             ('pc-smichea', 'timers'),
             ('pc-smichea', 'controler'),
+            ('pc-smichea', 'unites-desactivees'),
         ])
         self.assertIn('venv-ameesh doctor --harness', self.calls())
         # #4050 : le clone des migrations n'est exige que du chemin sans poste ;
@@ -897,6 +967,45 @@ class StagingTest(unittest.TestCase):
         self.assertIn('aucun retour', notifications[0])
         self.assertIn(precedent, notifications[0])
         self.assert_no_escape()
+
+    def test_checkout_target_with_old_live_venv_is_installed_forward(self):
+        (self.state / 'scenario').write_text(
+            'deja-10.77.0.4=%s\nvenv-10.77.0.4=abcdef0\n' % self.sha)
+        p = self.run_staging('--hotes', 'ameesh-agents-2', '--sans-sonde')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(('ameesh-agents-2', 'installer'), self.actions())
+        self.assertTrue(any(t['hote'] == 'ameesh-agents-2' and t['etape'] == 'sante'
+                            and t['verdict'] == 'ok' for t in self.traces()))
+
+    def test_checkout_target_failed_install_does_not_roll_back(self):
+        (self.state / 'scenario').write_text(
+            'deja-10.77.0.4=%s\nvenv-10.77.0.4=abcdef0\nko=ameesh-agents-2:installer\n' % self.sha)
+        p = self.run_staging('--hotes', 'ameesh-agents-2', '--sans-sonde')
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertNotIn(('ameesh-agents-2', 'retour'), self.actions())
+        self.assertIn('checkout cible, venv vivant abcdef0', p.stderr)
+
+    def test_stale_live_venv_after_install_is_named_and_rolled_back(self):
+        (self.state / 'scenario').write_text(
+            'venv-10.77.0.4=abcdef0\nfige=ameesh-agents-2\n')
+        p = self.run_staging('--hotes', 'ameesh-agents-2', '--sans-sonde')
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn(('ameesh-agents-2', 'retour'), self.actions())
+        self.assertIn('venv vivant abcdef0', p.stderr)
+
+    def test_unreadable_live_venv_is_inconclusive(self):
+        (self.state / 'scenario').write_text('illisible=ameesh-agents-2\n')
+        p = self.run_staging('--hotes', 'ameesh-agents-2', '--sans-sonde')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn(('ameesh-agents-2', 'retour'), self.actions())
+        trace = next(t for t in self.traces() if t['hote'] == 'ameesh-agents-2'
+                     and t['etape'] == 'sante')
+        self.assertEqual(trace['verdict'], 'non-concluant')
+        # #4126 : actif.py lit le rapport de la trace ; sans hote ni sha, il le
+        # rejette comme preuve etrangere et n'emet aucune attestation.
+        self.assertEqual(trace['rapport']['hote'], 'ameesh-agents-2')
+        self.assertEqual(trace['rapport']['sha'], self.sha)
+        self.assertEqual(json.loads(trace['detail']), trace['rapport'])
 
     def test_term_on_same_sha_host_leaves_no_return_to_the_supervisor(self):
         """#6778 : l'arret surveille d'un hote deja au commit vise ne laisse
@@ -1181,6 +1290,7 @@ class StagingTest(unittest.TestCase):
         (self.home / '.local/share/ameesh').mkdir(parents=True, exist_ok=True)
         (self.home / ('.local/share/ameesh/src-%s' % court)).mkdir()
         (self.home / '.local/share/ameesh/src-current').symlink_to('src-%s' % court)
+        (self.home / '.local/share/ameesh/venv-courant').symlink_to('venv-%s' % court)
         # N2 : la trace doit nommer la cible de retour conservee, pas la cible
         # courante.
         journal = self.home / '.local/state/ameesh/mise-a-jour'
@@ -1729,6 +1839,50 @@ class StagingTest(unittest.TestCase):
         sondes = [l for l in self.calls() if 'sante-courrier.py' in l]
         self.assertTrue(sondes, self.calls())
         self.assertIn('--attente-cible 300', sondes[0])
+
+    def test_7785_sante_recoit_les_unites_desactivees_de_chaque_hote(self):
+        """#7785 : les noms lus par le script de l'hote (vm.sh / poste.sh)
+        arrivent a sante-courrier.py en `--unite-desactivee` ; le serveur, qui
+        n'a pas ces unites, n'en demande pas et n'en recoit pas."""
+        (self.state / 'scenario').write_text(
+            'unite-desactivee=ameesh-agents-1:dev8\n'
+            'unite-desactivee=ameesh-agents-1:dev9\n'
+            'unite-desactivee=pc-smichea:poste-eteint\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        sondes = [l for l in self.calls()
+                  if l.startswith('venv-python ') and 'sante-courrier.py' in l]
+        vm = [l for l in sondes if '--hote ameesh-agents-1' in l]
+        self.assertEqual(len(vm), 1, sondes)
+        self.assertIn('--unite-desactivee dev8', vm[0])
+        self.assertIn('--unite-desactivee dev9', vm[0])
+        poste = [l for l in sondes if '--hote pc-smichea' in l]
+        self.assertEqual(len(poste), 1, sondes)
+        self.assertIn('--unite-desactivee poste-eteint', poste[0])
+        serveur = [l for l in sondes if '--hote manaty-mesh-1' in l]
+        self.assertEqual(len(serveur), 1, sondes)
+        self.assertNotIn('--unite-desactivee', serveur[0])
+        self.assertIn(('ameesh-agents-1', 'unites-desactivees'), self.actions())
+        self.assertNotIn(('manaty-mesh-1', 'unites-desactivees'), self.actions())
+
+    def test_7785_lecture_des_unites_en_echec_laisse_la_sante_stricte(self):
+        """Une lecture en echec n'est pas devinee : avertissement, sante sans
+        tolerance, et l'hote ne devient pas malsain pour autant."""
+        (self.state / 'scenario').write_text(
+            'ko=ameesh-agents-2:unites-desactivees\n'
+            'unite-desactivee=ameesh-agents-2:dev8\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertIn('unites desactivees de ameesh-agents-2 : lecture non'
+                      ' concluante', p.stderr)
+        sondes = [l for l in self.calls()
+                  if l.startswith('venv-python ') and 'sante-courrier.py' in l
+                  and '--hote ameesh-agents-2' in l]
+        self.assertEqual(len(sondes), 1, self.calls())
+        self.assertNotIn('--unite-desactivee', sondes[0])
+        self.assertTrue(any(t['hote'] == 'ameesh-agents-2'
+                            and t['etape'] == 'sante' and t['verdict'] == 'ok'
+                            for t in self.traces()))
 
     def test_outside_main_is_refused_without_override(self):
         self.repo.joinpath('marque').write_text('y\n')

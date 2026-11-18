@@ -106,6 +106,8 @@ reçu exact contradictoire est une erreur, pas une absence.
 """
 from __future__ import annotations
 
+import json
+
 import codecs
 import contextlib
 import contextvars
@@ -1301,6 +1303,7 @@ def _is_ancestor(repo: str, before: str, after: str, cache=None) -> Optional[boo
 
 
 def _present_commits(repo: str, shas: Sequence[str], *,
+                     non_commits: Optional[set[str]] = None,
                      timeout: Optional[float] = None) -> Optional[dict[str, str]]:
     """Les SHA de commits présents **localement**, en une seule commande git.
 
@@ -1308,6 +1311,8 @@ def _present_commits(repo: str, shas: Sequence[str], *,
     reçu ; 500 reçus prenaient ~40 s, au-delà du budget de 60 s du balayage en
     CI. `cat-file --batch-check` lit la présence des objets en un passage, sans
     fetch paresseux (magasin sans remote), et rend `{sha: sha complet}`.
+    `non_commits`, si fourni, reçoit les objets résolus de type blob, tree
+    ou tag (#7618) ; les objets absents ou ambigus restent non concluants.
     `None` quand la lecture échoue : la preuve locale reste non concluante.
     """
     wanted = list(dict.fromkeys(str(sha).lower() for sha in shas or ()
@@ -1332,6 +1337,9 @@ def _present_commits(repo: str, shas: Sequence[str], *,
         fields = line.split()
         if len(fields) == 2 and fields[1] == "commit":
             present[rev] = fields[0].lower()
+        elif (len(fields) == 2 and fields[1] in {"blob", "tree", "tag"}
+              and non_commits is not None):
+            non_commits.add(rev)
     return present
 
 
@@ -4316,7 +4324,7 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
         return None
 
 
-def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> str:
+def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> Optional[str]:
     """Le SHA complet d'un commit cité **abrégé**, résolu par la forge (#7252).
 
     Le correctif d'un relecteur retiré par un push forcé n'est plus dans la
@@ -4326,7 +4334,8 @@ def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> 
     devenu pendant (`repos/<slug>/commits/<token>`), et rend le SHA complet ;
     `_forge_fetch` rapatrie ensuite l'objet exact pour les contrôles de
     topologie. Rend `""` sans forge, sur réponse illisible ou sur échéance :
-    un doute, jamais une exclusion silencieuse.
+    un doute, jamais une exclusion silencieuse. `None` désigne uniquement
+    une réponse HTTP 404/422 disant explicitement « No commit found ».
     """
     token = str(token or "").strip()
     if not repo or not token:
@@ -4347,7 +4356,15 @@ def _forge_commit(repo: str, token: str, *, timeout: Optional[float] = None) -> 
 
         client = plan_github.client(timeout=bound, caller="review-authors")
         data = client.get("repos/%s/commits/%s" % (slug, token))
-    except Exception:  # noqa: BLE001 - forge injoignable ou muette : doute
+    except Exception as exc:  # noqa: BLE001 - forge injoignable : doute
+        if (isinstance(exc, plan_github.GithubError)
+                and exc.status in {404, 422}):
+            try:
+                message = json.loads(exc.body).get("message", "")
+            except (ValueError, TypeError, AttributeError):
+                message = ""
+            if str(message).lower().startswith("no commit found for sha:"):
+                return None
         return ""
     full = str((data or {}).get("sha") or "").strip().lower() \
         if isinstance(data, Mapping) else ""
@@ -5227,10 +5244,16 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
 #: #7252 : une citation de commit retiré dans le message de réécriture de
 #: l'auteur (7 à 40 caractères hexadécimaux). Un identifiant de B (`#40556`)
 #: n'a pas cette longueur. Les empreintes nommées checksum/sha256 sont
-#: écartées avant toute résolution Git (#7576).
+#: écartées avant toute résolution Git (#7576). Le nom complet d'un paquet
+#: horaire (`h-AAAAMMJJ-NN`) est un identifiant, pas une citation : sa date
+#: (huit chiffres hexadécimaux) est consommée avec lui (#7709). Une citation
+#: avec tiret (`correctif-<sha>`) reste lue et résolue. Une suite hexadécimale
+#: noyée dans un mot (par exemple `succeeded`, #7770) n'est pas un jeton de
+#: commit.
 _CITED_COMMIT = re.compile(
     r"\b(?:checksum|sha256)\s+[0-9a-f]+\b"
-    r"|(?P<commit>(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f]))",
+    r"|\bh-\d{8}-\d+\b"
+    r"|(?P<commit>(?<![0-9a-z])[0-9a-f]{7,40}(?![0-9a-z]))",
     re.IGNORECASE)
 
 #: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
@@ -5664,7 +5687,9 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         if not cited:
             return {}
         check()
-        present = _present_commits(repo, sorted(cited), timeout=remaining())
+        non_commits: set[str] = set()
+        present = _present_commits(repo, sorted(cited),
+                                   non_commits=non_commits, timeout=remaining())
         check()
         found: dict[str, dict] = {}
 
@@ -5688,6 +5713,11 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             full = (_read_local_commit(repo, token) if present is None
                     else present.get(token))
             if not full:
+                # #7618 : un objet explicitement non commit ne prouve aucun
+                # correctif. Toute citation absente reste à résoudre, même
+                # numérique : un abrégé Git peut ne contenir que des chiffres.
+                if token in non_commits:
+                    continue
                 # #7252 B/P2 auditeur : le commit réécrit a disparu du clone
                 # (push forcé). La forge le résout par l'abrégé, puis sert
                 # l'objet exact pour les contrôles de topologie. Forge muette :
@@ -5700,6 +5730,11 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     cite_doubt(token, citing, reason="not-prefetched")
                     continue
                 resolved = _forge_commit(repo, token, timeout=remaining())
+                if resolved is None:
+                    # #7730 : la forge prouve l’absence du commit, même
+                    # pour un mot hexadécimal tel que « ed25519 ».
+                    non_commits.add(token)
+                    continue
                 if not resolved:
                     cite_doubt(token, citing)
                     continue
@@ -5959,6 +5994,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             recover=None, admitted_heads=(),
             exclusions_out: Optional[list] = None,
             commits_out: Optional[dict] = None,
+            commit_families_out: Optional[dict] = None,
+            global_families_out: Optional[set] = None,
             fetch: bool = True,
             milestone_proof: Optional[Mapping] = None,
             doubts_out: Optional[list] = None) -> tuple[list, list, list]:
@@ -5989,6 +6026,19 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     antérieurs qui ont porté sa famille jusqu'à cette tête. Il ne sert qu'à
     nommer les commits d'un refus de gel ; aucune décision ne le lit, et son
     absence ne change rien.
+
+    `commit_families_out` (#7745) reçoit, pour chaque commit de la plage
+    courante, l'ensemble des familles prouvées de ses auteurs. C'est la lecture
+    de l'indépendance **par delta d'auteur** : la famille d'un commit n'exclut
+    pas un relecteur des autres commits de la tête. Une entrée vide est un
+    commit sans famille d'agent (un humain, une adaptation de tests seule) et
+    n'exclut personne. `global_families_out` reçoit les familles qu'aucun
+    commit de la tête ne porte : la famille du gel quand un commit sans reçu
+    exact a été réattribué (#7324) et celle d'un auteur d'un gel antérieur dont
+    le contenu a été réécrit (#2924). Ces familles restent exclues de **tous**
+    les deltas : on ne lave pas une provenance en découpant la tête. Un commit
+    de la plage que cette lecture n'attribue pas devient un inconnu : la porte
+    échoue fermé, la désignation attend.
 
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
     du titulaire de référence reste le sien ; un relecteur désigné reste
@@ -6139,9 +6189,32 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # #3805 : les copies d'une même réémission partagent la liste des commits
     # candidats d'un auteur (une seule recherche `git log --all` par auteur).
     patch_receipt_cache: dict = {}
+    #: #7745 : les acteurs attribués à chaque commit de la plage courante. La
+    #: famille finale se lit dans `by_name` après les fusions (correcteurs
+    #: promus, gels antérieurs, gel #7324) ; un acteur retiré de `by_name`
+    #: (adaptation de tests seule) laisse le commit sans famille.
+    commit_actors: dict[str, set[str]] = {}
+    #: #7745/#2924 : les acteurs qui **écrivent** un commit de la plage
+    #: courante (un correcteur de tests seuls n'écrit pas la tête). Seul un
+    #: auteur porteur d'un commit courant est rattaché ; un auteur d'un gel
+    #: antérieur dont le contenu survit sous une autre écriture garde une
+    #: famille globale, même s'il a par ailleurs une correction de tests dans
+    #: la plage.
+    authoring: dict[str, set[str]] = {}
+    skipped: set[str] = set()
+    freezer_global: set[str] = set()
+
+    def record_actor(actor: str, sha: str) -> None:
+        """#7745 : le commit est attribué à cet acteur, famille encore inconnue."""
+        if not actor or not sha:
+            return
+        commit_actors.setdefault(sha, set()).add(actor)
 
     def record_commit(actor: str, sha: str) -> None:
         """#3742 : le commit attribué à un acteur, pour nommer un refus de gel."""
+        record_actor(actor, sha)
+        if actor and sha:
+            authoring.setdefault(actor.casefold(), set()).add(sha)
         if commits_out is None or not actor or not sha:
             return
         key = next((name for name in commits_out
@@ -6155,6 +6228,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         if not sha:
             continue
         if packet and _manifest_commit(repo, sha):
+            skipped.add(sha)
             continue                      # composition mécanique du composeur (#2803)
         try:
             receipt = _commit_receipt(provider, db, sha, strict=strict)
@@ -6186,6 +6260,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                         (sha, row["family"]))
                     review_families.setdefault(actor, {}).setdefault(
                         sha, set()).update(values)
+                    record_actor(actor, sha)
                 else:
                     by_name.setdefault(actor, set()).update(values)
                     if row["role"] == "third":
@@ -6206,6 +6281,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             # sa correction est un contenu de la tête (#2888) ; le seuil ne
             # décide que de la trace « correcteur de premier tour »
             review_commits.setdefault(actor, []).append((sha, proven))
+            record_actor(actor, sha)
         else:
             by_name.setdefault(actor, set()).add(proven)
             third_commits.setdefault(actor, []).append(sha)
@@ -6227,6 +6303,12 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                     # sa famille vient du reçu du gel, pas du repli #2721 :
                     # aucune trace `proof: turn-journal` pour lui.
                     by_name.setdefault(name, set()).add(family)
+                    # #7745 : la famille du gel ne se rattache à aucun commit
+                    # précis (celui qui a réécrit l'identité a pu choisir
+                    # n'importe quel nom) : elle reste exclue de tous les
+                    # deltas, sinon un relecteur de sa famille couvrirait le
+                    # commit réattribué.
+                    freezer_global.add(str(family).strip().lower())
                 else:
                     head_sha = str(head or (milestone or {}).get("sha") or "")
                     if head_sha[:12] and head_sha[:12] not in unknown:
@@ -6352,6 +6434,44 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         # doit jamais effacer l'autre famille.
         by_name.setdefault(str(row["name"]), set()).update(
             str(value) for value in values if str(value or "").strip())
+    # #7745 : la lecture par delta d'auteur. La famille de chaque commit est
+    # celle de ses acteurs dans la lecture finale (correcteurs promus et gels
+    # antérieurs compris) ; un acteur sans commit de la plage courante — le gel
+    # d'un commit réattribué (#7324), un auteur de gel antérieur réécrit
+    # (#2924) — garde une famille globale, exclue de tous les deltas.
+    if commit_families_out is not None or global_families_out is not None:
+        # L'ordre de `commits` est celui de la tête : la porte en dérive les
+        # deltas contigus, un ensemble le rendrait non déterministe.
+        current = list(dict.fromkeys(
+            str(value).strip() for value in commits or () if str(value).strip()))
+        # #7745 : seuls les commits **écrits** rattachent leur acteur. Une
+        # correction de tests seuls (jamais promue auteur) ne rattache pas un
+        # auteur de gel antérieur : sa famille reste globale (#2924/#3518).
+        attached = set(authoring)
+        glob = {str(value).strip().lower() for value in freezer_global
+                if str(value).strip()}
+        for actor, proven in by_name.items():
+            if str(actor).casefold() not in attached:
+                glob.update(str(value).strip().lower() for value in proven
+                            if str(value).strip())
+        if commit_families_out is not None:
+            for sha in current:
+                if sha in skipped:
+                    continue          # composition mécanique, hors delta (#2803)
+                values: set[str] = set()
+                for actor in commit_actors.get(sha, ()):
+                    values.update(str(value) for value in by_name.get(actor, ())
+                                  if str(value).strip())
+                commit_families_out[sha] = values
+        if global_families_out is not None:
+            global_families_out.update(glob)
+        # Un commit que cette lecture n'attribue pas n'a pas de famille
+        # prouvée : inconnu, jamais une famille supposée (canon §2). Le commit
+        # de manifeste d'un véhicule est hors delta et déjà écarté.
+        for sha in [sha for sha in current
+                    if sha not in commit_actors and sha not in skipped]:
+            if sha[:12] not in unknown:
+                unknown.append(sha[:12])
     out = []
     for actor in sorted(by_name):
         proven = {value for value in by_name[actor] if value}

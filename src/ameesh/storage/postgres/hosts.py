@@ -45,6 +45,8 @@ READING_COLUMNS = (
     # L159d (0061): shared host measure
     "mem_total_bytes, psi_cpu_some, psi_mem_some, psi_mem_full, psi_io_some, "
     "app_cpu, guest_cpu, cpu_window_s, guest_mem_bytes, "
+    # #7687 (0589): live offloaded jobs of a lending host (`guest` runs)
+    "guest_jobs, "
     "lendable_cpu, lendable_memory_bytes, lendable_disk_bytes, "
     # #246 (0067): btrfs allocation
     "btrfs_unallocated_bytes, btrfs_metadata_headroom_bytes, "
@@ -63,7 +65,7 @@ READING_COLUMNS = (
 #: L159d (and #246, L159f) columns written by `record`, in this order
 MEASURE_COLUMNS = (
     "mem_total_bytes", "psi_cpu_some", "psi_mem_some", "psi_mem_full", "psi_io_some",
-    "app_cpu", "guest_cpu", "cpu_window_s", "guest_mem_bytes",
+    "app_cpu", "guest_cpu", "cpu_window_s", "guest_mem_bytes", "guest_jobs",
     "lendable_cpu", "lendable_memory_bytes", "lendable_disk_bytes",
     "btrfs_unallocated_bytes", "btrfs_metadata_headroom_bytes",
     "gate_state", "gate_seq", "gate_reason",

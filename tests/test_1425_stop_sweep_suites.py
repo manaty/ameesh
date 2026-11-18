@@ -31,12 +31,12 @@ from .support import PgTestCase
 class _Base(PgTestCase):
     """Mêmes fabriques que `tests/test_753_stop_returns_lots.py`."""
 
-    def agent(self, name, *, status="idle", team="nexlink"):
+    def agent(self, name, *, status="idle", team="nexlink", roles=None):
         registry.upsert(self.db, name, harness="deepseek", host=self.cfg.host)
         self.db.execute(
-            "UPDATE agent_registry SET status = %s, team = %s,"
+            "UPDATE agent_registry SET status = %s, team = %s, roles = %s,"
             " responsible = 'human:proprio' WHERE name = %s",
-            (status, team, name))
+            (status, team, roles, name))
 
     def lot(self, title, *, assignee=None):
         item = work.add(self.db, title=title, app="nexlink")
@@ -69,7 +69,7 @@ class CmdStopReleasesLotsTest(_Base):
 
     def test_cmd_stop_returns_open_lots_and_hands_promoted_to_the_auditor(self):
         self.agent("dev1")
-        self.agent("auditeur")
+        self.agent("auditeur", roles=["auditeur"])
         open_lot = self.lot("A", assignee="dev1")
         promoted = self.promoted("dev1")
         self.assertEqual(runner_mod.cmd_stop(self.cfg, self.db, ["dev1"]), 0)
@@ -102,7 +102,7 @@ class SweepHandsPromotedTest(_Base):
 
     def test_sweep_hands_promoted_lot_to_measure_actor(self):
         self.agent("dev1")
-        self.agent("auditeur")
+        self.agent("auditeur", roles=["auditeur"])
         promoted = self.promoted("dev1")
         self.stopped("dev1")
         done = runner_mod.Runner.release_stopped_lots_once(self.sweep_runner())

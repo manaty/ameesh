@@ -337,7 +337,7 @@ def _mark_order(mark: dict) -> tuple:
 
 
 def _gate_completed_ts(on_freeze, eligible: dict, *, required: int,
-                      waived: bool, distinct_families: bool):
+                      waived: bool, distinct_families: bool, deltas=None):
     """#2965 : début de la période ouverte courante, relu chronologiquement.
 
     La porte ne retient que le **dernier** verdict de chaque acteur ; relire
@@ -354,8 +354,14 @@ def _gate_completed_ts(on_freeze, eligible: dict, *, required: int,
 
     `eligible` associe le nom (casefold) d'un relecteur dont l'avis `ok` est
     retenu par la porte à sa famille ; les avis des auteurs, des correcteurs
-    et des familles non prouvées n'y sont pas.
+    et des familles non prouvées n'y sont pas. `deltas` (#7745) porte les
+    familles d'auteur de chaque delta contigu : la porte est alors couverte
+    quand **chaque** delta a ses `required` avis de familles recevables, et
+    non quand la tête entière en compte `required`.
     """
+    if deltas is not None:
+        from . import review_deltas
+        distinct = bool(required >= 2 and distinct_families)
     state: dict = {}
     open_ = bool(waived) or required == 0
     opened_at = None
@@ -377,7 +383,11 @@ def _gate_completed_ts(on_freeze, eligible: dict, *, required: int,
                     continue
                 retained.append((_mark_order(other), eligible[name]))
             retained.sort()
-            if required >= 2 and distinct_families:
+            if deltas is not None:
+                complete = review_deltas.covered(
+                    deltas, [family for _order, family in retained], required,
+                    distinct=distinct)
+            elif required >= 2 and distinct_families:
                 families = []
                 for _order, family in retained:
                     if family not in families:
@@ -621,7 +631,8 @@ def _designated_base(db, item, milestone, repo, frozen) -> str:
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
                            commits=None, strict=False, families_out=None,
-                           target="", admitted_heads=(), exclusions_out=None):
+                           target="", admitted_heads=(), exclusions_out=None,
+                           commit_families_out=None, global_families_out=None):
     """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
@@ -677,7 +688,9 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
                 db, item, milestone, repo, base, frozen, families=families or (),
                 commits=commits, strict=strict, families_out=families_out,
                 target=target or base, admitted_heads=tuple(admitted_heads),
-                exclusions_out=exclusions_out)
+                exclusions_out=exclusions_out,
+                commit_families_out=commit_families_out,
+                global_families_out=global_families_out)
         except review_authors.SweepDeadline as exc:
             raise ValueError("lecture d'auteurs non concluante: %s" % exc) from exc
         if sweep.tripped or sweep.deadline.expired():
@@ -852,9 +865,14 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     passer son compte : la porte garde le **maximum** et ne s'affaiblit jamais.
     Les avis comptés sont **indépendants** : jamais le travail d'un auteur ;
     pour un lot léger à plancher déclaré et pour une classe sensible, une
-    famille de modèle connue et autre que celle de tout auteur ; pour deux
-    avis, deux familles distinctes. L'indépendance ne se suppose jamais : une
-    famille d'auteur inconnue refuse la porte (canon §2, décision 18855a).
+    famille de modèle connue et autre que celle de l'auteur de **chaque delta
+    d'auteur** de la tête (#7745) ; pour deux avis, deux familles distinctes
+    par delta. Une tête qui mêle deux familles d'auteurs reste donc validable
+    avec trois familles : chaque delta est relu par les deux autres. Sans
+    lecture par commit (provenance illisible), la porte garde la règle
+    historique : la famille de tout auteur de la tête est exclue. L'indépendance
+    ne se suppose jamais : une famille d'auteur inconnue refuse la porte
+    (canon §2, décision 18855a).
 
     `authors` (#2681) est l'ensemble des auteurs **reconnus** de la tête, tel
     que l'appelant l'a lu (`review_authors.authors`) : `{name, family}`. La
@@ -972,9 +990,12 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
 
     Rend `{ok, why, class, required, accepted, accepted_unfiltered, blocked,
     waived, author, author_family, author_families, authors, corrections,
-    on_freeze, unproven, completed_ts, vehicle, attribution_read}` ; ne lève
-    jamais. `author_families` porte toutes les familles prouvées exclues
+    on_freeze, unproven, completed_ts, deltas, vehicle, attribution_read}` ; ne
+    lève jamais. `author_families` porte toutes les familles prouvées exclues
     (#3584) ; `author_family` reste la famille unique, vide si plusieurs.
+    `deltas` (#7745) porte, quand la provenance est lue, les familles d'auteur
+    de chaque commit et — sur la règle stricte — sa couverture par les avis
+    retenus (`covered`, sinon `missing` et `eligible`).
     `attribution_read` prouve une lecture effective de la provenance ; une
     dispense ou une porte sans avis requis ne fournit pas cette preuve.
     """
@@ -1356,6 +1377,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     corrections: set = set()
     stacked_doubts: dict = {}
     proven_families: dict = {}
+    #: #7745 : la lecture par delta d'auteur. `commit_families` donne les
+    #: familles de chaque commit de la plage relue, `global_families` celles
+    #: qu'aucun commit ne porte et qui restent exclues partout.
+    commit_families: dict = {}
+    global_families: set = set()
+    delta_sets = None
+    delta_commits: list = []
     try:
         attribution = _attribution_on_freeze(db, marks, frozen, repo=repo,
                                              klass=klass, item=item,
@@ -1365,7 +1393,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                                              families_out=proven_families,
                                              target=target or "",
                                              admitted_heads=scopes,
-                                             exclusions_out=out["provenance_exclusions"])
+                                             exclusions_out=out["provenance_exclusions"],
+                                             commit_families_out=commit_families,
+                                             global_families_out=global_families)
         # #3544 : le report des gels antérieurs complète la trace.
         out["provenance_manifest"] = provenance_scope.manifest(out["provenance_exclusions"])
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
@@ -1590,6 +1620,22 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     for entry in recognized.values():
         author_families.update(_author_families(entry))
     out["author_families"] = sorted(author_families)
+    # #7745 : chaque commit ne ferme que son propre delta. La lecture par
+    # commit n'est disponible que si la provenance a pu être lue ; sans elle,
+    # la porte garde la règle historique (famille de tout auteur exclue).
+    # Elle ne s'applique qu'à la règle stricte (famille exigée) : une classe
+    # normale à un avis accepte toujours un relecteur de famille inconnue.
+    if strict and attribution is not None and commit_families:
+        from . import review_deltas
+        delta_commits = list(commit_families)
+        delta_sets = review_deltas.delta_families(delta_commits, commit_families,
+                                                  global_families)
+    per_delta = delta_sets is not None
+    common_families: set = set()
+    if delta_sets:
+        common_families = set(delta_sets[0])
+        for delta in delta_sets[1:]:
+            common_families &= set(delta)
     accepted = []
     rejected: list[dict] = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
@@ -1635,7 +1681,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 rejected.append({"actor": actor, "family": "",
                                  "reason": "unknown-family"})
                 continue                  # famille du relecteur inconnue : non prouvée
-            if family in author_families:
+            # #7745 : seule la famille qui écrit **tous** les deltas ne peut
+            # relire aucun d'eux. La famille d'un auteur d'un autre delta reste
+            # recevable pour celui-ci. Sans lecture par commit, la règle
+            # historique exclut la famille de tout auteur de la tête.
+            blocked_family = (family in common_families if per_delta
+                              else family in author_families)
+            if blocked_family:
                 rejected.append({"actor": actor, "family": family,
                                  "reason": "author-family"})
                 continue                  # la famille d'un auteur ne compte pas
@@ -1651,19 +1703,60 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         on_freeze,
         {str(entry["actor"] or "").strip().casefold(): entry["family"]
          for entry in accepted},
-        required=required, waived=False, distinct_families=distinct_families)
-    if required >= 2 and distinct_families:
-        chosen, seen = [], set()
-        for entry in accepted:
-            if entry["family"] in seen:
-                continue
-            seen.add(entry["family"])
-            chosen.append(entry)
-            if len(chosen) >= required:
-                break
-        accepted = chosen
+        required=required, waived=False, distinct_families=distinct_families,
+        deltas=delta_sets if per_delta else None)
+    # #7745 : la couverture par delta se juge sur tous les avis retenus ; on
+    # garde donc toutes les familles contributives, pas seulement les
+    # `required` premières, et la troncature historique ne vaut que sans
+    # lecture par commit.
+    missing: list = []
+    if per_delta:
+        from . import review_deltas
+        distinct = bool(required >= 2 and distinct_families)
+        missing = review_deltas.uncovered(
+            delta_sets, [entry["family"] for entry in accepted], required,
+            distinct=distinct)
+        gaps = {row["index"]: row for row in missing}
+        reviewer_families = [entry["family"] for entry in accepted]
+        out["deltas"] = []
+        for index, sha in enumerate(delta_commits):
+            row = {"sha": sha, "families": sorted(delta_sets[index]),
+                   "eligible": review_deltas.eligible_families(
+                       delta_sets[index], reviewer_families, distinct=distinct),
+                   "covered": index not in gaps}
+            if index in gaps:
+                row["missing"] = gaps[index]["missing"]
+            out["deltas"].append(row)
+        ok = not missing
+        if ok and distinct:
+            # Même troncature qu'au chemin historique, mais par couverture :
+            # la porte ne retient que les avis qui ont mené à la couverture,
+            # dans l'ordre chronologique des verdicts. Un avis postérieur
+            # devenu redondant n'apparaît ni dans `accepted` ni dans
+            # `rejected`, comme les familles au-delà de `required` avant
+            # #7745 ; un refus, lui, garde tous les avis retenus.
+            kept: list = []
+            for entry in accepted:
+                kept.append(entry)
+                if review_deltas.covered(
+                        delta_sets, [row["family"] for row in kept], required,
+                        distinct=distinct):
+                    break
+            accepted = kept
+    else:
+        if required >= 2 and distinct_families:
+            chosen, seen = [], set()
+            for entry in accepted:
+                if entry["family"] in seen:
+                    continue
+                seen.add(entry["family"])
+                chosen.append(entry)
+                if len(chosen) >= required:
+                    break
+            accepted = chosen
+        ok = len(accepted) >= required
     out["accepted"] = accepted
-    if len(accepted) >= required:
+    if ok:
         if fallback is not None and record:
             # La marque est la preuve que la relecture après fusion relira :
             # sans elle, pas de désignation de la famille au retour. Une
@@ -1680,15 +1773,30 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         return out
     got = ", ".join("%s (%s)" % (e["actor"] or "?", e["family"] or "famille inconnue")
                     for e in accepted) or "aucun"
-    need = ("two independent verdicts from different model families, neither from an author's"
-            if required >= 2 else
-            "one verdict from another family than the author's" if strict
-            else "one verdict from another agent")
+    if per_delta:
+        need = ("for each author delta, two verdicts from distinct model families other "
+                "than the delta author's" if required >= 2 else
+                "for each author delta, one verdict from a family other than its "
+                "author's")
+    else:
+        need = ("two independent verdicts from different model families, neither from an "
+                "author's" if required >= 2 else
+                "one verdict from another family than the author's" if strict
+                else "one verdict from another agent")
     out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent review "
                   "verdict(s) required, %s; got %s"
                   % (frozen[:12], cls, required, need, got))
     if fallback_refused:
         out["why"] += "; " + fallback_refused
+    if per_delta and missing:
+        out["why"] += ("; delta(s) without the required independent review: %s"
+                       % "; ".join(
+                           "%s (author families: %s; %d missing, eligible families: %s)"
+                           % (delta_commits[row["index"]][:12],
+                              ", ".join(row["families"]) or "none",
+                              row["missing"],
+                              ", ".join(row["eligible"]) or "none")
+                           for row in missing))
     # #3968 : le refus nomme les familles d'auteurs de la tête et chaque avis
     # écarté avec sa cause. Une famille « interdite » sans cette preuve se
     # lisait comme un défaut d'attribution (nexlink #3882 : la famille codex
@@ -1703,7 +1811,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                                        " on this freeze may have been carried here;"
                                        " another reviewer of the family can review",
                   "unknown-family": "unknown model family (independence not proven)",
-                  "author-family": "family of an author of the head"}
+                  "author-family": ("family of the author of every delta of the head"
+                                    if per_delta
+                                    else "family of an author of the head")}
         out["why"] += "; not counted: %s" % ", ".join(
             "%s (%s): %s" % (row["actor"] or "?", row["family"] or "family unknown",
                              causes.get(row["reason"], row["reason"]))
@@ -1830,6 +1940,7 @@ def _gate_cache_store(cache, lot, signature, ok, now: float) -> None:
 def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
                          overview=None, gate_cache=None,
                          cache_only: bool = False,
+                         refresh_target: bool = False,
                          now: float | None = None) -> dict | None:
     """La porte des avis du dernier gel d'un lot, lue comme la composition du
     paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
@@ -1849,6 +1960,15 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
     `cache_only` (#7350) : une observation SLO ne reconstruit pas une porte.
     Sans résultat frais de même signature, rend None. Aucun chemin de fusion
     ne passe cette option ; l'inconnu conserve l'alerte, jamais un GO.
+
+    `refresh_target` (#7677) : la cible est rafraîchie (`review_target.resolve`,
+    un fetch) avant de lire la classe, comme la désignation au gel. Sans lui,
+    un `origin/<cible>` local périmé recule le merge-base et met dans le diff
+    tout ce qui a été fusionné depuis : #7659 (note docs seule, light à la
+    désignation) lu `sensitive` à deux avis par le clone d'un hôte en retard de
+    quatre jours. Seuls les appelants hors transaction qui décident d'un état
+    le passent ; un fetch raté garde la cible locale (plus stricte, jamais
+    plus légère).
 
     Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
     introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
@@ -1880,8 +2000,10 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
         # Comme la file : origin/<cible> avant la branche locale, qui peut
         # encore contenir dans le diff des changements déjà fusionnés (#2207).
         target = lot_class.default_base(cfg, item, repo) if repo else None
+        fresh_sha = (_refreshed_target(repo, target)
+                     if refresh_target and target and not cache_only else None)
         base = _class_base(repo, target) if target else None
-        base_sha = plan_git._commit(repo, base) if base else None
+        base_sha = fresh_sha or (plan_git._commit(repo, base) if base else None)
     except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
         return None
     signature = _gate_cache_signature(cfg, item, marks, repo, frozen, target,
@@ -1934,6 +2056,19 @@ def _remote_branch(name: str) -> str:
         if name.startswith(prefix):
             return name[len(prefix):]
     return name
+
+
+def _refreshed_target(repo: str, target: str) -> str | None:
+    """Le commit de la cible rafraîchie, lu comme la désignation (#7677).
+
+    `review_target.resolve` fetch la branche distante puis l'épingle ; un dépôt
+    sans remote rend sa cible locale. Un échec rend None : l'appelant garde la
+    lecture locale, dont le diff ne peut que contenir plus de chemins."""
+    from . import review_target
+    try:
+        return review_target.resolve(repo, target, fetch=True)
+    except (review_target.TargetError, GitError):
+        return None
 
 
 def _class_base(repo: str, target: str, *, queue: bool = False) -> str | None:

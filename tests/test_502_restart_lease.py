@@ -187,6 +187,19 @@ scenario=$(cat "$FAKE_STATE/scenario")
 # impl07) ; le fichier `statut_force` le fige pour le témoin de starvation.
 statut=idle
 [ -e "$FAKE_STATE/statut_force" ] && statut=$(cat "$FAKE_STATE/statut_force")
+# #7717 : une pause lisible au registre interdit tout tour, donc toute reprise
+# de bail ; `paused-budget` et `paused-operator` gardent l'époque 7 après le
+# redémarrage (aucune reprise), comme un agent qui ne peut pas commencer.
+pauses='"paused_on_budget": false, "operator_paused": false'
+case $scenario in
+  paused-budget) statut=blocked
+    pauses='"status_text": "budget : per-hour cap", "paused_on_budget": true, "operator_paused": false' ;;
+  paused-operator) pauses='"operator_paused": true, "paused_on_budget": false' ;;
+  # #7717 : le champ `paused_on_budget` manque (CLI d'un retour arrière) ; le
+  # préfixe du `status_text` porte la même lecture.
+  paused-budget-sans-champ) statut=blocked
+    pauses='"status_text": "budget : per-hour cap", "operator_paused": false' ;;
+esac
 owner='"runner-dev9@host"' epoch=7 expires=1300
 [ "$scenario" = not-held ] && owner=null
 [ "$scenario" = stopped ] && statut=stopped
@@ -198,8 +211,8 @@ if [ -e "$FAKE_STATE/restarted" ]; then
     expired) epoch=9 expires=900 ;;
   esac
 fi
-printf '{"name": "dev9", "status": "%s", "lease_owner": %s, "lease_epoch": %s, "lease_expires_ts": %s}\n' \
-  "$statut" "$owner" "$epoch" "$expires"
+printf '{"name": "dev9", "status": "%s", %s, "lease_owner": %s, "lease_epoch": %s, "lease_expires_ts": %s}\n' \
+  "$statut" "$pauses" "$owner" "$epoch" "$expires"
 '''
 
 
@@ -579,6 +592,44 @@ class RestartLeaseTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("dev9 : redémarré", proc.stdout)
         self.assertIn("no lease before the restart", proc.stdout)
+
+    def test_persona_en_pause_budget_sans_reprise_de_bail_ne_fait_pas_echouer(self):
+        """#7717 : une pause budget lisible au registre interdit tout tour.
+
+        Le bail de l'époque 7 n'est pas repris après le redémarrage ; sans
+        l'exemption, l'étape échouait sur ce seul agent et bloquait la release
+        en staging (avatar-essai, 1.59.1). L'unité est bien redémarrée.
+        """
+        proc = self.restart("paused-budget")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(self.op_position("start"))
+        self.assertIn("dev9 : redémarré (était blocked) — non vérifiée :"
+                      " pause budget", proc.stdout)
+        self.assertIn("WARNING: 1 persona(s) non vérifiée(s) : pause budget",
+                      proc.stdout)
+        self.assertNotIn("did not take its lease", proc.stderr)
+        self.assertNotIn("bail non repris", proc.stderr)
+
+    def test_pause_budget_sans_le_champ_est_lue_au_prefixe(self):
+        """#7717 : un CLI antérieur au champ `paused_on_budget` (retour
+        arrière) écrit `blocked` + `budget : …` ; même exemption, sans échec."""
+        proc = self.restart("paused-budget-sans-champ")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("non vérifiée : pause budget", proc.stdout)
+        self.assertNotIn("did not take its lease", proc.stderr)
+        self.assertNotIn("bail non repris", proc.stderr)
+
+    def test_persona_en_pause_operateur_sans_reprise_de_bail_ne_fait_pas_echouer(self):
+        """#7717 : même règle pour une pause opérateur déclarée — aucun tour,
+        donc aucun bail à reprendre ; l'unité est redémarrée sur le code neuf."""
+        proc = self.restart("paused-operator")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(self.op_position("start"))
+        self.assertIn("dev9 : redémarré (était idle) — non vérifiée :"
+                      " pause opérateur", proc.stdout)
+        self.assertIn("WARNING: 1 persona(s) non vérifiée(s) : pause opérateur",
+                      proc.stdout)
+        self.assertNotIn("did not take its lease", proc.stderr)
 
     def test_persona_stopped_with_an_active_unit_is_reloaded_not_reactivated(self):
         # #1131/#1633 : la persona arrêtée par le propriétaire n'est pas

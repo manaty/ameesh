@@ -256,13 +256,15 @@ class PacketCatchupTest(unittest.TestCase):
 
 
 def row(candidates=("agents-a", "agents-b")):
-    return {"name": "mesh-design", "releve": "election", "host": "agents-a",
+    return {"name": "mesh-design", "roles": ["conception"], "releve": "election",
+            "host": "agents-a",
             "candidats": list(candidates)}
 
 
-def plan(*, host="agents-a", role="mesh-design", projects=None, paquet=("", "/clone")):
+def plan(*, host="agents-a", role="mesh-design", projects=None,
+         paquet=("", "/clone"), row_value=None):
     return role_timers.plan(
-        host=host, role=role, row=row(),
+        host=host, role=role, row=row_value or row(),
         settings=SimpleNamespace(projects=projects if projects is not None
                                  else {"ameesh": "manaty/ameesh"}, interval=900),
         watch_intervals=[900], notify_humans=["human:owner"], paquet=paquet)
@@ -284,7 +286,8 @@ class RoleTimerTest(unittest.TestCase):
         self.assertEqual(plan(host="agents-c")["timers"], [])
 
     def test_l_auditeur_ne_porte_pas_la_carte(self):
-        names = [item["name"] for item in plan(role="auditeur")["timers"]]
+        names = [item["name"] for item in plan(
+            role="auditeur", row_value=dict(row(), roles=["auditeur"]))["timers"]]
         self.assertNotIn("carte", names)
 
     def test_sans_projets_la_passe_n_est_pas_posee(self):

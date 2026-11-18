@@ -127,6 +127,11 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #7672 (0594) : `in_reply_to` est l'identifiant interne de corrélation
+    # d'une réponse à sa demande, lu par la surface publique de réponse et le
+    # protocole de tour, jamais par un rôle superviseur ; colonne fermée aux
+    # deux rôles, aucun GRANT modifié.
+    "agent_mailbox": {"in_reply_to"},
     # #7518 (0581): internal monetary ledger, read through the budget API.
     # No supervisor reader is required; source/pricing stay private too.
     "credit_cycles": {"id", "billing_account", "credit_micro", "cap_micro",
@@ -456,6 +461,9 @@ FERMEES = {
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
 HORS_CONTRAT = {
+    # #7761 : curseurs et corrélations internes, fermés au superviseur.
+    "pre_act_audit_cursors": {"project", "repo", "workflow", "activated_at", "scanned_through"},
+    "pre_act_audit_runs": {"repo", "run_id", "attempt", "workflow", "pregeste_id", "reason"},
     # #7565 (0583): narrow bureau catch-up views, closed to both supervisor
     # roles. Decision proofs include signature material; no GRANT added.
     "ameesh_staging_attestations": {"id", "type", "object", "project", "data",
@@ -469,6 +477,12 @@ HORS_CONTRAT = {
     "host_release_fences": {"operation", "probe", "created_at"},
     "host_release_fence_receipts": {"action_id", "operation", "step", "receipt",
                                     "completed_at"},
+    # #7751: persisted train requalification requests (requester, cited
+    # opinions, trace lot) are internal to the live train service; only the
+    # holder reads and resolves them. No supervisor GRANT added.
+    "integration_train_requalifications": {
+        "id", "project", "pin", "gate", "reviews", "lot", "requester",
+        "requested_at", "state", "resolved_at", "resolved_by", "error"},
 }
 EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
            | FERMEES.get(rel, set()) | HORS_CONTRAT.get(rel, set())

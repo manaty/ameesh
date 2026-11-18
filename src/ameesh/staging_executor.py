@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from ameesh import role_run, staging_watch, storage
+from ameesh import canon as canon_mod, role_run, staging_watch, storage
 
 EVENT = "staging.request"
 #: One attempt's worktree is named after its run, so the tree kept after a
@@ -403,12 +403,15 @@ def _bascule_values(path: str) -> dict:
     return values
 
 
-def _topology_targets(env, options):
+def _topology_targets(env, options, topology=None):
     """The staging topology's SSH targets, its declared absents and `ssh`.
 
     Mirrors `quiescence-staging.sh`: `HOTES_STAGING` from BASCULE_ENV, or the
     three per-VM files plus `SERVEUR_SSH`/`VM`. `QUIESCENCE_*` overrides are
     read from the unit's environment and from the file, like the probe does.
+    #7662: the host names and their roles come from the canon's Host cards;
+    a composed topology takes the server's name and the number of agent VMs
+    from `topology`, never from a host name compiled here.
     Returns `(targets, absent, ssh, problem)`; a `problem` is a named refusal.
     """
     path = options.get("bascule_env") or env.get("BASCULE_ENV") or ""
@@ -423,15 +426,23 @@ def _topology_targets(env, options):
         return [], set(), "ssh", "BASCULE_ENV unreadable (%s)" % type(exc).__name__
     merged = dict(env)
     merged.update(values)
-    topology = (merged.get("HOTES_STAGING") or "").strip()
+    declared = (merged.get("HOTES_STAGING") or "").strip()
     parsed = []
-    if topology:
-        for entry in topology.split():
+    if declared:
+        for entry in declared.split():
             host, sep, target = entry.partition("=")
             if not sep or not host or not target:
                 return [], set(), "ssh", "HOTES_STAGING: entree invalide %r" % entry
             parsed.append((host, target))
+        if topology is not None and topology.hosts:
+            unknown = sorted({host for host, _target in parsed} - set(topology.hosts))
+            if unknown:
+                return ([], set(), "ssh", "HOTES_STAGING: hôte(s) hors du canon %s"
+                        % ", ".join(unknown))
     else:
+        if topology is None or not topology.hosts or topology.server is None:
+            return ([], set(), "ssh", "aucun hôte de staging déclaré au canon "
+                    "(ni HOTES_STAGING ni topologie du canon)")
         directory = os.path.dirname(os.path.abspath(path))
         entries = []
         for name in _TOPOLOGY_ENVS:
@@ -448,10 +459,10 @@ def _topology_targets(env, options):
                 entries.append((host, target))
         server = merged.get("SERVEUR_SSH") or (
             "root@" + merged["VM"] if merged.get("VM") else "")
-        if len(entries) < 3 or not server:
+        if len(entries) < len(topology.agents) or not server:
             return ([], set(), "ssh", "topologie illisible (ni HOTES_STAGING ni "
                     "bascule-*.env et SERVEUR_SSH complets)")
-        entries.append(("manaty-mesh-1", server))
+        entries.append((topology.server, server))
         parsed = entries
     effective = []
     for host, target in parsed:
@@ -466,21 +477,23 @@ def _topology_targets(env, options):
     return effective, absent, ssh, None
 
 
-def quiescence_access_problem(env, options) -> str | None:
+def quiescence_access_problem(env, options, topology=None) -> str | None:
     """#6761: the quiescence probe will reach every staging target, or refuse.
 
     A candidate that cannot deploy, or cannot prove a previous execution
     stopped, refuses the take by name (#6532: AG1 took the request while
-    `quiescence-staging.sh` could not reach `manaty-mesh-1`). The preparation
+    `quiescence-staging.sh` could not reach the mesh server). The preparation
     checks the same SSH targets here, before any request is taken; hosts the
     sequence never touches (`QUIESCENCE_ABSENTS`) and the workstation without
-    a target are not blocking, exactly as in the proof itself.
+    a target are not blocking, exactly as in the proof itself. #7662: the
+    workstation is the canon's `workstation`, never a compiled host name.
     """
-    targets, absent, ssh, problem = _topology_targets(env, options)
+    targets, absent, ssh, problem = _topology_targets(env, options, topology)
     if problem:
         return "quiescence access: " + problem
+    workstation = topology.workstation if topology is not None else None
     to_check = [(host, target) for host, target in targets
-                if host not in absent and host != "pc-smichea"
+                if host not in absent and host != workstation
                 and target not in ("poste", "local")]
     if not to_check:
         return None
@@ -552,11 +565,17 @@ def sequence_problem(cfg, env, options=None) -> str | None:
     except Exception as exc:  # noqa: BLE001 - unreachable is a refusal
         return "unreachable (%s)" % public_reason(db_mod.explain(exc), 200)
     if options is not None:
-        return quiescence_access_problem(env, options)
+        try:
+            canons = canon_mod.load_configured(resolved)
+            topology = canon_mod.staging_topology(canons[:1])
+        except Exception:  # noqa: BLE001 - an unreadable canon declares no host
+            topology = canon_mod.StagingTopology()
+        return quiescence_access_problem(env, options, topology)
     return None
 
 
-def publish_sequence_readiness(db, cfg, options, problem, descriptor) -> None:
+def publish_sequence_readiness(db, cfg, options, problem, descriptor, *,
+                               refresh=None) -> None:
     """#6761: publish the preparation's verdict for observation only.
 
     Every candidate runs the timer, holder or not. No election reads the
@@ -566,26 +585,39 @@ def publish_sequence_readiness(db, cfg, options, problem, descriptor) -> None:
     #7259: it also carries `executor_venv`, the version this tick runs: the
     alerts pass reads it after an install, which no completed pass records
     until the next staging. A changed version is published at once too.
+    #7750: `refresh` carries the standby preparation's outcome (`venv` and
+    `canon`) and `canon_ref` the canon copy this host reads, so a candidate
+    that never completes a pass is still visible to both alert families.
     """
     object_name = "staging-executor:%s:%s" % (options.get("role") or "", cfg.host)
     ready = problem is None
-    version = executor_venv(options)
+    refresh = refresh or {}
     try:
+        version = executor_venv(options)
+        canon_ref = canon_commit(cfg)
+        payload = {"key": options.get("key") or "",
+                   "role": options.get("role") or "",
+                   "host": cfg.host, "ready": ready,
+                   "diagnostic": "" if ready else public_reason(problem),
+                   "candidates": list(options.get("candidates") or []),
+                   "config": descriptor, "executor_venv": version,
+                   "canon_ref": canon_ref}
+        if refresh.get("venv") is not None:
+            payload["venv_refresh"] = refresh["venv"]
+        if refresh.get("canon") is not None:
+            payload["canon_refresh"] = refresh["canon"]
         rows = storage.of(db).events.recent_type(
             SEQUENCE_EVENT, 1, 1, object=object_name)
         previous = (rows[0].get("data") or {}) if rows else {}
         fresh = bool(rows) and time.time() - float(rows[0].get("ts") or 0) \
             < SEQUENCE_REPORT_S
-        if previous.get("ready") == ready and fresh and (
-                previous.get("executor_venv") == version):
+        if (previous.get("ready") == ready and fresh
+                and previous.get("executor_venv") == version
+                and previous.get("canon_ref") == canon_ref
+                and previous.get("venv_refresh") == payload.get("venv_refresh")
+                and previous.get("canon_refresh") == payload.get("canon_refresh")):
             return
-        storage.of(db).events.record(
-            SEQUENCE_EVENT, object_name, None,
-            {"key": options.get("key") or "", "role": options.get("role") or "",
-             "host": cfg.host, "ready": ready,
-             "diagnostic": "" if ready else public_reason(problem),
-             "candidates": list(options.get("candidates") or []),
-             "config": descriptor, "executor_venv": version})
+        storage.of(db).events.record(SEQUENCE_EVENT, object_name, None, payload)
     except Exception as exc:  # noqa: BLE001 - the refusal itself remains
         print("ameesh: staging preparation not published: %s"
               % type(exc).__name__, file=sys.stderr)
@@ -845,6 +877,18 @@ VENV_MANIFEST = "manifeste.json"
 VENV_STEP_TIMEOUT_S = 900
 #: #7164 review B2: the state of a refresh under way in the terminal record.
 VENV_REFRESH_RUNNING = "running"
+#: #7750: a candidate that never holds the role never completes a pass; it
+#: still follows the last deployment on every tick. A failed preparation is
+#: retried after this delay, never once a minute.
+STANDBY_RETRY_S = 900.0
+#: #7750: the canon copy of a candidate follows its remote at most this often.
+STANDBY_CANON_S = 300.0
+#: #7750: local trace of the last standby preparation, under `work`.
+STANDBY_STATE = "standby-refresh.json"
+#: #7750: how far back a completed pass is looked up for the deployed commit.
+DEPLOYED_HISTORY = 100
+#: #7750: standby worktrees stay apart from the retained attempt trees.
+STANDBY_WORKTREE_PREFIX = "ameesh-staging-standby-"
 
 
 def _venv_path(options) -> str:
@@ -870,6 +914,174 @@ def executor_venv(options) -> dict:
     except OSError:
         live = ""
     return {"running": running, "live": live}
+
+
+def deployed_commit(db, key: str) -> str:
+    """#7750: the newest commit a completed pass of this key deployed."""
+    rows = storage.of(db).events.recent_type(
+        EVENT, 60, DEPLOYED_HISTORY, object="staging-request:" + key)
+    for row in rows:
+        data = row.get("data") or {}
+        sha = data.get("sha")
+        if (data.get("state") == "completed" and isinstance(sha, str)
+                and re.fullmatch(r"[0-9a-f]{40}", sha)):
+            return sha
+    return ""
+
+
+def _standby_state(options) -> dict:
+    try:
+        data = json.loads((Path(options["venv_update"]["work"])
+                           / STANDBY_STATE).read_text())
+    except (KeyError, OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _standby_save(options, state: dict) -> None:
+    try:
+        path = Path(options["venv_update"]["work"]) / STANDBY_STATE
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(state, sort_keys=True))
+        os.replace(temporary, path)
+    except (KeyError, OSError):
+        pass
+
+
+def _standby_venv_recent(options, sha: str) -> bool:
+    item = _standby_state(options).get("venv")
+    return (isinstance(item, dict) and item.get("sha") == sha
+            and item.get("state") not in (None, "installed", "current", "ahead")
+            and isinstance(item.get("ts"), (int, float))
+            and 0 <= time.time() - item["ts"] < STANDBY_RETRY_S)
+
+
+def _standby_remember_venv(options, sha: str, result: dict) -> None:
+    state = _standby_state(options)
+    state["venv"] = {"sha": sha, "ts": time.time(),
+                     "state": result.get("state"),
+                     "step": result.get("step"),
+                     "reason": public_reason(result.get("reason"))}
+    _standby_save(options, state)
+
+
+def _standby_canon_due(options) -> bool:
+    item = _standby_state(options).get("canon")
+    return not (isinstance(item, dict) and isinstance(item.get("ts"), (int, float))
+                and 0 <= time.time() - item["ts"] < STANDBY_CANON_S)
+
+
+def _standby_remember_canon(options, result: dict) -> None:
+    state = _standby_state(options)
+    state["canon"] = {"ts": time.time(), "state": result.get("state"),
+                      "ref": result.get("to") or result.get("ref") or ""}
+    _standby_save(options, state)
+
+
+def _git_ancestor(repo: str, older: str, newer: str) -> bool:
+    try:
+        return subprocess.run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor", older, newer],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=30,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _fetch_origin(repo: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "fetch", "--quiet", "--no-tags", "origin"],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "fetch: " + type(exc).__name__
+    if proc.returncode == 0:
+        return None
+    lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+    return "fetch: " + public_reason(
+        lines[-1] if lines else "code %d" % proc.returncode, 200)
+
+
+def _prepare_standby_venv(options, sha: str) -> dict:
+    """#7750: sealed, forge-checked, forward-only route for a standby tick."""
+    update = options["venv_update"]
+    repo = str(Path(options["repo"]).resolve())
+    version = sha[:7]
+    live = executor_venv(options)["live"]
+    if not live:
+        return {"state": "refused", "to": version,
+                "reason": "live venv unreadable (%s)"
+                % os.path.join(os.path.dirname(update["venv"]), BASCULE_CURRENT)}
+    if _git_ancestor(repo, sha, live):
+        return {"state": "ahead", "from": live, "to": version}
+    problem = _fetch_origin(repo)
+    if problem:
+        return {"state": "refused", "to": version, "step": "fetch",
+                "reason": problem}
+    if _git_ancestor(repo, sha, live):
+        return {"state": "ahead", "from": live, "to": version}
+    if not _git_ancestor(repo, live, sha):
+        return {"state": "refused", "from": live, "to": version,
+                "reason": "not a fast-forward from venv-" + live}
+    refusal, _evidence = forge_ci(repo, options["github"], sha)
+    if refusal:
+        return {"state": "refused", "from": live, "to": version,
+                "step": "forge", "reason": refusal}
+    from ameesh import release_cutoff
+    try:
+        folder, tree = release_cutoff._worktree(
+            repo, sha, prefix=STANDBY_WORKTREE_PREFIX)
+    except Exception as exc:  # noqa: BLE001 - a preparation never raises
+        return {"state": "refused", "from": live, "to": version,
+                "step": "worktree",
+                "reason": public_reason(type(exc).__name__ + ": " + str(exc))}
+    try:
+        return refresh_venv(options, repo, tree, sha)
+    finally:
+        release_cutoff._drop_worktree(repo, folder, tree)
+
+
+def prepare_standby(db, cfg, options) -> dict:
+    """#7750: keep a candidate ready between two passes.
+
+    #7164 refreshed the executor's own venv and canon copy only after a
+    `completed` pass. A candidate that never holds the role never runs one:
+    it stayed on the version installed by the operator, and an election
+    would have served an older reader and an older canon. Every tick of a
+    candidate that does not hold the role now follows the last completed
+    deployment of its key, forward only,
+    through the same forge CI and sealed route; the canon copy follows once
+    the new venv is the one running. A refusal is recorded and retried later,
+    never raised. Returns the evidence for the `staging.executor` event."""
+    evidence = {}
+    target = deployed_commit(db, options["key"])
+    if not target:
+        return evidence
+    version = executor_venv(options)
+    running, live = version.get("running") or "", version.get("live") or ""
+    if not options.get("venv_update"):
+        # #7750: an unmanaged venv never follows the deployment; the tick
+        # says so, and the alert names the missing block instead of leaving
+        # the standby silent.
+        if not (live and target.startswith(live)):
+            evidence["venv"] = {"state": "unconfigured", "to": target[:7]}
+        return evidence
+    current = bool(live and target.startswith(live))
+    if not current and not _standby_venv_recent(options, target):
+        result = _prepare_standby_venv(options, target)
+        _standby_remember_venv(options, target, result)
+        if result.get("state") not in (None, "current", "ahead"):
+            evidence["venv"] = result
+    # Only the code that runs can judge a canon, and only once its own venv
+    # is the deployed one: a moved link is read by the next tick, and the old
+    # reader may refuse a new descriptor for reasons the canon does not own.
+    if (current and running and live and running == live
+            and _standby_canon_due(options)):
+        result = refresh_canon(cfg)
+        _standby_remember_canon(options, result)
+        if result.get("state") != "current":
+            evidence["canon"] = result
+    return evidence
 
 
 def _venv_step(argv, *, cwd=None) -> str | None:
@@ -925,10 +1137,17 @@ def _refresh_venv(options, repo: str, tree: str, sha: str) -> dict:
         forward = bool(base_sha) and subprocess.run(
             ["git", "-C", repo, "merge-base", "--is-ancestor", base_sha, sha],
             capture_output=True, timeout=30).returncode == 0
+        ahead = bool(base_sha) and subprocess.run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor", sha, base_sha],
+            capture_output=True, timeout=30).returncode == 0
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"state": "refused", "from": live,
                 "reason": "git: " + type(exc).__name__}
     if not forward:
+        # #7750: a venv manually moved ahead of the last deployment is not a
+        # backward move; it is left alone instead of being reported as stale.
+        if ahead:
+            return {"state": "ahead", "from": live, "to": version}
         return {"state": "refused", "from": live, "to": version,
                 "reason": "not a fast-forward from venv-" + live}
     tools = os.path.join(tree, "deploy", "mise-a-jour")
@@ -1282,6 +1501,15 @@ def tick(db, cfg, options) -> dict:
     host = cfg.host
     if host not in options["candidates"]:
         return {"state": "standby", "reason": "not a candidate"}
+    # #7750: a candidate that never holds the role never completes a pass.
+    # Prepare its own venv and canon copy from the last completed deployment
+    # before any election decision, so a takeover never serves an older
+    # reader; a no-op when the candidate is already current. The role holder
+    # keeps the previous path — it goes straight to a request and refreshes
+    # after its pass — so a wheel build never delays a deployment.
+    before = role_run.live(db, options["role"])
+    holder = bool(before["held"] and before.get("holder") == host)
+    refresh = {} if holder else prepare_standby(db, cfg, options)
     # #6761: the sequence's configuration is proved on EVERY candidate, holder
     # or not: the preparation publishes its verdict for observation, and the
     # probe below refuses this take if it fails. It runs the same
@@ -1293,7 +1521,8 @@ def tick(db, cfg, options) -> dict:
                                    STAGING_TIMEOUT_S=str(timeout)))
     sequence_settings = sequence_config(cfg, env)
     sequence_failure = sequence_problem(cfg, env, options)
-    publish_sequence_readiness(db, cfg, options, sequence_failure, sequence_settings)
+    publish_sequence_readiness(db, cfg, options, sequence_failure,
+                               sequence_settings, refresh=refresh)
     elected = role_run.live(db, options["role"])
     if not elected["held"] or elected.get("holder") != host:
         return {"state": "standby", "reason": "another role holder"}
@@ -1422,11 +1651,19 @@ def tick(db, cfg, options) -> dict:
                         return {"state": "blocked",
                                 "reason": request.get("blocked_reason")
                                 or "retour apres arret interrompu"}
-                    _release_cutoff._manual_return_mail(
-                        db, tree, request.get("notify") or "mesh-design",
+                    remise = _release_cutoff._manual_return_mail(
+                        db, tree, request.get("notify"),
                         "superviseur interrompu avant la fin du retour")
-                    reason = ("retour apres arret interrompu: marche manuelle "
-                              "remise au pilote; sources kept")
+                    if remise:
+                        reason = ("retour apres arret interrompu: marche manuelle "
+                                  "remise au pilote; sources kept")
+                    else:
+                        # #7792 B : le motif consigné ne peut pas affirmer une
+                        # remise qui n'a pas eu lieu ; l'alerte
+                        # `staging_interrupted` reprend ce texte.
+                        reason = ("retour apres arret interrompu: marche manuelle "
+                                  "NON remise (aucun destinataire ou envoi en "
+                                  "echec); alerte staging_interrupted, sources kept")
                     _record(db, options["key"],
                             dict(request, blocked_reason=reason,
                                  return_recovery=True), lease=lease)
@@ -1593,12 +1830,20 @@ def tick(db, cfg, options) -> dict:
                                  return_pid=retour.get("pid")), lease=lease)
                     return {"state": "blocked", "reason": guard,
                             "run": attempt["run"]}
+                remise = True
                 if not retour["ok"] and not retour["mailed"]:
-                    release_cutoff._manual_return_mail(
-                        db, tree, attempt.get("notify") or "mesh-design",
+                    remise = release_cutoff._manual_return_mail(
+                        db, tree, attempt.get("notify"),
                         retour["note"])
                 monitor.stop(reason)
                 result = dict(attempt, state="failed", exit=code, reason=reason)
+                if not remise:
+                    # #7792 B : l'échec porte la non-remise, pas la trace
+                    # locale seule ; l'alerte `staging_interrupted` la relaie.
+                    result["manual_return_unmailed"] = True
+                    result["reason"] = ("%s ; marche manuelle NON remise "
+                                        "(aucun destinataire ou envoi en echec)"
+                                        % (reason or "echec"))
                 if note:
                     result["unit_note"] = note
                 if retour["note"]:

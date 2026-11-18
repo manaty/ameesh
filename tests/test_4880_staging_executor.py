@@ -10,6 +10,7 @@ from unittest import mock
 
 from ameesh import (release_cutoff, role_run, staging_executor as executor,
                     staging_watch)
+from tests import canon_staging
 
 #: #5665: kept before ExecutorTest replaces it.
 FINGERPRINTS = executor.fingerprints
@@ -324,6 +325,29 @@ class ExecutorTest(unittest.TestCase):
         self.assertIn("depassement", self.request["return_note"])
         release_cutoff._drop_worktree.assert_called_once()
 
+    def test_a_failed_manual_return_is_named_in_the_recorded_failure(self):
+        """#7792 B: the recorded failure carries the non-delivery, not a false claim."""
+        release_cutoff._settle_poste_units.return_value = ("", True)
+
+        def child(*args, **kwargs):
+            self.calls.append((args[0], args[1]))
+            executor.role_run._AlertsExecution.return_value.stop_reason = \
+                "délai dépassé : figé"
+            return 143, False
+
+        executor.role_run._run_under_lease.side_effect = child
+        with mock.patch.object(release_cutoff, "_return_after_stop",
+                               return_value=dict(ran=True, ok=False,
+                                                 note="depassement de la borne",
+                                                 mailed=False, drop=True)), \
+             mock.patch.object(release_cutoff, "_manual_return_mail",
+                               return_value=False):
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "failed")
+        self.assertTrue(result.get("manual_return_unmailed"))
+        self.assertIn("NON remise", result["reason"])
+        self.assertIn("NON remise", self.request["reason"])
+
     def test_a_return_not_proved_stopped_keeps_the_guard(self):
         release_cutoff._settle_poste_units.return_value = ("", True)
 
@@ -397,6 +421,25 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(again["state"], "blocked")
         mail2.assert_not_called()
         drop2.assert_not_called()
+
+    def test_a_non_delivered_manual_return_is_recorded_not_claimed(self):
+        """#7792 B: the blocked reason must not claim a return that never left."""
+        self.request.update(state="running", host="host-a", run="attempt-a")
+        tree = self.root / "kept" / "worktree"
+        tree.mkdir(parents=True)
+        (tree / release_cutoff.STAGING_RETURN_STATE).write_text(
+            "ameesh-agents-2\tinstaller\t0123456789abcdef\t"
+            "vm.sh agents retour\t/tmp/journal.jsonl\t" + "a" * 40 + "\n")
+        with mock.patch.object(executor, "_retained_trees",
+                               return_value=[(str(tree.parent), str(tree))]), \
+             mock.patch.object(release_cutoff, "_manual_return_mail",
+                               return_value=False), \
+             mock.patch.object(executor, "_drop_retained"):
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("NON remise", result["reason"])
+        self.assertIn("NON remise", self.request["blocked_reason"])
+        self.assertEqual(self.request["blocked_reason"], result["reason"])
 
     def test_record_renewal_extends_the_local_deadline(self):
         executor.tick(self.db, self.cfg, self.options)
@@ -562,7 +605,8 @@ class ExecutorTest(unittest.TestCase):
 
     def test_automatic_release_queues_without_running_in_its_launcher(self):
         project = release_cutoff.ProjectRelease(
-            name="test", repo=str(self.root), staging_executor="private.json")
+            name="test", repo=str(self.root), staging_executor="private.json",
+            staging_topology=canon_staging.topology())
         with mock.patch.object(executor, "settings", return_value=self.options), \
              mock.patch("ameesh.config.load", return_value=self.cfg):
             result = release_cutoff.run_staging(project, "a" * 40, [],

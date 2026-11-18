@@ -140,21 +140,32 @@ class PreferenceSyncTest(test_canon._CanonDbCase):
                          ("preference", ["banc", "atelier"], ["banc", "atelier"]))
         self.assertEqual(self.actions(self.sync("atelier"))["relecteur"], "laissé")
 
-    def test_reclamation_croisee_vers_le_cloud(self):
+    def test_reclamation_croisee_par_brief_refusee(self):
+        """#7680 : un agent `preference` ne change jamais d'hôte par un brief.
+
+        Sa conversation suit `conversation_moves` : la ligne est déjà chez la
+        cible quand elle réclame (`verrou.host = H`). Le claim de la base
+        refuse donc la réclamation croisée, brief compris (l'ancien recours
+        d'EP1 remettait la session à zéro).
+        """
         self.sync("banc")
         self.sync("atelier")
         self.assertIn("relecteur", [r["name"] for r in registry.claimable(self.db, "atelier")])
-        lease = registry.claim(self.db, "relecteur", "runner-atelier", 600, host="atelier",
-                               election_brief="brief-atelier")
+        self.assertIsNone(registry.claim(self.db, "relecteur", "runner-atelier", 600,
+                                         host="atelier",
+                                         election_brief="brief-atelier"))
+        row = self.row("relecteur")
+        self.assertEqual(row["host"], "banc")
+        self.assertIsNone(row["lease_owner"])
+        # un brief resté d'une ancienne version est effacé au claim local ;
+        # la session de la source est conservée (aucun brief ne la remplace).
+        self.db.execute("UPDATE agent_registry SET election_brief = 'vieux brief',"
+                        " session_id = 'sess-source' WHERE name = 'relecteur'")
+        lease = registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc")
         self.assertIsNotNone(lease)
-        self.assertEqual(self.row("relecteur")["host"], "atelier")
-        # bail vivant : le poste ne le prend pas
-        self.assertIsNone(registry.claim(self.db, "relecteur", "runner-banc", 600,
-                                         host="banc"))
-        registry.release(self.db, "relecteur", "runner-atelier", lease["lease_epoch"])
-        self.assertIsNotNone(registry.claim(self.db, "relecteur", "runner-banc", 600,
-                                            host="banc", election_brief="brief-banc"))
         self.assertEqual(self.row("relecteur")["host"], "banc")
+        self.assertIsNone(self.row("relecteur")["election_brief"])
+        self.assertEqual(self.row("relecteur")["session_id"], "sess-source")
 
     def test_ordre_inverse_change_le_rang(self):
         self.sync("banc")

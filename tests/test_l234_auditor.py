@@ -55,8 +55,11 @@ class AuditorTest(unittest.TestCase):
             agent("chef", roles=["orchestrateur"]), agent("dev", roles=["read"])]))
 
     def test_roles_and_persona(self):
-        for name in ("auditeur", "controle", "controle-fr"):
+        # #7661 : la fiche déclare le rôle, le titre de la persona ne le donne
+        # jamais — y compris un agent nommé `auditeur` sans ce rôle.
+        for name in ("controle", "controle-fr"):
             self.assertTrue(self.runner.is_auditor(name))
+        self.assertFalse(self.runner.is_auditor("auditeur"))
         self.assertFalse(self.runner.is_auditor("dev"))
         self.runner.refresh_orchestrators(canon([]))
         self.assertFalse(self.runner.is_auditor("controle"))
@@ -68,7 +71,7 @@ class AuditorTest(unittest.TestCase):
     def test_auditor_passes_even_critical_and_power_pressure(self):
         for critical in (False, True):
             for breaches in ([{"key": "max_load"}], [{"power": "low"}]):
-                for name in ("auditeur", "controle"):
+                for name in ("controle", "controle-fr"):
                     self.assertFalse(self.held(name, blocked=True, critical=critical,
                                                breaches=breaches))
                 self.assertTrue(self.held("dev", blocked=True, critical=critical,
@@ -84,22 +87,22 @@ class AuditorTest(unittest.TestCase):
                               "-n", "10"] + argv)
             self.assertEqual(self.runner.audit_command("dev", argv), argv)
         with mock.patch("ameesh.runner.shutil.which", return_value=None):
-            self.assertEqual(self.runner.audit_command("auditeur", argv), argv)
+            self.assertEqual(self.runner.audit_command("controle", argv), argv)
         with mock.patch("ameesh.runner.shutil.which", side_effect=lambda x:
                         "/usr/bin/nice" if x == "nice" else None):
-            self.assertEqual(self.runner.audit_command("auditeur", argv),
+            self.assertEqual(self.runner.audit_command("controle", argv),
                              ["/usr/bin/nice", "-n", "10"] + argv)
 
     def test_pressure_journal_counts_auditors_separately(self):
         self.runner._pressure_lock = threading.Lock()
         self.runner._pressure_episode = {"orchestrator_turns": 0}
-        self.runner.pressure_bypassed("auditeur")
         self.runner.pressure_bypassed("controle")
+        self.runner.pressure_bypassed("controle-fr")
         self.runner.pressure_bypassed("chef")
         self.assertEqual(self.runner._pressure_episode["auditor_turns"], 2)
         self.assertEqual(self.runner._pressure_episode["orchestrator_turns"], 1)
 
-    def take(self, item, name="auditeur", queue=False, *, canons=None, owner=None,
+    def take(self, item, name="controle", queue=False, *, canons=None, owner=None,
              load_error=None, cfg=None):
         row = {"name": name, "team": "ameesh", "host": "test", "harness": "codex",
                "canon": owner}
@@ -118,7 +121,8 @@ class AuditorTest(unittest.TestCase):
                 lot_hold_events=lambda *a, **kw: []))
         real_cfg = cfg is not None
         cfg = cfg or types.SimpleNamespace(host=None)
-        loaded = canon([agent("controle", roles=["auditor"])])
+        loaded = canon([agent("controle", roles=["auditor"]),
+                        agent("controle-fr", role="Auditeur")])
         load_patch = (mock.patch("ameesh.auditor.load_all", wraps=auditor.load_all)
                       if real_cfg else mock.patch("ameesh.auditor.load_all",
                           return_value=canons or [loaded], side_effect=load_error))
@@ -133,7 +137,7 @@ class AuditorTest(unittest.TestCase):
     def test_auto_take_skips_evolutions_and_protected_bugs_for_both_roles(self):
         normal = {"id": 1, "type": "bug", "title": "Crash du runner", "state": "intake",
                   "created_ts": 100, "lot_team": "ameesh"}
-        for name in ("auditeur", "controle"):
+        for name in ("controle", "controle-fr"):
             self.assertEqual(len(self.take(normal, name)), 1)
             self.assertEqual(len(self.take(dict(normal, body="Corriger la fiche de dev"), name)), 1)
             for change in ({"type": "evolution"}, {"body": "docs/AUDITEUR.md"},
@@ -145,7 +149,7 @@ class AuditorTest(unittest.TestCase):
 
     def test_auditors_do_not_take_improvement_queue(self):
         item = {"id": 2, "type": "improvement", "title": "Optimisation", "team": "ameesh"}
-        self.assertEqual(self.take(item, queue=True), [])
+        self.assertEqual(self.take(item, "controle-fr", queue=True), [])
         self.assertEqual(self.take(item, "controle", queue=True), [])
         self.assertEqual(len(self.take(item, "dev", queue=True)), 1)
 
@@ -263,7 +267,7 @@ class AuditorTest(unittest.TestCase):
 
     def test_no_exemption_without_scope_and_timer_cancellation(self):
         with mock.patch.object(audit_guard, "available", return_value=False):
-            self.assertTrue(self.held("auditeur", blocked=True, critical=True, breaches=[]))
+            self.assertTrue(self.held("controle", blocked=True, critical=True, breaches=[]))
         worker = types.SimpleNamespace(stop_group_now=mock.Mock())
         done = threading.Event()
         done.set()

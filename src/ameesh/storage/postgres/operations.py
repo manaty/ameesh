@@ -186,6 +186,8 @@ class Operations(interface.Operations):
                    r.turn_grace_seconds,
                    r.session_max_tokens, r.turn_reread_budget, r.session_reread_budget,
                    r.compact_tokens,
+                   -- #7674 : politique de session déclarée par la carte du canon
+                   r.declared_policy,
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
@@ -243,7 +245,7 @@ class Operations(interface.Operations):
                   -- courrier passif (accusé, copie, diffusion) est compté à part.
                   -- #3923 : deux index partiels disjoints (actif 0495, passif
                   -- 0489) au lieu d'un parcours du tas de tous les non-lus —
-                  -- les 5 074 non-lus de `bureau` coûtaient 443 ms à eux seuls.
+                  -- les 5 074 non-lus de l'agent de supervision coûtaient 443 ms à eux seuls.
                   SELECT actif.n, actif.oldest, passif.n_passive
                     FROM (SELECT count(*) AS n,
                                  min(mb.created_at) AS oldest

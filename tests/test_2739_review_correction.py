@@ -173,24 +173,32 @@ class GateCorrectorTest(PgTestCase):
         out = self.vehicle_gate()
         self.assertFalse(out.get("error"), out)
         self.assertEqual(out["corrections"], ["cx2"])
-        # #2888: cx2's correction authors the codex family on the delta; cx3
-        # is excluded with that family. Only dev1 (claude) remains.
+        # #2888/#7745: cx2's correction authors the codex family on its own
+        # delta; cx3 (codex) still counts on the deepseek delta, but only dev1
+        # (claude) can read the codex delta, so a second opinion is missing.
         self.assertFalse(out["ok"], out["why"])
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
-                         ["dev1"])
+                         ["cx3", "dev1"])
         self.assertNotIn("cx2", [entry["actor"] for entry in out["accepted"]])
+        rows = {row["sha"]: row for row in out["deltas"]}
+        self.assertFalse(rows[self.frozen]["covered"])
+        self.assertEqual(rows[self.frozen]["eligible"], ["claude"])
 
     def test_the_corrector_verdict_does_not_count_and_neither_does_its_family(self):
         out = self.gate()
         self.assertFalse(out.get("error"), out)
         self.assertEqual(out["corrections"], ["cx2"])
-        # #2888: cx2/Codex authored the head. cx3 (same codex family) is out
-        # and dev1 is the only other family, so one independent opinion remains.
+        # #2888/#7745: cx2/Codex authored the codex delta. cx3 (same codex
+        # family) is out for that delta but counts on the deepseek one; dev1
+        # (claude) is the only reader of the codex delta, so one opinion is
+        # missing there.
         self.assertFalse(out["ok"], out["why"])
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
-                         ["dev1"])
+                         ["cx3", "dev1"])
         self.assertNotIn("cx2", [entry["actor"] for entry in out["accepted"]])
-        self.assertNotIn("cx3", [entry["actor"] for entry in out["accepted"]])
+        rows = {row["sha"]: row for row in out["deltas"]}
+        self.assertFalse(rows[self.frozen]["covered"])
+        self.assertEqual(rows[self.frozen]["eligible"], ["claude"])
 
     def test_the_correction_is_read_on_the_final_sha(self):
         # The first object of the correction has no receipt; the frozen head
@@ -285,10 +293,12 @@ class GateCorrectorTest(PgTestCase):
             out = self.gate()
         self.assertFalse(out.get("error"), out)
         self.assertEqual(out["corrections"], ["cx2"])
-        # #2888: cx2's correction authors its family; only dev1 remains.
+        # #2888/#7745: cx2's correction authors its family on the codex delta;
+        # cx3 (codex) counts on the deepseek delta, and dev1 (claude) is the
+        # only reader of the codex delta — one opinion short.
         self.assertFalse(out["ok"], out["why"])
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
-                         ["dev1"])
+                         ["cx3", "dev1"])
 
     def test_a_free_note_is_not_a_designation(self):
         # #2739: the line is only a text. A free note by an ordinary agent is

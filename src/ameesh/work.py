@@ -42,6 +42,7 @@ from urllib.parse import quote
 
 from . import storage
 from .db import Db, DbError, is_unique_violation
+from .roles import DESIGN_ROLES, ORCHESTRATOR_ROLES
 from .storage import interface
 from .storage.postgres import work as _pg
 
@@ -102,7 +103,7 @@ def development_transitions() -> dict:
 
 
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
-CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
+CORRECTOR_ROLES = ORCHESTRATOR_ROLES + DESIGN_ROLES
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
 #: portée par la note de la dernière attribution du lot (jamais une exemption
 #: silencieuse de qui a assigné le lot).
@@ -195,8 +196,9 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
 
 
 def is_auditor(cfg, db, name: str) -> bool:
-    """#3324 : `name` est-il l'auditeur — la persona `auditeur`, ou un agent
-    dont la fiche Agent du canon porte `roles: [auditeur]` (ou `auditor`) ?
+    """#3324 : `name` est-il l'auditeur — un agent dont la fiche Agent du canon
+    porte `roles: [auditeur]` (ou `auditor`) ? #7661 : le titre de la persona
+    ne compte plus, seule la fiche déclare le rôle.
 
     La fiche de l'auditeur (canon, 24/10/2026) range la redésignation d'un
     relecteur au niveau 1 ; le plancher d'avis (`--floor`) reste un geste de
@@ -501,8 +503,8 @@ def publisher(cfg, db, explicit: str | None = None) -> str:
         raise WorkError("--publish refused: invalid session identity (%s)"
                         % (binding.reason or "unbound identity"))
     refus = ("--publish refused: %s is not the auditor; the reference table (L157b) "
-             "is the auditor's pass (persona auditeur, or auditeur role on its Agent "
-             "card in the canon); work estimates without --publish reads it")
+             "is the auditor's pass (the declared audit role on its Agent card in "
+             "the canon); work estimates without --publish reads it")
     if binding.name:
         if text and text != binding.name:
             raise WorkError("--publish refused: this session belongs to %s, it does "
@@ -1796,8 +1798,9 @@ def held_lots(db: Db, agents) -> dict[str, dict]:
 
 def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
     """#753 : l'acteur de la mesure post-déploiement d'un lot promu —
-    l'auditeur du registre (l'agent `auditeur`, ou celui dont la fiche Agent
-    du canon porte le rôle). Un auditeur arrêté ou mort n'est pas un acteur :
+    l'auditeur du registre (celui dont la fiche Agent, ou la projection `roles`
+    du registre sans canon, porte le rôle ; #7661 : jamais un titre de
+    persona). Un auditeur arrêté ou mort n'est pas un acteur :
     on ne réassigne pas un lot à un agent arrêté, ce serait le mal que ce lot
     corrige. Chaîne vide s'il n'y a aucun auditeur vivant, ou plusieurs sans
     choix évident : les lots promus restent alors en place. Jamais
@@ -1813,8 +1816,8 @@ def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
     living = {row.get("name") for row in listing
               if row.get("name")
               and (row.get("status") or "") not in ("stopped", "dead")}
-    if alert_briefs.AUDITOR_NAME in living:   # le nom suffit : pas de canon
-        return alert_briefs.AUDITOR_NAME
+    # #7661 : l'auditeur se lit sur la fiche (rôle du canon, ou projection du
+    # registre sans canon), jamais sur le titre de la persona.
     names = [name for name in alert_briefs.auditors(
                  listing, configured_canons(cfg) if canons is None else canons)
              if name in living]
@@ -4674,11 +4677,12 @@ def _deliver_document(db: Db, item_id: int, *, evidence: dict, actor: str = "",
 
 
 def _deliver_done(db: Db, item_id: int, *, evidence: dict, actor: str = "",
-                  note: str = "") -> dict:
+                  note: str = "", fresh: bool = False) -> dict:
     """Connecteur `done` : livré sans fusion (un avis, une analyse, #1280)."""
     if evidence:
         raise WorkError("done: takes no evidence, not %s" % ", ".join(sorted(evidence)))
-    return _close(db, item_id, done=True, note=note, actor=actor, connector="done")
+    return _close(db, item_id, done=True, note=note, actor=actor, connector="done",
+                  fresh=fresh)
 
 
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
@@ -4739,9 +4743,72 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
                   note=note, actor=actor)
 
 
+def _moment_utc(ts) -> str:
+    """Un instant epoch en UTC lisible (une preuve, pas un âge relatif)."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(float(ts)))
+    except (TypeError, ValueError, OverflowError):
+        return "?"
+
+
+def fresh_closure_refusal(db: Db, item: dict) -> str | None:
+    """#7782 : pourquoi ce lot n'est pas **vierge** pour une clôture par preuve.
+
+    La passe de cohérence #4172 ne ferme un constat `already_done` que sur un
+    lot encore intact. Un lot revenu en `intake` après un début de travail
+    garde son début mesuré (`started_ts`, L157) : une citation Git ne prouve
+    pas que la sous-étape restante est livrée. Une retenue active (`hold:`,
+    #1664/#3219) dit de même qu'un geste est attendu, quelle que soit la
+    citation. Rend la raison vérifiable (début daté, auteurs de la retenue),
+    ou None si le lot est vierge.
+
+    Lecture seule ; `close_fresh` refait ce contrôle sous le verrou de ligne
+    du lot, avec l'état, la branche et la PR relus : un début ou une retenue
+    concurrents ne se glissent pas entre le constat et la fermeture.
+    """
+    state = str(item.get("state") or "")
+    if state not in (lifecycle.REQUESTED, lifecycle.BLOCKED):
+        return "state %s is not closable" % state
+    if str(item.get("branch") or "").strip() or str(item.get("pr_ref") or "").strip():
+        return "lot carries a branch or a PR"
+    started = item.get("started_ts")
+    if started is not None:
+        return "lot already started (%s)" % _moment_utc(started)
+    holds = _active_holds(db, int(item["id"]))
+    if holds:
+        since = min(float(hold.get("since") or 0.0)
+                    for hold in holds.values())
+        return ("lot has an active hold by %s (since %s)"
+                % (_hold_holders(holds), _moment_utc(since)))
+    return None
+
+
+def close_fresh(db: Db, item_id: int, *, note: str = "",
+                actor: str = "") -> dict:
+    """#7782 : clôture `done` réservée à un lot **vierge**.
+
+    Même porte que `close --done`, mais l'état, l'absence de branche/PR, le
+    début mesuré et les retenues actives sont relus sous le verrou de ligne du
+    lot (`work.lock`, celui de `note`/`move`/`mark_started`) : un démarrage ou
+    un `hold:` concurrent ne peut plus passer entre le contrôle et l'écriture.
+    Un lot démarré ou retenu est refusé par un `WorkError` qui nomme la preuve,
+    sans rien écrire. La clôture manuelle (`close --done`) reste ouverte à un
+    opérateur : la garde est celle de la passe automatique de cohérence.
+    """
+    if storage.is_remote(db):
+        # #7782 : le journal des retenues n'est pas au contrat médié et aucun
+        # verrou de ligne ne tient d'une requête à l'autre : refuser plutôt
+        # que fermer sur une précondition qu'on ne peut pas prouver.
+        raise WorkError("close_fresh: start and hold preconditions are not "
+                        "readable on a mediated connection")
+    return deliver(db, item_id, connector="done", evidence={}, actor=actor,
+                   note=note, fresh=True)
+
+
 def _close(db: Db, item_id: int, *, abandoned: bool = False,
            superseded_by: int | None = None, delivered: bool = False, done: bool = False,
-           sha: str = "", note: str = "", actor: str = "", connector: str = "") -> dict:
+           sha: str = "", note: str = "", actor: str = "", connector: str = "",
+           fresh: bool = False) -> dict:
     """Le corps de `close` : une porte, déjà choisie et validée par l'appelant
     (`close`, ou les connecteurs `document` et `done` de `deliver`)."""
     head = (sha or "").strip().lower()
@@ -4758,6 +4825,12 @@ def _close(db: Db, item_id: int, *, abandoned: bool = False,
         if get(db, superseded_by) is None:
             raise WorkError("superseding lot %s not found" % superseded_by)
     state = item["state"]
+    if fresh and state not in (lifecycle.REQUESTED, lifecycle.BLOCKED):
+        # #7782 : la clôture automatique ne touche ni un lot déjà clos, ni un
+        # lot avancé. Ce refus précède `_rectify_done` : sinon une clôture
+        # manuelle `superseded by` son parent, relue `closed` entre le constat
+        # et l'écriture, serait réécrite `done` par la passe.
+        raise WorkError("state %s is not closable" % state)
     review, parent = _review_parent(item)
     if state == lifecycle.CLOSED:
         row = _rectify_done(db, item, review=review, parent=parent, done=done,
@@ -4810,6 +4883,20 @@ def _close(db: Db, item_id: int, *, abandoned: bool = False,
     threads: list = []
     with db.transaction() as tx:
         work_dependencies.lock(tx)
+        if fresh:
+            # #7782 : le contrôle et l'écriture sous le MÊME verrou de ligne
+            # que `note` (hold/levée), `move` et `mark_started` ; la ligne
+            # relue après l'attente du verrou porte l'état, la branche, la PR
+            # et le début mesuré à jour. Un démarrage concurrent qui a gagné
+            # le verrou est vu ici et refuse ; celui qui l'attend écrit après
+            # la fermeture et ne peut plus démarrer un lot clos.
+            locked = storage.of(tx).work.lock(item_id)
+            if locked is None:
+                raise WorkError("lot %s not found" % item_id)
+            refusal = fresh_closure_refusal(tx, locked)
+            if refusal:
+                raise WorkError(refusal)
+            state = str(locked["state"])
         row = storage.of(tx).work.close(
             item_id, current=state, reason=reason,
             superseded_by=int(superseded_by) if superseded_by is not None else None,
@@ -5230,8 +5317,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                 "designates the reviewer)" % (item_id, why, item_id))
     if state == "validated":
         from . import merge_queue
+        from .db import in_transaction
+        # #7677 : la cible fraîche, comme la désignation au gel (hors
+        # transaction seulement : jamais de fetch sous un verrou).
         gate = merge_queue.review_gate_for_item(
-            db, getattr(db, "cfg", None), item, milestones(db, item_id))
+            db, getattr(db, "cfg", None), item, milestones(db, item_id),
+            refresh_target=not in_transaction(db))
         if not gate or not gate.get("ok"):
             raise WorkError(
                 "transition to validated requires the review quorum on the current frozen head; "
@@ -5338,7 +5429,7 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     (`assign --claim`) venait d'être refusée, le lot était à `ameesh-dev3`, et
     la commande suivante de la chaîne n'a rien refusé. Un lot qui a un porteur
     n'est déplacé que par lui ou celui qui lui a délégué le lot, un humain, un
-    pilote, le bureau ou l'auditeur (escalades du §9) ; un relecteur désigné
+    pilote, l'avatar ou l'auditeur (escalades du §9) ; un relecteur désigné
     rend un lot en revue. L'entrée en `validated` reste ouverte : elle a sa
     porte, le quorum d'avis (`move`). Un lot sans porteur se prend d'abord,
     mais son déplacement n'est pas refusé ici. Une session liée agit en son nom :
@@ -5346,7 +5437,7 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     n'a rien à prouver ici (l'avertissement « inconnu » la dit au journal). Le
     chemin médié a déjà sa garde (`_require_assigned`) ; les moves internes
     (décisions, report de verdict) n'appellent pas ce contrôle."""
-    from . import identity, slo
+    from . import alert_briefs, avatars, identity, slo
     from .work_reviewers import designated
 
     if storage.is_remote(db):
@@ -5364,11 +5455,16 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     if lifecycle.phase(item) in (*TO_VALIDATE, "validated") \
             and who in designated(item):
         return
-    if who in slo.CRITICAL_TARGETS or is_pilot(cfg, db, who) or is_auditor(cfg, db, who):
+    # #7661 : les cibles critiques du §9 sont des rôles, pas des noms ; le
+    # titre `auditeur` ne donne pas le déplacement, `is_auditor` le lit sur la
+    # fiche. L'avatar du responsable (#7634) garde son geste.
+    targets = set(slo.CRITICAL_TARGETS) - set(alert_briefs.AUDITOR_ROLES)
+    if (who in targets or avatars.is_avatar(cfg, who)
+            or is_pilot(cfg, db, who) or is_auditor(cfg, db, who)):
         return
     raise WorkError(
         "move refused: lot %s is held by %s, not %s; nothing changed. Only its holder, "
-        "a designated reviewer, a human, a pilot, the bureau or the auditor moves it "
+        "a designated reviewer, a human, a pilot, an avatar or the auditor moves it "
         "(take it through the pilot, or say what you found: ameesh work note %s \"…\")"
         % (item_id, holder, who, item_id))
 
@@ -5445,11 +5541,11 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
         # commande du pilote l'écrit, après contrôle de son autorité.
         raise WorkError("note refused: `%s` is reserved to the review floor; use "
                         "ameesh work reviewer %s --floor N" % (review_floor.PREFIX, item_id))
-    from . import nexlink_release
-    if text.startswith(nexlink_release.RESERVED_PREFIXES):
+    if text.startswith(_module_registry.release_reserved_prefixes()):
         # #6020 : l'attestation de staging remis et le passage du pilote sont
         # lus avec l'auteur du journal ; seule `ameesh release attest` les
-        # écrit, sous l'identité liée de la session (jamais un --actor).
+        # écrit, sous l'identité liée de la session (jamais un --actor). #7663:
+        # les préfixes viennent du module, par le registre.
         raise WorkError("note refused: `%s` is reserved to ameesh release attest"
                         % text.split(":", 1)[0])
     from . import planned_waits

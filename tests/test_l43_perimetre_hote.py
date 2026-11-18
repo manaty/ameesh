@@ -338,6 +338,9 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "pressure_scope": "host",
             "max_cgroup_memory_used": resources.DEFAULT_MAX_CGROUP_MEMORY_USED,
             "max_cgroup_throttled": resources.DEFAULT_MAX_CGROUP_THROTTLED,
+            # #7675 (E3b): no default, an undeclared host keeps them unwatched
+            "max_cgroup_cpu_used": None,
+            "max_cgroup_throttled_periods": None,
         })
         self.assertEqual(got["max_agents"], 3)
         self.assertEqual(got["origin"], {
@@ -356,6 +359,8 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "pressure_scope": resources.DEFAULT_ORIGIN,
             "max_cgroup_memory_used": resources.DEFAULT_ORIGIN,
             "max_cgroup_throttled": resources.DEFAULT_ORIGIN,
+            "max_cgroup_cpu_used": resources.DEFAULT_ORIGIN,
+            "max_cgroup_throttled_periods": resources.DEFAULT_ORIGIN,
             "max_agents": ID_T})
         self.assertEqual(got["fiches"], [ID_A, ID_T])
         # une fiche qui se tait n'impose pas le défaut à celle qui déclare

@@ -64,6 +64,11 @@ class ModuleStore:
                 self.db.execute("DELETE FROM project_modules WHERE project = %s AND module = %s",
                                 (row["project"], row["module"]))
 
+    def action_policy(self, project, module):
+        rows = self.db.query("SELECT canon, rules FROM project_modules "
+                             "WHERE project = %s AND module = %s", (project, module))
+        return rows[0] if rows else None
+
     def enabled(self, project, module):
         return bool(self.db.query("SELECT module FROM project_modules "
                                   "WHERE project = %s AND module = %s", (project, module)))

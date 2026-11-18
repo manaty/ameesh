@@ -15,6 +15,10 @@
         is stopped (#3299) ; an avatar `releve: preference` moves with its
         conversation, preflight and one `agent.moved` + `conversation_moves`
         transaction, no session or credential copied (#7108);
+  ameesh agent observe <name> [--account-profile NAME] [--json]
+        #7636 E1b: admitted profile, canon/placement, lease, bounds and redacted
+        budget in one read-only snapshot (schema ameesh-agent-observation/1);
+        no claim, reservation, dispatch or credential;
   ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh agent retire <name> --reason R | restore <name>   take an agent out of the
         active registry (never designated, claimed nor mailed), or back (#3460);
@@ -98,6 +102,13 @@
   ameesh export-v0            export to the v0 file mailbox;
   ameesh fil list | show <project> [<lot>] [--last N] | tail <project> [<lot>]
         readable threads: every message that went through ameesh, in clear (R12);
+  ameesh gate act --lot ID --kind kms|key|prod [--target T] [--wait-until ISO] -- COMMAND
+        the imposed credential path: the gate checks the lot, then runs the command (#7767);
+  ameesh gate audit --since ISO [--stale-seconds N] [--json]
+        KMS/IAM and production acts whose broker trace is incomplete (#7767);
+  ameesh gate broker serve|check [--config F] [--json]
+        the credential-gate service, run by its own Unix account (#7767);
+  ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO  check before an act;
   ameesh github gestes [--since 24h] [--agent A] [--match 'run cancel'] [--json]
         | identity <agent> [--json]
         the gh commands run by agents, journaled per turn (who cancelled,
@@ -115,9 +126,10 @@
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
-        durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
+  ameesh host reattach SOURCE AGENT --to NEW_HOST
+        durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
         tenants of a shared host: plan, binding, presence (#7106, bureau or
         human only; --register runs on the target host);
@@ -401,6 +413,18 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "staging-migrations":
         from . import staging_migrations
         return staging_migrations.main(rest)
+    if command == "gate" and rest[:1] == ["act"]:
+        from . import credential_gate
+        return credential_gate.client_main(rest[1:])
+    if command == "gate" and rest[:1] == ["audit"]:
+        from . import credential_gate
+        return credential_gate.audit_main(rest[1:])
+    if command == "gate" and rest[:1] == ["broker"]:
+        from . import credential_gate
+        return credential_gate.broker_main(rest[1:])
+    if command == "gate" and rest[:1] == ["pre-act"]:
+        from . import pre_act
+        return pre_act.main(rest[1:])
     from . import db as db_mod
     db_mod.set_command_application(command)  # #5976
     if command == "role" and rest[:1] == ["run"]:
@@ -521,7 +545,7 @@ def _dispatch(argv: list[str] | None) -> int:
         # #7106 (avatar B3) : tenants d'un hôte partagé, geste d'infrastructure
         from . import tenancy
         return tenancy.main(rest[1:])
-    if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
+    if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "reattach", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
     if command == "role":

@@ -24,38 +24,40 @@ l'ordre, sans agent :
 5. l’instantané ameesh (rendu transitoire sous TMPDIR) : base et SHA de la
    cible, table `## Composition` produite par `paquet-compose.py --units`
    (gabarit #3629), admissions, écartés et leur motif, freeze-checks ; ses
-   tests par unité y sont dits « en parallèle de la CI » (#4304) ;
+   séries directes y sont dites jouées sur le préfixe composé de chaque
+   unité, avant la poussée (#7740) ;
 6. `ameesh work packet record` (liaison des unités au porteur), puis
    `scripts/paquet-inclusion.py` sur la tête ;
-7. **dès ce point** (canon §6, #4304) : poussée de
-   `integration/paquet-<nom>`, PR ouverte ou mise à jour, gel
-   `ameesh work milestone <porteur> frozen --sha <tête>` et demande
-   `ameesh ci run <porteur> --full` — la CI complète part sans attendre les
-   tests par unité ;
-8. les tests par unité, pendant la CI : les modules de test apportés par
-   chaque unité et leurs voisins. La passe de contrats de l'arbre final
-   (plan commun, #6182) précède déjà la poussée, le gel et la ci-full :
-   budget canon, attente de créneau comprise, résultat réutilisé sans rejeu.
-   Une expiration est non concluante et laisse publier avec ci-full ; un
-   contrat négatif rejoint contract_red après publication avec ci-full ; un arbre
-   modifié invalide la passe et demande une nouvelle composition. Un test ciblé **rouge** d'un module **voisin**
-   est situé en rejouant ce test sur les préfixes de l'empilement, dans
-   l'ordre (`base + u1`, `base + u1 + u2`, …) : la première unité où il
-   apparaît est retirée, son auteur est prévenu, et le paquet est recomposé
-   **une seule fois** sans elle (#4217). L'attribution par chevauchement de
-   fichiers (`packet_red`, #3801) ne désigne plus un voisin ; elle reste la
-   lecture des rouges propres et des contrats (#3931). Un rouge voisin
+7. la passe de contrats de l'arbre final (plan commun, #6182), puis les
+   **séries directes** de chaque unité, jouées sur son **préfixe composé**
+   (`base + u1 + … + uN`, dans un worktree détaché) et **avant toute
+   poussée** (#7740) : les modules de test apportés par l'unité, ses voisins
+   de la carte et les témoins globaux que son empreinte touche (migration :
+   rôles et schéma ; stockage : contrats des écrivains). Une série joue
+   jusqu'au bout de `--tests-timeout` ; seule la borne totale
+   (`--tests-budget`) la coupe en temps mural. Une série sans module direct
+   est un **non-concluant nommé**, jamais un vert. Un test ciblé **rouge**
+   d'un module **voisin** est situé en rejouant ce test sur les préfixes de
+   l'empilement ; la première unité où il apparaît est retirée, son auteur
+   est prévenu, et le paquet est recomposé **une seule fois** sans elle
+   (#4217), sans consommer de CI de paquet. L'attribution par chevauchement
+   de fichiers (`packet_red`, #3801) ne désigne plus un voisin ; elle reste
+   la lecture des rouges propres et des contrats (#3931). Un rouge voisin
    impossible à situer sur les préfixes n'entraîne **aucun retrait** : le
    pilote est prévenu et le paquet s'arrête. Un test rouge sur la tête mais
    **vert sur tous les préfixes** est instable (#4221) : consigné non
    concluant, sans retrait, le paquet continue et le pilote est prévenu. Un
-   rouge non attribuable garde
-   le geste antérieur : une unité dont le module propre a rougi est retirée,
-   un contrat rouge arrête (l'attribution demande un agent). Un run **non
-   concluant** (délai, base absente, psql/psycopg indisponible, erreur de
-   fixture DB en QueryCanceled/timeout, rc inattendu) est consigné à la PR,
-   au porteur et au courrier, sans retirer d'unité ni arrêter le paquet : le
-   canon §3 le veut, la ci-full tranche ;
+   rouge non attribuable garde le geste antérieur : une unité dont le module
+   propre a rougi est retirée, un contrat rouge arrête (l'attribution demande
+   un agent). Un run **non concluant** (délai, base absente, psql/psycopg
+   indisponible, erreur de fixture DB en QueryCanceled/timeout, rc inattendu)
+   est consigné à la PR, au porteur et au courrier, sans retirer d'unité ni
+   arrêter le paquet : le canon §3 le veut, la ci-full tranche ;
+8. une fois contrats et séries directes verts (ou seulement non concluants
+   nommés) : poussée de `integration/paquet-<nom>`, PR ouverte ou mise à
+   jour, gel `ameesh work milestone <porteur> frozen --sha <tête>` et demande
+   `ameesh ci run <porteur> --full` (canon §6) ; un rouge de série a recomposé
+   avant ce point, donc aucune CI de paquet n'est consommée par lui ;
 9. le résultat des tests au corps de la PR et au journal du porteur,
    courrier au pilote.
 
@@ -67,12 +69,12 @@ manquant) reste rc 1 et ouvre seule cette empreinte.
 
 Ce qui reste au pilote, hors de ce script : « verdict non requis », le feu et
 toute fusion sur la cible. Le script ne fusionne jamais la cible et ne déclare
-aucun verdict. La ci-full demandée dès la poussée arme pourtant la fusion
-automatique (#2813), et un porteur sans delta propre n'attend aucun verdict :
-le paquet peut fusionner au vert **avant la fin des tests par unité** (canon
-§11 bis, panier #4322). La ci-full tranche ; si la PR est fusionnée pendant les
-tests, le script ne recompose plus rien : un rouge d'unité va au porteur et au
-pilote (corriger en avant ou revert), et la ligne `MERGED_LINE` dit à
+aucun verdict. La ci-full est demandée **après** les séries directes ; elle
+arme la fusion automatique (#2813), et un porteur sans delta propre n'attend
+aucun verdict. Le seul intervalle où une fusion peut précéder le relevé de la
+PR est celui entre la poussée et la fin du lancement (canon §11 bis, panier
+#4322) : le script ne recompose alors plus rien, un rouge d'unité va au porteur
+et au pilote (corriger en avant ou revert), et la ligne `MERGED_LINE` dit à
 `paquet-horaire.py` de ne rien publier.
 
 Un lot prêt peut être retiré de la composition par `--exclude LOT` (répétable,
@@ -115,25 +117,26 @@ carte sont pesés par `tests/parts/durees.json` pour le pilote des tests
 (`test_driver`), que le manifeste nomme : sous psql, la suite est ~6 fois plus
 lente que la mesure psycopg de la carte.
 
-#4463 : une fois la tête poussée, la garde relue avant chaque série relit
-aussi l'état de la PR : fusionnée (ou close) pendant les tests par unité, leurs
-résultats ne peuvent plus retirer une unité ; les séries non parties sont
-abandonnées et le porteur reçoit « tests par unité interrompus : porteur
-fusionné à <sha> ». `--tests-budget S` (paquet-horaire :
+#4463 : quand une tête a déjà été poussée (reprise), la garde relue avant
+chaque série relit aussi l'état de la PR : fusionnée (ou close) pendant les
+séries, leurs résultats ne peuvent plus retirer une unité ; les séries non
+parties sont abandonnées et le porteur reçoit « tests par unité interrompus :
+porteur fusionné à <sha> ». `--tests-budget S` (paquet-horaire :
 `packet_tests.total_timeout_seconds` du canon compilé) borne la durée totale
-des tests : chaque série est bornée au temps restant, celles qui ne partent
-plus avant l'échéance sont non concluantes (canon §3) et le tic suivant peut
-partir.
+des tests en temps mural : chaque série est arrêtée au temps restant, celles
+qui ne partent plus avant l'échéance sont non concluantes (canon §3) et le tic
+suivant peut partir.
 
-#4887 : sous cette borne, la première série ne mange plus le temps des autres.
-Chaque série ne reçoit que sa part des vagues restantes (`series_share`) :
-toutes les unités commencent, leurs modules directs (propres et voisins joués)
-passent avant l'échéance, les contrats en dernier. Le corps de la PR dit, lot
-par lot, si ses modules directs ont été joués jusqu'au bout (`_direct_lines`) ;
-une série coupée n'en revendique aucun (#4814). Le contrôle rapide du job plan
-« types clients à jour » passe avant la poussée et la demande de CI : le vrai
-`gen-api --check` si Node et les dépendances sont là, sinon la garde
-déterministe « OpenAPI changé sans schéma » (#4831).
+#4887/#7740 : sous cette borne, une série directe ne prend plus une part du
+budget total (c'est cette part qui la coupait après 29 à 43 s sur h-06/h-09) :
+elle part avec `--tests-timeout`, sur le préfixe composé de son unité, et seule
+la borne murale restante peut la couper. Les contrats gardent leur part
+(`series_share`). Le corps de la PR dit, lot par lot, si ses modules directs
+ont été joués jusqu'au bout (`_direct_lines`) ; une série coupée n'en
+revendique aucun et 0 module joué est un non-concluant nommé (#4814, #7740).
+Le contrôle rapide du job plan « types clients à jour » passe avant la
+poussée : le vrai `gen-api --check` si Node et les dépendances sont là, sinon
+la garde déterministe « OpenAPI changé sans schéma » (#4831).
 
 #4237 : un refus de geste (bail relevé, `GestureRefused`) **après des tests
 verts** ne perd plus le paquet : depuis #4304, la tête est déjà poussée,
@@ -192,6 +195,14 @@ Seul un déplacement (`behind`, `diverged`) relance aussitôt : une référence
 illisible (`absent`, `dirty`, `unknown`) sort en 1 avec sa cause. Des contrats
 rouges restent le verdict même si la cible a bougé pendant eux (rc 5).
 
+#7754 : après la poussée, la PR existe. La lecture `gh pr view` du corps final
+(GraphQL) peut tomber sous la limite de débit du compte partagé : elle est
+relue par l'API REST (`gh api`, bucket `core`, distinct du bucket GraphQL),
+dans `ensure_pull_request` comme dans `pull_request_state`. Une mise à jour
+finale du corps qui échoue encore (écriture refusée, repli REST indisponible)
+n'arrête plus le paquet : sa cause part à la note du porteur et au courrier,
+rc 0 — la poussée, le gel et la ci-full sont déjà faits.
+
 Modes :
 
 * normal : composition réelle, poussée, PR, gel, ci-full, tests et courrier ;
@@ -246,6 +257,24 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA_RE = re.compile(r"[0-9a-f]{7,64}", re.IGNORECASE)
 CONTRACT_ALWAYS = "tests/parts/toujours.txt"
 CONTRACT_MODULES = ("tests.test_l161f_plan", "tests.test_cluster")
+#: #7740 : témoins globaux qu'une empreinte touche, en plus de la sélection
+#: des voisins : une migration change les rôles et le schéma, un stockage
+#: change le contrat des écrivains, `alert_briefs.py` porte les alertes de
+#: pause (veille 17:58, test_5424 rouge sur une tête qui le touchait).
+MIGRATION_WITNESSES = ("tests.test_cluster", "tests.test_migrations",
+                       "tests.test_migrations_additives")
+STORAGE_WITNESSES = ("tests.test_l107_executor_contract",
+                     "tests.test_contract_registry_ameesh",
+                     "tests.test_contract_selection")
+ALERT_BRIEF_WITNESSES = ("tests.test_5424_review_family_paused",)
+#: (préfixes de chemin, modules témoins) : chaque groupe dont un préfixe est
+#: touché ajoute ses témoins à la série de l'unité.
+FOOTPRINT_WITNESSES = (
+    (("src/ameesh/migrations/", "deploy/sql/", "deploy/migrations/"),
+     MIGRATION_WITNESSES),
+    (("src/ameesh/storage/",), STORAGE_WITNESSES),
+    (("src/ameesh/alert_briefs.py",), ALERT_BRIEF_WITNESSES),
+)
 #: #6274 : les outils de la convention d'ameesh ; un projet les remplace par
 #: son bloc `prevalidation` (`plan_script`, `parts_script`, `contracts`)
 DEFAULT_PLAN_SCRIPT = "scripts/test-plan.py"
@@ -318,11 +347,15 @@ PUBLISH_REFUSED = 3
 CONTAINS_DISCARDED_REASON = "contient un lot écarté, coupure suivante"
 #: un rouge local n'est retiré du paquet qu'une fois ; au-delà, un agent lit.
 MAX_RECOMPOSITIONS = 1
-#: #4304 : la ligne du manifeste poussé avant les tests par unité (relue par
-#: `prevalidation_calls.composer_tested`, #4136 : ne pas la reformuler seule).
-TESTS_PARALLEL_LINE = ("- Tests locaux : joués par le composeur après la poussée, "
-                       "en parallèle de la CI complète (#4304) ; résultat à la PR, "
-                       "au porteur et au courrier du pilote.")
+#: #4304/#7740 : la ligne du manifeste poussé avant les séries directes
+#: (relue par `prevalidation_calls.composer_tested`, #4136 : ne pas la
+#: reformuler seule). #7740 : les tests ne tournent plus après la poussée en
+#: parallèle de la CI, mais avant elle, sur le préfixe composé de chaque
+#: unité ; l'ancienne formulation reste reconnue pour les manifestes déjà
+#: poussés.
+TESTS_PARALLEL_LINE = ("- Tests locaux : joués par le composeur sur le préfixe "
+                       "composé de chaque unité, avant la poussée (#7740) ; "
+                       "résultat à la PR, au porteur et au courrier du pilote.")
 #: #4322 : début de ligne quand la PR a fusionné pendant les tests par unité ;
 #: `paquet-horaire.py` (after_compose) n'appelle alors pas publish.
 MERGED_LINE = "porteur fusionné pendant les tests par unité"
@@ -1439,6 +1472,40 @@ def reader_worktree(repo: Path, base_sha: str) -> Path:
     return path
 
 
+def local_commits(repo: Path) -> set[str]:
+    """Les commits présents dans les refs locales, sans fetch promissoire.
+
+    #7740 : un SHA de composition factice (banc) ne doit pas déclencher le
+    fetch d'un clone partiel ; `rev-list --all` ne lit que le graphe local.
+    """
+    proc = git(repo, "rev-list", "--all", check=False)
+    if proc.returncode != 0:
+        return set()
+    return {line.strip() for line in _decode(proc.stdout).splitlines()
+            if re.fullmatch(r"[0-9a-f]{40,64}", line.strip())}
+
+
+def unit_prefix_worktree(repo: Path, commit: str, lot: int) -> Path:
+    """#7740 : un worktree détaché sur le **préfixe composé** d'une unité.
+
+    `unit.commit` est la fusion cumulative de la composition à cette unité :
+    sa série directe y voit les unités antérieures, jamais les suivantes.
+    L'arbre est jetable ; l'interpréteur et les dépendances viennent de
+    `project_python` / du clone, comme pour les autres arbres de contrôle.
+    """
+    parent = temporary_parent()
+    path = Path(tempfile.mkdtemp(prefix="paquet-auto-unite-", dir=str(parent)))
+    path.rmdir()
+    proc = git(repo, "worktree", "add", "--detach", str(path), commit,
+               check=False)
+    if proc.returncode != 0:
+        shutil.rmtree(path, ignore_errors=True)
+        raise PaquetAutoError(
+            "préfixe composé #%d (%s) illisible : %s"
+            % (lot, commit[:12], _tail(_decode(proc.stderr), 3)))
+    return path
+
+
 def _worktrees_on(repo: Path, branch: str) -> list[Path]:
     """Les worktrees du dépôt ouverts sur la branche locale `branch`."""
     listing = out(repo, "worktree", "list", "--porcelain")
@@ -2485,12 +2552,11 @@ def contract_modules(worktree: Path, *, base: str = "",
     return _dedupe_modules(worktree, modules)
 
 
-def unit_test_modules(worktree: Path, unit: Unit) -> list[str]:
-    """Les modules `tests/test_*.py` apportés par la fusion de l'unité.
+def unit_delta_paths(worktree: Path, unit: Unit) -> list[str]:
+    """Les chemins du delta propre de l'unité (`commit^1..commit`).
 
-    La fusion est comparée à sa première parente : c'est le delta propre de
-    l'unité dans le paquet (aucune résolution locale, par construction). Un
-    module supprimé par l'unité n'est pas exécuté.
+    La fusion est comparée à sa première parente : c'est le delta de l'unité
+    dans le paquet, sans résolution locale, par construction.
     """
     proc = git(worktree, "diff", "--name-only", unit.commit + "^1", unit.commit,
                check=False)
@@ -2498,13 +2564,66 @@ def unit_test_modules(worktree: Path, unit: Unit) -> list[str]:
         raise PaquetAutoError(
             "unité #%d : diff illisible : %s"
             % (unit.lot, _decode(proc.stderr).strip()))
-    modules = []
-    for path in _decode(proc.stdout).splitlines():
-        path = path.strip()
-        if re.fullmatch(r"tests/test_[A-Za-z0-9_]+\.py", path) \
-                and (worktree / path).is_file():
-            modules.append(path[:-3].replace("/", "."))
-    return _dedupe_modules(worktree, modules)
+    return [line.strip() for line in _decode(proc.stdout).splitlines()
+            if line.strip()]
+
+
+def unit_test_candidates(worktree: Path, unit: Unit,
+                         paths: list[str] | None = None) -> list[str]:
+    """#7740 : les modules de test du delta, **sans** filtre d'existence.
+
+    Une unité suivante peut supprimer le test ; la tête finale ne le porte
+    alors plus, mais le préfixe de l'unité, si. Le filtre se fait sur ce
+    préfixe (`_dedupe_modules`), pas ici.
+    """
+    return [path[:-3].replace("/", ".")
+            for path in (paths if paths is not None
+                         else unit_delta_paths(worktree, unit))
+            if re.fullmatch(r"tests/test_[A-Za-z0-9_]+\.py", path)]
+
+
+def unit_test_modules(worktree: Path, unit: Unit, *, tree: Path | None = None
+                      ) -> list[str]:
+    """Les modules `tests/test_*.py` apportés par la fusion de l'unité.
+
+    Un module supprimé par l'unité, ou absent de `tree` (son préfixe composé,
+    #7740), n'est pas exécuté.
+    """
+    base = tree or worktree
+    modules = [module for module in unit_test_candidates(worktree, unit)
+               if (base / (module.replace(".", "/") + ".py")).is_file()]
+    return _dedupe_modules(base, modules)
+
+
+def footprint_witnesses(worktree: Path, unit: Unit, *,
+                        tree: Path | None = None,
+                        paths: list[str] | None = None) -> list[dict]:
+    """#7740 : les témoins globaux que l'empreinte de l'unité touche.
+
+    Une migration change les rôles (test_cluster, SuperviseurRoleTest) et le
+    schéma (test_migrations*) ; une modification de stockage touche le
+    contrat des écrivains ; `alert_briefs.py` porte les alertes de pause
+    (test_5424, veille 17:58). `FOOTPRINT_WITNESSES` associe ces préfixes à
+    leurs témoins. Ces modules sont joués dans la série de l'unité, sur son
+    préfixe composé, même quand la carte d'impact ne les sélectionne pas.
+    `tree` est ce préfixe : un témoin absent de l'arbre n'est pas joué.
+    """
+    paths = unit_delta_paths(worktree, unit) if paths is None else paths
+    base = tree or worktree
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for prefixes, witnesses in FOOTPRINT_WITNESSES:
+        files = [path for path in paths if path.startswith(prefixes)]
+        if not files:
+            continue
+        for module in witnesses:
+            if module in seen:
+                continue
+            if (base / (module.replace(".", "/") + ".py")).is_file():
+                seen.add(module)
+                rows.append({"module": module, "reason": "empreinte",
+                             "files": files[:3]})
+    return rows
 
 
 def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
@@ -3608,7 +3727,7 @@ def check_client_types(worktree: Path, base_sha: str, *,
     """#4887 : le contrôle rapide du job plan (`types clients à jour`) avant la CI.
 
     h-10 a perdu sa CI sur `ui/src/api/schema.d.ts` périmé (#4831) : le job
-    `plan` le refuse, mais le composeur ne le voyait qu'après la poussée. Ici :
+    `plan` le refuse, mais le composeur ne le voyait qu'en CI. Ici :
 
     * le vrai `node ui/scripts/gen-api.mjs --check` tourne quand `node` et
       `openapi-typescript` sont disponibles (le clone dédié peut prêter ses
@@ -4074,11 +4193,14 @@ def designated_prefix(worktree: Path, composition: Composition,
     * vert sur tous les préfixes jusqu'à la tête : le test est instable
       (#4221), consigné non concluant, sans retrait.
 
-    Un rejeu non concluant (worktree impossible, délai, run illisible) garde
-    le retrait #3801 : c'est le geste antérieur, comme `earlier_red`. Les
-    retraits d'une autre preuve passent inchangés. Rend `(retraits, tests
-    instables, pourquoi)` ; `pourquoi` non vide signale un rejeu non concluant
-    dont le retrait a été gardé.
+    #7692 : un rejeu non concluant (worktree impossible, délai, run illisible)
+    ne confirme pas le retrait #3801 : il n'est **pas appliqué** (canon §3, un
+    non-concluant ne retient rien). L'unité reste dans la composition et la
+    ci-full tranche ; le test est consigné non concluant. Les retraits d'une
+    autre preuve passent inchangés. Rend `(retraits, tests instables,
+    pourquoi)` ; `pourquoi` non vide signale un rejeu non concluant dont le
+    retrait a été abandonné (l'appelant consigne les tests qu'il n'a pas
+    confirmés).
     """
     subjects: list[Removal] = []
     untouched: list[Removal] = []
@@ -4107,9 +4229,11 @@ def designated_prefix(worktree: Path, composition: Composition,
         group = groups[position]
         limit = series_timeout(timeout, deadline)
         if limit is None:
-            confirmed.extend(group)
             why = ("borne totale atteinte avant le préfixe de #%d"
                    % group[0].lot)
+            log("tests ciblés : rejeu du préfixe de #%d NON CONCLUANT (%s) — "
+                "retrait #3801 NON appliqué (canon §3), l'unité reste"
+                % (group[0].lot, why))
             continue
         if guard is not None:
             guard()
@@ -4126,17 +4250,15 @@ def designated_prefix(worktree: Path, composition: Composition,
                 [{"test": name} for name in names], timeout=timeout,
                 start=position, log=log, **bounds)
         except BudgetSpent as spent:
-            confirmed.extend(group)
             why = str(spent)
             log("tests ciblés : rejeu du préfixe de #%d NON CONCLUANT (%s) — "
-                "retrait #3801 gardé (geste antérieur)"
+                "retrait #3801 NON appliqué (canon §3), l'unité reste"
                 % (group[0].lot, spent))
             continue
         if group_why:
-            confirmed.extend(group)
             why = group_why
             log("tests ciblés : rejeu du préfixe de #%d NON CONCLUANT (%s) — "
-                "retrait #3801 gardé (geste antérieur)"
+                "retrait #3801 NON appliqué (canon §3), l'unité reste"
                 % (group[0].lot, group_why))
             continue
         # `found` est indexé par numéro de lot, pas par position (#7239 B) :
@@ -4158,8 +4280,14 @@ def designated_prefix(worktree: Path, composition: Composition,
                 elif test in flaky_names:
                     flaky.append({"test": test})
                 else:
-                    # ni confirmé ni situé : garder le retrait antérieur.
-                    keep.append(test)
+                    # ni confirmé ni situé : aucune preuve, aucun retrait
+                    # (canon §3) ; l'appelant le consigne non concluant.
+                    why = why or ("test %s ni confirmé ni situé sur les "
+                                  "préfixes" % test)
+                    log("tests ciblés : #%d désignée (#3801) mais %s ni "
+                        "confirmé ni situé sur les préfixes — retrait non "
+                        "appliqué (canon §3), l'unité reste"
+                        % (removal.lot, test))
             if keep:
                 confirmed.append(Removal(
                     lot=removal.lot, tests=keep,
@@ -4360,8 +4488,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                       parallel: int = DEFAULT_PARALLEL,
                       deadline: float | None = None,
                       contract_report: ContractPass | None = None,
-                      legacy_contracts: bool = False) -> tuple[list[TestRun], list[int],
-                                                              list[Removal]]:
+                      legacy_contracts: bool = False,
+                      unit_tree=None) -> tuple[list[TestRun], list[int],
+                                               list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
     Rend `(exécutions, unités fautives, retraits)`. Une unité est fautive
@@ -4393,8 +4522,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     préfixe de l'unité puis au-delà (`designated_prefix`, injectable par
     `confirm`). Préfixe vert = unité innocente (le premier préfixe rouge
     suivant est retiré à sa place) ; vert partout = instable consigné
-    (#4221) ; rouge dès son préfixe = retrait confirmé. Un rejeu non concluant
-    garde le retrait #3801 (geste antérieur).
+    (#4221) ; rouge dès son préfixe = retrait confirmé. #7692 : un rejeu non
+    concluant ne confirme pas le retrait — il n'est pas appliqué (canon §3),
+    l'unité reste et le test est consigné non concluant ; la ci-full tranche.
 
     #4025 : la série d'une unité joue aussi ses modules voisins
     (`neighbor_modules`, injectable par `select`). Dans le geste antérieur,
@@ -4402,6 +4532,16 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     l'a sélectionné ; un rouge partagé reste à l'attribution et à la ci-full.
     Un rouge de module voisin aussi rouge sur la base (`base_failures`,
     injectable par `on_base`) ne compte pas : environnement ou préexistant.
+
+    #7740 : chaque série d'unité est jouée sur son **préfixe composé**
+    (`unit.commit`, l'empilement jusqu'à elle), dans un worktree détaché
+    (`unit_tree`, injectable), et non sur la tête finale : un conflit de sens
+    avec une unité antérieure est vu à l'unité qui le crée. La série reçoit
+    `timeout` et non une part de `deadline` ; `deadline` ne la coupe qu'en
+    temps mural, à la borne totale. Les témoins globaux de l'empreinte
+    (`footprint_witnesses` : migration, stockage, alertes de pause)
+    rejoignent ses modules. Une série sans module, ou dont le préfixe est
+    indisponible, est un non-concluant nommé, jamais un vert.
 
     #4271 : avec `parallel` > 1, les séries des unités et celle des contrats
     sont indépendantes et jouées en même temps (au plus `parallel`), chacune
@@ -4413,9 +4553,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     est non concluante sans être jouée. L'attente d'un créneau `ameesh heavy`
     compte dans ce temps (`run_tests(wall=…)`) : à l'échéance la série est
     arrêtée, au plus `WALL_GRACE_S` après. #7195 : pour une série `heavy`,
-    cette attente ne consomme plus sa part d'exécution (`timeout`, passée à
-    `ameesh heavy --max-duration`) ; seule la série directe voit sa part
-    borner aussi son temps mural.
+    cette attente ne consomme pas sa borne d'exécution (`timeout`, passée à
+    `ameesh heavy --max-duration`). #7740 : la série directe n'a pas de part
+    de `deadline` ; `timeout` borne son exécution et le temps restant son
+    temps mural.
     """
     contract_run = None
     if contract_report is not None:
@@ -4442,26 +4583,112 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     # le créneau de l'hôte n'est demandé qu'en parallèle : la série reste le
     # geste antérieur, à l'identique
     slots = {"heavy": True} if parallel > 1 else {}
-    planned: list[tuple[Unit, list[str], list[dict], list[str]]] = []
-    for unit in composition.units:
-        proper = unit_test_modules(worktree, unit)
-        added = []
-        for row in neighbors.get(unit.lot, []):
-            if row["module"] not in proper \
-                    and all(row["module"] != done["module"] for done in added):
-                added.append(row)
-        modules = proper + [row["module"] for row in added]
-        if not modules:
-            log("tests unité #%d : aucun module propre" % unit.lot)
-            continue
-        if added:
-            log("tests unité #%d : %d module(s) voisin(s) : %s"
-                % (unit.lot, len(added),
-                   ", ".join("%s (%s)" % (row["module"], row["reason"])
-                             for row in added)))
-        planned.append((unit, proper, added, modules))
+    factory = unit_tree or unit_prefix_worktree
+    planned: list[tuple[Unit, list[str], list[dict], list[str], Path,
+                        Path | None, TestRun | None]] = []
+    prefixes: list[Path] = []
+    local = local_commits(worktree)
+    try:
+        for unit in composition.units:
+            prefix_path: Path | None = None
+            error_run: TestRun | None = None
+            base_tree = worktree
+            proper: list[str] = []
+            added: list[dict] = []
+            if unit.commit in local:
+                paths = unit_delta_paths(worktree, unit)
+                proper_candidates = unit_test_candidates(worktree, unit, paths)
+                witness_rows = footprint_witnesses(worktree, unit, paths=paths)
+                rows = neighbors.get(unit.lot, [])
+                if proper_candidates or rows or witness_rows:
+                    try:
+                        prefix_path = factory(worktree, unit.commit, unit.lot)
+                        prefixes.append(prefix_path)
+                        base_tree = prefix_path
+                    except PaquetAutoError as exc:
+                        log("tests unité #%d : préfixe composé %s indisponible "
+                            "(%s) : série non concluante"
+                            % (unit.lot, unit.commit[:12], exc))
+                        error_run = TestRun(
+                            "unité #%d" % unit.lot, [], None,
+                            "préfixe composé %s indisponible : %s"
+                            % (unit.commit[:12], exc), 0.0, timed_out=True)
+                if prefix_path is not None:
+                    # Un chemin supprimé par l'unité reste dans le delta : il
+                    # n'existe pas sur son préfixe et n'est donc pas joué.
+                    proper = [module for module in proper_candidates
+                              if (prefix_path
+                                  / (module.replace(".", "/") + ".py")).is_file()]
+                    proper = _dedupe_modules(prefix_path, proper)
+                    for row in rows + witness_rows:
+                        if row["module"] in proper:
+                            continue
+                        path = prefix_path / (row["module"].replace(".", "/")
+                                              + ".py")
+                        if not path.is_file():
+                            continue
+                        if all(row["module"] != done["module"] for done in added):
+                            added.append(row)
+                elif error_run is None:
+                    # Aucun module direct à jouer : le préfixe n'est pas créé.
+                    proper, added = [], []
+            else:
+                # Un SHA de composition factice (banc, témoin) n'a pas de
+                # préfixe : la série reste sur l'arbre composé, comme avant.
+                log("tests unité #%d : préfixe %s introuvable, série sur "
+                    "l'arbre composé (banc)" % (unit.lot, unit.commit[:12]))
+                proper = unit_test_modules(worktree, unit)
+                for row in neighbors.get(unit.lot, []):
+                    if row["module"] in proper:
+                        continue
+                    if all(row["module"] != done["module"] for done in added):
+                        added.append(row)
+            modules = proper + [row["module"] for row in added]
+            if not modules:
+                # #7740 : 0 module joué n'est jamais une inclusion verte.
+                log("tests unité #%d : aucun module direct sélectionné (non "
+                    "concluant, canon §3)" % unit.lot)
+                error_run = error_run or TestRun(
+                    "unité #%d" % unit.lot, [], None,
+                    "aucun module direct sélectionné : non concluant (#7740)",
+                    0.0, timed_out=True)
+            if added:
+                log("tests unité #%d : %d module(s) voisin(s)/témoin(s) : %s"
+                    % (unit.lot, len(added),
+                       ", ".join("%s (%s)" % (row["module"], row["reason"])
+                                 for row in added)))
+            planned.append((unit, proper, added, modules, base_tree,
+                            prefix_path, error_run))
+    except BaseException:
+        for path in prefixes:
+            remove_worktree(worktree, path)
+        raise
 
-    def bounded(label: str, modules: list[str]) -> TestRun:
+    def bounded(label: str, modules: list[str], *, tree: Path | None = None,
+                direct: bool = False) -> TestRun:
+        if direct:
+            # #7740 : la série directe ne prend pas une part de la borne
+            # totale (c'est cette part qui la coupait avant d'avoir joué) ;
+            # elle est bornée par `--tests-timeout`, et par le temps restant
+            # de la borne totale en temps mural. Une série non partie ou
+            # coupée reste non concluante, nommée.
+            limit = timeout
+            walled = {}
+            if deadline is not None:
+                remaining = max(0, int(deadline - time.monotonic()))
+                if remaining <= 0:
+                    log("tests %s : borne totale atteinte, série non jouée "
+                        "(non concluant)" % label)
+                    return budget_spent(label, modules)
+                walled = {"wall": remaining}
+            log("tests %s : série directe sur son préfixe composé, borne %d s%s"
+                % (label, limit,
+                   (" (temps total restant %d s)" % walled["wall"])
+                   if walled else ""))
+            run = run_tests(tree or worktree, label, modules, timeout=limit,
+                            **slots, **walled)
+            run.direct = list(modules)
+            return run
         limit, here = next_share()
         if limit is None:
             log("tests %s : borne totale atteinte, série non jouée (non "
@@ -4474,9 +4701,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         # #4463 : l'attente du créneau compte dans l'échéance totale mais,
         # #7195, pas dans la part d'exécution d'une série `heavy` : une série
         # qui attend longtemps son créneau garde sa part pour jouer ses
-        # tests, la borne restant le temps restant jusqu'à l'échéance. Une
-        # série directe n'attend aucun créneau : sa part borne aussi son
-        # temps mural.
+        # tests, la borne restant le temps restant jusqu'à l'échéance.
         walled = {}
         if deadline is not None:
             wall = max(1, int(deadline - time.monotonic())) if slots else limit
@@ -4485,8 +4710,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         run.direct = list(modules)
         return run
 
-    def unit_job(label: str, modules: list[str]):
-        return lambda: bounded(label, modules)
+    def unit_job(label: str, modules: list[str], tree: Path,
+                 error: TestRun | None):
+        if error is not None:
+            return lambda: error
+        return lambda: bounded(label, modules, tree=tree, direct=True)
 
     def contract_job():
         remaining = max(0.1, deadline - time.monotonic()) if deadline is not None else GIT_TIMEOUT
@@ -4508,15 +4736,15 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                                           tooling=_TOOLING)
         return bounded("contrats", modules)
 
-    jobs = [unit_job("unité #%d" % unit.lot, modules)
-            for unit, _proper, _added, modules in planned]
+    jobs = [unit_job("unité #%d" % unit.lot, modules, tree, error)
+            for unit, _proper, _added, modules, tree, _prefix, error in planned]
     if contract_run is None:
         jobs.append(contract_job)
     # #4887 : la part de chaque série est calculée au départ, pas à la
     # composition : une série qui finit tôt rend sa part aux suivantes. Une
     # réserve reste pour le rejeu d'un rouge de voisin (base, préfixes), sans
     # quoi la part des séries le coupe et le vrai rouge n'est pas attribué.
-    remaining = {"left": len(jobs)}
+    remaining = {"left": 1 if contract_run is None else 0}
     remaining_lock = threading.Lock()
     reserve = 0
     if deadline is not None:
@@ -4532,14 +4760,19 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         return series_share(timeout, deadline, here, parallel, reserve), here
 
     if slots:
-        log("tests ciblés : %d série(s), %d à la fois, créneaux `ameesh heavy`, "
-            "borne %d s par série, part de la borne totale (#4887)"
-            % (len(jobs), min(parallel, len(jobs)), timeout))
-    results = _run_series(jobs, parallel=parallel, guard=guard)
+        log("tests ciblés : %d série(s) directe(s) sur leur préfixe, %d à la "
+            "fois, créneaux `ameesh heavy`, borne %d s par série (#7740)"
+            % (len(planned), min(parallel, max(1, len(jobs))), timeout))
+    try:
+        results = _run_series(jobs, parallel=parallel, guard=guard)
+    finally:
+        for path in prefixes:
+            remove_worktree(worktree, path)
     contract = results.pop() if contract_run is None else contract_run
     pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str],
                         set[str]]] = []
-    for (unit, proper, added, modules), run in zip(planned, results):
+    for (unit, proper, added, modules, _tree, _prefix, _error), run in zip(
+            planned, results):
         run.added = added
         run.direct = list(modules)
         runs.append(run)
@@ -4551,7 +4784,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             found = unittest_failures(run.output, _unusable(run))
             proper_names = {module.split(".", 1)[1] for module in proper}
             mine = set(proper_names)
-            neighbor = {row["module"].split(".", 1)[1] for row in added}
+            # #7740 : un témoin d'empreinte (migration, stockage, alertes de
+            # pause) est une preuve du lot lui-même, pas un voisin de la
+            # carte : son rouge s'attribue au lot, sans rejeu de base.
+            neighbor = {row["module"].split(".", 1)[1] for row in added
+                        if row["reason"] != "empreinte"}
             mine |= {row["module"].split(".", 1)[1] for row in added
                      if row["reason"] != "carte" or shared.get(row["module"]) == 1}
             pending.append((unit, run, found, proper_names, mine, neighbor))
@@ -4757,6 +4994,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             log("tests contrats : rouge non attribuable (%s) — retrait des "
                 "unités aux tests propres rouges, puis recomposition"
                 % (why or "attribution incertaine"))
+    designated_before = [(removal.lot, test)
+                         for removal in removals
+                         if removal.proof == "3801"
+                         for test in removal.tests]
     if any(removal.proof == "3801" for removal in removals):
         # #7239 : le préfixe de l'unité désignée par la couverture tranche.
         if guard is not None:
@@ -4771,22 +5012,74 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         except BudgetSpent as spent:
             flaky_designated = []
             designation_why = str(spent)
+            # #7692 : sans rejeu concluant, aucun retrait #3801 n'est appliqué.
+            removals = [removal for removal in removals
+                        if removal.proof != "3801"]
+        flaky_names = sorted({_failure_name(failure)
+                              for failure in flaky_designated
+                              if _failure_name(failure)})
         if designation_why:
             log("tests ciblés : rejeu du préfixe de l'unité NON CONCLUANT "
-                "(%s) — retrait #3801 gardé (geste antérieur)"
+                "(%s) — retrait #3801 NON appliqué (canon §3), l'unité reste"
                 % designation_why)
-        if flaky_designated:
-            flaky_names = sorted({_failure_name(failure)
-                                  for failure in flaky_designated
-                                  if _failure_name(failure)})
-            if flaky_names:
-                log("tests ciblés : %d test(s) rouge(s) sur la tête mais "
-                    "vert(s) au rejeu des préfixes (instable) : %s — "
-                    "consigné(s) non concluant(s), le paquet continue"
-                    % (len(flaky_names), ", ".join(flaky_names[:5])))
-                red = _consign_flaky(red, runs, flaky_names)
-                if not red and not removals:
-                    return runs, [], []
+        # #7692 : quand le retrait #3801 tombe et qu'aucune autre preuve ne
+        # reste, le repli du rouge propre (geste antérieur) s'applique encore :
+        # le module de l'unité a réellement rougi sur la tête. Un test vert au
+        # rejeu (instable) est exclu : il ne retire rien (#4221).
+        if not removals and own:
+            fallback: list[Removal] = []
+            for lot, found in own.items():
+                tests = [_failure_name(failure) for failure in found
+                         if _failure_name(failure) not in flaky_names]
+                if tests:
+                    fallback.append(Removal(lot=lot, tests=tests))
+            removals = _merge_removals(removals, fallback)
+            if removals:
+                log("tests ciblés : repli sur les rouges propres : retrait de "
+                    "%s" % ", ".join("#%d" % removal.lot
+                                     for removal in removals))
+        # #7692 : les tests dont le retrait #3801 n'a pas été confirmé (rejeu
+        # non concluant, ni confirmé ni situé) ne retirent rien (canon §3) ;
+        # ils sont consignés non concluants et la ci-full tranche.
+        returned_tests = {test for removal in removals
+                          for test in removal.tests}
+        unconfirmed = sorted({test for _lot, test in designated_before
+                              if test not in returned_tests
+                              and test not in flaky_names})
+        if unconfirmed:
+            log("tests ciblés : %d test(s) non confirmé(s) sur les préfixes "
+                "(#3801) : %s — consigné(s) non concluant(s), la ci-full "
+                "tranche" % (len(unconfirmed), ", ".join(unconfirmed[:5])))
+            runs.append(TestRun(
+                label="préfixes (#3801 non confirmé)",
+                modules=list(unconfirmed), returncode=None,
+                output="rejeu du préfixe non concluant : %s ; retrait #3801 "
+                       "non appliqué (canon §3), l'unité reste ; la ci-full "
+                       "tranche"
+                       % (designation_why or "test ni confirmé ni situé"),
+                seconds=0.0, timed_out=True))
+            # #7692 (relecture B) : un échec non confirmé ne retient pas le
+            # paquet (canon §3) ; il sort de `red`. Un contrat rouge
+            # indépendant, lui, reste bloquant : seuls les noms non confirmés
+            # sont retirés.
+            unconfirmed_set = set(unconfirmed)
+            kept_red: list[tuple[TestRun, list[dict]]] = []
+            for run, found in red:
+                left = [failure for failure in found
+                        if _failure_name(failure) not in unconfirmed_set]
+                if left:
+                    kept_red.append((run, left))
+            red = kept_red
+            contract_left = [found for run, found in red if run is contract]
+            contract_red = bool(contract_left and contract_left[0])
+        if flaky_names:
+            log("tests ciblés : %d test(s) rouge(s) sur la tête mais "
+                "vert(s) au rejeu des préfixes (instable) : %s — "
+                "consigné(s) non concluant(s), le paquet continue"
+                % (len(flaky_names), ", ".join(flaky_names[:5])))
+            red = _consign_flaky(red, runs, flaky_names)
+            if not red and not removals:
+                return runs, [], []
     if len(removals) > 1:
         if guard is not None:
             guard()
@@ -4856,10 +5149,10 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
                    errors: int = 0, client_types: str = "") -> str:
     """Le manifeste §12, lisible par `paquet-inclusion.py` (#1644/#2409).
 
-    #4304 : `tests=None` — le manifeste est écrit et poussé avant les tests par
-    unité, qui tournent en parallèle de la CI complète ; il le dit
-    (`TESTS_PARALLEL_LINE`) et leur résultat va à la PR, au porteur et au
-    courrier.
+    #4304/#7740 : `tests=None` — le manifeste est écrit avant les séries
+    directes, qui jouent sur le préfixe composé de chaque unité **avant la
+    poussée** ; il le dit (`TESTS_PARALLEL_LINE`) et leur résultat va à la PR,
+    au porteur et au courrier.
 
     La table d'admissions ne porte que le lot et sa source : un id cité dans
     un objet (`#N`) serait relu par le contrôle d'inclusion comme un lot
@@ -5006,40 +5299,50 @@ def _neighbor_lines(composition: Composition, tests: list[TestRun]) -> list[str]
 
 
 def _direct_lines(composition: Composition, tests: list[TestRun]) -> list[str]:
-    """#4887 : par lot, ses modules directs et s'ils ont été joués.
+    """#4887/#7740 : par lot, ses modules directs et s'ils ont été joués.
 
-    Les modules directs d'une unité sont ceux de sa série : ses propres tests
-    et les voisins que la sélection lui a donnés. Une série coupée par sa part
-    de borne n'en a joué aucun jusqu'au bout (#4814) : le manifeste le dit lot
-    par lot, au lieu de ne compter que les modules de la tête.
+    Les modules directs d'une unité sont ceux de sa série, jouée sur le
+    préfixe composé de l'unité : ses propres tests, les voisins que la
+    sélection lui a donnés et les témoins de son empreinte. Une série coupée
+    par la borne murale n'en a joué aucun jusqu'au bout (#4814) ; une série
+    sans module direct est un non-concluant nommé (#7740). Le manifeste le dit
+    lot par lot, au lieu de ne compter que les modules de la tête.
     """
     by_label = {run.label: run for run in tests}
     rows: list[str] = []
     for unit in composition.units:
         run = by_label.get("unité #%d" % unit.lot)
         direct = list(run.direct or run.modules) if run is not None else []
-        if run is None:
-            state = "aucun module"
+        if run is None or not direct:
+            # #7740 : 0 module joué est un non-concluant nommé, jamais un
+            # « oui (0/0) » qui laisserait croire à une inclusion verte.
+            state = "aucun module direct (non concluant)"
         elif run.finished:
             state = "oui (%d/%d)" % (len(direct), len(direct))
         else:
-            state = "non (série coupée après %.0f s%s)" % (
-                run.seconds,
+            # Le décompte des modules **joués jusqu'au bout** est explicite :
+            # une série coupée n'en a joué aucun (#7740, note d'audit #225168).
+            state = "non (0/%d, série coupée après %.0f s%s)" % (
+                len(direct), run.seconds,
                 ", %d test(s)" % run.tests if run.tests else "")
         rows.append("| #%d | %d | %s |" % (unit.lot, len(direct), state))
-    return ["", "Modules directs par lot (#4887) :", "",
+    return ["", "Modules directs par lot (#4887, #7740) :", "",
             "| lot | modules directs | joués jusqu'au bout |", "|---|---|---|"] + rows
 
 
 def _direct_note(composition: Composition, tests: list[TestRun]) -> str:
-    """#4887 : les lots dont la série de modules directs n'est pas allée au bout."""
+    """#4887/#7740 : les lots dont la série directe n'est pas allée au bout."""
     by_label = {run.label: run for run in tests}
-    missing = [unit.lot for unit in composition.units
-               if (run := by_label.get("unité #%d" % unit.lot)) is not None
-               and not run.finished]
+    missing = []
+    for unit in composition.units:
+        run = by_label.get("unité #%d" % unit.lot)
+        direct = list(run.direct or run.modules) if run is not None else []
+        if run is None or not direct or not run.finished:
+            missing.append(unit.lot)
     if not missing:
         return "modules directs : tous joués jusqu'au bout"
-    return "modules directs non joués : " + ", ".join("#%d" % lot for lot in missing)
+    return "modules directs non joués (non concluant) : " + ", ".join(
+        "#%d" % lot for lot in missing)
 
 
 def _inconclusive_lines(tests: list[TestRun]) -> list[str]:
@@ -5180,16 +5483,103 @@ def _gh(cwd: Path, *args: str, timeout: int = GIT_TIMEOUT
     return run_command(["gh", *args], cwd=cwd, timeout=timeout)
 
 
-def ensure_pull_request(worktree: Path, branch: str, target: str,
-                        title: str, body: str) -> tuple[int | None, str]:
-    """Ouvre ou met à jour la PR ; rend `(numéro, url)`."""
+#: #7754 : marques d'un refus de quota GitHub dans la sortie de `gh` (le
+#: message GraphQL dit « API rate limit exceeded », le REST peut dire
+#: « secondary rate limit »).
+GH_QUOTA_MARKS = ("rate limit", "rate-limit", "quota")
+
+
+def _gh_quota_refused(text: str) -> bool:
+    """#7754 : la sortie de `gh` dit-elle un refus de débit ?"""
+    lowered = text.casefold()
+    return any(mark in lowered for mark in GH_QUOTA_MARKS)
+
+
+def _pull_request_rest(worktree: Path, branch: str) -> dict | None:
+    """#7754 : la PR de la branche par l'API REST (`gh api`).
+
+    Le bucket REST `core` est distinct du bucket GraphQL : un `gh pr view`
+    refusé pour quota reste lisible ici. Rend None quand la branche n'a pas
+    de PR. Le corps de l'endpoint est celui du diagnostic : le filtre `head`
+    porte `owner:branche`, `state=all` pour voir aussi une PR fusionnée ou
+    fermée.
+    """
+    endpoint = "repos/{owner}/{repo}/pulls?head={owner}:%s&state=all" % branch
+    proc = _gh(worktree, "api", endpoint)
+    if proc.returncode != 0:
+        raise PaquetAutoError(
+            "gh api %s a échoué : %s" % (endpoint, _tail(_output(proc))))
+    try:
+        items = json.loads(_decode(proc.stdout))
+    except (ValueError, TypeError) as exc:
+        raise PaquetAutoError(
+            "gh api %s : réponse illisible (%s)" % (endpoint, exc)) from exc
+    if not isinstance(items, list):
+        raise PaquetAutoError(
+            "gh api %s : réponse inattendue (liste attendue)" % endpoint)
+    if not items:
+        return None
+    item = items[0]
+    if not isinstance(item, dict):
+        raise PaquetAutoError("gh api %s : PR illisible" % endpoint)
+    state = str(item.get("state") or "").upper()
+    if item.get("merged_at") or state == "MERGED":
+        state = "MERGED"
+    elif state not in ("OPEN", "CLOSED"):
+        state = ""
+    return {"number": item.get("number"),
+            "url": str(item.get("html_url") or ""),
+            "state": state}
+
+
+def _pull_request(worktree: Path, branch: str) -> dict | None:
+    """#7754 : la PR de la branche, sans confondre un refus avec « absente ».
+
+    `gh pr view` (GraphQL) est lu d'abord ; s'il échoue, l'API REST prend le
+    relais : un refus de quota GraphQL n'est ni « not found », ni silencieux,
+    ni fatal à la lecture. Rend None quand la branche n'a pas de PR.
+    """
     view = _gh(worktree, "pr", "view", branch,
                "--json", "number,url,state")
-    number: int | None = None
-    url = ""
     if view.returncode == 0:
         try:
             data = json.loads(_decode(view.stdout))
+        except (ValueError, TypeError) as exc:
+            raise PaquetAutoError(
+                "gh pr view : réponse illisible (%s)" % exc) from exc
+        if not isinstance(data, dict):
+            raise PaquetAutoError("gh pr view : réponse inattendue")
+        return data
+    text = _output(view)
+    lowered = text.casefold()
+    if "no pull requests found" in lowered or "not found" in lowered:
+        return None
+    cause = _tail(text)
+    quota = _gh_quota_refused(text)
+    if quota:
+        print("gh pr view %s : limite de débit GraphQL ; lecture REST (#7754)"
+              % branch, flush=True)
+    try:
+        return _pull_request_rest(worktree, branch)
+    except PaquetAutoError as fallback:
+        raise PaquetAutoError(
+            "gh pr view %s a échoué%s : %s ; repli REST : %s"
+            % (branch, " (limite de débit)" if quota else "", cause, fallback)
+        ) from fallback
+
+
+def ensure_pull_request(worktree: Path, branch: str, target: str,
+                        title: str, body: str) -> tuple[int | None, str]:
+    """Ouvre ou met à jour la PR ; rend `(numéro, url)`.
+
+    La lecture passe par `_pull_request` : un refus de quota GraphQL est relu
+    par l'API REST au lieu d'être pris pour « pas de PR » (#7754).
+    """
+    data = _pull_request(worktree, branch)
+    number: int | None = None
+    url = ""
+    if data is not None:
+        try:
             number, url = int(data["number"]), str(data.get("url") or "")
             state = str(data.get("state") or "").upper()
         except (ValueError, KeyError, TypeError) as exc:
@@ -5199,12 +5589,6 @@ def ensure_pull_request(worktree: Path, branch: str, target: str,
                 "PR #%d pour %s est %s, pas ouverte : choisir un autre --name "
                 "(un paquet fusionné ou fermé ne se réécrit pas)"
                 % (number, branch, state))
-    else:
-        text = _output(view)
-        if "no pull requests found" not in text.lower() \
-                and "not found" not in text.lower():
-            raise PaquetAutoError(
-                "gh pr view %s a échoué : %s" % (branch, _tail(text)))
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md",
                                      delete=False, dir=str(temporary_parent())) as handle:
         handle.write(body)
@@ -5224,15 +5608,38 @@ def ensure_pull_request(worktree: Path, branch: str, target: str,
                 "gh pr create : %s" % _tail(_output(proc)))
         url = _output(proc)
         if url.startswith("http"):
-            view = _gh(worktree, "pr", "view", branch, "--json", "number")
-            if view.returncode == 0:
+            try:
+                created = _pull_request(worktree, branch)
+            except PaquetAutoError:
+                created = None
+            if created:
                 try:
-                    number = int(json.loads(_decode(view.stdout))["number"])
+                    number = int(created["number"])
                 except (ValueError, KeyError, TypeError):
                     number = None
         return number, url
     finally:
         body_path.unlink(missing_ok=True)
+
+
+def update_pull_request_body(worktree: Path, branch: str, target: str,
+                             title: str, body: str,
+                             pr_number: int | None = None,
+                             pr_url: str = "") -> tuple[int | None, str, str]:
+    """#7754 : met le corps de la PR finale à jour sans perdre le paquet.
+
+    À ce stade la PR existe depuis la poussée. Une lecture encore refusée
+    (même après le repli REST) ou une écriture refusée est dite, pas fatale :
+    la poussée, le gel et la ci-full sont déjà faits. Rend
+    `(numéro, url, échec)` ; `échec` est vide quand le corps est à jour,
+    sinon « corps de PR non mis à jour : <cause> ».
+    """
+    try:
+        number, url = ensure_pull_request(worktree, branch, target, title, body)
+    except (OSError, PaquetAutoError) as error:
+        return (pr_number, pr_url,
+                "corps de PR non mis à jour : %s" % _one_line(error))
+    return number, url, ""
 
 
 def freeze_carrier(worktree: Path, carrier: int, head: str, note: str) -> str:
@@ -5246,14 +5653,15 @@ def freeze_carrier(worktree: Path, carrier: int, head: str, note: str) -> str:
 
 
 def request_full_ci(worktree: Path, carrier: int, head: str) -> str:
-    """#4304 : la ci-full de la tête poussée, sans attendre les tests par unité.
+    """#4304/#7740 : la ci-full de la tête poussée, après contrats et séries.
 
     Jamais fatal : `ameesh ci run` est idempotent sur un run en vol de la même
     composition, et `paquet-horaire.py` (publish) la redemande après le retour.
     """
     cmd = ["ameesh", "ci", "run", str(carrier), "--full", "--sha", head,
            "--avis", "0", "--reason",
-           "paquet-auto : tête poussée dès la composition (canon §6, #4304)"]
+           "paquet-auto : tête poussée après contrats et séries directes "
+           "(canon §6, #4304, #7740)"]
     proc = run_command(cmd, cwd=worktree, timeout=FREEZE_TIMEOUT)
     if proc.returncode != 0:
         return ("ci-full non demandée sur %s (rc %d, le publish de paquet-horaire "
@@ -5278,14 +5686,18 @@ def note_carrier(worktree: Path, carrier: int, note: str) -> str:
 
 
 def pull_request_state(worktree: Path, branch: str) -> str:
-    """L'état de la PR de la branche (OPEN, MERGED, CLOSED), "" si illisible."""
-    view = _gh(worktree, "pr", "view", branch, "--json", "state")
-    if view.returncode != 0:
-        return ""
+    """L'état de la PR de la branche (OPEN, MERGED, CLOSED), "" si illisible.
+
+    #7754 : un refus de quota GraphQL est relu par l'API REST ; l'état n'est
+    vide que si les deux lectures échouent (les tests continuent, #4463).
+    """
     try:
-        return str(json.loads(_decode(view.stdout)).get("state") or "").upper()
-    except (ValueError, AttributeError):
+        data = _pull_request(worktree, branch)
+    except PaquetAutoError:
         return ""
+    if not data:
+        return ""
+    return str(data.get("state") or "").upper()
 
 
 def withdraw_packet(worktree: Path, carrier: int, pr_number: int | None,
@@ -5475,9 +5887,9 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
             continue
         tests = ", ".join(removal.tests[:3]) or "tests ciblés"
         if removal.proof == "prefixes":
-            why = ("les tests ciblés de la composition ont rougi sur la tête "
-                   "composée, et le test rouge apparaît pour la première fois "
-                   "au préfixe de ton unité (%s)"
+            why = ("les tests ciblés de ton unité ont rougi sur son préfixe "
+                   "composé ; le test rouge apparaît pour la première fois "
+                   "au préfixe (%s)"
                    % (" ; ".join(removal.evidence[:3])
                       or "préfixes de l'empilement"))
         elif removal.attributed:
@@ -5485,8 +5897,8 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
                    "composée, et la lecture #3801 désigne ton unité (%s)"
                    % (" ; ".join(removal.evidence[:3]) or "attribution #3801"))
         else:
-            why = ("les tests ciblés de la composition ont rougi sur la tête "
-                   "composée ; le module propre de ton unité est rouge "
+            why = ("les tests ciblés de ton unité ont rougi sur son préfixe "
+                   "composé ; le module propre de ton unité est rouge "
                    "(retrait de repli, sans attribution #3801 sûre)")
         body = (
             "#%d retiré du paquet %s : %s. Tests : %s. Le paquet est recomposé "
@@ -5560,7 +5972,8 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
             composition: Composition, candidates: list[Candidate],
             tests: list[TestRun] | None, inclusion_rc: int,
             freeze_seconds: float, composition_text: str = "", head: str = "") -> str:
-    """Le corps de la PR ; `tests=None` à la poussée, avant les tests (#4304)."""
+    """Le corps de la PR ; `tests=None` seulement quand aucune série n'a été
+    consignée (#7740 : la poussée vient après elles)."""
     by_lot = {candidate.lot: candidate for candidate in candidates}
     units = ", ".join("#%d" % unit.lot for unit in composition.units) or "aucun"
     discarded = ", ".join("#%d" % item.lot for item in composition.discarded) or "aucun"
@@ -5582,8 +5995,9 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
         lines.append("- #%d `%s`%s" % (
             unit.lot, unit.source[:12], (": " + title) if title else ""))
     if tests is None:
-        lines.append("- Tests par unité : en cours, en parallèle de la CI "
-                     "complète (#4304).")
+        lines.append("- Tests par unité : aucun résultat consigné dans ce "
+                     "corps ; les séries directes jouent avant la poussée "
+                     "(#7740).")
     else:
         lines.append("- Tests locaux : %s." % _tests_summary(tests))
         lines += ["  " + line for line in _inconclusive_lines(tests)]
@@ -5609,12 +6023,16 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
 def mail_body(*, name: str, target: str, base_sha: str, carrier: int,
               head: str, branch: str, composition: Composition,
               tests: list[TestRun], inclusion_rc: int, pr_number: int | None,
-              pr_url: str, report_info: bool = False) -> str:
+              pr_url: str, pr_note: str = "",
+              report_info: bool = False) -> str:
     units = ", ".join("#%d" % unit.lot for unit in composition.units) or "aucun"
     discarded = "; ".join(
         "#%d (%s)" % (item.lot, item.reason) for item in composition.discarded
     ) or "aucun"
     pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
+    if pr_note:
+        # #7754 : la cause d'une mise à jour finale refusée est dite au pilote.
+        pr += " ; " + pr_note
     inconclusive = _inconclusive_lines(tests)
     non_section = ("Non concluants (canon §3, consignés) :\n"
                    + "\n".join("  " + line for line in inconclusive)) \
@@ -6039,7 +6457,9 @@ def publish_tested(args: argparse.Namespace) -> int:
         state = pull_request_state(worktree, branch)
         pr_number: int | None = None
         pr_url = ""
+        body_failure = ""
         if state and state != "OPEN":
+            body_failure = "corps de PR non mis à jour (PR %s)" % state.lower()
             print("PR %s : corps non mis à jour" % state.lower(), flush=True)
         else:
             body = "\n".join([
@@ -6056,18 +6476,24 @@ def publish_tested(args: argparse.Namespace) -> int:
                                      target=args.target, carrier=args.carrier), "",
                 "Porteur : #%d. « Verdict non requis » et CI complète restent au pilote."
                 % args.carrier, ""])
-            pr_number, pr_url = ensure_pull_request(
+            pr_number, pr_url, body_failure = update_pull_request_body(
                 worktree, branch, args.target,
                 "Paquet %s — %d unités sur %s %s" % (
                     args.name, len(specs), args.target, base_sha[:12]), body)
-        print(note_carrier(
-            worktree, args.carrier,
-            "paquet %s : fin publiée par scripts/paquet-auto.py --publish (#4237) "
-            "sur la tête poussée %s, tests par unité non rejoués (qualification au journal d'origine) ; "
-            "instantané du porteur" % (args.name, head[:12])), flush=True)
+            if body_failure:
+                print(body_failure, flush=True)
+        note = ("paquet %s : fin publiée par scripts/paquet-auto.py --publish (#4237) "
+                "sur la tête poussée %s, tests par unité non rejoués (qualification "
+                "au journal d'origine) ; instantané du porteur"
+                % (args.name, head[:12]))
+        if body_failure:
+            note += " ; " + body_failure
+        print(note_carrier(worktree, args.carrier, note), flush=True)
         check_pause(worktree, getattr(args, "pause_project", "") or "", args.target)
         print(request_full_ci(worktree, args.carrier, head), flush=True)
         pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
+        if body_failure:
+            pr += " ; " + body_failure
         mail = "\n".join([
             "Paquet %s publié sans retester : tête `%s` sur %s `%s` (branche `%s`, %s)."
             % (args.name, head, args.target, base_sha[:12], branch, pr), "",
@@ -6273,10 +6699,10 @@ def compose_packet(args: argparse.Namespace) -> int:
         runs: list[TestRun] = []
         freeze_seconds = 0.0
         recomp = 0
-        # #4304 (canon §6) : la tête est poussée, gelée et sa ci-full demandée
-        # dès la composition et les freeze-checks verts ; les tests par unité
-        # tournent ensuite, en parallèle de la CI. Un rouge retire l'unité et la
-        # tête recomposée remplace la poussée (bail sur la tête poussée).
+        # #4304/#7740 : la tête est poussée, gelée et sa ci-full demandée après
+        # les contrats et les séries directes sur le préfixe de chaque unité,
+        # avant la CI. Un rouge retire l'unité et la tête recomposée est la
+        # seule poussée (aucun bail à remplacer).
         lease = remote_sha
         pushed = ""
         pr_number: int | None = None
@@ -6427,85 +6853,6 @@ def compose_packet(args: argparse.Namespace) -> int:
                 if not args.local:
                     record_contract_result(worktree, args.carrier, contract_report,
                                            base=base_sha, target=args.target)
-            if not args.local:
-                if not pushed:
-                    # #6867 : la cible peut atterrir pendant les contrats (≈12
-                    # min au constat h-11) ; la relecture #3782 tombait alors
-                    # dans `freeze_changes` (`paquet-candidats` rc 2), traduite
-                    # en rc 1 et lot d'empreinte §16 au lieu de la
-                    # recomposition immédiate de #6891. Relue ici, avant le gel
-                    # et la poussée, elle garde le même geste : rien n'est
-                    # poussé, `TARGET_MOVED_RC` et relance aussitôt.
-                    try:
-                        ensure_reference(repo, args.target, base_sha)
-                    except TargetMoved as moved:
-                        # #6981 : des contrats rouges restent le verdict :
-                        # le pilote reçoit le rouge, pas « cible avancée ».
-                        run = contract_report.run if contract_report else None
-                        if run is None or run.green or run.inconclusive:
-                            raise
-                        raise CompositionRed(
-                            "contrats rouges sur la tête composée %s (la cible "
-                            "a aussi avancé : %s)" % (head[:12], moved)) from moved
-                # #6566 : le gel de chaque unité est relu sur la base exacte
-                # juste avant la poussée ; une unité regelée (ou sortie de la
-                # liste prête) pendant la composition ne part pas sur cette
-                # tête : le paquet est recomposé sans elle.
-                changes = freeze_changes()
-                if changes:
-                    removed = {item.lot for item in changes}
-                    print("recomposition : gel changé pour %s ; la tête composée "
-                          "n'est pas poussée"
-                          % ", ".join("#%d" % lot for lot in sorted(removed)),
-                          flush=True)
-                    for item in changes:
-                        print("écarté #%d : %s — %s"
-                              % (item.lot, item.reason, item.detail), flush=True)
-                    previous = list(composition.discarded)
-                    removed_sources.update(
-                        (candidate.lot, candidate.source)
-                        for candidate in candidates if candidate.lot in removed)
-                    candidates = [candidate for candidate in candidates
-                                  if candidate.lot not in removed]
-                    composition = recompose(
-                        worktree, base_sha, candidates, args.carrier,
-                        compose_script=compose_script,
-                        record_package=not args.no_packet_record,
-                        expect_pushed=lease or "", removed=removed_sources,
-                        guard=guard)
-                    composition.discarded = unique_discarded(
-                        previous + composition.discarded + changes,
-                        composition.units)
-                    if not composition.units:
-                        return empty_after_recomposition("gel changé")
-                    continue
-                if guard is not None:
-                    guard()
-                if pushed:
-                    state = pull_request_state(worktree, branch)
-                    if state and state != "OPEN":
-                        raise PaquetAutoError(
-                            "PR de %s %s pendant les tests par unité : la "
-                            "recomposition n'est pas poussée, un agent lit"
-                            % (branch, state.lower()))
-                check_pause(worktree, getattr(args, "pause_project", "") or "",
-                            args.target)
-                if contract_report is not None:
-                    verify_contract_scope(worktree, contract_report)
-                push_branch(worktree, branch, force_lease=lease)
-                print("poussée : %s%s" % (branch, " (recomposition)"
-                                          if lease else ""), flush=True)
-                lease = pushed = head
-                pr_number, pr_url = ensure_pull_request(
-                    worktree, branch, args.target, title(), body(None))
-                print("PR : %s" % (pr_url or pr_number or "?"), flush=True)
-                note = ("paquet %s poussé par scripts/paquet-auto.py dès la "
-                        "composition (canon §6, #4304) : %d unités, %d écartés, "
-                        "inclusion verte, tests par unité en cours ; instantané %s"
-                        % (args.name, len(composition.units),
-                           len(composition.discarded), head))
-                print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
-                print(request_full_ci(worktree, args.carrier, head), flush=True)
             try:
                 runs, faulty, removals = check_local_tests(
                     worktree, composition, timeout=args.tests_timeout,
@@ -6541,6 +6888,90 @@ def compose_packet(args: argparse.Namespace) -> int:
                 record_contract_result(worktree, args.carrier, contract_report,
                                        base=base_sha, target=args.target)
             if not faulty:
+                # #7740 : les séries directes (sur leur préfixe composé) et
+                # les contrats ont été joués avant la poussée ; la tête
+                # composée peut être publiée. Un rouge a déjà recomposé.
+                if not args.local:
+                    if not pushed:
+                        # #6867 : la cible peut atterrir pendant les contrats (≈12
+                        # min au constat h-11) ; la relecture #3782 tombait alors
+                        # dans `freeze_changes` (`paquet-candidats` rc 2), traduite
+                        # en rc 1 et lot d'empreinte §16 au lieu de la
+                        # recomposition immédiate de #6891. Relue ici, avant le gel
+                        # et la poussée, elle garde le même geste : rien n'est
+                        # poussé, `TARGET_MOVED_RC` et relance aussitôt.
+                        try:
+                            ensure_reference(repo, args.target, base_sha)
+                        except TargetMoved as moved:
+                            # #6981 : des contrats rouges restent le verdict :
+                            # le pilote reçoit le rouge, pas « cible avancée ».
+                            run = contract_report.run if contract_report else None
+                            if run is None or run.green or run.inconclusive:
+                                raise
+                            raise CompositionRed(
+                                "contrats rouges sur la tête composée %s (la cible "
+                                "a aussi avancé : %s)" % (head[:12], moved)) from moved
+                    # #6566 : le gel de chaque unité est relu sur la base exacte
+                    # juste avant la poussée ; une unité regelée (ou sortie de la
+                    # liste prête) pendant la composition ne part pas sur cette
+                    # tête : le paquet est recomposé sans elle.
+                    changes = freeze_changes()
+                    if changes:
+                        removed = {item.lot for item in changes}
+                        print("recomposition : gel changé pour %s ; la tête composée "
+                              "n'est pas poussée"
+                              % ", ".join("#%d" % lot for lot in sorted(removed)),
+                              flush=True)
+                        for item in changes:
+                            print("écarté #%d : %s — %s"
+                                  % (item.lot, item.reason, item.detail), flush=True)
+                        previous = list(composition.discarded)
+                        removed_sources.update(
+                            (candidate.lot, candidate.source)
+                            for candidate in candidates if candidate.lot in removed)
+                        candidates = [candidate for candidate in candidates
+                                      if candidate.lot not in removed]
+                        composition = recompose(
+                            worktree, base_sha, candidates, args.carrier,
+                            compose_script=compose_script,
+                            record_package=not args.no_packet_record,
+                            expect_pushed=lease or "", removed=removed_sources,
+                            guard=guard)
+                        composition.discarded = unique_discarded(
+                            previous + composition.discarded + changes,
+                            composition.units)
+                        if not composition.units:
+                            return empty_after_recomposition("gel changé")
+                        continue
+                    if guard is not None:
+                        guard()
+                    if pushed:
+                        state = pull_request_state(worktree, branch)
+                        if state and state != "OPEN":
+                            raise PaquetAutoError(
+                                "PR de %s %s pendant les tests par unité : la "
+                                "recomposition n'est pas poussée, un agent lit"
+                                % (branch, state.lower()))
+                    check_pause(worktree, getattr(args, "pause_project", "") or "",
+                                args.target)
+                    if contract_report is not None:
+                        verify_contract_scope(worktree, contract_report)
+                    push_branch(worktree, branch, force_lease=lease)
+                    print("poussée : %s%s" % (branch, " (recomposition)"
+                                              if lease else ""), flush=True)
+                    lease = pushed = head
+                    pr_number, pr_url = ensure_pull_request(
+                        worktree, branch, args.target, title(), body(runs))
+                    print("PR : %s" % (pr_url or pr_number or "?"), flush=True)
+                    note = ("paquet %s poussé par scripts/paquet-auto.py après "
+                            "les contrats et les séries directes sur leur préfixe "
+                            "(canon §6, #4304, #7740) : %d unités, %d écartés, "
+                            "inclusion verte, tests par unité joués ou non "
+                            "concluants nommés ; instantané %s"
+                            % (args.name, len(composition.units),
+                               len(composition.discarded), head))
+                    print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
+                    print(request_full_ci(worktree, args.carrier, head), flush=True)
                 break
             if pushed:
                 # #4322 : la ci-full verte a pu fusionner la tête pendant les
@@ -6644,27 +7075,33 @@ def compose_packet(args: argparse.Namespace) -> int:
             success = True
             return 0
         state = pull_request_state(worktree, branch)
+        body_failure = ""
         if state == "MERGED":
             success = True
             return merged_during_tests(args, worktree, head, runs, [], branch, rel)
         if state and state != "OPEN":
+            body_failure = "corps de PR non mis à jour (PR %s)" % state.lower()
             print("PR %s pendant les tests par unité : corps non mis à jour"
                   % state.lower(), flush=True)
         else:
-            pr_number, pr_url = ensure_pull_request(
-                worktree, branch, args.target, title(), body(runs))
-        print(note_carrier(
-            worktree, args.carrier,
-            "paquet %s : tests par unité %s sur la tête poussée %s (%s) ; %s ; "
-            "inclusion verte ; instantané %s"
-            % (args.name, tests_note, head[:12], _tests_summary(runs),
-               _direct_note(composition, runs), head)),
-            flush=True)
+            pr_number, pr_url, body_failure = update_pull_request_body(
+                worktree, branch, args.target, title(), body(runs),
+                pr_number, pr_url)
+            if body_failure:
+                print(body_failure, flush=True)
+        note = ("paquet %s : tests directs (préfixe composé) et contrats %s avant "
+                "la poussée de %s (%s) ; %s ; inclusion verte ; instantané %s"
+                % (args.name, tests_note, head[:12], _tests_summary(runs),
+                   _direct_note(composition, runs), head))
+        if body_failure:
+            note += " ; " + body_failure
+        print(note_carrier(worktree, args.carrier, note), flush=True)
         mail = mail_body(name=args.name, target=args.target, base_sha=base_sha,
                          carrier=args.carrier, head=head, branch=branch,
                          composition=composition, tests=runs,
                          inclusion_rc=inclusion_rc, pr_number=pr_number,
-                         pr_url=pr_url, report_info=getattr(args, "report_info", False))
+                         pr_url=pr_url, pr_note=body_failure,
+                         report_info=getattr(args, "report_info", False))
         try:
             send_mail(args.pilot, args.carrier, mail, getattr(args, "sender", None),
                       info=getattr(args, "report_info", False))

@@ -39,6 +39,17 @@ puis démarrage, venv prouvé, sans drain ni bail exigé. Sans cela, le candidat
 `mesh-design` d'agents-2 est resté 13 h sur l'ancien code, puis a repris le
 bail sur ce code (staging du 28/10/2026, #4248).
 
+`agents unites-desactivees` rend, une par ligne, les personas du registre (ni
+arrêtées ni retirées) dont l’unité est `disabled` ou `masked` sur l’hôte.
+`staging.sh` passe ces noms à la santé du courrier (`--unite-desactivee`) : le
+courrier en attente d’un exécuteur volontairement retiré y est un
+**avertissement** nommant `ameesh agent retire`, jamais un KO qui fait revenir
+l’hôte en arrière (#7785). Une déactivation temporaire (pause budget, essai)
+n’est donc pas un échec de staging ; le retrait définitif reste un geste du
+registre, et `poste.sh unites-desactivees` suit la même règle sur le poste. Une
+unité dont l’état est illisible n’est pas devinée : elle n’est pas listée et la
+santé reste stricte pour cette persona.
+
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
 exact de l’hôte dans le registre :
@@ -1154,10 +1165,13 @@ Sans ce bloc, la configuration est acceptée, mais chaque passe rend
 `venv_refresh.state = unconfigured` : elle ne met pas le venv à jour. Sous
 un compte dédié, `vm.sh` ne le met pas à jour non plus. Dès que la version
 vivante reste en retard, l’alerte `staging_executor_stale` reste levée tant
-que le venv n’a pas rejoint la version attendue. Ajouter le bloc ne lance
-pas une mise à jour immédiate : celle-ci suit la prochaine passe
-`completed`. `bascule.py` réépingle les entrées `expected_sha256` existantes,
-mais ne crée jamais `venv_update` et ne devine pas le paquet opérateur.
+que le venv n’a pas rejoint la version attendue ; un tick de candidat porte
+aussi `unconfigured` (#7750), pour qu’un candidat qui ne complète jamais de
+passe ne reste pas muet. Ajouter le bloc ne lance pas une mise à jour
+immédiate : celle-ci suit la prochaine passe `completed` ou, sur un candidat
+au repos, le tick suivant (#7750). `bascule.py` réépingle les entrées
+`expected_sha256` existantes, mais ne crée jamais `venv_update` et ne devine
+pas le paquet opérateur.
 
 `package` est le paquet opérateur scellé de la dernière pose manuelle
 (`requirements-staging.lock` et `wheelhouse/`) ; `work` est un dossier du
@@ -1165,8 +1179,9 @@ compte (`0755` au plus). Après chaque passe `completed`, une fois
 l'enregistrement terminal écrit et dans le même bail, l'exécutant, sur la voie
 scellée (#5711) et jamais l'index :
 
-1. ne fait rien si `venv-courant` nomme déjà le commit déployé (`current`), et
-   refuse si la version vivante n'en est pas un ancêtre (avance seulement) ;
+1. ne fait rien si `venv-courant` nomme déjà le commit déployé (`current`),
+   laisse tel quel un venv déjà au-delà (`ahead`), et refuse une divergence
+   (avance seulement) ;
 2. dérive le paquet du commit (`venv-staging.py deriver`) : roues et
    épinglages du dernier paquet posé (`work/paquet-courant`) repris tels
    quels, seule la roue `ameesh` reconstruite hors réseau depuis le commit
@@ -1190,19 +1205,45 @@ nouveau. L'enregistrement terminal de la passe porte `venv_refresh` =
 `running` (avec son heure) : l'alerte ne lit pas l'ancienne version comme
 une mise à jour manquée pendant ce travail, sauf s'il dure plus de deux
 heures sans résultat. Le résultat va dans un second enregistrement :
-`venv_refresh` (`installed`, `current`, `unconfigured`, `rolled back`, ou
-`refused` avec l'étape et sa raison) et `executor_venv` (`running`, la version
-de ce processus, et `live`, celle du lien). Chaque passe porte aussi
-`executor_venv` dès sa prise. `staging_executor_stale` part quand la dernière
-passe `completed` d'un exécutant laisse `live` sur un autre commit que celui
-déployé, quand un staging attesté depuis par une autre voie en descend, ou
-quand le champ manque (exécutant antérieur à #7164 : la première pose qui
-porte #7164 reste le geste opérateur ci-dessus). Chaque tick publie aussi la
-version qu'il exécute dans `staging.executor` (#7259, aussitôt qu'elle
-change) : publiée après la dernière passe sur le même hôte, c'est elle que
-l'alerte lit, si bien qu'une pose faite après cette passe ne déclenche plus de
-fausse alerte ; le texte de l'alerte nomme la source lue (tick ou passe), et
-« not recorded » ne reste que sans aucune lecture.
+`venv_refresh` (`installed`, `current`, `ahead`, `unconfigured`,
+`rolled back`, ou `refused` avec l'étape et sa raison) et `executor_venv`
+(`running`, la version de ce processus, et `live`, celle du lien). Chaque
+passe porte aussi `executor_venv` dès sa prise.
+
+**Un candidat au repos se prépare aussi (#7750).** La mise à jour ci-dessus
+ne suivait qu'une passe `completed` : un candidat qui ne détenait jamais le
+rôle n'en faisait aucune et restait sur la version posée par l'opérateur ;
+élu, il aurait servi un ancien lecteur du canon et un canon en retard. Chaque
+tick d'un candidat qui ne détient pas le rôle (le détenteur garde le chemin
+d'avant : il va directement à une demande et met à jour après sa passe, pour
+qu'aucune construction de roue ne retarde un déploiement) lit la dernière
+passe `completed` de sa clé et prépare son propre venv par la même
+voie scellée (#5711), après contrôle de la CI du commit à la forge (#5500) et
+seulement en avance (`ahead` : un venv déplacé à la main au-delà du dernier
+déploiement est laissé tel quel). Le worktree temporaire des outils est
+retiré ensuite. Le résultat est publié dans `staging.executor` avec
+`venv_refresh` ; un refus est réessayé après quinze minutes, pas à chaque
+minute. Une fois le nouveau venv lancé (le tick suivant), le canon de ce
+candidat suit son remote (`canon_refresh` dans le même événement), au plus
+toutes les cinq minutes ; un `canon_ref` épinglé n'est jamais déplacé par un
+tick — l'opérateur le monte après avoir rattrapé le venv (geste manuel,
+`bascule.py` du commit posé, puis `canon check`).
+
+`staging_executor_stale` part quand la dernière passe `completed` d'un
+exécutant laisse `live` sur un autre commit que celui déployé, quand un
+staging attesté depuis par une autre voie en descend, ou quand le champ
+manque (exécutant antérieur à #7164 : la première pose qui porte #7164 reste
+le geste opérateur ci-dessus). Chaque tick publie aussi la version qu'il
+exécute dans `staging.executor` (#7259, aussitôt qu'elle change) : publiée
+après la dernière passe sur le même hôte, c'est elle que l'alerte lit, si
+bien qu'une pose faite après cette passe ne déclenche plus de fausse alerte ;
+le texte de l'alerte nomme la source lue (tick ou passe), et « not recorded »
+ne reste que sans aucune lecture. #7750 : l'alerte lit également le tick d'un
+candidat qui n'a **jamais** complété de passe, par hôte, contre le commit de
+la dernière passe complétée de sa clé ; `staging_canon_stale` fait de même
+pour son `canon_ref`. Un exécutant en retard sur un candidat n'est donc plus
+invisible : il est nommé avec son hôte, sa version lancée et la cause
+(`unconfigured`, `refused`, etc.).
 
 **Garde de démarrage du staging (#6806).** Le service de l'exécutant élu
 n'est admis que si son contexte et son environnement public sont ceux de

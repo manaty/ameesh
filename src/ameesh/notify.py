@@ -78,10 +78,11 @@ resolves and comes back, and even after `ameesh notify` restarts;
 `slo_breach` is never pushed to the owner (canon §9, owner decision 18/10),
 including from an old persisted summary bucket.
 
-Channels: `desktop`, `ntfy`, `slack`, `app`, `nexlink`. L66 — the `desktop` channel
-follows the OS through `ameesh.platform.notify`: `notify-send` on Linux,
-`osascript` on macOS, a Windows toast through `powershell.exe` under WSL2;
-native Windows comes with L67. `ameesh doctor --notify-test` says which
+Channels: `desktop`, `ntfy`, `slack`, `app`, and the kinds a built-in module
+declares (the `nexlink` module provides `nexlink`; #7793). L66 — the `desktop`
+channel follows the OS through `ameesh.platform.notify`: `notify-send` on
+Linux, `osascript` on macOS, a Windows toast through `powershell.exe` under
+WSL2; native Windows comes with L67. `ameesh doctor --notify-test` says which
 backend this OS uses (and sends a test if a `desktop` route is configured).
 L90 — the `app` channel is the embedded interface: it pushes nothing, the
 application reads the alerts through the mesh's event stream
@@ -90,16 +91,11 @@ view. Declaring it in a route says that this human's alerts are read in the
 application; without it, a human whose only interface is the application
 would be counted as having no channel.
 
-`nexlink` (#3536, owner decision #138440) pushes the alert into the owner's
-Nexlink app through a signed HMAC request; the content is encrypted to the
-account's X25519 key-wrap key (generation 1) and wrapped per active key, so
-the hub only stores the envelope (`ameesh.nexlink_alerts`). Without an
-active key the alert is sent *content-free* (the app shows "mesh alert" and
-opens the console): no detail leaves the mesh. The optional `fallback`
-names an `ntfy`/`slack` channel that receives the same text, prefixed
-"repli nexlink —", after the second consecutive failure (or at once on a
-permanent error), once per alert; the primary keeps being retried, and a
-fallback success does not mark the alert delivered on the Nexlink side.
+A module channel is reached through `registry.notify_channel(kind)`: the
+built-in `nexlink` module owns its `nexlink` channel (#7793, #3536), its
+crypto envelope (`ameesh.modules.nexlink.alerts`) and its fallback contract.
+The core keeps only the generic routing, validation, retry and fallback
+plumbing; the bare profile has no module kind, hence no `nexlink` channel.
 """
 from __future__ import annotations
 
@@ -125,10 +121,11 @@ from dataclasses import dataclass, field, replace
 from . import migrations
 from . import config as config_mod
 from . import db as db_mod
-from . import alert_briefs, exploitation, fil, mail, nexlink_alerts, notify_gap, \
-    sous_utilisation, storage
+from . import alert_briefs, avatars, exploitation, fil, mail, notify_gap, \
+    sous_utilisation, storage, work
 from . import vocab
 from .config import Config
+from .modules import registry
 from .platform import notify as platform_notify
 from .platform.child_environment import DEFAULT_SLACK_ENV
 
@@ -224,6 +221,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
                  # L242b : un agent critique est en pause budget
                  "critical_budget_pause",
+                 # #7712 : une coordination de vague qui refuse tour après tour
+                 "account_wave_coordination",
                  # #3969 : un compte déclaré invalide tient un agent sans tour
                  "account_config_invalid",
                  # #1268 : un agent critique enchaîne les échecs de tour réels
@@ -262,7 +261,10 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #532/#6054: a local PgBouncer pool queues its clients or
                  # reaches its server-session ceiling
                  "pgbouncer_pool_waiting", "pgbouncer_pool_at_ceiling")
-CHANNEL_KINDS = ("desktop", "ntfy", "slack", "app", "nexlink")
+#: The channel kinds the core itself implements. A built-in module adds its own
+#: kinds through ``registry.notify_channel_kinds`` (#7793): the core never
+#: names a module package.
+CORE_CHANNEL_KINDS = ("desktop", "ntfy", "slack", "app")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_TIMEOUT_S = 10.0
@@ -296,11 +298,58 @@ CHANNEL_OPTIONS = {
     # L90 : l'application embarquée lit le journal d'événements ; le canal ne
     # porte ni adresse ni secret, il déclare seulement la route.
     "app": ("type", "timeout"),
-    # #3536 : API de l'app Nexlink, secret nommé + repli remote push.
-    "nexlink": ("type", "timeout", "url", "token_env", "token_file", "fallback"),
 }
 TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per_minute",
             "max_attempts", "interval", "timeout")
+
+
+def channel_kinds() -> tuple:
+    """Channel kinds: the core's own, then the built-in modules' (#7793)."""
+    return CORE_CHANNEL_KINDS + tuple(registry.notify_channel_kinds())
+
+
+def channel_provider(kind):
+    """The module provider of a channel kind, or ``None`` for a core kind."""
+    if kind in CORE_CHANNEL_KINDS:
+        return None
+    return registry.notify_channel(kind)
+
+
+def channel_options(kind) -> tuple:
+    """The option names a channel kind admits (a typo is an error)."""
+    if kind in CHANNEL_OPTIONS:
+        return CHANNEL_OPTIONS[kind]
+    provider = channel_provider(kind)
+    options = getattr(provider, "OPTIONS", None) or {}
+    admitted = options.get(kind)
+    if admitted is None:
+        raise NotifyConfigError("channel type %r has no option declaration" % kind)
+    return tuple(admitted)
+
+
+def channel_fallback(channel: "Channel") -> str | None:
+    """The declared fallback channel of a module channel, or ``None``.
+
+    Only a provider that declares ``FALLBACK`` carries one: the core keeps no
+    knowledge of a module channel's fallback option (#7793)."""
+    provider = channel_provider(channel.kind)
+    if provider is None or not getattr(provider, "FALLBACK", False):
+        return None
+    name = channel.options.get("fallback")
+    return str(name) if name else None
+
+
+def channel_fallback_kinds(channel: "Channel") -> tuple:
+    """The kinds a module channel's fallback may target."""
+    provider = channel_provider(channel.kind)
+    return tuple(getattr(provider, "FALLBACK_KINDS", ()) or ())
+
+
+def channel_fallback_prefix(channel: "Channel") -> str:
+    """The text prefix a module channel puts on its fallback body."""
+    provider = channel_provider(channel.kind)
+    return str(getattr(provider, "FALLBACK_PREFIX", "") or "")
+
 
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
@@ -428,6 +477,7 @@ TYPE_LABELS = {
     "owner_key_registered": "owner key registered",
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
+    "account_wave_coordination": "critical agent blocked by account wave coordination",
     "account_config_invalid": "no valid harness account on the host",
     "account_profile_confined": "harness account usable on no agent host",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
@@ -478,6 +528,8 @@ URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "orphan_lot", "dead_runne
                 # #5503 : un compte entier bloqué par des réservations gardées
                 "account_cap_kept",
                 "credential_failing", "critical_budget_pause", "critical_turn_failures",
+                # #7712 : l'agent critique ne tourne plus, sans plafond en cause
+                "account_wave_coordination",
                 # #3969 : aucun tour tant que l'hôte n'est pas réparé
                 "account_config_invalid",
                 "owner_key_registered",
@@ -616,10 +668,11 @@ def _channel(name: str, raw) -> Channel:
         raise NotifyConfigError("notify.channels.%s: object expected" % name)
     _find_secret(raw, "notify.channels.%s" % name)
     kind = str(raw.get("type") or name)
-    if kind not in CHANNEL_KINDS:
+    kinds = channel_kinds()
+    if kind not in kinds:
         raise NotifyConfigError("notify.channels.%s: unknown type %r (%s)"
-                                % (name, kind, " | ".join(CHANNEL_KINDS)))
-    unknown = sorted(set(raw) - set(CHANNEL_OPTIONS[kind]))
+                                % (name, kind, " | ".join(kinds)))
+    unknown = sorted(set(raw) - set(channel_options(kind)))
     if kind == "slack" and "url" in raw:
         raise NotifyConfigError(
             "notify.channels.%s.url: a Slack webhook URL is a secret; name the variable "
@@ -636,19 +689,15 @@ def _channel(name: str, raw) -> Channel:
         if not _TOPIC_RE.match(str(raw["topic"])):
             raise NotifyConfigError("notify.channels.%s.topic invalid: %r"
                                     % (name, raw["topic"]))
-    if kind == "nexlink":
-        if not raw.get("url"):
-            raise NotifyConfigError("notify.channels.%s: `url` is required" % name)
-        check_url(str(raw["url"]), "notify.channels.%s.url" % name)
-        parts = urllib.parse.urlsplit(str(raw["url"]))
-        if parts.query or parts.fragment:
-            raise NotifyConfigError(
-                "notify.channels.%s.url: query or fragment not allowed (the "
-                "channel appends `/mesh/alerts`)" % name)
-        if not raw.get("token_env") and not raw.get("token_file"):
-            raise NotifyConfigError(
-                "notify.channels.%s: name the shared secret (`token_env` or "
-                "`token_file`), never a value in the configuration" % name)
+    provider = channel_provider(kind)
+    if provider is not None:
+        # kind-specific checks stay in the module that owns the channel; the
+        # core has already refused a plaintext secret and an unknown option.
+        validate = getattr(provider, "validate", None)
+        if not callable(validate):
+            raise NotifyConfigError("notify.channels.%s: type %r has no validator"
+                                    % (name, kind))
+        validate(name, raw)
     for key in ("token_env", "webhook_env"):
         if key in raw and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(raw[key] or "")):
             raise NotifyConfigError("notify.channels.%s.%s: invalid variable name"
@@ -726,10 +775,11 @@ def parse_config(raw) -> NotifyConfig:
             else:
                 raise NotifyConfigError("channel %r used in routes but not declared "
                                         "(notify.channels)" % name)
-    # #3536 : le repli d'un canal `nexlink` est un canal DÉCLARÉ, remote push,
-    # jamais lui-même (pas de chaîne de replis).
+    # #3536 : le repli d'un canal de module est un canal DÉCLARÉ, remote push,
+    # jamais lui-même (pas de chaîne de replis). Le module déclare les types
+    # admis ; le cœur ne connaît que la règle (#7793).
     for name, channel in channels.items():
-        if channel.kind != "nexlink" or not channel.options.get("fallback"):
+        if not channel_fallback(channel):
             continue
         fallback = str(channel.options["fallback"])
         target = channels.get(fallback)
@@ -740,21 +790,24 @@ def parse_config(raw) -> NotifyConfig:
         if target.name == channel.name:
             raise NotifyConfigError(
                 "notify.channels.%s.fallback: a channel cannot fall back to itself" % name)
-        if target.kind not in NEXLINK_FALLBACK_KINDS:
+        admitted = channel_fallback_kinds(channel)
+        if target.kind not in admitted:
             raise NotifyConfigError(
-                "notify.channels.%s.fallback: %r is a %s channel; a nexlink fallback "
-                "must be one of %s" % (name, fallback, target.kind,
-                                       ", ".join(NEXLINK_FALLBACK_KINDS)))
+                "notify.channels.%s.fallback: %r is a %s channel; a %s fallback "
+                "must be one of %s" % (name, fallback, target.kind, channel.kind,
+                                       ", ".join(admitted)))
     # #3536 : le repli ne double pas un canal déjà routé vers le même humain
     for human, names in list(routes.items()) + [(None, default)]:
         for name in names:
             channel = channels[name]
-            fallback = channel.options.get("fallback") if channel.kind == "nexlink" else None
+            fallback = channel_fallback(channel)
             if fallback and fallback in names:
                 raise NotifyConfigError(
-                    "notify.routes.%s: %r and its nexlink fallback %r are both routed "
-                    "to the same human (double send); keep only the nexlink channel "
-                    "and let `fallback` cover it" % (human or "(default)", name, fallback))
+                    "notify.routes.%s: %r and its %s fallback %r are both routed "
+                    "to the same human (double send); keep only the %s channel "
+                    "and let `fallback` cover it"
+                    % (human or "(default)", name, channel.kind, fallback,
+                       channel.kind))
     rate = int(_positive(raw.get("rate_per_minute", DEFAULT_RATE_PER_MINUTE),
                          "notify.rate_per_minute"))
     attempts = max(1, int(_positive(raw.get("max_attempts", DEFAULT_MAX_ATTEMPTS),
@@ -778,7 +831,7 @@ class Message:
     body: str
     urgent: bool = False
     low: bool = False
-    #: #3536 : identité portée jusqu'au canal `nexlink` (les autres canaux
+    #: #3536 : identité portée jusqu'au canal qui en a besoin (les autres
     #: l'ignorent) ; `alert_id` est posé par `_attempt`, qui connaît l'humain.
     alert_id: str | None = None
     event: str = "raised"
@@ -840,7 +893,7 @@ def local_time(ts) -> str:
 
 
 def iso_utc(ts) -> str:
-    """L'instant UTC du protocole Nexlink (`2026-10-25T11:41:27Z`)."""
+    """L'instant UTC (`2026-10-25T11:41:27Z`), l'instant figé d'un message."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
 
 
@@ -855,7 +908,7 @@ def _content_context(alert: dict) -> dict:
 
 
 def _identify(message: Message, alert: dict, event: str, now: float) -> Message:
-    """Marque un message de l'identité que le canal `nexlink` transporte."""
+    """Marque un message de l'identité et du contexte qu'un canal transporte."""
     return replace(message, kind=str(alert.get("type") or "?"), event=event,
                    occurred_at=iso_utc(now), context=_content_context(alert))
 
@@ -1001,10 +1054,23 @@ def render_summary(bucket: dict, host: str, *, alert_id: str | None = None,
                    alert_id=alert_id, kind="summary", occurred_at=occurred_at)
 
 
+#: Espace de noms fixe des `alert_id` (UUIDv5, jamais un UUIDv4 : la même
+#: alerte garde la même ligne après un redémarrage). Il est générique : le
+#: registre `notified` s'en sert quel que soit le canal qui livre.
+ALERT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "ameesh:mesh-alert:v1")
+
+
+def alert_id_for(identity: str) -> str:
+    """`alert_id` : UUIDv5 déterministe de l'identité de registre (#2395).
+
+    Une même identité (clé, sévérité, humain, `since`) donne toujours le même
+    UUID, valide comme identité d'alerte d'un canal qui en exige un."""
+    return str(uuid.uuid5(ALERT_NAMESPACE, str(identity)))
+
+
 def test_alert_id(human: str, channel: Channel, host: str) -> str:
     """Identité stable d'un message de test (le statut/accusé la réutilise)."""
-    return nexlink_alerts.alert_id_for(
-        "test|%s|%s|%s" % (human, channel.name, host))
+    return alert_id_for("test|%s|%s|%s" % (human, channel.name, host))
 
 
 def render_test(human: str, channel: Channel, host: str) -> Message:
@@ -1106,16 +1172,11 @@ def channel_secrets(channel: Channel, env: dict | None = None) -> tuple:
     return tuple(out)
 
 
-#: #3383: the channel kinds that reach a human from ANY host. The alerts role
-#: timer pushes from whichever candidate holds the lease: `desktop` needs that
-#: host's graphical session, `app` only records the alert in the event log.
-REMOTE_PUSH_KINDS = ("ntfy", "slack", "nexlink")
-
-#: #3536 : canaux admis comme repli d'un canal `nexlink` (jamais un autre
-#: `nexlink` : pas de chaîne de replis, pas de récursion de couverture).
-NEXLINK_FALLBACK_KINDS = ("ntfy", "slack")
-#: durée du cache des clés key-wrap d'un compte (`GET /mesh/alerts/keys`).
-NEXLINK_KEYS_TTL_S = 3600.0
+#: #3383: the core channel kinds that reach a human from ANY host. The alerts
+#: role timer pushes from whichever candidate holds the lease: `desktop` needs
+#: that host's graphical session, `app` only records the alert in the event
+#: log. A module channel declares `REMOTE_PUSH` for itself (#7793).
+CORE_REMOTE_PUSH_KINDS = ("ntfy", "slack")
 
 
 def remote_push_problem(channel: Channel, env: dict | None = None,
@@ -1124,33 +1185,19 @@ def remote_push_problem(channel: Channel, env: dict | None = None,
 
     The secret is resolved exactly as `Sender` does (file or environment
     variable, then L46's value check); the reason names the variable or the
-    file, never the value. #3536: a `nexlink` channel also needs the
-    `cryptography` extra; when either the extra or the secret is missing but
-    its configured `fallback` is a remote push whose own secret resolves
-    (``ncfg`` given), the channel is still covered.
+    file, never the value. A module channel answers for itself
+    (``push_problem``); when its extra or its secret is missing but its
+    configured `fallback` is a remote push whose own secret resolves
+    (``ncfg`` given), the channel is still covered (#3536).
     """
-    if channel.kind not in REMOTE_PUSH_KINDS:
-        return "%s: %s is not a remote push" % (channel.name, channel.kind)
     env = dict(os.environ if env is None else env)
-    if channel.kind == "nexlink":
-        problem = ""
-        if not nexlink_alerts.crypto_available():
-            problem = ("channel %s: the `cryptography` module is missing "
-                       "(install the `ameesh[crypto]` extra)" % channel.name)
-        else:
-            try:
-                value = _secret(channel, env, "token_env", "token_file", None, True)
-                check_secret_value(value, "channel %s: mesh secret" % channel.name)
-            except ChannelError as exc:
-                problem = str(exc)
-        if not problem:
-            return ""
-        fallback = (ncfg.channels.get(str(channel.options.get("fallback") or ""))
-                    if ncfg is not None else None)
-        if (fallback is not None and fallback.name != channel.name
-                and not remote_push_problem(fallback, env)):
-            return ""
-        return problem
+    provider = channel_provider(channel.kind)
+    if provider is not None:
+        if not getattr(provider, "REMOTE_PUSH", False):
+            return "%s: %s is not a remote push" % (channel.name, channel.kind)
+        return provider.push_problem(channel, env, ncfg)
+    if channel.kind not in CORE_REMOTE_PUSH_KINDS:
+        return "%s: %s is not a remote push" % (channel.name, channel.kind)
     try:
         if channel.kind == "slack":
             value = _secret(channel, env, "webhook_env", "webhook_file",
@@ -1167,15 +1214,13 @@ def remote_push_problem(channel: Channel, env: dict | None = None,
 
 def fallback_readiness(ncfg: NotifyConfig, channel: Channel,
                        env: dict | None = None) -> dict | None:
-    """#3536 : l'état du repli d'un canal `nexlink`, affiché par `--test`.
+    """#3536 : l'état du repli d'un canal de module, affiché par `--test`.
 
     ``None`` sans repli ; sinon ``{channel, ready[, problem]}``. La question
     posée est celle de `role timers --check` : le repli est-il un remote push
     utilisable depuis cet environnement ?
     """
-    if channel.kind != "nexlink":
-        return None
-    name = channel.options.get("fallback")
+    name = channel_fallback(channel)
     if not name:
         return None
     target = ncfg.channels.get(str(name))
@@ -1189,36 +1234,14 @@ def fallback_readiness(ncfg: NotifyConfig, channel: Channel,
     return out
 
 
-def nexlink_crypto_problem(channel: Channel, env: dict | None = None,
-                           ncfg: "NotifyConfig | None" = None) -> str:
-    """#3619 : le manque de l'extra `crypto` d'un canal `nexlink`, ou ''.
+def channel_activation(cfg, env: dict | None = None) -> tuple[bool, list[str]]:
+    """#3619 : `ameesh doctor` — les canaux de module routés de cet hôte.
 
-    Le chiffrement n'est pas optionnel : sans `cryptography`, un canal routé
-    ne s'active pas. Le repli `ntfy`/`slack` déclaré et utilisable le couvre
-    (#3536), comme pour `role timers --check`. Le secret du canal primaire
-    n'est pas regardé : ce contrôle porte sur la dépendance de l'hôte, pas
-    sur une credential (#3402).
-    """
-    if channel.kind != "nexlink" or nexlink_alerts.crypto_available():
-        return ""
-    env = dict(os.environ if env is None else env)
-    fallback = (ncfg.channels.get(str(channel.options.get("fallback") or ""))
-                if ncfg is not None else None)
-    if (fallback is not None and fallback.name != channel.name
-            and not remote_push_problem(fallback, env)):
-        return ""
-    return ("the `cryptography` module is missing (install the "
-            "`ameesh[psycopg,crypto]` extra)")
-
-
-def nexlink_activation(cfg, env: dict | None = None) -> tuple[bool, list[str]]:
-    """#3619 : `ameesh doctor` — les canaux `nexlink` routés de cet hôte.
-
-    Rend ``(ok, lignes)``. Un canal routé qui ne peut pas chiffrer et que
-    aucun repli utilisable ne couvre est refusé (``ok=False``) et nommé,
-    **avant tout envoi** : l'activation échoue fermée, jamais par un
-    `ModuleNotFoundError` au premier envoi. Un canal couvert par son repli
-    reste prêt (#3536). Aucun canal `nexlink` routé : ``(True, [])``.
+    Rend ``(ok, lignes)``. Un canal routé dont le module refuse l'activation
+    (dépendance manquante, non couverte par un repli utilisable) est refusé
+    (``ok=False``) et nommé, **avant tout envoi** : l'activation échoue fermée,
+    jamais par un `ModuleNotFoundError` au premier envoi. Aucun canal de module
+    routé : ``(True, [])``.
     """
     try:
         ncfg = parse_config(getattr(cfg, "notify", None))
@@ -1232,9 +1255,13 @@ def nexlink_activation(cfg, env: dict | None = None) -> tuple[bool, list[str]]:
     lines = []
     for name in sorted(names):
         channel = ncfg.channels.get(str(name))
-        if channel is None or channel.kind != "nexlink":
+        if channel is None:
             continue
-        problem = nexlink_crypto_problem(channel, env, ncfg=ncfg)
+        provider = channel_provider(channel.kind)
+        check = getattr(provider, "activation_problem", None)
+        if not callable(check):
+            continue
+        problem = check(channel, env, ncfg)
         if problem:
             ok = False
             lines.append("channel %s refused: %s" % (channel.name, problem))
@@ -1318,13 +1345,18 @@ class Sender:
     def __init__(self, env: dict | None = None, timeout: float = DEFAULT_TIMEOUT_S):
         self.env = dict(os.environ if env is None else env)
         self.timeout = timeout
-        #: #3536 : clés key-wrap par URL (`GET /mesh/alerts/keys`, TTL 1 h)
-        self._nexlink_keys: dict = {}
+        #: #7793 : état propre à chaque provider de canal (le module y garde
+        #: son cache de clés key-wrap) ; le cœur ne connaît pas son contenu.
+        self.channel_state: dict = {}
         #: #3536 : dernier envoi par canal (le statut/accusé de `--test`)
         self.last: dict = {}
 
     def send(self, channel: Channel, message: Message) -> None:
         timeout = float(channel.options.get("timeout") or self.timeout)
+        provider = channel_provider(channel.kind)
+        if provider is not None:
+            provider.send(self, channel, message, timeout)
+            return
         getattr(self, "_" + channel.kind)(channel, message, timeout)
 
     def _desktop(self, channel: Channel, message: Message, timeout: float) -> None:
@@ -1366,200 +1398,17 @@ class Sender:
               {"Content-Type": "application/json; charset=utf-8"}, timeout,
               show_url=False)   # l'URL d'un webhook est un secret : jamais journalisée
 
-    # -- #3536 : canal nexlink ------------------------------------------------
-    def _nexlink_secret(self, channel: Channel) -> str:
-        """Le secret HMAC nommé du canal ; jamais une valeur de la config."""
-        secret = _secret(channel, self.env, "token_env", "token_file", None, True)
-        return check_secret_value(secret, "channel %s: mesh secret" % channel.name)
-
-    def _nexlink_key_id(self) -> str:
-        """L'identité HMAC de l'émetteur (`AMEESH_NEXLINK_KEY_ID`, sinon v1)."""
-        value = str(self.env.get("AMEESH_NEXLINK_KEY_ID")
-                    or nexlink_alerts.MESH_ALERT_KEY_ID)
-        # la valeur entre dans la chaîne signée ET dans un en-tête : pas de
-        # blanc, de retour à la ligne ni de séparateur de champ
-        if not re.match(r"^[A-Za-z0-9._-]{1,64}$", value):
-            raise ChannelError("AMEESH_NEXLINK_KEY_ID: invalid key id",
-                               permanent=True)
-        return value
-
-    def _nexlink_call(self, channel: Channel, method: str, path: str,
-                      payload: dict | None, timeout: float) -> bytes:
-        """Une requête signée vers l'API Nexlink ; rend le corps 2xx."""
-        url = str(channel.options["url"]).rstrip("/") + path
-        body = (b"" if payload is None else
-                json.dumps(payload, ensure_ascii=False, sort_keys=True,
-                           separators=(",", ":")).encode("utf-8"))
-        secret = self._nexlink_secret(channel)
-        headers = nexlink_alerts.mesh_headers(secret, body,
-                                              key_id=self._nexlink_key_id())
-        headers["Accept"] = "application/json"
-        if payload is not None:
-            headers["Content-Type"] = "application/json; charset=utf-8"
-        _, raw = _request(url, body if method != "GET" else None, headers, timeout,
-                          method=method, show_url=True, secrets=(secret,))
-        return raw
-
-    @staticmethod
-    def _json_object(raw: bytes, what: str) -> dict:
-        try:
-            data = json.loads(bytes(raw).decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            raise ChannelError("%s: invalid JSON response" % what,
-                               permanent=True) from None
-        if not isinstance(data, dict):
-            raise ChannelError("%s: JSON object expected" % what, permanent=True)
-        return data
-
-    def _nexlink_keys_for(self, channel: Channel, timeout: float) -> dict:
-        """Les clés key-wrap actives du compte owner (cache 1 h)."""
-        url = str(channel.options["url"]).rstrip("/") + "/mesh/alerts/keys"
-        cached = self._nexlink_keys.get(url)
-        now = time.time()
-        if cached and now - cached[0] < NEXLINK_KEYS_TTL_S:
-            return cached[1]
-        raw = self._nexlink_call(channel, "GET", "/mesh/alerts/keys", None, timeout)
-        data = self._json_object(raw, "mesh alerts keys")
-        account = data.get("account_id")
-        try:
-            nexlink_alerts.uuid_bytes(account)
-        except ValueError:
-            raise ChannelError("mesh alerts keys: invalid account_id",
-                               permanent=True) from None
-        keys = data.get("keys")
-        if not isinstance(keys, list):
-            raise ChannelError("mesh alerts keys: `keys` list expected",
-                               permanent=True)
-        active = []
-        for entry in keys:
-            if not isinstance(entry, dict):
-                raise ChannelError("mesh alerts keys: object expected", permanent=True)
-            if entry.get("active") is False:
-                continue
-            alg = entry.get("alg")
-            if alg not in (None, nexlink_alerts.KEY_ALG):
-                raise ChannelError("mesh alerts keys: unsupported alg %r" % (alg,),
-                                   permanent=True)
-            try:
-                gen = int(entry.get("gen"))
-                public = bytes.fromhex(str(entry.get("public_key") or ""))
-            except (TypeError, ValueError):
-                raise ChannelError("mesh alerts keys: invalid key entry",
-                                   permanent=True) from None
-            key_id = str(entry.get("key_id") or "")
-            if not key_id or gen <= 0 or len(public) != 32:
-                raise ChannelError("mesh alerts keys: invalid key entry",
-                                   permanent=True)
-            active.append({"key_id": key_id, "gen": gen, "public_key": public})
-        data = {"account_id": str(account), "keys": active}
-        self._nexlink_keys[url] = (now, data)
-        return data
-
-    def _nexlink_envelope(self, message: Message, keys: dict) -> dict:
-        """L'enveloppe claire : identité + chiffré + un wrap par clé active."""
-        alert_id = message_alert_id(message)
-        occurred_at = message.occurred_at or iso_utc(time.time())
-        # #3537 refuse tout champ inconnu (`forbidNonWhitelisted`) : le clair
-        # ne porte que les champs du DTO ; l'événement reste dans le chiffré.
-        envelope = {"v": nexlink_alerts.ENVELOPE_V, "alert_id": alert_id,
-                    "severity": "urgent" if message.urgent else "normal",
-                    "occurred_at": occurred_at}
-        active = keys.get("keys") or []
-        if not active:
-            # content-free : aucun détail ne quitte le mesh, ce n'est pas un échec
-            envelope["content_free"] = True
-            return envelope
-        try:
-            cek = nexlink_alerts.new_cek()
-            nonce, sealed = nexlink_alerts.seal_content(
-                cek,
-                nexlink_alerts.content_plaintext(message.title, message.body,
-                                                 kind=message.kind,
-                                                 event=message.event,
-                                                 context=message.context),
-                nexlink_alerts.content_aad(alert_id, occurred_at))
-            wraps = []
-            for key in active:
-                wrapped = nexlink_alerts.wrap_to_x25519(
-                    key["public_key"],
-                    nexlink_alerts.WrapContext(keys["account_id"], key["gen"]),
-                    cek)
-                wraps.append({"key_id": key["key_id"], "gen": key["gen"],
-                              "wrap": nexlink_alerts.b64e(wrapped)})
-        except nexlink_alerts.CryptoUnavailable as exc:
-            raise ChannelError(str(exc), permanent=True) from None
-        except (ValueError, TypeError) as exc:
-            raise ChannelError("nexlink encryption: %s" % _clean(exc, 120),
-                               permanent=True) from None
-        envelope.update({"ciphertext": nexlink_alerts.b64e(sealed),
-                         "nonce": nexlink_alerts.b64e(nonce), "wraps": wraps})
-        return envelope
-
-    def _nexlink_post(self, channel: Channel, envelope: dict, delivery: str,
-                      timeout: float) -> bytes:
-        url = str(channel.options["url"]).rstrip("/") + "/mesh/alerts"
-        body = json.dumps(envelope, ensure_ascii=False, sort_keys=True,
-                          separators=(",", ":")).encode("utf-8")
-        secret = self._nexlink_secret(channel)
-        headers = nexlink_alerts.mesh_headers(secret, body,
-                                              key_id=self._nexlink_key_id())
-        headers.update({"Accept": "application/json",
-                        "Content-Type": "application/json; charset=utf-8",
-                        "X-Mesh-Idempotency-Key": delivery})
-        _, raw = _request(url, body, headers, timeout, method="POST", show_url=True,
-                          secrets=(secret,))
-        return raw
-
-    def _nexlink(self, channel: Channel, message: Message, timeout: float) -> None:
-        """Pousse une alerte dans l'app Nexlink (POST signé, contenu chiffré)."""
-        alert_id = message_alert_id(message)
-        if (message.event or "raised") != "raised":
-            # #3537 v1 ne stocke que l'alerte levée (pas d'état de résolution
-            # dans son schéma) ; la ligne de l'app reste levée, sans 400.
-            self.last[channel.name] = {"alert_id": alert_id,
-                                       "skipped": message.event or "raised"}
-            return
-        delivery = nexlink_alerts.delivery_key(message.event or "raised", alert_id)
-        keys = self._nexlink_keys_for(channel, timeout)
-        envelope = self._nexlink_envelope(message, keys)
-        try:
-            raw = self._nexlink_post(channel, envelope, delivery, timeout)
-        except ChannelError as exc:
-            if exc.status == 409 and b"key_unknown" in (exc.body or b""):
-                # clé de wrap inconnue : on relit les clés et on réessaie une fois
-                self._nexlink_keys.pop(str(channel.options["url"]).rstrip("/")
-                                       + "/mesh/alerts/keys", None)
-                keys = self._nexlink_keys_for(channel, timeout)
-                envelope = self._nexlink_envelope(message, keys)
-                try:
-                    raw = self._nexlink_post(channel, envelope, delivery, timeout)
-                except ChannelError as again:
-                    if again.status == 409:
-                        raise ChannelError("key_unknown after refreshing keys",
-                                           permanent=True, status=409,
-                                           body=again.body) from None
-                    raise
-            elif exc.status and 400 <= exc.status < 500 and exc.status not in (409, 429):
-                raise ChannelError(str(exc), permanent=True, status=exc.status,
-                                   body=exc.body) from None
-            else:
-                raise
-        accepted = self._json_object(raw, "mesh alert accepted")
-        if accepted.get("accepted") is False:
-            raise ChannelError("mesh alert not accepted", permanent=True)
-        self.last[channel.name] = {"alert_id": alert_id, "delivery": delivery,
-                                   "accepted": accepted.get("accepted"),
-                                   "duplicate": accepted.get("duplicate"),
-                                   "id": accepted.get("id")}
-
     def receipt(self, channel: Channel, alert_id: str,
                 timeout: float | None = None) -> dict:
-        """`GET /mesh/alerts/{id}` signé : l'accusé de lecture (jamais sondé)."""
+        """The read receipt of a channel that offers one (never polled)."""
+        provider = channel_provider(channel.kind)
+        get = getattr(provider, "receipt", None) if provider is not None else None
+        if not callable(get):
+            raise ChannelError("channel %s: no read receipt" % channel.name,
+                               permanent=True)
         if timeout is None:
             timeout = float(channel.options.get("timeout") or self.timeout)
-        path = "/mesh/alerts/" + urllib.parse.quote(str(alert_id), safe="")
-        raw = self._nexlink_call(channel, "GET", path, None, timeout)
-        return self._json_object(raw, "mesh alert receipt")
+        return get(self, channel, alert_id, timeout)
 
     def _app(self, channel: Channel, message: Message, timeout: float) -> None:
         """L90 : le canal de l'interface embarquée. Rien à pousser : l'alerte
@@ -1597,6 +1446,7 @@ class Router:
         self._agents = None
         self._canon = None
         self._canon_read = False
+        self._avatars = None
 
     def agents(self) -> dict:
         if self._agents is None:
@@ -1639,7 +1489,27 @@ class Router:
         fiche = canon_mod.find_host(self._canon or [], host)
         return fiche.responsible if fiche is not None else None
 
-    def resolve(self, alert: dict) -> tuple:
+    def avatar_for(self, human: str | None) -> str | None:
+        """L'agent avatar de `human`, lu au canon (#7634), ou None."""
+        if not human:
+            return None
+        if self._avatars is None:
+            try:
+                self._avatars = avatars.configured(self.cfg)
+            except Exception:  # noqa: BLE001 — un canon illisible ne fait pas d'avatar
+                self._avatars = {}
+        return self._avatars.get(str(human))
+
+    def avatars(self) -> dict:
+        """`{human: avatar}` des canons configurés (cache de la passe)."""
+        if self._avatars is None:
+            try:
+                self._avatars = avatars.configured(self.cfg)
+            except Exception:  # noqa: BLE001
+                self._avatars = {}
+        return self._avatars
+
+    def resolve(self, alert: dict, *, for_avatar: bool = False) -> tuple:
         """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None).
 
         #2395 (canon §9, owner 18/10) : un `slo_breach` n'est **jamais** poussé
@@ -1679,7 +1549,7 @@ class Router:
         for source, value in steps:
             human = normalize_human(value())
             if human:
-                if (alert.get("type") == "slo_breach"
+                if (alert.get("type") == "slo_breach" and not for_avatar
                         and human == normalize_human(self.ncfg.default_human)):
                     # #2395 : même explicitement configuré, un dépassement de
                     # délai ne part pas sur le bureau de l'owner.
@@ -1699,7 +1569,7 @@ def state_path(cfg: Config) -> str:
 def empty_state() -> dict:
     return {"schema": STATE_SCHEMA, "active": {}, "resolved": {}, "rate": {},
             "summary": {}, "last_summary": {}, "briefs": {}, "notified": {},
-            #: #3536 : replis nexlink déjà envoyés (une fois par alert_id)
+            #: #3536 : replis de canal déjà envoyés (une fois par alert_id)
             "fallback": {},
             #: #3761 : verdicts de porte des avis, relus seulement quand le
             #: gel, la cible, les jalons ou le canon changent
@@ -1709,7 +1579,11 @@ def empty_state() -> dict:
             #: #7572 B1 : remises à zéro déjà re-briefées après leur passage
             #: (clé de brief → échéance), pour ne pas rouvrir l'épisode à
             #: chaque passe tant que la pause dure.
-            "reset_rebriefed": {}}
+            "reset_rebriefed": {},
+            #: #7749 : avatars sans destinataire vivant déjà journalisés pour
+            #: un brief (clé de brief → raison), pour un seul repli par
+            #: épisode et non un journal à chaque passe.
+            "avatar_brief_fallback": {}}
 
 
 #: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
@@ -1725,6 +1599,10 @@ def empty_state() -> dict:
 #: la passe s'arrête d'elle-même avant.
 STATE_SCOPE = "alerts"
 STATE_LEASE_S = 90.0
+
+#: #7634 : délai laissé à l'avatar d'un humain pour lire son courrier avant
+#: que la route directe (canaux de l'humain) ne reprenne, avec journal.
+AVATAR_FALLBACK_S = 15 * 60.0
 #: intervalle de renouvellement : trois occasions avant l'expiration
 STATE_RENEW_S = STATE_LEASE_S / 3.0
 #: attente maximale du fil de renouvellement au rendu du bail
@@ -2297,17 +2175,16 @@ def _notification_id(key, severity, human, since=None) -> str:
 
 
 def message_alert_id(message: Message) -> str:
-    """L'identité stable d'un message pour le canal `nexlink`.
+    """L'identité stable d'un message, portée jusqu'au canal qui en a besoin.
 
     Posée par `_attempt` (identité du registre `notified` en UUIDv5) et par
     `_summaries` (identité de l'épisode de bucket) ; un message construit
     sans elle (test ad hoc) en reçoit une dérivée de son texte, stable entre
-    deux essais et valide comme UUID pour l'API #3537.
+    deux essais et valide comme UUID pour un canal qui en exige un.
     """
     if message.alert_id:
         return message.alert_id
-    return nexlink_alerts.alert_id_for(
-        "%s\n%s" % (message.title, message.body))
+    return alert_id_for("%s\n%s" % (message.title, message.body))
 
 
 def _since_of(alert: dict):
@@ -2662,7 +2539,7 @@ class Notifier:
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
-            self._resolved(key, entry, now)
+            self._resolved(key, entry, now, db=db)
             self._event(db, "alert.resolved", key, entry["alert"])
         for key, alert in wanted.items():
             entry = active.get(key)
@@ -2717,7 +2594,7 @@ class Notifier:
                     "channels": {}}
                 if alert.get("type") in exploitation.ESCALATING:
                     entry["escalated"] = bool(alert.get("critical"))
-                self._raise(entry, router, now)
+                self._raise(entry, router, now, db=db)
                 self._event(db, "alert.raised", key, alert)
             elif (alert.get("type") in exploitation.ESCALATING and alert.get("critical")
                   and not entry.get("escalated")):
@@ -2726,15 +2603,15 @@ class Notifier:
                 # retour au seuil puis au critique ne la relève pas)
                 entry.update(alert={k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
                              escalated=True, status="nouvelle", channels={})
-                self._raise(entry, router, now)
+                self._raise(entry, router, now, db=db)
             else:
                 if alert.get("type") == "orphan_lot" and alert.get("grouped"):
                     entry["alert"] = {k: alert.get(k) for k in _KEPT if alert.get(k) is not None}
                 if entry["status"] in ("nouvelle", "sans_destinataire", "sans_canal"):
                     # un responsable (ou une route) a pu apparaître depuis
-                    self._raise(entry, router, now)
+                    self._raise(entry, router, now, db=db)
                 else:
-                    self._retry(entry, "raised", now)
+                    self._retry(entry, "raised", now, db=db)
             entry.update(severity=level, ack_subjects=subjects)
         self._journal_capacity(db, current, now)
         self._brief_agents(db, current, router, now, unreadable=unreadable)
@@ -2749,7 +2626,7 @@ class Notifier:
             if self._acknowledged(entry, acknowledgements):
                 del self.state["resolved"][key]
                 continue
-            self._retry(entry, "resolved", now)
+            self._retry(entry, "resolved", now, db=db)
             if not self._pending(entry):
                 del self.state["resolved"][key]
         self._summaries(now)
@@ -3243,7 +3120,7 @@ class Notifier:
             newest = sorted(kept.items(), key=lambda item: float(item[1]))[-NOTIFIED_MAX:]
             kept = dict(newest)
         self.state["notified"] = kept
-        # #3536 : même rétention pour le registre des replis nexlink
+        # #3536 : même rétention pour le registre des replis de canal
         fallback = self.state.get("fallback") or {}
         kept = {key: ts for key, ts in fallback.items()
                 if now - float(ts) < NOTIFIED_RETENTION_S}
@@ -3284,7 +3161,161 @@ class Notifier:
         except Exception as exc:  # noqa: BLE001 — the notification goes on
             self.log("capacity alert journal not recorded: %s" % type(exc).__name__)
 
-    def _raise(self, entry: dict, router: Router, now: float) -> None:
+    def _avatar_reachable(self, name: str | None, db) -> bool:
+        """L'avatar est-il joignable maintenant ?
+
+        `externe` (session humaine, 0030) lit son courrier par son propre
+        script : joignable, sauf s'il est lui-même arrêté. Sinon le registre
+        tranche : une ligne arrêtée, en pause ou en erreur, ou un bail rendu,
+        ne l'est pas (même règle que `alert_briefs._split_live`, sans exiger
+        de bail pour un externe). Un registre illisible ne fait pas attendre
+        l'alerte : elle suit la route directe, une fois."""
+        if not name:
+            return False
+        if db is None:
+            return True
+        try:
+            row = next((item for item in storage.of(db).operations.listing()
+                        if item.get("name") == str(name)), None)
+        except Exception:  # noqa: BLE001 — la route directe reprend
+            return False
+        if row is None:
+            return False
+        if row.get("mode") in ("stopped", "off"):
+            return False
+        if str(row.get("status") or "") in ("stopped", "paused", "error", "dead"):
+            return False
+        if row.get("mode") == "externe":
+            return True
+        return bool(row.get("lease_live", True))
+
+    def _brief_avatar_dead(self, name: str, by_name: dict, closed: set) -> str:
+        """Pourquoi un avatar ne lira pas un brief d'alerte ("" s'il peut).
+
+        Mêmes preuves que `alert_briefs._split_live` : pause budget ou
+        opérateur, exécuteur arrêté, hôte aux claims fermés, bail rendu. Un
+        avatar `externe` (session humaine) lit son fil sans bail : seule une
+        ligne arrêtée le rend absent. Un nom hors registre ne reçoit rien.
+        La décision est prise sur le registre de la passe, sans attendre
+        `AVATAR_FALLBACK_S` : un courrier d'alerte qui attendrait un avatar
+        déjà en pause n'aurait aucun détenteur (#7749)."""
+        row = by_name.get(str(name))
+        if row is None:
+            return "not in the registry"
+        if row.get("mode") in ("stopped", "off"):
+            return "executor %s" % row.get("mode")
+        if row.get("mode") == "externe":
+            status = str(row.get("status") or "")
+            if status in ("stopped", "dead", "paused", "error"):
+                return "status %s" % status
+            return ""
+        live, dead = alert_briefs._split_live(
+            {str(name): ""}, {str(name): row}, closed, respect_pause=True)
+        if live:
+            return ""
+        return dead.get(str(name), "unavailable")
+
+    def _deliver_avatar(self, entry: dict, avatar: str, human: str,
+                        now: float, db) -> bool:
+        """Dépose l'alerte dans la boîte de l'avatar (#7634).
+
+        Le contenu reste chez l'avatar ; le canal direct ne porte qu'un
+        signal court, sans le texte de l'alerte (spec #7627 §5). Le dépôt est
+        durable : `_avatar_followup` replie sur le texte entier après
+        `AVATAR_FALLBACK_S` si le message n'a pas été remis."""
+        alert = entry["alert"]
+        message = render(alert, "raised", now, raised_ts=entry.get("raised_ts"))
+        payload = {"alert": alert.get("type"), "human": human,
+                   "avatar": avatar, "key": entry.get("key")}
+        if db is None and not self.dry_run:
+            entry["status"] = "sans_destinataire"
+            self._record("raised", entry, "sans_destinataire", {})
+            return False
+        if self.dry_run:
+            self.log("[%s] mail to avatar %s (dry run): %s"
+                     % (alert.get("type"), avatar, _subject(alert)))
+            entry["avatar_mail_id"] = None
+        else:
+            try:
+                entry["avatar_mail_id"] = mail.send(
+                    db, work.SYSTEM_SENDER, avatar, message.text,
+                    kind="event", payload=payload)
+            except Exception as exc:  # noqa: BLE001 — la route directe reprend
+                self.log("[%s] avatar %s unreachable (%s): direct route"
+                         % (alert.get("type"), avatar,
+                            _clean(_scrub(exc, ()), 160)))
+                return False
+        entry.pop("signal_ts", None)
+        entry.update(status="avatar", avatar=avatar, avatar_sent_ts=now,
+                     avatar_fallback=False, channels={})
+        self._event(db, "avatar.routed", entry.get("key") or "", alert)
+        self._record("raised", entry, "avatar", {})
+        self._signal_direct(entry, human, now)
+        return True
+
+    def _signal_direct(self, entry: dict, human: str, now: float) -> None:
+        """Le signal sans contenu : « ton avatar a besoin de toi » (#7634).
+
+        Il part une fois, au dépôt. Les canaux de l'humain ne portent jamais
+        le texte de l'alerte tant que son avatar la lit ; après le délai sans
+        remise, `_avatar_followup` envoie le texte entier par la route
+        directe."""
+        if entry.get("signal_ts") is not None or self.dry_run:
+            return
+        channels = self.ncfg.channels_for(human)
+        if not channels:
+            entry["signal_ts"] = now
+            return
+        message = Message(title="Ton avatar a besoin de toi",
+                          body="Une alerte attend dans la boîte de ton avatar.",
+                          urgent=True, event="raised", kind="signal")
+        results = {}
+        for channel in channels:
+            ok, error = self._send(channel, message)
+            results[channel.name] = "ok" if ok else "failed: %s" % error
+            if not ok:
+                self.log("[%s] avatar signal → %s, channel %s: %s"
+                         % (entry["alert"].get("type"), human, channel.name, error))
+        entry["signal_ts"] = now
+        self._record("raised", entry, "signal", results)
+
+    def _avatar_mail_delivered(self, entry: dict, db) -> bool:
+        """Le message déposé chez l'avatar a-t-il été remis (lu) ?"""
+        message_id = entry.get("avatar_mail_id")
+        if not message_id or db is None:
+            return False
+        try:
+            row = mail.get(db, int(message_id))
+        except Exception:  # noqa: BLE001 — non prouvé : le repli reprend
+            return False
+        return bool(row and (row.get("delivered_ts") is not None
+                             or row.get("status") == "delivered"))
+
+    def _avatar_followup(self, entry: dict, now: float, db) -> None:
+        """Après le dépôt chez l'avatar : attendre la remise, puis replier.
+
+        Le repli ne dépend pas de la seule « joignabilité » : un avatar
+        `externe` est toujours joignable, et le bureau a laissé 76 courriers
+        non remis en 24 h (nuit du 16/11). Après `AVATAR_FALLBACK_S`, si le
+        message n'est pas remis — ou si l'avatar est arrêté — la route
+        actuelle reprend avec le texte entier, et l'événement est journalisé."""
+        if entry.get("avatar_fallback"):
+            return
+        sent = float(entry.get("avatar_sent_ts") or 0.0)
+        if now - sent < AVATAR_FALLBACK_S:
+            return
+        if (self._avatar_mail_delivered(entry, db)
+                and self._avatar_reachable(entry.get("avatar"), db)):
+            return
+        alert = entry["alert"]
+        entry["avatar_fallback"] = True
+        self._event(db, "avatar.fallback", entry.get("key") or "", alert)
+        self.log("[%s] avatar %s did not read within %ds: direct route for %s"
+                 % (alert.get("type"), entry.get("avatar"), int(AVATAR_FALLBACK_S),
+                    entry.get("human")))
+        self._raise_direct(entry, entry.get("human"), now, first=False)
+
+    def _raise(self, entry: dict, router: Router, now: float, db=None) -> None:
         if not self._delivery_open():
             return
         alert = entry["alert"]
@@ -3298,8 +3329,22 @@ class Notifier:
                 self._record("raised", entry, "sans_destinataire", {})
             entry["status"] = "sans_destinataire"
             return
-        channels = self.ncfg.channels_for(human)
         entry.update(human=human, source=source)
+        # #7634 : d'abord la boîte de l'avatar de l'humain, s'il en a un.
+        # La passe locale n'a pas de base : sa livraison est directe, sans
+        # tenter une boîte avatar qui ne peut pas être écrite (relecture cx1).
+        avatar = (None if db is None or entry.get("avatar_fallback")
+                  else router.avatar_for(human))
+        if avatar and self._deliver_avatar(entry, avatar, human, now, db):
+            return
+        self._raise_direct(entry, human, now, first=first)
+
+    def _raise_direct(self, entry: dict, human: str, now: float, *,
+                      first: bool) -> None:
+        """La route directe historique : les canaux configurés de l'humain."""
+        alert = entry["alert"]
+        channels = self.ncfg.channels_for(human)
+        entry.update(human=human)
         if not channels:
             if entry["status"] != "sans_canal":
                 self.log("no channel for %s (notify.routes, notify.default): alert [%s] "
@@ -3484,6 +3529,11 @@ class Notifier:
                 # #7572 : l'épisode est clos ; le marqueur d'une remise à
                 # zéro déjà re-briefée ne doit pas suivre une pause ultérieure.
                 (self.state.get("reset_rebriefed") or {}).pop(key, None)
+        # #7749 : un épisode de repli d'avatar se referme avec son alerte.
+        fallback_journal = self.state.get("avatar_brief_fallback") or {}
+        for key in list(fallback_journal):
+            if key not in alive:
+                del fallback_journal[key]
         due = []
         dead_only = set()
         for key, alert in alive.items():
@@ -3550,12 +3600,62 @@ class Notifier:
             module_auditors = alert_briefs.auditors(listing, canons, explicit_only=True)
             from . import sous_utilisation
             module_orchestrators = sous_utilisation.role_orchestrators(canons)
+            avatars_by_human = avatars.from_canons(canons)
+            # #7661 : les alertes d'hôte visent le rôle de conception déclaré
+            # à la fiche, jamais un nom d'agent ; sans canon, la projection du
+            # registre (`roles`) est la déclaration disponible.
+            observers = sous_utilisation.declared_holders(
+                canons, listing, sous_utilisation.DESIGN_ROLES)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
         unevaluated: set = set()
         for key, alert, entry in due:
             kind = alert.get("type")
+            # #7634 : la route humaine vient du routeur quand la passe en a
+            # un ; l'appel direct des témoins (router=None) garde les briefs
+            # par rôles, sans boîte d'avatar.
+            human = None
+            if router is not None:
+                try:
+                    human, _ = router.resolve(alert, for_avatar=True)
+                except Exception as exc:  # noqa: BLE001 - brief par rôles quand même
+                    self.log("[%s] human route unreadable (%s)" % (kind, exc))
+            avatar = avatars_by_human.get(human) if human else None
+            avatar_name, avatar_dead = avatar, ""
+            if avatar:
+                # #7749 : un avatar déclaré mais sans destinataire vivant
+                # (pause budget, exécuteur arrêté, bail rendu) ne prend pas
+                # la route humaine ; la route configurée de l'humain reprend,
+                # puis l'auditeur. Le repli se dit une fois par épisode.
+                avatar_dead = self._brief_avatar_dead(avatar, by_name, closed)
+                if avatar_dead:
+                    avatar = None
+            if avatar:
+                desks = ()
+                route_names = ()
+            else:
+                desks = tuple(avatars.configured_desks(
+                    self.cfg, human, listing, alert.get("project")))
+                # L'avatar mort garde son fil lisible en dernier recours
+                # (#3036), seulement quand aucune route configurée n'existe :
+                # sinon le texte nommerait l'avatar absent au lieu du bureau.
+                route_names = desks or ((avatar_name,) if avatar_dead else ())
+            if avatar_dead:
+                journal = self.state.setdefault("avatar_brief_fallback", {})
+                if journal.get(key) != avatar_dead:
+                    journal[key] = avatar_dead
+                    if desks:
+                        route = "configured desk %s" % ", ".join(desks)
+                    elif route_names:
+                        route = "readable thread %s" % ", ".join(route_names)
+                    else:
+                        route = "auditor"
+                    self.log("[%s] avatar %s not live (%s): human route by %s"
+                             % (kind, avatars_by_human.get(human), avatar_dead, route))
+                    self._event(db, "avatar.brief_fallback", key, alert)
+            else:
+                (self.state.get("avatar_brief_fallback") or {}).pop(key, None)
             # #3036 : les destinataires écartés par la vivacité, pour que les
             # passes suivantes sachent qu'il reste quelqu'un à remettre.
             dead: dict = {}
@@ -3596,7 +3696,9 @@ class Notifier:
                     alert, listing, titles,
                     module_auditors if kind == "module_deviation" else auditors,
                     orchestrator_names=module_orchestrators,
-                    closed_hosts=closed, dead_out=dead, covered=covered)
+                    observation_names=observers,
+                    closed_hosts=closed, dead_out=dead, covered=covered,
+                    avatar_names=(avatar,) if avatar else (), desk_names=route_names)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 unevaluated.add(key)
@@ -3606,16 +3708,32 @@ class Notifier:
                 # escalade, la passe suivante remet à son retour.
                 briefs.pop(name)
                 dead[name] = "lease returned, grace"
-            if kind == "slo_breach" and "bureau" in (alert.get("targets") or ()) \
-                    and any(
-                        row.get("name") == "bureau" and row.get("mode") == "externe"
-                        for row in listing):
-                # Keep the desk's copy in the readable lot thread, without
-                # growing a mailbox nobody wakes to read. No `home` project
-                # exception (#2640): canon lots are `app=ameesh` (#2511).
-                # #3036 : `setdefault` — un repli a pu y placer le texte du
-                # palier effectivement visé, avec ses absents nommés.
-                briefs.setdefault("thread:bureau", alert_briefs._slo_breach(alert))
+            if kind == "slo_breach":
+                # #7634 : la copie de la route humaine externe va au fil
+                # lisible, sans boîte que personne ne réveille. L'avatar
+                # résolu par le routeur d'abord ; #7749 : quand il est sans
+                # destinataire vivant, la route configurée de l'humain
+                # (`desks`) prend sa place, avec la même copie au fil si elle
+                # est `externe`. Un target qui nomme directement un agent
+                # externe (alertes écrites avant #7634, état repris au
+                # déploiement) garde sa copie au fil, sans nom d'avatar en
+                # dur. Aucune exception `home` (#2640) : les lots du canon
+                # sont `app=ameesh` (#2511).
+                human_targets = alert.get("targets") or ()
+                route = ([str(avatar)] if avatar
+                         else [str(name) for name in route_names])
+                thread_desks = (route if "avatar" in human_targets else [])
+                thread_desks += [str(name) for name in human_targets
+                                 if name not in ("assignee", "pilot",
+                                                 alert_briefs.AUDITOR_ROLES[0], "avatar")]
+                for name in dict.fromkeys(thread_desks):
+                    row = by_name.get(name)
+                    if row is None or row.get("mode") != "externe":
+                        continue
+                    # #3036 : `setdefault` — un repli a pu y placer le texte
+                    # du palier effectivement visé, avec ses absents nommés.
+                    briefs.setdefault("thread:%s" % name,
+                                      alert_briefs._slo_breach(alert, desk=name))
             if kind == "slo_breach":
                 briefs = {n: t for n, t in briefs.items() if n not in covered}
             if not briefs:
@@ -3685,6 +3803,26 @@ class Notifier:
             # #6642 (accepté par mesh-design, #207423) : ne pas l'ajouter pour
             # mesurer — `lot`, `step` et `level` sont dans le payload.
             delivered = []
+            suppressed: set = set()
+            # #7625 : un compte rendu de pause budget ne se répète pas tant que
+            # l'état n'a pas changé. L'identité est celle de la pause (agent,
+            # hôte), et l'empreinte ignore la durée, l'échéance reculée et les
+            # relevés de jauge (le texte, lui, les porte) ; le passage de
+            # l'échéance annoncée, lui, est un changement d'état. Un rappel
+            # repart au plus toutes les `alert_briefs.REMIND_AFTER_S` (6 h).
+            report_label = report_fp = None
+            if kind == "budget_pause_long":
+                report_label = "budget_pause_long:%s:%s" % (
+                    alert.get("agent") or "", alert.get("host") or "")
+                resume_ts = alert.get("resume_ts")
+                try:
+                    passed = resume_ts is not None and float(resume_ts) <= now
+                except (TypeError, ValueError):
+                    passed = False
+                report_fp = json.dumps(
+                    [kind, alert.get("agent"), alert.get("host"), alert.get("harness"),
+                     bool(alert.get("waits_reset")), alert.get("resume_kind"), passed],
+                    sort_keys=True, ensure_ascii=False)
             quiet = alert_briefs.quiet_modes(alert, briefs, by_name)
             for name, text in sorted(briefs.items()):
                 if not self._delivery_open():
@@ -3710,11 +3848,12 @@ class Notifier:
                             if slo_delivery.merge_observed(
                                     self.cfg, db, item, overview=listing):
                                 break
-                    if name == "thread:bureau":
+                    if name.startswith("thread:"):
                         # #3036 : la route humaine — le fil lisible du lot,
-                        # comme la copie du bureau externe (#2602/#2640).
+                        # comme la copie de l'avatar externe (#2602/#2640).
+                        thread_name = name.split(":", 1)[1]
                         if fil.record(self.cfg, db, sender=work.SYSTEM_SENDER,
-                                      recipients=["bureau"], text=text,
+                                      recipients=[thread_name], text=text,
                                       project=alert.get("project"), lot=alert.get("lot"),
                                       meta=meta) is None:
                             continue
@@ -3722,8 +3861,20 @@ class Notifier:
                         if not self._send_module_brief(db, alert, name, text, meta):
                             continue
                     else:
-                        mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
-                                  payload=meta)
+                        message_id = mail.send(
+                            db, work.SYSTEM_SENDER, name, text, kind="event",
+                            payload=meta, report=report_label,
+                            report_fingerprint=report_fp)
+                        if message_id is None:
+                            # #7625 : le même compte rendu est déjà dans sa
+                            # boîte ; le destinataire n'est ni dans `to` ni en
+                            # `pending`, et l'épisode n'est pas rejoué à chaque
+                            # passage.
+                            suppressed.add(name)
+                            self.log("[%s] identical report to %s within %d h: "
+                                     "not sent" % (kind, name,
+                                                   int(mail.REPORT_REMIND_S // 3600)))
+                            continue
                     delivered.append(name)
                     self.log("[%s] %s delivered to %s [%s: %s]" % (
                         kind, "reminder" if meta["reminder"] else "mail", name,
@@ -3740,9 +3891,12 @@ class Notifier:
                     if kind != "slo_breach":
                         # #3036 : l'échec transitoire d'un destinataire reste
                         # à tenter ; il n'est ni dans `to` (réussi) ni dans
-                        # `dead` (écarté).
-                        entry["pending"] = sorted(set(briefs) - set(dead))
-                continue
+                        # `dead` (écarté). #7625 : un compte rendu identique
+                        # supprimé n'est pas une remise en échec — il est déjà
+                        # dans la boîte et ne doit pas faire tourner la passe.
+                        entry["pending"] = sorted(set(briefs) - set(dead) - suppressed)
+                if not suppressed or kind == "slo_breach":
+                    continue
             if kind == "slo_breach":
                 if delivered:
                     sent[key] = {"type": kind, "sent_ts": now,
@@ -3794,11 +3948,11 @@ class Notifier:
                              # suivante et remettre à qui est revenu, et les
                              # remises en échec, distinctes des réussies.
                              "dead": sorted(dead),
-                             "pending": sorted(set(briefs) - set(delivered) - set(dead))}
+                             "pending": sorted(set(briefs) - set(delivered) - set(dead) - suppressed)}
             else:
                 entry["to"] = sorted(set(entry.get("to") or ()) | set(delivered))
                 entry["dead"] = sorted(dead)
-                entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead))
+                entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead) - suppressed)
                 if remind_due:
                     entry["reminded"] = True
                     # #5461 : la garde contre l'oscillation se mesure depuis
@@ -3838,16 +3992,46 @@ class Notifier:
                 return False
             message_id = mail.send(tx, work.SYSTEM_SENDER, name, text, kind="event",
                                    payload=payload, thread=False)
+        if message_id is None:
+            # #7625 : le même compte rendu est déjà dans sa boîte.
+            return True
         fil.record(self.cfg, db, sender=work.SYSTEM_SENDER, recipients=[name], text=text,
                    project=project, mailbox_ids=[message_id], meta={"kind": "event"})
         return True
 
     # -- résolution -----------------------------------------------------------
-    def _resolved(self, key: str, entry: dict, now: float) -> None:
+    def _resolve_avatar(self, entry: dict, now: float, db) -> None:
+        """La résolution suit l'alerte déposée chez l'avatar (#7634)."""
+        avatar = entry.get("avatar")
+        if not avatar:
+            self._record("resolved", entry, "abandonnee", {})
+            return
+        if db is None or self.dry_run:
+            self._record("resolved", entry, "sans_envoi", {})
+            return
+        message = render(entry["alert"], "resolved", now,
+                         raised_ts=entry.get("raised_ts"))
+        try:
+            mail.send(db, work.SYSTEM_SENDER, avatar, message.text, kind="event",
+                      payload={"alert": entry["alert"].get("type"),
+                               "human": entry.get("human"), "avatar": avatar,
+                               "key": entry.get("key")})
+        except Exception as exc:  # noqa: BLE001 — la résolution ne bloque pas
+            self.log("[%s] avatar %s resolution not delivered: %s"
+                     % (entry["alert"].get("type"), avatar,
+                        _clean(_scrub(exc, ()), 160)))
+            self._record("resolved", entry, "abandonnee", {})
+            return
+        self._record("resolved", entry, "avatar", {})
+
+    def _resolved(self, key: str, entry: dict, now: float, db=None) -> None:
         if not self._delivery_open():
             return
         alert, human = entry["alert"], entry.get("human")
         status = entry.get("status")
+        if status == "avatar":
+            self._resolve_avatar(entry, now, db)
+            return
         if alert.get("type") in QUIET_RESOLUTION_TYPES:
             # L124 : l'humain a répondu (ou la demande est retirée) : rien à envoyer
             self._record("resolved", entry, "sans_envoi", {})
@@ -3875,7 +4059,7 @@ class Notifier:
             self._summary_add(bucket, "resolved", entry)
             return
         # #3536 : un repli livré n'est pas une livraison du primaire ; la
-        # résolution ne repart pas sur le pseudo-canal `nexlink→ntfy`.
+        # résolution ne repart pas sur le pseudo-canal `primaire→repli`.
         delivered = [name for name, st in entry["channels"].items()
                      if st.get("ok") and not st.get("fallback_of")]
         if not delivered:
@@ -3906,8 +4090,11 @@ class Notifier:
         return [name for name, st in entry.get("channels", {}).items()
                 if not st.get("ok") and st.get("attempts", 0) < self.ncfg.max_attempts]
 
-    def _retry(self, entry: dict, event: str, now: float) -> None:
+    def _retry(self, entry: dict, event: str, now: float, db=None) -> None:
         if not self._delivery_open():
+            return
+        if event == "raised" and entry.get("status") == "avatar":
+            self._avatar_followup(entry, now, db)
             return
         if entry.get("status") == "envoi" and self._pending(entry):
             self._attempt(entry, event, now)
@@ -3916,13 +4103,13 @@ class Notifier:
         if not self._delivery_open():
             return
         message = render(entry["alert"], event, now, raised_ts=entry.get("raised_ts"))
-        # #3536 : l'identité que porte le canal nexlink — le registre `notified`
-        # (#2395) haché, donc stable d'un redémarrage à l'autre ; l'instant est
-        # figé au premier essai pour que deux essais envoient les mêmes octets.
-        # Un épisode sans `since` (`account_overage`) n'a pas d'identité au
-        # registre : son `raised_ts`, figé dans l'entrée, distingue deux
-        # occurrences successives sans changer l'identité des retries
-        # (relecture cx3 B/P2).
+        # #3536 : l'identité que porte un canal qui en a besoin — le registre
+        # `notified` (#2395) haché, donc stable d'un redémarrage à l'autre ;
+        # l'instant est figé au premier essai pour que deux essais envoient les
+        # mêmes octets. Un épisode sans `since` (`account_overage`) n'a pas
+        # d'identité au registre : son `raised_ts`, figé dans l'entrée,
+        # distingue deux occurrences successives sans changer l'identité des
+        # retries (relecture cx3 B/P2).
         since = _since_of(entry["alert"])
         episode = since if since is not None else round(
             float(entry.get("raised_ts") or now), 3)
@@ -3930,8 +4117,7 @@ class Notifier:
                                     entry.get("human"), episode)
         occurred_at = entry.get("occurred_at") or iso_utc(now)
         entry["occurred_at"] = occurred_at
-        message = replace(message,
-                          alert_id=nexlink_alerts.alert_id_for(identity),
+        message = replace(message, alert_id=alert_id_for(identity),
                           occurred_at=occurred_at)
         results = {}
         fallbacks = {}
@@ -3960,8 +4146,8 @@ class Notifier:
                 " — GIVING UP (%d attempt(s))" % st["attempts"] if last
                 else " — retried on next pass (%d/%d)"
                 % (st["attempts"], self.ncfg.max_attempts)))
-            if channel.kind == "nexlink":
-                self._nexlink_fallback(entry, channel, message, st, error, fallbacks)
+            if channel_fallback(channel):
+                self._channel_fallback(entry, channel, message, st, error, fallbacks)
         # #3536 (relecture cx1 B/P1) : le repli garde son propre compteur et
         # son propre état `pending`. Il part dans le même passage (immédiat sur
         # erreur permanente) et il est retenté même quand le primaire est
@@ -3989,16 +4175,16 @@ class Notifier:
             self._record(event, entry, delivery, results, message,
                          fallback=fallbacks or None)
 
-    def _nexlink_fallback(self, entry: dict, channel: Channel, message: Message,
+    def _channel_fallback(self, entry: dict, channel: Channel, message: Message,
                           st: dict, error: ChannelError, out: dict) -> None:
-        """#3536 : met le repli `ntfy`/`slack` du canal `nexlink` en attente.
+        """#3536 : met le repli déclaré d'un canal de module en attente.
 
         Déclenché au 2e échec consécutif ou tout de suite sur une erreur
         permanente ; une seule fois par alerte (registre `fallback`). Le texte
-        enverra « repli nexlink — » ; le primaire reste retenté, et un repli
-        réussi ne vaut pas livraison côté Nexlink.
+        porte le préfixe que le module déclare ; le primaire reste retenté, et
+        un repli réussi ne vaut pas livraison du primaire.
         """
-        name = channel.options.get("fallback")
+        name = channel_fallback(channel)
         if not name:
             return
         target = self.ncfg.channels.get(str(name))
@@ -4040,8 +4226,10 @@ class Notifier:
             st.update(attempts=self.ncfg.max_attempts,
                       error="fallback channel removed")
             return "failed: fallback channel removed"
+        primary_channel = self.ncfg.channels.get(str(st.get("fallback_of") or ""))
+        prefix = channel_fallback_prefix(primary_channel) if primary_channel else ""
         fallback = replace(message, title="[repli] " + message.title,
-                           body="repli nexlink — " + message.body)
+                           body=prefix + message.body)
         ok, failure = self._send(target, fallback)
         st["attempts"] = st.get("attempts", 0) + 1
         if ok:
@@ -4351,7 +4539,7 @@ class Notifier:
         if not isinstance(episode, str) or not episode:
             episode = uuid.uuid4().hex
             bucket["episode"] = episode
-        alert_id = nexlink_alerts.alert_id_for("summary|%s|%s" % (human, episode))
+        alert_id = alert_id_for("summary|%s|%s" % (human, episode))
         bucket["alert_id"] = alert_id
         return alert_id
 
@@ -4457,11 +4645,11 @@ class Notifier:
                 results[channel.name] = "failed: %s" % error
                 self.log("rate summary → %s, channel %s: %s" % (human, channel.name,
                                                                 error))
-                if channel.kind == "nexlink":
+                if channel_fallback(channel):
                     # #3536 (relecture cx3 B/P1) : un résumé de débit passe par
-                    # le même repli qu'une alerte directe. Sans cela, une API
-                    # nexlink en panne perdait le résumé malgré un repli sain.
-                    self._nexlink_fallback(entry, channel, message, state, error,
+                    # le même repli qu'une alerte directe. Sans cela, un canal
+                    # de module en panne perdait le résumé malgré un repli sain.
+                    self._channel_fallback(entry, channel, message, state, error,
                                            fallbacks)
             for name in [name for name, state in states.items()
                          if state.get("fallback_of")]:
@@ -4811,8 +4999,9 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
         receipt = None
         channel = channels.get(name)
         last = sender.last.get(name) or {}
-        if error is None and channel is not None and channel.kind == "nexlink" \
-                and last.get("alert_id"):
+        provider = channel_provider(channel.kind) if channel is not None else None
+        if error is None and channel is not None and last.get("alert_id") \
+                and callable(getattr(provider, "receipt", None)):
             # #3536 : l'accusé de lecture, une lecture (jamais un sondage) ;
             # son échec ne change pas le résultat de l'envoi.
             try:

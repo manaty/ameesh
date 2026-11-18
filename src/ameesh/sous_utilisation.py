@@ -53,6 +53,7 @@ from . import cost as cost_mod
 from . import db as db_mod
 from . import planned_waits
 from . import storage
+from .roles import CRITICAL_ROLES, DESIGN_ROLES, ORCHESTRATOR_ROLES, ROLE_SYNONYMS
 
 UNDERUSE_TYPES = ("host_idle_reserved", "baseline_oversized", "plan_underused", "idle_capacity", "orchestrator_held", "host_underused",
                   "backlog_empty", "roadmap_exhausted")
@@ -115,17 +116,11 @@ WAITING_LOT_STATES = lifecycle.ACTIVE
 #: humain, autre lot) ; l'agent qui n'a que ceux-là est libre pour un lot
 #: d'équipe et compte dans `idle_capacity`
 LOTS_WAITING_ON_OTHERS = lifecycle.WAITING_ON_OTHERS
-#: mots qui désignent un orchestrateur dans `roles`/`role` d'une fiche Agent
-ORCHESTRATOR_ROLES = ("orchestrateur", "orchestrator")
-#: L165b : rôles de l'agent de conception, prévenu aussi d'`idle_capacity`
-DESIGN_ROLES = ("conception", "design")
-#: L242c : rôles qui rendent un agent critique (jamais en pause budget tant
-#: qu'un compte a de la marge), par défaut ; une organisation les règle par
-#: `critical_roles` dans son federation.yaml (manaty/home#25)
-CRITICAL_ROLES = ("orchestrateur", "conception", "auditeur", "relecture")
-#: L242c : les autres noms reconnus d'un rôle dans `roles`/`role` d'une fiche
-ROLE_SYNONYMS = {"orchestrateur": ("orchestrator",), "conception": ("design",),
-                 "auditeur": ("auditor",), "relecture": ("review", "reviewer")}
+#: Les rôles, leurs synonymes et les rôles critiques sont le vocabulaire de
+#: `roles.py` (#7792) : les lecteurs l'importent, ils ne le recopient pas.
+#: L165b : `DESIGN_ROLES` prévient aussi l'agent de conception d'`idle_capacity`.
+#: L242c : `CRITICAL_ROLES` est le défaut ; une organisation le règle par
+#: `critical_roles` dans son federation.yaml (manaty/home#25).
 _ROLE_OF = {alias: role for role, aliases in ROLE_SYNONYMS.items() for alias in aliases}
 #: L242c (#424 r2) : constats de chargement qui laissent un canon lu en partie
 #: (fiche ou manifeste illisible) — ses rôles ne sont alors pas connus
@@ -568,17 +563,44 @@ def _bare(name: str) -> str:
     return name[len("agent:"):] if name.startswith("agent:") else name
 
 
+def role_holders(canons, roles=None) -> list:
+    """Les agents dont la fiche Agent du canon nomme l'un des `roles` (ou
+    `role`), dans l'ordre du canon (L242c : un rôle se lit sur la fiche, jamais
+    sur le nom de l'agent ; synonymes ramenés au rôle).
+
+    Ordre stable, sans doublon : le premier porteur est le choix déterministe
+    des passes qui n'en admettent qu'un (`role_timers`), et `role_orchestrators`
+    rend le même ensemble. Un canon absent ou illisible ne rend aucun porteur,
+    jamais un nom deviné."""
+    wanted = {_canonical(r) for r in (roles or ORCHESTRATOR_ROLES)}
+    found: list = []
+    for canon in canons or []:
+        for agent in getattr(canon, "agents", None) or []:
+            title = getattr(agent, "title", None)
+            if title and title not in found and wanted & set(_card_roles(agent)):
+                found.append(title)
+    return found
+
+
 def role_orchestrators(canons, roles=None) -> set:
     """Les agents dont la fiche Agent du canon nomme un rôle d'orchestrateur
     (`roles` ou `role` : `orchestrateur`, `orchestrator`), ou l'un des
     `roles` donnés (synonymes dans les deux sens, L242c)."""
-    wanted = {_canonical(r) for r in (roles or ORCHESTRATOR_ROLES)}
-    found = set()
-    for canon in canons or []:
-        for agent in getattr(canon, "agents", None) or []:
-            if wanted & set(_card_roles(agent)):
-                found.add(agent.title)
-    return found
+    return set(role_holders(canons, roles))
+
+
+def declared_holders(canons, listing, roles) -> list:
+    """Les porteurs déclarés d'un rôle, lus là où la déclaration est visible.
+
+    Canon chargé : la fiche Agent fait foi (`role_holders`). Sans canon — un
+    lecteur qui ne lit pas de dépôt (minuterie, #3327 B/P1) ou un canon
+    illisible — la projection `roles` du registre, copiée de la carte par
+    `canon sync`, est la seule déclaration ; rien n'est deviné depuis un nom.
+    Liste triée, sans doublon."""
+    if canons:
+        return sorted(set(role_holders(canons, roles)))
+    return sorted({row.get("name") for row in listing or []
+                   if row.get("name") and row_has_role(row, roles)})
 
 
 def _canonical(role) -> str:
@@ -606,6 +628,34 @@ def _card_roles(agent) -> list:
         single = data.get("role")
         named = [single] if isinstance(single, str) else []
     return [role for role in (_canonical(r) for r in named) if role]
+
+
+def row_roles(row) -> list:
+    """Les rôles déclarés par la fiche d'un agent, lus sur sa ligne du registre
+    (`roles`, sinon `role`) — la projection que `canon sync` copie de la carte.
+
+    Sert aux lecteurs qui n'ont pas chargé le canon (une minuterie de rôle ne
+    lit pas un dépôt, #3327 B/P1). Même contrat que `_card_roles` : une valeur
+    illisible ne donne aucun rôle, jamais un rôle supposé."""
+    named = (row or {}).get("roles")
+    if isinstance(named, str):
+        named = [named]
+    elif isinstance(named, (list, tuple)) \
+            and all(isinstance(role, str) for role in named):
+        # même contrat que `_card_roles` : `roles: []` ne masque pas `role:`
+        named = list(named) or None
+    else:
+        named = None
+    if named is None:
+        single = (row or {}).get("role")
+        named = [single] if isinstance(single, str) else []
+    return [role for role in (_canonical(r) for r in named) if role]
+
+
+def row_has_role(row, roles) -> bool:
+    """La fiche de `row` (lue au registre) nomme-t-elle l'un des `roles` ?"""
+    wanted = {_canonical(role) for role in roles}
+    return bool(wanted & set(row_roles(row)))
 
 
 def roles_declared(canons) -> bool:
@@ -847,22 +897,18 @@ def remember_critical(cfg, name: str, verdict: bool) -> bool:
 
 def critical_by_role(row, canons) -> bool | None:
     """L242c : l'agent du registre `row` porte-t-il un rôle critique de son
-    organisation, dans la fiche de son canon propriétaire ? La persona
-    `auditeur` l'est sans fiche tant que le rôle auditeur est critique.
+    organisation, dans la fiche de son canon propriétaire ? Le rôle se lit sur
+    la fiche (`roles:`), jamais sur le nom de la persona : un agent qui
+    s'appelle `auditeur` sans ce rôle n'est pas critique, et un auditeur
+    renommé qui le déclare l'est.
     None (#424 r1) : son canon propriétaire n'est pas chargé ou illisible —
     inconnu, jamais « non » (`critical_verdict`) ; de même s'il n'a été lu
     qu'en partie (#424 r2, `fully_read`)."""
-    from .alert_briefs import AUDITOR_NAME
     owners = _owners(row, canons)
     if not owners or not all(fully_read(c) for c in owners):
         return None
-    for canon in owners:
-        roles = critical_roles(canon)
-        if row.get("name") == AUDITOR_NAME and "auditeur" in roles:
-            return True
-        if card_role(row, [canon], roles):
-            return True
-    return False
+    return any(card_role(row, [canon], critical_roles(canon))
+               for canon in owners)
 
 
 #: #424 r7 : les agents d'un canon étranger déjà signalés par ce processus
@@ -897,14 +943,15 @@ def warn_foreign(name: str) -> bool:
 
 def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
     """L242c : (critique ?, inconnu ?) pour l'agent `row`. Sans canon sur
-    l'hôte : la persona auditeur seule (rôles par défaut). Canon propriétaire
-    illisible (#424 r1) : le dernier verdict lu (`known`, `remembered`) ;
-    sinon — perdu, invalide, jamais lu (#424 r6) — critique (fail-safe).
-    Jamais une baisse silencieuse ; la surcharge `critical_agents` se juge
-    avant."""
-    from .alert_briefs import AUDITOR_NAME
+    l'hôte, la projection `roles` du registre — copiée de la carte par
+    `canon sync` — est la déclaration disponible (#7661) : une ligne sans rôle
+    n'est pas critique (connu), le titre de la persona ne compte pas, et la
+    surcharge `critical_agents` se juge avant. Canon propriétaire illisible
+    (#424 r1) : le dernier verdict lu (`known`, `remembered`) ; sinon — perdu,
+    invalide, jamais lu (#424 r6) — critique (fail-safe). Jamais une baisse
+    silencieuse."""
     if not configured and not canons:
-        return row.get("name") == AUDITOR_NAME, False
+        return row_has_role(row, CRITICAL_ROLES), False
     verdict = critical_by_role(row, canons)
     if verdict is not None:
         return verdict, False
@@ -916,8 +963,7 @@ def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
 def critical_candidates(canons) -> set:
     """Les noms qui PEUVENT être critiques par leur rôle (toute fiche, tout
     canon) : un nom hors de cet ensemble évite la lecture du registre."""
-    from .alert_briefs import AUDITOR_NAME
-    found = {AUDITOR_NAME}
+    found: set = set()
     for canon in canons or []:
         roles = critical_roles(canon)
         if roles:
@@ -1209,13 +1255,27 @@ def footprint_blockers(db, waiting_lots: list, lots: list, *,
     for row in store.work_footprints.for_items(
             [int(lot["id"]) for lot in lots]):
         paths.setdefault(int(row["work_item_id"]), []).append(str(row["path"]))
+    # #7760 : les dépendances déclarées sur un lot validé permettent de
+    # démarrer sur sa tête gelée ; le prérequis ne retient plus le démarrage.
+    # Une lecture en panne ne devine pas d'exception : les bloquants restent.
+    declared: dict = {}
+    try:
+        edges = getattr(store, "work_dependencies", None)
+        if edges is not None:
+            for edge in edges.for_items([int(lot["id"]) for lot in waiting_lots]):
+                if (edge or {}).get("start_on"):
+                    declared.setdefault(int(edge["work_item_id"]), set()).add(
+                        int(edge["blocker_id"]))
+    except Exception:  # noqa: BLE001 — lecture en panne : garde inchangée
+        declared = {}
     # #4818 : chemins partagés et plafond de lots en vol de chaque dépôt
     from . import work_footprints
     policies = work_footprints.policies_of(
         db, {str(lot.get("app") or "") for lot in waiting_lots})
     out: dict = {}
     for lot in waiting_lots:
-        blockers = slo.footprint_blockers(lot, lots, paths, policies)
+        blockers = slo.footprint_blockers(
+            lot, lots, paths, policies, declared.get(int(lot["id"]), ()))
         if blockers:
             out[int(lot["id"])] = blockers
     return out
@@ -1353,7 +1413,18 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     # #1608 : la liste garde les lots retenus par une attente et les classe
     # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
     # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).
+    # #7622 : même verdict que le débit et le sommeil, sur les notes du
+    # lot de découpage ouvert. Son intake épuisé n'est pas du travail à confier.
+    from . import debit, projects as projects_mod
+    roadmap_notes = []
+    for lot in lots:
+        if debit._decoupage_project(lot):
+            roadmap_notes.extend(dict(note, work_item_id=int(lot["id"]))
+                                 for note in file_decoupage.roadmap_notes(db, lot["id"]))
+    exhausted = debit._roadmap_verdicts(roadmap_notes, lots)
+    exhausted_splits = {entry["lot"] for entry in exhausted.values()}
     waiting_lots = waiting_project_lots(lots)
+    waiting_lots = [lot for lot in waiting_lots if int(lot["id"]) not in exhausted_splits]
     # #3447 : les lots réservés à un exécutant externe ne sont pas « sans
     # assigné » ; ils sont nommés à part, avec leur exécutant.
     reserved_lots = external_project_lots(lots)
@@ -1376,6 +1447,10 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                           if paid and row.get("harness") in paid
                           and _state(row) == "working" and not _attached(row))
     plan_idle = [row for row in idle if paid is not None and row.get("harness") not in paid]
+    plan_idle = [row for row in plan_idle
+                 if not projects_mod.agent_projects(row)
+                 or any(project not in exhausted
+                        for project in projects_mod.agent_projects(row))]
     aggravating = bool(paid_working and plan_idle)
     # #2337 : la levée se lit sur les lots DÉMARRABLES — un lot qu'une
     # dépendance ou une date retient n'est pas du travail à confier, et

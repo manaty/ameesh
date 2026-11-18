@@ -661,9 +661,15 @@ def run(db, args):
         if changed is not None:
             print("lot #%d: dependency %s" % (args.id, "updated" if changed else "unchanged"))
         for edge in edges:
+            if edge["blocking"] and edge.get("start_on"):
+                # #7760 : démarrage permis sur la tête gelée validée, fusion
+                # toujours retenue (le composeur prend les deux ensemble).
+                label = "starts on, frozen %s (merge still waits)" % (
+                    (edge.get("blocker_frozen_sha") or "?")[:12])
+            else:
+                label = "blocking" if edge["blocking"] else "satisfied"
             print("#%d depends on #%d (%s, %s)" % (
-                args.id, edge["blocker_id"], edge["blocker_state"],
-                "blocking" if edge["blocking"] else "satisfied"))
+                args.id, edge["blocker_id"], edge["blocker_state"], label))
         if not edges:
             print("lot #%d: no explicit prerequisites" % args.id)
     return 0

@@ -278,6 +278,56 @@ def list_actions(db: Db, *, state: str | None = None, project: str | None = None
     return storage.of(db).actions.recent(state=state, project=project, limit=limit)
 
 
+#: #7629 : issues de la charte, dans l'ordre du récap.
+RECAP_ISSUES = ("fait_seul", "soumis", "refuse", "autre")
+
+
+def recap(db: Db, *, avatar: str, since: float, until: float,
+          project: str | None = None) -> dict:
+    """Actions d'un avatar dans une période, rangées par issue de la charte.
+
+    * `fait_seul` : couverte par une approbation permanente (`auth_kind =
+      standing`) — c'est l'approbation qui a autorisé le geste ;
+    * `soumis` : approuvée par un reçu humain, ou encore en attente d'un reçu
+      (`proposed` d'une classe gardée) : « prépare et soumet » ;
+    * `refuse` : une décision `deny` a annulé l'action (événement `cancelled`
+      avec la note du refus) ;
+    * `autre` : ni couverte ni soumise (classe libre, action annulée à la
+      main…) : le récap ne lui invente pas d'issue de charte.
+
+    `avatar` est `agent:<nom>` ou le nom seul ; la fenêtre est
+    `[since, until)` sur l'heure de PROPOSITION.
+    """
+    if not isinstance(avatar, str) or not avatar.strip():
+        raise ActionError(INVALID, "avatar: agent name expected")
+    name = avatar.strip()
+    if not name.startswith("agent:"):
+        name = "agent:%s" % name
+    if not _MEMBER_RE.fullmatch(name) or not name.startswith("agent:"):
+        raise ActionError(INVALID, "avatar: agent:<name> expected, not %r" % (avatar,))
+    try:
+        since, until = float(since), float(until)
+    except (TypeError, ValueError) as exc:
+        raise ActionError(INVALID, "since/until: epoch seconds expected") from exc
+    if until <= since:
+        raise ActionError(INVALID, "until must be after since")
+    rows = storage.of(db).actions.recap(name, since, until, project)
+    issues: dict[str, list[dict]] = {issue: [] for issue in RECAP_ISSUES}
+    for row in rows:
+        if row.get("refused"):
+            issue = "refuse"
+        elif row.get("auth_kind") == "standing":
+            issue = "fait_seul"
+        elif row.get("auth_kind") == "receipt" or (
+                row.get("state") == "proposed" and row.get("requires_receipt")):
+            issue = "soumis"
+        else:
+            issue = "autre"
+        issues[issue].append(row)
+    return {"avatar": name, "since": since, "until": until, "project": project,
+            "issues": issues, "counts": {issue: len(rows) for issue, rows in issues.items()}}
+
+
 def attempts(db: Db, action_id: str) -> list[dict]:
     return storage.of(db).actions.attempts(action_id)
 
@@ -570,7 +620,11 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
     if not isinstance(policy_version, str) or not 1 <= len(policy_version) <= 128:
         raise ActionError(INVALID, "policy_version: text of 1 to 128 characters")
 
-    default = connector.classify(operation, args)
+    from . import module_actions
+    module_class = module_actions.policy_class(db, connector, project, operation)
+    if module_class is not None:
+        canon_class = module_class
+    default = canon_class if canon_class is not None else connector.classify(operation, args)
     if default not in ACTION_CLASSES:
         raise ActionError(CLASS, "connector %s: unknown class %r" % (connector.name, default))
     if canon_class is not None:
@@ -618,16 +672,22 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
 # autorisation : reçu, grant, ou rien (classes non gardées)
 # --------------------------------------------------------------------------
 
-def _covering_grant(db: Db, action: dict) -> int | None:
+def _covering_grant(db: Db, action: dict) -> dict | None:
     """Un grant qui couvre l'action (lecture seule, sans verrou : simple
     pré-filtre ; la réservation se fait au lancement, atomiquement, et y
     recontrôle tout sous verrou). Une réservation vivante de l'action passe en
-    premier."""
+    premier.
+
+    #7629 : le bénéficiaire (`proposed_by`) et la cible font partie du
+    pré-filtre ; un grant d'une autre personne ou hors cible n'est jamais
+    proposé."""
     amount = int(action.get("amount") or 0)
     # L44 (0031) : seuls les grants d'un authentificateur du canon de l'action
     rows = storage.of(db).actions.covering_grants(
         action["action_id"], amount, action["connector"], action["operation"],
-        action["class"], action.get("currency"), canon=canon_of(action))
+        action["class"], action.get("currency"), canon=canon_of(action),
+        proposed_by=action.get("proposed_by") or "",
+        target=action.get("target") or "")
     allowed = action.get("approvers") or []
     usable = []
     for row in rows:
@@ -636,11 +696,11 @@ def _covering_grant(db: Db, action: dict) -> int | None:
         usable.append(row)
     for row in usable:
         if row.get("live"):
-            return int(row["id"])
+            return receipts.get_standing(db, int(row["id"]))
     for row in usable:
         grant = receipts.get_standing(db, int(row["id"]))
         if grant and int(grant["consumed_amount"]) + amount <= int(grant["max_amount"]):
-            return int(row["id"])
+            return grant
     return None
 
 
@@ -684,14 +744,28 @@ def _authorize(db: Db, action: dict, receipt, *, standing: bool, policy, now,
         grant = _covering_grant(db, action)
         if grant is None:
             raise ActionError(NO_COVER, "no standing approval covers %s (%s %s, "
-                              "class %s, amount %s)" % (
+                              "class %s, amount %s, proposed by %s, target %s)" % (
                                   action["action_id"], action["connector"], action["operation"],
-                                  action["class"], action.get("amount")))
+                                  action["class"], action.get("amount"),
+                                  action.get("proposed_by") or "?",
+                                  action.get("target") or "—"))
+        beneficiary = grant.get("beneficiary") or "no named beneficiary"
+        if grant.get("beneficiary_kind") == "avatar":
+            beneficiary += " (avatar, clones included)"
+        charter = ""
+        if grant.get("charter_line") or grant.get("charter_version"):
+            charter = "; charter %s%s" % (
+                _one(grant.get("charter_line") or "?", 120),
+                " (%s)" % _one(grant["charter_version"], 40)
+                if grant.get("charter_version") else "")
         return "approve", {
-            "auth_kind": "standing", "auth_receipt": None, "auth_approver": None,
+            "auth_kind": "standing", "auth_receipt": None,
+            "auth_approver": grant.get("approver"),
             "auth_nonce": None, "auth_challenge": None, "auth_authenticator_id": None,
-            "auth_expires": None, "auth_grant_id": grant,
-            "note": "covered by grant #%d (reserved at launch)" % grant,
+            "auth_expires": None, "auth_grant_id": int(grant["id"]),
+            "policy_version": grant.get("charter_version") or None,
+            "note": "covered by grant #%d from %s for %s%s (reserved at launch)" % (
+                int(grant["id"]), grant.get("approver") or "?", beneficiary, charter),
         }
     if not action["requires_receipt"]:
         return "approve", {
@@ -705,8 +779,20 @@ def _authorize(db: Db, action: dict, receipt, *, standing: bool, policy, now,
 
 
 def _bind(db: Db, action: dict, auth: dict, *, from_states: tuple, by: str) -> dict:
+    expected = digest(action)
+    # #7629 : une couverture permanente recopie la version de charte du grant
+    # dans `policy_version` ; l'empreinte est recalculée dans la même écriture
+    # (la garde SQL n'ouvre ce changement que sur une liaison `standing`).
+    version = auth.get("policy_version")
+    new_digest = None
+    if version and version != (action.get("policy_version") or ""):
+        updated = dict(action)
+        updated["policy_version"] = version
+        new_digest = digest(updated)
     bound = storage.of(db).actions.bind(action["action_id"], from_states=from_states,
-                                        digest=digest(action), auth=auth, by=by)
+                                        digest=expected, auth=auth, by=by,
+                                        policy_version=version if new_digest else None,
+                                        new_digest=new_digest)
     if not bound:
         current = _require(db, action["action_id"])
         raise ActionError(STATE, "action %s changed in the meantime (state %s)"
@@ -728,6 +814,8 @@ def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, pol
     (`standing=True`), ou rien pour une classe non gardée.
     """
     action = _require(db, action_id)
+    from . import module_actions
+    module_actions.check_action(db, action)
     if action["state"] not in ("proposed", "approved"):
         hint = {"failed": ": use retry (new receipt, same action)",
                 "unknown": ": unknown outcome, see reconcile / retry / replace"}
@@ -931,6 +1019,8 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
     policy = policy if policy is not None else policy_from_env()
     recover(db, action_id=action_id)
     action = _require(db, action_id, with_receipts=True)
+    from . import module_actions
+    module_actions.check_action(db, action, connector)
     if action["connector"] != connector.name:
         raise ActionError(CONNECTOR, "action %s: connector %s, not %s"
                           % (action_id, action["connector"], connector.name))
@@ -1044,9 +1134,13 @@ def reconcile(db: Db, action_id: str, connector, *, by: str = "", force: bool = 
 
     Trouvée → `confirmed` ou `failed` (une réservation de grant est libérée
     sur `failed`). Introuvable → l'action reste `unknown` : décision humaine.
+    La politique du module n'est pas exigée : une issue déjà survenue se
+    constate même après désactivation, seul le fournisseur est recontrôlé.
     """
     connectors_mod.check(connector)
     action = _require(db, action_id)
+    from . import module_actions
+    module_actions.check_reconcile(action, connector)
     if action["connector"] != connector.name:
         raise ActionError(CONNECTOR, "action %s: connector %s, not %s"
                           % (action_id, action["connector"], connector.name))

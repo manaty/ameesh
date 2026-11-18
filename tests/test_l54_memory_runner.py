@@ -89,6 +89,16 @@ class MemoryRunnerTest(PgTestCase):
                 mock.patch.object(pm, "sync") as sync:
             self._turn()
         sync.assert_not_called()
+        # #7682 : l'échec n'est plus silencieux — l'agent le lit dans son tour
+        # et le défaut d'hôte est publié (fil + journal d'événements).
+        self.assertIn("PERSONA MEMORY UNAVAILABLE for this turn: offline",
+                      " ".join(self.turns()[0]["argv"]))
+        event = self.db.query("SELECT data FROM ameesh_events "
+                              "WHERE type = 'host.memory_unavailable' "
+                              "AND data->>'agent' = 'memory-a' "
+                              "AND data->>'cause' = 'unknown'")
+        self.assertEqual(1, len(event))
+        self.assertEqual("memory-a", event[0]["data"]["agent"])
 
     def test_active_consolidation_preserves_uncommitted_and_rejected_journals(self):
         path = pm.open_copy(self.bare, self.cfg.state_dir, "memory-a")
@@ -129,7 +139,11 @@ class MemoryRunnerTest(PgTestCase):
             self._turn()
         opened.assert_not_called()
         sync.assert_not_called()
-        self.assertNotIn("PERSONA MEMORY", " ".join(self.turns()[0]["argv"]))
+        # #7682 : pas de désignation, mais l'agent lit pourquoi sa mémoire
+        # manque ; le préfixe de désignation « PERSONA MEMORY ( » reste absent.
+        prompt = " ".join(self.turns()[0]["argv"])
+        self.assertNotIn("PERSONA MEMORY (", prompt)
+        self.assertIn("MEMORY UNAVAILABLE", prompt)
 
     def test_guard_refuses_active_peer_and_accepts_policy_exception(self):
         registry.upsert(self.db, "memory-b", harness="codex", host=self.cfg.host, mode="execute")

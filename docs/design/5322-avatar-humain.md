@@ -20,6 +20,7 @@ sources:
   - { resource: "decisions/0028-ressources-des-hotes-et-repartition.md", title: "Placement dynamique entre hôtes admis" }
   - { resource: "decisions/0035-agent-resident.md", title: "Agent résident, conversation, attach d'exception" }
   - { resource: "decisions/0006-lisibilite-humaine.md", title: "Tous les échanges sont lisibles et auditables" }
+  - { resource: "avatars-charte-porte.md", title: "Avatars, charte et porte d'actions : spec owner du 17/11 et contrat de mode (Q4)" }
 ---
 
 # Avatar d'humain : conception commune (#5322, #5323, #5324, #5325)
@@ -74,9 +75,11 @@ quatre lots porteurs existants (#7032 à #7035) attendent cette note.
    sont deux lots d'infrastructure, pas des finitions.
 6. **Décisions owner** : rétention de la conversation d'un avatar ; comptes
    personnels ou clés d'organisation sur un hôte partagé ; qui peut autoriser
-   un attach distant et l'exposition du relais ; pouvoirs de l'avatar ;
-   unicité de l'avatar par humain ; coût et placement des enfants ; rétention
-   du cache natif de la source après un déplacement. Voir §6.
+   un attach distant et l'exposition du relais ; unicité de l'avatar par
+   humain ; coût et placement des enfants ; rétention du cache natif de la
+   source après un déplacement. Les pouvoirs de l'avatar (Q4) sont tranchés
+   le 17/11/2026 : porte d'actions, contrôle par le code à TPK, journal à
+   Manaty (`avatars-charte-porte.md`). Voir §7.
 
 ## 1. Ce qui existe déjà, et ce qui manque
 
@@ -94,9 +97,11 @@ quatre lots porteurs existants (#7032 à #7035) attendent cette note.
 ### 1.1 La carte d'avatar
 
 L'avatar est une **persona** au sens de 0029 §4 (le jumeau numérique d'un
-humain), pas un nouveau type d'autorité. Il ne reçoit aucun droit nouveau :
-il ne signe pas, n'approuve pas et ne dépense pas à la place de son humain
-(0012) ; ses capacités restent celles de sa carte. La proposition est un bloc
+humain), pas un nouveau type d'autorité. Il agit au nom de son humain par la
+porte d'actions, dans sa charte (Q4, tranchée le 17/11/2026) : à TPK le code
+refuse ce que la charte ne couvre pas, à Manaty la porte journalise les
+quatre gestes réservés ; il ne reçoit aucun droit propre (0012, 0006). Ses
+capacités restent celles de sa carte. La proposition est un bloc
 `avatar` **données seulement**, plus deux propriétés déjà connues :
 
 ```yaml
@@ -105,6 +110,7 @@ title: alice-avatar
 responsible: human:alice
 team: alice
 releve: preference          # classement par l'ordre de la fiche Placement
+reveil: {}                  # #7632 : humain, urgent, demandes tout de suite ; le reste par 30 min
 avatar:
   conversation: portable   # local (défaut) | portable
   children: own-host       # own-host (défaut) | pod | none
@@ -119,7 +125,7 @@ avatar:
   **ordonnés** (sinon avertissement `avatar-no-fallback` : l'avatar reste
   plaçable, mais sans repli cloud).
 - `canon check` refuse (`avatar-duplicate`) deux avatars du même
-  `responsible` dans le même canon, sauf décision owner contraire (§6 Q5).
+  `responsible` dans le même canon, sauf décision owner contraire (§7 Q5).
 - `canon check` refuse (`avatar-harness-unsupported`) un avatar dont le
   harnais n'a pas de **mode interactif** et de **mode résident** : l'avatar
   doit pouvoir être attaché et rester piloté par l'exécuteur. À ce jour,
@@ -242,11 +248,14 @@ Règles de construction :
 - sélection **par tours entiers**, du plus récent au plus ancien, jusqu'à un
   budget de 24 Ko UTF-8 (paramètre compilé, jamais une variable cachée) ;
   jamais un demi-tour ; si un tour dépasse le budget, on garde sa question
-  humaine et sa réponse finale, et on marque `truncated_before_seq` ;
-- seuls `human_message`, `text` et `turn_end` portent du texte ; les `tool`
-  sont rendus en une ligne compacte (`outil test: terminé`, sans argument ni
-  sortie) ; `input` de mail n'est inclus que s'il est nécessaire à la
-  compréhension et jamais avec un secret ;
+  (humaine ou courrier d'agents) et sa réponse finale, et on marque
+  `truncated_before_seq` ;
+- les entrées porteuses de texte sont `human_message`, `text` et `turn_end`,
+  plus un `input` de courrier réduit aux messages d'agents qu'il a remis (id,
+  expéditeur, date, corps), sans le texte d'habillage du runner et sans les
+  messages humains déjà journalisés en `human_message` ; les `tool` sont
+  rendus en une ligne compacte (`outil test: terminé`, sans argument ni
+  sortie) ; jamais de secret ;
 - aucun texte du segment n'est réinséré dans `conversation_log` : l'entrée de
   déplacement est un `state` avec `meta={action: "move", move_id, from_seq,
   to_seq, digest}` ; le segment n'est pas un nouveau message humain ;
@@ -270,12 +279,16 @@ avant A2. Précisions du contrat :
   gardé, ses textes tronqués (`truncated: true`) si même sa forme réduite
   dépasse ;
 - la lecture est une fenêtre des 500 dernières entrées ; si elle commence au
-  milieu d'un tour (tour de plus de 500 entrées), ses messages humains sont
-  relus à rebours jusqu'au `turn_end` précédent et ce tour n'est gardé que
-  réduit ; le fil n'est alors pas consulté ;
-- les entrées `input` et `state` ne sont jamais incluses (le courrier est
-  relu par le tour lui-même) ; un `tool` ne garde que `meta.{tool, status}`,
-  nom filtré par `safe_tool_name` ;
+  milieu d'un tour (tour de plus de 500 entrées), ses messages humains et son
+  `input` de courrier sont relus à rebours jusqu'au `turn_end` précédent et ce
+  tour n'est gardé que réduit ; le fil n'est alors pas consulté ;
+- un `input` n'est inclus que réduit aux messages d'agents qu'il a remis
+  (en-tête expéditeur/id/date conservé, corps sans les `>` de citation), jamais
+  le prompt du runner ni un message humain déjà journalisé ; les entrées
+  `state` ne sont jamais incluses ; un `tool` ne garde que
+  `meta.{tool, status}`, nom filtré par `safe_tool_name`.  Le courrier
+  d'agents n'existe que dans le détail `input`, jamais dans le fil R12 : il
+  n'est donc recouvré que tant que cette ligne de détail est retenue ;
 - repli sur le fil : quand le détail retenu ne commence pas à la séquence 1,
   les copies R12 (`meta.conversation.{agent, seq}`) antérieures à la première
   entrée retenue fournissent les messages humains et les réponses finales
@@ -320,7 +333,7 @@ Points de sûreté :
   n'a pas de conversation à préserver.
 - **Source gardée** : le fichier de session natif de la source n'est ni copié
   ni supprimé avant `verified` ; il est marqué `stale-cache` ensuite et purgé
-  selon la rétention décidée (§6 Q7). Aucun fichier d'identifiants ne quitte
+  selon la rétention décidée (§7 Q7). Aucun fichier d'identifiants ne quitte
   l'hôte : le segment ne contient que du texte, et la cible utilise **son**
   compte local.
 - **Pas de reprise de la session native à travers l'hôte** : la cible ouvre
@@ -425,7 +438,7 @@ référence).
   l'epoch ne recule pas.
 - Rétention : un segment construit après 90 jours de détail mais avec un fil
   encore vivant utilise le fil pour les messages humains et les réponses
-  finales ; le test le vérifie (ou la rétention est prolongée, §6 Q1).
+  finales ; le test le vérifie (ou la rétention est prolongée, §7 Q1).
 
 ## 3. #5323 — placement à préférence et hôte partagé
 
@@ -544,6 +557,17 @@ Aucun `election_brief` n'est construit tant qu'un déplacement porte la
 conversation ; une bascule que personne ne réclame (cible et source
 disparues) est périmée après `HANDOVER_TTL_S` (300 s) pour qu'un nouveau plan
 aboutisse. Le bail et l'epoch restent les seuls arbitres.
+
+**Correction #7680.** Un agent `preference` ne traverse **jamais** un hôte par
+un `election_brief`, même sans déplacement ouvert : l'hôte qui le prend
+planifie le déplacement de reprise (le segment est bâti depuis le journal au
+premier tour cible) et ne réclame qu'une fois la ligne basculée. Le claim de
+la base refuse d'ailleurs toute réclamation `preference` dont la ligne est
+encore sur un autre hôte, avec ou sans brief. Enfin, une bascule
+abandonnée n'est refermée par sa source que si cette source peut servir un
+tour : sous une pression d'hôte qui retient ses tours, la réclamation est
+différée et la tentative reste ouverte à sa cible (la source la referme à la
+fin de la pression).
 
 ### 3.3 Ce qui n'est pas `election`
 
@@ -753,7 +777,7 @@ Un canal asynchrone, idempotent, borné, sans autorité :
   copie `input` avec l'auteur humain et `meta={child, copied_from: <seq>}`.
   La copie ne porte aucune autorité ; elle est bornée et idempotente. Elle
   n'est faite que si le parent et l'enfant ont le même `responsible` (ou un
-  humain explicitement autorisé, §6 Q3) : on ne recopie pas la conversation
+  humain explicitement autorisé, §7 Q3) : on ne recopie pas la conversation
   privée d'un humain vers l'avatar d'un autre.
 - **Question** : une question est un rapport ; le parent répond par courrier
   à l'enfant. Aucun RPC bloquant : l'enfant peut finir son tour et attendre
@@ -823,7 +847,7 @@ harnais.
   vérifié par le relais et par l'hôte de l'agent. Un grant absent, expiré,
   rejoué ou pour un autre agent est refusé ; tout refus est journalisé.
 - **Exposition** : le relais est un service public (ou exposé à l'extérieur
-  du mesh) ; c'est une nouvelle surface. Décision owner (§6 Q3) :
+  du mesh) ; c'est une nouvelle surface. Décision owner (§7 Q3) :
   l'exposer, avec TLS, quota, journaux sans contenu, ou le réserver au réseau
   du mesh. Le service ne stocke ni credential ni session ; il route des
   trames.
@@ -978,10 +1002,17 @@ droits. Recommandation entre parenthèses.
    `responsible` + liste explicite du canon, deputy sous sa propre identité ;
    `ameesh-approve`/WebAuthn, grant de 5 min à usage unique lié à
    l'appareil ; relais réservé au réseau du mesh (voir §5.2).
-4. **Q4 — Pouvoirs de l'avatar.** L'avatar parle, propose et exécute ses
-   tâches, mais ne signe pas et n'engage pas son humain (recommandé, 0012 et
-   0029 §4) ; ou l'owner veut qu'il réponde en son nom sur certains sujets,
-   ce qui demande une décision séparée et une preuve d'autorité.
+4. **Q4 — Pouvoirs de l'avatar (tranché le 17/11/2026).** L'avatar agit au
+   nom de son humain par la porte d'actions, dans sa charte (décisions 6 à 8
+   de la spec du 17/11). À TPK, le code refuse ce que la charte ne couvre pas
+   (`extensions.ameesh.action_gate.mode: enforce`) ; à Manaty, la porte
+   journalise les quatre gestes réservés — production, dépense, publication
+   store ou publique, signature de décision — et l'owner garde sa clé
+   fichier (`mode: journal`). Le « go » de l'owner dans la session est la
+   référence du reçu signé pour lui ; la preuve distingue la signature de
+   l'owner de celle de son avatar. Un avatar ne reçoit aucun droit propre :
+   il propose, et la porte vérifie ou journalise l'autorisation. Voir
+   `avatars-charte-porte.md` §3.4 et §3.7.
 5. **Q5 — Un avatar par humain ?** Un seul avatar par `responsible` et par
    canon (recommandé : le ticket parle d'« un agent permanent » ; cela
    simplifie l'unicité du bail et des comptes) ; ou plusieurs (par projet,
@@ -1029,9 +1060,10 @@ droits. Recommandation entre parenthèses.
 
 - **Aucune action de production** dans ce lot : pas de déploiement, pas
   d'hôte partagé réel, pas de migration, pas de secret copié.
-- **Aucun nouveau pouvoir** : l'avatar n'approuve pas, ne signe pas, ne
-  dépense pas ; une entrée humaine reste du contexte, jamais de l'autorité
-  (0012, 0006).
+- **Aucun nouveau type d'autorité** : l'avatar agit au nom de son humain par
+  la porte d'actions, dans sa charte (Q4) ; il ne reçoit aucun droit propre,
+  et une entrée humaine reste du contexte, jamais de l'autorité par
+  elle-même (0012, 0006).
 - **Pas de transfert de transcript natif ni de credential** : le segment est
   du texte de conversation ; le cache natif reste sur son hôte.
 - **Pas de garantie sur les journaux du fournisseur** : le modèle peut
@@ -1043,12 +1075,15 @@ droits. Recommandation entre parenthèses.
   explicitement au lieu de dégrader.
 - **Pas de transfert de fichiers** dans l'attach distant ; le copier-coller
   est du texte.
-- **Pas de décision sur les pouvoirs de l'avatar** : Q4 reste ouverte.
+- **Pouvoirs de l'avatar tranchés (Q4)** : porte d'actions, contrôle par le
+  code à TPK, journal à Manaty ; la note de référence est
+  `avatars-charte-porte.md`.
 
 ## 10. État
 
 Note de conception, **brouillon** : aucun code, aucune migration, aucun
 serveur, aucun secret touché. Elle attend la relecture d'une autre famille
 (conversation/placement/spawn/identité : classes sensibles) et les réponses
-owner du §7. Les quatre lots porteurs #7032 à #7035 restent en attente de
-cette note ; les sous-lots du §6 sont à créer par mesh-design après revue.
+owner restantes du §7 ; Q4 est tranchée le 17/11/2026. Les quatre lots
+porteurs #7032 à #7035 restent en attente de cette note ; les sous-lots du
+§6 sont à créer par mesh-design après revue.

@@ -323,9 +323,9 @@ class Canon(interface.Canon):
     def host_rows(self, host, names) -> list[dict]:
         sql = """
             SELECT name, harness, host, cwd, model, budget_usd, responsible, team, projects,
-                   aliases, roles, releve, candidats, relit, harnesses,
+                   aliases, roles, releve, candidats, relit, harnesses, reveil,
                    provider, credential_mode, capabilities, canon_ref, canon, ephemeral, priority,
-                   admitted_hosts, admitted_tags, memory_repository,
+                   admitted_hosts, admitted_tags, memory_repository, declared_policy,
                    visibility_ok, visibility_diagnostic,
                    status, status_text, lease_epoch,
                    placement_ok, placement_diagnostic, placement_ref,
@@ -359,6 +359,10 @@ class Canon(interface.Canon):
         harnesses = _caps_param(values.get("harnesses"))
         # L165 (EP1) : relève et hôtes candidats, déclaratifs comme le placement
         candidats = _caps_param(values.get("candidats"))
+        # #7674 (E3a) : politique de session déclarée ; NULL quand la fiche
+        # n'en déclare aucune (réglage impératif et défauts seuls juges).
+        declared = (None if values.get("declared_policy") is None
+                    else json.dumps(values["declared_policy"], sort_keys=True))
         rows = self.db.query(
             """
             __LOCK__
@@ -368,10 +372,12 @@ class Canon(interface.Canon):
                  priority, admitted_hosts, admitted_tags, memory_repository,
                  visibility_ok, visibility_diagnostic,
                  placement_ok, placement_diagnostic, placement_ref, placement_profile, canon,
-                 releve, candidats, projects, aliases, roles, relit, harnesses)
+                 releve, candidats, projects, aliases, roles, relit, harnesses, reveil,
+                 declared_policy)
             SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
                    %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s,
-                   %s, __CANDIDATS__, __PROJECTS__, __ALIASES__, __ROLES__, __RELIT__, __HARNESSES__
+                   %s, __CANDIDATS__, __PROJECTS__, __ALIASES__, __ROLES__, __RELIT__, __HARNESSES__,
+                   %s::jsonb, %s::jsonb
               FROM l
             ON CONFLICT (name) DO UPDATE SET
                 harness         = excluded.harness,
@@ -405,6 +411,8 @@ class Canon(interface.Canon):
                 canon           = excluded.canon,
                 releve          = excluded.releve,
                 candidats       = excluded.candidats,
+                reveil          = excluded.reveil,
+                declared_policy = excluded.declared_policy,
                 updated_at      = now()
             WHERE agent_registry.lease_epoch = %s
               AND (excluded.host = agent_registry.host
@@ -435,6 +443,9 @@ class Canon(interface.Canon):
                                        roles, roles,
                                        relit, relit,
                                        harnesses, harnesses,
+                                       (json.dumps(values["reveil"])
+                                        if values.get("reveil") is not None else None),
+                                       declared,
                                        values.get("_expected_lease_epoch", values.get("lease_epoch", -1))),
         )
         return bool(rows)

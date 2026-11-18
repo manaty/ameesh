@@ -112,7 +112,7 @@ class SecondaryBaseTest(PgTestCase):
     def setUp(self):
         super().setUp()
         self.ancienne = self.schema + "_ancienne"
-        self.db.execute('CREATE SCHEMA "%s"' % self.ancienne)
+        self.create_schema(self.ancienne)  # #7756 : annexe marquée, purgable
         self.db.execute(
             'CREATE TABLE "%s".schema_migrations AS '
             'SELECT * FROM schema_migrations WHERE version <> %s'
@@ -169,7 +169,7 @@ class SecondaryBaseTest(PgTestCase):
         """Un schéma secondaire complet, migré, dont 0518 est retiré du
         registre : la base attend une migration non additive."""
         self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % self.ancienne)
-        self.db.execute('CREATE SCHEMA "%s"' % self.ancienne)
+        self.create_schema(self.ancienne)  # #7756 : preuve de propriété
         other = self.connect(schema=self.ancienne)
         try:
             migrations.migrate(other)

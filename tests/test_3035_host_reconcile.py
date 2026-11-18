@@ -78,6 +78,65 @@ class HostReconcileTest(PgTestCase):
             data = json.loads(data)
         return dict(row, data=data)
 
+    def test_permanent_reattachment_retires_origin_and_traces_actor(self):
+        self.returned()
+        self.db.execute("UPDATE agent_registry SET host='target' WHERE name='dev'")
+        self.assertEqual(self.reconcile()["missing"], ["agent_moved:dev"])
+        result = self.api.host_lifecycle.reattach(
+            "source", "dev", "target", actor="human:operator")
+        self.assertEqual(result["to"], "target")
+        self.assertEqual(self.api.host_lifecycle.agents(
+            "source", self.control["generation"]), [])
+        event = self.db.query("SELECT data FROM ameesh_events "
+                              "WHERE type='host.agent_reattached' AND id>%s",
+                              (self.event_base,))[0]["data"]
+        if isinstance(event, str):
+            event = json.loads(event)
+        self.assertEqual(event["actor"], "human:operator")
+        self.assertEqual(event["origin"]["critical"], True)
+        self.assertTrue(self.reconcile()["reconciled"])
+
+    def test_reattachment_refuses_wrong_destination_without_removing_origin(self):
+        with self.assertRaisesRegex(ValueError, "already be on"):
+            self.api.host_lifecycle.reattach(
+                "source", "dev", "target", actor="human:operator")
+        self.assertEqual(len(self.api.host_lifecycle.agents(
+            "source", self.control["generation"])), 1)
+
+    def test_reattachment_keeps_fence_and_active_handoff_guards(self):
+        self.db.execute("UPDATE agent_registry SET host='target',handoff_fenced=true "
+                        "WHERE name='dev'")
+        with self.assertRaisesRegex(ValueError, "fenced"):
+            self.api.host_lifecycle.reattach(
+                "source", "dev", "target", actor="human:operator")
+        self.db.execute("UPDATE agent_registry SET handoff_fenced=false WHERE name='dev'")
+        self.add_handoff()
+        with self.assertRaisesRegex(ValueError, "active handoff"):
+            self.api.host_lifecycle.reattach(
+                "source", "dev", "target", actor="human:operator")
+
+    def test_reattached_completed_recovery_no_longer_blocks_return(self):
+        self.returned()
+        self.add_handoff(state="verified", evidence={"source_recovered": True})
+        self.db.execute("UPDATE agent_registry SET host='target' WHERE name='dev'")
+        self.assertIn("recovery_attempted:dev", self.reconcile()["missing"])
+        self.api.host_lifecycle.reattach("source", "dev", "target", actor="human:operator")
+        self.assertTrue(self.reconcile()["reconciled"])
+
+    def test_default_publisher_cadence_can_cover_the_proof_window(self):
+        from pathlib import Path
+        for name in ("deploy/systemd/ameesh-host-publish.timer",
+                     "deploy/serveur/ameesh-releve-hote.timer"):
+            timer = (Path(__file__).resolve().parents[1] / name).read_text()
+            self.assertIn("OnUnitActiveSec=60s", timer)
+            self.assertIn("AccuracySec=1s", timer)
+            self.assertIn("RandomizedDelaySec=10s", timer)
+        # Worst default gap is 71 seconds; cover a full 180-second window.
+        self.returned(span=213, middle=142)
+        self.db.execute("INSERT INTO host_resources(host,sampled_at,gate_state) "
+                        "VALUES ('source',clock_timestamp()-interval '71 seconds','available')")
+        self.assertTrue(self.reconcile()["reconciled"])
+
     def test_gate_state_names_lost_instead_of_draining(self):
         self.assertEqual(self.api.hosts.latest("source")["gate_state"], "lost")
 
@@ -362,6 +421,13 @@ class HostReconcileTest(PgTestCase):
             self.assertEqual(isolated_entrypoint(main_mod.main, ["host", "reconcile", "source"]), 0)
         impl.assert_called_once_with(["reconcile", "source"])
 
+    def test_cli_dispatch_routes_host_reattach(self):
+        from ameesh import main as main_mod
+        args = ["reattach", "source", "dev", "--to", "target"]
+        with mock.patch("ameesh.host_lifecycle.main", return_value=0) as impl:
+            self.assertEqual(isolated_entrypoint(main_mod.main, ["host", *args]), 0)
+        impl.assert_called_once_with(args)
+
     def test_module_reconcile_uses_the_session_corrector(self):
         self.returned()
         with mock.patch.object(host_lifecycle.work, "corrector",
@@ -370,6 +436,23 @@ class HostReconcileTest(PgTestCase):
         self.assertTrue(result["reconciled"], result)
         corrector.assert_called_once()
         self.assertEqual(self.api.host_lifecycle.get("source")["actor"], "human:smichea")
+
+    def test_command_reattach_authenticates_actor_and_status_explains_return(self):
+        real_connect = db_mod.connect
+        self.db.execute("UPDATE agent_registry SET host='target' WHERE name='dev'")
+        with mock.patch.object(host_lifecycle.config, "load", return_value=self.cfg), \
+                mock.patch.object(host_lifecycle.db_mod, "connect",
+                                  side_effect=lambda _cfg: real_connect(self.cfg)), \
+                mock.patch.object(host_lifecycle.work, "corrector",
+                                  return_value="human:operator") as corrector:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(host_lifecycle.main(["status", "source"]), 0)
+            self.assertIn("ameesh host reattach source", out.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = host_lifecycle.main(["reattach", "source", "dev", "--to", "target"])
+            self.assertEqual(result, 0)
+            corrector.assert_called_once_with(self.cfg, mock.ANY, None)
 
     def test_command_refuses_then_reopens_with_its_actor(self):
         real_connect = db_mod.connect

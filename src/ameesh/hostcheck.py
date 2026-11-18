@@ -491,7 +491,7 @@ def packet_watch_lines(cfg, run=_systemctl) -> list[str]:
             "(%s): if this host is a candidate, the takeover has no release tick here"
             % (role, RELEASE_TIMER, state),
             "             ameesh role timers --role %s --install (a host-pinned cutter "
-            "elsewhere is migrated by the bureau first: one cutter)" % role,
+            "elsewhere is migrated by its avatar first: one cutter)" % role,
         ]
     return [
         "warning    : packet_watch is declared for this host but %s is not active "
@@ -544,11 +544,11 @@ def paquet_horaire_lines(cfg, run=_systemctl) -> list[str]:
         detail = " (%s)" % "; ".join(errors)
     return [
         "warning    : %s is active but %s%s: a takeover of the "
-        "mesh-design lease would compose without a declared project on this host"
+        "elected role's lease would compose without a declared project on this host"
         % (PAQUET_HORAIRE_TIMER, subject, detail),
-        "             declare packet_watch.projects.<p>.repo with \"role\": "
-        "\"mesh-design\", or radar.projects.<p>.repo (stop the timer on a host "
-        "that is not a candidate)",
+        "             declare packet_watch.projects.<p>.repo with its configured "
+        "elected role (packet_watch.role), or radar.projects.<p>.repo (stop the "
+        "timer on a host that is not a candidate)",
     ]
 
 
@@ -756,6 +756,32 @@ def memory_cap_lines(cfg, db, canons=None, run=_systemctl,
     if ok and not lines:
         lines.append("memory caps: %d agent unit(s) in %s, MemoryMax matches the canon"
                      % (ok, AGENTS_SLICE))
+    return lines
+
+
+def memory_transport_lines(cfg, canons=None) -> list[str]:
+    """#7682 : persona memory repositories this host cannot open.
+
+    The memory Git environment ignores global/system configuration and
+    credential helpers, so an HTTPS repository can never authenticate; an SSH
+    repository also needs the host-managed `persona_memory.ssh_key`. Signalled,
+    never blocking: the persona still runs without memory, and the runner
+    tells it so in its turn and publishes the host defect.
+    """
+    from . import canon as canon_mod, persona_memory
+    if canons is None:
+        try:
+            canons = canon_mod.load_configured(cfg)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic never breaks the doctor
+            return ["memory     : repositories not checked (%s)" % exc]
+    lines = []
+    for canon in canons:
+        try:
+            findings = persona_memory.canon_findings(cfg, canon, cfg.host or "")
+        except Exception as exc:  # noqa: BLE001 - a diagnostic never breaks the doctor
+            lines.append("memory     : repository check failed (%s)" % exc)
+            continue
+        lines.extend("memory     : %s" % finding.message for finding in findings)
     return lines
 
 
@@ -979,6 +1005,40 @@ def _sql_name(name: str) -> str:
     return '"%s"' % str(name).replace('"', '""')
 
 
+def interactive_lines(cfg) -> list[str]:
+    """#7676 : les profils Claude déclarés, prêts pour une session interactive.
+
+    Un compte dont le `.claude.json` ne porte pas `hasCompletedOnboarding: true`
+    s'ouvre sur l'accueil (choix du thème) au premier `ameesh attach` : le
+    premier message de l'humain part dans ce menu. L'attach refuse désormais en
+    le disant (`accounts.interactive_problem`) ; ce constat le montre avant.
+
+    Ligne d'information, pas de verdict : un profil déclaré peut n'être utilisé
+    que par des tours non interactifs, et `doctor --harness` est une garde de
+    déploiement — aucun compte ne doit le faire échouer pour un accueil à faire.
+    """
+    from . import accounts
+    try:
+        items = accounts.profiles(cfg, "claude")
+    except accounts.AccountError as exc:
+        return ["interactive : not checked (%s)" % exc]
+    declared = [p for p in items if p.declared and p.kind == "config_dir"]
+    if not declared:
+        return ["interactive : no declared claude profile"]
+    problems = [(profile, accounts.interactive_problem(profile))
+                for profile in declared]
+    problems = [(profile, why) for profile, why in problems if why]
+    if not problems:
+        return ["interactive : %d declared claude profile(s) ready"
+                % len(declared)]
+    lines = []
+    for profile, why in problems:
+        lines.append("interactive : warning — claude/%s not ready: %s"
+                     % (profile.name, why))
+        lines.append("              %s" % accounts.interactive_init_hint(profile))
+    return lines
+
+
 def cmd_harness(cfg, db=None) -> int:
     """`ameesh doctor --harness` : 0 si chaque harnais servi est trouvé."""
     adapters.configure(cfg)
@@ -1018,6 +1078,10 @@ def cmd_harness(cfg, db=None) -> int:
         print(line)
     if not hooks["ok"]:
         verdict = 1
+    # #7676 : l'accueil interactif de Claude se vérifie ici ; une ligne
+    # d'information seulement, le verdict reste celui de l'installation.
+    for line in interactive_lines(cfg):
+        print(line)
     if db is not None and agents is not None:
         for line in missing_runner_lines(cfg, db) + memory_cap_lines(cfg, db):
             print(line)

@@ -24,7 +24,9 @@ Les parades, appelées par `ameesh mail send|forward`, `ameesh alerts` /
   avec l'identité liée à la session (`agent-mail whoami`) ; un courrier
   adressé à l'identité d'ÉMISSION de la veille (`watch.SENDER`, « veille »)
   est refusé : elle n'a pas de lecteur, les comptes rendus qu'on lui
-  envoyait s'y perdaient (#3342) ;
+  envoyait s'y perdaient (#3342) ; un message ÉMIS par cette identité part
+  quand même, mais l'expéditeur est averti que les réponses ne sont pas
+  livrées (#7725) ;
 * `alerts` : `mail_undeliverable`, du courrier en attente depuis plus de
   15 min chez un agent arrêté ou inexistant, pour le responsable humain et,
   par courrier (`orchestrator_briefs`), les orchestrateurs de l'équipe ;
@@ -54,6 +56,7 @@ import time
 
 from . import db as db_mod
 from . import fastmail, fil, registry, storage
+from .roles import ORCHESTRATOR_ROLES
 
 #: `mail_undeliverable` : courrier en attente depuis 15 min
 DEFAULT_THRESHOLD_S = 900.0
@@ -132,7 +135,7 @@ def role_of(name: str) -> str | None:
     « orch ») : l'envoi vise alors l'orchestrateur de l'équipe."""
     low = (name or "").strip().lower()
     if low.startswith("orchestr") or low == "orch":
-        return "orchestrateur"
+        return ORCHESTRATOR_ROLES[0]
     return None
 
 
@@ -348,6 +351,15 @@ def watch_sender_text(name: str) -> str:
     ])
 
 
+def watch_sender_note(name: str) -> str:
+    """#7725 : la mention portée par un message ÉMIS par une identité sans
+    boîte lue. L'expéditeur doit savoir qu'une réponse qui lui serait adressée
+    est perdue : elle se dit au fil, ou au relais de la demande."""
+    return ("replies to %s are not delivered (it has no read mailbox): write in the "
+            "readable thread or to the relay of the request (your pilot or "
+            "orchestrator), never to %s" % (name, name))
+
+
 def unknown_text(cfg, db, dest: str, rows: list | None = None, *, sender: str | None = None,
                  canons=None) -> str:
     """Le refus d'un destinataire absent du registre, avec les noms proches."""
@@ -550,10 +562,11 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     veilles et les réveils (#3460). Rend les
     avertissements à dire (destinataire arrêté avec `queue` ; #858 :
     destinataire inscrit mais non réveillable à l'instant — le message part
-    quand même, le réveil attend). `explicit` : l'expéditeur vient de
-    `--from` ; `binding` : l'identité déjà résolue de la session, s'il y en a
-    une. « all » ne contrôle que l'expéditeur (la diffusion écarte elle-même
-    les arrêtés)."""
+    quand même, le réveil attend ; #7725 : l'expéditeur émet depuis une
+    identité sans boîte lue — le message part, mais les réponses sont
+    perdues). `explicit` : l'expéditeur vient de `--from` ; `binding` :
+    l'identité déjà résolue de la session, s'il y en a une. « all » ne
+    contrôle que l'expéditeur (la diffusion écarte elle-même les arrêtés)."""
     names = [sender] if dest in ("all", sender) else [sender, dest]
     rows = registry_rows(db, names)
     row = rows.get(sender)
@@ -562,8 +575,12 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
                                           now=now))
     if row is not None and row.get("retired_ts") and not watch_sender(sender):
         raise Refused(retired_text(row, sender=True))
+    # #7725 : une identité d'émission sans boîte lue peut encore écrire (la
+    # veille et les scripts le font), mais son expéditeur doit savoir qu'une
+    # réponse adressée à ce nom est perdue : il écrit au fil ou au relais.
+    notes = [watch_sender_note(sender)] if watch_sender(sender) else []
     if dest == "all":
-        return []
+        return notes
     if watch_sender(dest):
         raise Refused(watch_sender_text(dest))
     row = rows.get(dest)
@@ -572,12 +589,12 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     if row.get("retired_ts"):
         raise Refused(retired_text(row, sender=False))
     if row.get("status") != "stopped":
-        return wake_note(cfg, db, dest, row, sender=sender)
+        return notes + wake_note(cfg, db, dest, row, sender=sender)
     if not queue:
         raise Refused(stopped_recipient_text(db, row, now))
-    return ["%s is stopped (%s): message queued until it resumes (ameesh resume %s) "
-            "or is forwarded (ameesh mail forward %s <agent>)"
-            % (dest, stop_facts(row, now), dest, dest)]
+    return notes + ["%s is stopped (%s): message queued until it resumes (ameesh resume %s) "
+                    "or is forwarded (ameesh mail forward %s <agent>)"
+                    % (dest, stop_facts(row, now), dest, dest)]
 
 
 # --------------------------------------------------------------------------

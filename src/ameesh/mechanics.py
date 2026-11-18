@@ -68,6 +68,8 @@ mécanique, ce que l'outillage exécute sans agent :
   #122895) : la branche de prod d'un projet, où un lot de porte de production
   (`prod_gate`) doit être présent pour se fermer. Absente : un tel lot n'est
   jamais fermé par une fusion constatée, aucune branche n'est supposée.
+  `production: none` (#7726) déclare explicitement un projet sans production ;
+  compilé en chaîne vide, distincte de None (déclaration absente).
 - `accounts.pace_multipliers` et `accounts.underused_loss` (#3647, canon §11,
   décision owner #141793 a) : le multiplicateur de rythme de chaque compte de
   forfait, par harnais et nom de compte (absent : ×1), et la perte prévue au
@@ -134,10 +136,10 @@ _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
                   "merge", "prevalidation", "backlog", "staging", "accounts",
-                  "paquet", "packet_tests", "file", "session", "auto_take", "projects")
+                  "paquet", "packet_tests", "file", "session", "auto_take", "projects", "prod_go_max_hours")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production",
                   "contract_selection", "repair_policy", "prevalidation")
-_PRODUCTION_KEYS = ("branch",)
+_PRODUCTION_KEYS = ("branch", "workflows", "mode_marked_workflows")
 _CONTRACT_SELECTION_KEYS = ("registry", "publish", "attestation_max_age_seconds")
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
 #: ni fin en `/`, `.` ou `.lock` — jamais une ref arbitraire ni un commit
@@ -238,7 +240,9 @@ class ProjectOverride:
     ci_environment_red: str | None = None
     ci_faulty_lot: str | None = None
     #: #3022 : la branche de prod du projet (`production.branch`)
-    production_branch: str | None = None
+    production_branch: str | None = None  # "": explicit production: none; None: undeclared
+    production_workflows: tuple[str, ...] | None = None
+    production_mode_marked_workflows: tuple[str, ...] = ()
     contract_selection: ContractSelection | None = None
     repair_policy: repair_policy.Policy | None = None
     #: #6915 : le bloc `prevalidation` du projet, qui remplace le bloc global
@@ -495,6 +499,9 @@ class Document:
     #: repli de la porte ; 0 = aucun repli ouvert
     paused_family_min_hours: int = 0
 
+    # #7726: absent means production attestations cannot be issued.
+    prod_go_max_hours: int | None = None
+
     def auto_take_excluded_families(self, now: float) -> tuple[str, ...]:
         """La date d'expiration est incluse, dans le fuseau du canon."""
         if self.auto_take is None:
@@ -551,6 +558,8 @@ class Document:
                       "post_merge_red": self.merge_post_merge_red},
             "projects": sorted(item.name for item in self.overrides),
         }
+        if self.prod_go_max_hours is not None:
+            payload["prod_go_max_hours"] = self.prod_go_max_hours
         if self.paused_family_min_hours:
             # #6990 : absent (0), la clé n'existe pas : le document sans clé
             # compile à l'identique, les lecteurs antérieurs ne la refusent pas.
@@ -1053,6 +1062,8 @@ def _backlog(value, where: str) -> int:
 def _production(value, where: str) -> str:
     """Le bloc `production` d'un projet (#3022) : sa branche de prod, nom de
     branche Git simple, jamais un commit ni une ref complète."""
+    if value == "none":
+        return ""  # explicit canon declaration: this project has no production
     data = _mapping(value, where, _PRODUCTION_KEYS)
     branch = data.get("branch")
     if (not isinstance(branch, str) or not _BRANCH.fullmatch(branch)
@@ -1060,6 +1071,26 @@ def _production(value, where: str) -> str:
             or branch.startswith(("refs/", "origin/")) or _SHA.fullmatch(branch)):
         raise MechanicsError("%s.branch: a plain branch name is required" % where)
     return branch
+
+
+def _production_workflows(value, where: str) -> tuple[str, ...] | None:
+    if value == "none":
+        return None
+    if "workflows" not in value:
+        if "mode_marked_workflows" in value:
+            raise MechanicsError(where + ".mode_marked_workflows requires workflows")
+        return None
+    workflows = value["workflows"]
+    if not isinstance(workflows, list) or not workflows:
+        raise MechanicsError(where + ".workflows: a non-empty list is required")
+    if any(not isinstance(w, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml", w)
+           for w in workflows) or len(set(workflows)) != len(workflows):
+        raise MechanicsError(where + ".workflows: unique workflow filenames are required")
+    marked = value.get("mode_marked_workflows", [])
+    if (not isinstance(marked, list) or any(w not in workflows for w in marked)
+            or len(set(marked)) != len(marked)):
+        raise MechanicsError(where + ".mode_marked_workflows: a unique subset of workflows is required")
+    return tuple(workflows)
 
 
 def _families(value, where: str) -> tuple[str, ...]:
@@ -1090,7 +1121,8 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
         packet_cutoffs = None
         max_in_build = None
         packet = label = environment = faulty = None
-        production = None
+        production = production_workflows = None
+        mode_marked_workflows = ()
         if "timezone" in data:
             timezone = _timezone(data["timezone"], scope + ".timezone")
         if "cutoffs" in data:
@@ -1106,6 +1138,9 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
             packet, label, environment, faulty = _ci(data["ci"], scope + ".ci")
         if "production" in data:
             production = _production(data["production"], scope + ".production")
+            production_workflows = _production_workflows(data["production"], scope + ".production")
+            if isinstance(data["production"], dict):
+                mode_marked_workflows = tuple(data["production"].get("mode_marked_workflows", []))
         out.append(ProjectOverride(name=name, timezone=timezone, cutoffs=cutoffs,
                                    packet_cutoffs=packet_cutoffs,
                                    max_in_build=max_in_build, ci_packet=packet,
@@ -1113,6 +1148,8 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
                                    ci_environment_red=environment,
                                    ci_faulty_lot=faulty,
                                    production_branch=production,
+                                   production_workflows=production_workflows,
+                                   production_mode_marked_workflows=mode_marked_workflows,
                                    repair_policy=(repair_policy.compile_policy(
                                        data["repair_policy"], project=name)
                                        if "repair_policy" in data else None),
@@ -1341,6 +1378,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                      if "backlog" in parsed else None)
     families = _families(reviews.get("families"), source + ".reviews.families")
     return Document(
+        prod_go_max_hours=(_positive_int(parsed["prod_go_max_hours"], source + ".prod_go_max_hours")
+                           if "prod_go_max_hours" in parsed else None),
         schema=schema,
         timezone=_timezone(parsed.get("timezone"), source + ".timezone"),
         cutoffs=_cutoffs(parsed.get("cutoffs"), source + ".cutoffs"),

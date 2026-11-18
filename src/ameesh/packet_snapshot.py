@@ -10,12 +10,15 @@ from __future__ import annotations
 import re
 from . import plan_git, storage
 
-#: #4304: the line a packet manifest carries when its per-unit tests run in
-#: parallel with the full CI. It must not read as ``pending``: that would
-#: withdraw the composer exemption from every newly composed packet.
+#: #4304/#7740: the line a packet manifest carries when its per-unit direct
+#: tests run before the push, on each unit's composed prefix. Both wordings
+#: are read: already-pushed #4304 manifests said "in parallel with the full
+#: CI". It must not read as ``pending``: that would withdraw the composer
+#: exemption from every newly composed packet.
 PARALLEL_TESTS_RE = re.compile(
-    r"^- Tests locaux : joués par le composeur après la poussée, en parallèle "
-    r"de la CI complète \(#4304\)", re.MULTILINE)
+    r"^- Tests locaux : (?:joués par le composeur sur le préfixe composé de "
+    r"chaque unité, avant la poussée \(#7740\)|joués par le composeur après "
+    r"la poussée, en parallèle de la CI complète \(#4304\))", re.MULTILINE)
 
 
 class SnapshotError(RuntimeError):

@@ -316,6 +316,1003 @@
         ],
         "type": "object"
       },
+      "ameesh-agent-observation-1": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "admitted": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "claim_predicate": {
+                "type": "boolean"
+              },
+              "governed": {
+                "type": "boolean"
+              },
+              "reasons": {
+                "items": {
+                  "enum": [
+                    "mode_externe",
+                    "retired",
+                    "ephemeral_expired",
+                    "host_claims_closed",
+                    "handoff_fenced",
+                    "responsible_missing",
+                    "responsible_policy_unavailable",
+                    "canon_state_missing",
+                    "canon_state_not_ok",
+                    "canon_stale",
+                    "canon_ref_mismatch",
+                    "placement_missing",
+                    "placement_refused",
+                    "placement_profile_diverged",
+                    "claim_predicate"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "responsible_required": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "admitted",
+              "claim_predicate",
+              "governed",
+              "responsible_required",
+              "reasons"
+            ],
+            "type": "object"
+          },
+          "agent": {
+            "properties": {
+              "ephemeral": {
+                "type": "boolean"
+              },
+              "ephemeral_expires_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "mode": {
+                "enum": [
+                  "execute",
+                  "externe"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "retired": {
+                "type": "boolean"
+              },
+              "status": {
+                "type": "string"
+              },
+              "status_since_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "status_text": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "stop_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "status",
+              "status_text",
+              "status_since_ts",
+              "mode",
+              "retired",
+              "stop_reason",
+              "ephemeral",
+              "ephemeral_expires_ts"
+            ],
+            "type": "object"
+          },
+          "budget": {
+            "properties": {
+              "account_profile": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "admitted": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "available": {
+                "type": "boolean"
+              },
+              "billing_account": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kept_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "limit_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "period": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "no_account_profile",
+                  "unknown_account_profile",
+                  "ambiguous_account_profile",
+                  "account_config_unreadable",
+                  "no_billing_account",
+                  "no_account_envelope",
+                  "foreign_host",
+                  "exhausted",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "remaining_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "reserve_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "reserved_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "reset_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "settled_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "timezone": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "used_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "account_profile",
+              "billing_account",
+              "available",
+              "reason",
+              "reserve_usd",
+              "limit_usd",
+              "settled_usd",
+              "reserved_usd",
+              "kept_usd",
+              "used_usd",
+              "remaining_usd",
+              "admitted",
+              "period",
+              "timezone",
+              "reset_ts"
+            ],
+            "type": "object"
+          },
+          "canon": {
+            "properties": {
+              "age_s": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "checked_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "diagnostic": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "fresh": {
+                "type": "boolean"
+              },
+              "last_good_commit": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "max_age_s": {
+                "type": "number"
+              },
+              "name": {
+                "type": "string"
+              },
+              "ref_commit": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ref_matches": {
+                "type": "boolean"
+              },
+              "state": {
+                "enum": [
+                  "ok",
+                  "invalid",
+                  "unreadable",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "state",
+              "last_good_commit",
+              "checked_ts",
+              "age_s",
+              "max_age_s",
+              "fresh",
+              "ref_commit",
+              "ref_matches",
+              "diagnostic"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "lease": {
+            "properties": {
+              "epoch": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "expires_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "live": {
+                "type": "boolean"
+              },
+              "owner": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "since_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "turn_in_progress": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "owner",
+              "epoch",
+              "live",
+              "expires_ts",
+              "since_ts",
+              "turn_in_progress"
+            ],
+            "type": "object"
+          },
+          "limits": {
+            "properties": {
+              "available": {
+                "type": "boolean"
+              },
+              "declared": {
+                "properties": {
+                  "compact_tokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "context_max_tokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "session_max_tokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "session_policy": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "session_reread_budget": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "turn_grace_seconds": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "turn_mail_max": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "turn_max_seconds": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "turn_reread_budget": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "context_max_tokens",
+                  "turn_max_seconds",
+                  "turn_mail_max",
+                  "turn_grace_seconds",
+                  "session_policy",
+                  "session_max_tokens",
+                  "turn_reread_budget",
+                  "session_reread_budget",
+                  "compact_tokens"
+                ],
+                "type": "object"
+              },
+              "effective": {
+                "properties": {
+                  "compact_tokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "context_max_tokens": {
+                    "type": "integer"
+                  },
+                  "session_max_tokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "session_policy": {
+                    "type": "string"
+                  },
+                  "session_reread_budget": {
+                    "type": "integer"
+                  },
+                  "turn_grace_seconds": {
+                    "type": "integer"
+                  },
+                  "turn_mail_max": {
+                    "type": "integer"
+                  },
+                  "turn_max_seconds": {
+                    "type": "integer"
+                  },
+                  "turn_reread_budget": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "context_max_tokens",
+                  "turn_max_seconds",
+                  "turn_mail_max",
+                  "turn_grace_seconds",
+                  "session_policy",
+                  "session_max_tokens",
+                  "turn_reread_budget",
+                  "session_reread_budget",
+                  "compact_tokens"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "host",
+              "available",
+              "declared",
+              "effective"
+            ],
+            "type": "object"
+          },
+          "missing": {
+            "items": {
+              "enum": [
+                "account_envelope",
+                "budget_headroom",
+                "limits",
+                "responsible_policy",
+                "canon_state"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "native": {
+            "properties": {
+              "sandbox": {
+                "properties": {
+                  "agent": {
+                    "type": "string"
+                  },
+                  "canon_ref": {
+                    "type": "string"
+                  },
+                  "completed_ts": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "counters": {
+                    "properties": {
+                      "model_calls": {
+                        "type": "integer"
+                      },
+                      "seconds": {
+                        "type": "integer"
+                      },
+                      "tool_calls": {
+                        "type": "integer"
+                      },
+                      "turns": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "turns",
+                      "tool_calls",
+                      "seconds",
+                      "model_calls"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "deadline_ts": {
+                    "type": "number"
+                  },
+                  "epoch": {
+                    "type": "integer"
+                  },
+                  "job": {
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "namespace": {
+                        "type": "string"
+                      },
+                      "phase": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "uid": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "namespace",
+                      "name",
+                      "uid",
+                      "phase"
+                    ],
+                    "type": "object"
+                  },
+                  "owner": {
+                    "type": "string"
+                  },
+                  "placement_ref": {
+                    "type": "string"
+                  },
+                  "profile_ref": {
+                    "type": "string"
+                  },
+                  "receipt": {
+                    "properties": {
+                      "epoch": {
+                        "type": "integer"
+                      },
+                      "job": {
+                        "type": "object"
+                      },
+                      "replayed": {
+                        "type": "boolean"
+                      },
+                      "result_id": {
+                        "type": "string"
+                      },
+                      "result_sha256": {
+                        "type": "string"
+                      },
+                      "schema": {
+                        "const": "ameesh-sandbox-receipt/1",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "type": "object"
+                      },
+                      "scope_digest": {
+                        "type": "string"
+                      },
+                      "source": {
+                        "type": "object"
+                      },
+                      "turn_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "schema",
+                      "turn_id",
+                      "epoch",
+                      "scope",
+                      "scope_digest",
+                      "result_id",
+                      "result_sha256",
+                      "job",
+                      "source",
+                      "replayed"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "refusal": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "result_sha256": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "schema": {
+                    "const": "ameesh-sandbox-turn/1",
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "object"
+                  },
+                  "scope_digest": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "type": "object"
+                  },
+                  "started_ts": {
+                    "type": "number"
+                  },
+                  "state": {
+                    "enum": [
+                      "intent",
+                      "created",
+                      "bound",
+                      "running",
+                      "cancelling",
+                      "succeeded",
+                      "failed",
+                      "cancelled",
+                      "expired",
+                      "orphaned",
+                      "lost"
+                    ],
+                    "type": "string"
+                  },
+                  "tranche": {
+                    "properties": {
+                      "kept_usd": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "reserved_usd": {
+                        "type": "number"
+                      },
+                      "settled_usd": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "state": {
+                        "enum": [
+                          "open",
+                          "settled",
+                          "kept",
+                          "released"
+                        ]
+                      },
+                      "tranche_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "tranche_id",
+                      "state",
+                      "reserved_usd",
+                      "settled_usd",
+                      "kept_usd"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "turn_id": {
+                    "type": "string"
+                  },
+                  "verdict": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "schema",
+                  "turn_id",
+                  "agent",
+                  "owner",
+                  "epoch",
+                  "state",
+                  "scope",
+                  "scope_digest",
+                  "profile_ref",
+                  "placement_ref",
+                  "canon_ref",
+                  "source",
+                  "job",
+                  "deadline_ts",
+                  "started_ts",
+                  "completed_ts",
+                  "counters",
+                  "result_sha256",
+                  "verdict",
+                  "receipt",
+                  "refusal",
+                  "tranche"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "turn": {
+                "properties": {
+                  "created_ts": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "ledger_ambiguous": {
+                    "type": "boolean"
+                  },
+                  "model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "spend_key": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "turn_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "work_item_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "turn_id",
+                  "spend_key",
+                  "model",
+                  "work_item_id",
+                  "created_ts",
+                  "ledger_ambiguous"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "turn",
+              "sandbox"
+            ],
+            "type": "object"
+          },
+          "observed_ts": {
+            "type": "number"
+          },
+          "placement": {
+            "properties": {
+              "current": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "diagnostic": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ok": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "profile": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "profile_ok": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "ref": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "ok",
+              "ref",
+              "profile",
+              "current",
+              "profile_ok",
+              "diagnostic"
+            ],
+            "type": "object"
+          },
+          "profile": {
+            "properties": {
+              "canon": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "canon_ref": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "capabilities": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "credential_mode": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "harness": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "responsible": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "session": {
+                "properties": {
+                  "account": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "harness": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "harness",
+                  "account"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "responsible",
+              "host",
+              "harness",
+              "model",
+              "provider",
+              "credential_mode",
+              "capabilities",
+              "canon",
+              "canon_ref",
+              "session"
+            ],
+            "type": "object"
+          },
+          "schema": {
+            "const": "ameesh-agent-observation/1",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema",
+          "observed_ts",
+          "agent",
+          "profile",
+          "admission",
+          "canon",
+          "placement",
+          "lease",
+          "limits",
+          "budget",
+          "native",
+          "missing"
+        ],
+        "type": "object"
+      },
       "ameesh-agent-peek-1": {
         "properties": {
           "agent": {
@@ -1007,6 +2004,8 @@
               "agent.updated",
               "agent.moved",
               "agent.attach",
+              "agent.tools",
+              "host.memory_unavailable",
               "cost.recorded",
               "thread.entry",
               "decision.created",
@@ -2137,6 +3136,120 @@
             },
             "required": [],
             "type": "object"
+          },
+          "deferral": {
+            "properties": {
+              "age_s": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "queue": {
+                "properties": {
+                  "capacity": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "critical": {
+                    "type": "boolean"
+                  },
+                  "detail": {
+                    "type": "string"
+                  },
+                  "host": {
+                    "type": "string"
+                  },
+                  "queued_s": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "const": "pressure",
+                    "type": "string"
+                  },
+                  "retry_s": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "scope": {
+                    "enum": [
+                      "own_cgroup",
+                      "host"
+                    ]
+                  },
+                  "state": {
+                    "const": "queued",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "state",
+                  "reason",
+                  "host",
+                  "scope",
+                  "critical",
+                  "detail",
+                  "queued_s",
+                  "retry_s",
+                  "capacity"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "operator",
+                  "pressure",
+                  "authentication",
+                  "provider_credits",
+                  "budget",
+                  "account",
+                  "account_window",
+                  "session",
+                  "database",
+                  "host",
+                  "workdir",
+                  "shutdown",
+                  "restart",
+                  "other"
+                ]
+              },
+              "schema": {
+                "const": "ameesh-deferral/1",
+                "type": "string"
+              },
+              "since_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "deferred"
+                ]
+              }
+            },
+            "required": [
+              "schema",
+              "state",
+              "reason",
+              "since_ts",
+              "age_s"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "lease": {
             "properties": {
@@ -3383,6 +4496,83 @@
           }
         },
         "summary": "Message to an agent: its mailbox and its thread (`agent-mail send`)"
+      }
+    },
+    "/api/v1/agents/{agent}/observation": {
+      "get": {
+        "operationId": "agents_agent_observation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "declared account profile whose envelope is reported; otherwise the session's recorded account, then the single declared profile",
+            "in": "query",
+            "name": "account_profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-agent-observation-1"
+                }
+              }
+            },
+            "description": "One agent's admitted profile, lease, bounds and redacted budget (`ameesh agent observe`, read-only, contract E1b)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "One agent's admitted profile, lease, bounds and redacted budget (`ameesh agent observe`, read-only, contract E1b)"
       }
     },
     "/api/v1/agents/{agent}/pause": {

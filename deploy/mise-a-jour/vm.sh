@@ -8,6 +8,7 @@
 #
 #   deploy/mise-a-jour/vm.sh <étape> [REF]
 #   deploy/mise-a-jour/vm.sh agents verifier|installer|timers|redemarrer|controler|retour [REF]
+#     ou `agents unites-desactivees` (une persona par ligne, voir plus bas)
 #     AGENTS_SSH=root@cible, HOTE_AGENTS=nom du registre dans BASCULE_ENV —
 #     un BASCULE_ENV par VM d'agents ; unités utilisateur sous ameesh, liste
 #     du registre lue sur la VM. Voir docs/DEPLOIEMENT-HOTE-AGENTS.md.
@@ -26,13 +27,23 @@
 #                liée à un agent (le CLI local refuse bad_actor), sinon le
 #                drain est refusé et le redémarrage de cet agent s'arrête sans
 #                tour interrompu ; refuse tant que les migrations du code
-#                installé manquent
+#                installé manquent ; un agent dont la pause budget (ou une
+#                pause opérateur déclarée) est lisible au registre ne peut
+#                reprendre aucun bail : son unité est rechargée et il est
+#                nommé « non vérifiée : pause … », sans échec (#7717)
 #   timers       pose les minuteries mécaniques EP5 (veille GitHub, CI,
 #                projection) sur cet hôte s'il est candidat du rôle élu ;
 #                refuse explicitement les passes dont la clé `github` locale
 #                manque (#3327) ; sans effet sur un hôte non candidat
 #   controler    unités actives, journal récent, venv du MainPID vivant,
 #                ameesh doctor et minuteries de rôle sur le serveur
+#   unites-desactivees  une persona par ligne : celles du registre (ni
+#                arrêtées ni retirées) dont l'unité runner est désactivée ou
+#                masquée sur cet hôte. La santé staging les reçoit et tient
+#                leur courrier pour un avertissement, jamais un KO (#7785) :
+#                un exécuteur volontairement retiré ne fait pas revenir un
+#                déploiement en arrière. Le retrait définitif, lui, passe par
+#                `ameesh agent retire`, nommé dans l'avertissement.
 #   (agents)     redemarrer et controler partagent un seul périmètre (#4437) :
 #                agents du registre menés (activité, bail et venv exigés) ;
 #                persona arrêtée ou unité désactivée : aucune activité ni bail
@@ -41,7 +52,9 @@
 #                encore active est seulement arrêtée (systemd refuse de la
 #                démarrer) ; toute autre unité ameesh-runner-agent@ active sur
 #                l'hôte (candidat d'un rôle élu, agent retiré/déplacé, #4248) :
-#                rechargée et venv prouvé, sans bail exigé
+#                rechargée et venv prouvé, sans bail exigé ; le contrôle d'un
+#                agent en pause budget ou opérateur porte sur ce venv, jamais
+#                sur un bail qu'aucun tour ne peut reprendre (#7717)
 #   retour       bascule en arrière vers le venv précédent conservé, puis
 #                redémarre
 #
@@ -87,8 +100,8 @@ if [ "${1:-}" = agents ]; then MODE=agents; shift; fi
 ACTION=${1:-}
 if [ "$MODE" = agents ]; then
   case "$ACTION" in
-    redemarrer|controler|verifier|installer|timers|retour) ;;
-    *) echo "mode agents : verifier, installer, timers, redemarrer, controler ou retour attendu" >&2; exit 2 ;;
+    redemarrer|controler|verifier|installer|timers|retour|unites-desactivees) ;;
+    *) echo "mode agents : verifier, installer, timers, redemarrer, controler, unites-desactivees ou retour attendu" >&2; exit 2 ;;
   esac
   : "${AGENTS_SSH:?AGENTS_SSH manquant dans $BASCULE_ENV}" "${HOTE_AGENTS:?HOTE_AGENTS manquant dans $BASCULE_ENV}"
   [[ $AGENTS_SSH =~ ^[a-zA-Z0-9_.@:-]+$ && $AGENTS_SSH != -* ]] || { echo "AGENTS_SSH invalide" >&2; exit 2; }
@@ -500,6 +513,19 @@ statut() {  # #4358 : « illisible » plutôt qu'une trace JSONDecodeError
   ligne=$(lire_bail "$1") || { echo illisible; return 0; }
   statut_de_json <<<"$ligne"
 }
+# #7717 : la pause lisible au registre (`show --json`), budget d'abord puis
+# opérateur. Un agent dans cet état ne peut commencer aucun tour : son bail
+# n'est pas à reprendre, et le contrôle porte sur le venv chargé.
+pause_de_json() {  # stdin : show JSON → « budget », « opérateur » ou vide
+  python3 -c 'import json,sys
+r = json.loads(sys.stdin.read() or "{}")
+budget = (r.get("paused_on_budget")
+          or (r.get("status") == "blocked"
+              and (r.get("status_text") or "").startswith("budget : ")))
+if budget: print("budget")
+elif r.get("operator_paused"): print("opérateur")
+else: print("")'
+}
 heure_base() {
   if [ "$MODE" = agents ]; then
     python_agents -c 'from ameesh import config,db
@@ -727,6 +753,29 @@ etat_unite_agents() {  # persona → UnitFileState
   utilisateur_agents systemctl --user show -p UnitFileState --value \
     "$(unite_agents "$1")" 2>/dev/null
 }
+# #7785 : personas du registre (ni arrêtées ni retirées) dont l'unité runner est
+# désactivée ou masquée sur cet hôte, une par ligne. La santé staging reçoit
+# ces noms : leur courrier est un avertissement nommant `agent retire`, jamais
+# un KO de déploiement — le retrait volontaire d'un exécuteur ne doit pas faire
+# revenir un staging en arrière. Une unité illisible n'est pas devinée : elle
+# n'est pas listée, et la santé reste stricte pour cette persona. Un hôte sans
+# agent n'est pas une erreur.
+unites_desactivees() {
+  local noms p etat rc=0
+  noms=$(agents_du_registre) || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;  # aucun agent à mener sur cet hôte
+    *) return "$rc" ;;
+  esac
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    etat=$(etat_unite_agents "$p") || continue
+    case "$etat" in
+      disabled|masked) printf '%s\n' "$p" ;;
+    esac
+  done <<<"$noms"
+}
 # #4248 : un rôle élu (§11) a un exécuteur sur chaque hôte candidat, mais le
 # registre ne porte que l'hôte du bail : agents_du_registre ne voit pas ici le
 # candidat en attente, qui restait sur l'ancien code puis reprenait le bail.
@@ -945,33 +994,47 @@ print("%d|%s" % (1 if r.get("operator_paused") else 0, r.get("operator_pause_rea
 }
 # #4358 : un registre illisible après LECTURE_ESSAIS lectures rend
 # « illisible|0|… » (rc 0) : l'appelant reporte la persona (reporter_illisible).
-etat_agent() {  # $1 persona → « statut|pause|raison du skip » (une seule lecture)
+# #7717 : le 4e champ dit la pause budget (`paused_on_budget`, la même lecture
+# que `handoff.paused`) — un agent sans tour ne peut reprendre aucun bail.
+etat_agent() {  # $1 persona → « statut|pause|raison du skip|pause budget »
   local ligne rc=0
   if [ "$MODE" = agents ]; then
     ligne=$(lire_show "$1" ameesh_agents_lecture) || rc=$?
   else
     ligne=$(lire_show "$1" ameesh_local_drain) || rc=$?
   fi
-  if [ "$rc" = 3 ]; then echo "illisible|0|lecture vide ou illisible"; return 0; fi
+  if [ "$rc" = 3 ]; then echo "illisible|0|lecture vide ou illisible|0"; return 0; fi
   [ "$rc" = 0 ] || return "$rc"
   if [ "$MODE" = agents ]; then
     python3 -c 'import json,sys
 r = json.loads(sys.stdin.read())
+# Même lecture que `handoff.paused` ; le préfixe couvre un CLI antérieur au
+# champ `paused_on_budget` (retour arrière).
+budget = (r.get("paused_on_budget")
+          or (r.get("status") == "blocked"
+              and (r.get("status_text") or "").startswith("budget : ")))
 if r.get("host") != sys.argv[1]:
-    print("skip|0|hôte=%s" % (r.get("host") or "absent"))
+    print("skip|0|hôte=%s|0" % (r.get("host") or "absent"))
 elif (r.get("mode") or "execute") != "execute":
-    print("skip|0|mode=%s" % (r.get("mode") or "execute"))
+    print("skip|0|mode=%s|0" % (r.get("mode") or "execute"))
 else:
-    print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))' "$HOTE_AGENTS" <<<"$ligne"
+    print("%s|%d||%d" % (r.get("status") or "",
+                         1 if r.get("operator_paused") else 0,
+                         1 if budget else 0))' "$HOTE_AGENTS" <<<"$ligne"
   else
     # #2198/N5 : le mode compte aussi en mode serveur ; sans cette garde,
     # une persona passée `externe`/`observe` était redémarrée avec les autres.
     python3 -c 'import json,sys
 r = json.loads(sys.stdin.read())
+budget = (r.get("paused_on_budget")
+          or (r.get("status") == "blocked"
+              and (r.get("status_text") or "").startswith("budget : ")))
 if (r.get("mode") or "execute") != "execute":
-    print("skip|0|mode=%s" % (r.get("mode") or "execute"))
+    print("skip|0|mode=%s|0" % (r.get("mode") or "execute"))
 else:
-    print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))' <<<"$ligne"
+    print("%s|%d||%d" % (r.get("status") or "",
+                         1 if r.get("operator_paused") else 0,
+                         1 if budget else 0))' <<<"$ligne"
   fi
 }
 # #4358 : persona au registre illisible pendant le balayage (relève d'un rôle
@@ -1355,10 +1418,10 @@ drains_non_leves_relus() {  # #2498 : passe du trap avant le verdict
 # les suivantes. Les intentions de pause restent dans le shell du trap EXIT.
 preparer_drain() {  # une seule persona, juste avant son arrêt
   [ "$DRAIN_ATTENTE" -gt 0 ] || return 0
-  local p=$1 etat st deja_pause detail
+  local p=$1 etat st deja_pause detail pause_budget
   etat=$(etat_agent "$p") \
     || { echo "$p : registre illisible avant le drain — aucun arrêt" >&2; return 1; }
-  IFS='|' read -r st deja_pause detail <<<"$etat"
+  IFS='|' read -r st deja_pause detail pause_budget <<<"$etat"
   case "$st" in
     running|idle|queued)
       if [ "$deja_pause" != 1 ]; then
@@ -1381,8 +1444,11 @@ preparer_drain() {  # une seule persona, juste avant son arrêt
 
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes i rc
-  local etat deja_pause detail hors etat_unite
+  local etat deja_pause detail pause_budget pause_etrangere hors etat_unite
   local non_verifiees=() echecs=() echecs_hors=()
+  # #7717 : personas dont une pause lisible au registre interdit tout tour —
+  # le bail n'est pas à reprendre, la preuve porte sur le venv (controler).
+  local pauses_budget=() pauses_operateur=()
   DRAINS_INDISPONIBLES=()
   DRAINS_NON_LEVES=()
   ILLISIBLES_REPORTEES=()
@@ -1410,7 +1476,7 @@ redemarrer_agents() {
       # #4437 : une seule classification pour redemarrer et controler.
       # Le statut et l'état de l'unité sont relus avant toute pause.
       etat=$(etat_agent "$p") || return 1
-      IFS='|' read -r st deja_pause detail <<<"$etat"
+      IFS='|' read -r st deja_pause detail pause_budget <<<"$etat"
       if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
       if [ "$st" = skip ]; then
         echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
@@ -1463,11 +1529,18 @@ redemarrer_agents() {
       # Le placement peut changer : relire avant de toucher une unité que cet
       # hôte ne doit plus mener.
       etat=$(etat_agent "$p") || return 1
-      IFS='|' read -r st deja_pause detail <<<"$etat"
+      IFS='|' read -r st deja_pause detail pause_budget <<<"$etat"
       if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
       if [ "$st" = skip ]; then
         lever_drain_sans_arreter "$p" "placement modifié" || true
         echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
+      fi
+      # #7717 : une pause opérateur qui n'est PAS le drain de ce script
+      # survivra au redémarrage — aucun tour, donc aucun bail à reprendre.
+      # Le drain, lui, est levé avant la preuve : le bail reste exigé.
+      pause_etrangere=0
+      if [ "$deja_pause" = 1 ] && ! drain_motif_de "$p" >/dev/null; then
+        pause_etrangere=1
       fi
       # #1131 : persona arrêtée par le propriétaire — un déploiement ne la
       # réactive pas. #1633 : son unité encore active est seulement rechargée
@@ -1498,7 +1571,7 @@ redemarrer_agents() {
         # et tenir compte d'un déplacement ou d'un arrêt survenu entre-temps,
         # mais ne pas attendre : l'arrêt prouvé prend la suite.
         etat=$(etat_agent "$p") || return 1
-        IFS='|' read -r st deja_pause detail <<<"$etat"
+        IFS='|' read -r st deja_pause detail pause_budget <<<"$etat"
         if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
         if [ "$st" = skip ]; then
           lever_drain_sans_arreter "$p" "placement modifié" || true
@@ -1534,7 +1607,19 @@ redemarrer_agents() {
       # #2152 : l'unité tourne sur le nouveau code — la pause du drain est
       # levée ici, avant la preuve de reprise du bail.
       lever_drain_sans_arreter "$p" "redémarrage hors tour" || true
-      if [ "$tenu" = 0 ]; then
+      # #7717 : une pause budget, ou une pause opérateur qui n'est pas notre
+      # drain, interdit tout nouveau tour. Le bail ne peut donc pas être repris
+      # et ne doit pas faire échouer le redémarrage : l'unité est vivante sur
+      # le code installé, et `controler` prouve son venv (jamais le bail).
+      if [ "$pause_budget" = 1 ]; then
+        pauses_budget+=("$p")
+        echo "$p : redémarré (était $st) — non vérifiée : pause budget (aucun tour, aucun bail à reprendre)"
+        continue
+      elif [ "$pause_etrangere" = 1 ]; then
+        pauses_operateur+=("$p")
+        echo "$p : redémarré (était $st) — non vérifiée : pause opérateur (aucun tour, aucun bail à reprendre)"
+        continue
+      elif [ "$tenu" = 0 ]; then
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")
       elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
@@ -1582,6 +1667,12 @@ redemarrer_agents() {
   fi
   if [ "${#non_verifiees[@]}" -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ "${#pauses_budget[@]}" -gt 0 ]; then
+    etape "WARNING: ${#pauses_budget[@]} persona(s) non vérifiée(s) : pause budget (aucun tour, aucun bail à reprendre) : ${pauses_budget[*]}"
+  fi
+  if [ "${#pauses_operateur[@]}" -gt 0 ]; then
+    etape "WARNING: ${#pauses_operateur[@]} persona(s) non vérifiée(s) : pause opérateur (aucun tour, aucun bail à reprendre) : ${pauses_operateur[*]}"
   fi
   if [ "${#ILLISIBLES[@]}" -gt 0 ]; then
     etape "WARNING: ${#ILLISIBLES[@]} persona(s) au registre illisible, laissée(s) en l'état (non concluant) : ${ILLISIBLES[*]}"
@@ -2043,7 +2134,7 @@ preuve_venv_agents() {  # persona → 0 si le MainPID vivant exécute le venv in
 }
 
 controler_agents() {
-  local noms p ligne heure attendu detail hors echec=0 etat_unite st rc
+  local noms p ligne heure attendu detail pause hors echec=0 etat_unite st rc
   local menes=()
   etape "code installé sur $HOTE_AGENTS"
   releve_agents || { echo "relevé du code impossible" >&2; echec=1; }
@@ -2094,6 +2185,14 @@ controler_agents() {
       || { echec_agent "$p" "unité inactive ou journal inaccessible"; echec=1; }
     preuve_venv_agents "$p" \
       || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
+    # #7717 : même règle que `redemarrer` (#4437 : un seul périmètre). Une
+    # pause budget ou opérateur interdit tout tour : le bail n'est pas à
+    # reprendre, le venv vivant vient d'être prouvé ci-dessus.
+    pause=$(pause_de_json <<<"$ligne")
+    if [ -n "$pause" ]; then
+      echo "WARNING $p: non vérifiée : pause $pause — preuve de bail non applicable (aucun tour, venv prouvé, sans retour)"
+      continue
+    fi
     if ! { heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
              && bail_valide 0 "$attendu" "$heure" <<<"$ligne"; }; then
       # #4239 : un rôle élu repris par un autre hôte candidat pendant le
@@ -2415,8 +2514,11 @@ redemarrer() {
   # shellcheck source=bail.sh
   . "$ICI/bail.sh"
   local p st avant ligne heure tenu attendu restantes i rc
-  local etat deja_pause detail
+  local etat deja_pause detail pause_budget pause_etrangere
   local non_verifiees=()
+  # #7717 : mêmes catégories qu'en mode agents — pause budgétaire ou
+  # opérateur lisible au registre : aucun tour, donc aucun bail à reprendre.
+  local pauses_budget=() pauses_operateur=()
   DRAINS_INDISPONIBLES=()
   DRAINS_NON_LEVES=()
   ILLISIBLES_REPORTEES=()
@@ -2447,11 +2549,17 @@ redemarrer() {
       drain_est_indisponible "$p" && continue
       etat=$(etat_agent "$p") \
         || { echo "$p: registry unreadable — nothing restarted" >&2; exit 1; }
-      IFS='|' read -r st deja_pause detail <<<"$etat"
+      IFS='|' read -r st deja_pause detail pause_budget <<<"$etat"
       if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
       if [ "$st" = skip ]; then
         lever_drain_sans_arreter "$p" "placement modifié" || true
         echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
+      fi
+      # #7717 : le drain de ce script est levé avant la preuve ; une pause
+      # opérateur étrangère, elle, survit au redémarrage.
+      pause_etrangere=0
+      if [ "$deja_pause" = 1 ] && ! drain_motif_de "$p" >/dev/null; then
+        pause_etrangere=1
       fi
       # #1131 : persona arrêtée par le propriétaire — un déploiement ne la
       # réactive pas.
@@ -2479,7 +2587,7 @@ redemarrer() {
         fi
         etat=$(etat_agent "$p") \
           || { echo "$p: registry unreadable — nothing restarted" >&2; exit 1; }
-        IFS='|' read -r st deja_pause detail <<<"$etat"
+        IFS='|' read -r st deja_pause detail pause_budget <<<"$etat"
         if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
         if [ "$st" = skip ]; then
           lever_drain_sans_arreter "$p" "placement modifié" || true
@@ -2514,7 +2622,17 @@ redemarrer() {
       # #2152 : l'unité tourne sur le nouveau code — la pause du drain est
       # levée ici, avant la preuve de reprise du bail.
       lever_drain_sans_arreter "$p" "redémarrage hors tour" || true
-      if [ "$tenu" = 0 ]; then
+      # #7717 : une pause budget ou opérateur interdit tout tour : le bail
+      # n'est pas à reprendre, le redémarrage n'échoue pas pour autant.
+      if [ "$pause_budget" = 1 ]; then
+        pauses_budget+=("$p")
+        echo "$p : redémarré (était $st) — non vérifiée : pause budget (aucun tour, aucun bail à reprendre)"
+        continue
+      elif [ "$pause_etrangere" = 1 ]; then
+        pauses_operateur+=("$p")
+        echo "$p : redémarré (était $st) — non vérifiée : pause opérateur (aucun tour, aucun bail à reprendre)"
+        continue
+      elif [ "$tenu" = 0 ]; then
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")
       elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
@@ -2525,6 +2643,12 @@ redemarrer() {
   done
   if [ ${#non_verifiees[@]} -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ ${#pauses_budget[@]} -gt 0 ]; then
+    etape "WARNING: ${#pauses_budget[@]} persona(s) non vérifiée(s) : pause budget (aucun tour, aucun bail à reprendre) : ${pauses_budget[*]}"
+  fi
+  if [ ${#pauses_operateur[@]} -gt 0 ]; then
+    etape "WARNING: ${#pauses_operateur[@]} persona(s) non vérifiée(s) : pause opérateur (aucun tour, aucun bail à reprendre) : ${pauses_operateur[*]}"
   fi
   if [ ${#ILLISIBLES[@]} -gt 0 ]; then
     etape "WARNING: ${#ILLISIBLES[@]} persona(s) au registre illisible, laissée(s) en l'état (non concluant) : ${ILLISIBLES[*]}"
@@ -2598,6 +2722,7 @@ if [ "$MODE" = agents ]; then
     verifier|controler) controler_agents ;;
     installer) installer_agents "${2:-HEAD}" ;;
     timers) timers_agents ;;
+    unites-desactivees) unites_desactivees ;;
     retour) retour_agents ;;
   esac
   exit

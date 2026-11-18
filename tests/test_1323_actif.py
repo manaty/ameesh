@@ -1249,13 +1249,14 @@ class StagingSignalTest(unittest.TestCase):
                        check=True, capture_output=True, env=env)
         self.sha = subprocess.run(run + ['rev-parse', 'HEAD'], check=True,
                                   capture_output=True, text=True).stdout.strip()
+        (self.home / '.local/share/ameesh/venv-courant').symlink_to('venv-' + self.sha[:7])
         base = env_isole()
         bacs = {}
         for nom in ('etat', 'fils', 'v0', 'config', 'tmp'):
             bacs[nom] = self.root / nom
             bacs[nom].mkdir()
         self.env = dict(base, HOME=str(self.home), BASCULE_ENV=str(self.config),
-                        FAKE_STATE=str(self.state),
+                        FAKE_STATE=str(self.state), FAKE_SHA=self.sha,
                         PATH=str(self.bin) + os.pathsep + base.get('PATH', ''),
                         TMPDIR=str(bacs['tmp']),
                         # #3848 : le banc tourne sur une VM ; les sequences
@@ -1568,6 +1569,13 @@ SSH = r'''#!/usr/bin/env bash
 printf 'stub %s %s\n' "$0" "$*" >> "${FAKE_STATE:?}/calls.log"
 printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 case "$*" in
+  *"venv-courant"*)
+    if grep -qx 'venv-illisible' "$FAKE_STATE/scenario"; then exit 1; fi
+    case "$*" in
+      *"readlink /opt/ameesh/venv-courant"*) echo "venv-${FAKE_SHA:0:7}" ;;
+      *) echo "${FAKE_SHA:0:7} ${FAKE_SHA:0:7}" ;;
+    esac
+    exit 0 ;;
   *"rev-parse --verify HEAD"*) echo "0123456789abcdef0123456789abcdef01234567"; exit 0 ;;  # clone migrations (#4050)
   *"bash -s -- "*) cat >/dev/null || true; exit 0 ;;   # migrations depuis une VM (#3848)
   *ameesh-sauvegarde.service*)   # dump serveur, poste absent (relecture dev1 #3848)
@@ -1614,15 +1622,20 @@ raise SystemExit(subprocess.run(args[index:], cwd=cwd, env=env).returncode)
 
 
 class HotesPartagesTest(unittest.TestCase):
-    """#3965 : la coupure relit l'attestation avec les memes hotes qu'actif.py."""
+    """#3965 : la coupure relit l'attestation avec les memes hotes qu'actif.py.
+
+    #7662 : le cœur ne porte plus de nom d'hôte ; la séquence vient des fiches
+    Host du canon. Ce test garde la parité avec `actif.py` (qui reste le script
+    de l'hôte) sur la fixture Manaty du canon."""
 
     def test_release_cutoff_et_actif_listent_les_memes_hotes(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-        from ameesh import release_cutoff
+        from tests import canon_staging
         actif = charger_actif()
-        self.assertEqual(release_cutoff.STAGING_AGENTS, actif.HOTES_AGENTS)
-        self.assertEqual(release_cutoff.STAGING_VMS, actif.HOTES_VMS)
-        self.assertEqual(release_cutoff.STAGING_HOSTS, actif.HOTES_CANON)
+        topology = canon_staging.topology()
+        self.assertEqual(topology.agents, actif.HOTES_AGENTS)
+        self.assertEqual(topology.vms, actif.HOTES_VMS)
+        self.assertEqual(topology.hosts, actif.HOTES_CANON)
 
 
 if __name__ == '__main__':

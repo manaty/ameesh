@@ -42,7 +42,10 @@
 #                JIT de Postgres coupé par défaut sur la base du mesh (#3503)
 #   redemarrer   exécuteurs du poste un par un (arrêt prouvé avant chaque
 #                démarrage), puis notify, puis les exécuteurs de l'ancienne base
-#                refusé depuis une unité ameesh-* (risque de tuer le script)
+#                refusé depuis une unité ameesh-* (risque de tuer le script) ;
+#                un agent en pause budget ou opérateur lisible au registre ne
+#                reprend aucun bail : unité rechargée, « non vérifiée : pause … »
+#                sans échec (#7717)
 #   timers       pose les minuteries mécaniques EP5 (veille GitHub, CI,
 #                projection) sur cet hôte s'il est candidat du rôle élu ;
 #                refuse explicitement les passes dont la clé `github` manque
@@ -51,6 +54,10 @@
 #                le venv réellement exécuté par le MainPID de notify et de
 #                chaque exécuteur (#2950, #3311), et les minuteries de rôle
 #                (EP5) vérifiées par `role timers --check`
+#   unites-desactivees  une persona par ligne : celles du registre (ni arrêtées
+#                ni retirées) dont l'unité runner est désactivée ou masquée sur
+#                ce poste. La santé staging les reçoit (#7785) : leur courrier
+#                est un avertissement nommant `agent retire`, jamais un KO.
 #   retour       bascule en arrière vers le venv précédent conservé (sans pip),
 #                puis redémarre (sans toucher aux bases : 0041 à 0047 sont
 #                additives)
@@ -549,7 +556,17 @@ installer() {
         || { echo "ancienne base pas prête pour $court (ligne ci-dessus) : « $0 migrer $ref » d'abord" >&2; exit 1; }
     fi
   fi
-  [ -L "$PARTAGE/src-current" ] && readlink "$PARTAGE/src-current" > "$TRAVAIL/precedent"
+  # Le venv vivant peut être en retard sur src-current après une passe interrompue.
+  # Le retour doit rétablir le code qui servait réellement les agents.
+  local vivant
+  vivant=$(readlink "$PARTAGE/venv-courant" 2>/dev/null || true)
+  vivant=${vivant##*/}; vivant=${vivant#venv-}
+  if [[ $vivant =~ ^[0-9a-fA-F]{7}$ ]]; then
+    [ -d "$PARTAGE/src-$vivant" ] || { echo "instantané du venv vivant src-$vivant absent : installation refusée, retour impossible" >&2; exit 1; }
+    printf 'src-%s\n' "$vivant" > "$TRAVAIL/precedent"
+  elif [ -L "$PARTAGE/src-current" ]; then
+    readlink "$PARTAGE/src-current" > "$TRAVAIL/precedent"
+  fi
   echo "version précédente : $(cat "$TRAVAIL/precedent" 2>/dev/null || echo '?')"
   if [ -s "$TRAVAIL/precedent" ]; then
     precedent_court=$(basename "$(cat "$TRAVAIL/precedent")"); precedent_court=${precedent_court#src-}
@@ -800,6 +817,20 @@ print(json.dumps(r))' <<<"$sortie" 2>/dev/null && return 0
   done
   return 3  # #4358 : lecture non concluante, aucun redémarrage
 }
+# #7717 : la pause lisible au registre, budget d'abord puis opérateur. Un
+# agent dans cet état ne peut commencer aucun tour : son bail n'a pas à être
+# repris, et le redémarrage ne doit pas échouer pour cela (le venv reste
+# prouvé par `controler`).
+pause_de_json() {  # stdin : show JSON → « budget », « opérateur » ou vide
+  python3 -c 'import json,sys
+r = json.loads(sys.stdin.read() or "{}")
+budget = (r.get("paused_on_budget")
+          or (r.get("status") == "blocked"
+              and (r.get("status_text") or "").startswith("budget : ")))
+if budget: print("budget")
+elif r.get("operator_paused"): print("opérateur")
+else: print("")'
+}
 # base … → the clock of that base's database, epoch seconds, read through
 # ameesh's own connection, as `ameesh show` is: no DSN nor password in argv
 heure_base() {
@@ -934,7 +965,7 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
 # sans bail ni tour.
 redemarrer_liste() {
   local base=$1; shift
-  local u p st avant ligne heure tenu attendu rc
+  local u p st avant ligne heure tenu attendu rc pause
   for u in "$@"; do
     p=$(persona_de "$u")
     [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
@@ -968,6 +999,10 @@ redemarrer_liste() {
       echo "WARNING $p: bail illisible — unité $u laissée en l'état (non concluant, sans retour)"
       continue
     fi
+    # #7717 : pause budget (ou opérateur) lisible au registre — aucun tour ne
+    # peut partir, donc le bail n'est pas à reprendre. La lecture `show` du
+    # registre suffit à le constater, avant l'arrêt.
+    pause=$(pause_de_json <<<"$ligne")
     [ "$rc" = 0 ] && heure=$(heure_base "$base") \
       && attendu=$(proprietaire_de "$u") \
       || { echo "$u: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
@@ -984,7 +1019,18 @@ redemarrer_liste() {
       echo "$u : ne redémarre pas — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
       exit 1
     fi
-    if [ "$tenu" = 0 ]; then
+    # #7717 : l'unité tourne sur le code installé ; la pause interdit tout
+    # tour, donc le bail n'est ni repris ni exigé (le venv est prouvé par
+    # `controler`). Non concluant, jamais un échec de redémarrage.
+    if [ "$pause" = budget ]; then
+      pauses_budget+=("$p")
+      echo "$p : redémarré (était $st) — non vérifiée : pause budget (aucun tour, aucun bail à reprendre)"
+      continue
+    elif [ "$pause" = opérateur ]; then
+      pauses_operateur+=("$p")
+      echo "$p : redémarré (était $st) — non vérifiée : pause opérateur (aucun tour, aucun bail à reprendre)"
+      continue
+    elif [ "$tenu" = 0 ]; then
       echo "WARNING $p: not checked: no lease before the restart, no sign of life"
       non_verifiees+=("$p")
     elif ! attendu=$(proprietaire_de "$u") || ! attendre_bail "$avant" "$attendu" "$base" "$p"; then
@@ -1017,6 +1063,10 @@ redemarrer() {
   . "$ICI/bail.sh"
   local unites
   non_verifiees=()
+  # #7717 : personas en pause budgétaire ou opérateur — aucun tour, donc
+  # aucun bail à reprendre ; nommées à la trace, sans retour arrière.
+  pauses_budget=()
+  pauses_operateur=()
   mapfile -t unites < <(unites_mesh)
   etape "exécuteurs du poste, base du mesh (${#unites[@]}), arrêt prouvé avant démarrage"
   [ ${#unites[@]} -gt 0 ] && redemarrer_liste mesh "${unites[@]}"
@@ -1032,6 +1082,12 @@ redemarrer() {
   fi
   if [ ${#non_verifiees[@]} -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ ${#pauses_budget[@]} -gt 0 ]; then
+    etape "WARNING: ${#pauses_budget[@]} persona(s) non vérifiée(s) : pause budget (aucun tour, aucun bail à reprendre) : ${pauses_budget[*]}"
+  fi
+  if [ ${#pauses_operateur[@]} -gt 0 ]; then
+    etape "WARNING: ${#pauses_operateur[@]} persona(s) non vérifiée(s) : pause opérateur (aucun tour, aucun bail à reprendre) : ${pauses_operateur[*]}"
   fi
 }
 
@@ -1074,6 +1130,34 @@ controler_executeurs() {
       || { echo "$u : MainPID changé pendant le contrôle, relancer controler" >&2; echec=1; }
   done < <(unites_mesh)
   [ "$echec" = 0 ]
+}
+
+# #7785 : personas du registre (ni arrêtées ni retirées, mode execute) dont
+# l'unité runner est désactivée ou masquée sur ce poste, une par ligne. La
+# santé staging reçoit ces noms : leur courrier est un avertissement nommant
+# `agent retire`, jamais un KO — un exécuteur volontairement retiré ne fait pas
+# revenir un déploiement en arrière. Une unité dont la persona ou l'état du
+# registre est illisible n'est pas devinée : elle n'est pas listée.
+unites_desactivees() {
+  local u p etat
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    p=$(persona_de "$u") || continue
+    [ -n "$p" ] || continue
+    etat=$("$AMEESH" show "$p" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    row = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(1)
+if row.get("retired_ts") or row.get("status") == "stopped" \
+        or (row.get("mode") or "execute") != "execute":
+    print("hors")
+' 2>/dev/null) || continue
+    [ -n "$etat" ] || printf '%s\n' "$p"
+  done < <(systemctl --user list-unit-files 'ameesh-runner-agent@*.service' \
+             --plain --no-legend 2>/dev/null \
+           | awk '$2 == "disabled" || $2 == "masked" {print $1}')
 }
 
 timers() {
@@ -1356,6 +1440,7 @@ case "${1:-}" in
   timers) timers ;;
   redemarrer) redemarrer ;;
   controler) controler ;;
+  unites-desactivees) unites_desactivees ;;
   retour) retour ;;
   *) sed -n '4,35p' "$0" >&2; exit 2 ;;
 esac

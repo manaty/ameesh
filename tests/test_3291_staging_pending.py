@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Staging must never undo a fix already active on the mesh (#3291)."""
+import dataclasses
 import json
 import types
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from ameesh import mechanics, release_cutoff, staging_pending
+from tests import canon_staging
 from tests.test_2448_release_cutoff import MECHANICS, ReleaseFixtureMixin, _paris
 
 
@@ -36,11 +38,11 @@ class ActiveFloorTest(ReleaseFixtureMixin, unittest.TestCase):
         compte dans la vue des hotes actifs, sans fichier local."""
         data = {"sha": self.head, "date": "2026-10-24T04:00:00Z",
                 "hotes": {hote: {"actif": self.head}
-                          for hote in release_cutoff.STAGING_AGENTS}}
+                          for hote in canon_staging.AGENTS}}
         with mock.patch.object(release_cutoff, "stored_attestations",
                                return_value=[data]):
             active = staging_pending.active_hosts(db=object())
-        for hote in release_cutoff.STAGING_AGENTS:
+        for hote in canon_staging.AGENTS:
             self.assertEqual(active[hote]["sha"], self.head)
             self.assertTrue(active[hote]["attestation"].startswith("ameesh_events:"))
 
@@ -56,11 +58,11 @@ class ActiveFloorTest(ReleaseFixtureMixin, unittest.TestCase):
 
         ecrire("actif-ancienne.json", {
             "sha": old, "date": "2026-10-24T04:00:00Z",
-            "hotes": {hote: {"actif": old} for hote in release_cutoff.STAGING_HOSTS}
+            "hotes": {hote: {"actif": old} for hote in canon_staging.HOSTS}
             | {"pc-smichea": {"actif": self.head}}})
         ecrire("actif-reportee.json", {
             "sha": self.head, "date": "2026-10-24T05:00:00Z",
-            "hotes": {hote: {"actif": old} for hote in release_cutoff.STAGING_VMS},
+            "hotes": {hote: {"actif": old} for hote in canon_staging.VMS},
             "reportes": {"pc-smichea": {"raison": "poste absent",
                                         "mise_a_jour": "a son retour"}}})
         active = staging_pending.active_hosts()
@@ -70,7 +72,7 @@ class ActiveFloorTest(ReleaseFixtureMixin, unittest.TestCase):
         # une attestation complete plus recente reprend le poste
         ecrire("actif-complete.json", {
             "sha": old, "date": "2026-10-24T06:00:00Z",
-            "hotes": {hote: {"actif": old} for hote in release_cutoff.STAGING_HOSTS}})
+            "hotes": {hote: {"actif": old} for hote in canon_staging.HOSTS}})
         active = staging_pending.active_hosts()
         self.assertFalse(active["pc-smichea"].get("absent"))
         self.assertEqual(active["pc-smichea"]["sha"], old)
@@ -334,6 +336,7 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
             self.st.work.land_lock.assert_not_called()
 
     def test_timer_alert_is_deduplicated_for_each_recipient_and_rearmed(self):
+        project = dataclasses.replace(self.project, report="bureau")  # route d'ameesh (#7634)
         report = {"result": "needed", "lots": [1, 2, 3], "candidate": self.head,
                   "active": self.active}
         cfg = types.SimpleNamespace(state_dir=self.cfg.state_dir,
@@ -341,14 +344,14 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
                                         "notify": ["pilot", "bureau"]}}})
         with mock.patch.object(staging_pending, "inspect", return_value=report), \
              mock.patch("ameesh.mail.send") as send:
-            staging_pending.tick(cfg, None, self.project, now=_paris(22, 30))
-            staging_pending.tick(cfg, None, self.project, now=_paris(22, 31))
+            staging_pending.tick(cfg, None, project, now=_paris(22, 30))
+            staging_pending.tick(cfg, None, project, now=_paris(22, 31))
             self.assertEqual(send.call_count, 2)
             self.assertEqual({c.args[2] for c in send.call_args_list}, {"pilot", "bureau"})
             with mock.patch.object(staging_pending, "inspect", return_value={
                     "result": "below-threshold"}):
-                staging_pending.tick(cfg, None, self.project, now=_paris(22, 32))
-            staging_pending.tick(cfg, None, self.project, now=_paris(22, 33))
+                staging_pending.tick(cfg, None, project, now=_paris(22, 32))
+            staging_pending.tick(cfg, None, project, now=_paris(22, 33))
             self.assertEqual(send.call_count, 4)
 
 

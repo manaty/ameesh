@@ -18,20 +18,21 @@ Escalade (§9), à chaque dépassement :
 1. au premier dépassement, alerte à l'assigné ;
 2. au double du délai, alerte au pilote du projet (orchestrateur), qui
    réassigne ;
-3. au triple — ou si le pilote est lui-même en retard — le bureau ou
+3. au triple — ou si le pilote est lui-même en retard — l'avatar de l'humain ou
    l'auditeur réassigne directement à un agent libre ;
-4. pour un P1, le bureau traite, avec l'auditeur en copie. **Aucun
+4. pour un P1, l'avatar de l'humain traite, avec l'auditeur en copie. **Aucun
    dépassement de délai n'est notifié à l'owner** (décision de l'owner du
-   18/10/2026 vers 08:00 : « rien sur les SLO ») : le niveau 4 vise le bureau
+   18/10/2026 vers 08:00 : « rien sur les SLO ») : le niveau 4 vise l'avatar
    et l'auditeur, jamais l'owner.
 
 Un lot P1 (priorité 1, « high ») porte le délai court de la colonne
-« P1 / bloquant » et vise le bureau et l'auditeur dès le premier dépassement ;
+« P1 / bloquant » et vise l'avatar et l'auditeur dès le premier dépassement ;
 aucun dépassement n'est notifié à l'owner.
 """
 from __future__ import annotations
 
 from ameesh import work_lifecycle as lifecycle
+from .roles import AUDITOR_ROLES
 
 import re
 import time
@@ -95,7 +96,7 @@ STEPS: tuple = (
     # (`review_designation_activation.due_fixes`, le même calcul que les avis
     # dus de #3033) : un lot en qa avec un avis bloquant n'attend plus un
     # relecteur, il attend la correction de son assigné. 2 h, 1 h en P1 ;
-    # escalade §9 : ×1 assigné, ×2 pilote, ×3 bureau/auditeur. #3487 : la même
+    # escalade §9 : ×1 assigné, ×2 pilote, ×3 avatar/auditeur. #3487 : la même
     # étape mesure le correctif d'un lot revenu en build après son GO ; le
     # porteur porte le correctif, et le niveau 3 ne prescrit pas de le
     # réassigner (la réassignation perdrait son contexte).
@@ -125,11 +126,11 @@ BY_KEY = {step.key: step for step in STEPS}
 LEVEL_TARGETS = {
     1: ("assignee",),
     2: ("pilot",),
-    3: ("bureau", "auditeur"),
+    3: ("avatar", AUDITOR_ROLES[0]),
 }
 #: #2395 : le niveau 4 n'a pas de seuil propre — un P1 le déclenche. Il vise le
-#: bureau et l'auditeur, jamais l'owner (canon §9, décision owner 18/10).
-CRITICAL_TARGETS = ("bureau", "auditeur")
+#: l'avatar et l'auditeur, jamais l'owner (canon §9, décision owner 18/10).
+CRITICAL_TARGETS = ("avatar", AUDITOR_ROLES[0])
 
 
 def step_of(key: str) -> Step:
@@ -158,7 +159,7 @@ def level(elapsed_s: float, target: float) -> int:
 
 
 def targets(level_: int, *, critical: bool = False) -> tuple:
-    """Les destinataires du niveau atteint ; un P1 y ajoute le bureau et
+    """Les destinataires du niveau atteint ; un P1 y ajoute l'avatar et
     l'auditeur (niveau 4, canon §9) — jamais l'owner."""
     out = list(LEVEL_TARGETS.get(int(level_), ()))
     if critical:
@@ -242,7 +243,7 @@ RESERVED_AT_CREATION = "reserved to external executor "
 
 
 def _external_executor_ts(item: dict, events: Iterable[dict]) -> float | None:
-    """#4704 : l'instant où un lot a un exécutant externe (bureau, owner), ou
+    """#4704 : l'instant où un lot a un exécutant externe (avatar, owner), ou
     None s'il n'en a jamais porté.
 
     Un lot réservé n'a pas d'`assignee` : sans cette lecture,
@@ -638,7 +639,8 @@ def _footprint_exact_release(named: Iterable[int],
 
 
 def footprint_blockers(item: dict, lots: Iterable[dict],
-                       paths_by_lot: dict, policies: dict | None = None) -> list[dict]:
+                       paths_by_lot: dict, policies: dict | None = None,
+                       declared: Iterable[int] = ()) -> list[dict]:
     """Les lots qui retiennent `item` par la garde d'empreinte (#3185, #4561).
 
     Même règle que la garde d'attribution : un lot du même dépôt (`app`), qui
@@ -650,7 +652,12 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
     #4818 : `policies` (`{app: politique}`) porte les chemins partagés du
     dépôt (ignorés) et son plafond de lots en vol : sans chevauchement, un
     dépôt au plafond retient le lot par tous ses occupants (`reason: cap`,
-    lots exemptés exceptés : `work_footprints.is_exempt`). Le marqueur `.` chevauche tout."""
+    lots exemptés exceptés : `work_footprints.is_exempt`). Le marqueur `.` chevauche tout.
+
+    #7760 : `declared` nomme les bloquants dont `item` a déclaré la dépendance.
+    Un occupant `validated` déclaré ne retient plus le DÉMARRAGE (il démarre
+    sur sa tête gelée) ; il compte toujours dans le plafond de lots en vol,
+    et la fusion, elle, attend toujours sa fusion."""
     if str(item.get("state") or "") != lifecycle.REQUESTED:
         return []
     if str(item.get("assignee") or "").strip():
@@ -660,6 +667,8 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
     if not app:
         return []
     from . import work_footprints
+
+    starts_on = {int(ident) for ident in declared or ()}
 
     policy = (policies or {}).get(app) or {}
     shared = policy.get("shared_paths") or ()
@@ -683,6 +692,10 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
                "last_activity_ts": other.get("last_activity_ts")}
         if not work_footprints.is_exempt(other):
             occupants.append(row)
+        if state == lifecycle.VALIDATED and other_id in starts_on:
+            # #7760 : la paire démarre sur la tête gelée du validé ; seule la
+            # fusion l'attend encore.
+            continue
         theirs = paths_by_lot.get(other_id) or ()
         if not mine or not theirs:
             continue
@@ -955,7 +968,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     l'assigné), `blocked_ts`, `blocked_by`, `sha`). Chacune donne une ligne
     `blocked_freeze` en cours, depuis le **premier** avis bloquant encore en
     vigueur sur le dernier gel : l'escalade §9 vise l'assigné, puis le pilote
-    qui réassigne, puis le bureau/l'auditeur. La grâce de prise en charge
+    qui réassigne, puis l'avatar/l'auditeur. La grâce de prise en charge
     s'applique ici en revanche : le débiteur est bien le porteur du lot, et
     une réassignation ne doit pas déclencher une nouvelle demande de
     réassignation dans la minute. Une correction livrée (nouveau gel) ou
@@ -968,7 +981,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     levé et passé par `hold_releases`), l'horloge repart de la levée si elle
     suit le blocage. Le temps passé sous retenue n'est donc pas un retard du
     porteur, et un lot parqué volontairement ne fait plus crier « réassigner
-    maintenant » vers le bureau à la levée.
+    maintenant » vers l'avatar à la levée.
 
     #3487 : un lot revenu en `build` après un GO courant porte un correctif
     dû. Le GO → fusion ne court plus — la tête relue n'est plus le travail
@@ -1001,7 +1014,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     aussi `signal_assigned` (#6140) ; levée, elle date son départ, comme pour
     `intake_started` (#2551). A2 : un lot réservé à un exécutant externe
     (`external_executor`, #3447) garde ses étapes mesurées mais sans escalade
-    — aucun rôle du §9 ne peut faire avancer le geste du bureau ou de l'owner
+    — aucun rôle du §9 ne peut faire avancer le geste de l'avatar ou de l'owner
     (#6241). `external_retired` lève cette règle quand le système déclaré a été
     retiré : le pilote doit alors lever la réservation, et l'alerte le dit
     (#6105). A3 : un dossier d'acte sur branche `review/**` n'a pas d'horloge
@@ -1114,7 +1127,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             # prêt. Passé intake sans événement `build` (#1982), la phase est
             # franchie mais non mesurable : aucune ligne, donc aucun retard
             # inventé — seules l'origine réelle et les durées mesurées restent.
-            # #6255 A2 : un lot tenu par un exécutant externe (bureau, owner,
+            # #6255 A2 : un lot tenu par un exécutant externe (avatar, owner,
             # système) reste mesuré, sans escalade — le §9 ne vise que des
             # agents, et l'exécutant agit sans changer l'état du lot (#6241).
             out.append(_row(step, ready, now=now, critical=critical,

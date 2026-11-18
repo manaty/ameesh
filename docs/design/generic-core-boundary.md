@@ -102,11 +102,10 @@ tooling provider in `DELIVERY_CONNECTORS` and read through
 declared merge, `work merged`) or `{action}` (a merge confirmed by the gate).
 L101 tranche 4 (#4357) integrates `dev` on the Module interface: `discover()`
 lists it as a built-in tooling module with the `workspaces` capability and no
-work item type. It is always active, and the canon cannot select it (a
-descriptor without types is refused in a project policy). Project policy
-activation applies to modules with work item types. The core obtains the
-workspaces façade
-through `registry.get("dev")`; its `audit` hook delegates the `canon check`
+work item type. Its tooling remains always active. A project can select an
+explicit action policy for it without adding lifecycle types (#7628); an empty lifecycle-only
+selection is still refused. Project policies activate lifecycle and action
+modules. The core obtains the workspaces façade through `registry.get("dev")`; its `audit` hook delegates the `canon check`
 workspace findings (`host-work-dir-*`, `host-workspaces-unknown`) under the
 Module interface. Those settings are host-scoped, so `modules.audit` runs the
 hook once, with `project=None`, after the project modules: one finding is not
@@ -115,8 +114,10 @@ orchestrator or project event brief; the human route uses the responsible of
 its agent, then of its host, then `notify.default_human`, and two hosts with
 the same rule stay two alerts. The bare profile has no
 `dev` module and documents housekeeping and worktrees as no-ops. Installed
-entry points cannot declare connectors, and a name declared twice or taken by
-the core is refused. `registry.merge_connector()` replaces
+entry points may declare action connectors through the Module interface; delivery connectors remain built-in. Names taken twice or by the
+core are refused. Action activation and operation classes come from the applied
+project policy; see [Module action connectors](module-action-connectors.md).
+`registry.merge_connector()` replaces
 `work_lifecycle.delivery_connector()`. The lot journal names the connector
 (`[via <connector>]`). Tranche 2b (#4366)
 routes the merges observed by the sweeps and the packet and merge-queue paths
@@ -125,12 +126,48 @@ same verb, with a third `git-merge` evidence `{seen: <source>, sha, pr}`; a
 test refuses any new direct call to `work.close_merged` outside the
 `git-merge` connector and `work.record_merge`.
 
+#7637 tranche 4 (#7663) moves the Nexlink release engine into the built-in
+`nexlink` tooling module. The core keeps the `semver` engine
+(`CORE_RELEASE_MODELS`) and reads any other release model through
+`registry.release_model(name)`, which returns the module object declared in
+the Module's `RELEASE_MODELS` (`release` capability). The provider supplies
+`plan`, `execute`, `child_credentials`, the attestation vocabulary and,
+optionally, `abandon`, `validate_project`, `plan_text`, `error_body` and
+`abandon_text`; `work.note` reads the module's `RESERVED_PREFIXES` through
+`registry.release_reserved_prefixes()`. `nexlink` is always-active tooling
+like `dev` and declares no work item type; the bare profile has no built-in
+module, hence no `nexlink` release model and no direct import of the engine.
+The configuration names the model; the core never names the module package.
+
+#7637 tranche 3b (#7793) moves the `nexlink` alert channel into that same
+built-in tooling module. A module declares `NOTIFY_CHANNELS`; the core merges
+those kinds with its own (`desktop`, `ntfy`, `slack`, `app`) and reads one
+through `registry.notify_channel(kind)`, which imports the provider lazily.
+The provider owns its configuration checks (`OPTIONS`, `validate`), its
+sender (`send`, `receipt`), its remote-push and doctor checks
+(`push_problem`, `activation_problem`) and its fallback contract
+(`FALLBACK`, `FALLBACK_KINDS`, `FALLBACK_PREFIX`). The generic `Sender` hands
+each provider a per-sender `channel_state`; the core keeps routing, retry,
+rate summary and the `notified`/`fallback` registries.
+`ameesh.modules.nexlink.alerts` holds the crypto envelope and the signed
+transport (formerly `ameesh.nexlink_alerts`). The bare profile has no
+built-in module, hence no `nexlink` channel and no import of either file.
+
+#7637 tranche 3c (#7794) moves the dynamic Nexlink packet CI contract of the
+train (#2503) into that module (`ameesh.modules.nexlink.packet_ci`). A module
+declares `TRAIN_CONTRACTS` and a lazy `train_contract(name)` returning the
+contract factory; `train_assembly.contracts()` merges them with the core's
+`ameesh` contract and refuses a name both declare. The host configuration
+still selects the contract by its exact name (`ci_contract`); the bare
+profile has no `nexlink` contract and refuses that name as unknown.
+
 L100 tranche 1 (#4382) moves the development merge paths into the built-in
 `dev` provider. The `git-merge` action connector lives in
 `modules/dev/git_merge.py`; `connectors.get("git-merge")` reads it through
 `registry.action_connectors()`, which follows the delivery rule: the core
 keeps `shell-noop`, a name declared twice or taken by the core is refused, and
-installed entry points cannot declare action connectors. The `work merge-pr`
+installed entry points can declare project-scoped action connectors (#7628).
+The `work merge-pr`
 gesture lives in `modules/dev/merge_pr.py`; the `ameesh work merge-pr` route is
 unchanged. The old paths `ameesh.connectors.git_merge` and `ameesh.merge_pr`
 are `sys.modules` aliases of the same module object, so importers and tests
@@ -148,7 +185,8 @@ when no database is reachable), while `doctor` compares declarations, installed
 descriptors and applied policies. Discovery remains separate from activation.
 The standard profile includes the always-active `dev` tooling provider, whose
 CLI is available through `ameesh module dev`; existing command aliases are
-retained. The bare profile has neither built-ins nor external entry points,
+retained. The bare profile has no built-ins (installed entry points remain
+discoverable),
 and workspace operations without `dev` are no-ops.
 
 The site's [Core and modules](../../site/docs/concepts/core-and-modules.md)

@@ -20,7 +20,11 @@ alors sans réseau.
 """
 from __future__ import annotations
 
+import io
+import json
 import os
+import unittest
+import urllib.error
 import subprocess
 
 from unittest import mock
@@ -360,6 +364,80 @@ class _Fixture:
 class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
     """Les témoins #7252, sur la lecture et la sélection du gel."""
 
+    def test_strict_reading_ignores_non_commit_objects_and_run_numbers(self):
+        blob = self.repo.git("rev-parse", "HEAD:src/ameesh/mail.py")
+        tree = self.repo.git("rev-parse", "HEAD^{tree}")
+        for token in (blob[:8], tree[:12]):
+            for fetch in (False, True):
+                with self.subTest(token=token, fetch=fetch):
+                    self.repo.git("reset", "--hard", self.head_a)
+                    self.repo.write("src/ameesh/mail.py", token + "\n")
+                    head = self.repo.commit("author: reference (%s)" % token,
+                                            agent="author")
+                    self._receipt("author", "deepseek", [head])
+                    with mock.patch.object(review_authors, "_forge_commit") as forge:
+                        (_authors, unknown, correctors), _freeze = self._reading(
+                            head, strict=True, fetch=fetch)
+                    self.assertEqual(unknown, [])
+                    self.assertEqual(correctors, [])
+                    forge.assert_not_called()
+
+    def test_hex_word_requires_a_definitive_forge_negative(self):
+        from ameesh import plan_github
+
+        _fix, head = self._rewrite(cite="ed25519")
+        for status, message, accepted in (
+                (404, "No commit found for SHA: ed25519", True),
+                (422, "No commit found for SHA: ed25519", True),
+                (404, "Not Found", False),
+                (422, "Ambiguous SHA", False),
+                (403, "API rate limit exceeded", False),
+                (503, "Service unavailable", False)):
+            with self.subTest(status=status, message=message):
+                def unavailable(*args, **kwargs):
+                    raise urllib.error.HTTPError(
+                        "https://api.invalid", status, "failure", {},
+                        io.BytesIO(json.dumps({"message": message}).encode()))
+
+                api = plan_github.Api(token="test", opener=unavailable)
+                with mock.patch.object(review_authors, "_repository_slug",
+                                       return_value="owner/repo"), \
+                        mock.patch.object(plan_github, "client", return_value=api), \
+                        mock.patch.object(review_authors, "_forge_fetch") as fetch:
+                    if accepted:
+                        (_authors, unknown, correctors), _freeze = self._reading(
+                            head, strict=True)
+                        self.assertEqual(unknown, [])
+                        self.assertEqual(correctors, [])
+                    else:
+                        with self.assertRaisesRegex(
+                                review_provenance.ProvenanceError,
+                                "cited commit ed25519 .*forge-unreadable"):
+                            self._reading(head, strict=True)
+                    fetch.assert_not_called()
+
+    def test_numeric_citation_requires_a_definitive_forge_negative(self):
+        _fix, head = self._rewrite(cite="43969930787")
+        with mock.patch.object(review_authors, "_forge_commit", return_value=None):
+            self._reading(head, strict=True)
+        for fetch in (False, True):
+            with self.subTest(fetch=fetch):
+                with mock.patch.object(review_authors, "_forge_commit", return_value=""):
+                    with self.assertRaises(review_provenance.ProvenanceError):
+                        self._reading(head, strict=True, fetch=fetch)
+
+    def test_numeric_abbreviation_resolved_by_forge_excludes_corrector(self):
+        fix, head = self._remote_rewrite()
+        body = self.repo.git("log", "-1", "--format=%B").replace(fix[:12], "1234567")
+        self.repo.git("commit", "--amend", "-m", body)
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        with mock.patch.object(review_authors, "_forge_commit", return_value=fix) as forge:
+            (_authors, unknown, correctors), _freeze = self._reading(head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(forge.call_args.args[1], "1234567")
+
     def test_strict_reading_ignores_explicit_checksums(self):
         for label in ("checksum", "sha256", "SHA256"):
             with self.subTest(label=label):
@@ -383,3 +461,129 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
         (_authors, unknown, correctors), _freeze = self._reading(head, strict=True)
         self.assertEqual(unknown, [])
         self.assertEqual([row["name"] for row in correctors], ["cx3"])
+
+    def test_strict_reading_ignores_a_package_name_date(self):
+        # #7709 : la date d'un nom complet de paquet horaire (h-AAAAMMJJ-NN)
+        # est consommée avec l'identifiant ; ce n'est pas une citation Git.
+        # Le cas se répète dans les messages réels (#7692, #7707) et refusait
+        # la porte en lecture stricte, faute de résolution à la forge.
+        for text in ("paquet h-20261117-05",
+                     "h-20261117-05",
+                     "paquet-h-20261117-05"):
+            with self.subTest(text=text):
+                self.repo.git("reset", "--hard", self.head_a)
+                self.repo.write("src/ameesh/mail.py", text + "\n")
+                head = self.repo.commit("author: " + text, agent="author")
+                self._receipt("author", "deepseek", [head])
+                with mock.patch.object(review_authors, "_forge_commit") as forge:
+                    (_authors, unknown, correctors), _freeze = self._reading(
+                        head, strict=True)
+                self.assertEqual(unknown, [])
+                self.assertEqual(correctors, [])
+                forge.assert_not_called()
+
+    def test_package_name_does_not_hide_a_real_commit_citation(self):
+        # #7709 : écarter la date du nom de paquet ne doit pas écarter la
+        # vraie citation du correctif retiré présente dans le même message.
+        fix, head = self._rewrite()
+        self.repo.git("commit", "--amend", "-m",
+                      "author: paquet h-20261117-05 ; correctif %s" % fix[:12])
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        (_authors, unknown, correctors), _freeze = self._reading(head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head)
+
+    def test_hyphenated_real_citation_is_still_resolved(self):
+        # B/P2 auditeur : un mot suivi d'un tiret n'est pas un identifiant
+        # reconnu. La citation réelle `correctif-<sha>` reste lue et résolue ;
+        # l'exclusion ne vaut que pour le nom complet d'un paquet.
+        fix, head = self._rewrite()
+        self.repo.git("commit", "--amend", "-m",
+                      "author: correctif-%s retiré par la réécriture" % fix[:12])
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        (_authors, unknown, correctors), _freeze = self._reading(head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head)
+
+    def test_package_name_does_not_excuse_an_unreadable_short_sha(self):
+        # #7709 : un vrai jeton court avec tiret, numérique comme la date du
+        # paquet, reste une citation à résoudre ; introuvable, il refuse.
+        self.repo.git("reset", "--hard", self.head_a)
+        self.repo.write("src/ameesh/mail.py", "package\n")
+        head = self.repo.commit(
+            "author: correctif-43969930787 ; paquet h-20261117-05",
+            agent="author")
+        self._receipt("author", "deepseek", [head])
+        with mock.patch.object(review_authors, "_forge_commit",
+                               return_value="") as forge:
+            with self.assertRaisesRegex(
+                    review_provenance.ProvenanceError,
+                    "cited commit 43969930787 .*forge-unreadable"):
+                self._reading(head, strict=True)
+        self.assertEqual([call.args[1] for call in forge.call_args_list],
+                         ["43969930787"])
+
+
+class ForgeCitationResolutionTest(unittest.TestCase):
+    def test_hex_suffix_in_a_word_is_not_a_commit_citation(self):
+        text = "owner-decision job succeeded; correctif-1234abcd retiré"
+        citations = [
+            match["commit"]
+            for match in review_authors._CITED_COMMIT.finditer(text)
+            if match["commit"]
+        ]
+        self.assertEqual(citations, ["1234abcd"])
+
+    def test_gh_without_shared_reads_preserves_commit_absence(self):
+        from ameesh import plan_github
+
+        sha = "a" * 40
+        for status, payload, expected in (
+                (422, {"message": "No commit found for SHA: 43969930787"}, None),
+                (404, {"message": "Not Found"}, ""),
+                (403, {"message": "No commit found for SHA: 43969930787"}, ""),
+                (200, {"sha": sha}, sha)):
+            with self.subTest(status=status):
+                gh = mock.Mock()
+                gh.run.return_value = (
+                    1 if status >= 400 else 0,
+                    "HTTP/2.0 %d Failure\r\nContent-Type: application/json\r\n\r\n%s"
+                    % (status, json.dumps(payload)),
+                    "gh: request failed" if status >= 400 else "")
+                api = plan_github.GhApi(gh, reads=None)
+                with mock.patch.object(review_authors, "_repository_slug",
+                                       return_value="owner/repo"), \
+                        mock.patch.object(plan_github, "client", return_value=api):
+                    self.assertEqual(review_authors._forge_commit(
+                        "repo", "43969930787"), expected)
+                gh.run.assert_called_once_with(
+                    ["api", "repos/owner/repo/commits/43969930787", "-i"])
+
+    def test_only_explicit_commit_absence_is_definitive(self):
+        from ameesh import plan_github
+
+        for status, message, expected in (
+                (404, "No commit found for SHA: 43969930787", None),
+                (422, "No commit found for SHA: 43969930787", None),
+                (404, "Not Found", ""),
+                (422, "Ambiguous SHA", ""),
+                (403, "No commit found for SHA: 43969930787", ""),
+                (503, "Service unavailable", "")):
+            with self.subTest(status=status, message=message):
+                def unavailable(*args, **kwargs):
+                    raise urllib.error.HTTPError(
+                        "https://api.invalid", status, "failure", {},
+                        io.BytesIO(json.dumps({"message": message}).encode()))
+
+                api = plan_github.Api(token="test", opener=unavailable)
+                with mock.patch.object(review_authors, "_repository_slug",
+                                       return_value="owner/repo"), \
+                        mock.patch.object(plan_github, "client", return_value=api):
+                    self.assertEqual(review_authors._forge_commit(
+                        "repo", "43969930787"), expected)

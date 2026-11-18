@@ -1,0 +1,2 @@
+[ameesh.modules]
+bench-actions = bench_actions

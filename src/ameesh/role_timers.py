@@ -113,9 +113,15 @@ from . import db as db_mod
 from . import fingerprints
 from . import plan_github
 from . import registry
+from .roles import AUDITOR_ROLES, DESIGN_ROLES
 
-#: the elected role that carries the mechanical observation (EP5)
-DEFAULT_ROLE = "mesh-design"
+#: #7661 : le rôle d'observation n'est plus un nom de persona. L'agent dont la
+#: fiche déclare le rôle de conception (`conception`/`design`, lus au registre
+#: que `canon sync` projette de la carte) porte les passes mécaniques EP5. Un
+#: mesh sans ce rôle n'installe rien et ne lève aucune alerte de rôle manquant.
+#: (repris de `sous_utilisation.DESIGN_ROLES` pour ne pas importer tout le
+#: module au chargement)
+OBSERVATION_ROLES = DESIGN_ROLES
 #: installed layout of the command, as the systemd units spell it
 DEFAULT_BIN = "%h/.local/share/ameesh/venv/bin/ameesh"
 #: override for tests and isolated hosts
@@ -174,14 +180,19 @@ NOCTURNE_CALENDAR = "*-*-* 01:47:00 UTC"
 NOCTURNE_DESCRIPTION = "ameesh — daily psql dispatch in its window (#7483)"
 
 #: #5863: the auditor's short pass, every hour as the canon card says; :15 on
-#: the wall clock, the minute of the hand copy it replaces
-AUDITOR_ROLE = "auditeur"
-AUDITOR_PASS = "auditeur-court"
-AUDITOR_UNIT = "ameesh-auditeur-court"
+#: the wall clock, the minute of the hand copy it replaces.
+#: #7661: `AUDITOR_ROLE` is the ROLE class token (what a card declares), not a
+#: persona name; the holder is resolved by its card, under any name.
+#: #7792: the token is the one in `roles.py`; the unit and mail names stay the
+#: same, they are derived from it.
+AUDITOR_ROLE = AUDITOR_ROLES[0]
+AUDITOR_PASS = AUDITOR_ROLE + "-court"
+AUDITOR_UNIT = "ameesh-" + AUDITOR_PASS
 AUDITOR_INTERVAL_S = 3600
 AUDITOR_CALENDAR = "*-*-* *:15:00"
 AUDITOR_DESCRIPTION = "ameesh — auditor short pass, hourly, under the elected role lease (#5863)"
-AUDITOR_MAIL = "Passage court (chaque heure). Consigne : ameesh/docs/AUDITEUR.md, à jour."
+AUDITOR_MAIL = ("Passage court (chaque heure). Consigne : ameesh/docs/%s.md, à jour."
+                % AUDITOR_ROLE.upper())
 #: #6643: the unit runs `ameesh auditor tick`, not the blind mail. `vm.sh`
 #: probes this attribute with the CLI it is about to control: a rollback to a
 #: CLI that predates it re-poses the unit with that CLI before checking it,
@@ -401,6 +412,62 @@ def is_candidate(row: dict, host: str) -> bool:
     if str(row.get("releve") or "") == "election":
         return host in candidates(row)
     return str(row.get("host") or "") == host
+
+
+def declared_roles(row: dict) -> list:
+    """The roles the agent's card declares, read on its registry row (#7661).
+
+    ``canon sync`` copies ``roles:``/``role:`` from the Agent card onto the
+    registry row; a timer reads no canon checkout (#3327 B/P1), so that
+    projection is the declaration it sees. An unreadable value declares no
+    role, never a guessed one."""
+    from . import sous_utilisation
+    return sous_utilisation.row_roles(row or {})
+
+
+def has_declared_role(row: dict, roles) -> bool:
+    """Does the agent's card declare one of ``roles`` (#7661)?"""
+    from . import sous_utilisation
+    return sous_utilisation.row_has_role(row or {}, roles)
+
+
+def _role_set(roles) -> set:
+    from . import sous_utilisation
+    return {sous_utilisation._canonical(role) for role in roles or ()}
+
+
+def _auditor_roles() -> tuple:
+    return AUDITOR_ROLES
+
+
+def _has_role_in(declared, wanted) -> bool:
+    """Une liste de rôles déclarés nomme-t-elle l'un des ``wanted`` ?"""
+    return bool(_role_set(declared) & _role_set(wanted))
+
+
+def is_observation(row: dict) -> bool:
+    """Does this agent's card declare the design/observation role?"""
+    return has_declared_role(row, OBSERVATION_ROLES)
+
+
+def is_auditor(row: dict) -> bool:
+    """Does this agent's card declare the auditor role? The pass is carried by
+    the role, not by an agent named ``auditeur`` (#7661)."""
+    return has_declared_role(row, _auditor_roles())
+
+
+def role_holders(db, roles) -> list:
+    """Registry names whose card declares one of ``roles``, sorted.
+
+    Used to resolve a role token (``auditeur``) or the default observation
+    role without assuming a persona name. An unreadable registry is an empty
+    list: nothing is guessed."""
+    try:
+        rows = list(registry.overview(db) or [])
+    except Exception:  # noqa: BLE001 - un registre illisible ne devine rien
+        return []
+    return sorted(row["name"] for row in rows
+                  if row.get("name") and has_declared_role(row, roles))
 
 
 #: the secrets file the role units load after ``env`` (see render_service)
@@ -654,7 +721,7 @@ def alerts_timer_gap(*, role: str, directory: Path | None = None,
 def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
          watch_error: str = "", expected_projects=None, notify_humans=None,
          notify_error: str = "", paquet=None, fingerprint_intervals=(),
-         fingerprint_error: str = "", release=None) -> dict:
+         fingerprint_error: str = "", release=None, roles=None) -> dict:
     """The timers this host should run, without touching the filesystem.
 
     ``row`` is the role's ``agent_registry`` row: an elected role is a
@@ -665,17 +732,21 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
     and ``notify_error`` come from :func:`notify_reach`: without a remote push
     to every required human, the ``alerts`` pass is blocked (#3383).
     ``paquet`` is the ``(blocked, detail)`` of :func:`paquet_reach`; ``None``
-    leaves the hourly packet tick out of the plan (#3854), as does any role
-    but ``mesh-design``, whose lease carries the tick.
+    leaves the hourly packet tick out of the plan (#3854), as does a role whose
+    card does not declare the design role (#7661).
     ``fingerprint_intervals`` are the cadences of the canon's ``fingerprints``
     cards (#3885): at least one declaration installs the pass; none installs
     nothing, and an unreadable declaration is reported blocked.
     ``release`` is the ``(blocked, detail)`` of :func:`release_reach`; ``None``
     leaves the release tick out of the plan (#5748).
-    The ``auditeur`` role carries its short pass only (#5863).
+    A card declaring the auditor role carries its short pass only (#5863).
+    ``roles`` overrides the roles read on ``row`` (tests, callers holding the
+    card); the default reads the projection ``canon sync`` wrote, never a name.
     """
     declared = candidates(row)
     candidate = is_candidate(row, host)
+    declared_roles_ = declared_roles(row) if roles is None else list(roles)
+    auditor = _has_role_in(declared_roles_, _auditor_roles())
     report = {
         "schema": "ameesh-role-timers/1",
         "host": host,
@@ -683,15 +754,18 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
         "releve": str(row.get("releve") or ""),
         "candidates": declared,
         "candidate": candidate,
+        "observation": _has_role_in(declared_roles_, OBSERVATION_ROLES),
+        "auditor": auditor,
         "timers": [],
         "missing_projects": [],
     }
     if not candidate:
         return report
-    if role == AUDITOR_ROLE:
+    if auditor:
         report["timers"] = [TimerSpec(AUDITOR_PASS, AUDITOR_PASS, AUDITOR_INTERVAL_S,
                                       AUDITOR_DESCRIPTION).as_json()]
         return report
+    observation = report["observation"]
     local = {str(name).casefold() for name in
              (getattr(settings, "projects", None) or {})}
     report["missing_projects"] = [
@@ -759,19 +833,20 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
     # packet tick): it closes lots, which is a pilot-side hygiene gesture, not
     # an auditor's. It needs no GitHub key: without a clone it still finds
     # duplicates and contradictions, and says the git checks "non vérifié".
-    if role == DEFAULT_ROLE:
+    # #7661: "pilot-side" is the design role declared on the card.
+    if observation:
         reported.append(TimerSpec(
             "coherence", "coherence", COHERENCE_INTERVAL_S,
             "ameesh — backlog coherence pass under the elected role lease (#4172)"))
     # #6777: the daily impact-map dispatch, under the same elected lease as the
     # packet tick. `github.projects` names the repositories; the workflow guard
     # (scripts/carte-fenetre.py) remains the only judge of a measurement.
-    if role == DEFAULT_ROLE and projects:
+    if observation and projects:
         reported.append(TimerSpec(
             CARTE_PASS, CARTE_PASS, CARTE_INTERVAL_S, CARTE_DESCRIPTION))
         reported.append(TimerSpec(
             NOCTURNE_PASS, NOCTURNE_PASS, NOCTURNE_INTERVAL_S, NOCTURNE_DESCRIPTION))
-    if paquet is not None and role == DEFAULT_ROLE:
+    if paquet is not None and observation:
         blocked, detail = paquet
         # #3854: a missing clone is a host setting, not a negative result (§3)
         reported.append(TimerSpec(
@@ -875,7 +950,9 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
         "Environment=TMPDIR=%C/ameesh/paquet-auto",
         "Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin",
         "Environment=AMEESH_PAQUET_TARGET=main",
-        "Environment=AMEESH_PAQUET_PILOT=%s" % DEFAULT_ROLE,
+        # #7661: the pilot named to the packet script is the resolved holder of
+        # the design role, never a fixed persona name.
+        "Environment=AMEESH_PAQUET_PILOT=%s" % role,
         "EnvironmentFile=%h/.config/ameesh/env",
         "EnvironmentFile=-%h/.config/ameesh/release.env",
         "EnvironmentFile=%s" % PAQUET_ENV.replace("~", "%h", 1),
@@ -1233,8 +1310,10 @@ def _notify_unit(path: Path) -> bool:
 
 
 def _owns_dropin(report: dict) -> bool:
-    """#5863: the notifier drop-in belongs to the observation role only."""
-    return report.get("role") != AUDITOR_ROLE
+    """#5863: the notifier drop-in belongs to the observation role only.
+    #7661: the verdict is the declared role on the card (`auditor` in the
+    report), never the role token or a persona name."""
+    return not report.get("auditor")
 
 
 def install(report: dict, *, directory: Path, bin_path: str = DEFAULT_BIN,
@@ -1469,7 +1548,7 @@ def _run_action(args, report: dict, *, db) -> int:
         problems = check(report, directory=directory, apply=not args.no_apply,
                          bin_path=args.bin)
         notes = warnings(report)
-        paused = paquet_pause_note(db, report) if args.role == DEFAULT_ROLE else ""
+        paused = paquet_pause_note(db, report) if report.get("observation") else ""
         if paused:
             notes.append(paused)
         if args.json:
@@ -1520,10 +1599,49 @@ def _run_action(args, report: dict, *, db) -> int:
     return 0
 
 
+def _resolve_role(db, requested: str | None) -> tuple[str | None, int]:
+    """L'agent dont la fiche porte le rôle demandé (#7661), ou ``(None, code)``.
+
+    Un nom d'agent au registre l'emporte (rétrocompatibilité des unités) ;
+    sinon le mot est un rôle (`auditeur`, `conception`…) résolu en son unique
+    porteur. Sans `--role`, le rôle d'observation par défaut est cherché sur
+    les fiches : un mesh qui n'en déclare pas n'installe rien (code 0), un
+    porteur unique est pris, plusieurs exigent un choix explicite. Rien n'est
+    inventé depuis un titre de persona."""
+    if requested:
+        if registry.get(db, requested) is not None:
+            return requested, 0
+        holders = role_holders(db, [requested])
+        if len(holders) == 1:
+            return holders[0], 0
+        if len(holders) > 1:
+            print("role timers: several agents declare the %s role: %s; choose "
+                  "one with --role" % (requested, ", ".join(holders)),
+                  file=sys.stderr)
+            return None, 2
+        wanted = _role_set([requested])
+        if wanted & _role_set(tuple(_auditor_roles()) + OBSERVATION_ROLES):
+            print("role timers: no %s role on this mesh, nothing to do" % requested)
+            return None, 0
+        print("role timers: unknown role %s (no agent_registry row and no card "
+              "declares it)" % requested, file=sys.stderr)
+        return None, 2
+    holders = role_holders(db, OBSERVATION_ROLES)
+    if len(holders) == 1:
+        return holders[0], 0
+    if not holders:
+        print("role timers: no observation role on this mesh, nothing to do")
+        return None, 0
+    print("role timers: several agents declare the observation role: %s; choose "
+          "one with --role" % ", ".join(holders), file=sys.stderr)
+    return None, 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ameesh role timers")
-    parser.add_argument("--role", default=DEFAULT_ROLE,
-                        help="elected role carrying the timers (default: %s)" % DEFAULT_ROLE)
+    parser.add_argument("--role", default=None,
+                        help="agent whose card carries the role (default: the "
+                             "unique agent declaring the observation role)")
     parser.add_argument("--bin", default=DEFAULT_BIN,
                         help="ameesh binary in the units (default: %(default)s)")
     parser.add_argument("--systemd-dir", default=None,
@@ -1548,18 +1666,24 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         try:
-            row = registry.get(db, args.role)
+            name, code = _resolve_role(db, args.role)
         except Exception as exc:  # noqa: BLE001 - database error is a real failure
             print("role timers: cannot read role %s: %s" % (args.role, exc), file=sys.stderr)
             return 1
-        if row is None and args.role == AUDITOR_ROLE:
-            # #5863: a mesh without an auditor has no short pass to wake
-            print("role timers: no %s role on this mesh, nothing to do" % args.role)
-            return 0
+        if name is None:
+            return code
+        try:
+            row = registry.get(db, name)
+        except Exception as exc:  # noqa: BLE001 - database error is a real failure
+            print("role timers: cannot read role %s: %s" % (name, exc), file=sys.stderr)
+            return 1
         if row is None:
-            print("role timers: unknown role %s (no agent_registry row)" % args.role,
+            print("role timers: unknown role %s (no agent_registry row)" % name,
                   file=sys.stderr)
             return 2
+        declared = declared_roles(row)
+        observation = _has_role_in(declared, OBSERVATION_ROLES)
+        auditor = _has_role_in(declared, _auditor_roles())
         host = str(getattr(cfg, "host", "") or "")
         if not host:
             print("role timers: this host has no name (AMEESH_HOST or config host)",
@@ -1568,17 +1692,17 @@ def main(argv: list[str] | None = None) -> int:
         # #3327 B/P1: a non-candidate must not read the canon, rewrite the
         # host configuration (sync) or touch a backup. Check candidacy first.
         if not is_candidate(row, host):
-            report = plan(host=host, role=args.role, row=row, settings=None,
-                          watch_intervals=())
+            report = plan(host=host, role=name, row=row, settings=None,
+                          watch_intervals=(), roles=declared)
             if args.json:
                 print(json.dumps(report, ensure_ascii=False, sort_keys=True))
             else:
                 _print_report(report)
             return 0
-        if args.role == AUDITOR_ROLE:
+        if auditor:
             # #5863: the auditor's pass reads neither GitHub nor the notify routes
-            report = plan(host=host, role=args.role, row=row, settings=None,
-                          watch_intervals=())
+            report = plan(host=host, role=name, row=row, settings=None,
+                          watch_intervals=(), roles=declared)
             return _run_action(args, report, db=db)
         try:
             settings = plan_github.settings_of(cfg)
@@ -1606,14 +1730,14 @@ def main(argv: list[str] | None = None) -> int:
             cfg, lambda text: print("role timers: %s" % text, file=sys.stderr))
         fingerprint_intervals = sorted(
             {float(item.interval) for item in fingerprint_sources})
-        report = plan(host=host, role=args.role,
+        report = plan(host=host, role=name,
                       row=row, settings=settings, watch_intervals=intervals,
                       watch_error=watch_error, expected_projects=expected,
                       notify_humans=humans, notify_error=notify_error,
-                      paquet=paquet_reach() if args.role == DEFAULT_ROLE else None,
+                      paquet=paquet_reach() if observation else None,
                       fingerprint_intervals=fingerprint_intervals,
                       fingerprint_error=fingerprint_error,
-                      release=release_reach(cfg, args.role))
+                      release=release_reach(cfg, name), roles=declared)
         if sync is not None:
             report["github_sync"] = sync
         return _run_action(args, report, db=db)

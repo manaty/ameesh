@@ -348,7 +348,13 @@ class RealCompositionTest(unittest.TestCase):
             runs, faulty, removals = paquet_auto.check_local_tests(
                 self.repo, self.composition, timeout=60,
                 log=lambda _line: None)
-        self.assertEqual([run.label for run in runs], ["contrats"])
+        # #7740 : l'unité 1 (docs) n'a aucun module direct et reste un
+        # non-concluant nommé ; l'unité 2 joue le témoin de sa migration sur
+        # son préfixe. Le contrat rouge désigne la même unité.
+        self.assertEqual([run.label for run in runs],
+                         ["unité #1", "unité #2", "contrats"])
+        self.assertTrue(runs[0].inconclusive)
+        self.assertFalse(runs[1].green)
         self.assertEqual(faulty, [2])
         self.assertEqual([removal.lot for removal in removals], [2])
         self.assertTrue(removals[0].attributed)
@@ -415,7 +421,8 @@ class LocalTestCompositionTest(unittest.TestCase):
             discarded=[], head="e" * 40)
 
     def check(self, *, unit_runs=(), contract_run=None, attribute=None,
-              unit_modules=None, contract_module_list=("tests.test_cluster",)):
+              unit_modules=None, contract_module_list=("tests.test_cluster",),
+              confirm=None):
         # Les unités sans module propre ne produisent aucun run : le témoin
         # contracts-only reste lisible.
         modules = unit_modules or {}
@@ -423,6 +430,12 @@ class LocalTestCompositionTest(unittest.TestCase):
 
         def unit_modules_for(_worktree, unit):
             return modules.get(unit.lot, [])
+
+        # Les SHA sont des sentinelles : le vrai rejeu de préfixe ne peut pas
+        # construire son worktree (#7692, couvert par test_7239). Le témoin
+        # injecte donc la confirmation du retrait #3801.
+        def confirmed(_worktree, _composition, removals, **_kwargs):
+            return list(removals), [], ""
 
         with mock.patch.object(paquet_auto, "unit_test_modules",
                                side_effect=unit_modules_for), \
@@ -432,7 +445,8 @@ class LocalTestCompositionTest(unittest.TestCase):
                                   side_effect=side):
             return paquet_auto.check_local_tests(
                 self.worktree, self.composition, timeout=1,
-                log=lambda _line: None, attribute=attribute)
+                log=lambda _line: None, attribute=attribute,
+                confirm=confirm or confirmed)
 
     def test_contrat_rouge_attribue_retire_l_unite_et_garde_l_autre(self) -> None:
         self.assertEqual(self.composition.units[1].lot, 2)
@@ -445,7 +459,11 @@ class LocalTestCompositionTest(unittest.TestCase):
 
         runs, faulty, removals = self.check(
             contract_run=red_contract, attribute=attribute)
-        self.assertEqual([run.label for run in runs], ["contrats"])
+        # #7740 : les unités sans module direct sont des non-concluants nommés,
+        # pas des séries absentes.
+        self.assertEqual([run.label for run in runs],
+                         ["unité #1", "unité #2", "contrats"])
+        self.assertTrue(runs[0].inconclusive and runs[1].inconclusive)
         self.assertEqual(faulty, [2])
         self.assertEqual([removal.lot for removal in removals], [2])
         self.assertTrue(removals[0].attributed)
@@ -546,7 +564,9 @@ class LocalTestCompositionTest(unittest.TestCase):
             attribute=attribute, unit_modules={1: ["tests.test_unit"]})
         # Le contrat rouge non attribuable ne bloque pas : l'unité au test
         # propre rouge est retirée et le paquet recompose (geste antérieur).
-        self.assertEqual([run.label for run in runs], ["unité #1", "contrats"])
+        self.assertEqual([run.label for run in runs],
+                         ["unité #1", "unité #2", "contrats"])
+        self.assertTrue(runs[1].inconclusive)   # #7740 : 0 module direct
         self.assertEqual(faulty, [1])
         self.assertFalse(removals[0].attributed)
 

@@ -9,6 +9,7 @@ on the local host, with stubs for everything that reads the host's state
 import os
 from pathlib import Path
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -57,6 +58,8 @@ exec %(find)s "${racines[@]}" "$@"
 FLOCK = "#!/usr/bin/env bash\nexit 0\n"
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "probe runs bash 4 launchers and Linux paths")
 class QuiescenceTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="5494-quiescence-")

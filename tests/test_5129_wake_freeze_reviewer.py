@@ -187,8 +187,9 @@ class WakeMissingFamilyTest(_ActivationFixture, PgTestCase):
         item = work.get(self.db, self.lot)
         self.assertEqual(out["state"], rd.WAITING)
         self.assertEqual(set(designated(item)), {"r1"})
-        self.assertIn("1 independent review missing", out["why"])
-        self.assertIn("1 eligible family (claude)", out["why"])
+        # #7745 : le manque se dit par delta et nomme les familles recevables.
+        self.assertIn("1 independent review(s) missing by author delta", out["why"])
+        self.assertIn("eligible families: claude", out["why"])
         self.assertTrue(registry.get(self.db, "r2")["operator_paused"])
         self.assertTrue(registry.get(self.db, "r3")["operator_paused"])
         self.assertEqual(self.lifts("r2"), [])

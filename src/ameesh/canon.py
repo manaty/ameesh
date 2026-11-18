@@ -60,7 +60,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from . import harnesses
 from . import review as review_mod
-from .config import NAME_RE
+from . import reveil as reveil_mod
+from .config import NAME_RE, SESSION_POLICIES
 from .deadline import Deadline
 
 try:  # facultatif : jamais requis
@@ -198,6 +199,15 @@ SCOPE_FIELDS = ("scope", "projects")
 #: PREMIER niveau de `extensions.ameesh` seulement — le canon, c'est
 #: l'organisation ; l'entrée d'un membre n'a pas de nommage propre.
 NAMING_KEY = "naming"
+#: #7629 : bloc du plafond d'organisation des approbations permanentes, admis
+#: au PREMIER niveau de `extensions.ameesh` (le schéma OKF Federation n'admet
+#: aucune clé libre à la racine de federation.yaml).
+STANDING_APPROVALS_KEY = "standing_approvals"
+#: #7653 : mode de la porte d'actions, au PREMIER niveau de
+#: `extensions.ameesh` (`action_gate.mode` : journal | enforce). Le contrat de
+#: lecture appartient à #7630 ; absent vaut `journal`, et ce défaut implicite
+#: est signalé pour un canon qui porte un avatar.
+ACTION_GATE_KEY = "action_gate"
 #: L243 (#468) : un segment de nom est en minuscules, 2 à 6 caractères.
 #: `\Z` (et non `$`) : `$` accepte une fin de ligne, donc `"mty\n"` passerait
 #: et engendrerait un nom invalide.
@@ -1077,6 +1087,33 @@ class Agent:
     #: #2202 S2 : le profil de relecteur borné (`sandbox:`), None = aucun tour
     #: en bac à sable pour cet agent.
     sandbox: SandboxProfile | None = None
+    #: #7632 : cadence de réveil déclarée (`reveil:`, `reveil.parse`) ; None =
+    #: réveil par courrier de l'exécuteur, inchangé.
+    reveil: dict | None = None
+    #: #7674 (E3a) : politique de session déclarée par la fiche, consommée par
+    #: l'exécuteur. `None`/`False` = rien de déclaré, les réglages impératifs
+    #: (`ameesh set`) et les défauts de l'exécuteur restent seuls juges.
+    session_policy: str | None = None
+    fresh_session: bool = False
+    context_max_tokens: int | None = None
+    failure_wait_min: int | None = None
+
+    def declared_policy(self) -> dict | None:
+        """#7674 : la politique de session que la fiche déclare, ou None.
+
+        Objet stable écrit au registre (`declared_policy`) et lu par
+        l'exécuteur ; les clés absentes ne sont pas écrites, pour qu'une
+        suppression dans la fiche rende la main au réglage impératif."""
+        policy: dict = {}
+        if self.session_policy is not None:
+            policy["session_policy"] = self.session_policy
+        if self.fresh_session:
+            policy["fresh_session"] = True
+        if self.context_max_tokens is not None:
+            policy["context_max_tokens"] = int(self.context_max_tokens)
+        if self.failure_wait_min is not None:
+            policy["failure_wait_min"] = int(self.failure_wait_min)
+        return policy or None
 
     @property
     def is_persona(self) -> bool:
@@ -1254,6 +1291,29 @@ def work_dir_for(host: "Host | None", agent: "Agent", admission: "Placement | No
     return None, None
 
 
+#: #7662 : rôles d'un hôte dans la séquence staging (canon §14). `agents` est
+#: une VM d'agents, jamais reportable ; `server` est un serveur sans exécutant,
+#: reportable ; `workstation` est le poste, mis à jour à son retour, reportable.
+#: Aucun nom d'hôte n'est connu du cœur : la fiche déclare son rôle et son rang.
+STAGING_KINDS = ("agents", "server", "workstation")
+
+
+@dataclass
+class HostStaging:
+    """#7662 : la place d'un hôte dans la séquence staging, lue sur sa fiche.
+
+    `order` est l'ordre croissant de la séquence (VM d'abord, poste en dernier
+    par la déclaration Manaty) ; `kind` dit ce que la preuve d'activation peut
+    exiger de lui (une VM d'agents est toujours requise, un serveur et un poste
+    peuvent être reportés)."""
+
+    order: int
+    kind: str
+
+    def to_dict(self) -> dict:
+        return {"order": self.order, "kind": self.kind}
+
+
 @dataclass
 class Host:
     title: str
@@ -1280,6 +1340,9 @@ class Host:
     #: (`device_gates`) ; passé ce jour, la déclaration cesse d'elle-même.
     unavailable_until: str | None = None
     unavailable_reason: str | None = None
+    #: #7662 : place dans la séquence staging (canon §14), absent = l'hôte
+    #: n'est pas un hôte de staging (un profil nu n'en a aucun).
+    staging: HostStaging | None = None
 
     def unavailable_end(self) -> float | None:
         """Fin de l'indisponibilité (minuit local du lendemain), ou None."""
@@ -1539,6 +1602,28 @@ class Canon:
         policies = (self.federation or {}).get("review_policies")
         return policies if isinstance(policies, dict) else {}
 
+    def standing_policy(self):
+        """#7629 : le plafond d'organisation des approbations permanentes.
+
+        Le bloc `extensions.ameesh.standing_approvals` de `federation.yaml`,
+        validé par `ameesh.standing_policy` ; absent = politique VIDE (aucune
+        approbation permanente acceptée, défaut sûr). Une erreur de lecture est
+        levée, pas interprétée comme un élargissement."""
+        from . import standing_policy
+        return standing_policy.from_federation(self.federation)
+
+    def avatar_of(self, human: str) -> Agent | None:
+        """#7629 : l'avatar de `human` dans CE canon (carte `avatar`).
+
+        `canon check` refuse deux avatars du même responsable ; ici le premier
+        l'emporte, et l'absence rend None (un grant `avatar` est alors refusé,
+        jamais résolu vers un autre agent)."""
+        for agent in self.agents:
+            data = getattr(getattr(agent, "fiche", None), "data", None) or {}
+            if "avatar" in data and agent.responsible == human:
+                return agent
+        return None
+
     def loaded_members(self) -> set[str]:
         """Membres dont les fiches ont été lues. L43 : un membre au périmètre
         invalide ou introuvable n'en est pas (rien n'est retiré pour absence)."""
@@ -1632,6 +1717,7 @@ class Canon:
                            admins=h.admins, occupants=h.occupants,
                            unavailable_until=h.unavailable_until,
                            unavailable_reason=h.unavailable_reason,
+                           staging=h.staging.to_dict() if h.staging is not None else None,
                            policy=h.policy.to_dict(), **fiche(h.fiche))
                       for h in self.hosts],
             "agents": [dict(title=a.title, aliases=a.aliases or [], type=a.fiche.type, responsible=a.responsible, team=a.team,
@@ -1664,6 +1750,74 @@ class Canon:
             "ameesh_scope_unread": sorted(self.scope_unread),
             "out_of_scope": dict(sorted(self.out_of_scope.items())),
         }
+
+
+# ==========================================================================
+# Séquence staging lue au canon (#7662, canon §14)
+# ==========================================================================
+
+@dataclass(frozen=True)
+class StagingTopology:
+    """#7662 : la séquence staging d'un mesh, calculée depuis les fiches Host.
+
+    Aucun nom d'hôte n'est connu du cœur : `hosts` est l'ordre déclaré par les
+    fiches (`staging.order`), `agents` les VM d'agents, `server` le serveur sans
+    exécutant, `workstation` le poste. Un profil nu rend une séquence vide :
+    rien n'est supposé, et rien ne peut être déployé ni attesté par défaut."""
+
+    hosts: tuple[str, ...] = ()
+    agents: tuple[str, ...] = ()
+    server: str | None = None
+    workstation: str | None = None
+
+    def __bool__(self) -> bool:
+        """Une séquence nue est fausse : un profil vide n'est jamais un hôte."""
+        return bool(self.hosts)
+
+    @property
+    def vms(self) -> tuple[str, ...]:
+        """Les VM de la séquence : les VM d'agents, puis le serveur."""
+        return self.agents + ((self.server,) if self.server else ())
+
+    @property
+    def reportable(self) -> frozenset[str]:
+        """Hôtes dont l'absence peut être déclarée (§14) : serveur et poste."""
+        return frozenset(h for h in (self.server, self.workstation) if h)
+
+    def required(self, reported: Iterable[str] = ()) -> tuple[str, ...]:
+        """Hôtes que la preuve doit porter, une fois les reports retirés."""
+        absent = set(reported)
+        return tuple(host for host in self.hosts if host not in absent)
+
+
+def staging_topology(canons: Iterable["Canon"]) -> StagingTopology:
+    """#7662 : la séquence staging déclarée par les fiches Host d'un mesh.
+
+    L'appelant passe le canon du mesh — le canon par défaut (L42) — et non la
+    liste des canons configurés : un autre client ne doit pas ajouter d'hôte à
+    la séquence. Les fiches sont triées par `(staging.order, title)` ; une
+    fiche sans bloc `staging` n'est jamais un hôte de staging. Un même nom
+    déclaré par deux canons ne compte qu'une fois (le premier gagne), comme
+    `Canon.host`. Plusieurs serveurs ou plusieurs postes ne sont pas devinés :
+    le premier de la séquence représente seul son rôle."""
+    entries: list[tuple[int, str, str]] = []
+    seen: set[str] = set()
+    for canon in canons or ():
+        for host in getattr(canon, "hosts", ()) or ():
+            staging = getattr(host, "staging", None)
+            title = str(getattr(host, "title", "") or "")
+            if staging is None or not title or title in seen:
+                continue
+            seen.add(title)
+            entries.append((staging.order, title, staging.kind))
+    entries.sort()
+    agents = tuple(title for _order, title, kind in entries if kind == "agents")
+    servers = [title for _order, title, kind in entries if kind == "server"]
+    postes = [title for _order, title, kind in entries if kind == "workstation"]
+    return StagingTopology(hosts=tuple(title for _order, title, _kind in entries),
+                           agents=agents,
+                           server=servers[0] if servers else None,
+                           workstation=postes[0] if postes else None)
 
 
 # ==========================================================================
@@ -2005,7 +2159,7 @@ def sandbox_profile_problems(profile: SandboxProfile) -> list[str]:
         out.append("`sandbox.profile`: non-empty lowercase name expected (letters, "
                    "digits, `.`, `_`, `-`, 64 characters at most)")
     if not profile.admitted_ref or not profile.admitted_ref.strip():
-        out.append("`sandbox.admitted_ref`: the bureau-reviewed canon PR/decision "
+        out.append("`sandbox.admitted_ref`: the reviewed canon PR/decision "
                    "reference is required")
     if profile.status not in SANDBOX_STATUSES:
         out.append("`sandbox.status`: %s expected, not %r"
@@ -2074,7 +2228,7 @@ def sandbox_placement_problems(placement: SandboxPlacement,
         out.append("`policy.sandbox.image`: a digest-shaped image is required "
                    "(`repository@sha256:<64 hex>`), not a mutable tag")
     if not placement.admitted_ref or not placement.admitted_ref.strip():
-        out.append("`policy.sandbox.admitted_ref`: the bureau-reviewed canon "
+        out.append("`policy.sandbox.admitted_ref`: the reviewed canon "
                    "PR/decision reference is required")
     for name in placement.allowed_profiles:
         if not isinstance(name, str) or not SANDBOX_PROFILE_RE.match(name):
@@ -3888,7 +4042,9 @@ class _Loader:
                 continue
             allowed = set(SCOPE_FIELDS)
             if member == root.member:
+                allowed.add('action_gate')  # #7630: root canon action policy
                 allowed.add(NAMING_KEY)     # L243 (#468) : le nommage est à la racine
+                allowed.add(STANDING_APPROVALS_KEY)  # #7629 : plafond des grants
             for unknown in sorted(set(map(str, raw)) - allowed):
                 self.add("ameesh-key-unknown", WARNING,
                          "`%s.%s`: unknown key (ignored)" % (label, unknown), **where)
@@ -4219,6 +4375,55 @@ class _Loader:
             relit = self._list(fiche, "relit", where, "agent-relit-invalid", **subject)
         if relit is not None:
             relit = list(dict.fromkeys(p for p in relit if p))
+        # #7632 : cadence de réveil (spec avatars §4.4) ; un bloc fautif est
+        # une erreur de fiche, sa politique garde les défauts de la clé fautive
+        reveil, reveil_problems = reveil_mod.parse(fiche.data.get("reveil"))
+        for problem in reveil_problems:
+            self.add("agent-reveil-invalid", ERROR, problem, **where, **subject)
+        # #7674 (E3a) : politique de session déclarée. Une valeur illisible est
+        # une ERREUR de fiche (fail closed : l'agent n'est plus réclamable),
+        # jamais un repli silencieux vers un réglage impératif qui changerait
+        # la session ou le contexte de l'agent à son insu.
+        session_policy = _text(fiche.data.get("session_policy"))
+        if session_policy is not None:
+            session_policy = session_policy.strip().lower()
+            if session_policy not in SESSION_POLICIES:
+                self.add("agent-session-policy-invalid", ERROR,
+                         "`session_policy`: %s expected, not %r"
+                         % (" | ".join(SESSION_POLICIES), fiche.data.get("session_policy")),
+                         **where, **subject)
+                session_policy = None
+        fresh_session = False
+        raw = fiche.data.get("fresh_session")
+        if raw is not None:
+            parsed = _card_bool(raw)
+            if parsed is None:
+                self.add("agent-fresh-session-invalid", ERROR,
+                         "`fresh_session`: boolean expected, not %r" % (raw,),
+                         **where, **subject)
+            else:
+                fresh_session = parsed
+        if fresh_session and session_policy not in (None, "jamais"):
+            self.add("agent-session-policy-conflict", ERROR,
+                     "`fresh_session: true` requires no session rotation, but "
+                     "`session_policy: %s` asks for one" % session_policy,
+                     **where, **subject)
+        context_max_tokens = None
+        raw = fiche.data.get("context_max_tokens")
+        if raw is not None:
+            context_max_tokens = _card_tokens(raw)
+            if context_max_tokens is None:
+                self.add("agent-context-max-invalid", ERROR,
+                         "`context_max_tokens`: tokens >= 0 expected (`15000000`, "
+                         "`15M`, `500k`), not %r" % (raw,), **where, **subject)
+        failure_wait_min = None
+        raw = fiche.data.get("failure_wait_min")
+        if raw is not None:
+            failure_wait_min = _card_seconds(raw)
+            if failure_wait_min is None:
+                self.add("agent-failure-wait-invalid", ERROR,
+                         "`failure_wait_min`: duration >= 0 expected (`60s`, `1m`), "
+                         "not %r" % (raw,), **where, **subject)
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -4243,6 +4448,11 @@ class _Loader:
             candidats=candidats,
             relit=relit,
             sandbox=self._sandbox_profile(fiche, where, subject),
+            reveil=reveil,
+            session_policy=session_policy,
+            fresh_session=fresh_session,
+            context_max_tokens=context_max_tokens,
+            failure_wait_min=failure_wait_min,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -4309,7 +4519,7 @@ class _Loader:
             self.add("agent-sandbox-ref-weak", WARNING,
                      "`sandbox.admitted_ref` %r does not look like a canon PR/decision "
                      "reference (`owner/repo#123`, `#123` or `card@commit`): the "
-                     "bureau's evidence must be citable" % admitted_ref,
+                     "avatar's evidence must be citable" % admitted_ref,
                      **where, **subject)
         return profile
 
@@ -4477,16 +4687,20 @@ class _Loader:
                              **where, **subject)
                 policy.lend = offer
                 # #5905: a lending host runs guest jobs offloaded from other
-                # hosts, outside its own turns and leases. No interface counts
-                # them yet (C5): its runs stay unknown, and `none` there would
-                # turn a missing observation into a proven zero.
-                from .host_idle import RUNS_LENDING
-                if policy.runs_interface == "none":
+                # hosts, outside its own turns and leases. `none` there would
+                # turn a missing observation into a proven zero; #7687 adds
+                # `guest`, which counts the live offloaded jobs of the host
+                # measure. Without it the runs stay unknown.
+                from .host_idle import (RUNS_GUEST, RUNS_INVALID, RUNS_LENDING,
+                                        RUNS_NONE)
+                if policy.runs_interface == RUNS_NONE:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.runs_interface: none` on a lending host "
                              "(`policy.lend`): its offloaded guest jobs are runs "
-                             "that no interface counts yet", **where, **subject)
-                policy.runs_interface = RUNS_LENDING
+                             "that `none` would declare absent; use `guest`",
+                             **where, **subject)
+                if policy.runs_interface not in (RUNS_GUEST, RUNS_INVALID):
+                    policy.runs_interface = RUNS_LENDING
             # L101 : espace de travail et ménage, forme canonique
             # `policy.workspaces` ; les anciennes clés restent lues en alias.
             self._host_workspaces(raw, policy, where, subject)
@@ -4496,11 +4710,44 @@ class _Loader:
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
         occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
         until, reason = self._host_unavailability(fiche, where, subject)
+        staging = self._host_staging(fiche, where, subject)
         self.canon.hosts.append(Host(title=fiche.title,
                                      responsible=_text(fiche.data.get("responsible")),
                                      policy=policy, tags=tags, admins=admins,
                                      occupants=occupants, fiche=fiche,
-                                     unavailable_until=until, unavailable_reason=reason))
+                                     unavailable_until=until, unavailable_reason=reason,
+                                     staging=staging))
+
+    def _host_staging(self, fiche: Fiche, where: dict,
+                      subject: dict) -> HostStaging | None:
+        """#7662 : `staging: {order, kind}` place l'hôte dans la séquence.
+
+        Le champ est facultatif : absent, l'hôte n'est pas un hôte de staging
+        (un profil nu n'en a aucun). Un bloc illisible ne déclare rien — aucune
+        valeur par défaut ne doit devenir un hôte de staging implicite."""
+        raw = fiche.data.get("staging")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            self.add("host-staging-invalid", ERROR, "`staging`: mapping expected",
+                     **where, **subject)
+            return None
+        for key in sorted(set(map(str, raw)) - {"order", "kind"}):
+            self.add("host-staging-unknown", WARNING,
+                     "`staging.%s`: unknown key (ignored)" % key, **where, **subject)
+        order = raw.get("order")
+        if isinstance(order, bool) or not isinstance(order, int) or order < 0:
+            self.add("host-staging-invalid", ERROR,
+                     "`staging.order`: a non-negative integer expected",
+                     **where, **subject)
+            return None
+        kind = raw.get("kind")
+        if not isinstance(kind, str) or kind not in STAGING_KINDS:
+            self.add("host-staging-invalid", ERROR,
+                     "`staging.kind`: one of %s expected" % ", ".join(STAGING_KINDS),
+                     **where, **subject)
+            return None
+        return HostStaging(order=order, kind=kind)
 
     def _host_unavailability(self, fiche: Fiche, where: dict,
                              subject: dict) -> tuple[str | None, str | None]:
@@ -4628,7 +4875,7 @@ class _Loader:
             if not isinstance(value, dict) or not all(caps.values()):
                 self.add("host-policy-invalid", ERROR,
                          "`policy.resources.agent_memory_max_by_agent`: mapping "
-                         "{agent: size} expected (e.g. mesh-design: 8G)", **where, **subject)
+                         "{agent: size} expected (e.g. <agent>: 8G)", **where, **subject)
                 continue
             parsed[key] = caps
         for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)
@@ -4790,7 +5037,7 @@ class _Loader:
             self.add("host-sandbox-ref-weak", WARNING,
                      "`policy.sandbox.admitted_ref` %r does not look like a canon "
                      "PR/decision reference (`owner/repo#123`, `#123` or `card@commit`): "
-                     "the bureau's evidence must be citable" % admitted_ref,
+                     "the avatar's evidence must be citable" % admitted_ref,
                      **where, **subject)
         return placement
 
@@ -5039,6 +5286,60 @@ def _text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+#: #7674 : formes acceptées par les durées et les compteurs de jetons d'une
+#: fiche Agent — les mêmes suffixes que `ameesh set` (`30m`, `15M`, `500k`).
+_CARD_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smh]?)$", re.I)
+_CARD_TOKEN_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([km]?)$", re.I)
+_CARD_DURATION_FACTORS = {"": 1, "s": 1, "m": 60, "h": 3600}
+_CARD_TOKEN_FACTORS = {"": 1, "k": 1_000, "m": 1_000_000}
+
+
+def _card_bool(value: Any) -> bool | None:
+    """#7674 : booléen de fiche, ou None si la valeur est illisible.
+
+    Accepte aussi les deux textes `true`/`false` entre guillemets : le lecteur
+    YAML minimal du canon ne les convertit pas toujours, et une fiche générée
+    les cite parfois."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "yes", "on", "1"):
+        return True
+    if text in ("false", "no", "off", "0"):
+        return False
+    return None
+
+
+def _card_seconds(value: Any) -> int | None:
+    """#7674 : durée >= 0 en secondes (`60`, `60s`, `1.5m`), None si illisible."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 2 ** 40 else None
+    match = _CARD_DURATION_RE.match(str(value).strip())
+    if not match:
+        return None
+    seconds = float(match.group(1)) * _CARD_DURATION_FACTORS[match.group(2).lower()]
+    if seconds != seconds or seconds > 2 ** 40:
+        return None
+    return int(round(seconds))
+
+
+def _card_tokens(value: Any) -> int | None:
+    """#7674 : compteur de jetons >= 0 (`0`, `250000`, `15M`), None si illisible."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 2 ** 62 else None
+    match = _CARD_TOKEN_RE.match(str(value).strip())
+    if not match:
+        return None
+    tokens = float(match.group(1)) * _CARD_TOKEN_FACTORS[match.group(2).lower()]
+    if tokens != tokens or tokens > 2 ** 62:
+        return None
+    return int(round(tokens))
 
 
 def _utf8_safe(text: str) -> str:
@@ -5339,6 +5640,24 @@ def _relationship_cycles(graph):
                 stack.append((target, iter(graph.get(target, ()))))
 
 
+def _action_gate_mode_declared(federation: dict | None) -> bool:
+    """#7653 : `extensions.ameesh.action_gate.mode` est-il déclaré ?
+
+    Seule la présence de la clé compte ici : le contrat de lecture (défaut
+    `journal`, valeurs `journal | enforce`, valeur inconnue refusée) appartient
+    à #7630. Ce constat ne juge pas la valeur ; il rend visible le défaut
+    implicite d'un canon qui porte un avatar.
+    """
+    extensions = (federation or {}).get("extensions")
+    if not isinstance(extensions, dict):
+        return False
+    ameesh = extensions.get(SCOPE_KEY)
+    if not isinstance(ameesh, dict):
+        return False
+    gate = ameesh.get(ACTION_GATE_KEY)
+    return isinstance(gate, dict) and "mode" in gate
+
+
 def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[Finding]:
     """Constats de lecture + constats du profil. Une erreur est bloquante.
 
@@ -5356,6 +5675,21 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
 
     if not canon.readable:
         return findings
+
+    # -- #7653 : le mode de la porte d'actions est explicite ---------------------
+    # Le contrat de la clé (#7630) vaut `journal` par défaut et ce défaut ne
+    # refuse aucun geste hors charte. Un canon qui porte un avatar sans
+    # déclarer le mode laisserait croire à une politique appliquée : on le dit
+    # sans bloquer, le comportement restant `journal`.
+    if not _action_gate_mode_declared(canon.federation):
+        for agent in canon.agents:
+            if "avatar" in (agent.fiche.data or {}):
+                add("action-gate-mode-implicit", WARNING,
+                    "avatar %s: `extensions.ameesh.action_gate.mode` is not declared "
+                    "in federation.yaml; the action gate defaults to `journal` (it "
+                    "journals reserved actions but refuses none). Declare `journal` "
+                    "or `enforce` to make the policy explicit." % agent.title,
+                    agent.fiche, agent=agent.title)
 
     # -- doublons --------------------------------------------------------------
     for kind, items, subject in (("member", canon.members, None),
@@ -5473,6 +5807,12 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 % (agent.harness, agent.title, ", ".join(agent.harnesses)),
                 f, agent=agent.title)
         if "avatar" in (agent.fiche.data or {}):
+            from . import avatar_tools
+            from .spawn import SpawnToolsError
+            try:
+                avatar_tools.lists(agent, canon)
+            except SpawnToolsError as exc:
+                add(exc.code, ERROR, str(exc), f, agent=agent.title)
             # #7051 (avatar A3, design 5322 §1.1) : un avatar est attaché par
             # un humain (mode interactif) ET piloté par l'exécuteur entre deux
             # attaches (mode résident). Un harnais qui n'a pas les deux ne peut
@@ -5580,6 +5920,35 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                     "policy of host %s: harness %r has no known descriptor (%s)"
                     % (host.title, name, ", ".join(sorted(known_harnesses)) or "none"),
                     host.fiche, host=host.title)
+
+    # -- séquence staging (#7662, canon §14) -----------------------------------
+    staged = [(host, host.staging) for host in canon.hosts if host.staging is not None]
+    if staged:
+        agents = [(host, st) for host, st in staged if st.kind == "agents"]
+        servers = [(host, st) for host, st in staged if st.kind == "server"]
+        postes = [(host, st) for host, st in staged if st.kind == "workstation"]
+        if not agents:
+            add("host-staging-no-agents", ERROR,
+                "staging sequence without an `agents` VM: one VM is always "
+                "required (canon §14)",
+                staged[0][0].fiche, host=staged[0][0].title)
+        for kind, group in (("server", servers), ("workstation", postes)):
+            if len(group) > 1:
+                add("host-staging-duplicate", ERROR,
+                    "staging sequence declares %d `%s` hosts (%s): at most one"
+                    % (len(group), kind, ", ".join(host.title for host, _ in group)),
+                    group[1][0].fiche, host=group[1][0].title)
+        # §14 : les VM d'abord, le poste en dernier.
+        if postes:
+            first_poste = min(st.order for _host, st in postes)
+            late = [(host, st) for host, st in staged
+                    if st.kind != "workstation" and st.order >= first_poste]
+            if late:
+                add("host-staging-order", ERROR,
+                    "the workstation comes before %s in the staging sequence "
+                    "(VM first, workstation last, canon §14)"
+                    % ", ".join(host.title for host, _ in late),
+                    late[0][0].fiche, host=late[0][0].title)
 
     # -- admissions (ex-placements, L31/0029) --------------------------------------------
     host_names = {h.title for h in canon.hosts}

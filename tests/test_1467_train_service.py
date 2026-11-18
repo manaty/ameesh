@@ -17,11 +17,12 @@ class TrainServiceTest(unittest.TestCase):
     def test_passes_use_distinct_scoped_connections_closed_on_success_and_error(self):
         passage = mock.Mock()
         passage.scheduled_step.side_effect = [({"result": "ci"}, 200), RuntimeError("closed")]
-        service = self.service(passage)
+        service = self.service(passage, clock=lambda: 101)
         first, second = mock.Mock(), mock.Mock()
         with mock.patch("ameesh.scoped_db.ScopedDb", side_effect=[first, second]):
             self.assertEqual(service.pass_once(0, 100), 200)
-            self.assertIsNone(service.pass_once(0, 101))
+            self.assertEqual(service.pass_once(0, 101),
+                             101 + train_runner.PASSAGE_RETRY_S)
         first.close.assert_called_once_with()
         second.close.assert_called_once_with()
         self.assertEqual(passage.scheduled_step.call_args_list,
@@ -141,17 +142,38 @@ class TrainServiceTest(unittest.TestCase):
         self.assertEqual(seen, [(0, 100), (0, 100)])
         waiting.assert_called_once()
 
-    def test_failure_waits_for_an_event_instead_of_retrying(self):
-        service = self.service(mock.Mock(), clock=lambda: 100)
+    def test_a_failed_passage_is_replayed_and_reapplies_the_durable_queue(self):
+        """#7803: without any external event, the service replays the pass.
+
+        ``scheduled_step`` raises at 100 s. Before the fix the failed passage
+        returned no deadline, so the loop waited indefinitely (``wait(None)``)
+        and a durable requalification request waited for an external event.
+        The service now replays the same passage at 160 s and re-enters
+        ``pass_once``, which applies the pending requests again.
+        """
+        passage = mock.Mock()
+        passage.scheduled_step.side_effect = [RuntimeError("closed"),
+                                              ({"result": "ci"}, 500)]
+        clock = [100.0]
+        service = self.service(passage, clock=lambda: clock[0])
+        applied = mock.Mock()
+        service._apply_requalification_requests = applied
 
         def wait(timeout):
-            self.assertIsNone(timeout)
-            service.stop.set()
+            if clock[0] < 160:
+                self.assertEqual(timeout, train_runner.PASSAGE_RETRY_S)
+                clock[0] += timeout
+            else:
+                service.stop.set()
 
-        with mock.patch.object(service, "pass_once", return_value=None) as passage, \
+        with mock.patch("ameesh.scoped_db.ScopedDb", return_value=mock.Mock()), \
              mock.patch.object(service.condition, "wait", side_effect=wait):
             service.run()
-        passage.assert_called_once_with(0, 100)
+
+        self.assertEqual([call.args[1] for call in passage.scheduled_step.call_args_list],
+                         [100.0, 160.0])
+        self.assertEqual(applied.call_count, 2)
+        service.report.assert_called_once_with("train passage failed (RuntimeError: closed)")
 
     def test_event_filters_project_target_and_terminal_kind_and_coalesces(self):
         passage = types.SimpleNamespace(project=types.SimpleNamespace(name="p", target="main"))
@@ -167,6 +189,19 @@ class TrainServiceTest(unittest.TestCase):
         self.assertEqual(service.pending, {0})
         service.stop.set()
         self.assertFalse(service.event(kind="fire", project="p", target="main"))
+
+    def test_requalification_event_selects_its_project_without_a_target(self):
+        """#7806: the deposit hint is project-scoped, and still narrows by target."""
+        passage = types.SimpleNamespace(project=types.SimpleNamespace(name="p", target="main"))
+        service = self.service(passage)
+        service.pending.clear()
+        self.assertFalse(service.event(kind="requalification-request",
+                                       project="other", target=""))
+        self.assertFalse(service.event(kind="requalification-request",
+                                       project="p", target="release/x"))
+        self.assertTrue(service.event(kind="requalification-request",
+                                      project="p", target=""))
+        self.assertEqual(service.pending, {0})
 
     def test_event_arriving_during_passage_is_not_lost(self):
         passage = types.SimpleNamespace(project=types.SimpleNamespace(name="p", target="main"))

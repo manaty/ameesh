@@ -111,7 +111,32 @@ class LandingProofTest(unittest.TestCase):
 
 
 class RealLandingWitnessTest(unittest.TestCase):
-    """Frozen H8 witnesses; portable shallow checkouts may lack these objects."""
+    """Frozen H8 witnesses: they need the commits and their content.
+
+    A shallow checkout lacks the commits; a blob-partial clone has the commits
+    but silently truncates content reads (``git grep`` may return a partial
+    result with rc 0 and no stderr), which used to turn this witness red for
+    an environment reason (#7790). Both cases are skipped explicitly.
+    """
+
+    @staticmethod
+    def _missing_objects(repo, target, head, copies):
+        """Number of objects the H8 reads need but this clone lacks, or None."""
+        from ameesh import plan_git
+        base = plan_git._out(repo, "merge-base", "--octopus", target, *copies)
+        if not base:
+            return None
+        revisions = [target + "^{tree}", head + "^{tree}",
+                     base + "^{tree}", "%s..%s" % (base, target)]
+        for sha in copies:
+            revisions += [sha + "^{tree}", sha + "^^{tree}"]
+        proc = plan_git._git(repo, "rev-list", "--objects", "--missing=print",
+                             *revisions, env_extra=plan_git.NO_LAZY_FETCH)
+        if proc.returncode:
+            return None
+        return sum(1 for line in proc.stdout.decode("utf-8", "replace").splitlines()
+                   if line.startswith("?"))
+
     def test_h8_against_frozen_target(self):
         from pathlib import Path
         from ameesh import plan_git
@@ -123,7 +148,13 @@ class RealLandingWitnessTest(unittest.TestCase):
                   "3f0f641bec21ab308e2b70cd5966f5e8ccc0e20a"]
         if any(not plan_git.local_commit(repo, sha)
                for sha in [target, head, *copies]):
-            self.skipTest("historical H8 objects unavailable")
+            self.skipTest("historical H8 commits unavailable (shallow checkout)")
+        missing = self._missing_objects(repo, target, head, copies)
+        if missing is None:
+            self.skipTest("historical H8 object store unreadable")
+        if missing:
+            self.skipTest("historical H8 content unavailable in a partial clone "
+                          "(%d missing object(s))" % missing)
         self.assertEqual(authors._not_in_target(repo, copies, target), copies)
         # #3902 : les trois copies sont déjà dans la cible par contenu, et la
         # tête ne réintroduit aucune de leurs lignes **propres** (les lignes

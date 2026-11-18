@@ -26,7 +26,7 @@ from . import (NAME, RESERVED_NAMES, _builtin, _check_types, _digest,
                _distribution, _entry_points, _external, _validate_descriptor)
 
 #: Capabilities a module may declare in ``CAPABILITIES``.
-CAPABILITIES = ("lifecycle", "cli", "audit", "workspaces")
+CAPABILITIES = ("lifecycle", "cli", "audit", "workspaces", "release")
 
 
 @dataclass(frozen=True)
@@ -42,14 +42,30 @@ class Module:
     entry_point: str | None = None
     descriptor_sha256: str = ""
     card_ref: str | None = None      # L103 T2: canon_ref of a Pipeline card
+    action_connectors: tuple[str, ...] = ()
+    #: #7663: release model names the module provides through ``release_model``.
+    release_models: tuple[str, ...] = ()
+    #: P1a #7649: logical schema name, declared migrations and schema
+    #: requirements. A module without a migrations folder has no schema.
+    schema: str | None = None
+    migrations: tuple = ()
+    requires: tuple[str, ...] = ()
 
     def as_dict(self):
-        return {"name": self.name, "version": self.version, "source": self.source,
+        result = {"name": self.name, "version": self.version, "source": self.source,
                 "capabilities": list(self.capabilities), "cli": self.cli,
                 "storage": {"types": list(self.storage)},
                 "distribution": self.distribution, "entry_point": self.entry_point,
                 "descriptor_sha256": self.descriptor_sha256,
-                "card_ref": self.card_ref}
+                "card_ref": self.card_ref,
+                "schema": self.schema,
+                "migrations": [migration.as_dict() for migration in self.migrations],
+                "requires": list(self.requires)}
+        if self.action_connectors:
+            result["action_connectors"] = list(self.action_connectors)
+        if self.release_models:
+            result["release_models"] = list(self.release_models)
+        return result
 
 
 class PipelineModule:
@@ -100,6 +116,14 @@ def _capabilities(name, module):
         # L101 T4 (#4357): a tooling module owns the workspaces façade; the core
         # reads it through the registry, never by importing the implementation.
         provided.append("workspaces")
+    release_models = getattr(module, "RELEASE_MODELS", None) or ()
+    if release_models:
+        # #7663: a module that provides release models must return their
+        # provider object lazily; the core never imports the engine.
+        if not callable(getattr(module, "release_model", None)):
+            raise ValueError("installed module %r: RELEASE_MODELS without "
+                             "release_model(name)" % name)
+        provided.append("release")
     declared = getattr(module, "CAPABILITIES", None)
     if declared is None:
         return tuple(provided)
@@ -118,11 +142,20 @@ def _capabilities(name, module):
 def _describe(name, module, compiled, *, source, version, distribution=None,
               entry_point=None):
     capabilities = _capabilities(name, module)
+    # P1a #7649 : faits de schéma et de migrations, lus sur le descripteur
+    # installé (aucun import du module par le cœur).
+    from .. import migrations as migrations_mod
+    declaration = migrations_mod.module_metadata(name, module)
     return Module(name=name, version=version, source=source,
                   capabilities=capabilities,
                   cli=("ameesh module %s" % name) if "cli" in capabilities else None,
                   storage=tuple(compiled["types"]), distribution=distribution,
-                  entry_point=entry_point, descriptor_sha256=_digest(compiled))
+                  entry_point=entry_point, descriptor_sha256=_digest(compiled),
+                  action_connectors=tuple(sorted(getattr(module, "ACTION_CONNECTORS", {}))),
+                  release_models=tuple(sorted(getattr(module, "RELEASE_MODELS", ()) or ())),
+                  schema=declaration["schema"],
+                  migrations=declaration["migrations"],
+                  requires=declaration["requires"])
 
 
 def _core_version():
@@ -158,10 +191,12 @@ def _discover(*, builtin=True, canon=None):
             continue
         try:
             module, compiled = _external(entry)
+            _action_declarations({**implementations, name: module})
+            described = _describe(name, module, compiled, source="external",
+                                  version=version, distribution=dist,
+                                  entry_point=row["entry_point"])
             implementations[name] = module
-            modules.append(_describe(name, module, compiled, source="external",
-                                     version=version, distribution=dist,
-                                     entry_point=row["entry_point"]))
+            modules.append(described)
         except ValueError as exc:
             refused.append(dict(row, error=str(exc)))
     discovery = (implementations, tuple(modules), tuple(refused))
@@ -243,12 +278,25 @@ CORE_CONNECTORS = ("document", "done")
 CORE_ACTION_CONNECTORS = ("shell-noop",)
 
 
-def _connector_providers():
-    """Built-in providers of action and delivery connectors: the lifecycle
-    modules plus the development tooling (`dev`, now a built-in module).
-    Installed entry points are not read: a connector path is reviewed core
-    code."""
-    return dict(_builtin())
+def _connector_providers(*, external=False):
+    """Delivery providers remain built-in; actions can include installed modules."""
+    return _discover()[0] if external else dict(_builtin())
+
+
+def _action_declarations(providers):
+    found = {}
+    for provider, module in sorted(providers.items()):
+        declarations = getattr(module, "ACTION_CONNECTORS", {})
+        if not isinstance(declarations, dict):
+            raise ValueError("module %r: ACTION_CONNECTORS must be a mapping" % provider)
+        for name, connector in declarations.items():
+            if not isinstance(name, str) or not NAME.fullmatch(name) or not callable(connector):
+                raise ValueError("module %r: invalid action connector %r" % (provider, name))
+            if (name in CORE_ACTION_CONNECTORS or name in found
+                    or (name == "git-merge" and module is not _builtin().get("dev"))):
+                raise ValueError("duplicate action connector: %r (module %s)" % (name, provider))
+            found[name] = (provider, connector)
+    return found
 
 
 def action_connectors():
@@ -257,17 +305,13 @@ def action_connectors():
 
     L100 T1 (#4382): the registry is the core's only way to the development
     module's action connectors (`git-merge`); the core keeps `shell-noop`."""
-    found = {}
-    for provider, module in sorted(_connector_providers().items()):
-        for name, connector in sorted((getattr(module, "ACTION_CONNECTORS", None)
-                                       or {}).items()):
-            if not NAME.fullmatch(name) or not callable(connector):
-                raise ValueError("module %r: invalid action connector %r"
-                                 % (provider, name))
-            if name in CORE_ACTION_CONNECTORS or name in found:
-                raise ValueError("duplicate action connector: %r" % (name,))
-            found[name] = (provider, connector)
-    return found
+    return _action_declarations(_connector_providers(external=True))
+
+
+def action_policy(db, project, provider):
+    """Applied policy read through the module interface, never its implementation."""
+    from .storage import ModuleStore
+    return ModuleStore(db).action_policy(project, provider)
 
 
 def delivery_connectors():
@@ -284,6 +328,118 @@ def delivery_connectors():
                 raise ValueError("duplicate delivery connector: %r" % (name,))
             found[name] = (provider, deliver)
     return found
+
+
+def _providers(declared, getter_name, what):
+    """`{name: (module_name, getter)}` of one kind of built-in provider.
+
+    Release, notification and train contracts are core runtime paths, like the
+    delivery and merge connectors: only built-in tooling modules are read here.
+    An installed entry point is loaded by discovery and selected by the canon,
+    never by this path. A name declared twice is refused rather than silently
+    ordered. ``declared`` is the module attribute listing the names,
+    ``getter_name`` the lazy getter returning one provider."""
+    found = {}
+    for provider, module in sorted(_builtin().items()):
+        names = getattr(module, declared, ()) or ()
+        if not isinstance(names, (list, tuple)) or any(
+                not isinstance(name, str) or not NAME.fullmatch(name) for name in names):
+            raise ValueError("module %r: %s must be unique names" % (provider, declared))
+        if len(set(names)) != len(names):
+            raise ValueError("module %r: %s must be unique names" % (provider, declared))
+        getter = getattr(module, getter_name, None)
+        if names and not callable(getter):
+            raise ValueError("module %r: %s without %s(name)"
+                             % (provider, declared, getter_name))
+        for name in names:
+            if name in found:
+                raise ValueError("duplicate %s: %r (modules %s and %s)"
+                                 % (what, name, found[name][0], provider))
+            found[name] = (provider, getter)
+    return found
+
+
+def _release_providers():
+    """`{model: (module_name, getter)}` of the built-in release providers."""
+    return _providers("RELEASE_MODELS", "release_model", "release model")
+
+
+def release_models():
+    """Names of the release models the built-in modules provide, sorted."""
+    return tuple(sorted(_release_providers()))
+
+
+def release_model(name):
+    """The provider object of one release model, or ``None`` when no module
+    provides it (#7663).
+
+    The module returns its implementation lazily; importing this function never
+    imports a release engine, so the bare profile and discovery stay light. The
+    core only knows the model name from its configuration (``ProjectRelease``)
+    and reads the provider here, never by importing ``ameesh.modules.nexlink``."""
+    found = _release_providers().get(name)
+    if found is None:
+        return None
+    _provider, getter = found
+    return getter(name)
+
+
+def _notify_providers():
+    """`{kind: (module_name, getter)}` of the built-in notification channels
+    (#7793)."""
+    return _providers("NOTIFY_CHANNELS", "notify_channel", "notification channel")
+
+
+def notify_channel_kinds():
+    """Names of the notification channel kinds the built-in modules provide."""
+    return tuple(sorted(_notify_providers()))
+
+
+def notify_channel(kind):
+    """The provider object of one notification channel kind, or ``None``
+    (#7793).
+
+    The module returns its implementation lazily; importing this function never
+    imports a channel implementation, so the bare profile and discovery stay
+    light. The core reads channel configuration and sends through this provider,
+    never by importing a module package."""
+    found = _notify_providers().get(kind)
+    if found is None:
+        return None
+    _provider, getter = found
+    return getter(kind)
+
+
+def train_contract_names():
+    """Names of the train CI contracts the built-in modules provide (#7794)."""
+    return tuple(sorted(_providers("TRAIN_CONTRACTS", "train_contract",
+                                   "train contract")))
+
+
+def train_contract(name):
+    """The factory of one module train CI contract, or ``None`` (#7794).
+
+    ``train_assembly`` selects a contract by the name the host configuration
+    gives (``ci_contract``); a project contract lives in its module and is
+    imported lazily by the module getter, never by the core."""
+    found = _providers("TRAIN_CONTRACTS", "train_contract", "train contract").get(name)
+    if found is None:
+        return None
+    _provider, getter = found
+    return getter(name)
+
+
+def release_reserved_prefixes():
+    """Note prefixes reserved to a module's release commands (`work.note`)."""
+    prefixes = set()
+    for provider, module in sorted(_builtin().items()):
+        declared = getattr(module, "RESERVED_PREFIXES", ()) or ()
+        if not isinstance(declared, (list, tuple)) or any(
+                not isinstance(prefix, str) or not prefix for prefix in declared):
+            raise ValueError("module %r: RESERVED_PREFIXES must be non-empty strings"
+                             % provider)
+        prefixes.update(declared)
+    return tuple(sorted(prefixes))
 
 
 def merge_connector():
@@ -371,6 +527,38 @@ def _canon_registry():
     return Registry(discovery[1], discovery[2])
 
 
+def _annotate_module_rows(rows, modules):
+    """P1a #7649: `schema_actual` and per-migration `applied` when the base is
+    readable. Read-only; without a database the declared fields stand alone."""
+    if not any(getattr(module, "migrations", ()) for module in modules):
+        return
+    import sys
+    from .. import config, db as db_mod, migrations as migrations_mod
+    try:
+        cfg = config.load()
+        db = db_mod.connect(cfg, writer=False)
+    except (db_mod.Unavailable, OSError, ValueError) as exc:
+        print("warning: database not reachable (%s); applied module migrations "
+              "unknown" % (" ".join(str(exc).split())[:160],), file=sys.stderr)
+        return
+    try:
+        schemas = migrations_mod.module_schemas(modules, cfg.schema)
+        state = migrations_mod.check_modules(db, schemas)
+        checks = {check.module: check for check in state.checks}
+        for row in rows:
+            check = checks.get(row["name"])
+            if check is None:
+                continue
+            row["schema_actual"] = check.registered_schema
+            for migration in row["migrations"]:
+                migration["applied"] = migration["version"] in check.applied
+    except (db_mod.DbError, ValueError) as exc:
+        print("warning: module schemas unreadable (%s)"
+              % (" ".join(str(exc).split())[:160],), file=sys.stderr)
+    finally:
+        db.close()
+
+
 def main(argv):
     """`ameesh modules [--json] [--active] [--no-canon]` — discovered or active
     modules."""
@@ -414,7 +602,9 @@ def main(argv):
         return 0
     registry = discover() if args.no_canon else _canon_registry()
     if args.json:
-        print(json.dumps({"modules": [module.as_dict() for module in registry.modules],
+        rows = [module.as_dict() for module in registry.modules]
+        _annotate_module_rows(rows, registry.modules)
+        print(json.dumps({"modules": rows,
                           "refused": list(registry.refused)},
                          ensure_ascii=False, indent=2, sort_keys=True))
     else:

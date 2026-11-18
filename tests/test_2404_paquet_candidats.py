@@ -295,6 +295,39 @@ class InventoryTest(unittest.TestCase):
     def by_id(self, payload):
         return {entry["work_item"]: entry for entry in payload["candidates"]}
 
+    def test_resolution_refresh_failure_refuses_the_inventory(self):
+        with mock.patch.object(packet_candidates, "list_remises",
+                               return_value=({}, "resolution fetch failed")):
+            with self.assertRaisesRegex(packet_candidates.CandidateError,
+                                        "resolution fetch failed"):
+                self.inventory()
+
+    def test_stale_pair_resolution_keeps_prior_freeze_readable(self):
+        # #7737: both branches move, but their old resolution still retains
+        # the old freeze on origin. It is provenance, not a target remise.
+        old = self.tips[1]
+        ref = "refs/ameesh/resolutions/1/5"
+        _git(self.repo, "push", "-q", "origin", "%s:%s" % (old, ref))
+        for lot in (1, 5):
+            _git(self.repo, "switch", "-q", self.branches[lot])
+            _git(self.repo, "reset", "--hard", "main")
+            _write(self.repo, "rebased%d.py" % lot, "rebased\n")
+            head = _commit(self.repo, "rebased #%d" % lot)
+            self.tips[lot] = head
+            for mark in self.marks[lot]:
+                mark["sha"] = head
+            _git(self.repo, "push", "-q", "--force", "origin", self.branches[lot])
+        _git(self.repo, "switch", "-q", "main")
+        report = self.inventory()
+        from ameesh import plan_git
+        self.assertTrue(plan_git.ref_reachable(self.clone.path, old))
+        self.assertTrue(self.by_id(report)[1]["ready"])
+        self.assertEqual(self.by_id(report)[1]["remises"], [])
+        # A deleted remote resolution must not remain as a stale local proof.
+        _git(self.repo, "push", "-q", "origin", ":" + ref)
+        self.inventory()
+        self.assertFalse(plan_git.ref_reachable(self.clone.path, old))
+
     def test_validated_lot_is_a_candidate_with_the_same_review_gate(self):
         row = next(row for row in self.rows if row["id"] == 1)
         row["state"] = "validated"
@@ -654,6 +687,75 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(cause["depends_on"], 1)
         self.assertEqual(cause["stacked_on"][0]["lot"], 1)
         self.assertIn("ameesh work dependencies 14 --add 1", cause["detail"])
+
+    def test_start_on_dependency_is_ready_with_its_prerequisite_first(self):
+        """#7760 : un dépendant démarré sur la tête gelée d'un lot validé
+        entre dans le MÊME paquet, après lui — jamais seul."""
+        self.stacked()
+        next(row for row in self.rows if row["id"] == 1)["state"] = "validated"
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 14, "blocker_id": 1, "blocker_state": "validated",
+             "blocking": True, "start_on": True}]
+        payload = self.inventory()
+        entry = self.by_id(payload)[14]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertLess(payload["ready"].index(1), payload["ready"].index(14))
+        self.assertNotIn("dependency-blocking",
+                         [cause["code"] for cause in entry["causes"]])
+
+    def test_start_on_chained_dependencies_are_ordered(self):
+        """#7760 : une chaîne de démarrages garde l'ordre prérequis → dépendant."""
+        self.stacked()
+        for row in self.rows:
+            if row["id"] == 1:
+                row["state"] = "validated"
+        # un second dépendant, branché sur le premier
+        name = "lot/15-stacked"
+        _git(self.repo, "switch", "-q", "-c", name, "lot/14-stacked")
+        _write(self.repo, "stacked2.py", "y\n")
+        tip = _commit(self.repo, "#15")
+        _git(self.repo, "switch", "-q", "main")
+        _git(self.repo, "push", "-q", "origin", name)
+        self.marks[15] = [
+            {"id": 1500, "work_item_id": 15, "kind": "frozen", "sha": tip,
+             "actor": "author", "verdict": None, "at_ts": 1500.0},
+            {"id": 1501, "work_item_id": 15, "kind": "verdict", "sha": tip,
+             "actor": "reviewer", "verdict": "ok", "at_ts": 1501.0}]
+        self.rows.append({"id": 15, "state": "qa", "app": "ameesh",
+                          "branch": name, "branch_target": None,
+                          "title": "lot 15", "assignee": "author",
+                          "priority": 1, "created_ts": 15.0})
+        self.classes[15] = "normal"
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 14, "blocker_id": 1, "blocker_state": "validated",
+             "blocking": True, "start_on": True},
+            {"work_item_id": 15, "blocker_id": 14, "blocker_state": "qa",
+             "blocking": True, "start_on": True},
+            # la branche porte aussi les commits de #1 (chaîne de démarrages)
+            {"work_item_id": 15, "blocker_id": 1, "blocker_state": "validated",
+             "blocking": True, "start_on": True}]
+        payload = self.inventory()
+        self.assertIn(14, payload["ready"], self.by_id(payload)[14]["causes"])
+        self.assertIn(15, payload["ready"], self.by_id(payload)[15]["causes"])
+        self.assertLess(payload["ready"].index(14), payload["ready"].index(15))
+
+    def test_start_on_dependency_not_ready_removes_the_dependent(self):
+        """#7760 : le prérequis retiré ou rendu en build retire le dépendant —
+        sa source emporterait sinon les commits non admis au paquet."""
+        self.stacked()
+        next(row for row in self.rows if row["id"] == 1)["state"] = "validated"
+        self.role_verdicts["mesh-design"] = True
+        self.hold(1, "hold: prérequis retiré", actor="mesh-design")
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 14, "blocker_id": 1, "blocker_state": "validated",
+             "blocking": True, "start_on": True}]
+        payload = self.inventory()
+        entry = self.by_id(payload)[14]
+        self.assertFalse(entry["ready"])
+        self.assertNotIn(14, payload["ready"])
+        self.assertEqual([cause["code"] for cause in entry["causes"]],
+                         ["dependency-unready"])
+
 
     def test_stacked_on_a_lot_outside_qa_is_refused(self):
         # Le parent en `build` n'est pas candidat : sa tête vient du gel.

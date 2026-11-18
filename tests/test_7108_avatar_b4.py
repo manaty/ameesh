@@ -193,6 +193,28 @@ class MoveBothWaysTest(_AvatarCase):
         self.assertEqual(back["target_cwd"], self.row(AVATAR)["cwd"])
         self.assertTrue(back["target_cwd"].endswith("/acme/acme-web"))
 
+    def test_the_reclaim_of_a_manual_move_names_the_manual_move(self):
+        # #7680 : « preferred host did not claim » est faux pour un move
+        # manuel — la cible n'est pas un hôte préféré, c'est l'hôte demandé.
+        self.source()
+        self.ready(BANC, tenant=True)
+        self.ready(ATELIER, tenant=False)
+        result = relocation.move_manual(
+            self.cfg, self.db, AVATAR, BANC, actor=ALICE)
+        move_id = result["conversation_move"]
+        self.db.execute(
+            "UPDATE conversation_moves SET switched_at = clock_timestamp()"
+            " - interval '1 hour' WHERE move_id = %s", (move_id,))
+        closed = conversation_move.reclaim(
+            self.db, AVATAR, ATELIER,
+            holdoff_s=election.PREFERENCE_HOLDOFF_S)
+        self.assertIsNotNone(closed)
+        self.assertEqual(closed["state"], "failed")
+        self.assertIn("manual move", closed["error"])
+        self.assertIn(BANC, closed["error"])
+        self.assertNotIn("preferred", closed["error"])
+        self.assertEqual(self.row(AVATAR)["host"], ATELIER)
+
     def test_no_session_or_credential_file_is_copied(self):
         self.source()
         self.ready(BANC)

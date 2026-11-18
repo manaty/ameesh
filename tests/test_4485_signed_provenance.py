@@ -123,6 +123,20 @@ class SignedProvenanceTest(PgTestCase):
         return sb.bind(self.cfg, self.db, agent, session_id=session,
                        harness=harness, by="human:test")
 
+    def bind_signed(self, *, agent="bureau", session=SESSION,
+                    harness="claude", host=HOST):
+        """La liaison de la session attestée sur l'hôte du commit (#7741).
+
+        Depuis le retrait de la dérogation « hôte sans ameesh » (B/P1 de la
+        revue #43307), une attestation signée exige une liaison qui couvre la
+        date de committer : le banc l'écrit comme `mail bind` le ferait sur
+        l'hôte (le stockage porte l'hôte, le CLI local ne le choisit pas)."""
+        row = storage.of(self.db).session_bindings.bind(
+            host=host, harness=harness, session_id=session, agent=agent,
+            pid=None, created_by="human:test")
+        self.assertIsNotNone(row)
+        return row
+
     def unbind(self, *, session="s-bureau-old", harness="claude"):
         return sb.unbind(self.cfg, self.db, session_id=session, harness=harness,
                          by="human:test")
@@ -152,6 +166,7 @@ class SignedProvenanceTest(PgTestCase):
 
     # -- la preuve --------------------------------------------------------
     def test_an_owner_signed_commit_is_proven_outside_a_turn(self):
+        self.bind_signed()
         head = self.commit("canon", trailer=True)
         # Le commit est celui du bureau : auteur/committer humains, pas le
         # `<agent>@ameesh.invalid` d'un tour managé.
@@ -176,6 +191,7 @@ class SignedProvenanceTest(PgTestCase):
         self.assertIn({"name": "bureau", "family": "claude"}, authors)
 
     def test_the_signed_commit_does_not_need_to_be_head(self):
+        self.bind_signed()
         older = self.commit("premier")
         newer = self.commit("second")
         self.assertNotEqual(older, newer)
@@ -185,6 +201,7 @@ class SignedProvenanceTest(PgTestCase):
         self.assertIsNone(prov.receipt_for_commit(self.db, newer))
 
     def test_a_pre_signed_approval_also_proves_the_commit(self):
+        self.bind_signed()
         head = self.commit("pré-signé")
         built = self.approval(head)
         row = prov.record_signed_commit(
@@ -204,6 +221,7 @@ class SignedProvenanceTest(PgTestCase):
         B P1 de la relecture cx3 (#4485) : `build_approval` accepte
         `decision=rejected`, et `verify_approval` en vérifie la signature sans
         exiger « approved ». La décision doit être contrôlée avant l'écriture."""
+        self.bind_signed()
         head = self.commit("refusé")
         built = self.approval(head, decision="rejected")
         with self.assertRaises(prov.ProvenanceError) as raised:
@@ -253,22 +271,26 @@ class SignedProvenanceTest(PgTestCase):
             self.sign(head)
         self.assertIn("live lease", str(raised.exception))
 
-    def test_the_signed_harness_must_match_the_registry(self):
+    def test_an_unbound_session_is_refused_even_when_the_harness_is_known(self):
+        """#43307 : une session sans liaison n'est pas une preuve.
+
+        La dérogation « hôte sans ameesh » de #4485 acceptait le harnais déclaré
+        dès qu'il était connu de l'acteur, sans aucune liaison : une session et
+        un hôte inventés contournaient alors les liaisons réelles du commit. La
+        voie signée refuse désormais toute session non liée."""
         head = self.commit()
         with self.assertRaises(prov.ProvenanceError) as raised:
-            self.sign(head, harness="codex")
-        self.assertIn("registered under", str(raised.exception))
+            self.sign(head, harness="claude")
+        self.assertIn("has no binding on any host", str(raised.exception))
 
-    def test_a_past_binding_keeps_the_former_harness_known(self):
-        """#5756 : le registre au harnais COURANT ne cache pas la session passée.
+    def test_a_binding_keeps_its_harness_when_the_registry_moved(self):
+        """#5756 : le registre au harnais COURANT ne cache pas la session.
 
         Le bureau est passé de claude à codex au registre ; le commit signé a
-        été créé par une session claude (hôte sans ameesh, session jamais
-        liée). La liaison claude révoquée prouve que l'acteur a bien connu ce
-        harnais : l'attestation est acceptée, et le harnais courant divergent
-        reste lisible dans le meta de l'approbation."""
-        self.bind(session="s-claude-old", harness="claude")
-        self.unbind(session="s-claude-old", harness="claude")
+        été créé par une session claude liée sur l'hôte. La liaison couvre le
+        commit et fixe le harnais claude ; le harnais courant divergent reste
+        lisible dans le meta de l'approbation."""
+        self.bind_signed()
         registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
                         mode="externe")
         head = self.commit("claude d'hier")
@@ -285,8 +307,7 @@ class SignedProvenanceTest(PgTestCase):
         L'approbation pré-signée ne contient que le texte signé. Le contexte
         (registre codex, session claude) est écrit au moment de la
         consommation, sans toucher au texte version 1 ni à l'empreinte."""
-        self.bind(session="s-claude-old", harness="claude")
-        self.unbind(session="s-claude-old", harness="claude")
+        self.bind_signed()
         registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
                         mode="externe")
         head = self.commit("claude pré-signé")
@@ -312,8 +333,7 @@ class SignedProvenanceTest(PgTestCase):
 
         Le premier essai a consommé l'approbation puis s'est arrêté avant le
         reçu ; la reprise échoue avant l'écriture du diagnostic."""
-        self.bind(session="s-claude-old", harness="claude")
-        self.unbind(session="s-claude-old", harness="claude")
+        self.bind_signed()
         registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
                         mode="externe")
         head = self.commit("consommé sans reçu")
@@ -335,31 +355,25 @@ class SignedProvenanceTest(PgTestCase):
                          (before.get("meta") or {}).get("registry_harness"))
         self.assertIsNone(prov.receipt_for_commit(self.db, head))
 
-    def test_a_harness_never_seen_is_refused(self):
-        """#5756 : registre codex, aucune liaison claude -> refus nommé."""
-        registry.upsert(self.db, "bureau", harness="codex", host=self.cfg.host,
-                        mode="externe")
-        head = self.commit()
-        with self.assertRaises(prov.ProvenanceError) as raised:
-            self.sign(head, harness="claude")
-        self.assertIn("registered under", str(raised.exception))
-        self.assertIn("no session binding", str(raised.exception))
-
     def test_a_bound_session_keeps_its_own_harness(self):
         """#5756 : une session liée en codex ne peut pas être signée en claude."""
         self.bind(session="s-codex-1", harness="codex")
         head = self.commit()
         with self.assertRaises(prov.ProvenanceError) as raised:
-            self.sign(head, session="s-codex-1", harness="claude")
+            self.sign(head, session="s-codex-1", harness="claude",
+                      host=self.cfg.host)
         self.assertIn("bound under", str(raised.exception))
         self.assertIn("codex", str(raised.exception))
 
     def test_a_revoked_binding_of_the_session_still_fixes_identity(self):
-        """#5756 : une liaison révoquée de la session compte encore."""
+        """#5756/#7741 : une liaison révoquée compte pour l'intervalle où elle
+        était active. Le commit doit être fait pendant la liaison ; un commit
+        postérieur au unbind n'est plus attribuable (témoin #7741)."""
         self.bind(session=SESSION, harness="claude")
-        self.unbind(session=SESSION, harness="claude")
         head = self.commit()
-        row = self.sign(head, session=SESSION, harness="claude")
+        self.unbind(session=SESSION, harness="claude")
+        row = self.sign(head, session=SESSION, harness="claude",
+                        host=self.cfg.host)
         self.assertTrue(row["recorded"])
         self.assertEqual(prov.receipt_for_commit(self.db, head)["harness"],
                          "claude")
@@ -371,11 +385,13 @@ class SignedProvenanceTest(PgTestCase):
         self.bind(agent="autre", session="s-autre-1", harness="codex")
         head = self.commit()
         with self.assertRaises(prov.ProvenanceError) as raised:
-            self.sign(head, session="s-autre-1", harness="codex")
+            self.sign(head, session="s-autre-1", harness="codex",
+                      host=self.cfg.host)
         self.assertIn("bound to autre", str(raised.exception))
 
     def test_the_current_harness_writes_no_extra_meta(self):
         """#5756 : harnais courant égal au harnais signé, comportement inchangé."""
+        self.bind_signed()
         head = self.commit()
         row = self.sign(head)
         self.assertTrue(row["recorded"])
@@ -389,6 +405,7 @@ class SignedProvenanceTest(PgTestCase):
         self.assertIn("unknown harness", str(raised.exception))
 
     def test_no_signature_proves_nothing(self):
+        self.bind_signed()
         head = self.commit()
         with self.assertRaises(prov.ProvenanceError) as raised:
             prov.record_signed_commit(
@@ -406,12 +423,14 @@ class SignedProvenanceTest(PgTestCase):
         with open(key_path, "w", encoding="utf-8") as fh:
             fh.write(signing.encode_private(agent_seed))
         os.chmod(key_path, 0o600)
+        self.bind_signed()
         head = self.commit()
         with self.assertRaises(prov.ProvenanceError) as raised:
             self.sign(head, approver="ameesh-cx3", key_path=key_path)
         self.assertIn("owner key", str(raised.exception))
 
     def test_a_revoked_owner_key_proves_nothing(self):
+        self.bind_signed()
         head = self.commit()
         built = self.approval(head)
         authority.revoke_key(self.db, OWNER)
@@ -430,6 +449,7 @@ class SignedProvenanceTest(PgTestCase):
         posée sur la fiche `bureau`. Le même secret signe l'owner et son
         délégataire, mais la déclaration « détenteur = agent » suffit à
         refuser ; l'approbation n'est pas consommée."""
+        self.bind_signed()
         self.delegated_copy("bureau")
         head = self.commit("auto-attesté")
         with self.assertRaises(prov.ProvenanceError) as raised:
@@ -444,6 +464,7 @@ class SignedProvenanceTest(PgTestCase):
         clé identique détenue par `bureau-goal` ne permet pas de savoir qui a
         signé. Tant que la copie existe, la provenance signée par cette clé est
         refusée : la séparation demande une clé distincte (décision #164261)."""
+        self.bind_signed()
         registry.upsert(self.db, "bureau-goal", harness="codex",
                         host=self.cfg.host, mode="externe")
         self.delegated_copy("bureau-goal")
@@ -455,6 +476,7 @@ class SignedProvenanceTest(PgTestCase):
 
     def test_the_owner_in_person_still_signs_when_no_copy_is_registered(self):
         """Témoin inverse : clé owner humaine, aucun agent ne la détient."""
+        self.bind_signed()
         head = self.commit("owner en personne")
         row = self.sign(head)
         self.assertTrue(row["recorded"])
@@ -468,6 +490,7 @@ class SignedProvenanceTest(PgTestCase):
         `receipt_for_commit` rend `None` (auteur inconnu pour la porte), la
         lecture ne retombe pas sur l'identité Git, et ni une nouvelle clé ni
         une approbation pré-signée ne ressuscitent le reçu."""
+        self.bind_signed()
         head = self.commit("à révoquer")
         row = self.sign(head)
         self.assertTrue(row["recorded"])
@@ -542,6 +565,8 @@ class SignedProvenanceTest(PgTestCase):
         self.assertIn("no provenance receipt", str(raised.exception))
 
     def test_an_approval_for_another_statement_is_refused(self):
+        self.bind_signed()
+        self.bind_signed(session="autre-session")
         head = self.commit("autre")
         built = self.approval(head)
         # Même commit, mais une session différente : l'approbation ne couvre pas.
@@ -554,6 +579,8 @@ class SignedProvenanceTest(PgTestCase):
         self.assertIn("does not cover", str(raised.exception))
 
     def test_a_consumed_approval_cannot_be_replayed(self):
+        self.bind_signed()
+        self.bind_signed(session="autre-session")
         head = self.commit()
         built = self.approval(head)
         prov.record_signed_commit(
@@ -576,6 +603,7 @@ class SignedProvenanceTest(PgTestCase):
         self.assertIn("already recorded", str(raised.exception))
 
     def test_the_lot_must_exist(self):
+        self.bind_signed()
         head = self.commit()
         with self.assertRaises(prov.ProvenanceError) as raised:
             prov.record_signed_commit(
@@ -609,6 +637,11 @@ class SignedProvenanceCliTest(PgTestCase):
         self.repo = tempfile.mkdtemp(prefix="ameesh-4485-cli-", dir=self.tmp)
         subprocess.run(["git", "init", "-q", self.repo], check=True,
                        capture_output=True)
+        # #7741/#43307 : la session attestée est liée sur l'hôte du commit,
+        # avant sa création (la liaison doit couvrir la date de committer).
+        self.assertIsNotNone(storage.of(self.db).session_bindings.bind(
+            host=HOST, harness="claude", session_id=SESSION, agent="bureau",
+            pid=None, created_by="human:test"))
         env = dict(os.environ,
                    GIT_AUTHOR_NAME="smichea",
                    GIT_AUTHOR_EMAIL="sebastien.michea@manaty.net",

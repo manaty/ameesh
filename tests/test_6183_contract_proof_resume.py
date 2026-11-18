@@ -188,7 +188,10 @@ class HourlyProofTest(Base):
 
 
 class LegacyCompositionTest(TestCase):
-    def test_rollback_restores_4304_order_without_prepublication_reuse(self):
+    def test_legacy_runs_direct_series_before_ci_full_without_prepublication_reuse(self):
+        # #7740 : le mode legacy ne réutilise pas les contrats (aucun
+        # `contract_report`, aucun appel à `prepublication_contracts`), mais les
+        # séries directes précèdent quand même la poussée et la ci-full.
         composition = auto.Composition([auto.Unit(1, 'a' * 40, 'b' * 40)], [], 'c' * 40)
         def unit_tests(**kwargs):
             self.assertIsNone(kwargs['contract_report'])
@@ -197,7 +200,7 @@ class LegacyCompositionTest(TestCase):
         flow = Flux(self, tests=[unit_tests], compositions=[composition], contract_publication='legacy')
         self.assertEqual(flow.run(), 0)
         self.assertFalse(flow.calls('contracts'))
-        self.assertLess(flow.names().index('ci-full'), flow.names().index('tests'))
+        self.assertLess(flow.names().index('tests'), flow.names().index('ci-full'))
 
 
 class RecoveryProofTest(recovery.Chain):

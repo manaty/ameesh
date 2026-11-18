@@ -532,6 +532,16 @@ class Leases(Domain):
         (`live`), ou None."""
 
     @abc.abstractmethod
+    def fence(self, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+        """#7672 : le bail, verrouillé (`FOR UPDATE`) puis recontrôlé.
+
+        Même verdict que `registry.lease_agent`, mais la ligne du registre est
+        tenue jusqu'au commit : un changement de détenteur, d'epoch ou une
+        expiration ne peut pas glisser entre le contrôle et l'écriture de
+        l'appelant. Rend (ok, raison, ligne) ; une ligne absente rend
+        (False, raison, None)."""
+
+    @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
         """Prolonge le bail sans raccourcir son échéance ; rend la nouvelle
         échéance, None si on ne le détient plus."""
@@ -1743,6 +1753,21 @@ class Mailbox(Domain):
         (`sender_project`, `recipient_project`) des deux agents."""
 
     @abc.abstractmethod
+    def send_reply(self, sender: str, recipient: str, body: str, *, host: str | None,
+                   kind: str, payload: dict | None, work_item_id: str | None,
+                   signature: str | None, signature_key: str | None,
+                   signed_payload: str | None, nonce: str | None,
+                   created_us: int | None, expires_us: int | None,
+                   in_reply_to: int) -> dict:
+        """#7672 : dépose une réponse corrélée à la demande `in_reply_to`.
+
+        Même dépôt que `send`, plus la corrélation que l'index unique partiel
+        0594 rend unique : une seconde réponse à la même demande est refusée.
+        Réservé au chemin public de réponse (bail et tour vérifiés) ; jamais
+        servi à l'exécuteur médié, qui ne peut donc pas marquer une demande
+        répondue sans tenir le bail."""
+
+    @abc.abstractmethod
     def unread(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis, du plus ancien au plus récent, avec leur lot
         (`work_item_id`, #794 : le brief d'un lot ne montre que son fil)."""
@@ -1844,6 +1869,54 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def history(self, recipient: str, limit: int) -> list[dict]:
         """Derniers messages du destinataire, du plus récent au plus ancien."""
+
+    @abc.abstractmethod
+    def history_page(self, actor: str, *, peer: str | None = None,
+                     after_id: int | None = None, limit: int = 100,
+                     since_ts: float | None = None, until_ts: float | None = None,
+                     kind: str | None = None) -> list[dict]:
+        """Contrat public 1.2 (E2a) : page d'historique du périmètre de `actor`.
+
+        Messages où `actor` est expéditeur OU destinataire, du plus ancien au
+        plus récent par id, strictement après `after_id`. `peer` restreint à la
+        conversation entre `actor` et cet agent (dans les deux sens). Les
+        bornes `since_ts`/`until_ts` s'appliquent à la création ; `kind`
+        filtre la nature. Rend au plus `limit + 1` lignes : la ligne
+        surnuméraire prouve qu'une page suivante existe, l'appelant la retire.
+        `limit` est borné à 200 par le pilote. Lecture seule, sans remise.
+        """
+
+    @abc.abstractmethod
+    def pending_requests(self, recipient: str, owner: str, epoch: int, *,
+                         sender: str | None = None, limit: int = 50) -> list[dict]:
+        """Contrat public 1.3 (E2b) : demandes tenues par ce bail et ce tour.
+
+        Demandes (`kind = 'request'`) encore sans réponse corrélée
+        (`in_reply_to`), réservées comme consigne du tour courant
+        (`meta.consigne.runner`/`epoch`/`turn`), avec un marqueur comptable
+        (`spend_pending`) de ce destinataire portant le MÊME `turn_id`, et
+        remises dans la fenêtre du marqueur (`delivered_at` nul ou postérieur
+        à `spend_pending.created_at`). Le bail est revérifié dans la même
+        requête (détenteur, epoch, échéance avec `clock_timestamp()`), et le
+        marqueur reste l'autorité du tour. `sender` restreint à un expéditeur.
+        Rend au plus `limit + 1` lignes, du plus ancien au plus récent par id :
+        la ligne surnuméraire prouve une page suivante. Lecture seule."""
+
+    @abc.abstractmethod
+    def reply_target(self, request_id: int) -> dict | None:
+        """#7672 : la demande à répondre et ses réponses corrélées, verrouillées.
+
+        La ligne de la demande est lue `FOR SHARE` (un retrait attend la
+        réponse) ; son marqueur comptable `spend_pending` est lu `FOR SHARE`
+        dans la même transaction, donc il ne peut être ni effacé ni remplacé
+        avant le commit de la réponse (B #7672 : le tour qui a autorisé la
+        remise reste vivant jusqu'à l'écriture). Les réponses déjà corrélées
+        sont lues sous le même verrou. Rend
+        `{request: {...}, replies: [...]}` ou None si la demande n'existe pas ;
+        `request.marker_present` et les champs `marker_*` décrivent le
+        marqueur verrouillé. Aucune règle d'autorisation ici : l'appelant
+        contrôle le bail, le destinataire et le tour, puis écrit la réponse
+        dans la transaction."""
 
     @abc.abstractmethod
     def staging_emission(self, recipient: str, sender: str, key: str) -> int | None:
@@ -2559,6 +2632,38 @@ class WorkItems(Domain):
         request for the same plan when the incoming document carries no
         request object (a holder clears it by writing one, e.g. `refused`).
         Returns the document, None on any mismatch.
+        """
+
+    @abc.abstractmethod
+    def train_requalify_request(self, project: str, pin: str, gate: str,
+                                reviews: list[str], lot: int,
+                                requester: str) -> dict | None:
+        """#7751: durably ask the live train service holder to apply a reviewed
+        canon requalification with exactly the cited milestone opinions.
+
+        No lease is taken and no configuration is written: the request only
+        records the exact reading (``project``, ``pin``, ``gate``), the review
+        references and the trace lot, together with the bound requester. It is
+        idempotent for the same pending reading and evidence set: a repeated
+        call returns the existing row instead of stacking duplicates. #7806: a
+        new deposit emits a project-scoped train wake-up in the same
+        transaction; a retry that finds the existing row emits nothing.
+        Returns the pending row, or None when the request cannot be stored.
+        """
+
+    @abc.abstractmethod
+    def train_requalify_requests(self, project: str) -> list[dict]:
+        """#7751: pending requalification requests of ``project``, oldest
+        first. The live train service holder reads them at each pass."""
+
+    @abc.abstractmethod
+    def train_requalify_resolve(self, request_id: int, state: str, *,
+                                actor: str, error: str = "") -> dict | None:
+        """#7751: compare-and-set one pending requalification request to
+        ``applied`` or ``refused``, naming the resolving host and the refusal.
+
+        Only a request still in ``state = 'requested'`` moves. Returns the
+        resolved row, or None when another pass already resolved it.
         """
 
     @abc.abstractmethod
@@ -3609,10 +3714,23 @@ class Actions(Domain):
     @abc.abstractmethod
     def covering_grants(self, action_id: str, amount: int, connector: str, operation: str,
                         action_class: str, currency: str | None,
-                        canon: str = "") -> list[dict]:
+                        canon: str = "", proposed_by: str = "",
+                        target: str = "") -> list[dict]:
         """Grants vivants qui couvrent l'action (pré-filtre sans verrou), avec
         `live` : une réservation vivante de l'action existe déjà. L44 : seuls
-        ceux dont l'authentificateur est déclaré par `canon`."""
+        ceux dont l'authentificateur est déclaré par `canon`. #7629 : seuls
+        ceux dont le bénéficiaire couvre `proposed_by` et dont une cible couvre
+        `target` ; la réservation recontrôle tout sous verrou."""
+
+    @abc.abstractmethod
+    def recap(self, proposed_by: str, since_ts: float, until_ts: float,
+              project: str | None = None) -> list[dict]:
+        """Actions proposées par `proposed_by` dans la fenêtre (#7629).
+
+        Chaque ligne porte sa nature (`auth_kind`, `auth_grant_id`,
+        `policy_version`) et `refused` : une décision `deny` a annulé l'action
+        (événement `cancelled` avec la note du refus). Le classement par issue
+        de charte est fait par `actions.recap`."""
 
     @abc.abstractmethod
     def launched(self, *, action_id: str | None, grace: float, force: bool) -> list[dict]:
@@ -3628,9 +3746,13 @@ class Actions(Domain):
 
     @abc.abstractmethod
     def bind(self, action_id: str, *, from_states: tuple, digest: str, auth: dict,
-             by: str) -> bool:
+             by: str, policy_version: str | None = None,
+             new_digest: str | None = None) -> bool:
         """Lie une autorisation (`→ approved`) si l'action est encore dans
-        `from_states`, non remplacée, d'empreinte `digest`."""
+        `from_states`, non remplacée, d'empreinte `digest`.
+
+        #7629 : `policy_version` / `new_digest` recopient la version de charte
+        du grant permanent et l'empreinte recalculée, dans la même écriture."""
 
     @abc.abstractmethod
     def launch(self, action_id: str, *, digest: str, auth_kind: str, auth_nonce: str | None,
@@ -4143,9 +4265,18 @@ class Grants(Domain):
     def register(self, *, approver: str, nonce: str, challenge: str, authenticator_id: int,
                  receipt_json: str, connector: str, operations_json: str, action_class: str,
                  max_amount: int, currency: str | None, exp: int, iat: int, until: int,
-                 clock_skew: int, registered_by: str) -> int | None:
+                 clock_skew: int, registered_by: str,
+                 beneficiary_kind: str = "none", beneficiary: str = "",
+                 beneficiary_clones: bool = False, targets_json: str = "[]",
+                 charter_line: str = "", charter_version: str = "") -> int | None:
         """Consomme le nonce du reçu `standing` et crée le grant ; rend son id,
-        ou None (nonce déjà consommé, authentificateur révoqué)."""
+        ou None (nonce déjà consommé, authentificateur révoqué).
+
+        #7629 : `beneficiary_kind` (`none|any|agent|avatar`), le bénéficiaire
+        nommé, la lignée de clones, les motifs de cible (`targets_json`) et la
+        référence de charte sont écrits dans la même transaction. Les défauts
+        (`none`, aucun bénéficiaire, aucune cible) ne couvrent RIEN : un
+        écrivain qui ne les nomme pas n'élargit jamais un grant."""
 
     @abc.abstractmethod
     def reserve(self, grant_id: int, action_id: str, amount: int, *, reserved_by: str | None,
@@ -4163,9 +4294,12 @@ class Grants(Domain):
 
     @abc.abstractmethod
     def candidates(self, connector: str, operation: str, action_class: str, amount: int,
-                   currency: str | None, canon: str = "") -> list[dict]:
+                   currency: str | None, canon: str = "", proposed_by: str = "",
+                   target: str = "") -> list[dict]:
         """Grants qui pourraient couvrir l'action (pré-filtre sans verrou) ;
-        L44 : seuls ceux dont l'authentificateur est déclaré par `canon`."""
+        L44 : seuls ceux dont l'authentificateur est déclaré par `canon`.
+        #7629 : le bénéficiaire (`proposed_by`) et la cible sont pré-filtrés
+        ici aussi ; la décision finale reste `ameesh_standing_reserve`."""
 
     @abc.abstractmethod
     def revoke(self, grant_id: int, by: str) -> bool:
@@ -4173,7 +4307,7 @@ class Grants(Domain):
 
     @abc.abstractmethod
     def get(self, grant_id: int) -> dict | None:
-        """Un grant, ou None."""
+        """Un grant, ou None (avec sa portée et sa charte, #7629)."""
 
     @abc.abstractmethod
     def listed(self, *, include_inactive: bool = False) -> list[dict]:
@@ -4643,6 +4777,7 @@ class Decisions(Domain):
         ou la provenance (jamais l'inverse) ; rend la ligne, ou None."""
         raise NotImplementedError
 
+    @abc.abstractmethod
     def register_chat(self, name: str, *, human: str, host: str, harness: str,
                       cwd: str | None, status_text: str) -> dict | None:
         """Inscrit (ou rafraîchit) l'agent de conversation `name` : mode
@@ -5302,12 +5437,21 @@ class HostLifecycle(Domain):
         """
 
     @abc.abstractmethod
+    def reattach(self, host: str, agent: str, target: str, *, actor: str) -> dict:
+        """Accept an already moved agent's permanent home and journal its origin.
+
+        The source must be lost, the registry must name target, and no fence
+        or active handoff may remain. Retires only this generation's return
+        obligation; never moves a process or changes the agent's host.
+        """
+
+    @abc.abstractmethod
     def reconcile_loss(self, host: str, *, actor: str, fresh_within: int) -> dict:
         """Reopen a lost host only on a verified proof.
 
         Readings in database time must cover at least `fresh_within` without a
         hole that large, with no reading dated in the future; every origin
-        agent must still be home and unfenced, with no active handoff and no
+        agent not explicitly reattached must still be home and unfenced, with no active handoff and no
         `recover_source` attempt since the loss. A live lease of an agent that
         is home is the returning host's own runner and does not block the
         proof (#3180). The transition `lost -> returning -> available` is
@@ -6217,6 +6361,35 @@ class PrevalidationReports(Domain):
 
 class GithubWatch(Domain):
     """#2845: transactional GitHub intake; notifier host only."""
+
+    @abc.abstractmethod
+    def audit_activate(self, project, repo, workflow, now):
+        """Persist initial activation once and return the audit cursor."""
+
+    @abc.abstractmethod
+    def audit_lock(self):
+        """Serialize receipt consumption across workflows and repositories."""
+
+    @abc.abstractmethod
+    def audit_receipts(self, ids):
+        """Structured pre-act evidence for exact candidate identifiers."""
+
+    @abc.abstractmethod
+    def audit_known(self, repo, runs):
+        """Already processed (run ID, attempt) pairs."""
+
+    @abc.abstractmethod
+    def audit_consumed(self, ids):
+        """Candidate receipts already matched to a production attempt."""
+
+    @abc.abstractmethod
+    def audit_record(self, repo, workflow, run, pregeste_id, reason):
+        """Persist one attempt and its correlation outcome."""
+
+    @abc.abstractmethod
+    def audit_advance(self, project, repo, workflow, until):
+        """Advance only after audit outcomes and alerts have committed."""
+
 
     @abc.abstractmethod
     def cursor(self, project: str, repo: str) -> float | None:

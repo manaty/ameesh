@@ -183,7 +183,11 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                # #3185 : projets relus hors équipe, lus par la désignation
                "relit",
                # #7004 : harnais admis, lus par la provenance d'une session liée
-               "harnesses")
+               "harnesses",
+               # #7632 : cadence de réveil déclarée (`reveil.parse`), lue par l'exécuteur
+               "reveil",
+               # #7674 (E3a) : politique de session déclarée par la fiche
+               "declared_policy")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -2178,8 +2182,14 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # #7004 : l'ensemble fermé des harnais admis (NULL : `harness` seul)
             "harnesses": (list(agent.harnesses) if agent.harnesses is not None
                           else None),
+            # #7632 : cadence de réveil (NULL : réveil par courrier, inchangé)
+            "reveil": agent.reveil,
             # L42 (0031) : canon déclarant (NULL pour le canon par défaut)
             "canon": None if canon.is_default else ident,
+            # #7674 (E3a) : politique de session déclarée, ou NULL — une
+            # suppression dans la fiche rend la main à `ameesh set` et aux
+            # défauts de l'exécuteur.
+            "declared_policy": agent.declared_policy(),
             # Reject writes based on a pre-handoff read, including after the
             # handoff is terminal. A missing-row read cannot overwrite a row
             # inserted concurrently by another synchronizer.

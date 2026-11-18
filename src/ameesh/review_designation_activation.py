@@ -245,6 +245,15 @@ class Inputs:
     #: auteurs (plage courante et gels antérieurs reportés). Le refus de gel
     #: les nomme ; aucune décision ne les lit.
     author_commits: dict = field(default_factory=dict)
+    #: #7745 : familles d'auteur de chaque commit de la plage courante. La
+    #: désignation et le gel y lisent l'indépendance **par delta** : une
+    #: famille n'exclut un relecteur que du delta qu'elle a écrit, pas des
+    #: autres commits de la tête.
+    commit_families: dict = field(default_factory=dict)
+    #: #7745 : familles qu'aucun commit de la tête ne porte (commit réattribué
+    #: #7324, contenu d'un gel antérieur réécrit #2924) ; exclues de tous les
+    #: deltas, elles ne se lavent pas par un découpage de la tête.
+    global_families: set = field(default_factory=set)
     #: #3948 : marques de charge illisibles, lues avec les entrées. La note
     #: est écrite dans la transaction du gel (hors de la lecture préalable),
     #: pour ne pas séparer un diagnostic de son gel.
@@ -816,8 +825,10 @@ def _reading_range(db, item: Mapping, repo: str, base: str,
     start, paths, commits = _range(repo, base, head,
                                    bounded=not packet_reviews.is_vehicle(item))
     if packet_reviews.is_vehicle(item):
+        # #7716 : la cible épinglée sert aussi à résoudre le gel effectif des
+        # membres (repli mécanique d'un avis reporté), comme au lien du paquet.
         own = packet_reviews.designation_changes(db, int(item["id"]), item,
-                                                 repo, start, head)
+                                                 repo, start, head, target=base)
         if own is not None:
             paths, commits = own["paths"], own["commits"]
     return start, paths, commits
@@ -951,7 +962,10 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         commits=None, strict: bool = False,
                         families_out: Optional[dict] = None,
                         target: str = "", admitted_heads=(),
-                        exclusions_out: Optional[list] = None) -> tuple[list, list, list]:
+                        exclusions_out: Optional[list] = None,
+                        commit_families_out: Optional[dict] = None,
+                        global_families_out: Optional[set] = None
+                        ) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
 
     La même lecture partagée que la désignation (`review_authors.reading`),
@@ -973,6 +987,10 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     sa porte relit (`packet_reviews.need`). La lecture des auteurs et des
     correcteurs porte alors exactement sur ce delta, jamais sur les commits
     des membres déjà relus sur leur propre tête.
+
+    #7745 : `commit_families_out` et `global_families_out` sont les sorties de
+    la règle par delta (`review_authors.reading`) : familles de chaque commit
+    et familles qui ne se rattachent à aucun commit et restent exclues partout.
     """
     if commits is None:
         _start, _paths, commits = _range(repo, base, head)
@@ -981,7 +999,9 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                                   families_out=families_out,
                                   base=base, head=head, target=target,
                                   admitted_heads=admitted_heads,
-                                  exclusions_out=exclusions_out)
+                                  exclusions_out=exclusions_out,
+                                  commit_families_out=commit_families_out,
+                                  global_families_out=global_families_out)
 
 
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
@@ -1642,11 +1662,38 @@ def _waiver(item: Mapping) -> bool:
     return any(str(name or "").strip() == REVIEWER_NONE for name in names or ())
 
 
+def _delta_reading(commit_families, global_families=()):
+    """#7745 : les familles d'auteur par delta, ou None sans lecture.
+
+    La même règle que le gel (`freeze_families.assess`) et la porte
+    (`merge_queue.review_gate`) : `review_deltas.delta_families` ajoute les
+    familles globales à chaque delta et rend None si un commit de la plage
+    n'a pas de lecture. Ce None garde le chemin historique, plus strict.
+    """
+    if not commit_families:
+        return None
+    from . import review_deltas
+    return review_deltas.delta_families(
+        list(commit_families), commit_families, global_families or ())
+
+
+def _input_deltas(inputs):
+    """#6661/#7745 : les deltas d'un `Inputs`, ou None s'il ne les porte pas.
+
+    Un appelant de test peut simuler les entrées par un objet minimal
+    (`types.SimpleNamespace`) : l'absence de la lecture par commit garde le
+    chemin historique, jamais une `AttributeError` au milieu du gel.
+    """
+    return _delta_reading(getattr(inputs, "commit_families", None),
+                          getattr(inputs, "global_families", ()))
+
+
 def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
                   authors: Sequence[Mapping], families, *,
                   correctors: Sequence[Mapping] = (),
                   closed_hosts: Sequence[str] = (),
-                  answered: Sequence[str] = ()) -> list:
+                  answered: Sequence[str] = (),
+                  commit_families=None, global_families=()) -> list:
     """The manual reviewers that cover a required seat (#2627).
 
     A manual reviewer is always kept in the column; this only says which ones
@@ -1681,7 +1728,19 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
     """
     forbidden_names, forbidden_families = rd.families_of(authors)
     _names, corrector_families = rd.families_of(correctors)
-    forbidden_families = forbidden_families | corrector_families
+    deltas = _delta_reading(commit_families, global_families)
+    if deltas is not None:
+        # #7745 : seule une famille qui a écrit **tous** les deltas (ou une
+        # famille globale, #7324/#2924) ne couvre aucun avis. La famille d'un
+        # auteur d'un autre delta reste recevable pour celui-ci.
+        forbidden_families = set(deltas[0]) if deltas else set()
+        for delta in deltas[1:]:
+            forbidden_families &= set(delta)
+        forbidden_families |= {str(value).strip().lower()
+                               for value in global_families or ()
+                               if str(value).strip()}
+    else:
+        forbidden_families = forbidden_families | corrector_families
     forbidden_names = forbidden_names | rd.names_of(correctors)
     rows = {str((row or {}).get("name") or ""): row for row in listing or ()}
     answered_names = {str(name or "").strip().casefold()
@@ -1726,9 +1785,15 @@ def _manual_covers(inputs: Inputs) -> bool:
     required = int(inputs.policy.required)
     if required == 0:
         return True
-    if len(inputs.manual_seats) < required or inputs.unknown_authors:
+    if inputs.unknown_authors or rd.unknown_families(inputs.authors):
         return False
-    return not rd.unknown_families(inputs.authors)
+    deltas = _input_deltas(inputs)
+    if deltas is not None:
+        # #7745 : la couverture se juge par delta, comme la porte du gel.
+        from . import review_deltas
+        return review_deltas.covered(
+            deltas, [seat["family"] for seat in inputs.manual_seats], required)
+    return len(inputs.manual_seats) >= required
 
 
 def _held_manual(inputs: Inputs, reported: Sequence[str] = ()) -> list:
@@ -1979,6 +2044,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     latest = _latest_freeze_marker(db, int(lot),
                                    before_id=int(freeze.get("id") or 0))
     author_commits: dict = {}
+    commit_families: dict = {}
+    global_families: set = set()
     # #4343 : un lot empilé sur un prérequis déclaré ne relit pas les commits
     # du parent (gelé et relu sur sa propre tête) ; la provenance inconnue d'un
     # commit du parent ne bloque donc pas l'enfant.
@@ -1990,6 +2057,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         db, item, freeze, commits, repo, families=policy.families, trace=True,
         base=start, head=frozen_sha, target=read_target,
         commits_out=author_commits, fetch=fetch,
+        commit_families_out=commit_families,
+        global_families_out=global_families,
         admitted_heads=parent_heads,
         milestone_proof=milestone_proof, doubts_out=doubts)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
@@ -2000,8 +2069,12 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   manual_seats=_manual_seats(manual, listing, authors, families,
                                              correctors=correctors,
                                              closed_hosts=closed_hosts,
-                                             answered=answered),
+                                             answered=answered,
+                                             commit_families=commit_families,
+                                             global_families=global_families),
                   advances=_advances(db), author_commits=author_commits,
+                  commit_families=commit_families,
+                  global_families=global_families,
                   unreadable=tuple(unreadable),
                   basis=_prepared_basis(item, target, latest), doubts=doubts)
 
@@ -3181,7 +3254,9 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
             required=required, authors=inputs.authors,
             candidates=inputs.candidates, families=families,
             already=list(inputs.manual_seats), fixers=inputs.correctors,
-            advances=inputs.advances, automatic=previous)
+            advances=inputs.advances, automatic=previous,
+            deltas=_input_deltas(inputs),
+            global_families=getattr(inputs, "global_families", ()))
         # La même sélection sur le vivier réveillé : elle nomme les sièges que
         # le sommeil retient, sans en réveiller plus que nécessaire. Le vivier
         # de base est celui du gel (retraits compris) ; on n'y remplace que
@@ -3223,7 +3298,9 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
             required=required, authors=inputs.authors, candidates=shadow,
             families=families, already=list(inputs.manual_seats),
             fixers=inputs.correctors, advances=inputs.advances,
-            automatic=list(current.get("reviewers") or ()))
+            automatic=list(current.get("reviewers") or ()),
+            deltas=_input_deltas(inputs),
+            global_families=getattr(inputs, "global_families", ()))
     except Exception:  # noqa: BLE001 - pas de prévision : comportement d'avant
         return inputs
     if current.get("state") != rd.WAITING:
@@ -3332,7 +3409,9 @@ def _selection(inputs: Inputs, port, *, force: bool = False,
         already=list(inputs.manual_seats) + [dict(seat) for seat in kept or ()],
         fixers=inputs.correctors, held=held, doubts=inputs.doubts,
         answered=inputs.answered,
-        required=inputs.policy.required, advances=inputs.advances)
+        required=inputs.policy.required, advances=inputs.advances,
+        deltas=_input_deltas(inputs),
+        global_families=getattr(inputs, "global_families", ()))
 
 
 def carried_plan(cfg, db, lot: int, sha: str, *,
@@ -3606,7 +3685,11 @@ def _fresh_prepared(cfg, tx, item: Mapping, freeze: Mapping,
                                    inputs.policy.families,
                                    correctors=inputs.correctors,
                                    closed_hosts=alert_briefs.claims_closed_hosts(tx),
-                                   answered=answered))
+                                   answered=answered,
+                                   commit_families=getattr(
+                                       inputs, "commit_families", None),
+                                   global_families=getattr(
+                                       inputs, "global_families", ())))
 
 
 def _unavailable_in_transaction(cfg, tx, item: Mapping, freeze: Mapping,
@@ -4170,7 +4253,7 @@ def _stale(freeze: Mapping, why: str = "") -> dict:
 
 
 def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
-              force: bool = False) -> dict:
+              force: bool = False, refresh_policy: bool = False) -> dict:
     """Replays the latest freeze outside the hook (recovery, CLI).
 
     The selection's mark, its mails and the reviewer column are written in ONE
@@ -4179,6 +4262,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     an old freeze writes nothing at all (B/P1 of the Codex review cx2). A
     policy/evidence problem is journaled in its own transaction; a selection
     refusal is returned, never raised to the caller.
+
+    `refresh_policy` (#7624) rechecks a final designation against the current
+    audited canon, completing missing seats without resending acquired requests.
 
     `force` (#2487) : rejoue la désignation réelle même quand un plan de report
     couvrait la tête (le report a refusé après le gel : les sièges manquants
@@ -4262,12 +4348,12 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 completion = {"mark_id": int(effective[0]), "shape": shape}
             elif effective[1] == "carried":
                 carried = _carried_shape(effective[2])
-                if _mark_covers(carried, floor, column=live):
+                if not refresh_policy and _mark_covers(carried, floor, column=live):
                     return carried
                 completion = {"mark_id": int(effective[0]), "shape": carried}
             elif effective[2].get("state") == rd.DESIGNATED:
                 existing = dict(effective[2])
-                if _mark_covers(existing, floor, column=live):
+                if not refresh_policy and _mark_covers(existing, floor, column=live):
                     return existing
                 # #3557 : le plancher dépasse le compte enregistré. Les sièges
                 # de la marque sont gardés ; seuls les manquants seront choisis
@@ -5667,7 +5753,7 @@ def _manual_reseat_alert(db, item: Mapping, freeze: Mapping, recipient: str,
                 lines.append("  Reprise annoncée : %s%s." % (resume, qualifier))
     body = "\n".join([
         "Unreachable manual reviewer seat past its review deadline (canon §2, §9;"
-        " #4757, decision mesh-design 30/10).",
+        " #4757, decision of the design role, 30/10).",
         "",
         "Lot: #%s \"%s\"" % (lot, " ".join(str((item or {}).get("title") or "").split())),
         "- Freeze: frozen milestone %s." % _freeze_label(freeze),

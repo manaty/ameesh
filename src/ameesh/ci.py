@@ -2461,13 +2461,81 @@ class Watcher:
                 out += self._alert_pending(db, repo, run, lots, cancelled, now)
         return out
 
+    def _retry_missing_part(self, db, repo, lot, sha, workflow, inputs) -> bool:
+        """#7623: reconcile one durable intent per frozen packet/part, under its lock.
+
+        True also means an existing intent is awaiting run visibility (#7639).
+
+        Commit intent before contacting GitHub: an ambiguous POST or a killed
+        watcher must never create another automatic attempt. Mediated storage
+        has no cross-host transaction, so it retains the pilot alert instead.
+        """
+        from . import merge_queue, plan_github, work
+        if self.dry_run or storage.is_remote(db):
+            return False
+        client = getattr(self.api, "__self__", None)
+
+        def read(path):
+            if isinstance(client, (plan_github.Api, plan_github.GhApi)):
+                value = self.api(path, ttl=0)
+                if client.last_read is None or client.last_read.stale:
+                    raise GelError("missing-part dispatch requires a fresh GitHub read")
+                return value
+            return self.api(path)
+
+        marker = "ci-missing-part " + json.dumps([repo, sha, workflow], separators=(",", ":"))
+        item_id = int(lot["id"])
+        def eligible(tx):
+            current = storage.of(tx).work.lock(item_id)
+            if (not current or current.get("state") not in ("qa", "validated")
+                    or current.get("branch") != lot["branch"]):
+                return False
+            marks = work.milestones(tx, item_id)
+            freeze = next((m for m in marks if m["kind"] == "frozen"), None)
+            gate = merge_queue.review_gate_for_item(tx, self.cfg, current, marks)
+            if (not freeze or freeze.get("sha") != sha or not gate or not gate.get("ok")
+                    or _head_of(read, repo, lot["branch"]) != sha):
+                return False
+            plan = _dispatch_plan(tx, self.cfg, current, read, repo, lot["branch"], sha)
+            if workflow not in plan or plan[workflow] != inputs:
+                return False
+            data = read("repos/%s/actions/workflows/%s/runs?per_page=1&head_sha=%s&branch=%s"
+                            % (repo, _q(workflow), _q(sha), _q(lot["branch"])))
+            return (isinstance(data, dict) and data.get("workflow_runs") == []
+                    and type(data.get("total_count")) is int and data["total_count"] == 0)
+
+        with db.transaction() as tx:
+            # Take the same packet lock as ci run before inspecting intent.
+            if not storage.of(tx).work.lock(item_id):
+                return False
+            intent = next((e for e in work.events(tx, item_id, limit=None)
+                           if e.get("note") == marker), None)
+            if intent is not None:
+                # A dispatch can precede the runs API by several watcher passes.
+                # Use the durable timestamp so restart cannot renew this grace.
+                created = intent.get("created_ts")
+                return created is not None and float(self.clock()) - float(created) < PENDING_ALERT
+            if not eligible(tx):
+                return False
+            work.note(tx, item_id, marker)
+        # Intent survives a crash; a second critical section protects the final
+        # review/freeze/run checks through POST against concurrent packet edits.
+        with db.transaction() as tx:
+            if not eligible(tx):
+                return False
+            decision = dict(repo=repo, branch=lot["branch"], sha=sha, dispatch={workflow: inputs})
+            result = _pose_dispatch(plan_github.Gh(), decision, api=read)
+        self.log("CI %s #%s: missing part %s: %s (automatic intent retained)"
+                 % (repo, item_id, workflow, result.get("why") or result["action"]))
+        return bool(result.get("requested"))
+
     def _undispatched_parts(self, db, repo: str, lots: list[dict]) -> list[dict]:
         """#7605: a frozen packet can lack a run, not just wait for a runner.
 
         Reuse the dispatch contract, including its expected_sha and additional
         inputs. Observe every selected workflow, even ones whose names do not
         match SUITE_RE. Allow the CI pending grace after current-head milestones.
-        Never dispatch or change a merge verdict here.
+        Reconcile missing dispatches once; never change a merge verdict here.
         """
         import hashlib
         import shlex
@@ -2532,6 +2600,10 @@ class Watcher:
                     if not rows:
                         missing.append((workflow, inputs))
                 if not missing or _head_of(self.api, repo, branch) != sha:
+                    continue
+                missing = [(w, inputs) for w, inputs in missing
+                           if not self._retry_missing_part(db, repo, lot, sha, w, inputs)]
+                if not missing:
                     continue
                 pilot = self._merge_pilot(db, repo, lot)
                 if not pilot:
@@ -3742,9 +3814,10 @@ def _dispatch_plan(db, cfg, item, api, repo, branch, sha) -> dict:
 def _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha):
     """Read the planner at the frozen tree, then run only its dry-run path.
 
-    Mirrors nexlink_release.ci_plan: a detached worktree prevents the caller's
-    checkout from substituting a planner. Absence permits generic suites;
-    presence with an unreadable/invalid plan fails before any dispatch.
+    Mirrors the Nexlink release module's `ci_plan`: a detached worktree
+    prevents the caller's checkout from substituting a planner. Absence permits
+    generic suites; presence with an unreadable/invalid plan fails before any
+    dispatch.
     """
     import json
     import os

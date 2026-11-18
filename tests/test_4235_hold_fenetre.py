@@ -183,7 +183,7 @@ class ClassificationTest(unittest.TestCase):
                           "[réveil programmé: 2026-10-24 05:20 UTC]",
                           actor="pilote"),
                     event(3482, 2, T - 3 * H,
-                          "hold: attente bureau : poser le staging",
+                          "hold: attente avatar : poser le staging",
                           actor="pilote")])
         self.assertEqual(report["slow_waits"], [])
         self.assertEqual([row["kind"] for row in report["external_waits"]],

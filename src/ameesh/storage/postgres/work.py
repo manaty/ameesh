@@ -37,6 +37,7 @@ from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENC
 from .work_dependencies import current_verdict as _current_verdict
 from .work_dependencies import last_freeze_sha as _last_freeze_sha
 from .work_dependencies import not_blocking as _not_blocking
+from .work_dependencies import start_blocking as _start_blocking
 from .work_dependencies import start_defers as _start_defers
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
@@ -645,6 +646,14 @@ def _unknown_marker(tx, item, footprint, unknown):
         if not paths and item["footprint_policy"] == "repository":
             paths = ["."]
     return paths
+
+
+def _requalify_row(row):
+    """#7751: a requalification row with its JSON evidence decoded."""
+    row = dict(row)
+    if isinstance(row.get("reviews"), str):
+        row["reviews"] = json.loads(row["reviews"])
+    return row
 
 
 class WorkItems(interface.WorkItems):
@@ -1504,12 +1513,14 @@ class WorkItems(interface.WorkItems):
             # `unassigned_lots` (une seule règle).
             if self.db.query("SELECT 1 FROM work_item_dependencies d"
                              " JOIN work_items b ON b.id = d.blocker_id"
-                             " WHERE d.work_item_id = %s AND NOT " + _not_blocking("b") +
+                             " JOIN work_items i ON i.id = d.work_item_id"
+                             " WHERE d.work_item_id = %s AND " + _start_blocking("i", "b") +
                              " LIMIT 1", (int(item_id),)):
                 return None
             ready_state = item["state"]
             if ready_state == lifecycle.REQUESTED and (
-                    self._footprint_overlaps(item_id) or self._footprint_cap(item_id)):
+                    self._footprint_overlaps(item_id, start_on=True)
+                    or self._footprint_cap(item_id)):
                 return None
         else:
             ready_state = None
@@ -1519,7 +1530,7 @@ class WorkItems(interface.WorkItems):
                 # attributions concurrentes de lots chevauchants décident
                 # l'une après l'autre.
                 self.db.execute(_DEPENDENCIES_LOCK)
-                self._footprint_guard(item_id, free_only=True)
+                self._footprint_guard(item_id, free_only=True, start_on=True)
         behind = None
         if (queued_note is not None or take) and assignee:
             lot = self.db.query("SELECT started_at IS NULL AS fresh FROM work_items"
@@ -1536,7 +1547,8 @@ class WorkItems(interface.WorkItems):
             row["forced_behind" if forced_note else "queued_behind"] = behind
         return row
 
-    def _footprint_overlaps(self, item_id, *, free_only=False) -> list[dict]:
+    def _footprint_overlaps(self, item_id, *, free_only=False,
+                            start_on=False) -> list[dict]:
         """#4173, sous le verrou du graphe : les chevauchements de l'empreinte
         du lot avec celle d'un lot occupant de son dépôt (requête POSTÉRIEURE
         au verrou, comme le contrôle des dépendances). `free_only` : vide si
@@ -1544,7 +1556,7 @@ class WorkItems(interface.WorkItems):
         guard = (" AND NOT " + footprint_occupying_sql("c")) if free_only else ""
         return self.db.query(
             "SELECT DISTINCT x.* FROM work_items c, LATERAL ("
-            + footprint_overlap_rows_sql("c") + ") x WHERE c.id = %s" + guard +
+            + footprint_overlap_rows_sql("c", start_on=start_on) + ") x WHERE c.id = %s" + guard +
             " ORDER BY x.id, x.path", (int(item_id),))
 
     def _footprint_cap(self, item_id, *, free_only=False) -> dict | None:
@@ -1557,11 +1569,13 @@ class WorkItems(interface.WorkItems):
             + ") x WHERE c.id = %s" + guard, (int(item_id),))
         return dict(rows[0]) if rows else None
 
-    def _footprint_guard(self, item_id, *, free_only=False) -> None:
+    def _footprint_guard(self, item_id, *, free_only=False,
+                         start_on=False) -> None:
         """La garde d'attribution d'un lot libre : `FootprintOverlap` s'il
         chevauche un lot occupant, `RepositoryCapReached` si son dépôt est au
         plafond (#4818). Rien n'est écrit ; l'appelant tient le verrou."""
-        overlaps = self._footprint_overlaps(item_id, free_only=free_only)
+        overlaps = self._footprint_overlaps(item_id, free_only=free_only,
+                                            start_on=start_on)
         if overlaps:
             raise interface.FootprintOverlap(overlaps)
         cap = self._footprint_cap(item_id, free_only=free_only)
@@ -2672,8 +2686,11 @@ class WorkItems(interface.WorkItems):
         from ... import merge_queue
         item = self.get(item_id) if item is None else item
         marks = self.milestones(item_id, None) if marks is None else marks
+        # #7677 : la cible fraîche, comme la désignation au gel ; un fetch
+        # n'entre jamais dans une transaction.
         gate = merge_queue.review_gate_for_item(
-            self.db, getattr(self.db, "cfg", None), item, marks)
+            self.db, getattr(self.db, "cfg", None), item, marks,
+            refresh_target=not in_transaction(self.db))
         return gate
 
     def sync_validations(self) -> list[dict]:
@@ -3672,6 +3689,82 @@ class WorkItems(interface.WorkItems):
                        (json.dumps(request), key))
             return dict(current, abandon_request=request, revision=int(rows[0]["revision"]))
 
+    _REQUALIFY_COLUMNS = (
+        " id, project, pin, gate, reviews, lot, requester,"
+        " to_char(requested_at AT TIME ZONE 'UTC',"
+        " 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS requested_at, state,"
+        " to_char(resolved_at AT TIME ZONE 'UTC',"
+        " 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS resolved_at, resolved_by, error")
+
+    def train_requalify_request(self, project, pin, gate, reviews, lot,
+                                requester) -> dict | None:
+        """#7751: persist a reviewed requalification request without a lease.
+
+        The partial unique index makes a retry of the same pending reading
+        return the existing row instead of stacking duplicates. The lot is a
+        real trace target (foreign key); the caller checks it before asking.
+
+        #7806: a *new* deposit also wakes the live train service holder in this
+        transaction. The hint is project-scoped and carries no authority: the
+        holder still applies the request with the reviewed guards at its next
+        passage. A retry that hits the unique index is not a new deposit and
+        emits nothing; a rollback discards the request and the hint together.
+        """
+        if not isinstance(reviews, (list, tuple)) or not reviews:
+            return None
+        # The same evidence set in another order is the same request: the
+        # partial unique index must not let a retry stack a second row.
+        evidence = json.dumps(sorted({str(reference) for reference in reviews}))
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "INSERT INTO integration_train_requalifications"
+                " (project, pin, gate, reviews, lot, requester)"
+                " VALUES (%s, %s, %s, %s::jsonb, %s, %s)"
+                " ON CONFLICT (project, pin, gate, reviews)"
+                "   WHERE state = 'requested' DO NOTHING"
+                " RETURNING" + self._REQUALIFY_COLUMNS,
+                (project, pin, gate, evidence, int(lot), requester))
+            if rows:
+                from ... import train_events
+                try:
+                    train_events.emit(tx, kind="requalification-request",
+                                      project=project, target="")
+                except ValueError:
+                    # A project name outside the wake envelope's closed set is
+                    # still a valid durable request; the hourly pass applies it.
+                    pass
+                return _requalify_row(rows[0])
+            rows = tx.query(
+                "SELECT" + self._REQUALIFY_COLUMNS
+                + " FROM integration_train_requalifications"
+                " WHERE project = %s AND pin = %s AND gate = %s"
+                " AND reviews = %s::jsonb AND state = 'requested'",
+                (project, pin, gate, evidence))
+            return _requalify_row(rows[0]) if rows else None
+
+    def train_requalify_requests(self, project) -> list[dict]:
+        """#7751: pending requests of ``project``, oldest first."""
+        rows = self.db.query(
+            "SELECT" + self._REQUALIFY_COLUMNS
+            + " FROM integration_train_requalifications"
+            " WHERE project = %s AND state = 'requested' ORDER BY id",
+            (project,))
+        return [_requalify_row(row) for row in rows]
+
+    def train_requalify_resolve(self, request_id, state, *, actor,
+                                error="") -> dict | None:
+        """#7751: compare-and-set one pending request; None if already resolved."""
+        if state not in ("applied", "refused"):
+            return None
+        rows = self.db.query(
+            "UPDATE integration_train_requalifications"
+            " SET state = %s, resolved_at = clock_timestamp(), resolved_by = %s,"
+            " error = NULLIF(%s, '')"
+            " WHERE id = %s AND state = 'requested'"
+            " RETURNING" + self._REQUALIFY_COLUMNS,
+            (state, actor, error, int(request_id)))
+        return _requalify_row(rows[0]) if rows else None
+
     def train_abandon(self, key, plan_id, document, *, revision, owner, epoch) -> dict | None:
         with self.db.transaction() as tx:
             held = tx.query("SELECT owner, epoch"
@@ -4631,7 +4724,7 @@ class WorkItems(interface.WorkItems):
             "             ORDER BY b.id) AS open_conflicts,"
             "       (pd.lot IS NOT NULL) AS pending_decision,"
             # Match the intake footprint guard used by dispatch (#4173).
-            "       (w.state = 'intake' AND " + footprint_overlap_sql("w", items="plan_open_items") + ")"
+            "       (w.state = 'intake' AND " + footprint_overlap_sql("w", items="plan_open_items", start_on=True) + ")"
             "         AS footprint_overlap,"
             # #4818 : plafond de lots en vol du dépôt, et ce qu'il faut au plan
             # pour choisir un ensemble aux empreintes disjointes deux à deux
@@ -4686,14 +4779,14 @@ class WorkItems(interface.WorkItems):
                "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
                "                             JOIN work_items b ON b.id = d.blocker_id"
                "                            WHERE d.work_item_id = work_items.id"
-               "                              AND NOT " + _not_blocking("b") + ")"
+               "                              AND " + _start_blocking("work_items", "b") + ")"
                # #4173 : un lot `intake` dont l'empreinte chevauche celle d'un
                # lot occupant du même dépôt attend sa fusion (un lot `build`
                # rendu à la file occupe déjà la sienne) ; même prédicat que la
                # garde de `_assign_locked`, avant le LIMIT.
                # #4818 : et le plafond de lots en vol de son dépôt (`held_sql`).
                f"           AND (state <> '{lifecycle.REQUESTED}' OR NOT "
-               + footprint_held_sql("work_items") + ")) w"
+               + footprint_held_sql("work_items", start_on=True) + ")) w"
                "  LEFT JOIN work_packages k ON k.id = w.package_id"
                "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
                f" ORDER BY coalesce(w.priority, 2), (w.state = '{lifecycle.IN_PROGRESS}') DESC,"

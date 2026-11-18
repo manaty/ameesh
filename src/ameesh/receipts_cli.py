@@ -139,15 +139,44 @@ def _env_policy(canon: str = "") -> receipts.Policy:
                            origins=tuple(origins), canon=canon or "")
 
 
+def _standing_canon(cfg: Config, wanted: str | None):
+    """#7629 : le canon dont la politique borne le grant — None s'il est illisible."""
+    from . import canon as canon_mod
+    canons = [canon for canon in canon_mod.load_configured(cfg)
+              if getattr(canon, "readable", False)]
+    if wanted:
+        return next((canon for canon in canons if canon.id == wanted), None)
+    return canons[0] if canons else None
+
+
 def cmd_standing_register(cfg: Config, args: argparse.Namespace) -> int:
     with open(args.file, "rb") as fh:
         raw = fh.read()
+    try:
+        parsed = receipts.parse_receipt(raw)
+    except receipts.ReceiptError as exc:
+        print("refused [%s]: %s" % (receipts.FORMAT, exc), file=sys.stderr)
+        return 1
+    if parsed.kind != "standing":
+        print("refused [%s]: a standing receipt is required, not %s"
+              % (receipts.KIND, parsed.kind), file=sys.stderr)
+        return 1
+    canon = _standing_canon(cfg, args.canon)
+    if canon is None:
+        print("refused [%s]: no readable canon%s" % (
+            receipts.CANON, " %s" % args.canon if args.canon else ""), file=sys.stderr)
+        return 1
+    # #7629 : le plafond du canon s'applique aussi au chemin `standing register`
+    # de #7631 ; sans lui, un grant serait accepté hors politique.
+    limits = canon.standing_policy()
+    card = canon.avatar_of(parsed.request["approver"])
     by = args.by or os.environ.get("AGENT_MAIL_NAME") or "human:%s" % (
         os.environ.get("USER") or "?")
     db = _open(cfg)
     try:
-        verdict, grant_id = receipts.register_standing(db, raw, _env_policy(args.canon),
-                                                       registered_by=by)
+        verdict, grant_id = receipts.register_standing(
+            db, raw, _env_policy(canon.state_key), registered_by=by,
+            limits=limits, avatar=card.title if card else None)
     finally:
         db.close()
     if args.json:

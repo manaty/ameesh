@@ -116,13 +116,10 @@ ASSETS_TIMEOUT_S = 1800.0
 STAGING_EVENT = "staging.attested"
 STAGING_EVENT_DAYS = 60
 STAGING_EVENT_LIMIT = 1000
-#: staging hosts (canon §14): the agent VMs are always proved; the server and
-#: the poste may be reported absent (#3848, #3965: same lists as actif.py)
-STAGING_AGENTS = ("ameesh-agents-1", "ameesh-agents-2", "ameesh-agents-3")
-STAGING_SERVEUR = "manaty-mesh-1"
-STAGING_POSTE = "pc-smichea"
-STAGING_VMS = (*STAGING_AGENTS, STAGING_SERVEUR)
-STAGING_HOSTS = (*STAGING_VMS, STAGING_POSTE)
+#: staging hosts (canon §14) are NOT named here: the sequence is read from the
+#: `staging` block of the canon's Host cards (#7662), the agent VMs always
+#: proved, the server and the workstation reportable. The core keeps only the
+#: rules; `actif.py` (deploy/) carries the same sequence for the launcher.
 _VERSION_LINE = re.compile(r'^version\s*=\s*"([^"\s]+)"\s*$', re.MULTILINE)
 _SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 _TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
@@ -1197,6 +1194,29 @@ def _staging_rights(project: str, raw) -> tuple:
     return tuple(out)
 
 
+#: Release models the core itself implements. Any other model must be
+#: provided by an installed module through the Module interface (#7663); the
+#: bare profile has no such module and refuses the model.
+CORE_RELEASE_MODELS = ("semver",)
+
+
+def release_provider(model):
+    """The module provider of a release model, or ``None`` for the core.
+
+    The core never imports a release implementation: the provider is the
+    module object declared in ``RELEASE_MODELS`` and returned lazily by the
+    registry. A non-core model with no installed provider is a configuration
+    error, never a silent fallback to the semver engine."""
+    if model in CORE_RELEASE_MODELS:
+        return None
+    from .modules import registry
+    provider = registry.release_model(model)
+    if provider is None:
+        raise ReleaseError("release model %r is not provided by an installed module"
+                           % (model,))
+    return provider
+
+
 @dataclasses.dataclass(frozen=True)
 class ProjectRelease:
     name: str
@@ -1227,6 +1247,14 @@ class ProjectRelease:
     #: compiled here: the gesture, beneficiary, host, lot, decision and date
     #: come from the configuration.
     staging_rights: tuple = ()
+    #: #7666: this project publishes the weekly stable channel at the tick
+    #: (`ameesh.stable_channel`); off by default, nothing client-specific here
+    stable_channel: bool = False
+    #: #7662: the staging sequence read from the canon Host cards. Empty on a
+    #: bare profile (never a default host), filled by `with_staging_topology`
+    #: where a canon is available.
+    staging_topology: canon_mod.StagingTopology = dataclasses.field(
+        default_factory=canon_mod.StagingTopology)
 
     @classmethod
     def from_config(cls, cfg, name: str, entry: dict) -> "ProjectRelease":
@@ -1235,7 +1263,8 @@ class ProjectRelease:
         unknown = set(entry) - {"repo", "target", "remote", "staging", "report",
                                 "github", "window_s", "staging_timeout_s", "staging_executor",
                                 "lock_ttl_s", "lock_wait_s", "version_bump", "model",
-                                "staging_handoff", "attestation_timeout_s", "staging_rights"}
+                                "staging_handoff", "attestation_timeout_s", "staging_rights",
+                                "stable_channel"}
         if unknown:
             raise ReleaseError("release.projects.%s: unknown key(s) %s"
                                % (name, ", ".join(sorted(unknown))))
@@ -1252,26 +1281,31 @@ class ProjectRelease:
                       if h.strip()]
             report = humans[0] if humans else "smichea"
         model = entry.get("model", "semver")
-        if model not in ("semver", "nexlink"):
-            raise ReleaseError("release model: semver | nexlink expected")
-        if model == "nexlink" and (name != "nexlink" or target != "develop"
-                                    or "staging" in entry):
-            raise ReleaseError("nexlink model requires project nexlink, target develop, "
-                               "and its closed staging workflow list (no staging script)")
+        provider = release_provider(model)
+        if provider is not None:
+            validate = getattr(provider, "validate_project", None)
+            if validate is not None:
+                validate(name, entry, target)
         handoff = entry.get("staging_handoff", "")
-        if handoff and (model != "nexlink" or not isinstance(handoff, str)
+        if handoff and (provider is None
+                        or not getattr(provider, "SUPPORTS_HANDOFF", False)
+                        or not isinstance(handoff, str)
                         or not config.NAME_RE.fullmatch(handoff)):
             raise ReleaseError("release.projects.%s.staging_handoff: an agent name, "
-                               "nexlink model only" % name)
+                               "a module release model with handoff only" % name)
         if handoff:
             # #6039 N4: canonicalize an alias as early as the configuration,
             # without the registry (which the tick reads before any tag).
             handoff = canonical_handoff(cfg, None, handoff)
         rights = _staging_rights(name, entry.get("staging_rights", []))
+        stable = entry.get("stable_channel", False)
+        if not isinstance(stable, bool) or (stable and model not in CORE_RELEASE_MODELS):
+            raise ReleaseError("release.projects.%s.stable_channel: a boolean, semver model only"
+                               % name)
         elected_role = ((getattr(cfg, "release", None) or {}).get("role")
                         or (getattr(cfg, "packet_watch", None) or {}).get("role"))
         executor = entry.get("staging_executor")
-        if (elected_role and model != "nexlink"
+        if (elected_role and model in CORE_RELEASE_MODELS
                 and (not isinstance(executor, str) or not executor.strip())):
             raise ReleaseError("release.projects.%s.staging_executor is required under an "
                                "elected role: synchronous staging can restart its pilot" % name)
@@ -1305,7 +1339,7 @@ class ProjectRelease:
             lock_ttl_s=number("lock_ttl_s", LOCK_TTL_S),
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
             suite_tolerated=tolerated, model=model, staging_handoff=handoff or "",
-            staging_rights=rights,
+            staging_rights=rights, stable_channel=stable,
             attestation_timeout_s=number("attestation_timeout_s", ATTESTATION_TIMEOUT_S))
 
 
@@ -1347,12 +1381,10 @@ def canonical_handoff(cfg, db, name: str) -> str:
 
 def child_credentials(project) -> frozenset[str]:
     """Credentials needed by the selected release model's guarded child."""
-    if getattr(project, "model", "semver") == "nexlink":
-        if getattr(project, "staging_handoff", ""):
-            return frozenset()  # #6020: the bureau holds staging credentials
-        from . import nexlink_release
-        return nexlink_release.CHILD_CREDENTIALS
-    return frozenset()
+    model = getattr(project, "model", "semver")
+    if model in CORE_RELEASE_MODELS:
+        return frozenset()
+    return release_provider(model).child_credentials(project)
 
 
 def projects(cfg) -> dict[str, ProjectRelease]:
@@ -1373,6 +1405,34 @@ def projects(cfg) -> dict[str, ProjectRelease]:
         raise ReleaseError("release.projects: an object is required")
     return {name: ProjectRelease.from_config(cfg, name, entry)
             for name, entry in sorted(declared.items())}
+
+
+def staging_topology_of(cfg) -> canon_mod.StagingTopology:
+    """#7662: the staging sequence declared by the canon's Host cards.
+
+    Only the default canon (the mesh's, L42) declares it: another configured
+    canon must not add hosts to the sequence. A missing or unreadable canon
+    gives the empty sequence, never a fallback to a known host: the bare
+    profile has no staging host at all. Callers that need to deploy refuse on
+    an empty sequence (`run_staging`)."""
+    try:
+        canons = canon_mod.load_configured(cfg)
+        return canon_mod.staging_topology(canons[:1])
+    except Exception:  # noqa: BLE001 - an unreadable canon declares no host
+        return canon_mod.StagingTopology()
+
+
+def with_staging_topology(cfg, project: ProjectRelease) -> ProjectRelease:
+    """The project carrying the canon's staging sequence (#7662).
+
+    A configuration whose canon declares no host never wipes a sequence the
+    project already carries (a caller may pass one explicitly, as the tests
+    do); production projects start empty, so a bare canon stays bare."""
+    topology = staging_topology_of(cfg)
+    current = getattr(project, "staging_topology", None)
+    if not topology.hosts and current is not None and current.hosts:
+        return project
+    return dataclasses.replace(project, staging_topology=topology)
 
 
 # --------------------------------------------------------------------------
@@ -1714,10 +1774,9 @@ def tree_proof_text(head: str, proof: dict) -> str:
 
 def build_plan(cfg, project: ProjectRelease, *, now: float,
                version: str | None = None, db=None, state=None) -> Plan:
-    if project.model == "nexlink":
-        from . import nexlink_release
-        return nexlink_release.plan(cfg, project, now=now, version=version,
-                                    state=state)
+    provider = release_provider(project.model)
+    if provider is not None:
+        return provider.plan(cfg, project, now=now, version=version, state=state)
     rules, source = compiled_rules(cfg, project.name)
     cutoff_at, cutoff_label = cutoff_slot(rules, now)
     fetch(project.repo, project.remote, project.target)
@@ -2331,7 +2390,19 @@ def attestation_path(sha: str) -> str:
                         ATTESTATION_DIR, "actif-%s.json" % sha[:12])
 
 
-def read_attestation(sha: str, db=None) -> dict | None:
+def topology_for(db=None, topology=None) -> canon_mod.StagingTopology:
+    """The staging sequence to judge a proof with.
+
+    Explicit `topology` wins (the release path passes the project's); otherwise
+    the database's own configuration is read (#7662), and no readable canon
+    means no host at all — never a fallback to a named host."""
+    if topology is not None:
+        return topology
+    cfg = getattr(db, "cfg", None)
+    return staging_topology_of(cfg) if cfg is not None else canon_mod.StagingTopology()
+
+
+def read_attestation(sha: str, db=None, topology=None) -> dict | None:
     """The durable attestation of `sha`, if present and complete.
 
     Two sources, the same proof: the local file (the complete one `actif.py`
@@ -2341,21 +2412,27 @@ def read_attestation(sha: str, db=None) -> dict | None:
     `attestation_path` and the local readers (`staging_pending`) keep their
     file. `db=None` keeps the local-only behaviour (dry runs, tests).
 
-    Complete = the agent VMs and the server proved (the server may be
-    reported); the poste either proved itself or is explicitly reported absent
-    (`reportes`, #3848). A reported poste does not make the VMs inactive;
-    `maybe_staging` reruns the sequence only on the poste, so it catches up
-    when it is back.
+    Complete = the canon's staging sequence (#7662): every host required, save
+    the reportable ones explicitly reported absent (`reportes`, #3848). A
+    reported poste does not make the VMs inactive; `maybe_staging` reruns the
+    sequence only on the poste, so it catches up when it is back. A local
+    file primes only when it proves every host (no report); a local proof
+    with a reported host lets a more complete shared event of the same SHA
+    win, exactly as before the sequence came from the canon.
     """
-    local = _read_attestation_file(sha)
+    topology = topology_for(db, topology)
+    if not topology.hosts:
+        return None
+    local = _read_attestation_file(sha, topology)
     # le fichier local est la preuve COMPLETE : il porte aussi l'etat
-    # d'emission (cle de courrier). S'il couvre tous les hotes, il prime et
-    # aucune lecture de base n'est utile.
-    if local is not None and len(local.get("hotes") or {}) == len(STAGING_HOSTS):
+    # d'emission (cle de courrier). Seul un fichier qui couvre toute la
+    # sequence prime ; avec un report, l'evenement partage plus complet du
+    # meme SHA peut gagner.
+    if local is not None and len(local.get("hotes") or {}) == len(topology.hosts):
         return local
     best = local
     for data in stored_attestations(db, sha):
-        if not _attestation_valid(data, sha):
+        if not _attestation_valid(data, sha, topology):
             continue
         if best is None or len(data.get("hotes") or {}) > len(best.get("hotes") or {}):
             best = data
@@ -2370,22 +2447,23 @@ def read_attestation(sha: str, db=None) -> dict | None:
     return best
 
 
-def _attestation_valid(data, sha: str) -> bool:
+def _attestation_valid(data, sha: str, topology=None) -> bool:
     """The shape and the commit checks of an attestation (file or event)."""
     if not isinstance(data, dict):
         return False
     stored_sha = data.get("sha")
     if not isinstance(stored_sha, str) or stored_sha[:len(sha)] != sha[:len(sha)]:
         return False
+    topology = topology_for(None, topology)
+    if not topology.hosts:
+        return False
     hosts = data.get("hotes")
     reportes = data.get("reportes") or {}
     if not isinstance(hosts, dict) or not isinstance(reportes, dict):
         return False
-    if set(reportes) - {STAGING_SERVEUR, STAGING_POSTE}:
+    if set(reportes) - topology.reportable:
         return False
-    requis = (set(STAGING_AGENTS) | ({STAGING_SERVEUR} - set(reportes))
-              | ({STAGING_POSTE} - set(reportes)))
-    if set(hosts) != requis:
+    if set(hosts) != set(topology.required(reportes)):
         return False
     for host, detail in hosts.items():
         if not isinstance(detail, dict):
@@ -2399,14 +2477,14 @@ def _attestation_valid(data, sha: str) -> bool:
     return True
 
 
-def _read_attestation_file(sha: str) -> dict | None:
+def _read_attestation_file(sha: str, topology=None) -> dict | None:
     path = attestation_path(sha)
     try:
         with open(path, encoding="utf-8") as stream:
             data = json.load(stream)
     except (FileNotFoundError, OSError, ValueError):
         return None
-    return data if _attestation_valid(data, sha) else None
+    return data if _attestation_valid(data, sha, topology) else None
 
 
 def _write_attestation_file(data: dict) -> str:
@@ -2487,8 +2565,11 @@ def read_journal(since: str = "") -> list[dict]:
     return out
 
 
-def staging_summary(events: list[dict], sha: str) -> list[dict]:
-    """Last event per host of this run, with the rollback evidence."""
+def staging_summary(events: list[dict], sha: str, topology=None) -> list[dict]:
+    """Last event per host of this run, with the rollback evidence.
+
+    Hosts are listed in the canon's staging order (#7662), never in the order
+    the journal happened to write them."""
     by_host: dict[str, list[dict]] = {}
     for row in events:
         if str(row.get("sha") or "")[:len(sha)] != sha[:len(sha)]:
@@ -2496,8 +2577,9 @@ def staging_summary(events: list[dict], sha: str) -> list[dict]:
         host = str(row.get("hote") or "")
         if host:
             by_host.setdefault(host, []).append(row)
+    topology = topology_for(None, topology)
     out = []
-    for host in STAGING_HOSTS:
+    for host in topology.hosts:
         rows = by_host.get(host, [])
         if not rows:
             continue
@@ -2689,9 +2771,72 @@ def _return_after_stop(tree: str, sha: str, *, env: dict, budget: float) -> dict
             "drop": settled, "pid": proc.pid}
 
 
-def _manual_return_mail(db, tree: str, notify: str, reason: str) -> bool:
-    """#5450: the manual fallback when the bounded return did not conclude."""
+def _role_recipient(db, roles) -> tuple[str, str]:
+    """#7792 : premier porteur déclaré d'un rôle, lu sur la projection `roles`
+    du registre (celle que `canon sync` écrit de la fiche Agent). Le motif
+    d'absence est rendu, jamais effacé : un lecteur ne devine pas un nom."""
+    try:
+        from . import registry, sous_utilisation
+        holders = sous_utilisation.declared_holders([], registry.overview(db), roles)
+    except Exception as exc:  # noqa: BLE001 - le motif est rendu à l'appelant
+        return "", "lecture des rôles impossible (%s)" % exc
+    if not holders:
+        return "", "aucun porteur déclaré"
+    return holders[0], ""
+
+
+def _return_recipient(db, notify: str | None) -> tuple[str, str]:
+    """#7792 B : qui reçoit la marche manuelle du retour de staging.
+
+    La demande (`notify`) d'abord, puis le porteur déclaré du rôle de
+    conception, puis celui du rôle orchestrateur. Sans porteur, le motif est
+    rendu : l'état bloqué que l'appelant consigne porte alors l'alerte
+    `staging_interrupted` de `ameesh alerts`, et la trace est écrite au
+    journal du staging par `_manual_return_mail`."""
+    if notify:
+        return notify, ""
+    from .roles import DESIGN_ROLES, ORCHESTRATOR_ROLES
+    reasons = []
+    for roles in (DESIGN_ROLES, ORCHESTRATOR_ROLES):
+        holder, why = _role_recipient(db, roles)
+        if holder:
+            return holder, ""
+        reasons.append("%s : %s" % (roles[0], why))
+    return "", "; ".join(reasons)
+
+
+def _manual_return_trace(state: dict, text: str) -> None:
+    """#7792 B : une marche manuelle non remise laisse une trace nommée.
+
+    Elle est écrite au journal du staging que le lanceur a gardé, et sur la
+    sortie d'erreur ; `_manual_return_mail` ne rend donc jamais `False` en
+    silence."""
+    print("release: " + text, file=sys.stderr)
+    path = state.get("journal") or ""
+    if not path:
+        return
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (stamp, text))
+    except OSError:
+        pass
+
+
+def _manual_return_mail(db, tree: str, notify: str | None, reason: str) -> bool:
+    """#5450: the manual fallback when the bounded return did not conclude.
+
+    #7792: `notify` absent désigne le porteur déclaré du rôle de conception,
+    puis celui du rôle orchestrateur ; sans porteur, la trace est écrite au
+    journal du staging et l'état bloqué consigné par l'appelant porte l'alerte
+    `staging_interrupted`. Aucun nom de persona n'est inventé, et un échec
+    n'est jamais silencieux."""
     state = _return_state(tree)
+    notify, why = _return_recipient(db, notify)
+    if not notify:
+        _manual_return_trace(
+            state, "marche manuelle non remise : %s" % (why or "destinataire absent"))
+        return False
     host = state.get("host") or "?"
     step = state.get("step") or "?"
     precedent = state.get("precedent") or "previous-sha"
@@ -2710,7 +2855,9 @@ def _manual_return_mail(db, tree: str, notify: str, reason: str) -> bool:
                   "%s\n\n%s" % (subject, body), kind="event",
                   payload={"urgent": True, "staging": {"sujet": subject}})
         return True
-    except Exception:  # noqa: BLE001 - the journal and the failure remain
+    except Exception as exc:  # noqa: BLE001 - la trace et l'alerte restent
+        _manual_return_trace(
+            state, "marche manuelle non remise à %s : %s" % (notify, exc))
         return False
 
 
@@ -2732,6 +2879,11 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 *, state_dir: str, timeout_s: float | None = None,
                 db=None) -> dict:
     """Run `staging.sh` from a worktree of the release commit, under its lock."""
+    topology = getattr(project, "staging_topology", None)
+    if topology is None or not topology.hosts:
+        raise ReleaseError(
+            "no staging host declared in the canon: the `staging` block of the "
+            "Host cards is required (a bare profile has no implicit host)")
     if project.staging_executor:
         from . import config, staging_executor
         if db is None:
@@ -2877,7 +3029,7 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                     drop = retour["drop"]
                     if not retour["ok"] and not retour["mailed"]:
                         if db is not None:
-                            _manual_return_mail(db, worktree, "mesh-design",
+                            _manual_return_mail(db, worktree, None,
                                                 retour["note"])
                 if read["output"] is None:
                     wait(STAGING_DRAIN_S)
@@ -2913,8 +3065,9 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
         return {"exit": proc.returncode, "duration_s": round(time.time() - started, 1),
                 "log": log_path,
                 "output_tail": "\n".join((output or "").splitlines()[-20:]),
-                "summary": staging_summary(read_journal(since_iso), release_sha),
-                "attestation": read_attestation(release_sha, db)}
+                "summary": staging_summary(read_journal(since_iso), release_sha,
+                                           topology),
+                "attestation": read_attestation(release_sha, db, topology)}
     finally:
         if drop:
             _drop_worktree(project.repo, folder, worktree)
@@ -2981,9 +3134,11 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
         reportes = (staging.get("attestation") or {}).get("reportes") or {}
         catchups = staging.get("catchups") or {}
         rights = staging.get("rights") or {}
+        workstation = getattr(project, "staging_topology", None)
+        workstation = workstation.workstation if workstation is not None else None
         for host, detail in sorted(reportes.items()):
             raison = " ".join(str((detail or {}).get("raison") or "absent").split())
-            suite = ("mise à jour à son retour" if host == STAGING_POSTE
+            suite = ("mise à jour à son retour" if host == workstation
                      else "rattrapage requis, jamais en dessous (§14)")
             declared = (catchups.get(host) if isinstance(catchups, dict) else None)
             if isinstance(declared, dict):
@@ -2993,7 +3148,7 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
                              declared.get("result") or "?",
                              declared.get("date") or "date inconnue",
                              declared.get("actor") or "auteur inconnu"))
-            elif host != STAGING_POSTE:
+            elif host != workstation:
                 right = (rights.get(host) if isinstance(rights, dict) else None)
                 if isinstance(right, dict):
                     if right.get("expired"):
@@ -3118,13 +3273,14 @@ def execute(cfg, db, project: ProjectRelease, *, now: float | None = None,
             version: str | None = None) -> dict:
     """One release attempt; the report is the durable answer."""
     now = time.time() if now is None else float(now)
-    if project.model == "nexlink":
-        from . import nexlink_release
-        return nexlink_release.execute(cfg, db, project, now=now, force=force,
-                                       no_staging=no_staging, version=version)
+    provider = release_provider(project.model)
+    if provider is not None:
+        return provider.execute(cfg, db, project, now=now, force=force,
+                                no_staging=no_staging, version=version)
     state = load_state(cfg)
     state_slot = project_state(state, project.name)
     rules, source = compiled_rules(cfg, project.name)
+    project = with_staging_topology(cfg, project)
     at, label = cutoff_slot(rules, now)
     if not force and float(state_slot.get("last_cutoff") or 0) >= at:
         return {"result": "already-recorded", "cutoff_at": at, "label": label}
@@ -3718,15 +3874,18 @@ def _staging_busy_text(project: ProjectRelease, db, text: str) -> str:
 
 def maybe_staging(project: ProjectRelease, release_sha: str, included: list[int],
                   state_dir: str, db=None) -> dict:
-    attestation = read_attestation(release_sha, db)
+    topology = getattr(project, "staging_topology", None) or topology_for(db)
+    attestation = read_attestation(release_sha, db, topology)
     # Un poste reporte ne prouve pas le staging complet : relancer le met a jour
     # au commit actif a son retour, jamais en dessous (#3848). Lancee ailleurs
     # que sur le poste, la sequence le reporterait encore : relancer referait
     # migrations, controles et sondes des VM deja au commit, pour rien. Un
     # serveur sans acces root reporte ne justifie pas de relancer : il n'a
     # aucun runner, la prochaine release le reprendra s'il redevient joignable.
-    if attestation and (STAGING_POSTE not in (attestation.get("reportes") or {})
-                        or staging_local_host() != STAGING_POSTE):
+    poste = topology.workstation
+    if attestation and (poste is None
+                        or poste not in (attestation.get("reportes") or {})
+                        or staging_local_host() != poste):
         return {"exit": 0, "duration_s": 0.0, "log": "", "summary": [],
                 "attestation": attestation, "skipped": "already attested"}
     return run_staging(project, release_sha, included, state_dir=state_dir, db=db)

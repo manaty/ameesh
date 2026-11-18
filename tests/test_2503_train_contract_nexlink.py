@@ -19,7 +19,9 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import ci_parts, radar, train, train_ci, train_contracts
+from tests import support
+from ameesh import ci_parts, radar, train, train_ci
+from ameesh.modules.nexlink import packet_ci as train_contracts
 
 
 class NexlinkContractTest(unittest.TestCase):
@@ -709,9 +711,39 @@ class VerifyLocalTest(unittest.TestCase):
 
 
 class AssemblyTest(unittest.TestCase):
+    @support.needs_builtin_modules
     def test_assembly_exposes_the_nexlink_contract(self):
         from ameesh import train_assembly
-        self.assertIs(train_assembly.CONTRACTS["nexlink"], train_contracts.nexlink)
+        self.assertIs(train_assembly.contracts()["nexlink"], train_contracts.nexlink)
+
+    @support.needs_builtin_modules
+    def test_the_core_contract_file_no_longer_declares_it(self):
+        """#7794 : le contrat Nexlink vit dans son module, lu par le registre."""
+        from ameesh import train_assembly, train_contracts as core
+        from ameesh.modules import registry
+        self.assertFalse(hasattr(core, "nexlink"))
+        self.assertNotIn("nexlink", train_assembly.CONTRACTS)
+        self.assertIn("nexlink", registry.train_contract_names())
+        self.assertIs(registry.train_contract("nexlink"), train_contracts.nexlink)
+        self.assertIsNone(registry.train_contract("absent"))
+
+    def test_bare_profile_has_no_nexlink_contract(self):
+        from ameesh import train_assembly
+        from ameesh.modules import registry
+        with mock.patch.dict(os.environ, {"AMEESH_MODULES": "bare"}):
+            self.assertEqual(registry.train_contract_names(), ())
+            self.assertIsNone(registry.train_contract("nexlink"))
+            self.assertEqual(set(train_assembly.contracts()), {"ameesh"})
+
+    def test_a_module_cannot_shadow_a_core_contract(self):
+        from ameesh import train_assembly
+        from ameesh.modules import registry
+        shadow = types.SimpleNamespace(TRAIN_CONTRACTS=("ameesh",),
+                                       train_contract=lambda name: None)
+        with mock.patch.object(registry, "_builtin", return_value={"x": shadow}):
+            with self.assertRaisesRegex(train_assembly.ConfigurationError,
+                                        "core and a module"):
+                train_assembly.contracts()
 
 
 if __name__ == "__main__":

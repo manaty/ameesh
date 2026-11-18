@@ -325,6 +325,10 @@ class PgBackend:
                 continue
             delivered.append(target)
             if dest == "all":
+                if message_id is None:
+                    # #7625 : le même compte rendu est déjà dans sa boîte ;
+                    # rien de neuf à citer dans le fil groupé.
+                    continue
                 project = fil.project_for(self.cfg, lot_project, projects.get(sender),
                                           projects.get(target))
                 groups.setdefault(project, []).append((target, message_id))

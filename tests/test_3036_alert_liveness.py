@@ -14,6 +14,8 @@ brief le compte pour prévenu et l'alerte ne repart jamais. Les témoins :
 """
 from __future__ import annotations
 
+import dataclasses
+import os
 import time
 import unittest
 from unittest import mock
@@ -56,7 +58,7 @@ class BriefsLivenessTest(unittest.TestCase):
         briefs = alert_briefs.briefs(
             _slo(level=2, targets=("pilot",)), listing,
             auditor_names=["auditeur"], orchestrator_names=("orch",),
-            closed_hosts={"lost"})
+            closed_hosts={"lost"}, avatar_names=("bureau",))
         self.assertEqual(sorted(briefs), ["bureau"])
         self.assertIn("orch (no live lease)", briefs["bureau"])
         self.assertIn("auditeur (host lost: claims closed)", briefs["bureau"])
@@ -109,7 +111,8 @@ class BriefsLivenessTest(unittest.TestCase):
                    _row("bureau"), _row("auditeur")]
         briefs = alert_briefs.briefs(
             _slo(level=2, targets=("pilot",)), listing,
-            auditor_names=["auditeur"], orchestrator_names=("orch",))
+            auditor_names=["auditeur"], orchestrator_names=("orch",),
+            avatar_names=("bureau",))
         self.assertEqual(sorted(briefs), ["auditeur", "bureau"])
         self.assertIn("orch (status stopped)", briefs["bureau"])
         self.assertIn("Escalated from level 2 to level 3", briefs["bureau"])
@@ -182,7 +185,8 @@ class BriefsLivenessTest(unittest.TestCase):
     def test_plan_underused_sans_vivant_replie_sur_le_bureau(self):
         listing = [_row("dev1"), _row("orch", lease=False),
                    _row("auditeur", lease=False), _row("bureau")]
-        briefs = alert_briefs.briefs(self.PLAN, listing, auditor_names=["auditeur"])
+        briefs = alert_briefs.briefs(self.PLAN, listing, auditor_names=["auditeur"],
+                                     avatar_names=("bureau",))
         self.assertEqual(list(briefs), ["bureau"])
         self.assertIn("No live recipient:", briefs["bureau"])
         self.assertIn("orch (no live lease)", briefs["bureau"])
@@ -197,12 +201,42 @@ class LivenessFixture:
         super().setUp()
         self.notifiers = []
         self.long_dead = set()
+        # #7634 : le bureau n'est plus un nom du cœur ; il est l'avatar de
+        # l'humain déclaré au canon. Le banc lui donne la fiche que la série
+        # avatars pose (même agent, bloc `avatar`), pour que la vivacité se
+        # juge sur la route réelle et non sur un nom en dur.
+        self.cfg = dataclasses.replace(self.cfg, canon=self._avatar_canon(),
+                                       canon_untrusted=True, canon_ref="")
         for name in ("dev1", "orch", "bureau", "auditeur", "claude3"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
             self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
                             " WHERE name = %s", (name,))
+        # #7661 : l'auditeur se lit sur le rôle projeté, pas sur son nom.
+        self.db.execute("UPDATE agent_registry SET roles = ARRAY['auditeur']"
+                        " WHERE name = 'auditeur'")
         self.lease("dev1", "orch", "bureau", "auditeur")
         self.now = time.time()
+
+    def _avatar_canon(self) -> str:
+        """Un canon minimal : l'avatar `bureau` de `human:smichea`."""
+        root = os.path.join(self.tmp, "canon-avatars")
+        for sub in ("agents", "membres"):
+            os.makedirs(os.path.join(root, sub), exist_ok=True)
+        with open(os.path.join(root, "membres", "smichea.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("---\ntype: Member\ntitle: smichea\n---\n")
+        with open(os.path.join(root, "agents", "bureau.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("---\ntype: Agent\ntitle: bureau\n"
+                     "responsible: human:smichea\nroles: [bureau]\n"
+                     "avatar:\n  conversation: portable\n---\n")
+        # #7661 : le canon fait foi quand il est chargé ; l'auditeur doit y
+        # déclarer son rôle, comme sur le canon réel du mesh.
+        with open(os.path.join(root, "agents", "auditeur.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("---\ntype: Agent\ntitle: auditeur\n"
+                     "responsible: human:smichea\nroles: [auditeur]\n---\n")
+        return root
 
     def lease(self, *names):
         for name in names:
@@ -231,8 +265,14 @@ class LivenessFixture:
         for name in self.long_dead:
             since[name] = self.now - HEURE
 
-    def notifier(self):
-        notifier = notify.Notifier(self.cfg, notify.parse_config({"default": []}),
+    def notifier(self, *, default_human=None):
+        raw = {"default": []}
+        if default_human:
+            # #7634 : l'avatar se résout depuis l'humain de la route ; les
+            # alertes SLO ne sont pas poussées à cet humain (#2395), elles
+            # passent seulement par son avatar pour le brief.
+            raw["default_human"] = default_human
+        notifier = notify.Notifier(self.cfg, notify.parse_config(raw),
                                    sender=object(), log=lambda text: None,
                                    clock=lambda: self.now)
         self._seen_dead(notifier)
@@ -258,7 +298,7 @@ class NotifierLivenessTest(LivenessFixture, PgTestCase):
                         " ON CONFLICT (host) DO UPDATE SET mode = 'lost'")
         self.db.execute("UPDATE agent_registry SET host = 'lost-host'"
                         " WHERE name = 'auditeur'")
-        notifier = self.notifier()
+        notifier = self.notifier(default_human="human:smichea")
         alert = _slo(level=2, targets=("pilot",))
         notifier.run_pass(self.db, current=[alert])
         self.assertEqual(self.mails("orch"), [])      # bail mort : aucun dépôt
@@ -277,7 +317,7 @@ class NotifierLivenessTest(LivenessFixture, PgTestCase):
                         " ON CONFLICT (host) DO UPDATE SET mode = 'lost'")
         self.db.execute("UPDATE agent_registry SET host = 'lost-host'"
                         " WHERE name = 'auditeur'")
-        notifier = self.notifier()
+        notifier = self.notifier(default_human="human:smichea")
         alert = _slo(level=2, targets=("pilot",))
         notifier.run_pass(self.db, current=[alert])
         self.assertEqual(self.mails("auditeur"), [])
@@ -296,7 +336,7 @@ class NotifierLivenessTest(LivenessFixture, PgTestCase):
 
     def test_aucun_vivant_ecrit_au_fil_puis_remet_au_retour(self):
         self.dead("dev1", "orch", "bureau", "auditeur")
-        notifier = self.notifier()
+        notifier = self.notifier(default_human="human:smichea")
         alert = _slo(level=1, targets=("assignee",))
         notifier.run_pass(self.db, current=[alert])
         for name in ("dev1", "orch", "bureau", "auditeur"):

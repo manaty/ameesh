@@ -1,0 +1,11 @@
+{
+  "dsn": "host=10.77.0.1 port=5432 dbname=ameesh user=bureau_goal sslmode=require application_name=ameesh-gate",
+  "host": "bureau-goal",
+  "driver": "auto",
+  "canons": [
+    {
+      "path": "/var/lib/ameesh-gate/canon",
+      "ref": "origin/main"
+    }
+  ]
+}

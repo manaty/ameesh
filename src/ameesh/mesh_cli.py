@@ -203,6 +203,9 @@ def _annotate_agents(cfg: Config, db, rows: list, *, sees=None) -> list:
         # sans décoder le texte français (`ameesh-agents/1`,
         # `GET /api/v1/agents`) ; None hors d'une attente de pression.
         row["queue"] = _queue_of(row)
+        # E3b (#7675): same block as `show`, for `/api/v1/agents` and list.
+        from . import deferral_observation
+        row.setdefault("deferral", deferral_observation.classify(row))
     return rows
 
 
@@ -234,9 +237,18 @@ def agent_detail(db, name: str, *, cfg=None, footprint: bool = False, sees=None)
     row["paused_on_budget"] = progress.paused_on_budget(row)
     # #2814 : même objet `queued` que `ameesh list --json`
     row["queue"] = _queue_of(row)
+    # E3b (#7675): the closed bounded deferral block of `ameesh show --json`.
+    from . import deferral_observation
+    row["deferral"] = deferral_observation.classify(row)
     from . import sandbox_observation
     row['sandbox'] = sandbox_observation.current_agents(db, [name], sees=sees).get(name)
     row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
+    # #7632 : cadence de réveil déclarée, courrier en attente, prochain tour groupé
+    from . import reveil as reveil_mod
+    try:
+        row["wake"] = reveil_mod.status(db, row, human_names=getattr(cfg, "human_names", ()))
+    except db_mod.DbError:
+        row["wake"] = None  # le courrier illisible ne prive pas de la fiche
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
     row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
@@ -803,13 +815,28 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 tag("pressure_scope") if fiches else "",
                 scope_note))
             if limits.get("pressure_scope") == "own_cgroup":
-                print("  thresholds cgroup memory ≤ %s%s; cgroup throttled ≤ %s%s"
-                      % (res.fmt_value("max_cgroup_memory_used",
-                                       limits.get("max_cgroup_memory_used")),
-                         tag("max_cgroup_memory_used"),
-                         res.fmt_value("max_cgroup_throttled",
-                                       limits.get("max_cgroup_throttled")),
-                         tag("max_cgroup_throttled")))
+                # #7675: the two IMA-era measures are optional (no default);
+                # print them only when a Host fiche declares them.
+                parts = ["cgroup memory ≤ %s%s"
+                         % (res.fmt_value("max_cgroup_memory_used",
+                                          limits.get("max_cgroup_memory_used")),
+                            tag("max_cgroup_memory_used")),
+                         "cgroup throttled ≤ %s%s"
+                         % (res.fmt_value("max_cgroup_throttled",
+                                          limits.get("max_cgroup_throttled")),
+                            tag("max_cgroup_throttled"))]
+                if limits.get("max_cgroup_cpu_used") is not None:
+                    parts.append("cgroup CPU used ≤ %s%s"
+                                 % (res.fmt_value("max_cgroup_cpu_used",
+                                                  limits["max_cgroup_cpu_used"]),
+                                    tag("max_cgroup_cpu_used")))
+                if limits.get("max_cgroup_throttled_periods") is not None:
+                    parts.append("cgroup throttled periods ≤ %s%s"
+                                 % (res.fmt_value(
+                                     "max_cgroup_throttled_periods",
+                                     limits["max_cgroup_throttled_periods"]),
+                                    tag("max_cgroup_throttled_periods")))
+                print("  thresholds " + "; ".join(parts))
             if limits.get("max_cpu_pressure") is not None:
                 print("  thresholds CPU pressure ≤ %s%s"
                       % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
@@ -838,6 +865,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 if cgroup.get("throttled") is not None:
                     parts.append("throttled %s" % res.fmt_value(
                         "max_cgroup_throttled", cgroup["throttled"]))
+                if cgroup.get("cpu_used_ratio") is not None:
+                    parts.append("CPU used %s of quota" % res.fmt_value(
+                        "max_cgroup_cpu_used", cgroup["cpu_used_ratio"]))
+                if cgroup.get("throttled_periods") is not None:
+                    parts.append("throttled periods %s" % res.fmt_value(
+                        "max_cgroup_throttled_periods",
+                        cgroup["throttled_periods"]))
                 if cgroup.get("cpu_some") is not None:
                     parts.append("CPU PSI %.1f %%" % cgroup["cpu_some"])
                 if cgroup.get("mem_some") is not None:
@@ -1404,6 +1438,16 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         elif credit_harness:
             print("credits  : %s ok (no credit exhaustion seen)" % credit_harness)
         print("lease    : %s" % _lease(row))
+        # #7632 : la cadence de réveil déclarée et le prochain tour groupé
+        wake = row.get("wake")
+        if wake:
+            print("wake     : %s" % wake["cadence"])
+            print("           %d grouped mail(s) pending%s, %d immediate%s" % (
+                wake["pending"],
+                (" — next grouped turn %s" % _fmt_moment(wake["next_wake_ts"]))
+                if wake.get("next_wake_ts") else "",
+                wake["immediate_pending"],
+                " (turn due now)" if wake["immediate_pending"] else ""))
         print("model    : %-9s budget: %s" % (row.get("model") or "—", _budget(row)))
         # #6046 : réglages de contexte et leur source (agent, role:<classe>,
         # host, default)
@@ -2817,9 +2861,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 from .work_dependencies import wait_label
                 print("planned  : %s" % wait_label(item["planned_wait"]))
             for edge in item.get("dependencies", []):
+                if edge["blocking"] and edge.get("start_on"):
+                    # #7760 : démarrage sur la tête gelée validée ; la fusion
+                    # attend toujours celle du prérequis.
+                    label = "starts on, frozen %s (merge waits)" % (
+                        (edge.get("blocker_frozen_sha") or "?")[:12])
+                else:
+                    label = "blocking" if edge["blocking"] else "satisfied"
                 print("depends  : #%d (%s, %s)" % (
-                    edge["blocker_id"], edge["blocker_state"],
-                    "blocking" if edge["blocking"] else "satisfied"))
+                    edge["blocker_id"], edge["blocker_state"], label))
             if item.get("queue"):
                 q = item["queue"]
                 print("queue    : %s to %s, rank %s, frozen %s%s" % (
@@ -3742,7 +3792,9 @@ def cmd_set(cfg: Config, args) -> int:
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
     (L26 : `list --json` les rend quel que soit l'hôte) ; la politique de
-    session (`par-lot` | `taille` | `jamais`, décision 0025) en base seulement.
+    session (`par-lot` | `taille` | `jamais`, décision 0025) en base seulement
+    — une carte `Agent`/`Persona` du canon peut la déclarer, et sa déclaration
+    fait foi (#7674).
     Le tour suivant les lit et les applique ; une valeur vide revient au
     défaut. Le tier n'a d'effet que sur un harnais dont le descripteur le
     déclare (Codex : `service_tier`). Le mode (`execute` | `externe`, L37) est
@@ -4838,7 +4890,7 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_note = work_sub.add_parser(
         "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated",
         epilog="#3498: a pilot hold may declare an external wait — "
-               "\"hold: attente bureau : <geste>\" (or owner), with an optional "
+               "\"hold: attente avatar : <geste>\" (or owner), with an optional "
                "\"(due 2026-10-25 12:00 UTC)\"; ameesh debit lists it as an "
                "external wait, not an agent wait. #3773: it may also declare "
                "a third party — \"hold: attente externe : revue Apple\". #4235: "

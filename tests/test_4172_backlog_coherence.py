@@ -13,10 +13,12 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
-from ameesh import backlog_coherence, config, work
+from ameesh import backlog_coherence, config, db as db_mod, registry, storage, work
 
 from .support import PgTestCase
 
@@ -193,6 +195,182 @@ class CoherenceTest(PgTestCase):
         self.assertEqual(refused[0]["result"], "refused")
         self.assertIn("branch", refused[0]["reason"])
         self.assertEqual(work.get(self.db, self.already_ref["id"])["state"], "intake")
+
+    def _cite(self, *lot_ids, subject="partial step"):
+        """A merged change that only references the lots: a sub-step, not proof."""
+        self._write("src/x.py", "alpha\nbug fixed\ngamma\n# %s\n"
+                    % ",".join(str(int(lot)) for lot in lot_ids))
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qam",
+             "%s\n\n%s" % (subject, "\n".join(
+                 "ameesh-work: %d" % int(lot) for lot in lot_ids)))
+
+    def _started_and_back_in_intake(self):
+        """A lot whose work has started (build) and which returned to intake.
+
+        The measured start (L157) stays on the row, and the lot carries no
+        branch: exactly the operator lot a git citation must not close (#7782).
+        """
+        lot = self.lot("Corriger la ligne deux (démarré)")
+        work.move(self.db, lot["id"], "build", actor="test")
+        work.move(self.db, lot["id"], "blocked", actor="test")
+        work.move(self.db, lot["id"], "intake", actor="test")
+        item = work.get(self.db, lot["id"])
+        self.assertIsNotNone(item["started_ts"])
+        self.assertEqual(item["state"], "intake")
+        self.assertFalse(item["branch"] or item["pr_ref"])
+        return lot
+
+    def test_a_started_lot_is_not_closed_by_a_git_citation(self):
+        started = self._started_and_back_in_intake()
+        held = self.lot("Corriger la ligne deux (retenu)")
+        work.note(self.db, held["id"], "hold: smoke P6 du déplacement à livrer",
+                  actor="test")
+        self._cite(started["id"], held["id"])
+        report = backlog_coherence.scan(self.db, "p", cfg=self.test_cfg,
+                                        repo=self.repo)
+        found = {row["lot"] for row in report["findings"]
+                 if row["kind"] == "already_done"}
+        self.assertIn(started["id"], found)
+        self.assertIn(held["id"], found)
+        applied = backlog_coherence.apply_report(self.db, report,
+                                                 cfg=self.test_cfg, digest=False)
+        refused = {row["lot"]: row for row in applied["closures"]
+                   if row["result"] == "refused"}
+        self.assertIn(started["id"], refused)
+        self.assertIn("started", refused[started["id"]]["reason"])
+        self.assertIn("hold", refused[held["id"]]["reason"])
+        self.assertIn("test", refused[held["id"]]["reason"])
+        self.assertEqual(work.get(self.db, started["id"])["state"], "intake")
+        self.assertEqual(work.get(self.db, held["id"])["state"], "intake")
+
+    def test_manual_close_of_a_started_lot_stays_allowed(self):
+        """#7782 only guards the automatic pass: an operator keeps `work close`."""
+        started = self._started_and_back_in_intake()
+        work.close(self.db, started["id"], done=True, actor="test",
+                   note="read and closed by hand")
+        self.assertEqual(work.get(self.db, started["id"])["state"], "closed")
+
+    def _apply_while_the_lot_is_locked(self, lot_id: int, report: dict, action):
+        """Run `apply_report` while another connection holds the lot's row lock.
+
+        `action(tx)` writes the concurrent start/hold inside that transaction,
+        after the pass has read the lot and is waiting on the lock. The write
+        is committed before the pass can proceed (#7782).
+        """
+        writer = db_mod.connect(self.cfg)
+        result: dict = {}
+        errors: list = []
+
+        def run():
+            try:
+                result.update(backlog_coherence.apply_report(
+                    self.db, report, cfg=self.test_cfg, digest=False))
+            except BaseException as exc:  # noqa: BLE001 - reported to the test
+                errors.append(exc)
+
+        thread = None
+        try:
+            with writer.transaction() as tx:
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE",
+                         (int(lot_id),))
+                thread = threading.Thread(target=run)
+                thread.start()
+                time.sleep(0.5)
+                self.assertTrue(
+                    thread.is_alive(),
+                    "apply_report did not wait for the lot's row lock")
+                action(tx)
+            thread.join(20)
+            self.assertFalse(thread.is_alive(), "apply_report did not return")
+            self.assertEqual(errors, [])
+            return result
+        finally:
+            if thread is not None:
+                thread.join(20)
+            writer.close()
+
+    def test_a_start_winning_the_race_refuses_the_closure(self):
+        """#7782: `started_ts` read before the lock must not close the lot."""
+        lot = self.lot("Corriger la ligne deux (course au démarrage)")
+        self._cite(lot["id"])
+        report = backlog_coherence.scan(self.db, "p", cfg=self.test_cfg,
+                                        repo=self.repo)
+        self.assertTrue(any(row["kind"] == "already_done"
+                            and row["lot"] == lot["id"]
+                            for row in report["findings"]))
+        applied = self._apply_while_the_lot_is_locked(
+            lot["id"], report,
+            lambda tx: tx.execute(
+                "UPDATE work_items SET started_at = now() WHERE id = %s",
+                (lot["id"],)))
+        refused = [row for row in applied["closures"]
+                   if row["lot"] == lot["id"] and row["result"] == "refused"]
+        self.assertEqual(len(refused), 1, applied["closures"])
+        self.assertIn("started", refused[0]["reason"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_a_hold_winning_the_race_refuses_the_closure(self):
+        """#7782: a `hold:` committed while the pass waits on the lock holds."""
+        lot = self.lot("Corriger la ligne deux (course au hold)")
+        self._cite(lot["id"])
+        report = backlog_coherence.scan(self.db, "p", cfg=self.test_cfg,
+                                        repo=self.repo)
+        applied = self._apply_while_the_lot_is_locked(
+            lot["id"], report,
+            lambda tx: work.note(tx, lot["id"],
+                                 "hold: smoke P6 du déplacement à livrer",
+                                 actor="test"))
+        refused = [row for row in applied["closures"]
+                   if row["lot"] == lot["id"] and row["result"] == "refused"]
+        self.assertEqual(len(refused), 1, applied["closures"])
+        self.assertIn("hold", refused[0]["reason"])
+        self.assertIn("test", refused[0]["reason"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_a_concurrent_manual_closure_is_not_rectified(self):
+        """#7782: a manual `superseded` closure of a review mission stays so.
+
+        The pass may read the mission while it is still in intake; a manual
+        closure then commits before `close_fresh` reloads it. `done` used to
+        rewrite the review's `superseded by` its parent into `done` (the
+        `_rectify_done` path) before the fresh guard ran. The automatic pass
+        must refuse, not regularise a manual gesture.
+        """
+        parent = self.lot("Lot relu par la passe")
+        registry.upsert(self.db, "relecteur", harness="claude",
+                        host=self.cfg.host, cwd=self.tmp, mode="execute")
+        review = work.add(
+            self.db,
+            title="R1 Codex #%d : reprise du suivi CI" % int(parent["id"]),
+            source="mail", issue_ref="manaty/ameesh#941", app="p",
+            assignee="relecteur")
+        storage.of(self.db).work.add_milestone(
+            parent["id"], "verdict", sha="e" * 40, actor="relecteur",
+            verdict="blocked", note="")
+        self._cite(review["id"])
+        report = backlog_coherence.scan(self.db, "p", cfg=self.test_cfg,
+                                        repo=self.repo)
+        real_close_fresh = work.close_fresh
+
+        def close_manually_then_apply(db, item_id, **kwargs):
+            work.close(db, item_id, superseded_by=parent["id"], actor="qa",
+                       note="clôture administrative du suivi de revue")
+            return real_close_fresh(db, item_id, **kwargs)
+
+        with mock.patch.object(work, "close_fresh",
+                               side_effect=close_manually_then_apply):
+            applied = backlog_coherence.apply_report(
+                self.db, report, cfg=self.test_cfg, digest=False)
+        refused = [row for row in applied["closures"]
+                   if row["lot"] == review["id"]]
+        self.assertEqual(len(refused), 1, applied["closures"])
+        self.assertEqual(refused[0]["result"], "refused")
+        self.assertIn("not closable", refused[0]["reason"])
+        after = work.get(self.db, review["id"])
+        self.assertEqual((after["state"], after["close_reason"]),
+                         ("closed", "superseded"))
+        self.assertEqual(int(after["superseded_by"]), int(parent["id"]))
 
     def _cfg_with_recipients(self, recipients):
         return dataclasses.replace(

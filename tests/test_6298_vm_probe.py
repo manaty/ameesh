@@ -7,6 +7,7 @@ import json
 import secrets
 import urllib.parse
 from ameesh import db as db_mod
+from ameesh import bench as bench_mod
 import subprocess
 import uuid
 
@@ -18,11 +19,26 @@ ROOT = Path(__file__).resolve().parents[1]
 SQL = ROOT / 'deploy/sql'
 
 
+def create_roles(cls, role, writer):
+    db = db_mod.connect(dataclasses.replace(cls.cfg, dsn=TEST_DSN))
+    try:
+        bench_mod.create_test_roles(db, role, writer)
+    finally:
+        db.close()
+
+
 def install_for_native_test(cls):
     """Install the real endpoint dependency; roles are local to this schema."""
     serialize_role_acl(cls)
     role = 't_vm_native_' + uuid.uuid4().hex[:10]
     writer = role + '_writer'
+    create_roles(cls, role, writer)
+    def cleanup():
+        query = ''.join('DROP OWNED BY "' + r + '" CASCADE; DROP ROLE "' + r + '";'
+                        for r in (role, writer))
+        subprocess.run(['psql', '-X', '-w', TEST_DSN, '-q', '-c', query],
+                       capture_output=True, text=True, timeout=30, check=True)
+    cls.addClassCleanup(cleanup)
     result = subprocess.run(['psql', '-X', '-w', TEST_DSN, '-q',
         '-v', 'ON_ERROR_STOP=1', '-v', 'role=' + role,
         '-v', 'writer=' + writer, '-f', str(SQL / 'role-vm-probe.sql')],
@@ -30,14 +46,8 @@ def install_for_native_test(cls):
         capture_output=True, text=True, timeout=60)
     # Use a fresh administrative connection: class cleanups happen after the
     # PgTestCase connection has closed and its schema has been dropped.
-    def cleanup():
-        query = ''.join('DROP OWNED BY "' + r + '" CASCADE; DROP ROLE "' + r + '";'
-                        for r in (role, writer))
-        subprocess.run(['psql', '-X', '-w', TEST_DSN, '-q', '-c', query],
-                       capture_output=True, text=True, timeout=30, check=True)
     if result.returncode:
         raise AssertionError(result.stderr)
-    cls.addClassCleanup(cleanup)
 
 
 class VmProbeRoleTest(PgTestCase):
@@ -47,6 +57,7 @@ class VmProbeRoleTest(PgTestCase):
         serialize_role_acl(cls)
         cls.role = 't_vm_probe_' + uuid.uuid4().hex[:10]
         cls.writer = cls.role + '_writer'
+        create_roles(cls, cls.role, cls.writer)
         cls.addClassCleanup(cls.drop_roles)
         result = cls.script('role-vm-probe.sql')
         if result.returncode:
@@ -116,7 +127,12 @@ class VmProbeRoleTest(PgTestCase):
         ]
         for kind, definition, grant, name, marker, condition in cases:
             with self.subTest(kind=kind, grant=grant):
-                self.db.execute('CREATE ' + kind + ' ' + definition)
+                if kind == 'SCHEMA':
+                    # #7756 : une annexe porte sa preuve de propriété pour
+                    # qu'un kill ne laisse pas un schéma sans détenteur.
+                    self.create_schema(name)
+                else:
+                    self.db.execute('CREATE ' + kind + ' ' + definition)
                 try:
                     self.db.execute('GRANT ' + grant + ' ON ' + kind + ' ' + name
                                     + ' TO "' + self.role + '"')
@@ -191,7 +207,7 @@ class VmProbeRoleTest(PgTestCase):
 
     def test_diagnostics_usage_refused_even_without_table_rights(self):
         ns = self.schema + '_diagnostics'
-        self.db.execute('CREATE SCHEMA "' + ns + '"')
+        self.create_schema(ns)
         try:
             self.db.execute('GRANT USAGE ON SCHEMA "' + ns + '" TO PUBLIC')
             self.assertNotEqual(self.script('_contrat-vm-probe.sql').returncode, 0)
@@ -201,7 +217,7 @@ class VmProbeRoleTest(PgTestCase):
 
     def test_public_extension_view_is_inert_only_without_schema_usage(self):
         ns = self.schema + '_closed_extension'
-        self.db.execute('CREATE SCHEMA "' + ns + '"')
+        self.create_schema(ns)
         try:
             self.db.execute('CREATE VIEW "' + ns + '".extension_stats AS SELECT 1 AS calls')
             self.db.execute('GRANT SELECT ON "' + ns + '".extension_stats TO PUBLIC')
