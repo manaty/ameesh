@@ -50,9 +50,16 @@ def correlate(runs, receipts):
     return anomalies
 
 
+def markers(run):
+    title = run.get("display_title")
+    return _MARKER.findall(title) if isinstance(title, str) else []
+
+
 def production_run(run):
     """Mode-marked workflow: exclude only explicit, unambiguous safe modes."""
-    title = run.get("display_title") or ""
+    title = run.get("display_title")
+    if not isinstance(title, str):
+        return None
     env = re.findall(r"(?:^|\s)environment=([^\s]*)", title)
     observe = re.findall(r"(?:^|\s)observe_only=([^\s]*)", title)
     if len(env) != 1 or len(observe) != 1:
@@ -66,8 +73,8 @@ def collect(api, repo, workflow, start, until):
     """Read a fixed creation window; split GitHub's 1000-result limit.
 
     The caller uses the existing GitHub watch's five minute settlement lag.
-    Inclusive windows are re-read from activation to observe reruns. An incomplete or stale response never advances
-    the durable cursor. Attempts are retained separately from their run ID.
+    Inclusive windows are re-read from activation to observe reruns. An
+    incomplete or stale response never advances the durable cursor. Attempts are retained separately from their run ID.
     """
     from datetime import datetime, timezone
     from urllib.parse import quote, urlencode
@@ -136,12 +143,12 @@ def deliver(db, sub, workflow, runs, until, auditor, *, mode_marked=False):
                 if key not in known:
                     pending[key] = dict(run, run_attempt=attempt)
         ids = {value for run in pending.values()
-               for value in _MARKER.findall(run.get("display_title") or "")
+               for value in markers(run)
                if _UUID4.fullmatch(value)}
         receipts = st.audit_receipts(ids) if ids else []
         consumed = st.audit_consumed(ids) if ids else set()
         for key, run in sorted(pending.items()):
-            values = _MARKER.findall(run.get("display_title") or "")
+            values = markers(run)
             value = values[0] if len(values) == 1 and _UUID4.fullmatch(values[0]) else None
             mode = production_run(run) if mode_marked else True
             if mode is False:

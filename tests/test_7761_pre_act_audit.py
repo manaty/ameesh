@@ -102,7 +102,7 @@ class DurableAuditTest(PgTestCase):
                         " VALUES (%s,'build',%s::jsonb)", (item, json.dumps(receipt())))
 
     def messages(self):
-        return self.db.query("SELECT body FROM agent_mailbox WHERE recipient='auditor'")
+        return self.db.query("SELECT body FROM agent_mailbox WHERE recipient='auditor' ORDER BY id")
 
     def test_restart_reuse_fast_retries_and_transactional_alert(self):
         from ameesh import mail, pre_act_audit as audit
@@ -140,6 +140,8 @@ class DurableAuditTest(PgTestCase):
         self.assertIn("missing-or-invalid-id", self.messages()[0]["body"])
         self.assertIn("missing-or-invalid-mode", self.messages()[1]["body"])
         self.assertEqual(self.st.audit_consumed([ID]), set())
+        audit.deliver(self.db, self.sub, "deploy.yml", [run(5, 42)], 300, "auditor")
+        self.assertIn("missing-or-invalid-id", self.messages()[-1]["body"])
 
     def test_tick_uses_canon_inventory_and_activation_not_history(self):
         from ameesh import pre_act_audit as audit, mechanics, canon
