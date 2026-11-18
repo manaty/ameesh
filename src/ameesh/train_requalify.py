@@ -123,7 +123,8 @@ def _validate(spec, path, raw, project, gate):
         raise RequalifyError(str(exc)) from exc
 
 
-def _plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=()):
+def _plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=(),
+          expected_pin=None, expected_gate=None):
     try:
         spec = train_assembly.project_of(cfg, project)
     except train_assembly.ConfigurationError as exc:
@@ -137,6 +138,21 @@ def _plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=()):
         raise RequalifyError("no gate canon commit to qualify: %s"
                              % (why or "unknown"))
     pin = str(spec.canon_commit or "").strip().lower()
+    # #7751: a persisted request names the reading it was reviewed against.
+    # An application never follows a newer pin or gate on the strength of
+    # opinions recorded for another reading: it refuses and names both values.
+    if expected_pin is not None:
+        expected_pin = str(expected_pin).strip().lower()
+        if pin != expected_pin:
+            raise RequalifyError(
+                "stale requalification request: pin moved from %s to %s"
+                % (expected_pin[:12] or "?", pin[:12] or "?"))
+    if expected_gate is not None:
+        expected_gate = str(expected_gate).strip().lower()
+        if gate != expected_gate:
+            raise RequalifyError(
+                "stale requalification request: gate moved from %s to %s"
+                % (expected_gate[:12] or "?", gate[:12] or "?"))
     files = _paths(cfg, project)
     if not files:
         raise RequalifyError(
@@ -192,10 +208,12 @@ def _plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=()):
     return result, files
 
 
-def plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=()):
+def plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=(),
+         expected_pin=None, expected_gate=None):
     """Compute the requalification; no write, no trace."""
     result, _files = _plan(cfg, db, project, gate_reader=gate_reader,
-                           reviewed=reviewed, reviews=reviews)
+                           reviewed=reviewed, reviews=reviews,
+                           expected_pin=expected_pin, expected_gate=expected_gate)
     return result
 
 
@@ -229,21 +247,30 @@ def _write(path, raw):
 
 
 def apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None,
-          reviewed=False, reviews=()):
+          reviewed=False, reviews=(), request=None, expected_pin=None,
+          expected_gate=None):
     """Serialize manual and automatic writers of this host's train pins."""
     directory = os.path.dirname(os.path.abspath(cfg.config_base or cfg.config_path))
     with open(os.path.join(directory, ".train-canon.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         extra = {"reviewed": True, "reviews": reviews} if reviewed else {}
+        if request is not None:
+            extra["request"] = request
+        if expected_pin is not None:
+            extra["expected_pin"] = expected_pin
+        if expected_gate is not None:
+            extra["expected_gate"] = expected_gate
         return _apply(cfg, db, project, lot=lot, actor=actor,
                       gate_reader=gate_reader, record=record, **extra)
 
 
 def _apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None,
-           reviewed=False, reviews=()):
+           reviewed=False, reviews=(), request=None, expected_pin=None,
+           expected_gate=None):
     """Requalify the pin, write every declaring file, trace on the lot."""
     result, files = _plan(cfg, db, project, gate_reader=gate_reader,
-                          reviewed=reviewed, reviews=reviews)
+                          reviewed=reviewed, reviews=reviews,
+                          expected_pin=expected_pin, expected_gate=expected_gate)
     if result["state"] == "aligned":
         return result
     if lot is not None and work.get(db, int(lot)) is None:
@@ -273,10 +300,15 @@ def _apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None,
                ", ".join(result["changed"]) or "none", ", ".join(written)))
     if reviewed:
         text += "; reviews: " + json.dumps(result["reviews"], ensure_ascii=False)
+    if request is not None:
+        # #7751: the move runs on the holder's host for a request recorded
+        # elsewhere; the trace names the request and where it was applied.
+        text += "; request: %s; applied on %s" % (request, cfg.host)
     try:
         if record is None:
             # #6034: the reload follows only a journaled move, mechanical too.
-            with journal(cfg, result, actor=actor, lot=int(lot)):
+            with journal(cfg, result, actor=actor, lot=int(lot),
+                         request=request):
                 work.note(db, int(lot), text, actor=actor)
         else:
             record(result)
@@ -296,11 +328,15 @@ def _apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None,
 
 
 def execute(cfg, db, project, *, lot, actor, dry_run=False, gate_reader=None,
-            reviewed=False, reviews=()):
+            reviewed=False, reviews=(), expected_pin=None, expected_gate=None):
     """The command body: plan or apply, with one named result."""
     if reviews and not reviewed:
         raise RequalifyError("--review requires --reviewed")
     extra = {"reviewed": True, "reviews": reviews} if reviewed else {}
+    if expected_pin is not None:
+        extra["expected_pin"] = expected_pin
+    if expected_gate is not None:
+        extra["expected_gate"] = expected_gate
     if dry_run:
         result = plan(cfg, db, project, gate_reader=gate_reader, **extra)
         result["dry_run"] = True
@@ -309,7 +345,7 @@ def execute(cfg, db, project, *, lot, actor, dry_run=False, gate_reader=None,
 
 
 @contextmanager
-def journal(cfg, result, *, actor, lot=None):
+def journal(cfg, result, *, actor, lot=None, request=None):
     """Durable host trace; undo the append if a companion lot trace fails.
 
     The caller holds .train-canon.lock for the whole pin and journal move.
@@ -319,6 +355,8 @@ def journal(cfg, result, *, actor, lot=None):
     row = dict(result, host=cfg.host, actor=actor, lot=lot, event="canon-requalified",
                at=datetime.now(timezone.utc).isoformat(),
                guard=list(train_assembly.REQUALIFY_GUARD))
+    if request is not None:
+        row["request"] = request
     with open(path, "a+",
               encoding="utf-8") as stream:
         stream.seek(0, os.SEEK_END)
