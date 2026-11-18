@@ -66,6 +66,27 @@ class SnapshotContract(unittest.TestCase):
         self.git("update-ref", "refs/remotes/origin/main", value)
         return value
 
+    def sibling(self, name, *, git=True, ref=True):
+        """A directory next to the root (the workspace is ``self.base``)."""
+        path = self.base / name
+        path.mkdir()
+        if not git:
+            return path
+        commands = [["init", "-q", "-b", "main"],
+                    ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                     "commit", "--allow-empty", "-qm", "sibling"]]
+        for args in commands:
+            subprocess.run(["git", "-C", str(path), *args], env=self.env,
+                           capture_output=True, check=True, timeout=15)
+        if ref:
+            commit = subprocess.check_output(
+                ["git", "-C", str(path), "rev-parse", "HEAD"],
+                env=self.env, text=True).strip()
+            subprocess.run(["git", "-C", str(path), "update-ref",
+                            "refs/remotes/origin/main", commit], env=self.env,
+                           check=True, timeout=15)
+        return path
+
     def cli(self, *args, expected=0, env=None):
         result = subprocess.run(
             [sys.executable, "-m", "ameesh", "canon", "snapshot", "--json",
@@ -274,6 +295,66 @@ class SnapshotContract(unittest.TestCase):
         self.assertEqual(doc["snapshot"]["omitted_members"], ["other-project"])
         self.assertEqual(len(doc["snapshot"]["sources"]), 1)
         self.assertEqual([m["title"] for m in doc["snapshot"]["members"]], ["alice"])
+
+    def test_single_source_lists_present_but_unloadable_siblings(self):
+        # One sibling per reason a present member can stay unloaded: a Git
+        # repository without the selected ref, a plain directory, a path
+        # outside the workspace and an unreadable declared scope.
+        self.sibling("sib-noref", ref=False)
+        self.sibling("sib-nongit", git=False)
+        self.sibling("sib-scope")
+        self.write("federation.yaml",
+                   "id: public-test\nroot: home\nmembers:\n"
+                   "  - id: home\n    ref: main\n    bundle: .\n"
+                   "    workspace_path: home\n"
+                   "  - id: sib-noref\n    ref: main\n    bundle: .\n"
+                   "    workspace_path: sib-noref\n"
+                   "  - id: sib-nongit\n    ref: main\n    bundle: .\n"
+                   "    workspace_path: sib-nongit\n"
+                   "  - id: sib-escape\n    ref: main\n    bundle: .\n"
+                   "    workspace_path: ../outside\n"
+                   "  - id: sib-scope\n    ref: main\n    bundle: .\n"
+                   "    workspace_path: sib-scope\n"
+                   "extensions:\n  ameesh:\n    scope: canon\n"
+                   "    members:\n      sib-scope:\n        scope: [{bad}]\n")
+        self.commit = self.commit_all()
+        # The tolerance belongs to the explicit root-only request: the same
+        # canon still refuses every unloadable member when read as a federation.
+        refused = self.codes(self.cli(expected=1))
+        self.assertTrue({"canon-ref-missing", "canon-untrusted-refused",
+                         "member-path-escape", "ameesh-scope-invalid"} <= refused,
+                        refused)
+        doc = self.cli("--single-source", "--expect-scope", "canon")
+        self.assertTrue(doc["ok"], doc)
+        payload = doc["snapshot"]
+        self.assertEqual(payload["omitted_members"],
+                         ["sib-escape", "sib-nongit", "sib-noref", "sib-scope"])
+        self.assertEqual([s["member"] for s in payload["sources"]], ["home"])
+        self.assertEqual(payload["sources"][0]["commit"], self.commit)
+        self.assertEqual([m["title"] for m in payload["members"]], ["alice"])
+        # No diagnostic about content the document does not export.
+        self.assertEqual([f for f in doc["findings"] if f["member"] != "home"], [])
+
+    def test_single_source_refuses_a_loaded_sibling(self):
+        self.sibling("sib-loaded")
+        self.write("federation.yaml",
+                   "id: public-test\nroot: home\nmembers:\n"
+                   "  - id: home\n    ref: main\n    bundle: .\n"
+                   "    workspace_path: home\n"
+                   "  - id: sib-loaded\n    ref: main\n    bundle: .\n"
+                   "    workspace_path: sib-loaded\n"
+                   "extensions:\n  ameesh:\n    scope: canon\n")
+        self.commit = self.commit_all()
+        self.assertIn("unexpected-source-count",
+                      self.codes(self.cli("--single-source", expected=1)))
+
+    def test_single_source_still_refuses_an_unreadable_root_scope(self):
+        self.write("federation.yaml", (self.repo / "federation.yaml").read_text()
+                   .replace("scope: canon", "scope: ../outside"))
+        self.commit = self.commit_all()
+        refused = self.codes(self.cli("--single-source", expected=1))
+        self.assertTrue({"ameesh-scope-invalid", "scope-unreadable"} <= refused,
+                        refused)
 
 
 if __name__ == "__main__":
