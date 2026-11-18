@@ -44,6 +44,14 @@ fait (ameesh : les classes sans base de ses modules de contrat de la porte).
 l'avertissement d'herméticité du gel ne montre que les tests que le lot
 change (`tests/test_*.py`), pas les constats déjà présents de la suite. Une
 variable absente (lancement manuel du script) fait avertir sur toute la suite.
+
+#7777 : les renommages du même diff, `(ancien, nouveau)` détectés par
+`git diff -M`, sont transmis dans [`RENAMES_ENV`] : la garde
+`scripts/garde-renommages-classe.py` refuse un déplacement dont le nouveau
+chemin est classé plus bas que l'ancien sans que le canon le nomme (le cas
+#7663 : le moteur de release Nexlink passé du cœur au module). Le gel transmet
+toujours la liste, vide comprise ; quand le diff ne se lit pas, il refuse au
+lieu de supposer qu'aucun fichier n'a bougé.
 """
 from __future__ import annotations
 
@@ -56,7 +64,8 @@ import tempfile
 import time
 
 from . import work
-from .canon import GitError, _git, git_range_paths, git_toplevel
+from .canon import (GitError, _git, git_range_paths, git_range_renames,
+                    git_toplevel)
 from .deadline import Deadline
 
 #: le script de contrôles du projet, chemin dépôt lu au commit gelé
@@ -83,6 +92,11 @@ GATE_ENV = "AMEESH_FREEZE_GATE"
 #: l'avertissement d'herméticité ne montre que les tests du lot. Absente,
 #: le script avertit sur la suite entière (lancement manuel).
 PATHS_ENV = "AMEESH_FREEZE_PATHS"
+#: #7777 : les renommages du diff gelé (`git diff -M`), paires
+#: `[ancien, nouveau]` en JSON, pour la garde de classe des fichiers déplacés.
+#: Le gel transmet toujours la liste, vide comprise ; d'autres lancements du
+#: script (composition d'un paquet) laissent la garde inactive.
+RENAMES_ENV = "AMEESH_FREEZE_RENAMES"
 #: rappel de l'échappatoire, à la fin de chaque refus
 BYPASS = ('fix the lot and freeze again; to freeze anyway: '
           '--no-static-checks "<reason>" (written in the milestone note)')
@@ -196,6 +210,26 @@ def changed_paths(cfg, item: dict, repo: str, commit: str) -> list[str] | None:
         return None
 
 
+def renamed_paths(cfg, item: dict, repo: str, commit: str) -> list[list[str]] | None:
+    """Les renommages du diff gelé, paires `[ancien, nouveau]`, triés.
+
+    Même diff que [`changed_paths`] (`git diff -M` depuis le merge-base de la
+    cible) : ce sont les déplacements que la classe de revue doit couvrir.
+    None quand la cible ou le diff ne se lisent pas — un doute que le gel
+    refuse, jamais une liste vide rassurante (#7777).
+    """
+    from . import lot_class
+    target = lot_class.default_base(cfg, item, repo)
+    if not target:
+        return None
+    try:
+        pairs = git_range_renames(repo, lot_class._landing_ref(repo, target),
+                                  commit)
+    except GitError:
+        return None
+    return [[old, new] for old, new in pairs]
+
+
 def gate_paths(cfg, item: dict, repo: str, commit: str, *,
                canons=None, paths: list[str] | None = None) -> list[str] | None:
     """Les chemins du diff gelé (merge-base avec la cible..`commit`) que la
@@ -218,13 +252,17 @@ def gate_paths(cfg, item: dict, repo: str, commit: str, *,
 
 def run(repo: str, commit: str, *, timeout: float = TIMEOUT,
         gate: list[str] | None = None,
-        paths: list[str] | None = None) -> dict:
+        paths: list[str] | None = None,
+        renames: list[list[str]] | None = None) -> dict:
     """Passe le script de `commit` sur son arbre construit.
 
     `gate` : les chemins de la porte de fusion touchés ([`gate_paths`]),
     transmis au script dans [`GATE_ENV`] ; None ne transmet rien (doute).
     `paths` : tous les chemins du diff gelé, transmis dans [`PATHS_ENV`] pour
     l'avertissement d'herméticité (#5427) ; None ne transmet rien.
+    `renames` : les renommages du diff gelé ([`renamed_paths`]), transmis dans
+    [`RENAMES_ENV`] pour la garde de classe des fichiers déplacés (#7777) ;
+    None ne transmet rien (garde inactive : lancement hors du gel).
     Rend `{"result": "none"}` sans script, `{"result": "green", "seconds",
     "output"}` s'il sort à 0 ; lève [`Refused`] sinon."""
     if not declared(repo, commit):
@@ -232,10 +270,13 @@ def run(repo: str, commit: str, *, timeout: float = TIMEOUT,
     env = dict(os.environ)
     env.pop(GATE_ENV, None)
     env.pop(PATHS_ENV, None)
+    env.pop(RENAMES_ENV, None)
     if gate is not None:
         env[GATE_ENV] = json.dumps(list(gate))
     if paths is not None:
         env[PATHS_ENV] = json.dumps(list(paths))
+    if renames is not None:
+        env[RENAMES_ENV] = json.dumps([list(pair) for pair in renames])
     from . import ci_parts
     with tempfile.TemporaryDirectory(prefix="ameesh-freeze-checks-") as tree:
         try:
@@ -315,7 +356,15 @@ def before_freeze(cfg, db, lot: int, sha: str, *, repo: str | None = None,
         raise Refused("checks-incomplete",
                       "freeze budget exhausted before the static checks of %s"
                       % commit[:12])
-    result = run(where, commit, gate=gate, timeout=timeout, paths=paths)
+    renames = renamed_paths(cfg, item, where, commit)
+    if renames is None:
+        # #7777 : sans la liste des déplacements, le gel ne peut pas prouver
+        # que la classe d'un chemin sensible a suivi son nouveau chemin.
+        raise Refused("checks-incomplete",
+                      "renames of the frozen diff %s..%s could not be read"
+                      % (str(item.get("branch_target") or "target"), commit[:12]))
+    result = run(where, commit, gate=gate, timeout=timeout, paths=paths,
+                 renames=renames)
     if result["result"] == "none":
         say("static checks: none declared at %s (%s)" % (commit[:12], SCRIPT))
     else:
