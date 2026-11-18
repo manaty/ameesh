@@ -948,10 +948,11 @@ def _bench_satellites(db) -> None:
     `_bench_upkeep` : un résidu frais d'une suite tuée empoisonne la classe
     suivante. Une vue `<schéma>_closed_extension` lisible par PUBLIC suffit à
     faire échouer `_contrat-superviseur.sql` et `_contrat-vm-probe.sql`, qui
-    auditent toute la base. `purge_satellites` ne retire que les annexes dont
-    la base de classe a disparu ou dont le propriétaire est prouvé mort ;
-    jamais un schéma sans preuve (#3735 B/P1). Même désactivation que
-    `_bench_upkeep`, et un ménage de banc ne juge jamais un test.
+    auditent toute la base. `purge_satellites` ne retire que les annexes qui
+    portent **leur propre** preuve de propriétaire, morte (`create_schema`) ;
+    jamais un schéma sans preuve, même si sa base a disparu (#3735 B/P1,
+    #43420). Même désactivation que `_bench_upkeep`, et un ménage de banc ne
+    juge jamais un test.
     """
     if os.environ.get("AMEESH_BENCH_UPKEEP", "1").lower() in ("0", "false", "no", "off"):
         return
@@ -1330,6 +1331,21 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
         configuration sur cette connexion (ex. `statement_timeout_ms`)."""
         return db_mod.connect(dataclasses.replace(
             self.cfg, schema=schema or self.schema, **overrides))
+
+    def create_schema(self, name: str) -> None:
+        """Crée un schéma annexe du test, avec sa preuve de propriété (#7756).
+
+        La création et le commentaire de propriétaire sont dans la **même**
+        transaction, sous `bench_mod.lock_annexes` : un kill ne peut pas
+        laisser une annexe sans preuve, et `purge_satellites` ne peut pas
+        s'intercaler entre la création et le marquage (#43420). Le test garde
+        la responsabilité de son schéma (`finally`, `addCleanup`) ;
+        `_drop_satellite_schemas` le retire en dernier recours.
+        """
+        with self.db.transaction() as tx:
+            bench_mod.lock_annexes(tx)
+            tx.execute("CREATE SCHEMA %s" % db_mod.quote_ident(name))
+            bench_mod.claim_owner(tx, name)
 
     def cli(self, *args: str, env: dict | None = None, stdin: str | None = None,
             timeout: float = 60.0) -> subprocess.CompletedProcess:

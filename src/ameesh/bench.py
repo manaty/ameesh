@@ -30,9 +30,11 @@ depuis le 17/10). Cette maintenance :
 * purge les **annexes** ``<schéma de classe>_<suffixe>`` d'une classe morte
   (#7756) : un test crée parfois un schéma à côté de celui de sa classe (une
   vue lisible par PUBLIC) ; `_drop_schema` ne connaît que le schéma de la
-  classe et le résidu fait échouer les contrats de rôle suivants. La preuve
-  est la même (base de classe disparue, ou propriétaire prouvé mort), sans
-  âge minimal : un résidu frais empoisonne la classe suivante ;
+  classe et le résidu fait échouer les contrats de rôle suivants. L'annexe
+  doit porter **sa propre** preuve de propriétaire (écrite par
+  `PgTestCase.create_schema` dans la transaction de création), morte, sans
+  âge minimal : un résidu frais empoisonne la classe suivante. Une annexe
+  sans preuve est gardée — une base disparue ne prouve rien (#43420) ;
 * purge les bases jetables laissées **invalides** (`datconnlimit = -2`) par un
   DROP DATABASE annulé pendant son checkpoint (#4822) : sans cela elles ne
   peuvent plus être ouvertes et l'autovacuum du banc s'arrête (#4680) ;
@@ -75,6 +77,13 @@ SCHEMA_RE = re.compile(r"^t_[a-z0-9_]{1,58}$")
 #: Un test peut créer des schémas **annexes** sous ce préfixe
 #: (`<schéma de classe>_<suffixe>`), hors du schéma que `_drop_schema` connaît.
 CLASS_SCHEMA_RE = re.compile(r"^t_[a-z0-9_]{1,18}_[0-9a-f]{8}$")
+
+#: #7756/#43420 : verrou consultatif de la preuve de propriété d'une annexe.
+#: `PgTestCase.create_schema` le prend dans la transaction qui crée le schéma
+#: **et** écrit son commentaire de propriétaire ; `purge_satellites` le reprend
+#: dans la transaction du DROP. Une création concurrente ne peut donc pas se
+#: glisser entre la relecture de la preuve et le DROP : elle attend le verrou.
+ANNEX_LOCK = "ameesh-test-schema-annex"
 
 #: #4822 : bases jetables créées par la suite et ses scripts (`scripts/test.sh`,
 #: `tests/test_l56_role_executor.py`, la restauration de sauvegarde). Seuls ces
@@ -412,6 +421,19 @@ def claim_owner(db, schema: str, *, pid: int | None = None,
     db.execute('COMMENT ON SCHEMA "%s" IS %s' % (schema, literal))
 
 
+def lock_annexes(db) -> None:
+    """Sérialise création et purge des annexes, dans la transaction courante.
+
+    Le verrou est transactionnel : ``create_schema`` le prend pour écrire
+    ``CREATE SCHEMA`` et le commentaire de propriétaire ensemble, et
+    `purge_satellites` le reprend pour relire la preuve puis supprimer. Sans
+    lui, une création concurrente pourrait se glisser entre la lecture et le
+    DROP (#43420).
+    """
+    db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+               (ANNEX_LOCK,))
+
+
 def _owners(db) -> dict[str, str]:
     """Commentaire de chaque schéma t_* (vide si aucun)."""
     try:
@@ -604,20 +626,23 @@ def _satellite_bases(name: str) -> list[str]:
 def satellite_schemas(db, *,
                       only: frozenset[str] | set[str] | None = None,
                       ) -> list[str]:
-    """Annexes de classe de test dont le propriétaire n'est plus prouvé vivant.
+    """Annexes de classe de test dont la **propre** preuve est morte.
 
     #7756 : `PgTestCase` ne supprime que son schéma ``t_<classe>_<hex>`` ; un
     test qui crée ``<ce schéma>_<suffixe>`` (une vue lisible par PUBLIC, par
     exemple) et meurt avant son ``finally`` laisse un résidu qui casse les
-    contrats de rôle suivants. Une annexe est prouvée orpheline quand :
+    contrats de rôle suivants. Une annexe n'est retenue que si **elle-même**
+    porte une preuve de propriété (``claim_owner``), et que cette preuve est
+    **morte** : `create_schema` écrit la preuve dans la transaction qui crée
+    le schéma, donc elle est toujours présente, sauf pour un schéma créé hors
+    de ce chemin.
 
-    * elle porte elle-même une preuve de propriétaire **morte** ; ou
-    * sa base n'existe plus (la classe est finie) ; ou
-    * toutes ses bases existantes portent une preuve **morte**.
-
-    Une preuve vivante, absente ou illisible garde le schéma, comme pour
-    `orphan_schemas` (#3735 B/P1 : seule la mort prouvée autorise un DROP).
-    Un nom qui n'a aucune base de classe n'est pas une annexe : il est gardé.
+    Une annexe sans preuve n'est **jamais** sélectionnée, même si sa base de
+    classe n'existe plus : l'absence d'une base déduite du nom ne prouve ni
+    la propriété ni la mort (#43420). Un schéma indépendant
+    ``t_foo_<8 hex>_import`` peut vivre sans base et sans marqueur ; il est
+    gardé, comme tout nom hors du motif d'annexe (#3735 B/P1 : seule la mort
+    prouvée autorise un DROP).
     ``only`` borne la passe à ces noms (témoins : le banc est partagé).
     """
     schemas = _schema_comments(db)
@@ -627,18 +652,9 @@ def satellite_schemas(db, *,
             continue
         if only is not None and name not in only:
             continue
-        bases = _satellite_bases(name)
-        if not bases:
+        if not _satellite_bases(name):
             continue
-        if comment is not None:
-            if owner_state(comment) == OWNER_DEAD:
-                out.append(name)
-            continue
-        present = [base for base in bases if base in schemas]
-        if not present:
-            out.append(name)  # la classe est finie : le résidu n'a plus de base
-            continue
-        if {owner_state(schemas[base]) for base in present} == {OWNER_DEAD}:
+        if comment is not None and owner_state(comment) == OWNER_DEAD:
             out.append(name)
     out.sort()
     return out
@@ -748,11 +764,17 @@ def purge_satellites(db, *, only: frozenset[str] | set[str] | None = None,
                      budget_s: float = PURGE_BUDGET_S) -> Purge:
     """Purge les annexes orphelines des schémas de classe de test (#7756).
 
-    Mêmes gardes que `purge_orphans` : banc local seulement (la preuve de
-    propriété est un PID de l'hôte), aucune session ne nomme le schéma, et un
-    verrou non obtenu le garde (``lock_timeout``). Pas d'âge minimal : la
-    preuve est la base de classe disparue ou son propriétaire mort, pas
-    l'ancienneté — un résidu frais empoisonne la classe suivante.
+    Seule une annexe portant **sa propre** preuve de propriétaire morte est
+    candidate (`satellite_schemas`) : une base disparue ou un nom d'annexe ne
+    prouvent rien (#43420). Pas d'âge minimal : la preuve est la mort du
+    propriétaire, pas l'ancienneté — un résidu frais empoisonne la classe
+    suivante.
+
+    Mêmes gardes que `purge_orphans` : banc local seulement (la preuve est un
+    PID de l'hôte), aucune session ne nomme le schéma, verrou court. La
+    preuve est **relue** dans la transaction du DROP, sous `lock_annexes` :
+    une création concurrente, qui prend le même verrou, ne peut pas se glisser
+    entre la sélection et la suppression.
     """
     if not _local_dsn(getattr(getattr(db, "cfg", None), "dsn", "") or ""):
         return Purge(scanned=0, dropped=(), kept=(),
@@ -793,8 +815,22 @@ def purge_satellites(db, *, only: frozenset[str] | set[str] | None = None,
             with db.transaction() as tx:
                 tx.execute("SET LOCAL lock_timeout = '%dms'"
                            % int(LOCK_TIMEOUT_S * 1000))
+                lock_annexes(tx)
+                # Relecture sous le verrou : la preuve peut avoir changé
+                # depuis la sélection (schéma recréé et marqué vivant).
+                fresh = _schema_comments(tx)
+                if name not in fresh:
+                    kept.append((name, "schema disappeared"))
+                    continue
+                comment = fresh.get(name)
+                if comment is None or owner_state(comment) != OWNER_DEAD:
+                    kept.append((name, "owner proof changed"))
+                    continue
+                if name in _in_use(tx):
+                    kept.append((name, "session holds the schema"))
+                    continue
                 tx.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % name)
-        except db_mod.DbError as exc:
+        except (db_mod.DbError, BenchError) as exc:
             kept.append((name, _short_reason(exc)))
             continue
         dropped.append(name)

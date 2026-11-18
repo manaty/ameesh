@@ -116,7 +116,12 @@ class VmProbeRoleTest(PgTestCase):
         ]
         for kind, definition, grant, name, marker, condition in cases:
             with self.subTest(kind=kind, grant=grant):
-                self.db.execute('CREATE ' + kind + ' ' + definition)
+                if kind == 'SCHEMA':
+                    # #7756 : une annexe porte sa preuve de propriété pour
+                    # qu'un kill ne laisse pas un schéma sans détenteur.
+                    self.create_schema(name)
+                else:
+                    self.db.execute('CREATE ' + kind + ' ' + definition)
                 try:
                     self.db.execute('GRANT ' + grant + ' ON ' + kind + ' ' + name
                                     + ' TO "' + self.role + '"')
@@ -191,7 +196,7 @@ class VmProbeRoleTest(PgTestCase):
 
     def test_diagnostics_usage_refused_even_without_table_rights(self):
         ns = self.schema + '_diagnostics'
-        self.db.execute('CREATE SCHEMA "' + ns + '"')
+        self.create_schema(ns)
         try:
             self.db.execute('GRANT USAGE ON SCHEMA "' + ns + '" TO PUBLIC')
             self.assertNotEqual(self.script('_contrat-vm-probe.sql').returncode, 0)
@@ -201,7 +206,7 @@ class VmProbeRoleTest(PgTestCase):
 
     def test_public_extension_view_is_inert_only_without_schema_usage(self):
         ns = self.schema + '_closed_extension'
-        self.db.execute('CREATE SCHEMA "' + ns + '"')
+        self.create_schema(ns)
         try:
             self.db.execute('CREATE VIEW "' + ns + '".extension_stats AS SELECT 1 AS calls')
             self.db.execute('GRANT SELECT ON "' + ns + '".extension_stats TO PUBLIC')
