@@ -835,6 +835,40 @@ def _advance_of(candidate, pace: Mapping) -> float:
     return general if general is not None else 0.0
 
 
+def _fixer_provenance_text(rows: Iterable) -> str:
+    """#4679/#7252 : ce que le gel dit d'un correcteur écarté sur preuve.
+
+    Un reçu de correction introuvable (rebase/amend avant push) est un doute :
+    le nom et le SHA local sont dits. Un correctif retiré retrouvé par la
+    citation de l'auteur dit le SHA et la citation. Chaîne vide sans preuve.
+    """
+    doubts: dict = {}
+    rewrites: dict = {}
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        if row.get("unresolved"):
+            doubts[name] = str(row.get("unresolved") or "").strip()
+        if row.get("rewritten"):
+            rewrites[name] = (str(row.get("rewritten") or "").strip(),
+                              str(row.get("cited") or "").strip())
+    text = ""
+    if doubts:
+        text += (" (unresolved correction: %s — commit not recoverable,"
+                 " excluded by doubt)" % ", ".join(
+                     "%s %s" % (name, sha[:12])
+                     for name, sha in sorted(doubts.items())))
+    if rewrites:
+        text += (" (rewritten correction: %s)" % ", ".join(
+            "%s %s%s" % (name, sha[:12],
+                         " cited by %s" % cited[:12] if cited else "")
+            for name, (sha, cited) in sorted(rewrites.items())))
+    return text
+
+
 def _by_delta_select(*, required: int, authors, candidates, families, already,
                      fixers, hypothetical=(), deltas, global_families=(),
                      advances=None, automatic=(), preferred=()):
@@ -869,6 +903,10 @@ def _by_delta_select(*, required: int, authors, candidates, families, already,
     simulated_fixers = list(hypothetical or ())
     fixer_names = names_of(registered_fixers)
     hypothetical_names = names_of(simulated_fixers) - fixer_names
+    # #4679/#7252 : le doute ou la réécriture d'un correcteur est dit au gel,
+    # quel que soit le chemin de sélection (par delta ou historique).
+    fixer_provenance = _fixer_provenance_text(
+        registered_fixers + simulated_fixers)
     forbidden_names = names | fixer_names | hypothetical_names
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
            "manual": [], "why": "no review required",
@@ -955,6 +993,7 @@ def _by_delta_select(*, required: int, authors, candidates, families, already,
         if fixer_names or hypothetical_names:
             why += (" (corrector(s) excluded: %s)"
                     % (", ".join(sorted(fixer_names | hypothetical_names))))
+        why += fixer_provenance
         if pace and chosen:
             reading = ["%s %+.0f pt" % (c.family.strip().lower(),
                                         _advance_of(c, pace) * 100)
@@ -970,20 +1009,25 @@ def _by_delta_select(*, required: int, authors, candidates, families, already,
     # un delta peut n'avoir qu'un avis alors que d'autres familles restent
     # libres pour les autres deltas.
     gaps = review_deltas.uncovered(deltas, families_now + available, required)
+    why = ("%d independent review(s) missing by author delta "
+           "(eligible families: %s; forbidden author families: %s; "
+           "uncovered deltas: %s)"
+           % (sum(row["missing"] for row in gaps) or required,
+              ", ".join(sorted(set(available) - seat_families)) or "none",
+              ", ".join(sorted(common)) or "none",
+              "; ".join("%d (author families: %s; %d missing)"
+                        % (row["index"] + 1,
+                           ", ".join(row["families"]) or "none",
+                           row["missing"])
+                        for row in gaps) or "none"))
+    if fixer_names or hypothetical_names:
+        why += (" (corrector(s) excluded: %s)"
+                % (", ".join(sorted(fixer_names | hypothetical_names))))
+    why += fixer_provenance
     out.update({
         "state": WAITING,
         "missing": max((row["missing"] for row in gaps), default=required),
-        "why": ("%d independent review(s) missing by author delta "
-                "(eligible families: %s; forbidden author families: %s; "
-                "uncovered deltas: %s)"
-                % (sum(row["missing"] for row in gaps) or required,
-                   ", ".join(sorted(set(available) - seat_families)) or "none",
-                   ", ".join(sorted(common)) or "none",
-                   "; ".join("%d (author families: %s; %d missing)"
-                             % (row["index"] + 1,
-                                ", ".join(row["families"]) or "none",
-                                row["missing"])
-                             for row in gaps) or "none")),
+        "why": why,
     })
     return out
 
@@ -1082,38 +1126,11 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     names, forbidden = families_of(authors)
     fixer_names = names_of(registered_fixers)
     hypothetical_names = names_of(simulated_fixers) - fixer_names
-    #: #4679 : un correcteur dont le commit local (avant rebase/amend) est
-    #: introuvable reste exclu par son nom ; le gel dit le doute et le SHA,
-    #: au lieu de le redésigner en silence.
-    fixer_doubts: dict[str, str] = {}
-    for row in all_fixers:
-        if isinstance(row, Mapping) and row.get("unresolved"):
-            name = str(row.get("name") or "").strip()
-            if name:
-                fixer_doubts[name] = str(row.get("unresolved") or "").strip()
-    #: #7252 : un correctif retiré retrouvé par la citation de l'auteur. Le
-    #: nom suffit à exclure ; le SHA et la citation disent la preuve au gel.
-    fixer_rewrites: dict[str, tuple[str, str]] = {}
-    for row in all_fixers:
-        if not isinstance(row, Mapping) or not row.get("rewritten"):
-            continue
-        name = str(row.get("name") or "").strip()
-        if name:
-            fixer_rewrites[name] = (str(row.get("rewritten") or "").strip(),
-                                    str(row.get("cited") or "").strip())
+    fixer_provenance = _fixer_provenance_text(all_fixers)
 
     def excluded_fixers_text() -> str:
         text = "%s registered" % (", ".join(sorted(fixer_names)) or "none")
-        if fixer_doubts:
-            text += (" (unresolved correction: %s — commit not recoverable,"
-                     " excluded by doubt)" % ", ".join(
-                         "%s %s" % (name, sha[:12])
-                         for name, sha in sorted(fixer_doubts.items())))
-        if fixer_rewrites:
-            text += (" (rewritten correction: %s)" % ", ".join(
-                "%s %s%s" % (name, sha[:12],
-                             " cited by %s" % cited[:12] if cited else "")
-                for name, (sha, cited) in sorted(fixer_rewrites.items())))
+        text += fixer_provenance
         if hypothetical_names:
             text += ("; hypothetical corrector: %s"
                      % ", ".join(sorted(hypothetical_names)))
