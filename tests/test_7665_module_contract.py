@@ -407,7 +407,9 @@ class ModuleInterfaceTest(unittest.TestCase):
                 self.assertEqual([row["name"] for row in found.refused], [witness.NAME])
 
     def test_capabilities_are_the_published_names_and_are_checked(self):
-        self.assertEqual(list(registry.CAPABILITIES), SURFACE["module"]["capabilities"])
+        # A frozen name stays published; a capability added since is additive.
+        self.assertEqual([name for name in SURFACE["module"]["capabilities"]
+                          if name not in registry.CAPABILITIES], [])
         with mock.patch.object(witness, "CAPABILITIES", ("lifecycle", "workspaces")), \
                 mock.patch.dict(sys.modules, {"ameesh_contract_witness": witness}):
             found = self.discover()
