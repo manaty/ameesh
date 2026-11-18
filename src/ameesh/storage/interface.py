@@ -1863,6 +1863,26 @@ class Mailbox(Domain):
         """Annule la réservation `token` (rien n'a été montré)."""
 
     @abc.abstractmethod
+    def requeue_interrupted(self, recipient: str, owner: str, epoch: int,
+                            token: str, turn_id: str | None,
+                            ids: Sequence[int]) -> dict:
+        """#7673 (contrat 1.4, E2c) : remet en attente les demandes d'un tour
+        interrompu par le cœur.
+
+        Garde de bail : la ligne du registre est verrouillée d'abord ; rien
+        n'est écrit si un autre détenteur a pris le bail depuis l'epoch
+        capturé (bail toujours `(owner, epoch)`, même échu, ou rendu par lui
+        sans reprise : propriétaire nul et epoch suivant). Ensuite, dans une
+        AUTRE instruction (instantané pris après le verrou), seules les
+        demandes (`kind = 'request'`) de `ids` dont la consigne porte encore
+        exactement `owner`/`epoch`/`token` (et `turn_id` s'il est donné), non
+        retirées et sans réponse corrélée (`in_reply_to`), redeviennent non
+        lues : remise effacée, consigne retirée, `deja_consigne` posé. Les
+        autres natures, `pending_prompt` et le marqueur comptable ne sont
+        jamais touchés. Rend `{"guard": "held"|"released"|"refused"|"missing",
+        "requeued": [...], "replied": [...]}`."""
+
+    @abc.abstractmethod
     def unread_counts(self) -> dict[str, int]:
         """Nombre de messages non remis par destinataire."""
 

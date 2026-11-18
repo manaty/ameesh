@@ -608,6 +608,73 @@ class Mailbox(interface.Mailbox):
         )
         return len(rows)
 
+    def requeue_interrupted(self, recipient, owner, epoch, token, turn_id,
+                            ids) -> dict:
+        """#7673 (E2c) : voir `interface.Mailbox.requeue_interrupted`.
+
+        Deux instructions dans une transaction, jamais une seule : la réponse
+        corrélée (`public.mail.reply`) verrouille la même ligne du registre
+        avant d'écrire, donc une réponse concurrente est soit validée avant
+        notre verrou — et l'instantané de la SECONDE instruction, pris après
+        lui, la voit —, soit attend notre commit et trouve une demande dont la
+        consigne a disparu (refus « pas la consigne du tour courant »). Une
+        seule instruction garderait l'instantané d'avant l'attente et
+        remettrait en attente une demande déjà répondue.
+        """
+        clean = sorted({int(i) for i in ids})
+        result = {"guard": "missing", "requeued": [], "replied": []}
+        if not clean:
+            return result
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT lease_owner, lease_epoch FROM agent_registry"
+                " WHERE name = %s FOR UPDATE", (recipient,))
+            if not rows:
+                return result
+            held, at = rows[0]["lease_owner"], rows[0]["lease_epoch"]
+            if held == owner and int(at) == int(epoch):
+                result["guard"] = "held"
+            elif held is None and int(at) == int(epoch) + 1:
+                result["guard"] = "released"
+            else:
+                result["guard"] = "refused"
+                return result
+            capture = """
+                m.recipient = %s AND m.id = ANY(%s::bigint[])
+                AND m.kind = 'request'
+                AND m.meta->'consigne'->>'runner' = %s
+                AND m.meta->'consigne'->>'epoch' = %s
+                AND m.meta->'consigne'->>'jeton' = %s
+                AND (%s::text IS NULL OR m.meta->'consigne'->>'turn' = %s::text)
+                AND NOT coalesce((m.meta ? 'retire'), false)
+            """
+            params = (recipient, clean, owner, str(int(epoch)), token,
+                      turn_id, turn_id)
+            requeued = tx.query(
+                """
+                UPDATE agent_mailbox AS m
+                   SET delivered_at = NULL, status = 'pending',
+                       meta = (m.meta - 'consigne') || jsonb_build_object(
+                           'deja_consigne', true,
+                           'remise_interrompue', jsonb_build_object(
+                               'runner', %%s::text, 'epoch', %%s::bigint,
+                               'turn', %%s::text,
+                               'ts', extract(epoch from clock_timestamp())::float8))
+                 WHERE %s
+                   AND NOT EXISTS (SELECT 1 FROM agent_mailbox r
+                                    WHERE r.in_reply_to = m.id)
+                RETURNING m.id
+                """ % capture,
+                (owner, int(epoch), turn_id) + params)
+            replied = tx.query(
+                "SELECT m.id FROM agent_mailbox m WHERE " + capture
+                + " AND EXISTS (SELECT 1 FROM agent_mailbox r"
+                  " WHERE r.in_reply_to = m.id)",
+                params)
+        result["requeued"] = sorted(int(row["id"]) for row in requeued)
+        result["replied"] = sorted(int(row["id"]) for row in replied)
+        return result
+
     def unread_counts(self) -> dict[str, int]:
         rows = self.db.query(
             """

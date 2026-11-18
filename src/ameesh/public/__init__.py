@@ -11,12 +11,14 @@ with #7706, reserves the core's sender identities and confines module data to
 the imposed ``payload["module"]`` namespace. Contract 1.3 adds its lease-fenced
 pending requests and correlated replies (tranche E2b, #7672); it is additive
 to 1.2, and the mail surface stays source-compatible for a caller that already
-used that namespace.
+used that namespace. Contract 1.4 adds no name: the core itself puts back in
+the queue the requests of a turn it interrupted, under the captured lease
+(tranche E2c, #7673).
 """
 from __future__ import annotations
 
 #: revision of the written contract served by this package
-CONTRACT_VERSION = "1.3"
+CONTRACT_VERSION = "1.4"
 
 from . import mail  # noqa: E402  (the version is defined before the surface)
 

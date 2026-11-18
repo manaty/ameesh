@@ -8305,6 +8305,10 @@ class AgentWorker(threading.Thread):
             # réservation repartir en livraison (au moins une fois).
             self._solde_humains(spec)
         elif not self._courrier_lance or not result:
+            if self._courrier_lance and not spec.get("human"):
+                # #7673 (E2c) : lancé puis coupé par le cœur — ses demandes,
+                # déjà soldées au lancement, repartent en attente.
+                self._requeue_interrupted(spec, jeton, ids)
             # Pas lancé, ou lancé puis mort/échec avant la fin : rien n'est
             # tenu pour servi ; la réservation est libérée et sera reprise.
             try:
@@ -8314,6 +8318,67 @@ class AgentWorker(threading.Thread):
                 # re-livré, signalé (aucune perte).
                 log("[%s] could not cancel the reservation (%s)"
                     % (self.name, exc))
+
+    def _core_interruption(self) -> str | None:
+        """#7673 : la cause d'un tour coupé par le cœur, ou None.
+
+        Arrêt ou drainage de l'exécuteur, retrait d'hôte (hors point sûr),
+        redémarrage, préemption, bail perdu. Un échec du harnais n'en est pas
+        une : sa demande n'est pas rejouée (elle bouclerait)."""
+        def raised(owner, name: str) -> bool:
+            event = getattr(owner, name, None)
+            return event is not None and event.is_set()
+
+        runner = getattr(self, "runner", None)
+        if raised(runner, "stop") or raised(runner, "draining") or raised(self, "stopping"):
+            return "runner shutdown"
+        host_yield = getattr(self, "host_yield", None)
+        if host_yield is not None and host_yield != self.HOST_SAFE_POINT:
+            return "host withdrawal (%s)" % host_yield
+        if raised(self, "restarting"):
+            return "restart"
+        if raised(self, "preempting"):
+            return "preemption"
+        if raised(self, "lease_lost"):
+            return "lease lost"
+        return None
+
+    def _requeue_interrupted(self, spec: dict, jeton: str, ids: list[int]) -> None:
+        """#7673 (E2c) : remet en attente les demandes d'un tour coupé par le
+        cœur, sous la garde du bail capturé (voir `mail.requeue_interrupted`).
+
+        Les demandes déjà répondues restent répondues ; les autres natures et
+        la consigne en attente (`pending_prompt`) ne sont pas touchées. Un
+        exécuteur médié n'a pas cette écriture : son comportement est inchangé.
+        """
+        cause = self._core_interruption()
+        if cause is None or not ids:
+            return
+        if getattr(self.runner, "mediated", False):
+            return
+        try:
+            out = mail.requeue_interrupted(
+                self.db, self.name, self.runner.runner_id, self.epoch, jeton,
+                spec.get("turn_id"), ids)
+        except db_mod.DbError as exc:
+            log("[%s] interrupted requests not put back in the queue (%s)"
+                % (self.name, exc))
+            return
+        requeued, replied = out.get("requeued") or [], out.get("replied") or []
+        if out.get("guard") == "refused":
+            log("[%s] interrupted requests not put back in the queue: the lease "
+                "changed hands since epoch %s" % (self.name, self.epoch))
+        if not requeued and not replied:
+            return
+        log("[%s] turn interrupted (%s): request(s) %s back in the queue%s"
+            % (self.name, cause, ", ".join(map(str, requeued)) or "none",
+               "; already answered: %s" % ", ".join(map(str, replied)) if replied else ""))
+        self._fil_note(
+            "Turn interrupted (%s): %d request(s) put back in the queue, to be "
+            "delivered again and flagged as possibly redelivered; %d already "
+            "answered." % (cause, len(requeued), len(replied)),
+            meta={"action": "remise-en-attente", "raison": cause,
+                  "messages": requeued, "repondus": replied})
 
     def _run_guarded_turn(self, spec: dict) -> bool:
         """Un tour. Pour un tour de courrier, protocole de remise unique :
