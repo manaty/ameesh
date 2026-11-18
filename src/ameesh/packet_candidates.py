@@ -1107,13 +1107,22 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
             for edge in dependencies.get(entry["work_item"], [])
             if edge.get("blocker_id") is not None})
         for edge in dependencies.get(entry["work_item"], []):
-            if edge["blocking"]:
-                entry["causes"].append(_cause(
-                    "dependency-blocking", "#%d %s" % (
-                        edge["blocker_id"], edge["blocker_state"]),
-                    blocker_id=edge["blocker_id"],
-                    blocker_state=edge["blocker_state"]))
-                entry["ready"] = False
+            if not edge["blocking"]:
+                continue
+            if edge.get("start_on"):
+                # #7760 : le dépendant démarre sur la tête gelée de ce lot
+                # validé (dépendance déclarée, empreintes chevauchantes). Le
+                # composeur doit prendre les deux dans le MÊME paquet, le
+                # prérequis d'abord : la vérification est faite en fin de
+                # calcul, quand tous les prêts sont connus.
+                entry.setdefault("starts_on", []).append(int(edge["blocker_id"]))
+                continue
+            entry["causes"].append(_cause(
+                "dependency-blocking", "#%d %s" % (
+                    edge["blocker_id"], edge["blocker_state"]),
+                blocker_id=edge["blocker_id"],
+                blocker_state=edge["blocker_state"]))
+            entry["ready"] = False
         # #6607 : une tête empilée sur un lot ouvert non fusionné, sans
         # dépendance déclarée, emporterait ses commits non relus.
         head = entry["source"] or entry["published_head"]
@@ -1177,6 +1186,11 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
         _migration_collisions(db, candidates, where=where, package_base=package_base,
                               directory=directory, slug=_migration_repo(project, repo),
                               target_branch=target_branch)
+    # #7760 : dernier mot sur les démarrages sur empreinte. Les étapes
+    # ci-dessus (unités rouges, couverture) peuvent avoir retiré un prêt :
+    # un dépendant dont le prérequis n'est plus prêt sort aussi, et l'ordre
+    # des prêts met chaque prérequis avant son dépendant.
+    _settle_start_on(candidates, where)
     for entry in candidates:
         if entry["error"]:
             errors.append("#%d : %s" % (entry["work_item"], entry["error"]))
@@ -1185,8 +1199,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
             errors_by_lot.append({"work_item": int(entry["work_item"]),
                                   "error": entry["error"]})
     by_id = {entry["work_item"]: entry for entry in candidates}
-    ready = sorted((entry["work_item"] for entry in candidates if entry["ready"]),
-                   key=lambda lot: _ready_order(by_id[lot]))
+    ready = _packet_order(by_id)
     return {
         "schema": SCHEMA,
         "project": app,
@@ -1284,6 +1297,83 @@ def _ready_order(entry: dict) -> tuple:
     """Priorité, puis âge de création, puis id : un ordre stable, jamais un tirage."""
     return (entry.get("priority") if entry.get("priority") is not None else 2,
             entry.get("created_ts") or 0.0, entry["work_item"])
+
+
+def _settle_start_on(candidates: list[dict], repo: str) -> None:
+    """#7760 : le dépendant ne reste prêt qu'avec un prérequis prêt, dans le
+    même paquet et sur une base qui contient sa tête gelée.
+
+    Une dépendance n'est plus bloquante pour la FUSION quand le prérequis est
+    `validated` et que les empreintes se chevauchent (démarrage sur sa tête,
+    `starts_on`). Le composeur doit alors porter les deux : si le prérequis
+    n'est pas (ou plus) prêt — conflit, rouge d'unité, migration, gel changé —
+    le dépendant sort avec le motif `dependency-unready` ; sa source qui
+    contient le prérequis serait autrement composée seule. Une base qui ne
+    contient pas la tête gelée est refusée (`dependency-base`) : le gel l'a
+    déjà prouvée, la liste la revérifie. Une lecture Git impossible ne refuse
+    pas (doute, comme les autres preuves de ce module) ; le point fixe traite
+    les chaînes de démarrages."""
+    by_id = {entry["work_item"]: entry for entry in candidates}
+    changed = True
+    while changed:
+        changed = False
+        for entry in candidates:
+            starts = entry.get("starts_on") or ()
+            if not starts or entry.get("error") or not entry.get("ready"):
+                continue
+            for blocker in starts:
+                other = by_id.get(int(blocker))
+                if other is None or not other.get("ready"):
+                    entry["causes"].append(_cause(
+                        "dependency-unready",
+                        "#%d is not ready in this packet; a lot only merges with "
+                        "the validated lot it starts on" % int(blocker),
+                        blocker_id=int(blocker)))
+                    entry["ready"] = False
+                    changed = True
+                    break
+                parent = other.get("source") or other.get("published_head") or ""
+                head = entry.get("source") or entry.get("published_head") or ""
+                if not parent or not head:
+                    continue
+                try:
+                    contained = _ancestor(repo, parent, head)
+                except CandidateError:
+                    # dépôt illisible ou commit absent : pas de preuve ici,
+                    # le gel (#7760, freeze_stack.guard_start_base) a tranché
+                    continue
+                if not contained:
+                    entry["causes"].append(_cause(
+                        "dependency-base",
+                        "does not start on #%d's frozen head %s"
+                        % (int(blocker), parent[:12]),
+                        blocker_id=int(blocker)))
+                    entry["ready"] = False
+                    changed = True
+                    break
+
+
+def _packet_order(by_id: dict[int, dict]) -> list[int]:
+    """#7760 : l'ordre stable des prêts (priorité, âge, id), où chaque
+    prérequis de démarrage précède son dépendant. Le graphe refuse les
+    cycles ; un cycle aperçu ici retombe sur l'ordre stable, jamais une
+    boucle."""
+    pending = sorted((lot for lot, entry in by_id.items() if entry.get("ready")),
+                     key=lambda lot: _ready_order(by_id[lot]))
+    ordered: list[int] = []
+    placed: set[int] = set()
+    while pending:
+        for lot in pending:
+            starts = set(by_id[lot].get("starts_on") or ())
+            if starts <= placed:
+                ordered.append(lot)
+                placed.add(lot)
+                pending.remove(lot)
+                break
+        else:
+            ordered.extend(pending)
+            break
+    return ordered
 
 
 def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,

@@ -403,6 +403,58 @@ def owner_alive(comment: str | None) -> bool:
     return owner_state(comment) == OWNER_ALIVE
 
 
+# Roles are cluster-wide; all users of this lock must connect to the same
+# canonical test database, even when their class uses another database.
+ROLE_RE = re.compile(r"^t_vm_(?:probe|native)_[0-9a-f]{10}(?:_writer)?$")
+ROLE_LOCK = "ameesh-test-owned-roles"
+
+
+def _role_lock(tx):
+    tx.execute("SET LOCAL lock_timeout = '5s'")
+    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (ROLE_LOCK,))
+
+
+def create_test_roles(db, role: str, writer: str) -> None:
+    """Atomically create and mark the two test roles on the canonical DB."""
+    if not _local_dsn(db.dsn) or not ROLE_RE.fullmatch(role) or writer != role + "_writer":
+        raise ValueError("invalid local test role pair")
+    marker = owner_marker().replace("'", "''")
+    with db.transaction() as tx:
+        _role_lock(tx)
+        for name, login in ((role, "LOGIN"), (writer, "NOLOGIN")):
+            tx.execute('CREATE ROLE "%s" %s NOINHERIT' % (name, login))
+            tx.execute('COMMENT ON ROLE "%s" IS \'%s\'' % (name, marker))
+
+
+def purge_test_roles(db, *, only=None) -> "Purge":
+    """Drop marked dead owners' roles only when no shared dependency remains."""
+    if not _local_dsn(db.dsn):
+        return Purge(0, (), (), unreadable="non-local test database")
+    dropped, kept = [], []
+    with db.transaction() as tx:
+        _role_lock(tx)
+        rows = tx.query("SELECT oid, rolname, shobj_description(oid, 'pg_authid') AS comment "
+                        "FROM pg_roles WHERE rolname LIKE 't_vm_%'")
+        scanned = 0
+        for row in rows:
+            name = str(row['rolname'])
+            if not ROLE_RE.fullmatch(name) or (only is not None and name not in only):
+                continue
+            scanned += 1
+            state = owner_state(row.get('comment'))
+            if state != OWNER_DEAD:
+                kept.append((name, 'owner ' + state))
+                continue
+            deps = tx.query("SELECT count(*) AS n FROM pg_shdepend "
+                            "WHERE refclassid = 'pg_authid'::regclass AND refobjid = %s", (row['oid'],))
+            if int(deps[0]['n']):
+                kept.append((name, 'shared dependencies remain'))
+                continue
+            tx.execute('DROP ROLE "%s"' % name)
+            dropped.append(name)
+    return Purge(scanned, tuple(dropped), tuple(kept))
+
+
 def claim_owner(db, schema: str, *, pid: int | None = None,
                 start: float | None = None) -> None:
     """Pose la preuve de propriété du schéma, tenue par toute la classe.

@@ -688,6 +688,75 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(cause["stacked_on"][0]["lot"], 1)
         self.assertIn("ameesh work dependencies 14 --add 1", cause["detail"])
 
+    def test_start_on_dependency_is_ready_with_its_prerequisite_first(self):
+        """#7760 : un dépendant démarré sur la tête gelée d'un lot validé
+        entre dans le MÊME paquet, après lui — jamais seul."""
+        self.stacked()
+        next(row for row in self.rows if row["id"] == 1)["state"] = "validated"
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 14, "blocker_id": 1, "blocker_state": "validated",
+             "blocking": True, "start_on": True}]
+        payload = self.inventory()
+        entry = self.by_id(payload)[14]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertLess(payload["ready"].index(1), payload["ready"].index(14))
+        self.assertNotIn("dependency-blocking",
+                         [cause["code"] for cause in entry["causes"]])
+
+    def test_start_on_chained_dependencies_are_ordered(self):
+        """#7760 : une chaîne de démarrages garde l'ordre prérequis → dépendant."""
+        self.stacked()
+        for row in self.rows:
+            if row["id"] == 1:
+                row["state"] = "validated"
+        # un second dépendant, branché sur le premier
+        name = "lot/15-stacked"
+        _git(self.repo, "switch", "-q", "-c", name, "lot/14-stacked")
+        _write(self.repo, "stacked2.py", "y\n")
+        tip = _commit(self.repo, "#15")
+        _git(self.repo, "switch", "-q", "main")
+        _git(self.repo, "push", "-q", "origin", name)
+        self.marks[15] = [
+            {"id": 1500, "work_item_id": 15, "kind": "frozen", "sha": tip,
+             "actor": "author", "verdict": None, "at_ts": 1500.0},
+            {"id": 1501, "work_item_id": 15, "kind": "verdict", "sha": tip,
+             "actor": "reviewer", "verdict": "ok", "at_ts": 1501.0}]
+        self.rows.append({"id": 15, "state": "qa", "app": "ameesh",
+                          "branch": name, "branch_target": None,
+                          "title": "lot 15", "assignee": "author",
+                          "priority": 1, "created_ts": 15.0})
+        self.classes[15] = "normal"
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 14, "blocker_id": 1, "blocker_state": "validated",
+             "blocking": True, "start_on": True},
+            {"work_item_id": 15, "blocker_id": 14, "blocker_state": "qa",
+             "blocking": True, "start_on": True},
+            # la branche porte aussi les commits de #1 (chaîne de démarrages)
+            {"work_item_id": 15, "blocker_id": 1, "blocker_state": "validated",
+             "blocking": True, "start_on": True}]
+        payload = self.inventory()
+        self.assertIn(14, payload["ready"], self.by_id(payload)[14]["causes"])
+        self.assertIn(15, payload["ready"], self.by_id(payload)[15]["causes"])
+        self.assertLess(payload["ready"].index(14), payload["ready"].index(15))
+
+    def test_start_on_dependency_not_ready_removes_the_dependent(self):
+        """#7760 : le prérequis retiré ou rendu en build retire le dépendant —
+        sa source emporterait sinon les commits non admis au paquet."""
+        self.stacked()
+        next(row for row in self.rows if row["id"] == 1)["state"] = "validated"
+        self.role_verdicts["mesh-design"] = True
+        self.hold(1, "hold: prérequis retiré", actor="mesh-design")
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 14, "blocker_id": 1, "blocker_state": "validated",
+             "blocking": True, "start_on": True}]
+        payload = self.inventory()
+        entry = self.by_id(payload)[14]
+        self.assertFalse(entry["ready"])
+        self.assertNotIn(14, payload["ready"])
+        self.assertEqual([cause["code"] for cause in entry["causes"]],
+                         ["dependency-unready"])
+
+
     def test_stacked_on_a_lot_outside_qa_is_refused(self):
         # Le parent en `build` n'est pas candidat : sa tête vient du gel.
         self.stacked()
