@@ -111,23 +111,23 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
         self.assertEqual(self.authors(), {"author": "deepseek", "r1": "claude"})
         r2_sha = self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
         self.status("r1", "idle")              # dev1 is back for the third freeze
-        # #2739/#2888: r1 and r2 are both authors now; no independent family
-        # remains, even for another Claude agent: the correction was not
-        # receivable and must go back to the author. Since #3742 the freeze
-        # itself refuses the head, names both commits and writes no third
-        # designation mark.
+        # #2739/#2888: r1 and r2 are both authors now. #7745 : chaque delta
+        # garde pourtant les deux **autres** familles ; r1b/claude est le seul
+        # siège disponible (r1 et r2 sont auteurs, exclus par leur nom) et
+        # couvre les deltas deepseek et codex, pas le delta claude : le gel
+        # désigne ce siège et attend le second avis, au lieu de refuser la
+        # tête pour « zéro famille éligible ».
         self.agent("r1b", "claude")
         marks = self.marks()
-        with self.assertRaises(work.WorkError) as caught:
-            self.freeze()
-        text = str(caught.exception)
-        self.assertIn("freeze refused (author-families)", text)
-        self.assertIn("0 eligible family(ies)", text)
-        self.assertIn("forbidden: claude, codex, deepseek", text)
-        self.assertIn(r1_sha[:12], text)
-        self.assertIn(r2_sha[:12], text)
-        self.assertIn("(reviewer correction)", text)
-        self.assertEqual(self.marks(), marks)
+        mark, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1b"])
+        self.assertEqual(out["missing"], 1)
+        self.assertEqual(self.authors(),
+                         {"author": "deepseek", "r1": "claude", "r2": "codex"})
+        self.assertIn(mark["id"], [row["id"] for row in
+                                   work.milestones(self.db, self.lot)])
+        self.assertNotEqual(self.marks(), marks)
 
     def test_2602_three_families_with_small_reviewer_fixes_refuse_the_freeze(self):
         # #2602: cx2 (Codex) authors, dev1 (Claude) then dev5 (DeepSeek) push
@@ -136,42 +136,44 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
         # remains for two required opinions. Since #3742 the freeze refuses
         # the head instead of freezing an unreadable waiting designation.
         self.first_freeze()
-        r1_sha = self.commit("r1", "claude", "lot\nr1 small fix\n")
-        r2_sha = self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
+        self.commit("r1", "claude", "lot\nr1 small fix\n")
+        self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
         self.agent("r1b", "claude")
         self.agent("r2b", "codex")
-        with self.assertRaises(work.WorkError) as caught:
-            self.freeze()
-        text = str(caught.exception)
-        self.assertIn("2 required review(s)", text)
-        self.assertIn("0 eligible family(ies)", text)
-        self.assertIn("forbidden: claude, codex, deepseek", text)
-        self.assertIn(r1_sha[:12], text)
-        self.assertIn(r2_sha[:12], text)
+        # #7745 : trois familles d'auteurs, deux avis requis. Aucune famille
+        # ne couvre les trois deltas (chacune est exclue du sien), mais les
+        # deux autres se pourvoient ; le gel désigne claude et codex et attend
+        # le deepseek manquant au lieu de refuser la tête.
+        _mark, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1b", "r2b"])
+        self.assertEqual(out["missing"], 1)
+        self.assertEqual(self.authors(),
+                         {"author": "deepseek", "r1": "claude", "r2": "codex"})
 
     def test_a_reviewer_fix_over_fifty_lines_makes_that_family_an_author(self):
         self.first_freeze()
         big = "lot\n" + "".join("extra %02d\n" % index for index in range(60))
-        sha = self.commit("r1", "claude", big)
-        with self.assertRaises(work.WorkError) as caught:
-            self.freeze()
-        text = str(caught.exception)
-        self.assertIn("1 eligible family(ies)", text)
-        self.assertIn("forbidden: claude, deepseek", text)
-        self.assertIn(sha[:12], text)
+        self.commit("r1", "claude", big)
+        # #7745 : la correction rend claude auteur de son delta ; codex (r2)
+        # est le seul siège restant et la tête attend le second avis.
+        _mark, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r2"])
+        self.assertEqual(out["missing"], 1)
+        self.assertIn("claude", {row["family"] for row in out["authors"]})
 
     def test_a_reviewer_design_change_excludes_the_family_even_when_small(self):
         # canon §2: a correction "> ~50 lignes ou de conception" goes back to
         # the author; the small size does not buy the exception.
         self.first_freeze()
-        sha = self.commit("r1", "claude", "study\n",
-                          path="docs/design/etudes/x.md")
-        with self.assertRaises(work.WorkError) as caught:
-            self.freeze()
-        text = str(caught.exception)
-        self.assertIn("1 eligible family(ies)", text)
-        self.assertIn("forbidden: claude, deepseek", text)
-        self.assertIn(sha[:12], text)
+        self.commit("r1", "claude", "study\n",
+                    path="docs/design/etudes/x.md")
+        _mark, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r2"])
+        self.assertEqual(out["missing"], 1)
+        self.assertIn("claude", {row["family"] for row in out["authors"]})
 
     def test_a_third_party_commit_excludes_its_family(self):
         # A non-reviewer never gets the §2 first-round correction allowance:
@@ -181,10 +183,11 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
                         cwd=self.repo.root, status="idle")
         self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
                         ("third",))
-        sha = self.commit("third", "claude", "lot\nthird small fix\n")
-        with self.assertRaises(work.WorkError) as caught:
-            self.freeze()
-        text = str(caught.exception)
-        self.assertIn("1 eligible family(ies)", text)
-        self.assertIn("forbidden: claude, deepseek", text)
-        self.assertIn(sha[:12], text)
+        self.commit("third", "claude", "lot\nthird small fix\n")
+        # #7745 : la famille claude est auteur du delta du tiers ; elle ne
+        # relit pas ce delta, mais ses sièges restent disponibles pour l'autre.
+        _mark, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        self.assertEqual(out["missing"], 1)
+        self.assertIn("claude", {row["family"] for row in out["authors"]})
