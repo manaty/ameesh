@@ -27,7 +27,7 @@ from ameesh import db as db_mod
 from ameesh.storage.postgres import work as work_pg
 from ameesh.storage.postgres.mailbox import PASSIVE_SQL
 
-from .support import PgTestCase
+from .support import PgTestCase, registry_absent
 
 
 # --------------------------------------------------------------------------
@@ -174,6 +174,13 @@ class IssueFeedSqlTest(unittest.TestCase):
             _has_reviewer = True
             _has_migration_slots = True
             _has_current_item_columns = True
+
+            def query(self, sql, params=()):
+                probe = registry_absent(sql)
+                if probe is not None:
+                    return probe
+                return []
+
         cols = work_pg.item_columns(_Db())
         self.assertIn("to_jsonb(reviewers) AS reviewers", cols)
         self.assertIn("external_executor AS external_executor", cols)

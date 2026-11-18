@@ -25,7 +25,9 @@ from tests.support import PgTestCase
 BORNES = {
     "mail list": 1,
     "list": 1,
-    "work list": 2,
+    #: #7650 : la sonde du registre `module_schemas` ajoute un aller-retour
+    #: par connexion neuve ; `work list` en ouvre une.
+    "work list": 3,
     "progress": 2,
     #: indépendant du nombre d'agents (avant L61 : deux requêtes par agent)
     "cost report": 3,

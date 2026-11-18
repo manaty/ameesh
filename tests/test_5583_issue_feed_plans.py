@@ -31,6 +31,7 @@ import textwrap
 import unittest
 
 from ameesh import db as db_mod, storage, work
+from ameesh.modules.dev.storage import work as dev_work
 from ameesh.storage.postgres import work as work_pg
 
 from .support import PgTestCase
@@ -293,7 +294,9 @@ class IssueFeedFormTest(unittest.TestCase):
         self.assertIn("'[]'::jsonb AS migrations", sql)
 
     def test_garde_statique_sur_la_source(self):
-        source = inspect.getsource(work_pg.WorkItems.issue_feed)
+        # #7650 : la lecture vit dans le stockage du module `dev` ; le noyau
+        # ne fait que la déléguer.
+        source = inspect.getsource(dev_work.DevWork.issue_feed)
         self.assertNotRegex(source, r"SELECT extract\(epoch from max\(m\.at\)")
         tree = ast.parse(textwrap.dedent(source))
         self.assertTrue(any(isinstance(node, ast.JoinedStr) for node in ast.walk(tree))
