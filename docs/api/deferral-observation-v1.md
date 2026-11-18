@@ -28,9 +28,9 @@ deferral", not "available", and no value promises that a turn will run.
 | `queue` | Optional. Present only for `pressure`: the **same** `queued` object already published by `ameesh list --json` (`scope`, `critical`, `detail`, `queued_s`, `retry_s`, `capacity`), not a new free-text error field. |
 
 The block is absent (or `null`) when no hold is known: a running, idle or
-paused-for-later agent, a `blocked` status with an unrecognised text, and an
-operator pause that has not taken effect yet (`after_turn` on a running agent)
-all carry no block. An absent block is not a successful turn.
+paused-for-later agent and an operator pause that has not taken effect yet
+(`after_turn` on a running agent) carry no block. An absent block is not a
+successful turn.
 
 ## Closed reasons
 
