@@ -327,6 +327,11 @@ class DevWork(DevDomain):
         porte sur la cible (réservation à numéro exact, `target_numbers`) ou
         sur une branche (allocation du prochain libre, `repo_numbers`). Tous
         les créneaux réservés du lot sont rendus, pas seulement le scalaire."""
+        # P1b #7650 : le noyau appelle cette opération avec la transaction
+        # brute de son propre mouvement ; la qualification du module se fait
+        # ici, jamais par un import de l'implémentation dans le noyau (L97).
+        if not isinstance(tx, ModuleDb):
+            tx = ModuleDb(tx)
         numbers = sorted({int(item["number"]) for item in (row.get("migrations") or ())
                           if item.get("number") is not None})
         if row.get("migration") is not None and int(row["migration"]) not in numbers:
@@ -362,6 +367,10 @@ class DevWork(DevDomain):
         `work_items_migration_slot_sync` réécrit alors le créneau `default`
         sans rencontrer le doublon du créneau promu. Les slots nommés restent
         intacts : leur identité ne devient jamais `default` (#4430)."""
+        # P1b #7650 : même frontière que `_release_migration`, le noyau passe
+        # la transaction brute et le module la qualifie.
+        if not isinstance(tx, ModuleDb):
+            tx = ModuleDb(tx)
         numbers = sorted({int(row["number"]) for row in slots})
         if scalar is not None and int(scalar) not in numbers:
             numbers.append(int(scalar))

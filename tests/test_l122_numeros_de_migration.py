@@ -18,6 +18,7 @@ from unittest import mock
 
 from ameesh import db as db_mod, migrations, storage, work
 from ameesh.db import DbError
+from ameesh.modules.dev.storage import work as dev_work
 from ameesh.storage.postgres import work as pg_work
 
 from .support import PgTestCase
@@ -1087,9 +1088,12 @@ class RetryReservationTest(PgTestCase):
             draws.append((low, high))
             return high
 
-        with mock.patch.object(pg_work, "time", clock), \
+        # P1b #7650 : la boucle de réessai a rejoint le stockage du module
+        # `dev` ; l'horloge et le tirage à patcher sont ceux de ce module, le
+        # budget restant se lit toujours au noyau (`_core()`).
+        with mock.patch.object(dev_work, "time", clock), \
                 mock.patch.object(pg_work, "_RESERVE_BUDGET_S", budget), \
-                mock.patch.object(pg_work, "random",
+                mock.patch.object(dev_work, "random",
                                   types.SimpleNamespace(uniform=uniform)), \
                 mock.patch.object(self.db, "transaction", side_effect=transaction):
             try:
