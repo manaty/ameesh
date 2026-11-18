@@ -1336,6 +1336,40 @@ class Leases(interface.Leases):
         )
         return rows[0] if rows else None
 
+    def fence(self, name, owner, epoch) -> tuple[bool, str, dict | None]:
+        """#7672 : verrouille la ligne du registre, puis juge le bail.
+
+        Le verrou est pris AVANT la lecture des faits que l'appelant va
+        écrire : un changement de détenteur, d'epoch ou une expiration attend
+        le commit de cette transaction. Les raisons sont celles de
+        `registry.lease_agent` (mêmes mots), pour que le diagnostic ne dépende
+        pas du chemin. L'échéance est relue avec `clock_timestamp()` après
+        l'attente éventuelle du verrou.
+        """
+        rows = self.db.query(
+            """
+            SELECT name, lease_owner, lease_epoch, status,
+                   (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live
+              FROM agent_registry
+             WHERE name = (SELECT ameesh_resolve_agent_name(%s, 'registry.lease_fence'))
+             FOR UPDATE
+            """,
+            (name,),
+        )
+        if not rows:
+            return False, "agent %s not in the registry" % name, None
+        row = rows[0]
+        if row.get("status") == "stopped":
+            return False, "agent stopped", row
+        if (row.get("lease_owner") or "") != owner:
+            return False, "lease held by %s" % (row.get("lease_owner") or "nobody"), row
+        if int(row.get("lease_epoch") or 0) != int(epoch):
+            return (False, "epoch %s in the registry, %s in the session"
+                    % (row.get("lease_epoch"), epoch), row)
+        if not row.get("live"):
+            return False, "lease expired", row
+        return True, "", row
+
     def renew(self, name, owner, epoch, ttl_seconds) -> float | None:
         """Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()`
         dans l'écriture : un renouvellement qui a attendu le verrou au-delà de
