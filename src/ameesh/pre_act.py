@@ -64,7 +64,14 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *, cfg=Non
         if float(event["created_ts"]) >= since and (stop_hold or (not planned_waits.is_hold_note(note)
                                                                   and _STOP.search(note))):
             raise Refused("hold or STOP in lot event #%s" % event["id"])
-    holds = planned_waits.active_holds(tx, hold_events, cfg=cfg, strict=True).get(lot, {})
+    def preserve_stop(event, hold):
+        who = (event.get("actor") or "").removeprefix("agent:")
+        author = (hold.get("by") or "").removeprefix("agent:")
+        return (who == actor.removeprefix("agent:") and author != who
+                and bool(_STOP.search(hold.get("note") or "")))
+
+    holds = planned_waits.active_holds(
+        tx, hold_events, cfg=cfg, strict=True, preserve_on_transition=preserve_stop).get(lot, {})
     for hold in holds.values():
         if _STOP.search(hold.get("note") or ""):
             raise Refused("active STOP hold by %s" % hold.get("by"))

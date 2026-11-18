@@ -107,6 +107,17 @@ class PreActTest(unittest.TestCase):
         self.check(tx)
         self.assertTrue(tx.writes)
 
+    def test_actor_transition_does_not_clear_another_authors_stop(self):
+        for author in ("orchestrateur", "other"):
+            with self.subTest(author=author):
+                tx = Transaction(events=[
+                    {"id": 1, "actor": author, "state": "intake", "note": "hold: STOP", "ts": 10},
+                    {"id": 2, "actor": "bureau", "state": "build", "note": "claim", "ts": 20},
+                ])
+                with self.assertRaisesRegex(pre_act.Refused, "active STOP"):
+                    self.check(tx)
+                self.assertFalse(tx.writes)
+
     def test_clear_check_records_receipt(self):
         tx = Transaction(events=[{"id": 1, "note": "préparation", "ts": 90}])
         receipt_id = self.check(tx)
