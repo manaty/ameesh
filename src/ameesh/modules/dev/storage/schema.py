@@ -81,23 +81,41 @@ def _registry_probe(db, core: str) -> tuple[bool, bool]:
     résolvent aucun nom par le search_path.
 
     La lecture est dite possible si le rôle a ``USAGE`` sur le schéma **et**
-    ``SELECT`` sur la relation : sans ``USAGE``, la lecture lèverait
-    « permission denied for schema ». ``to_regclass`` ne suffit pas pour la
-    même raison.
+    ``SELECT`` sur les deux colonnes lues (``module``, ``schema_name``) : sans
+    ``USAGE``, la lecture lèverait « permission denied for schema ».
+    ``has_column_privilege`` accepte les deux formes de droit — table entière
+    (bureau, #6881) ou colonne par colonne (role-superviseur, #7649) — alors
+    que ``has_table_privilege`` refuserait la seconde (revue B2 de #7650).
+    ``to_regclass`` ne suffit pas pour la même raison.
     """
     clauses = (
         "  SELECT 1 FROM pg_catalog.pg_class c"
         "  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
         "  WHERE n.nspname = %s AND c.relname = 'module_schemas'"
     )
+    #: `CASE` et non `AND` : PostgreSQL n'ordonne pas les prédicats d'un WHERE,
+    #: et `has_column_privilege` lève sur une colonne absente — une table
+    #: homonyme incomplète ferait alors avarier la transaction, ce que la
+    #: sonde doit interdire. Une colonne absente se lit « non lisible ».
+    columns = (
+        "    AND CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a"
+        "             WHERE a.attrelid = c.oid AND a.attname = 'module'"
+        "               AND NOT a.attisdropped)"
+        "      THEN has_column_privilege(c.oid, 'module', 'SELECT')"
+        "      ELSE false END"
+        "    AND CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a"
+        "             WHERE a.attrelid = c.oid AND a.attname = 'schema_name'"
+        "               AND NOT a.attisdropped)"
+        "      THEN has_column_privilege(c.oid, 'schema_name', 'SELECT')"
+        "      ELSE false END"
+    )
     rows = _raw(db).query(
-        "SELECT"
-        "  EXISTS (%s) AS present,"
-        "  EXISTS (%s"
-        "    AND c.relkind IN ('r', 'p', 'v', 'm', 'f')"
-        "    AND has_schema_privilege(n.oid, 'USAGE')"
-        "    AND has_table_privilege(c.oid, 'SELECT')) AS readable"
-        % (clauses, clauses),
+        ("SELECT"
+         "  EXISTS (%s) AS present,"
+         "  EXISTS (%s"
+         "    AND c.relkind IN ('r', 'p', 'v', 'm', 'f')"
+         "    AND has_schema_privilege(n.oid, 'USAGE')"
+         + columns + ") AS readable") % (clauses, clauses),
         (core, core))
     row = rows[0] if rows else {}
     return bool(row.get("present")), bool(row.get("readable"))

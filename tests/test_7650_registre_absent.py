@@ -201,6 +201,30 @@ class RegistryAbsentTest(unittest.TestCase):
                 finally:
                     conn.close()
 
+    def test_registry_column_level_select_is_readable(self):
+        """B2 : `role-superviseur` n'a que des droits colonne par colonne.
+
+        La sonde accepte cette forme (elle vérifie les deux colonnes lues),
+        sinon tout accès aux tables `dev` échouerait pour ce rôle dès P1a.
+        """
+        role = self._new_role("colselect")
+        self._create_registry()
+        self._grant_movement(role, self.schema)
+        self.admin.execute("REVOKE ALL ON %s.module_schemas FROM %s"
+                           % (Q(self.schema), Q(role)))
+        self.admin.execute(
+            "GRANT SELECT (module, schema_name) ON %s.module_schemas TO %s"
+            % (Q(self.schema), Q(role)))
+        for driver in DRIVERS:
+            with self.subTest(driver=driver):
+                conn = db_mod.connect(self.cfg, driver=driver, writer=False)
+                try:
+                    with conn.transaction() as tx:
+                        tx.execute("SET LOCAL ROLE %s" % Q(role))
+                        self.assertEqual(schema_mod.schema_name(tx), self.schema)
+                finally:
+                    conn.close()
+
     def test_registry_readable_after_p2_uses_the_registered_schema(self):
         """P2 : la ligne du registre désigne le schéma physique du module."""
         self._create_dev_schema()

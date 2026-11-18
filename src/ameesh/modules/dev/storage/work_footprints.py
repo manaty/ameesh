@@ -67,6 +67,27 @@ def start_on_sql(dependent: str, occupant: str = "o") -> str:
             + footprints_overlap_sql(dependent, occupant) + ")")
 
 
+def start_blocking(dependent: str, blocker: str = "b") -> str:
+    """#7760 : prédicat SQL « ce prérequis retient le DÉMARRAGE du dépendant ».
+
+    La règle de fusion ne bouge pas (`not_blocking` : fusionné seulement).
+    Au démarrage, un prérequis `validated` dont le dépendant chevauche
+    l'empreinte et dont il déclare la dépendance ne retient plus : il démarre
+    sur sa tête gelée, et le composeur les prend ensemble. Tout autre
+    prérequis non fusionné retient, comme avant (#2252).
+
+    Le SQL des empreintes doit être exécuté par la connexion du module
+    (`ModuleDb`), qui le qualifie ; un appel noyau sur la connexion brute
+    casserait après P2 (revue B1 de #7650).
+
+    `dependent` et `blocker` sont des alias de `work_items`."""
+    # import paresseux : `work_dependencies` (noyau) importe les contrats de
+    # ce module, l'importer au chargement ferait un cycle.
+    from ....storage.postgres.work_dependencies import not_blocking
+    return ("(NOT " + not_blocking(blocker) + " AND NOT "
+            + start_on_sql(dependent, blocker) + ")")
+
+
 # `items` is a trusted SQL relation name, like `alias`, never user input.
 # A snapshot may supply a CTE containing all non-terminal lots; the canonical
 # predicates below still decide which of those lots occupy an individual app.

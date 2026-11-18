@@ -28,7 +28,9 @@ from .work_footprints import (cap_reached_sql as footprint_cap_sql,
                               in_flight_sql as footprint_in_flight_sql,
                               occupying_sql as footprint_occupying_sql,
                               overlap_exists_sql as footprint_overlap_sql,
-                              overlap_rows_sql as footprint_overlap_rows_sql)
+                              overlap_rows_sql as footprint_overlap_rows_sql,
+                              start_blocking as footprint_start_blocking,
+                              start_on_sql as footprint_start_on_sql)
 
 #: L160d (0057) : les colonnes d'une ligne de file de fusion. Le fragment
 #: nomme `integration_train_queue_receipts`, une table du module : le noyau
@@ -1719,6 +1721,42 @@ class DevWork(DevDomain):
             "SELECT x.* FROM work_items c, LATERAL (" + footprint_cap_rows_sql("c")
             + ") x WHERE c.id = %s" + guard, (int(item_id),))
         return dict(rows[0]) if rows else None
+
+    def start_blocked(self, item_id) -> bool:
+        """#7760 : une dépendance retient-elle le démarrage du lot ?
+
+        Même prédicat que `unassigned_lots` (`start_on` écarté), exécuté sur
+        la connexion du module : le SQL des empreintes y est qualifié (revue
+        B1 de #7650). Les gardes de prise l'appellent sous le verrou du graphe.
+        """
+        return bool(self.db.query(
+            "SELECT 1 FROM work_item_dependencies d"
+            " JOIN work_items b ON b.id = d.blocker_id"
+            " JOIN work_items i ON i.id = d.work_item_id"
+            " WHERE d.work_item_id = %s AND " + footprint_start_blocking("i", "b")
+            + " LIMIT 1", (int(item_id),)))
+
+    def start_on_pairs(self, item_ids) -> set[tuple[int, int]]:
+        """#7760 : les couples (dépendant, prérequis) en « démarrage sur ».
+
+        Lecture qualifiée pour `work show` (`WorkDependencies.for_items`) :
+        hors du module, le SQL des empreintes ne serait pas résolu après P2
+        (revue B1 de #7650).
+        """
+        ids = sorted({int(i) for i in item_ids})
+        if not ids:
+            return set()
+        rows = self.db.query(
+            "SELECT d.work_item_id, d.blocker_id"
+            "  FROM work_item_dependencies d"
+            "  JOIN work_items w ON w.id = d.blocker_id"
+            "  JOIN work_items i ON i.id = d.work_item_id"
+            " WHERE d.work_item_id IN (" + ", ".join(["%s"] * len(ids)) + ")"
+            "   AND " + footprint_start_on_sql("i", "w"),
+            tuple(ids))
+        return {(int(row["work_item_id"]), int(row["blocker_id"]))
+                for row in rows}
+
     def unassigned_lots(self, limit) -> list[dict]:
         # #2252 : seuls les lots dont TOUTES les dépendances sont fusionnées
         # (`merged`/`promoted`/`closed`) sont prenables. La règle est celle de
@@ -1750,7 +1788,7 @@ class DevWork(DevDomain):
                "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
                "                             JOIN work_items b ON b.id = d.blocker_id"
                "                            WHERE d.work_item_id = work_items.id"
-               "                              AND " + self._core()._start_blocking("work_items", "b") + ")"
+               "                              AND " + footprint_start_blocking("work_items", "b") + ")"
                # #4173 : un lot `intake` dont l'empreinte chevauche celle d'un
                # lot occupant du même dépôt attend sa fusion (un lot `build`
                # rendu à la file occupe déjà la sienne) ; même prédicat que la

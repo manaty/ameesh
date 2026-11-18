@@ -175,21 +175,6 @@ def not_blocking(alias: str) -> str:
     return "(%s.state IN %s)" % (alias, _DONE_SQL)
 
 
-def start_blocking(dependent: str, blocker: str = "b") -> str:
-    """#7760 : prédicat SQL « ce prérequis retient le DÉMARRAGE du dépendant ».
-
-    La règle de fusion ne bouge pas (`not_blocking` : fusionné seulement).
-    Au démarrage, un prérequis `validated` dont le dépendant chevauche
-    l'empreinte et dont il déclare la dépendance ne retient plus : il démarre
-    sur sa tête gelée, et le composeur les prend ensemble. Tout autre
-    prérequis non fusionné retient, comme avant (#2252).
-
-    `dependent` et `blocker` sont des alias de `work_items`."""
-    from .work_footprints import start_on_sql
-    return ("(NOT " + not_blocking(blocker) + " AND NOT "
-            + start_on_sql(dependent, blocker) + ")")
-
-
 class WorkDependencies(Contract):
 
     def __init__(self, db):
@@ -270,8 +255,9 @@ class WorkDependencies(Contract):
         # `false` — l'attente « blocking » est la lecture prudente, et les
         # gardes qui décident du démarrage lisent les empreintes avec un rôle
         # qui y a droit. Pas de GRANT : ce lot reste hors classe droits SQL.
-        from .work_footprints import start_on_sql
-        head = ("""
+        # Le prédicat vit dans le module `dev` : `_start_on_pairs` l'exécute
+        # sur sa connexion qualifiée (revue B1 de #7650).
+        rows = self.db.query("""
             SELECT d.work_item_id, d.blocker_id, d.created_by,
                    extract(epoch FROM d.created_at)::float8 AS created_ts,
                    coalesce(to_jsonb(w)->>'legacy_state', w.state) AS blocker_state,
@@ -280,20 +266,31 @@ class WorkDependencies(Contract):
                      WHERE m.work_item_id = w.id AND m.kind = 'frozen'
                      ORDER BY m.at DESC, m.id DESC LIMIT 1) AS blocker_frozen_sha,
                    NOT """ + not_blocking("w") + """ AS blocking,
-                   """)
-        tail = ("""
-            FROM work_item_dependencies d
-            JOIN work_items w ON w.id = d.blocker_id
-            JOIN work_items i ON i.id = d.work_item_id
+                   false AS start_on
+            FROM work_item_dependencies d JOIN work_items w ON w.id = d.blocker_id
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
-            " ORDER BY d.work_item_id, d.blocker_id")
+            " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
+        starts = self._start_on_pairs(ids)
+        if starts:
+            for row in rows:
+                row["start_on"] = ((int(row["work_item_id"]),
+                                    int(row["blocker_id"])) in starts)
+        return rows
+
+    def _start_on_pairs(self, ids):
+        """#7760 : les couples « démarrage sur », lus par le module `dev`.
+
+        Le prédicat nomme `work_item_footprints`, une table du module : il ne
+        doit pas être exécuté sur la connexion brute du noyau, qui ne le
+        résoudrait plus après P2 (revue B1 de #7650).
+        """
+        from .work_dev import DevWork
         try:
-            return self.db.query(head + start_on_sql("i", "w") + " AS start_on" + tail,
-                                 tuple(ids))
+            return DevWork(self.db).start_on_pairs(ids)
         except DbError as exc:
             if exc.sqlstate != _INSUFFICIENT_PRIVILEGE:
                 raise
-            return self.db.query(head + "false AS start_on" + tail, tuple(ids))
+            return set()
 
     # ------------------------------------------------------------------
     # #4167 : liens typés (duplicates, supersedes, part_of, conflicts_with)

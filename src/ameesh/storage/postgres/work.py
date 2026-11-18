@@ -27,19 +27,11 @@ from . import catalog as _catalog
 from .work_dev import DevWork
 from .provenance import Provenance as _DevProvenance
 from .external_executors import require_active as require_external_executor_active
-from .work_footprints import (cap_reached_sql as footprint_cap_sql,
-                              cap_rows_sql as footprint_cap_rows_sql,
-                              held_sql as footprint_held_sql,
-                              in_flight_sql as footprint_in_flight_sql,
-                              occupying_sql as footprint_occupying_sql,
-                              overlap_exists_sql as footprint_overlap_sql,
-                              overlap_rows_sql as footprint_overlap_rows_sql)
 from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK,
                                 _UNPINNED)
 from .work_dependencies import current_verdict as _current_verdict
 from .work_dependencies import last_freeze_sha as _last_freeze_sha
 from .work_dependencies import not_blocking as _not_blocking
-from .work_dependencies import start_blocking as _start_blocking
 from .work_dependencies import start_defers as _start_defers
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
@@ -1445,12 +1437,10 @@ class WorkItems(interface.WorkItems):
             # COMMITTED, un SELECT … FOR UPDATE lit l'instantané pris avant
             # l'attente du verrou, donc une fusion ou une arête ajoutée
             # pendant cette attente y serait invisible. Même prédicat que
-            # `unassigned_lots` (une seule règle).
-            if self.db.query("SELECT 1 FROM work_item_dependencies d"
-                             " JOIN work_items b ON b.id = d.blocker_id"
-                             " JOIN work_items i ON i.id = d.work_item_id"
-                             " WHERE d.work_item_id = %s AND " + _start_blocking("i", "b") +
-                             " LIMIT 1", (int(item_id),)):
+            # `unassigned_lots` (une seule règle). Le prédicat nomme les
+            # empreintes (table du module `dev`) : il est exécuté par le
+            # module, sur sa connexion qualifiée (revue B1 de #7650).
+            if self._dev.start_blocked(item_id):
                 return None
             ready_state = item["state"]
             if ready_state == lifecycle.REQUESTED and (

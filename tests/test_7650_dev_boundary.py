@@ -21,6 +21,10 @@ from pathlib import Path
 import re
 import unittest
 
+#: Ordre d'import : `schema` importe `ameesh.storage`, dont les alias Postgres
+#: importent ce paquet ; charger `storage` d'abord évite le cycle quand ce
+#: module est lancé seul (le reste de la suite l'a déjà chargé).
+import ameesh.storage  # noqa: F401
 from ameesh.modules.dev.tables import TABLES
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +100,34 @@ def scan_to_regclass_literals() -> dict[tuple[str, str], list[int]]:
     return found
 
 
+#: Les constructeurs SQL du module `dev` (#7650) : leur texte nomme des
+#: tables `dev` et n'est qualifié que par ``ModuleDb``. Le noyau ne les
+#: importe pas — il passerait par un port du module ; un appel sur sa
+#: connexion brute casserait après P2 (revue B1 de #7760).
+_DEV_SQL_BUILDERS = frozenset({
+    "start_on_sql", "start_blocking", "footprints_overlap_sql",
+    "overlap_rows_sql", "overlap_exists_sql", "held_sql", "cap_rows_sql",
+    "cap_reached_sql", "in_flight_sql", "occupying_sql",
+})
+
+
+def scan_dev_sql_builder_imports() -> list[tuple[str, int, str]]:
+    """Les imports noyau d'un constructeur SQL du module `dev`."""
+    found = []
+    for path in sorted(SOURCE.rglob("*.py")):
+        if DEV in path.parents:
+            continue
+        tree = ast.parse(path.read_text(), str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            for alias in node.names:
+                if alias.name in _DEV_SQL_BUILDERS:
+                    found.append((str(path.relative_to(SOURCE)),
+                                  node.lineno, alias.name))
+    return found
+
+
 class DevBoundaryTest(unittest.TestCase):
 
     def test_core_never_names_a_dev_table_in_sql(self):
@@ -113,6 +145,13 @@ class DevBoundaryTest(unittest.TestCase):
                 self.assertRegex(lot, r"^#\d+$")
                 self.assertRegex(declared_on, r"^\d{4}-\d{2}-\d{2}$")
                 self.assertTrue(reason)
+
+    def test_core_never_imports_a_dev_sql_builder(self):
+        found = scan_dev_sql_builder_imports()
+        self.assertFalse(found,
+                         "constructeurs SQL du module `dev` importés par le "
+                         "noyau (exécutés sur la connexion brute, non "
+                         "qualifiés après P2) : %s" % found)
 
     def test_no_to_regclass_literal_names_a_dev_table(self):
         found = scan_to_regclass_literals()
