@@ -1,9 +1,11 @@
 # Noms Manaty du cœur — inventaire et garde (#7637)
 
-> **Lot** : #7637 (issue `manaty/ameesh#5828`), inventaire final après les
-> tranches #7792 à #7796 ; ce document est né avec #7660 (tranche 1).
+> **Lot** : #7637 (issue `manaty/ameesh#5828`), inventaire après les tranches
+> #7792 à #7796 ; ce document est né avec #7660 (tranche 1).
 > **Date** : 18/11/2026. **Base** : `main` `3b92fbf3df4523467c70f14619b386f8cf5cd643`.
 > **Portée** : `src/ameesh/`, hors `modules/`, tests et notes.
+> **Dépendance** : #7813 (sixième tranche, 13 `nexlink`) ; l'inventaire final
+> sera régénéré à sa fusion (cible : 7 occurrences, 5 fichiers).
 > **Garde** : `tests/test_7660_coeur_sans_noms_manaty.py`. L'inventaire est
 > régénéré depuis `occurrences()` ; `EXCEPTIONS` porte le même contenu agrégé
 > par fichier et nom, et `INSTRUCTION_EXCEPTIONS` couvre les consignes.
@@ -26,8 +28,13 @@ Après les cinq tranches de code (#7792 à #7796), il reste **20 occurrences
 dans 13 fichiers**, contre 440 dans 56 au premier inventaire (#7660). Le nom
 `manaty` a disparu du code ; `nexlink` reste 13 fois. Cinq occurrences sont
 figées dans des migrations déjà appliquées, deux sont des jetons de rôle
-assumés par #7792 et treize n'ont aucune tranche : le détail est au §5 et le
-verdict au §7.
+autorisés par la décision du 18/11 et treize sont portés par la sixième tranche
+#7813 : le détail est au §5 et le verdict au §7.
+
+Le critère, amendé par mesh-design le 18/11/2026, autorise **7 occurrences** :
+les 5 figées dans des migrations appliquées et les 2 jetons de rôle de
+`roles.py`. Les 13 `nexlink` restants sont portés par la sixième tranche
+#7813, dépendance bloquante de #7637.
 
 Les formes plurielles (`auditeurs`, `orchestrateurs`, `bureaux`) sont comptées
 sous le nom canonique. Les noms les plus longs sont masqués d'abord :
@@ -84,9 +91,9 @@ Reproduction :
 PYTHONPATH=src python3 -m unittest tests.test_7660_coeur_sans_noms_manaty -v
 ```
 
-La fonction `occurrences()` du test rend les 20 lignes de l'inventaire ;
-`EXCEPTIONS` porte le même contenu agrégé en 14 entrées. Les consignes
-(`consignes/*.md`) sont lues à part par `instruction_occurrences()` ;
+La fonction `occurrences()` du test rend les lignes de l'inventaire (20 sur
+cette base) ; `EXCEPTIONS` porte le même contenu agrégé en 14 entrées. Les
+consignes (`consignes/*.md`) sont lues à part par `instruction_occurrences()` ;
 `INSTRUCTION_EXCEPTIONS` porte leur unique exception (§5.4).
 
 ## 3. Synthèse
@@ -94,8 +101,8 @@ La fonction `occurrences()` du test rend les 20 lignes de l'inventaire ;
 | Statut | Occurrences | Fichiers | Détail |
 |---|---|---|---|
 | Figées dans des migrations appliquées | 5 | 4 | `bureau` 3, `smichea` 2 |
-| Assumées : vocabulaire des fiches | 2 | 1 | `auditeur`, `orchestrateur` dans `roles.py` (#7792) |
-| Restantes : aucune tranche | 13 | 8 | `nexlink` |
+| Autorisées : vocabulaire des fiches | 2 | 1 | `auditeur`, `orchestrateur` dans `roles.py` (décision 18/11) |
+| Restantes : portées par #7813 | 13 | 8 | `nexlink` |
 | **Total** | **20** | **13** | |
 
 Un fichier peut porter plusieurs statuts : les colonnes « Fichiers » ne
@@ -106,7 +113,7 @@ s'additionnent pas, le total est le nombre de fichiers distincts.
   rollback, figées dans l'histoire du schéma.
 - **#7661, #7792** : les rôles `mesh-design`, `auditeur`, `orchestrateur` sont
   lus à la fiche Agent. `roles.py` ne garde que deux jetons par défaut
-  (`auditeur`, `orchestrateur`), assumés par #7792.
+  (`auditeur`, `orchestrateur`), autorisés par la décision du 18/11.
 - **#7662, #7795** : les hôtes et la personne `smichea` sont lus au canon ;
   restent 2 `smichea` dans la migration 0364. Les 9 `manaty` sont retirés.
 - **#7663, #7793, #7794, #7795** : le module Nexlink reprend la release, le
@@ -116,8 +123,9 @@ s'additionnent pas, le total est le nombre de fichiers distincts.
   chemin `docs/ORCHESTRATEUR.md` de `veille.md` (§5.4), et la garde lit
   `Global`/`Nonlocal`.
 
-Aucune tranche ne couvre les 13 `nexlink` restants : c'est le seul écart
-matériel avec l'acceptation du lot (§5.3, §7).
+Les 13 `nexlink` restants sont portés par la sixième tranche #7813 (décision
+mesh-design du 18/11/2026). Après sa fusion, la cible est **7 occurrences dans
+5 fichiers** : les 5 migrations et les 2 jetons de `roles.py` (§5.2, §7).
 
 ## 4. Inventaire
 
@@ -127,40 +135,40 @@ sur deux lignes de tableau si elle porte deux formes différentes ; `×N`
 signale N occurrences du même nom sur la même ligne.
 
 État : `figée (migration)` = SQL d'une migration déjà appliquée, non réécrit ;
-`assumée (#7792)` = jeton par défaut du vocabulaire des fiches, déclaré et
-justifié par la tranche ; `reste (sans tranche)` = nom encore dans le cœur,
-qu'aucune tranche ne retire à ce jour.
+`autorisée (décision 18/11)` = jeton de vocabulaire des fiches, autorisé par la
+décision mesh-design ; `reste (#7813)` = nom encore dans le cœur, que la
+sixième tranche #7813 retire.
 
 ### `approve/config.py` (2 occurrences)
 
 | Ligne(s) | Nom | Nature | Forme | Tranche | État |
 |---|---|---|---|---|---|
-| 85, 86 | `nexlink` | projet | constante/clé | #7663 | reste (sans tranche) |
+| 85, 86 | `nexlink` | projet | constante/clé | #7663 | reste (#7813) |
 
 ### `ci.py` (2 occurrences)
 
 | Ligne(s) | Nom | Nature | Forme | Tranche | État |
 |---|---|---|---|---|---|
-| 3432 | `nexlink` | projet | message | #7663 | reste (sans tranche) |
-| 3851 | `nexlink` | projet | constante/clé | #7663 | reste (sans tranche) |
+| 3432 | `nexlink` | projet | message | #7663 | reste (#7813) |
+| 3851 | `nexlink` | projet | constante/clé | #7663 | reste (#7813) |
 
 ### `cost.py` (1 occurrence)
 
 | Ligne(s) | Nom | Nature | Forme | Tranche | État |
 |---|---|---|---|---|---|
-| 1196 | `nexlink` | projet | constante/clé | #7663 | reste (sans tranche) |
+| 1196 | `nexlink` | projet | constante/clé | #7663 | reste (#7813) |
 
 ### `fingerprints.py` (1 occurrence)
 
 | Ligne(s) | Nom | Nature | Forme | Tranche | État |
 |---|---|---|---|---|---|
-| 58 | `nexlink` | projet | constante/clé | #7663 | reste (sans tranche) |
+| 58 | `nexlink` | projet | constante/clé | #7663 | reste (#7813) |
 
 ### `host_cli.py` (2 occurrences)
 
 | Ligne(s) | Nom | Nature | Forme | Tranche | État |
 |---|---|---|---|---|---|
-| 272, 508 | `nexlink` | projet | message | #7663 | reste (sans tranche) |
+| 272, 508 | `nexlink` | projet | message | #7663 | reste (#7813) |
 
 ### `migrations/0364_key_holders.sql` (2 occurrences)
 
@@ -190,26 +198,26 @@ qu'aucune tranche ne retire à ce jour.
 
 | Ligne(s) | Nom | Nature | Forme | Tranche | État |
 |---|---|---|---|---|---|
-| 1045, 1256, 1274 | `nexlink` | projet | constante/clé | #7663 | reste (sans tranche) |
+| 1045, 1256, 1274 | `nexlink` | projet | constante/clé | #7663 | reste (#7813) |
 
 ### `role_timers.py` (1 occurrence)
 
 | Ligne(s) | Nom | Nature | Forme | Tranche | État |
 |---|---|---|---|---|---|
-| 624 | `nexlink` | projet | message | #7663 | reste (sans tranche) |
+| 624 | `nexlink` | projet | message | #7663 | reste (#7813) |
 
 ### `roles.py` (2 occurrences)
 
 | Ligne(s) | Nom | Nature | Forme | Tranche | État |
 |---|---|---|---|---|---|
-| 15 | `auditeur` | rôle | constante/clé | #7661 | assumée (#7792) |
-| 17 | `orchestrateur` | rôle | constante/clé | #7661 | assumée (#7792) |
+| 15 | `auditeur` | rôle | constante/clé | #7661 | autorisée (décision 18/11) |
+| 17 | `orchestrateur` | rôle | constante/clé | #7661 | autorisée (décision 18/11) |
 
 ### `server_faults.py` (1 occurrence)
 
 | Ligne(s) | Nom | Nature | Forme | Tranche | État |
 |---|---|---|---|---|---|
-| 51 | `nexlink` | projet | constante/clé | #7663 | reste (sans tranche) |
+| 51 | `nexlink` | projet | constante/clé | #7663 | reste (#7813) |
 
 ## 5. Ce qui reste, et pourquoi
 
@@ -236,9 +244,9 @@ rôle sur le titre d'une persona. Les deux jetons restants sont le vocabulaire
 par défaut de la fiche ; un mesh dont le canon emploie d'autres mots n'est pas
 reconnu comme auditeur ou orchestrateur sans passer par ces synonymes.
 
-Deux lectures possibles, à trancher par le pilote : les assumer comme schéma
-du canon (le vocabulaire des fiches est alors une constante du produit), ou
-les lire à la configuration pour que le profil nu n'en porte aucun.
+Décision mesh-design du 18/11/2026 : ces deux jetons sont **autorisés** comme
+vocabulaire générique comparé au `roles:` déclaré par la fiche ; ce n'est pas
+un nom de persona. Ils restent dans la liste des 7 occurrences autorisées.
 
 ### 5.3 `nexlink` restants (13)
 
@@ -256,8 +264,10 @@ les lire à la configuration pour que le profil nu n'en porte aucun.
 | `server_faults.py:51` | schéma de page servi `nexlink-fingerprints/1` | même correctif que `fingerprints.py` |
 
 Les cinq tranches ont laissé ces huit fichiers hors de leurs empreintes, ou en
-dette déclarée ; aucun lot ouvert ne les porte. C'est l'écart avec l'attente du
-découpage (« il ne reste que les 5 migrations »).
+dette déclarée. La sixième tranche **#7813** (mty-amh-impl-08, décision
+mesh-design du 18/11/2026) les retire tous ; elle est dépendance bloquante de
+#7637. C'est l'écart avec l'attente du découpage (« il ne reste que les
+5 migrations »).
 
 ### 5.4 Consignes (1)
 
@@ -271,8 +281,8 @@ consigne ne nomme un rôle, un hôte, une personne ou un projet.
 Elle refuse un nouveau nom et une exception devenue inutile. Toute tranche qui
 retire du code inclut `tests/test_7660_coeur_sans_noms_manaty.py` dans son
 empreinte et baisse les compteurs. La liste `EXCEPTIONS` ne peut que décroître ;
-`RECORDED_BY_TRANCHE` est le plafond historique. Une sixième tranche qui
-retirerait les 13 `nexlink` devrait donc modifier le test dans le même commit.
+`RECORDED_BY_TRANCHE` est le plafond historique. La sixième tranche #7813 doit
+donc modifier le test dans le même commit que le retrait des 13 `nexlink`.
 
 ### 5.6 Lignes et rebase
 
@@ -293,11 +303,10 @@ changer avec une fusion voisine : régénérer l'inventaire depuis
   figée, pas comme un oubli.
 - Le choix du lexique est une décision de revue : `orchestrateur` et `bureau`
   sont retenus comme identités ; `pilote`, `relecteur`, `composeur` et `veille`
-  restent du vocabulaire générique. Les deux jetons de `roles.py` sont des
-  exceptions assumées, pas des noms hors lexique : si le pilote les exclut, la
-  garde et les compteurs changent ensemble.
+  restent du vocabulaire générique. Les deux jetons de `roles.py` sont autorisés
+  par la décision du 18/11 ; ils ne changent que si le lexique change.
 - L'inventaire du §4 ne compte que le cœur exécutable ; les consignes sont
-  lues à part (§5.4) et n'entrent pas dans les 20 occurrences.
+  lues à part (§5.4) et n'entrent pas dans le total du §4.
 
 ## 7. Acceptation
 
@@ -305,13 +314,13 @@ changer avec une fusion voisine : régénérer l'inventaire depuis
 |---|---|
 | Inventaire exhaustif | **oui** — 20 occurrences dans 13 fichiers, régénérées depuis `occurrences()` ; les consignes sont traitées à part (§5.4). |
 | Garde verte | **oui** — les 7 tests de `tests/test_7660_coeur_sans_noms_manaty.py` sont verts sur la base ; 172 tests ciblés des tranches (rôles, hôtes, module Nexlink, train, notifications, profil nu) le sont aussi. |
-| Plus aucun nom de rôle, d'hôte ou de projet Manaty dans le cœur, hors tests et notes | **non** — 15 occurrences hors migrations : 2 jetons dans `roles.py`, 13 `nexlink`. |
+| Plus aucun nom de rôle, d'hôte ou de projet Manaty dans le cœur, hors tests et notes | **en attente de #7813** — le critère amendé le 18/11 autorise 7 occurrences (5 migrations + 2 jetons de `roles.py`) ; les 13 `nexlink` restants sont portés par #7813. |
 | Le mesh Manaty se comporte à l'identique avec son canon | **couvert par les tranches** — #7792 à #7796 ont livré leurs tests ciblés ; ce lot ne change pas le code. |
-| Le profil nu démarre sans ces rôles ni ces hôtes | **oui pour les hôtes** (0 occurrence) et pour le démarrage (`test_l98_bare_profile`, `test_l104_bare_canon` verts) ; **à trancher pour les 2 jetons de rôle** de `roles.py`. |
+| Le profil nu démarre sans ces rôles ni ces hôtes | **oui pour les hôtes** (0 occurrence) et pour le démarrage (`test_l98_bare_profile`, `test_l104_bare_canon` verts) ; les 2 jetons de rôle sont autorisés par la décision du 18/11 ; les 13 `nexlink` sortiront avec #7813. |
 | Aucun changement de comportement | **oui** — ce lot ne modifie que ce document. |
 
-L'inventaire est à jour et la garde est verte, mais le critère « plus aucun
-nom » n'est pas atteint : 15 occurrences hors migrations restent dans le cœur,
-dont 13 sans aucune tranche. Le lot ne peut pas clore sur ce critère sans une
-sixième tranche de code, ou sans une acceptation explicite du pilote (ou de
-l'owner) qui amende le critère. La décision est demandée à mesh-design.
+L'inventaire est à jour sur la base du 18/11 et la garde est verte. Le critère
+amendé par mesh-design autorise 7 occurrences (5 migrations + 2 jetons) ; les
+13 `nexlink` restants sont l'unique écart, porté par la sixième tranche #7813,
+dépendance bloquante de #7637. À sa fusion, ce document sera régénéré à 7
+occurrences dans 5 fichiers, puis la tête sera gelée pour la revue.
