@@ -640,10 +640,10 @@ class InstallerTreeCheck(unittest.TestCase):
     """Le contrôle de l'arbre source avant le pip root (B de la revue).
 
     `find -perm -022` exige g+w ET o+w : un fichier root:groupe-client en 0664
-    passait, alors que pip exécute ensuite son backend de build en root. Le
-    test lit l'expression exacte d'install.sh et la rejoue sur un arbre
-    temporaire ; seul le bras de propriété est neutralisé, faute de root dans
-    le test, pour que le mode décide.
+    (ou root:autres en 0646) passait, alors que pip exécute ensuite son backend
+    de build en root. Le test lit l'expression exacte d'install.sh et la rejoue
+    sur un arbre temporaire ; seul le bras de propriété est neutralisé, faute de
+    root dans le test, pour que le mode décide.
     """
 
     def _command(self):
@@ -668,6 +668,14 @@ class InstallerTreeCheck(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("import os\n")
             os.chmod(path, 0o664)
+            self.assertEqual(self._unsafe_entry(directory), path)
+
+    def test_an_other_only_writable_entry_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "backend.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("import os\n")
+            os.chmod(path, 0o646)
             self.assertEqual(self._unsafe_entry(directory), path)
 
     def test_a_root_private_entry_is_accepted(self):
