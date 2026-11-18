@@ -531,6 +531,21 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
 
 
 class ForgeCitationResolutionTest(unittest.TestCase):
+    def test_hex_suffix_in_a_word_is_not_a_commit_citation(self):
+        # #7774 : la fin de `succeeded` (`cceeded`) est faite de caractères
+        # hexadécimaux ; la lecture stricte la prenait pour un SHA cité et
+        # refusait la tête. Un fragment noyé dans un mot, avant ou après des
+        # lettres, n'est pas un jeton ; la vraie citation reste lue.
+        for text in ("owner-decision job succeeded; correctif-1234abcd retiré",
+                     "mot 1234abcdxyz ; correctif-1234abcd retiré"):
+            with self.subTest(text=text):
+                citations = [
+                    match["commit"]
+                    for match in review_authors._CITED_COMMIT.finditer(text)
+                    if match["commit"]
+                ]
+                self.assertEqual(citations, ["1234abcd"])
+
     def test_gh_without_shared_reads_preserves_commit_absence(self):
         from ameesh import plan_github
 

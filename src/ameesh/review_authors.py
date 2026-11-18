@@ -5247,13 +5247,15 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
 #: écartées avant toute résolution Git (#7576). Le nom complet d'un paquet
 #: horaire (`h-AAAAMMJJ-NN`) est un identifiant, pas une citation : sa date
 #: (huit chiffres hexadécimaux) est consommée avec lui (#7709). Une citation
-#: avec tiret (`correctif-<sha>`) reste lue et résolue : l'exclusion ne vaut
-#: que pour l'identifiant reconnu, jamais pour un mot quelconque (B/P2
-#: auditeur).
+#: avec tiret (`correctif-<sha>`) ou souligné reste lue et résolue : le tiret
+#: et le souligné restent des séparateurs. Une suite hexadécimale noyée dans
+#: un mot (`succeeded`) n'est pas un jeton de commit, même quand sa fin n'est
+#: faite que de chiffres hexadécimaux (#7774) ; le jeton est donc borné par
+#: des caractères non alphanumériques ASCII, pas seulement non hexadécimaux.
 _CITED_COMMIT = re.compile(
     r"\b(?:checksum|sha256)\s+[0-9a-f]+\b"
     r"|\bh-\d{8}-\d+\b"
-    r"|(?P<commit>(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f]))",
+    r"|(?P<commit>(?<![0-9a-z])[0-9a-f]{7,40}(?![0-9a-z]))",
     re.IGNORECASE)
 
 #: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
