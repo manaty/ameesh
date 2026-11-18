@@ -16,6 +16,7 @@
         "src/ameesh/provenance_scope.py",
         "src/ameesh/fire.py",
         "src/ameesh/registry.py",
+        "src/ameesh/modules/registry.py",
         "src/ameesh/merge_queue.py",
         "src/ameesh/land.py",
         "src/ameesh/packet_reviews.py",
@@ -33,7 +34,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/modules/nexlink/release.py",
+        "src/ameesh/modules/nexlink/**",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -51,6 +52,7 @@
         "src/ameesh/provenance_scope.py",
         "src/ameesh/fire.py",
         "src/ameesh/registry.py",
+        "src/ameesh/modules/registry.py",
         "src/ameesh/merge_queue.py",
         "src/ameesh/land.py",
         "src/ameesh/packet_reviews.py",
@@ -68,7 +70,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/modules/nexlink/release.py",
+        "src/ameesh/modules/nexlink/**",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -90,6 +92,7 @@
         "src/ameesh/provenance_scope.py",
         "src/ameesh/fire.py",
         "src/ameesh/registry.py",
+        "src/ameesh/modules/registry.py",
         "src/ameesh/merge_queue.py",
         "src/ameesh/land.py",
         "src/ameesh/packet_reviews.py",
@@ -107,7 +110,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/modules/nexlink/release.py",
+        "src/ameesh/modules/nexlink/**",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -125,6 +128,7 @@
         "src/ameesh/provenance_scope.py",
         "src/ameesh/fire.py",
         "src/ameesh/registry.py",
+        "src/ameesh/modules/registry.py",
         "src/ameesh/merge_queue.py",
         "src/ameesh/land.py",
         "src/ameesh/packet_reviews.py",
@@ -142,7 +146,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/modules/nexlink/release.py",
+        "src/ameesh/modules/nexlink/**",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -177,6 +181,7 @@
         "src/ameesh/provenance_scope.py",
         "src/ameesh/fire.py",
         "src/ameesh/registry.py",
+        "src/ameesh/modules/registry.py",
         "src/ameesh/merge_queue.py",
         "src/ameesh/land.py",
         "src/ameesh/packet_reviews.py",
@@ -194,7 +199,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/modules/nexlink/release.py",
+        "src/ameesh/modules/nexlink/**",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -212,6 +217,7 @@
         "src/ameesh/provenance_scope.py",
         "src/ameesh/fire.py",
         "src/ameesh/registry.py",
+        "src/ameesh/modules/registry.py",
         "src/ameesh/merge_queue.py",
         "src/ameesh/land.py",
         "src/ameesh/packet_reviews.py",
@@ -229,7 +235,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/modules/nexlink/release.py",
+        "src/ameesh/modules/nexlink/**",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -264,6 +270,7 @@
         "src/ameesh/provenance_scope.py",
         "src/ameesh/fire.py",
         "src/ameesh/registry.py",
+        "src/ameesh/modules/registry.py",
         "src/ameesh/merge_queue.py",
         "src/ameesh/land.py",
         "src/ameesh/packet_reviews.py",
@@ -281,7 +288,7 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/modules/nexlink/release.py",
+        "src/ameesh/modules/nexlink/**",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
@@ -299,6 +306,7 @@
         "src/ameesh/provenance_scope.py",
         "src/ameesh/fire.py",
         "src/ameesh/registry.py",
+        "src/ameesh/modules/registry.py",
         "src/ameesh/merge_queue.py",
         "src/ameesh/land.py",
         "src/ameesh/packet_reviews.py",
@@ -316,14 +324,14 @@
         "scripts/paquet-attribution.py",
         "src/ameesh/release.py",
         "src/ameesh/release_cutoff.py",
-        "src/ameesh/modules/nexlink/release.py",
+        "src/ameesh/modules/nexlink/**",
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
       ]
     }
   },
-  "policy_ref": "f735569e0650e65aa4b8507c62445930ee0b3d55",
+  "policy_ref": "d26a821679075b561876d0b2b2213176cf6727ea",
   "project": "ameesh",
   "version": 1
 }
