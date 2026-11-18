@@ -121,10 +121,10 @@ EXCEPTIONS = {
     ("migrations/0364_key_holders.sql", "smichea"): 2,
     ("release_cutoff.py", "smichea"): 2,
     ("storage/postgres/authority.py", "smichea"): 1,
-    # -- release Nexlink dans le module Nexlink (#7663) : 55
+    # -- release Nexlink dans le module Nexlink (#7663) : 17
+    #    (#7794 : contrat CI du train et doctor, 38 retirés)
     ("approve/config.py", "nexlink"): 2,
     ("ci.py", "nexlink"): 2,
-    ("cli.py", "nexlink"): 8,
     ("cost.py", "nexlink"): 1,
     ("fingerprints.py", "nexlink"): 1,
     ("host_cli.py", "nexlink"): 2,
@@ -133,8 +133,6 @@ EXCEPTIONS = {
     ("release.py", "nexlink"): 3,
     ("role_timers.py", "nexlink"): 1,
     ("server_faults.py", "nexlink"): 1,
-    ("train_assembly.py", "nexlink"): 2,
-    ("train_contracts.py", "nexlink"): 28,
     # -- aucune tranche annoncée : organisation Manaty, à décider : 9
     ("alert_briefs.py", "manaty"): 2,
     ("incident.py", "manaty"): 2,
