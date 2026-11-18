@@ -28,3 +28,19 @@ accès à la base du mesh (voir `docs/prod-go.md`) ; l'appel de cette commande
 doit donc être placé sur le poste de dispatch, avant l'envoi, et ses autres
 chemins d'accès doivent être examinés. Une fois le run envoyé, un STOP exige
 l'annulation du run et la tenue de `prod-deploy` pendant la fenêtre signée.
+
+Un appel peut placer la commande d'effet après `--` : le processus de garde
+enregistre le reçu, ferme la connexion puis exécute directement cette
+commande, sans interpréteur ajouté. La borne `--since` reste celle capturée
+avant l'attente. Il faut placer l'attente avant cet appel : une attente ou un
+autre travail à l'intérieur de la commande relance la même faille. Un refus
+n'exécute pas la commande.
+
+Selon bureau (courrier #225756, 18/11), p2a et la sauvegarde sont jetables
+sur bureau-goal ; les déploiements utilisent des appels directs à `gh` et les
+migrations `scripts/migrate.sh` dans Nexlink. Le préfixe est donc volontaire :
+il ne bloque pas les appels directs, ni un STOP entre contrôle et effet, ni
+un STOP après le dispatch. Son adoption ne constitue pas une barrière imposée
+aux identifiants KMS, à GitHub ou à la base. Il faut identifier et mettre en
+place une voie d'exécution imposable, couvrir les chemins directs et les
+attentes, puis qualifier ces courses avant de considérer l'intégration finie.

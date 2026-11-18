@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 from ameesh import pre_act
@@ -95,3 +96,29 @@ class PreActTest(unittest.TestCase):
         with self.assertRaises(pre_act.Refused):
             pre_act.inspect(tx, 5772, "bureau", 100, "kms")
         self.assertFalse(tx.writes)
+
+    def test_guard_executes_only_after_receipt_and_closes_connection(self):
+        tx = Transaction()
+        db = mock.Mock()
+        db.transaction.return_value = nullcontext(tx)
+        binding = mock.Mock(ok=True, name="bureau")
+        binding.name = "bureau"
+        with mock.patch.object(pre_act.config, "load", return_value=object()), \
+             mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
+             mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
+             mock.patch.object(pre_act.identity, "resolve_binding", return_value=binding), \
+             mock.patch.object(pre_act.os, "execvp") as execute:
+            self.assertEqual(pre_act.main(["--lot", "5772", "--kind", "kms", "--since",
+                                           "1970-01-01T00:01:40Z", "--", "true"]), 0)
+        self.assertTrue(tx.writes)
+        db.close.assert_called_once()
+        execute.assert_called_once_with("true", ["true"])
+
+    def test_refusal_never_executes_command(self):
+        with mock.patch.object(pre_act.config, "load", return_value=object()), \
+             mock.patch.object(pre_act.db_mod, "open_db", side_effect=OSError("offline")), \
+             mock.patch.object(pre_act.os, "execvp") as execute:
+            result = pre_act.main(["--lot", "5772", "--kind", "kms", "--since",
+                                   "2026-11-18T01:00:00Z", "--", "true"])
+        self.assertEqual(result, 1)
+        execute.assert_not_called()
