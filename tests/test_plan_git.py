@@ -328,6 +328,15 @@ class RebaseIdentityTest(unittest.TestCase):
         self.assertEqual(out["sha"], "")
         self.assertIn("blocked-verdict", out["causes"])
 
+    def test_sans_depot_avis_compagnon_reste_candidat(self) -> None:
+        foreign = "f" * 40
+        rows = [frozen(self.frozen, 10), verdict(self.frozen, 11),
+                verdict(foreign, 12, id=3)]
+        out = plan_git.freeze_candidate(rows)
+        self.assertEqual(out["sha"], foreign)
+        self.assertEqual(out["origin"], "verdict")
+        self.assertNotIn("verdict-unresolved-in-lot-repository", out["notes"])
+
     def test_nouvelle_tete_connue_du_depot_reste_effective(self) -> None:
         rows = [frozen(self.reviewed, 10), verdict(self.reviewed, 11),
                 verdict(self.frozen, 12, id=3)]

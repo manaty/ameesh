@@ -1099,6 +1099,8 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     # peut ni déplacer le gel ni masquer les avis du dépôt du lot. Ne filtrer
     # qu'avec un dépôt lisible et un gel vérifié : sinon conserver le refus
     # habituel, jamais transformer une lecture impossible en preuve de gel.
+    # Sans dépôt, les lecteurs non composeurs (dont slo_delivery) gardent
+    # leur comportement historique, sans refus non concluant ni filtre.
     foreign_verdicts = []
     if repo and f_sha and _commit(repo, f_sha, timeout=PROBE_TIMEOUT_S):
         resolved = {}
