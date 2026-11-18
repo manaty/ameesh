@@ -18,9 +18,13 @@ from ameesh import alert_briefs, mail, notify, storage, work
 from .test_l118_assignments import _Base
 
 
-def _row(name, *, team="ameesh"):
-    return {"name": name, "team": team, "host": "h1", "lease_live": True,
-            "status": "idle", "mode": "execute"}
+def _row(name, *, team="ameesh", roles=None):
+    row = {"name": name, "team": team, "host": "h1", "lease_live": True,
+           "status": "idle", "mode": "execute"}
+    if roles is not None:
+        # #7661 : le rôle auditeur se lit sur la fiche, jamais sur le nom.
+        row["roles"] = list(roles)
+    return row
 
 
 def _slo(*, level=1, overdue=360, targets=("assignee",), **kw):
@@ -35,7 +39,7 @@ def _slo(*, level=1, overdue=360, targets=("assignee",), **kw):
 
 
 LISTING = [_row("dev1"), _row("orch1"), _row("orch2"), _row("bureau"),
-           _row("auditeur")]
+           _row("auditeur", roles=["auditeur"])]
 
 
 def _briefs(alert, listing=LISTING, covered=()):

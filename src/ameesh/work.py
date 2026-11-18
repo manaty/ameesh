@@ -195,8 +195,9 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
 
 
 def is_auditor(cfg, db, name: str) -> bool:
-    """#3324 : `name` est-il l'auditeur — la persona `auditeur`, ou un agent
-    dont la fiche Agent du canon porte `roles: [auditeur]` (ou `auditor`) ?
+    """#3324 : `name` est-il l'auditeur — un agent dont la fiche Agent du canon
+    porte `roles: [auditeur]` (ou `auditor`) ? #7661 : le titre de la persona
+    ne compte plus, seule la fiche déclare le rôle.
 
     La fiche de l'auditeur (canon, 24/10/2026) range la redésignation d'un
     relecteur au niveau 1 ; le plancher d'avis (`--floor`) reste un geste de
@@ -501,8 +502,8 @@ def publisher(cfg, db, explicit: str | None = None) -> str:
         raise WorkError("--publish refused: invalid session identity (%s)"
                         % (binding.reason or "unbound identity"))
     refus = ("--publish refused: %s is not the auditor; the reference table (L157b) "
-             "is the auditor's pass (persona auditeur, or auditeur role on its Agent "
-             "card in the canon); work estimates without --publish reads it")
+             "is the auditor's pass (the auditeur role on its Agent card in the canon); "
+             "work estimates without --publish reads it")
     if binding.name:
         if text and text != binding.name:
             raise WorkError("--publish refused: this session belongs to %s, it does "
@@ -1796,8 +1797,9 @@ def held_lots(db: Db, agents) -> dict[str, dict]:
 
 def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
     """#753 : l'acteur de la mesure post-déploiement d'un lot promu —
-    l'auditeur du registre (l'agent `auditeur`, ou celui dont la fiche Agent
-    du canon porte le rôle). Un auditeur arrêté ou mort n'est pas un acteur :
+    l'auditeur du registre (celui dont la fiche Agent, ou la projection `roles`
+    du registre sans canon, porte le rôle ; #7661 : jamais un titre de
+    persona). Un auditeur arrêté ou mort n'est pas un acteur :
     on ne réassigne pas un lot à un agent arrêté, ce serait le mal que ce lot
     corrige. Chaîne vide s'il n'y a aucun auditeur vivant, ou plusieurs sans
     choix évident : les lots promus restent alors en place. Jamais
@@ -1813,8 +1815,8 @@ def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
     living = {row.get("name") for row in listing
               if row.get("name")
               and (row.get("status") or "") not in ("stopped", "dead")}
-    if alert_briefs.AUDITOR_NAME in living:   # le nom suffit : pas de canon
-        return alert_briefs.AUDITOR_NAME
+    # #7661 : l'auditeur se lit sur la fiche (rôle du canon, ou projection du
+    # registre sans canon), jamais sur le titre de la persona.
     names = [name for name in alert_briefs.auditors(
                  listing, configured_canons(cfg) if canons is None else canons)
              if name in living]
@@ -5434,7 +5436,7 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     n'a rien à prouver ici (l'avertissement « inconnu » la dit au journal). Le
     chemin médié a déjà sa garde (`_require_assigned`) ; les moves internes
     (décisions, report de verdict) n'appellent pas ce contrôle."""
-    from . import avatars, identity, slo
+    from . import alert_briefs, avatars, identity, slo
     from .work_reviewers import designated
 
     if storage.is_remote(db):
@@ -5452,7 +5454,11 @@ def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
     if lifecycle.phase(item) in (*TO_VALIDATE, "validated") \
             and who in designated(item):
         return
-    if (who in slo.CRITICAL_TARGETS or avatars.is_avatar(cfg, who)
+    # #7661 : les cibles critiques du §9 sont des rôles, pas des noms ; le
+    # titre `auditeur` ne donne pas le déplacement, `is_auditor` le lit sur la
+    # fiche. L'avatar du responsable (#7634) garde son geste.
+    targets = set(slo.CRITICAL_TARGETS) - set(alert_briefs.AUDITOR_ROLES)
+    if (who in targets or avatars.is_avatar(cfg, who)
             or is_pilot(cfg, db, who) or is_auditor(cfg, db, who)):
         return
     raise WorkError(

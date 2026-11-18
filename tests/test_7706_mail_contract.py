@@ -200,24 +200,25 @@ class ReservedActorTest(PublicMailBase):
         self.assertEqual(self.rows(), [])
 
     def test_reserved_names_come_from_the_canon_not_the_core(self):
-        from ameesh import alert_briefs, chat, watch, work
+        from ameesh import chat, watch, work
 
         self.assertIn(work.SYSTEM_SENDER, public_mail.RESERVED_ACTORS)
         self.assertIn(watch.SENDER, public_mail.RESERVED_ACTORS)
         self.assertIn(work.UNKNOWN_ACTOR, public_mail.RESERVED_ACTORS)
         self.assertIn(chat.CHAT_PREFIX, public_mail.RESERVED_ACTOR_PREFIXES)
         self.assertIn(work.HUMAN_PREFIX, public_mail.RESERVED_ACTOR_PREFIXES)
-        # No mesh role is written in the core: they are read from the canon.
-        for name in (alert_briefs.AUDITOR_NAME, "bureau"):
+        # No mesh persona name is written in the core (#7661): a governance
+        # identity is recognized by the role its Agent/Persona card declares.
+        for name in ("auditeur", "bureau"):
             self.assertNotIn(name, public_mail.RESERVED_ACTORS)
         with canon_configured(
-            (alert_briefs.AUDITOR_NAME, list(alert_briefs.AUDITOR_ROLES)),
+            ("auditeur", ["auditeur", "auditor"]),
             ("bureau", ["bureau"]),
             ("pilote-nexlink", ["pilote"]),
             ("agent-sans-role", []),
         ):
             names = public_mail.reserved_actors(self.db)
-        self.assertIn(alert_briefs.AUDITOR_NAME, names)
+        self.assertIn("auditeur", names)
         self.assertIn("bureau", names)
         # A role declared by another canon, unknown to the core, is covered.
         self.assertIn("pilote-nexlink", names)

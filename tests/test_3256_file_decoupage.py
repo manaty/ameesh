@@ -12,6 +12,7 @@ paramètres viennent du bloc `file` du canon.
 from __future__ import annotations
 
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -42,6 +43,19 @@ def team(idle: int, busy: int, project="ameesh", prefix="dev"):
                for i in range(busy)])
 
 
+class _Canon:
+    """Canon minimal (#7661) : les fiches des agents, rôles déclarés."""
+
+    readable = True
+    federation: dict = {}
+
+    def __init__(self, cards):
+        self.agents = [
+            types.SimpleNamespace(
+                title=name, fiche=types.SimpleNamespace(data={"roles": roles}))
+            for name, roles in cards.items()]
+
+
 def _footprint(db, item, *paths):
     """#4717 : l'empreinte déclarée du lot, comme `work assign` la lit."""
     storage.of(db).work_footprints.replace(int(item["id"]), "manual",
@@ -49,19 +63,25 @@ def _footprint(db, item, *paths):
 
 
 class MeasureTest(unittest.TestCase):
-    def measures(self, listing, lots=(), waits=None, footprint=None):
-        return fd.measure(listing, list(lots), waits or {}, 1000.0, [],
-                          configured=False, footprint=footprint)
+    def measures(self, listing, lots=(), waits=None, footprint=None, *,
+                 canons=(), configured=False):
+        return fd.measure(listing, list(lots), waits or {}, 1000.0, list(canons),
+                          configured=configured, footprint=footprint)
 
     def test_critical_external_and_ephemeral_agents_are_not_wakeable(self):
-        listing = team(1, 1) + [agent("auditeur"), agent("chat", mode="externe"),
+        # #7661 : la criticité se lit sur le rôle déclaré, pas sur le nom ;
+        # une persona nommée `auditeur` sans ce rôle reste une capacité.
+        listing = team(1, 1) + [agent("auditeur"),
+                                agent("veille", roles=["auditeur"]),
+                                agent("chat", mode="externe"),
                                 agent("probe", ephemeral=True),
                                 agent("dormeur", operator_paused=True),
                                 agent("retraite", retired_ts=900.0),
                                 agent("sans_executeur", lease_live=False)]
-        item = self.measures(listing)["ameesh"]
-        self.assertEqual(item.wakeable, ["dev0", "devb0"])
-        self.assertEqual(item.idle, ["dev0"])
+        item = self.measures(listing, canons=[_Canon({"veille": ["auditeur"]})],
+                             configured=True)["ameesh"]
+        self.assertEqual(item.wakeable, ["auditeur", "dev0", "devb0"])
+        self.assertEqual(item.idle, ["auditeur", "dev0"])
 
     def test_startable_lots_are_counted_per_project_and_waits_excluded(self):
         lots = [{"id": 1, "state": "intake", "app": "ameesh", "type": "evolution"},
@@ -241,17 +261,19 @@ class PassTest(PgTestCase):
         self.assertEqual(self.split_lots(), [])
 
     def test_fallback_mails_the_auditor_once_after_an_hour(self):
-        self.run_pass(0)
-        self.run_pass(1800)
+        # #7661 : le repli vise l'agent dont la fiche déclare le rôle.
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
         lot = int(self.split_lots()[0]["id"])
-        self.assertEqual(self.run_pass(1800 + 1200), [])
-        out = self.run_pass(1800 + 3700)
+        self.assertEqual(self.run_pass(1800 + 1200, listing), [])
+        out = self.run_pass(1800 + 3700, listing)
         self.assertEqual([g["kind"] for g in out], ["fallback"])
         mails = self.db.query("SELECT recipient FROM agent_mailbox WHERE work_item_id = %s",
                               (str(lot),))
         self.assertEqual([m["recipient"] for m in mails], ["auditeur"])
         self.assertTrue(any(n.startswith(fd.FALLBACK_MARK) for n in self.notes(lot)))
-        self.assertEqual(self.run_pass(1800 + 4000), [])
+        self.assertEqual(self.run_pass(1800 + 4000, listing), [])
 
     def test_no_fallback_when_a_startable_lot_was_created(self):
         self.run_pass(0)
@@ -262,13 +284,14 @@ class PassTest(PgTestCase):
         self.assertNotIn("fallback", [g["kind"] for g in out])
 
     def test_a_lot_created_already_assigned_is_not_a_startable_arrival(self):
-        self.run_pass(0)
-        self.run_pass(1800)
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
         registry.upsert(self.db, "devb9", harness="deepseek", host=self.cfg.host, cwd=self.tmp)
         with mock.patch("ameesh.pilot_gesture.gate", return_value=None):
             work.add(self.db, title="déjà confié", app="ameesh", actor="pilote",
                      assignee="devb9")
-        out = self.run_pass(1800 + 3700)
+        out = self.run_pass(1800 + 3700, listing)
         self.assertEqual([g["kind"] for g in out], ["fallback"])
 
     def test_exhausted_roadmap_sleeps_idle_executors_alerts_and_wakes(self):
@@ -276,7 +299,7 @@ class PassTest(PgTestCase):
         self.run_pass(1800)
         lot = int(self.split_lots()[0]["id"])
         work.note(self.db, lot, "roadmap: épuisée ameesh (docs/ROADMAP.md)", actor="pilote")
-        listing = self.listing() + [agent("auditeur")]
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
         out = self.run_pass(1900, listing)
         self.assertEqual([g["kind"] for g in out], ["sleep"])
         self.assertEqual(sorted(a["agent"] for a in out[0]["agents"] if a["slept"]),

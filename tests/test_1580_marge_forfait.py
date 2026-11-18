@@ -263,10 +263,15 @@ class GardesMargeTest(unittest.TestCase):
         # celui d'après (`critical_by_role`, `critical_roles` par défaut).
         card = SimpleNamespace(title="designer",
                                fiche=SimpleNamespace(data={"roles": ["conception"]}))
+        # #7661 : l'auditeur aussi se lit sur sa fiche ; sans cette carte il
+        # n'est plus critique et entre dans les candidats.
+        audit_card = SimpleNamespace(title="auditeur",
+                                     fiche=SimpleNamespace(data={"roles": ["auditeur"]}))
+        cards = {"designer": card, "auditeur": audit_card}
         canon = SimpleNamespace(name="A", readable=True, federation=None,
-                                agents=[card], load_findings=(),
+                                agents=[card, audit_card], load_findings=(),
                                 owns=lambda ref: ref == "A",
-                                agent=lambda name: card if name == "designer" else None)
+                                agent=lambda name: cards.get(name))
         with (mock.patch.object(cost, "paid_harnesses_of", return_value=("deepseek",)),
               mock.patch.object(auditor, "load_all", return_value=[canon]),
               mock.patch.object(sous_utilisation, "declared_orchestrators", return_value={"pilot"}),

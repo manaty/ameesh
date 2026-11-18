@@ -71,7 +71,9 @@ class CanonGuardTest(unittest.TestCase):
         (cards / "controle.md").write_text(
             "---\ntype: Agent\ntitle: controle\nroles: [auditor]\n---\n", encoding="utf-8")
         self.assert_takes("B", 0, "controle")
-        self.assert_takes("B", 0, "auditeur")
+        # #7661 : le titre `auditeur` ne donne pas le rôle ; sans fiche qui le
+        # déclare, cet agent prend le lot comme les autres.
+        self.assert_takes("B", 1, "auditeur")
         self.assert_takes("B", 1)
 
     def test_missing_owner_never_borrows_another_canon(self):

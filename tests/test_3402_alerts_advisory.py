@@ -26,7 +26,8 @@ WATCH = SimpleNamespace(project="ameesh", repo="manaty/ameesh", interval=900)
 
 
 def row():
-    return {"name": "mesh-design", "releve": "election", "host": "agents-a",
+    return {"name": "mesh-design", "roles": ["conception"], "releve": "election",
+            "host": "agents-a",
             "candidats": ["agents-a", "agents-b"], "responsible": "human:owner"}
 
 
@@ -91,7 +92,8 @@ class MainExitTest(unittest.TestCase):
                 mock.patch.object(role_timers, "_watch_declarations",
                                   return_value=([WATCH], "")), \
                 redirect_stderr(err), redirect_stdout(out):
-            code = role_timers.main(argv + ["--no-apply", "--no-sync", "--systemd-dir", tmp])
+            code = role_timers.main(argv + ["--role", "mesh-design", "--no-apply",
+                                            "--no-sync", "--systemd-dir", tmp])
         return code, err.getvalue()
 
     def test_install_and_check_exit_0_without_the_owner_route(self):

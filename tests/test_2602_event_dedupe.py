@@ -20,6 +20,8 @@ class SloDeliveryTest(unittest.TestCase):
         self.listing = [dict(name=n, team="ameesh", mode="execute")
                         for n in ("dev", "pilot", "auditeur", "bureau")]
         self.listing[-1]["mode"] = "externe"
+        # #7661 : le rôle auditeur se lit sur la fiche, jamais sur le nom.
+        self.listing[2]["roles"] = ["auditeur"]
         self.store.operations.listing.side_effect = lambda: self.listing
         self.item = dict(state="build", assignee="dev")
         self.store.work.get.side_effect = lambda lot: self.item
