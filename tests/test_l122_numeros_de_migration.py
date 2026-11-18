@@ -64,6 +64,13 @@ def _depot(path, slug, directory, base=(), branches=None):
     os.makedirs(path)
     _git(path, "init", "-q", "-b", "develop")
     _git(path, "remote", "add", "origin", "git@github.com:%s.git" % slug)
+    # #7650 : l'origine n'est qu'une identité. Un rafraîchissement de cible
+    # (lecture des migrations atterries, `work migration`) ne doit pas joindre
+    # la forge réelle et rapporter ses numéros (815 au lieu de 378) : les
+    # transports externes sont refusés dans ce dépôt, l'URL `origin` reste
+    # lisible par `origin_repo`, et un fetch local (file) reste permis.
+    _git(path, "config", "protocol.allow", "never")
+    _git(path, "config", "protocol.file.allow", "always")
     _commit(path, directory, *base)
     for branch, names in (branches or {}).items():
         _git(path, "checkout", "-qb", branch)
