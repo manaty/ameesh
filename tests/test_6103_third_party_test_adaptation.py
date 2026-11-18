@@ -45,10 +45,24 @@ class ThirdPartyTestAdaptationTest(base.TestOnlyCorrectorTest):
         self.assertNotIn("md", accepted)
 
     def test_third_party_product_change_excludes_its_family(self):
+        # #7745 : l'exclusion de famille se lit par delta. md/claude a écrit un
+        # delta produit : sa famille (claude) est exclue de **ce** delta, qui
+        # reste couvert par le seul codex et fait refuser la porte ; l'avis de
+        # dev1/claude reste retenu pour le delta de l'auteur (deepseek). La
+        # règle globale « un produit tiers exclut sa famille de toute la tête »
+        # est remplacée, pas affaiblie : md n'est jamais relecteur de son
+        # propre delta, et la porte refuse tant qu'il y manque un avis.
         self.freeze_at(self.adapt(["tests/test_product.py", "src/ameesh/work.py"]))
         out = self.gate()
+        self.assertFalse(out["ok"], out)
         self.assertIn("md", {row["name"] for row in out["authors"]})
-        self.assertNotIn("dev1", {row["actor"] for row in out["accepted"]})
+        claude_deltas = [row for row in out["deltas"]
+                         if "claude" in row["families"]]
+        self.assertEqual(len(claude_deltas), 1)
+        self.assertFalse(claude_deltas[0]["covered"])
+        self.assertEqual(claude_deltas[0]["missing"], 1)
+        self.assertNotIn("claude", claude_deltas[0]["eligible"])
+        self.assertNotIn("md", {row["actor"] for row in out["accepted"]})
 
     def test_carried_adaptation_from_a_prior_freeze_keeps_family_eligible(self):
         self.freeze_at(self.adapt(["tests/test_product.py"]))
