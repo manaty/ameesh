@@ -189,7 +189,14 @@ bureau (ou un script du bureau)
 - Une commande qui n'est pas exactement `exe` + préfixe d'une règle.
 - Un flag qui imprime ou détourne un identifiant (`--log-http`,
   `--verbosity=debug`, `--access-token-file`, `--impersonate-service-account`,
-  `--credential-file-override`).
+  `--credential-file-override`), et `--flags-file` partout : gcloud lit ce
+  fichier après le courtier et y trouverait les flags interdits ou les flags
+  fixes (revue B1 du 18/11).
+- Tout flag non déclaré par la règle : seuls `fixed`, `allow`, `required` et
+  la liste explicite `free` sont admis ; un flag inconnu, une abréviation
+  (`--impersonate-service`) ou un flag court (`-q`) est refusé. C'est le seul
+  modèle sûr face aux flags globaux de gcloud (`--configuration`, `--account`,
+  `--billing-project`).
 - Un flag fixe avec une autre valeur (projet, région), une valeur hors liste
   (keyring, clé), un flag requis absent, une cible positionnelle hors liste
   (`targets` : le nom de keyring ou de clé est alors exact).
@@ -317,14 +324,30 @@ owner ; il ne se fait pas sous un STOP.
   une compromission de ce compte donne tous les actes admis. Le garder sans
   login, sans shell, avec un magasin 0700 et une unité systemd durcie.
 - **La politique est une frontière de sécurité.** Une règle trop large
-  (`gcloud kms` entier, `gh api`) rouvre le contournement. Un sous-commandement
+  (`gcloud kms` entier, `gh api`) rouvre le contournement. Tout flag non
+  déclaré est refusé, et `--flags-file` est interdit globalement : une liste
+  blanche de flags est le seul modèle sûr (B1 de la revue). Un sous-commandement
   à argument positionnel sans `targets` laisse libre le nom de la keyring ou
   de la clé : la politique d'exemple n'en contient aucun. La revue de la
   politique est aussi importante que celle du code ; les règles du dépôt sont
   un exemple, la politique réelle est root-owned et datée.
+- **Le lot cité n'est pas lié à la cible (N1 de la revue).** L'appelant choisit
+  le lot ; le courtier relit les holds et STOP de ce lot, pas ceux d'un autre.
+  Citer un lot propre pour un acte destiné à un autre lot passe la garde et
+  n'est vu qu'après coup par l'audit. Correctif de conception à décider : lier
+  la règle ou la cible à un lot autorisé (décision portée par le lot, par
+  exemple). En attendant, la revue de l'audit rapproche les preuves
+  `pre-act/2` des actes réels.
+- **Attente longue et threads (N3 de la revue).** `max_wait_seconds` vaut
+  86400 et chaque demande en attente tient un thread, sans plafond par
+  appelant. Un plafond de demandes simultanées est à ajouter avant un usage
+  large ; aujourd'hui le seul client est le bureau.
 - **Pas de limite de débit par lot** : plusieurs actes admis restent possibles
   après un contrôle propre. Le frein est la rareté des lots de production, pas
   le courtier.
+- **Installeur et source root (N2 de la revue).** Sans `--wheel`, l'installeur
+  refuse un arbre source non root-owned ou writable par le groupe, car pip
+  exécute son backend en root. La roue est la voie recommandée.
 - **Le courtier n'est pas HA** : s'il tombe, les actes KMS/prod sont bloqués
   (fail-closed). Le retour à la main de l'owner est une décision, pas un
   automatisme.
@@ -345,16 +368,20 @@ owner ; il ne se fait pas sous un STOP.
 ## 6. Vérifications livrées par ce lot
 
 - `tests/test_7767_credential_gate.py` : politique stricte, commandes
-  admises/refusées, flags interdits, fixed/allow/required, dispatch prod
-  (dépôt, branche, workflow, entrées, `pregeste`), courtier (STOP pendant
-  l'attente, reçu, preuves, doublon, base distante, échec d'exécution), audit
-  (début sans fin, fin sans début, doublon), socket aller-retour.
+  admises/refusées, flags interdits dont `--flags-file`, refus des flags
+  inconnus/courts/abrégés, fixed/allow/required/free, cibles positionnelles,
+  dispatch prod (dépôt, branche, workflow, entrées, `pregeste`), courtier
+  (STOP pendant l'attente, reçu, preuves, doublon, base distante, échec
+  d'exécution), audit (début sans fin, fin sans début, doublon), socket
+  aller-retour.
 - `tests/test_7761_pre_act.py`, `tests/test_7761_pre_act_audit.py` et les
   contrats existants restent verts (le reçu `pre-act/1` gagne seulement le
   champ optionnel `request_id`).
 - `deploy/gate/install.sh --check` : modes, propriétaires, répertoires
   d'identifiants privés, JSON, chargement de la politique par le compte gate ;
-  `--live` ajoute `ameesh gate broker check` (canon, base).
+  `--live` ajoute `ameesh gate broker check` (canon, base). Sans `--wheel`,
+  l'installeur refuse un arbre source non root-owned ou writable par le groupe
+  (revue N2), car pip exécute son backend en root.
 - `bash -n deploy/gate/install.sh` : l'installeur n'est pas exécuté par les
   tests (il crée un compte système) ; son exécution appartient à l'étape 1 de
   la migration, après décision owner.

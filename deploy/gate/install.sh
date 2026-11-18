@@ -245,6 +245,14 @@ run install -d -m 0700 -o "$GATE_USER" -g "$GATE_GROUP" "$ROOT"
 run install -d -m 0700 -o "$GATE_USER" -g "$GATE_GROUP" "$ROOT/gcloud" "$ROOT/gh"
 
 say "gate venv"
+if [ -z "$WHEEL" ]; then
+  # pip runs the build backend of the source tree as root: the tree must not
+  # be writable by the client account (review N2 of #7767).
+  [ "$(stat -c '%u' "$SRC")" = 0 ] || \
+    die "source tree $SRC is not root-owned; pip would run its build backend as root. Use a root-owned checkout or --wheel FILE"
+  writable=$(find "$SRC" -xdev -perm -022 -print -quit 2>/dev/null || true)
+  [ -z "$writable" ] || die "source tree $SRC has a group/world-writable entry: $writable; use --wheel FILE"
+fi
 if [ ! -x "$VENV/bin/pip" ]; then
   run "$PYTHON" -m venv "$VENV"
 fi

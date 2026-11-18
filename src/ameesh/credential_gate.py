@@ -86,6 +86,9 @@ FORBIDDEN_FLAGS = (
     "--access-token-file",
     "--credential-file-override",
     "--impersonate-service-account",
+    # A flags file is parsed by gcloud after the gate: it can carry any of the
+    # flags above plus --project/--location/--keyring. Refuse it everywhere.
+    "--flags-file",
 )
 #: flag values that turn a client into a debug dump of its requests
 FORBIDDEN_VALUES = {
@@ -158,6 +161,8 @@ class Rule:
     allow: tuple[tuple[str, tuple[str, ...]], ...] = ()
     required: tuple[str, ...] = ()
     forbid: tuple[str, ...] = ()
+    #: flags admitted with any value (booleans, formatting); all others refused
+    free: tuple[str, ...] = ()
     #: exact positional arguments after the argv prefix; None leaves them free
     targets: tuple = None
 
@@ -263,7 +268,7 @@ def _int(value, where, low, high):
 def _rule(value, where):
     data = _mapping(value, where, ("id", "kind", "exe", "argv", "project", "repo",
                                    "inputs", "fixed", "allow", "required", "forbid",
-                                   "targets"))
+                                   "free", "targets"))
     ident = data.get("id")
     if not isinstance(ident, str) or not _NAME.fullmatch(ident):
         raise PolicyError("%s.id: a simple name is required" % where)
@@ -321,6 +326,10 @@ def _rule(value, where):
     if not isinstance(forbid, list) or not all(
             isinstance(flag, str) and flag.startswith("-") and "\x00" not in flag for flag in forbid):
         raise PolicyError("%s.forbid: flag names only" % where)
+    free = data.get("free", [])
+    if not isinstance(free, list) or not all(
+            isinstance(flag, str) and _FLAG.fullmatch(flag) for flag in free):
+        raise PolicyError("%s.free: --flag names only" % where)
     targets = data.get("targets")
     if targets is not None:
         if not isinstance(targets, list) or not all(
@@ -328,12 +337,12 @@ def _rule(value, where):
                 and "\n" not in target for target in targets):
             raise PolicyError("%s.targets: a list of single-line values is required" % where)
         targets = tuple(targets)
-    if kind == "prod" and (fixed_items or allow_items or required or forbid
+    if kind == "prod" and (fixed_items or allow_items or required or forbid or free
                            or targets is not None):
-        raise PolicyError("%s: prod rules take no fixed/allow/required/forbid/targets" % where)
+        raise PolicyError("%s: prod rules take no fixed/allow/required/forbid/free/targets" % where)
     return Rule(ident, kind, exe, tuple(argv), project, repo, tuple(inputs),
                 tuple(fixed_items), tuple(allow_items), tuple(required), tuple(forbid),
-                targets)
+                tuple(free), targets)
 
 
 def load_policy(path=DEFAULT_POLICY):
@@ -503,8 +512,16 @@ def _apply_rule(policy, rule, argv):
         for arg in rest:
             if arg == flag or arg.startswith(flag + "="):
                 raise Refused("a flag refused by rule %s" % rule.id)
+    known = ({flag for flag, _wanted in rule.fixed}
+             | {flag for flag, _values in rule.allow}
+             | set(rule.required) | set(rule.free))
     present = {}
+    for arg in rest:
+        if arg.startswith("-") and not arg.startswith("--") and arg != "-":
+            raise Refused("short flag %s is not admitted by rule %s" % (arg, rule.id))
     for flag, value, index, count in _flags(rest):
+        if flag not in known:
+            raise Refused("flag %s is not admitted by rule %s" % (flag, rule.id))
         present.setdefault(flag, []).append((value, count, index))
         allowed = dict(rule.allow)
         if flag in allowed:

@@ -192,6 +192,39 @@ class CommandTest(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaisesRegex(gate.Refused, "refused"):
                 gate._check_argv(argv)
 
+    def test_flags_file_is_refused_globally(self):
+        for argv in (["/usr/bin/gcloud", "kms", "--flags-file", "x"],
+                     ["/usr/bin/gcloud", "kms", "--flags-file=x"],
+                     ["/bin/echo", "hello", "--flags-file", "x"]):
+            with self.subTest(argv=argv), self.assertRaisesRegex(gate.Refused, "refused"):
+                gate._check_argv(argv)
+
+    def test_unknown_flag_is_refused_by_rule(self):
+        policy = _policy(self.directory, rules=[_rule()])
+        for flag in ("--format=json", "--impersonate-service", "--project=other"):
+            with self.subTest(flag=flag), self.assertRaisesRegex(gate.Refused, "not admitted by rule"):
+                gate._apply_rule(policy, policy.rules[0],
+                                 ["/bin/echo", "hello", flag])
+
+    def test_short_flag_is_refused(self):
+        policy = _policy(self.directory, rules=[_rule()])
+        with self.assertRaisesRegex(gate.Refused, "short flag"):
+            gate._apply_rule(policy, policy.rules[0], ["/bin/echo", "hello", "-q"])
+
+    def test_free_flag_is_admitted(self):
+        policy = _policy(self.directory, rules=[_rule(free=["--quiet"])])
+        rule = policy.rules[0]
+        gate._apply_rule(policy, rule, ["/bin/echo", "hello", "--quiet"])
+        gate._apply_rule(policy, rule, ["/bin/echo", "hello", "--quiet=1"])
+        with self.assertRaisesRegex(gate.Refused, "not admitted by rule"):
+            gate._apply_rule(policy, rule, ["/bin/echo", "hello", "--format=json"])
+
+    def test_prod_rule_refuses_free(self):
+        with self.assertRaisesRegex(gate.PolicyError, "free"):
+            _policy(self.directory, rules=[_rule(
+                id="prod", kind="prod", exe="/bin/echo", argv=["workflow", "run"],
+                project="nexlink", repo="manaty/nexlink", free=["--quiet"])])
+
     def test_multiline_and_empty_arguments_are_refused(self):
         with self.assertRaises(gate.Refused):
             gate._check_argv(["/bin/echo", ""])
@@ -250,7 +283,7 @@ class CommandTest(unittest.TestCase):
                 "/bin/echo", "hello", "nexlink-messages", "extra"])
 
     def test_empty_targets_refuse_any_positional(self):
-        policy = _policy(self.directory, rules=[_rule(targets=[])])
+        policy = _policy(self.directory, rules=[_rule(targets=[], free=["--keyring"])])
         rule = policy.rules[0]
         gate._apply_rule(policy, rule, ["/bin/echo", "hello", "--keyring", "k"])
         with self.assertRaisesRegex(gate.Refused, "positional target"):

@@ -40,9 +40,12 @@ The example policy is deliberately minimal. It is a template, not the
 production policy: the real one is root-owned, dated and reviewed like code.
 Rules with a positional argument (for example `gcloud kms keyrings describe
 KEYRING`) must set `targets`; without it the broker leaves positionals free,
-which is only acceptable for commands that take none. A rule that creates,
-imports or sets a key version is an owner act, not a routine gate act; add it
-only after the owner decision names the key.
+which is only acceptable for commands that take none. Every flag must be
+declared in `fixed`, `allow`, `required` or `free`: any other long flag, any
+short flag and any abbreviation is refused, and `--flags-file` is refused
+everywhere. A rule that creates, imports or sets a key version is an owner
+act, not a routine gate act; add it only after the owner decision names the
+key.
 
 ## Before installing
 
@@ -64,11 +67,16 @@ cloud or GitHub identity and grants no role. In particular:
 From a checkout of ameesh, as root, on the act host:
 
 ```sh
-sudo deploy/gate/install.sh --client bureau --pgpass /root/gate.pgpass
+sudo deploy/gate/install.sh --client bureau --pgpass /root/gate.pgpass --wheel /root/ameesh.whl
 # review /etc/ameesh-gate/broker.json and /etc/ameesh-gate/config.json
 sudo deploy/gate/install.sh --check --live
 sudo systemctl enable --now ameesh-gate.service
 ```
+
+Without `--wheel`, the installer builds from this checkout, whose build
+backend then runs as root: the source tree must be root-owned and free of
+group/world-writable entries, otherwise the installer refuses (review N2).
+A root-owned checkout is acceptable; a wheel is the safer path.
 
 `--client` adds an existing account to `ameesh-gate-client`; add only the
 bureau account, never an agent. `--pgpass` installs the gate's `.pgpass`
@@ -91,7 +99,7 @@ ameesh gate act --lot 1234 --kind kms --target nexlink-messages -- \
   gcloud kms keyrings describe nexlink-messages --project=nexlink-prod \
   --location=asia-southeast1
 
-ameesh gate act --lot 1234 --kind prod --target manaty/nexlink --wait-until 2026-11-19T08:00:00+00:00 -- \
+ameesh gate act --lot 1234 --kind prod --wait-until 2026-11-19T08:00:00+00:00 -- \
   gh workflow run deploy-api-prod.yml --repo manaty/nexlink --ref main
 ```
 
