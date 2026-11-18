@@ -89,6 +89,33 @@ refusé : sans bail, avec les mêmes gardes (plan exact, ni phase terminale sauf
 suivant, sous son bail, et rend la réservation ; un feu donné entre-temps la
 marque `refused` et le train continue.
 
+La **requalification relue demandée depuis un autre hôte** (#7751) suit le
+même partage. Un pilote, un agent de design ou un avatar lié exécute
+`python -m ameesh.train_cli --project <p> requalify --reviewed --request
+--lot <lot-trace> --review milestone:<id>…` là où il se trouve : la commande
+n'écrit aucune configuration, ne prend aucun bail, et persiste en base la
+demande (projet, épingle, porte, avis cités, demandeur, lot de trace). Sur un
+hôte qui ne porte pas le bloc `train`, l'épingle exacte est donnée par
+`--pin <sha>` (et la porte par `--gate <sha>` si elle ne peut pas être lue) ;
+le détenteur les recontrôle contre sa propre configuration. Le
+détenteur vivant du bail de service l'applique à sa passe suivante, sur sa
+propre configuration, par la voie relue : mêmes gardes que `qualify` (avis
+exacts sur le commit, assentiment courant d'un pilote, provenance des auteurs,
+opposition, plancher de la politique). Son nom d'hôte ou son rôle n'élargit
+rien : l'autorité reste l'avis du pilote exigé à la porte. Une demande dont
+l'épingle ou la porte a changé entre la demande et l'application est refusée
+et nommée, sans écriture ; le demandeur reçoit le motif par courrier et
+`train_cli show`, sur un train persisté, nomme les demandes encore en attente.
+La trace du mouvement va sur le lot cité, avec le numéro de la demande et
+l'hôte qui l'a appliquée. Si le détenteur s'interrompt entre l'écriture et la
+résolution de la demande, le journal de l'hôte (qui nomme la demande) fait
+foi à la passe suivante : la demande est résolue sans rejouer l'écriture, au
+lieu d'être refusée comme périmée, et une note de lot manquante (arrêt entre
+la ligne de journal et la note) est complétée avant la résolution. Le journal
+est celui de l'hôte détenteur : si le bail change d'hôte avant la résolution,
+le nouveau détenteur applique la demande sur sa propre configuration et sur
+sa propre épingle ; un déplacement déjà fait y est refusé et nommé.
+
 ## Modes
 
 ### `shadow` — le plan calculé, sans effet

@@ -425,18 +425,21 @@ def _startup_pins(cfg, passages, report, alerted):
             _unjournaled(cfg, passage, name, "", pin, report, alerted, startup=True)
 
 
-def project_of(cfg, name):
+def project_of(cfg, name, *, host_check=True):
     """The validated train project named ``name`` (refusal by name otherwise).
 
     The host check is the assembly's: without an elected role, a command run
     on another host would edit a configuration whose train service does not
-    execute here.
+    execute here. #7751: a persisted requalification *request* writes no
+    configuration, so it may be recorded from any host; only the live service
+    holder applies it, on its own configuration, with ``host_check`` unchanged.
     """
     raw = getattr(cfg, "train", None) or {}
     if not raw:
         raise ConfigurationError("no `train` configuration")
     settings = Settings.parse(raw)
-    if settings.role is None and (getattr(cfg, "host", "") or "").strip() != settings.host:
+    if host_check and settings.role is None \
+            and (getattr(cfg, "host", "") or "").strip() != settings.host:
         raise ConfigurationError("`train.host` designates %s, this host is %s"
                                  % (settings.host, getattr(cfg, "host", "") or "?"))
     for spec in settings.projects:

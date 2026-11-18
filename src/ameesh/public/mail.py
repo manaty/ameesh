@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Public mail surface, contract v1.2 (tranche E2a, #7636/#5827).
+"""Public mail surface, contract v1.2 (tranche E2a, #7636/#5827/#7706).
 
 An installed external module already trusted with a database identity submits
 typed mail and reads its own bounded history through this module instead of
@@ -10,15 +10,22 @@ part of it.
 What the core owns here:
 
 * the **actor** is fixed by the call — a submission is always deposited with
-  ``sender = actor``; a caller cannot name another sender;
+  ``sender = actor``; a caller cannot name another sender, and the core's own
+  sender identities (``ameesh``, ``veille``, the canon's role-holding
+  Agent/Persona names, human and chat prefixes) are refused before alias
+  resolution or deposit; a canon that is configured but cannot be read
+  completely refuses the call rather than dropping its roles;
 * **idempotency** is scoped to ``(actor, recipient)``: the same key with the
   same content reuses the durable message id, the same key with another
   content refuses, and concurrent retries end on one durable row (the unique
   index of migration 0497 is the authority);
 * **history** is bounded by a cursor and restricted to conversations the actor
   takes part in;
-* the module-owned ``payload`` stays free-form (bounded JSON), while core
-  delivery markers are reserved.
+* the module-owned payload is a JSON object under the imposed
+  ``payload["module"]`` namespace; every other top-level key is core-owned and
+  refused, so a core marker added in a later release is closed to modules by
+  default.  ``payload.attribution`` is the one admitted core key, validated
+  and never authority.
 
 The database credential remains the trust boundary: this surface scopes a
 caller that already holds the database identity, it does not authenticate a
@@ -31,6 +38,7 @@ import dataclasses
 import json
 import os
 import re
+import time
 from typing import Any, Mapping, Sequence
 
 from .. import agent_names, cost_attribution, fil, mail, storage
@@ -60,10 +68,10 @@ _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 #: unique index that carries idempotency in the core mailbox (migration 0497)
 _IDEMPOTENCY_INDEX = "agent_mailbox_idempotency_key_idx"
 
-#: payload keys the core reads for delivery, review, decisions, accounting or
-#: threading.  A module writes its own data under its own namespace;
-#: ``attribution`` is the one core key admitted here, and it is validated,
-#: never authority.
+#: known payload keys the core reads for delivery, review, decisions,
+#: accounting or threading.  They are listed for diagnostics and for the
+#: precise refusal message; admission is the allow-list below, so a marker
+#: added later is refused even before this list knows it.
 RESERVED_PAYLOAD_KEYS = frozenset((
     "idempotency_key",
     "report",
@@ -96,6 +104,38 @@ RESERVED_PAYLOAD_KEYS = frozenset((
     "staging_actif",
 ))
 
+#: the one top-level payload namespace a module owns; its value is the module's
+#: JSON object.  Every other top-level key is core-owned and refused.
+MODULE_PAYLOAD_KEY = "module"
+
+#: top-level payload keys admitted by the public surface.  This is an
+#: allow-list, not a deny-list: a core marker added to the mailbox in a later
+#: release is refused here by default, even before RESERVED_PAYLOAD_KEYS names
+#: it.  ``attribution`` is validated by the closed caller-attribution schema.
+ADMITTED_PAYLOAD_KEYS = frozenset((MODULE_PAYLOAD_KEY, "attribution"))
+
+#: Sender identities the core owns statically: the system sender, the watch
+#: sender and the unbound actor.  A public module submits under its own
+#: identity; these names are refused before alias resolution, identity checks
+#: and any deposit.  The governance identities are **not** named here: they
+#: are read from the configured canon (:func:`reserved_actors`), so a mesh's
+#: roles stay in its canon (#7637/#7660).  Their sources are cross-checked by
+#: tests/test_7706_mail_contract.py so drift is caught.
+RESERVED_ACTORS = frozenset((
+    "ameesh",      # work.SYSTEM_SENDER: system events, CI, deep analysis
+    "veille",      # watch.SENDER: periodic watch reports
+    "inconnu",     # work.UNKNOWN_ACTOR: no bound identity
+))
+
+#: Prefixes owned by the core: human identities and chat agents.
+RESERVED_ACTOR_PREFIXES = ("human:", "chat-")
+
+#: How long the canon's role-holding identities are reused before a new read:
+#: a module may submit often, a canon changes rarely.
+_CANON_ACTORS_TTL_S = 60.0
+#: configured canon key -> (monotonic read time, reserved titles)
+_CANON_ACTORS: dict[tuple, tuple[float, frozenset[str]]] = {}
+
 
 # ---------------------------------------------------------------------------
 # typed values
@@ -106,11 +146,12 @@ class Submission:
     """One message to deposit.
 
     ``recipient`` must be a registered agent.  ``kind`` is one of
-    :data:`KINDS`.  ``payload`` is the module-owned JSON object (bounded);
-    ``work_item_id`` optionally links the message to a lot; ``thread=False``
-    keeps private module content out of the readable project thread (the
-    mailbox row and its history remain).  ``idempotency_key`` scopes retries
-    to ``(actor, recipient)``.
+    :data:`KINDS`.  ``payload`` is the module-owned JSON object, carried under
+    the imposed ``payload["module"]`` namespace (a top-level key outside that
+    namespace and ``attribution`` is refused); ``work_item_id`` optionally
+    links the message to a lot; ``thread=False`` keeps private module content
+    out of the readable project thread (the mailbox row and its history
+    remain).  ``idempotency_key`` scopes retries to ``(actor, recipient)``.
     """
 
     recipient: str
@@ -277,6 +318,17 @@ class ScopeRefused(PublicMailError, PermissionError):
     code = "refused"
 
 
+class CanonInventoryUnavailable(ScopeRefused):
+    """The configured canon inventory cannot be read completely.
+
+    A canon that is configured but unreadable, partially loaded or invalid
+    could omit a governance role: the surface refuses instead of treating the
+    missing names as ordinary service identities.
+    """
+
+    code = "refused"
+
+
 class RecipientRefused(PublicMailError):
     """The recipient is unknown or retired; nothing is deposited."""
 
@@ -333,6 +385,101 @@ def _resolve(db: Db, name: str, operation: str) -> str:
     return agent_names.resolve(name, db=db, cfg=cfg, operation=operation)
 
 
+def _canon_key(entries) -> tuple:
+    """Identity of the configured canons, for the short read cache."""
+    return tuple((str(getattr(entry, "path", "")),
+                  str(getattr(entry, "ref", "")),
+                  bool(getattr(entry, "untrusted", False)))
+                 for entry in entries)
+
+
+def _canon_actor_names(db: Db) -> frozenset[str]:
+    """Titles of the canon Agent/Persona cards that declare a role.
+
+    The core never names a mesh's governance roles (#7637/#7660): a card that
+    declares ``roles:`` is a governed identity, whatever its labels are
+    (orchestrator, auditor, bureau, pilot, composer, watch...).  Reading the
+    cards therefore covers a role added later or declared by another canon.
+
+    No configured canon is an explicit absence: only the static
+    :data:`RESERVED_ACTORS` and the prefixes apply.  A canon that **is**
+    configured but cannot be read completely is not an absence of roles: the
+    read is refused with :class:`CanonInventoryUnavailable`, because guessing
+    an empty inventory would admit an omitted governance name as a service
+    identity.  Only a complete, readable inventory is cached.
+    """
+    cfg = getattr(db, "cfg", None)
+    if cfg is None:
+        return frozenset()
+    from .. import canon as canon_mod
+
+    try:
+        entries = canon_mod.configured(cfg)
+    except Exception as exc:  # noqa: BLE001 - refus explicite, pas une absence
+        raise CanonInventoryUnavailable(
+            "the configured canon inventory cannot be listed: %s" % exc) from exc
+    if not entries:
+        return frozenset()
+    key = _canon_key(entries)
+    now = time.monotonic()
+    cached = _CANON_ACTORS.get(key)
+    if cached is not None and now - cached[0] < _CANON_ACTORS_TTL_S:
+        return cached[1]
+    try:
+        canons = canon_mod.load_configured(cfg)
+    except Exception as exc:  # noqa: BLE001 - refus explicite, pas une absence
+        raise CanonInventoryUnavailable(
+            "the configured canon inventory cannot be read: %s" % exc) from exc
+    if len(canons) != len(entries):
+        raise CanonInventoryUnavailable(
+            "the configured canon inventory is incomplete: %d of %d canon(s) "
+            "read" % (len(canons), len(entries)))
+    for canon in canons:
+        if not getattr(canon, "readable", False):
+            raise CanonInventoryUnavailable(
+                "the configured canon %s is unreadable"
+                % (getattr(canon, "root", "") or "?"))
+        broken = canon_mod.errors(getattr(canon, "load_findings", ()) or ())
+        if broken:
+            raise CanonInventoryUnavailable(
+                "the configured canon %s is invalid (%s)"
+                % (getattr(canon, "root", "") or "?", broken[0].code))
+    names = frozenset(
+        name for name in (
+            str(getattr(card, "title", "") or "").strip().casefold()
+            for canon in canons
+            for card in getattr(canon, "agents", ()) or ()
+            if getattr(card, "roles", None))
+        if name)
+    _CANON_ACTORS[key] = (now, names)
+    return names
+
+
+def reserved_actors(db: Db) -> frozenset[str]:
+    """The sender names this deployment refuses on the public surface.
+
+    The static system senders plus the role-holding Agent/Persona titles of
+    the configured canon, case-folded.  The reserved **prefixes** are separate
+    and listed by :data:`RESERVED_ACTOR_PREFIXES`.  Raises
+    :class:`CanonInventoryUnavailable` (a :class:`ScopeRefused`) when a canon
+    is configured but its complete, readable inventory cannot be established.
+    """
+    return frozenset(RESERVED_ACTORS | _canon_actor_names(db))
+
+
+def _reset_canon_cache() -> None:
+    """Forget the canon identities read so far (tests, explicit reload)."""
+    _CANON_ACTORS.clear()
+
+
+def _reserved_actor(db: Db, name: str) -> bool:
+    """``name`` is one of the core's own sender identities (case-insensitive)."""
+    folded = name.casefold()
+    return (folded in RESERVED_ACTORS
+            or folded.startswith(RESERVED_ACTOR_PREFIXES)
+            or folded in _canon_actor_names(db))
+
+
 def _actor(db: Db, actor: Any) -> str:
     """Resolve the actor and check the identity this process declares.
 
@@ -340,10 +487,22 @@ def _actor(db: Db, actor: Any) -> str:
     is that a process run by a mesh runner cannot submit under another name.
     Processes with no declared identity (an installed module service) keep the
     actor they name — the database credential is their trust boundary.
+
+    The core's own sender identities are never available to this surface: a
+    module payload that named ``ameesh`` (or a canon role-holder, human or
+    chat name) would inherit the paths and authority those senders carry.  The
+    governance names are read from the configured canon, not written here.  The
+    check runs on the supplied spelling **and** its resolved primary, so an
+    alias cannot launder a reserved name.
     """
-    name = _resolve(db, _name(actor, "actor"), "public_mail.actor")
-    if name == "all":
+    raw = _name(actor, "actor")
+    if raw == "all":
         raise InvalidSubmission("actor cannot be \"all\": name the sender identity")
+    name = _resolve(db, raw, "public_mail.actor")
+    if _reserved_actor(db, raw) or _reserved_actor(db, name):
+        raise ScopeRefused(
+            "actor %s is a sender identity reserved by the core: nothing "
+            "submitted" % (name if raw == name else "%s (%s)" % (raw, name)))
     if not (os.environ.get("AGENT_MAIL_NAME") or os.environ.get("AMEESH_RUNNER_ID")):
         return name
     cfg = getattr(db, "cfg", None)
@@ -364,7 +523,16 @@ def _actor(db: Db, actor: Any) -> str:
 
 
 def _sender(db: Db, name: str) -> str:
-    """A registered sender must be live; a service identity may stay unknown."""
+    """A registered sender must be live; a service identity may stay unknown.
+
+    The reserved-identity guard is repeated here as the last line of defence:
+    ``_actor`` already refused those names before any preparation, but a future
+    caller of this helper must not be able to deposit under one.
+    """
+    if _reserved_actor(db, name):
+        raise ScopeRefused(
+            "sender %s is a sender identity reserved by the core: nothing "
+            "submitted" % name)
     row = storage.of(db).agents.get(name)
     if row is None:
         return name
@@ -422,12 +590,21 @@ def _payload(value: Any) -> dict:
             "payload is larger than %d bytes" % MAX_PAYLOAD_BYTES)
     payload = json.loads(text)
     # Validate the serialized object, not only the caller's mapping: a custom
-    # Mapping could hide a reserved key from iteration while ``dict()`` keeps
-    # it, and the core reads the stored JSON, never the caller's object.
+    # Mapping could hide a key from iteration while ``dict()`` keeps it, and the
+    # core reads the stored JSON, never the caller's object.
     for key in payload:
         if key in RESERVED_PAYLOAD_KEYS:
             raise InvalidSubmission(
                 "payload key %r is reserved by the core" % key)
+        if key not in ADMITTED_PAYLOAD_KEYS:
+            raise InvalidSubmission(
+                "payload key %r is not admitted: module data goes under "
+                "payload[%r], the imposed module namespace"
+                % (key, MODULE_PAYLOAD_KEY))
+    if MODULE_PAYLOAD_KEY in payload and not isinstance(
+            payload[MODULE_PAYLOAD_KEY], dict):
+        raise InvalidSubmission(
+            "payload[%r] must be a JSON object" % MODULE_PAYLOAD_KEY)
     attribution = payload.get("attribution")
     if attribution is not None:
         try:
@@ -730,6 +907,8 @@ def history(db: Db, actor: str, *, peer: str | None = None,
 __all__ = [
     "CONTRACT_VERSION", "MAX_BODY_BYTES", "MAX_PAYLOAD_BYTES", "MAX_BATCH",
     "MAX_HISTORY", "DEFAULT_HISTORY", "KINDS", "RESERVED_PAYLOAD_KEYS",
+    "MODULE_PAYLOAD_KEY", "ADMITTED_PAYLOAD_KEYS", "RESERVED_ACTORS",
+    "RESERVED_ACTOR_PREFIXES", "reserved_actors",
     "Submission", "Receipt", "HistoryEntry", "HistoryPage", "SubmissionResult",
     "BatchResult", "PublicMailError", "InvalidSubmission", "IdempotencyConflict",
     "ScopeRefused", "RecipientRefused", "UnsupportedStorage",

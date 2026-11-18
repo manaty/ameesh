@@ -580,6 +580,14 @@ def _unknown_marker(tx, item, footprint, unknown):
     return paths
 
 
+def _requalify_row(row):
+    """#7751: a requalification row with its JSON evidence decoded."""
+    row = dict(row)
+    if isinstance(row.get("reviews"), str):
+        row["reviews"] = json.loads(row["reviews"])
+    return row
+
+
 class WorkItems(interface.WorkItems):
 
     def __init__(self, db):
@@ -2996,6 +3004,67 @@ class WorkItems(interface.WorkItems):
 
     def train_abandon_request(self, key, plan_id, request):
         return self._dev.train_abandon_request(key, plan_id, request)
+
+    _REQUALIFY_COLUMNS = (
+        " id, project, pin, gate, reviews, lot, requester,"
+        " to_char(requested_at AT TIME ZONE 'UTC',"
+        " 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS requested_at, state,"
+        " to_char(resolved_at AT TIME ZONE 'UTC',"
+        " 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS resolved_at, resolved_by, error")
+
+    def train_requalify_request(self, project, pin, gate, reviews, lot,
+                                requester) -> dict | None:
+        """#7751: persist a reviewed requalification request without a lease.
+
+        The partial unique index makes a retry of the same pending reading
+        return the existing row instead of stacking duplicates. The lot is a
+        real trace target (foreign key); the caller checks it before asking.
+        """
+        if not isinstance(reviews, (list, tuple)) or not reviews:
+            return None
+        # The same evidence set in another order is the same request: the
+        # partial unique index must not let a retry stack a second row.
+        evidence = json.dumps(sorted({str(reference) for reference in reviews}))
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "INSERT INTO integration_train_requalifications"
+                " (project, pin, gate, reviews, lot, requester)"
+                " VALUES (%s, %s, %s, %s::jsonb, %s, %s)"
+                " ON CONFLICT (project, pin, gate, reviews)"
+                "   WHERE state = 'requested' DO NOTHING"
+                " RETURNING" + self._REQUALIFY_COLUMNS,
+                (project, pin, gate, evidence, int(lot), requester))
+            if not rows:
+                rows = tx.query(
+                    "SELECT" + self._REQUALIFY_COLUMNS
+                    + " FROM integration_train_requalifications"
+                    " WHERE project = %s AND pin = %s AND gate = %s"
+                    " AND reviews = %s::jsonb AND state = 'requested'",
+                    (project, pin, gate, evidence))
+            return _requalify_row(rows[0]) if rows else None
+
+    def train_requalify_requests(self, project) -> list[dict]:
+        """#7751: pending requests of ``project``, oldest first."""
+        rows = self.db.query(
+            "SELECT" + self._REQUALIFY_COLUMNS
+            + " FROM integration_train_requalifications"
+            " WHERE project = %s AND state = 'requested' ORDER BY id",
+            (project,))
+        return [_requalify_row(row) for row in rows]
+
+    def train_requalify_resolve(self, request_id, state, *, actor,
+                                error="") -> dict | None:
+        """#7751: compare-and-set one pending request; None if already resolved."""
+        if state not in ("applied", "refused"):
+            return None
+        rows = self.db.query(
+            "UPDATE integration_train_requalifications"
+            " SET state = %s, resolved_at = clock_timestamp(), resolved_by = %s,"
+            " error = NULLIF(%s, '')"
+            " WHERE id = %s AND state = 'requested'"
+            " RETURNING" + self._REQUALIFY_COLUMNS,
+            (state, actor, error, int(request_id)))
+        return _requalify_row(rows[0]) if rows else None
 
     def train_abandon(self, key, plan_id, document, *, revision, owner, epoch):
         return self._dev.train_abandon(key, plan_id, document, revision=revision, owner=owner, epoch=epoch)
