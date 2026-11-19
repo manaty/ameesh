@@ -335,9 +335,20 @@ class Selection:
             cause = ", ".join(origin) or str(self.fallback.get("cause") or "incertaine")
             joues = ("contrats et tests du lot"
                      if self.fallback.get("transverse")
-                     or self.fallback.get("changed_tests") else "contrats seuls")
-            detail.append("sélection incertaine (%s) : %s (%d module(s))"
-                          % (cause, joues, len(self.modules)))
+                     or self.fallback.get("changed_tests")
+                     or self.fallback.get("importers") else "contrats seuls")
+            line = ("sélection incertaine (%s) : %s (%d module(s))"
+                    % (cause, joues, len(self.modules)))
+            #: #7823 : la part du lot se lit à part — ses tests, et les
+            #: importateurs statiques de ses fichiers retenus dans le budget.
+            own = len(self.fallback.get("changed_tests") or ())
+            importers = len(self.fallback.get("importers") or ())
+            dropped = int(self.fallback.get("importers_dropped") or 0)
+            if own or importers or dropped:
+                line += ("; lot : %d test(s) changé(s), %d importateur(s)%s"
+                         % (own, importers,
+                            " (%d au-delà du budget)" % dropped if dropped else ""))
+            detail.append(line)
         if excluded:
             detail.append(
                 "%d module(s) exclu(s) du guest : %s%s"
@@ -411,6 +422,18 @@ class Selection:
                 # un run `run-red` dont tous les échecs sont ceux de modules
                 # exclus du guest n'a plus de rouge réel : il est vert.
                 outcome = "green"
+        elif outcome == "run-incomplete" and red and failed and not explained:
+            #: #7823 : une part finie en échec avant l'échéance est un rouge
+            #: réel (seul `echec` d'une part terminée compte, jamais une part
+            #: coupée) ; le budget épuisé ensuite ne l'efface pas.
+            outcome = "run-red"
+            causes.append("run-red")
+            detail.append("parts rouges avant l'échéance (run incomplet): %s"
+                          % ", ".join(red[:4]))
+            detail.append("tests en échec: %s%s"
+                          % (", ".join(failed[:6]),
+                             " (+%d)" % (len(failed) - 6)
+                             if len(failed) > 6 else ""))
         else:
             causes.append(outcome)
         unique: list[str] = []

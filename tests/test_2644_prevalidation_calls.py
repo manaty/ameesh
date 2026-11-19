@@ -390,7 +390,7 @@ class ContractFallbackTest(unittest.TestCase):
         plan = prepared.plan
         self.assertEqual(plan["selection"]["mode"], "contract")
         self.assertEqual(plan["fallback"]["cause"], "selection-full")
-        modules = plan["parts"]["psycopg"][0]["modules"]
+        modules = pv.planned_modules(plan)
         self.assertIn("test_cluster", modules)
         self.assertIn("test_migrations", modules)
         self.assertIn("test_l161f_plan", modules)
@@ -522,10 +522,12 @@ class ContractFallbackTest(unittest.TestCase):
         # aussi le contrat de la liste figée (test_l161f_plan).
         self.assertEqual(fallback["transverse"],
                          ["test_l107_executor_contract", "test_l161f_plan"])
-        self.assertEqual(fallback["changed_tests"], ["test_3845_paquet_horaire"])
+        # #7823 : les tests que le diff propre change (le décor ajoute aussi
+        # les modules de contrat après la base)
+        self.assertIn("test_3845_paquet_horaire", fallback["changed_tests"])
         self.assertFalse(fallback["transverse_all"])
         self.assertEqual(fallback["diff"], "read")
-        modules = plan["parts"]["psycopg"][0]["modules"]
+        modules = pv.planned_modules(plan)
         self.assertIn("test_l107_executor_contract", modules)
         self.assertIn("test_3845_paquet_horaire", modules)
         self.assertIn("test_cluster", modules)
@@ -549,7 +551,7 @@ class ContractFallbackTest(unittest.TestCase):
         self.assertEqual(fallback["diff"], "unreadable")
         self.assertEqual(fallback["transverse"],
                          sorted(calls.transverse_contracts.CONTRACTS))
-        modules = prepared.plan["parts"]["psycopg"][0]["modules"]
+        modules = pv.planned_modules(prepared.plan)
         self.assertIn("test_l107_executor_contract", modules)
         self.assertIn("test_cluster", modules)
 

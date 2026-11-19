@@ -621,8 +621,9 @@ def notify_reach(cfg, *, responsible=None, env: dict | None = None) -> tuple[lis
         problems = [notify_mod.remote_push_problem(channel, env, ncfg=ncfg)
                     for channel in channels]
         if all(problems):
-            gaps.append("%s has no usable remote push (ntfy, slack, nexlink): %s"
-                        % (human, "; ".join(problems)))
+            gaps.append("%s has no usable remote push (%s): %s"
+                        % (human, ", ".join(notify_mod.remote_push_kinds()),
+                           "; ".join(problems)))
     if gaps:
         return [], " ".join("; ".join(gaps).split())[:400]
     return required, ""

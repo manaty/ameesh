@@ -546,6 +546,19 @@ même nom sur la même ligne.
    `registry.train_contract(name)` (`train_assembly.contracts()`, 2 occurrences retirées) et le
    doctor (`cli.py`, 8) nomme le canal de module sans nom de projet. La dette `#7663` du test
    descend de 55 à 17.
+   **Tranche 6 faite (#7813)** : après #7795 (4 occurrences retirées), les 13
+   dernières occurrences `nexlink` du cœur quittent le scan —
+   `approve/config.py` 2 (zones et hôtes réservés lus au module et à la
+   configuration),
+   `ci.py` 2 (message générique et schéma du plan de dispatch déclaré par le
+   module), `cost.py` 1 (prix sous `~/.config/ameesh/`), `fingerprints.py` 1
+   et `server_faults.py` 1 (schéma de page générique, l'ancien nom devenant un
+   alias du module), `host_cli.py` 2 (textes d'interface), `release.py` 3
+   (projet par défaut lu à la configuration) et `role_timers.py` 1 (canaux de
+   push lus au registre). La dette `#7663` du test descend de 13 à 0 ; la liste
+   autorisée ne garde que les 7 occurrences figées (3 migrations `bureau`,
+   2 jetons de `roles.py`, 2 migrations `smichea`). Le tableau par fichier
+   ci-dessus reste l'instantané initial de l'inventaire.
 5. **`manaty` n'a aucune tranche** : 9 occurrences dans 4 fichiers (migrations.py 3,
    alert_briefs.py 2, incident.py 2, packet_guard.py 2). `manaty/ameesh` est le dépôt du cœur,
    `manaty/home` le canon, `manaty/nexlink` un dépôt de projet. Recommandation : les traiter

@@ -103,17 +103,8 @@ EXCEPTIONS = {
     ("roles.py", "orchestrateur"): 1,
     # -- migration déjà appliquée : le nom y est figé (#7662) : 2
     ("migrations/0364_key_holders.sql", "smichea"): 2,
-    # -- release Nexlink dans le module Nexlink (#7663) : 13
-    #    (#7794 : contrat CI du train et doctor, 38 retirés)
-    #    (#7795 : dépôts lus au canon, 4 retirés)
-    ("approve/config.py", "nexlink"): 2,
-    ("ci.py", "nexlink"): 2,
-    ("cost.py", "nexlink"): 1,
-    ("fingerprints.py", "nexlink"): 1,
-    ("host_cli.py", "nexlink"): 2,
-    ("release.py", "nexlink"): 3,
-    ("role_timers.py", "nexlink"): 1,
-    ("server_faults.py", "nexlink"): 1,
+    # -- #7813 : les 13 « nexlink » du cœur sont lus à la configuration ou au
+    #    module Nexlink ; plus aucune occurrence exécutable n'y reste.
 }
 
 #: #7796: (instruction file relative to src/ameesh, name) -> allowed

@@ -268,12 +268,21 @@ class ProfilStrictTest(unittest.TestCase):
         for rp_id in ("equipe-a.pages.example.test", "equipe-a.approve.pages.example.test"):
             self.assertEqual(self.config(rp_id=rp_id, origins=("https://" + rp_id,),
                                          **values).rp_id, rp_id)
-        # réservés par la décision 0026, sans configuration
+        # décision 0026 : le module Nexlink déclare sa zone et son apex, la
+        # configuration du déploiement peut les redéclarer ; un nom déclaré
+        # reste réservé, aucune configuration ne le rend RP ID
+        manaty = dict(reserved_zones=("nexlink.ph",),
+                      reserved_hosts=("ameesh.nexlink.ph",))
         for rp_id in ("nexlink.ph", "ameesh.nexlink.ph"):
-            self.refused("reserved", rp_id=rp_id, origins=("https://" + rp_id,))
+            self.refused("reserved", rp_id=rp_id, origins=("https://" + rp_id,), **manaty)
         self.assertEqual(self.config(rp_id="equipe-a.nexlink.ph",
-                                     origins=("https://equipe-a.nexlink.ph",)).rp_id,
-                         "equipe-a.nexlink.ph")
+                                     origins=("https://equipe-a.nexlink.ph",),
+                                     **manaty).rp_id, "equipe-a.nexlink.ph")
+        # profil nu : aucun module, aucune déclaration → aucun nom réservé
+        with unittest.mock.patch.dict(os.environ, {"AMEESH_MODULES": "bare"}):
+            self.assertEqual(self.config(rp_id="nexlink.ph",
+                                         origins=("https://nexlink.ph",)).rp_id,
+                             "nexlink.ph")
         self.refused("unreadable reserved name", reserved_zones=("Zone Invalide",))
 
     def test_chargement_json_et_environnement(self):
@@ -330,7 +339,8 @@ class ProfilStrictTest(unittest.TestCase):
              "--rp-id", "nexlink.ph", "--origin", "https://nexlink.ph",
              "--state-dir", os.path.join(self.tmp, "s")],
             capture_output=True, text=True, timeout=60,
-            env=child_env(AMEESH_APPROVE_CONFIG=os.path.join(self.tmp, "absent.json")))
+            env=child_env(AMEESH_APPROVE_CONFIG=os.path.join(self.tmp, "absent.json"),
+                          AMEESH_APPROVE_RESERVED_ZONES="nexlink.ph"))
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("reserved zone", proc.stderr)
 

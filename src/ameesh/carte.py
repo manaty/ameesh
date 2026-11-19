@@ -8,7 +8,7 @@ la carte n'est plus jamais remesurée. La minuterie de rôle ``ameesh-carte``
 fenêtre [00:00, 07:00)Z, sur l'hôte qui détient le bail du rôle élu. Le cron
 reste un filet de secours, et le garde du workflow
 (``scripts/carte-fenetre.py``) reste le seul juge : carte fraîche, paquet en
-cours ou autre mesure le font sauter ; une carte de plus de 48 h l'emporte sur
+cours ou autre mesure le font sauter ; une carte de plus de 24 h (#7823) l'emporte sur
 la fenêtre.
 
 ``ameesh carte dispatch`` fait donc un ``workflow_dispatch`` de ``carte.yml``
@@ -21,8 +21,8 @@ ignore un dépôt qui ne porte pas ce workflow. ``--repo``, ``--project`` et
 #7430 : le premier tic du paquet horaire appelle ``--horaire`` chaque
 heure, hors 01Z laissé à la minuterie carte quotidienne. À 01:00Z,
 le dispatch quotidien reste systématique. Aux autres heures, seule une
-carte connue de plus de ``exploitation.MAP_STALE_S`` sur la branche visée
-provoque une demande. Une lecture absente ou impossible ne prouve pas cet
+carte connue de plus de ``RATTRAPAGE_S`` (24 h, #7823 ; 48 h avant, le seuil
+de l'alerte ``map_stale``) sur la branche visée provoque une demande. Une lecture absente ou impossible ne prouve pas cet
 âge. Le dispatcher ne consulte ni les paquets ni les autres mesures : le
 garde du workflow reste seul juge, et une demande sautée à H est retentée
 à H+1 tant que la carte reste périmée.
@@ -47,6 +47,12 @@ WORKFLOW = "carte.yml"
 SCHEMA = "ameesh-carte-dispatch/1"
 #: branche de base quand la configuration n'en déclare pas
 BRANCHE_DEFAUT = "main"
+#: #7823 : âge d'une carte qui demande une mesure de rattrapage hors de 01Z.
+#: Le 18/11, le dispatch de 01:00Z a cédé au paquet en cours et la carte n'était
+#: redemandée qu'à 48 h : le plan de chaque lot jugeait alors la dérive de
+#: `main` depuis la carte (511 fichiers) et la prévalidation ne concluait plus.
+#: Même seuil que `FRAICHEUR_MAX_H` de scripts/carte-fenetre.py.
+RATTRAPAGE_S = 24 * 3600.0
 
 
 class CarteError(RuntimeError):
@@ -148,13 +154,12 @@ def demande_horaire(cible, cartes, maintenant):
     maintenant = maintenant.astimezone(dt.timezone.utc)
     if maintenant.hour == 1:
         return True
-    from .exploitation import MAP_STALE_S
     for row in cartes:
         if (row["repo"].casefold() == cible["depot"].casefold()
                 and row.get("branch") == cible["branche"]):
             published = row.get("published_ts")
             return (published is not None
-                    and maintenant.timestamp() - float(published) > MAP_STALE_S)
+                    and maintenant.timestamp() - float(published) > RATTRAPAGE_S)
     return False
 
 
@@ -179,7 +184,7 @@ def main(argv=None, *, gh=None, cfg=None, maintenant=None) -> int:
     dispatch.add_argument("--branch", default="",
                           help="branche de base (défaut : celle du dépôt, sinon main)")
     dispatch.add_argument("--horaire", action="store_true",
-                          help="01:00Z quotidien ; sinon carte connue de plus de 48 h")
+                          help="01:00Z quotidien ; sinon carte connue de plus de 24 h")
     dispatch.add_argument("--manuel", action="store_true",
                           help="dispatch manuel (planifie=false, toujours mesuré)")
     dispatch.add_argument("--dry-run", action="store_true",

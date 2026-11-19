@@ -93,9 +93,11 @@ porte l'identifiant nul.
    propre canal, vérifie, ouvre le PTY et répond `OK` (ou `NO` avec un code
    stable). Les `DATA` circulent ensuite dans les deux sens, avec `WINSIZE`,
    `SIGNAL`, `ACK` et `CLOSE`.
-4. Une déconnexion est un échec de session : l'hôte ferme le PTY, le relais
-   oublie la session, aucun état ne survit. Le poste ne reçoit ni session
-   ni credential.
+4. Une déconnexion est un échec de session : le relais oublie la session
+   dès qu'il constate la coupure du poste et prévient l'hôte ; l'hôte ferme
+   alors son PTY dans son fil de session. Cette fermeture côté hôte est
+   **asynchrone** (un test attend l'événement, jamais un délai fixe). Aucun
+   état ne survit. Le poste ne reçoit ni session ni credential.
 
 Signaux acceptés : HUP, INT, QUIT, TERM, CONT, TSTP. Jamais SIGKILL.
 

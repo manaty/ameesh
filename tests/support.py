@@ -269,8 +269,8 @@ EMPTY_HARNESS_DIR = _mkdtemp(prefix="ameesh-test-harnesses-")
 os.environ["AMEESH_HARNESSES_DIR"] = EMPTY_HARNESS_DIR
 
 #: barème de prix ABSENT : le fichier de prix de l'hôte
-#: (~/.config/nexlink-agents/prices.json) ne fuit pas dans les tests, ni dans
-#: le processus (l'exécuteur construit son `CostBook` en mémoire) ni dans les
+#: (~/.config/ameesh/prices.json) ne fuit pas dans les tests, ni dans le
+#: processus (l'exécuteur construit son `CostBook` en mémoire) ni dans les
 #: sous-processus. Les tests de tarif posent leur propre `AMEESH_PRICES`.
 EMPTY_PRICES = os.path.join(_mkdtemp(prefix="ameesh-test-prices-"), "absent.json")
 os.environ["AMEESH_PRICES"] = EMPTY_PRICES

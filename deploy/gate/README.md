@@ -92,6 +92,14 @@ temporary directory, a restricted address-family list and `UMask=0077`.
 
 ## Operate
 
+Each rule requires a `lots` list of positive lot IDs explicitly authorized for
+that rule. The example lists are empty and authorize no acts. A root policy
+maintainer must set them after verifying that every listed lot covers every
+command and target admitted by that rule; narrow the rule first if needed.
+An absent or invalid list prevents the policy from loading. Remove IDs when
+their authorization ends. The broker refuses an unrelated lot before the
+pre-act check, even if that lot has no STOP or hold.
+
 The caller must have an open pre-act check on the lot, or use
 `--wait-until` so the broker waits for the window:
 

@@ -6,6 +6,7 @@
     scripts/paquet-horaire.py recompose --repo ~/ameesh-composeur --carrier N \
         --exclude LOT [--exclude-reason TEXTE] [--wait DURÉE [--cancel-ci]] \
         [--expect-head SHA]
+    scripts/paquet-horaire.py compose --repo ~/ameesh-composeur
     scripts/paquet-horaire.py pause --until 20:15 --reason "staging hors créneau"
     scripts/paquet-horaire.py resume | status
 
@@ -132,6 +133,13 @@ retrait automatique unique du point 4. `--repo` est le clone **dédié** du
 composeur (comme le tic), jamais le dossier de travail d'un agent : la branche
 locale `integration/**` y serait lue par le balayage de l'assigné comme une
 tête de la forge (#4562).
+
+**Hors du tour** (#7824) : `recompose` et `compose` (la composition manuelle
+du créneau manqué, un tic lancé par l'agent désigné) se relancent dans une
+unité `systemd-run --user` et rendent la main avec son nom (journal
+`journalctl --user -u <unité>`, comme le tic) ; `--attached` compose sur
+place. L'unité ne garde pas le jeton de bail de la session (voir
+`SESSION_LEASE_ENV`) ; un rôle élu y compose sous `ameesh role run`.
 
 Comme le retrait automatique, elle est **bornée par `--keep-composition`**
 (`this.base`, la tête gelée du paquet rouge) : elle reprend les membres de la
@@ -3023,11 +3031,167 @@ def main_pause(args, *, connect=_connect, shell: Shell | None = None,
     return 0
 
 
+# ---------------------------------------------------------------------------
+# #7824 : composition manuelle et recomposition hors du tour
+# ---------------------------------------------------------------------------
+
+#: #7824 : le jeton de bail d'une **session** d'agent. Une composition
+#: détachée survit au tour, donc à la session : l'époque du runner qu'elle
+#: hériterait est celle de la prise du bail (`AgentWorker.__init__`), et une
+#: reprise du bail de l'agent pendant la composition la rend périmée — le gel
+#: d'h-10 (#7814) refusé « epoch 293 in the session, 295 in the registry ».
+#: L'unité ne le garde pas : un agent non élu y compose sous son nom, sans
+#: garde d'époque (`pilot_gesture.gate` ne la pose qu'aux rôles élus), et le
+#: bail de composition du porteur (#6563, `claim.require` avant poussée et
+#: gel) reste la garde ; un agent élu y compose sous `ameesh role run`,
+#: l'identité du rôle (`AMEESH_ROLE` et son époque), comme le tic.
+SESSION_LEASE_ENV = ("AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
+                     "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH")
+#: Variables propres au tour ou au scope de `paquet-auto` (#6814), sans objet
+#: dans une unité qui leur survit.
+TURN_ENV = ("AMEESH_REFUSAL_FILE", "AMEESH_LOT", "AMEESH_TMPDIR",
+            "AMEESH_PAQUET_AUTO_SCOPED", "AMEESH_PAQUET_AUTO_LOG")
+TURN_ENV_PREFIX = "AMEESH_TURN_"
+#: Préfixe des unités détachées, distinct du tic et du scope de `paquet-auto`.
+UNIT_PREFIX = "ameesh-paquet-horaire-"
+#: Durée de vie d'une unité, comme `TimeoutStartSec` du tic, plus `--wait`.
+UNIT_RUNTIME = 4 * 3600
+
+
+def unit_environment(environ: dict, home: Path) -> dict:
+    """#7824 : l'environnement de l'unité détachée.
+
+    Celui de l'appelant (DSN, configuration, forge, `AGENT_MAIL_NAME`), sans
+    le jeton de bail de la session ni les variables du tour. L'époque d'un
+    `AMEESH_ROLE` est gardée : c'est le bail du rôle, pas une session. Les
+    worktrees vont au dossier du tic (#5204, #6814) : le TMPDIR d'un tour peut
+    être vidé à sa fin.
+    """
+    env = {key: value for key, value in environ.items()
+           if key not in TURN_ENV and not key.startswith(TURN_ENV_PREFIX)}
+    if not env.get("AMEESH_ROLE"):
+        for key in SESSION_LEASE_ENV:
+            env.pop(key, None)
+    tmp = home / auto.SCOPE_TMPDIR
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        env[key] = str(tmp)
+    return env
+
+
+def elected_agent(name: str) -> bool:
+    """#7824 : l'agent est-il un rôle élu (`releve: election`) ?
+
+    Seul un rôle élu passe la garde du pilote sous son bail (#7318) : son unité
+    compose sous `ameesh role run`. Une lecture impossible refuse le
+    détachement plutôt que de deviner l'identité.
+    """
+    from ameesh import registry
+    db = _connect()
+    try:
+        row = registry.get(db, name) if db is not None else None
+    finally:
+        close = getattr(db, "close", None)
+        if close:
+            close()
+    return bool(row) and row.get("releve") == "election"
+
+
+def detach(ctx: Context, argv: list[str], *, kind: str, wait: float = 0,
+           environ: dict | None = None, home: Path | None = None,
+           elected=elected_agent, script: Path | None = None) -> str:
+    """#7824 : relance cette commande dans une unité `systemd-run --user`.
+
+    h-10 du 18/11 : la recomposition du pilote lancée depuis un tour est morte
+    avec lui (paquet-auto laissé zombie, composition non poussée). L'unité a
+    son cgroup sous le gestionnaire de l'utilisateur et son journal (`journalctl
+    --user -u <unité>`, comme le tic) ; l'appelant rend la main avec son nom.
+    L'environnement passe par un fichier 0600 que l'unité lit puis efface :
+    ni secret sur la ligne de commande, ni propriété lisible de l'unité.
+    """
+    environ = dict(os.environ if environ is None else environ)
+    home = Path.home() if home is None else home
+    agent = "" if environ.get("AMEESH_ROLE") else str(environ.get("AGENT_MAIL_NAME") or "")
+    as_role = agent if agent and elected(agent) else ""
+    stamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d%H%M%S")
+    unit = re.sub(r"[^A-Za-z0-9_.-]", "-", "%s%s-%s-%d" % (
+        UNIT_PREFIX, kind, stamp, os.getpid()))
+    directory = home / auto.SCOPE_TMPDIR / "units"
+    command = [sys.executable, str(script or Path(__file__).resolve())]
+    if ctx.dry_run:
+        return "[essai] unité %s (%s)" % (unit, "rôle %s" % as_role if as_role
+                                         else "sans jeton de session")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = directory / (unit + ".env.json")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(unit_environment(environ, home), handle)
+    command += ["--environ-file", str(path)]
+    if as_role:
+        command += ["--as-role", as_role]
+    cmd = ["systemd-run", "--user", "--unit", unit, "--collect", "--quiet",
+           "--working-directory", str(ctx.repo),
+           "--property", "NoNewPrivileges=yes",
+           "--property", "SuccessExitStatus=3 5",
+           "--property", "RuntimeMaxSec=%d" % (UNIT_RUNTIME + int(max(wait, 0))),
+           "--"] + command + list(argv) + ["--attached"]
+    result = ctx.shell.run(cmd, cwd=ctx.repo, timeout=60)
+    if result.returncode != 0:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise HoraireError("unité %s non lancée (rc %d) : %s"
+                           % (unit, result.returncode, auto._tail(result.text, 5)))
+    return ("%s lancée dans l'unité %s (%s) ; journal : journalctl --user -u %s"
+            % (kind, unit, "rôle %s" % as_role if as_role else "sans jeton de session",
+               unit))
+
+
+def load_environ(path: str) -> None:
+    """#7824 : dans l'unité, l'environnement de l'appelant, puis le fichier effacé."""
+    file = Path(path)
+    try:
+        data = json.loads(file.read_text(encoding="utf-8"))
+    finally:
+        try:
+            file.unlink()
+        except OSError:
+            pass
+    if not isinstance(data, dict):
+        raise InputError("--environ-file : objet JSON attendu")
+    os.environ.clear()
+    os.environ.update({str(k): str(v) for k, v in data.items()})
+
+
+def role_command(role: str, argv: list[str]) -> list[str]:
+    """#7824 : la même commande sous le bail du rôle élu, comme le tic."""
+    return [shutil.which("ameesh") or "ameesh", "role", "run", role, "--",
+            sys.executable, str(Path(__file__).resolve())] + list(argv)
+
+
+def check_recompose(args) -> float:
+    """#5703 : les refus d'entrée de `recompose`, avant tout geste ou détachement."""
+    if args.exclude_reason and len(args.exclude_reason) != len(args.exclude):
+        raise InputError("--exclude-reason : %d motif(s) pour %d --exclude"
+                         % (len(args.exclude_reason), len(args.exclude)))
+    wait = parse_wait(args.wait)
+    if args.cancel_ci and wait <= 0:
+        raise InputError("--cancel-ci exige --wait : le relevé de la ci-full annulée "
+                         "reste « in_progress » un moment, la recomposition serait "
+                         "refusée après l'annulation")
+    return wait
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Paquet horaire déclenché par minuterie, sans agent (#3845).")
+    parser.add_argument("--environ-file", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--as-role", default="", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
     one = sub.add_parser("tick", help="un tic : composer, publier ou suivre")
+    manual = sub.add_parser(
+        "compose", help="#7824 : composition manuelle (créneau manqué), un tic "
+                        "lancé dans une unité systemd-run détachée de l'appelant")
     again = sub.add_parser(
         "recompose", help="#4237 : recomposition du pilote, marquée « tentative » "
                           "et reprise par le tic du détenteur courant")
@@ -3045,7 +3209,11 @@ def main(argv: list[str] | None = None) -> int:
     again.add_argument("--expect-head", default="", metavar="SHA",
                        help="#5696 : rien à faire (sortie 0) si la tête gelée a "
                             "changé ; refusé (sortie 2) sans tête gelée")
-    for each in (one, again):
+    for each in (manual, again):
+        each.add_argument("--attached", action="store_true",
+                          help="#7824 : composer dans ce processus (ce que lance "
+                               "l'unité) au lieu d'une unité systemd-run détachée")
+    for each in (one, manual, again):
         each.add_argument("--repo", default=".", help="clone du projet (défaut : .)")
         each.add_argument("--actor", default=None,
                           help="auteur des gestes (défaut : AMEESH_ROLE, sinon --pilot)")
@@ -3063,7 +3231,7 @@ def main(argv: list[str] | None = None) -> int:
     lift.add_argument("--source", default="",
                       help="source de l'annonce de fin : auteur, date, message (200 caractères max)")
     look = sub.add_parser("status", help="#4361 : la pause active, s'il y en a une")
-    for each in (one, again, hold, lift, look):
+    for each in (one, manual, again, hold, lift, look):
         each.add_argument("--target", default="main")
         each.add_argument("--project", default="ameesh")
         each.add_argument("--pilot", default="mesh-design",
@@ -3071,7 +3239,17 @@ def main(argv: list[str] | None = None) -> int:
     for each in (hold, lift, look):
         each.add_argument("--by", default=None,
                           help="auteur (défaut : AGENT_MAIL_NAME, AMEESH_ROLE, USER)")
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    if args.environ_file:
+        # #7824 : l'unité détachée reçoit l'environnement de son appelant
+        load_environ(args.environ_file)
+    if args.as_role:
+        # #7824 : un rôle élu compose sous son bail de rôle, comme le tic
+        rest = [arg for i, arg in enumerate(raw_argv)
+                if arg not in ("--environ-file", "--as-role")
+                and (i == 0 or raw_argv[i - 1] not in ("--environ-file", "--as-role"))]
+        os.execvp(role_command(args.as_role, rest)[0], role_command(args.as_role, rest))
     if not use_tree_library():
         loaded = getattr(sys.modules.get("ameesh"), "__file__", "") or "aucune"
         print("paquet-horaire : bibliothèque ameesh de l'arbre %s indisponible "
@@ -3112,7 +3290,17 @@ def main(argv: list[str] | None = None) -> int:
                   carrier_claim=lambda carrier: read_carrier_claim(
                       args.project, carrier))
     try:
-        if args.command == "recompose":
+        if args.command in ("compose", "recompose") and not args.attached:
+            # #7824 : hors du tour, dans une unité ; l'appelant rend la main
+            wait = check_recompose(args) if args.command == "recompose" else 0
+            refuse_agent_clone(ctx)
+            check_fresh(ctx)
+            # B cx2 : l'unité part de `--working-directory` = le clone ; un
+            # `--repo` relatif y serait résolu une seconde fois. Le chemin
+            # absolu résolu est repassé en dernier (argparse : le dernier gagne).
+            sub_argv = raw_argv[raw_argv.index(args.command):] + ["--repo", str(repo)]
+            print(detach(ctx, sub_argv, kind=args.command, wait=wait), flush=True)
+        elif args.command == "recompose":
             # geste explicite du pilote (#4237) : la pause (#4361) ne vise que le tic
             refuse_agent_clone(ctx)
             check_fresh(ctx)
@@ -3138,7 +3326,8 @@ def main(argv: list[str] | None = None) -> int:
         return COMPOSITION_RED_RC
     except (HoraireError, auto.PaquetAutoError) as error:
         print("paquet-horaire : %s" % error, file=sys.stderr)
-        if args.command == "tick" and not getattr(error, "alerted", False):
+        if (args.command == "tick" or (args.command == "compose" and args.attached)) \
+                and not getattr(error, "alerted", False):
             alert_tick(ctx, error)
         return 1
 

@@ -189,7 +189,8 @@ class CommandLineTest(unittest.TestCase):
         clone = tempfile.TemporaryDirectory(prefix="paquet-5696-")
         self.addCleanup(clone.cleanup)
         (pathlib.Path(clone.name) / ".git").mkdir()
-        argv = [clone.name if a == "CLONE" else a for a in argv]
+        # #7824 : sans `--attached`, la recomposition part dans une unité
+        argv = [clone.name if a == "CLONE" else a for a in argv] + ["--attached"]
         zone = mock.Mock(timezone="Europe/Paris")
         with mock.patch.object(ph, "pose_git_identity"), \
                 mock.patch.object(ph, "check_fresh"), mock.patch.object(ph, "align_schema"), \

@@ -89,9 +89,11 @@ name: carte
 # (scripts/carte-fenetre.py) : hors de [00:00, 07:00)Z, carte de main de moins
 # de 12 h, autre mesure en cours ou paquet en file → mesure sautée, job vert,
 # raison en annotation (une mesure sautée n'est pas un échec). #6777 : une
-# carte de plus de 48 h (le seuil de `map_stale`) fait mesurer même hors
-# fenêtre, au premier créneau sans paquet en cours : la fraîcheur l'emporte sur
-# l'heure, sinon un cron toujours démarré en retard ne mesurerait plus jamais.
+# carte de plus de 24 h (#7823 ; 48 h avant) fait mesurer même hors fenêtre,
+# au premier créneau sans paquet en cours : la fraîcheur l'emporte sur l'heure,
+# sinon un cron toujours démarré en retard ne mesurerait plus jamais. #7823 :
+# au-delà de 36 h, un paquet en cours ne retient plus la mesure (18/11 : carte
+# de 46 h, prévalidation des lots non concluante).
 on:
   schedule:
     - cron: "30 3 * * *"
@@ -159,8 +161,8 @@ env:
 # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
 jobs:
   # #6157/#6777 — la mesure planifiée (cron en retard, minuterie de rôle) n'est
-  # due que dans sa fenêtre et sans paquet en file, sauf carte périmée (> 48 h :
-  # la mesure de rattrapage l'emporte) ; un dispatch manuel et une PR mesurent
+  # due que dans sa fenêtre et sans paquet en file, sauf carte périmée (> 24 h :
+  # la mesure de rattrapage l'emporte sur l'heure, > 36 h sur le paquet, #7823) ; un dispatch manuel et une PR mesurent
   # toujours. Runner hébergé : le garde ne prend jamais un runner du pool. Un
   # garde en panne laisse mesurer (non concluant, canon §3).
   fenetre:
