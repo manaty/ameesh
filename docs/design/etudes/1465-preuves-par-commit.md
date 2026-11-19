@@ -535,3 +535,31 @@ session non liée ; #7725 : liaison historique à `veille` qui n'écrit ni ne li
 de reçu ; X → Y → X refusé pour un commit de l'époque Y ; commits faits sous
 `veille` non couverts par une réparation ; commit d'un intervalle révolu du
 même agent accepté).
+
+## 10. Citer un commit dans un message : la règle lue au gel (#7252, #7721)
+
+Quand un relecteur corrige et que l'auteur réécrit depuis le B, le commit du
+relecteur n'est plus dans l'histoire ; le message de réécriture doit le citer
+pour que l'exclusion par son nom survive (#7252). Le lecteur
+(`review_authors._CITED_COMMIT`) retient un jeton hexadécimal de 7 à 40
+caractères borné par des caractères non alphanumériques — `correctif-<sha>`
+reste donc lu — et écarte ce qui n'est pas une citation : une empreinte
+explicitement nommée (`checksum`, `sha256`), le nom complet d'un paquet horaire
+(`h-AAAAMMJJ-NN`) et une suite noyée dans un mot (`succeeded`, #7770).
+
+Un jeton n'est une citation que si le dépôt ou la forge le confirme comme
+commit. Un objet local d'un autre type (arbre, blob, étiquette) est écarté sans
+réseau ; une forge qui répond explicitement « No commit found for SHA » écarte
+le jeton (#7730), qu'il s'agisse d'un mot courant comme `ed25519` ou d'un SHA
+d'un autre dépôt. Une forge muette, coupée ou ambiguë ne prouve pas l'absence :
+la citation reste un doute dit au gel, et la lecture stricte de la porte refuse
+(le refus fermé de #2924 B5) — jamais une exclusion silencieuse.
+
+Pour les auteurs : citez le commit retiré par au moins 12 caractères
+hexadécimaux de son SHA quand vous le pouvez ; ne citez jamais un mot
+hexadécimal ordinaire (`ed25519`, `deadbeef`) ni le SHA d'un autre dépôt comme
+preuve de cette tête. Un jeton court (moins de 12 caractères) reste lu pour ne
+pas perdre une vraie citation abrégée, mais il n'est retenu que si la forge en
+confirme l'existence. Le gel prépare ces citations hors transaction
+(`prefetch_prior_freezes`) ; une citation non préparée est dite, jamais
+silencieusement exclue.

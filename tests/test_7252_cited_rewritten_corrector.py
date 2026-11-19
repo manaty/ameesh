@@ -416,6 +416,37 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
                             self._reading(head, strict=True)
                     fetch.assert_not_called()
 
+    def test_foreign_repository_sha_is_ignored_on_a_definitive_forge_negative(self):
+        """#7721 : un SHA d'un autre dépôt, cité en entier dans le message,
+        n'est pas un commit de ce clone. La forge qui répond explicitement
+        « No commit found » l'écarte sans refus ni exclusion."""
+        from ameesh import plan_github
+
+        foreign = "0123456789abcdef0123456789abcdef01234567"
+        _fix, _head = self._rewrite(cite=False)
+        self.repo.git("commit", "--amend", "-m",
+                      "author: reprise\n\nSHA d'un autre dépôt %s cité pour"
+                      " mémoire." % foreign)
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+
+        def unavailable(*args, **kwargs):
+            raise urllib.error.HTTPError(
+                "https://api.invalid", 422, "failure", {},
+                io.BytesIO(json.dumps(
+                    {"message": "No commit found for SHA: " + foreign}).encode()))
+
+        api = plan_github.Api(token="test", opener=unavailable)
+        with mock.patch.object(review_authors, "_repository_slug",
+                               return_value="owner/repo"), \
+                mock.patch.object(plan_github, "client", return_value=api), \
+                mock.patch.object(review_authors, "_forge_fetch") as fetch:
+            (_authors, unknown, correctors), _freeze = self._reading(
+                head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual(correctors, [])
+        fetch.assert_not_called()
+
     def test_numeric_citation_requires_a_definitive_forge_negative(self):
         _fix, head = self._rewrite(cite="43969930787")
         with mock.patch.object(review_authors, "_forge_commit", return_value=None):
