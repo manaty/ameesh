@@ -395,10 +395,18 @@ def _wake_owner(application: Any) -> str | None:
     return getattr(application, "responsible", None)
 
 
-def verify_owner_go(db: Any, decision_id: Any, owner: str) -> tuple[bool, str]:
-    """A signed answer by `owner` to the named decision; the operator names
-    that decision in `AMEESH_INCIDENT_CALL_GO`.  A pending, unsigned or
-    misaddressed decision is refused."""
+def verify_owner_go(db: Any, decision_id: Any, owner: str,
+                    application: Any = None, *, now: float | None = None,
+                    ) -> tuple[bool, str]:
+    """A signed answer by `owner` to the named decision — provided the signed
+    question carries exactly one `incident-call/1` declaration for *this*
+    application and the signed answer selects the declared option inside its
+    window.
+
+    The operator names the decision in `AMEESH_INCIDENT_CALL_GO`.  A pending,
+    unsigned, misaddressed, superseded, unverifiable, unrelated, refusing,
+    out-of-scope or expired decision is a refusal, never a call.
+    """
     try:
         ident = int(str(decision_id).strip().lstrip("#"))
     except (TypeError, ValueError):
@@ -422,6 +430,32 @@ def verify_owner_go(db: Any, decision_id: Any, owner: str) -> tuple[bool, str]:
         return False, "owner-go-unreadable"
     if not ok:
         return False, "owner-go-unverified"
+    try:
+        decisions_mod.require_current(db, view)
+    except Exception:
+        return False, "owner-go-superseded"
+    # #7866 (B cx2) : the signed data itself must scope the go.  A "no", an
+    # unrelated question, another application or an expired window never
+    # activates the call.
+    try:
+        rule = routing.parse_call_go(view.get("question"))
+    except ValueError:
+        return False, "owner-go-unscoped"
+    if rule is None:
+        return False, "owner-go-unscoped"
+    app = str(application or "").strip()
+    if not app or rule.application != app:
+        return False, "owner-go-other-application"
+    instant = time.time() if now is None else float(now)
+    if instant >= rule.until:
+        return False, "owner-go-expired"
+    if rule.until > instant + routing.CALL_GO_MAX_HOURS * 3600:
+        return False, "owner-go-window"
+    keys = {str(option.get("key") or "") for option in view.get("options") or ()}
+    if rule.option not in keys:
+        return False, "owner-go-option-unknown"
+    if str(answer.get("option") or "") != rule.option:
+        return False, "owner-go-not-approved"
     return True, ""
 
 
@@ -433,7 +467,7 @@ def _short_reason(text: str) -> str:
 def request_call(application: Any, severity: str, resolution: Resolution,
                  *, db: Any, env: Mapping[str, str],
                  transport: Callable[..., tuple[int, bytes]] = _http,
-                 go_check: Callable[[Any, Any, str], tuple[bool, str]] = verify_owner_go,
+                 go_check: Callable[[Any, Any, str, str], tuple[bool, str]] = verify_owner_go,
                  ) -> Wake:
     """Ask the voice service for one call, only when the wake rule applies."""
     plan = routing.wake_plan(severity, resolution.responder)
@@ -452,8 +486,9 @@ def request_call(application: Any, severity: str, resolution: Resolution,
     if not go_id:
         wake.status, wake.reason = "refused", "owner-go-required"
         return wake
+    app_name = getattr(application, "id", "") or getattr(application, "title", "")
     try:
-        allowed, why = go_check(db, go_id, owner)
+        allowed, why = go_check(db, go_id, owner, app_name)
     except Exception:
         allowed, why = False, "owner-go-unreadable"
     if not allowed:
