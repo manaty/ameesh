@@ -11,7 +11,7 @@
 \set ON_ERROR_STOP on
 \if :{?role}
 \else
-  \set role bureau_goal
+  DO $$ BEGIN RAISE EXCEPTION 'droits limites : -v role=<connexion limitee> requis'; END $$;
 \endif
 SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = :'role') AS bureau_present \gset
 \if :bureau_present

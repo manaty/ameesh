@@ -220,8 +220,16 @@ class RejeuDroitsLimitesTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("password checks skipped", proc.stderr)
 
+    def test_roles_lus_dans_limited_logins(self):
+        # #7660 : aucun nom de rôle en dur, les inscriptions de la base
+        self.assertIn(self.login, droits_limites.enrolled(self.cfg))
+
+    def test_sql_sans_role_refuse(self):
+        proc = self.psql("rejeu-droits-limites.sql")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("-v role=<connexion limitee> requis", proc.stderr)
+
     def test_entree_cli(self):
-        self.assertEqual(droits_limites.ROLES, ("bureau_goal",))
         with tempfile.TemporaryDirectory() as vide:
             code, verdict = droits_limites.replay(self.cfg, vide, self.login)
         self.assertEqual(code, 2)

@@ -9,6 +9,8 @@ sequence now runs `deploy/sql/rejeu-droits-limites.sql` right after
 before any executor is restarted: GRANT and REVOKE of the reviewed scripts,
 then the contract audit `_contrat-bureau.sql` in the same transaction. No
 role is created and no password is touched; an absent role is skipped.
+The roles come from the database (`limited_logins`, enrolled by the
+installation script), never from a name written here (#7660).
 
 Exit codes: 0 replayed and audited (or skipped), 1 refused (audit or grant
 failure, the violated right named on stderr), 2 could not run (psql or
@@ -23,8 +25,18 @@ import sys
 from . import config, db as db_mod
 
 SCRIPT = "rejeu-droits-limites.sql"
-#: the limited logins whose grants are replayed, each with its own spec
-ROLES = ("bureau_goal",)
+
+
+def enrolled(cfg) -> list[str]:
+    """The limited logins enrolled on this database, read-only."""
+    db = db_mod.connect(cfg, writer=False)
+    try:
+        if not db.query("SELECT to_regclass('limited_logins') IS NOT NULL AS ok")[0]["ok"]:
+            return []
+        return [row["rolname"] for row in
+                db.query("SELECT rolname FROM limited_logins ORDER BY rolname")]
+    finally:
+        db.close()
 
 
 def replay(cfg, sql_dir: str, role: str) -> tuple[int, str]:
@@ -59,11 +71,19 @@ def main(argv=None) -> int:
     parser.add_argument("--sql-dir", required=True,
                         help="deploy/sql of the snapshot being deployed")
     parser.add_argument("--role", action="append",
-                        help="limited login to replay (default: %s)" % ", ".join(ROLES))
+                        help="limited login to replay (default: those of limited_logins)")
     args = parser.parse_args(argv)
     cfg = config.load(register_credentials=False)
+    try:
+        roles = args.role or enrolled(cfg)
+    except db_mod.DbError as exc:
+        print("droits limites : inscriptions illisibles : %s" % exc, file=sys.stderr)
+        return 2
+    if not roles:
+        print("droits limites : aucune connexion limitee inscrite, rejeu saute")
+        return 0
     worst = 0
-    for role in args.role or ROLES:
+    for role in roles:
         code, verdict = replay(cfg, args.sql_dir, role)
         print(verdict, file=sys.stderr if code else sys.stdout)
         worst = max(worst, code)
