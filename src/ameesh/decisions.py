@@ -186,7 +186,10 @@ def prose_route(human, db=None, cfg=None) -> tuple:
             rows = list(storage.of(db).operations.listing())
         except Exception:  # noqa: BLE001 — registre illisible : rien de deviné
             rows = []
-    name = avatars.name_for(cfg, human) if cfg is not None and human else None
+    # #7851 : le registre lu (`rows`) écarte un avatar retiré ou non admis ;
+    # la route configurée (`configured_desks`) reprend alors, comme sans
+    # avatar déclaré. Le filtre reste dans `avatars`, pas ici.
+    name = avatars.name_for(cfg, human, rows) if cfg is not None and human else None
     if name:
         allowed.append(name)
     elif cfg is not None:

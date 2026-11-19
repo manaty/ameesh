@@ -15,6 +15,7 @@ from ameesh import work_lifecycle as lifecycle
 import datetime
 import json
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -382,6 +383,22 @@ def tick(cfg, db, project, *, now: float) -> dict:
         return _notify(cfg, db, project, report)
 
 
+def skipped_retired(project, alert: str, target: str, report: dict) -> None:
+    """Un destinataire retiré n'interrompt pas les autres (#7851).
+
+    `mail.send` refuse un agent retiré (`RecipientRetired`, #3460). À l'appel,
+    la cible est écartée, son nom est consigné dans le rapport
+    (`skipped_retired`) et sur la sortie d'erreur — le journal du tick —
+    jamais l'exception ne remonte et n'empêche les autres cibles d'être
+    servies.
+    """
+    target = str(target)
+    report.setdefault("skipped_retired", []).append(target)
+    label = "staging-needed" if alert == "pending" else "staging-deferred"
+    print("%s %s: recipient %s is retired; skipped"
+          % (label, project.name, target), file=sys.stderr)
+
+
 def _notify(cfg, db, project, report):
     from . import mail, release_cutoff as rc, work
     state = rc.load_state(cfg)
@@ -403,13 +420,16 @@ def _notify(cfg, db, project, report):
     # #7634 : la route humaine est l'avatar du responsable du projet, lu au
     # canon ; aucun nom d'avatar n'est connu du cœur. Sans avatar déclaré,
     # l'agent configuré du projet (`report`) garde la route d'avant.
+    # #7851 : un avatar retiré ou absent du registre ne prend pas la route —
+    # `mail.send` le refuserait et les autres cibles seraient perdues ; le
+    # `report` configuré reprend, comme sans avatar.
     from . import avatars, staging_deferred
     try:
         rows = storage.of(db).operations.listing() if db is not None else ()
     except Exception:  # noqa: BLE001 - sans registre lisible, la route d'avant
         rows = ()
     owner = staging_deferred.owner_human(cfg, db, project, rows)
-    avatar = avatars.name_for(cfg, owner) if owner else None
+    avatar = avatars.name_for(cfg, owner, rows) if owner else None
     targets = set(notify)
     if avatar:
         targets.add(avatar)
@@ -424,8 +444,13 @@ def _notify(cfg, db, project, report):
     for target in targets:
         if sent.get(target) == fingerprint:
             continue
-        mail.send(db, work.SYSTEM_SENDER, target, text, kind="event",
-                  payload={"urgent": True, "staging_pending": report})
+        try:
+            mail.send(db, work.SYSTEM_SENDER, target, text, kind="event",
+                      payload={"urgent": True, "staging_pending": report})
+        except storage.RecipientRetired:
+            # #7851 : retiré entre la lecture du registre et le dépôt ; la
+            # cible est écartée et tracée, les autres reçoivent leur alerte.
+            skipped_retired(project, "pending", target, report)
         sent[target] = fingerprint
         rc.save_state(cfg, state)
     return report
