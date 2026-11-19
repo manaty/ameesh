@@ -119,6 +119,14 @@ class AvatarPolicyTest(unittest.TestCase):
         self.assertEqual(record.call_args.kwargs['mode'], 'resident')
         self.assertEqual(record.call_args.kwargs['digest'], applied.proof['digest'])
 
+    def test_resident_refuses_launch_when_proof_cannot_be_recorded(self):
+        fake = types.SimpleNamespace(_avatar_tools=self.prepare(), db=object(), name='avatar')
+        with mock.patch.object(policy.events, 'record', side_effect=NotImplementedError), \
+                mock.patch('ameesh.resident.spawn_leader') as start:
+            with self.assertRaises(runner._LancementImpossible):
+                runner.AgentWorker._spawn_resident(fake, ['claude', '-p'], env={})
+        start.assert_not_called()
+
 
 class AvatarAttachTest(PgTestCase):
     def setUp(self):
@@ -198,6 +206,30 @@ class AvatarAttachTest(PgTestCase):
             self.assertEqual(runner.run_attach(self.cfg, self.db, 'avatar7630'), 1)
         self.assertEqual(self.turns(), [])
         self.assertIsNone(registry.get(self.db, 'avatar7630')['lease_owner'])
+
+    def test_missing_proof_refuses_turn_and_cleans_up(self):
+        name = 'avatar7630'
+        owner = runner.Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, name, owner.runner_id, 3600)
+        worker = runner.AgentWorker(owner, registry.get(self.db, name), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        os.makedirs(worker.state_dir, exist_ok=True)
+        self.register('sender7630', 'claude', cwd=self.tmp)
+        mail.send(self.db, 'sender7630', name, 'hello', kind='request')
+        try:
+            from ameesh.platform import turn_cgroup
+            with mock.patch.object(policy.events, 'record', side_effect=NotImplementedError), \
+                    mock.patch.object(owner, 'turn_cgroup_root', return_value='/fake/root'), \
+                    mock.patch.object(turn_cgroup, 'create', return_value='/fake/turn'), \
+                    mock.patch.object(turn_cgroup, 'command', return_value=['unused']), \
+                    mock.patch.object(turn_cgroup, 'kill', return_value=True) as kill:
+                worker.run_turn(worker.pick())
+            kill.assert_called_once_with('/fake/turn')
+            self.assertEqual(self.turns(), [])
+            self.assertIsNone(worker.proc)
+            self.assertFalse(owner._turn_cgroups_live)
+        finally:
+            registry.release(self.db, name, owner.runner_id, int(lease['lease_epoch']))
 
     def test_unsupported_avatar_refused_before_attach_lease(self):
         with mock.patch.object(spawn, 'support', return_value=None), \
