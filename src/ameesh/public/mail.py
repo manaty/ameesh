@@ -84,10 +84,9 @@ _IDEMPOTENCY_INDEX = "agent_mailbox_idempotency_key_idx"
 
 #: unique index that carries reply correlation (migration 0594, E2b)
 _REPLY_INDEX = "agent_mailbox_in_reply_to_idx"
-#: #7778 : essais d'une réponse victime d'un interblocage (40P01). Deux agents
-#: qui se répondent en même temps tiennent chacun leur ligne du registre
-#: (`fence`) et attendent celle de l'autre (`_insert`, FOR SHARE) ; le serveur
-#: annule l'une des deux, rejouée ici en entier une seule fois.
+#: #7778 : essais d'une réponse victime d'un interblocage (40P01). Les deux
+#: lignes du registre (l'acteur, le destinataire) se prennent dans l'ordre des
+#: noms (`fence(peer=…)`) ; la reprise reste un filet, rejouée une seule fois.
 _REPLY_ATTEMPTS = 2
 
 #: known payload keys the core reads for delivery, review, decisions,
@@ -1185,8 +1184,13 @@ def _reply_once(db: Db, name: str, claim: Lease, ident: int,
                 prepared: _PreparedReply, cfg: Any, threads: list) -> Receipt:
     """One reply transaction; ``threads`` receives the deferred thread write."""
     with db.transaction() as tx:
+        # #7778 : le destinataire de la réponse (l'expéditeur de la demande,
+        # immuable) est lu sans verrou, pour prendre les deux lignes du
+        # registre dans l'ordre des noms avant toute autre prise.
+        asked = storage.of(tx).mailbox.get(ident)
         ok, reason, _row = registry.lease_agent_locked(
-            tx, name, claim.owner, claim.epoch)
+            tx, name, claim.owner, claim.epoch,
+            peer=(str(asked.get("sender") or "") or None) if asked else None)
         if not ok:
             raise ScopeRefused(
                 "lease refused for %s: %s" % (name, reason))
@@ -1228,8 +1232,8 @@ def reply(db: Db, actor: str, request_id: int, answer: Reply, *,
     receipt with ``reused=True``; another body or payload raises
     :class:`ReplyConflict`.  The native spend marker and reservation remain
     authoritative: this surface never reserves or settles spend.  Two agents
-    answering each other at once never see the server's deadlock: the victim
-    is replayed once.  The thread entry is written after the commit only.
+    answering each other at once take their registry rows in name order,
+    so they do not deadlock; a deadlock victim is still replayed once.  The thread entry is written after the commit only.
     """
     _direct(db)
     name = _actor(db, actor)

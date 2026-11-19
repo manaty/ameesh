@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#7778 — panier de #7672 : réponses croisées et fil écrit après le commit.
 
-1. Deux agents qui se répondent en même temps tiennent chacun leur ligne du
-   registre (`fence`, FOR UPDATE) puis attendent celle de l'autre (`_insert`,
-   FOR SHARE) : le serveur annule l'une des deux transactions (40P01). La
-   victime est rejouée une fois ; aucune erreur brute ne remonte.
+1. Deux agents qui se répondent en même temps tenaient chacun leur ligne du
+   registre (`fence`, FOR UPDATE) puis attendaient celle de l'autre
+   (`_insert`, FOR SHARE) : le serveur annulait l'une des deux (40P01). Les
+   deux lignes se prennent désormais dans l'ordre des noms : aucun
+   interblocage, aucune reprise ; la reprise unique reste un filet.
 2. Une réponse annulée après son dépôt (lecture de la ligne, commit) ne laisse
    aucune entrée dans le fil : l'écriture du fil attend le commit.
 
@@ -55,18 +56,19 @@ class CrossedReplyTest(PgTestCase):
     def test_crossed_replies_both_land_without_a_raw_deadlock(self):
         requests = {"beta": self.held_request("alpha", "beta"),
                     "alpha": self.held_request("beta", "alpha")}
-        # Each worker holds its own registry row before either inserts: the
-        # second insert waits on the first's row, and the first on the second.
+        # Before #7778 each worker held its own registry row here, then the
+        # inserts crossed.  In name order the second worker waits inside its
+        # fence instead: the barrier breaks after a short wait, nothing more.
         barrier = threading.Barrier(2)
         fenced = registry.lease_agent_locked
         first = threading.local()
 
-        def fence_then_wait(tx, name, owner, epoch):
-            result = fenced(tx, name, owner, epoch)
+        def fence_then_wait(tx, name, owner, epoch, **kwargs):
+            result = fenced(tx, name, owner, epoch, **kwargs)
             if not getattr(first, "done", False):
                 first.done = True
                 try:
-                    barrier.wait(timeout=10)
+                    barrier.wait(timeout=2)
                 except threading.BrokenBarrierError:
                     pass
             return result
@@ -90,7 +92,9 @@ class CrossedReplyTest(PgTestCase):
             finally:
                 db.close()
 
-        with mock.patch.object(registry, "lease_agent_locked", fence_then_wait):
+        once = mock.Mock(wraps=public_mail._reply_once)
+        with mock.patch.object(registry, "lease_agent_locked", fence_then_wait), \
+                mock.patch.object(public_mail, "_reply_once", once):
             threads = [threading.Thread(target=worker, args=(actor,))
                        for actor in ("alpha", "beta")]
             for thread_ in threads:
@@ -100,6 +104,8 @@ class CrossedReplyTest(PgTestCase):
                 self.assertFalse(thread_.is_alive(), "a crossed reply is stuck")
         self.assertEqual(errors, [])
         self.assertEqual(results, requests)
+        # No deadlock victim: each reply committed on its first transaction.
+        self.assertEqual(once.call_count, 2)
         replies = self.db.query(
             "SELECT in_reply_to FROM agent_mailbox WHERE kind = 'reply'"
             " ORDER BY in_reply_to")

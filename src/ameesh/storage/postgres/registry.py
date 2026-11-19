@@ -1336,7 +1336,7 @@ class Leases(interface.Leases):
         )
         return rows[0] if rows else None
 
-    def fence(self, name, owner, epoch) -> tuple[bool, str, dict | None]:
+    def fence(self, name, owner, epoch, *, peer=None) -> tuple[bool, str, dict | None]:
         """#7672 : verrouille la ligne du registre, puis juge le bail.
 
         Le verrou est pris AVANT la lecture des faits que l'appelant va
@@ -1345,7 +1345,15 @@ class Leases(interface.Leases):
         `registry.lease_agent` (mêmes mots), pour que le diagnostic ne dépende
         pas du chemin. L'échéance est relue avec `clock_timestamp()` après
         l'attente éventuelle du verrou.
+
+        #7778 : un `peer` dont le nom précède `name` est pris `FOR SHARE`
+        d'abord (le mode du dépôt qui suivra) : les lignes se prennent dans
+        l'ordre des noms.
         """
+        if peer and peer < name:
+            self.db.query(
+                "SELECT 1 FROM agent_registry WHERE name = %s OR %s = ANY(aliases)"
+                " FOR SHARE", (peer, peer))
         rows = self.db.query(
             """
             SELECT name, lease_owner, lease_epoch, status,
