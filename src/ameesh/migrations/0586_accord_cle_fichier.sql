@@ -19,7 +19,7 @@ set local lock_timeout = '5s';
 alter table authenticators
     add column if not exists accord_operations jsonb not null default '[]'::jsonb;
 
-create table if not exists accord_claims (
+create table accord_claims (
     agent      text not null,
     seq        bigint not null,
     kind       text not null check (kind in ('action', 'standing', 'decision')),
