@@ -27,3 +27,12 @@ create table if not exists accord_claims (
     claimed_at timestamptz not null default clock_timestamp(),
     primary key (agent, seq)
 );
+
+-- Même contrat d'écriture que les colonnes réécrites de 0516 : un accord écrit
+-- sous une ancienne orthographe est ramené au primaire, et `agent_rename`
+-- réécrit la colonne avec l'entrée de journal (conversation_log.agent, en
+-- cascade) — sinon le même go redeviendrait citable sous la nouvelle
+-- orthographe.
+drop trigger if exists ameesh_agent_spelling on accord_claims;
+create trigger ameesh_agent_spelling before insert or update of agent on accord_claims
+    for each row execute function ameesh_agent_spelling('agent');

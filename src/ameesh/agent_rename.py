@@ -42,6 +42,10 @@ RENAMED_EVENT = "agent.renamed"
 # Columns holding an agent name, rewritten where equal to OLD. Array columns
 # are marked with a trailing "[]".
 REWRITTEN = (
+    # #7631 (0586): the claim (agent, seq) follows the journal entry — the
+    # conversation log cascades on rename; a go already cited must not become
+    # reusable under the new spelling.
+    "accord_claims.agent",
     "account_budgets.set_by", "account_rate_events.agent", "account_reservations.agent",
     "account_reservations.closed_by", "account_switches.agent", "account_turn_slots.agent",
     "account_turn_starts.agent", "agent_lot_sessions.agent", "agent_mailbox.recipient",

@@ -132,6 +132,21 @@ class AgentRenameTest(PgTestCase):
             "SELECT updated_by FROM repository_footprint_policies WHERE app = 'demo-4299'"
         )[0]['updated_by'], 'new-worker')
 
+    def test_rename_moves_an_accord_claim(self):
+        # #7631 (0586): an accord claim is keyed by (agent, seq) to the
+        # conversation journal; it follows the renamed identity, otherwise the
+        # same go could be cited again under the new spelling.
+        self.db.execute("INSERT INTO accord_claims (agent, seq, kind, ref)"
+                        " VALUES ('worker', 7, 'action', 'a-1')")
+
+        result = self.rename('worker', 'new-worker')
+
+        self.assertEqual(result['rewritten'].get('accord_claims.agent'), 1)
+        rows = self.db.query("SELECT agent, seq, kind, ref FROM accord_claims"
+                             " WHERE seq = 7")
+        self.assertEqual([(r['agent'], r['seq'], r['kind'], r['ref']) for r in rows],
+                         [('new-worker', 7, 'action', 'a-1')])
+
     def test_rename_moves_the_external_executor_trace(self):
         # #6091 (0554): the declaration and retirement trace names the pilot
         # authority (an agent, or human:<id>); an agent spelling follows the
