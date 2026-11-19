@@ -21,11 +21,17 @@ hébergé (il ne prend jamais un runner du pool) :
     l'aîné mesure) ;
   - paquet en cours : une exécution d'une branche `integration/*` est en file
     ou en cours ; la mesure lui prendrait ses runners ;
-  - carte périmée (#6777) : une carte de main de plus de 48 h (le seuil de
-    l'alerte `map_stale`, #3344) fait mesurer même hors de la fenêtre, au
-    premier créneau sans paquet en cours : la fraîcheur l'emporte sur
-    l'heure, sinon un cron toujours démarré en retard ne mesurerait plus
-    jamais ;
+  - carte périmée (#6777) : une carte de main de plus de 24 h (#7823 ; 48 h
+    avant) fait mesurer même hors de la fenêtre, au premier créneau sans
+    paquet en cours : la fraîcheur l'emporte sur l'heure, sinon un cron
+    toujours démarré en retard ne mesurerait plus jamais ;
+  - carte très périmée (#7823) : au-delà de 36 h, un paquet en cours ne
+    retient plus la mesure. Le 18/11, la minuterie de 01:00Z a cédé au paquet
+    h-20261118-01 et le cron de 12:08Z était hors fenêtre : la carte du 17/11
+    a vieilli jusqu'à 46 h, le plan de chaque lot jugeait 511 fichiers de
+    dérive de `main` et la prévalidation au gel ne concluait plus. La mesure
+    garde son plafond de runners (`max-parallel`), la ci-full du paquet
+    garde les autres ;
   - hors fenêtre : l'heure UTC n'est pas dans [00:00, 07:00) — loin des
     coupures 10:00Z/22:00Z (11:00/23:00 Europe/Paris) et des heures de
     paquets de jour.
@@ -54,9 +60,14 @@ import urllib.request
 FENETRE_UTC = (0, 7)
 #: une carte de main plus jeune que ceci rend la mesure planifiée « pas due »
 FRAICHEUR_H = 12
-#: au-delà, la carte est périmée (même seuil que `map_stale`, #3344) : la
-#: mesure de rattrapage l'emporte sur la fenêtre horaire (#6777)
-FRAICHEUR_MAX_H = 48
+#: au-delà, la carte est périmée : la mesure de rattrapage l'emporte sur la
+#: fenêtre horaire (#6777). #7823 : 24 h, pas 48 (le seuil de `map_stale`) —
+#: une carte de 46 h faisait juger au plan de chaque lot toute la dérive de
+#: `main` depuis la carte, donc une sélection incertaine à chaque gel.
+FRAICHEUR_MAX_H = 24
+#: #7823 : au-delà, un paquet en cours ne retient plus la mesure (la carte
+#: n'avançait plus quand les paquets de nuit occupaient chaque créneau)
+FRAICHEUR_PAQUET_H = 36
 #: préfixe des branches de paquet (paquet.yml : `integration/**`)
 PREFIXE_PAQUET = "integration/"
 
@@ -78,6 +89,10 @@ def decider(*, evenement: str, planifie: bool, maintenant: dt.datetime,
                            "(< %d h)" % (age_h, FRAICHEUR_H))
     if autre_carte:
         return False, "pas due : une autre mesure de la carte est en file ou en cours"
+    if age_h is not None and age_h > FRAICHEUR_PAQUET_H:
+        return True, ("carte de main très périmée (%.1f h > %d h) : mesure "
+                      "malgré l'heure et les paquets en cours (#7823)"
+                      % (age_h, FRAICHEUR_PAQUET_H))
     if paquet_actif:
         return False, "paquet en cours : la mesure lui laisse les runners"
     debut, fin = FENETRE_UTC
@@ -85,7 +100,7 @@ def decider(*, evenement: str, planifie: bool, maintenant: dt.datetime,
         return True, "mesure planifiée dans sa fenêtre"
     # #6777 : la fraîcheur l'emporte sur la fenêtre. Un cron que GitHub démarre
     # toujours avec six à huit heures de retard ne mesurerait plus jamais : une
-    # carte de plus de 48 h (le seuil de `map_stale`) est mesurée au premier
+    # carte de plus de `FRAICHEUR_MAX_H` (24 h, #7823) est mesurée au premier
     # créneau sans paquet, même hors de [00:00, 07:00)Z.
     if age_h is not None and age_h > FRAICHEUR_MAX_H:
         return True, ("carte de main périmée (%.1f h > %d h) : mesure de "

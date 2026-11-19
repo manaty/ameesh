@@ -802,6 +802,154 @@ def _tree_modules(prepared: Prepared, head: str, *,
     return out
 
 
+#: #7823 : budget, en secondes mesurées (`tests/parts/durees.json`, pilote
+#: psycopg), des modules qui importent les fichiers changés du lot. Le repli
+#: tient dans la prévalidation d'un gel (`FREEZE_BUDGET_S`) : le lot y passe
+#: avant les contrats, jamais toute la suite.
+FALLBACK_IMPORTERS_BUDGET_S = 120.0
+#: durée d'un module absent de la table (même forfait que paquet-attribution)
+FALLBACK_UNKNOWN_S = 60.0
+#: fichiers changés dont on cherche les importateurs (un `git grep` chacun)
+FALLBACK_IMPORTED_FILES = 40
+DURATIONS_PATH = "tests/parts/durees.json"
+
+
+def _own_tests(changes, tree_modules: set[str]) -> list[str]:
+    """#7823 : les modules de test que le diff **propre** du lot ajoute ou change.
+
+    Les classes P0 du plan ne suffisent plus : avec une carte de 46 h, le plan
+    juge la dérive de `main` depuis la carte, et ses P0 portaient 247 modules
+    que le lot ne touchait pas (#7813, 18/11)."""
+    out = []
+    for status, path in changes:
+        name = os.path.basename(path)[:-3] if path.endswith(".py") else ""
+        if status != "D" and path.startswith("tests/test") \
+                and name in tree_modules and name not in out:
+            out.append(name)
+    return sorted(out)
+
+
+def _dotted(path: str) -> str:
+    """`src/ameesh/x/y.py` → `ameesh.x.y` ; `tests/support.py` → `tests.support`."""
+    if not path.endswith(".py"):
+        return ""
+    if path.startswith("src/"):
+        stem = path[len("src/"):-3]
+    elif path.startswith("tests/") and not os.path.basename(path).startswith("test"):
+        stem = path[:-3]
+    else:
+        return ""
+    parts = [p for p in stem.split("/") if p]
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    if not parts or not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", p) for p in parts):
+        return ""
+    return ".".join(parts)
+
+
+def _durations(prepared: Prepared, head: str, run) -> dict[str, float]:
+    """Les secondes par module de la table du candidat (psycopg), ou `{}`."""
+    try:
+        proc = run(["git", "-C", prepared.repo, *prevalidation.NO_REPLACE,
+                    "show", "%s:%s" % (head, DURATIONS_PATH)],
+                   capture_output=True, text=True)
+        if getattr(proc, "returncode", 1):
+            return {}
+        table = json.loads(getattr(proc, "stdout", "") or "{}").get("psycopg")
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return {}
+    if not isinstance(table, dict):
+        return {}
+    out = {}
+    for name, seconds in table.items():
+        try:
+            out[str(name)] = float(seconds)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _importers(prepared: Prepared, head: str, changes, tree_modules: set[str],
+               taken, *, deadline: Deadline | None = None
+               ) -> tuple[list[str], int]:
+    """#7823 : le repli statique borné — les tests qui importent les fichiers
+    changés du lot.
+
+    Un `git grep` par fichier changé (`import a.b.c`, `from a.b.c import`,
+    `from a.b import … c`) dans les `tests/test*.py` de la tête ; un import
+    sur plusieurs lignes ou dynamique n'est pas vu (la ci-full du paquet reste
+    la preuve finale). Le budget `FALLBACK_IMPORTERS_BUDGET_S` se partage entre
+    les fichiers changés à tour de rôle, le module le moins cher de chacun
+    d'abord (même règle que #7195) : un fichier très importé
+    (`tests/support.py`) ne consomme pas seul la borne. Rend
+    `(modules retenus, modules au-delà du budget)`."""
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé avant les importateurs du lot")
+    if not str(getattr(prepared, "repo", "") or ""):
+        return [], 0
+    bounded = prevalidation._bounded_runner(subprocess.run, deadline)
+    targets = []
+    for status, path in changes:
+        dotted = _dotted(path) if status != "D" else ""
+        if dotted and dotted not in targets:
+            targets.append(dotted)
+    queues: list[list[str]] = []
+    candidates: set[str] = set()
+    durations: dict[str, float] | None = None
+    for dotted in targets[:FALLBACK_IMPORTED_FILES]:
+        parent, _, leaf = dotted.rpartition(".")
+        here = re.escape(dotted)
+        patterns = [r"^\s*(import|from)\s+%s(\s|\.|,|$)" % here]
+        if parent:
+            patterns.append(r"^\s*from\s+%s\s+import\s.*\b%s\b"
+                            % (re.escape(parent), re.escape(leaf)))
+        argv = ["git", "-C", prepared.repo, *prevalidation.NO_REPLACE,
+                "grep", "-l", "-E"]
+        for pattern in patterns:
+            argv += ["-e", pattern]
+        argv += [head, "--", "tests/test*.py"]
+        try:
+            proc = bounded(argv, capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        #: 1 : aucun fichier ne correspond ; plus : lecture impossible, ignorée
+        if getattr(proc, "returncode", 1) not in (0, 1):
+            continue
+        found = []
+        for line in (getattr(proc, "stdout", "") or "").splitlines():
+            path = line.split(":", 1)[-1]
+            name = os.path.basename(path)[:-3] if path.endswith(".py") else ""
+            if name in tree_modules and name not in taken:
+                found.append(name)
+        if not found:
+            continue
+        if durations is None:
+            durations = _durations(prepared, head, bounded)
+        found.sort(key=lambda name: (durations.get(name, FALLBACK_UNKNOWN_S), name))
+        queues.append(found)
+        candidates.update(found)
+    durations = durations or {}
+    chosen: list[str] = []
+    spent = 0.0
+    while queues:
+        still = []
+        for queue in queues:
+            while queue and (queue[0] in chosen or spent
+                             + durations.get(queue[0], FALLBACK_UNKNOWN_S)
+                             > FALLBACK_IMPORTERS_BUDGET_S):
+                queue.pop(0)
+            if not queue:
+                continue
+            name = queue.pop(0)
+            spent += durations.get(name, FALLBACK_UNKNOWN_S)
+            chosen.append(name)
+            still.append(queue)
+        queues = still
+    return sorted(chosen), len(candidates - set(chosen))
+
+
 def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
                       deadline: Deadline | None = None) -> dict | None:
     """#3800 : sur sélection incertaine, la prévalidation joue les contrats.
@@ -820,6 +968,11 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
     modules joués, il ne se lit pas comme un vert de sélection. `validate`
     retire ensuite de ce plan les tests que le guest ne peut pas exécuter
     (#4071, `GUEST_EXCLUSIONS`) ; la suite complète les garde.
+
+    #7823 : les « tests du lot » sont ceux de son diff propre, plus les
+    importateurs statiques de ses fichiers sous `FALLBACK_IMPORTERS_BUDGET_S`
+    (`_importers`), jamais les P0 d'un plan jugé depuis une carte ancienne. Le
+    lot passe dans une première part, les contrats dans une seconde.
 
     Rend le bloc ``fallback`` quand le repli a été écrit, ``None`` sinon (le
     refus d'origine reste alors la réponse). Un contrat déclaré illisible ne
@@ -903,6 +1056,30 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
     changed_tests = [str(name) for name, entry in (plan.get("classes") or {}).items()
                      if isinstance(entry, (list, tuple)) and entry
                      and str(entry[0]) == "P0"]
+    #: #7823 : diff lu, seuls les tests que le lot change lui-même comptent.
+    #: Les P0 d'un plan jugé depuis le commit de la carte portent toute la
+    #: dérive de `main` (247 modules le 18/11 pour #7813) : le repli jouait
+    #: alors la suite presque entière et n'aboutissait jamais dans sa borne.
+    #: Un P0 garde sa place s'il nomme un fichier du diff (projet sans
+    #: `tests/test*.py`) ; diff illisible, les P0 restent (élargir, jamais
+    #: rétrécir en silence).
+    importers: list[str] = []
+    importers_dropped = 0
+    if changes is not None:
+        changes = [(str(item[0]), str(item[1]))
+                   if isinstance(item, (list, tuple)) and len(item) >= 2
+                   else ("M", str(item)) for item in changes]
+        stems = {os.path.splitext(path)[0] for status, path in changes
+                 if status != "D"}
+        own = set(_own_tests(changes, tree_modules))
+        own.update(name for name in changed_tests
+                   if name in stems or any(stem.endswith("/" + name)
+                                           for stem in stems))
+        changed_tests = sorted(own)
+        importers, importers_dropped = _importers(
+            prepared, head, changes, tree_modules,
+            set(changed_tests) | set(required) | set(transverse),
+            deadline=deadline)
     #: #6186 : les modules de la porte et du superviseur sont un filet propre à
     #: ameesh ; l'inventaire du plan dit si le projet les porte. Sans inventaire
     #: (plan N-1), le filet historique reste appliqué.
@@ -912,16 +1089,24 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
         if inventory:
             historical = tuple(name for name in FALLBACK_MODULES
                                if name in inventory)
-    modules: list[str] = []
-    for name in (*required, *historical, *sorted(transverse),
-                 *sorted(changed_tests)):
-        if name not in modules:
-            modules.append(name)
+    #: #7823 : deux parts jouées dans l'ordre — le lot (ses tests, puis les
+    #: importateurs de ses fichiers), puis les contrats. Chaque part rend son
+    #: flux en finissant : un budget épuisé pendant les contrats garde la
+    #: preuve du lot, et un rouge du lot est vu avant l'échéance.
+    own_part: list[str] = []
+    for name in (*sorted(changed_tests), *importers):
+        if name not in own_part:
+            own_part.append(name)
+    contract_part: list[str] = []
+    for name in (*required, *historical, *sorted(transverse)):
+        if name not in contract_part and name not in own_part:
+            contract_part.append(name)
+    modules = own_part + contract_part
     if not modules:
         return None
     classes = tuple(getattr(block, "classes", ()) or ())
     rank = classes[0] if classes else "P1"
-    extra = bool(transverse or changed_tests)
+    extra = bool(transverse or changed_tests or importers)
     fallback = {
         "cause": chosen.causes[0],
         "causes": list(chosen.causes),
@@ -929,6 +1114,8 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
         "contracts": list(required),
         "transverse": sorted(transverse),
         "changed_tests": sorted(changed_tests),
+        "importers": list(importers),
+        "importers_dropped": importers_dropped,
         "transverse_all": not diff_read,
         "diff": "read" if diff_read else "unreadable",
         "modules": list(modules),
@@ -949,9 +1136,13 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
     #: et que les classes retenues soient exactement les modules joués.
     plan["contract"] = list(required)
     plan["classes"] = {name: [rank, "contrat (#3800)"] for name in modules}
+    listed = [(label, names) for label, names in
+              (("psycopg lot", own_part), ("psycopg contrats", contract_part))
+              if names]
     plan["parts"] = {
-        "psycopg": [{"part": 1, "of": 1, "label": "psycopg contrats",
-                     "modules": list(modules), "estimate_s": 0.0}],
+        "psycopg": [{"part": index, "of": len(listed), "label": label,
+                     "modules": list(names), "estimate_s": 0.0}
+                    for index, (label, names) in enumerate(listed, 1)],
         "psql": [],
     }
     if deadline is not None and deadline.expired():
@@ -1407,6 +1598,35 @@ def after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
         why = _timed_out(deadline, "%s: %s" % (type(exc).__name__, str(exc)[:300]))
         _journal(db, lot, "%s unavailable: %s" % (JOURNAL_PREFIX, why))
         return {"state": "unavailable", "why": why}
+
+
+def freeze_line(outcome: dict | None) -> str:
+    """#7823 : ce que la commande de gel affiche de sa prévalidation.
+
+    Une prévalidation non concluante ne doit pas passer pour une absence de
+    tests : le gel dit combien de modules prévus ont réellement tourné, et
+    que les tests impactés du lot restent à jouer avant le paquet."""
+    if not isinstance(outcome, dict):
+        return ""
+    state = str(outcome.get("state") or "")
+    report = outcome.get("report") if isinstance(outcome.get("report"), dict) else {}
+    ran = len(report.get("modules") or ())
+    planned = len(report.get("planned") or ())
+    played = (" (%d/%d module(s) joué(s))" % (ran, planned)) if planned else ""
+    if state == "green":
+        return "prevalidation: verte%s" % played
+    if state == "red":
+        return "prevalidation: ROUGE%s — %s" % (played, describe(report))
+    if state == "unavailable":
+        why = describe(report) if report else str(outcome.get("why") or "")
+        return ("prevalidation: NON CONCLUANTE%s — les tests impactés du lot "
+                "n'ont pas été prouvés avant le paquet ; à jouer localement "
+                "(`ameesh work prevalidate`) : %s" % (played, why[:400]))
+    if state in ("queued", "skipped"):
+        return "prevalidation: %s — %s" % (
+            "en file" if state == "queued" else "sautée",
+            str(outcome.get("why") or "")[:300])
+    return ""
 
 
 def _repo_slug(cfg, item) -> str:

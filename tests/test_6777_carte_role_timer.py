@@ -164,7 +164,7 @@ class HourlyCatchupTest(unittest.TestCase):
         guard = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(guard)
         now = dt.datetime(2026, 11, 15, 12, tzinfo=dt.timezone.utc)
-        published = now - dt.timedelta(hours=49)
+        published = now - dt.timedelta(hours=30)
         rows = [{"repo": "manaty/ameesh", "branch": "main",
                  "published_ts": published.timestamp()}]
         gh = FakeGh(workflows={("manaty/ameesh", "main")})
@@ -182,7 +182,8 @@ class HourlyCatchupTest(unittest.TestCase):
 
     def test_fresh_unknown_or_other_branch_never_dispatch_hourly(self):
         now = dt.datetime(2026, 11, 15, 12, tzinfo=dt.timezone.utc)
-        for age, branch in ((47, "main"), (48, "main"), (None, "main"), (49, "other")):
+        # #7823 : le rattrapage horaire part au-delà de 24 h (48 h avant)
+        for age, branch in ((23, "main"), (24, "main"), (None, "main"), (25, "other")):
             with self.subTest(age=age, branch=branch):
                 rows = [{"repo": "manaty/ameesh", "branch": branch,
                          "published_ts": None if age is None else

@@ -46,7 +46,9 @@ class DecisionTest(unittest.TestCase):
 
     def decider(self, **kw):
         base = dict(evenement="schedule", planifie=False, maintenant=a("03:31"),
-                    derniere_carte=a("03:31") - dt.timedelta(hours=24),
+                    # #7823 : une carte de 20 h, due (> 12 h) sans être
+                    # périmée (> 24 h)
+                    derniere_carte=a("03:31") - dt.timedelta(hours=20),
                     paquet_actif=False, autre_carte=False)
         base.update(kw)
         return fenetre.decider(**base)
@@ -55,7 +57,9 @@ class DecisionTest(unittest.TestCase):
         # les heures réelles du constat : 10:37Z, 11:24Z
         for heure in ("10:37", "11:24", "07:00"):
             with self.subTest(heure=heure):
-                mesurer, raison = self.decider(maintenant=a(heure))
+                mesurer, raison = self.decider(
+                    maintenant=a(heure),
+                    derniere_carte=a(heure) - dt.timedelta(hours=20))
                 self.assertFalse(mesurer)
                 self.assertIn("hors fenêtre", raison)
 
@@ -66,17 +70,19 @@ class DecisionTest(unittest.TestCase):
         self.assertTrue(self.decider(maintenant=a("06:59"))[0])
 
     def test_la_minuterie_hors_fenetre_est_sautee(self):
-        # rattrapage `Persistent=true` d'un hôte rallumé en pleine journée
+        # rattrapage `Persistent=true` d'un hôte rallumé en pleine journée,
+        # carte de moins de 24 h (#7823)
         mesurer, _ = self.decider(evenement="workflow_dispatch", planifie=True,
-                                  maintenant=a("14:00"))
+                                  maintenant=a("14:00"),
+                                  derniere_carte=a("14:00") - dt.timedelta(hours=20))
         self.assertFalse(mesurer)
 
     def test_une_carte_perimee_mesure_hors_fenetre(self):
         # #6777 : le cron de 03:30Z démarre vers 11Z ; une carte de plus de
-        # 48 h (le seuil de `map_stale`) l'emporte sur la fenêtre.
+        # 24 h (#7823) l'emporte sur la fenêtre.
         mesurer, raison = self.decider(
             maintenant=a("11:24"),
-            derniere_carte=a("11:24") - dt.timedelta(hours=49))
+            derniere_carte=a("11:24") - dt.timedelta(hours=25))
         self.assertTrue(mesurer)
         self.assertIn("périmée", raison)
         self.assertIn("rattrapage", raison)
@@ -84,9 +90,20 @@ class DecisionTest(unittest.TestCase):
     def test_une_carte_perimee_attend_le_creneau_sans_paquet(self):
         mesurer, raison = self.decider(
             maintenant=a("11:24"), paquet_actif=True,
-            derniere_carte=a("11:24") - dt.timedelta(hours=49))
+            derniere_carte=a("11:24") - dt.timedelta(hours=30))
         self.assertFalse(mesurer)
         self.assertIn("paquet", raison)
+
+    def test_une_carte_tres_perimee_mesure_malgre_le_paquet(self):
+        # #7823 : le 18/11, la minuterie de 01:00Z a cédé au paquet et le cron
+        # de 12:08Z était hors fenêtre ; la carte du 17/11 a atteint 46 h.
+        for heure in ("01:00", "12:08"):
+            with self.subTest(heure=heure):
+                mesurer, raison = self.decider(
+                    maintenant=a(heure), paquet_actif=True,
+                    derniere_carte=a(heure) - dt.timedelta(hours=37))
+                self.assertTrue(mesurer)
+                self.assertIn("très périmée", raison)
 
     def test_une_carte_perimee_ne_double_pas_une_mesure(self):
         mesurer, raison = self.decider(
@@ -95,13 +112,19 @@ class DecisionTest(unittest.TestCase):
         self.assertFalse(mesurer)
         self.assertIn("autre mesure", raison)
 
-    def test_le_seuil_de_peremption_est_48_h(self):
+    def test_les_seuils_de_peremption_sont_24_h_et_36_h(self):
         self.assertFalse(self.decider(
             maintenant=a("11:24"),
-            derniere_carte=a("11:24") - dt.timedelta(hours=47))[0])
+            derniere_carte=a("11:24") - dt.timedelta(hours=23))[0])
         self.assertTrue(self.decider(
             maintenant=a("11:24"),
-            derniere_carte=a("11:24") - dt.timedelta(hours=49))[0])
+            derniere_carte=a("11:24") - dt.timedelta(hours=25))[0])
+        self.assertFalse(self.decider(
+            maintenant=a("11:24"), paquet_actif=True,
+            derniere_carte=a("11:24") - dt.timedelta(hours=35))[0])
+        self.assertTrue(self.decider(
+            maintenant=a("11:24"), paquet_actif=True,
+            derniere_carte=a("11:24") - dt.timedelta(hours=37))[0])
 
     def test_lecture_impossible_hors_fenetre_ne_mesure_pas(self):
         # une lecture en panne ne prouve pas la péremption : la fenêtre borne
