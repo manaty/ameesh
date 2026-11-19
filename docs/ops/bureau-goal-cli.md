@@ -16,10 +16,15 @@ jamais avec le rôle `ameesh` ni un DSN d'agent.
 | lire les lots qu'il exécute | `ameesh work show <lot>` | SELECT des tables de lots, du registre, du courrier ; `actions` limité aux colonnes du résumé (ni `args`, ni empreinte, ni nonce, ni reçu) |
 | se lier, PID vérifié localement | `ameesh mail bind|unbind` | INSERT/UPDATE de colonnes de `session_bindings` |
 | prendre / lever un geste externe | `ameesh work claim <lot> --session <id> [--release]` | UPDATE des seules colonnes `external_claim_*` de `work_items` (dont `external_claim_harness` et `external_claim_binding` dès la migration 0566 de #6877) |
+| lever SA propre réservation (#7870) | `ameesh work external-executor <lot> --clear` | UPDATE des seules colonnes `external_executor`, `external_session` et `external_claim_*` de `work_items`, borné par la garde 0567 au lot réservé à l'agent et à une liaison L41 vérifiée ; la pose et le changement d'exécutant restent des gestes de pilote |
 | reçus de provenance | hooks `provenance intent|created|record` | INSERT de `provenance_receipts` |
 | courrier | `agent-mail send`, `agent-mail inbox`, `agent-mail ack <id>…` | INSERT de `agent_mailbox` ; UPDATE de `meta`, `delivered_at`, `status` (réservation et remise du courrier reçu) |
 | déclarer le rattrapage staging (#7565) | `ameesh release catchup` | SELECT de `ameesh_staging_attestations` (seul type `staging.attested`) ; SELECT du seul `ameesh_events.id` pour INSERT RETURNING ; trace `staging.catchup` au nom du bureau ; signatures de décisions déjà consommées via `ameesh_decision_proofs` |
 | présence et non-lus des agents (#7058) | `agent-mail list` | SELECT de la vue `agent_mesh_overview` (registre et courrier, déjà lisibles) ; pour le prédicat de réclamation, SELECT des seules colonnes lues de `host_lifecycle`, `host_release_fences` et `host_handoffs` |
+
+La clôture (`ameesh work close`) écrit `work_items.state` : elle reste un
+geste de pilote, et la connexion limitée la refuse en le nommant. L'exécutant
+lève sa réservation, puis un pilote rend le lot et le ferme.
 
 La liste exacte est `deploy/sql/_bureau-droits.sql` ; `_contrat-bureau.sql`
 compare les droits **effectifs** (PUBLIC et appartenances compris) à cette

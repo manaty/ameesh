@@ -1708,21 +1708,38 @@ class WorkItems(interface.WorkItems):
                      " RETURNING __COLUMNS__").replace(
                          "__COLUMNS__", item_columns(self.db)),
                     (executor, session or None, int(item_id)))
-            else:
-                rows = tx.query(
-                    ("UPDATE work_items SET external_executor = NULL,"
-                     " external_session = NULL, external_claim_session = NULL,"
-                     " external_claimed_at = NULL, external_claim_actor = NULL,"
-                     " external_claim_host = NULL, external_claim_proof = NULL,"
-                     " external_claim_harness = NULL, external_claim_binding = NULL,"
-                     " updated_at = now()"
-                     f" WHERE id = %s AND state NOT IN {closed}"
-                     " RETURNING __COLUMNS__").replace(
-                         "__COLUMNS__", item_columns(self.db)),
-                    (int(item_id),))
-            if not rows:
+                if not rows:
+                    return None
+                WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+                return rows[0]
+            # #7870 : la ligne de journal de la levée est écrite AVANT
+            # l'effacement de la réservation. La garde 0567 des connexions
+            # limitées lit `work_items.external_executor` au moment de
+            # l'INSERT : après la levée, le lot n'est plus réservé et la
+            # garde refuserait la trace à l'exécutant qui vient de se lever.
+            # Sous le verrou de la ligne, l'état lu ici ne bouge plus jusqu'à
+            # l'écriture ; un échec de l'UPDATE annule tout.
+            current = tx.query(
+                f"SELECT state FROM work_items WHERE id = %s AND state NOT IN {closed}"
+                " FOR UPDATE", (int(item_id),))
+            if not current:
                 return None
-            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            WorkItems(tx)._event(int(item_id), current[0]["state"], note, actor)
+            rows = tx.query(
+                ("UPDATE work_items SET external_executor = NULL,"
+                 " external_session = NULL, external_claim_session = NULL,"
+                 " external_claimed_at = NULL, external_claim_actor = NULL,"
+                 " external_claim_host = NULL, external_claim_proof = NULL,"
+                 " external_claim_harness = NULL, external_claim_binding = NULL,"
+                 " updated_at = now()"
+                 " WHERE id = %s RETURNING __COLUMNS__").replace(
+                     "__COLUMNS__", item_columns(self.db)),
+                (int(item_id),))
+            if not rows:
+                # sous le verrou, une disparition est anormale : la trace
+                # sans levée ne doit pas être commitée
+                raise DbError("lot %s changed while clearing its external "
+                              "executor: nothing changed" % item_id)
             return rows[0]
 
     #: #6839 : les états d'un lot qui ne prennent plus de geste externe

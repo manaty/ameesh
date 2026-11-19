@@ -2878,22 +2878,58 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     return out
 
 
+def _self_clear_reservation(cfg, db, item: dict, actor: str) -> dict | None:
+    """#7870 : la preuve de session qui autorise l'exécutant réservé à se lever.
+
+    L'exécutant externe du lot porte son propre geste : sa liaison de session
+    VÉRIFIÉE (L41) doit nommer l'agent réservé, et, quand le feu nomme une
+    session (`external_session`), cette session-là. Rend la preuve
+    `{session, agent, host, harness, binding}` ; None si ce n'est pas lui —
+    l'appelant laisse alors le refus de `corrector` au pilote.
+
+    Un `--actor` qui nomme un autre agent est refusé, comme dans `corrector` :
+    une session ne parle que pour elle-même. Ni un humain ni un `system:…`
+    réservé n'a de liaison L41 : leur levée reste un geste de pilote.
+    """
+    executor = (item.get("external_executor") or "").strip()
+    if not executor or executor.startswith(HUMAN_PREFIX) \
+            or executor.startswith(SYSTEM_PREFIX):
+        return None
+    proved, source, _agent = caller_session_proof(cfg, db)
+    if not proved or source != "binding" or proved.get("agent") != executor:
+        return None
+    named = (actor or "").strip()
+    if named and named != executor:
+        raise WorkError(
+            "external executor refused: this session belongs to %s, it does not "
+            "act on behalf of %s" % (executor, named))
+    reserved_session = (item.get("external_session") or "").strip()
+    if reserved_session and proved.get("session") != reserved_session:
+        return None
+    return proved
+
+
 def set_external_executor(db: Db, item_id: int, executor: str | None, *,
                           actor: str = "", cfg=None, clear: bool = False,
                           session: str | None = None) -> dict:
     """#3447 : déclare (ou efface, `clear=True`) l'exécutant externe d'un lot.
 
     Geste de pilote (`corrector`, `history=False`), comme la déclaration à la
-    création. Le lot reste sans assigné : l'exécutant externe ne se réveille
-    pas (0030), il porte l'attente nommée par les alertes et le débit. Un lot
-    déjà assigné est refusé (deux exécutants) ; le lot doit être ouvert. Rend
+    création, sauf la levée par l'exécutant réservé lui-même (#7870). Le lot
+    reste sans assigné : l'exécutant externe ne se réveille pas (0030), il
+    porte l'attente nommée par les alertes et le débit. Un lot déjà assigné
+    est refusé (deux exécutants) ; le lot doit être ouvert. Rend
     `{item, previous, executor, session}`.
 
     #6839 : `session` nomme la session que le feu désigne pour ce geste ; sur
     une réservation déjà posée, la même session peut être (re)nommée sans
     changer d'exécutant. Un lot déjà pris (`external_claim_session`) refuse
-    toute pose sauf `clear=True`, qui efface la prise avec la réservation."""
-    who = corrector(cfg, db, actor, what="external executor", history=False)
+    toute pose sauf `clear=True`, qui efface la prise avec la réservation.
+
+    #7870 : la levée (`clear=True`) est aussi ouverte à l'exécutant réservé
+    lui-même, par sa liaison de session VÉRIFIÉE (`_self_clear_reservation`) ;
+    déclarer, changer d'exécutant ou lever celle d'un autre reste un geste de
+    pilote. La note du journal nomme la levée par l'exécutant."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -2903,12 +2939,25 @@ def set_external_executor(db: Db, item_id: int, executor: str | None, *,
     previous = (item.get("external_executor") or "").strip() or None
     previous_session = (item.get("external_session") or "").strip() or None
     named = normalize_external_session(session)
+    self_clear = None
+    if clear:
+        try:
+            who = corrector(cfg, db, actor, what="external executor", history=False)
+        except WorkError:
+            self_clear = _self_clear_reservation(cfg, db, item, actor)
+            if self_clear is None:
+                raise
+            who = self_clear["agent"]
+    else:
+        who = corrector(cfg, db, actor, what="external executor", history=False)
     if clear:
         name = None
         note = ("%s (was %s)" % (interface.EXTERNAL_EXECUTOR_CLEARED_NOTE, previous)
                 if previous else interface.EXTERNAL_EXECUTOR_CLEARED_NOTE)
         if previous_session:
             note += " (session %s)" % previous_session
+        if self_clear is not None:
+            note += " (by the reserved executor, session %s)" % self_clear["session"]
     else:
         name = check_external_executor(db, executor or "", cfg=cfg)
         if item.get("assignee"):
@@ -4706,6 +4755,31 @@ def _deliver_done(db: Db, item_id: int, *, evidence: dict, actor: str = "",
                   fresh=fresh)
 
 
+def close_writer_refusal(db: Db) -> str | None:
+    """#7870 : nomme le geste de pilote quand cette connexion ne peut pas fermer.
+
+    La clôture écrit `work_items.state` ; la connexion limitée du bureau ne
+    l'a pas (la clôture reste un geste de pilote, docs/ops/bureau-goal-cli.md).
+    Sans cette sonde, le refus sortait en « permission denied for table
+    work_items » au fond de la transaction, après des lectures inutiles. Une
+    sonde illisible ne refuse pas à tort : la transaction dira son propre
+    refus.
+    """
+    try:
+        ok = db.query(
+            "SELECT has_column_privilege(current_user, 'work_items', 'state',"
+            " 'UPDATE') AS ok")[0]["ok"]
+    except Exception:  # noqa: BLE001 - une sonde ne refuse jamais à tort
+        return None
+    if ok:
+        return None
+    return ("closing a lot writes work_items.state: this connection is not a "
+            "writer (limited role); the closure is a pilot gesture — on a lot "
+            "reserved to an external executor, the executor clears its "
+            "reservation (`ameesh work external-executor <lot> --clear`) and a "
+            "pilot closes the lot")
+
+
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
           delivered: bool = False, done: bool = False, sha: str = "", note: str = "",
           actor: str = "") -> dict:
@@ -4755,6 +4829,9 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     head = (sha or "").strip().lower()
     if not delivered and head:
         raise WorkError("--sha only makes sense with --delivered")
+    refusal = close_writer_refusal(db)
+    if refusal:
+        raise WorkError(refusal)
     if delivered:
         return deliver(db, item_id, connector="document", evidence={"sha": sha},
                        actor=actor, note=note)
