@@ -176,6 +176,9 @@ class Operations(interface.Operations):
             """
             SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
                    r.relit, r.session_harness, r.session_account,
+                   -- #7874 : `wake_due`, `return_targets` et `release_check`
+                   -- excluent les rôles élus (`releve: election/preference`)
+                   r.releve,
                    -- #4779 : le profil de relecture (capacité `propose`, rôles),
                    -- lu par `file_decoupage._reviewer_spares`
                    r.capabilities, r.roles,

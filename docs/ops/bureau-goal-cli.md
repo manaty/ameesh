@@ -109,6 +109,13 @@ Limites, dites franchement :
    Le secret est transmis au bureau par fichier 0600, jamais par courrier ni
    en argument. Après chaque migration, l'audit seul (`_contrat-bureau.sql`,
    même commande) doit passer.
+   Depuis #7873, le staging le fait lui-même : après `migrate`, sous la même
+   connexion (propriétaire des tables), `python -m ameesh.droits_limites`
+   rejoue `deploy/sql/rejeu-droits-limites.sql` (GRANT et REVOKE de
+   `_bureau-poser-droits.sql`, puis l'audit, en une transaction). Rôle absent :
+   sauté ; audit refusé : le droit est nommé et rien n'est installé. Sans
+   superutilisateur, l'audit saute les deux contrôles de mot de passe
+   (`pg_authid`), que garde l'audit administrateur.
 6. **Lot de contrôle** : un lot réservé au bureau, par exemple
    `ameesh work add … --external-executor bureau`. Son numéro sert à l'étape
    `controler`.

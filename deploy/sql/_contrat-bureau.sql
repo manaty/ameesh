@@ -69,12 +69,19 @@ BEGIN
          OR rolinherit OR rolcanlogin IS DISTINCT FROM (oid = rid))) THEN
         errors := errors || 'role attributes'::text;
     END IF;
-    IF EXISTS (SELECT FROM pg_authid WHERE oid = rid AND rolpassword IS NOT NULL
-               AND rolpassword NOT LIKE 'SCRAM-SHA-256$%') THEN
-        errors := errors || 'password is not SCRAM'::text;
-    END IF;
-    IF EXISTS (SELECT FROM pg_authid WHERE oid = mid AND rolpassword IS NOT NULL) THEN
-        errors := errors || 'marker has a password'::text;
+    -- #7873 : pg_authid n'est lisible que d'un superutilisateur ; le rejeu du
+    -- staging audite sous la connexion de `migrate` (propriétaire des tables)
+    -- et dit qu'il saute ces deux contrôles, que l'audit administrateur garde
+    IF has_table_privilege('pg_catalog.pg_authid', 'SELECT') THEN
+        IF EXISTS (SELECT FROM pg_authid WHERE oid = rid AND rolpassword IS NOT NULL
+                   AND rolpassword NOT LIKE 'SCRAM-SHA-256$%') THEN
+            errors := errors || 'password is not SCRAM'::text;
+        END IF;
+        IF EXISTS (SELECT FROM pg_authid WHERE oid = mid AND rolpassword IS NOT NULL) THEN
+            errors := errors || 'marker has a password'::text;
+        END IF;
+    ELSE
+        RAISE NOTICE 'bureau contract: password checks skipped (pg_authid unreadable by %)', current_user;
     END IF;
     -- appartenances : la connexion est membre du seul marqueur ; le marqueur
     -- n'est membre de rien et n'a pour membres que des connexions limitées

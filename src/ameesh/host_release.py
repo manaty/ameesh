@@ -364,6 +364,30 @@ def return_targets(control, listing, controls, *, known_hosts, holds):
     return sorted(out)
 
 
+def release_check(host, listing, lots, *, controls, holds):
+    """#7874: the R1 entry guard of deploy/vm-adapter, read before a drain.
+
+    `blockers` are the open lots assigned to an agent placed on `host` (its
+    registry row, elected roles excepted): each one must be finished or moved
+    first, or the adapter's `wake_due` asks for the return at its first pass.
+    `return_targets` names the placed agents whose pending work would wake the
+    host right away, read as if `host` were already draining (the branch that
+    decided the R1 return of 19/11). Read only; the adapter is unchanged."""
+    placed = {row.get("name") for row in listing or ()
+              if row.get("host") == host and row.get("releve") not in ("election", "preference")
+              and row.get("mode") in (None, "execute")}
+    blockers = sorted(({"id": lot.get("id"), "state": lot.get("state"),
+                        "assignee": lot.get("assignee"), "title": lot.get("title") or ""}
+                       for lot in lots or ()
+                       if lot.get("assignee") in placed and lot.get("state") not in host_idle.DONE),
+                      key=lambda lot: (str(lot["assignee"]), lot["id"] or 0))
+    known = {h for row in listing or () for h in (row.get("admitted_hosts") or ())}
+    control = dict((controls or {}).get(host) or {}, host=host, mode="draining", claims_open=False)
+    wake = return_targets(control, listing, dict(controls or {}, **{host: control}),
+                          known_hosts=known, holds={h: v for h, v in (holds or {}).items() if h != host})
+    return {"host": host, "ok": not blockers, "blockers": blockers, "return_targets": wake}
+
+
 def _known_hosts(canons, listing):
     names = {row.get("host") for row in listing or () if row.get("host")}
     for canon in canons or ():

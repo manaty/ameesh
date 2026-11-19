@@ -13,6 +13,9 @@ d'agent) :
         relâchés, codes en attente annulés ;
   ameesh host list [--json]             exécuteurs enrôlés et codes en attente ;
   ameesh host show <hôte> [--json]      fiche, occupants, exécuteurs, baux, journal.
+  ameesh host release-check <hôte> [--json]
+        garde d'entrée R1 de l'adaptateur VM (#7874) : lots ouverts des agents
+        placés sur l'hôte ; 0 si aucun, 1 sinon (lecture seule).
 
 Habilité : le responsable de la fiche `Host` visée, ou un membre de rôle
 coordinateur (`coordinator`, `coordinateur`, `coordinatrice`) du canon qui
@@ -227,6 +230,31 @@ def cmd_list(cfg: Config, db, args) -> int:
             print("  %-16s par %s, échéance %s" % (row["host"], row["created_by"],
                                                    _moment(row["expires_ts"])))
     return 0
+
+
+def cmd_release_check(cfg: Config, db, args) -> int:
+    """#7874 : aucun lot ouvert assigné à un agent placé sur l'hôte cible."""
+    from . import host_release, storage
+    store = storage.of(db)
+    result = host_release.release_check(
+        args.host, store.operations.listing(), store.operations.open_lots_activity(None),
+        controls={c["host"]: c for c in store.host_lifecycle.listing()},
+        holds={h["host"]: h for h in store.hosts.holds()})
+    if args.json:
+        print(json.dumps(dict(result, schema="ameesh-host-release-check/1"),
+                         ensure_ascii=False, indent=2))
+        return 0 if result["ok"] else 1
+    if result["ok"]:
+        print("%s : aucun lot ouvert assigné à un agent placé" % args.host)
+    else:
+        print("%s : %d lot(s) ouvert(s) d'agents placés, à finir ou déplacer avant la vidange :"
+              % (args.host, len(result["blockers"])))
+        for lot in result["blockers"]:
+            print("  #%s %-10s %-20s %s" % (lot["id"], lot["state"], lot["assignee"],
+                                            lot["title"][:70]))
+    if result["return_targets"]:
+        print("réveil immédiat (return_targets) : %s" % ", ".join(result["return_targets"]))
+    return 0 if result["ok"] else 1
 
 
 def cmd_show(cfg: Config, db, args) -> int:
@@ -490,6 +518,9 @@ def _parser() -> argparse.ArgumentParser:
     s = sub.add_parser("show", help="un hôte")
     s.add_argument("host")
     s.add_argument("--json", action="store_true")
+    rc = sub.add_parser("release-check", help="garde R1 : lots ouverts des agents placés")
+    rc.add_argument("host")
+    rc.add_argument("--json", action="store_true")
     dev = top.add_parser("device", help="l'appareil (VM) et mon poste (L93)")
     dsub = dev.add_subparsers(dest="device_command", required=True)
     for name in ("enroll", "challenge"):
@@ -542,7 +573,7 @@ def main(argv: list[str] | None = None) -> int:
     db = db_mod.open_db(cfg)
     try:
         handler = {"enroll": cmd_enroll, "revoke": cmd_revoke, "list": cmd_list,
-                   "show": cmd_show}[args.command]
+                   "show": cmd_show, "release-check": cmd_release_check}[args.command]
         return handler(cfg, db, args)
     except Refused as exc:
         print("erreur : %s" % exc, file=sys.stderr)
