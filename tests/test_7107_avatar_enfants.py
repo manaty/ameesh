@@ -134,6 +134,17 @@ class ChildrenPlacementTest(test_canon._CanonDbCase):
         self.assertNotEqual(child["cwd"], parent["cwd"])
         self.assertTrue(child["cwd"].startswith(tenancy.tenant_home(ALICE) + "/"))
 
+    def test_module_absent_du_projet_refuse_l_enfant(self):
+        # #7860 : le projet de l'avatar sélectionne un module absent de l'hôte
+        # candidat ; le canon reste ok, mais l'enfant ne doit pas y être placé.
+        write(self.root, "federation.yaml",
+              'federation: "0.1"\nmembers: []\nextensions:\n  ameesh:\n    projects:\n'
+              '      acme-web:\n        modules: [tpk]\n')
+        self.sync_both()
+        with self.assertRaisesRegex(canon_sync.SpawnError,
+                                    "module missing on this host: tpk"):
+            self.spawn()
+
     def test_petit_enfant_ne_revient_pas_sur_un_hote_ancetre(self):
         self.spawn()
         with self.assertRaises(canon_sync.SpawnError) as ctx:
