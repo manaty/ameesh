@@ -188,6 +188,14 @@ local files). The lease is the only authorization to run.
   outputs of `attach` are the CLI messages (`print` on stderr) emitted before
   any lease is taken (unknown agent, turn in progress, not claimable) or by the
   `--wait` loop without a held lease.
+  **#7789 — the terminal belongs to the harness:** from its `Popen` until it
+  exits, the attach process redirects its own stdout and stderr to
+  `<state>/<agent>/attach.log` (fallback `/dev/null`) and passes the original
+  descriptors to the harness. Background lines (heartbeat, watchdog, waiting
+  inputs) can therefore never desynchronise the harness's TUI; the last queued
+  lines are flushed to the file, bounded, before the terminal is restored.
+  Waiting inputs are reported on exit, after the session, with the log path
+  when the file received something.
   The watchdog **remains active during a graceful stop** (`stopping`, 3 s
   SIGTERM grace): it only stops when the lease is released (`release_lease`)
   or once the loss has been consumed, otherwise a harness that ignores SIGTERM

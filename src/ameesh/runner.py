@@ -156,12 +156,38 @@ class _AsyncLog:
     def _drain(self) -> None:
         while True:
             message = self.queue.get()
-            if message is None:
-                return
-            if self.perdus:
-                perdus, self.perdus = self.perdus, 0
-                log("[journal] %d message(s) dropped: sink saturated" % perdus)
-            log(message)
+            try:
+                if message is None:
+                    return
+                if self.perdus:
+                    perdus, self.perdus = self.perdus, 0
+                    log("[journal] %d message(s) dropped: sink saturated" % perdus)
+                log(message)
+            finally:
+                self.queue.task_done()
+
+    def flush(self, timeout: float = 0.5) -> bool:
+        """Attend (borné) que les messages déjà acceptés soient écrits.
+
+        `restore` s'en sert pour vider le journal d'une session `attach` avant
+        de rendre le terminal : les dernières lignes de la session partent au
+        fichier, jamais à la TUI du harnais. Le puits peut être plein ou
+        bloqué (tube sans lecteur) : l'attente est bornée et l'appelant reprend
+        la main ; les messages restants sont écrits après la session, sur le
+        terminal rendu, sans retarder le chemin d'arrêt.
+        """
+        if self.ferme or not self.thread.is_alive():
+            return True
+        if threading.current_thread() is self.thread:
+            return False
+        fin = time.monotonic() + max(0.0, timeout)
+        with self.queue.all_tasks_done:
+            while self.queue.unfinished_tasks:
+                reste = fin - time.monotonic()
+                if reste <= 0:
+                    return False
+                self.queue.all_tasks_done.wait(reste)
+        return True
 
     def write(self, message: str) -> None:
         if self.ferme:
@@ -17448,6 +17474,148 @@ def _attach_permission_mode(cfg: Config, name: str, harness: str,
     return mode.strip()
 
 
+#: #7789 : journal d'arrière-plan d'une session `attach` (jamais le terminal
+#: du harnais)
+ATTACH_LOG = "attach.log"
+
+#: #7789 : attente bornée du vidage du journal avant de rendre le terminal
+ATTACH_LOG_FLUSH_S = 0.5
+
+
+class _HarnessTerminal:
+    """Le terminal appartient au harnais : l'attach n'y écrit plus (#7789).
+
+    `ameesh attach` lance le harnais (`subprocess.Popen`) sur le terminal de
+    l'humain, puis continue de journaliser depuis ses fils d'arrière-plan
+    (battement, veilleur, attente d'inputs) par `log_async` → `_AsyncLog` →
+    `print`. Tout octet écrit hors de la TUI désynchronise son redessin (écran
+    brouillé de Claude Code, manaty/ameesh#6001).
+
+    Dès que le harnais est lancé, ce garde redirige donc les descripteurs 1 et
+    2 du processus d'attach vers `<état agent>/attach.log` (ou `/dev/null` à
+    défaut d'ouverture, pour ne jamais retomber sur le terminal). Le harnais
+    reçoit, lui, les descripteurs d'origine (`fd`) : son entrée/sortie reste
+    le terminal. `restore()` rend le terminal à l'attach une fois le harnais
+    mort, pour le diagnostic de fin de session et l'attente d'inputs.
+    """
+
+    def __init__(self, directory: str) -> None:
+        self.path = os.path.join(directory, ATTACH_LOG)
+        self._saved: dict[int, int] = {}
+        self._log = None
+        self._start = 0
+        self._wrote = False
+        self._entered = False
+
+    def _sink(self) -> bool:
+        """Ouvre le fichier de journal, ou `/dev/null` en repli."""
+        try:
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            self._log = os.fdopen(fd, "a", encoding="utf-8", errors="replace",
+                                  buffering=1)
+            self._start = os.fstat(fd).st_size
+            return True
+        except OSError as exc:
+            self.path = ""
+            print("ameesh attach: cannot open the background log (%s); its "
+                  "messages are discarded while the harness owns the terminal"
+                  % exc, file=sys.stderr, flush=True)
+        try:
+            fd = os.open(os.devnull, os.O_WRONLY)
+            self._log = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
+            return True
+        except OSError:
+            self._log = None
+            return False
+
+    def enter(self) -> None:
+        """Prend le terminal hors de l'attach, avant de lancer le harnais.
+
+        Les descripteurs d'origine sont dupliqués d'abord : `fd()` les donne au
+        harnais, et `restore()` les remet en place. Sans les deux (1 et 2), on
+        ne redirige rien : un descripteur fermé n'a pas de TUI à protéger.
+        """
+        if self._entered:
+            return
+        self._entered = True
+        try:
+            self._saved[1] = os.dup(1)
+            self._saved[2] = os.dup(2)
+        except OSError:
+            self.restore()
+            return
+        if not self._sink():
+            return
+        for which in (1, 2):
+            try:
+                os.dup2(self._log.fileno(), which)
+            except OSError:
+                pass
+
+    def fd(self, which: int) -> int | None:
+        """Le descripteur d'origine à donner au harnais (`None` : hérité)."""
+        return self._saved.get(which)
+
+    @property
+    def wrote(self) -> bool:
+        """Le journal de cette session a-t-il reçu au moins une ligne ?"""
+        return self._wrote
+
+    def restore(self) -> None:
+        """Rend le terminal à l'attach, après avoir vidé le journal borné."""
+        if not self._entered:
+            return
+        self._entered = False
+        try:
+            _journal.flush(ATTACH_LOG_FLUSH_S)
+        except Exception:  # noqa: BLE001 — la remise du bail prime
+            pass
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        for which, saved in list(self._saved.items()):
+            try:
+                os.dup2(saved, which)
+            except OSError:
+                pass
+            try:
+                os.close(saved)
+            except OSError:
+                pass
+            self._saved.pop(which, None)
+        if self._log is not None:
+            try:
+                self._wrote = os.fstat(self._log.fileno()).st_size > self._start
+            except (OSError, ValueError):
+                pass
+            try:
+                self._log.close()
+            except (OSError, ValueError):
+                pass
+            self._log = None
+
+
+def _attach_session_summary(terminal: _HarnessTerminal,
+                            alert_since: float | None, *,
+                            remote: bool = False) -> None:
+    """#7789 : ce que l'attach n'a pas pu dire au terminal du harnais.
+
+    Rendu après `restore()`, jamais pendant la session : l'attente d'inputs
+    qui a franchi le seuil est signalée ici plutôt que dans la TUI, et le
+    chemin du journal n'est nommé que s'il a effectivement reçu des lignes
+    (jamais en distant : le fichier est sur l'hôte, pas sur le poste).
+    """
+    if alert_since is not None:
+        age = _duree(max(0.0, time.time() - alert_since))
+        print("attach: inputs were waiting (oldest %s); returned to the runner."
+              % age, flush=True)
+    if not remote and terminal.wrote and terminal.path:
+        print("attach: background log: %s" % terminal.path, flush=True)
+
+
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
                ttl: float | None = None, max_seconds: float | None = None,
                owner: str | None = None, human: str = "", attach_id: str = "",
@@ -17768,6 +17936,9 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     proc: subprocess.Popen | None = None
     code = 0
     holds: list = []
+    #: #7789 : l'attente signalée pendant la session, rendue à l'humain après
+    #: le harnais (le terminal du harnais, lui, ne reçoit plus rien)
+    attente = {"since": None}
     def check_inputs() -> None:
         prompt_since = time.time() if agent.get("pending_prompt") else None
         alerted_since = None
@@ -17781,15 +17952,18 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                 since = attach_mod.waiting_since(db, name, queued, prompt_since)
                 if since is None:
                     alerted_since = None
+                    attente["since"] = None
                 elif time.time() - since >= attach_mod.INPUT_DELAY and since != alerted_since:
                     log_async("[%s] attach: inputs waiting for more than 10 min; "
                               "close the session to return to the runner" % name)
                     alerted_since = since
+                    attente["since"] = since
             except db_mod.DbError as exc:
                 log_async("[%s] attach: cannot check waiting inputs (%s)" % (name, exc))
             stop.wait(attach_mod.INPUT_CHECK)
 
     inputs = threading.Thread(target=check_inputs, daemon=True, name="%s-attach-inputs" % name)
+    terminal: _HarnessTerminal | None = None
     try:
         # codex verdict #182 (P2): everything after taking the lease is under the
         # `finally` — an error or a Ctrl-C while preparing (unreadable setting,
@@ -17852,23 +18026,36 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         except (db_mod.DbError, spawn_policy.SpawnToolsError) as exc:
             return refuse("avatar_tools_unavailable", "attach: tool policy proof not recorded: %s" % exc)
         launched = time.monotonic()
-        proc = subprocess.Popen(argv, cwd=cwd, env=child_environment.harness(
-                                    env, harness_revendique, compte,
-                                    auditor=auditor),
-                                start_new_session=True)
-        # Course de publication (même correctif que B5a-P) : le veilleur a pu
-        # conclure pendant que ce Popen n'était pas encore publié.
-        if etat["deadline"] > 0 and time.time() >= etat["deadline"]:
-            perdu.set()
-        while proc.poll() is None:
-            if perdu.is_set() or stop_event.is_set():
-                # `perdu` : le bail/session est perdu (échec) ; `stop_event` :
-                # coupure du relais ou arrêt demandé (fermeture propre).
-                stop_group_now(proc, "lease lost (attach)" if perdu.is_set()
-                               else "attach stopped", name=name)
-                break
-            time.sleep(0.2)
-        code = proc.wait()
+        # #7789 : à partir du Popen, le terminal appartient au harnais. Le
+        # garde redirige les descripteurs 1 et 2 de l'attach vers
+        # `<état agent>/attach.log` et donne au harnais ceux d'origine : les
+        # lignes du battement, du veilleur et de l'attente d'inputs ne
+        # touchent plus sa TUI. `restore()` rend le terminal à la fin de la
+        # session, avant le diagnostic de sortie.
+        terminal = _HarnessTerminal(cfg.agent_dir(name))
+        terminal.enter()
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=cwd, env=child_environment.harness(
+                    env, harness_revendique, compte, auditor=auditor),
+                stdout=terminal.fd(1), stderr=terminal.fd(2),
+                start_new_session=True)
+            # Course de publication (même correctif que B5a-P) : le veilleur a
+            # pu conclure pendant que ce Popen n'était pas encore publié.
+            if etat["deadline"] > 0 and time.time() >= etat["deadline"]:
+                perdu.set()
+            while proc.poll() is None:
+                if perdu.is_set() or stop_event.is_set():
+                    # `perdu` : le bail/session est perdu (échec) ;
+                    # `stop_event` : coupure du relais ou arrêt demandé
+                    # (fermeture propre).
+                    stop_group_now(proc, "lease lost (attach)" if perdu.is_set()
+                                   else "attach stopped", name=name)
+                    break
+                time.sleep(0.2)
+            code = proc.wait()
+        finally:
+            terminal.restore()
         if (code and not expired.is_set() and not perdu.is_set()
                 and not stop_event.is_set()
                 and time.monotonic() - launched < attach_mod.EARLY_FAILURE_S):
@@ -17900,6 +18087,15 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
             registry.release(db, name, lease_owner, epoch)
         except db_mod.DbError:
             pass
+        # #7789 : le bail est rendu avant toute sortie ; le garde vide alors
+        # le journal de la session dans le fichier, puis rend le terminal.
+        if terminal is not None:
+            terminal.restore()
+            if proc is not None:
+                try:
+                    _attach_session_summary(terminal, attente["since"], remote=remote)
+                except Exception:  # noqa: BLE001 — la sortie ne retient jamais le bail
+                    pass
         log_async("[%s] attach lease returned" % name)
     return code
 
