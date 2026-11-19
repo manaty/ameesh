@@ -128,7 +128,9 @@ human: the page keeps the signed answer and sends it again, and the failure is
 counted by fingerprint (route template, exception code, version; no personal
 data) in `<state_dir>/faults.json`. The service is read-only in the database,
 so it does not open the lot itself: the `fingerprints` pass of the elected
-watch role (#3885) reads this page, in the `nexlink-fingerprints/1` format,
+watch role (#3885) reads this page, in the `ameesh-fingerprints/1` format
+(the historical `nexlink-fingerprints/1` stays read as an alias declared by
+the Nexlink module, #7813),
 like any source declared in the canon. The route is **closed** until
 `fingerprints_token_file` (or `AMEESH_APPROVE_FINGERPRINTS_TOKEN_FILE`) names a
 0600 token file (`ameesh-approve gen-token --token-file F`), distinct from the

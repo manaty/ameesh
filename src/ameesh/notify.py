@@ -1179,6 +1179,21 @@ def channel_secrets(channel: Channel, env: dict | None = None) -> tuple:
 CORE_REMOTE_PUSH_KINDS = ("ntfy", "slack")
 
 
+def remote_push_kinds() -> tuple:
+    """Kinds that reach a human from any host: the core's then the modules'.
+
+    #7813: the alerts gap names them from this function, never from a compiled
+    list: a module channel counts only when its provider declares
+    ``REMOTE_PUSH``, like a core kind. The bare profile keeps the core kinds.
+    """
+    kinds = list(CORE_REMOTE_PUSH_KINDS)
+    for kind in registry.notify_channel_kinds():
+        provider = registry.notify_channel(kind)
+        if provider is not None and getattr(provider, "REMOTE_PUSH", False):
+            kinds.append(kind)
+    return tuple(kinds)
+
+
 def remote_push_problem(channel: Channel, env: dict | None = None,
                         ncfg: "NotifyConfig | None" = None) -> str:
     """'' when ``channel`` can push from this environment, else why.

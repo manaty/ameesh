@@ -8,9 +8,11 @@ de #3885 (`ameesh.fingerprints.open_lot`, projet `ameesh`) :
 - une application qui écrit dans la base du maillage (la page de
   progression) **rapporte** elle-même ses entrées nouvelles (:meth:`Journal.report`) ;
 - ameesh-approve, en lecture seule dans la base (deploy/sql/role-approve.sql),
-  **sert** son journal en page `nexlink-fingerprints/1` (:meth:`Journal.page`,
+  **sert** son journal en page `ameesh-fingerprints/1` (:meth:`Journal.page`,
   `GET /fingerprints`) : la passe `fingerprints` de #3885 la lit comme toute
-  source déclarée au canon.
+  source déclarée au canon. L'ancien nom `nexlink-fingerprints/1` reste lu par
+  l'alias que le module Nexlink déclare (#7813) : la page de l'application
+  Nexlink ne change pas.
 
 Contrat (celui du lecteur de #3885, sans aucun autre champ) :
 
@@ -47,8 +49,9 @@ log = logging.getLogger(__name__)
 APP = "ameesh"
 #: le format du fichier
 FILE_SCHEMA = "ameesh-server-faults/2"
-#: le format d'une page servie : celui du lecteur de #3885
-PAGE_SCHEMA = "nexlink-fingerprints/1"
+#: le format d'une page servie : le schéma générique du lecteur de #3885
+#: (l'ancien nom d'un client reste lu par l'alias de son module, #7813)
+PAGE_SCHEMA = "ameesh-fingerprints/1"
 #: champs d'une entrée : exactement le contrat de #3885
 FIELDS = ("fingerprint", "route", "code", "revision", "first_seen", "last_seen",
           "occurrences", "users")
@@ -169,7 +172,7 @@ class Journal:
         return [self._public(row) for row in rows]
 
     def page(self, since: str | None = None) -> dict:
-        """Une page `nexlink-fingerprints/1` : les entrées mises à jour après
+        """Une page `ameesh-fingerprints/1` : les entrées mises à jour après
         le curseur `since` (toutes sans lui) ; `cursor` est le dernier numéro
         de mise à jour servi (null : rien de nouveau)."""
         floor = int(since) if since and since.isdigit() else 0

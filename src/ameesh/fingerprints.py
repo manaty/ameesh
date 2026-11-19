@@ -49,13 +49,15 @@ from dataclasses import dataclass
 
 from . import canon, httpkit, plan_github, storage, work
 from .db import DbError, is_unique_violation
+from .modules import registry
 
 #: the durable identity of a failure fingerprint
 PREFIX = "empreinte:"
 #: the namespace of the database guard (migration 0492)
 FINGERPRINT_INDEX = "work_items_fingerprint_open_uniq"
-#: the only page schema this reader accepts
-SCHEMA = "nexlink-fingerprints/1"
+#: the generic page schema this reader accepts; a module whose application
+#: still serves an older name declares it as an alias (#7813)
+SCHEMA = "ameesh-fingerprints/1"
 #: the exact fields of a page and of an entry (#3882 contract).  An unknown
 #: field is refused, never ignored: a new field must be added here first.
 PAGE_FIELDS = frozenset(("schema", "cursor", "fingerprints"))
@@ -638,9 +640,10 @@ def parse_page(payload: dict) -> tuple[list[Entry], str | None]:
     if missing:
         raise FingerprintError("fingerprints page: missing field(s) %s"
                                % ", ".join(missing))
-    if payload.get("schema") != SCHEMA:
-        raise FingerprintError("fingerprints page: schema %r refused (expected %r)"
-                               % (payload.get("schema"), SCHEMA))
+    schemas = (SCHEMA,) + registry.fingerprint_schemas()
+    if payload.get("schema") not in schemas:
+        raise FingerprintError("fingerprints page: schema %r refused (expected %s)"
+                               % (payload.get("schema"), " or ".join(map(repr, schemas))))
     cursor = payload.get("cursor")
     if cursor is not None and (not isinstance(cursor, str) or len(cursor) > 1000
                                or _CONTROL_RE.search(cursor)):

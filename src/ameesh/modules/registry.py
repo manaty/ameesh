@@ -359,6 +359,32 @@ def _providers(declared, getter_name, what):
     return found
 
 
+def _declared_strings(declared, what):
+    """`tuple` of unique non-empty strings a built-in module declares (#7813).
+
+    A schema name (``nexlink-fingerprints/1``) or a reserved name of decision
+    0026 is a contract string, not a provider: the core reads it to accept an
+    old name beside its own generic one, or to keep a name out of approve's RP
+    IDs. Only built-in tooling modules are read here, like ``_providers``: the
+    bare profile declares none. A name declared twice is refused rather than
+    silently ordered."""
+    found = {}
+    for provider, module in sorted(_builtin().items()):
+        names = getattr(module, declared, ()) or ()
+        if (not isinstance(names, (list, tuple)) or any(
+                not isinstance(name, str) or not name.strip()
+                or any(char.isspace() for char in name) for name in names)
+                or len(set(names)) != len(names)):
+            raise ValueError("module %r: %s must be unique non-empty names"
+                             % (provider, declared))
+        for name in names:
+            if name in found:
+                raise ValueError("duplicate %s: %r (modules %s and %s)"
+                                 % (what, name, found[name], provider))
+            found[name] = provider
+    return tuple(sorted(found))
+
+
 def _release_providers():
     """`{model: (module_name, getter)}` of the built-in release providers."""
     return _providers("RELEASE_MODELS", "release_model", "release model")
@@ -427,6 +453,42 @@ def train_contract(name):
         return None
     _provider, getter = found
     return getter(name)
+
+
+def fingerprint_schemas():
+    """Historical fingerprint page schemas the built-in modules declare (#7813).
+
+    The core reads its generic ``ameesh-fingerprints/1`` page; a module whose
+    application still serves an older name declares it here, so that page stays
+    read without changing the application."""
+    return _declared_strings("FINGERPRINT_SCHEMAS", "fingerprint page schema")
+
+
+def dispatch_plan_schemas():
+    """Historical CI dispatch-plan schemas the built-in modules declare (#7813).
+
+    The core expects its generic ``ameesh-dispatch-due-parts/1`` plan; a module
+    whose repository planner still emits an older name declares it here, so the
+    planner stays unchanged on its side."""
+    return _declared_strings("DISPATCH_PLAN_SCHEMAS", "dispatch plan schema")
+
+
+def reserved_zones():
+    """Zones a built-in module reserves as never an approve RP ID (#7813).
+
+    Decision 0026 keeps the team-host zone reserved: a parent RP ID would
+    cover every team host of the zone. The core compiles no client name; the
+    module declares it and ameesh-approve reads it here, beside the host
+    configuration's own ``reserved_zones``."""
+    return _declared_strings("RESERVED_ZONES", "reserved zone")
+
+
+def reserved_hosts():
+    """Hosts a built-in module reserves as never an approve RP ID (#7813).
+
+    Same contract as :func:`reserved_zones`, for the approval apex of decision
+    0026 and any host a module keeps out of RP IDs."""
+    return _declared_strings("RESERVED_HOSTS", "reserved host")
 
 
 def release_reserved_prefixes():

@@ -1407,7 +1407,7 @@ def projects(cfg) -> dict[str, ProjectRelease]:
     block = getattr(cfg, "release", None) or {}
     if not isinstance(block, dict):
         raise ReleaseError("release: an object is required")
-    unknown = set(block) - {"host", "role", "projects"}
+    unknown = set(block) - {"host", "role", "projects", "default_project"}
     if unknown:
         raise ReleaseError("release: unknown key(s) %s" % ", ".join(sorted(unknown)))
     host = block.get("host")
@@ -1416,11 +1416,39 @@ def projects(cfg) -> dict[str, ProjectRelease]:
         raise ReleaseError("release.role: a non-empty role name is required")
     if not role and host and str(host) != cfg.host:
         return {}
+    default = block.get("default_project")
+    if default is not None and (not isinstance(default, str) or not default.strip()):
+        raise ReleaseError("release.default_project: a non-empty project name is required")
     declared = block.get("projects") or {}
     if not isinstance(declared, dict):
         raise ReleaseError("release.projects: an object is required")
     return {name: ProjectRelease.from_config(cfg, name, entry)
             for name, entry in sorted(declared.items())}
+
+
+def default_project(cfg) -> str:
+    """The project a release command without ``--project`` works on (#7813).
+
+    The host configuration must name it (``release.default_project``). A sole
+    project under ``release.projects`` is deliberately not inferred: the old
+    commands defaulted to one client project, and silently choosing the only
+    project of the host could write that client's release for another one
+    (#7813 B2). Without the explicit key, the caller passes ``--project``.
+    """
+    declared = projects(cfg)
+    block = getattr(cfg, "release", None) or {}
+    configured = block.get("default_project") if isinstance(block, dict) else None
+    if configured is not None:
+        configured = configured.strip()
+        if configured not in declared:
+            raise ReleaseError(
+                "release.default_project %r is not declared under release.projects"
+                % configured)
+        return configured
+    if not declared:
+        raise ReleaseError("--project is required: release.projects declares no project "
+                           "on this host")
+    raise ReleaseError("--project is required: release.default_project is not set")
 
 
 def staging_topology_of(cfg) -> canon_mod.StagingTopology:
