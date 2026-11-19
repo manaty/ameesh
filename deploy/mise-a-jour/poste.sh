@@ -612,7 +612,7 @@ redemarrer_urgence() {
 # si ce code est déjà installé. Le lien src-current n'accorde aucune autorité de
 # migration. --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
-  local ref cible d garde=(--additive-only) sha incompatible=0 code_dry=0
+  local ref cible d garde=(--additive-only) sha incompatible=0 code_dry=0 droits=0
   if [ "${1:-}" = "--additif-seulement" ]; then
     shift
   fi
@@ -640,6 +640,13 @@ migrer() {
   fi
   [ "$code_dry" = 0 ] || return "$code_dry"
   migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
+  # #7873 : droits des connexions limitées rejoués sous la connexion de
+  # `migrate`, puis audités (_contrat-bureau.sql), base du mesh seulement.
+  etape "droits des connexions limitées, base du mesh (rejeu puis audit)"
+  if ! AMEESH_CONFIG="$CONFIG" PYTHONPATH="$cible/src" "$VENV/bin/python" \
+       -m ameesh.droits_limites --sql-dir "$cible/deploy/sql"; then
+    droits=1
+  fi
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
     dsn_part d "$CONFIG_RESTE" dsn || return
@@ -649,6 +656,13 @@ migrer() {
       return 1
     fi
     AMEESH_CONFIG="$CONFIG_RESTE" migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
+  fi
+  # #7873 : un audit refusé arrête la mise à jour avant toute installation,
+  # sauf quand l'ancien code ne sert plus le schéma migré (installation
+  # immédiate ci-dessous, puis échec).
+  if [ "$droits" = 1 ] && { [ "$incompatible" = 0 ] || [ "${MIGRER_SANS_REDEMARRAGE:-0}" = 1 ]; }; then
+    echo "droits des connexions limitées refusés par l'audit : aucune installation, version précédente conservée" >&2
+    return 1
   fi
   # #2357: after a failed compatibility probe the OLD code can no longer serve
   # the migrated schema. The target snapshot already passed doctor --probe,
@@ -681,6 +695,10 @@ migrer() {
     fi
     echo "Code ${cible##*/src-} installé et exécuteurs du poste redémarrés sans attendre." >&2
     echo "La base est migrée pour tout le mesh : installer et redémarrer les autres hôtes sans délai (vm.sh, ou la séquence staging)." >&2
+  fi
+  if [ "$droits" = 1 ]; then
+    echo "droits des connexions limitées refusés par l'audit : à corriger avant tout autre hôte" >&2
+    return 1
   fi
 }
 migrer_base() {

@@ -63,8 +63,6 @@ DECLARE
     h text := current_setting('ameesh.bureau_host');
     m text := 'ameesh_login_limite';
     s text := current_schema();
-    item record;
-    cols text[];
 BEGIN
     IF current_setting('server_version_num')::int < 160000 THEN
         RAISE EXCEPTION 'PostgreSQL 16+ required (membership without SET ROLE)';
@@ -92,43 +90,12 @@ BEGIN
     EXECUTE format('INSERT INTO %I.limited_logins(rolname, agent, host) VALUES ($1, $2, $3)'
                    ' ON CONFLICT (rolname) DO UPDATE SET agent = excluded.agent, host = excluded.host', s)
        USING r, a, h;
-    -- droits DIRECTS remis à zéro, puis la liste exacte
-    EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM %I', s, r);
-    EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM %I', s, r);
-    FOR item IN SELECT c.relname, a2.attname FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_attribute a2 ON a2.attrelid = c.oid
-           WHERE n.nspname = s AND c.relkind IN ('r','v','m','p','f')
-             AND a2.attnum > 0 AND NOT a2.attisdropped
-             AND EXISTS (SELECT FROM aclexplode(a2.attacl) x
-                          WHERE x.grantee = to_regrole(quote_ident(r)))
-    LOOP
-        EXECUTE format('REVOKE ALL (%I) ON %I.%I FROM %I', item.attname, s, item.relname, r);
-    END LOOP;
     EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', s, r);
     EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM %I', s, r);
-    FOR item IN SELECT * FROM pg_temp.bureau_spec LOOP
-        IF to_regclass(format('%I.%I', s, item.rel)) IS NULL THEN
-            RAISE EXCEPTION 'bureau grant on missing relation %.%', s, item.rel;
-        END IF;
-        IF item.priv = 'USAGE' THEN
-            EXECUTE format('GRANT USAGE ON SEQUENCE %I.%I TO %I', s, item.rel, r);
-        ELSIF item.cols IS NULL THEN
-            EXECUTE format('GRANT %s ON %I.%I TO %I', item.priv, s, item.rel, r);
-        ELSE
-            cols := item.cols || ARRAY(
-                SELECT c FROM unnest(item.opt_cols) c
-                 WHERE EXISTS (SELECT FROM pg_attribute a3
-                                WHERE a3.attrelid = to_regclass(format('%I.%I', s, item.rel))
-                                  AND a3.attname = c AND a3.attnum > 0 AND NOT a3.attisdropped));
-            IF cardinality(cols) > 0 THEN
-                EXECUTE format('GRANT %s (%s) ON %I.%I TO %I', item.priv,
-                    (SELECT string_agg(quote_ident(c), ',') FROM unnest(cols) c),
-                    s, item.rel, r);
-            END IF;
-        END IF;
-    END LOOP;
 END
 $install$;
+-- droits DIRECTS remis à zéro, puis la liste exacte (#7873 : le même script
+-- est rejoué par le staging après les migrations, rejeu-droits-limites.sql)
+\ir _bureau-poser-droits.sql
 \ir _contrat-bureau.sql
 COMMIT;
