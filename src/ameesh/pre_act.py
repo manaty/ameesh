@@ -115,7 +115,10 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
         # Generated decision replies append the original question verbatim.
         # Inspect the answer and option label, but not that quoted question.
         if message.get("kind") == "reply" and message.get("answer_decision"):
-            body = body.split("\n", 1)[0] + "\n" + (message.get("answer_text") or "")
+            header = body.split("\n", 1)[0]
+            # The title preceding the final answer marker is quoted context too.
+            answer_header = header.rsplit(": option ", 1)[-1] if ": option " in header else ""
+            body = answer_header + "\n" + (message.get("answer_text") or "")
         if float(message["ts"]) >= since and planned_waits.contains_stop(body):
             raise Refused("STOP in lot mail #%s" % message["id"])
         if message.get("decision_state") == "withdrawn":
