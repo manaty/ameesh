@@ -227,6 +227,33 @@ def tagged_at(project, sha):
     return {value for value, commit in release_tags(project).items() if commit == sha}
 
 
+#: #7856: the merge candidate of a cutoff, before and after the slot marker.
+_LEGACY_CANDIDATE = "Nexlink cutoff: merge pinned main"
+_CUTOFF_MARKER = re.compile(r"(?m)^cutoff-at:[ \t]*(\d+)[ \t]*$")
+
+
+def candidate_names_cutoff(project, commit, version, at):
+    """#7856: does the tagged commit itself name this cutoff's slot?
+
+    The pre-#7856 engine wrote a generic subject, so its candidates are
+    recognised by that exact subject (the 19/11 `release-11bt` case). New
+    candidates carry the version in the subject and the cutoff timestamp in
+    a `cutoff-at:` trailer: a manual tag on an ordinary commit, or a
+    candidate of another slot, never names this cutoff. The message is
+    durable in the tagged commit, not inferred from a clock.
+    """
+    message = (rc._git(project.repo, "show", "-s", "--format=%B", commit).stdout
+               or "")
+    lines = message.splitlines()
+    subject = lines[0].strip() if lines else ""
+    if subject == _LEGACY_CANDIDATE:
+        return True
+    if subject != "Nexlink cutoff %s: merge pinned main" % version:
+        return False
+    marker = _CUTOFF_MARKER.search(message)
+    return bool(marker and int(marker.group(1)) == int(at))
+
+
 def cutoff_tag(project, at, now, *, window_s):
     """#7856: the `release-*` tag naming this cutoff's release, or None.
 
@@ -234,11 +261,12 @@ def cutoff_tag(project, at, now, *, window_s):
     pushed only after the final-tree CI, possibly outside the tick's window.
     It names the merge candidate created by the first in-window tick
     (`merge_candidate`), so that commit's date is the cutoff's own timestamp
-    (`%(creatordate)` on a lightweight tag is its commit date). A tag
-    produced for another slot has its candidate before the cutoff (an earlier
-    release, or a manual tag on an old commit) or after the window (a later
-    slot); it never reconciles this one. The remote read is authoritative:
-    the elected release host may have changed after the tag was published.
+    (`%(creatordate)` on a lightweight tag is its commit date). The candidate
+    message must also name the slot (see `candidate_names_cutoff`): a manual
+    tag on an ordinary commit created in the window, or a candidate of
+    another execution, does not reconcile the cutoff. The remote read is
+    authoritative: the elected release host may have changed after the tag
+    was published.
     """
     remote = release_tags(project)
     if not remote:
@@ -257,11 +285,14 @@ def cutoff_tag(project, at, now, *, window_s):
             published = float(stamp)
         except ValueError:
             continue
-        if (at - rc.TAG_MARGIN_S <= published
+        if not (at - rc.TAG_MARGIN_S <= published
                 <= at + float(window_s) + rc.TAG_MARGIN_S
                 and published <= now + rc.TAG_MARGIN_S):
-            found.append({"version": value, "tag": TAG_PREFIX + value,
-                          "commit": commit, "at": published})
+            continue
+        if not candidate_names_cutoff(project, commit, value, at):
+            continue
+        found.append({"version": value, "tag": TAG_PREFIX + value,
+                      "commit": commit, "at": published})
     return max(found, key=lambda row: version_key(row["version"])) if found else None
 
 
@@ -498,12 +529,24 @@ def plan_text(plan):
                " ; delta vide : branche créée sans staging" if plan.empty else ""))
 
 
-def merge_candidate(project, base, main):
+def merge_candidate(project, base, main, *, version="", cutoff_at=None):
+    """The final-tree merge; its message names the slot (#7856).
+
+    A tag published after a host handover is reconciled only against durable
+    evidence of the cutoff's own execution: the subject carries the version
+    and the `cutoff-at:` trailer carries the slot's UTC epoch. Without
+    `version` the legacy subject is kept (the tests and old candidates).
+    """
+    message = _LEGACY_CANDIDATE
+    if version:
+        message = "Nexlink cutoff %s: merge pinned main" % version
+        if cutoff_at is not None:
+            message += "\n\ncutoff-at: %d" % int(cutoff_at)
     folder, path = rc._worktree(project.repo, base)
     try:
         proc = rc._git(path, "-c", "user.name=ameesh release", "-c",
                        "user.email=ameesh-release@localhost", "merge", "--no-ff",
-                       "--no-edit", "-m", "Nexlink cutoff: merge pinned main", main)
+                       "--no-edit", "-m", message, main)
         if proc.returncode:
             raise rc.ReleaseError("Nexlink final-tree merge conflicts; resolve before cutoff")
         return rc.commit_of(path, "HEAD")
@@ -1779,7 +1822,7 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 return _skip_cutoff(cfg, db, project, slot, at, label, source,
                                     now, save, version=skipped, head=head, base=base)
             value = choose_version(project, version)
-            sha = merge_candidate(project, base, main)
+            sha = merge_candidate(project, base, main, version=value, cutoff_at=at)
             pending = slot["pending_nexlink"] = dict(
                 schema=rc.SCHEMA, project=project.name,
                 version=value, tag=TAG_PREFIX + value, integration="integration/release-" + value,

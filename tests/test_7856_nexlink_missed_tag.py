@@ -6,6 +6,9 @@ ameesh-agents-1; the elected `mesh-design` role then moved to
 ameesh-agents-2 at 10:49:49, whose local release state never recorded the
 slot. The missed path did not read the durable tag and sent a false urgent
 alert at 10:50Z. The tag is the durable fact; the local slot only caches it.
+
+Review B (ameesh-cx2, #44156): the tag must name the cutoff's own execution,
+not merely be put on any commit created in the window.
 """
 from __future__ import annotations
 
@@ -21,6 +24,22 @@ from ameesh.modules.nexlink import release as nx
 SHA = "a" * 40
 OLDER = "b" * 40
 CUTOFF = 1000.0
+LEGACY = "Nexlink cutoff: merge pinned main\n"
+
+
+def listed(tags, stamps):
+    return "".join("release-%s %s %s\n" % (version, commit,
+                                           stamps.get(commit, ""))
+                   for version, commit in tags.items())
+
+
+def fake_git(listing, messages):
+    def run(repo, *args, **kwargs):
+        if args[:1] == ("show",):
+            return types.SimpleNamespace(stdout=messages.get(args[-1], ""),
+                                         returncode=0)
+        return types.SimpleNamespace(stdout=listing, returncode=0)
+    return run
 
 
 class CutoffTagTest(unittest.TestCase):
@@ -28,20 +47,36 @@ class CutoffTagTest(unittest.TestCase):
         self.project = rc.ProjectRelease("nexlink", "/unused", target="develop",
                                          github="acme/nexlink", model="nexlink")
 
-    def read(self, stamps, tags):
-        listing = "".join("release-%s %s %s\n" % (version, commit,
-                                                  stamps.get(commit, ""))
-                          for version, commit in tags.items())
+    def read(self, stamps, tags, messages=None):
+        messages = {SHA: LEGACY, OLDER: LEGACY} if messages is None else messages
         with mock.patch.object(nx, "release_tags", return_value=tags), \
-                mock.patch.object(rc, "_git", return_value=types.SimpleNamespace(
-                    stdout=listing, returncode=0)):
+                mock.patch.object(rc, "_git",
+                                  side_effect=fake_git(listed(tags, stamps),
+                                                       messages)):
             return nx.cutoff_tag(self.project, CUTOFF, 4600.0, window_s=1800.0)
 
-    def test_the_candidate_created_in_the_window_names_the_cutoff(self):
+    def test_the_legacy_candidate_created_in_the_window_names_the_cutoff(self):
         found = self.read({SHA: "1005", OLDER: "800"},
                           {"11bs": OLDER, "11bt": SHA})
         self.assertEqual(found["tag"], "release-11bt")
         self.assertEqual(found["commit"], SHA)
+
+    def test_a_candidate_carrying_the_cutoff_marker_is_reconciled(self):
+        message = "Nexlink cutoff 11bt: merge pinned main\n\ncutoff-at: 1000\n"
+        found = self.read({SHA: "1005"}, {"11bt": SHA}, {SHA: message})
+        self.assertEqual(found["tag"], "release-11bt")
+
+    def test_a_manual_tag_on_an_ordinary_commit_is_not_the_cutoff(self):
+        self.assertIsNone(self.read({SHA: "1005"}, {"11bt": SHA},
+                                    {SHA: "manual release\n"}))
+
+    def test_a_candidate_of_another_slot_is_not_this_cutoff(self):
+        message = "Nexlink cutoff 11bt: merge pinned main\n\ncutoff-at: 5000\n"
+        self.assertIsNone(self.read({SHA: "1005"}, {"11bt": SHA}, {SHA: message}))
+
+    def test_a_candidate_named_for_another_version_is_not_this_cutoff(self):
+        message = "Nexlink cutoff 11bs: merge pinned main\n\ncutoff-at: 1000\n"
+        self.assertIsNone(self.read({SHA: "1005"}, {"11bt": SHA}, {SHA: message}))
 
     def test_a_tag_from_an_earlier_cutoff_does_not_reconcile_this_one(self):
         self.assertIsNone(self.read({OLDER: "800"}, {"11bs": OLDER}))
@@ -70,12 +105,11 @@ class ReconciledCutoffTest(unittest.TestCase):
     def run_tick(self, tags=None, stamps=None):
         tags = {"11bt": SHA} if tags is None else tags
         stamps = {SHA: "1005"} if stamps is None else stamps
-        listing = "".join("release-%s %s %s\n" % (version, commit,
-                                                  stamps.get(commit, ""))
-                          for version, commit in tags.items())
+        messages = {SHA: LEGACY}
         with mock.patch.object(nx, "release_tags", return_value=tags), \
-                mock.patch.object(rc, "_git", return_value=types.SimpleNamespace(
-                    stdout=listing, returncode=0)), \
+                mock.patch.object(rc, "_git",
+                                  side_effect=fake_git(listed(tags, stamps),
+                                                       messages)), \
                 mock.patch.object(rc, "send_report") as send:
             report = nx.execute(self.cfg, object(), self.project, now=4600.0)
         return report, send
