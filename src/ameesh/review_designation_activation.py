@@ -669,8 +669,44 @@ def _repo_holding(path: str, frozen_sha: str, seen: set) -> str:
         return ""
 
 
+def _canon_paths(cfg) -> list[str]:
+    """Les clones de canon configurés sur l'hôte (#7846).
+
+    Un lot du dépôt canon gèle une tête de ce dépôt-là, pas de celui de son
+    issue ; la porte (`freeze_gate._head_repos`, #2928) lit déjà ces clones.
+    """
+    try:
+        return [str(getattr(entry, "path", "") or "")
+                for entry in canon_mod.configured(cfg)]
+    except Exception:  # noqa: BLE001 - canon illisible : aucun clone
+        return []
+
+
+def _frozen_repository(db, item: Mapping, frozen_sha: str) -> str:
+    """Le dépôt `owner/repo` que la marque du gel de `frozen_sha` nomme, ou "".
+
+    #7846 : `ameesh-freeze-repo` (#6735) est la machine qui dit où vit la tête ;
+    sans elle, une tête du canon n'était cherchée et rapatriée que dans les
+    clones du dépôt de l'issue — introuvable jusqu'au fetch suivant.
+    """
+    try:
+        lot = int((item or {}).get("id") or 0)
+        rows = (storage.of(db).work.milestones(lot, None) or []) if lot else []
+    except Exception:  # noqa: BLE001 - frise illisible : aucune marque
+        return ""
+    for row in rows:
+        if str((row or {}).get("kind") or "") != "frozen":
+            continue
+        if not rd._same_freeze(frozen_sha, (row or {}).get("sha")):
+            continue
+        named = review_authors.freeze_repository(row)
+        if named:
+            return named
+    return ""
+
+
 def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
-                fetch: bool = True) -> str:
+                fetch: bool = True, hint: str = "") -> str:
     """The repository holding the frozen head (assignee's worktree first).
 
     #2561: a freeze command often runs from the agent's *session* directory
@@ -688,10 +724,16 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
     #2786: `frozen_sha` must be a full commit id. A symbolic ref (`HEAD`, a
     branch) is never resolved in this host's clone: it would read a commit
     that nobody froze (#2712).
+
+    #7846: `hint` is the checkout that resolved the head at freeze time (the
+    gate's `--repo` or its own resolution), read first. The configured canon
+    clones are read after the tracked worktrees, and the repository named by
+    the freeze mark (`ameesh-freeze-repo`) is trusted for a neighbour and is
+    the one fetched: a canon lot's head is not in the issue's repository.
     """
     if not _SHA_TEXT.fullmatch(str(frozen_sha or "").strip().lower()):
         return ""
-    candidates = _candidate_paths(db, cfg, item)
+    candidates = ([hint] if hint else []) + _candidate_paths(db, cfg, item)
     seen: set[str] = set()
     for path in candidates:
         repo = _repo_holding(path, frozen_sha, seen)
@@ -706,11 +748,14 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
     except (TypeError, ValueError):
         lot = ""
     hints = _tracked_worktrees(db, cfg, item)
-    for path in hints:
+    canons = _canon_paths(cfg)
+    for path in list(hints) + canons:
         repo = _repo_holding(path, frozen_sha, seen)
         if repo:
             return repo
-    if not slug:
+    named = _frozen_repository(db, item, frozen_sha)
+    slugs = [value for value in (named, slug) if value]
+    if not slugs:
         return ""
     needles = [needle for needle in
                (lot, str((item or {}).get("assignee") or "").strip())
@@ -719,14 +764,16 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
     neighbours = _neighbour_paths(roots, needles)
     for path in neighbours:
         repo = _repo_holding(path, frozen_sha, seen)
-        if repo and _origin_matches(repo, slug):
+        if repo and any(_origin_matches(repo, value) for value in slugs):
             return repo
     # The head may have been pushed but not fetched into any local clone
-    # (#2517); fetch it from the lot's own origin, bounded, and verify the SHA.
+    # (#2517); fetch it from its own origin (the freeze mark, else the lot's),
+    # bounded, and verify the SHA.
     if not fetch:
         return ""
     return _fetch_from_local_clone(
-        list(candidates) + list(hints) + list(neighbours), slug, frozen_sha,
+        list(candidates) + list(hints) + canons + list(neighbours), slugs[0],
+        frozen_sha,
         str((item or {}).get("branch") or "").strip(), set())
 
 
@@ -1853,8 +1900,8 @@ class Target:
 
 
 def prepare_target(cfg, db, item: Mapping, head: str, *,
-                   fetch: bool = True) -> Target | Unavailable:
-    repo = _repository(db, cfg, item, head, fetch=fetch)
+                   fetch: bool = True, hint: str = "") -> Target | Unavailable:
+    repo = _repository(db, cfg, item, head, fetch=fetch, hint=hint)
     if not repo:
         return Unavailable("no repository holds the frozen head %s: cannot read the"
                            " frozen diff" % head[:12])
