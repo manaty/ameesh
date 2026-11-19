@@ -26,10 +26,21 @@ def _refs(cfg, db, project):
 
 
 def _record(cfg, db, item, freeze, prefix, result):
-    """A successful check or one pilot notice; never alter the freeze."""
+    """A successful check or one pilot notice; never alter the freeze.
+
+    #7662 : a `stale` result means the designation moved under the read, not
+    that the policy failed: nothing is written, so the next pass re-reads it.
+    """
     lot = int(item["id"])
+    state = str(result.get("state") or "")
+    if state == "stale":
+        # #7662 : un gel ou un siège a bougé pendant la complétion du
+        # plancher : la désignation lue n'est plus la courante, ce n'est pas
+        # un échec de la politique. Aucune note, aucun courrier au pilote et
+        # pas de clé `checked:` — la passe suivante relit ce lot.
+        return
     threads = []
-    unavailable = result.get("state") not in {"designated", "manual", "none"}
+    unavailable = state not in {"designated", "manual", "none"}
     key = prefix + ("notice:" if unavailable else "checked:")
     with db.transaction() as tx:
         if not act._lock_current_freeze(tx, lot, freeze):
@@ -92,7 +103,8 @@ def after_sync(cfg, db, *, limit=act.RETRY_LIMIT):
                     continue
                 result = act.designate(cfg, db, lot, freeze=freeze, refresh_policy=True)
                 _record(cfg, db, item, freeze, prefix, result)
-                out["refreshed"] += 1
+                if str((result or {}).get("state") or "") != "stale":
+                    out["refreshed"] += 1
             except Exception as exc:  # one lot never prevents the next one
                 out["errors"].append("#%d: %s: %s" % (lot, type(exc).__name__, str(exc)[:160]))
                 if freeze:

@@ -60,9 +60,13 @@ class NexlinkMissedTest(unittest.TestCase):
         state = {"schema": rc.SCHEMA, "projects": {"nexlink": {
             "last_error": "git ls-remote failed", "last_error_at": 1100.0}}}
         rc.save_state(self.cfg, state)
+        # #7856: the missed path now reads the durable tags before alarming;
+        # this fixture has no published tag, so the alarm must still fire.
         for name, value in (("compiled_rules", (object(), types.SimpleNamespace(commit="d" * 40))),
-                            ("cutoff_slot", (1000.0, "23:00")), ("fetch", None)):
-            patcher = mock.patch.object(rc, name, return_value=value)
+                            ("cutoff_slot", (1000.0, "23:00")), ("fetch", None),
+                            ("release_tags", {})):
+            patcher = mock.patch.object(rc if name != "release_tags" else nx,
+                                        name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
 

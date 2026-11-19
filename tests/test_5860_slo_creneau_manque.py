@@ -69,26 +69,36 @@ class CreneauManqueTest(_SloBase):
                                return_value=dict(cause)):
             return self.alert(now=at)
 
+    UNKNOWN = {"code": "", "detail": "", "owner": "", "gesture": "",
+               "ready": False, "unknown": True}
+
     def test_creneau_passe_niveau_1_et_raison_nommee(self):
         # 50 min après le second créneau : depuis le premier, 110 min (×3 de
         # la cible de repli de 30 min) ; depuis le créneau manqué, niveau 1.
-        alerts = self.alert_with(self.READY, self.first + HEURE + 50 * 60)
+        # #7759 : un candidat « ready » n'a plus de ligne propre ; la raison
+        # nommée est ici celle d'une lecture incomplète.
+        alerts = self.alert_with(self.UNKNOWN, self.first + HEURE + 50 * 60)
         self.assertEqual(len(alerts), 1, alerts)
         alert = alerts[0]
         self.assertLessEqual(alert["level"], 1)
         self.assertEqual(alert["packet_missed"]["count"], 1)
         self.assertEqual(alert["packet_missed"]["slot"], self.first + HEURE)
         self.assertIn("passed without it", alert["detail"])
-        self.assertIn("ready candidate not taken", alert["detail"])
+        self.assertIn("reason unreadable here", alert["detail"])
         self.assertIn("passed without it", alert["waiting"]["label"])
         self.assertNotIn("executor not designated", alert["waiting"]["label"])
         self.assertIn("pilot", alert["targets"])
         text = "\n".join(self.briefs(alert).values())
-        self.assertIn("passed without the", text)
+        self.assertIn("scripts/paquet-candidats.py", text)
+
+    def test_pret_sans_alerte_par_lot(self):
+        # #7759 : prêt, il attend le créneau suivant ; le paquet en vol (le
+        # porteur ouvert) tait aussi l'alerte groupée.
+        self.assertEqual(self.alert_with(self.READY, self.first + HEURE + 50 * 60), [])
 
     def test_signale_des_le_creneau_manque(self):
         # 2 min après le second créneau : sous la cible, mais le manque se dit.
-        alerts = self.alert_with(self.READY, self.first + HEURE + 120)
+        alerts = self.alert_with(self.UNKNOWN, self.first + HEURE + 120)
         self.assertEqual([a["level"] for a in alerts], [1])
 
     def test_cause_auteur_nommee(self):
@@ -105,7 +115,7 @@ class CreneauManqueTest(_SloBase):
     def test_premier_creneau_inchange(self):
         # Pendant l'attente du premier créneau, rien de nouveau : l'horloge
         # part du créneau, aucun manque n'est nommé.
-        alerts = self.alert_with(self.READY, self.first + 40 * 60)
+        alerts = self.alert_with(self.UNKNOWN, self.first + 40 * 60)
         self.assertEqual(len(alerts), 1, alerts)
         self.assertNotIn("packet_missed", alerts[0])
 

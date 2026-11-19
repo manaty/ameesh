@@ -7,8 +7,8 @@ docs/design/5322-avatar-humain.md §3.4. Un hôte dont la fiche Host déclare
 * chaque tenant a un utilisateur système propre (`ameesh-<id>`, home 0700,
   `linger`), un runner propre (`ameesh-runner-tenant@<id>.service`) dont
   `tenant` vaut `human:<id>`, et ses dossiers de comptes sous son home ;
-  sur l'hôte partagé, des clés d'organisation seulement (décision Q2,
-  #213954) ;
+  sur l'hôte partagé, l'abonnement personnel exige l'opt-in et l'isolation
+  (décision Q2 amendée #224052, manaty/ameesh#5901) ;
 * le **superviseur d'hôte** (le runner de l'utilisateur `ameesh`, sans
   `tenant`) garde l'état machine : relevés, cycle de vie, portes, ménage ;
   il ne réclame aucun agent ;
@@ -225,7 +225,7 @@ def add_plan(host: str, tenant: str) -> list[list[str]]:
 
     Utilisateur sans groupe partagé (groupe personnel), home 0700, `linger`
     pour ses unités utilisateur, dossier de comptes 0700 sous son home ;
-    les secrets (clés d'organisation, Q2) sont installés ensuite par
+    les secrets (clés ou abonnements selon Q2 #224052) sont installés ensuite par
     l'humain ou son tenant, jamais par ce plan ni par le canon."""
     user = unix_user(tenant)
     home = tenant_home(tenant)

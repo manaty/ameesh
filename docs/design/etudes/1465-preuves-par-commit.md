@@ -535,3 +535,46 @@ session non liée ; #7725 : liaison historique à `veille` qui n'écrit ni ne li
 de reçu ; X → Y → X refusé pour un commit de l'époque Y ; commits faits sous
 `veille` non couverts par une réparation ; commit d'un intervalle révolu du
 même agent accepté).
+
+## 10. Citer un commit dans un message : la règle lue au gel (#7252, #7721)
+
+Quand un relecteur corrige et que l'auteur réécrit depuis le B, le commit du
+relecteur n'est plus dans l'histoire ; le message de réécriture doit le citer
+pour que l'exclusion par son nom survive (#7252). Le lecteur
+(`review_authors._cited_tokens`) ne retient que des citations **qualifiées** :
+un SHA de 12 à 40 caractères hexadécimaux, la forme `dépôt@sha` quand le dépôt
+nommé est celui du clone lu (`owner/repo`, ou son seul nom), ou un abrégé de 7
+à 11 caractères **présent localement comme commit** dans le clone lu. La
+dernière forme couvre l'abrégé usuel de Git (9 caractères dans ce dépôt) : sans
+elle, une réécriture citant `reprend 4c39e880a` ne serait plus lue et le
+correcteur retiré pourrait compter comme un avis indépendant (B auditeur sur
+474fe7c9). La présence locale est lue sans réseau (`_present_commits`) ; un mot
+hexadécimal absent (`ed25519`, `deadbeef`, `correctif-1234abcd`) ou un SHA
+d'un autre dépôt nommé n'est pas une citation : il n'interroge jamais la forge
+et ne peut donc pas faire refuser la lecture de provenance. Une lecture locale
+**non concluante** (git en échec, coupé ou délai) ou une abréviation ambiguë ne
+prouve pas l'absence : l'abrégé court reste un jeton et devient un doute (dit
+au gel, refusé en lecture stricte), jamais une exclusion silencieuse (B2
+auditeur/cx2 sur 3a7e2272). Ce doute local est propagé jusqu'au verdict : une
+forge qui répondrait « No commit found » ne l'écarte pas, et un objet unique
+qu'elle résoudrait ne le choisit pas malgré les objets locaux concurrents (B
+cx2 sur 0c407b5f). Les empreintes explicitement nommées (`checksum`,
+`sha256`), le nom complet d'un paquet horaire (`h-AAAAMMJJ-NN`) et une suite
+noyée dans un mot (`succeeded`, #7770) restent écartés.
+
+Une citation qualifiée n'est lue que si le dépôt ou la forge la confirme comme
+commit. Un objet local d'un autre type (arbre, blob, étiquette) est écarté sans
+réseau ; une forge qui répond explicitement « No commit found for SHA » écarte
+le jeton (#7730). Une forge muette, coupée ou ambiguë ne prouve pas l'absence :
+la citation reste un doute dit au gel, et la lecture stricte de la porte refuse
+(le refus fermé de #2924 B5) — jamais une exclusion silencieuse. Un SHA d'un
+autre dépôt nommé (`other/repo@sha`) n'est pas une citation de cette tête : il
+est écarté localement, sans forge.
+
+Pour les auteurs : citez le commit retiré par au moins 12 caractères
+hexadécimaux de son SHA, ou par `dépôt@sha` si vous devez utiliser une
+abréviation plus courte ; un abrégé de 7 à 11 caractères n'est lu que si le
+commit est encore présent dans le clone (la forge n'est pas interrogée pour
+lui). Ne citez jamais un mot hexadécimal ordinaire (`ed25519`, `deadbeef`). Le
+gel prépare ces citations hors transaction (`prefetch_prior_freezes`) ; une
+citation non préparée est dite, jamais silencieusement exclue.

@@ -126,6 +126,34 @@ class TriggerTest(unittest.TestCase):
         self.assertIn("#90", cap["alerts"][0]["gesture"])
         self.assertIn("l'auditeur crée les lots", cap["alerts"][0]["gesture"])
 
+    def test_a_split_lot_moved_within_the_hour_holds_the_check(self):
+        # #7848 : #7711 avait 48 h, mais son pilote y notait un point chaque
+        # heure ; le repli court depuis le dernier mouvement, pas la création.
+        lots = [split_lot(created_ts=T - 48 * H, moved_ts=T - 20 * 60)]
+        cap = measure(team(2, 8), open_lots=lots)
+        self.assertEqual(cap["alerts"], [])
+        entry = cap["projects"][0]["decoupage"]
+        self.assertEqual(entry["age_s"], 48 * H)
+        self.assertEqual(entry["quiet_s"], 20 * 60)
+
+    def test_a_split_lot_quiet_for_an_hour_calls_the_auditor(self):
+        lots = [split_lot(created_ts=T - 48 * H, moved_ts=T - 2 * H)]
+        cap = measure(team(2, 8), open_lots=lots)
+        self.assertEqual(len(cap["alerts"]), 1)
+        self.assertEqual(cap["alerts"][0]["decoupage"]["quiet_s"], 2 * H)
+        self.assertIn("sans mouvement", cap["alerts"][0]["gesture"])
+
+    def test_a_move_before_creation_never_rejuvenates_the_lot(self):
+        lots = [split_lot(created_ts=T - 2 * H, moved_ts=T - 3 * H)]
+        entry = measure(team(2, 8), open_lots=lots)["projects"][0]["decoupage"]
+        self.assertEqual(entry["quiet_s"], 2 * H)
+
+    def test_the_text_names_the_last_move(self):
+        lots = [split_lot(created_ts=T - 48 * H, moved_ts=T - 20 * 60)]
+        lines = debit._capacity_text(measure(team(2, 8), open_lots=lots))
+        self.assertTrue(any("découpage #90 (48 h 00, dernier mouvement il y a 20 min)"
+                            in line for line in lines), lines)
+
     def test_startable_lots_name_the_dispatch(self):
         cap = measure(team(2, 8), startable=[{"id": 12, "app": "ameesh"}])
         self.assertEqual(cap["projects"][0]["startable_lots"], [12])
@@ -540,6 +568,45 @@ class ReadCapacityTest(unittest.TestCase):
         self.assertTrue(cap["gating_ok"])
         self.assertEqual(cap["alerts"], [])
 
+
+    def test_the_last_split_move_is_read_and_holds_the_check(self):
+        # #7848 : `read_capacity` lit le dernier mouvement du lot de découpage
+        # (note du pilote, lot créé qui le cite) ; un lot de 48 h noté il y a
+        # 20 min ne lève pas l'alerte. La requête vise le seul lot de découpage.
+        from types import SimpleNamespace
+        row = {"id": 90, "title": "Découper la feuille de route de ameesh",
+               "state": "intake", "assignee": "pilote", "app": "ameesh",
+               "type": "evolution", "created_ts": T - 48 * H}
+        other = {"id": 91, "title": "autre", "state": "intake", "app": "ameesh",
+                 "type": "bug", "created_ts": T - H}
+        store = SimpleNamespace(operations=SimpleNamespace(
+            listing=lambda: team(2, 8), open_lots_activity=lambda limit: [row, other]))
+        asked = []
+
+        def query(sql, params=()):
+            if "file-decoupage:%%'" in sql and "SELECT id, source" in sql:
+                return [{"id": 90, "source": SPLIT}]
+            if sql is debit._SPLIT_MOVES_SQL:
+                asked.append(params)
+                return [{"id": 90, "moved_ts": T - 20 * 60}]
+            return []
+        db = mock.Mock()
+        db.query.side_effect = query
+        with mock.patch("ameesh.storage.of", return_value=store), \
+                mock.patch("ameesh.mechanics.configured", return_value=mechanics_doc()), \
+                mock.patch("ameesh.account_turn.turn_hold", return_value=""), \
+                mock.patch("ameesh.sous_utilisation.waiting_project_lots", return_value=[]), \
+                mock.patch("ameesh.sous_utilisation.critical_verdict",
+                           return_value=(False, False)), \
+                mock.patch("ameesh.host_lifecycle.closed_hosts", return_value={}), \
+                mock.patch("ameesh.sous_utilisation.latest_account_gauges", return_value={}):
+            cap = debit.read_capacity(db, cfg=object(), now=T, hours=6, turns=[],
+                                      canons=[], unreadable=[])
+        self.assertEqual(asked, [("90",)])
+        project = [p for p in cap["projects"] if p["project"] == "ameesh"][0]
+        self.assertEqual(project["decoupage"]["quiet_s"], 20 * 60)
+        self.assertTrue(cap["gating_ok"])
+        self.assertEqual(cap["alerts"], [])
 
     def _read_with(self, patches, *, listing=None, document=None):
         """`read_capacity` sur 2/10 au repos, un lot ouvert démarrable, et des

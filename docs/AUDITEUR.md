@@ -154,8 +154,10 @@ attente de plus de 2 h. Le geste dépend de l'état :
 - aucun lot de découpage : le pilote du projet doit en recevoir un (spec
   `docs/design/3256-debit-file.md` §2.2, #4273) ; s'il manque, l'auditeur le
   signale au pilote ;
-- un lot de découpage a plus d'une heure sans lot démarrable créé : le
-  **repli** de la spec §2.2, geste de niveau 1 ci-dessous.
+- un lot de découpage est sans mouvement depuis plus d'une heure (ni note de
+  son pilote, ni lot créé qui le cite, `capacity…decoupage.quiet_s`, #7848)
+  sans lot démarrable : le **repli** de la spec §2.2, geste de niveau 1
+  ci-dessous.
 
 Une feuille de route notée épuisée (`roadmap: épuisée <projet>` sur le lot de
 découpage) retire le projet de l'alerte et de ses heures au repos. Sans bloc
@@ -786,7 +788,7 @@ FIN
 | orchestrateur muet avec du courrier | `agent-mail send <orchestrateur> "…"` | aucun |
 | « Idle with an actionable lot: … » (`idle_actionable_lot`, #408) : un agent au repos détient un lot `intake`/`build` et les réveils de son exécuteur (règle 1) sont restés sans effet | **relancer, pas seulement nommer** : `agent-mail send <agent> "…" --lot <lot>` (ce qui est attendu sur le lot, ou qu'il note pourquoi il ne peut pas avancer : `ameesh work note <lot> "hold: <raison>"`) ; exécuteur pas vivant : `ameesh resume <agent>` d'abord ; s'il ne peut pas prendre le lot : `ameesh work assign <lot> <agent>` | `ameesh work assign <lot> <ancien>` |
 | « Idle capacity: … » qui cite des lots ouverts sans agent, toujours vrai à son passage 30 min ou plus après le courrier (L165b) | `ameesh work assign <lot> <agent>` (un agent au repos de l'équipe du lot, le lot le plus prioritaire d'abord), puis `agent-mail send <agent> "…" --lot <lot>` pour le réveiller | `ameesh work assign <lot> <autre>` |
-| lot de découpage ouvert depuis plus d'une heure sans lot démarrable créé (`capacity.alerts`, repli de la spec #3256 §2.2) | créer lui-même les lots démarrables du projet, d'au plus une journée chacun, depuis la feuille de route citée par le lot de découpage : `ameesh work add --app <projet> --estimate <durée> …`, puis les nommer dans une note du lot de découpage ; il ne touche ni au code ni à la priorité des lots du pilote | `ameesh work close <lot>` |
+| lot de découpage sans mouvement depuis plus d'une heure (note du pilote ou lot créé qui le cite, #7848) sans lot démarrable créé (`capacity.alerts`, repli de la spec #3256 §2.2) | créer lui-même les lots démarrables du projet, d'au plus une journée chacun, depuis la feuille de route citée par le lot de découpage : `ameesh work add --app <projet> --estimate <durée> …`, puis les nommer dans une note du lot de découpage ; il ne touche ni au code ni à la priorité des lots du pilote | `ameesh work close <lot>` |
 | dépense au-dessus de l'estimation | `ameesh budget set --per-hour X [--per-day Y] [--agent A]`, **uniquement vers le bas**, et seulement si la dépense de la fenêtre en cours reste sous le nouveau plafond | `ameesh budget set` à l'ancienne valeur, par un humain |
 | CI en file, réserve arrêtée ; ou réserve inactive | `"$AUDITEUR_RESERVE_DIR"/demarrer-reserve.sh` ou `arreter-reserve.sh` | le script inverse |
 | avis dû depuis plus de 2 h sur la tête gelée (`reviews_by_reviewer`) | relancer le relecteur avec la liste de ses avis dus (le débit la porte : `agent-mail send <relecteur> "…" --lot <lot>`) ; au repos, `ameesh resume <relecteur>` ; s'il est marqué `en pause : …`, ne pas le relancer : le pilote désigne un autre relecteur de la même famille ou attend la levée (`agent-mail send mesh-design …`) | le verdict rendu, la redésignation, ou la levée de la pause |
