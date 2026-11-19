@@ -6,6 +6,7 @@ fail closed, intégration au verdict de placement."""
 from __future__ import annotations
 
 import os
+import shlex
 import unittest
 from unittest import mock
 
@@ -37,9 +38,13 @@ def fake_gh(perms, appels=None):
     return run
 
 
-def fake_git(reachable):
-    return lambda argv, capture_output=True, text=True, timeout=None: \
-        FakeProc(0 if reachable else 1, "")
+def fake_git(reachable, appels=None):
+    """`git ls-remote` simulé ; journalise (argv, env) vus."""
+    def run(argv, capture_output=True, text=True, timeout=None, env=None):
+        if appels is not None:
+            appels.append((list(argv), env))
+        return FakeProc(0 if reachable else 1, "")
+    return run
 
 
 def _replace(path, old, new):
@@ -94,6 +99,9 @@ class ForgeTest(test_canon._TmpMixin, unittest.TestCase):
         add_forge(self.root, "bruno", "bruno-gh")
         add_admin(self.root, "atelier", "human:alice")
         self.canon = canon.load(self.root, untrusted=True)
+        self.key = os.path.join(self.make_tmp(), "id_memoire")
+        with open(self.key, "w", encoding="utf-8") as fh:
+            fh.write("cle factice\n")
         self.repo = visibility.parse_repository(REPO)
         self.humans = visibility.host_humans(self.canon, "atelier")
         self.logins = {h: visibility.human_login(self.canon, h) for h in self.humans}
@@ -142,12 +150,14 @@ class ForgeTest(test_canon._TmpMixin, unittest.TestCase):
         self.assertFalse(visible)
         self.assertIn("not supported", why)
         # un seul humain : la copie d'essai prévue par 0029 peut prouver l'accès
-        forge = visibility.Forge(mode="auto", gh=fake_gh({}), git=fake_git(True))
+        forge = visibility.Forge(mode="auto", gh=fake_gh({}), git=fake_git(True),
+                                 ssh_key=self.key)
         visible, why = forge.visible(repo, ["human:bruno"], {"human:bruno": None})
         self.assertTrue(visible, why)
 
     def test_copie_d_essai_poste_personnel(self):
-        forge = visibility.Forge(mode="auto", gh=fake_gh({}), git=fake_git(True))
+        forge = visibility.Forge(mode="auto", gh=fake_gh({}), git=fake_git(True),
+                                 ssh_key=self.key)
         visible, why = forge.visible(self.repo, ["human:bruno"], {"human:bruno": None})
         self.assertTrue(visible, why)
         visible, why = forge.visible(self.repo, self.humans,
@@ -155,11 +165,57 @@ class ForgeTest(test_canon._TmpMixin, unittest.TestCase):
         self.assertFalse(visible)
 
     def test_mode_git_et_desactive(self):
-        forge = visibility.Forge(mode="git", git=fake_git(True))
+        forge = visibility.Forge(mode="git", git=fake_git(True),
+                                 ssh_key=self.key)
         self.assertTrue(forge.visible(self.repo, ["human:bruno"],
                                       {"human:bruno": None})[0])
         forge = visibility.Forge(mode="none")
         self.assertFalse(forge.visible(self.repo, self.humans, self.logins)[0])
+
+
+    def test_copie_d_essai_ssh_avec_la_cle_memoire(self):
+        # #7690 : un humain sans compte de forge, dépôt SSH, clé déclarée
+        appels = []
+        forge = visibility.Forge(mode="auto", gh=fake_gh({}),
+                                 git=fake_git(True, appels), ssh_key=self.key)
+        visible, why = forge.visible(self.repo, ["human:bruno"], {"human:bruno": None})
+        self.assertTrue(visible, why)
+        argv, env = appels[-1]
+        self.assertEqual(argv, ["git", "ls-remote", "--exit-code", REPO])
+        self.assertIn("-i %s" % shlex.quote(self.key), env["GIT_SSH_COMMAND"])
+        self.assertIn("IdentitiesOnly=yes", env["GIT_SSH_COMMAND"])
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+
+    def test_copie_d_essai_ssh_sans_cle_refus_nomme(self):
+        appels = []
+        for mode in ("auto", "git"):
+            forge = visibility.Forge(mode=mode, gh=fake_gh({}), git=fake_git(True, appels))
+            visible, why = forge.visible(self.repo, ["human:bruno"], {"human:bruno": None})
+            self.assertFalse(visible)
+            self.assertIn("persona_memory.ssh_key", why)
+        absente = visibility.Forge(mode="auto", gh=fake_gh({}), git=fake_git(True, appels),
+                                   ssh_key=self.key + ".absente")
+        visible, why = absente.visible(self.repo, ["human:bruno"], {"human:bruno": None})
+        self.assertFalse(visible)
+        self.assertIn("does not exist", why)
+        self.assertEqual(appels, [], "aucune copie d'essai sans clé")
+
+    def test_copie_d_essai_https_inchangee(self):
+        appels = []
+        url = "https://github.com/acme/memoire-orchestre.git"
+        forge = visibility.Forge(mode="auto", gh=fake_gh({}), git=fake_git(True, appels))
+        visible, why = forge.visible(visibility.parse_repository(url), ["human:bruno"],
+                                     {"human:bruno": None})
+        self.assertTrue(visible, why)
+        self.assertEqual(appels, [(["git", "ls-remote", "--exit-code", url], None)])
+
+    def test_from_config_porte_la_cle(self):
+        cfg = mock.Mock(forge_hosts=None, forge="", visibility_timeout=None,
+                        persona_memory={"ssh_key": self.key})
+        self.assertEqual(visibility.Forge.from_config(cfg).ssh_key, self.key)
+        cfg.persona_memory = {}
+        self.assertIsNone(visibility.Forge.from_config(cfg).ssh_key)
 
 
 class ContextTest(test_canon._TmpMixin, unittest.TestCase):

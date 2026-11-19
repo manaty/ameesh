@@ -142,8 +142,8 @@ def human_login(canon, human: str) -> str | None:
     return None
 
 
-def _default_run(argv, capture_output=True, text=True, timeout=None):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+def _default_run(argv, capture_output=True, text=True, timeout=None, env=None):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
 
 
 @dataclass
@@ -156,12 +156,18 @@ class Forge:
     hosts: frozenset = field(default_factory=lambda: frozenset(DEFAULT_FORGE_HOSTS))
     gh: object = _default_run
     git: object = _default_run
+    #: `persona_memory.ssh_key` de l'hôte : seul identifiant de la copie
+    #: d'essai d'une URL SSH, comme pour le module mémoire (#7690)
+    ssh_key: str | None = None
 
     @classmethod
     def from_config(cls, cfg) -> "Forge":
         declared = getattr(cfg, "forge_hosts", None) or DEFAULT_FORGE_HOSTS
         hosts = frozenset(str(h).strip().lower() for h in declared if str(h).strip())
-        return cls(mode=(getattr(cfg, "forge", "") or "auto").strip().lower(),
+        memory = getattr(cfg, "persona_memory", None)
+        key = memory.get("ssh_key") if isinstance(memory, dict) else None
+        return cls(ssh_key=str(key) if key else None,
+                   mode=(getattr(cfg, "forge", "") or "auto").strip().lower(),
                    timeout=max(1.0, float(getattr(cfg, "visibility_timeout",
                                                  DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)),
                    hosts=hosts or frozenset(DEFAULT_FORGE_HOSTS))
@@ -189,14 +195,34 @@ class Forge:
             return None
         return (proc.stdout or "").strip().lower() or None
 
-    def reachable(self, repo: Repo) -> bool:
-        """Copie d'essai : `git ls-remote` suffit à prouver la lecture."""
+    def trial_problem(self, repo: Repo) -> str | None:
+        """Copie d'essai : `git ls-remote` suffit à prouver la lecture.
+
+        Rend None si la lecture est prouvée, sinon la raison. Une URL SSH passe
+        par le transport du module mémoire (environnement Git isolé, clé
+        `persona_memory.ssh_key` seule) : une clé absente ou illisible est un
+        refus nommé, sans lancer Git. Les autres URL gardent l'environnement
+        de l'exécuteur."""
+        from . import persona_memory
+        argv = ["git", "ls-remote", "--exit-code", repo.url]
+        kwargs = {}
+        if persona_memory.transport_kind(repo.url) == "ssh":
+            cfg_raw = {"ssh_key": self.ssh_key} if self.ssh_key else {}
+            problem = persona_memory.transport_problem(repo.url, cfg_raw)
+            if problem:
+                return problem
+            kwargs["env"] = persona_memory._git_env(cfg_raw)
         try:
-            proc = self.git(["git", "ls-remote", "--exit-code", repo.url],
-                            capture_output=True, text=True, timeout=self.timeout)
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return getattr(proc, "returncode", 1) == 0
+            proc = self.git(argv, capture_output=True, text=True, timeout=self.timeout,
+                            **kwargs)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "test clone failed: %s" % exc.__class__.__name__
+        if getattr(proc, "returncode", 1) != 0:
+            return "test clone failed"
+        return None
+
+    def reachable(self, repo: Repo) -> bool:
+        return self.trial_problem(repo) is None
 
     def visible(self, repo: Repo, humans: list[str], logins: dict) -> tuple[bool, str]:
         """(visible, raison) pour l'ensemble `H(hôte)`.
@@ -209,27 +235,39 @@ class Forge:
         if self.mode in ("none", "off", "0"):
             return False, "visibility check disabled (AMEESH_FORGE=%s)" % self.mode
         if self.mode == "git":
-            if len(humans) == 1 and self.reachable(repo):
+            if len(humans) != 1:
+                return False, "host has several humans (the test clone only proves the owner)"
+            problem = self.trial_problem(repo)
+            if problem is None:
                 return True, "test clone succeeded (host owner)"
-            return False, ("test clone failed or host has several humans "
-                           "(it only proves the owner)")
+            return False, problem
         if not self.supports(repo):
-            if len(humans) == 1 and self.reachable(repo):
+            problem = self.trial_problem(repo) if len(humans) == 1 else None
+            if len(humans) == 1 and problem is None:
                 return True, ("test clone succeeded (forge %s cannot be queried by gh)"
                               % repo.forge)
+            if problem:
+                return False, "forge %s not supported by the API and %s" % (repo.forge, problem)
             return False, ("forge %s not supported by the API (AMEESH_FORGE_HOSTS) "
                            "and host has several humans" % repo.forge)
         inconnus = [h for h in humans if not logins.get(h)]
         if inconnus:
-            if len(humans) == 1 and self.reachable(repo):
+            problem = self.trial_problem(repo) if len(humans) == 1 else None
+            if len(humans) == 1 and problem is None:
                 return True, "test clone succeeded (single-human workstation)"
+            if problem:
+                return False, "no forge account for %s and %s" % (", ".join(inconnus), problem)
             return False, ("no forge account for %s, the test clone proves nothing "
                            "for the administrators" % ", ".join(inconnus))
         for human in humans:
             permission = self.permission(repo, logins[human])
             if permission is None:
-                if len(humans) == 1 and self.reachable(repo):
+                problem = self.trial_problem(repo) if len(humans) == 1 else None
+                if len(humans) == 1 and problem is None:
                     return True, "test clone succeeded (forge API unavailable)"
+                if problem:
+                    return False, "permissions of %s on %s unreadable and %s" % (
+                        human, repo.identity, problem)
                 return False, "permissions of %s on %s unreadable" % (human, repo.identity)
             if permission not in READ_PERMISSIONS:
                 return False, "%s has no access to repository %s (permission %s)" % (
@@ -257,6 +295,7 @@ def decision_context(canon, host: str, repository: str | None, forge: Forge) -> 
                                for h in sorted(humans or [])),
         "mode=%s" % forge.mode,
         "forges=%s" % ",".join(sorted(forge.hosts or [])),
+        "ssh_key=%s" % (forge.ssh_key or ""),
     ])
     return {"fingerprint": fingerprint, "repo": repo, "humans": humans, "logins": logins,
             "refs": refs}
