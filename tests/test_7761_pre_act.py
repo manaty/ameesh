@@ -235,6 +235,21 @@ class PreActTest(unittest.TestCase):
             self.check(tx)
         self.assertFalse(tx.writes)
 
+    def test_unread_mail_bound_does_not_limit_stop_search(self):
+        message = {"id": 4, "recipient": "bureau", "unread": True,
+                   "body": "information", "ts": 100 - 86400 - 1}
+        self.check(Transaction(messages=[message]))
+        message["body"] = "STOP #5772"
+        with self.assertRaisesRegex(pre_act.Refused, "unread"):
+            self.check(Transaction(messages=[message]))
+        message["body"] = "information"
+        message["ts"] = 100 - 86400
+        with self.assertRaisesRegex(pre_act.Refused, "unread"):
+            self.check(Transaction(messages=[message]))
+        message.update(recipient="other", ts=150, body="STOP", unread=True)
+        with self.assertRaisesRegex(pre_act.Refused, "STOP"):
+            self.check(Transaction(messages=[message]))
+
     def test_old_active_hold_and_new_hold_both_block(self):
         for timestamp in (10, 150):
             with self.subTest(timestamp=timestamp):
