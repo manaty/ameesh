@@ -182,8 +182,9 @@ class RegleTest(unittest.TestCase):
         lots = [waiting, self._lot(2, "build", "a"), self._lot(3, "qa", "b"),
                 self._lot(4, "build", "c", branch="integration/paquet-1")]
         paths = {1: ["src/x.py"], 2: ["src/y.py"], 3: ["CHANGELOG.md"], 4: ["src"]}
-        # sans politique : le véhicule chevauche (comme la garde SQL)
-        self.assertEqual([b["id"] for b in slo.footprint_blockers(waiting, lots, paths)], [4])
+        # #7758 : le véhicule ne chevauche pas (comme la garde SQL), ses
+        # membres sont comptés chacun
+        self.assertEqual(slo.footprint_blockers(waiting, lots, paths), [])
         paths[4] = ["other"]
         policies = {"tpk": {"max_in_flight": 2, "shared_paths": []}}
         held = slo.footprint_blockers(waiting, lots, paths, policies)
@@ -332,6 +333,27 @@ class GardeTest(_Empreintes):
         work.assign(self.db, libre["id"], "human:autre", actor="test")
         # sans changement de politique, rien n'est touché
         self.assertEqual(self.policy(max_in_flight=3)["lots"], [])
+
+    def test_un_vehicule_ne_retient_pas_seuls_ses_membres(self):
+        """#7758 : le véhicule de paquet n'a pas de delta propre ; il ne
+        compte pas comme occupant, son membre retient jusqu'à sa fusion."""
+        membre = self.lot("membre")
+        vehicule = self.lot("paquet", branch="integration/paquet-h-7758")
+        attend = self.lot("attend")
+        self.footprint(membre, "src/a.py")
+        self.footprint(vehicule, "src")
+        self.footprint(attend, "src/a.py")
+        self.give(membre)
+        self.give(vehicule)
+        rows = storage.of(self.db).work_footprints.overlapping(attend["id"])
+        self.assertEqual({int(r["id"]) for r in rows}, {int(membre["id"])})
+        self.assertNotIn(attend["id"],
+                         {i["id"] for i in storage.of(self.db).work.unassigned_lots(10)})
+        self.merge(membre)
+        self.assertEqual(storage.of(self.db).work_footprints.overlapping(attend["id"]), [])
+        self.assertIn(attend["id"],
+                      {i["id"] for i in storage.of(self.db).work.unassigned_lots(10)})
+        work.assign(self.db, attend["id"], "human:autre", actor="test")
 
     def test_politique_par_defaut_et_journal(self):
         self.assertEqual(fp.policy_of(self.db, "nexlink")["unknown_policy"], "open")

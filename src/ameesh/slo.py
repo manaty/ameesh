@@ -651,8 +651,9 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
 
     #4818 : `policies` (`{app: politique}`) porte les chemins partagés du
     dépôt (ignorés) et son plafond de lots en vol : sans chevauchement, un
-    dépôt au plafond retient le lot par tous ses occupants (`reason: cap`,
-    lots exemptés exceptés : `work_footprints.is_exempt`). Le marqueur `.` chevauche tout.
+    dépôt au plafond retient le lot par tous ses occupants (`reason: cap`).
+    Un lot exempté (`work_footprints.is_exempt`) n'occupe rien, ni plafond ni
+    chevauchement (#7758). Le marqueur `.` chevauche tout.
 
     #7760 : `declared` nomme les bloquants dont `item` a déclaré la dépendance.
     Un occupant `validated` déclaré ne retient plus le DÉMARRAGE (il démarre
@@ -690,8 +691,11 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
                "assignee": other.get("assignee") or None,
                "updated_ts": other.get("updated_ts"),
                "last_activity_ts": other.get("last_activity_ts")}
-        if not work_footprints.is_exempt(other):
-            occupants.append(row)
+        if work_footprints.is_exempt(other):
+            # #7758 : un véhicule de paquet n'a pas de delta propre (ses
+            # membres sont comptés chacun) ; un lot exempté n'occupe rien.
+            continue
+        occupants.append(row)
         if state == lifecycle.VALIDATED and other_id in starts_on:
             # #7760 : la paire démarre sur la tête gelée du validé ; seule la
             # fusion l'attend encore.

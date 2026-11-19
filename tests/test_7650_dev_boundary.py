@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """P1b #7650 (étude #7616 §4.6) : la frontière du module `dev`.
 
-Deux garanties, sans base :
+Garanties, sans base :
 
 * le noyau ne nomme **aucune** table du module `dev` dans une position de
   table SQL (``FROM``, ``JOIN``, ``UPDATE``, ``INSERT INTO``, ``DELETE FROM``,
@@ -12,19 +12,20 @@ Deux garanties, sans base :
   search_path noyau et rendrait NULL sans erreur (revue B1 de #7650) ;
 * le résolveur ``relation``/``qualify`` rend le nom du schéma noyau avant P2
   et le schéma ``<noyau>__dev`` lu dans ``module_schemas`` après P2, sans
-  toucher aux littéraux SQL ni aux commentaires.
+  toucher aux littéraux SQL ni aux commentaires ;
+* chaque module du paquet ``dev.storage`` s'importe seul dans un processus
+  Python propre, sans préchargement d'``ameesh.storage`` (#7808).
 """
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import unittest
 
-#: Ordre d'import : `schema` importe `ameesh.storage`, dont les alias Postgres
-#: importent ce paquet ; charger `storage` d'abord évite le cycle quand ce
-#: module est lancé seul (le reste de la suite l'a déjà chargé).
-import ameesh.storage  # noqa: F401
 from ameesh.modules.dev.tables import TABLES
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -327,6 +328,72 @@ class DevBoundaryTest(unittest.TestCase):
         for column in tuple(REWRITTEN) + tuple(KEPT):
             table = column.split(".", 1)[0]
             self.assertIn(table, TABLES, column)
+
+    def test_each_dev_storage_module_imports_alone(self):
+        """#7808 : chaque module se charge dans un processus propre, à froid.
+
+        Sans préchargement d'``ameesh.storage`` : le cycle
+        ``dev.storage`` → ``storage`` → ``storage.postgres`` (ses alias datés
+        importent ``dev.storage``) → ``dev.storage`` faisait boucler l'import
+        avant l'initialisation du stockage. Le processus vérifie aussi que
+        l'export public ``PostgresStorage`` reste résolu malgré le chargement
+        différé du pilote."""
+        package = "ameesh.modules.dev.storage"
+        directory = SOURCE / "modules" / "dev" / "storage"
+        modules = sorted(path.stem for path in directory.glob("*.py")
+                         if path.stem != "__init__")
+        self.assertTrue(modules)
+        script = (
+            "import importlib\n"
+            "import sys\n"
+            "module = importlib.import_module(sys.argv[1])\n"
+            "assert module.__name__ == sys.argv[1], module.__name__\n"
+            "from ameesh.storage import PostgresStorage\n"
+            "assert PostgresStorage.__name__ == 'PostgresStorage'\n"
+        )
+        env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+        for module in modules:
+            with self.subTest(module=module):
+                done = subprocess.run(
+                    [sys.executable, "-c", script, package + "." + module],
+                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(
+                    done.returncode, 0,
+                    "import isolé de %s.%s échoue :\n%s"
+                    % (package, module, done.stderr[-2000:]))
+
+    def test_apply_unknown_repository_needs_no_database(self):
+        """B de #7808 : `_apply_unknown('repository')` construit son SQL avec
+        une transaction factice, donc sans base ni pilote. Le noyau y est
+        importé à l'usage (`_done_sql`) : un nom retiré du module (le
+        `_DONE_SQL` du chargement) se voit ici au lieu d'un NameError dans la
+        transaction réelle."""
+        from ameesh.modules.dev.storage.work_footprints import WorkFootprints
+
+        class _Tx:
+            def __init__(self):
+                self.queries = []
+                self.executes = []
+
+            def query(self, sql, params=()):
+                self.queries.append((sql, params))
+                return [{"id": 7, "state": "build"}]
+
+            def execute(self, sql, params=()):
+                self.executes.append((sql, params))
+
+        tx = _Tx()
+        marked = WorkFootprints._apply_unknown(
+            tx, "acme", "repository", "agent")
+        self.assertEqual(marked, [7])
+        self.assertEqual(tx.queries[0][1], ("acme",))
+        self.assertIn("w.state NOT IN ('delivered', 'delivered', 'closed')",
+                      tx.queries[0][0])
+        # une empreinte `.`, une analyse inconnue, une ligne de journal
+        self.assertEqual(len(tx.executes), 3, tx.executes)
+        self.assertIn("work_item_footprints", tx.executes[0][0])
+        self.assertIn("work_item_impact_analyses", tx.executes[1][0])
+        self.assertIn("work_item_events", tx.executes[2][0])
 
 
 if __name__ == "__main__":

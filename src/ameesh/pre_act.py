@@ -113,8 +113,6 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
     for message in messages:
         if (message.get("sender") or "").removeprefix("agent:") == actor.removeprefix("agent:"):
             continue
-        if message.get("recipient") == actor and message.get("unread"):
-            raise Refused("unread lot mail #%s" % message["id"])
         body = message.get("body") or ""
         # Generated decision replies append the original question verbatim.
         # Inspect the answer and option label, but not that quoted question.
@@ -123,6 +121,10 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
             # The title preceding the final answer marker is quoted context too.
             answer_header = header.rsplit(": option ", 1)[-1] if ": option " in header else ""
             body = answer_header + "\n" + (message.get("answer_text") or "")
+        if (message.get("recipient") == actor and message.get("unread")
+                and (float(message["ts"]) >= since - 24 * 60 * 60
+                     or planned_waits.contains_stop(body))):
+            raise Refused("unread lot mail #%s" % message["id"])
         if float(message["ts"]) >= since and planned_waits.contains_stop(body):
             raise Refused("STOP in lot mail #%s" % message["id"])
         if message.get("decision_state") == "withdrawn":
