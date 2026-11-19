@@ -25,6 +25,7 @@ from ameesh import avatar_children, canon, canon_sync, registry, storage, tenanc
 
 from . import test_canon
 from .test_canon import codes, fiche, write
+from .test_l98_modules_activation import FakeEntryPoint, external_points, sample
 from .test_placement import host_card
 
 ALICE = "human:alice"
@@ -134,16 +135,56 @@ class ChildrenPlacementTest(test_canon._CanonDbCase):
         self.assertNotEqual(child["cwd"], parent["cwd"])
         self.assertTrue(child["cwd"].startswith(tenancy.tenant_home(ALICE) + "/"))
 
-    def test_module_absent_du_projet_refuse_l_enfant(self):
-        # #7860 : le projet de l'avatar sélectionne un module absent de l'hôte
-        # candidat ; le canon reste ok, mais l'enfant ne doit pas y être placé.
+    # -- #7860 : modules installés, fait de l'hôte de l'enfant ---------------
+    def placement_of(self, name: str = "enfant1") -> dict:
+        return self.db.query("SELECT placement_ok, placement_diagnostic FROM agent_registry "
+                             "WHERE name = %s", (name,))[0]
+
+    def select_module(self, module: str) -> None:
         write(self.root, "federation.yaml",
               'federation: "0.1"\nmembers: []\nextensions:\n  ameesh:\n    projects:\n'
-              '      acme-web:\n        modules: [tpk]\n')
+              "      acme-web:\n        modules: [%s]\n" % module)
+
+    def test_module_livre_avec_ameesh_ne_retient_pas_l_enfant(self):
+        self.select_module("it")
         self.sync_both()
-        with self.assertRaisesRegex(canon_sync.SpawnError,
-                                    "module missing on this host: tpk"):
-            self.spawn()
+        self.assertTrue(self.spawn()["placement_ok"])
+
+    def test_module_installe_ici_et_absent_de_l_hote_de_l_enfant(self):
+        # le parent a tpk : sa découverte ne vaut pas pour l'hôte de l'enfant
+        self.select_module("tpk")
+        tpk = FakeEntryPoint(sample(name="tpk"), name="tpk")
+        with external_points(tpk):
+            canon_sync.sync(self.db, self.load(), "atelier")
+            row = self.spawn()
+        self.assertEqual(row["host"], "enfants")
+        pending = self.placement_of()
+        self.assertIs(pending["placement_ok"], False)
+        self.assertIn("module availability to be confirmed by its host: tpk",
+                      pending["placement_diagnostic"])
+        self.assertIsNone(registry.claim(self.db, "enfant1", "enfants/alice", 600))
+        with external_points():
+            canon_sync.sync(self.db, self.load(), "enfants")
+        refused = self.placement_of()
+        self.assertIs(refused["placement_ok"], False)
+        self.assertIn("module missing on this host: tpk (project acme-web)",
+                      refused["placement_diagnostic"])
+        self.assertIsNone(registry.claim(self.db, "enfant1", "enfants/alice", 600))
+
+    def test_module_absent_ici_et_installe_sur_l_hote_de_l_enfant(self):
+        # le parent n'a pas tpk : l'hôte équipé n'est pas refusé pour autant
+        self.select_module("tpk")
+        tpk = FakeEntryPoint(sample(name="tpk"), name="tpk")
+        with external_points(tpk):
+            canon_sync.sync(self.db, self.load(), "atelier")
+        with external_points():
+            self.assertEqual(self.spawn()["host"], "enfants")
+        self.assertIs(self.placement_of()["placement_ok"], False)
+        with external_points(tpk):
+            canon_sync.sync(self.db, self.load(), "enfants")
+        admitted = self.placement_of()
+        self.assertTrue(admitted["placement_ok"], admitted["placement_diagnostic"])
+        self.assertIsNotNone(registry.claim(self.db, "enfant1", "enfants/alice", 600))
 
     def test_petit_enfant_ne_revient_pas_sur_un_hote_ancetre(self):
         self.spawn()

@@ -534,6 +534,29 @@ def refuse_missing(verdict, agent, absent):
             "; " + verdict.diagnostic if verdict.diagnostic else "")
 
 
+#: #7860: head of the verdict of an avatar child placed on another host while
+#: a module of its projects depends on what that host installed.
+UNCONFIRMED_PREFIX = "module availability to be confirmed by its host"
+
+
+def host_dependent(canon, projects):
+    """Modules selected for `projects` whose presence depends on the host: an
+    installed entry point, or a module missing here. Built-in modules ship
+    with ameesh and Pipeline cards with the canon: they are the same on every
+    host. Only the host itself can confirm the others (its `canon sync`)."""
+    try:
+        resolution = resolve(canon.federation, canon)
+    except ValueError:
+        return []
+    mine = set(projects or ())
+    shipped = set(_builtin())
+    names = {row["module"] for row in resolution.rows
+             if row["project"] in mine and row["module"] not in shipped
+             and canon.pipeline(row["module"]) is None}
+    names.update(name for name, _project in agent_needs(resolution.warnings, mine))
+    return sorted(names)
+
+
 def missing(canon):
     """The `project-module-missing` warnings of `canon` on this host; none when
     the declaration is invalid (`canon check` already refuses it)."""

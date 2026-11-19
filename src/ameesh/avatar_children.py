@@ -237,7 +237,7 @@ def _inside(path: str, parent: str | None) -> bool:
 
 
 def _refusal_reason(*, canon, host: str, db: Db, tenant: str, root_card: Any,
-                   child: str, lineage_rows: list[dict], absent=()) -> str:
+                   child: str, lineage_rows: list[dict]) -> str:
     """Pourquoi `host` ne peut pas recevoir l'enfant ("" = admissible)."""
     cards = [h for h in canon.hosts if h.title == host]
     if not cards:
@@ -246,10 +246,6 @@ def _refusal_reason(*, canon, host: str, db: Db, tenant: str, root_card: Any,
         return "Host card declared %d times: ambiguous policy" % len(cards)
     host_card = cards[0]
     verdict = placement.evaluate(canon, root_card.title, host)
-    # #7860 : un module absent de cet hôte et sélectionné par un projet de
-    # l'avatar refuse l'enfant, comme le placement de l'avatar lui-même.
-    from . import modules as project_modules
-    project_modules.refuse_missing(verdict, root_card, absent)
     if verdict.ok is not True:
         return "placement refused: %s" % (verdict.diagnostic or "not admitted")
     policy = storage.of(db).tenancy.policy(host)
@@ -370,16 +366,22 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
     lineage_hosts = [str(row.get("host")) for row in lineage_rows if row.get("host")]
     excluded = [host for host in admitted if host in lineage_hosts]
     candidates = [host for host in admitted if host not in lineage_hosts]
-    # #7860 : fait local, lu une fois pour tous les hôtes candidats.
+    # #7860 : un enfant va toujours sur un AUTRE hôte que celui qui décide ; les
+    # modules installés de cet hôte ne se lisent pas d'ici. L'enfant naît non
+    # réclamable et le `canon sync` de son hôte tranche (`_own_child_verdict`).
     from . import modules as project_modules
-    absent = project_modules.missing(canon) if canon is not None else ()
+    pending = project_modules.host_dependent(canon, root_card.effective_projects)
     reasons: list[tuple[str, str]] = []
     for host in candidates:
         why = _refusal_reason(canon=canon, host=host, db=db, tenant=tenant,
                               root_card=root_card, child=child,
-                              lineage_rows=lineage_rows, absent=absent)
+                              lineage_rows=lineage_rows)
         if not why:
             verdict = placement.evaluate(canon, root_card.title, host)
+            if pending:
+                verdict.ok = False
+                verdict.diagnostic = "%s: %s — `ameesh canon sync` on %s" % (
+                    project_modules.UNCONFIRMED_PREFIX, ", ".join(pending), host)
             host_card = canon.host(host)
             workdir, _source = child_workdir(host_card, root_card, child)
             workdir = _expand_child_path(workdir or "", tenant)
