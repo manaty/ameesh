@@ -349,6 +349,7 @@
                     "placement_missing",
                     "placement_refused",
                     "placement_profile_diverged",
+                    "module_missing",
                     "claim_predicate"
                   ],
                   "type": "string"
@@ -2005,6 +2006,7 @@
               "agent.moved",
               "agent.attach",
               "agent.tools",
+              "agent.read",
               "host.memory_unavailable",
               "cost.recorded",
               "thread.entry",

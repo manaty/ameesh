@@ -17,6 +17,11 @@
       "restore": "src/ameesh/migrations/rollback/0596_restore.sql",
       "rejects_previous_writes": false,
       "previous_writes_justification": "#7865: the trigger only copies an already-recorded attempt state into the spend ledger; it never rejects a write"
+    },
+    "src/ameesh/migrations/0598_bureau_clear_only.sql": {
+      "checksum": "25417ce2c34be1d93859f373f99de9df8bc233d9d201a5f8818b1cc23933f475",
+      "lot": 7870,
+      "restore": "src/ameesh/migrations/rollback/0598_restore.sql"
     }
   },
   "exceptions": {

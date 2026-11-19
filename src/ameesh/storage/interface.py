@@ -3099,13 +3099,19 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def set_external_executor(self, item_id: int, executor: str | None, *,
                               session: str | None = None, note: str,
-                              actor: str) -> dict | None:
+                              actor: str, expect_executor: str | None = None,
+                              expect_session: str | None = None) -> dict | None:
         """#3447 : pose (ou efface, `executor=None`) l'exécutant externe d'un
         lot ouvert, avec sa ligne de journal, en UNE transaction ; None si le
         lot est fermé, ou si la pose perd la course contre une attribution.
         Un lot assigné ne reçoit pas d'exécutant externe (deux porteurs).
         #6839 : `session` nomme la session exécutante du feu ; une levée efface
-        aussi la prise exclusive et son instant."""
+        aussi la prise exclusive et son instant.
+
+        #7870 : une levée par l'exécutant réservé passe la réservation lue
+        avant son verrou (`expect_executor`, `expect_session`). Sous le verrou,
+        une réservation différente n'écrit RIEN et rend None : la preuve ne
+        vaut que pour la réservation qu'elle a vérifiée (B2 de la relecture)."""
 
     @abc.abstractmethod
     def claim_external(self, item_id: int, session: str, *, note: str,

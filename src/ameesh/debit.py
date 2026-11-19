@@ -162,6 +162,9 @@ _UNDEPLOYED = re.compile(
     r"jusqu'au|avant|après|dès)\b[^.;]{0,60}\bd[ée]ploiement\b"
     r"|\bd[ée]ploiement\s+(?:constat[ée]e?|non\s+constat[ée]e?|à\s+faire|"
     r"attendu|requis|dû|pas\s+fait)\b", re.I)
+#: #7847 : un `#N` cité par une retenue (lot, PR, ticket). Seul un lot lu peut
+#: prouver la fusion ; un numéro de PR ou de ticket ne résout aucun lot.
+_CITED_LOT = re.compile(r"(?<![\w/])#([1-9][0-9]*)\b")
 _DEVICE_TOKEN = re.compile(r"`([^`]+)`")
 _DEVICE_PHRASE = re.compile(r"\b((?:Mac|PC|portable|ordinateur)\s+de\s+[A-ZÉÈÀÂÎÔÛ][\w-]+)",
                             re.I)
@@ -290,6 +293,37 @@ def installed_version() -> str:
 
 def _version_gt(left: tuple[int, int, int], right: tuple[int, int, int] | None) -> bool:
     return right is not None and left > right
+
+
+def _cites_unmerged_fix(note: Any, *, known: Iterable[int],
+                        states: Mapping[int, str | None],
+                        milestones: Mapping[int, Iterable[Mapping[str, Any]]],
+                        own: int | None = None) -> bool:
+    """#7847 : le hold cite-t-il un lot lu qui n'est pas fusionné ?
+
+    Un hold « correctif fusionné non déployé » n'est reconnu que si les `#N`
+    qu'il cite ne contredisent pas la fusion. Un `#N` qui ne correspond à
+    aucun lot lu (numéro de PR, ticket, lot hors de la fenêtre) ne prouve rien
+    et ne fait pas basculer la ligne ; le lot retenu lui-même (`own`) est son
+    sujet, jamais le correctif cité. Un lot lu dont un jalon ou l'état du
+    journal dit la fusion (`merged`, `delivered`, `promoted`) la prouve ; un
+    lot lu dans un autre état ne la prouve pas : le hold reprend le geste
+    ordinaire, le sens sûr. Un état illisible ne conclut pas.
+    """
+    known = set(known)
+    for match in _CITED_LOT.finditer(str(note or "")):
+        ident = int(match.group(1))
+        if ident == own or ident not in known:
+            continue
+        if states.get(ident) in lifecycle.DELIVERED:
+            continue
+        if any(str(mark.get("kind") or "") in ("merged", "delivered")
+               for mark in milestones.get(ident, ())):
+            continue
+        if states.get(ident) is None:
+            continue                    # aucun état lu : ne pas conclure
+        return True
+    return False
 
 
 def _branch_name(value: Any) -> str:
@@ -1766,8 +1800,15 @@ def build(*, items: Iterable[Mapping[str, Any]],
             device = match_device(note, devices)
             versions = _versions(note)
             version = max(versions) if versions else None
-            undeployed = bool(_UNDEPLOYED.search(note)) \
+            # #7847 : « correctif fusionné non déployé » ne vaut que si le `#N`
+            # cité est un lot réellement fusionné ; un correctif encore ouvert
+            # ne peut pas attendre son staging, le hold reste ordinaire.
+            undeployed = (
+                bool(_UNDEPLOYED.search(note))
                 or any(_version_gt(item, installed_triple) for item in versions)
+            ) and not _cites_unmerged_fix(
+                note, known=by_id, states=state_by_lot,
+                milestones=milestones_by_lot, own=ident)
             entry = {
                 "lot": ident, "title": item.get("title") or "",
                 "app": item.get("app") or None,

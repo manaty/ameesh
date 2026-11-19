@@ -680,7 +680,7 @@ export interface components {
                 admitted: boolean | null;
                 claim_predicate: boolean;
                 governed: boolean;
-                reasons: ("mode_externe" | "retired" | "ephemeral_expired" | "host_claims_closed" | "handoff_fenced" | "responsible_missing" | "responsible_policy_unavailable" | "canon_state_missing" | "canon_state_not_ok" | "canon_stale" | "canon_ref_mismatch" | "placement_missing" | "placement_refused" | "placement_profile_diverged" | "claim_predicate")[];
+                reasons: ("mode_externe" | "retired" | "ephemeral_expired" | "host_claims_closed" | "handoff_fenced" | "responsible_missing" | "responsible_policy_unavailable" | "canon_state_missing" | "canon_state_not_ok" | "canon_stale" | "canon_ref_mismatch" | "placement_missing" | "placement_refused" | "placement_profile_diverged" | "module_missing" | "claim_predicate")[];
                 responsible_required: boolean | null;
             };
             agent: {
@@ -1017,7 +1017,7 @@ export interface components {
             project: string | null;
             ts: number;
             /** @enum {unknown} */
-            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "agent.attach" | "agent.tools" | "host.memory_unavailable" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "git.lock_removed" | "mail.export" | "packet.pause" | "auditor.pass" | "packet.client_types";
+            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "agent.attach" | "agent.tools" | "agent.read" | "host.memory_unavailable" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "git.lock_removed" | "mail.export" | "packet.pause" | "auditor.pass" | "packet.client_types";
         };
         "ameesh-host-1": {
             history: Record<string, never>[];

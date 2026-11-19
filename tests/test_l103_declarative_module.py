@@ -175,14 +175,17 @@ class ActivationTest(unittest.TestCase):
     def test_without_the_canon_the_card_name_is_unknown(self):
         c = canon_with(card("livraison"),
                        projects={"acme": {"modules": ["livraison"]}})
-        with self.assertRaisesRegex(ValueError, "unknown installed module: livraison"):
-            modules.declarations(c.federation)
+        resolution = modules.resolve(c.federation)
+        self.assertEqual(resolution.rows, ())
+        self.assertEqual([(w["code"], w["name"]) for w in resolution.warnings],
+                         [("project-module-missing", "livraison")])
 
-    def test_canon_check_refuses_an_unknown_name(self):
+    def test_canon_check_warns_on_an_unknown_project_name(self):
+        # #7860: only the agents of `acme` are refused, on this host
         c = canon_with(projects={"acme": {"modules": ["absent"]}})
         found = canon.validate(c)
-        error = next(f for f in found if f.code == "project-modules-invalid")
-        self.assertIn("unknown installed module: absent", error.message)
+        self.assertNotIn("project-modules-invalid", codes(found))
+        self.assertIn("project-module-missing", codes(found, canon.WARNING))
 
     def test_canon_check_refuses_an_activated_invalid_card(self):
         c = canon_with(card("cassee", valid=False, error="bloc fautif"),
