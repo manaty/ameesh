@@ -2268,6 +2268,29 @@ def _floor_of(db, lot: int, cfg) -> int:
     return int(review_floor.of_lot(db, int(lot), cfg=cfg).get("floor") or 0)
 
 
+def _with_live_families(db, seats, *, families) -> list:
+    """Seats whose family the mark left empty, read from the registry (#7822).
+
+    A carried mark (`verdict_carry.carried_mark_note`) names the reported
+    reviewers without their family. The completion counted no family for
+    them, judged the seats short and sent the kept reviewers a new request at
+    every policy recheck (#7745, #7767). The family is the live one, as the
+    selection reads it; an unreadable row leaves the seat without family,
+    which never covers a seat.
+    """
+    out = []
+    for seat in seats or ():
+        seat = dict(seat)
+        if not str(seat.get("family") or "").strip():
+            try:
+                row = registry.get(db, seat["name"]) or {}
+            except Exception:  # noqa: BLE001 - an unreadable row proves nothing
+                row = {}
+            seat["family"] = rd.live_family(row, families=families)
+        out.append(seat)
+    return out
+
+
 def _mark_covers(mark: Mapping, floor: int, *, column=None) -> bool:
     """True when a recorded designation already covers `floor` opinions.
 
@@ -4457,7 +4480,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             # nouveau comme candidat (sinon la complétion réinscrit le retrait
             # sans courrier, B/P1 dev4) : il est exclu, et l'attente est
             # journalisée si la couverture manque.
-            live_seats = _kept_seats(completion["shape"], item)
+            live_seats = _with_live_families(
+                db, _kept_seats(completion["shape"], item),
+                families=inputs.policy.families)
             live_names = {seat["name"] for seat in live_seats}
             mark_names = {str((row or {}).get("name") or "").strip()
                           for row in (completion["shape"] or {}).get("reviewers") or ()}
