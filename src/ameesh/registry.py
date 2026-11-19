@@ -256,15 +256,18 @@ def lease_agent(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, d
     return True, "", row
 
 
-def lease_agent_locked(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+def lease_agent_locked(db: Db, name: str, owner: str, epoch: int, *,
+                       peer: str | None = None) -> tuple[bool, str, dict | None]:
     """#7672 : `lease_agent`, mais la ligne du registre reste verrouillée.
 
     À appeler DANS la transaction qui écrit sous le bail : le contrôle et
     l'écriture voient la même version de la ligne, et un changement de
     détenteur ou d'epoch attend le commit. Doit donc être suivi d'un commit
-    (ou rollback) rapide ; jamais d'appel hors transaction.
+    (ou rollback) rapide ; jamais d'appel hors transaction. #7778 : `peer`,
+    le correspondant de l'écriture qui suit, verrouillé dans l'ordre des noms
+    (voir `Leases.fence`).
     """
-    return storage.of(db).leases.fence(name, owner, epoch)
+    return storage.of(db).leases.fence(name, owner, epoch, peer=peer)
 
 
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:

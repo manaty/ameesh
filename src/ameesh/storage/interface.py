@@ -532,8 +532,15 @@ class Leases(Domain):
         (`live`), ou None."""
 
     @abc.abstractmethod
-    def fence(self, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
+    def fence(self, name: str, owner: str, epoch: int, *,
+              peer: str | None = None) -> tuple[bool, str, dict | None]:
         """#7672 : le bail, verrouillé (`FOR UPDATE`) puis recontrôlé.
+
+        #7778 : `peer`, le correspondant dont l'écriture prendra ensuite la
+        ligne en partage (`FOR SHARE` du dépôt) ; quand son nom précède
+        `name`, sa ligne est prise d'abord. Les deux lignes suivent ainsi
+        l'ordre des noms : deux agents qui se répondent ne s'interbloquent
+        pas.
 
         Même verdict que `registry.lease_agent`, mais la ligne du registre est
         tenue jusqu'au commit : un changement de détenteur, d'epoch ou une
