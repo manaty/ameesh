@@ -15754,7 +15754,10 @@ class Runner:
         # écarte `max_load` ; la première fiche qui en déclare un fait foi.
         runtime = None
         for one in canons:
-            fiche = one.host(self.host) if hasattr(one, "host") else None
+            # Un faux canon de test peut porter `host=None` : l'attribut
+            # existe sans être appelable (L159f), comme dans lease_ttl_rule.
+            lookup = getattr(one, "host", None)
+            fiche = lookup(self.host) if callable(lookup) else None
             candidate = getattr(getattr(fiche, "policy", None), "runtime", None)
             if candidate is not None:
                 runtime = candidate

@@ -325,7 +325,10 @@ def pod_runtime(cfg, host: str):
     rend jamais un hôte pod par défaut (fail closed)."""
     try:
         for canon in canon_mod.load_configured(cfg):
-            fiche = canon.host(host) if hasattr(canon, "host") else None
+            # Même garde que runner.refresh_host_limits : un faux canon peut
+            # porter `host=None`, attribut présent mais non appelable.
+            lookup = getattr(canon, "host", None)
+            fiche = lookup(host) if callable(lookup) else None
             runtime = getattr(getattr(fiche, "policy", None), "runtime", None)
             if runtime is not None:
                 return runtime
