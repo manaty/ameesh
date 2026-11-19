@@ -108,7 +108,7 @@
         KMS/IAM and production acts whose broker trace is incomplete (#7767);
   ameesh gate broker serve|check [--config F] [--json]
         the credential-gate service, run by its own Unix account (#7767);
-  ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO  check before an act;
+  ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO [--dry-run]  check before an act;
   ameesh github gestes [--since 24h] [--agent A] [--match 'run cancel'] [--json]
         | identity <agent> [--json]
         the gh commands run by agents, journaled per turn (who cancelled,
