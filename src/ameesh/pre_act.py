@@ -53,7 +53,7 @@ def parse_since(value):
 
 
 def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
-            request_id="", cfg=None):
+            request_id="", cfg=None, dry_run=False):
     """Read the journal and mailbox and record a receipt in one transaction."""
     item = tx.query("SELECT state, extract(epoch from now())::float8 AS now_ts "
                     "FROM work_items WHERE id = %s FOR NO KEY UPDATE", (lot,))
@@ -97,7 +97,10 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
     # even when delivered: a session may have consumed mail during the wait.
     reference = r"(^|[^0-9])#%s([^0-9]|$)" % lot
     messages = tx.query(
-        "SELECT id, sender, recipient, body, delivered_at IS NULL AS unread, "
+        "SELECT id, sender, recipient, body, kind, "
+        "payload->'decision_answer'->>'decision' AS answer_decision, "
+        "payload->'decision_answer'->>'text' AS answer_text, "
+        "delivered_at IS NULL AS unread, "
         "extract(epoch from created_at)::float8 AS ts, "
         "payload->'decision'->>'state' AS decision_state, "
         "payload->'decision'->'withdrawn'->>'ts' AS withdrawn_ts "
@@ -108,8 +111,15 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
             continue
         if message.get("recipient") == actor and message.get("unread"):
             raise Refused("unread lot mail #%s" % message["id"])
-        if float(message["ts"]) >= since and planned_waits.contains_stop(
-                message.get("body") or ""):
+        body = message.get("body") or ""
+        # Generated decision replies append the original question verbatim.
+        # Inspect the answer and option label, but not that quoted question.
+        if message.get("kind") == "reply" and message.get("answer_decision"):
+            header = body.split("\n", 1)[0]
+            # The title preceding the final answer marker is quoted context too.
+            answer_header = header.rsplit(": option ", 1)[-1] if ": option " in header else ""
+            body = answer_header + "\n" + (message.get("answer_text") or "")
+        if float(message["ts"]) >= since and planned_waits.contains_stop(body):
             raise Refused("STOP in lot mail #%s" % message["id"])
         if message.get("decision_state") == "withdrawn":
             try:
@@ -120,6 +130,9 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
                 raise Refused("withdrawn decision #%s has no readable timestamp" % message["id"])
             if withdrawn >= since:
                 raise Refused("withdrawn decision #%s" % message["id"])
+
+    if dry_run:
+        return None
 
     note = "pre-act: kind=%s actor=%s since=%s" % (kind, actor, since)
     pregeste_id = pregeste_id or str(uuid.uuid4())
@@ -229,6 +242,7 @@ def main(argv=None):
     window.add_argument("--since", help="ISO timestamp with timezone captured before waiting")
     window.add_argument("--wait-until", help="wait until ISO timestamp, then check and execute")
     parser.add_argument("--target", default="", help="target of the effect")
+    parser.add_argument("--dry-run", action="store_true", help="check without recording a receipt or executing a command")
     parser.add_argument("command", nargs=argparse.REMAINDER,
                         help="optional command after --, executed immediately after the check")
     args = parser.parse_args(argv)
@@ -239,6 +253,8 @@ def main(argv=None):
         parser.error("a command is required after --")
     db = None
     try:
+        if args.dry_run and command:
+            raise Refused("--dry-run cannot execute a command")
         if args.lot <= 0:
             raise Refused("invalid lot")
         if args.kind == "prod" and not args.target.strip():
@@ -277,11 +293,14 @@ def main(argv=None):
             raise Refused("valid agent identity required")
         check_started = time.monotonic()
         with db.transaction(isolation="READ COMMITTED") as tx:
-            pregeste_id = inspect(tx, args.lot, binding.name, since, args.kind, args.target.strip(), cfg=cfg)
+            pregeste_id = inspect(tx, args.lot, binding.name, since, args.kind, args.target.strip(), cfg=cfg, dry_run=args.dry_run)
         db.close()
         db = None
-        print("pre-act: receipt recorded for lot #%d (%s), pregeste=%s" %
-              (args.lot, args.kind, pregeste_id))
+        if args.dry_run:
+            print("pre-act: check passed for lot #%d (%s); no receipt recorded" % (args.lot, args.kind))
+        else:
+            print("pre-act: receipt recorded for lot #%d (%s), pregeste=%s" %
+                  (args.lot, args.kind, pregeste_id))
         if command:
             sys.stdout.flush()
             if time.monotonic() - check_started > 30:

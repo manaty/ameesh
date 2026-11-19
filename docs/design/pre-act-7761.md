@@ -103,3 +103,5 @@ Un marqueur absent, inconnu ou dupliqué déclenche une alerte de mode. Les
 workflows prod ordinaires sont tous contrôlés, quelle que soit leur branche.
 Le lecteur compatible et la migration additive doivent être déployés avant
 l'activation de la déclaration canonique (proposition home#304).
+
+Le mode `--dry-run` vérifie les mêmes conditions sans écrire de reçu et refuse toute commande à exécuter. Les réponses de décision gardent la détection de STOP dans la réponse et son option, sans interpréter la question reproduite comme un nouvel ordre.

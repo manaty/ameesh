@@ -33,6 +33,30 @@ class PreActTest(unittest.TestCase):
         with mock.patch.object(pre_act.planned_waits, "lift_authority", return_value=lambda who: False):
             return pre_act.inspect(tx, 5772, "bureau", 100, "kms")
 
+    def test_decision_reply_excludes_quoted_question_but_keeps_answer(self):
+        message = {"id": 42, "recipient": "other", "unread": False, "ts": 150,
+                   "kind": "reply", "answer_decision": "227075",
+                   "answer_text": "go", "body": 'Decision: option a "go"\nExact text: go\nYour question: séance suspendue'}
+        self.check(Transaction(messages=[message]))
+        message["answer_text"] = "STOP"
+        with self.assertRaisesRegex(pre_act.Refused, "STOP"):
+            self.check(Transaction(messages=[message]))
+
+    def test_dry_run_checks_without_writing(self):
+        tx = Transaction()
+        self.assertIsNone(pre_act.inspect(tx, 5772, "bureau", 100, "kms", dry_run=True))
+        self.assertEqual(tx.writes, [])
+        tx = Transaction(messages=[{"id": 42, "ts": 150, "body": "STOP"}])
+        with self.assertRaises(pre_act.Refused):
+            pre_act.inspect(tx, 5772, "bureau", 100, "kms", dry_run=True)
+        self.assertEqual(tx.writes, [])
+
+    def test_dry_run_rejects_command(self):
+        with mock.patch.object(pre_act.os, "execvp") as execute:
+            self.assertEqual(pre_act.main(["--lot", "5772", "--kind", "kms", "--since",
+                                           "1970-01-01T00:01:40Z", "--dry-run", "--", "true"]), 1)
+        execute.assert_not_called()
+
     def test_stop_delivered_during_wait_refuses_without_receipt(self):
         tx = Transaction(messages=[{"id": 42, "recipient": "bureau", "unread": False,
                                     "body": "STOP séance #5772", "ts": 150}])
