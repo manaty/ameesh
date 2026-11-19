@@ -4073,7 +4073,10 @@ class _Loader:
                 declared.append((member, entry.get(SCOPE_KEY), "members[%s].%s" % (member,
                                                                                   SCOPE_KEY)))
         for member, raw, label in declared:
-            where = {"member": root.member, "path": "federation.yaml"}
+            # The finding is about this member's scope, so it names that
+            # member: a root-only snapshot can then tell a sibling's unreadable
+            # scope (no content, listed as omitted) from the root's (refusal).
+            where = {"member": member, "path": "federation.yaml"}
             if raw is None:
                 continue
             if not isinstance(raw, dict):

@@ -87,10 +87,26 @@ def build(loaded, *, expected_commit, previous_commit=None, expected_scope=None,
             refuse("canon-unreadable")
         if loaded.untrusted:
             refuse("canon-untrusted")
-        if single_source and len(loaded.sources) != 1:
-            refuse("unexpected-source-count")
-        if loaded.sources:
-            root = loaded.sources[0]
+        root = loaded.sources[0] if loaded.sources else None
+        # A root-only request makes no completeness claim about sibling
+        # bundles: every declared sibling that contributed no card is listed
+        # as omitted and its diagnostics never become refusals. A sibling that
+        # did read cards is still an unexpected source (fail closed).
+        siblings: set[str] = set()
+        omitted: set[str] = set()
+        checked_sources = loaded.sources
+        if single_source and root is not None:
+            declared = {str(entry["id"])
+                        for entry in (loaded.federation or {}).get("members") or ()
+                        if isinstance(entry, dict) and entry.get("id")}
+            siblings = declared - {root.member}
+            omitted = {member for member in siblings
+                       if member in loaded.scope_unread}
+            if [s for s in loaded.sources[1:]
+                    if s.member not in loaded.scope_unread]:
+                refuse("unexpected-source-count")
+            checked_sources = [root]
+        if root is not None:
             if root.commit != expected_commit:
                 refuse("expected-commit-mismatch", root.member)
             if previous_commit and not canon.git_contains(root.repo, previous_commit,
@@ -100,21 +116,31 @@ def build(loaded, *, expected_commit, previous_commit=None, expected_scope=None,
                 scope, error = canon.parse_scope(expected_scope)
                 if error or scope != loaded.scopes.get(root.member):
                     refuse("expected-scope-mismatch", root.member)
-        for source in loaded.sources:
+        for source in checked_sources:
             for code in _source_errors(source):
                 refuse(code, source.member)
         findings = canon.validate(loaded)
-        result["findings"] = sorted((_finding(f) for f in findings),
+        visible = []
+        for finding in findings:
+            if finding.member in siblings:
+                # The sibling read no card: its state, scope or path cannot
+                # grant authority, and an ok document carries no ERROR about
+                # content it does not export.
+                omitted.add(finding.member)
+                continue
+            visible.append(finding)
+        result["findings"] = sorted((_finding(f) for f in visible),
                                     key=lambda f: (f["code"], f["member"] or "",
                                                    f["path"] or "", f["severity"]))
-        for finding in findings:
+        for finding in visible:
             if finding.severity == canon.ERROR or finding.code in _UNSAFE_FINDINGS:
                 refuse(finding.code, finding.member)
-            # A root-only request makes no completeness claim about sibling
-            # bundles. A federation-wide request must not silently omit them.
+            # A federation-wide request must not silently omit a member.
             if finding.code == "member-absent" and not single_source:
                 refuse(finding.code, finding.member)
-        if loaded.scope_unread:
+        if root is not None and root.member in loaded.scope_unread:
+            refuse("scope-unreadable")
+        elif not single_source and loaded.scope_unread:
             refuse("scope-unreadable")
         if result["refusals"]:
             return result
@@ -122,13 +148,14 @@ def build(loaded, *, expected_commit, previous_commit=None, expected_scope=None,
         payload = {
             "canon": loaded.id,
             "root_commit": expected_commit,
-            "omitted_members": sorted({f.member for f in findings
-                                       if f.code == "member-absent"}),
+            "omitted_members": (sorted(omitted) if single_source else
+                                sorted({f.member for f in findings
+                                        if f.code == "member-absent"})),
             "sources": sorted([
                 {"member": s.member, "commit": s.commit, "ref": s.rev,
                  "prefix": s.prefix, "scope": loaded.scopes.get(s.member),
                  "trust": "git-pinned"}
-                for s in loaded.sources
+                for s in checked_sources
             ], key=lambda s: (s["member"], s["prefix"], s["commit"])),
             "members": sorted([
                 {"title": m.title, "roles": m.roles, "deputies": m.deputies,
@@ -152,7 +179,7 @@ def build(loaded, *, expected_commit, previous_commit=None, expected_scope=None,
                              separators=(",", ":"), allow_nan=False).encode("utf-8")
         # Validate again after all projection work: no moving ref, dirty tree,
         # or checkout switch may acquire a successful freshness observation.
-        for source in loaded.sources:
+        for source in checked_sources:
             for code in _source_errors(source):
                 refuse(code, source.member)
         if result["refusals"]:
