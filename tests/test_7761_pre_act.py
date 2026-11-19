@@ -239,6 +239,10 @@ class PreActTest(unittest.TestCase):
         message = {"id": 4, "recipient": "bureau", "unread": True,
                    "body": "information", "ts": 100 - 86400 - 1}
         self.check(Transaction(messages=[message]))
+        message["body"] = "STOP #5772"
+        with self.assertRaisesRegex(pre_act.Refused, "unread"):
+            self.check(Transaction(messages=[message]))
+        message["body"] = "information"
         message["ts"] = 100 - 86400
         with self.assertRaisesRegex(pre_act.Refused, "unread"):
             self.check(Transaction(messages=[message]))
