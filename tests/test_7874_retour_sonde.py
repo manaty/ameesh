@@ -167,5 +167,32 @@ class ReleaseCheckTest(unittest.TestCase):
         self.assertEqual(out, {'host': AG3, 'ok': True, 'blockers': [], 'return_targets': []})
 
 
+
+class ListingReleveTest(PgTestCase):
+    """B of mty-amh-docs-01 (freeze #44304): the real `Operations.listing()`
+    did not select `releve`, so an elected role was read as placed."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute('DELETE FROM host_lifecycle')
+        registry.upsert(self.db, 'placed', harness='claude', host=AG3)
+        registry.upsert(self.db, 'pilot', harness='claude', host=AG3)
+        self.db.execute("UPDATE agent_registry SET releve='election', candidats=%s, "
+                        "admitted_hosts=%s WHERE name='pilot'",
+                        ([AG3, 'ameesh-agents-1'], [AG3]))
+        self.db.execute("UPDATE agent_registry SET admitted_hosts=%s WHERE name='placed'", ([AG3],))
+
+    def test_listing_carries_releve_and_the_guard_skips_elected_roles(self):
+        listing = storage.of(self.db).operations.listing()
+        rows = {r['name']: r for r in listing if r['name'] in ('placed', 'pilot')}
+        self.assertEqual(rows['pilot']['releve'], 'election')
+        lots = [dict(id=1, state='build', assignee='placed', title='a'),
+                dict(id=2, state='build', assignee='pilot', title='b')]
+        listing = [dict(r, actionable_lots=1) if r['name'] in rows else r for r in listing]
+        out = host_release.release_check(AG3, listing, lots, controls={}, holds={})
+        self.assertEqual([l['id'] for l in out['blockers']], [1])
+        self.assertEqual(out['return_targets'], ['placed'])
+
+
 if __name__ == '__main__':
     unittest.main()
