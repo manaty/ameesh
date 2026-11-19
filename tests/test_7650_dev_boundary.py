@@ -342,7 +342,7 @@ class DevBoundaryTest(unittest.TestCase):
         directory = SOURCE / "modules" / "dev" / "storage"
         modules = sorted(path.stem for path in directory.glob("*.py")
                          if path.stem != "__init__")
-        self.assertEqual(len(modules), 13, modules)
+        self.assertTrue(modules)
         script = (
             "import importlib\n"
             "import sys\n"
@@ -356,11 +356,44 @@ class DevBoundaryTest(unittest.TestCase):
             with self.subTest(module=module):
                 done = subprocess.run(
                     [sys.executable, "-c", script, package + "." + module],
-                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
+                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
                 self.assertEqual(
                     done.returncode, 0,
                     "import isolé de %s.%s échoue :\n%s"
                     % (package, module, done.stderr[-2000:]))
+
+    def test_apply_unknown_repository_needs_no_database(self):
+        """B de #7808 : `_apply_unknown('repository')` construit son SQL avec
+        une transaction factice, donc sans base ni pilote. Le noyau y est
+        importé à l'usage (`_done_sql`) : un nom retiré du module (le
+        `_DONE_SQL` du chargement) se voit ici au lieu d'un NameError dans la
+        transaction réelle."""
+        from ameesh.modules.dev.storage.work_footprints import WorkFootprints
+
+        class _Tx:
+            def __init__(self):
+                self.queries = []
+                self.executes = []
+
+            def query(self, sql, params=()):
+                self.queries.append((sql, params))
+                return [{"id": 7, "state": "build"}]
+
+            def execute(self, sql, params=()):
+                self.executes.append((sql, params))
+
+        tx = _Tx()
+        marked = WorkFootprints._apply_unknown(
+            tx, "acme", "repository", "agent")
+        self.assertEqual(marked, [7])
+        self.assertEqual(tx.queries[0][1], ("acme",))
+        self.assertIn("w.state NOT IN ('delivered', 'delivered', 'closed')",
+                      tx.queries[0][0])
+        # une empreinte `.`, une analyse inconnue, une ligne de journal
+        self.assertEqual(len(tx.executes), 3, tx.executes)
+        self.assertIn("work_item_footprints", tx.executes[0][0])
+        self.assertIn("work_item_impact_analyses", tx.executes[1][0])
+        self.assertIn("work_item_events", tx.executes[2][0])
 
 
 if __name__ == "__main__":

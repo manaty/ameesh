@@ -33,11 +33,16 @@ def occupying_sql(alias: str) -> str:
 
     Import paresseux : `storage.postgres.work_dependencies` charge le paquet
     `storage.postgres`, dont les alias datés importent ce module (#7808)."""
-    from ....storage.postgres.work_dependencies import _DONE_SQL
-
-    return ("(" + alias + ".state NOT IN " + _DONE_SQL +
+    return ("(" + alias + ".state NOT IN " + _done_sql() +
             " AND (" + alias + ".assignee IS NOT NULL OR " + alias
             + ".state <> '" + lifecycle.REQUESTED + "'))")
+
+
+def _done_sql() -> str:
+    """Les états terminaux du noyau, importés à l'usage (#7808)."""
+    from ....storage.postgres.work_dependencies import _DONE_SQL
+
+    return _DONE_SQL
 
 
 def _graph_lock_sql() -> str:
@@ -380,7 +385,7 @@ class WorkFootprints(DevDomain, Contract):
         if policy == "repository":
             rows = tx.query(
                 "SELECT w.id, w.state FROM work_items w"
-                " WHERE btrim(w.app) = %s AND w.state NOT IN " + _DONE_SQL +
+                " WHERE btrim(w.app) = %s AND w.state NOT IN " + _done_sql() +
                 "   AND NOT " + exempt_sql("w") +
                 "   AND (NOT EXISTS (SELECT 1 FROM work_item_footprints f"
                 "                     WHERE f.work_item_id = w.id)"
