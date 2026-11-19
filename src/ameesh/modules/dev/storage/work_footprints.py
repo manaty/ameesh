@@ -6,17 +6,9 @@ from .... import work_lifecycle as lifecycle
 
 from ....storage.work_footprints import WorkFootprints as Contract
 from .schema import DevDomain
-from ....storage.postgres.catalog import _text_array
-from ....storage.postgres.work_dependencies import _DONE_SQL, _LOCK as _GRAPH_LOCK, _UNPINNED
 
 #: Le préfixe de `source` d'un panier (`backlog.BASKET_PREFIX`).
 BASKET_PREFIX = "backlog-basket:"
-
-#: Un lot OCCUPE son empreinte dès qu'il est confié ou démarré, jusqu'à sa
-#: fusion (ou sa fermeture) : sa branche peut encore entrer en conflit. Un lot
-#: `intake` sans assigné n'occupe rien.
-_OCCUPYING = ("({o}.state NOT IN " + _DONE_SQL +
-              f" AND ({{o}}.assignee IS NOT NULL OR {{o}}.state <> '{lifecycle.REQUESTED}'))")
 
 #: Deux chemins se chevauchent : égaux, ou l'un est un dossier parent de
 #: l'autre ; le marqueur `.` (empreinte inconnue, dépôt entier, #4818)
@@ -35,7 +27,29 @@ _SHARED = ("EXISTS (SELECT 1 FROM repository_footprint_policies sp,"
 
 
 def occupying_sql(alias: str) -> str:
-    return _OCCUPYING.format(o=alias)
+    """Un lot OCCUPE son empreinte dès qu'il est confié ou démarré, jusqu'à sa
+    fusion (ou sa fermeture) : sa branche peut encore entrer en conflit. Un lot
+    `intake` sans assigné n'occupe rien.
+
+    Import paresseux : `storage.postgres.work_dependencies` charge le paquet
+    `storage.postgres`, dont les alias datés importent ce module (#7808)."""
+    return ("(" + alias + ".state NOT IN " + _done_sql() +
+            " AND (" + alias + ".assignee IS NOT NULL OR " + alias
+            + ".state <> '" + lifecycle.REQUESTED + "'))")
+
+
+def _done_sql() -> str:
+    """Les états terminaux du noyau, importés à l'usage (#7808)."""
+    from ....storage.postgres.work_dependencies import _DONE_SQL
+
+    return _DONE_SQL
+
+
+def _graph_lock_sql() -> str:
+    """Le verrou du graphe des dépendances, importé à l'usage (#7808)."""
+    from ....storage.postgres.work_dependencies import _LOCK
+
+    return _LOCK
 
 
 def footprints_overlap_sql(left: str, right: str) -> str:
@@ -219,7 +233,7 @@ class WorkFootprints(DevDomain, Contract):
             # Le verrou de la garde (prise, attribution, création attribuée),
             # pris avant la ligne du lot comme elles : une empreinte ne change
             # pas entre leur contrôle et leur écriture (B2 de la relecture).
-            tx.execute(_GRAPH_LOCK)
+            tx.execute(_graph_lock_sql())
             rows = tx.query("SELECT id, CASE WHEN state = 'delivered' THEN coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE state END AS state FROM work_items WHERE id = %s"
                             " FOR NO KEY UPDATE", (int(item_id),))
             if not rows:
@@ -321,10 +335,14 @@ class WorkFootprints(DevDomain, Contract):
 
     def set_policy(self, app, *, actor, unknown_policy=None, max_in_flight=None,
                    clear_cap=False, shared_paths=None):
+        # import paresseux (#7808) : charger `storage.postgres` au chargement
+        # de ce module refermerait le cycle `dev.storage` → `storage.postgres`.
+        from ....storage.postgres.catalog import _text_array
+
         with self.db.transaction() as tx:
             # le verrou de la garde : une politique ne change pas entre le
             # contrôle d'une attribution et son écriture
-            tx.execute(_GRAPH_LOCK)
+            tx.execute(_graph_lock_sql())
             rows = tx.query("SELECT unknown_policy, max_in_flight, shared_paths"
                             "  FROM repository_footprint_policies WHERE app = %s"
                             " FOR UPDATE", (str(app),))
@@ -367,7 +385,7 @@ class WorkFootprints(DevDomain, Contract):
         if policy == "repository":
             rows = tx.query(
                 "SELECT w.id, w.state FROM work_items w"
-                " WHERE btrim(w.app) = %s AND w.state NOT IN " + _DONE_SQL +
+                " WHERE btrim(w.app) = %s AND w.state NOT IN " + _done_sql() +
                 "   AND NOT " + exempt_sql("w") +
                 "   AND (NOT EXISTS (SELECT 1 FROM work_item_footprints f"
                 "                     WHERE f.work_item_id = w.id)"
@@ -523,12 +541,16 @@ class WorkFootprints(DevDomain, Contract):
             " ORDER BY w.id LIMIT %s", params + (int(limit),))
 
     def release(self, item_id, *, state, assignee, executor, note, actor):
+        # import paresseux (#7808) : charger `storage.postgres` au chargement
+        # de ce module refermerait le cycle `dev.storage` → `storage.postgres`.
+        from ....storage.postgres.work_dependencies import _UNPINNED
+
         # #6092 : sous le verrou de la garde, comme la prise et l'attribution :
         # une prise qui lit l'occupation ne croise jamais une libération à
         # moitié écrite. CAS sur l'état, l'assigné et la réservation
         # d'exécutant externe lus par l'appelant (B2 de cx1).
         with self.db.transaction() as tx:
-            tx.execute(_GRAPH_LOCK)
+            tx.execute(_graph_lock_sql())
             rows = tx.query(
                 "UPDATE work_items SET state = %s, assignee = NULL, updated_at = now(),"
                 "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
