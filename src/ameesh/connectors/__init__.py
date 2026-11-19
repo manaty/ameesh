@@ -56,6 +56,11 @@ class Action:
     policy_version: str = "1"
     attempt: int = 0
     work_item: Optional[int] = None
+    #: #7865 : description de la dépense, copiée dans l'action (jamais lue du
+    #: connecteur comme une autorisation ; la porte décide sur la ligne)
+    recurrence: str = "once"
+    spend_provider: str = ""
+    spend_purpose: str = ""
 
 
 @dataclass(frozen=True)

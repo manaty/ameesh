@@ -769,6 +769,62 @@ ligne et la version de charte ; l'action couverte recopie cette version dans
 `ameesh action recap --avatar N --since 7d` range les actions de l'avatar par
 issue de la charte (fait seul, soumis, refusé).
 
+**Dépense pré-déléguée (#7865).** Un grant peut porter une dimension `spend =
+{max_per_month, max_per_day, providers, purposes}`, signée avec le reste du
+reçu. Les plafonds sont en unités mineures de la devise du grant ;
+`providers` et `purposes` sont des listes fermées. Le canon doit alors
+compiler `review_horizon_hours` (la prochaine revue humaine, jamais une
+constante cachée), recopié dans le grant à l'enregistrement. Une action de
+dépense déclare dans ses `args` signés `spend = {recurrence, provider,
+purpose}` : `recurrence` vaut `once` ou `daily` (aucun engagement mensuel ou
+annuel n'est représentable), et seuls les fournisseurs et objets du grant
+passent. Sous le verrou du grant, le contrôle lit le ledger `spend_ledger`
+(une ligne par action de dépense : montant, récurrence, fournisseur, objet,
+décideur, grant) : le plafond journalier compte la journée, le mensuel le
+déjà dépensé plus le coût quotidien de chaque ressource en cours jusqu'à SA
+prochaine revue (ou jusqu'à l'horizon du grant pour une candidate). Un
+plafond atteint refuse nommément (`spend_daily_cap`, `spend_monthly_cap`,
+`spend_total_cap`, `spend_provider`, `spend_purpose`, `spend_currency`,
+`spend_recurrence`, `spend_amount`, `spend_scope`, `spend_review`) et
+escalade au responsable du grant ; jamais de dépassement.
+
+L'arrêt d'une ressource récurrente est une ACTION du connecteur
+(`operation = 'stop'`, classe réversible), liée à la ligne du ledger
+(`stop_action_id`) : la ligne ne passe `stopped` qu'à la confirmation de
+cette action, jamais sur déclaration ; un échec certain libère la demande,
+une issue inconnue la laisse en place. L'action doit viser exactement la
+ressource (même connecteur, cible et projet), nommer dans ses `args` signés
+la ligne et son action de départ, et ne peut être liée qu'à une seule ligne.
+`ameesh action spend stop <ledger>` émet et exécute cet arrêt sous l'acteur
+`agent:`/`human:` qui le demande (jamais un `--by` libre). À la prochaine
+revue, l'owner confirme la ressource par une DÉCISION SIGNÉE
+(`ameesh action spend confirm <ledger> --decision N`) dont l'option signée
+est exactement `confirm-spend-<ledger>` : la preuve (`verify_proof` vivante,
+clé `owner`) est vérifiée, `confirmed_at` est l'heure réelle de la base,
+aucune date n'est fournie par l'appelant. Une décision ne sert qu'UNE fois :
+son usage est inscrit dans `spend_review_confirmations` (clé primaire sur la
+décision), la rejouer sur la même ligne rend la ligne courante sans
+rafraîchir `confirmed_at`, même après une décision plus récente, et une
+décision déjà utilisée ailleurs est refusée. L'heure signée doit être
+postérieure à la dernière confirmation : une signature antérieure ne peut
+pas prolonger la revue, et une signature de plus d'une heure (ou expirée)
+est refusée dès le premier usage. La confirmation ouvre une nouvelle
+fenêtre `review_horizon_hours`. Sans confirmation, le balayage
+`ameesh action spend sweep` calcule, PAR GRANT, le déjà-dépensé plus le coût
+futur de chaque ressource en cours jusqu'à sa revue ; il arrête les
+ressources dont la revue est dépassée, puis assez de ressources (coût futur
+le plus élevé d'abord) pour que la projection des lignes conservées tienne
+sous le plafond mensuel ET total, avant le jour qui les franchirait. Le
+balayage est déclenché chaque jour à 23:30 UTC par la minuterie de rôle
+`ameesh-spend-sweep` (sous le bail élu), avant la bascule du jour ; une
+sortie en échec est journalisée et chaque arrêt non confirmé est escaladé au
+responsable du grant. Le relevé (`ameesh action recap`) liste les
+ressources récurrentes, leur projection, leur échéance de revue et la
+commande d'arrêt ; `ameesh action spend list|state` donnent le ledger et la
+projection d'un grant. Une dépense `daily` n'est acceptée que si le
+connecteur classe `stop` comme réversible : sinon le balayage ne pourrait
+pas garantir l'arrêt avant le plafond.
+
 # 9. ameesh-approve (C8)
 
 Service séparé (`ameesh-approve`, Python stdlib `http.server` + vérification de

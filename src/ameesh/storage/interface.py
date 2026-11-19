@@ -3769,7 +3769,9 @@ class Actions(Domain):
                 args_json: str, action_class: str, amount: int | None,
                 currency: str | None, policy_version: str, digest: str, dedupe: str,
                 requires_receipt: bool, approvers_json: str, note: str) -> None:
-        """Enregistre une action `proposed`."""
+        """Enregistre une action `proposed`. #7865 : les colonnes de dépense
+        (`recurrence`, fournisseur, objet) sont dérivées de `args.spend`, le
+        JSON signé, par le pilote de stockage."""
 
     @abc.abstractmethod
     def bind(self, action_id: str, *, from_states: tuple, digest: str, auth: dict,
@@ -4298,7 +4300,8 @@ class Grants(Domain):
     """Grants et réservations. `register`, `reserve` et `release` sont chacune
     UNE transaction (verrous, puis échéances recontrôlées à l'heure réelle de
     la base après le dernier verrou) ; une échéance dépassée lève une erreur
-    de base `ameesh_echeance [expired|iat_future]`."""
+    de base `ameesh_echeance [expired|iat_future]`, un plafond de dépense une
+    erreur `ameesh_spend [code]`."""
 
     @abc.abstractmethod
     def register(self, *, approver: str, nonce: str, challenge: str, authenticator_id: int,
@@ -4307,7 +4310,10 @@ class Grants(Domain):
                  clock_skew: int, registered_by: str,
                  beneficiary_kind: str = "none", beneficiary: str = "",
                  beneficiary_clones: bool = False, targets_json: str = "[]",
-                 charter_line: str = "", charter_version: str = "") -> int | None:
+                 charter_line: str = "", charter_version: str = "",
+                 max_per_month: int = 0, max_per_day: int = 0,
+                 spend_providers_json: str = "[]", spend_purposes_json: str = "[]",
+                 review_horizon_hours: int = 24) -> int | None:
         """Consomme le nonce du reçu `standing` et crée le grant ; rend son id,
         ou None (nonce déjà consommé, authentificateur révoqué).
 
@@ -4315,13 +4321,24 @@ class Grants(Domain):
         nommé, la lignée de clones, les motifs de cible (`targets_json`) et la
         référence de charte sont écrits dans la même transaction. Les défauts
         (`none`, aucun bénéficiaire, aucune cible) ne couvrent RIEN : un
-        écrivain qui ne les nomme pas n'élargit jamais un grant."""
+        écrivain qui ne les nomme pas n'élargit jamais un grant.
+
+        #7865 : `max_per_month` / `max_per_day` (unités mineures de
+        `currency`), le périmètre fermé des fournisseurs et des objets et
+        l'horizon de la prochaine revue humaine. Les défauts 0 / 0 / [] / []
+        ne couvrent aucune dépense : un écrivain qui ne les nomme pas
+        n'élargit jamais un grant à l'argent."""
 
     @abc.abstractmethod
     def reserve(self, grant_id: int, action_id: str, amount: int, *, reserved_by: str | None,
                 connector: str, operation: str, action_class: str,
                 currency: str | None) -> dict | None:
-        """Réserve `amount` pour la tentative ; None = pas de couverture."""
+        """Réserve `amount` pour la tentative ; None = pas de couverture.
+
+        #7865 : sur un grant de dépense, recontrôle les plafonds jour / mois /
+        total et la portée fournisseur + objet SOUS le verrou du grant, et
+        écrit le ledger dans la même transaction ; un dépassement lève
+        `ameesh_spend [code]` (rien n'est réservé)."""
 
     @abc.abstractmethod
     def release(self, reservation_id: int, reason: str | None) -> dict | None:
@@ -4334,11 +4351,13 @@ class Grants(Domain):
     @abc.abstractmethod
     def candidates(self, connector: str, operation: str, action_class: str, amount: int,
                    currency: str | None, canon: str = "", proposed_by: str = "",
-                   target: str = "") -> list[dict]:
+                   target: str = "", action_id: str = "") -> list[dict]:
         """Grants qui pourraient couvrir l'action (pré-filtre sans verrou) ;
         L44 : seuls ceux dont l'authentificateur est déclaré par `canon`.
         #7629 : le bénéficiaire (`proposed_by`) et la cible sont pré-filtrés
-        ici aussi ; la décision finale reste `ameesh_standing_reserve`."""
+        ici aussi ; #7865 : un grant de dépense exige une action de dépense
+        dont le fournisseur et l'objet sont dans son périmètre. La décision
+        finale reste `ameesh_standing_reserve`."""
 
     @abc.abstractmethod
     def revoke(self, grant_id: int, by: str) -> bool:
@@ -4346,12 +4365,65 @@ class Grants(Domain):
 
     @abc.abstractmethod
     def get(self, grant_id: int) -> dict | None:
-        """Un grant, ou None (avec sa portée et sa charte, #7629)."""
+        """Un grant, ou None (avec sa portée, sa charte et sa dépense, #7629/#7865)."""
 
     @abc.abstractmethod
     def listed(self, *, include_inactive: bool = False) -> list[dict]:
         """#7631 : les grants (actifs : ni révoqués ni échus, à l'heure de la
         base), avec `receipt_json` et la façade de leur authentificateur."""
+
+    @abc.abstractmethod
+    def spend_state(self, grant_id: int) -> dict | None:
+        """#7865 : l'état de projection d'un grant — `day_spent`,
+        `month_spent`, `total_accrued`, `ongoing_daily`, `projected`,
+        `horizon`, `max_per_day`, `max_per_month`, `max_amount`, `currency`.
+        Calculé par `ameesh_spend_state` à l'heure réelle de la base sur le
+        ledger, seule source du déjà-dépensé."""
+
+    @abc.abstractmethod
+    def spend_totals_at(self, grant_id: int, day) -> dict | None:
+        """#7865 : `day_spent`, `month_spent`, `total_accrued` d'un grant à
+        une date UTC donnée (balayage et simulation de jours)."""
+
+    @abc.abstractmethod
+    def spend_ongoing(self, *, decided_by: str | None = None) -> list[dict]:
+        """#7865 : les ressources récurrentes en cours (ou toutes les lignes
+        du ledger d'un décideur si `decided_by` est donné), avec leur ligne
+        d'action (`connector`, `target`, `project`, `work_item`), l'horizon de
+        revue de leur grant et la demande d'arrêt éventuelle (#7865 B1/B2)."""
+
+    @abc.abstractmethod
+    def spend_get(self, ledger_id: int) -> dict | None:
+        """#7865 : une ligne du ledger (tout état), avec sa ligne d'action."""
+
+    @abc.abstractmethod
+    def spend_for_action(self, action_id: str) -> dict | None:
+        """#7865 : la ligne du ledger d'une action, ou None."""
+
+    @abc.abstractmethod
+    def spend_request_stop(self, ledger_id: int, action_id: str, *, by: str,
+                           on=None, reason: str | None = None) -> dict | None:
+        """#7865 (B1) : lie une action `operation = 'stop'` à une ressource
+        récurrente ; la ligne ne passe `stopped` qu'à la confirmation de
+        l'action (déclencheur). None si la ligne n'est pas une ressource
+        quotidienne en cours ou si une demande est déjà liée."""
+
+    @abc.abstractmethod
+    def spend_confirmation(self, decision_id: int) -> dict | None:
+        """#7865 (B4) : l'usage durable d'une décision signée déjà consommée
+        (`decision_id`, `ledger_id`, `signed_at`, `confirmed_at`), ou None."""
+
+    @abc.abstractmethod
+    def spend_confirm(self, ledger_id: int, *, by: str, decision: int,
+                      signed_at: float) -> dict | None:
+        """#7865 (B2/B4) : confirmation d'une ressource récurrente par une
+        décision signée de l'owner ; ouvre une nouvelle fenêtre à partir de
+        l'heure réelle de la base et recopie l'acteur `human:`, la décision et
+        son heure signée. Une décision ne sert qu'une fois ; rejouer la même
+        est idempotent et ne rafraîchit pas la date. None si l'acteur n'est pas
+        `human:`, si un arrêt est demandé, si la signature n'est pas
+        postérieure à la dernière confirmation, ou si la ligne n'est pas une
+        ressource quotidienne en cours."""
 
 
 # --------------------------------------------------------------------------

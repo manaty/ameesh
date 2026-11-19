@@ -74,7 +74,7 @@ import time
 
 from . import connectors as connectors_mod
 from . import db as db_mod
-from . import authority, fil, jcs, receipts, storage, work
+from . import authority, fil, jcs, receipts, spend as spend_mod, standing_policy, storage, work
 from .connectors import ACTION_CLASSES, SEVERITY, Action, ConnectorError, Outcome
 from .db import Db, DbError
 from .modules import registry
@@ -295,6 +295,11 @@ def recap(db: Db, *, avatar: str, since: float, until: float,
     * `autre` : ni couverte ni soumise (classe libre, action annulée à la
       main…) : le récap ne lui invente pas d'issue de charte.
 
+    #7865 : le récap porte aussi `spending`, la section « dépenses » du relevé
+    — ressources récurrentes en cours de l'avatar, total quotidien engagé et
+    ressources dont la projection atteint un plafond (`stop_required`), avec
+    la commande d'arrêt d'une ligne.
+
     `avatar` est `agent:<nom>` ou le nom seul ; la fenêtre est
     `[since, until)` sur l'heure de PROPOSITION.
     """
@@ -325,7 +330,46 @@ def recap(db: Db, *, avatar: str, since: float, until: float,
             issue = "autre"
         issues[issue].append(row)
     return {"avatar": name, "since": since, "until": until, "project": project,
-            "issues": issues, "counts": {issue: len(rows) for issue, rows in issues.items()}}
+            "issues": issues, "counts": {issue: len(rows) for issue, rows in issues.items()},
+            "spending": spend_mod.recap(db, avatar=name)}
+
+
+def spend_list(db: Db, *, decided_by: str | None = None) -> list[dict]:
+    """#7865 : les ressources récurrentes en cours (ou celles d'un décideur)."""
+    return spend_mod.ledger_rows(db, decided_by=decided_by)
+
+
+def spend_state(db: Db, grant_id: int) -> dict | None:
+    """#7865 : l'état de projection d'un grant (ledger, heure de la base)."""
+    return storage.of(db).grants.spend_state(int(grant_id))
+
+
+def spend_of(db: Db, action_id: str) -> dict | None:
+    """#7865 : la ligne du ledger d'une action de dépense, ou None."""
+    return storage.of(db).grants.spend_for_action(action_id)
+
+
+def spend_request_stop(db: Db, ledger_id: int, *, by: str = "",
+                       reason: str | None = None, connector=None,
+                       on=None) -> dict | None:
+    """#7865 (B1) : arrête une ressource par une action `operation = 'stop'`.
+
+    La ligne ne passe `stopped` qu'à la confirmation du connecteur ; le
+    résultat porte `ledger`, `action` et `result` (ou `pending`)."""
+    return spend_mod.request_stop(db, int(ledger_id), by=by, reason=reason,
+                                  connector=connector, on=on)
+
+
+def spend_confirm(db: Db, ledger_id: int, *, decision: int) -> dict | None:
+    """#7865 (B2/B4) : confirmation d'une revue par décision signée de l'owner."""
+    return spend_mod.confirm(db, int(ledger_id), decision=int(decision))
+
+
+def spend_sweep(db: Db, *, today=None, by: str = spend_mod.SWEEP_ACTOR,
+                connector=None, dry_run: bool = False) -> dict:
+    """#7865 (B2) : balayage des ressources à arrêter avant un plafond."""
+    return spend_mod.sweep(db, today=today, by=by, connector=connector,
+                           dry_run=dry_run)
 
 
 def attempts(db: Db, action_id: str) -> list[dict]:
@@ -564,6 +608,9 @@ def to_action(row: dict, attempt: int | None = None) -> Action:
         policy_version=row.get("policy_version") or "1",
         attempt=int(row.get("attempts") or 0) if attempt is None else int(attempt),
         work_item=row.get("work_item"),
+        recurrence=row.get("recurrence") or "once",
+        spend_provider=row.get("spend_provider") or "",
+        spend_purpose=row.get("spend_purpose") or "",
     )
 
 
@@ -576,7 +623,10 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
             canon_class: str | None = None, amount: int | None = None,
             currency: str | None = None, work_item: int | None = None,
             approvers=(), policy_version: str = "1",
-            receipt_classes=DEFAULT_RECEIPT_CLASSES) -> dict:
+            receipt_classes=DEFAULT_RECEIPT_CLASSES,
+            recurrence: str | None = None, provider: str | None = None,
+            purpose: str | None = None,
+            limits: standing_policy.Policy | None = None) -> dict:
     """Enregistre une action `proposed` ; renvoie la ligne.
 
     `canon_class` : la classe déclarée par le canon (prime sur
@@ -585,6 +635,13 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
     `receipt_classes` : classes qui exigent un reçu (irreversible et costly
     toujours). `approvers` : humains habilités à approuver (vide = tout
     approbateur du registre).
+
+    #7865 : une action de dépense porte `args.spend = {recurrence, provider,
+    purpose}` — signé avec le reste de l'action — ou les paramètres
+    `recurrence` / `provider` / `purpose`, qui l'y écrivent. `limits` (policy
+    du canon) vérifie à la proposition que le fournisseur, l'objet et le
+    montant du jour sont dans une règle de dépense ; sans `limits`, seule la
+    forme est contrôlée (les tests et les appels directs).
     """
     connectors_mod.check(connector)
     if not isinstance(project, str) or not _IDENT_RE.fullmatch(project):
@@ -605,11 +662,7 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
         args = {}
     if not isinstance(args, dict):
         raise ActionError(INVALID, "args: JSON object expected")
-    try:
-        canonical_args = jcs.dumps(args)
-        args = jcs.loads(canonical_args)
-    except jcs.JcsError as exc:
-        raise ActionError(INVALID, "args cannot be canonicalized (JCS): %s" % exc) from exc
+    action_id = new_action_id()
     if amount is not None:
         if type(amount) is not int or amount < 0 or amount > jcs.MAX_SAFE_INTEGER:
             raise ActionError(INVALID, "amount: integer >= 0 in minor units expected")
@@ -619,6 +672,45 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
         raise ActionError(INVALID, "currency: ISO 4217 code (3 capitals) expected")
     if not isinstance(policy_version, str) or not 1 <= len(policy_version) <= 128:
         raise ActionError(INVALID, "policy_version: text of 1 to 128 characters")
+    # #7865 : la dépense est une description FERMÉE, signée dans args. Elle
+    # n'est acceptée que si le montant et la devise existent : un montant de
+    # 0, un engagement mensuel/annuel ou un champ libre sont refusés par nom.
+    explicit = {"recurrence": recurrence, "provider": provider, "purpose": purpose}
+    explicit = {key: value for key, value in explicit.items() if value is not None}
+    declared = args.get("spend")
+    if explicit and declared is not None and declared != explicit:
+        raise ActionError(INVALID, "args.spend and --recurrence/--provider/--purpose "
+                          "disagree")
+    value = declared if declared is not None else (explicit or None)
+    spend_value = None
+    if value is not None:
+        try:
+            spend_value = spend_mod.normalize(
+                value, amount=amount, currency=currency, limits=limits,
+                connector=connector.name, operation=operation)
+        except spend_mod.SpendError as exc:
+            raise ActionError(exc.code, str(exc)) from exc
+        # #7865 (B2) : une ressource quotidienne doit pouvoir être arrêtée
+        # sans reçu humain ; sinon le balayage ne peut pas garantir l'arrêt
+        # avant le plafond. Un connecteur qui garde `stop` ne reçoit pas de
+        # dépense récurrente.
+        if spend_value["recurrence"] == "daily":
+            try:
+                stop_class = connector.classify("stop", {})
+            except Exception:  # noqa: BLE001 - un connecteur qui ne sait pas classer
+                stop_class = "irreversible"
+            if SEVERITY.get(stop_class, 99) > SEVERITY["reversible"]:
+                raise ActionError(
+                    "spend_stop_unsupported",
+                    "connector %s classifies stop as %s: a daily spend could not be "
+                    "stopped automatically before the cap" % (connector.name, stop_class))
+        args = dict(args)
+        args["spend"] = spend_value
+    try:
+        canonical_args = jcs.dumps(args)
+        args = jcs.loads(canonical_args)
+    except jcs.JcsError as exc:
+        raise ActionError(INVALID, "args cannot be canonicalized (JCS): %s" % exc) from exc
 
     from . import module_actions
     module_class = module_actions.policy_class(db, connector, project, operation)
@@ -646,7 +738,6 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
         raise ActionError(CLASS, "unknown classes: %s" % sorted(unknown))
     requires = chosen in (set(receipt_classes or ()) | GATED_CLASSES)
 
-    action_id = new_action_id()
     fields = {"action_id": action_id, "project": project, "connector": connector.name,
               "operation": operation, "target": target, "args": args, "amount": amount,
               "currency": currency, "policy_version": policy_version}
@@ -1079,6 +1170,11 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
             if current is not None and current["state"] != "approved":
                 raise _refuse_state(current)
         _event(db, action, "refused", by, "launch refused [%s]: %s" % (code, reason))
+        if code.startswith("spend_"):
+            # #7865 : un plafond de dépense refuse NOMMÉMENT et escalade au
+            # humain responsable du grant (arrêt de la ressource ou nouveau
+            # grant). Aucun dépassement n'est autorisé.
+            spend_mod.escalate(db, action, code, reason)
         raise ActionError(code, "action %s: %s" % (action_id, reason))
     attempt = int(launch["attempt"])
     _publish(db, action_id, "launched", by)
