@@ -180,6 +180,31 @@ class DurableAuditTest(PgTestCase):
         self.assertIn(value, {row["evidence"]["pregeste_id"] for row in self.db.query(
             "SELECT evidence FROM work_item_events WHERE work_item_id=%s", (item,))})
 
+    def test_pre_act_indexes_old_mail_and_exact_references(self):
+        import json
+        from ameesh import pre_act
+        item = int(self.db.query("SELECT id FROM work_items LIMIT 1")[0]["id"])
+        since = float(self.db.query("SELECT extract(epoch from now())::float8 AS ts")[0]["ts"]) - 1
+        # Adjacent digits must never turn an unrelated reference into a match.
+        self.db.execute("INSERT INTO agent_mailbox (sender,recipient,body,created_at) "
+                        "VALUES ('other','auditor',%s, now() - interval '2 days')",
+                        ("STOP #" + str(item) + "0",))
+        with self.db.transaction() as tx:
+            pre_act.inspect(tx, item, "auditor", since, "kms")
+        self.db.execute("INSERT INTO agent_mailbox (sender,recipient,body,created_at) "
+                        "VALUES ('other','auditor',%s, now() - interval '2 days')",
+                        ("STOP #" + str(item),))
+        with self.db.transaction() as tx:
+            with self.assertRaisesRegex(pre_act.Refused, "unread lot mail"):
+                pre_act.inspect(tx, item, "auditor", since, "kms")
+        self.db.execute("DELETE FROM agent_mailbox WHERE recipient='auditor'")
+        self.db.execute("INSERT INTO agent_mailbox (sender,recipient,body,created_at,delivered_at,payload) "
+                        "VALUES ('other','elsewhere',%s,now() - interval '2 days',now(),%s::jsonb)",
+                        ("decision #" + str(item), json.dumps({"decision": {"state": "withdrawn", "withdrawn": {"ts": since + 0.5}}})))
+        with self.db.transaction() as tx:
+            with self.assertRaisesRegex(pre_act.Refused, "withdrawn decision"):
+                pre_act.inspect(tx, item, "auditor", since, "kms")
+
     def test_real_pre_act_sql_preserves_another_authors_stop_hold(self):
         from ameesh import pre_act
         from unittest import mock
