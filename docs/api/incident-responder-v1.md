@@ -63,7 +63,7 @@ is not an absence**: the next one is used.
 | Signal | Read from | Window / bound |
 | --- | --- | --- |
 | `attach` | a live lease `attach:<local account>` in `agent_registry` | the lease expiry |
-| `interaction` | ameesh journal (mail sent from one of the member's own devices, mail delivered to their mailbox, a decision answered from their own device), then Memoria's public interface | 30 min |
+| `interaction` | ameesh journal: mail sent from one of the member's own devices, or a decision answered from their own device; then Memoria's public interface | 30 min |
 | `presence` | Slack `users.getPresence`: `active` = available, `away` = not available | live, cached 5 min |
 | `timezone` | `Member.timezone` and usual local hours (08:00–20:00) | last resort |
 
@@ -74,9 +74,11 @@ the CLI for an unbound human entry) or, failing it, by a host declared in
 decision answer typed by the bureau under the §10 delegation — its signed text
 carries "saisi par le bureau, délégation §10" or "réponse de l'owner relayée
 par le bureau" — is never the owner's own activity, whatever host recorded it.
-An `action_events` row names an actor but no device, so a relay acting under
-`human:<id>` cannot be told apart and is not used. Fewer signals, never a
-false one; a missing signal passes to the next one.
+Mail delivery, a decision's reply mail and an `action_events` row are not
+device proofs and are not used: the decision close itself writes the delivery
+timestamp when anyone answers (the bureau included), a reply mail is only the
+answer's byproduct, and an action event names an actor but no device. Fewer
+signals, never a false one; a missing signal passes to the next one.
 
 A present `away` presence and the local-hours fallback can rule a human out;
 a missing timezone never makes someone reachable by default. A signal

@@ -29,9 +29,11 @@ owner (UTC+8) sleeps, the French team is at work.
    `incident_eligible: true` is never a candidate. **Only the human's own
    activity counts**: a journal row needs the `user@host` proof or a host
    declared in `local_accounts`; a decision answer typed by the bureau under
-   the §10 delegation (its signed text carries the mention) and an
-   actor-only `action_events` row are ignored, so a relay acting under
-   `human:<id>` never fakes a recent interaction (B1 de l'auditeur).
+   the §10 delegation (its signed text carries the mention) is ignored, and so
+   are mail delivery (the decision close writes it when anyone answers), a
+   decision's reply mail and an actor-only `action_events` row — none is a
+   device proof. Fewer signals, never a false one (B1 de l'auditeur, B de cx2
+   sur le bras `read`).
 3. **`ameesh responder <application> --severity S`** is the resolver and the
    public contract (`ameesh-responder/1`). It journals only the chosen
    responder, the reason and the *kinds* of signals used: no activity

@@ -740,6 +740,22 @@ class LiveSignalsTest(unittest.TestCase):
              "host": "ameesh-agents-2", "answer_text": "a"}]), env={})
         self.assertIsNone(signals.journal_last(self.member()))
 
+    def test_a_mail_delivery_is_not_a_device_proof(self):
+        # La clôture d'une décision pose delivered_at sur la demande : ce n'est
+        # pas une lecture de l'humain (B de cx2, B1' de l'auditeur).
+        epoch = self.NOW.timestamp() - 30
+        signals = responder.LiveSignals(db=self.Db([
+            {"source": "read", "ts": epoch, "proof": "alice@pc",
+             "host": "pc"}]), env={})
+        self.assertIsNone(signals.journal_last(self.member()))
+
+    def test_a_decision_reply_mail_is_not_counted_on_its_own(self):
+        epoch = self.NOW.timestamp() - 30
+        signals = responder.LiveSignals(db=self.Db([
+            {"source": "sent", "ts": epoch, "proof": "alice@pc", "host": "pc",
+             "decision_reply": True}]), env={})
+        self.assertIsNone(signals.journal_last(self.member()))
+
     def test_missing_memoria_and_slack_degrade_cleanly(self):
         signals = responder.LiveSignals(db=self.Db([]), env={})
         self.assertIsNone(signals.interaction(self.member(), self.NOW))
@@ -855,6 +871,38 @@ class HumanAccountProofTest(fixtures._Base):
         answer = self.answer(view["id"], "a")["decision"]["answer"]
         user, host = resident_queue.local_account(self.cfg)
         self.assertEqual(answer.get("human_account"), "%s@%s" % (user, host))
+
+
+class DelegatedCloseTest(fixtures._Base):
+    """#7866 (B de cx2, B1' de l'auditeur) : répondre clôt la demande et pose
+    `delivered_at` dessus. Cette clôture n'est pas une lecture de l'owner, et
+    la réponse déléguée ne revient pas par le courrier de réponse."""
+
+    def member(self, accounts):
+        return SimpleNamespace(title="alice", local_accounts=list(accounts),
+                               timezone="Europe/Paris",
+                               fiche=SimpleNamespace(data={}))
+
+    def test_a_delegated_answer_closed_by_the_bureau_is_not_an_interaction(self):
+        view = self.ask()
+        text = "a — saisi par le bureau, délégation §10"
+        with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "bureau"},
+                             clear=False):
+            self.answer(view["id"], text)
+        row = self.db.query(
+            "select delivered_at from agent_mailbox where id = %s",
+            (view["id"],))[0]
+        # the real close wrote the delivery timestamp on the request
+        self.assertIsNotNone(row["delivered_at"])
+        self.assertIsNone(responder.LiveSignals(db=self.db).journal_last(
+            self.member(["alice@not-%s" % self.cfg.host])))
+
+    def test_a_human_answer_on_the_owners_device_is_an_interaction(self):
+        view = self.ask()
+        proof = self.answer(view["id"], "a")["decision"]["answer"]["human_account"]
+        self.assertTrue(proof)
+        self.assertIsNotNone(responder.LiveSignals(db=self.db).journal_last(
+            self.member([proof])))
 
 
 class CliResponderTest(PgTestCase):

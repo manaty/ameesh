@@ -25,8 +25,10 @@ Availability, strongest first, each with its freshness window:
 
 * `attach` — a live lease `attach:<unix user>@<host>` held by one of the
   member's `local_accounts` (the lease itself is the freshness bound);
-* `interaction` — a human interaction in ameesh's journal (mail sent or read,
-  action event) or, failing that, Memoria's public interface, fresher than
+* `interaction` — a human interaction in ameesh's journal that is proven to
+  come from one of the member's own devices (`user@host` proof or a declared
+  `local_accounts` host; mail sent, decision answered, never a delivery or a
+  delegated answer) or, failing that, Memoria's public interface, fresher than
   `INTERACTION_FRESH_S`;
 * `presence` — Slack presence (`active` means available, `away` means not),
   fresher than `PRESENCE_FRESH_S`;

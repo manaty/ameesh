@@ -18,8 +18,10 @@ the local-hours fallback can rule a human out.
 Only the human's **own activity** counts. A journal row proves it with the
 `user@host` proof (`payload.human_account`) or, failing that, a host declared
 in `Member.local_accounts`; a decision answer typed by the bureau under the
-§10 delegation carries its mention and is never counted, nor is an actor-only
-`action_events` row (it has no device). Fewer signals, never a false one.
+§10 delegation carries its mention and is never counted. Mail delivery, a
+decision's reply mail and an actor-only `action_events` row are not device
+proofs and are never used: the decision close writes the delivery timestamp
+itself when anyone answers. Fewer signals, never a false one.
 
 The phone wake is **off by default** and is a new expense: it requires
 `AMEESH_INCIDENT_CALL=1`, a configured voice endpoint, and a signed owner
@@ -271,42 +273,51 @@ class LiveSignals:
                 "       extract(epoch from m.created_at) as ts,"
                 "       m.host as host,"
                 "       m.payload->>'human_account' as proof,"
+                "       m.payload ? 'decision_answer' as decision_reply,"
                 "       null::text as answer_text"
                 "  from agent_mailbox m"
                 " where m.sender = %s and m.created_at > now() - interval '1 day'"
-                " union all"
-                " select 'read', extract(epoch from m.delivered_at), m.host,"
-                "        m.payload->>'human_account', null::text"
-                "   from agent_mailbox m"
-                "  where m.recipient = %s and m.delivered_at is not null"
-                "    and m.delivered_at > now() - interval '1 day'"
                 " union all"
                 " select 'answer',"
                 "        (m.payload->'decision'->'answer'->>'ts')::float8,"
                 "        m.payload->'decision'->'answer'->>'host',"
                 "        m.payload->'decision'->'answer'->>'human_account',"
+                "        false,"
                 "        m.payload->'decision'->'answer'->>'text'"
                 "   from agent_mailbox m"
                 "  where m.kind = 'request'"
                 "    and m.payload->'decision'->'answer'->>'by' = %s"
                 "    and m.created_at > now() - interval '1 day'",
-                (human, human, human))
+                (human, human))
         except Exception:
             return None
-        # `action_events` is deliberately absent: it names an actor but no
-        # device, so a relay acting under `human:<id>` cannot be told apart
-        # (same finding). Fewer signals, never a false one.
+        # Two sources are deliberately absent.
+        #
+        # `action_events` names an actor but no device: a relay acting under
+        # `human:<id>` cannot be told apart.
+        #
+        # A mail *delivery* (`delivered_at`) is not a device proof either: the
+        # decision close writes it on the request row when anyone answers —
+        # the bureau included — so it would resurrect the delegated answer
+        # excluded below (B de cx2, B1' de l'auditeur, #7866). A real delivery
+        # carries no `user@host` proof of the reader.
+        #
+        # A decision's reply mail (`payload.decision_answer`) is the answer's
+        # byproduct: the answer row already carries the proof and the
+        # delegation mention, so the reply is never counted on its own.
         newest: _dt.datetime | None = None
         for row in rows:
             source = str(row.get("source") or "")
-            if source not in ("sent", "read", "answer"):
+            if source not in ("sent", "answer"):
                 continue
             if source == "answer" and delegated_answer(row.get("answer_text")):
                 # A bureau/relay answer is never the human's own activity,
                 # whatever host recorded it. The signed text carries the
                 # mention that `match_option` already relies on.
                 continue
-            if source != "read" and not self._own_device(row, accounts):
+            if source == "sent" and row.get("decision_reply"):
+                continue
+            if not self._own_device(row, accounts):
                 continue
             try:
                 moment = _dt.datetime.fromtimestamp(float(row.get("ts")),
