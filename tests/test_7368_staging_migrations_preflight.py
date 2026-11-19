@@ -20,6 +20,7 @@ from unittest import mock
 
 from ameesh import migrations
 from ameesh import staging_migrations_preflight as preflight
+from tests import support
 
 ADDITIVE = "CREATE TABLE fresh (id integer);\n"
 DESTRUCTIVE = "DROP TABLE legacy;\n"
@@ -36,6 +37,9 @@ class Ledger:
 
     def query(self, sql, params=None):
         self.queries.append(sql)
+        probe = support.registry_absent(sql)
+        if probe is not None:
+            return probe
         if "to_regclass" in sql:
             return [{"ok": True}]
         if "schema_migrations" in sql:

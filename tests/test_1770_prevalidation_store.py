@@ -107,8 +107,18 @@ class PrevalidationStoreTest(PgTestCase):
 class _Db:
     """Connexion factice : capture les instructions, ne touche aucune base."""
 
+    class _Cfg:
+        schema = "public"
+
+    cfg = _Cfg()
+
     def __init__(self):
         self.calls: list[tuple] = []
+
+    def query(self, sql: str, params=None):
+        # Sonde du registre `module_schemas` (#7650) : registre absent, le
+        # module écrit dans le schéma noyau.
+        return [{"present": False, "readable": False}]
 
     def execute(self, sql: str, params=()) -> int:
         self.calls.append((sql, params))
@@ -148,7 +158,7 @@ class CommandRecordTest(unittest.TestCase):
         self.assertEqual(seen["pendant"], [], "aucune écriture pendant le run")
         self.assertEqual(len(db.calls), 1)
         sql, values = db.calls[0]
-        self.assertIn("INSERT INTO prevalidation_reports", sql)
+        self.assertIn('INSERT INTO "public"."prevalidation_reports"', sql)
         self.assertEqual(values[0], 1770)
         self.assertEqual(values[1], A)
         self.assertIn('"modules": ["test_a", "test_cluster"]', values[-1])

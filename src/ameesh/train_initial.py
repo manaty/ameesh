@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 
+from . import storage
 from .train import TrainError
 
 
@@ -42,9 +43,8 @@ class Boundary:
         frozen_id = subject.get("frozen_id")
         if type(lot) is not int or lot <= 0 or type(frozen_id) is not int or frozen_id <= 0:
             raise TrainError("exact lot and freeze required for initial history")
-        rows = db.query(
-            "SELECT kind FROM integration_train_queue_receipts"
-            " WHERE work_item_id = %s AND frozen_id = %s ORDER BY id", (lot, frozen_id))
+        # #7650 : les reçus de file sont une table du module `dev`.
+        rows = storage.of(db).work.train_receipt_kinds(lot, frozen_id)
         if rows:
             # An allocation is replayed from its own receipt; a withdrawal is
             # final. Neither is an initial absence.

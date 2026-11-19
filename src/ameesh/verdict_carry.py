@@ -1646,13 +1646,7 @@ _COPY_SQL = ("INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, 
 #: son geste qui reste la preuve, le report n'étant que mécanique. Sans cette
 #: copie, un verdict reporté sur un lot sensible perdait son reçu et la porte
 #: le refusait, alors que le report dit « pas de nouvelle relecture due ».
-_COPY_RECEIPT_SQL = (
-    "INSERT INTO provenance_receipts"
-    "       (subject, sha, actor, session, turn, harness, work_item_id)"
-    " SELECT 'milestone:' || %s, %s, actor, session, turn, harness, work_item_id"
-    "   FROM provenance_receipts"
-    "  WHERE subject = 'milestone:' || %s"
-    " ON CONFLICT (subject) DO NOTHING")
+#: P1b #7650 : la copie est le port `Provenance.carry_milestone` du module `dev`.
 
 
 def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
@@ -1699,8 +1693,9 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
             if copied:
                 # #2928 : le reçu du verdict d'origine suit le jalon reporté
                 # (même acteur/session/tour, tête du nouveau jalon).
-                tx.execute(_COPY_RECEIPT_SQL,
-                           (int(copied[0]["id"]), frozen, int(mark["id"])))
+                # #7650 : `provenance_receipts` est une table du module `dev`.
+                storage.of(tx).provenance.carry_milestone(
+                    tx, int(copied[0]["id"]), sha=frozen, source_id=int(mark["id"]))
                 carried.append(_entry(mark, reviewed))
         if carried:
             try:

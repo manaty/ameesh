@@ -14,7 +14,7 @@ from unittest import mock
 from ameesh import db as D, mail, plan, planned_waits, progress, stagnation, storage, work
 from ameesh import work_dependencies as dependencies
 from ameesh.storage.postgres.work_dependencies import WorkDependencies as PgLandingStore
-from tests.support import PgTestCase
+from tests.support import PgTestCase, registry_absent
 
 
 class StoreTest(PgTestCase):
@@ -747,6 +747,9 @@ class _RecordingTx:
 
     def query(self, sql, params=()):
         self.calls.append(str(sql))
+        probe = registry_absent(str(sql))
+        if probe is not None:
+            return probe
         return self.responses.pop(0) if self.responses else []
 
 

@@ -440,15 +440,13 @@ def _tracked_worktrees(db, cfg, item: Mapping) -> list[str]:
     if not lot:
         return []
     try:
-        rows = db.query(
-            "SELECT path FROM managed_worktrees"
-            " WHERE host = %s AND lot = %s AND status = 'active'"
-            " ORDER BY id DESC",
-            (str(getattr(cfg, "host", "") or ""), str(lot)))
+        # #7650 : le SQL de `managed_worktrees` vit avec le module `dev`.
+        rows = storage.of(db).housekeeping.worktrees_for_lot(
+            str(getattr(cfg, "host", "") or ""), lot)
     except Exception:  # noqa: BLE001 - no tracking table/readable row: next hint
         return []
-    return [str(row.get("path") or "") for row in rows or ()
-            if str(row.get("path") or "").strip()]
+    return [str(path or "") for path in rows or ()
+            if str(path or "").strip()]
 
 
 def _search_roots(paths: Sequence[str]) -> list[str]:

@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tests import support
+
 SPEC = importlib.util.spec_from_file_location(
     'release_health_turn',
     Path(__file__).resolve().parents[1] / 'deploy/mise-a-jour/pilote-sante.py')
@@ -35,6 +37,9 @@ class Database:
     def query(self, sql, params=()):
         if self.unreachable:
             raise OSError('fixture database unavailable')
+        probe = support.registry_absent(sql)
+        if probe is not None:
+            return probe
         if 'clock_timestamp' in sql:
             return [{'now': self.now}]
         if 'agent_registry' in sql:

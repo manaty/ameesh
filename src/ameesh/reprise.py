@@ -1116,14 +1116,12 @@ def _lot_worktrees(db, cfg, item: dict) -> list[str]:
     if not lot or not host:
         return []
     try:
-        rows = db.query(
-            "SELECT path FROM managed_worktrees"
-            " WHERE host = %s AND lot = %s AND status = 'active'"
-            " ORDER BY id DESC", (host, str(lot)))
+        # #7650 : le SQL de `managed_worktrees` vit avec le module `dev`.
+        rows = storage.of(db).housekeeping.worktrees_for_lot(host, lot)
     except Exception:  # noqa: BLE001 - table absente/illisible : pas de piste
         return []
-    return [str(row.get("path") or "").strip() for row in rows or ()
-            if str(row.get("path") or "").strip()]
+    return [str(path or "").strip() for path in rows or ()
+            if str(path or "").strip()]
 
 
 def _lot_diff(item: dict, cwd: str, *, db=None, cfg=None) -> list[str]:

@@ -23,6 +23,7 @@ import unittest
 from unittest import mock
 
 from ameesh import auditor_pass, events, role_timers
+from tests.support import registry_absent
 
 STATE = {"milestones": 41, "merged": 39, "ci_seen": 100.5,
          "ci_concluded": 90.25, "ci_running": 1, "staging": 7}
@@ -44,23 +45,36 @@ class FakeDb:
 
     def query(self, sql, params=()):
         self.queries.append((sql, params))
+        probe = registry_absent(sql)
+        if probe is not None:
+            return probe
         return [dict(self.row)]
 
 
 class GateStateTest(unittest.TestCase):
-    def test_the_state_is_read_in_one_indexed_statement(self):
+    def test_the_state_is_read_in_indexed_statements(self):
         db = FakeDb({"milestones": 5, "merged": 3, "ci_seen": 1.5,
                      "ci_concluded": 2.5, "ci_running": 1, "staging": 9})
         self.assertEqual(auditor_pass.gate_state(db), {
             "milestones": 5, "merged": 3, "ci_seen": 1.5,
             "ci_concluded": 2.5, "ci_running": 1, "staging": 9})
+        # #7650 : les témoins de `ci_runs` sont lus par le port `dev`. Sur une
+        # connexion neuve, la sonde du registre qualifie ce port avant
+        # l'énoncé CI (elle est ensuite amortie par le cache de connexion).
         sql, params = db.queries[0]
         self.assertEqual(params, ())
         self.assertIn("work_item_milestones", sql)
         self.assertIn("staging.attested", sql)
-        self.assertIn("ci_runs", sql)
+        self.assertNotIn("ci_runs", sql)
         # a Python list would not bind through the psql fallback (#286)
         self.assertNotIn("ANY(", sql)
+        probe_sql, probe_params = db.queries[1]
+        self.assertIn("module_schemas", probe_sql)
+        self.assertEqual(probe_params, ("public", "public"))
+        sql_ci, params_ci = db.queries[2]
+        self.assertEqual(params_ci, ())
+        self.assertIn("ci_runs", sql_ci)
+        self.assertNotIn("ANY(", sql_ci)
 
 
 class MailArrivalsTest(unittest.TestCase):

@@ -120,6 +120,7 @@ import secrets
 import subprocess
 
 from . import storage
+from .storage.postgres.provenance import Provenance as _DevProvenance
 
 #: un identifiant de commit complet : SHA-1 (40) ou SHA-256 (64)
 FULL_SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
@@ -251,8 +252,9 @@ def _receipt(row, *, commit: str, milestone) -> dict:
         "session": row["session"],
         "turn": row["turn"],
         "harness": row["harness"],
-        # la ligne elle-même est le reçu exact, jamais une note libre
-        "record": "provenance_receipts:%s" % row["subject"],
+        # la ligne elle-même est le reçu exact, jamais une note libre ;
+        # #7650 : l'étiquette de la table `dev` est rendue par son module.
+        "record": _DevProvenance.record_label(row["subject"]),
         "milestone": milestone,
     }
 

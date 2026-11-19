@@ -97,7 +97,8 @@ class PacketMembersSqlTest(unittest.TestCase):
         self.assertEqual(self.sql.count("kind = 'frozen'"), 1, self.sql)
 
     def test_the_item_filter_bounds_the_materialized_members(self):
-        self.assertIn("WITH member AS (SELECT m.* FROM work_packet_members m"
+        # #7650 : le stockage dev qualifie la table par le schéma courant.
+        self.assertIn('WITH member AS (SELECT m.* FROM "public"."work_packet_members" m'
                       " WHERE m.work_item_id IN (%s, %s, %s))", self.sql)
         self.assertEqual(self.params, (5347, 5348, 5349))
 
