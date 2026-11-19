@@ -195,3 +195,30 @@ class DeskNamesTest(unittest.TestCase):
         self.assertIn("bureau or auditor", text)
         self.assertIn("the bureau handles it with the auditor", text)
         self.assertNotIn("the avatar handles it", text)
+
+
+class EscalationLabelTest(unittest.TestCase):
+    def test_escalation_uses_resolved_route_not_stale_target(self):
+        alert = {"type": "slo_breach", "lot": 7852, "agent": "worker",
+                 "level": 1, "step": "blocked_freeze", "targets": ["assignee"],
+                 "critical": True, "title": "test", "lot_state": "qa",
+                 "value": 9000, "threshold": 3600}
+        rows = {"worker": {"status": "stopped"},
+                "avatar-essai": {"status": "stopped"},
+                "bureau": {"status": "idle"}, "pilot": {"status": "idle"}}
+        out = alert_briefs._slo_briefs(alert, rows, ["pilot"], set(), [], set(),
+                                        avatar_names=["bureau"])
+        for text in out.values():
+            self.assertIn("the bureau handles it with the auditor", text)
+            self.assertNotIn("the avatar-essai handles it", text)
+        self.assertIn("pilot", out)
+
+    def test_dead_legacy_target_is_not_named_as_handler(self):
+        alert = {"type": "slo_breach", "lot": 7852, "agent": "worker",
+                 "level": 3, "step": "blocked_freeze", "targets": ["avatar-essai", "auditeur"],
+                 "critical": True, "title": "test", "lot_state": "qa",
+                 "value": 9000, "threshold": 3600}
+        rows = {"avatar-essai": {"status": "stopped"}, "auditeur": {"status": "idle"}}
+        out = alert_briefs._slo_briefs(alert, rows, [], set(), ["auditeur"], set())
+        self.assertIn("the avatar handles it with the auditor", out["auditeur"])
+        self.assertNotIn("the avatar-essai handles it", out["auditeur"])
