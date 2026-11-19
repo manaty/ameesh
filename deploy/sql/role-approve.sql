@@ -50,9 +50,7 @@
 --     `accord_operations`, vérifiées avec le reçu) ;
 --   * mesh_consumed_nonces : refuser à la signature un nonce déjà consommé
 --     (sans jamais en consommer : c'est l'exécuteur qui consomme, sous la
---     porte) — pas le challenge ;
---   * accord_claims : le « go » déjà cité par un geste (#7631, 0586) — le
---     service le lit pour refuser la réutilisation ; il ne l'écrit jamais.
+--     porte) — pas le challenge.
 --
 -- Rien d'autre : ni boîte aux lettres, ni registre des agents, ni lots, ni
 -- coûts, ni approbations permanentes, ni journal du canon. Aucune écriture :
@@ -90,11 +88,6 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('mesh_consumed_nonces', ARRAY[
         'approver', 'nonce', 'consumed_by', 'consumed_at'
-    ]),
-    -- #7631 (0586) : le « go » déjà cité par un geste, lu par le service
-    -- pour refuser la réutilisation, jamais écrit par lui.
-    ('accord_claims', ARRAY[
-        'agent', 'seq', 'kind', 'ref'
     ]);
 
 \ir _contrat-superviseur.sql

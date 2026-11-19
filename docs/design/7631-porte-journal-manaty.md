@@ -30,8 +30,14 @@
   des espaces ou une ponctuation simple. Tout autre mot refuse l'accord
   (`accord_ref`) : une question, un report (« demain », « attends », « later »)
   ou une négation (« pas », « don't ») ne peut pas se cacher dans la phrase.
-  L'opération seule et une autre cible sont refusées — relectures cx2, dev3 et
-  auditeur du 18/11 (B1, 2e tour).
+  L'opération seule et une autre cible sont refusées. Pour `decide`, le go
+  doit désigner **une seule** option, et ce doit être celle qui est signée :
+  la clé canonique, ou un libellé entier comparé mot à mot ; un libellé
+  contenu dans un autre, une clé égale au libellé d'une autre option ou deux
+  libellés identiques laissent deux lectures et sont refusés (à la signature,
+  et dès la demande pour les libellés dupliqués). Un texte libre ne nomme
+  aucune option : l'avatar ne le signe pas, c'est l'owner qui le signe.
+  — relectures cx2, dev3 et auditeur du 18/11 (B1 et B2).
 - Un accord (`agent`, `seq`) ne cite **qu'un reçu** : la table
   `accord_claims` (même migration 0586, additive) réserve l'accord au geste
   (`kind`, `ref`) ; la clé primaire tranche la course entre deux reçus et la
@@ -88,8 +94,9 @@ Accord d'une décision (point 4, validé par le bureau le 17/11) : forme (a)
   Sans `--accord`, la garde est inchangée.
 - Accord vérifié avant de signer : message de l'humain au journal, au plus
   24 h avant, go de grammaire fermée qui nomme l'identifiant de la décision
-  ET l'option signée (comme au point 1) — un go qui nomme une autre option ne
-  couvre pas la signature.
+  ET l'option signée (comme au point 1) — un go qui nomme une autre option,
+  ou plusieurs, ne couvre pas la signature. Une réponse libre (aucune option)
+  n'est jamais signée par l'avatar : l'owner la signe.
 - Forme (b), `grant:ID`, refusée dans cette tranche (relecture cx2, B) : un
   grant ne vaut que par le contrat complet des approbations permanentes
   (connecteur, classe, plafond, réservation atomique liée à la signature,

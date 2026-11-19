@@ -1056,11 +1056,11 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
 #: « don't ») ou une question ne peuvent pas se cacher dans une liste noire.
 #: L'opération seule, une autre cible ou un mot hors références ne suffisent
 #: jamais.
-_GO_RE = re.compile(r"^\s*go(?![0-9A-Za-z])(?P<rest>.*)$",
-                    re.IGNORECASE | re.DOTALL)
+_GO_RE = re.compile(r"^\s*go(?!\w)(?P<rest>.*)$", re.IGNORECASE | re.DOTALL)
 #: un mot du message : les références gardent leurs `: / # @ . -` internes ;
-#: la ponctuation simple sépare. Le point final d'un jeton est retiré
-#: (N auditeur : « go prod-deploy. » vaut « go prod-deploy »).
+#: la ponctuation simple sépare. Le point ou les deux-points finaux d'un jeton
+#: sont retirés (N auditeur : « go prod-deploy. » et « go #a-1: » valent la
+#: référence seule).
 _GO_WORD_RE = re.compile(r"[^\s,;!?()\[\]{}<>\"'`|]+", re.UNICODE)
 #: un grant ne s'inscrit que sur un go qui le nomme comme mandat
 _MANDATE_WORDS = frozenset({
@@ -1079,7 +1079,7 @@ def _go_words(text: str) -> list[str]:
     final d'un jeton retiré."""
     words: list[str] = []
     for match in _GO_WORD_RE.finditer(text):
-        token = _token_key(match.group(0).rstrip("."))
+        token = _token_key(match.group(0).rstrip(".:"))
         if token:
             words.append(token)
     return words
@@ -1093,6 +1093,16 @@ def _go_tokens(text: str) -> dict[str, int]:
 def _reference_tokens(value) -> set[str]:
     """Les mots d'une référence de geste (un libellé d'option en a plusieurs)."""
     return set(_go_words(str(value or "")))
+
+
+def _words_contain(words: list[str], needle: list[str]) -> bool:
+    """`needle` apparaît comme une suite CONTIGUË de `words` (pas une
+    sous-chaîne : le libellé d'option est comparé mot à mot)."""
+    size = len(needle)
+    if not size or size > len(words):
+        return False
+    return any(words[index:index + size] == needle
+               for index in range(len(words) - size + 1))
 
 
 def _gesture_allowed(gesture: dict) -> set[str]:
@@ -1109,18 +1119,15 @@ def _gesture_allowed(gesture: dict) -> set[str]:
             allowed |= _reference_tokens(value)
         allowed |= set(_MANDATE_WORDS)
     elif kind == "decision":
-        for key in ("decision_id", "option", "option_label", "lot"):
+        for key in ("decision_id", "lot"):
             allowed |= _reference_tokens(gesture.get(key))
+        for option in gesture.get("options") or ():
+            allowed |= _reference_tokens(option.get("key"))
+            allowed |= _reference_tokens(option.get("label"))
     else:
         for value in gesture.get("references") or ():
             allowed |= _reference_tokens(value)
     return allowed
-
-
-def _phrase_in(text: str, phrase: str) -> bool:
-    """Le libellé d'option, espaces normalisés, apparaît dans le message."""
-    wanted = " ".join(str(phrase or "").split()).casefold()
-    return len(wanted) >= 2 and wanted in " ".join(text.casefold().split())
 
 
 def _gesture_references(db: Db, request: dict, expected_operation: str | None,
@@ -1159,16 +1166,18 @@ def _gesture_references(db: Db, request: dict, expected_operation: str | None,
     return gesture
 
 
-def _gesture_match(gesture: dict, tokens: dict[str, int],
-                   text: str) -> tuple[bool, list[str]]:
+def _gesture_match(gesture: dict, words) -> tuple[bool, list[str]]:
     """(le message nomme le geste, références attendues). Une seule référence
     suffit ; `target` et `operation` vont ensemble, jamais l'un sans l'autre.
-    La grammaire fermée est revérifiée ici : un mot hors références ne nomme
-    pas le geste, même si un appelant a omis le contrôle amont.
+    `words` est la suite ordonnée des mots (les doublons comptent : un libellé
+    « oui oui » ne se confond pas avec « oui »). La grammaire fermée est
+    revérifiée ici : un mot hors références ne nomme pas le geste, même si un
+    appelant a omis le contrôle amont.
     """
-    words = set(tokens)
-    words.discard("go")
-    if words - _gesture_allowed(gesture):
+    words = [str(word) for word in words]
+    tokens = set(words)
+    tokens.discard("go")
+    if tokens - _gesture_allowed(gesture):
         return False, []
     kind = gesture.get("kind")
     expected: list[str] = []
@@ -1207,6 +1216,7 @@ def _gesture_match(gesture: dict, tokens: dict[str, int],
         decision_id = str(gesture.get("decision_id") or "").strip()
         option = str(gesture.get("option") or "").strip()
         label = str(gesture.get("option_label") or "").strip()
+        options = gesture.get("options") or []
         if decision_id:
             expected.append(decision_id)
         if option:
@@ -1215,11 +1225,21 @@ def _gesture_match(gesture: dict, tokens: dict[str, int],
                 expected.append(label)
         if not decision_id or _token_key(decision_id) not in tokens:
             return False, expected
+        # une réponse libre n'est rattachée à aucune option : l'owner la signe
         if not option:
-            return True, expected
-        if _token_key(option) in tokens:
-            return True, expected
-        return bool(label and _phrase_in(text, label)), expected
+            return False, expected
+        words = [word for word in words if word != "go"]
+        signed = _token_key(option)
+        named: set[str] = set()
+        for candidate in options:
+            key = _token_key(candidate.get("key"))
+            if not key:
+                continue
+            label_words = _go_words(candidate.get("label") or "")
+            if key in tokens or (label_words and _words_contain(words, label_words)):
+                named.add(key)
+        # le go doit désigner UNE option, et ce doit être celle qui est signée
+        return named == {signed}, expected
     expected = [str(value) for value in gesture.get("references") or ()]
     return any(_token_key(value) in tokens for value in expected), expected
 
@@ -1266,7 +1286,7 @@ def check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
                         "(%s); write only \"go\" followed by the references (%s)"
                         % (where, ", ".join(unknown[:5]),
                            ", ".join(sorted(allowed)) or "?"))
-    named, expected = _gesture_match(gesture, _go_tokens(match.group("rest")), text)
+    named, expected = _gesture_match(gesture, _go_words(match.group("rest")))
     if not expected:
         return ACCORD, "accord %s: no gesture reference to check" % where
     if not named:

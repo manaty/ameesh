@@ -614,6 +614,23 @@ def parse_options(values) -> list[dict]:
         if reason:
             raise DecisionError("unreadable option %s — %s" % (key, reason))
         out.append({"key": key, "label": label})
+    # #7631 (B1 dev3) : un go ne peut désigner qu'une option ; deux libellés
+    # identiques, ou un libellé égal à la clé d'une autre option, rendraient
+    # l'accord ambigu — refusés à la demande.
+    keys = {o["key"].casefold(): o["key"] for o in out}
+    labels: dict[str, str] = {}
+    for option in out:
+        folded = " ".join(option["label"].split()).casefold()
+        if folded in labels:
+            raise DecisionError("duplicate option label %r (%s and %s): a go would "
+                                "designate either" % (option["label"],
+                                                      labels[folded], option["key"]))
+        labels[folded] = option["key"]
+        other = keys.get(folded)
+        if other and other != option["key"]:
+            raise DecisionError("option %s: label %r is also the key of option %s; a go "
+                                "would be ambiguous" % (option["key"], option["label"],
+                                                        other))
     if len(out) > MAX_OPTIONS:
         raise DecisionError("%d options at most" % MAX_OPTIONS)
     return out
@@ -1172,14 +1189,22 @@ def check_accord(db, view: dict, human: str, accord: dict, *, now: float,
                             "cover a decision signature (it must go through the gate with "
                             "reservation); cite the human's go: --accord AGENT#SEQ"
                             % (accord["grant"], kind))
+    if not option:
+        # B2 auditeur : un texte libre ne nomme aucune option, donc rien ne
+        # rattache le go à la réponse ; c'est l'owner qui la signe.
+        raise DecisionError("a free-text answer cannot be signed by an avatar (the go "
+                            "names no option): the owner signs it, or answer with an "
+                            "option key")
     gesture = {
         "kind": "decision",
         "decision_id": str(view.get("id") or ""),
-        "option": option or "",
+        "option": option,
         "option_label": _option_label(view, option) or "",
+        "options": [{"key": str(o.get("key") or ""), "label": str(o.get("label") or "")}
+                    for o in view.get("options") or ()],
         "lot": view.get("lot"),
     }
-    claim_ref = ref or "decision:%s:%s" % (view.get("id"), option or "")
+    claim_ref = ref or "decision:%s:%s" % (view.get("id"), option)
     code, reason = receipts.check_accord_entry(
         db, accord, human, int(now), receipts.Policy(), gesture=gesture,
         kind="decision", ref=claim_ref)

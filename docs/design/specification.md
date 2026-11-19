@@ -716,10 +716,12 @@ Façades vérifiées en v1 :
   **grammaire fermée** : il commence par « go » et ne porte ensuite que les
   références du geste — identifiant d'action, cible, opération, lot pour une
   action ; connecteur, toutes ses opérations et un mot de mandat (« mandat »,
-  « grant », « permanent »…) pour un grant ; identifiant de la décision,
-  option et libellé pour `decide` — séparées par des espaces ou une
+  « grant », « permanent »…) pour un grant ; identifiant de la décision et
+  UNE seule option désignée (clé canonique ou libellé entier, sans ambiguïté
+  avec une autre option) pour `decide` — séparées par des espaces ou une
   ponctuation simple ; tout autre mot (question, report, négation) refuse
-  l'accord. Écrit au plus 120 s après `iat` et au plus `max_ttl` avant. Un
+  l'accord ; une réponse libre (aucune option) n'est pas signée par un
+  avatar. Écrit au plus 120 s après `iat` et au plus `max_ttl` avant. Un
   accord ne cite qu'un reçu (`accord_claims`, même migration 0586) : la
   réutilisation par un autre geste est refusée. Sinon refus (`facade_refused`,
   `accord_operation`, `accord_ref`), comme avant.

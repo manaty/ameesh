@@ -194,6 +194,8 @@ class VerificationTest(AccordBase):
             "réserve": "go {action} sauf la nuit",
             "except": "go {action} except friday",
             "later": "go {action} later",
+            # N dev3 : « goût » n'est pas le mot « go »
+            "goût": "goût {action}",
         }
         for label, template in cases.items():
             with self.subTest(label):
@@ -212,11 +214,14 @@ class VerificationTest(AccordBase):
         self.assertRefused(self.verify(receipt), receipts.ACCORD)
 
     def test_go_ponctuation_finale_acceptee(self):
-        """N auditeur : « go prod-deploy. » vaut « go prod-deploy » ; la
-        référence reste l'identifiant de l'action."""
-        request = make_request(ALICE)
-        request["accord"] = self.go(text="go %s." % request["action_id"])
-        self.assertTrue(self.verify(self.key.receipt(request)).ok)
+        """N auditeur/dev3 : « go prod-deploy. » et « go #a-1: » valent la
+        référence seule ; la référence reste l'identifiant de l'action."""
+        for suffix in (".", ":"):
+            with self.subTest(suffix=suffix):
+                request = make_request(ALICE)
+                request["accord"] = self.go(
+                    text="go %s%s" % (request["action_id"], suffix))
+                self.assertTrue(self.verify(self.key.receipt(request)).ok)
 
     def test_grant_borne_aux_operations_nommees(self):
         until = int(time.time()) + 3600

@@ -96,6 +96,56 @@ class AvatarDecisionTest(_Base):
                              signer=self.avatar(accord))
         self.assertEqual(signed["decision"]["answer"]["by"], ALICE)
 
+    def test_option_ambigue_refusee(self):
+        """B1 cx2/dev3 : le go doit désigner UNE option, et ce doit être celle
+        qui est signée. Un libellé inclus dans un autre, ou une clé égale au
+        libellé d'une autre option, laisse deux lectures : refus."""
+        view = self.ask(needs_signature=True, options=["a=oui", "b=oui oui"])
+        ambiguous = self.go(view["id"], text="go %d oui oui" % view["id"])
+        for option in ("a", "b"):
+            with self.subTest(option=option):
+                with self.assertRaises(DecisionError):
+                    self.answer(view["id"], option, key_path=self.private,
+                                signer=self.avatar(ambiguous))
+        self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
+        # clé égale au libellé d'une autre option : la demande la refuse, mais
+        # une décision antérieure peut la porter — la signature doit refuser.
+        legacy = {"id": 55, "lot": None,
+                  "options": [{"key": "a", "label": "oui"},
+                              {"key": "oui", "label": "refuser"}]}
+        with self.assertRaises(DecisionError):
+            decisions.check_accord(self.db, legacy, ALICE,
+                                   self.go(55, text="go 55 oui"),
+                                   now=time.time(), option="a")
+        # la clé canonique lève l'ambiguïté
+        self.assertTrue(decisions.check_accord(
+            self.db, legacy, ALICE, self.go(55, text="go 55 a"),
+            now=time.time(), option="a"))
+
+    def test_reponse_libre_refusee(self):
+        """B2 auditeur : un texte libre ne nomme aucune option ; l'avatar ne
+        peut pas le signer sur un simple go qui ne cite que la décision."""
+        view = self.ask(needs_signature=True)
+        accord = self.go(view["id"])
+        with self.assertRaises(DecisionError):
+            self.answer(view["id"], "je préfère attendre la revue", key_path=self.private,
+                        signer=self.avatar(accord))
+        self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
+        # décision sans options : le go ne cite que l'identifiant
+        bare = self.ask(needs_signature=True, options=[])
+        with self.assertRaises(DecisionError):
+            self.answer(bare["id"], "texte libre", key_path=self.private,
+                        signer=self.avatar(self.go(bare["id"],
+                                                   text="go %d" % bare["id"])))
+
+    def test_options_ambigues_refusees_a_la_demande(self):
+        """B1 dev3 : deux libellés identiques, ou un libellé égal à la clé
+        d'une autre option, sont refusés dès la demande."""
+        for options in (["a=oui", "b=OUI"], ["a=oui", "oui=refuser"]):
+            with self.subTest(options=options):
+                with self.assertRaises(DecisionError):
+                    self.ask(options=options)
+
     def test_avatar_signe_avec_la_cle(self):
         view = self.ask()
         with self.assertRaises(DecisionError):
