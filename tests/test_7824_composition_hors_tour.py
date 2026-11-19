@@ -165,8 +165,32 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         recomposed.assert_not_called()
         sub_argv = detached.call_args.args[1]
-        self.assertEqual((sub_argv[0], sub_argv[-2:]), ("recompose", ["--wait", "20m"]))
+        self.assertEqual(sub_argv[0], "recompose")
+        self.assertEqual(sub_argv[-4:-2], ["--wait", "20m"])
         self.assertEqual(detached.call_args.kwargs, {"kind": "recompose", "wait": 1200.0})
+
+    def test_repo_relatif_repasse_en_absolu(self):
+        """B cx2 : l'unité part du clone ; un `--repo` relatif y serait relu."""
+        parent = tempfile.mkdtemp(prefix="paquet-7824-")
+        self.addCleanup(shutil.rmtree, parent, True)
+        clone = pathlib.Path(parent) / "composeur"
+        (clone / ".git").mkdir(parents=True)
+        for argv in (["compose", "--repo", "composeur"],
+                     ["recompose", "--repo", "composeur", "--carrier", "7814"]):
+            with self.subTest(argv[0]):
+                old = os.getcwd()
+                os.chdir(parent)
+                try:
+                    rc, detached, _, _ = self.run_main(argv)
+                finally:
+                    os.chdir(old)
+                self.assertEqual(rc, 0)
+                sub_argv = detached.call_args.args[1]
+                self.assertEqual(sub_argv[-2:], ["--repo", str(clone.resolve())])
+                parsed = ph.argparse.ArgumentParser()
+                parsed.add_argument("--repo", action="store")
+                known, _ = parsed.parse_known_args(sub_argv[1:])
+                self.assertEqual(known.repo, str(clone.resolve()))
 
     def test_refus_d_entree_avant_l_unite(self):
         rc, detached, _, _ = self.run_main(

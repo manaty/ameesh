@@ -3295,7 +3295,10 @@ def main(argv: list[str] | None = None) -> int:
             wait = check_recompose(args) if args.command == "recompose" else 0
             refuse_agent_clone(ctx)
             check_fresh(ctx)
-            sub_argv = raw_argv[raw_argv.index(args.command):]
+            # B cx2 : l'unité part de `--working-directory` = le clone ; un
+            # `--repo` relatif y serait résolu une seconde fois. Le chemin
+            # absolu résolu est repassé en dernier (argparse : le dernier gagne).
+            sub_argv = raw_argv[raw_argv.index(args.command):] + ["--repo", str(repo)]
             print(detach(ctx, sub_argv, kind=args.command, wait=wait), flush=True)
         elif args.command == "recompose":
             # geste explicite du pilote (#4237) : la pause (#4361) ne vise que le tic
