@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7694 (design 7633 §5.3) — témoin kind de l'isolation des comptes d'un hôte
+# pod : identité (UID du chart = UID du processus = entrée passwd), montage
+# (le PVC de B n'est pas dans le conteneur de A), permissions (le dossier de
+# comptes 0700 de B refuse l'UID de A, même monté en lecture seule).
+#
+# Ce script est un geste de BUREAU/OPÉRATEUR, pas de l'agent intéressé : il
+# crée un cluster kind jetable, applique les gabarits du dossier, exécute les
+# contrôles depuis les conteneurs, imprime une trace (version Kubernetes,
+# image, UID du pod, UID/GID, modes) puis supprime le cluster. Aucun secret
+# n'est lu ni affiché.
+#
+#   ./preuve-isolation-comptes.sh                 # kind + contrôles + nettoyage
+#   ./preuve-isolation-comptes.sh --render-only   # rendu des manifestes, sans cluster
+#   ./preuve-isolation-comptes.sh --keep          # garde le cluster pour inspection
+#
+# Sortie 77 si kind/kubectl/docker manque : le témoin est alors « non exécuté »
+# (non-concluant), jamais « vert ». Variables/options : --uid-a, --uid-b,
+# --fs-group, --image, --cluster, --namespace.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CLUSTER=${CLUSTER:-ameesh-pod-witness}
+NS=${NS:-ameesh-pod-witness}
+UID_A=${UID_A:-2519}
+UID_B=${UID_B:-2520}
+FS_GROUP=${FS_GROUP:-10000}
+IMAGE=${IMAGE:-busybox:1.36}
+KEEP=0
+RENDER_ONLY=0
+
+usage() {
+    sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --render-only) RENDER_ONLY=1 ;;
+        --keep) KEEP=1 ;;
+        --cluster) CLUSTER=${2:?}; shift ;;
+        --namespace) NS=${2:?}; shift ;;
+        --uid-a) UID_A=${2:?}; shift ;;
+        --uid-b) UID_B=${2:?}; shift ;;
+        --fs-group) FS_GROUP=${2:?}; shift ;;
+        --image) IMAGE=${2:?}; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "option inconnue: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+for valeur in UID_A UID_B FS_GROUP; do
+    eval "v=\${$valeur}"
+    case "$v" in
+        ''|*[!0-9]*) echo "$valeur doit être un entier: $v" >&2; exit 2 ;;
+    esac
+done
+[ "$UID_A" != "$UID_B" ] || { echo "UID_A et UID_B doivent différer" >&2; exit 2; }
+[ "$FS_GROUP" -gt 0 ] || { echo "FS_GROUP doit être > 0" >&2; exit 2; }
+for uid in "$UID_A" "$UID_B"; do
+    if [ "$uid" -eq 0 ] || [ "$uid" -eq "$FS_GROUP" ] || [ "$uid" -eq 10001 ]; then
+        echo "UID de tenant refusé : $uid (0, fsGroup et superviseur 10001 sont réservés)" >&2
+        exit 2
+    fi
+done
+
+render() {
+    sed -e "s#__UID_A__#${UID_A}#g" \
+        -e "s#__UID_B__#${UID_B}#g" \
+        -e "s#__FS_GROUP__#${FS_GROUP}#g" \
+        -e "s#__IMAGE__#${IMAGE}#g" \
+        "$HERE/$1"
+}
+
+if [ "$RENDER_ONLY" -eq 1 ]; then
+    echo "# #7694 témoin kind — UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE"
+    echo "# kubectl create namespace $NS && kubectl -n $NS apply -f -"
+    echo "---"
+    render temoin-pvc.yaml
+    echo "---"
+    render temoin-deux.yaml
+    echo "---"
+    render temoin-lecture.yaml
+    exit 0
+fi
+
+for outil in kind kubectl docker; do
+    command -v "$outil" >/dev/null 2>&1 \
+        || { echo "SKIP: $outil absent — témoin kind non exécuté (non-concluant)" >&2; exit 77; }
+done
+
+k() { kubectl -n "$NS" "$@"; }
+kexec() { local conteneur=$1; shift; k exec temoin-deux -c "$conteneur" -- "$@"; }
+pass() { echo "PASS: $*"; }
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+pod_uid() {
+    k get pod "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null || true
+}
+
+diagnostic() {
+    echo "--- diagnostic (namespace $NS) ---" >&2
+    k get pods -o wide >&2 || true
+    k get pvc >&2 || true
+    k get events --sort-by=.lastTimestamp >&2 | tail -20 || true
+    for conteneur in a b; do
+        k logs temoin-deux -c "$conteneur" >&2 || true
+    done
+    k logs temoin-lecture >&2 || true
+}
+
+cleanup() {
+    local code=$?
+    trap - EXIT
+    if [ "$code" -ne 0 ]; then
+        diagnostic || true
+    fi
+    if [ "$KEEP" -eq 0 ]; then
+        kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+    else
+        echo "cluster conservé : kubectl --context kind-$CLUSTER -n $NS get pods" >&2
+    fi
+    exit "$code"
+}
+trap cleanup EXIT
+
+apply_manifest() {
+    render "$1" | k apply -f - >/dev/null
+}
+
+wait_ready() {
+    k wait --for=condition=Ready pod/temoin-deux --timeout=180s >/dev/null
+}
+
+# --- trace : ce que la preuve attachée au lot doit citer ---------------------
+trace() {
+    echo "trace: date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "trace: kubernetes=$(kubectl version -o jsonpath='{.serverVersion.gitVersion}' 2>/dev/null || echo '?')"
+    echo "trace: image=$IMAGE"
+    echo "trace: image_id=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo '?')"
+    echo "trace: uid_a=$UID_A uid_b=$UID_B fs_group=$FS_GROUP"
+    echo "trace: pod_uid=$(pod_uid temoin-deux)"
+    echo "trace: image_ids=$(k get pod temoin-deux -o jsonpath='{.status.containerStatuses[*].imageID}' 2>/dev/null || echo '?')"
+}
+
+# --- contrôle 1 : identité et modes -----------------------------------------
+check_identity() {
+    local conteneur=$1 attendu=$2 home="/home/ameesh-$1"
+    local uid passwd home_stat acct_stat marker_stat
+    uid=$(kexec "$conteneur" id -u | tr -d '\r')
+    [ "$uid" = "$attendu" ] \
+        || fail "identite $conteneur: id -u=$uid, attendu $attendu"
+    passwd=$(kexec "$conteneur" sh -ec "grep '^ameesh-$conteneur:' /etc/passwd | cut -d: -f3,4")
+    [ "$passwd" = "$attendu:$FS_GROUP" ] \
+        || fail "passwd $conteneur: uid:gid=$passwd, attendu $attendu:$FS_GROUP"
+    { read -r home_stat; read -r acct_stat; read -r marker_stat; } < <(
+        kexec "$conteneur" stat -c '%u:%g %a %n' \
+            "$home" "$home/.config/ameesh/accounts" \
+            "$home/.config/ameesh/accounts/.temoin-$conteneur")
+    local home_group home_mode acct_owner acct_group acct_mode
+    local marker_owner marker_group marker_mode
+    home_group=$(echo "$home_stat" | awk '{print $1}' | cut -d: -f2)
+    home_mode=$(echo "$home_stat" | awk '{print $2}')
+    acct_owner=$(echo "$acct_stat" | awk '{print $1}' | cut -d: -f1)
+    acct_group=$(echo "$acct_stat" | awk '{print $1}' | cut -d: -f2)
+    acct_mode=$(echo "$acct_stat" | awk '{print $2}')
+    marker_owner=$(echo "$marker_stat" | awk '{print $1}' | cut -d: -f1)
+    marker_group=$(echo "$marker_stat" | awk '{print $1}' | cut -d: -f2)
+    marker_mode=$(echo "$marker_stat" | awk '{print $2}')
+    # La racine du PVC n'est pas la frontière : elle peut être root:fsGroup
+    # 0770/0775. Ce qui compte est le fsGroup appliqué et les modes du compte.
+    [ "$home_group" = "$FS_GROUP" ] \
+        || fail "home $conteneur: groupe $home_group, attendu fsGroup $FS_GROUP"
+    # fsGroup peut poser le bit setgid (2770) : on juge les permissions
+    # effectives (3 derniers chiffres), pas le bit d'héritage.
+    home_perms=${home_mode: -3}
+    case "$home_perms" in
+        770|775) ;;
+        *) fail "home $conteneur: mode $home_mode, attendu 770/775 (racine du PVC)" ;;
+    esac
+    [ "$acct_owner" = "$attendu" ] \
+        || fail "comptes $conteneur: proprietaire $acct_owner, attendu $attendu"
+    [ "$acct_group" = "$FS_GROUP" ] \
+        || fail "comptes $conteneur: groupe $acct_group, attendu $FS_GROUP"
+    acct_perms=${acct_mode: -3}
+    [ "$acct_perms" = "700" ] \
+        || fail "comptes $conteneur: mode $acct_mode, attendu 700 (setgid toléré)"
+    [ "$marker_owner" = "$attendu" ] \
+        || fail "temoin $conteneur: proprietaire $marker_owner, attendu $attendu"
+    [ "$marker_group" = "$FS_GROUP" ] \
+        || fail "temoin $conteneur: groupe $marker_group, attendu $FS_GROUP"
+    marker_perms=${marker_mode: -3}
+    [ "$marker_perms" = "600" ] \
+        || fail "temoin $conteneur: mode $marker_mode, attendu 600"
+    pass "identite $conteneur: id -u=$uid passwd=$passwd home=[$home_stat] comptes=[$acct_stat] temoin=[$marker_stat]"
+}
+
+# --- contrôle 2 : isolation des montages ------------------------------------
+check_mount() {
+    if kexec a sh -ec 'test -e /home/ameesh-b' 2>/dev/null; then
+        fail "montage: /home/ameesh-b existe dans le conteneur de A"
+    fi
+    if kexec a sh -ec 'grep -Fq " /home/ameesh-b " /proc/self/mountinfo' 2>/dev/null; then
+        fail "montage: le PVC de B apparait dans /proc/self/mountinfo de A"
+    fi
+    kexec a sh -ec 'grep -Fq " /home/ameesh-a " /proc/self/mountinfo' 2>/dev/null \
+        || fail "montage: controle positif — /home/ameesh-a absent de mountinfo"
+    kexec a sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-a")" = temoin-a' \
+        || fail "montage: A ne lit pas son propre temoin (controle positif)"
+    if kexec a sh -ec 'test -e /var/run/secrets/kubernetes.io/serviceaccount/token' 2>/dev/null; then
+        fail "montage: jeton de compte de service monte dans A"
+    fi
+    pass "montage: A ne voit ni /home/ameesh-b, ni le PVC de B, ni un jeton ; il lit son temoin"
+}
+
+# --- contrôle 3 : permissions (pod séparé, sans fsGroup) --------------------
+check_lecture() {
+    apply_manifest temoin-lecture.yaml
+    if ! k wait --for=jsonpath='{.status.phase}'=Succeeded pod/temoin-lecture --timeout=120s >/dev/null; then
+        k logs temoin-lecture >&2 || true
+        fail "lecture: le pod temoin-lecture n'a pas réussi"
+    fi
+    local logs code
+    logs=$(k logs temoin-lecture)
+    printf '%s\n' "$logs"
+    grep -q '^PASS lecture-a:' <<<"$logs" \
+        || fail "lecture: contrôle positif A manquant"
+    grep -q '^PASS lecture-b:' <<<"$logs" \
+        || fail "lecture: B n'est pas refusé à l'UID de A"
+    grep -q '^PASS listage-b' <<<"$logs" \
+        || fail "lecture: le dossier de comptes de B est listable par A"
+    if grep -q '^FAIL' <<<"$logs"; then
+        fail "lecture: au moins un contrôle du pod temoin-lecture a échoué"
+    fi
+    code=$(k get pod temoin-lecture -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}')
+    [ "$code" = "0" ] || fail "lecture: code de sortie $code"
+    pass "lecture: A lit son compte, B (0700, monté sans fsGroup) le refuse"
+}
+
+echo "== témoin kind #7694 : UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE =="
+docker pull --quiet "$IMAGE" >/dev/null
+kind create cluster --name "$CLUSTER" --wait 120s >/dev/null
+kind load docker-image "$IMAGE" --name "$CLUSTER" >/dev/null
+kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# PSA restricted : si le cluster l'applique, le gabarit doit y être admis.
+kubectl label namespace "$NS" \
+    pod-security.kubernetes.io/enforce=restricted \
+    pod-security.kubernetes.io/enforce-version=latest >/dev/null
+
+apply_manifest temoin-pvc.yaml
+k wait --for=jsonpath='{.status.phase}'=Bound \
+    pvc/pvc-temoin-a pvc/pvc-temoin-b --timeout=120s >/dev/null
+pass "PVC: pvc-temoin-a et pvc-temoin-b liés"
+
+apply_manifest temoin-deux.yaml
+wait_ready
+pass "pod: temoin-deux prêt (A et B)"
+trace
+
+check_identity a "$UID_A"
+check_identity b "$UID_B"
+check_mount
+
+# --- témoin 1 rejoué après un déplacement du PVC ---------------------------
+premier_uid=$(pod_uid temoin-deux)
+kubectl -n "$NS" delete pod temoin-deux --wait=true --timeout=120s >/dev/null
+apply_manifest temoin-deux.yaml
+wait_ready
+second_uid=$(pod_uid temoin-deux)
+[ -n "$premier_uid" ] && [ -n "$second_uid" ] || fail "rejeu: UID de pod illisible"
+[ "$premier_uid" != "$second_uid" ] \
+    || fail "rejeu: le pod recréé porte le même UID ($premier_uid)"
+trace
+check_identity a "$UID_A"
+check_identity b "$UID_B"
+kexec a sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-a")" = temoin-a' \
+    || fail "rejeu: le temoin de A n'a pas survécu au déplacement du PVC"
+kexec b sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-b")" = temoin-b' \
+    || fail "rejeu: le temoin de B n'a pas survécu au déplacement du PVC"
+pass "rejeu: pod $premier_uid -> $second_uid, identité et modes conservés, temoins persistants"
+
+# Le pod à deux conteneurs est supprimé avant le témoin 3 pour ne pas
+# partager un PVC ReadWriteOnce entre deux pods.
+kubectl -n "$NS" delete pod temoin-deux --wait=true --timeout=120s >/dev/null
+check_lecture
+
+# --- témoin 1 rejoué après le passage du PVC dans un pod SANS fsGroup ------
+# Le pod 3 a monté les deux PVC en lecture seule, sans fsGroup : c'est le
+# déplacement qui, dans le constat N de #7659, pouvait élargir les modes au
+# groupe. On recrée le pod à deux conteneurs et on rejoue l'identité : les
+# dossiers 0700/0600 doivent être intacts.
+kubectl -n "$NS" delete pod temoin-lecture --wait=true --timeout=120s >/dev/null
+apply_manifest temoin-deux.yaml
+wait_ready
+trace
+check_identity a "$UID_A"
+check_identity b "$UID_B"
+kexec a sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-a")" = temoin-a' \
+    || fail "rejeu final: temoin de A illisible apres le pod sans fsGroup"
+pass "rejeu final: identite et modes intacts apres un montage sans fsGroup"
+
+echo "TOUS LES TEMOINS PASSENT (#7694 : identité, montage, permissions)"

@@ -1,0 +1,403 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7694 (P1 de #7633) : squelette d'un hôte pod — UN superviseur, UN tenant.
+#
+# Modèle (design 7633 §2.1) :
+#   superviseur  uid 10001, sans tenant, sans volume de tenant : publie
+#                host_resources (capacité déclarée du pod, pas le nœud),
+#                tient host_lifecycle et la porte, synchronise le canon ;
+#   tenant       uid 2519 (du plan `host tenant add --pod`), SON PVC monté
+#                dans SON conteneur seulement, son /tmp, son canon en lecture
+#                seule ; aucun jeton Kubernetes, aucun volume d'un autre.
+#
+# Ce que ce squelette NE fait pas (tranches suivantes) : N tenants (P2),
+# carte Host `subscription` et connexion du siège (P3), pourvoyeur d'enfants
+# (P4), NetworkPolicy/quota/PDB/sauvegardes (P6). Aucun Service : le pod
+# n'expose aucun port (design 7633 §6.4).
+#
+# Secrets (créés à part, jamais dans ce dépôt — secrets.exemple.yaml) :
+#   ameesh-db                 password                    → PGPASSWORD
+#   ameesh-harness-alice      clés d'API d'organisation   → environnement du tenant
+#   ameesh-canon-deploy-key   ssh-privatekey, known_hosts → init canon et canon-fetch
+#
+# Le nom de l'hôte ameesh est LOGIQUE et stable (`pod-alice-exemple`), pas
+# `metadata.name` : un redémarrage du pod ne change ni le canon, ni le bail,
+# ni les relevés (design 7633 §2.1).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ameesh-pod-alice
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-host
+spec:
+  # Un seul superviseur par hôte : deux répliques seraient deux écrivains de
+  # `host_resources`/`host_lifecycle` et pourraient ouvrir la porte à tort
+  # (design 7633 §3.3). Le nom stable du pod est celui du StatefulSet.
+  replicas: 1
+  serviceName: ameesh-pod
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    # Avec une seule réplique, le rollout arrête l'ancien pod avant de créer
+    # le nouveau (drain par terminationGracePeriodSeconds).
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh
+      app.kubernetes.io/component: pod-host
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ameesh
+        app.kubernetes.io/component: pod-host
+    spec:
+      serviceAccountName: ameesh-pod
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      # `shareProcessNamespace` reste au défaut false : chaque conteneur a son
+      # namespace PID, donc pas de /proc/<pid> d'un autre tenant.
+      # Le runner rend son bail sur SIGTERM ; 120 s couvrent un tour en vol et
+      # son arrêt (design 7633 §6.1). Un `preStop` de drain explicite arrive
+      # avec la tranche P5 (déplacement).
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        # Le superviseur et les init tournent sous 10001 ; chaque conteneur de
+        # tenant le remplace par l'UID de son plan.
+        runAsUser: 10001
+        # GID neutre = `fsGroup` du pod : les volumes sont group-écrivables à
+        # leur racine, ce qui laisse le tenant créer ses dossiers sans chown
+        # root. Ce n'est pas une frontière : chaque PVC n'est monté que dans
+        # son conteneur et les dossiers de comptes sont 0700 (design §6.2).
+        # Jamais un fsGroup par tenant : Kubernetes n'en a qu'un par pod, et
+        # le passage récursif de kubelet élargirait les modes au groupe.
+        runAsGroup: 10000
+        fsGroup: 10000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        - name: canon
+          image: ameesh-runner
+          # `args` seulement : l'ENTRYPOINT de l'image (tini) est conservé.
+          args:
+            - sh
+            - -ec
+            - |
+              # Clé copiée en 0600 dans le /tmp de CE conteneur (ssh refuse
+              # une clé lisible par le groupe).
+              install -m 600 /etc/ameesh/canon-key/ssh-privatekey /tmp/canon-key
+              export GIT_SSH_COMMAND="ssh -i /tmp/canon-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/ameesh/canon-key/known_hosts"
+              repo=/var/lib/ameesh/canon/repo
+              if [ ! -d "$repo/.git" ]; then
+                git clone --quiet --branch "$CANON_BRANCH" -- "$CANON_URL" "$repo"
+              fi
+              # Un canon invalide ne bloque pas le démarrage : il ferme la
+              # réclamation des agents du canon (fail closed), comme dans le
+              # profil cluster.
+              ameesh canon sync --fetch \
+                || echo "canon sync en échec : réclamation fermée jusqu'au prochain sync" >&2
+              rm -f /tmp/canon-key
+          env:
+            - name: HOME
+              value: /tmp
+            - name: AMEESH_HOST
+              value: pod-alice-exemple
+            - name: AMEESH_CONFIG
+              value: /etc/ameesh/supervisor/config.json
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ameesh-db
+                  key: password
+            - name: CANON_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: ameesh-pod-canon
+                  key: url
+            - name: CANON_BRANCH
+              valueFrom:
+                configMapKeyRef:
+                  name: ameesh-pod-canon
+                  key: branch
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: supervisor-config
+              mountPath: /etc/ameesh/supervisor
+              readOnly: true
+            - name: canon
+              mountPath: /var/lib/ameesh/canon
+            - name: canon-key
+              mountPath: /etc/ameesh/canon-key
+              readOnly: true
+            - name: canon-tmp
+              mountPath: /tmp
+
+      containers:
+        - name: supervisor
+          image: ameesh-runner
+          args:
+            - sh
+            - -ec
+            - |
+              umask 077
+              exec ameesh run --poll 5
+          workingDir: /home/ameesh
+          env:
+            - name: HOME
+              value: /home/ameesh
+            - name: AMEESH_HOST
+              value: pod-alice-exemple
+            - name: AMEESH_CONFIG
+              value: /etc/ameesh/supervisor/config.json
+            # Le superviseur publie la capacité DÉCLARÉE du pod, pas les
+            # mesures du nœud : load1 n'est jamais mesuré (design §3.2).
+            # Valeurs = somme des limites des tenants (P2 met à jour le chart
+            # en même temps qu'il ajoute un conteneur).
+            - name: AMEESH_POD
+              value: "1"
+            - name: AMEESH_POD_MEMORY_BYTES
+              value: "2147483648"
+            - name: AMEESH_POD_CPU_CORES
+              value: "2"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ameesh-db
+                  key: password
+          readinessProbe:
+            exec:
+              command: ["ameesh", "doctor", "--probe"]
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: supervisor-home
+              mountPath: /home/ameesh
+            - name: supervisor-config
+              mountPath: /etc/ameesh/supervisor
+              readOnly: true
+            - name: canon
+              mountPath: /var/lib/ameesh/canon
+              readOnly: true
+            - name: supervisor-tmp
+              mountPath: /tmp
+
+        - name: tenant-alice
+          image: ameesh-runner
+          args:
+            - sh
+            - -ec
+            - |
+              umask 077
+              exec ameesh run --poll 5
+          workingDir: /home/ameesh-alice
+          env:
+            - name: HOME
+              value: /home/ameesh-alice
+            - name: USER
+              value: ameesh-alice
+            - name: LOGNAME
+              value: ameesh-alice
+            - name: TMPDIR
+              value: /tmp
+            - name: AMEESH_HOST
+              value: pod-alice-exemple
+            - name: AMEESH_TENANT
+              value: human:alice
+            - name: AMEESH_RUNNER_ID
+              value: pod-alice-exemple/alice
+            - name: AMEESH_CONFIG
+              value: /etc/ameesh/tenant/config.json
+            - name: AMEESH_CANON
+              value: /var/lib/ameesh/canon/repo
+            - name: AMEESH_CANON_SYNC_INTERVAL
+              value: "0"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ameesh-db
+                  key: password
+          # Clés d'API d'ORGANISATION seulement (mode `api-key`, P1). Aucun
+          # abonnement : la tranche P3 rouvre Q2 bis et la connexion du siège.
+          envFrom:
+            - secretRef:
+                name: ameesh-harness-alice
+                optional: true
+          readinessProbe:
+            exec:
+              command: ["ameesh", "doctor", "--probe"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            runAsUser: 2519
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            # Le PVC de CE tenant, et lui seul : aucun volume de tenant n'est
+            # monté dans le superviseur ou dans un autre conteneur (design
+            # §4.1, §5.2).
+            - name: home-alice
+              mountPath: /home/ameesh-alice
+            - name: passwd
+              mountPath: /etc/passwd
+              subPath: passwd
+              readOnly: true
+            - name: group
+              mountPath: /etc/group
+              subPath: group
+              readOnly: true
+            - name: tenant-config
+              mountPath: /etc/ameesh/tenant
+              readOnly: true
+            # Canon alimenté par l'init, lu seulement : le runner du tenant ne
+            # le synchronise jamais (garde de `canon_sync_once`).
+            - name: canon
+              mountPath: /var/lib/ameesh/canon
+              readOnly: true
+            - name: tenant-tmp
+              mountPath: /tmp
+
+        - name: canon-fetch
+          image: ameesh-runner
+          args:
+            - sh
+            - -ec
+            - |
+              install -m 600 /etc/ameesh/canon-key/ssh-privatekey /tmp/canon-key
+              export GIT_SSH_COMMAND="ssh -i /tmp/canon-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/ameesh/canon-key/known_hosts"
+              while :; do
+                git -C /var/lib/ameesh/canon/repo fetch --quiet --no-tags origin \
+                  || echo "git fetch du canon en échec : dernière révision connue conservée" >&2
+                sleep "$CANON_FETCH_INTERVAL" & wait $!
+              done
+          env:
+            - name: HOME
+              value: /tmp
+            - name: CANON_FETCH_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: ameesh-pod-canon
+                  key: fetch-interval
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: canon
+              mountPath: /var/lib/ameesh/canon
+            - name: canon-key
+              mountPath: /etc/ameesh/canon-key
+              readOnly: true
+            - name: canon-tmp
+              mountPath: /tmp
+
+      volumes:
+        # État local éphémère du superviseur (il n'écrit que des fichiers de
+        # service) ; le PVC d'un tenant n'est JAMAIS monté ici.
+        - name: supervisor-home
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: home-alice
+          persistentVolumeClaim:
+            claimName: pvc-alice
+        - name: canon
+          emptyDir: {}
+        - name: canon-key
+          secret:
+            secretName: ameesh-canon-deploy-key
+            defaultMode: 0440
+        - name: canon-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: supervisor-tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tenant-tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: supervisor-config
+          configMap:
+            name: ameesh-pod-supervisor
+        - name: tenant-config
+          configMap:
+            name: ameesh-pod-tenant-alice
+            items:
+              - key: config.json
+                path: config.json
+        - name: passwd
+          configMap:
+            name: ameesh-pod-passwd
+            items:
+              - key: passwd
+                path: passwd
+        - name: group
+          configMap:
+            name: ameesh-pod-passwd
+            items:
+              - key: group
+                path: group

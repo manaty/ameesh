@@ -1041,6 +1041,43 @@ class SandboxPlacement:
                 "job": self.job.to_dict()}
 
 
+#: #7694 : les deux formes d'hôte pod (design 7633 §7.1). `pod` est un hôte
+#: durable (un conteneur et un volume par tenant) ; `pod-template` est le
+#: gabarit figé d'un pod d'enfant, jamais un hôte plaçable.
+POD_RUNTIME_KINDS = ("pod", "pod-template")
+#: isolation des comptes d'un hôte pod : volume par tenant (hôte durable) ou
+#: dossier vide par pod (enfant éphémère).
+POD_ACCOUNT_ISOLATIONS = ("per-tenant-volume", "per-pod-empty-dir")
+#: libellé de charge de travail : `statefulset/<nom>` ou `deployment/<nom>`,
+#: une forme faible est un avertissement, jamais une hypothèse.
+POD_WORKLOAD_RE = re.compile(
+    r"^(?:statefulset|deployment)/[a-z0-9]([-a-z0-9]*[a-z0-9])?\Z")
+
+
+@dataclass
+class PodRuntime:
+    """#7694 : le bloc `policy.runtime` d'une carte Host pod (design 7633 §7.1).
+
+    Il décrit le **runtime** de l'hôte (pod Kubernetes, namespace, charge de
+    travail, isolation des comptes et référence citable du chart/témoin), pas
+    le provisionnement : l'UID d'un tenant vient du chart, et `canon check`
+    vérifie ici que les invariants du modèle sont déclarés. Aucun secret ni
+    valeur d'exécution n'y figure.
+    """
+
+    kind: str
+    namespace: str
+    workload: str
+    account_isolation: str
+    isolation_ref: str = ""
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "namespace": self.namespace,
+                "workload": self.workload,
+                "account_isolation": self.account_isolation,
+                "isolation_ref": self.isolation_ref}
+
+
 @dataclass
 class Agent:
     title: str
@@ -1198,12 +1235,16 @@ class HostPolicy:
     #: l'isolation de chaque tenant par UID, home et dossier de comptes.
     allow_subscription: bool = False
     require_isolation: bool = False
+    #: #7694 (design 7633 §7.1) : runtime d'un hôte pod (`policy.runtime`).
+    #: None = hôte VM, règles inchangées.
+    runtime: PodRuntime | None = None
 
     def to_dict(self) -> dict:
-        """Politique sérialisable (`canon show --json`) : le bloc sandbox est
-        un objet, jamais une dataclass brute."""
+        """Politique sérialisable (`canon show --json`) : les blocs sandbox et
+        runtime sont des objets, jamais une dataclass brute."""
         out = dict(self.__dict__)
         out["sandbox"] = self.sandbox.to_dict() if self.sandbox is not None else None
+        out["runtime"] = self.runtime.to_dict() if self.runtime is not None else None
         return out
 
     def work_dir(self, project: str | None, agent: str | None = None) -> str | None:
@@ -2080,6 +2121,54 @@ def _validate_tenancy(canon: "Canon", host: Any, add) -> None:
             host.fiche, host=host.title)
 
 
+def _validate_pod_runtime(canon: "Canon", host: Any, add) -> None:
+    """#7694 : invariants mécaniques d'un hôte `policy.runtime` (design §7.1).
+
+    Un hôte pod reste un hôte partagé : `shared: true`, `tenants` non vide,
+    un volume par tenant. Le gabarit d'enfant (`pod-template`) est figé — un
+    seul agent, volatil, sans siège — et n'est jamais un hôte plaçable.
+    """
+    policy = host.policy
+    runtime = policy.runtime
+    if runtime is None:
+        return
+    if not policy.shared:
+        add("host-pod-not-shared", ERROR,
+            "host %s: `policy.runtime` requires `policy.shared: true` (one "
+            "container and one volume per tenant, design 7633 §2.1)"
+            % host.title, host.fiche, host=host.title)
+    tenants = [t for t in (policy.tenants or []) if tenant_key(t)]
+    if not tenants:
+        add("host-pod-no-tenant", ERROR,
+            "host %s: `policy.runtime` requires a non-empty `policy.tenants`"
+            % host.title, host.fiche, host=host.title)
+    modes = policy.credential_modes or []
+    if runtime.kind == "pod-template":
+        if policy.max_agents != 1:
+            add("host-pod-template-max-agents", ERROR,
+                "host %s: `runtime.kind: pod-template` requires `max_agents: 1`"
+                % host.title, host.fiche, host=host.title)
+        if not policy.volatile:
+            add("host-pod-template-volatile", ERROR,
+                "host %s: `runtime.kind: pod-template` requires `volatile: true` "
+                "(an ephemeral child host)" % host.title,
+                host.fiche, host=host.title)
+        if "subscription" in modes:
+            add("host-pod-template-subscription", ERROR,
+                "host %s: `runtime.kind: pod-template` must not carry "
+                "`subscription` (a seat is not shareable with an ephemeral "
+                "child, design 7633 §8.4)" % host.title,
+                host.fiche, host=host.title)
+    # #7694 (design 7633 §7.1) : la charge 1 min est celle du nœud, pas du
+    # pod ; un `max_load` déclaré est accepté mais jamais évalué en mode pod.
+    if (policy.resources or {}).get("max_load") is not None:
+        add("host-pod-load-unmeasured", WARNING,
+            "host %s: `policy.resources.max_load` is accepted but not evaluated "
+            "on a pod (`load1` is the node's load, not the pod's); use "
+            "`max_cgroup_throttled`/`max_cgroup_memory_used` (design 7633 §3.2)"
+            % host.title, host.fiche, host=host.title)
+
+
 def placement_violations(agent: Any, host: Any, placement: Any = None) -> list[str]:
     """Raisons pour lesquelles ce placement viole la politique de l'hôte ([] = admis).
 
@@ -2096,6 +2185,12 @@ def placement_violations(agent: Any, host: Any, placement: Any = None) -> list[s
     if policy is None:
         return []
     host_name = _get(host, "title") or _get(host, "name") or "?"
+    runtime = _get(policy, "runtime")
+    # #7694 : le gabarit d'enfant n'est pas un hôte : il ne reçoit aucun
+    # placement, même si la fiche partage ses règles de tenants.
+    if runtime is not None and _get(runtime, "kind") == "pod-template":
+        return ["host %s is a `pod-template`, not a placeable host "
+                "(design 7633 §7.1)" % host_name]
     mode = _get(placement, "credential_mode") or _get(agent, "credential_mode")
     checks = (
         ("harnesses", "harness", _get(agent, "harness"), False),
@@ -4774,6 +4869,8 @@ class _Loader:
             self._host_workspaces(raw, policy, where, subject)
             # #2202 S2 : le placement de Job, quand l'hôte en déclare un
             policy.sandbox = self._host_sandbox(raw, policy, where, subject)
+            # #7694 : runtime d'un hôte pod, quand la fiche en déclare un
+            policy.runtime = self._host_runtime(raw, policy, where, subject)
         tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
         occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
@@ -5108,6 +5205,85 @@ class _Loader:
                      "the avatar's evidence must be citable" % admitted_ref,
                      **where, **subject)
         return placement
+
+    def _host_runtime(self, raw: dict, policy: HostPolicy, where: dict,
+                      subject: dict) -> PodRuntime | None:
+        """#7694 : lit `policy.runtime` d'une carte Host pod (None si absent).
+
+        Le bloc décrit le runtime, pas un secret : type, namespace DNS-1123,
+        charge de travail, isolation des comptes et référence citable du
+        chart/témoin. Un bloc illisible rend None et une erreur : une fiche
+        fautive n'ouvre pas le mode pod par un défaut silencieux.
+        """
+        runtime = raw.get("runtime")
+        if runtime is None:
+            return None
+        if not isinstance(runtime, dict):
+            self.add("host-runtime-invalid", ERROR,
+                     "`policy.runtime`: mapping expected", **where, **subject)
+            return None
+        known = {"kind", "namespace", "workload", "account_isolation",
+                 "isolation_ref"}
+        for key in sorted(set(map(str, runtime)) - known):
+            self.add("host-runtime-unknown", WARNING,
+                     "`policy.runtime.%s`: unknown key (ignored)" % key,
+                     **where, **subject)
+        kind = _text(runtime.get("kind"))
+        if kind not in POD_RUNTIME_KINDS:
+            self.add("host-runtime-invalid", ERROR,
+                     "`policy.runtime.kind`: one of %s expected"
+                     % ", ".join(POD_RUNTIME_KINDS), **where, **subject)
+            return None
+        namespace = _text(runtime.get("namespace"))
+        if namespace is None or not SANDBOX_NAMESPACE_RE.match(namespace) \
+                or len(namespace) > 63:
+            self.add("host-runtime-invalid", ERROR,
+                     "`policy.runtime.namespace`: DNS-1123 namespace expected",
+                     **where, **subject)
+            namespace = ""
+        workload = _text(runtime.get("workload"))
+        if workload is None:
+            self.add("host-runtime-invalid", ERROR,
+                     "`policy.runtime.workload`: non-empty workload expected "
+                     "(e.g. `statefulset/ameesh-pod`)", **where, **subject)
+            workload = ""
+        elif not POD_WORKLOAD_RE.match(workload):
+            self.add("host-runtime-workload-weak", WARNING,
+                     "`policy.runtime.workload` %r does not look like "
+                     "`statefulset/<name>` or `deployment/<name>` (runbook only)"
+                     % workload, **where, **subject)
+        isolation = _text(runtime.get("account_isolation"))
+        if isolation not in POD_ACCOUNT_ISOLATIONS:
+            self.add("host-runtime-invalid", ERROR,
+                     "`policy.runtime.account_isolation`: one of %s expected"
+                     % ", ".join(POD_ACCOUNT_ISOLATIONS), **where, **subject)
+            isolation = ""
+        ref = _text(runtime.get("isolation_ref")) or ""
+        if not ref:
+            self.add("host-runtime-invalid", ERROR,
+                     "`policy.runtime.isolation_ref`: a citable reference of the "
+                     "chart and its witness expected (`owner/repo#123`, `#123` or "
+                     "`card@commit`)", **where, **subject)
+        elif not SANDBOX_REF_RE.match(ref):
+            self.add("host-runtime-ref-weak", WARNING,
+                     "`policy.runtime.isolation_ref` %r does not look like a canon "
+                     "PR/decision reference (`owner/repo#123`, `#123` or "
+                     "`card@commit`)" % ref, **where, **subject)
+        if kind == "pod" and isolation and isolation != "per-tenant-volume":
+            self.add("host-pod-account-isolation", ERROR,
+                     "host %s: `runtime.kind: pod` requires "
+                     "`account_isolation: per-tenant-volume` (one volume per "
+                     "tenant, design 7633 §4)" % subject.get("host"),
+                     **where, **subject)
+        if kind == "pod-template" and isolation \
+                and isolation != "per-pod-empty-dir":
+            self.add("host-pod-account-isolation", ERROR,
+                     "host %s: `runtime.kind: pod-template` requires "
+                     "`account_isolation: per-pod-empty-dir` (an ephemeral child "
+                     "never mounts a parent volume, design 7633 §8.4)"
+                     % subject.get("host"), **where, **subject)
+        return PodRuntime(kind=kind, namespace=namespace, workload=workload,
+                          account_isolation=isolation, isolation_ref=ref)
 
     def _sandbox_job(self, raw, where: dict, subject: dict) -> SandboxJob | None:
         """Les défauts du Job Kubernetes, tous requis ; None si illisible."""
@@ -5982,6 +6158,7 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                     "occupant %r de l'hôte %s ne résout pas vers un Member humain"
                     % (ref, host.title), host.fiche, host=host.title)
         _validate_tenancy(canon, host, add)
+        _validate_pod_runtime(canon, host, add)
         for name in host.policy.harnesses or []:
             if name not in known_harnesses:
                 add("host-harness-unknown", ERROR,

@@ -1,0 +1,179 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7694 (design 7633 §5.3, témoins 1 et 2) — GABARIT, remplacé par le script.
+#
+# Deux conteneurs, deux UID, deux PVC : chacun ne monte QUE son volume.
+# `fsGroup` est le GID neutre unique du pod (10000), jamais un fsGroup par
+# tenant. Le script `preuve-isolation-comptes.sh` remplace __UID_A__,
+# __UID_B__, __FS_GROUP__ et __IMAGE__, applique ce pod, exécute les contrôles
+# depuis le conteneur de A, puis le supprime.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: temoin-passwd
+data:
+  passwd: |
+    root:x:0:0:root:/root:/bin/sh
+    ameesh-a:x:__UID_A__:__FS_GROUP__:temoin a:/home/ameesh-a:/bin/sh
+    ameesh-b:x:__UID_B__:__FS_GROUP__:temoin b:/home/ameesh-b:/bin/sh
+    nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+  group: |
+    root:x:0:
+    temoin:x:__FS_GROUP__:
+    nogroup:x:65534:
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: temoin-deux
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-witness
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  securityContext:
+    runAsNonRoot: true
+    fsGroup: __FS_GROUP__
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: a
+      image: __IMAGE__
+      imagePullPolicy: IfNotPresent
+      args:
+        - sh
+        - -ec
+        - |
+          set -eu
+          test "$(id -u)" = "__UID_A__"
+          umask 077
+          mkdir -p "$HOME/.config/ameesh/accounts"
+          chmod 700 "$HOME/.config/ameesh" "$HOME/.config/ameesh/accounts"
+          printf 'temoin-a\n' > "$HOME/.config/ameesh/accounts/.temoin-a"
+          chmod 600 "$HOME/.config/ameesh/accounts/.temoin-a"
+          sleep 3600
+      env:
+        - name: HOME
+          value: /home/ameesh-a
+        - name: USER
+          value: ameesh-a
+        - name: LOGNAME
+          value: ameesh-a
+        - name: TMPDIR
+          value: /tmp
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      securityContext:
+        runAsUser: __UID_A__
+        runAsGroup: __FS_GROUP__
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: home-a
+          mountPath: /home/ameesh-a
+        - name: passwd
+          mountPath: /etc/passwd
+          subPath: passwd
+          readOnly: true
+        - name: group
+          mountPath: /etc/group
+          subPath: group
+          readOnly: true
+        - name: tmp-a
+          mountPath: /tmp
+    - name: b
+      image: __IMAGE__
+      imagePullPolicy: IfNotPresent
+      args:
+        - sh
+        - -ec
+        - |
+          set -eu
+          test "$(id -u)" = "__UID_B__"
+          umask 077
+          mkdir -p "$HOME/.config/ameesh/accounts"
+          chmod 700 "$HOME/.config/ameesh" "$HOME/.config/ameesh/accounts"
+          printf 'temoin-b\n' > "$HOME/.config/ameesh/accounts/.temoin-b"
+          chmod 600 "$HOME/.config/ameesh/accounts/.temoin-b"
+          sleep 3600
+      env:
+        - name: HOME
+          value: /home/ameesh-b
+        - name: USER
+          value: ameesh-b
+        - name: LOGNAME
+          value: ameesh-b
+        - name: TMPDIR
+          value: /tmp
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      securityContext:
+        runAsUser: __UID_B__
+        runAsGroup: __FS_GROUP__
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: home-b
+          mountPath: /home/ameesh-b
+        - name: passwd
+          mountPath: /etc/passwd
+          subPath: passwd
+          readOnly: true
+        - name: group
+          mountPath: /etc/group
+          subPath: group
+          readOnly: true
+        - name: tmp-b
+          mountPath: /tmp
+  volumes:
+    - name: home-a
+      persistentVolumeClaim:
+        claimName: pvc-temoin-a
+    - name: home-b
+      persistentVolumeClaim:
+        claimName: pvc-temoin-b
+    - name: passwd
+      configMap:
+        name: temoin-passwd
+        items:
+          - key: passwd
+            path: passwd
+    - name: group
+      configMap:
+        name: temoin-passwd
+        items:
+          - key: group
+            path: group
+    - name: tmp-a
+      emptyDir:
+        sizeLimit: 64Mi
+    - name: tmp-b
+      emptyDir:
+        sizeLimit: 64Mi

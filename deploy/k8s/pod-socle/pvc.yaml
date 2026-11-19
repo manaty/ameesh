@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7694 (design 7633 §4.1) : un PVC par tenant, monté dans SON conteneur seul.
+#
+# Le nom, l'UID et le home viennent de
+# `ameesh host tenant add human:alice --host pod-alice-exemple --pod`.
+# `ReadWriteOnce` : pas de ReadWriteMany, pas de subPath partagé, pas de
+# hostPath — ce sont les trois façons de rendre un volume visible à deux
+# tenants.
+#
+# Ce PVC survit à la suppression du pod (politique Kubernetes par défaut) ;
+# le supprimer est un geste explicite du bureau, jamais d'un agent.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-alice
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-host
+    ameesh.kubernetes.io/tenant: alice
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # storageClassName: <classe>   # à adapter au cluster (design 7633 §1.3)
+  resources:
+    requests:
+      storage: 20Gi
