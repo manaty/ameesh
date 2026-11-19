@@ -422,6 +422,26 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
         # n'appelle jamais le résolveur d'abrégé de la forge.
         forge.assert_not_called()
 
+    def test_unreadable_local_presence_refuses_instead_of_opening_provenance(self):
+        # B2 auditeur/cx2 sur 3a7e2272 : quand la lecture groupée de présence
+        # rend None (git en échec, coupé ou délai), l'abrégé court n'est pas
+        # écarté en silence ; en lecture stricte, le doute refuse la porte.
+        _fix, head = self._rewrite(cite="deadbeef1")
+        real = review_authors._present_commits
+
+        def unreadable(repo, shas, **kwargs):
+            if "deadbeef1" in {str(sha).lower() for sha in shas}:
+                return None
+            return real(repo, shas, **kwargs)
+
+        with mock.patch.object(review_authors, "_present_commits", unreadable), \
+                mock.patch.object(review_authors, "_forge_commit",
+                                  return_value=""):
+            with self.assertRaisesRegex(
+                    review_provenance.ProvenanceError,
+                    "cited commit deadbeef1 .*forge-unreadable"):
+                self._reading(head, strict=True)
+
     def test_ambiguous_forge_still_refuses_a_qualified_citation(self):
         # La garantie de provenance reste : une vraie citation (12 hex) que
         # la forge ne résout pas explicitement est un doute refusé.
@@ -639,6 +659,50 @@ class ForgeCitationResolutionTest(unittest.TestCase):
                     "ed25519 deadbeef1 correctif-1234abcd", "owner/repo",
                     repo=repo.root),
                 [])
+
+    def test_unreadable_local_presence_keeps_the_short_citation(self):
+        # B2 auditeur/cx2 sur 3a7e2272 : None de _present_commits est une
+        # lecture non concluante, pas une absence ; l'abrégé court reste un
+        # jeton, et le chemin existant en fait un doute (refus en strict).
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(review_authors, "_present_commits",
+                                   return_value=None):
+                self.assertEqual(
+                    review_authors._cited_tokens(
+                        "reprend 4c39e880a", "owner/repo", repo=tmp),
+                    ["4c39e880a"])
+
+    def test_ambiguous_local_abbreviation_keeps_the_short_citation(self):
+        # B2 cx2 : une abréviation ambiguë ne prouve ni présence ni absence ;
+        # elle reste un jeton, dit au gel ou refusé en lecture stricte.
+        with tempfile.TemporaryDirectory() as tmp:
+            def probe(repo, shas, *, ambiguous=None, timeout=None):
+                if ambiguous is not None:
+                    ambiguous.update(str(sha).lower() for sha in shas)
+                return {}
+
+            with mock.patch.object(review_authors, "_present_commits",
+                                   side_effect=probe):
+                self.assertEqual(
+                    review_authors._cited_tokens(
+                        "reprend deadbeef1", "owner/repo", repo=tmp),
+                    ["deadbeef1"])
+
+    def test_present_commits_reports_an_ambiguous_abbreviation(self):
+        # `cat-file --batch-check` répond « <jeton> ambiguous » pour une
+        # abréviation ambiguë ; ce n'est pas une absence.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _Repo(os.path.join(tmp, "depot"))
+            repo.write("f.txt", "base\n")
+            repo.commit("base")
+            proc = mock.Mock(returncode=0, stdout=b"deadbeef1 ambiguous\n")
+            ambiguous: set[str] = set()
+            with mock.patch.object(review_authors, "_read_git",
+                                   return_value=proc):
+                self.assertEqual(
+                    review_authors._present_commits(
+                        repo.root, ["deadbeef1"], ambiguous=ambiguous), {})
+            self.assertEqual(ambiguous, {"deadbeef1"})
 
     def test_qualified_repository_citation_keeps_a_short_sha(self):
         # La forme `dépôt@sha` qualifie un SHA court ; un autre dépôt nommé

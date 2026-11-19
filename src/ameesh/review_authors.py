@@ -1304,6 +1304,7 @@ def _is_ancestor(repo: str, before: str, after: str, cache=None) -> Optional[boo
 
 def _present_commits(repo: str, shas: Sequence[str], *,
                      non_commits: Optional[set[str]] = None,
+                     ambiguous: Optional[set[str]] = None,
                      timeout: Optional[float] = None) -> Optional[dict[str, str]]:
     """Les SHA de commits présents **localement**, en une seule commande git.
 
@@ -1312,8 +1313,11 @@ def _present_commits(repo: str, shas: Sequence[str], *,
     CI. `cat-file --batch-check` lit la présence des objets en un passage, sans
     fetch paresseux (magasin sans remote), et rend `{sha: sha complet}`.
     `non_commits`, si fourni, reçoit les objets résolus de type blob, tree
-    ou tag (#7618) ; les objets absents ou ambigus restent non concluants.
-    `None` quand la lecture échoue : la preuve locale reste non concluante.
+    ou tag (#7618) ; `ambiguous`, si fourni, reçoit les abréviations ambiguës
+    (`cat-file` répond `<jeton> ambiguous`), qui ne prouvent ni présence ni
+    absence (#7721 B2 cx2). Une abréviation absente reste hors des deux
+    ensembles. `None` quand la lecture échoue : la preuve locale reste non
+    concluante.
     """
     wanted = list(dict.fromkeys(str(sha).lower() for sha in shas or ()
         if re.fullmatch(r"[0-9a-fA-F]{7,64}(?:\^[0-9]*)?", str(sha))))
@@ -1340,6 +1344,9 @@ def _present_commits(repo: str, shas: Sequence[str], *,
         elif (len(fields) == 2 and fields[1] in {"blob", "tree", "tag"}
               and non_commits is not None):
             non_commits.add(rev)
+        elif (len(fields) == 2 and fields[1] == "ambiguous"
+              and ambiguous is not None):
+            ambiguous.add(rev)
     return present
 
 
@@ -5269,7 +5276,7 @@ _CITED_COMMIT = re.compile(
 
 
 def _cited_tokens(body: str, own_repository: str = "",
-                  repo: str = "") -> list[str]:
+                  repo: str = "", *, timeout: Optional[float] = None) -> list[str]:
     """Les citations de commit d'un message (#7252, #7721).
 
     Un jeton de 12 à 40 caractères hexadécimaux est une citation. Un jeton plus
@@ -5280,8 +5287,13 @@ def _cited_tokens(body: str, own_repository: str = "",
     l'abrégé usuel de Git (9 caractères ici) sans transformer `ed25519` ou
     `deadbeef` en citations : la résolution est locale et sans réseau
     (`_present_commits`, sans fetch paresseux) ; un jeton absent du clone ou
-    d'un autre type que commit est écarté sans interroger la forge. Un SHA
-    d'un autre dépôt nommé n'est jamais lu ici (#7721).
+    d'un autre type que commit est écarté sans interroger la forge.
+
+    Une lecture locale **non concluante** (`_present_commits` rend None) ou
+    ambiguë ne prouve pas l'absence : l'abrégé court reste alors un jeton, et
+    le chemin existant en fait un doute (refus en lecture stricte) plutôt
+    qu'une exclusion silencieuse (B2 auditeur/cx2 sur 3a7e2272). Un SHA d'un
+    autre dépôt nommé n'est jamais lu ici (#7721).
     """
     own = str(own_repository or "").strip().casefold()
     own_name = own.rpartition("/")[2]
@@ -5302,11 +5314,18 @@ def _cited_tokens(body: str, own_repository: str = "",
         if token:
             found.append(("short", token))
     shorts = [token for kind, token in found if kind == "short"]
-    present: dict[str, str] = {}
+    present: Optional[dict[str, str]] = {}
+    ambiguous: set[str] = set()
     if shorts and str(repo or "").strip():
-        present = _present_commits(str(repo).strip(), shorts) or {}
+        present = _present_commits(str(repo).strip(), shorts,
+                                   ambiguous=ambiguous, timeout=timeout)
+    if present is None:
+        # La présence locale n'a pas pu être lue : ne pas écarter en silence
+        # un abrégé qui peut être la citation du correctif.
+        return [token for _kind, token in found]
     return [token for kind, token in found
-            if kind == "long" or token.lower() in present]
+            if kind == "long" or token.lower() in present
+            or token.lower() in ambiguous]
 
 
 #: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
@@ -5728,8 +5747,10 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             # citation Git, même si sa longueur ressemble à un SHA abrégé.
             # #7721 : seuls les jetons qualifiés sont des citations (12 hex
             # ou plus, `dépôt@sha` du dépôt lu, ou abrégé local de 7 à 11
-            # caractères présent comme commit — B auditeur sur 474fe7c9).
-            tokens = _cited_tokens(body, own_repository, repo=repo)
+            # caractères présent comme commit — B auditeur sur 474fe7c9) ;
+            # une lecture locale non concluante garde l'abrégé (B2).
+            tokens = _cited_tokens(body, own_repository, repo=repo,
+                                   timeout=remaining())
             if not tokens:
                 continue
             check()

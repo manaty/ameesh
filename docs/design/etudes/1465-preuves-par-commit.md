@@ -551,10 +551,13 @@ correcteur retiré pourrait compter comme un avis indépendant (B auditeur sur
 474fe7c9). La présence locale est lue sans réseau (`_present_commits`) ; un mot
 hexadécimal absent (`ed25519`, `deadbeef`, `correctif-1234abcd`) ou un SHA
 d'un autre dépôt nommé n'est pas une citation : il n'interroge jamais la forge
-et ne peut donc pas faire refuser la lecture de provenance. Les empreintes
-explicitement nommées (`checksum`, `sha256`), le nom complet d'un paquet
-horaire (`h-AAAAMMJJ-NN`) et une suite noyée dans un mot (`succeeded`, #7770)
-restent écartés.
+et ne peut donc pas faire refuser la lecture de provenance. Une lecture locale
+**non concluante** (git en échec, coupé ou délai) ou une abréviation ambiguë ne
+prouve pas l'absence : l'abrégé court reste un jeton et devient un doute (dit
+au gel, refusé en lecture stricte), jamais une exclusion silencieuse (B2
+auditeur/cx2 sur 3a7e2272). Les empreintes explicitement nommées (`checksum`,
+`sha256`), le nom complet d'un paquet horaire (`h-AAAAMMJJ-NN`) et une suite
+noyée dans un mot (`succeeded`, #7770) restent écartés.
 
 Une citation qualifiée n'est lue que si le dépôt ou la forge la confirme comme
 commit. Un objet local d'un autre type (arbre, blob, étiquette) est écarté sans
