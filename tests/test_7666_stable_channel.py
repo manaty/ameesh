@@ -202,6 +202,41 @@ class StableChannelTest(unittest.TestCase):
         with self.assertRaises(sc.StableError):
             sc.publish(self.project, other)
 
+    def test_a_refused_push_leaves_no_local_tag_behind(self):
+        manifest = self.designate("2026-W47")["manifest"]
+        hook = os.path.join(self.remote, "hooks", "pre-receive")
+        with open(hook, "w", encoding="utf-8") as stream:
+            stream.write("#!/bin/sh\nexit 1\n")
+        os.chmod(hook, 0o755)
+        try:
+            with self.assertRaises(sc.StableError):
+                sc.publish(self.project, manifest)
+        finally:
+            os.unlink(hook)
+        self.assertEqual(sc.published(self.repo), {})
+        self.assertEqual(sc.remote_weeks(self.repo, "origin"), [])
+        # A later designation with another manifest is not blocked by the
+        # unpublished leftover the refused push would have left behind.
+        other = dict(manifest, tag="v1.0.0", version="1.0.0", commit=self.commits["1.0.0"],
+                     tag_object=git(self.repo, "rev-parse", "refs/tags/v1.0.0"))
+        sc.publish(self.project, other)
+        self.assertEqual(sc.remote_weeks(self.repo, "origin"), ["2026-W47"])
+        self.assertEqual(sc.read_tag(self.repo, "2026-W47")["tag"], "v1.0.0")
+
+    def test_an_unpublished_local_tag_is_replaced(self):
+        # A crash between the local tag and the push leaves it behind; the
+        # remote is empty, so the next designation must replace it.
+        manifest = self.designate("2026-W47")["manifest"]
+        sc.publish(self.project, manifest, push=False)
+        self.assertEqual(set(sc.published(self.repo)), {"2026-W47"})
+        self.assertEqual(sc.remote_weeks(self.repo, "origin"), [])
+        other = dict(manifest, tag="v1.0.0", version="1.0.0", commit=self.commits["1.0.0"],
+                     tag_object=git(self.repo, "rev-parse", "refs/tags/v1.0.0"))
+        with mock.patch.object(rc, "remote_tag", return_value=None):
+            sc.publish(self.project, other)
+        self.assertEqual(sc.remote_weeks(self.repo, "origin"), ["2026-W47"])
+        self.assertEqual(sc.read_tag(self.repo, "2026-W47")["tag"], "v1.0.0")
+
     def consumer(self):
         """A clone of the publisher, as an external module would hold one."""
         path = os.path.join(self.tmp.name, "consumer-clone")

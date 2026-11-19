@@ -60,6 +60,10 @@ Until that gesture, the tick reports `awaiting-decision` and publishes nothing.
 After the first stable, each weekly tag is published by the tick without a
 human gesture. This is ordinary channel operation, not a new publication.
 
+A refused push never leaves its local tag behind: the next designation replaces
+a local `stable/<week>` tag that the remote does not carry, instead of blocking
+the week on a stale manifest.
+
 ## Channel manifest
 
 The message of the annotated tag `stable/<week>` is the manifest (schema
