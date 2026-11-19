@@ -1385,6 +1385,7 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
         if not key_path:
             raise DecisionError("accord grant: the avatar signs with the owner key")
         description = _decision_grant_action(db, view, human, signer, digest)
+        cited = int(signer["accord"]["grant"])
         from . import actions as actions_mod
         proposal = None
         try:
@@ -1394,9 +1395,12 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
                 args=description["args"], proposed_by=description["proposed_by"],
                 action_class=description["class"],
                 work_item=description["work_item"])
+            # #7684 (B, relecture) : le grant CITE couvre l'action et le
+            # finance ; aucun autre grant ne peut s'y substituer.
             actions_mod.approve(db, proposal["action_id"], standing=True,
-                                by=description["proposed_by"].split(":", 1)[-1])
-            reserved = receipts.standing_cover(db, proposal)
+                                by=description["proposed_by"].split(":", 1)[-1],
+                                grant_id=cited)
+            reserved = receipts.standing_cover(db, proposal, only_grant=cited)
         except (actions_mod.ActionError, receipts.ReceiptError) as exc:
             _abandon_decision_grant(
                 db, {"key": proposal["action_id"]} if proposal else None,
@@ -1514,6 +1518,22 @@ def verify_proof(db, view: dict, *, live: bool = False, public_only: bool = Fals
                 or action_decision != int(view["id"])
                 or args.get("answer") != digest):
             return False, "the standing reservation is not tied to this answer"
+        if int(action.get("auth_grant_id") or 0) != grant:
+            return False, "the standing reservation is not on the cited grant"
+        approval = storage.of(db).approvals.get(int(row["id"]))
+        meta = (approval or {}).get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except ValueError:
+                meta = {}
+        accord = meta.get("accord") if isinstance(meta, dict) else None
+        try:
+            cited = int((accord or {}).get("grant") or 0)
+        except (TypeError, ValueError):
+            cited = 0
+        if cited != grant:
+            return False, "the standing grant is not the cited accord"
         live_rows = [int(r["grant_id"]) for r in
                      storage.of(db).grants.live_reservations(key)]
         if grant not in live_rows:

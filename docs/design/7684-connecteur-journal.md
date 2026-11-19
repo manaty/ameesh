@@ -40,17 +40,23 @@ la porte, dans la transaction de la signature :
    `args = {"decision": <id>, "answer": <empreinte de la réponse>}`,
    `proposed_by = agent:<avatar>`, `target = <destinataire de la décision>` ;
    le canon du projet fixe la classe ;
-2. elle est **approuvée en `standing`** : le grant doit couvrir ce
-   bénéficiaire, cette cible, ce canon, cette classe et cette opération ;
-3. `receipts.standing_cover` **réserve** le grant sur cette action ; la
-   réservation est liée à l'empreinte de la réponse par l'`args` de l'action ;
+2. elle est **approuvée en `standing` sur le grant cité** (`--accord
+   grant:ID`) : ce grant doit couvrir ce bénéficiaire, cette cible, ce canon,
+   cette classe et cette opération ; aucun autre grant couvrant ne peut s'y
+   substituer (la liaison échoue si le grant cité est absent, révoqué, échu
+   ou hors portée) ;
+3. `receipts.standing_cover(..., only_grant=ID)` **réserve ce grant** sur
+   cette action ; la réservation est liée à l'empreinte de la réponse par
+   l'`args` de l'action ;
 4. l'approbation Ed25519 de la réponse est créée, consommée par la décision,
    et la décision est close — le tout dans la même transaction.
 
 La preuve de la réponse porte
 `standing = {grant, reservation, key}` (`key` = identifiant de l'action).
 `verify_proof` recontrôle que l'action décrit bien **cette** décision et
-**cette** empreinte, et que la réservation est vivante sur le grant cité.
+**cette** empreinte, que son grant lié et le `meta.accord.grant` de
+l'approbation sont **le grant cité**, et que la réservation est vivante sur
+ce grant.
 Un échec certain (clé illisible, signature refusée, décision close ailleurs)
 libère la réservation ; hors transaction (exécuteur médié), l'action de porte
 est annulée en plus. En transaction, le retour arrière fait le nettoyage.

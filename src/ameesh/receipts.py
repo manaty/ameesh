@@ -1599,7 +1599,8 @@ def standing_release(db: Db, reservation_id: int, *, outcome: str = "failed",
     return dict(released) if released is not None else None
 
 
-def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> dict | None:
+def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None,
+                   only_grant: int | None = None) -> dict | None:
     """Trouve un grant qui couvre l'action et y réserve son montant.
 
     `action` : action_id, connector, operation, class, amount (facultatif),
@@ -1611,12 +1612,29 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
     couvrent. Une réservation vivante existante pour l'action est réutilisée
     en priorité — si elle décrit la même action, sinon ReceiptError
     (`standing_reserve`). None = aucune couverture.
+
+    `only_grant` (#7684) : ne réserve QUE ce grant, et rend None s'il ne
+    couvre pas. Un appelant qui cite un accord ne peut ainsi pas être couvert
+    par un autre grant ; aucune autre réservation vivante de l'action ne doit
+    exister, sinon ReceiptError (deux accords concurrents).
     """
     action_id = action["action_id"]
     action_class = action.get("class", action.get("action_class"))
     value = _amount(action.get("amount"))
     currency = action.get("currency")
     live = storage.of(db).grants.live_reservations(action_id)
+    if only_grant is not None:
+        cited = int(only_grant)
+        others = [int(row["grant_id"]) for row in live
+                  if int(row["grant_id"]) != cited]
+        if others:
+            raise ReceiptError("action %s already reserved on grant(s) %s, not the "
+                               "cited grant #%d"
+                               % (action_id, ", ".join("#%d" % g for g in others), cited))
+        return standing_reserve(
+            db, cited, action_id, value, connector=action["connector"],
+            operation=action["operation"], action_class=action_class, currency=currency,
+            reserved_by=reserved_by)
     candidates = [int(row["grant_id"]) for row in live]
     # simple PRÉ-FILTRE, sans verrou : la décision (révocation, échéance à
     # l'heure réelle après le dernier verrou, couverture, cumul) est refaite

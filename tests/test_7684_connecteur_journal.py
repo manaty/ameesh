@@ -376,6 +376,54 @@ class DecisionGrantTest(DecisionGrantBase):
                                   outcome="failed", reason="test")
         self.assertFalse(decisions.verify_proof(self.db, signed["decision"])[0])
 
+    def test_cited_grant_is_the_one_bound_and_reserved(self):
+        """B (relecture P1) : le grant CITE par --accord est celui qui
+        approuve et réserve, jamais un autre grant couvrant."""
+        verdict, first = self.grant()
+        self.assertTrue(verdict.ok, verdict.reason)
+        verdict, second = self.grant()
+        self.assertTrue(verdict.ok, verdict.reason)
+        view = self.ask(needs_signature=True)
+        signed = self.sign(view, second)
+        proof = signed["decision"]["answer"]["proof"]
+        self.assertEqual(proof["standing"]["grant"], second)
+        action = actions.get(self.db, proof["standing"]["key"])
+        self.assertEqual(action["auth_grant_id"], second)
+        live = storage.of(self.db).grants.live_reservations(action["action_id"])
+        self.assertEqual([int(row["grant_id"]) for row in live], [second])
+        self.assertTrue(decisions.verify_proof(self.db, signed["decision"])[0])
+        # le meta de l'approbation dit le grant cité ; le changer (il n'est
+        # pas signé) fait refuser la preuve, il ne peut pas réécrire l'accord.
+        storage.of(self.db).approvals.merge_meta(
+            proof["approval_id"], {"accord": {"grant": first}})
+        self.assertFalse(decisions.verify_proof(self.db, signed["decision"])[0])
+
+    def test_absent_or_revoked_cited_grant_is_refused_even_with_another(self):
+        """B (relecture P1) : un grant cité inexistant ou révoqué refuse la
+        signature, même si un autre grant valide couvrirait la décision."""
+        verdict, valid = self.grant()
+        self.assertTrue(verdict.ok, verdict.reason)
+        view = self.ask(needs_signature=True)
+        with self.assertRaises(decisions.DecisionError):
+            self.sign(view, 999999)
+        self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
+        verdict, revoked = self.grant()
+        self.assertTrue(verdict.ok, verdict.reason)
+        receipts.revoke_standing(self.db, revoked, by="human:alice")
+        with self.assertRaises(decisions.DecisionError):
+            self.sign(view, revoked)
+        self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
+        # aucun grant n'a été réservé, aucune action de porte n'est restée
+        self.assertEqual(self.db.query(
+            "SELECT count(*)::int AS n FROM standing_reservations")[0]["n"], 0)
+        self.assertEqual(self.db.query(
+            "SELECT count(*)::int AS n FROM actions WHERE operation = "
+            "'decision-sign'")[0]["n"], 0)
+        # le grant valide, lui, signe toujours
+        signed = self.sign(view, valid)
+        self.assertEqual(signed["decision"]["answer"]["proof"]["standing"]["grant"],
+                         valid)
+
     def test_other_beneficiary_or_target_grant_does_not_cover(self):
         # Un grant ENREGISTRÉ pour un autre bénéficiaire ne couvre pas la
         # décision : la porte le refuse à la signature (le canon peut
