@@ -68,6 +68,9 @@ BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
                  # #6014 : un train en pause depuis plus d'un jour ne
                  # redémarre pas seul ; le pilote du projet doit trancher
                  "train_paused",
+                 # #7759 : des candidats prêts laissés dehors par un créneau ;
+                 # un seul composeur/pilote du projet
+                 "packet_ready_waiting",
                  # #6014 : une coupure due sans release.projects déclaré sur
                  # le coupeur ; le pilote du projet doit déclarer ou déplacer
                  "release_project_undeclared",
@@ -1576,7 +1579,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     diffusion aux agents. `stale_lot` d'un lot en qa : le relecteur DÉSIGNÉ
     reçoit en outre le verdict qui lui est dû (#705).
     Auditeurs : pour tous les types sauf `stale_lot` (L713), `plan_underused`
-    (#3274) et `estimate_bias` avec un estimateur au registre (#6426) — lus à
+    (#3274), `packet_ready_waiting` (#7759) et `estimate_bias` avec un
+    estimateur au registre (#6426) — lus à
     la passe de l'auditeur, sans réveil ; sans aucun orchestrateur vivant,
     `plan_underused` se replie sur l'auditeur (#3036). Un agent à la fois
     orchestrateur et auditeur reçoit un seul texte.
@@ -1745,6 +1749,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "release_project_undeclared":
             text = alert["detail"]
             teams = {alert["project"]} if alert.get("project") else set()
+        elif kind == "packet_ready_waiting":
+            text = alert["detail"]
+            teams = {alert["project"]} if alert.get("project") else set()
         elif kind == "notify_undeliverable":
             # #3007 : aucun notificateur vivant ne couvre l'humain ; tous les
             # orchestrateurs de l'alerte et l'auditeur la reçoivent.
@@ -1772,6 +1779,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             pool = _of_project(list(out), by_name, alert.get("project"), teams)
             chosen = _one_orchestrator(pool, by_name, alert.get("lot"))
             out = {name: out[name] for name in chosen}
+        if kind == "packet_ready_waiting":
+            # #7759 : un seul pilote du projet, stable d'une passe à l'autre
+            pool = _of_project(list(out), by_name, alert.get("project"), teams)
+            chosen = _one_orchestrator(pool, by_name, 0)
+            out = {name: out[name] for name in chosen}
         if kind in ("estimate_bias", "waiting_without_question") \
                 and alert.get("agent") in by_name:
             out.setdefault(alert["agent"], text)       # l'estimateur, l'assigné lui-même
@@ -1783,8 +1795,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     # par cette voie (un seul texte). #3274 : `plan_underused` aussi est lu à
     # la passe de l'auditeur — donner du travail aux agents au repos est le
     # geste des orchestrateurs, pas le sien ; s'il ne reste aucun orchestrateur
-    # vivant, l'auditeur prend le relais plus bas (#3036).
-    if kind not in ("stale_lot", "plan_underused"):
+    # vivant, l'auditeur prend le relais plus bas (#3036). #7759 : les
+    # candidats prêts laissés dehors sont le geste du composeur/pilote.
+    if kind not in ("stale_lot", "plan_underused", "packet_ready_waiting"):
         for name in auditor_names or ():
             if kind == "estimate_bias" and alert.get("agent") in by_name:
                 # #6426 : l'estimateur est briefé ; l'auditeur lit le biais à
