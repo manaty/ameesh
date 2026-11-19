@@ -371,6 +371,18 @@ SUMMARY_DISPLAY_MAX_CHARS = 64_000
 ROTATION_BACKOFF_S = 60.0
 ROTATION_BACKOFF_MAX_S = 1800.0
 ROTATION_SUMMARY_MAX_FAILURES = 3
+#: #7825 : entre deux tours, la session tourne dès que le contexte du dernier
+#: appel atteint le plafond MOINS cette part. Un tour parti à moins de 5 % du
+#: plafond le franchit dès ses premiers appels (relevé du 17-19/11 : 9 tours
+#: sur 11 gâchés partaient de 0,02 à 3 % sous le plafond, ~27 s et ~3 k
+#: jetons de travail avant leur clôture). Le plafond du tour en vol
+#: (`turn_close_due`) reste le plafond entier.
+CONTEXT_ROTATION_HEADROOM = 0.05
+#: #7825 : état local où survit au redémarrage de l'exécuteur la mesure de
+#: rotation du dernier tour (« <contexte> <session> ») ; sans elle, un
+#: exécuteur relancé entre une clôture au plafond et le tour suivant
+#: reprenait la session saturée.
+LAST_CONTEXT_STATE = "last_turn_context"
 #: #2096 : croissance de RSS (octets) à partir de laquelle un tour rend au
 #: noyau les arènes qu'il a fait croître (pic de flux, de parsing ou de
 #: journalisation). En deçà, l'allocateur garde sa marge : un tour ordinaire ne
@@ -971,6 +983,9 @@ class AgentWorker(threading.Thread):
         #: relectures du tour), jamais pour la rotation d'un tour Codex
         self.last_turn_context: int | None = None
         self.last_turn_context_session: str | None = None
+        #: #7825 : la mesure gardée par l'exécuteur précédent n'est relue
+        #: qu'une fois, avant le premier tour de ce worker
+        self._last_context_restore = True
         #: L81 (étude §6.3) : instant monotone du dernier message humain en
         #: attente — un entretien de session résidente ne le précède pas de
         #: moins de `resident_runner.QUIET_S`, sauf dépassement dur
@@ -2948,9 +2963,42 @@ class AgentWorker(threading.Thread):
         tour clos avant son `result` — pour Codex, dans le journal de session
         du fil (#2932) ; sans relevé, les jetons relus par le dernier tour
         inscrit au grand livre (L60)."""
+        self._restore_last_context()
         if self.last_turn_context is not None:
             return self.last_turn_context, self.last_turn_context_session
         return self.last_turn_reread, self.last_turn_reread_session
+
+    def _restore_last_context(self) -> None:
+        """#7825 : relit, une fois et avant tout tour de ce worker, la mesure
+        de rotation gardée par l'exécuteur précédent (`LAST_CONTEXT_STATE`).
+        Elle porte sa session : `context_rotation_due` l'ignore si la session
+        courante est une autre (rotation faite, oubli, remplaçant)."""
+        if not self._last_context_restore:
+            return
+        self._last_context_restore = False
+        if self.last_turn_context is not None:
+            return
+        champs = self._state_read(LAST_CONTEXT_STATE).split()
+        if len(champs) != 2 or not champs[0].isdigit():
+            return
+        self.last_turn_context, self.last_turn_context_session = int(champs[0]), champs[1]
+
+    def _keep_last_context(self) -> None:
+        """#7825 : garde la mesure de rotation du tour pour un exécuteur
+        relancé ; vide quand le tour n'en a pas."""
+        self._last_context_restore = False
+        valeur = ""
+        if self.last_turn_context is not None and self.last_turn_context_session:
+            valeur = "%d %s" % (self.last_turn_context, self.last_turn_context_session)
+        self._state_note(LAST_CONTEXT_STATE, valeur)
+
+    def context_rotation_threshold(self) -> int:
+        """#7825 : contexte à partir duquel la session tourne entre deux
+        tours — le plafond moins `CONTEXT_ROTATION_HEADROOM` ; 0 = désactivé."""
+        plafond = self.context_max_tokens()
+        if plafond <= 0:
+            return 0
+        return plafond - int(plafond * CONTEXT_ROTATION_HEADROOM)
 
     def _context_session_baseline(self, session: str | None) -> int | None:
         """CTX-02b : ``R_session`` des tours précédents, pour le normalisateur.
@@ -3212,14 +3260,19 @@ class AgentWorker(threading.Thread):
         Ni minimum de tours, ni rotation pendant un tour ; la politique
         `jamais` s'en dispense ; il faut une session courante, et que le
         relevé soit bien celui de cette session.
+
+        #7825 : la rotation part du seuil `context_rotation_threshold` (le
+        plafond moins sa marge), pas du plafond même, et la mesure survit au
+        redémarrage de l'exécuteur (`LAST_CONTEXT_STATE`).
         """
         if self.proc is not None or self.session_policy() == "jamais":
             return False
+        self._restore_last_context()
         if self.last_turn_context is None and self._ledger_harness() == "codex":
             return False
-        plafond = self.context_max_tokens()
+        seuil = self.context_rotation_threshold()
         relus, relus_session = self.last_turn_context_reread()
-        if plafond <= 0 or relus < plafond:
+        if seuil <= 0 or relus < seuil:
             return False
         session = self.current_session()
         if not session:
@@ -3405,8 +3458,10 @@ class AgentWorker(threading.Thread):
                 return self._rotate(raison)
         if self.context_rotation_due():
             return self._rotate("context cap: %d tokens in context "
-                                "(cap %d)" % (self.last_turn_context_reread()[0],
-                                              self.context_max_tokens()))
+                                "(cap %d, rotation from %d)"
+                                % (self.last_turn_context_reread()[0],
+                                   self.context_max_tokens(),
+                                   self.context_rotation_threshold()))
         if not self.rotation_due():
             return False
         return self._rotate("turns=%d, tokens=%.0f, last turn=%.0fs" % (
@@ -10810,6 +10865,7 @@ class AgentWorker(threading.Thread):
             # le contexte du dernier appel se lit dans le journal de session
             self.last_turn_context = self._codex_last_call_context(
                 self.last_turn_context_session)
+        self._keep_last_context()
         if resume and not session_new and not result_code and not error:
             self._resume_drop()  # tour achevé sans id de session : livré
         if relus_sous_agents:
