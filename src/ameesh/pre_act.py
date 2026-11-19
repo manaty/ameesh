@@ -104,8 +104,12 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
         "extract(epoch from created_at)::float8 AS ts, "
         "payload->'decision'->>'state' AS decision_state, "
         "payload->'decision'->'withdrawn'->>'ts' AS withdrawn_ts "
-        "FROM agent_mailbox WHERE work_item_id = %s OR body ~ %s ORDER BY id",
-        (str(lot), reference))
+        "FROM agent_mailbox WHERE id IN ("
+        "SELECT id FROM agent_mailbox WHERE recipient = %s AND delivered_at IS NULL "
+        "UNION SELECT id FROM agent_mailbox WHERE created_at >= to_timestamp(%s) "
+        "UNION SELECT id FROM agent_mailbox WHERE payload->'decision'->>'state' = 'withdrawn'"
+        ") AND (work_item_id = %s OR body ~ %s) ORDER BY id",
+        (actor, since, str(lot), reference))
     for message in messages:
         if (message.get("sender") or "").removeprefix("agent:") == actor.removeprefix("agent:"):
             continue
