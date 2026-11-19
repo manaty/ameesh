@@ -159,12 +159,28 @@ def consume(db, passages, *, consumer):
     if not passages:
         return consumer.consume(db)
     from . import ci
+    # #7795 : la table d'intégration se lit à la configuration de l'hôte,
+    # jamais dans un nom compilé. Un dépôt couvert par un passage du train
+    # mais absent de la configuration n'est pas ignoré : la cible du passage
+    # fait foi (c'est celle sur laquelle la CI a tourné). Une cible déclarée
+    # différente reste une contradiction refusée.
+    cfg = getattr(db, "cfg", None)
+    table = dict(consumer.integrations(cfg))
     readers = {}
     for passage in passages:
         reader = passage.incident_facts(db, fallback=ci.landed_commits)
-        spec = consumer.INTEGRATION.get(reader.repo)
-        branch = spec[0] if isinstance(spec, tuple) else spec
-        if branch != reader.target or reader.repo in readers:
+        if not reader.repo or not reader.target:
+            raise TrainError("one exact integration target per incident repository required")
+        spec = table.get(reader.repo)
+        if spec is None:
+            name = str(getattr(getattr(reader, "project", None), "name", "") or "").strip()
+            table[reader.repo] = (reader.target, name or reader.repo.rsplit("/", 1)[-1])
+        else:
+            branch = spec[0] if isinstance(spec, tuple) else spec
+            if branch != reader.target:
+                raise TrainError(
+                    "one exact integration target per incident repository required")
+        if reader.repo in readers:
             raise TrainError("one exact integration target per incident repository required")
         readers[reader.repo] = reader
 
@@ -180,4 +196,5 @@ def consume(db, passages, *, consumer):
         reader = readers.get(repo)
         return reader.links_for(repo, head) if reader else None
 
-    return consumer.consume(db, lands=lands, diagnoses=diagnoses, links_for=links_for)
+    return consumer.consume(db, integration=table, lands=lands,
+                            diagnoses=diagnoses, links_for=links_for)

@@ -168,7 +168,7 @@ class Project:
     repo: str
     migrations: str = ""
     #: #4750 : chiffres des numéros de migration (`014_x.sql` : 3) ; 0 : celui
-    #: d'un dépôt connu (`migrations.LAYOUTS`), sinon 4
+    #: lu dans les fichiers du dépôt (#7795), sinon 4
     migrations_width: int = 0
     #: #7000 : chemins (répertoires ou fichiers) qui suivent le numéro d'une
     #: migration — rollback, registre : une renumérotation imposée par la

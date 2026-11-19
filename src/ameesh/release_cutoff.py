@@ -1217,6 +1217,24 @@ def release_provider(model):
     return provider
 
 
+def default_report(cfg) -> str:
+    """#7795 : le destinataire par défaut d'un rapport de release.
+
+    Les humains déclarés à l'hôte (`humans`) d'abord, sinon le premier Member
+    du canon par défaut : un nom de personne ne se compile pas dans le cœur.
+    Un profil nu n'a aucun destinataire (chaîne vide)."""
+    humans = [h.strip() for h in str(getattr(cfg, "humans", "") or "").split(",")
+              if h.strip()]
+    if humans:
+        return humans[0]
+    try:
+        canons = canon_mod.load_configured(cfg)
+    except Exception:  # noqa: BLE001 - un canon illisible ne nomme personne
+        canons = []
+    members = sorted(member.title for member in canons[0].members) if canons else []
+    return members[0] if members else ""
+
+
 @dataclasses.dataclass(frozen=True)
 class ProjectRelease:
     name: str
@@ -1225,7 +1243,7 @@ class ProjectRelease:
     remote: str = "origin"
     staging: str = "deploy/mise-a-jour/staging.sh"
     staging_executor: str = ""
-    report: str = "smichea"
+    report: str = ""
     github: str = ""
     window_s: float = WINDOW_S
     staging_timeout_s: float = STAGING_TIMEOUT_S
@@ -1277,9 +1295,7 @@ class ProjectRelease:
             raise ReleaseError("release.projects.%s.target is required" % name)
         report = entry.get("report")
         if report is None:
-            humans = [h.strip() for h in str(getattr(cfg, "humans", "") or "").split(",")
-                      if h.strip()]
-            report = humans[0] if humans else "smichea"
+            report = default_report(cfg)
         model = entry.get("model", "semver")
         provider = release_provider(model)
         if provider is not None:
@@ -3179,7 +3195,10 @@ def report_recipients(cfg, db, project: ProjectRelease) -> list[str]:
     happened to look. The pilot comes from the shared rule
     (`alert_briefs.project_pilots`, the one base failures use); an unreadable
     role keeps the configured recipient alone."""
-    recipients = [project.report]
+    # #7795 : un profil nu n'a pas de destinataire compilé ; le projet
+    # construit directement hors configuration retombe sur le canon.
+    recipients = [project.report or default_report(cfg)]
+    recipients = [name for name in recipients if name]
     try:
         from . import alert_briefs, registry
         pilots = alert_briefs.project_pilots(project.name, list(registry.overview(db)),

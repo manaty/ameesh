@@ -262,7 +262,7 @@ def _outside_why(ident: str) -> str:
 
 def _merge_refusal(source: str, target: str) -> str:
     return (
-        "direct merge of %s into %s refused: canon §11 bis (manaty/home#107, owner "
+        "direct merge of %s into %s refused: canon §11 bis (owner decision of "
         "18/10/2026 « tout passe par paquet ») — no lot branch (anything but "
         "integration/**: lot/**, agent/**, review/**, fix/**…) is merged directly on the integration target; it enters by the "
         "packet (integration/**). If this lot fixes an incident (target red) or "
@@ -273,7 +273,7 @@ def _merge_refusal(source: str, target: str) -> str:
 
 def _ci_refusal(source: str, target: str) -> str:
     return (
-        "ci-lot request for %s refused: canon §11 bis (manaty/home#107, owner "
+        "ci-lot request for %s refused: canon §11 bis (owner decision of "
         "18/10/2026 « tout passe par paquet ») — no lot CI (label ci-lot-<sha>) is "
         "started between packets; the packet runs one full suite (--full --reason …). "
         "If this lot unblocks the CI or fixes an incident (target red), declare the "

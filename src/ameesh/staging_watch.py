@@ -336,10 +336,10 @@ _DESCENDS: set = set()
 def ancestry_repos(cfg=None) -> list[str]:
     """#5558: local ameesh clones that can prove a commit's ancestry.
 
-    In order: the clone declared to the host (`radar.projects`, github
-    manaty/ameesh), the deployment clone beside the sealed venv
-    (`~/.local/share/ameesh/src`, fetched by every install, and the
-    `src-<sha7>` snapshot of a `venv-<sha7>`), then the source checkout this
+    In order: the clone declared to the host (`radar.projects`, the package's
+    own repository read from its origin, #7795), the deployment clone beside
+    the sealed venv (`~/.local/share/ameesh/src`, fetched by every install, and
+    the `src-<sha7>` snapshot of a `venv-<sha7>`), then the source checkout this
     module runs from. Only existing directories are kept; a non-repository
     simply never proves anything.
     """
@@ -347,7 +347,8 @@ def ancestry_repos(cfg=None) -> list[str]:
     if cfg is not None:
         try:
             from . import migrations
-            declared = migrations.checkout_for(migrations.AMEESH_REPO, cfg)
+            repo = migrations.package_repo()
+            declared = migrations.checkout_for(repo, cfg) if repo else None
         except Exception:  # noqa: BLE001 - a malformed radar proves nothing
             declared = None
         if declared:

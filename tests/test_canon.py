@@ -1347,6 +1347,24 @@ class ReviewPolicyTest(_TmpMixin, unittest.TestCase):
         self.assertEqual(canon.git_range_paths(clone, base, head),
                          ["ancien.txt", "nouveau.txt"])
 
+    def test_renommages_rendus_en_paires_ancien_nouveau(self):
+        """#7777 : le garde du gel a besoin du couple, pas des deux chemins mêlés."""
+        workspace = self.make_tmp()
+        _bare, clone = publish(workspace, "home")
+        write(clone, "ancien.txt", "un\n")
+        write(clone, "modifie.txt", "deux\n")
+        base = commit_all(clone, "base")
+        git(clone, "mv", "ancien.txt", "nouveau.txt")
+        write(clone, "modifie.txt", "deux bis\n")
+        head = commit_all(clone, "renomme et modifie")
+        self.assertEqual(canon.git_range_renames(clone, base, head),
+                         [("ancien.txt", "nouveau.txt")])
+        # Quelque chose n'est pas un renommage, et une erreur git n'est jamais
+        # une liste vide rassurante.
+        self.assertEqual(canon.git_range_renames(clone, base, base), [])
+        with self.assertRaises(canon.GitError):
+            canon.git_range_renames(clone, "ref-qui-n-existe-pas", head)
+
     def test_reference_inconnue_leve_jamais_une_plage_vide(self):
         workspace = self.make_tmp()
         _bare, clone = publish(workspace, "home")

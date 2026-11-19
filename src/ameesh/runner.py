@@ -2130,6 +2130,36 @@ class AgentWorker(threading.Thread):
                 row.get("placement_diagnostic") or "placement not admitted")
         return ""
 
+    def host_claims_closed(self) -> bool:
+        """#7799 : cet agent peut-il encore ouvrir un tour sur cet hôte ?
+
+        Même prédicat que `begin_turn` (`ameesh_agent_claims_open`) : un hôte
+        `draining` ou `lost`, un retour `returning` prises fermées, ou un
+        verrou de release vivant ferment les prises de tous, sauf la sonde
+        nommée du verrou. Entre deux tours, un runner au repos n'a donc plus
+        rien à garder : il rend son bail pour que la vidange puisse prouver
+        `idle-drained` (sans cela, `host_release.release_blocker` refuse
+        indéfiniment : « a lease is still held »).
+
+        Un exécuteur médié lit le même prédicat par le contrat
+        (`host_lifecycle.claims_open`, portée A/H, hôte forcé) : la fonction
+        serveur est celle de `begin_turn`, donc le même verdict. Un ancien
+        serveur ne sert pas cette lecture (`NotSupportedRemotely`) : on ne
+        conclut pas, le bail est conservé et le cas est journalisé une fois
+        (comportement d'avant #7799). Une lecture impossible lève
+        (`db_mod.Unavailable`), la boucle la traite en panne de base et le
+        bail est conservé."""
+        from .mediated_executor.contract import NotSupportedRemotely
+        try:
+            return not storage.of(self.db).host_lifecycle.claims_open(
+                self.runner.host, self.name)
+        except NotSupportedRemotely as exc:
+            if not getattr(self, "_claims_read_unavailable", False):
+                self._claims_read_unavailable = True
+                log_async("[%s] host claims read unavailable (%s): old executor "
+                          "server, lease kept between turns" % (self.name, exc))
+            return False
+
     def peek(self) -> bool:
         agent = registry.get(self.db, self.name)
         if agent is None or agent.get("status") == "stopped":
@@ -2561,16 +2591,23 @@ class AgentWorker(threading.Thread):
             log_async("[%s] status after the move refusal not written (%s)"
                       % (self.name, db_mod.explain(exc)))
 
-    def _leave_for_host(self) -> None:
+    def _leave_for_host(self, reason: str | None = None) -> None:
         """L159f : porte d'hôte fermée — plus aucun tour ici. Session écrite,
         consigne éventuelle remise en attente, statut dit ; le bail est rendu
         par `run()` en sortant, et l'agent sera réclamé de nouveau au retour
         de l'hôte (ici, ou ailleurs). Écritures au mieux : en échec, le bail
-        échoit seul."""
+        échoit seul.
+
+        `reason` (#7799) nomme la fermeture quand elle vient du contrôle
+        durable de l'hôte (`draining`/retour fermé) et non de la porte locale.
+        """
         gate = getattr(self.runner, "host_gate", None)
         etat = gate.current if gate is not None else None
-        texte = "host unavailable (%s, %s): resumes when the host is back" % (
-            etat.state if etat else "?", etat.reason if etat else "?")
+        if reason is None:
+            texte = "host unavailable (%s, %s): resumes when the host is back" % (
+                etat.state if etat else "?", etat.reason if etat else "?")
+        else:
+            texte = "%s: resumes when the host is back" % reason
         log_async("[%s] the host is withdrawing: lease released (%s)" % (self.name, texte))
         if self.lease_lost.is_set():
             return
@@ -8305,6 +8342,10 @@ class AgentWorker(threading.Thread):
             # réservation repartir en livraison (au moins une fois).
             self._solde_humains(spec)
         elif not self._courrier_lance or not result:
+            if self._courrier_lance and not spec.get("human"):
+                # #7673 (E2c) : lancé puis coupé par le cœur — ses demandes,
+                # déjà soldées au lancement, repartent en attente.
+                self._requeue_interrupted(spec, jeton, ids)
             # Pas lancé, ou lancé puis mort/échec avant la fin : rien n'est
             # tenu pour servi ; la réservation est libérée et sera reprise.
             try:
@@ -8314,6 +8355,67 @@ class AgentWorker(threading.Thread):
                 # re-livré, signalé (aucune perte).
                 log("[%s] could not cancel the reservation (%s)"
                     % (self.name, exc))
+
+    def _core_interruption(self) -> str | None:
+        """#7673 : la cause d'un tour coupé par le cœur, ou None.
+
+        Arrêt ou drainage de l'exécuteur, retrait d'hôte (hors point sûr),
+        redémarrage, préemption, bail perdu. Un échec du harnais n'en est pas
+        une : sa demande n'est pas rejouée (elle bouclerait)."""
+        def raised(owner, name: str) -> bool:
+            event = getattr(owner, name, None)
+            return event is not None and event.is_set()
+
+        runner = getattr(self, "runner", None)
+        if raised(runner, "stop") or raised(runner, "draining") or raised(self, "stopping"):
+            return "runner shutdown"
+        host_yield = getattr(self, "host_yield", None)
+        if host_yield is not None and host_yield != self.HOST_SAFE_POINT:
+            return "host withdrawal (%s)" % host_yield
+        if raised(self, "restarting"):
+            return "restart"
+        if raised(self, "preempting"):
+            return "preemption"
+        if raised(self, "lease_lost"):
+            return "lease lost"
+        return None
+
+    def _requeue_interrupted(self, spec: dict, jeton: str, ids: list[int]) -> None:
+        """#7673 (E2c) : remet en attente les demandes d'un tour coupé par le
+        cœur, sous la garde du bail capturé (voir `mail.requeue_interrupted`).
+
+        Les demandes déjà répondues restent répondues ; les autres natures et
+        la consigne en attente (`pending_prompt`) ne sont pas touchées. Un
+        exécuteur médié n'a pas cette écriture : son comportement est inchangé.
+        """
+        cause = self._core_interruption()
+        if cause is None or not ids:
+            return
+        if getattr(self.runner, "mediated", False):
+            return
+        try:
+            out = mail.requeue_interrupted(
+                self.db, self.name, self.runner.runner_id, self.epoch, jeton,
+                spec.get("turn_id"), ids)
+        except db_mod.DbError as exc:
+            log("[%s] interrupted requests not put back in the queue (%s)"
+                % (self.name, exc))
+            return
+        requeued, replied = out.get("requeued") or [], out.get("replied") or []
+        if out.get("guard") == "refused":
+            log("[%s] interrupted requests not put back in the queue: the lease "
+                "changed hands since epoch %s" % (self.name, self.epoch))
+        if not requeued and not replied:
+            return
+        log("[%s] turn interrupted (%s): request(s) %s back in the queue%s"
+            % (self.name, cause, ", ".join(map(str, requeued)) or "none",
+               "; already answered: %s" % ", ".join(map(str, replied)) if replied else ""))
+        self._fil_note(
+            "Turn interrupted (%s): %d request(s) put back in the queue, to be "
+            "delivered again and flagged as possibly redelivered; %d already "
+            "answered." % (cause, len(requeued), len(replied)),
+            meta={"action": "remise-en-attente", "raison": cause,
+                  "messages": requeued, "repondus": replied})
 
     def _run_guarded_turn(self, spec: dict) -> bool:
         """Un tour. Pour un tour de courrier, protocole de remise unique :
@@ -11633,6 +11735,21 @@ class AgentWorker(threading.Thread):
                         # rendu et l'agent n'est plus réclamé
                         log("[%s] %s: lease released after the current turn"
                             % (self.name, retrait))
+                        break
+                    if self.host_claims_closed():
+                        # #7799 : hôte retiré (draining/lost, retour fermé ou
+                        # verrou de release) — entre deux tours, le runner au
+                        # repos cesse de renouveler et rend son bail ; sinon
+                        # `release_blocker` refuse `idle-drained` tant que ce
+                        # bail vit et la vidange d'un hôte où des agents sont
+                        # placés ne converge jamais. Un tour en cours n'est
+                        # jamais interrompu ici (contrôle après lui) et
+                        # `begin_turn` refuse déjà les tours suivants ; l'agent
+                        # est réclamé de nouveau à la réouverture des prises.
+                        log("[%s] host %s claims closed: lease released between turns"
+                            % (self.name, self.runner.host))
+                        self._leave_for_host(
+                            "host claims closed (draining or returning)")
                         break
                     self.apply_restart_if_requested()
                     with self._preparing("session rotation"):

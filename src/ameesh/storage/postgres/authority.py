@@ -13,8 +13,6 @@ import json
 
 from .. import interface
 
-#: the registry row made by SQL on 2026-10-12 for the owner's key (#330)
-STOPGAP_NAME = "smichea"
 
 class Keys(interface.Keys):
 
@@ -56,16 +54,20 @@ class Keys(interface.Keys):
     def register_human(self, name, human, public_key, fingerprint, role, *,
                        replace=False) -> str:
         with self.db.transaction() as tx:
-            # the stopgap row of 2026-10-12 (0364), exactly: it only ever
-            # stood for the owner's key
+            # The stopgap row of 2026-10-12 (0364) is the owner's placeholder,
+            # recognized by its shape and its owner key role — never by a
+            # compiled owner name (#7795). A row of another name, a real
+            # agent, a non-owner placeholder, or a placeholder with a
+            # session/lease/canon stays.
             tx.execute(
                 """
                 DELETE FROM agent_registry
-                 WHERE name = %s AND name = %s AND responsible = %s
+                 WHERE name = %s AND responsible = 'human:' || name
                    AND harness = 'none' AND mode = 'externe' AND turns = 0
+                   AND key_role = 'owner'
                    AND session_id IS NULL AND lease_owner IS NULL AND canon_ref IS NULL
                 """,
-                (name, STOPGAP_NAME, "human:" + STOPGAP_NAME),
+                (name,),
             )
             if tx.query("SELECT 1 FROM agent_registry WHERE name = %s", (name,)):
                 return "agent"

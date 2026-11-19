@@ -1180,7 +1180,8 @@ def _project_repo(text: str) -> tuple[str, str]:
 def _canon_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--canon", default=None,
                         help="id of a configured canon (L42; otherwise all for "
-                             "check/show/sync, the default canon elsewhere), or root "
+                             "check/show/sync, the default canon elsewhere; snapshot "
+                             "requires exactly one), or root "
                              "of a canon (otherwise AMEESH_CANON)")
     parser.add_argument("--ref", default=None,
                         help="canonical revision (otherwise AMEESH_CANON_REF, the manifest "
@@ -1332,7 +1333,9 @@ def add_parsers(sub) -> None:
     p_snapshot.add_argument("--expect-scope", metavar="DIR",
                             help="required root scope (refuse an absent or broader scope)")
     p_snapshot.add_argument("--single-source", action="store_true",
-                            help="refuse federation sources beyond the selected root")
+                            help="only the root source carries authority: refuse an "
+                                 "additional source with a readable scope, list "
+                                 "unloaded siblings as omitted members")
     p_snapshot.set_defaults(func=cmd_snapshot)
     p_sync = canon_sub.add_parser("sync", help="canon → host registry (§4.4)")
     _canon_options(p_sync)

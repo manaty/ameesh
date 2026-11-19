@@ -1,7 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.3, 18 November 2026** (additive E2b lease-fenced pending
-requests and correlated replies on the Python mail surface). Scope: an
+Contract revision: **1.5, 18 November 2026** (additive public fixture for a
+consumer-owned disposable database). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -17,6 +17,12 @@ module schema/migrations snapshot; all are additive to revision 1.1.
 Revision 1.3 adds the lease-fenced pending request and correlated reply
 operations to the same Python mail surface (tranche E2b, #7672); it is additive
 to revision 1.2.
+Revision 1.4 adds no name: the core puts the requests of a turn it interrupted
+back in the queue, under the captured lease (tranche E2c, #7673); it is
+additive to revision 1.3.
+Revision 1.5 adds `ameesh.public.fixture` (tranche F2, #7701): an installed
+consumer creates, migrates, observes and drops its own disposable database
+without `tests.support` or a private path; it is additive to revision 1.4.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -54,14 +60,15 @@ lists it in this contract. Clients check that version before enabling it.
 In particular, the baseline here is ameesh commit
 `aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007`; an open PR is not an installed feature.
 The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
-(#7671 E2a, #7674 E3a, #7675 E3b) and the revision 1.3 element (#7672 E2b) are
+(#7671 E2a, #7674 E3a, #7675 E3b), the revision 1.3 element (#7672 E2b), the
+revision 1.4 element (#7673 E2c) and the revision 1.5 element (#7701 F2) are
 available only in a released version that carries those lots; at the 1.0
 baseline they are absent, and a consumer must still treat their absence as
 "unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
-[coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2 and 1.3
-elements from the release that implements them; the surface keeps the 1.0
-commit as its comparison point.
+[coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3 and
+1.5 elements from the release that implements them, and freeze revision 1.5;
+the surface keeps the 1.0 commit as its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
@@ -167,7 +174,7 @@ base class or a required superclass of the installed implementation.
 | `NAME` | Unique installed name, matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; reserved or duplicate names are refused. |
 | `SCHEMA`, `MIGRATIONS`, `REQUIRES` | Optional storage facts, additive since 1.2. `SCHEMA` is the logical schema name (the module name by default); `MIGRATIONS` is a folder of `NNNN_name.sql` files **inside the installed package**, or None; `REQUIRES` lists modules whose schema must exist first. A module without `MIGRATIONS` declares no schema. Migration SQL is installed code reviewed as sensitive SQL; the canon never supplies an executable path. The runner derives `<core schema>__<module>`, applies the module's migrations in the core migration transaction and records them in `module_schema_migrations`. Every `SECURITY DEFINER` routine must set `search_path` in its own definition: the runner refuses a routine without it, and refuses a migration whose dynamic SQL or uncertain parse prevents that proof. |
 | `descriptor(options=None)` | Returns exactly `types`, `schemas`, `rules`: unique type-name list, schema mapping, list of rule mappings. The baseline requires an external lifecycle module to have a type. |
-| `CAPABILITIES` | Optional unique names among `lifecycle`, `cli`, `audit`, `workspaces`, backed by the corresponding implementation. |
+| `CAPABILITIES` | Optional unique names among `lifecycle`, `cli`, `audit`, `workspaces`, backed by the corresponding implementation. `release` (with `RELEASE_MODELS`) is reserved to built-in modules: an installed module declaring it is refused. |
 | `main(db, argv, *, actor)` | Optional CLI callback. Receives the resolved actor and a core-owned connection for ordinary dispatch. Help can receive `db=None`, `actor=""`; do not query in that case. Return an exit status. |
 | `audit(store, project)` | Optional callback for active project modules; returns findings through the existing module audit protocol. Host-only behavior is reserved to the core's always-active modules. |
 | `ameesh.modules.registry.discover(*, builtin=True, canon=None)` | Discovery record with `modules`, `refused`, `names()` and `get(name)`; each Module offers `as_dict()`. Discovery errors never authorize an entry. |
@@ -253,9 +260,9 @@ core's responsibility. The optional `harness` argument of the internal
 applies to every harness.
 
 IMA's per-document fresh-session policy is covered by this declarative
-surface. The remaining gap is the lease-bound replay requirement (tranche
-E2c), inventoried in the mapping and not available as a runner hook. Until it
-is delivered, IMA's remaining adaptation stays tracked by its
+surface. The lease-bound replay requirement (tranche E2c) is a core behavior,
+not a runner hook: see [interrupted requests](#requests-of-an-interrupted-turn-e2c-7673)
+(revision 1.4). IMA's removal of its shutdown subclass stays tracked by its
 [#1803](https://github.com/thepackengers/issue-manager-agent/issues/1803),
 rather than acquiring compatibility guarantees for private methods.
 
@@ -290,7 +297,8 @@ long as that name is not one the core reserves (below). Mediated executor
 connections are refused — their contract is separate.
 
 Enable the surface only when `ameesh.public.CONTRACT_VERSION` is `"1.3"` or a
-compatible later minor. A consumer written against the 1.1 draft applies the
+compatible later minor; rely on the requeue of interrupted requests only from
+`"1.4"`. A consumer written against the 1.1 draft applies the
 `payload.module` migration above before treating 1.2 as compatible.
 
 | Element | Contract |
@@ -383,6 +391,31 @@ settles, spends or changes a turn, its marker or its reservation. The
 `/requests/{request}` and `turn observe` observations remain the read-only
 surfaces for turn, accounting and quiescence.
 
+### Requests of an interrupted turn (E2c, #7673)
+
+From revision 1.4 the core, not the module, puts back in the queue the
+requests of a turn it interrupted. A mail turn marks its messages delivered
+when the harness starts; if the core then cuts the turn — runner shutdown or
+drain, host withdrawal (outside the safe point), `ameesh restart`, priority
+preemption, or a lost lease — each `request` that turn carried and that has no
+correlated reply becomes unread again. It is delivered to a later turn of the
+same agent, under that turn's own reservation, flagged as possibly redelivered,
+and appears in `pending` for that turn only. A module therefore needs no
+shutdown subclass and writes no restored prompt.
+
+| Guarantee | Contract |
+| --- | --- |
+| Exact captured set | Only the requests of the interrupted turn: the ids it served, still reserved under its runner, epoch, reservation token and native turn id. Another turn's request, a message reserved since by another reservation, and other kinds (`notify`, `event`, `reply`) are not touched. Human messages keep their own end-of-turn settlement. |
+| Lease guard | The registry row is locked first. Nothing is written once another holder has taken the lease since the captured epoch; the requeue proceeds only while the lease is still `(owner, epoch)` (live or expired but not reclaimed) or after that owner released it with no claim since. A refused requeue is logged; the request then stays delivered. |
+| Already-replied exclusion | A request with a correlated reply (`in_reply_to`) stays answered and is not delivered again. |
+| Race with `reply` | `reply` and the requeue lock the same registry row, so they serialize. A reply committed first is seen by the requeue, which leaves that request answered; a reply that comes after the requeue finds a request that is no longer the current turn's prompt and raises `ScopeRefused`. One request never ends both answered and queued again. |
+| Pending prompt | `pending_prompt` and its identity are never modified: an unrelated instruction queued during the turn stays as it was. |
+| No duplicate | The requeue removes the turn's reservation in the same write, so the next turn reserves the request once; no second reply is possible (unique `in_reply_to`), and no reservation, spend marker or ledger row is created or changed. |
+
+A turn that ends because its harness failed is not a core interruption: its
+requests are not delivered again, so that a request that makes the harness fail
+cannot loop. A mediated executor does not requeue (its behavior is unchanged).
+
 The module payload supports role, document and Memoria data, and is confined
 to `payload.module`, a JSON object (at most 256 KiB serialized). The namespace
 belongs to the calling actor: the module submits under its own identity, so
@@ -432,19 +465,64 @@ internal. `SELECT *` makes additional internals a dependency. All writes to
 core data go through an admitted command/API/callback operation, never through
 an updatable view or a caller-built transaction on core tables.
 
+## Public fixture for a consumer-owned database (1.5, #7701)
+
+Revision 1.5 adds `ameesh.public.fixture`, the qualification fixture for an
+installed module. A consumer uses it to run its own Process, usage, refusal and
+mail witnesses on a **consumer-owned disposable database**, without importing
+`tests.support`, a private ameesh path or a core table. Enable the surface when
+`ameesh.public.CONTRACT_VERSION` is `"1.5"` or a compatible later minor;
+`ameesh.public.fixture.CONTRACT_VERSION` is `"1.5"`.
+
+| Element | Contract |
+| --- | --- |
+| `Fixture(admin_dsn, *, executable=None, mail_executable=None, root=None, prefix="ameesh_fixture_", keep=False)` | A fixture bound to a PostgreSQL server the consumer controls. `admin_dsn` must name an existing database whose role may `CREATE DATABASE`; it is a secret, kept out of `repr()`. `executable` and `mail_executable` default to the installed `ameesh` and `agent-mail` commands. `root` selects a private directory (a fresh temporary one otherwise); `prefix` must stay in the `ameesh_fixture_` namespace. `keep=True` leaves the database for inspection. |
+| `create() -> Fixture`, `close()`, `with Fixture(...) as fixture` | `create()` creates `ameesh_fixture_<random>`, derives its DSN and applies the released schema through the installed `ameesh migrate` command (never an import of the migrator). The context manager creates and closes. `close()` is idempotent, drops only a database this instance created and removes only a root it created. |
+| `database`, `dsn`, `root` | The disposable database name, its DSN (carrying the consumer's credentials) and the private root. They refuse before `create()`. |
+| `env(**extra) -> dict` | The isolated child environment. Every inherited `AMEESH_*`, `AGENT_MESH_*` and `AGENT_MAIL_*` variable is removed first; the fixture then sets `AMEESH_DSN` (the disposable database), an empty `AMEESH_CONFIG`, private `AMEESH_STATE`/`AGENT_MAIL_STATE`/`AGENT_MAIL_CONFIG`, and `AMEESH_SCHEMA=public`. After `canon()`, `AMEESH_CANON` and `AMEESH_CANON_REF` name the private repository. `extra` is applied last and must be strings. |
+| `cli(*args, env=None, stdin=None, timeout=120)`, `mail(*args, ...)`, `run(command, *args, ...)` | Run an installed executable as a subprocess with `env()`, the private root as working directory and a bounded timeout. `cli` and `mail` use the installed commands; `run` takes a command prefix. They return `subprocess.CompletedProcess` and never import a dispatcher. |
+| `canon(files, *, message="fixture canon", ref="main") -> str` | Write a fresh private git repository from `files` (relative path → text), commit it and return the commit. `refs/remotes/origin/<ref>` is set so the core's authenticator check sees the canonical branch after a fetch, with no network remote. `git(*args)` runs git in that repository. |
+| `connect()`, `read_view(view, columns) -> list` | `connect()` opens one opaque core-owned connection to the disposable database, for the public Python surfaces (`ameesh.public.mail`) and one connection per racing thread; use it for those surfaces, not for SQL on core tables. `read_view` is the only SQL read surface: one of `agent_mesh_overview`, `mesh_keys` or `mesh_approvals_status`, with an explicit column list (never `*`). |
+| `path(relative)`, `write(relative, text)`, `read(relative)` | Files under the private root. Absolute paths and `..` escapes are refused. |
+| Errors | `FixtureError` (code `fixture`) when creation, migration or a read fails; `FixtureRefused` (code `refused`) for an unsafe target, an uncreated fixture or an out-of-protocol call. |
+
+The fixture's safety boundary is part of the contract:
+
+- it creates and drops only `ameesh_fixture_*` names; `close()` refuses any
+  other name, so a wrong string cannot drop a consumer's database;
+- `prefix` is bounded so the generated name (prefix plus 16 random bytes) stays
+  within PostgreSQL's 63-byte identifier limit and is never silently truncated;
+- the admin DSN is never printed and reaches only the disposable database; the
+  child environment never inherits the host's canon, DSN or runner identity,
+  and the `psql` fallback passes a password through `PGPASSWORD`, never argv;
+- the schema is applied only by the documented `ameesh migrate` command, and
+  core data is written only through admitted commands, HTTP or callbacks;
+- the named read views, with explicit columns, are the only SQL the fixture
+  offers; base tables, triggers and joins through them remain internal.
+
+The fixture does not probe whether the target is production: the consumer must
+point `admin_dsn` at a server and role whose disposable databases are
+acceptable. A consumer that needs a different PostgreSQL server provides its
+own DSN; no host default is read. The witness that exercises this surface is
+[public-fixture-witness](../../examples/fixtures/public-fixture-witness);
+`tests/test_7701_public_fixture.py` runs it on `AMEESH_TEST_DSN` and proves that
+the reported `ameesh_fixture_*` database is gone afterwards.
+
 ## Consumer qualification and delivery
 
 [#7665](https://github.com/manaty/ameesh/issues/5857) supplies the external
 witness ([contract-witness](../../examples/modules/contract-witness)), the
 frozen [surface](module-contract-v1.surface.json) and the compatibility CI; the
 element → test table is [module-contract-v1-coverage.md](module-contract-v1-coverage.md).
-The public fixture interface is a follow-up. Existing evidence is
+[#7701](https://github.com/manaty/ameesh/issues/5902) supplies the Python
+fixture surface and its external witness
+([public-fixture-witness](../../examples/fixtures/public-fixture-witness)),
+frozen as revision 1.5. Existing evidence is
 in `test_l84_serve`, `test_l98_modules_registry`, `test_l104_bare_canon`,
-`test_l2894_turn_observe`, and `test_l2894_turn_context`; it is not yet the complete
-external-module qualification required by #5827. The exact follow-up coverage
-is listed in the mapping. No test imports `tests.support` across the package
-boundary: the forthcoming fixture kit or a consumer-owned process/database
-fixture replaces that dependency.
+`test_l2894_turn_observe`, and `test_l2894_turn_context`; the fixture witness
+covers the process, usage, refusal and mail paths that previously required
+`tests.support`. No test imports `tests.support` across the package boundary:
+a consumer-owned process/database fixture replaces that dependency.
 
 Validate the same consumer unchanged against two consecutive stable versions.
 A contract failure belongs in upstream CI before release. Delivery of an

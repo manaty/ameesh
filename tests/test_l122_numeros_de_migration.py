@@ -7,6 +7,8 @@ numéro dans `src/ameesh/migrations` (le 2026-10-10, quatre lots ont pris
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import subprocess
 import tempfile
@@ -71,8 +73,21 @@ def _depot(path, slug, directory, base=(), branches=None):
     return path
 
 
-NEXLINK = migrations.LAYOUTS["manaty/nexlink"]
-AMEESH = migrations.LAYOUTS[migrations.AMEESH_REPO]
+# #7795 : les dispositions du banc sont des données de test ; le cœur les lit
+# à la configuration (`radar.projects`) ou à l'`origin` du paquet.
+NEXLINK = migrations.Layout("manaty/nexlink", "supabase/migrations", 3)
+AMEESH = migrations.package_layout() or migrations.Layout(
+    "manaty/ameesh", migrations.REPO_PATH, 4)
+
+
+def _declare(db, cfg, **projects):
+    """#7795 : le banc déclare ses clones dans `radar.projects` (la source de
+    la disposition des migrations, plus aucun `owner/repo` compilé)."""
+    cfg = dataclasses.replace(cfg, radar={"projects": {
+        name: {"repo": repo, "github": slug, "migrations": directory}
+        for name, (repo, slug, directory) in projects.items()}})
+    db.cfg = cfg
+    return cfg
 
 
 class NumerosDuDepotTest(unittest.TestCase):
@@ -250,6 +265,20 @@ class NumerosDuDepotTest(unittest.TestCase):
         self.assertEqual(AMEESH.file(378), "src/ameesh/migrations/0378_<name>.sql")
         self.assertIsNone(migrations.layout_for("manaty/inconnu"))
 
+    def test_packet_watch_sans_radar_nomme_le_clone(self):
+        """#7795 B : le composeur n'a pas de bloc `radar` ; la disposition se
+        lit quand même dans `packet_watch.projects.<p>.repo`, clone réel."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _depot(os.path.join(tmp, "nexlink"), "manaty/nexlink",
+                          NEXLINK.directory, ["375_a.sql"])
+            cfg = types.SimpleNamespace(
+                radar=None, release=None,
+                packet_watch={"projects": {"nexlink": {"repo": repo,
+                                                       "target": "develop"}}})
+            layout = migrations.layout_for("manaty/nexlink", cfg)
+        self.assertEqual(layout.directory, NEXLINK.directory)
+        self.assertEqual(layout.width, 3)
+
     def test_largeur_declaree(self):
         """#4750 : un dépôt déclaré à la configuration (pas en dur) porte sa
         largeur ; `014_x.sql` se lit sur 3 chiffres, défaut 4, valeur vérifiée."""
@@ -272,7 +301,31 @@ class NumerosDuDepotTest(unittest.TestCase):
                 radar.settings_of(cfg(migrations_width=bad))
 
 
-class ReservationTest(PgTestCase):
+def _mesh_config(tmp, **projects):
+    """#7795 : la configuration du CLI de test — `radar.projects` pour les
+    clones du banc, la disposition n'étant plus compilée dans le cœur."""
+    path = os.path.join(tmp, "mesh-config.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"radar": {"projects": {
+            name: {"repo": repo, "github": slug, "migrations": directory,
+                   "migrations_width": width}
+            for name, (repo, slug, directory, width) in projects.items()}}}, fh)
+    return path
+
+
+class MeshConfigMixin:
+    """#7795 : le CLI lancé par le banc lit la même configuration que lui."""
+
+    mesh_config = ""
+
+    def mesh(self, *args, env=None, timeout=60.0):
+        env = dict(env if env is not None else self.env())
+        if self.mesh_config:
+            env["AMEESH_CONFIG"] = self.mesh_config
+        return super().mesh(*args, env=env, timeout=timeout)
+
+
+class ReservationTest(MeshConfigMixin, PgTestCase):
     def setUp(self):
         super().setUp()
         self.nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
@@ -280,11 +333,18 @@ class ReservationTest(PgTestCase):
                               {"agent/autre": ["377_c.sql"]})
         self.ameesh = _depot(os.path.join(self.tmp, "ameesh"), "manaty/ameesh",
                              AMEESH.directory, ["0005_e.sql"])
+        self.cfg = _declare(self.db, self.cfg,
+                 ameesh=(self.ameesh, "manaty/ameesh", AMEESH.directory),
+                 nexlink=(self.nexlink, "manaty/nexlink", NEXLINK.directory))
         # #2620 : un numéro exact lit la cible du lot ; ces dépôts n'ont que
         # `develop` (pas d'`origin/HEAD`, pas de main), la cible est déclarée.
         _git(self.nexlink, "config", "ameesh.target", "develop")
         _git(self.ameesh, "config", "ameesh.target", "develop")
         self.floor = max(migrations.repo_numbers(self.ameesh, AMEESH)) + 1
+        self.mesh_config = _mesh_config(
+            self.tmp,
+            ameesh=(self.ameesh, "manaty/ameesh", AMEESH.directory, AMEESH.width),
+            nexlink=(self.nexlink, "manaty/nexlink", NEXLINK.directory, NEXLINK.width))
 
     def _lot(self, title="un lot", repo="manaty/ameesh", n=1):
         return work.add(self.db, title=title, issue_ref="%s#%d" % (repo, n), actor="mesh-design")
@@ -460,7 +520,10 @@ class ReservationTest(PgTestCase):
         unknown = self._lot("x", "manaty/inconnu")
         with self.assertRaises(work.WorkError) as ctx:
             work.reserve_migration(self.db, unknown["id"], repo=self.ameesh)
-        self.assertIn("migrations directory unknown", str(ctx.exception))
+        # #7795 : le clone explicite est vérifié avant la disposition ; il est
+        # celui d'ameesh, pas de `manaty/inconnu` — refus nommé, jamais deviné.
+        self.assertIn("clone of manaty/ameesh, not of manaty/inconnu",
+                      str(ctx.exception))
         self.assertIsNone(work.get(self.db, nx["id"])["migration"])
 
     def test_cle_de_depot_en_minuscules(self):
@@ -843,6 +906,7 @@ class CorrectionIssueRefTest(PgTestCase):
         nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                          NEXLINK.directory, ["376_b.sql"])
         _git(nexlink, "config", "ameesh.target", "develop")   # #2620 : cible lue
+        self.cfg = _declare(self.db, self.cfg, nexlink=(nexlink, "manaty/nexlink", NEXLINK.directory))
         work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
         with self.assertRaises(work.WorkError) as ctx:
             work.set_issue_ref(self.db, lot["id"], "manaty/ameesh#1603", actor="human:owner")
@@ -872,6 +936,7 @@ class CorrectionIssueRefTest(PgTestCase):
         nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                          NEXLINK.directory, ["376_b.sql"])
         _git(nexlink, "config", "ameesh.target", "develop")   # #2620 : cible lue
+        self.cfg = _declare(self.db, self.cfg, nexlink=(nexlink, "manaty/nexlink", NEXLINK.directory))
         work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
         live = work.get(self.db, lot["id"])
         with mock.patch.object(work, "get", side_effect=[observed, live]):
@@ -892,6 +957,7 @@ class CorrectionIssueRefTest(PgTestCase):
         nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                          NEXLINK.directory, ["376_b.sql"])
         _git(nexlink, "config", "ameesh.target", "develop")   # #2620 : cible lue
+        self.cfg = _declare(self.db, self.cfg, nexlink=(nexlink, "manaty/nexlink", NEXLINK.directory))
         work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
         store = storage.of(self.db).work
         self.assertFalse(store.set_issue_ref(lot["id"], "manaty/ameesh#1603",
@@ -917,6 +983,7 @@ class ReservationsSimultaneesTest(PgTestCase):
         super().setUp()
         self.nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                               NEXLINK.directory, ["376_b.sql"])
+        self.cfg = _declare(self.db, self.cfg, nexlink=(self.nexlink, "manaty/nexlink", NEXLINK.directory))
 
     def _lots(self, n):
         return [work.add(self.db, title="lot %d" % i, issue_ref="manaty/nexlink#%d" % i,
@@ -1067,6 +1134,7 @@ class RetryReservationTest(PgTestCase):
         super().setUp()
         self.nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                               NEXLINK.directory, ["376_b.sql"])
+        self.cfg = _declare(self.db, self.cfg, nexlink=(self.nexlink, "manaty/nexlink", NEXLINK.directory))
 
     def _lot(self):
         return work.add(self.db, title="lot", issue_ref="manaty/nexlink#1",
@@ -1232,7 +1300,7 @@ class RetryReservationTest(PgTestCase):
         self.assertEqual(clock.slept, [])
 
 
-class NumeroAtterriTest(PgTestCase):
+class NumeroAtterriTest(MeshConfigMixin, PgTestCase):
     """#1567 : le numéro **atterri** est enregistré et nommé par `work show`,
     pas seulement la réservation — un paquet renumérote au max+1 de la cible
     (#1240 réservait 457, atterri 452)."""
@@ -1244,6 +1312,13 @@ class NumeroAtterriTest(PgTestCase):
         _git(self.nexlink, "config", "ameesh.target", "develop")
         self.ameesh = _depot(os.path.join(self.tmp, "ameesh"), "manaty/ameesh",
                              AMEESH.directory, ["0005_e.sql"])
+        self.cfg = _declare(self.db, self.cfg,
+                 ameesh=(self.ameesh, "manaty/ameesh", AMEESH.directory),
+                 nexlink=(self.nexlink, "manaty/nexlink", NEXLINK.directory))
+        self.mesh_config = _mesh_config(
+            self.tmp,
+            ameesh=(self.ameesh, "manaty/ameesh", AMEESH.directory, AMEESH.width),
+            nexlink=(self.nexlink, "manaty/nexlink", NEXLINK.directory, NEXLINK.width))
 
     def _lot(self, repo="manaty/nexlink", n=1):
         return work.add(self.db, title="lot", issue_ref="%s#%d" % (repo, n),
@@ -1276,7 +1351,7 @@ class NumeroAtterriTest(PgTestCase):
         self.assertTrue(any("migration 452 landed (reserved 377)" in n for n in notes), notes)
         self.assertTrue(any("migration 377 released (fusion, #956)" in n for n in notes), notes)
         self.assertEqual(
-            work.migration_line(item),
+            work.migration_line(item, self.cfg),
             "452 landed in manaty/nexlink (L122) — file"
             " supabase/migrations/452_<name>.sql")
         proc = self.mesh("work", "show", str(lot["id"]))
@@ -1299,7 +1374,7 @@ class NumeroAtterriTest(PgTestCase):
         # atterrie. La branche « landed number not recorded » reste celle des
         # lignes héritées d'avant #956, où `migration` survit à l'état terminal.
         self.assertEqual((item["migration"], item["migration_repo"]), (None, None))
-        self.assertIsNone(work.migration_line(item))
+        self.assertIsNone(work.migration_line(item, self.cfg))
         proc = self.mesh("work", "show", str(lot["id"]))
         self.assertNotIn("migration:", proc.stdout)
         self.assertNotIn("377 landed", proc.stdout)
@@ -1308,7 +1383,7 @@ class NumeroAtterriTest(PgTestCase):
         self.db.execute("UPDATE work_items SET migration = 377,"
                         " migration_repo = 'manaty/nexlink' WHERE id = %d" % lot["id"])
         item = work.get(self.db, lot["id"])
-        self.assertEqual(work.migration_line(item),
+        self.assertEqual(work.migration_line(item, self.cfg),
                          "377 reserved in manaty/nexlink (L122)"
                          " — landed number not recorded")
         proc = self.mesh("work", "show", str(lot["id"]))
@@ -1779,7 +1854,7 @@ class NumeroAtterriTest(PgTestCase):
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["migration"], item["migration_repo"]), (None, None))
         self.assertEqual(
-            work.migration_line(item),
+            work.migration_line(item, self.cfg),
             "452 landed in manaty/nexlink (L122) — file"
             " supabase/migrations/452_<name>.sql")
         proc = self.mesh("work", "show", str(lot["id"]))

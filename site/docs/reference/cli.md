@@ -923,6 +923,8 @@ orchestrators and never takes another agent's session (L123).
 ```
 ameesh canon check [--canon DIR] [--ref REV] [--fetch] [--json] [--host H]
 ameesh canon show  [--canon DIR] [--ref REV] [--fetch] [--json]
+ameesh canon snapshot [--canon DIR] [--ref REV] [--fetch] [--json] \
+    --expect-commit SHA [--previous-commit SHA] [--expect-scope DIR] [--single-source]
 ameesh canon sync  [--canon DIR] [--ref REV] [--fetch] [--json] [--host H] [--bootstrap-ref BRANCH]
 ameesh placement check [--canon DIR] [--ref REV] [--fetch] [--json] [--agent A]
 ameesh agent name  --role R [--project P …] [--canon DIR] [--ref REV] [--fetch] [--json]
@@ -934,14 +936,23 @@ ameesh identity verify [FILE|-] [--issuer URL --client-id ID] [--domain D …] [
 
 | Option | Meaning |
 |---|---|
-| `--canon` | id of a configured canon (its federation id): only that canon; without it, `check`, `show` and `sync` process every configured canon, one block each (`{"canons": [...]}` in JSON). Also accepts a canon root (else `AMEESH_CANON`) |
+| `--canon` | id of a configured canon (its federation id): only that canon; without it, `check`, `show` and `sync` process every configured canon, one block each (`{"canons": [...]}` in JSON), while `snapshot` requires exactly one. Also accepts a canon root (else `AMEESH_CANON`) |
 | `--ref` | canonical revision (else `AMEESH_CANON_REF`, the manifest's `ref`, `origin/main`) |
 | `--fetch` | `git fetch` before reading |
 | `--host` | host whose state is diagnosed or synced (else `AMEESH_HOST` / this machine) |
 | `--bootstrap-ref` | first bootstrap of the passkey registry only: trusted canonical branch (`origin/<BRANCH>`), logged, ignored afterwards |
+| `--expect-commit` (snapshot) | required full trusted root commit (40 or 64 lowercase hex digits, never a branch or abbreviation); it binds the selected canon root, not the installed package |
+| `--previous-commit` (snapshot) | previous root commit that must be an ancestor of the pin (equality included): an unknown object, unrelated history or rewind is refused |
+| `--expect-scope` (snapshot) | required exact root `ameesh` scope; a missing or broader scope is refused |
+| `--single-source` (snapshot) | only the root source carries authority: a second source with a readable declared scope is refused (`unexpected-source-count`); unloaded siblings are listed in `omitted_members` and acquire no authority |
 | `--ttl` (spawn) | expiry: `30m`, `2h`, `1d` (max `7d`) |
 | `--role`, `--project` (name, spawn) | role and projects of a generated name; `--project` repeats, several projects drop the repo segment (`<org>-<role>-<seq>`). Segments come from `extensions.ameesh.naming`; a role without a short name is refused, and a name already used by a card or any registry row (stopped agents included) is never reused. Two repos never share a segment and one repo keeps the same segment in every canon (a divergent mesh is refused); a configured canon that cannot be read also refuses generation, naming the canon and its ref |
 | `--diff` (review-class) | files changed since REF (`REF..HEAD` + working tree) |
+
+`ameesh canon snapshot` is read-only and always prints one
+`ameesh-canon-snapshot/1` JSON document (exit 0 on success, 1 on refusal); full
+wire contract and trust model:
+[docs/api/canon-snapshot-v1.md](https://github.com/manaty/ameesh/blob/main/docs/api/canon-snapshot-v1.md).
 
 `ameesh process check` compiles the `workflow:` block of a Process card
 (`processus/*.md`, see [Write a Process card](../guides/write-a-process.md));

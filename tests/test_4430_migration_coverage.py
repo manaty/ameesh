@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -67,4 +68,34 @@ class MigrationCoverageTest(unittest.TestCase):
         with mock.patch.object(migration_reservations, 'uncovered') as read:
             self.check()
         read.assert_not_called()
+        self.assertTrue(self.entry['ready'])
+
+    def test_unknown_layout_with_a_numbered_sql_file_refuses(self):
+        """#7795 B : un ajout de migration ne passe pas quand le dossier du
+        dépôt est inconnu (ni configuration, ni clone lisible)."""
+        self.entry['files'] = ['db/999_new.sql']
+        with mock.patch('ameesh.migrations.layout_for', return_value=None), \
+                mock.patch('ameesh.migrations.inferred_layout', return_value=None), \
+                mock.patch.object(migration_reservations, 'uncovered') as read:
+            with self.assertRaisesRegex(packet_candidates.CandidateError,
+                                        'migrations layout unknown'):
+                self.check()
+        read.assert_not_called()
+        self.assertTrue(self.entry['ready'])
+
+    def test_packet_watch_without_radar_reads_the_clone(self):
+        """#7795 B : sans bloc `radar`, la couverture lit le clone déclaré par
+        `packet_watch` et vérifie la réservation ; elle ne passe pas en
+        silence."""
+        cfg = types.SimpleNamespace(
+            radar=None, release=None,
+            packet_watch={"projects": {"nexlink": {"repo": self.repo,
+                                                   "target": "develop"}}})
+        with mock.patch.object(migration_reservations, 'uncovered',
+                               return_value=[]) as read:
+            packet_candidates._check_migration_coverage(
+                None, self.entry, repo=self.repo, origin_repo=self.repo,
+                base=self.base, target='develop', cfg=cfg)
+        read.assert_called_once_with(None, 42, {377}, repository='manaty/nexlink',
+                                     target_branch='develop')
         self.assertTrue(self.entry['ready'])

@@ -552,6 +552,22 @@ def release(db: Db, recipient: str, token: str, ids: Sequence[int]) -> int:
     return storage.of(db).mailbox.release(recipient, token, ids)
 
 
+def requeue_interrupted(db: Db, recipient: str, owner: str, epoch: int, token: str,
+                        turn_id: str | None, ids: Sequence[int]) -> dict:
+    """#7673 (E2c) : remet en attente les demandes d'un tour coupé par le cœur.
+
+    Le tour était lancé (remise soldée) puis interrompu — arrêt, drainage,
+    retrait d'hôte, redémarrage, préemption, bail perdu : seules ses demandes
+    exactes (`ids`, sous la consigne `owner`/`epoch`/`token`/`turn_id`), sans
+    réponse corrélée, redeviennent non lues, signalées « re-livrées ». Garde
+    de bail : rien n'est écrit si un autre détenteur a pris le bail depuis.
+    """
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.requeue_interrupted")
+    return storage.of(db).mailbox.requeue_interrupted(
+        recipient, owner, int(epoch), token, turn_id, ids)
+
+
 def maybe_redelivered(row: Any) -> bool:
     """Déjà réservé sans être soldé (panne) : peut-être déjà vu."""
     return bool(row.get("deja_consigne"))
