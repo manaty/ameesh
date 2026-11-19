@@ -115,17 +115,19 @@ class TableTest(unittest.TestCase):
         # ajoute turn_costs.insert(inputs) (attribution des messages) ;
         # contrat 1.12 : #6005 ajoute turn_costs.insert(attribution) et
         # pending_spend.put(attribution) (attribution d'appelant des tours
-        # hors lot), deux paramètres facultatifs.
-        self.assertEqual(len(self.c.operations), 73)
+        # hors lot), deux paramètres facultatifs ; contrat 1.13 : #7799
+        # admet host_lifecycle.claims_open (lecture des prises d'hôte pour
+        # un runner médié au repos).
+        self.assertEqual(len(self.c.operations), 74)
         self.assertEqual(sum(o.write for o in ops), 44)
-        self.assertEqual(sum(not o.write for o in ops), 29)
+        self.assertEqual(sum(not o.write for o in ops), 30)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
         # contrat 1.1 : lignes de la route op servies aussi par session/op
         self.assertEqual(sorted(o.name for o in ops if o.session),
                          ["agents.resolve_name", "mailbox.deliver", "mailbox.release", "mailbox.reserve",
                           "mailbox.unread", "mailbox.unread_human",
                           "mailbox.unread_human_page", "threads.index", "threads.recount"])
-        self.assertEqual(self.c.version, "1.12.0")
+        self.assertEqual(self.c.version, "1.13.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 

@@ -5230,6 +5230,16 @@ class HostLifecycle(Domain):
         """Persistent host controls, release/hook states included."""
 
     @abc.abstractmethod
+    def claims_open(self, host: str, agent: str) -> bool:
+        """#7799: may this agent open a turn on `host` right now?
+
+        Same predicate as `begin_turn`'s `host_closed`
+        (`ameesh_agent_claims_open`): false on a `draining` or `lost` host, on
+        a `returning` whose claims stay closed, and under a live release
+        fence, except for the fence's own probe agent. The runner worker reads
+        it between turns to release its lease on a withdrawn host."""
+
+    @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
               critical: Sequence[str] = (), automatic: bool = False,
               close_claims: bool = False) -> dict:
