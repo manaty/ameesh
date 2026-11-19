@@ -3776,6 +3776,20 @@ def _local_clones(db, host: str | None) -> list[tuple[str, str, dict]]:
     return found
 
 
+def _canon_lot_clone(db, row: dict, local: list[tuple[str, str, dict]]) -> str | None:
+    """#7835 : le clone du canon où lire un lot du canon, s'il est parmi les
+    clones locaux de ce relevé (`_local_clones` ne les y met que pour l'hôte
+    local), sinon None. La règle est celle de `lot_class._canon_lot`."""
+    from . import lot_class
+    paths = {cwd for cwd, _slug, _agent in local}
+    clones = [(path, slug) for path, slug in
+              lot_class.canon_clones(getattr(db, "cfg", None)) if path in paths]
+    if not clones:
+        return None
+    is_canon, clone = lot_class._canon_lot(row, clones)
+    return clone if is_canon else None
+
+
 def _lot_clone(db, host: str | None, row: dict, repo: str,
                local: list[tuple[str, str, dict]]) -> tuple[str | None, str]:
     """#2302 : le clone où lire le lot — celui de l'assigné s'il est le bon
@@ -3784,7 +3798,20 @@ def _lot_clone(db, host: str | None, row: dict, repo: str,
     Rend `(dossier, note)` ; `(None, raison)` quand le dossier de l'assigné
     est un autre dépôt et qu'aucun clone du bon dépôt n'est connu sur l'hôte.
     Sans indication de dépôt, le dossier de l'assigné reste la seule lecture
-    possible (comportement d'avant)."""
+    possible (comportement d'avant).
+
+    #7835 : un lot du canon sans PR enregistrée (branche `canon/…`, issue
+    miroir dans le dépôt du projet) se lit dans le clone du canon de l'hôte,
+    comme `lot_class.repository` : l'issue nommait le clone du projet, qui ne
+    porte ni la branche ni le gel, et le lot restait en `qa_merge` après la
+    fusion de sa PR (#7830). Sans clone du canon parmi les clones locaux, la
+    résolution d'avant reste la seule lecture possible."""
+    canon = _canon_lot_clone(db, row, local)
+    if canon:
+        if canon == repo:
+            return repo, ""
+        return canon, ("read in %s: canon lot, the assignee's working directory is %s"
+                       % (canon, _repo_slug(repo) or repo))
     expected_slug, expected_name = _expected_repo(row)
     if not expected_slug and not expected_name:
         return repo, ""
