@@ -12,7 +12,7 @@
       "lot": 7566
     },
     "src/ameesh/migrations/0598_bureau_clear_only.sql": {
-      "checksum": "8c856df894d7e75d703ec820850d64a0d11fb0e0c3d55515efb92a7480ebf654",
+      "checksum": "25417ce2c34be1d93859f373f99de9df8bc233d9d201a5f8818b1cc23933f475",
       "lot": 7870,
       "restore": "src/ameesh/migrations/rollback/0598_restore.sql"
     }

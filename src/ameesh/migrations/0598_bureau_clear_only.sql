@@ -100,6 +100,27 @@ begin
             raise exception 'limited login %: clearing the reservation clears its session and claim',
                 session_user using errcode = 'insufficient_privilege';
         end if;
+        -- #7870 B3 : une levée atomique par SQL direct n'est ouverte que si la
+        -- session réservée (ou, à défaut, une session de l'agent) a une liaison
+        -- L41 ACTIVE sur cet hôte. Sans cela, un simple UPDATE du login limité
+        -- contournerait _self_clear_reservation (preuve de session vérifiée).
+        if old.external_executor is not null and new.external_executor is null then
+            if old.external_session is not null then
+                execute format('select exists (select from %I.session_bindings'
+                               ' where session_id = $1 and agent = $2 and host = $3'
+                               ' and revoked_at is null)', s)
+                   into bound using old.external_session, l.agent, l.host;
+            else
+                execute format('select exists (select from %I.session_bindings'
+                               ' where agent = $1 and host = $2'
+                               ' and revoked_at is null)', s)
+                   into bound using l.agent, l.host;
+            end if;
+            if not bound then
+                raise exception 'limited login %: clearing lot % requires an active session binding of % on %',
+                    session_user, old.id, l.agent, l.host using errcode = 'insufficient_privilege';
+            end if;
+        end if;
         if new.external_claim_session is not null then
             execute format('select exists (select from %I.session_bindings'
                            ' where session_id = $1 and agent = $2 and host = $3'

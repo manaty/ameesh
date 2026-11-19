@@ -448,6 +448,40 @@ class BureauRoleLimiteTest(PgTestCase):
         self.assertEqual(row["external_executor"], "bureau")
         self.assertEqual(row["external_session"], "BG")
 
+    def test_le_sql_brut_ne_leve_pas_sans_liaison_active(self):
+        """#7870 B3 : le SQL direct ne contourne pas la preuve de session.
+
+        `UPDATE work_items SET external_executor = NULL, external_session =
+        NULL` est la levée atomique ; le login limité ne peut la faire que si
+        la session réservée (ou, sans session nommée, une session de l'agent)
+        a une liaison L41 active sur cet hôte. Sans liaison, ou avec une autre
+        session liée, la garde refuse et la réservation reste intacte.
+        """
+        lot = self.reserve()
+        self.db.execute("UPDATE work_items SET external_session = 'BG' WHERE id = %s",
+                        (lot,))
+        self.refused(
+            "UPDATE work_items SET external_executor = NULL, external_session = NULL"
+            " WHERE id = %d" % lot,
+            "requires an active session binding")
+        # une réservation sans session nommée exige aussi une liaison de
+        # l'agent sur cet hôte (même contrôle, branche sans session)
+        autre = self.reserve()
+        self.refused(
+            "UPDATE work_items SET external_executor = NULL WHERE id = %d" % autre,
+            "requires an active session binding")
+        # une liaison d'une AUTRE session du même agent ne vaut pas pour la
+        # session nommée par le feu
+        self.bind("PC")
+        self.refused(
+            "UPDATE work_items SET external_executor = NULL, external_session = NULL"
+            " WHERE id = %d" % lot,
+            "requires an active session binding")
+        row = work.get(self.db, lot)
+        self.assertEqual(row["external_executor"], "bureau")
+        self.assertEqual(row["external_session"], "BG")
+        self.assertEqual(work.get(self.db, autre)["external_executor"], "bureau")
+
     def test_la_levee_relit_la_reservation_sous_le_verrou(self):
         """#7870 B2 : la preuve ne vaut que pour la réservation qu'elle a lue.
 
