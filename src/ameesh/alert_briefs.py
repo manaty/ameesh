@@ -1428,7 +1428,10 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     covered = set(covered or ())
     roles = set(alert.get("targets") or ("assignee",))
     desk = _desk_names(alert, by_name, avatar_names)
-    text = _slo_breach(alert, desk=desk[0] if desk else None)
+    live_desks, _ = _split_live({name: "" for name in desk}, by_name, closed,
+                                respect_pause=True)
+    label = next(iter(live_desks), "bureau")
+    text = _slo_breach(alert, desk=label)
     raw: dict = {}
     for role in roles:
         for name in _target_names(role, alert, by_name, orchestras, teams,
@@ -1467,7 +1470,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
                or any(r not in known for r in roles)
                else 2 if "pilot" in roles else 1)
     for next_level in range(current + 1, 4):
-        next_text = _slo_breach(alert, level=next_level)
+        next_text = _slo_breach(alert, level=next_level, desk=label)
         if next_level == 2:
             names = _target_names("pilot", alert, by_name, orchestras, teams,
                                   auditor_names, avatar_names)
@@ -1495,8 +1498,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     # Plus aucun agent au registre ne peut lire : route humaine (fil de
     # l'avatar), en nommant les absents. Sans avatar, rien n'est inventé — le
     # passage suivant réessaiera (l'alerte reste dans `ameesh alerts`).
-    fallback = _fallback_avatar(by_name, _slo_breach(alert, level=3, desk=desk[0]
-                                                    if desk else None), desk)
+    fallback = _fallback_avatar(by_name, _slo_breach(alert, level=3, desk=label), desk)
     live, more = _split_live(fallback, by_name, closed, covered, respect_pause=True)
     dead.update(more)
     if live:
@@ -1506,7 +1508,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         if name in by_name:
             return {"thread:%s" % name:
                     _dead_note(dead) + _slo_breach(alert, level=3,
-                                                   desk=name)}
+                                                   desk=label)}
     return {}
 
 
