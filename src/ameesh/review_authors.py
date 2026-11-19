@@ -1164,22 +1164,16 @@ def _bounded_git(repo, *args, limit=None, **kwargs):
     return plan_git._git(repo, *args, **kwargs)
 
 
-#: #7779 : partial-clone detection, cached per repository path. A work clone
-#: is usually `blob:none`; its content reads may be truncated without error.
-_PARTIAL_CLONE: dict = {}
-_PARTIAL_CLONE_MAX = 64
-
-
 def _partial_clone(repo: str) -> bool:
     """Does this clone declare a promisor/partial object store?
+
+    Read on every call: a repository can become partial in the same process
+    (the clone is configured, or a promisor remote is added) and a cached
+    "complete" answer would then skip the completeness checks.
 
     Doubt (unreadable config, unknown value) returns True: the completeness
     checks then run, and a complete clone simply passes them.
     """
-    key = (os.path.realpath(str(repo or "")),
-           canon._repository_identity(repo))
-    if key in _PARTIAL_CLONE:
-        return _PARTIAL_CLONE[key]
     partial = True
     try:
         proc = _bounded_git(
@@ -1205,9 +1199,6 @@ def _partial_clone(repo: str) -> bool:
                 # An empty value is git's boolean true.
                 partial = True
                 break
-    if len(_PARTIAL_CLONE) >= _PARTIAL_CLONE_MAX:
-        _PARTIAL_CLONE.clear()
-    _PARTIAL_CLONE[key] = partial
     return partial
 
 
@@ -1406,7 +1397,9 @@ def _read_diff_patch_id(repo, before, after):
     partial = _partial_clone(repo)
     options = ["diff", "--no-ext-diff", "--no-color"]
     if partial:
-        options[1:1] = ["--raw", "--no-abbrev"]
+        # `--raw` replaces the default patch on `git diff`: keep `-p` so the
+        # patch-id still has a patch to hash.
+        options[1:1] = ["-p", "--raw", "--no-abbrev"]
     diff = _read_git(repo, *options, before, after)
     if diff.returncode:
         return None

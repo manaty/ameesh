@@ -367,3 +367,27 @@ class LocalAuthorsTest(unittest.TestCase):
         with open(os.path.join(self.repo, ".git", "config"), "a") as stream:
             stream.write('\n[remote "origin"]\n\tpromisor\n')
         self.assertTrue(authors._partial_clone(self.repo))
+
+    def test_a_complete_repo_that_becomes_partial_is_rechecked(self):
+        # The detection is read on every call: a cached complete answer
+        # would skip the checks after the clone becomes a promisor.
+        self.assertFalse(authors._partial_clone(self.repo))
+        self.git("config", "remote.origin.promisor", "true")
+        self.assertTrue(authors._partial_clone(self.repo))
+        self.git("config", "--unset", "remote.origin.promisor")
+        self.assertFalse(authors._partial_clone(self.repo))
+
+    def test_partial_clone_with_all_objects_keeps_its_diff_patch_id(self):
+        # `git diff --raw` replaces the patch unless `-p` is kept: the
+        # same-patch matching of provenance receipts must survive the guard.
+        with open(os.path.join(self.repo, "content"), "a") as stream:
+            stream.write("changed\n")
+        self.git("commit", "-am", "change", "--quiet")
+        after = self.git("rev-parse", "HEAD")
+        before = self.git("rev-parse", "HEAD^")
+        complete = authors._read_diff_patch_id(self.repo, before, after)
+        self.assertIsNotNone(complete)
+        self.git("config", "remote.origin.promisor", "true")
+        self.git("config", "remote.origin.url", "https://invalid.example/repo")
+        self.assertEqual(
+            authors._read_diff_patch_id(self.repo, before, after), complete)
