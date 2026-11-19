@@ -579,7 +579,20 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      ameesh-agents-3`), aucune retenue ;
    - `/home/ameesh/.local/share/ameesh/venv/bin/python` présent et
      exécutable sur chaque hôte au runner vivant ;
-   - #297 et #298 gelées et relues.
+   - #297 et #298 gelées et relues ;
+   - aucun lot ouvert assigné à un agent placé sur AG3 (#7874) :
+     `ameesh host release-check ameesh-agents-3` rend 0. Sinon, chaque lot
+     nommé est fini ou déplacé (réassigné, ou son agent déplacé) avant
+     l'étape 4, puis la commande est relancée et sa sortie consignée.
+     Sans cette garde, la première passe du worker demande le retour
+     (`wake_due`, branche `return_targets` : du travail ouvert qui ne peut
+     tourner que sur AG3), comme au R1 du 19/11. Ce comportement de
+     l'adaptateur est voulu et reste inchangé. La ligne « réveil immédiat »
+     de la commande nomme les agents qui déclencheraient ce retour ;
+   - la version lancée sur AG3 contient #7874 : la sonde du retour
+     (`probe_agent`) figure parmi les agents réclamables d'un retour
+     `returning` prises fermées. Avant #7874, elle n'était jamais réclamée,
+     et le retour bouclait sur `health deadline passed`.
 2. Le bureau active l'inscription (`enabled: true`, copie avant) et démarre
    le timer (R1 de D1). Le worker doit être vu (`vm_adapter_observations`)
    **avant** l'étape 3 : un hook sans worker laisse l'hôte fermé.
