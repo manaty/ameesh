@@ -358,15 +358,16 @@ def wake_plan(severity: str, chosen: Any | None) -> str:
 #: carries exactly one machine-readable line (no prose heuristics, the same
 #: rule as `prod-go/1`):
 #:
-#:     incident-call/1 application=<id> option=<key> until=<YYYY-MM-DDTHH:MM:SSZ>
+#:     incident-call/1 application=<id> until=<YYYY-MM-DDTHH:MM:SSZ>
 #:
-#: The signed answer must select `<key>`.  Question and options are part of the
-#: signed document (`decisions.answer_document`), so a signed "no", an
-#: unrelated decision, another application or an expired window authorizes
-#: nothing.
+#: The go is not a free option key: only the reserved key and its exact
+#: positive label below may carry the authorization.  Both are part of the
+#: signed request (`decisions.answer_document`), so a refusal option labelled
+#: "Non" can never be presented — or signed — as the authorization.
+CALL_GO_OPTION = "incident-call"
+CALL_GO_LABEL = "Oui, autoriser les appels de réveil"
 CALL_GO_LINE = re.compile(
     r"^incident-call/1 application=([A-Za-z0-9._-]{1,64}) "
-    r"option=([A-Za-z0-9]{1,16}) "
     r"until=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.M)
 #: an emergency wake go is short-lived: a week, then the owner renews it
 CALL_GO_MAX_HOURS = 24 * 7
@@ -375,7 +376,6 @@ CALL_GO_MAX_HOURS = 24 * 7
 @dataclass(frozen=True)
 class CallGo:
     application: str
-    option: str
     until: float
 
 
@@ -391,19 +391,19 @@ def parse_call_go(question: Any) -> CallGo | None:
     matches = list(CALL_GO_LINE.finditer(text))
     if len(matches) != 1 or text.count("incident-call/") != 1:
         raise ValueError("one exact incident-call/1 declaration required")
-    application, option, until = matches[0].groups()
+    application, until = matches[0].groups()
     try:
         expiry = _dt.datetime.strptime(until, "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=_dt.timezone.utc).timestamp()
     except ValueError as exc:
         raise ValueError("incident-call/1 until is not a UTC date") from exc
-    return CallGo(application=application, option=option, until=expiry)
+    return CallGo(application=application, until=expiry)
 
 
 __all__ = [
-    "Availability", "CALL_GO_MAX_HOURS", "CallGo", "INTERACTION_FRESH_S",
-    "IncidentPolicy", "NoSignals", "PRESENCE_FRESH_S", "Responder", "SEVERITIES",
-    "USUAL_HOURS", "WAKE_IMMEDIATE", "WAKE_ON_NO_RESPONDER", "availability",
-    "in_usual_hours", "local_hour", "parse_call_go", "parse_incident",
-    "severity_of", "wake_plan",
+    "Availability", "CALL_GO_LABEL", "CALL_GO_MAX_HOURS", "CALL_GO_OPTION",
+    "CallGo", "INTERACTION_FRESH_S", "IncidentPolicy", "NoSignals",
+    "PRESENCE_FRESH_S", "Responder", "SEVERITIES", "USUAL_HOURS",
+    "WAKE_IMMEDIATE", "WAKE_ON_NO_RESPONDER", "availability", "in_usual_hours",
+    "local_hour", "parse_call_go", "parse_incident", "severity_of", "wake_plan",
 ]

@@ -476,13 +476,12 @@ class WakeTest(unittest.TestCase):
 class CallGoParseTest(unittest.TestCase):
     """#7866 (B cx2): the go is one exact, scoped machine line."""
 
-    LINE = ("incident-call/1 application=acme option=call "
+    LINE = ("incident-call/1 application=acme "
             "until=2026-11-26T00:00:00Z")
 
     def test_one_exact_line_is_read(self):
         rule = incident_routing.parse_call_go("Autoriser ?\n%s" % self.LINE)
-        self.assertEqual((rule.application, rule.option),
-                         ("acme", "call"))
+        self.assertEqual(rule.application, "acme")
         self.assertEqual(rule.until, 1795651200.0)
 
     def test_a_question_without_the_marker_has_no_go(self):
@@ -495,16 +494,18 @@ class CallGoParseTest(unittest.TestCase):
     def test_a_bad_date_is_refused(self):
         with self.assertRaises(ValueError):
             incident_routing.parse_call_go(
-                "incident-call/1 application=acme option=call until=demain")
+                "incident-call/1 application=acme until=demain")
 
 
 class OwnerGoTest(fixtures._Base):
     """#7866 (B cx2): the phone wake needs a positive, scoped signed go.
 
     A signed answer, even by the wake owner, is not enough: the signed
-    question must carry one `incident-call/1` line for this application and
-    the signed answer must select the option it declares, inside the window.
-    A signed "no" or an unrelated decision authorizes nothing.
+    question must carry one `incident-call/1` line for this application, the
+    request must offer the reserved `incident-call` option with its exact
+    positive label, and the signed answer must select it inside the window.
+    A signed "no", a refusal option dressed as the go, or an unrelated
+    decision authorizes nothing.
     """
 
     def setUp(self):
@@ -514,13 +515,13 @@ class OwnerGoTest(fixtures._Base):
         # a fixed instant: the wire is deterministic (H3, no clock dependency)
         self.now = _dt.datetime(2026, 11, 19, 18, 0, tzinfo=_dt.timezone.utc)
 
-    def go(self, *, application="acme", option="call",
-           until=None, options=("call=Oui, autoriser les appels", "no=Non")):
+    def go(self, *, application="acme", until=None, options=None):
         until = until or self.now + _dt.timedelta(days=1)
+        options = options or ("incident-call=%s" % incident_routing.CALL_GO_LABEL,
+                              "no=Non")
         question = ("Autoriser les appels de réveil ?\n"
-                    "incident-call/1 application=%s option=%s until=%s"
-                    % (application, option,
-                       until.strftime("%Y-%m-%dT%H:%M:%SZ")))
+                    "incident-call/1 application=%s until=%s"
+                    % (application, until.strftime("%Y-%m-%dT%H:%M:%SZ")))
         return self.ask(question=question, options=list(options),
                         needs_signature=True)
 
@@ -530,7 +531,7 @@ class OwnerGoTest(fixtures._Base):
 
     def test_a_scoped_signed_go_authorizes_the_call(self):
         view = self.go()
-        self.answer(view["id"], "call", key_path=self.key)
+        self.answer(view["id"], "incident-call", key_path=self.key)
         allowed, why = self.check(view, now=self.now.timestamp())
         self.assertTrue(allowed, why)
 
@@ -546,6 +547,21 @@ class OwnerGoTest(fixtures._Base):
         self.assertEqual(self.check(view, now=self.now.timestamp()),
                          (False, "owner-go-not-approved"))
 
+    def test_a_refusal_option_dressed_as_the_go_is_refused(self):
+        # B cx2 second round: the reserved key with a "Non" label must never
+        # turn a signed refusal into an authorization.
+        view = self.go(options=("incident-call=Non, refuser les appels",
+                                "yes=Oui"))
+        self.answer(view["id"], "incident-call", key_path=self.key)
+        self.assertEqual(self.check(view, now=self.now.timestamp()),
+                         (False, "owner-go-option-not-positive"))
+
+    def test_the_reserved_option_must_be_present(self):
+        view = self.go(options=("call=Oui, autoriser les appels", "no=Non"))
+        self.answer(view["id"], "call", key_path=self.key)
+        self.assertEqual(self.check(view, now=self.now.timestamp()),
+                         (False, "owner-go-option-missing"))
+
     def test_an_unrelated_signed_decision_does_not_authorize(self):
         view = self.ask(needs_signature=True)
         self.answer(view["id"], "a", key_path=self.key)
@@ -554,28 +570,22 @@ class OwnerGoTest(fixtures._Base):
 
     def test_another_application_does_not_authorize(self):
         view = self.go(application="other")
-        self.answer(view["id"], "call", key_path=self.key)
+        self.answer(view["id"], "incident-call", key_path=self.key)
         self.assertEqual(self.check(view, now=self.now.timestamp()),
                          (False, "owner-go-other-application"))
 
     def test_an_expired_window_does_not_authorize(self):
         view = self.go(until=self.now - _dt.timedelta(hours=1))
-        self.answer(view["id"], "call", key_path=self.key)
+        self.answer(view["id"], "incident-call", key_path=self.key)
         self.assertEqual(self.check(view, now=self.now.timestamp()),
                          (False, "owner-go-expired"))
 
     def test_a_window_beyond_the_cap_does_not_authorize(self):
         view = self.go(until=self.now + _dt.timedelta(
             hours=incident_routing.CALL_GO_MAX_HOURS + 1))
-        self.answer(view["id"], "call", key_path=self.key)
+        self.answer(view["id"], "incident-call", key_path=self.key)
         self.assertEqual(self.check(view, now=self.now.timestamp()),
                          (False, "owner-go-window"))
-
-    def test_the_declared_option_must_exist_in_the_request(self):
-        view = self.go(options=("a=Oui", "b=Non"))
-        self.answer(view["id"], "a", key_path=self.key)
-        self.assertEqual(self.check(view, now=self.now.timestamp()),
-                         (False, "owner-go-option-unknown"))
 
     def test_pending_and_unsigned_decisions_are_refused(self):
         view = self.go()

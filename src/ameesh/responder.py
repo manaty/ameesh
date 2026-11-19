@@ -400,12 +400,13 @@ def verify_owner_go(db: Any, decision_id: Any, owner: str,
                     ) -> tuple[bool, str]:
     """A signed answer by `owner` to the named decision — provided the signed
     question carries exactly one `incident-call/1` declaration for *this*
-    application and the signed answer selects the declared option inside its
+    application, the request offers the reserved `incident-call` option with
+    its exact positive label, and the signed answer selects it inside its
     window.
 
     The operator names the decision in `AMEESH_INCIDENT_CALL_GO`.  A pending,
     unsigned, misaddressed, superseded, unverifiable, unrelated, refusing,
-    out-of-scope or expired decision is a refusal, never a call.
+    out-of-scope, mislabelled or expired decision is a refusal, never a call.
     """
     try:
         ident = int(str(decision_id).strip().lstrip("#"))
@@ -451,10 +452,18 @@ def verify_owner_go(db: Any, decision_id: Any, owner: str,
         return False, "owner-go-expired"
     if rule.until > instant + routing.CALL_GO_MAX_HOURS * 3600:
         return False, "owner-go-window"
-    keys = {str(option.get("key") or "") for option in view.get("options") or ()}
-    if rule.option not in keys:
-        return False, "owner-go-option-unknown"
-    if str(answer.get("option") or "") != rule.option:
+    # #7866 (B cx2, second round): the go is not any declared option key.
+    # Only the reserved key may carry it, and only with its exact positive
+    # label in the signed request.  A "Non" option can never authorize.
+    option = next((candidate for candidate in view.get("options") or ()
+                   if str(candidate.get("key") or "") == routing.CALL_GO_OPTION),
+                  None)
+    if option is None:
+        return False, "owner-go-option-missing"
+    label = " ".join(str(option.get("label") or "").split())
+    if label != routing.CALL_GO_LABEL:
+        return False, "owner-go-option-not-positive"
+    if str(answer.get("option") or "") != routing.CALL_GO_OPTION:
         return False, "owner-go-not-approved"
     return True, ""
 

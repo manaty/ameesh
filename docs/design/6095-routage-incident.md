@@ -36,11 +36,13 @@ owner (UTC+8) sleeps, the French team is at work.
    immediately; a P1 with nobody available wakes too; P2–P4 never wake. The
    call is a new expense: off by default, and only with a signed owner go plus
    a configured voice endpoint. The go is a machine-readable
-   `incident-call/1 application=<id> option=<key> until=<Z>` declaration inside
-   the signed decision question, and the signed answer must select
-   `<key>` — a signed "no" or an unrelated decision authorizes nothing (same
-   rule as `prod-go/1`). The window is at most seven days. The resolver sends
-   a short reason; the number stays in the voice service's secrets.
+   `incident-call/1 application=<id> until=<Z>` declaration inside the signed
+   decision question, and the request must offer the reserved `incident-call`
+   option with its exact positive label; the signed answer must select it — a
+   signed "no", a refusal option dressed as the go, or an unrelated decision
+   authorizes nothing (same rule as `prod-go/1`). The window is at most seven
+   days. The resolver sends a short reason; the number stays in the voice
+   service's secrets.
 5. **Consumers** use the JSON CLI contract (IMA for production P1s, avatars to
    route instead of queueing, later mesh hand-offs). A dependency-free
    consumer fixture in `examples/fixtures/responder-consumer` is exercised by

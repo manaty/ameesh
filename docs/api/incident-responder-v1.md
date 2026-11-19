@@ -102,11 +102,13 @@ The owner go is a **positive, scoped authorization** carried by the signed
 decision data itself — the same rule as `prod-go/1`: one machine-readable line,
 no prose heuristics. The decision question carries exactly one line
 
-    incident-call/1 application=<application-id> option=<option-key> until=<YYYY-MM-DDTHH:MM:SSZ>
+    incident-call/1 application=<application-id> until=<YYYY-MM-DDTHH:MM:SSZ>
 
-and its options include `<option-key>`, whose label says it authorizes the
-calls. The signed answer must select that option. The decision must be
-answered, by the wake owner, through a signed answer whose owner-key proof
+The request must offer the reserved option `incident-call` with the exact
+positive label `Oui, autoriser les appels de réveil`; the signed answer must
+select that option. There is no free choice of key or label, so a "Non" option
+can never be presented — or signed — as the authorization. The decision must
+be answered, by the wake owner, through a signed answer whose owner-key proof
 still verifies, and must not have been superseded. The window must be in the
 future and at most `CALL_GO_MAX_HOURS` (7 days) away.
 
@@ -114,14 +116,14 @@ Example request (the wake owner signs the answer):
 
     ameesh decide ask --new-lot "Call go: incident routing for acme" \
       --question "Autoriser les appels de réveil pour acme ?
-incident-call/1 application=acme option=call until=2026-11-26T00:00:00Z" \
-      --option call="Oui, autoriser les appels" --option no="Non" \
-      --needs-signature
+incident-call/1 application=acme until=2026-11-26T00:00:00Z" \
+      --option "incident-call=Oui, autoriser les appels de réveil" \
+      --option no="Non" --needs-signature
 
 A pending, unsigned, misaddressed, superseded or unverifiable decision, an
 unrelated question, another application's go, a signed "no" or free-text
-answer, an expired window, a go beyond the maximum window, or a declared
-option absent from the request: all are refusals, not calls.
+answer, an expired window, a go beyond the maximum window, a missing reserved
+option or a reserved option with any other label: all are refusals, not calls.
 
 ## Wire document: `ameesh-responder/1`
 
