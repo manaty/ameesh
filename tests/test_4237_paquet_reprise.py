@@ -795,7 +795,8 @@ class PilotRecomposeTest(HoraireBase):
                 mock.patch.object(ph, "pilot_recompose", return_value="ok") as called, \
                 mock.patch.object(ph, "Shell", return_value=self.shell):
             rc = ph.main(["recompose", "--repo", clone.name, "--carrier",
-                          "4000", "--exclude", "3801", "--exclude-reason", "B"])
+                          "4000", "--exclude", "3801", "--exclude-reason", "B",
+                          "--attached"])
         self.assertEqual(rc, 0)
         self.assertEqual(called.call_args.args[1:], (4000, [3801], ["B"]))
 
