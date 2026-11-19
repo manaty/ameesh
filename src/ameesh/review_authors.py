@@ -5242,19 +5242,54 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
 
 
 #: #7252 : une citation de commit retiré dans le message de réécriture de
-#: l'auteur (7 à 40 caractères hexadécimaux). Un identifiant de B (`#40556`)
-#: n'a pas cette longueur. Les empreintes nommées checksum/sha256 sont
-#: écartées avant toute résolution Git (#7576). Le nom complet d'un paquet
-#: horaire (`h-AAAAMMJJ-NN`) est un identifiant, pas une citation : sa date
-#: (huit chiffres hexadécimaux) est consommée avec lui (#7709). Une citation
-#: avec tiret (`correctif-<sha>`) reste lue et résolue. Une suite hexadécimale
-#: noyée dans un mot (par exemple `succeeded`, #7770) n'est pas un jeton de
-#: commit.
+#: l'auteur. #7721 : seuls les jetons **qualifiés** sont des citations — un
+#: SHA de 12 à 40 caractères hexadécimaux, ou la forme `dépôt@sha` (le dépôt
+#: lu, ou le dépôt lu illisible). Un mot hexadécimal court (`ed25519`,
+#: `deadbeef`) ou un SHA d'un autre dépôt nommé n'est pas une citation et
+#: n'interroge jamais la forge. Un identifiant de B (`#40556`) n'a pas cette
+#: longueur. Les empreintes nommées checksum/sha256 sont écartées avant toute
+#: résolution Git (#7576). Le nom complet d'un paquet horaire
+#: (`h-AAAAMMJJ-NN`) est un identifiant, pas une citation : sa date (huit
+#: chiffres hexadécimaux) est consommée avec lui (#7709). Une suite
+#: hexadécimale noyée dans un mot (par exemple `succeeded`, #7770) n'est pas
+#: un jeton de commit.
 _CITED_COMMIT = re.compile(
     r"\b(?:checksum|sha256)\s+[0-9a-f]+\b"
     r"|\bh-\d{8}-\d+\b"
-    r"|(?P<commit>(?<![0-9a-z])[0-9a-f]{7,40}(?![0-9a-z]))",
+    r"|(?P<qualified>(?<![0-9a-z])"
+    r"(?P<repo>[a-z0-9_.-]+(?:/[a-z0-9_.-]+)?)@"
+    r"(?P<qcommit>[0-9a-f]{7,40})(?![0-9a-z]))"
+    r"|(?P<commit>(?<![0-9a-z])[0-9a-f]{12,40}(?![0-9a-z]))",
     re.IGNORECASE)
+
+
+def _cited_tokens(body: str, own_repository: str = "") -> list[str]:
+    """Les citations de commit d'un message, seulement les qualifiées (#7721).
+
+    Un jeton de 12 à 40 caractères hexadécimaux est une citation. Un jeton plus
+    court ne l'est que sous la forme `dépôt@sha`, et seulement quand `dépôt` est
+    le dépôt lu (`own_repository`, `owner/repo` ou son seul nom) ; un dépôt lu
+    illisible (`own_repository` vide) garde le jeton, par prudence. Un SHA d'un
+    autre dépôt nommé n'est donc jamais lu ici : il n'interroge pas la forge et
+    ne peut pas faire refuser la lecture de provenance (#7721).
+    """
+    own = str(own_repository or "").strip().casefold()
+    own_name = own.rpartition("/")[2]
+    tokens: list[str] = []
+    for match in _CITED_COMMIT.finditer(str(body or "")):
+        token = match.group("commit")
+        if token:
+            tokens.append(token)
+            continue
+        token = match.group("qcommit")
+        if not token:
+            continue
+        named = str(match.group("repo") or "").strip().casefold()
+        if (not own or named == own
+                or ("/" not in named and named == own_name)):
+            tokens.append(token)
+    return tokens
+
 
 #: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
 #: Le relecteur corrige dans son tour : 6 h avant l'avis couvrent un tour
@@ -5356,6 +5391,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     if db is None or not repo or packet_composer(item):
         return {}
     state_dir = str(getattr(getattr(db, "cfg", None), "state_dir", "") or "")
+    own_repository = _repository_slug(repo)
     lot = int(item.get("id") or 0)
     if not lot:
         return {}
@@ -5672,9 +5708,9 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 continue
             # #7576 : une empreinte explicitement nommée n'est pas une
             # citation Git, même si sa longueur ressemble à un SHA abrégé.
-            tokens = [match.group("commit")
-                      for match in _CITED_COMMIT.finditer(body)
-                      if match.group("commit")]
+            # #7721 : seuls les jetons qualifiés sont des citations (12 hex
+            # ou plus, ou `dépôt@sha` du dépôt lu).
+            tokens = _cited_tokens(body, own_repository)
             if not tokens:
                 continue
             check()

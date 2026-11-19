@@ -541,25 +541,27 @@ même agent accepté).
 Quand un relecteur corrige et que l'auteur réécrit depuis le B, le commit du
 relecteur n'est plus dans l'histoire ; le message de réécriture doit le citer
 pour que l'exclusion par son nom survive (#7252). Le lecteur
-(`review_authors._CITED_COMMIT`) retient un jeton hexadécimal de 7 à 40
-caractères borné par des caractères non alphanumériques — `correctif-<sha>`
-reste donc lu — et écarte ce qui n'est pas une citation : une empreinte
-explicitement nommée (`checksum`, `sha256`), le nom complet d'un paquet horaire
-(`h-AAAAMMJJ-NN`) et une suite noyée dans un mot (`succeeded`, #7770).
+(`review_authors._cited_tokens`) ne retient que des citations **qualifiées** :
+un SHA de 12 à 40 caractères hexadécimaux, ou la forme `dépôt@sha` quand le
+dépôt nommé est celui du clone lu (`owner/repo`, ou son seul nom). Un jeton
+plus court et non qualifié (`ed25519`, `deadbeef`, `correctif-1234abcd`) n'est
+pas une citation : il n'interroge jamais la forge et ne peut donc pas faire
+refuser la lecture de provenance. Les empreintes explicitement nommées
+(`checksum`, `sha256`), le nom complet d'un paquet horaire (`h-AAAAMMJJ-NN`)
+et une suite noyée dans un mot (`succeeded`, #7770) restent écartés.
 
-Un jeton n'est une citation que si le dépôt ou la forge le confirme comme
+Une citation qualifiée n'est lue que si le dépôt ou la forge la confirme comme
 commit. Un objet local d'un autre type (arbre, blob, étiquette) est écarté sans
 réseau ; une forge qui répond explicitement « No commit found for SHA » écarte
-le jeton (#7730), qu'il s'agisse d'un mot courant comme `ed25519` ou d'un SHA
-d'un autre dépôt. Une forge muette, coupée ou ambiguë ne prouve pas l'absence :
+le jeton (#7730). Une forge muette, coupée ou ambiguë ne prouve pas l'absence :
 la citation reste un doute dit au gel, et la lecture stricte de la porte refuse
-(le refus fermé de #2924 B5) — jamais une exclusion silencieuse.
+(le refus fermé de #2924 B5) — jamais une exclusion silencieuse. Un SHA d'un
+autre dépôt nommé (`other/repo@sha`) n'est pas une citation de cette tête : il
+est écarté localement, sans forge.
 
 Pour les auteurs : citez le commit retiré par au moins 12 caractères
-hexadécimaux de son SHA quand vous le pouvez ; ne citez jamais un mot
-hexadécimal ordinaire (`ed25519`, `deadbeef`) ni le SHA d'un autre dépôt comme
-preuve de cette tête. Un jeton court (moins de 12 caractères) reste lu pour ne
-pas perdre une vraie citation abrégée, mais il n'est retenu que si la forge en
-confirme l'existence. Le gel prépare ces citations hors transaction
+hexadécimaux de son SHA, ou par `dépôt@sha` si vous devez utiliser une
+abréviation plus courte ; ne citez jamais un mot hexadécimal ordinaire
+(`ed25519`, `deadbeef`). Le gel prépare ces citations hors transaction
 (`prefetch_prior_freezes`) ; une citation non préparée est dite, jamais
 silencieusement exclue.

@@ -367,7 +367,7 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
     def test_strict_reading_ignores_non_commit_objects_and_run_numbers(self):
         blob = self.repo.git("rev-parse", "HEAD:src/ameesh/mail.py")
         tree = self.repo.git("rev-parse", "HEAD^{tree}")
-        for token in (blob[:8], tree[:12]):
+        for token in (blob[:12], tree[:12]):
             for fetch in (False, True):
                 with self.subTest(token=token, fetch=fetch):
                     self.repo.git("reset", "--hard", self.head_a)
@@ -382,29 +382,29 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
                     self.assertEqual(correctors, [])
                     forge.assert_not_called()
 
-    def test_hex_word_requires_a_definitive_forge_negative(self):
-        from ameesh import plan_github
-
+    def test_hex_word_is_not_a_citation_and_never_asks_the_forge(self):
+        # #7721 : `ed25519` n'est pas un SHA qualifié (moins de 12 caractères,
+        # pas de forme dépôt@sha) : il n'est jamais lu, donc une forge
+        # inaccessible ou ambiguë ne peut plus le refuser.
         _fix, head = self._rewrite(cite="ed25519")
-        for status, message, accepted in (
-                (404, "No commit found for SHA: ed25519", True),
-                (422, "No commit found for SHA: ed25519", True),
-                (404, "Not Found", False),
-                (422, "Ambiguous SHA", False),
-                (403, "API rate limit exceeded", False),
-                (503, "Service unavailable", False)):
-            with self.subTest(status=status, message=message):
-                def unavailable(*args, **kwargs):
-                    raise urllib.error.HTTPError(
-                        "https://api.invalid", status, "failure", {},
-                        io.BytesIO(json.dumps({"message": message}).encode()))
+        with mock.patch.object(review_authors, "_forge_commit") as forge, \
+                mock.patch.object(review_authors, "_forge_fetch") as fetch:
+            (_authors, unknown, correctors), _freeze = self._reading(
+                head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual(correctors, [])
+        forge.assert_not_called()
+        fetch.assert_not_called()
 
-                api = plan_github.Api(token="test", opener=unavailable)
-                with mock.patch.object(review_authors, "_repository_slug",
-                                       return_value="owner/repo"), \
-                        mock.patch.object(plan_github, "client", return_value=api), \
-                        mock.patch.object(review_authors, "_forge_fetch") as fetch:
-                    if accepted:
+    def test_ambiguous_forge_still_refuses_a_qualified_citation(self):
+        # La garantie de provenance reste : une vraie citation (12 hex) que
+        # la forge ne résout pas explicitement est un doute refusé.
+        _fix, head = self._rewrite(cite="deadbeef1234")
+        for resolved in (None, ""):
+            with self.subTest(resolved=resolved):
+                with mock.patch.object(review_authors, "_forge_commit",
+                                       return_value=resolved):
+                    if resolved is None:
                         (_authors, unknown, correctors), _freeze = self._reading(
                             head, strict=True)
                         self.assertEqual(unknown, [])
@@ -412,9 +412,8 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
                     else:
                         with self.assertRaisesRegex(
                                 review_provenance.ProvenanceError,
-                                "cited commit ed25519 .*forge-unreadable"):
+                                "cited commit deadbeef1234 .*forge-unreadable"):
                             self._reading(head, strict=True)
-                    fetch.assert_not_called()
 
     def test_foreign_repository_sha_is_ignored_on_a_definitive_forge_negative(self):
         """#7721 : un SHA d'un autre dépôt, cité en entier dans le message,
@@ -447,8 +446,28 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
         self.assertEqual(correctors, [])
         fetch.assert_not_called()
 
+    def test_foreign_qualified_repository_is_ignored_without_the_forge(self):
+        """#7721 : `dépôt@sha` nommant un autre dépôt n'est pas une citation
+        de cette tête ; aucune forge n'est interrogée pour lui."""
+        foreign = "0123456789abcdef0123456789abcdef01234567"
+        _fix, _head = self._rewrite(cite=False)
+        self.repo.git("commit", "--amend", "-m",
+                      "author: reprise\n\nVoir le dépôt other/foreign@%s." % foreign)
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        with mock.patch.object(review_authors, "_repository_slug",
+                               return_value="owner/repo"), \
+                mock.patch.object(review_authors, "_forge_commit") as forge, \
+                mock.patch.object(review_authors, "_forge_fetch") as fetch:
+            (_authors, unknown, correctors), _freeze = self._reading(
+                head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual(correctors, [])
+        forge.assert_not_called()
+        fetch.assert_not_called()
+
     def test_numeric_citation_requires_a_definitive_forge_negative(self):
-        _fix, head = self._rewrite(cite="43969930787")
+        _fix, head = self._rewrite(cite="439699307871")
         with mock.patch.object(review_authors, "_forge_commit", return_value=None):
             self._reading(head, strict=True)
         for fetch in (False, True):
@@ -459,7 +478,7 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
 
     def test_numeric_abbreviation_resolved_by_forge_excludes_corrector(self):
         fix, head = self._remote_rewrite()
-        body = self.repo.git("log", "-1", "--format=%B").replace(fix[:12], "1234567")
+        body = self.repo.git("log", "-1", "--format=%B").replace(fix[:12], "123456789012")
         self.repo.git("commit", "--amend", "-m", body)
         head = self.repo.git("rev-parse", "HEAD")
         self._receipt("author", "deepseek", [head])
@@ -467,7 +486,7 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
             (_authors, unknown, correctors), _freeze = self._reading(head, strict=True)
         self.assertEqual(unknown, [])
         self.assertEqual([row["name"] for row in correctors], ["cx3"])
-        self.assertEqual(forge.call_args.args[1], "1234567")
+        self.assertEqual(forge.call_args.args[1], "123456789012")
 
     def test_strict_reading_ignores_explicit_checksums(self):
         for label in ("checksum", "sha256", "SHA256"):
@@ -548,28 +567,49 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
         self.repo.git("reset", "--hard", self.head_a)
         self.repo.write("src/ameesh/mail.py", "package\n")
         head = self.repo.commit(
-            "author: correctif-43969930787 ; paquet h-20261117-05",
+            "author: correctif-439699307871 ; paquet h-20261117-05",
             agent="author")
         self._receipt("author", "deepseek", [head])
         with mock.patch.object(review_authors, "_forge_commit",
                                return_value="") as forge:
             with self.assertRaisesRegex(
                     review_provenance.ProvenanceError,
-                    "cited commit 43969930787 .*forge-unreadable"):
+                    "cited commit 439699307871 .*forge-unreadable"):
                 self._reading(head, strict=True)
         self.assertEqual([call.args[1] for call in forge.call_args_list],
-                         ["43969930787"])
+                         ["439699307871"])
 
 
 class ForgeCitationResolutionTest(unittest.TestCase):
     def test_hex_suffix_in_a_word_is_not_a_commit_citation(self):
-        text = "owner-decision job succeeded; correctif-1234abcd retiré"
-        citations = [
-            match["commit"]
-            for match in review_authors._CITED_COMMIT.finditer(text)
-            if match["commit"]
-        ]
-        self.assertEqual(citations, ["1234abcd"])
+        text = "owner-decision job succeeded; correctif-1234abcd5678 retiré"
+        self.assertEqual(review_authors._cited_tokens(text, "owner/repo"),
+                         ["1234abcd5678"])
+
+    def test_short_hex_word_is_not_a_commit_citation(self):
+        # #7721 : un jeton non qualifié de moins de 12 caractères n'est jamais
+        # une citation, même entier et borné (`ed25519`, `deadbeef`).
+        for text in ("ed25519", "deadbeef", "correctif-1234abcd",
+                     "paquet h-20261117-05"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    review_authors._cited_tokens(text, "owner/repo"), [])
+
+    def test_qualified_repository_citation_keeps_a_short_sha(self):
+        # La forme `dépôt@sha` qualifie un SHA court ; un autre dépôt nommé
+        # n'est pas une citation de cette tête.
+        for text in ("manaty/ameesh@1234abcd", "ameesh@1234abcd"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    review_authors._cited_tokens(text, "manaty/ameesh"),
+                    ["1234abcd"])
+        self.assertEqual(
+            review_authors._cited_tokens("other/repo@1234abcd", "manaty/ameesh"),
+            [])
+        # Un fork qui ne diffère que par le propriétaire n'est pas le dépôt lu.
+        self.assertEqual(
+            review_authors._cited_tokens("other/ameesh@1234abcd", "manaty/ameesh"),
+            [])
 
     def test_gh_without_shared_reads_preserves_commit_absence(self):
         from ameesh import plan_github
