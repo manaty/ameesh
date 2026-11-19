@@ -30,6 +30,7 @@ from ameesh import attach_grant, attach_host, attach_pty, attach_relay
 from ameesh import attach_transport as t
 from ameesh import receipts
 
+from . import support
 from .webauthn_soft import ORIGIN, RP_ID, SoftDevice, SoftWebAuthn
 
 TOKEN = "relay-token-" + "a" * 40
@@ -44,23 +45,42 @@ HOST_PUBLIC_KEY = Ed25519PrivateKey.from_private_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 #: un shell qui répond et reste vivant (le PTY est le terminal)
 COMMAND = ["/bin/sh", "-c", 'while IFS= read -r line; do printf "echo:%s\\n" "$line"; done']
-#: borne généreuse des échanges locaux du module : sous la charge d'une partie
-#: psycopg ou des unités voisines, 5 s ne suffisent pas. La condition reste un
-#: événement ou une trame attendue ; la borne n'est qu'un garde-fou.
-LOCAL_IO_TIMEOUT = 30.0
+#: #5629 : les bornes du banc suivent le facteur d'échelle
+#: (`AMEESH_TEST_TIME_SCALE`, 5 sous psql, 1 sinon). #7820 : une part
+#: psycopg chargée a dépassé 30 s sur une simple réponse du poste.
+#: La condition reste un événement ou une trame attendue ; la borne n'est
+#: qu'un garde-fou, jamais le mécanisme d'attente.
+LOCAL_IO_TIMEOUT = support.scaled(30.0)
 #: #7640 : borne de la *mise en place* (connexion de l'hôte, session créée
 #: côté hôte). Le relais répond PAIRED dès qu'il a mis le PAIR en file pour
 #: l'hôte, pas quand celui-ci a créé sa session ; sous la charge d'une part,
 #: ce démarrage a consommé à lui seul la borne des échanges (run 43994301490 :
 #: poignée de main du poste à 30,7 s). La mise en place est un événement de
 #: cycle de vie : sa borne reste loin du tour normal (#7440), 120 s ne coûtent
-#: rien au vert et distinguent un hôte lent d'un hôte muet.
-HOST_SETUP_TIMEOUT = 120.0
+#: rien au vert et distinguent un hôte lent d'un hôte muet. #7820 : elle suit
+#: l'échelle du banc comme les autres.
+HOST_SETUP_TIMEOUT = support.scaled(120.0)
 #: budget des sessions ouvertes par les tests : très au-dessus de la borne
 #: d'E/S du poste, pour qu'une part lente ne ferme jamais une session en cours
 #: de test (le relais rendait `max_duration` avant la réponse, #7325). Les
 #: bornes de production du relais et de l'hôte restent leurs défauts.
 SESSION_BUDGET = 10 * LOCAL_IO_TIMEOUT
+#: #7820 : la réponse à REQ (vérification du grant, spawn du PTY) et la
+#: fermeture après déconnexion sont des étapes de mise en place, pas des
+#: échanges locaux. Sous la charge d'une part psycopg, la réponse a consommé
+#: les 30 s de LOCAL_IO_TIMEOUT (run 44427431883) et la fermeture asynchrone
+#: de l'hôte a dépassé son ancienne borne fixe de 3 s. Ces deux attentes
+#: prennent donc la borne de mise en place, sans dépasser le budget de
+#: session : le relais fermerait la session avant.
+SETUP_EVENT_TIMEOUT = min(HOST_SETUP_TIMEOUT, SESSION_BUDGET)
+#: `HostConfig` plafonne `request_timeout` à 300 s ; le budget de session des
+#: tests peut le dépasser sans changer cette borne du produit.
+HOST_REQUEST_TIMEOUT = min(SESSION_BUDGET, 300.0)
+#: #5629/#7820 : attente d'un processus local (sortie, descendant nettoyé) ;
+#: sous la charge d'une part, un shell peut mettre plusieurs secondes à être
+#: ordonnancé. La condition reste l'état du processus, la borne est un
+#: garde-fou.
+PROCESS_TIMEOUT = support.scaled(5.0)
 
 
 class _ObservedConnector(attach_host.HostConnector):
@@ -210,8 +230,14 @@ class Station:
                 self._send(*self.channel.confirm_frame())
                 self._confirm_sent = True
 
-    def request(self, *, term="xterm", rows=24, cols=80, timeout=LOCAL_IO_TIMEOUT,
+    def request(self, *, term="xterm", rows=24, cols=80, timeout=SETUP_EVENT_TIMEOUT,
                 transcript_hash=None):
+        """Envoie REQ et attend OK/NO.
+
+        La réponse est une étape de mise en place côté hôte (vérification du
+        grant, spawn du PTY) : sa borne est celle des événements de mise en
+        place (#7820), pas celle d'un échange local.
+        """
         transcript_hash = transcript_hash or self.channel.transcript_hash
         signature = self.device.key.sign(attach_grant.device_message(
             receipts.challenge(self.receipt["request"]), transcript_hash))
@@ -407,7 +433,7 @@ class PtyTest(unittest.TestCase):
         self.assertEqual((rows, cols), (40, 120))
         proc.write(b"hello\n")
         out = bytearray()
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + PROCESS_TIMEOUT
         while time.monotonic() < deadline and b"got:hello" not in out:
             chunk = proc.read(4096)
             if chunk:
@@ -446,13 +472,13 @@ class PtyTest(unittest.TestCase):
         # le shell sort tout de suite ; le descendant ignore TERM et HUP
         proc = attach_pty.PtyProcess(
             ["/bin/sh", "-c", "trap '' TERM HUP; sleep 30 & exit 0"])
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + PROCESS_TIMEOUT
         while time.monotonic() < deadline and proc.poll() is None:
             time.sleep(0.01)
         self.assertIsNotNone(proc.poll())
         self.assertTrue(self._live_group(proc.pid), "the descendant must be alive")
         proc.close()
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + PROCESS_TIMEOUT
         while time.monotonic() < deadline and self._live_group(proc.pid):
             time.sleep(0.01)
         self.assertEqual(self._live_group(proc.pid), [])
@@ -514,7 +540,7 @@ class RelayTest(unittest.TestCase):
                       host=HOST, agents=(AGENT,), plaintext_loopback=True,
                       command=COMMAND, host_signing_key=HOST_SIGNING_KEY,
                       max_sessions=4, max_session_seconds=SESSION_BUDGET,
-                      request_timeout=SESSION_BUDGET, keepalive=1.0)
+                      request_timeout=HOST_REQUEST_TIMEOUT, keepalive=1.0)
         config.update(overrides)
         self.connector = _ObservedConnector(
             attach_host.HostConfig(**config), self.verifier, logger=self.logger)
@@ -539,8 +565,16 @@ class RelayTest(unittest.TestCase):
         self.host()
         receipt, device = make_grant()
         station = self.station(receipt, device)
-        station.handshake()
-        self.assertEqual(station.request()["v"], 1)
+        try:
+            station.handshake()
+        except (AssertionError, TimeoutError) as exc:
+            self.fail("handshake failed: %s\n%s" % (exc, self.logs.getvalue()))
+        try:
+            answer = station.request()
+        except (AssertionError, TimeoutError) as exc:
+            self.fail("no answer to REQ within %.1fs: %s\n%s"
+                      % (SETUP_EVENT_TIMEOUT, exc, self.logs.getvalue()))
+        self.assertEqual(answer["v"], 1)
         self.assertEqual(len(self.verifier.requests), 1)
         request = self.verifier.requests[0]
         self.assertEqual((request.agent, request.host, request.tenant),
@@ -562,7 +596,7 @@ class RelayTest(unittest.TestCase):
     def test_fermeture_pendant_la_verification_ne_laisse_pas_de_pty(self):
         self.start(idle_timeout=LOCAL_IO_TIMEOUT * 2,
                    max_session_seconds=LOCAL_IO_TIMEOUT * 3)
-        self.host(request_timeout=LOCAL_IO_TIMEOUT * 2,
+        self.host(request_timeout=min(LOCAL_IO_TIMEOUT * 2, 300.0),
                   max_session_seconds=LOCAL_IO_TIMEOUT * 3)
         created = []
         verification_closed = threading.Event()
@@ -700,7 +734,7 @@ class RelayTest(unittest.TestCase):
         first.handshake()
         first.request()
         first.close()
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + SETUP_EVENT_TIMEOUT
         while time.monotonic() < deadline and self.connector.sessions:
             time.sleep(0.02)
         second_receipt, second_device = make_grant()
@@ -744,11 +778,15 @@ class RelayTest(unittest.TestCase):
         station.request()
         session = next(iter(self.connector.sessions.values()))
         station.sock.close()
-        deadline = time.monotonic() + 3
+        # #7820 : la fermeture est asynchrone — le relais constate la coupure
+        # dans son fil de lecture, prévient l'hôte, dont le fil de session
+        # ferme le PTY et se désinscrit. On attend cet état jusqu'à une borne
+        # de mise en place, pas sur-le-champ avec un délai mural fixe.
+        deadline = time.monotonic() + SETUP_EVENT_TIMEOUT
         while time.monotonic() < deadline and self.connector.sessions:
             time.sleep(0.02)
-        self.assertEqual(self.connector.sessions, {})
-        self.assertIn("peer_closed", self.logs.getvalue())
+        self.assertEqual(self.connector.sessions, {}, self.logs.getvalue())
+        self.assertIn("peer_closed", self.logs.getvalue(), self.logs.getvalue())
         self.assertIsNone(session.pty)
 
     def test_poignee_de_main_attend_le_pair_cote_hote(self):
@@ -819,8 +857,19 @@ class RelayTest(unittest.TestCase):
         self.assertGreater(relay.config.max_session_seconds, LOCAL_IO_TIMEOUT)
         self.assertGreater(self.connector.config.max_session_seconds,
                            LOCAL_IO_TIMEOUT)
-        self.assertGreater(self.connector.config.request_timeout,
-                           LOCAL_IO_TIMEOUT)
+        # `HostConfig` plafonne request_timeout à 300 s : sous une échelle
+        # extrême, la borne du poste peut atteindre ce plafond.
+        if LOCAL_IO_TIMEOUT < 300.0:
+            self.assertGreater(self.connector.config.request_timeout,
+                               LOCAL_IO_TIMEOUT)
+        else:
+            self.assertEqual(self.connector.config.request_timeout, 300.0)
+        # #7820 : les bornes du banc suivent le facteur #5629, et la réponse à
+        # REQ / la fermeture après déconnexion prennent la borne de mise en
+        # place, au-dessus de celle des échanges locaux.
+        self.assertEqual(LOCAL_IO_TIMEOUT, support.scaled(30.0))
+        self.assertEqual(HOST_SETUP_TIMEOUT, support.scaled(120.0))
+        self.assertGreater(SETUP_EVENT_TIMEOUT, LOCAL_IO_TIMEOUT)
 
 
 class TlsTest(unittest.TestCase):
@@ -871,7 +920,7 @@ class TlsTest(unittest.TestCase):
             relay_host="127.0.0.1", relay_port=relay.port, token=TOKEN, host=HOST,
             agents=(AGENT,), tls_context=self.client_ctx, command=COMMAND,
             host_signing_key=HOST_SIGNING_KEY, max_session_seconds=SESSION_BUDGET,
-            request_timeout=SESSION_BUDGET), verifier)
+            request_timeout=HOST_REQUEST_TIMEOUT), verifier)
         thread = threading.Thread(target=connector.run_forever, daemon=True)
         thread.start()
         self.addCleanup(connector.stop)
