@@ -1004,28 +1004,56 @@ _WAIT_HISTORY = 200
 
 
 def _wait_unread(bk, name: str) -> list[dict]:
-    """Les non-remis que la veille regarde, avec leur id quand il existe.
+    """Les non-remis récents de la boîte, avec leur id.
 
-    Postgres : les derniers messages (lus compris), filtrés sur `delivered_ts`
-    et sur l'id — un arriéré de plus de `_WAIT_HISTORY` ne masque pas un
-    arrivage récent. Fichiers : la boîte non lue, identifiée par son fichier.
+    `mail.history` rend les messages les plus récents d'abord : un arrivage
+    est vu même derrière plus de `_WAIT_HISTORY` non-lus.
     """
-    if bk.kind == "pg":
-        return [row for row in mail.history(bk.db, name, _WAIT_HISTORY)
-                if row.get("delivered_ts") is None]
-    return bk.unread(name)
+    return [row for row in mail.history(bk.db, name, _WAIT_HISTORY)
+            if row.get("delivered_ts") is None]
 
 
 def _wait_notice(row: dict) -> str:
-    """La ligne remise au modèle (stderr du hook) : expéditeur et objet court."""
+    """Le réveil ne transmet que des métadonnées, jamais le corps.
+
+    Avec `asyncRewake`, Claude Code remet le stderr du hook au modèle comme
+    rappel **système**. Y mettre le début du corps ferait entrer le texte d'un
+    tiers dans ce canal sans le cadrage du hook de livraison ; le corps reste
+    donc à `agent-mail hook`, qui l'accompagne de son en-tête d'autorité.
+    """
     ident = row.get("id")
     sender = row.get("sender") or row.get("from") or "?"
-    body = (row.get("body") or row.get("text") or "").strip()
-    subject = body.splitlines()[0] if body else ""
-    if len(subject) > 120:
-        subject = subject[:117] + "..."
+    kind = row.get("kind") or "notify"
     label = "#%s" % ident if ident is not None else "?"
-    return "agent-mail: new mail %s from %s: %s" % (label, sender, subject)
+    return ("agent-mail: new mail %s from %s (%s); the delivery hook will hand "
+            "it over. End the turn or run agent-mail inbox." % (label, sender, kind))
+
+
+def _wait_lease(bk, name: str) -> tuple[bool, str]:
+    """Le bail d'attach vivant qui autorise CETTE session à veiller.
+
+    Sans ce contrôle, `agent-mail wait --agent X` laisserait un agent lire la
+    boîte d'un autre et prendre son verrou (le second veilleur sort 0), donc
+    neutraliser son réveil. La veille n'est autorisée que pour l'identité
+    annoncée par la session (`AGENT_MAIL_NAME`), sous le bail d'attach
+    (`attach:…`) vivant dont le propriétaire et l'epoch sont ceux de
+    l'environnement du harnais (`AMEESH_RUNNER_ID`, `AMEESH_LEASE_EPOCH`).
+    """
+    if bk.kind != "pg":
+        return False, "the wake watcher needs the database"
+    row = registry.get(bk.db, name) or {}
+    owner = str(row.get("lease_owner") or "")
+    expires = float(row.get("lease_expires_ts") or 0)
+    try:
+        epoch = str(int(row.get("lease_epoch") or 0))
+    except (TypeError, ValueError):
+        epoch = "0"
+    if not owner.startswith("attach:") or expires <= time.time():
+        return False, "no live attach lease"
+    if owner != (os.environ.get("AMEESH_RUNNER_ID") or "") \
+            or epoch != (os.environ.get("AMEESH_LEASE_EPOCH") or ""):
+        return False, "attach lease holder mismatch"
+    return True, ""
 
 
 def cmd_wait(bk, cfg: Config, rest: list[str]) -> int:
@@ -1039,6 +1067,11 @@ def cmd_wait(bk, cfg: Config, rest: list[str]) -> int:
     Le démarrage fixe la borne : un message déjà non lu n'est jamais réveillé
     par cette veille (il appartient au hook ordinaire). Sans cela, chaque
     réveil suivi du Stop relancerait la veille sur le même message — boucle.
+
+    La veille n'est autorisée que pour l'identité de la session attachée et
+    sous son bail vivant (`_wait_lease`) : jamais la boîte d'un autre agent,
+    jamais le verrou d'une autre session. Le rappel ne porte que des
+    métadonnées (id, expéditeur, genre), jamais le corps.
     """
     import fcntl
 
@@ -1074,6 +1107,17 @@ def cmd_wait(bk, cfg: Config, rest: list[str]) -> int:
             or delay < 0 or (since is not None and since < 0)):
         print(_WAIT_USAGE, file=sys.stderr)
         return 2
+    advertised = os.environ.get("AGENT_MAIL_NAME") or ""
+    if advertised != name:
+        print("agent-mail wait: --agent must be the session's own identity",
+              file=sys.stderr)
+        return 1
+    allowed, reason = _wait_lease(bk, name)
+    if not allowed:
+        if reason == "the wake watcher needs the database":
+            print("agent-mail wait: %s" % reason, file=sys.stderr)
+            return 1
+        return 0  # pas de bail vivant : rien à veiller, le hook ordinaire reste
     lock_dir = os.path.join(cfg.state_dir, "attach-wait")
     try:
         os.makedirs(lock_dir, mode=0o700, exist_ok=True)
@@ -1087,20 +1131,20 @@ def cmd_wait(bk, cfg: Config, rest: list[str]) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return 0  # un veilleur est déjà armé : rien à réveiller
+        # entre le contrôle et le verrou, le bail a pu être rendu ou repris :
+        # une veille orpheline doit lâcher le verrou tout de suite
+        allowed, reason = _wait_lease(bk, name)
+        if not allowed:
+            return 0
         deadline = time.monotonic() + timeout
         # Borne de démarrage : seuls les messages strictement plus récents
-        # réveillent (anti-boucle, cf. docstring). En repli fichier, la borne
-        # est l'ensemble des fichiers déjà présents.
+        # réveillent (anti-boucle, cf. docstring).
         baseline = 0
-        seen: set = set()
         try:
-            if bk.kind == "pg":
-                rows = mail.history(bk.db, name, _WAIT_HISTORY)
-                baseline = max([int(row.get("id") or 0) for row in rows] or [0])
-                if since is not None:
-                    baseline = since
-            else:
-                seen = {row.get("_file") for row in bk.unread(name)}
+            rows = mail.history(bk.db, name, _WAIT_HISTORY)
+            baseline = max([int(row.get("id") or 0) for row in rows] or [0])
+            if since is not None:
+                baseline = since
         except db_mod.DbError:
             # sans borne fiable, ne pas s'armer (un réveil pour un ancien
             # message ferait une boucle) : le hook ordinaire reste la règle
@@ -1111,16 +1155,14 @@ def cmd_wait(bk, cfg: Config, rest: list[str]) -> int:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return 0
+            allowed, _reason = _wait_lease(bk, name)
+            if not allowed:
+                return 0  # bail perdu ou remplacé : la veille orpheline s'arrête
             try:
                 rows = _wait_unread(bk, name)
-                if bk.kind == "pg":
-                    hits = [row for row in rows
-                            if int(row.get("id") or 0) > baseline
-                            and not mail.passive_reason(row)]
-                else:
-                    hits = [row for row in rows
-                            if row.get("_file") not in seen
-                            and not mail.passive_reason(row)]
+                hits = [row for row in rows
+                        if int(row.get("id") or 0) > baseline
+                        and not mail.passive_reason(row)]
             except db_mod.DbError:
                 # veille : une base momentanément indisponible ne fait pas
                 # échouer le hook, elle repoll au tour suivant
