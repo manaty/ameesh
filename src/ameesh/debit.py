@@ -116,6 +116,32 @@ EVENT_DAYS = 60
 _MARK = re.compile(
     r"^review-designation(?:-carried)?:(\d+):(\d+):\s*(\{.*\})\s*$", re.S)
 _MARK_NONE = re.compile(r"^review-designation-none:(\d+):(\d+):")
+#: #7804 : l'état effectif d'une désignation n'est pas toujours dans la marque
+#: JSON du gel. Un plancher non couvert (`review-designation-floor:… not
+#: covered`), une désignation impossible (`review-designation-unavailable:`) et
+#: le rafraîchissement de canon (`review-canon-refresh:… notice/checked`) disent
+#: `waiting`/`unavailable` et leur cause. Les ignorer laissait la marque de
+#: report (`carried`) ou des verdicts reportés passer pour un quorum : le lot
+#: sortait `qa_merge` au lieu de « désignation en attente » (témoin Nexlink
+#: #7678, `author provenance unknown`).
+_FLOOR_WAIT = re.compile(
+    r"^review-designation-floor:(\d+):(\d+):(\d+):\s*review floor \d+ "
+    r"not covered at freeze #(\d+):\s*(.*?);\s*kept:\s*(.*)$", re.S)
+_DESIGNATION_UNAVAILABLE = re.compile(
+    r"^review-designation-unavailable:(\d+):(\d+):\s*automatic reviewer "
+    r"designation not computed:\s*(.*)$", re.S)
+_CANON_REFRESH = re.compile(
+    r"^review-canon-refresh:(\d+):(\d+):[0-9a-fA-F]+:(notice|checked):\s*"
+    r"canon policy rechecked:\s*([^;]+);\s*(.*)$", re.S)
+_MARK_MANUAL = re.compile(r"^review-designation-manual:(\d+):(\d+):")
+#: la provenance inconnue, telle que la désignation la dit (marque #1617,
+#: plancher #3557, rafraîchissement #7624) : la famille d'un auteur ne peut pas
+#: être prouvée, donc aucune famille n'est éligible pour un nouvel avis.
+_PROVENANCE_UNKNOWN = re.compile(
+    r"author\s+provenance\s+unknown|provenance\s+inconnue", re.I)
+_PROVENANCE_SHAS = re.compile(
+    r"author\s+provenance\s+unknown for \d+ commit\(s\) of the frozen range:\s*"
+    r"([0-9a-f]{7,40}(?:,\s*[0-9a-f]{7,40})*)", re.I)
 _MANUAL = re.compile(r"^reviewer\s+(.+?)\s+(designated|removed)\s*$")
 _WAKE = re.compile(r"^wake\s*:\s*(.*)$", re.I)
 _WAKE_DELIVERED = re.compile(r"scheduled wake delivered", re.I)
@@ -156,6 +182,9 @@ GESTURES = {
                    "(`ameesh work reviewer {lot} <agent>`)",
     "qa_merge": "lot relu, en attente du paquet : rappeler au pilote de le ranger "
                 "dans le prochain paquet horaire (canon §11 bis)",
+    "qa_designation": "désignation en attente : {cause} — traiter la cause puis "
+                      "relancer la désignation (`ameesh work reviewers {lot} "
+                      "--apply`)",
     "blocking_review": "relancer l'auteur {who} sur l'avis bloquant ; sans "
                        "mouvement, le pilote réassigne (canon §9 ×2)",
     "hold_device": "hold sans objet : demander au pilote de le lever (appareil "
@@ -842,6 +871,19 @@ def _independent_families(mark: Mapping | None, by_actor: Mapping,
     return len(families) + (1 if unknown else 0)
 
 
+def _provenance_shas(why: Any) -> list[str]:
+    """Les commits de provenance inconnue nommés par une cause de désignation.
+
+    La marque #1617 les porte dans `unknown_authors` ; les notes de plancher
+    (#3557) et de rafraîchissement (#7624) ne citent que le texte « author
+    provenance unknown for N commit(s) of the frozen range: <sha>, … ». Une
+    cause sans liste ne devine aucun commit : elle rend une liste vide."""
+    match = _PROVENANCE_SHAS.search(str(why or ""))
+    if not match:
+        return []
+    return [value.strip() for value in match.group(1).split(",") if value.strip()]
+
+
 def designations(milestones: list[dict], events: list[dict], *,
                  agent_families: Mapping[str, str] | None = None) -> dict:
     """Les relecteurs désignés sur le dernier gel et leurs avis encore dus.
@@ -870,6 +912,14 @@ def designations(milestones: list[dict], events: list[dict], *,
       familles **distinctes et éligibles**, atteint `required` — ou si la
       porte l'a passé en `validated` (#5202). Le manque et sa cause sont
       rendus (`shortfall`, `cause`), jamais tus derrière un `ready: true` ;
+    * #7804 : la dernière preuve de l'état de la désignation fait foi, y
+      compris hors de la marque JSON : `review-designation-floor:… not
+      covered`, `review-designation-unavailable:` et
+      `review-canon-refresh:… waiting/unavailable` disent une désignation en
+      attente avec sa cause (provenance inconnue, tête introuvable, plancher).
+      Un report `carried` ou des verdicts reportés ne la remplacent pas : la
+      ligne `qa` porte `designation_wait`, n'est pas `ready`, et ne sort pas
+      `qa_merge` ;
     * #5202 : le passage en `validated` depuis le gel, que la porte n'accorde
       qu'au quorum de la tête gelée (#4423, report compris). Comme pour la
       file et le SLO (#4851), aucun désigné n'est plus dû (#5083 : quorum
@@ -883,7 +933,7 @@ def designations(milestones: list[dict], events: list[dict], *,
         return {"freeze": None, "designees": [], "pending": [], "missing": False,
                 "none": False, "unreadable": [], "quorum": None,
                 "required": None, "acquired": None, "shortfall": 0,
-                "why": "", "cause": ""}
+                "why": "", "cause": "", "designation_wait": None}
     freeze_at = float(freeze.get("at_ts") or 0.0)
     freeze_sha = str(freeze.get("sha") or "").strip()
     unreadable: list[str] = []
@@ -897,6 +947,13 @@ def designations(milestones: list[dict], events: list[dict], *,
     ever_id: dict[str, int] = {}
     manual: dict[str, dict] = {}
     quorum_at: float | None = None
+    #: #7804 : les preuves de l'état de la désignation du gel, dans l'ordre du
+    #: journal. Une marque, un plancher non couvert, une désignation impossible
+    #: ou un rafraîchissement de canon peuvent dire `waiting`/`unavailable` ;
+    #: seule la **dernière** preuve fait foi (une nouvelle marque `designated`
+    #: efface une attente antérieure, et une attente plus récente efface un
+    #: report devenu faux).
+    wait_evidence: list[dict] = []
     for event in sorted(events or (),
                         key=lambda e: (float(e.get("at_ts") or 0.0),
                                        int(e.get("id") or 0))):
@@ -905,7 +962,13 @@ def designations(milestones: list[dict], events: list[dict], *,
         if at >= freeze_at:
             if text.startswith("verdict not required:"):
                 waived = True
-            elif text == "reviewer designation removed" or _MANUAL.match(text):
+                wait_evidence.append({"waiting": False, "at": at,
+                                      "id": int(event.get("id") or 0)})
+            elif text == "reviewer designation removed":
+                waived = False
+                wait_evidence.append({"waiting": False, "at": at,
+                                      "id": int(event.get("id") or 0)})
+            elif _MANUAL.match(text):
                 waived = False
         if at > freeze_at:
             state = str(event.get("state") or "")
@@ -925,10 +988,77 @@ def designations(milestones: list[dict], events: list[dict], *,
             if parsed["freeze"] == int(freeze.get("id") or 0):
                 latest_mark = parsed
                 none_mark = False
+                mark_at = float(event.get("at_ts") or 0.0)
+                mark_kind = str(parsed.get("state") or "")
+                provenance = bool(parsed.get("unknown_authors")) \
+                    or bool(_PROVENANCE_UNKNOWN.search(parsed.get("why") or ""))
+                unknown = list(parsed.get("unknown_authors") or ())
+                if not unknown:
+                    unknown = _provenance_shas(parsed.get("why"))
+                if mark_kind in ("designated", "carried", "manual", "none"):
+                    wait_evidence.append({"waiting": False, "at": mark_at,
+                                          "id": event_id})
+                elif mark_kind == "waiting" and provenance:
+                    wait_evidence.append({
+                        "waiting": True, "kind": "mark", "at": mark_at,
+                        "id": event_id, "why": parsed.get("why") or "",
+                        "unavailable": False, "provenance": True,
+                        "unknown_authors": unknown})
+                elif mark_kind == "unavailable":
+                    wait_evidence.append({
+                        "waiting": True, "kind": "mark", "at": mark_at,
+                        "id": event_id, "why": parsed.get("why") or "",
+                        "unavailable": True, "provenance": provenance,
+                        "unknown_authors": unknown})
             continue
         match = _MARK_NONE.match(text)
         if match and int(match.group(2)) == int(freeze.get("id") or 0):
             none_mark = True
+            wait_evidence.append({"waiting": False, "at": at,
+                                  "id": int(event.get("id") or 0)})
+            continue
+        #: #7804 : une marque `manual` couvre le gel sans nouvel avis ; elle
+        #: lève une attente antérieure, comme une marque `designated`.
+        manual_mark = _MARK_MANUAL.match(text)
+        if manual_mark and int(manual_mark.group(2)) == int(freeze.get("id") or 0):
+            wait_evidence.append({"waiting": False, "at": at,
+                                  "id": int(event.get("id") or 0)})
+            continue
+        floor_wait = _FLOOR_WAIT.match(text)
+        if (floor_wait and int(floor_wait.group(2)) == int(freeze.get("id") or 0)):
+            why = " ".join(floor_wait.group(5).split())
+            wait_evidence.append({
+                "waiting": True, "kind": "floor", "at": at,
+                "id": int(event.get("id") or 0), "why": why,
+                "unavailable": False,
+                "provenance": bool(_PROVENANCE_UNKNOWN.search(why)),
+                "unknown_authors": _provenance_shas(why)})
+            continue
+        unavailable = _DESIGNATION_UNAVAILABLE.match(text)
+        if (unavailable
+                and int(unavailable.group(2)) == int(freeze.get("id") or 0)):
+            why = " ".join(unavailable.group(3).split())
+            wait_evidence.append({
+                "waiting": True, "kind": "unavailable", "at": at,
+                "id": int(event.get("id") or 0), "why": why,
+                "unavailable": True,
+                "provenance": bool(_PROVENANCE_UNKNOWN.search(why)),
+                "unknown_authors": _provenance_shas(why)})
+            continue
+        refresh = _CANON_REFRESH.match(text)
+        if refresh and int(refresh.group(2)) == int(freeze.get("id") or 0):
+            refresh_state = refresh.group(4).strip().lower()
+            why = " ".join(refresh.group(5).split())
+            if refresh_state in ("waiting", "unavailable"):
+                wait_evidence.append({
+                    "waiting": True, "kind": "refresh", "at": at,
+                    "id": int(event.get("id") or 0), "why": why,
+                    "unavailable": refresh_state == "unavailable",
+                    "provenance": bool(_PROVENANCE_UNKNOWN.search(why)),
+                    "unknown_authors": _provenance_shas(why)})
+            elif refresh_state in ("designated", "manual", "none"):
+                wait_evidence.append({"waiting": False, "at": at,
+                                      "id": int(event.get("id") or 0)})
             continue
         manual_match = _MANUAL.match(text)
         if manual_match:
@@ -937,13 +1067,49 @@ def designations(milestones: list[dict], events: list[dict], *,
                                    "kind": manual_match.group(2),
                                    "at": float(event.get("at_ts") or 0.0),
                                    "id": int(event.get("id") or 0)}
+    # #7804 : la dernière preuve de l'état de la désignation du gel tranche.
+    # Un report (`carried`) ou une marque `designated` antérieure ne prouve
+    # rien si un plancher non couvert ou un rafraîchissement de canon plus
+    # récent dit `waiting`/`unavailable` : le lot n'est pas « relu, en attente
+    # du paquet ». Inversement, une marque finale plus récente efface l'attente.
+    wait_evidence.sort(key=lambda row: (float(row.get("at") or 0.0),
+                                        int(row.get("id") or 0)))
+    designation_wait = None
+    wait_run_start = None
+    latest_evidence = None
+    for evidence in wait_evidence:
+        if evidence.get("waiting"):
+            if wait_run_start is None:
+                wait_run_start = float(evidence.get("at") or 0.0)
+            latest_evidence = evidence
+        else:
+            wait_run_start = None
+            latest_evidence = evidence
+    if (latest_evidence is not None and latest_evidence.get("waiting")
+            and quorum_at is None):
+        why = str(latest_evidence.get("why") or "").strip()
+        designation_wait = {
+            "kind": str(latest_evidence.get("kind") or "designation"),
+            "state": ("unavailable" if latest_evidence.get("unavailable")
+                      else "waiting"),
+            "why": why,
+            "provenance": bool(latest_evidence.get("provenance")),
+            "unavailable": bool(latest_evidence.get("unavailable")),
+            "unknown_authors": list(latest_evidence.get("unknown_authors") or ()),
+            "since_ts": (wait_run_start if wait_run_start is not None
+                         else float(latest_evidence.get("at") or 0.0)),
+        }
     # #3818/#1979 : la dispense vaut pour ce gel seulement. Un nouveau
-    # gel ou une désignation explicite rend la revue à nouveau due.
-    if waived:
+    # gel ou une désignation explicite rend la revue à nouveau due. #7804 :
+    # une attente de désignation plus récente (rafraîchissement de canon,
+    # plancher non couvert) la lève aussi — un lot ne reste pas « dispensé »
+    # quand la politique du gel demande de nouveau des avis.
+    if waived and designation_wait is None:
         return {"freeze": freeze, "designees": [], "pending": [],
                 "missing": False, "none": True, "unreadable": [],
                 "quorum": None, "required": None, "acquired": None,
-                "shortfall": 0, "why": "", "cause": ""}
+                "shortfall": 0, "why": "", "cause": "",
+                "designation_wait": None}
     auto = list(latest_mark["names"]) if latest_mark else []
     # Un auteur de la tête — dont le relecteur qui y a poussé un correctif
     # (#2888/#2739) — ne peut pas la relire. La marque du gel courant le dit ;
@@ -1023,14 +1189,25 @@ def designations(milestones: list[dict], events: list[dict], *,
     else:
         missing = (latest_mark is None and not none_mark and not designees
                    and not by_actor and quorum_at is None)
+    # #7804 : une désignation en attente n'est pas un siège « aucun relecteur »
+    # à désigner : sa cause est la provenance (ou une indisponibilité), et le
+    # geste est de la traiter puis de relancer la désignation. Le lot n'est
+    # jamais prêt tant que cette attente tient.
+    if designation_wait is not None:
+        missing = False
+        cause = ""
+    unknown_authors = list((latest_mark or {}).get("unknown_authors") or ())
+    if designation_wait is not None and designation_wait.get("unknown_authors"):
+        unknown_authors = list(designation_wait["unknown_authors"])
     return {"freeze": freeze, "designees": designees, "pending": pending,
             "missing": missing, "none": none_mark, "unreadable": unreadable,
             "quorum": _iso(quorum_at) if quorum_at is not None else None,
             "required": required, "acquired": acquired,
             "shortfall": shortfall, "why": str((latest_mark or {}).get("why") or ""),
             "cause": cause,
+            "designation_wait": designation_wait,
             "author_families": (latest_mark or {}).get("author_families") or [],
-            "unknown_authors": (latest_mark or {}).get("unknown_authors") or [],
+            "unknown_authors": unknown_authors,
             "acquired_families": sorted({
                 ((latest_mark or {}).get("reviewer_families") or {}).get(actor)
                 or (agent_families or {}).get(actor) or ""
@@ -1510,7 +1687,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
                                    if designation["missing"] else None),
                 "required_reviews": designation.get("required"),
                 "acquired_reviews": designation.get("acquired"),
-                "ready": not pending and not designation["missing"] and not blocked,
+                #: #7804 : la désignation elle-même attend (provenance
+                #: inconnue, plancher non couvert, tête introuvable) : ce n'est
+                #: ni un avis dû nominatif ni « relu, attente paquet ».
+                "designation_wait": designation.get("designation_wait"),
+                "ready": (not pending and not designation["missing"]
+                          and not designation.get("designation_wait")
+                          and not blocked),
                 "held": ident in held_lots,
             }
             qa.append(state)
@@ -1685,9 +1868,17 @@ def build(*, items: Iterable[Mapping[str, Any]],
                            "level": level, "human": bool(human)}, **extra))
 
     for row in qa:
-        if row.get("held"):
-            continue                    # la retenue active porte already sa cause
         state = state_by_lot.get(int(row["lot"]))
+        wait = row.get("designation_wait") or {}
+        declared = (external_by_lot.get(int(row["lot"])) or {}).get("external") or {}
+        recorded_owner = str(declared.get("executor") or "") in ("owner", "avatar")
+        #: #7804 : une provenance inconnue dont la voie owner est consignée
+        #: (hold `attente owner`/`attente avatar`) est une attente humaine
+        #: explicite. Elle est dite même sous la retenue : `ready` est faux et
+        #: le rapport nomme la désignation, pas seulement le hold qui la porte.
+        owner_provenance = bool(wait.get("provenance")) and recorded_owner
+        if row.get("held") and not owner_provenance:
+            continue                    # la retenue active porte already sa cause
         # #7233 : an old freeze on a lot returned to intake does not make
         # its dependency wait a review wait. QA lots still need their reviews.
         if state == "intake" and row.get("blocking_dependencies"):
@@ -1724,6 +1915,30 @@ def build(*, items: Iterable[Mapping[str, Any]],
                          gesture, human=_human_wait(state))
         elif row.get("blocked_verdict"):
             continue                    # l'avis bloquant a son attente dédiée
+        elif row.get("designation_wait"):
+            # #7804 : la désignation du gel attend une preuve (provenance des
+            # auteurs, tête introuvable, plancher non couvert). Ce n'est pas un
+            # avis dû ni un lot « relu, en attente du paquet » : la ligne dit la
+            # cause, et le geste la traite. Une provenance inconnue dont la voie
+            # owner est consignée (hold `attente owner`/`attente avatar`, #3498)
+            # est une attente humaine explicite, hors `--check` ; une
+            # indisponibilité technique reste une attente d'agent.
+            cause = " ".join(str(wait.get("why") or "").split())
+            human = _human_wait(state, cause) or owner_provenance
+            gesture = GESTURES["qa_designation"].format(
+                lot=row["lot"], cause=cause or "cause non lisible")
+            if recorded_owner:
+                #: la voie owner consignée porte déjà le geste attendu (#3498) :
+                #: le citer rend la ligne lisible sans ouvrir le hold.
+                route = " ".join(str(declared.get("gesture") or "").split())
+                if route:
+                    gesture += " — voie owner consignée : %s" % route[:240]
+            add_wait("qa_designation", row,
+                     wait.get("since_ts") or row["frozen_ts"],
+                     "owner" if recorded_owner else "désignation",
+                     gesture, human=human, cause=cause or None,
+                     provenance=bool(wait.get("provenance")),
+                     unavailable=bool(wait.get("unavailable")))
         elif row.get("missing_reviewer"):
             # #5430 : le geste porte la cause de la marque (aucune famille
             # éligible, N familles éligibles), pas seulement « aucun
@@ -2102,6 +2317,10 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "blocked_reviews": len(blocked_reviews),
         "reviews_due": len([r for r in reviews_due if r.get("reviewer")]),
         "missing_reviewer": len([row for row in qa if row.get("missing_reviewer")]),
+        #: #7804 : désignations en attente (provenance, plancher, tête
+        #: introuvable), à ne pas confondre avec un siège « aucun relecteur ».
+        "designation_waits": len([row for row in qa
+                                  if row.get("designation_wait")]),
         "holds": len(holds_out),
         "wakes": len(wakes_out),
         "device_holds": len(device_holds),

@@ -120,7 +120,9 @@ closed (not retried).
 **Lots that are not code** — a packet vehicle (`integration/**`), a question
 to the pilot (`source = decision`), a roadmap-cutting lot
 (`file-decoupage:…`) — never get the marker, are neither counted nor held
-by the in-flight cap, and are not refreshed at push. An improvement backlog
+by the in-flight cap, never occupy their footprint for the overlap guard
+(a vehicle has no delta of its own: its members are counted one by one,
+#7758), and are not refreshed at push. An improvement backlog
 lot is code, taken like any other: it follows the common rule. A basket
 line takes the marker too, united with the earlier lines' paths, and a known
 line does not clear the unknown analysis of an earlier one: such a basket is
