@@ -186,6 +186,25 @@ class CanonRefreshCarryTest(_CarryFixture):
         self.assertEqual(self.designated(), ["rev1", "rev2"])
         self.assertEqual(self.review_mail(), [])
 
+    def test_carried_designation_is_not_resent_by_the_refresh(self):
+        """#7822 : un gel réaligné dont les deux verdicts sont reportés au gel
+        même n'est pas redésigné par le contrôle du canon qui suit ; les
+        sièges reportés ne reçoivent aucune demande (constat 4 de #225658 :
+        #7745, #7767)."""
+        self.freeze(self.repo.reviewed)
+        self.verdict("rev1", self.repo.reviewed)
+        self.verdict("rev2", self.repo.reviewed)
+        mark, _ = self.freeze(self.repo.merge_target())
+        effective = act._effective_mark(self.db, self.lot, mark["id"])
+        self.assertIsNotNone(effective)
+        self.assertEqual(effective[1], "carried")
+        self.db.execute("DELETE FROM agent_mailbox")
+        result = refresh.after_sync(self.cfg, self.db)
+        self.assertEqual(result["errors"], [], result)
+        self.assertEqual(self.review_mail(), [])
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.assertEqual(act._effective_mark(self.db, self.lot, mark["id"])[1], "carried")
+
 
 class RunnerRefreshTest(unittest.TestCase):
     def test_sync_recovery_rechecks_policy_before_capacity_retries(self):
