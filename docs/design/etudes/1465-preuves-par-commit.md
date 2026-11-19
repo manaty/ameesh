@@ -555,7 +555,10 @@ et ne peut donc pas faire refuser la lecture de provenance. Une lecture locale
 **non concluante** (git en échec, coupé ou délai) ou une abréviation ambiguë ne
 prouve pas l'absence : l'abrégé court reste un jeton et devient un doute (dit
 au gel, refusé en lecture stricte), jamais une exclusion silencieuse (B2
-auditeur/cx2 sur 3a7e2272). Les empreintes explicitement nommées (`checksum`,
+auditeur/cx2 sur 3a7e2272). Ce doute local est propagé jusqu'au verdict : une
+forge qui répondrait « No commit found » ne l'écarte pas, et un objet unique
+qu'elle résoudrait ne le choisit pas malgré les objets locaux concurrents (B
+cx2 sur 0c407b5f). Les empreintes explicitement nommées (`checksum`,
 `sha256`), le nom complet d'un paquet horaire (`h-AAAAMMJJ-NN`) et une suite
 noyée dans un mot (`succeeded`, #7770) restent écartés.
 

@@ -442,6 +442,34 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
                     "cited commit deadbeef1 .*forge-unreadable"):
                 self._reading(head, strict=True)
 
+    def test_a_locally_ambiguous_citation_is_a_doubt_whatever_the_forge_says(self):
+        # B cx2 sur 0c407b5f3f8c : le statut ambigu de la lecture locale ne
+        # doit pas être perdu dans _rewritten_after_freeze ; « No commit
+        # found » ne l'écarte pas et une résolution unique ne le choisit pas.
+        fix, head = self._rewrite(cite="deadbeef1")
+        real = review_authors._present_commits
+
+        def ambiguous(repo, shas, *, ambiguous=None, **kwargs):
+            words = {str(sha).lower() for sha in shas}
+            if ambiguous is not None and "deadbeef1" in words:
+                ambiguous.update(words)
+                return {}
+            return real(repo, shas, **kwargs)
+
+        for answer in (None, fix):
+            with self.subTest(forge=answer):
+                with mock.patch.object(review_authors, "_present_commits",
+                                       ambiguous), \
+                        mock.patch.object(review_authors, "_forge_commit",
+                                          return_value=answer) as forge, \
+                        mock.patch.object(review_authors, "_forge_fetch") as fetch:
+                    with self.assertRaisesRegex(
+                            review_provenance.ProvenanceError,
+                            "cited commit deadbeef1 .*ambiguous"):
+                        self._reading(head, strict=True)
+                forge.assert_not_called()
+                fetch.assert_not_called()
+
     def test_ambiguous_forge_still_refuses_a_qualified_citation(self):
         # La garantie de provenance reste : une vraie citation (12 hex) que
         # la forge ne résout pas explicitement est un doute refusé.

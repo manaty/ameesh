@@ -5764,8 +5764,10 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             return {}
         check()
         non_commits: set[str] = set()
+        ambiguous: set[str] = set()
         present = _present_commits(repo, sorted(cited),
-                                   non_commits=non_commits, timeout=remaining())
+                                   non_commits=non_commits,
+                                   ambiguous=ambiguous, timeout=remaining())
         check()
         found: dict[str, dict] = {}
 
@@ -5786,6 +5788,14 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
 
         for token, citing in sorted(cited.items()):
             check()
+            # B cx2 sur 0c407b5f : une abréviation ambiguë localement n'est
+            # ni une absence ni une résolution univoque. Interroger la forge
+            # laisserait « No commit found » l'écarter, ou un seul objet
+            # résolu la choisir malgré les objets concurrents : le doute
+            # local se dit au gel et refuse la lecture stricte.
+            if token in ambiguous:
+                cite_doubt(token, citing, reason="ambiguous")
+                continue
             full = (_read_local_commit(repo, token) if present is None
                     else present.get(token))
             if not full:
