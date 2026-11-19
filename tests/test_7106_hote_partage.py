@@ -67,13 +67,46 @@ class SharedCanonTest(test_canon._TmpMixin, unittest.TestCase):
         write(self.root, "hotes/banc.md", banc_partage(tenants=[ALICE, "human:carole"]))
         self.assertIn("host-tenant-unresolved", self.errors())
 
-    def test_abonnement_refuse_q2(self):
+    def test_abonnement_refuse_sans_opt_in(self):
         write(self.root, "hotes/banc.md",
               banc_partage(credential_modes=["api-key", "subscription"]))
         found = [f for f in canon.validate(self.load())
                  if f.code == "host-shared-credential-mode"]
-        self.assertTrue(found and "#213954" in found[0].message, found)
+        self.assertTrue(found and "#224052" in found[0].message, found)
         write(self.root, "hotes/banc.md", banc_partage(credential_modes=None))
+        self.assertIn("host-shared-credential-mode", self.errors())
+
+    def test_abonnement_admis_avec_opt_in_et_isolation(self):
+        write(self.root, "hotes/banc.md", banc_partage(
+            credential_modes=["api-key", "subscription"],
+            allow_subscription="true", require_isolation="true"))
+        host = self.load().host("banc")
+        self.assertTrue(host.policy.allow_subscription)
+        self.assertTrue(host.policy.require_isolation)
+        self.assertEqual(self.errors(), set())
+        self.assertEqual(canon.placement_violations(
+            {"responsible": ALICE, "harness": "codex", "provider": "openai",
+             "credential_mode": "subscription"}, host), [])
+        reasons = canon.placement_violations(
+            {"responsible": "human:carole", "harness": "codex",
+             "provider": "openai", "credential_mode": "subscription"}, host)
+        self.assertTrue(any("not a tenant" in reason for reason in reasons), reasons)
+
+    def test_abonnement_refuse_si_isolation_ou_partage_absent(self):
+        write(self.root, "hotes/banc.md", banc_partage(
+            credential_modes=["api-key", "subscription"],
+            allow_subscription="true"))
+        self.assertIn("host-subscription-no-isolation", self.errors())
+        write(self.root, "hotes/banc.md", banc_partage(
+            shared=None, tenants=None, credential_modes=["api-key", "subscription"],
+            allow_subscription="true", require_isolation="true"))
+        self.assertIn("host-subscription-not-shared", self.errors())
+
+    def test_opt_in_illisible_reste_ferme(self):
+        write(self.root, "hotes/banc.md", banc_partage(
+            credential_modes=["api-key", "subscription"],
+            allow_subscription="oui", require_isolation="true"))
+        self.assertIn("host-policy-invalid", self.errors())
         self.assertIn("host-shared-credential-mode", self.errors())
 
     def test_dossier_absolu_averti(self):
@@ -109,7 +142,10 @@ class SharedCanonTest(test_canon._TmpMixin, unittest.TestCase):
         reasons = canon.placement_violations(
             {"responsible": ALICE, "credential_mode": "subscription"}, host)
         self.assertEqual(len(reasons), 1, reasons)
-        self.assertIn("organization keys only", reasons[0])
+        self.assertIn("subscription requires explicit tenant isolation", reasons[0])
+        host["policy"]["credential_modes"] = ["api-key", "subscription"]
+        self.assertTrue(canon.placement_violations(
+            {"responsible": ALICE, "credential_mode": "subscription"}, host))
         self.assertEqual(canon.placement_violations(
             {"responsible": ALICE, "credential_mode": "api-key"}, host), [])
 
@@ -156,6 +192,20 @@ class SharedClaimTest(test_canon._CanonDbCase):
         self.assertIsNotNone(lease)
         registry.release(self.db, "relecteur", "banc/alice", lease["lease_epoch"])
         self.assertIsNotNone(registry.claim(self.db, "ouvrier", "banc/bruno", 600))
+
+    def test_abonnement_du_tenant_ne_change_pas_la_garde_sql(self):
+        write(self.root, "hotes/banc.md", banc_partage(
+            credential_modes=["api-key", "subscription"],
+            allow_subscription="true", require_isolation="true"))
+        write(self.root, "placements/relecteur-atelier.md", test_canon.fiche(
+            type="Placement", title="relecteur@banc", agent="relecteur",
+            hosts=["banc"], credential_mode="subscription"))
+        self.sync("banc")
+        self.assertIn("relecteur", [r["name"] for r in registry.claimable(self.db, "banc")])
+        self.assertIsNone(registry.claim(self.db, "relecteur", "banc/bruno", 600))
+        self.assertIsNone(registry.attach_claim(self.db, "relecteur",
+                                                 "attach:ameesh-bruno@banc", 60))
+        self.assertIsNotNone(registry.claim(self.db, "relecteur", "banc/alice", 600))
 
     def test_dossier_dans_le_home_du_tenant(self):
         # le superviseur synchronise ; `~` reste le home du tenant de l'agent
