@@ -220,5 +220,5 @@ class EscalationLabelTest(unittest.TestCase):
                  "value": 9000, "threshold": 3600}
         rows = {"avatar-essai": {"status": "stopped"}, "auditeur": {"status": "idle"}}
         out = alert_briefs._slo_briefs(alert, rows, [], set(), ["auditeur"], set())
-        self.assertIn("the bureau handles it with the auditor", out["auditeur"])
+        self.assertIn("the avatar handles it with the auditor", out["auditeur"])
         self.assertNotIn("the avatar-essai handles it", out["auditeur"])

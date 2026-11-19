@@ -1430,7 +1430,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     desk = _desk_names(alert, by_name, avatar_names)
     live_desks, _ = _split_live({name: "" for name in desk}, by_name, closed,
                                 respect_pause=True)
-    label = next(iter(live_desks), "bureau")
+    label = next(iter(live_desks), "avatar")
     text = _slo_breach(alert, desk=label)
     raw: dict = {}
     for role in roles:
