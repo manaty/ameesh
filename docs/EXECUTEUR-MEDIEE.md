@@ -1036,3 +1036,29 @@ paramètres. Les lignes antérieures restent sans attribution.
 L'opération n'ajoute aucune ligne à la table du contrat : le rapport
 `ameesh cost attribution` lit `turn_costs.ledger` (déjà refusé à l'appareil)
 et regroupe côté mesh.
+
+### Contrat 1.13 : prises d'hôte lues par un runner médié (#7799)
+
+La vidange d'un hôte où des agents sont placés ne converge vers `idle-drained`
+que si les runners au repos rendent leur bail. Un runner classique lit le
+prédicat de `begin_turn` (`ameesh_agent_claims_open`) sur sa connexion ; un
+exécuteur médié n'a pas cette lecture locale. Le contrat 1.13 admet donc une
+lecture, `host_lifecycle.claims_open(host, agent)` :
+
+- lecture (`write: false`, route `op`), portées `A` et `H` : l'agent est borné
+  aux agents admis sur l'hôte de l'exécuteur, et l'hôte est forcé à celui de
+  l'enrôlement (`executor_host`) ; la réponse est un booléen, sans donnée
+  d'autrui ;
+- c'est la même fonction serveur que `begin_turn`, donc le même verdict :
+  faux sur un hôte `draining`/`lost`, sur un retour `returning` prises
+  fermées, ou sous un verrou de release vivant (sauf la sonde nommée du
+  verrou) ;
+- entre deux tours, un worker médié au repos qui lit `false` rend son bail
+  comme un runner classique et le reprend à la réouverture des prises. Un
+  tour en cours n'est jamais interrompu.
+
+Déploiement : serveur d'abord (il doit servir l'opération), exécuteurs
+ensuite. Un ancien serveur répond `404 op_not_allowed` ; le client lève
+`NotSupportedRemotely`, ne conclut pas et conserve le bail (comportement
+d'avant #7799, journalisé une fois). Un client d'avant 1.13 ignore
+simplement l'opération.

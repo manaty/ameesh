@@ -1,0 +1,37 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "family": "host_lifecycle",
+ "cases": [
+  {
+   "name": "host_lifecycle.claims_open/ok",
+   "op": "host_lifecycle.claims_open",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "host_lifecycle.claims_open",
+     "args": [
+      "anna-portable",
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": true,
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

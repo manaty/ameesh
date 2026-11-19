@@ -131,6 +131,34 @@ relevé frais postérieur à l'acquittement busy avant réouverture. Une génér
 périmée, un hold ou une panne laisse les claims fermés. Un hôte `lost` relève
 de la récupération native, jamais d'un forçage par l'adaptateur.
 
+## Garde d'entrée R1 — baux des runners
+
+La séquence R1 (installation puis premier arrêt/réveil réel) ne part que sur
+la version qui contient #7799 : sur un hôte `draining` prises fermées, un
+runner dont l'agent est au repos (aucun tour en cours) cesse de renouveler et
+rend son bail entre deux tours ; un runner dont un tour court le finit, puis
+rend son bail. Aucun agent n'est déplacé et aucun runner n'est arrêté par
+cette voie. Le bail rendu, l'agent est réclamé de nouveau à la réouverture des
+prises (`returning`/`available`), par le même exécuteur ou un autre. Un
+exécuteur médié lit le même prédicat par le contrat
+(`host_lifecycle.claims_open`, contrat 1.13, hôte forcé, agent borné à
+l'admission) : serveur d'abord, exécuteurs ensuite ; un ancien serveur ne sert
+pas la lecture et l'exécuteur conserve alors son bail, journalisé une fois.
+
+Garde : `host_release.release_blocker` refuse `idle-drained` tant qu'un agent
+placé tient un bail, et son motif nomme les agents (`a lease is still held:
+claude1, impl-11`). Le worker de l'adaptateur appelle la même garde au moment
+de l'effet (`vm_adapter.stop_evidence`, avant `quiesce_argv` et `halt_argv`) :
+il refuse le halt et journalise le motif nommé. Après la demande de drainage
+et le délai de stabilisation, si des agents sont encore nommés, R1 est
+**refusé** : ne pas halter, ne pas forcer la libération ; lire l'alerte
+`host_release_overdue` (qui nomme les détenteurs) et le journal du worker,
+puis traiter la cause — exécuteur resté sur une version antérieure à #7799,
+tour long, ou panne de base. Un `idle-drained` non atteint n'autorise ni
+arrêt ni archivage. La version **réellement lancée** sur chaque cible
+(`ameesh version`, version des runners) se vérifie et se consigne avant le
+premier geste, comme le mode.
+
 ## Préparer l'installation (bureau, feu distinct)
 
 1. Appliquer les migrations additives 0547 et 0552 (#6017) avant le nouveau code. Installer la

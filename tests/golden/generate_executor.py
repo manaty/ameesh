@@ -116,6 +116,7 @@ ARGS = {  # op: (args, kwargs, résultat)
  "hosts.latest": ([HOST], {}, dict(READING_ROW)),
  "hosts.current": ([HOST], {}, [dict(READING_ROW)]),
  "hosts.turns_in_progress": ([HOST], {}, 1),
+ "host_lifecycle.claims_open": ([HOST, AG], {}, True),
  "keys.info": (["coord"], {}, {"public_key": "MCowBQYDK2VwAyEA…", "fingerprint": "sha256:9c1f…",
                                "role": "coordinator", "registered_ts": TS - 864000, "revoked_ts": None}),
  "threads.index": ([], {"project": "site", "lot": "812", "transport": "github", "host": HOST,
