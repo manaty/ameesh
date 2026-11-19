@@ -135,14 +135,16 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("canon valid — 0 error(s)", done.stdout)
 
-    def test_a_canon_activating_a_built_in_module_is_refused(self):
+    def test_a_canon_activating_a_built_in_module_only_warns(self):
         root = self.canon('federation: "0.1"\nid: exemple\nmembers: []\n'
                           "extensions:\n  ameesh:\n    projects:\n"
                           "      atelier:\n        modules: [it]\n")
         done = self.ameesh("canon", "check", "--canon", str(root), "--ref", "HEAD",
                            "--host", "banc")
-        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertIn("unknown installed module: it", done.stdout + done.stderr)
+        # #7860: the agents of `atelier` are refused on this host, not the canon
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("project-module-missing", done.stdout)
+        self.assertIn("module it selected by project atelier", done.stdout)
 
 
 if __name__ == "__main__":

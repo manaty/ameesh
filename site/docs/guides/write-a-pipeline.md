@@ -245,8 +245,12 @@ ameesh canon sync
 ameesh modules --active
 ```
 
-`canon check` refuses an unknown name, an activated card that is invalid, and
-two selected modules claiming one type (`project-modules-invalid`). The
+`canon check` refuses an activated card that is invalid and two selected
+modules claiming one type (`project-modules-invalid`). A name a project or a
+team selects that is neither installed nor a valid card is the
+`project-module-missing` warning: the canon stays valid, and only the agents
+of those projects are refused on that host (`module_missing`). A name the
+whole canon selects (`extensions.ameesh.modules`) is still refused. The
 declarative module stores empty `types`, `schemas` and `rules`: the work item
 types covered by the card must still be admitted by the project's installed
 modules, as any project type is (here `work-types`). Two selected modules

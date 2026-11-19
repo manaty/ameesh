@@ -280,6 +280,15 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
     # L243 : les projets inconnus ne se vérifient qu'avec la base (lots)
     findings = canon_mod.validate(canon, (recorded or {}).get("projects"))
     placements = placement_mod.verdicts(canon) if canon.readable else []
+    if placements:
+        # #7860 : un module absent de CET hôte refuse ici les agents de ses
+        # projets (fait local : les verdicts des autres hôtes n'en savent rien)
+        from . import modules as project_modules
+        absent = project_modules.missing(canon)
+        for verdict in placements:
+            agent = canon.agent(verdict.agent)
+            if absent and verdict.host == host and agent is not None:
+                project_modules.refuse_missing(verdict, agent, absent)
     # #7682 : un dépôt de mémoire que l'environnement Git isolé ne peut pas
     # ouvrir sur cet hôte (HTTPS, ou SSH sans persona_memory.ssh_key). Un
     # avertissement, pas une erreur : l'avatar tourne sans mémoire et

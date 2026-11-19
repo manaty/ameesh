@@ -24,11 +24,13 @@ class ModuleStore:
     def __init__(self, db):
         self.db = db
 
-    def replace(self, canon, declarations):
+    def replace(self, canon, declarations, keep=()):
+        """`keep`: `(project, module)` pairs this host cannot compile (#7860,
+        module not installed here): their applied rows are left as they are."""
         with self.db.transaction() as tx:
-            ModuleStore(tx)._replace_locked(canon, declarations)
+            ModuleStore(tx)._replace_locked(canon, declarations, keep)
 
-    def _replace_locked(self, canon, declarations):
+    def _replace_locked(self, canon, declarations, keep=()):
         # Serialized across all canons; ownership conflicts must never steal
         # another canon's project, including projects removed in this sync.
         self.db.execute("SELECT pg_advisory_xact_lock(hashtext('ameesh-project-modules'))")
@@ -60,7 +62,7 @@ class ModuleStore:
                  json.dumps(entry["schemas"]), json.dumps(entry["rules"])))
         for row in self.db.query("SELECT project, module FROM project_modules WHERE canon = %s",
                                  (canon,)):
-            if (row["project"], row["module"]) not in wanted:
+            if (row["project"], row["module"]) not in wanted | set(keep):
                 self.db.execute("DELETE FROM project_modules WHERE project = %s AND module = %s",
                                 (row["project"], row["module"]))
 

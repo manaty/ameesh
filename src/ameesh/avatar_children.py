@@ -366,6 +366,11 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
     lineage_hosts = [str(row.get("host")) for row in lineage_rows if row.get("host")]
     excluded = [host for host in admitted if host in lineage_hosts]
     candidates = [host for host in admitted if host not in lineage_hosts]
+    # #7860 : un enfant va toujours sur un AUTRE hôte que celui qui décide ; les
+    # modules installés de cet hôte ne se lisent pas d'ici. L'enfant naît non
+    # réclamable et le `canon sync` de son hôte tranche (`_own_child_verdict`).
+    from . import modules as project_modules
+    pending = project_modules.host_dependent(canon, root_card.effective_projects)
     reasons: list[tuple[str, str]] = []
     for host in candidates:
         why = _refusal_reason(canon=canon, host=host, db=db, tenant=tenant,
@@ -373,6 +378,10 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
                               lineage_rows=lineage_rows)
         if not why:
             verdict = placement.evaluate(canon, root_card.title, host)
+            if pending:
+                verdict.ok = False
+                verdict.diagnostic = "%s: %s — `ameesh canon sync` on %s" % (
+                    project_modules.UNCONFIRMED_PREFIX, ", ".join(pending), host)
             host_card = canon.host(host)
             workdir, _source = child_workdir(host_card, root_card, child)
             workdir = _expand_child_path(workdir or "", tenant)
