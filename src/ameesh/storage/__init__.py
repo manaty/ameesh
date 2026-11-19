@@ -37,12 +37,27 @@ from __future__ import annotations
 
 from .interface import (FootprintOverlap, MailboxRefused, PendingLot, RecipientRetired,
                         RepositoryCapReached, ReservationContention, Storage)
-from .postgres import PostgresStorage
 from .remote.client import RemoteDb
 
 __all__ = ["FootprintOverlap", "MailboxRefused", "PendingLot", "RecipientRetired",
            "RepositoryCapReached", "ReservationContention", "Storage",
            "PostgresStorage", "of", "is_remote"]
+
+
+def __getattr__(name: str):
+    """Export différé de ``PostgresStorage`` (#7808).
+
+    L'importer ici chargeait tout le pilote Postgres dès l'import du paquet
+    ``storage`` : ses alias datés importent ``ameesh.modules.dev.storage``,
+    qui importe ce paquet. Un module ``dev.storage`` importé seul dans un
+    processus propre partait donc en cycle (« partially initialized module »)
+    avant l'initialisation du stockage."""
+    if name == "PostgresStorage":
+        from .postgres import PostgresStorage
+
+        globals()["PostgresStorage"] = PostgresStorage
+        return PostgresStorage
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def of(db) -> Storage:
@@ -52,6 +67,8 @@ def of(db) -> Storage:
     stockage distant (`/api/exec/v1`)."""
     if isinstance(db, RemoteDb):
         return db.storage
+    from .postgres import PostgresStorage
+
     return PostgresStorage(db)
 
 
