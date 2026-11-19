@@ -3487,13 +3487,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # le jalon et la désignation. Il ne défait jamais le gel : le
                 # run peut être rouge, incomplet ou indisponible, la frise est
                 # déjà écrite et l'échec est journalisé.
-                prevalidation_calls.after_freeze(
-                    cfg, db, args.id, row.get("sha") or args.sha or "",
-                    repo=args.repo or "",
-                    map_path=args.prevalidation_map or "",
-                    deadline=prevalidation_calls.caller_deadline(
-                        getattr(args, "prevalidation_budget", None),
-                        limit=freeze_deadline))
+                # #7823 : la sortie dit l'issue ; une prévalidation non
+                # concluante ne passe plus pour une absence de tests.
+                line = prevalidation_calls.freeze_line(
+                    prevalidation_calls.after_freeze(
+                        cfg, db, args.id, row.get("sha") or args.sha or "",
+                        repo=args.repo or "",
+                        map_path=args.prevalidation_map or "",
+                        deadline=prevalidation_calls.caller_deadline(
+                            getattr(args, "prevalidation_budget", None),
+                            limit=freeze_deadline)))
+                if line:
+                    print(line)
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
