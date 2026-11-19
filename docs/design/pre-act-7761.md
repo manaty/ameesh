@@ -11,18 +11,24 @@ ni fichier de workflow n'est inscrit dans le code du collecteur.
 La commande `ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO`
 relit le journal et le courrier puis écrit un reçu sur le lot si aucun motif
 de refus n'est trouvé. `--since` est un horodatage ISO avec fuseau, capturé
-avant la planification ou l'attente, puis conservé jusqu'au contrôle. Une
-date future, une identité absente, une base illisible ou une écriture de reçu
-impossible refusent le passage. La commande ne remplace pas les autorisations
-requises pour le geste.
+avant la planification ou l'attente, puis conservé jusqu'au contrôle. Le mode
+`--wait-until ISO -- commande` capture lui-même la borne avant d'attendre :
+elle est lue dans la base (`now()`), la même horloge que les `created_at` du
+journal et du courrier ; la connexion est fermée pendant l'attente puis
+rouverte pour le contrôle (#7775). Une date future, une identité absente, une
+base illisible ou une écriture de reçu impossible refusent le passage. La
+commande ne remplace pas les autorisations requises pour le geste.
 
-Le contrôle détecte les holds explicites contenant un mot d'arrêt (par exemple
-`hold: STOP`), les mots d'arrêt dans les autres notes et les
-messages associés au lot, les messages non livrés à l'agent dont le lot est
-référencé, et les décisions retirées pendant la fenêtre. Un hold d'arrêt ancien
-non levé est également bloquant ; un hold d'attente ordinaire ne bloque pas.
-Les notes et courriers de l'acteur lui-même sont ignorés. Le texte libre est
-reconnu de façon prudente,
+Le contrôle détecte les holds d'arrêt explicites, dans la forme structurée
+`hold: STOP …` : le motif du hold commence par un mot d'arrêt (`STOP`,
+`arrêt`, `suspend…`, `annul…`, `halt`). Un hold d'attente ordinaire, par
+exemple `hold: aucun geste avant le go owner`, ne bloque pas un acte même si
+son texte cite un arrêt plus loin. Les mots d'arrêt dans les autres notes et
+les messages associés au lot restent détectés, ainsi que les messages non
+livrés à l'agent dont le lot est référencé, et les décisions retirées pendant
+la fenêtre. Un hold d'arrêt ancien non levé est également bloquant. Les notes
+et courriers de l'acteur lui-même sont ignorés. Le texte libre est reconnu de
+façon prudente,
 mais une formulation imprévue peut échapper à cette détection ; une référence
 prose doit contenir `#ID` si le courrier ne porte pas le champ lot structuré.
 Un courrier de session mentionnant seulement « MP-2 », tel que #225697, ne
@@ -45,10 +51,10 @@ l'annulation du run et la tenue de `prod-deploy` pendant la fenêtre signée.
 Un appel peut placer la commande d'effet après `--` : le processus de garde
 enregistre le reçu, ferme la connexion puis exécute directement cette
 commande, sans interpréteur ajouté. Pour toute attente programmée, utiliser
-`--wait-until ISO -- commande` : le garde capture lui-même la borne avant
-d'attendre, puis contrôle et exécute. `--since` reste réservé aux scripts qui
-ont capturé la borne avant leur attente. Une attente ou un autre travail à
-l'intérieur de la commande relance la même faille. Un refus
+`--wait-until ISO -- commande` : le garde lit lui-même la borne dans la base
+avant d'attendre, puis contrôle et exécute. `--since` reste réservé aux
+scripts qui ont capturé la borne avant leur attente. Une attente ou un autre
+travail à l'intérieur de la commande relance la même faille. Un refus
 n'exécute pas la commande.
 
 Le reçu écrit une preuve structurée `pre-act/1` (lot, acteur, type de geste,
