@@ -25,7 +25,8 @@ Le contrôle détecte les holds d'arrêt explicites, dans la forme structurée
 exemple `hold: aucun geste avant le go owner`, ne bloque pas un acte même si
 son texte cite un arrêt plus loin. Les mots d'arrêt dans les autres notes et
 les messages associés au lot restent détectés, ainsi que les messages non
-livrés à l'agent dont le lot est référencé, et les décisions retirées pendant
+livrés à l'agent dont le lot est référencé et créés depuis 24 heures avant
+la borne `--since`, et les décisions retirées pendant
 la fenêtre. Un hold d'arrêt ancien non levé est également bloquant. Les notes
 et courriers de l'acteur lui-même sont ignorés. Le texte libre est reconnu de
 façon prudente,

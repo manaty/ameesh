@@ -113,7 +113,8 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
     for message in messages:
         if (message.get("sender") or "").removeprefix("agent:") == actor.removeprefix("agent:"):
             continue
-        if message.get("recipient") == actor and message.get("unread"):
+        if (message.get("recipient") == actor and message.get("unread")
+                and float(message["ts"]) >= since - 24 * 60 * 60):
             raise Refused("unread lot mail #%s" % message["id"])
         body = message.get("body") or ""
         # Generated decision replies append the original question verbatim.
