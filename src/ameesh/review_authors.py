@@ -195,14 +195,24 @@ def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str
     if sweep is not None:
         sweep.check(step)
     try:
+        # #7779 : un clone partiel peut rendre un `git grep` tronqué avec
+        # rc 0 et un stderr vide (le blob absent est sauté sans erreur).
+        # L'arbre de `rev` est exactement ce que grep lit : un objet qui y
+        # manque rend le balayage incomplet, jamais une absence prouvée.
+        missing = _tree_missing_objects(repo, rev)
+        if missing is None:
+            raise canon.GitError("tree unreadable")
+        if missing:
+            raise canon.GitError(
+                "tree has %d missing object(s): grep would be incomplete" % missing)
         with _local_object_repo(repo) as (reader, local_env):
             proc = plan_git._git(
                 reader, "grep", *args, "-f", "-", str(rev), stdin=stdin,
                 timeout=sweep.deadline.remaining() if sweep is not None else canon.GIT_TIMEOUT,
                 deadline=sweep.deadline if sweep is not None else None,
                 env_extra={**env, **local_env})
-            # Missing blobs can yield rc=1 (no matches) or rc=0 (partial
-            # matches). Neither proves absence and neither may be shared.
+            # Missing blobs can also yield rc=1 (no matches) or rc=0 with a
+            # stderr; neither proves absence and neither may be shared.
             if proc.stderr:
                 raise canon.GitError(proc.stderr.decode("utf-8", "replace"))
             return proc
@@ -1143,6 +1153,137 @@ def _read_git(repo, *args, **kwargs):
             sweep.check("git " + str(args[0]))
 
 
+def _bounded_git(repo, *args, limit=None, **kwargs):
+    """A bounded git read, on the current sweep budget when there is one."""
+    sweep = _SWEEP.get()
+    if sweep is not None:
+        kwargs["timeout"] = sweep.deadline.remaining()
+        kwargs["deadline"] = sweep.deadline
+    else:
+        kwargs["timeout"] = canon.GIT_TIMEOUT if limit is None else limit
+    return plan_git._git(repo, *args, **kwargs)
+
+
+#: #7779 : partial-clone detection, cached per repository path. A work clone
+#: is usually `blob:none`; its content reads may be truncated without error.
+_PARTIAL_CLONE: dict = {}
+_PARTIAL_CLONE_MAX = 64
+
+
+def _partial_clone(repo: str) -> bool:
+    """Does this clone declare a promisor/partial object store?
+
+    Doubt (unreadable config, unknown value) returns True: the completeness
+    checks then run, and a complete clone simply passes them.
+    """
+    key = (os.path.realpath(str(repo or "")),
+           canon._repository_identity(repo))
+    if key in _PARTIAL_CLONE:
+        return _PARTIAL_CLONE[key]
+    partial = True
+    try:
+        proc = _bounded_git(
+            repo, "config", "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+            limit=plan_git.PROBE_TIMEOUT_S,
+            env_extra=plan_git.NO_LAZY_FETCH)
+    except canon.GitDeadline:
+        raise
+    except Exception:  # noqa: BLE001 - unreadable: run the checks
+        proc = None
+    if proc is not None and proc.returncode in (0, 1):
+        partial = False
+        for line in proc.stdout.decode("utf-8", "replace").splitlines():
+            name, _, value = line.partition(" ")
+            name = name.strip().lower()
+            value = value.strip().lower()
+            if name == "extensions.partialclone":
+                partial = True
+                break
+            if name.endswith(".promisor") and value not in (
+                    "false", "0", "no", "off"):
+                # An empty value is git's boolean true.
+                partial = True
+                break
+    if len(_PARTIAL_CLONE) >= _PARTIAL_CLONE_MAX:
+        _PARTIAL_CLONE.clear()
+    _PARTIAL_CLONE[key] = partial
+    return partial
+
+
+#: raw diff line of `git log --raw`/`git diff --raw`: old mode, new mode,
+#: old object, new object; the path follows a tab.
+_RAW_DIFF_LINE = re.compile(
+    rb"^:(\d{6}) (\d{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) [A-Z]")
+
+
+def _raw_blob_ids(output: bytes) -> set:
+    """The blobs a raw diff output reads, with submodule links excluded."""
+    ids = set()
+    for line in output.splitlines():
+        match = _RAW_DIFF_LINE.match(line)
+        if not match:
+            continue
+        old_mode, new_mode, old, new = match.groups()
+        for mode, oid in ((old_mode, old), (new_mode, new)):
+            if mode == b"160000":
+                continue                # gitlink: no blob is read
+            if oid.strip(b"0"):
+                ids.add(oid.decode("ascii"))
+    return ids
+
+
+def _missing_blobs(repo: str, oids) -> Optional[int]:
+    """How many of these blob ids are absent, or None if unreadable.
+
+    The check runs in the isolated object reader (no promisor, no remote):
+    a missing object is answered `missing` there instead of waking a lazy
+    fetch, and the answer cannot be a partial read."""
+    oids = sorted(str(oid) for oid in oids if oid)
+    if not oids:
+        return 0
+    stdin = ("\n".join(oids) + "\n").encode("ascii")
+    try:
+        with _local_object_repo(repo) as (reader, env):
+            proc = _bounded_git(reader, "cat-file", "--batch-check",
+                                stdin=stdin, env_extra=env)
+    except canon.GitDeadline:
+        raise
+    except Exception:  # noqa: BLE001 - unreadable: doubt
+        return None
+    if proc.returncode:
+        return None
+    lines = [line for line in
+             proc.stdout.decode("utf-8", "replace").splitlines() if line]
+    if len(lines) != len(oids):
+        return None
+    return sum(1 for line in lines if line.endswith(" missing"))
+
+
+def _tree_missing_objects(repo: str, rev: str) -> Optional[int]:
+    """Objects missing from the tree `rev`, or None if unreadable.
+
+    `git rev-list --objects --quiet <rev>^{tree}` walks exactly the objects
+    `git grep <rev>` reads and prints only the missing ones. In a complete
+    clone no check is needed: an absent object there is a git error, not a
+    silent truncation."""
+    if not _partial_clone(repo):
+        return 0
+    try:
+        proc = _bounded_git(repo, "rev-list", "--objects", "--missing=print",
+                            "--quiet", "%s^{tree}" % rev,
+                            env_extra=plan_git.NO_LAZY_FETCH)
+    except canon.GitDeadline:
+        raise
+    except Exception:  # noqa: BLE001 - unreadable: doubt
+        return None
+    if proc.returncode:
+        return None
+    return sum(1 for line in
+               proc.stdout.decode("utf-8", "replace").splitlines()
+               if line.startswith("?"))
+
+
 def _read_out(repo, *args):
     try:
         if args[0] in {"log", "show", "diff"}:
@@ -1234,12 +1375,25 @@ def _touches_only_files_absent_from(repo: str, sha: str, heads) -> bool:
 
 
 def _read_patch_ids(repo, *args):
-    log = _read_git(repo, "log", "-p", "--no-merges", "--no-color",
-                    "--format=commit %H", *args)
+    partial = _partial_clone(repo)
+    options = ["log", "-p", "--no-merges", "--no-color", "--format=commit %H"]
+    if partial:
+        # #7779 : `--raw` lists the blobs the patch reads. A partial clone
+        # can silently truncate the patch (rc 0, empty stderr); the raw line
+        # still names the missing blob, so the read becomes a doubt.
+        options[1:1] = ["--raw", "--no-abbrev"]
+    log = _read_git(repo, *options, *args)
     if log.returncode:
         raise plan_git.MergeProbeError("patch history unreadable")
     if not log.stdout.strip():
         return {}
+    if partial:
+        missing = _missing_blobs(repo, _raw_blob_ids(log.stdout))
+        if missing is None:
+            raise plan_git.MergeProbeError("patch history unreadable")
+        if missing:
+            raise plan_git.MergeProbeError(
+                "patch history incomplete: %d missing object(s)" % missing)
     proc = _read_git(repo, *plan_git.PATCH_ID, stdin=log.stdout)
     if proc.returncode:
         raise plan_git.MergeProbeError("patch ids unreadable")
@@ -1249,9 +1403,17 @@ def _read_patch_ids(repo, *args):
 def _read_diff_patch_id(repo, before, after):
     if not _local_reads(repo, [before, after], {}):
         return None
-    diff = _read_git(repo, "diff", "--no-ext-diff", "--no-color", before, after)
+    partial = _partial_clone(repo)
+    options = ["diff", "--no-ext-diff", "--no-color"]
+    if partial:
+        options[1:1] = ["--raw", "--no-abbrev"]
+    diff = _read_git(repo, *options, before, after)
     if diff.returncode:
         return None
+    if partial:
+        missing = _missing_blobs(repo, _raw_blob_ids(diff.stdout))
+        if missing is None or missing:
+            return None
     proc = _read_git(repo, *plan_git.PATCH_ID,
                      stdin=b"commit " + after.encode() + b"\n" + diff.stdout)
     if proc.returncode:

@@ -267,3 +267,103 @@ class LocalAuthorsTest(unittest.TestCase):
                 shutil.copyfile(os.path.join(complete, ".git", "objects", blob[:2], blob[2:]),
                                 os.path.join(self.repo, ".git", "objects", blob[:2], blob[2:]))
                 shutil.rmtree(complete)
+
+    def _make_partial(self):
+        """A promisor clone whose HEAD tree is missing its `content` blob."""
+        blob = self.git("rev-parse", self.head + ":content")
+        self.git("config", "remote.origin.promisor", "true")
+        self.git("config", "remote.origin.url", "https://invalid.example/repo")
+        os.unlink(os.path.join(self.repo, ".git", "objects", blob[:2], blob[2:]))
+        return blob
+
+    def test_silent_partial_grep_is_refused_before_it_runs(self):
+        # #7779: a partial clone can skip a missing blob with rc 0 and an
+        # empty stderr. The tree's object check must refuse the scan before
+        # any truncated result can be read as a proof.
+        self._make_partial()
+        calls = []
+        original = authors.plan_git._git
+
+        def silent_grep(repo, *args, **kwargs):
+            calls.append(args)
+            if args and args[0] == "grep":
+                return subprocess.CompletedProcess(
+                    args, 0, b"original content\n", b"")
+            return original(repo, *args, **kwargs)
+
+        with mock.patch.object(authors.plan_git, "_git", side_effect=silent_grep), \
+                mock.patch.object(grep_cache, "ENABLED", False):
+            self.assertIsNone(authors._tree_lines(
+                self.repo, self.head, ["original content"]))
+        self.assertFalse(any(call and call[0] == "grep" for call in calls))
+
+    def test_silent_partial_patch_history_is_refused_before_patch_id(self):
+        # #7779: the same silent truncation on `git log -p` would compute a
+        # patch id from an incomplete patch. The raw line still names the
+        # missing blob; the read must become a doubt, not an id.
+        blob = self._make_partial()
+        output = (
+            b"commit " + self.head.encode() + b"\n\n"
+            b":100644 100644 " + b"0" * 40 + b" " + blob.encode()
+            + b" M\tcontent\n\n"
+            b"diff --git a/content b/content\n"
+            b"--- a/content\n+++ b/content\n@@ -1 +1 @@\n"
+            b"-original content\n+changed content\n")
+        calls = []
+        original = authors.plan_git._git
+
+        def silent_log(repo, *args, **kwargs):
+            calls.append(args)
+            if args and args[0] == "log":
+                return subprocess.CompletedProcess(args, 0, output, b"")
+            if args and args[0] == "patch-id":
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+            return original(repo, *args, **kwargs)
+
+        with mock.patch.object(authors.plan_git, "_git", side_effect=silent_log):
+            with self.assertRaisesRegex(
+                    authors.plan_git.MergeProbeError, "incomplete"):
+                authors._read_patch_ids(self.repo, "--no-walk", self.head)
+        self.assertFalse(any(call and call[0] == "patch-id" for call in calls))
+
+    def test_silent_partial_diff_is_refused_before_patch_id(self):
+        blob = self._make_partial()
+        output = (
+            b":100644 100644 " + b"0" * 40 + b" " + blob.encode()
+            + b" M\tcontent\n\n"
+            b"diff --git a/content b/content\n"
+            b"--- a/content\n+++ b/content\n@@ -1 +1 @@\n"
+            b"-original content\n+changed content\n")
+        calls = []
+        original = authors.plan_git._git
+
+        def silent_diff(repo, *args, **kwargs):
+            calls.append(args)
+            if args and args[0] == "diff":
+                return subprocess.CompletedProcess(args, 0, output, b"")
+            if args and args[0] == "patch-id":
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+            return original(repo, *args, **kwargs)
+
+        with mock.patch.object(authors.plan_git, "_git", side_effect=silent_diff):
+            self.assertIsNone(authors._read_diff_patch_id(
+                self.repo, self.head, self.head))
+        self.assertFalse(any(call and call[0] == "patch-id" for call in calls))
+
+    def test_partial_clone_with_all_objects_keeps_its_patch_ids(self):
+        # The extra `--raw` listing must not change the patch ids when the
+        # partial clone actually has the content.
+        self.git("config", "remote.origin.promisor", "true")
+        self.git("config", "remote.origin.url", "https://invalid.example/repo")
+        patches = authors._read_patch_ids(self.repo, "--no-walk", self.head)
+        self.assertIn(self.head, patches.values())
+
+    def test_complete_clone_keeps_its_patch_ids(self):
+        patches = authors._read_patch_ids(self.repo, "--no-walk", self.head)
+        self.assertIn(self.head, patches.values())
+
+    def test_a_valueless_promisor_is_a_partial_clone(self):
+        # A boolean git key without a value is true (`promisor` alone).
+        with open(os.path.join(self.repo, ".git", "config"), "a") as stream:
+            stream.write('\n[remote "origin"]\n\tpromisor\n')
+        self.assertTrue(authors._partial_clone(self.repo))
