@@ -214,7 +214,7 @@ def _election_placement_sql(alias: str, host: str | None = None) -> str:
 
 
 def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = False,
-                              host: str | None = None) -> str:
+                              host: str | None = None, return_probe: bool = False) -> str:
     """Condition SQL de réclamation liée au canon (§4.1), pour un `WHERE`.
 
     Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`)
@@ -258,6 +258,14 @@ def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = Fa
     d'ordonnancement (`claimable`, `wakeable`, aperçu) gardent le prédicat
     strict d'une fermeture.
 
+    `return_probe=True` (#7874, pour `claimable`) : un retour `returning`
+    prises fermées n'a pas de contrôleur qui réclame sa sonde par son nom ;
+    l'exécuteur de l'hôte ne la trouve que parmi les candidats. Sans cette
+    branche, la sonde nommée par l'adaptateur VM (#6017) n'était jamais
+    réclamée, ne jouait aucun tour, et le retour finissait en « health
+    deadline passed » en boucle. Seule la sonde nommée du retour est offerte,
+    et jamais sous un verrou de release vivant (L232b reste strict).
+
     Un agent `releve: election` n'est pas fencé par L232e : le pilote n'a pas
     de travail local à publier, et le bail (epoch) suffit à fencer l'ancien
     détenteur (EP1).
@@ -268,6 +276,12 @@ def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = Fa
     h = _host_expr(a, host)
     open_sql = ("ameesh_agent_claims_open(%s, %s.name)" % (h, a) if probe
                 else "ameesh_host_claims_open(%s)" % h)
+    if return_probe and not probe:
+        open_sql = ("(%(open)s OR (EXISTS (SELECT 1 FROM host_lifecycle rp"
+                    " WHERE rp.host = %(h)s AND rp.mode = 'returning'"
+                    " AND NOT rp.claims_open AND rp.return_probe = %(a)s.name)"
+                    " AND NOT EXISTS (SELECT 1 FROM host_release_fences rf"
+                    " WHERE rf.host = %(h)s)))") % {"open": open_sql, "h": h, "a": a}
     sql = """(%(open)s
        AND %(a)s.retired_at IS NULL
        AND (%(a)s.releve IN ('election', 'preference') OR NOT ameesh_handoff_fenced(%(a)s.name))
@@ -832,7 +846,8 @@ class Agents(interface.Agents):
                                                     ELSE agent_registry.host END
                                  AND hh.until > clock_timestamp())
               AND %s
-        """ % (AGENT_COLUMNS, canon_claim_predicate_sql("agent_registry", host=host))
+        """ % (AGENT_COLUMNS, canon_claim_predicate_sql("agent_registry", host=host,
+                                                        return_probe=True))
         if require_responsible:
             sql += " AND coalesce(responsible, '') <> ''"
         params: list[Any] = [host, host, host, host]
