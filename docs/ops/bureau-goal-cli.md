@@ -17,7 +17,7 @@ jamais avec le rôle `ameesh` ni un DSN d'agent.
 | se lier, PID vérifié localement | `ameesh mail bind|unbind` | INSERT/UPDATE de colonnes de `session_bindings` |
 | prendre / lever un geste externe | `ameesh work claim <lot> --session <id> [--release]` | UPDATE des seules colonnes `external_claim_*` de `work_items` (dont `external_claim_harness` et `external_claim_binding` dès la migration 0566 de #6877) |
 | reçus de provenance | hooks `provenance intent|created|record` | INSERT de `provenance_receipts` |
-| courrier | `agent-mail send`, `agent-mail inbox` | INSERT de `agent_mailbox` ; UPDATE de `meta`, `delivered_at`, `status` (réservation et remise du courrier reçu) |
+| courrier | `agent-mail send`, `agent-mail inbox`, `agent-mail ack <id>…` | INSERT de `agent_mailbox` ; UPDATE de `meta`, `delivered_at`, `status` (réservation et remise du courrier reçu) |
 | déclarer le rattrapage staging (#7565) | `ameesh release catchup` | SELECT de `ameesh_staging_attestations` (seul type `staging.attested`) ; SELECT du seul `ameesh_events.id` pour INSERT RETURNING ; trace `staging.catchup` au nom du bureau ; signatures de décisions déjà consommées via `ameesh_decision_proofs` |
 | présence et non-lus des agents (#7058) | `agent-mail list` | SELECT de la vue `agent_mesh_overview` (registre et courrier, déjà lisibles) ; pour le prédicat de réclamation, SELECT des seules colonnes lues de `host_lifecycle`, `host_release_fences` et `host_handoffs` |
 
@@ -64,7 +64,10 @@ Limites, dites franchement :
 - le hook `agent-mail hook` n'est pas installé sur bureau-goal : son
   inscription écrit le registre, fermé à cette connexion. Sous la connexion
   limitée, il ne fait pas échouer la session et laisse le courrier non lu ;
-  le bureau lit par `agent-mail inbox` ;
+  le bureau lit par `agent-mail inbox` ; un lecteur hors hook acquitte ce
+  qu'il a affiché par `agent-mail ack <id>…` (même réservation que les
+  runners, #7836), jamais par un `UPDATE` direct de `delivered_at` — voir
+  [`bureau-veilleur-courrier.md`](bureau-veilleur-courrier.md) ;
 - la base ne peut pas empêcher une session de lever la prise d'une autre
   session du même agent sur le même hôte. Le CLI la refuse (« verified
   session is … »).

@@ -440,15 +440,13 @@ def _tracked_worktrees(db, cfg, item: Mapping) -> list[str]:
     if not lot:
         return []
     try:
-        rows = db.query(
-            "SELECT path FROM managed_worktrees"
-            " WHERE host = %s AND lot = %s AND status = 'active'"
-            " ORDER BY id DESC",
-            (str(getattr(cfg, "host", "") or ""), str(lot)))
+        # #7650 : le SQL de `managed_worktrees` vit avec le module `dev`.
+        rows = storage.of(db).housekeeping.worktrees_for_lot(
+            str(getattr(cfg, "host", "") or ""), lot)
     except Exception:  # noqa: BLE001 - no tracking table/readable row: next hint
         return []
-    return [str(row.get("path") or "") for row in rows or ()
-            if str(row.get("path") or "").strip()]
+    return [str(path or "") for path in rows or ()
+            if str(path or "").strip()]
 
 
 def _search_roots(paths: Sequence[str]) -> list[str]:
@@ -2268,6 +2266,29 @@ def _floor_of(db, lot: int, cfg) -> int:
     recorded designation looks complete and its completion is skipped without
     a trace. The caller reports the failure and writes nothing."""
     return int(review_floor.of_lot(db, int(lot), cfg=cfg).get("floor") or 0)
+
+
+def _with_live_families(db, seats, *, families) -> list:
+    """Seats whose family the mark left empty, read from the registry (#7822).
+
+    A carried mark (`verdict_carry.carried_mark_note`) names the reported
+    reviewers without their family. The completion counted no family for
+    them, judged the seats short and sent the kept reviewers a new request at
+    every policy recheck (#7745, #7767). The family is the live one, as the
+    selection reads it; an unreadable row leaves the seat without family,
+    which never covers a seat.
+    """
+    out = []
+    for seat in seats or ():
+        seat = dict(seat)
+        if not str(seat.get("family") or "").strip():
+            try:
+                row = registry.get(db, seat["name"]) or {}
+            except Exception:  # noqa: BLE001 - an unreadable row proves nothing
+                row = {}
+            seat["family"] = rd.live_family(row, families=families)
+        out.append(seat)
+    return out
 
 
 def _mark_covers(mark: Mapping, floor: int, *, column=None) -> bool:
@@ -4459,7 +4480,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             # nouveau comme candidat (sinon la complétion réinscrit le retrait
             # sans courrier, B/P1 dev4) : il est exclu, et l'attente est
             # journalisée si la couverture manque.
-            live_seats = _kept_seats(completion["shape"], item)
+            live_seats = _with_live_families(
+                db, _kept_seats(completion["shape"], item),
+                families=inputs.policy.families)
             live_names = {seat["name"] for seat in live_seats}
             mark_names = {str((row or {}).get("name") or "").strip()
                           for row in (completion["shape"] or {}).get("reviewers") or ()}

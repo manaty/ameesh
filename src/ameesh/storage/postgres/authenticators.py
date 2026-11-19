@@ -25,11 +25,13 @@ comme pour le contrôle (`registry_lock_held`).
 """
 from __future__ import annotations
 
+import json
+
 from .. import interface
 
 AUTH_COLUMNS = """
     id, approver, facade, credential_id, public_key, key_fingerprint, aaguid, level,
-    canon_ref, canon,
+    canon_ref, canon, accord_operations,
     extract(epoch from enrolled_at)::float8 AS enrolled_ts,
     extract(epoch from updated_at)::float8  AS updated_ts,
     extract(epoch from revoked_at)::float8  AS revoked_ts,
@@ -159,11 +161,14 @@ class Authenticators(interface.Authenticators):
             "AND credential_id = %s AND canon = %s AND revoked_at IS NULL",
             (facade, credential_id, canon))
 
-    def update_meta(self, authenticator_id, *, level, aaguid, canon_ref) -> bool:
+    def update_meta(self, authenticator_id, *, level, aaguid, canon_ref,
+                    accord_operations=()) -> bool:
         rows = self.db.query(
             "UPDATE authenticators SET level = %s, aaguid = %s, canon_ref = %s, "
+            "accord_operations = %s::jsonb, "
             "updated_at = now() WHERE id = %s AND revoked_at IS NULL RETURNING id",
-            (level, aaguid, canon_ref, int(authenticator_id)))
+            (level, aaguid, canon_ref, json.dumps(list(accord_operations or ())),
+             int(authenticator_id)))
         return bool(rows)
 
     def revoke(self, authenticator_id, *, reason, canon_ref) -> bool:
@@ -177,17 +182,41 @@ class Authenticators(interface.Authenticators):
             (reason, canon_ref, int(authenticator_id)))
         return bool(rows)
 
+    # -- #7631 : un « go » du journal ne cite qu'un geste -------------------
+    def accord_claim(self, agent, seq):
+        rows = self.db.query(
+            "SELECT kind, ref FROM accord_claims WHERE agent = %s AND seq = %s",
+            (str(agent), int(seq)))
+        return rows[0] if rows else None
+
+    def claim_accord(self, agent, seq, kind, ref):
+        """INSERT … ON CONFLICT : la ligne existe déjà pour ce même geste
+        (relecture du même reçu) ou elle est créée ; un autre geste ne rend
+        aucune ligne. Une seule instruction, donc atomique entre deux reçus."""
+        rows = self.db.query(
+            """
+            INSERT INTO accord_claims (agent, seq, kind, ref)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (agent, seq) DO UPDATE SET agent = EXCLUDED.agent
+              WHERE accord_claims.kind = EXCLUDED.kind
+                AND accord_claims.ref = EXCLUDED.ref
+            RETURNING agent
+            """,
+            (str(agent), int(seq), str(kind), str(ref)))
+        return bool(rows)
+
     def insert(self, record) -> bool:
         rows = self.db.query(
             """
             INSERT INTO authenticators
                 (approver, facade, credential_id, public_key, key_fingerprint, aaguid,
-                 level, canon_ref, canon)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 level, canon_ref, canon, accord_operations)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             ON CONFLICT (canon, facade, credential_id) WHERE revoked_at IS NULL DO NOTHING
             RETURNING id
             """,
             (record["approver"], record["facade"], record["credential_id"],
              record["public_key"], record["key_fingerprint"], record["aaguid"],
-             record["level"], record["canon_ref"], record.get("canon") or ""))
+             record["level"], record["canon_ref"], record.get("canon") or "",
+             json.dumps(list(record.get("accord_operations") or ()))))
         return bool(rows)

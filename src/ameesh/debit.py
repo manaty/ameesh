@@ -2843,38 +2843,9 @@ _MERGES_SQL = """
      ORDER BY at
 """
 
-_CI_SQL = """
-    SELECT repo, run_id, run_attempt, workflow, status, branch, work_item_id, url,
-           extract(epoch FROM
-               coalesce(rc.started_at, rc.created_at, rc.first_seen_at))::float8 AS started_ts,
-           extract(epoch FROM rc.concluded_at)::float8 AS concluded_ts
-      FROM ci_runs rc
-     WHERE coalesce(rc.concluded_at, to_timestamp(%s)) > to_timestamp(%s)
-       AND coalesce(rc.started_at, rc.created_at, rc.first_seen_at) > to_timestamp(%s)
-       AND coalesce(rc.started_at, rc.created_at, rc.first_seen_at) IS NOT NULL
-     ORDER BY coalesce(rc.concluded_at, to_timestamp(%s)) DESC
-     LIMIT %s
-"""
-
-#: #3256 C : l'ouverture de chaque paquet d'un lot, pour l'attente qa_merge.
-#: La composition est datée par la création du porteur (stable sur une
-#: recomposition) ; le gel effectif de l'unité est celui enregistré par
-#: `work packet record`, et le jalon verdict de la même tête est lu par
-#: `packet_parallel.daily_waits`. La lecture ne part **pas** des lots de
-#: `_ITEMS_SQL` : un lot fusionné en est exclu, et c'est justement un lot relu
-#: puis composé que la mesure doit compter (relecture auditeur du 28/10).
-#: #7435 : `package_state` dit si le porteur est encore ouvert ; la
-#: classification `in_packet` de `build` en dépend. #7445 : une retenue
-#: (`blocked`, `waiting_human`) compte comme non porteuse.
-_PACKETS_SQL = """
-    SELECT m.package_id, m.work_item_id, m.frozen_sha,
-           p.state AS package_state,
-           extract(epoch FROM p.created_at)::float8 AS composed_ts
-      FROM work_packet_members m
-      JOIN work_items p ON p.id = m.package_id
-     WHERE p.created_at > to_timestamp(%s)
-     ORDER BY p.created_at, m.work_item_id
-"""
+#: #3256 C : le SQL des paquets et des exécutions de CI vit avec le module
+#: `dev` (P1b #7650) ; la fenêtre et les colonnes lues sont celles de
+#: `work.packet_members_since` et `ci.recent_runs`.
 
 
 def human_route_names(cfg, agents, canons) -> set[str]:
@@ -2939,8 +2910,11 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
     # fusionné, alors que son attente est justement mesurée). Les jalons de ces
     # lots sont lus au même passage.
     from . import packet_parallel
+    from . import storage
     qa_window = now - (packet_parallel.DAYS + 1) * 86400
-    packets = _rows(db, _PACKETS_SQL, (qa_window,))
+    # #7650 : `work_packet_members` est une table du module `dev`.
+    packets = [dict(row) for row in
+               storage.of(db).work.packet_members_since(qa_window) or ()]
     packet_ids = {int(row["work_item_id"]) for row in packets}
     all_ids = sorted(set(ids) | packet_ids)
     if all_ids:
@@ -2974,9 +2948,9 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
     turns = _rows(db, _TURNS_SQL, (now - int(hours) * 3600,))
     merges = _rows(db, _MERGES_SQL,
                    (now - int(hours) * 3600, now))
-    ci_runs = _rows(db, _CI_SQL,
-                    (now, now - int(ci_hours) * 3600, now - int(ci_hours) * 3600,
-                     now, MAX_CI_RUNS))
+    # #7650 : `ci_runs` est une table du module `dev`.
+    ci_runs = [dict(row) for row in storage.of(db).ci.recent_runs(
+        now, now - int(ci_hours) * 3600, MAX_CI_RUNS) or ()]
 
     # Appareils déclarés indisponibles : fiches Host + règle du canon §12.
     if canons is None:

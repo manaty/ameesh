@@ -19,6 +19,8 @@ de chaque transition ; `log_event` n'écrit que les événements informatifs.
 """
 from __future__ import annotations
 
+import json
+
 from .. import interface
 
 ACTION_COLUMNS = """
@@ -59,6 +61,14 @@ class Actions(interface.Actions):
         sql += " ORDER BY created_at DESC, action_id DESC LIMIT %s"
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
+
+    def reserved(self, operations, *, since_ts, until_ts) -> list[dict]:
+        return self.db.query(
+            "SELECT %s, auth_receipt FROM actions"
+            " WHERE operation = ANY(ARRAY(SELECT jsonb_array_elements_text(%%s::jsonb)))"
+            " AND created_at >= to_timestamp(%%s) AND created_at < to_timestamp(%%s)"
+            " ORDER BY created_at, action_id" % ACTION_COLUMNS,
+            (json.dumps(list(operations)), float(since_ts), float(until_ts)))
 
     def attempts(self, action_id) -> list[dict]:
         return self.db.query(

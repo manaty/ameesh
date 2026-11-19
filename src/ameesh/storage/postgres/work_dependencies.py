@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..work_dependencies import WorkDependencies as Contract
+from .landings import Landings
 from ... import work_lifecycle as lifecycle
 from ...db import DbError
 
@@ -174,24 +175,12 @@ def not_blocking(alias: str) -> str:
     return "(%s.state IN %s)" % (alias, _DONE_SQL)
 
 
-def start_blocking(dependent: str, blocker: str = "b") -> str:
-    """#7760 : prédicat SQL « ce prérequis retient le DÉMARRAGE du dépendant ».
-
-    La règle de fusion ne bouge pas (`not_blocking` : fusionné seulement).
-    Au démarrage, un prérequis `validated` dont le dépendant chevauche
-    l'empreinte et dont il déclare la dépendance ne retient plus : il démarre
-    sur sa tête gelée, et le composeur les prend ensemble. Tout autre
-    prérequis non fusionné retient, comme avant (#2252).
-
-    `dependent` et `blocker` sont des alias de `work_items`."""
-    from .work_footprints import start_on_sql
-    return ("(NOT " + not_blocking(blocker) + " AND NOT "
-            + start_on_sql(dependent, blocker) + ")")
-
-
 class WorkDependencies(Contract):
+
     def __init__(self, db):
         self.db = db
+        # P1b #7650 : les landings sont une table du module `dev`.
+        self._landings = Landings(db)
 
     def lock(self):
         # Les fermetures de lot appellent ce verrou avec la TRANSACTION
@@ -266,8 +255,9 @@ class WorkDependencies(Contract):
         # `false` — l'attente « blocking » est la lecture prudente, et les
         # gardes qui décident du démarrage lisent les empreintes avec un rôle
         # qui y a droit. Pas de GRANT : ce lot reste hors classe droits SQL.
-        from .work_footprints import start_on_sql
-        head = ("""
+        # Le prédicat vit dans le module `dev` : `_start_on_pairs` l'exécute
+        # sur sa connexion qualifiée (revue B1 de #7650).
+        rows = self.db.query("""
             SELECT d.work_item_id, d.blocker_id, d.created_by,
                    extract(epoch FROM d.created_at)::float8 AS created_ts,
                    coalesce(to_jsonb(w)->>'legacy_state', w.state) AS blocker_state,
@@ -276,20 +266,31 @@ class WorkDependencies(Contract):
                      WHERE m.work_item_id = w.id AND m.kind = 'frozen'
                      ORDER BY m.at DESC, m.id DESC LIMIT 1) AS blocker_frozen_sha,
                    NOT """ + not_blocking("w") + """ AS blocking,
-                   """)
-        tail = ("""
-            FROM work_item_dependencies d
-            JOIN work_items w ON w.id = d.blocker_id
-            JOIN work_items i ON i.id = d.work_item_id
+                   false AS start_on
+            FROM work_item_dependencies d JOIN work_items w ON w.id = d.blocker_id
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
-            " ORDER BY d.work_item_id, d.blocker_id")
+            " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
+        starts = self._start_on_pairs(ids)
+        if starts:
+            for row in rows:
+                row["start_on"] = ((int(row["work_item_id"]),
+                                    int(row["blocker_id"])) in starts)
+        return rows
+
+    def _start_on_pairs(self, ids):
+        """#7760 : les couples « démarrage sur », lus par le module `dev`.
+
+        Le prédicat nomme `work_item_footprints`, une table du module : il ne
+        doit pas être exécuté sur la connexion brute du noyau, qui ne le
+        résoudrait plus après P2 (revue B1 de #7650).
+        """
+        from .work_dev import DevWork
         try:
-            return self.db.query(head + start_on_sql("i", "w") + " AS start_on" + tail,
-                                 tuple(ids))
+            return DevWork(self.db).start_on_pairs(ids)
         except DbError as exc:
             if exc.sqlstate != _INSUFFICIENT_PRIVILEGE:
                 raise
-            return self.db.query(head + "false AS start_on" + tail, tuple(ids))
+            return set()
 
     # ------------------------------------------------------------------
     # #4167 : liens typés (duplicates, supersedes, part_of, conflicts_with)
@@ -450,16 +451,8 @@ class WorkDependencies(Contract):
             if not freezes:
                 return {"error": "no_freeze"}
             pinned = freezes[0]["sha"].strip()
-            tx.execute("""
-                INSERT INTO work_landings(work_item_id, vehicle_id, pinned_sha, until_on, created_by)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (work_item_id) DO UPDATE
-                    SET vehicle_id = EXCLUDED.vehicle_id,
-                        pinned_sha = EXCLUDED.pinned_sha,
-                        until_on = EXCLUDED.until_on,
-                        created_by = EXCLUDED.created_by,
-                        created_at = clock_timestamp()
-                """, (item_id, vehicle_id, pinned, until_on, actor))
+            self._landings.set(tx, item_id, vehicle_id, pinned_sha=pinned,
+                               until_on=until_on, actor=actor)
             self._landing_journal(
                 tx, item_id,
                 "Landing declared: vehicle #%d until %s (frozen %s)"
@@ -469,22 +462,16 @@ class WorkDependencies(Contract):
     def clear_landing(self, item_id, *, actor):
         with self.db.transaction() as tx:
             tx.execute(_LOCK)                 # #2171 N1 : même verrou, dans la transaction
-            removed = tx.query("DELETE FROM work_landings WHERE work_item_id = %s"
-                               " RETURNING vehicle_id", (item_id,))
-            if not removed:
+            vehicle_id = self._landings.clear(tx, item_id)
+            if vehicle_id is None:
                 return False
             self._landing_journal(
-                tx, item_id, "Landing cleared: vehicle #%d" % int(removed[0]["vehicle_id"]), actor)
+                tx, item_id, "Landing cleared: vehicle #%d" % int(vehicle_id), actor)
             return True
 
     def landings_on_vehicle(self, vehicle_id):
         """#3641 : les déclarations épinglées à ce véhicule (lecture groupée)."""
-        return self.db.query("""
-            SELECT work_item_id, vehicle_id, pinned_sha,
-                   until_on::text AS until_on, created_by
-              FROM work_landings
-             WHERE vehicle_id = %s
-             ORDER BY work_item_id""", (int(vehicle_id),))
+        return self._landings.on_vehicle(vehicle_id)
 
     @staticmethod
     def _current_freeze(tx, vehicle_id):
@@ -512,26 +499,13 @@ class WorkDependencies(Contract):
                        (int(vehicle_id),))
             if self._current_freeze(tx, vehicle_id) != frozen_sha:
                 return False
-            rows = tx.query(
-                "SELECT pinned_sha FROM work_landings"
-                " WHERE work_item_id = %s AND vehicle_id = %s",
-                (int(item_id), int(vehicle_id)))
-            return bool(rows) and (rows[0]["pinned_sha"] or "").strip() == pinned_sha
+            return self._landings.pinned(item_id, vehicle_id) == pinned_sha
 
     def landings_for(self, item_ids):
         ids = sorted({int(i) for i in item_ids})
         if not ids:
             return []
-        return self.db.query(f"""
-            SELECT l.work_item_id, l.vehicle_id, l.pinned_sha,
-                   l.until_on::text AS until_on,
-                   l.created_by,
-                   extract(epoch FROM l.created_at)::float8 AS created_ts,
-                   w.state AS vehicle_state,
-                   w.state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}') AS open
-            FROM work_landings l JOIN work_items w ON w.id = l.vehicle_id
-            WHERE l.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
-            " ORDER BY l.work_item_id", tuple(ids))
+        return self._landings.for_items(ids)
 
     def release_unassigned(self, item_ids, *, actor):
         """#1668 : un dépendant NON ASSIGNÉ dont la dernière attente vient de

@@ -198,11 +198,8 @@ class Admissions:
         ids = sorted({int(row["work_item_id"]) for row in rows})
         if not ids:
             return set()
-        marks = ", ".join(["%s"] * len(ids))
-        receipts = self.db.query(
-            "SELECT work_item_id, generation, frozen_id, kind"
-            " FROM integration_train_queue_receipts"
-            " WHERE work_item_id IN (" + marks + ") ORDER BY id", tuple(ids))
+        # #7650 : les reçus de file sont une table du module `dev`.
+        receipts = storage.of(self.db).work.train_receipts(ids)
         return {(int(receipt["work_item_id"]), int(receipt["generation"]),
                  receipt["frozen_id"])
                 for receipt in receipts if receipt["kind"] == "packet"}

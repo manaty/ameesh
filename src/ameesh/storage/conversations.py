@@ -26,6 +26,13 @@ class Conversations(abc.ABC):
         """
 
     @abc.abstractmethod
+    def entry(self, agent: str, seq: int) -> dict | None:
+        """One trusted entry by (agent, seq), or None (absent, pruned or untrusted).
+
+        #7631: the accord reference of a file-key receipt is checked against it.
+        """
+
+    @abc.abstractmethod
     def recent(self, agents: Sequence[str], *, limit: int = 20) -> list[dict]:
         """Per-agent last_seq and last `limit` entries in ascending order.
 

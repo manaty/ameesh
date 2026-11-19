@@ -263,6 +263,55 @@ class PlafondDeContexteTest(_Base):
             self.assertFalse(worker.maybe_rotate())
         self.assertEqual(registry.get(self.db, "ds-sous")["session_id"], "dsh-session-1")
 
+    def test_juste_sous_le_plafond_la_session_tourne(self):
+        """#7825 : un tour fini à 245 k (plafond 250 k) n'est pas clos, mais le
+        suivant franchirait le plafond dès ses premiers appels : la session
+        tourne à partir du plafond moins sa marge (237,5 k)."""
+        runner, worker = self._worker("ds-marge")
+        self.assertEqual(worker.context_rotation_threshold(), 237_500)
+        with self._env("30000,200000,100"):   # contexte 230 k
+            self.assertTrue(self._tour(worker))
+        self.assertIsNone(worker.last_turn_closed)
+        self.assertFalse(worker.context_rotation_due())
+        with self._env("45000,200000,100"):   # contexte 245 k
+            self.assertTrue(self._tour(worker))
+            self.assertIsNone(worker.last_turn_closed, "sous le plafond : tour non clos")
+            self.assertTrue(worker.context_rotation_due())
+            with mock.patch.object(worker, "_fil_note"):
+                self.assertTrue(worker.maybe_rotate())
+        self.assertIsNone(registry.get(self.db, "ds-marge")["session_id"])
+
+    def test_la_mesure_survit_au_redemarrage_de_l_executeur(self):
+        """#7825 : un exécuteur relancé entre une clôture au plafond et le tour
+        suivant ne garde ni `rotation_forcee` ni la mesure en mémoire ; il la
+        relit dans l'état local et tourne avant de reprendre la session."""
+        runner, worker = self._worker("ds-relance")
+        with self._env(GROS_TOUR):
+            self.assertTrue(self._tour(worker))
+        with open(os.path.join(worker.state_dir, "last_turn_context"),
+                  encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "16000000 dsh-session-1")
+        # worker neuf : rien en mémoire
+        worker.rotation_forcee = None
+        worker.last_turn_context = worker.last_turn_context_session = None
+        worker.last_turn_reread, worker.last_turn_reread_session = 0, None
+        worker._last_context_restore = True
+        self.assertTrue(worker.context_rotation_due())
+        self.assertEqual(worker.last_turn_context_reread(),
+                         (16_000_000, "dsh-session-1"))
+        # la mesure d'une autre session (remplaçant, rotation faite) est ignorée
+        worker.last_turn_context = worker.last_turn_context_session = None
+        worker._last_context_restore = True
+        registry.set_session(self.db, "ds-relance", "session-du-remplacant")
+        worker.agent = registry.get(self.db, "ds-relance")
+        self.assertFalse(worker.context_rotation_due())
+        # la relecture n'a lieu qu'une fois, avant le premier tour du worker
+        with open(os.path.join(worker.state_dir, "last_turn_context"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("16000000 session-du-remplacant")
+        worker.last_turn_context = worker.last_turn_context_session = None
+        self.assertFalse(worker.context_rotation_due())
+
     def test_tour_deepseek_clos_a_250k_et_tour_claude_laisse(self):
         """#6677 : pendant un tour, le plafond lu est celui du harnais
         effectivement lancé — deepseek ferme à 250 k, claude reste au défaut

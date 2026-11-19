@@ -108,7 +108,7 @@
         KMS/IAM and production acts whose broker trace is incomplete (#7767);
   ameesh gate broker serve|check [--config F] [--json]
         the credential-gate service, run by its own Unix account (#7767);
-  ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO  check before an act;
+  ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO [--dry-run]  check before an act;
   ameesh github gestes [--since 24h] [--agent A] [--match 'run cancel'] [--json]
         | identity <agent> [--json]
         the gh commands run by agents, journaled per turn (who cancelled,
@@ -149,10 +149,12 @@
   ameesh list                 agents, hosts, leases, unread messages and budgets;
   ameesh mail <bind|unbind|bindings>
         explicit binding of an external session to an agent (L41, 0030);
-  ameesh mail <send|show|inbox|list|status|alias|hook|statusline|whoami>
+  ameesh mail <send|show|inbox|ack|list|status|alias|hook|statusline|whoami>
         the mailbox; `agent-mail` remains an alias (harness hooks call it);
-        `send` refuses an unknown recipient (close names suggested) or a
-        stopped one (unless --queue);
+        `ack` delivers received messages by number through the runners'
+        reservation protocol, for a reader that displays them outside a hook
+        (#7836); `send` refuses an unknown recipient (close names suggested)
+        or a stopped one (unless --queue);
   ameesh mail forward <old> <new> [--dry-run]
         re-delivers the pending mail of a stopped agent to a live agent;
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
@@ -264,6 +266,8 @@
   ameesh show <agent>         detailed agent observability;
   ameesh staging-migrations --repo DIR --sha SHA --project P --file PATH
         read-only gate on the applicator's explicit pending SQL inventory;
+  ameesh standing register|list   standing approvals: register from a receipt,
+        list with operations, cap and expiry (spec §8.3, #7631);
   ameesh turn current [--local] [--expect-turn ID] [--json]
         read the calling turn; reuse requires its captured turn id;
   ameesh turn observe (--turn ID | --request ID) [--json]
@@ -355,7 +359,7 @@ EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
 #: adoption et reprise (L39, décision 0030)
 REPRISE_COMMANDS = ("adopt", "resume", "pause")
 #: sous-commandes des reçus d'approbation (receipts_cli)
-RECEIPT_COMMANDS = ("receipt", "authenticator")
+RECEIPT_COMMANDS = ("receipt", "authenticator", "standing")
 #: actions sous porte et file des décisions (actions_cli)
 ACTION_COMMANDS = ("action", "decisions")
 

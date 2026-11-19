@@ -20,6 +20,7 @@ from unittest import mock
 
 from ameesh import db as db_mod, migrations, storage, work
 from ameesh.db import DbError
+from ameesh.modules.dev.storage import work as dev_work
 from ameesh.storage.postgres import work as pg_work
 
 from .support import PgTestCase
@@ -65,6 +66,13 @@ def _depot(path, slug, directory, base=(), branches=None):
     os.makedirs(path)
     _git(path, "init", "-q", "-b", "develop")
     _git(path, "remote", "add", "origin", "git@github.com:%s.git" % slug)
+    # #7650 : l'origine n'est qu'une identité. Un rafraîchissement de cible
+    # (lecture des migrations atterries, `work migration`) ne doit pas joindre
+    # la forge réelle et rapporter ses numéros (815 au lieu de 378) : les
+    # transports externes sont refusés dans ce dépôt, l'URL `origin` reste
+    # lisible par `origin_repo`, et un fetch local (file) reste permis.
+    _git(path, "config", "protocol.allow", "never")
+    _git(path, "config", "protocol.file.allow", "always")
     _commit(path, directory, *base)
     for branch, names in (branches or {}).items():
         _git(path, "checkout", "-qb", branch)
@@ -1155,9 +1163,12 @@ class RetryReservationTest(PgTestCase):
             draws.append((low, high))
             return high
 
-        with mock.patch.object(pg_work, "time", clock), \
+        # P1b #7650 : la boucle de réessai a rejoint le stockage du module
+        # `dev` ; l'horloge et le tirage à patcher sont ceux de ce module, le
+        # budget restant se lit toujours au noyau (`_core()`).
+        with mock.patch.object(dev_work, "time", clock), \
                 mock.patch.object(pg_work, "_RESERVE_BUDGET_S", budget), \
-                mock.patch.object(pg_work, "random",
+                mock.patch.object(dev_work, "random",
                                   types.SimpleNamespace(uniform=uniform)), \
                 mock.patch.object(self.db, "transaction", side_effect=transaction):
             try:

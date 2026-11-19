@@ -233,6 +233,19 @@ class Approvals(interface.Approvals):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
+    def decision_signatures(self, *, since_ts, until_ts) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT id, approver, artifact_hash, consumed_by, meta, key_is_owner,
+                   extract(epoch from created_at)::float8 AS created_ts,
+                   extract(epoch from consumed_at)::float8 AS consumed_ts
+              FROM mesh_approvals_status
+             WHERE action = 'decision' AND artifact_kind = 'decision'
+               AND decision = 'approved' AND consumed_by ~ '^decision:[0-9]+$'
+               AND consumed_at >= to_timestamp(%s) AND consumed_at < to_timestamp(%s)
+             ORDER BY consumed_at, id
+            """, (float(since_ts), float(until_ts)))
+
     def candidates(self, action, artifact_hash, decision) -> list[dict]:
         return self.db.query(
             """

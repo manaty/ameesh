@@ -56,8 +56,8 @@ from . import review_designation_pg as designation_pg
 
 #: le schéma rendu par `ameesh work findings --json`
 SCHEMA = "ameesh-review-finding/1"
-#: la table du journal additif (migration 0564)
-TABLE = "review_finding_resolutions"
+#: le journal additif (migration 0564) et son SQL vivent dans le module `dev`
+#: (`modules.dev.storage.reviews.ReviewFindings`, P1b #7650).
 #: préfixe de la note de journal écrite sur le lot, lisible et requêtable
 NOTE_PREFIX = "review-resolution:"
 
@@ -114,10 +114,8 @@ def _milestone(db, milestone_id: int) -> dict | None:
 
 def _reviewer_family(db, milestone_id: int) -> str:
     """La famille exacte du reçu `milestone:<id>` ; "" sans preuve."""
-    rows = db.query(
-        "SELECT harness FROM provenance_receipts WHERE subject = %s",
-        ("milestone:%d" % int(milestone_id),))
-    return str((rows[0] or {}).get("harness") or "").strip().lower() if rows else ""
+    # #7650 : `provenance_receipts` est une table du module `dev`.
+    return storage.of(db).provenance.harness("milestone:%d" % int(milestone_id))
 
 
 def _agent_family(db, name: str) -> str:
@@ -474,20 +472,16 @@ def resolve(db, lot: int, milestone_id: int, *, state: str, witness: str = "",
         # Le genre `regressed_by` casserait aussi un lecteur N-1
         # (`_INVERSE[kind]`), donc aucune valeur n'est ajoutée à la contrainte
         # de 0501 ; `regression_lot` du journal porte la preuve.
-        inserted = tx.query(
-            "INSERT INTO " + TABLE + " ("
-            " milestone_id, work_item_id, witness_sha, state, basis,"
-            " correction_sha, regression_lot, corrector, withdrawn_by,"
-            " adjudicator, adjudicator_family, judged_families, independent,"
-            " review_room, note)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
-            "         %s::jsonb, %s) RETURNING id",
-            (int(milestone_id), int(lot), read_sha, state, basis,
-             correction_sha or None, regression_lot, corrector, withdrawn_by,
-             adjudicator, adjudicator_family, sorted(judged), bool(independent),
-             json.dumps(room, ensure_ascii=False) if room is not None else None,
-             note))
-        if not inserted:
+        # #7650 : le SQL du journal 0564 vit avec le module `dev`.
+        written = storage.of(tx).review_findings.add(
+            milestone_id=int(milestone_id), work_item_id=int(lot),
+            witness_sha=read_sha, state=state, basis=basis,
+            correction_sha=correction_sha, regression_lot=regression_lot,
+            corrector=corrector, withdrawn_by=withdrawn_by,
+            adjudicator=adjudicator, adjudicator_family=adjudicator_family,
+            judged_families=judged, independent=bool(independent),
+            review_room=room, note=note)
+        if not written:
             raise ReviewFindingError("resolution was not written")
         storage.of(tx).work.note(
             int(lot), str(row[0]["state"]),
@@ -498,7 +492,7 @@ def resolve(db, lot: int, milestone_id: int, *, state: str, witness: str = "",
                        note=note),
             adjudicator)
     out = read(db, int(lot), milestone_id=int(milestone_id))
-    out["written"] = int(inserted[0]["id"])
+    out["written"] = int(written)
     return out
 
 
@@ -512,18 +506,14 @@ def journal_present(db) -> bool:
     elle, refuse clairement au lieu d'échouer sur une table absente.
     """
     try:
-        rows = db.query(
-            "SELECT to_regclass(%s) IS NOT NULL AS present", (TABLE,))
+        # #7650 : la présence et la lecture du journal sont des ports `dev`.
+        return storage.of(db).review_findings.journal_present()
     except Exception:  # noqa: BLE001 - lecture d'un schéma en retard
         return False
-    return bool((rows[0] or {}).get("present")) if rows else False
 
 
 def _latest_resolutions(db, lot: int) -> dict[int, dict]:
-    rows = db.query(
-        "SELECT *, extract(epoch FROM created_at)::float8 AS created_ts"
-        "  FROM " + TABLE + " WHERE work_item_id = %s ORDER BY id",
-        (int(lot),))
+    rows = storage.of(db).review_findings.for_lot(lot)
     latest: dict[int, dict] = {}
     for row in rows or ():
         latest[int(row["milestone_id"])] = dict(row)

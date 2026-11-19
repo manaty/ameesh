@@ -61,7 +61,9 @@ SIGNATURES = {
     "agent_mesh_overview": {"public_key"},
     "key_holders": {"public_key"},     # #330
     "mesh_keys": {"public_key"},
-    "authenticators": {"public_key", "credential_id"},
+    # #7631 (0586) : opérations admises sous accord pour une clé fichier —
+    # politique du registre de confiance, fermée à la supervision
+    "authenticators": {"public_key", "credential_id", "accord_operations"},
     # exécuteurs médiés (voie B, 0062 et 0063)
     "executor_tokens": {"token_sha256"},
     "executor_invitations": {"code_sha256"},
@@ -125,6 +127,10 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #7631 (0586) : l'accord déjà cité par un geste (agent, seq → kind, ref)
+    # est une autorité interne à la porte ; le rôle superviseur ne le lit pas,
+    # aucun GRANT modifié.
+    "accord_claims": {"agent", "seq", "kind", "ref", "claimed_at"},
     # #7672 (0594) : `in_reply_to` est l'identifiant interne de corrélation
     # d'une réponse à sa demande, lu par la surface publique de réponse et le
     # protocole de tour, jamais par un rôle superviseur ; colonne fermée aux

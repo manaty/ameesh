@@ -151,6 +151,9 @@ USER_VERIFICATION = "user_verification"
 BACKUP = "backup_eligible"
 SIGNATURE = "bad_signature"
 REPLAY = "replay"
+#: #7631 : reçu par clé fichier (façade ed25519) sous accord journalisé
+ACCORD = "accord_ref"
+ACCORD_OPERATION = "accord_operation"
 
 _NAME = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 _HUMAN_RE = re.compile(r"^human:%s$" % _NAME)
@@ -197,6 +200,13 @@ _STANDING_REQUIRED = frozenset({"connector", "operations", "class", "max_amount"
 _STANDING_OPTIONAL = frozenset({"beneficiary", "targets", "charter_line",
                                 "charter_version"})
 _STANDING_KEYS = _STANDING_REQUIRED | _STANDING_OPTIONAL
+#: #7631 : `standing.charter` (facultatif, signé) : le cadre de la charte de
+#: l'avatar qu'un grant inscrit, {frame, version}
+#: #7631 : référence d'accord — l'entrée du journal de conversation (L78) où
+#: l'humain a donné son « go » ; facultative, seulement pour une action ou un
+#: grant, et signée avec le reste de la demande
+_ACCORD_KEYS = frozenset({"agent", "seq"})
+_ACCORD_KINDS = ("action", "standing")
 _PROOF_FIELDS = {
     "webauthn": (frozenset({"authenticatorData", "clientDataJSON", "signature"}),
                  frozenset({"userHandle"})),
@@ -395,6 +405,11 @@ class ReceiptVerdict:
     standing: dict | None = None
     flags: dict = field(default_factory=dict)
     consumed: bool = False
+    #: #7631 : l'entrée de journal citée ({agent, seq}), vérifiée ; None sans accord
+    accord: dict | None = None
+    #: #7631 : vrai si le reçu n'est admis que par l'accord journalisé (clé
+    #: fichier sur un hôte d'agents, opération nommée par le canon)
+    file_key: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -436,10 +451,16 @@ def _check_standing(standing, iat: int) -> None:
         raise ReceiptError("standing: object expected")
     keys = set(standing)
     missing = _STANDING_REQUIRED - keys
-    extra = keys - _STANDING_KEYS
+    extra = keys - (_STANDING_KEYS | {"charter"})
     if missing or extra:
         raise ReceiptError("standing: missing fields %s, extra %s"
                            % (sorted(missing), sorted(extra)))
+    if "charter" in standing:
+        charter = standing["charter"]
+        if (not isinstance(charter, dict) or set(charter) != {"frame", "version"}
+                or not all(isinstance(charter[k], str) and _IDENT_RE.fullmatch(charter[k])
+                           for k in ("frame", "version"))):
+            raise ReceiptError("standing.charter: {frame, version} expected (identifiers)")
     if not isinstance(standing["connector"], str) or not _IDENT_RE.fullmatch(standing["connector"]):
         raise ReceiptError("standing.connector invalide")
     operations = standing["operations"]
@@ -507,6 +528,8 @@ def check_request(request) -> str:
         kind = "action"
     expected = {"standing": _STANDING_FIELDS, "login": _LOGIN_FIELDS,
                 "attach": _ATTACH_FIELDS, "action": _ACTION_FIELDS}[kind]
+    if "accord" in keys and kind in _ACCORD_KINDS:
+        expected = expected | {"accord"}
     if keys != expected:
         raise ReceiptError("request (%s): missing fields %s, extra %s"
                            % (kind, sorted(expected - keys), sorted(keys - expected)))
@@ -565,7 +588,18 @@ def check_request(request) -> str:
             raise ReceiptError("request.device_key: device credential_id expected")
     else:
         _check_standing(request["standing"], iat)
+    if "accord" in request:
+        _check_accord(request["accord"])
     return kind
+
+
+def _check_accord(accord) -> None:
+    if not isinstance(accord, dict) or set(accord) != _ACCORD_KEYS:
+        raise ReceiptError("request.accord: {agent, seq} expected")
+    if not isinstance(accord["agent"], str) or not _IDENT_RE.fullmatch(accord["agent"]):
+        raise ReceiptError("request.accord.agent: agent name expected")
+    if _int(accord["seq"], "request.accord.seq") <= 0:
+        raise ReceiptError("request.accord.seq: positive sequence expected")
 
 
 def parse_receipt(data) -> Receipt:
@@ -802,7 +836,8 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
             expected_digest: str | None, expected_action_id: str | None,
             expected_login: dict | None, expect_decision: str | None,
             consume_by: str | None, now: float | None,
-            expected_attach: dict | None = None) -> tuple[ReceiptVerdict, Receipt | None]:
+            expected_attach: dict | None = None,
+            expected_operation: str | None = None) -> tuple[ReceiptVerdict, Receipt | None]:
     policy = policy or Policy()
     moment = time.time() if now is None else float(now)
     ctx: dict = {}
@@ -824,10 +859,17 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         iat=request["iat"], exp=request["exp"], standing=request.get("standing"),
     )
 
-    # 1. façade, nature, liaison
-    if parsed.facade not in policy.allow_facades:
-        return refuse(FACADE, "facade %s not accepted for this authority (accepted: %s)"
-                      % (parsed.facade, ", ".join(sorted(policy.allow_facades)) or "none"))
+    # 1. façade, nature, liaison — #7631 : une clé fichier (ed25519) hors de
+    #    la politique n'est admise que sous accord journalisé, pour les
+    #    opérations que le canon nomme sur CET authentificateur (étape 3 bis)
+    accord = request.get("accord")
+    file_key = (parsed.facade == "ed25519" and accord is not None
+                and parsed.facade not in policy.allow_facades)
+    if parsed.facade not in policy.allow_facades and not file_key:
+        return refuse(FACADE, "facade %s not accepted for this authority (accepted: %s)%s"
+                      % (parsed.facade, ", ".join(sorted(policy.allow_facades)) or "none",
+                         "; a file-key receipt must cite the accord (journal entry)"
+                         if parsed.facade == "ed25519" else ""))
     if kind is not None and parsed.kind != kind:
         return refuse(KIND, "receipt of kind %s, %s expected" % (parsed.kind, kind))
     if parsed.kind == "standing" and consume_by:
@@ -939,6 +981,25 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
     except ReceiptError as exc:
         return refuse(KEY, "stored key unusable: %s" % exc)
 
+    # 3 bis. #7631 : opérations nommées par le canon pour la clé fichier
+    if file_key:
+        allowed = set(row.get("accord_operations") or ())
+        if parsed.kind == "standing":
+            needed = set(request["standing"]["operations"])
+        elif expected_operation is None:
+            return refuse(UNBOUND, "a file-key receipt is checked against the operation it "
+                                   "approves (expected_operation)")
+        else:
+            needed = {expected_operation}
+        if not allowed:
+            return refuse(ACCORD_OPERATION, "the canon accepts no file-key receipt from "
+                                            "this authenticator")
+        missing = sorted(needed - allowed)
+        if missing:
+            return refuse(ACCORD_OPERATION, "operation(s) %s not named by the canon for "
+                          "a file-key receipt (named: %s)"
+                          % (", ".join(missing), ", ".join(sorted(allowed))))
+
     # 4. preuve
     if parsed.facade == "webauthn":
         code, reason, flags = _verify_webauthn(parsed, key, policy, row["level"])
@@ -947,6 +1008,18 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
             return refuse(code, reason)
     elif not key.verify(parsed.challenge, parsed.proof_bytes["signature"]):
         return refuse(SIGNATURE, "signature %s invalide" % key.alg)
+
+    # 4 bis. #7631 : l'accord cité est une entrée du journal de conversation,
+    #    écrite par l'approbateur lui-même, avant la signature et récente
+    if accord is not None:
+        gesture = _gesture_references(db, request, expected_operation, parsed.kind)
+        code, reason = check_accord_entry(db, accord, request["approver"], iat, policy,
+                                          gesture=gesture, kind=parsed.kind,
+                                          ref=parsed.challenge.hex())
+        if code:
+            return refuse(code, reason)
+        ctx.update(accord={"agent": accord["agent"], "seq": accord["seq"]},
+                   file_key=file_key)
 
     # 5. nonce — la consommation recontrôle exp et iat EN SQL, après le
     #    dernier verrou, à l'heure réelle de la base (pas `moment`)
@@ -974,13 +1047,287 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         request["decision"], approver, parsed.facade), **ctx), parsed
 
 
+#: #7631 (B1, 2e tour auditeur) : grammaire FERMÉE. Le message vaut « go »
+#: (mot isolé, pas `golang`) suivi SEULEMENT des références du geste signé —
+#: identifiant d'action, cible, opération, lot ; connecteur, opérations, mot
+#: de mandat ; identifiant de décision, option et libellé — séparées par des
+#: espaces ou une ponctuation simple. Tout autre mot refuse l'accord : un
+#: report (« demain », « attends », « later »), une négation (« pas »,
+#: « don't ») ou une question ne peuvent pas se cacher dans une liste noire.
+#: L'opération seule, une autre cible ou un mot hors références ne suffisent
+#: jamais.
+_GO_RE = re.compile(r"^\s*go(?!\w)(?P<rest>.*)$", re.IGNORECASE | re.DOTALL)
+#: un mot du message : les références gardent leurs `: / # @ . -` internes ;
+#: la ponctuation simple sépare. Le point ou les deux-points finaux d'un jeton
+#: sont retirés (N auditeur : « go prod-deploy. » et « go #a-1: » valent la
+#: référence seule).
+_GO_WORD_RE = re.compile(r"[^\s,;!?()\[\]{}<>\"'`|]+", re.UNICODE)
+#: un grant ne s'inscrit que sur un go qui le nomme comme mandat
+_MANDATE_WORDS = frozenset({
+    "mandat", "mandate", "grant", "standing", "permanent", "permanente",
+    "approbation",
+})
+
+
+def _token_key(value) -> str:
+    """La forme comparée d'un jeton : casée, sans `#`/`@` de tête."""
+    return str(value or "").strip().lstrip("#@").casefold()
+
+
+def _go_words(text: str) -> list[str]:
+    """Les mots du message, casés ; ponctuation simple en séparateurs, point
+    final d'un jeton retiré."""
+    words: list[str] = []
+    for match in _GO_WORD_RE.finditer(text):
+        token = _token_key(match.group(0).rstrip(".:"))
+        if token:
+            words.append(token)
+    return words
+
+
+def _go_tokens(text: str) -> dict[str, int]:
+    """Les mots du message (casés), pour `_gesture_match`."""
+    return {word: index for index, word in enumerate(_go_words(text))}
+
+
+def _reference_tokens(value) -> set[str]:
+    """Les mots d'une référence de geste (un libellé d'option en a plusieurs)."""
+    return set(_go_words(str(value or "")))
+
+
+def _words_contain(words: list[str], needle: list[str]) -> bool:
+    """`needle` apparaît comme une suite CONTIGUË de `words` (pas une
+    sous-chaîne : le libellé d'option est comparé mot à mot)."""
+    size = len(needle)
+    if not size or size > len(words):
+        return False
+    return any(words[index:index + size] == needle
+               for index in range(len(words) - size + 1))
+
+
+def _gesture_allowed(gesture: dict) -> set[str]:
+    """La grammaire fermée : les seuls mots que le go peut porter pour CE
+    geste. Aucune autre référence n'est admise."""
+    kind = gesture.get("kind")
+    allowed: set[str] = set()
+    if kind == "action":
+        for key in ("action_id", "target", "operation", "lot"):
+            allowed |= _reference_tokens(gesture.get(key))
+    elif kind == "standing":
+        allowed |= _reference_tokens(gesture.get("connector"))
+        for value in gesture.get("operations") or ():
+            allowed |= _reference_tokens(value)
+        allowed |= set(_MANDATE_WORDS)
+    elif kind == "decision":
+        for key in ("decision_id", "lot"):
+            allowed |= _reference_tokens(gesture.get(key))
+        for option in gesture.get("options") or ():
+            allowed |= _reference_tokens(option.get("key"))
+            allowed |= _reference_tokens(option.get("label"))
+    else:
+        for value in gesture.get("references") or ():
+            allowed |= _reference_tokens(value)
+    return allowed
+
+
+def _gesture_references(db: Db, request: dict, expected_operation: str | None,
+                        kind: str) -> dict:
+    """Le geste signé, sous la forme que `check_accord_entry` confronte au
+    message : action (identifiant, cible, opération, lot) ou grant (connecteur,
+    opérations).
+
+    Une lecture ratée de l'action ne prouve rien : elle laisse l'identifiant
+    signé, qui suffit à rattacher le go ; la cible et l'opération ne sont
+    opposées que lorsqu'elles sont connues.
+    """
+    if kind == "standing":
+        standing = request.get("standing") or {}
+        return {
+            "kind": "standing",
+            "connector": str(standing.get("connector") or "").strip(),
+            "operations": [str(value).strip() for value in standing.get("operations") or ()
+                           if str(value or "").strip()],
+        }
+    action_id = str(request.get("action_id") or "")
+    gesture = {"kind": "action", "action_id": action_id, "operation": "",
+               "target": "", "lot": None}
+    if action_id:
+        try:
+            action = storage.of(db).actions.get(action_id, with_receipts=False)
+        except Exception:  # noqa: BLE001 - une lecture ratée ne prouve rien
+            action = None
+        if action:
+            gesture["operation"] = str(action.get("operation") or "").strip()
+            gesture["target"] = str(action.get("target") or "").strip()
+            lot = action.get("work_item")
+            gesture["lot"] = str(lot) if lot not in (None, "") else None
+    if expected_operation:
+        gesture["operation"] = gesture["operation"] or str(expected_operation)
+    return gesture
+
+
+def _gesture_match(gesture: dict, words) -> tuple[bool, list[str]]:
+    """(le message nomme le geste, références attendues). Une seule référence
+    suffit ; `target` et `operation` vont ensemble, jamais l'un sans l'autre.
+    `words` est la suite ordonnée des mots (les doublons comptent : un libellé
+    « oui oui » ne se confond pas avec « oui »). La grammaire fermée est
+    revérifiée ici : un mot hors références ne nomme pas le geste, même si un
+    appelant a omis le contrôle amont.
+    """
+    words = [str(word) for word in words]
+    tokens = set(words)
+    tokens.discard("go")
+    if tokens - _gesture_allowed(gesture):
+        return False, []
+    kind = gesture.get("kind")
+    expected: list[str] = []
+    if kind == "action":
+        action_id = str(gesture.get("action_id") or "").strip()
+        target = str(gesture.get("target") or "").strip()
+        operation = str(gesture.get("operation") or "").strip()
+        lot = gesture.get("lot")
+        if action_id:
+            expected.append(action_id)
+            if _token_key(action_id) in tokens:
+                return True, expected
+        if target and operation:
+            expected.append("%s %s" % (target, operation))
+            if _token_key(target) in tokens and _token_key(operation) in tokens:
+                return True, expected
+        if lot not in (None, ""):
+            expected.append(str(lot))
+            if _token_key(lot) in tokens:
+                return True, expected
+        return False, expected
+    if kind == "standing":
+        connector = str(gesture.get("connector") or "").strip()
+        operations = [str(value).strip() for value in gesture.get("operations") or ()
+                      if str(value or "").strip()]
+        if connector:
+            expected.append(connector)
+        expected.extend(operations)
+        expected.append("mandat")
+        named = bool(connector and operations)
+        named = named and _token_key(connector) in tokens
+        named = named and all(_token_key(value) in tokens for value in operations)
+        named = named and any(word in tokens for word in _MANDATE_WORDS)
+        return named, expected
+    if kind == "decision":
+        decision_id = str(gesture.get("decision_id") or "").strip()
+        option = str(gesture.get("option") or "").strip()
+        label = str(gesture.get("option_label") or "").strip()
+        options = gesture.get("options") or []
+        if decision_id:
+            expected.append(decision_id)
+        if option:
+            expected.append(option)
+            if label and label.casefold() != option.casefold():
+                expected.append(label)
+        if not decision_id or _token_key(decision_id) not in tokens:
+            return False, expected
+        # une réponse libre n'est rattachée à aucune option : l'owner la signe
+        if not option:
+            return False, expected
+        words = [word for word in words if word != "go"]
+        signed = _token_key(option)
+        named: set[str] = set()
+        for candidate in options:
+            key = _token_key(candidate.get("key"))
+            if not key:
+                continue
+            label_words = _go_words(candidate.get("label") or "")
+            if key in tokens or (label_words and _words_contain(words, label_words)):
+                named.add(key)
+        # le go doit désigner UNE option, et ce doit être celle qui est signée
+        return named == {signed}, expected
+    expected = [str(value) for value in gesture.get("references") or ()]
+    return any(_token_key(value) in tokens for value in expected), expected
+
+
+def check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
+                       policy: Policy, *, gesture: dict, kind: str = "",
+                       ref: str = "") -> tuple[str, str]:
+    """("", "") si l'entrée (agent, seq) du journal L78 porte un accord de
+    `approver` rattaché au geste : message humain de confiance, de cet humain,
+    commençant par « go » et ne portant QUE les références du geste signé
+    (grammaire fermée, voir `_gesture_allowed` et `_gesture_match`) ; écrit au
+    plus `clock_skew` après `iat` et au plus `max_ttl` avant. `kind`/`ref` : le
+    reçu qui cite l'accord ; un accord déjà cité par un autre geste est
+    refusé. Sinon (code, raison) — le refus dit quoi citer.
+    """
+    where = "%s#%d" % (accord["agent"], accord["seq"])
+    entry = storage.of(db).conversations.entry(accord["agent"], accord["seq"])
+    if entry is None:
+        return ACCORD, "accord %s: no trusted journal entry" % where
+    if entry.get("kind") != "human_message" or entry.get("author") != approver:
+        return ACCORD, "accord %s: not a message from %s (%s by %s)" % (
+            where, approver, entry.get("kind"), entry.get("author"))
+    ts = float(entry.get("ts") or 0)
+    if ts > iat + policy.clock_skew:
+        return ACCORD, "accord %s: written after the signature" % where
+    if ts < iat - policy.max_ttl:
+        return ACCORD, ("accord %s: older than %d s before the signature (a lasting go "
+                        "is a standing approval)" % (where, policy.max_ttl))
+    text = str(entry.get("text") or "")
+    match = _GO_RE.match(text)
+    if not match:
+        return ACCORD, ("accord %s: not an explicit go (the human message must start "
+                        "with \"go\" and name the gesture)" % where)
+    if "?" in text:
+        return ACCORD, ("accord %s: a question cannot be an accord (the go is "
+                        "affirmative)" % where)
+    if not isinstance(gesture, dict):
+        return ACCORD, "accord %s: no gesture reference to check" % where
+    words = _go_words(match.group("rest"))
+    allowed = _gesture_allowed(gesture)
+    unknown = [word for word in words if word not in allowed]
+    if unknown:
+        return ACCORD, ("accord %s: the go carries words outside the gesture references "
+                        "(%s); write only \"go\" followed by the references (%s)"
+                        % (where, ", ".join(unknown[:5]),
+                           ", ".join(sorted(allowed)) or "?"))
+    named, expected = _gesture_match(gesture, _go_words(match.group("rest")))
+    if not expected:
+        return ACCORD, "accord %s: no gesture reference to check" % where
+    if not named:
+        return ACCORD, ("accord %s: the message names none of the gesture references "
+                        "(%s); reply \"go <action id, target and operation, lot, "
+                        "mandate, or decision and option>\""
+                        % (where, ", ".join(sorted(set(expected)))))
+    lot = gesture.get("lot")
+    if (lot not in (None, "") and entry.get("lot") not in (None, "")
+            and str(entry["lot"]) != str(lot)):
+        return ACCORD, "accord %s: written for lot %s, not %s" % (
+            where, entry["lot"], lot)
+    if kind and ref:
+        claim = storage.of(db).authenticators.accord_claim(accord["agent"],
+                                                           int(accord["seq"]))
+        if claim is not None and (str(claim.get("kind") or ""),
+                                  str(claim.get("ref") or "")) != (kind, ref):
+            return ACCORD, ("accord %s: already cited by another gesture (%s); a go "
+                            "authorizes one receipt" % (where, claim.get("kind") or "?"))
+    return "", ""
+
+
+def claim_accord(db: Db, accord: dict, *, kind: str, ref: str) -> bool:
+    """Réclame l'accord (agent, seq) pour le geste (`kind`, `ref`) ; faux si un
+    autre geste l'a déjà cité. La clé primaire d'`accord_claims` tranche la
+    course entre deux reçus, là où la seule lecture de `check_accord_entry` ne
+    prouverait rien."""
+    if not isinstance(accord, dict) or "agent" not in accord or "seq" not in accord:
+        raise ReceiptError("accord {agent, seq} expected")
+    return storage.of(db).authenticators.claim_accord(
+        str(accord["agent"]), int(accord["seq"]), str(kind), str(ref))
+
+
 def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
                    kind: str | None = "action", expected_digest: str | None = None,
                    expected_action_id: str | None = None,
                    expected_login: dict | None = None,
                    expect_decision: str | None = "approve", consume_by: str | None = None,
                    now: float | None = None,
-                   expected_attach: dict | None = None) -> ReceiptVerdict:
+                   expected_attach: dict | None = None,
+                   expected_operation: str | None = None) -> ReceiptVerdict:
     """Vérifie un reçu ; le consomme (une fois, atomiquement) si `consume_by`.
 
     Sans `consume_by`, le nonce est seulement contrôlé (non encore consommé) :
@@ -992,6 +1339,8 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     l'appelant depuis SA demande, jamais lu dans le reçu. Pour un grant
     d'attach (#7119), c'est `expected_attach` (tous les champs de
     `ATTACH_BINDING_FIELDS`), recalculé par l'hôte de l'agent.
+    `expected_operation` (#7631) : l'opération de l'action approuvée,
+    recalculée par la porte ; exigée pour un reçu par clé fichier sous accord.
     `kind=None` accepte les quatre natures ; `expect_decision=None` toutes les
     décisions.
     `now` ne règle que les contrôles faits ici : une consommation recontrôle
@@ -1003,7 +1352,7 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
         db, receipt, policy, kind=kind, expected_digest=expected_digest,
         expected_action_id=expected_action_id, expected_login=expected_login,
         expect_decision=expect_decision, consume_by=consume_by, now=now,
-        expected_attach=expected_attach)
+        expected_attach=expected_attach, expected_operation=expected_operation)
     return verdict
 
 
@@ -1098,6 +1447,12 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
     if scope is None:
         return dataclasses.replace(verdict, ok=False, code=POLICY,
                                    reason=reason), None
+    if verdict.accord is not None and not claim_accord(
+            db, verdict.accord, kind="standing", ref=verdict.challenge):
+        return dataclasses.replace(
+            verdict, ok=False, code=ACCORD,
+            reason="accord %s#%d already cited by another gesture: a go authorizes "
+                   "one receipt" % (verdict.accord["agent"], verdict.accord["seq"])), None
     try:
         grant_id = storage.of(db).grants.register(
             approver=verdict.approver, nonce=verdict.nonce, challenge=verdict.challenge,
@@ -1231,6 +1586,21 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
     return None
 
 
+def list_standing(db: Db, *, include_inactive: bool = False) -> list[dict]:
+    """#7631 : les grants (actifs seulement par défaut), avec leur cadre de
+    charte et leur accord, relus du reçu enregistré."""
+    rows = storage.of(db).grants.listed(include_inactive=include_inactive)
+    for row in rows:
+        try:
+            request = parse_receipt(row.pop("receipt_json")).request
+        except (ReceiptError, TypeError, ValueError):
+            request = {}
+        row["charter"] = (request.get("standing") or {}).get("charter")
+        row["accord"] = request.get("accord")
+        row["facade"] = row.get("facade") or ""
+    return rows
+
+
 def revoke_standing(db: Db, grant_id: int, *, by: str) -> bool:
     """Révoque un grant (aucune réservation nouvelle ensuite).
 
@@ -1266,6 +1636,20 @@ def _normalize_aaguid(value) -> str | None:
     if not _AAGUID_RE.fullmatch(text):
         raise ReceiptError("unreadable aaguid: %r" % (value,))
     return "%s-%s-%s-%s-%s" % (text[:8], text[8:12], text[12:16], text[16:20], text[20:])
+
+
+def _normalize_accord_operations(facade: str, value) -> list:
+    """#7631 : opérations pour lesquelles le canon accepte un reçu de CETTE clé
+    fichier sous accord journalisé ; absent = aucune (comportement d'avant)."""
+    if value is None:
+        return []
+    if facade != "ed25519":
+        raise ReceiptError("accord_operations: only for an ed25519 file key")
+    if (not isinstance(value, list) or len(value) > 64
+            or any(not isinstance(op, str) or not _IDENT_RE.fullmatch(op) for op in value)
+            or len(set(value)) != len(value)):
+        raise ReceiptError("accord_operations: list of distinct operations expected")
+    return sorted(value)
 
 
 def _label(approver: str, facade: str, credential_id: str) -> str:
@@ -1349,7 +1733,8 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
 
     `members` : [{"title": "smichea", "canon_ref": "members/smichea.md@<sha>",
     "authenticators": [{facade, credential_id, public_key, aaguid, level,
-    canon_ref?}]}]. Le canon est la référence complète : un authentificateur
+    canon_ref?, accord_operations?}]}] — `accord_operations` (#7631, clé
+    `ed25519` seulement) : opérations admises sous accord journalisé. Le canon est la référence complète : un authentificateur
     actif absent de la liste est révoqué ; un changement de clé révoque
     l'ancienne ligne et en crée une nouvelle. Une révocation est un UPDATE de
     la ligne : elle se sérialise avec les lectures sous verrou partagé (`FOR
@@ -1473,6 +1858,8 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
                     "level": _normalize_level(entry.get("level")),
                     "canon_ref": canon_ref,
                     "canon": canon,
+                    "accord_operations": _normalize_accord_operations(
+                        facade, entry.get("accord_operations")),
                 }
             except ReceiptError as exc:
                 errors.append("%s (%s): %s" % (where, _label(approver, *identity), exc))
@@ -1513,10 +1900,13 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
         if wanted and wanted["approver"] == row["approver"] \
                 and wanted["public_key"] == row["public_key"]:
             keep.add(identity)
-            if (wanted["level"], wanted["aaguid"], wanted["canon_ref"]) != (
-                    row["level"], row.get("aaguid"), row.get("canon_ref")):
+            if (wanted["level"], wanted["aaguid"], wanted["canon_ref"],
+                    wanted["accord_operations"]) != (
+                    row["level"], row.get("aaguid"), row.get("canon_ref"),
+                    sorted(row.get("accord_operations") or ())):
                 store.update_meta(row["id"], level=wanted["level"],
-                                  aaguid=wanted["aaguid"], canon_ref=wanted["canon_ref"])
+                                  aaguid=wanted["aaguid"], canon_ref=wanted["canon_ref"],
+                                  accord_operations=wanted["accord_operations"])
                 result["updated"].append(label)
             else:
                 result["unchanged"] += 1

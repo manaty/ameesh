@@ -34,7 +34,7 @@ import os
 import re
 
 from . import agent_names, storage, work
-from .storage.postgres import catalog as _catalog
+from .modules.dev import tables as dev_tables
 from .config import Config
 
 RENAMED_EVENT = "agent.renamed"
@@ -42,6 +42,10 @@ RENAMED_EVENT = "agent.renamed"
 # Columns holding an agent name, rewritten where equal to OLD. Array columns
 # are marked with a trailing "[]".
 REWRITTEN = (
+    # #7631 (0586): the claim (agent, seq) follows the journal entry — the
+    # conversation log cascades on rename; a go already cited must not become
+    # reusable under the new spelling.
+    "accord_claims.agent",
     "account_budgets.set_by", "account_rate_events.agent", "account_reservations.agent",
     "account_reservations.closed_by", "account_switches.agent", "account_turn_slots.agent",
     "account_turn_starts.agent", "agent_lot_sessions.agent", "agent_mailbox.recipient",
@@ -53,14 +57,13 @@ REWRITTEN = (
     # ordinary actor (not an approval), renamed like `work_items.planned_by`
     "conversation_moves.agent", "conversation_moves.requested_by",
     "estimate_references.published_by", "external_executors.declared_by",
-    "external_executors.retired_by", "github_watch_pending.agent", "host_lifecycle.actor",
+    "external_executors.retired_by", "host_lifecycle.actor",
     "host_lifecycle.return_requested_by", "host_lifecycle_transitions.actor",
-    "housekeeping_log.actor", "housekeeping_log.agent", "integration_train_fires.changed_by",
-    "integration_train_fires.owner", "managed_worktrees.agent", "merge_locks.owner",
-    "merge_queue.queued_by", "notify_briefs.recipient", "notify_state.owner",
+    "housekeeping_log.actor", "housekeeping_log.agent",
+    "notify_briefs.recipient", "notify_state.owner",
     "operator_pause_events.actor", "persona_sessions.persona", "provider_account_credits.agent",
-    "provider_account_credits.prepaid_by", "repository_footprint_policies.updated_by",
-    "review_catch_up.actor", "sandbox_turns.agent", "session_bindings.agent",
+    "provider_account_credits.prepaid_by",
+    "sandbox_turns.agent", "session_bindings.agent",
     "tranche_reservations.agent", "tranche_reservations.closed_by", "tranche_events.actor",
     "tranche_limits.admitted_by",
     "session_bindings.created_by", "spend_pending.agent", "spend_marker_events.agent",
@@ -69,14 +72,15 @@ REWRITTEN = (
     "work_item_delegations.delegate", "work_item_delegations.delegated_by",
     "work_item_delegations.resolved_by", "work_item_dependencies.created_by",
     "work_item_estimates.estimated_by", "work_item_events.actor",
-    "work_item_impact_analyses.analyzed_by",
-    "work_item_footprints.created_by", "work_item_links.created_by",
+    "work_item_links.created_by",
     "work_item_links.decided_by", "work_item_milestones.actor", "work_items.assignee",
     "work_items.delegated_by", "work_items.estimate_by",
     "work_items.external_executor", "work_items.planned_by", "work_items.reviewer",
-    "work_review_withdrawals.reviewer", "work_items.reviewers[]", "work_landings.created_by",
-    "work_packages.planned_by", "work_packet_members.recorded_by", "work_resolutions.created_by",
-)
+    "work_items.reviewers[]",
+    "work_packages.planned_by",
+    # P1b #7650 : les colonnes des tables du module `dev` sont déclarées par
+    # leur propriétaire (une seule liste, jamais recopiée ici).
+) + dev_tables.REWRITTEN
 
 # Children of agent_registry(name) and conversation_heads(agent): moved by the
 # cascade (0516), counted only.
@@ -97,9 +101,6 @@ KEPT = (
     # Admission/settlement use account + attempt_id, never this spelling.
     "credit_cycles.actor", "credit_requests.agent",
     "credit_reconciliations.actor",  # Operator reconciliation audit evidence.
-    # #7477 (0580): immutable composition provenance, including the exact
-    # composer lease identity. Historical receipts are read through aliases.
-    "work_packet_snapshots.recorded_by", "work_packet_snapshots.lease_owner",
     # #7066: the spelling is bound by the owner's signature. A renamed agent
     # needs a fresh decision; rewriting this index must not widen authority.
     "account_turn_exceptions.agent",
@@ -119,31 +120,28 @@ KEPT = (
     "agent_name_resolutions.primary_name", "agent_name_resolutions.supplied_name",
     "agent_registry.name", "agent_registry.roles", "agent_renames.actor",
     "agent_renames.new_name", "agent_renames.old_name", "authenticator_syncs.applied_by",
-    "authenticators.approver", "ci_runner_state.name", "ci_runs.superseded_by",
+    "authenticators.approver",
     "exec_audit.agent", "executor_events.actor", "executor_invitations.agents_allowlist",
     "executor_invitations.created_by", "executors.agents_allowlist",
     "executor_tokens.agent", "executors.enrolled_by", "executors.revoked_by",
     "key_events.holder", "key_events.name", "key_holders.name", "mesh_approvals.approver",
     "mesh_approvals.consumed_by", "mesh_consumed_nonces.approver",
-    "mesh_consumed_nonces.consumed_by", "provenance_receipts.actor",
-    # #6873 (0566) : la révocation est une preuve datée (acteur, raison), au
-    # même titre que le reçu qu'elle retire ; un renommage ne la réécrit pas.
-    "provenance_revocations.actor",
+    "mesh_consumed_nonces.consumed_by",
+    # #6873 (0566) : la révocation est une preuve datée (acteur, raison) ;
+    # sa colonne vit avec le module `dev` (P1b #7650).
     # #7119 (0574) : le journal des grants d'attach est une preuve datée (grant
     # accepté ou refusé pour CET agent) ; un renommage ne le réécrit pas.
     "attach_grant_events.agent", "attach_grant_events.checked_by",
     # #6669 (0564) : le journal additif des résolutions de constat est une
-    # preuve historique (retrait, correction) que l'append-only interdit de
-    # réécrire ; un renommage ne le déplace pas (corrector/adjudicator ne
-    # relèvent pas du motif d'identité, ils restent des preuves aussi).
-    "review_finding_resolutions.withdrawn_by", "schema_migrations.name",
+    # preuve historique ; sa colonne vit avec le module `dev` (P1b #7650).
+    "schema_migrations.name",
     "schema_non_additive_migrations.name",
     "spend_marker_events.actor",  # Human resolution / runner audit evidence.
     "sandbox_turns.owner",  # Runner lease owner, never an agent identity.
     "standing_approvals.approver", "standing_approvals.registered_by",
     "standing_approvals.revoked_by", "turn_cost_corrections.actor",
     "work_module_milestones.actor",
-)
+) + dev_tables.KEPT
 
 
 class RenameError(ValueError):
@@ -158,6 +156,9 @@ def _split(column: str) -> tuple[str, str, bool]:
 
 def _uses(tx, column: str, name: str) -> int:
     table, col, is_array = _split(column)
+    if table in dev_tables.TABLES:
+        # P1b #7650 : le nom physique d'une table `dev` est lu au registre.
+        return storage.of(tx).agent_columns.uses(table, col, is_array, name)
     predicate = "%s = ANY(%s)" if is_array else "%s = %s"
     rows = tx.query("SELECT count(*) AS n FROM %s WHERE %s" % (
         table, predicate % ("%s", col)), (name,))
@@ -166,6 +167,9 @@ def _uses(tx, column: str, name: str) -> int:
 
 def _rewrite(tx, column: str, old: str, new: str) -> int:
     table, col, is_array = _split(column)
+    if table in dev_tables.TABLES:
+        # P1b #7650 : la table n'est pas dans le schéma noyau après P2.
+        return storage.of(tx).agent_columns.rewrite(table, col, is_array, old, new)
     # Counted in SQL (0516): the psql driver's execute() reports no row count.
     rows = tx.query("SELECT ameesh_rename_agent_column(%s, %s, %s, %s, %s) AS n",
                     (table, col, is_array, old, new))
@@ -265,18 +269,12 @@ def _rename_tx(tx, old: str, new: str, who: str, reason: str) -> dict:
     # under review that pairing is not proven to hold everywhere. Merged and
     # closed lots are past the gate.
     spellings = [old] + aliases
-    pending = tx.query(
-        "SELECT DISTINCT w.id FROM provenance_receipts p"
-        "  LEFT JOIN work_item_milestones m ON p.subject = 'milestone:' || m.id"
-        "  JOIN work_items w ON w.id = coalesce(p.work_item_id, m.work_item_id)"
-        " WHERE p.actor = ANY(%s::text[]) AND w.state = ANY(%s::text[])"
-        " ORDER BY w.id LIMIT 6",
-        # literals, not lists: the psql driver cannot bind a Python list
-        (_catalog._text_array(spellings), _catalog._text_array(work.OPEN_STATES)))
+    # P1b #7650 : `provenance_receipts` est une table du module `dev`.
+    pending = storage.of(tx).provenance.pending_lots(spellings, work.OPEN_STATES)
     if pending:
         raise RenameError("agent rename refused: %s has signed proofs on unmerged lots "
                           "(%s): rename once they are merged or closed"
-                          % (old, ", ".join("#%d" % r["id"] for r in pending)))
+                          % (old, ", ".join("#%d" % lot for lot in pending)))
     other = tx.query("SELECT name FROM agent_registry WHERE name <> %s"
                      " AND (name = %s OR %s = ANY(aliases))", (old, new, new))
     if other:

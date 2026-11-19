@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from . import packet_close, plan_git, work
+from . import packet_close, plan_git, storage, work
 
 #: un chemin de test : son adaptation de composition n'exige aucun avis (§11 bis)
 _TEST = re.compile(
@@ -76,9 +76,8 @@ def _landing_members(db, vehicle: int) -> list[dict]:
     if db is None:
         return []
     try:
-        rows = db.query(
-            "SELECT work_item_id, pinned_sha FROM work_landings"
-            " WHERE vehicle_id = %s ORDER BY work_item_id", (int(vehicle),))
+        # #7650 : `work_landings` est une table du module `dev`.
+        rows = storage.of(db).work_dependencies.landings_on_vehicle(vehicle)
     except Exception:  # noqa: BLE001 - base illisible : aucun membre lu
         return []
     found = []
@@ -448,12 +447,8 @@ def _packet_base(db, vehicle: int, repo: str, head: str, target: str) -> tuple[s
     if not target:
         return "", ""
     try:
-        rows = db.query(
-            "SELECT m.base_sha, m.head_sha, p.branch_target AS package_target"
-            " FROM work_packet_members m JOIN work_items p ON p.id = m.package_id"
-            " WHERE m.package_id = %s"
-            " ORDER BY m.recorded_at DESC, m.work_item_id",
-            (int(vehicle),))
+        # #7650 : `work_packet_members` est une table du module `dev`.
+        rows = storage.of(db).work.packet_member_heads(vehicle)
     except Exception:  # noqa: BLE001 - base ou schéma illisible : repli
         return "", ""
     head = str(head or "").strip().lower()

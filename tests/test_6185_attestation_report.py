@@ -58,10 +58,14 @@ class ReportTest(unittest.TestCase):
     def test_postgres_json_retains_the_envelope_and_n_minus_one_columns(self):
         from ameesh.storage.postgres.prevalidation import PrevalidationReports
         database = mock.Mock()
+        # #7650 : le schéma dev est lu une fois par connexion. Le double n'est
+        # pas une connexion réelle : sans cache explicite, la Mock rendrait un
+        # nom de schéma illisible dans le SQL qualifié.
+        database.driver._ameesh_dev_schema = 'public'
         store = PrevalidationReports(database)
         store.record(self.report)
         sql, parameters = database.execute.call_args.args
-        self.assertIn('INSERT INTO prevalidation_reports', sql)
+        self.assertIn('INSERT INTO "public"."prevalidation_reports"', sql)
         self.assertEqual(parameters[0:2], (6185, 'a' * 40))
         self.assertEqual(parameters[4], prevalidation.REPORT_SCHEMA)
         self.assertEqual(json.loads(parameters[-1]), self.report)

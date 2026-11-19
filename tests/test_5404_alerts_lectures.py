@@ -6,7 +6,7 @@ from unittest import mock
 from ameesh import canon, db as db_mod
 from ameesh.modules.dev import lot_class
 from ameesh.storage.postgres import operations, roadmap, work, work_dependencies
-from tests.support import PgTestCase
+from tests.support import PgTestCase, registry_absent
 
 
 class SqlSansLigneEntiere(unittest.TestCase):
@@ -28,6 +28,11 @@ class SqlSansLigneEntiere(unittest.TestCase):
 
             def query(self, sql, params=()):
                 self.lectures += 1
+                probe = registry_absent(sql)
+                if probe is not None:
+                    return probe
+                if "to_regclass" in sql:
+                    return [{"present": False}]
                 return [{"n": self.n}]
 
         a_jour = Base(len(work._OPTIONAL_ITEM_COLUMNS))
