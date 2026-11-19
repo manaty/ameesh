@@ -98,7 +98,11 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
 
     `start_on=True` (: #7760) écarte les paires « démarrage sur » (#7760) :
     reste ce qui retient vraiment le démarrage. Sans lui, chaque paire porte
-    `start_on` et `other_frozen_sha` pour l'affichage."""
+    `start_on` et `other_frozen_sha` pour l'affichage.
+
+    #7758 : un occupant exempté (`exempt_sql` : véhicule de paquet, décision,
+    découpage) n'occupe rien ; un véhicule n'a pas de delta propre, ses
+    membres sont comptés chacun."""
     rows = ("SELECT o.id, o.state, o.assignee, mine.path, theirs.path AS other_path,"
             "       " + start_on_sql(alias, "o") + " AS start_on,"
             "       (SELECT m.sha FROM work_item_milestones m"
@@ -113,6 +117,7 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
             "   AND coalesce(btrim(" + alias + ".app), '') <> ''"
             "   AND btrim(o.app) = btrim(" + alias + ".app)"
             "   AND " + occupying_sql("o") +
+            "   AND NOT " + exempt_sql("o") +
             "   AND NOT " + _SHARED.format(app=alias + ".app", p="mine") +
             "   AND NOT " + _SHARED.format(app=alias + ".app", p="theirs"))
     if start_on:
