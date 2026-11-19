@@ -83,9 +83,18 @@ inventaire) lève `CandidateError` et rend toute la liste inutilisable.
 #4572 : `candidate_refusal` rend le **premier refus côté auteur** d'un seul
 lot (`freeze-not-head`, `conflict`, …), avec le geste attendu, pour les
 lecteurs qui ne composent pas — escalade SLO « review GO → merge » et
-`ameesh debit`. Mêmes codes que `_candidate`, lecture locale des refs du
-dépôt (aucun fetch) ; `ready=True` seulement quand le gel est la tête publiée
-et que la fusion avec la cible est propre.
+`ameesh debit`. Mêmes codes que `_candidate`, lecture des refs du dépôt
+(aucun fetch ; la forge n'est relue qu'avant un refus possible) ;
+`ready=True` seulement quand le gel est la tête publiée et que la fusion avec
+la cible est propre.
+
+#7755 : la ref de suivi `origin/<branche>` d'un clone peut être restée au gel
+N-1 alors que la poussée a publié N ; la lire seule accusait l'auteur d'un
+faux `freeze-not-head` (débit, escalade SLO). Avant ce refus — et seulement
+là — la tête est relue à la forge par un `ls-remote` mis en cache ; la forge
+tranche, et sans lecture possible une ref locale antérieure au gel rend
+`unknown`, jamais `freeze-not-head`. Le cas « gel = tête locale » ne paie
+aucune lecture réseau.
 
 #6607 : une tête qui porte des commits d'un autre lot **ouvert** du projet
 absents de la cible (son `branch_head`, sa tête publiée, l'une des têtes
@@ -461,6 +470,78 @@ def _ancestor(repo: str, tip: str, base: str) -> bool:
                              % (proc.returncode,
                                 proc.stderr.decode("utf-8", "replace").strip()[:300]))
     return proc.returncode == 0
+
+
+#: #7755 : une tête lue à la forge par `ls-remote` est réutilisée ce temps (s) :
+#: une passe de débit ou d'escalade ne relance pas une lecture par lot.
+FORGE_HEAD_TTL_S = 60.0
+#: #7755 : délai d'un `ls-remote` (s). Court : une forge muette fait douter le
+#: lecteur, jamais accuser l'auteur d'un gel périmé.
+FORGE_HEAD_TIMEOUT_S = 8.0
+#: têtes lues récemment, `(dépôt, branche)` → `(lu à, (genre, sha))`
+_FORGE_HEADS: dict = {}
+
+
+def _forge_head(repo: str, branch: str) -> tuple[str, str | None]:
+    """La tête **publiée** de `branch` sur `origin`, lue maintenant (#7755).
+
+    Rend `('sha', commit)` quand la forge répond, `('absent', None)` quand elle
+    ne porte pas la branche, `('error', None)` quand elle est illisible
+    (réseau, droits, délai) et `('local', None)` quand le dépôt n'a aucun
+    distant : le clone est alors la seule référence. Aucune écriture, aucun
+    `fetch` : `ls-remote` ne fait que lire. Une lecture par `(dépôt, branche)`
+    est réutilisée `FORGE_HEAD_TTL_S` secondes, échecs compris — c'est un
+    cache, jamais une preuve plus vieille qu'une passe."""
+    branch = merge_queue._remote_branch(branch)
+    if not branch:
+        return "error", None
+    key = (repo, branch)
+    cached = _FORGE_HEADS.get(key)
+    if cached is not None and time.monotonic() - cached[0] < FORGE_HEAD_TTL_S:
+        return cached[1]
+    try:
+        remotes = (plan_git._out(repo, "remote") or "").split()
+    except Exception:  # noqa: BLE001 - dépôt illisible : pas de forge lisible
+        remotes = []
+    if "origin" not in remotes:
+        # Un dépôt sans distant n'a que son clone ; un distant qui n'est pas
+        # `origin` ne prouve rien de la branche lue ici.
+        out = ("local", None) if not remotes else ("error", None)
+    else:
+        try:
+            proc = plan_git._git(repo, "ls-remote", "--heads", "origin",
+                                 "refs/heads/" + branch,
+                                 timeout=FORGE_HEAD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - forge illisible : on ne conclut pas
+            out = ("error", None)
+        else:
+            words = (proc.stdout or b"").decode("utf-8", "replace").split()
+            if proc.returncode != 0:
+                out = ("error", None)
+            elif not words:
+                out = ("absent", None)
+            else:
+                sha = plan_git.full_commit_id(words[0])
+                out = ("sha", sha) if sha else ("error", None)
+    _FORGE_HEADS[key] = (time.monotonic(), out)
+    return out
+
+
+def _behind_freeze(repo: str, head: str, frozen: str) -> bool:
+    """#7755 : `head` est un ancêtre de `frozen` et en diffère.
+
+    Une ref de suivi locale peut être restée au gel N-1 : la poussée qui a
+    publié N n'a pas été récupérée par ce clone (`repo_for_freeze` choisit le
+    clone de l'assigné, jamais réactualisé). Elle ne prouve donc pas que le
+    gel n'est pas la tête publiée : le lecteur rend `unknown`, jamais
+    `freeze-not-head`. Une lecture impossible ne déclare pas non plus que la
+    tête est en retard."""
+    if not (repo and head and frozen) or plan_git.same_commit(head, frozen):
+        return False
+    try:
+        return _ancestor(repo, head, frozen)
+    except CandidateError:
+        return False
 
 
 def open_lot_heads(db, app: str, *, tips: dict | None = None) -> tuple[list[dict], bool]:
@@ -1617,6 +1698,9 @@ def refusal_of(row: dict, *, frozen: str = "", raw_freeze: str = "",
     observation et ne doit pas la remplacer (voir `plan_git.freeze_candidate`).
     Un `published` vide laisse la tête inconnue : si aucun conflit n'est
     trouvé, le résultat est `unknown` — on ne dit jamais « prêt » sans preuve.
+    #7755 : le lecteur qui ne peut pas établir la tête (ref de suivi en
+    retard) passe `published` vide, jamais une ref antérieure au gel — c'est
+    ce qui interdit le faux `freeze-not-head`.
 
     `ready=True` seulement quand le gel est la tête publiée et que l'essai de
     fusion est propre. `unknown=True` quand la lecture n'a pas pu conclure
@@ -1808,10 +1892,13 @@ def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
     être fourni par un appelant qui l'a déjà résolu. Le dépôt est retrouvé par
     le commit gelé comme dans `merge_queue.review_gate_for_item` (#2559) ;
     `overview` réutilise les lignes du registre déjà lues par la passe.
-    `published` est la ref `origin/<branche>` du dépôt, jamais `branch_head` ;
-    à défaut de dépôt, `branch_head` ne sert qu'à **nommer** la tête dans le
-    détail (`published_source="observed"`), la conclusion restant `unknown`
-    sans essai de fusion. Lecture seule, aucun fetch, aucune écriture.
+    `published` est la tête **publiée** de la branche : la ref
+    `origin/<branche>` du dépôt, relue à la forge par un `ls-remote` mis en
+    cache (#7755) quand elle diffère du gel — une ref de suivi restée en
+    arrière ne fait jamais un `freeze-not-head`, elle rend `unknown`. À défaut,
+    `branch_head` ne sert qu'à **nommer** la tête dans le détail
+    (`published_source="observed"`), la conclusion restant `unknown` sans
+    essai de fusion. Lecture seule, aucun fetch, aucune écriture.
 
     #6607 : un gel qui porte des commits d'un autre lot ouvert absents de la
     cible, sans dépendance déclarée, rend `stacked-undeclared` (`depends_on`
@@ -1840,6 +1927,7 @@ def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
                 frozen = plan_git.local_commit(repo, raw) or ""
             except Exception:  # noqa: BLE001 - commit illisible : on ne conclut pas
                 frozen = ""
+    forge_absent = False
     if repo:
         branch = str(row.get("branch") or "").strip()
         if branch:
@@ -1850,6 +1938,28 @@ def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
                 published = ""
             if published:
                 source = "origin"
+            if frozen and (not published
+                           or not plan_git.same_commit(published, frozen)):
+                # #7755 : la ref de suivi peut être restée au gel précédent
+                # (clone de l'assigné jamais réactualisé). Avant d'accuser
+                # l'auteur, la forge tranche ; elle n'est lue que dans ce cas,
+                # jamais quand le gel est déjà la tête locale, pour ne pas
+                # ajouter un `ls-remote` par lot aux passes de débit et d'SLO.
+                kind, tip = _forge_head(repo, branch)
+                if kind == "sha" and tip:
+                    published, source = tip, "forge"
+                elif kind == "absent":
+                    # La branche n'est plus sur la forge : la ref locale ne
+                    # prouve plus une tête publiée.
+                    published, source = "", ""
+                    forge_absent = True
+                elif _behind_freeze(
+                        repo,
+                        published or str(row.get("branch_head") or "").strip(),
+                        frozen):
+                    # Une tête en retard de la poussée qui a publié le gel ne
+                    # prouve pas que le gel n'est pas la tête publiée.
+                    published, source = "", ""
         try:
             target_name = lot_class.default_base(cfg, row, repo) or target_name
         except Exception:  # noqa: BLE001 - cible illisible : essai sans cible
@@ -1861,9 +1971,9 @@ def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
                 base = (plan_git._commit(repo, ref) or "") if ref else ""
             except Exception:  # noqa: BLE001 - cible illisible : essai sans base
                 base = ""
-    if not published:
+    if not published and not forge_absent:
         observed = str(row.get("branch_head") or "").strip()
-        if observed:
+        if observed and not _behind_freeze(repo, observed, frozen):
             published, source = observed, "observed"
     result = refusal_of(row, frozen=frozen, raw_freeze=raw,
                         published=published, published_source=source,
