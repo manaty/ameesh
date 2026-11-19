@@ -2431,6 +2431,18 @@ def _git_env() -> dict:
     return env
 
 
+def _git_safe_directory(repo: str) -> str:
+    """#7694 (B1 de #44265) : dépôt du canon, chemin canonique, pour Git.
+
+    Un hôte pod clone le canon sous l'UID du superviseur et le lit sous celui
+    du tenant : Git refuse alors « detected dubious ownership », même en
+    lecture seule. `_git` déclare donc la confiance **en argument** — `-c
+    safe.directory=<ce dépôt>`, jamais `*` — et non par l'environnement : le
+    filtrage de `_git_env` (GIT_CONFIG_COUNT/KEY/VALUE retirés) reste entier.
+    """
+    return os.path.realpath(os.path.abspath(str(repo)))
+
+
 #: #1749 : une **sonde de présence** (l'objet est-il là ?) ne doit pas
 #: réveiller le fetch paresseux d'un clone partiel : il part, échoue, et
 #: laisse son transport orphelin, adopté par l'exécuteur puis jamais
@@ -3022,6 +3034,10 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         timeout = deadline.timeout(timeout)
     cmd = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",
            "-c", "core.fsmonitor=false", "-c", "core.hooksPath=%s" % os.devnull,
+           # #7694 : confiance bornée à CE dépôt (le canon d'un hôte pod est
+           # cloné sous un autre UID que celui qui le lit) ; en argument, donc
+           # insensible au filtrage des GIT_CONFIG_* de `_git_env`.
+           "-c", "safe.directory=%s" % _git_safe_directory(repo),
            *args]
     key = _content_cache_key(repo, args, stdin, env_extra)
     if key is not None:

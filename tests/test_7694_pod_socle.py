@@ -687,6 +687,30 @@ class SafeDirectoryTest(unittest.TestCase):
             self.assertEqual(accepte.returncode, 0, accepte.stderr)
             self.assertEqual(accepte.stdout.strip(), ".git")
 
+    def test_canon_git_porte_lui_meme_la_confiance_bornee(self):
+        """Le lecteur RÉEL du canon (`canon._git`, dont l'environnement filtre
+        les `GIT_CONFIG_*`) déclare lui-même `-c safe.directory=<ce dépôt>` :
+        sans cet argument, Git refuserait le clone d'un autre UID."""
+        if shutil.which("git") is None:  # pragma: no cover - environnement
+            self.skipTest("git absent")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "canon")
+            subprocess.run(["git", "init", "-q", repo], check=True)
+            self.assertEqual(canon._git_safe_directory(repo), os.path.realpath(repo))
+            self.assertNotEqual(canon._git_safe_directory(repo), "*")
+            with mock.patch.dict(os.environ,
+                                 {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "true"}):
+                proc = canon._git(repo, "rev-parse", "--git-dir")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), b".git")
+            # …sans relâcher le filtrage de la configuration Git injectée.
+            with mock.patch.dict(os.environ,
+                                 {"GIT_CONFIG_COUNT": "1",
+                                  "GIT_CONFIG_KEY_0": "safe.directory",
+                                  "GIT_CONFIG_VALUE_0": "*"}):
+                self.assertNotIn("GIT_CONFIG_COUNT", canon._git_env())
+                self.assertNotIn("GIT_CONFIG_KEY_0", canon._git_env())
+
 
 @unittest.skipIf(yaml is None, "PyYAML absent : témoin non vérifié (bash -n reste possible)")
 class WitnessTest(unittest.TestCase):
