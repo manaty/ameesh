@@ -295,7 +295,8 @@ def decision_context(canon, host: str, repository: str | None, forge: Forge) -> 
                                for h in sorted(humans or [])),
         "mode=%s" % forge.mode,
         "forges=%s" % ",".join(sorted(forge.hosts or [])),
-        "ssh_key=%s" % (forge.ssh_key or ""),
+        # Façade de forge sans clé (doubles de test, forges anciennes) : vide.
+        "ssh_key=%s" % (getattr(forge, "ssh_key", None) or ""),
     ])
     return {"fingerprint": fingerprint, "repo": repo, "humans": humans, "logins": logins,
             "refs": refs}
