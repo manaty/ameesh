@@ -1,11 +1,30 @@
 # SPDX-License-Identifier: AGPL-3.0-only
+import threading
+import time
 import unittest
 import json
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import planned_waits, pre_act
 from tests import support
+
+
+def fake_clock(*, times=(), monotonic=()):
+    """A time namespace private to pre_act (#7845).
+
+    ``pre_act.time`` is patched, not the stdlib module it imported: the real
+    ``time`` stays shared, untouched, with every other thread of the process.
+    Patching ``time.time`` directly let any concurrent reader consume the
+    side effects meant for pre_act and made the wait tests red in CI only.
+    """
+    return SimpleNamespace(
+        time=mock.Mock(side_effect=list(times)) if times else time.time,
+        sleep=mock.Mock(),
+        monotonic=(mock.Mock(side_effect=list(monotonic)) if monotonic
+                   else time.monotonic),
+    )
 
 
 class Transaction:
@@ -86,8 +105,8 @@ class PreActTest(unittest.TestCase):
         db.transaction.return_value = nullcontext(tx)
         binding = mock.Mock(ok=True, name="bureau")
         binding.name = "bureau"
-        with mock.patch.object(pre_act.time, "time", side_effect=[1000, 1060]), \
-             mock.patch.object(pre_act.time, "sleep") as sleep, \
+        clock = fake_clock(times=[1000, 1060])
+        with mock.patch.object(pre_act, "time", clock), \
              mock.patch.object(pre_act.config, "load", return_value=object()), \
              mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
              mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
@@ -96,7 +115,7 @@ class PreActTest(unittest.TestCase):
             result = pre_act.main(["--lot", "5772", "--kind", "kms", "--wait-until",
                                    "1970-01-01T00:17:40Z", "--", "true"])
         self.assertEqual(result, 1)
-        sleep.assert_called_once_with(60)
+        clock.sleep.assert_called_once_with(60)
         execute.assert_not_called()
         self.assertFalse(tx.writes)
 
@@ -107,8 +126,8 @@ class PreActTest(unittest.TestCase):
         db.transaction.return_value = nullcontext(tx)
         binding = mock.Mock(ok=True)
         binding.name = "bureau"
-        with mock.patch.object(pre_act.time, "time", side_effect=[1000, 1060]), \
-             mock.patch.object(pre_act.time, "sleep") as sleep, \
+        clock = fake_clock(times=[1000, 1060])
+        with mock.patch.object(pre_act, "time", clock), \
              mock.patch.object(pre_act.config, "load", return_value=object()), \
              mock.patch.object(pre_act.db_mod, "open_db", return_value=db) as open_db, \
              mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
@@ -117,7 +136,7 @@ class PreActTest(unittest.TestCase):
             result = pre_act.main(["--lot", "5772", "--kind", "kms", "--wait-until",
                                    "1970-01-01T00:17:40Z", "--", "true"])
         self.assertEqual(result, 0)
-        sleep.assert_called_once_with(60)
+        clock.sleep.assert_called_once_with(60)
         execute.assert_called_once_with("true", ["true"])
         # The connection is closed for the wait and reopened for the check.
         self.assertEqual(open_db.call_count, 2)
@@ -135,8 +154,8 @@ class PreActTest(unittest.TestCase):
         db.transaction.return_value = nullcontext(tx)
         binding = mock.Mock(ok=True)
         binding.name = "bureau"
-        with mock.patch.object(pre_act.time, "time", side_effect=[100, 160]), \
-             mock.patch.object(pre_act.time, "sleep") as sleep, \
+        clock = fake_clock(times=[100, 160])
+        with mock.patch.object(pre_act, "time", clock), \
              mock.patch.object(pre_act.config, "load", return_value=object()), \
              mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
              mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
@@ -145,8 +164,47 @@ class PreActTest(unittest.TestCase):
             result = pre_act.main(["--lot", "5772", "--kind", "kms", "--wait-until",
                                    "1970-01-01T00:02:40Z", "--", "true"])
         self.assertEqual(result, 0)
-        sleep.assert_called_once_with(60)
+        clock.sleep.assert_called_once_with(60)
         execute.assert_called_once_with("true", ["true"])
+
+    def test_wait_until_foreign_clock_read_does_not_consume_side_effects(self):
+        # #7845: the old tests patched the stdlib ``time`` module through
+        # ``pre_act.time``. Another thread of the CI process (psycopg pool,
+        # leftover worker) then consumed the first side effect, leaving
+        # ``remaining == 0`` and no sleep. The fake clock is now private to
+        # pre_act: a concurrent real clock read changes nothing.
+        real_time = time.time
+        tx = Transaction(events=[{"id": 2, "actor": "owner", "note": "STOP", "ts": 105}])
+        db = mock.Mock()
+        db.query.return_value = [{"now_ts": 100}]
+        db.transaction.return_value = nullcontext(tx)
+        binding = mock.Mock(ok=True, name="bureau")
+        binding.name = "bureau"
+        clock = fake_clock(times=[1000, 1060])
+        read = threading.Event()
+
+        def read_the_stdlib_clock():
+            time.time()
+            read.set()
+
+        with mock.patch.object(pre_act, "time", clock), \
+             mock.patch.object(pre_act.config, "load", return_value=object()), \
+             mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
+             mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
+             mock.patch.object(pre_act.identity, "resolve_binding", return_value=binding), \
+             mock.patch.object(pre_act.os, "execvp") as execute:
+            self.assertIs(time.time, real_time)
+            reader = threading.Thread(target=read_the_stdlib_clock)
+            reader.start()
+            self.assertTrue(read.wait(5), "the witness thread did not read the clock")
+            reader.join(5)
+            self.assertFalse(reader.is_alive())
+            result = pre_act.main(["--lot", "5772", "--kind", "kms", "--wait-until",
+                                   "1970-01-01T00:17:40Z", "--", "true"])
+        self.assertEqual(result, 1)
+        clock.sleep.assert_called_once_with(60)
+        execute.assert_not_called()
+        self.assertFalse(tx.writes)
 
     def test_wait_until_unreadable_database_clock_refuses(self):
         for rows in ([], [{"now_ts": float("nan")}], [{"now_ts": "not-a-date"}]):
@@ -345,11 +403,12 @@ class PreActTest(unittest.TestCase):
         db.transaction.return_value = nullcontext(Transaction())
         binding = mock.Mock(ok=True)
         binding.name = "bureau"
+        clock = fake_clock(monotonic=[100, 131])
         with mock.patch.object(pre_act.config, "load", return_value=object()), \
              mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
              mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
              mock.patch.object(pre_act.identity, "resolve_binding", return_value=binding), \
-             mock.patch.object(pre_act.time, "monotonic", side_effect=[100, 131]), \
+             mock.patch.object(pre_act, "time", clock), \
              mock.patch.object(pre_act.os, "execvp") as execute:
             result = pre_act.main(["--lot", "5772", "--kind", "kms", "--since",
                                    "1970-01-01T00:01:40Z", "--", "true"])
