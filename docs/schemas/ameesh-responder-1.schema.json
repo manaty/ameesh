@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/manaty/ameesh/docs/schemas/ameesh-responder-1.schema.json",
+  "title": "ameesh responder wire document, version 1",
+  "description": "#7866 incident routing: one document per ameesh responder --json call.",
+  "type": "object",
+  "required": ["schema", "ok"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "ameesh-responder/1"},
+    "ok": {"type": "boolean"},
+    "application": {
+      "type": "object",
+      "required": ["id", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string"},
+        "title": {"type": "string"}
+      }
+    },
+    "severity": {"enum": ["P1", "P2", "P3", "P4", "security", "data-loss", "outage"]},
+    "responder": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["member", "title"],
+          "additionalProperties": false,
+          "properties": {
+            "member": {"type": "string", "pattern": "^human:"},
+            "title": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "reason": {
+      "enum": ["attached", "recent-interaction", "present", "usual-hours",
+               "no-responder", "severity-not-covered", "no-incident-block"]
+    },
+    "signals": {
+      "type": "array",
+      "items": {"enum": ["attach", "interaction", "presence", "timezone"]},
+      "uniqueItems": true
+    },
+    "via": {
+      "oneOf": [
+        {"type": "object", "required": ["role"], "additionalProperties": false,
+         "properties": {"role": {"type": "string"}}},
+        {"type": "object", "required": ["member"], "additionalProperties": false,
+         "properties": {"member": {"type": "string", "pattern": "^human:"}}}
+      ]
+    },
+    "wake": {
+      "type": "object",
+      "required": ["plan", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "plan": {"enum": ["none", "immediate", "no-responder"]},
+        "status": {"enum": ["not-needed", "requested", "disabled", "refused",
+                            "unconfigured", "failed"]},
+        "reason": {"type": "string"},
+        "request_id": {"type": "string"}
+      }
+    },
+    "journal": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["event"],
+          "additionalProperties": false,
+          "properties": {"event": {"type": "integer", "minimum": 1}}
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {"type": "string"},
+        "message": {"type": "string"}
+      }
+    }
+  }
+}
