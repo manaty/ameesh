@@ -1433,7 +1433,7 @@ def _set_placement(db: Db, name: str, host: str, verdict: placement_mod.Verdict)
 
 
 def _write_candidate(db: Db, canon: Canon, agent, admission, host: str, *,
-                     canon_key: str, forge=None) -> None:
+                     canon_key: str, forge=None, absent=()) -> None:
     """L165 (EP1) : verdict de placement de `agent` sur l'hôte candidat `host`.
 
     Le verdict est évalué comme celui de l'hôte courant (politique de l'hôte
@@ -1442,6 +1442,8 @@ def _write_candidate(db: Db, canon: Canon, agent, admission, host: str, *,
     """
     verdict = placement_mod.evaluate(canon, agent.title, host)
     visibility_mod.annotate(canon, agent, host, verdict, db=db, forge=forge)
+    from . import modules as project_modules
+    project_modules.refuse_missing(verdict, agent, absent)
     cwd, _ = canon_mod.work_dir_for(canon.host(host), agent, admission)
     # #7048 : rang de préférence (index dans l'ordre du Placement) ; None pour
     # un rôle élu, classé par disponibilité
@@ -1573,9 +1575,12 @@ def _own_child_verdict(canon: Canon | None, row: dict, root: dict, host: str,
             "host %s belongs to the child's lineage (%s): own placement lost"
             % (host, ", ".join(lineage_hosts)))
     verdict = placement_mod.evaluate(canon, root["name"], host)
+    card = canon.agent(root["name"])
+    if card is not None and verdict.ok is True:
+        from . import modules as project_modules
+        project_modules.refuse_missing(verdict, card, project_modules.missing(canon))
     if verdict.ok is not True:
         return verdict
-    card = canon.agent(root["name"])
     if card is None:
         return placement_mod.Verdict(
             row["name"], host, False,
@@ -1970,6 +1975,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     #: la foi d'une lecture locale incomplète (clone ou membre fédéré absent).
     loaded = canon.loaded_members()
     actions: list[SyncAction] = []
+    #: #7860 : modules sélectionnés par une équipe ou un projet, absents ici
+    from . import modules as project_modules
+    absent = project_modules.missing(canon)
 
     # L31 (0029) : une fiche `Placement` est une ADMISSION (hôtes nommés ou
     # étiquettes). L'hôte d'une ligne du registre est un ÉTAT d'exécution : on
@@ -2086,7 +2094,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                         _clear_responsible(db, name, row.get("host") or host, owner)
                 else:
                     _write_candidate(db, canon, agent, admission, host,
-                                     canon_key=canon_key, forge=forge)
+                                     canon_key=canon_key, forge=forge, absent=absent)
             actions.append(SyncAction(
                 name, "laissé",
                 "running on %s, an admitted host: \"canon sync\" does not move it"
@@ -2113,6 +2121,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         # (fail closed ; sans dépôt de mémoire, sans objet).
         visibility_ok, visibility_diag = visibility_mod.annotate(
             canon, agent, host, verdict, db=db, forge=forge)
+        project_modules.refuse_missing(verdict, agent, absent)
         if candidate and card_errors:
             # L165 : le verdict de placement local ne valide pas la fiche.
             _close_card_candidates(db, name, canon_key, card_errors)
@@ -2216,7 +2225,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             action = SyncAction(name, "créé" if row is None else "mis à jour")
         if candidate and not card_errors:
             _write_candidate(db, canon, agent, admission, host,
-                             canon_key=canon_key, forge=forge)
+                             canon_key=canon_key, forge=forge, absent=absent)
         action.placement = verdict
         if reasons:
             action.blocked = reasons

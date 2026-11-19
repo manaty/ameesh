@@ -6186,7 +6186,10 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 add("pipeline-module-duplicate", ERROR, warning["message"],
                     card.fiche if card is not None else None, pipeline=warning["name"])
                 continue
-            add("module-refused", WARNING, warning["message"],
+            # #7860: a module a team or a project selects, absent from this
+            # host, is a warning; `canon sync` refuses the placement of the
+            # agents of those projects here (`placement_diagnostic`).
+            add(warning["code"], WARNING, warning["message"],
                 **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
     _scoped = review_mod.scoped_from_federation(canon.federation)
     for code, severity, message in _scoped.problems:

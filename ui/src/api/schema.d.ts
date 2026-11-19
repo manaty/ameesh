@@ -680,7 +680,7 @@ export interface components {
                 admitted: boolean | null;
                 claim_predicate: boolean;
                 governed: boolean;
-                reasons: ("mode_externe" | "retired" | "ephemeral_expired" | "host_claims_closed" | "handoff_fenced" | "responsible_missing" | "responsible_policy_unavailable" | "canon_state_missing" | "canon_state_not_ok" | "canon_stale" | "canon_ref_mismatch" | "placement_missing" | "placement_refused" | "placement_profile_diverged" | "claim_predicate")[];
+                reasons: ("mode_externe" | "retired" | "ephemeral_expired" | "host_claims_closed" | "handoff_fenced" | "responsible_missing" | "responsible_policy_unavailable" | "canon_state_missing" | "canon_state_not_ok" | "canon_stale" | "canon_ref_mismatch" | "placement_missing" | "placement_refused" | "placement_profile_diverged" | "module_missing" | "claim_predicate")[];
                 responsible_required: boolean | null;
             };
             agent: {

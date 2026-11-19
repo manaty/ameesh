@@ -35,7 +35,7 @@ The public surface is `ameesh agent observe` (CLI) and
 """
 from __future__ import annotations
 
-from . import accounts, placement, registry, sandbox_observation, storage
+from . import accounts, modules, placement, registry, sandbox_observation, storage
 
 SCHEMA = "ameesh-agent-observation/1"
 
@@ -62,6 +62,7 @@ REASONS = (
     "placement_missing",
     "placement_refused",
     "placement_profile_diverged",
+    "module_missing",
     "claim_predicate",
 )
 
@@ -235,7 +236,14 @@ def _admission(row: dict, *, responsible_required: bool | None, fresh: bool,
         if row["placement_ok"] is None:
             reasons.append("placement_missing")
         elif not row["placement_ok"]:
-            reasons.append("placement_refused")
+            # #7860: a module its project selects is not installed on this
+            # host; the canon stays ok, only this agent is refused. Other
+            # placement causes follow it in the diagnostic.
+            diagnostic = row.get("placement_diagnostic") or ""
+            if diagnostic.startswith(modules.MISSING_PREFIX):
+                reasons.append("module_missing")
+            if not diagnostic.startswith(modules.MISSING_PREFIX) or "; " in diagnostic:
+                reasons.append("placement_refused")
         elif row["placement_profile"] != row["placement_profile_current"]:
             reasons.append("placement_profile_diverged")
         if row["canon_status"] == "ok" and not fresh:
