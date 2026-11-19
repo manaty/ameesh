@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from . import canon as canon_mod, events, spawn
+from . import avatar_connectors, canon as canon_mod, events, spawn
 
 
 @dataclass(frozen=True)
@@ -49,7 +49,10 @@ def lists(card, canon):
                                              or v.startswith('-') for v in value):
             raise spawn.SpawnToolsError('avatar-tools-invalid', '%s must be a list of nonempty tool names' % key)
         values.append(value)
-    return *spawn.normalize(values[0], None), values[1]
+    tools, mcp = spawn.normalize(values[0], None)
+    # #6085: `connector:<name>` and its `mcp__<name>__<tool>` entries.
+    tools, connectors = avatar_connectors.split(tools, mcp)
+    return tools, mcp, values[1], connectors
 
 
 def prepare(cfg, agent, state_dir, cwd, *, harness=None) -> Applied | None:
@@ -67,7 +70,7 @@ def prepare(cfg, agent, state_dir, cwd, *, harness=None) -> Applied | None:
     policy = lists(card, owner)
     if policy is None:
         return None
-    tools, mcp, deny = policy
+    tools, mcp, deny, connectors = policy
     harness = harness or agent.get('harness') or ''
     block = spawn.support(harness)
     # Empty allow-lists still require BOTH mechanisms: no inherited tools/MCP.
@@ -76,16 +79,26 @@ def prepare(cfg, agent, state_dir, cwd, *, harness=None) -> Applied | None:
                                    'harness cannot apply the complete avatar tool policy')
     profile = dict(child=agent['name'], harness=harness, tools=tools, mcp=mcp, deny=deny)
     path, mcp_path = spawn.write_profile(state_dir, profile, cwd)
-    args = tuple(spawn.argv(profile, path))
+    args = spawn.argv(profile, path)
+    files = [path, mcp_path]
+    if connectors:
+        settings_path, args = avatar_connectors.apply(block, connectors, mcp, state_dir, args)
+        files.append(settings_path)
+    else:
+        avatar_connectors.remove(state_dir)
+    args = tuple(args)
     # Hash configuration contents, including MCP transport changes, not just names.
     digest = hashlib.sha256()
     digest.update(repr(args).encode('utf-8'))
-    for file in (path, mcp_path):
+    for file in files:
         with open(file, 'rb') as handle:
             digest.update(handle.read())
     proof = dict(contract='ameesh-avatar-tools/1', harness=harness, tools=tools,
                  mcp=mcp, deny_tools=deny, digest=digest.hexdigest(),
                  card=card.fiche.ref, host=getattr(cfg, 'host', None))
+    if connectors:
+        # #6085: names only (connector and read tools), never content.
+        proof['connectors'] = {name: list(allowed) for name, allowed in connectors.items()}
     return Applied(args, proof)
 
 

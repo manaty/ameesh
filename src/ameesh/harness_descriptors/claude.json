@@ -51,7 +51,17 @@
       "contract": "ameesh-spawn-tools/1",
       "tools": {"flag": ["--tools"]},
       "deny": {"flag": ["--disallowedTools"]},
-      "mcp": {"flag": ["--mcp-config", "{path}", "--strict-mcp-config"], "source": ".mcp.json"}
+      "mcp": {"flag": ["--mcp-config", "{path}", "--strict-mcp-config"], "source": ".mcp.json"},
+      "connectors": {
+        "flag": ["--settings", "{path}"],
+        "replaces": ["--strict-mcp-config"],
+        "servers": {
+          "claude_ai_Slack": "https://mcp.slack.com/*",
+          "claude_ai_Gmail": "https://gmailmcp.googleapis.com/*",
+          "claude_ai_Google_Calendar": "https://calendarmcp.googleapis.com/*",
+          "claude_ai_Google_Drive": "https://drivemcp.googleapis.com/*"
+        }
+      }
     },
     "install": {"note": "binaire `claude` installé par l'hôte ; distribution signée en L17"}
   }

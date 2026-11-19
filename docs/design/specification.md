@@ -173,6 +173,32 @@ rules and configuration digest, without MCP credentials. A changed policy
 restarts the resident before its next turn. Attach rereads the card after
 waiting for the resident to release the session.
 
+**Account connectors** (#6085). An MCP server that needs a credential takes it
+from the harness environment (`"Authorization": "Bearer ${MEMORIA_TOKEN}"`); a
+literal credential in a header, an environment entry or a URL query of
+`.mcp.json` is refused (`spawn-context-secret`). Account-level connectors
+(claude.ai Slack, Gmail…) are not in `.mcp.json`, and Claude Code does not load
+them under `--strict-mcp-config`. A card declares one with `connector:<name>`
+and names each tool it may call; a connector without a named tool, a tool of an
+undeclared connector or a connector unknown to the harness descriptor
+(`ameesh.spawn.connectors.servers`) is refused:
+
+```yaml
+tools:
+  - Read
+  - mcp:memoria
+  - connector:claude_ai_Slack
+  - mcp__claude_ai_Slack__slack_read_thread
+  - mcp__claude_ai_Slack__slack_search_public_and_private
+```
+
+The strict flag is then replaced by a private settings file (`--settings`):
+`allowedMcpServers` admits the declared `mcp:` servers by name and each
+connector by its descriptor URL pattern, and a `PreToolUse` hook refuses every
+other `mcp__` tool, so a tool that a connector adds later stays refused.
+`agent.tools` records the connector and tool names. A managed Claude policy
+(`allowManagedHooksOnly`, its own `allowedMcpServers`) outranks this file.
+
 The mesh's `federation.yaml` can require an explicit avatar list:
 
 ```yaml

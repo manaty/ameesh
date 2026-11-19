@@ -70,6 +70,10 @@ class Support:
     mcp_flag: tuple[str, ...]
     mcp_source: str | None
     deny_flag: tuple[str, ...] = ()
+    #: #6085: account connectors (claude.ai Slack, Gmail…), see avatar_connectors
+    connectors_flag: tuple[str, ...] = ()
+    connectors_replaces: tuple[str, ...] = ()
+    connectors_known: tuple[tuple[str, str], ...] = ()
 
     @property
     def tools(self) -> bool:
@@ -92,9 +96,15 @@ def support(harness: str) -> Support | None:
     mcp_flag = tuple(mcp.get("flag") or ())
     deny = raw.get("deny") if isinstance(raw.get("deny"), Mapping) else {}
     source = mcp.get("source")
+    connectors = raw.get("connectors") if isinstance(raw.get("connectors"), Mapping) else {}
+    known = connectors.get("servers") if isinstance(connectors.get("servers"), Mapping) else {}
     return Support(harness=harness, tools_flag=tools_flag, mcp_flag=mcp_flag,
                    mcp_source=source if isinstance(source, str) and source else None,
-                   deny_flag=tuple(deny.get("flag") or ()))
+                   deny_flag=tuple(deny.get("flag") or ()),
+                   connectors_flag=tuple(connectors.get("flag") or ()),
+                   connectors_replaces=tuple(connectors.get("replaces") or ()),
+                   connectors_known=tuple(sorted((str(k), str(v)) for k, v in known.items()
+                                                 if isinstance(v, str) and v)))
 
 
 def name(value: str, what: str) -> str:
@@ -245,8 +255,51 @@ def mcp_servers(cwd: str | None, source: str | None,
             raise SpawnToolsError(
                 "spawn-context-secret",
                 "MCP server %r carries a literal secret: refusing to copy it" % value)
+        where = literal_credential(servers[value])
+        if where:
+            raise SpawnToolsError(
+                "spawn-context-secret",
+                "MCP server %r carries a literal credential in %s: use an environment "
+                "placeholder such as ${MEMORIA_TOKEN}" % (value, where))
         out[value] = servers[value]
     return out
+
+
+#: #6085: a header, environment variable or query parameter that holds a credential
+_CREDENTIAL_NAME = re.compile(r"(?i)auth|token|secret|key|passw|credential|cookie|session")
+#: what may remain once `${VAR}` placeholders are removed (an auth scheme, nothing else)
+_PLACEHOLDER = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")  # no `:-default`: it could hold a literal
+_SCHEME_ONLY = re.compile(r"(?i)\s*(?:bearer|basic|token)?\s*")
+
+
+def literal_credential(server) -> str | None:
+    """Where a server definition holds a credential written in clear, or None.
+
+    #6085: an MCP server reaches the child through a private file copied from
+    the project's `.mcp.json`. A credential must come from the environment of
+    the harness (`"Authorization": "Bearer ${MEMORIA_TOKEN}"`, expanded by the
+    harness), never as a literal value: the generic patterns of `_has_secret`
+    do not recognise an opaque bearer token.
+    """
+    if not isinstance(server, Mapping):
+        return None
+    for field in ("headers", "env"):
+        values = server.get(field)
+        if not isinstance(values, Mapping):
+            continue
+        for key, value in values.items():
+            if not _CREDENTIAL_NAME.search(str(key)):
+                continue
+            if not _SCHEME_ONLY.fullmatch(_PLACEHOLDER.sub("", str(value))):
+                return "%s.%s" % (field, key)
+    url = server.get("url")
+    if isinstance(url, str) and "?" in url:
+        from urllib.parse import parse_qsl
+        query = url.split("?", 1)[1].split("#", 1)[0]
+        for key, value in parse_qsl(query, keep_blank_values=True):
+            if _CREDENTIAL_NAME.search(key) and _PLACEHOLDER.sub("", value).strip():
+                return "url query %s" % key
+    return None
 
 
 def _has_secret(text: str) -> bool:
