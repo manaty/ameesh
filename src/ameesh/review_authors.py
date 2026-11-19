@@ -5243,52 +5243,70 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
 
 #: #7252 : une citation de commit retiré dans le message de réécriture de
 #: l'auteur. #7721 : seuls les jetons **qualifiés** sont des citations — un
-#: SHA de 12 à 40 caractères hexadécimaux, ou la forme `dépôt@sha` (le dépôt
-#: lu, ou le dépôt lu illisible). Un mot hexadécimal court (`ed25519`,
-#: `deadbeef`) ou un SHA d'un autre dépôt nommé n'est pas une citation et
-#: n'interroge jamais la forge. Un identifiant de B (`#40556`) n'a pas cette
-#: longueur. Les empreintes nommées checksum/sha256 sont écartées avant toute
-#: résolution Git (#7576). Le nom complet d'un paquet horaire
-#: (`h-AAAAMMJJ-NN`) est un identifiant, pas une citation : sa date (huit
-#: chiffres hexadécimaux) est consommée avec lui (#7709). Une suite
-#: hexadécimale noyée dans un mot (par exemple `succeeded`, #7770) n'est pas
-#: un jeton de commit.
+#: SHA de 12 à 40 caractères hexadécimaux, la forme `dépôt@sha` (le dépôt lu,
+#: ou le dépôt lu illisible), ou un abrégé de 7 à 11 caractères **présent
+#: localement comme commit** quand le dépôt lu est fourni. L'abrégé par défaut
+#: de Git dans ce dépôt fait 9 caractères : une réécriture qui cite
+#: `reprend 4c39e880a` doit rester lue, sinon le correcteur n'est plus exclu
+#: (B auditeur). La présence locale est lue sans réseau (`_present_commits`) :
+#: un mot hexadécimal absent (`ed25519`, `deadbeef`) ou un SHA d'un autre
+#: dépôt nommé n'est pas une citation et n'interroge jamais la forge. Un
+#: identifiant de B (`#40556`) n'a pas cette longueur. Les empreintes nommées
+#: checksum/sha256 sont écartées avant toute résolution Git (#7576). Le nom
+#: complet d'un paquet horaire (`h-AAAAMMJJ-NN`) est un identifiant, pas une
+#: citation : sa date (huit chiffres hexadécimaux) est consommée avec lui
+#: (#7709). Une suite hexadécimale noyée dans un mot (par exemple `succeeded`,
+#: #7770) n'est pas un jeton de commit.
 _CITED_COMMIT = re.compile(
     r"\b(?:checksum|sha256)\s+[0-9a-f]+\b"
     r"|\bh-\d{8}-\d+\b"
     r"|(?P<qualified>(?<![0-9a-z])"
     r"(?P<repo>[a-z0-9_.-]+(?:/[a-z0-9_.-]+)?)@"
     r"(?P<qcommit>[0-9a-f]{7,40})(?![0-9a-z]))"
-    r"|(?P<commit>(?<![0-9a-z])[0-9a-f]{12,40}(?![0-9a-z]))",
+    r"|(?P<commit>(?<![0-9a-z])[0-9a-f]{12,40}(?![0-9a-z]))"
+    r"|(?P<short>(?<![0-9a-z])[0-9a-f]{7,11}(?![0-9a-z]))",
     re.IGNORECASE)
 
 
-def _cited_tokens(body: str, own_repository: str = "") -> list[str]:
-    """Les citations de commit d'un message, seulement les qualifiées (#7721).
+def _cited_tokens(body: str, own_repository: str = "",
+                  repo: str = "") -> list[str]:
+    """Les citations de commit d'un message (#7252, #7721).
 
     Un jeton de 12 à 40 caractères hexadécimaux est une citation. Un jeton plus
-    court ne l'est que sous la forme `dépôt@sha`, et seulement quand `dépôt` est
-    le dépôt lu (`own_repository`, `owner/repo` ou son seul nom) ; un dépôt lu
-    illisible (`own_repository` vide) garde le jeton, par prudence. Un SHA d'un
-    autre dépôt nommé n'est donc jamais lu ici : il n'interroge pas la forge et
-    ne peut pas faire refuser la lecture de provenance (#7721).
+    court ne l'est que sous deux formes : `dépôt@sha` quand `dépôt` est le
+    dépôt lu (`own_repository`, `owner/repo` ou son seul nom ; un dépôt lu
+    illisible le garde, par prudence), ou un abrégé de 7 à 11 caractères
+    **présent localement comme commit** dans `repo`. La seconde forme couvre
+    l'abrégé usuel de Git (9 caractères ici) sans transformer `ed25519` ou
+    `deadbeef` en citations : la résolution est locale et sans réseau
+    (`_present_commits`, sans fetch paresseux) ; un jeton absent du clone ou
+    d'un autre type que commit est écarté sans interroger la forge. Un SHA
+    d'un autre dépôt nommé n'est jamais lu ici (#7721).
     """
     own = str(own_repository or "").strip().casefold()
     own_name = own.rpartition("/")[2]
-    tokens: list[str] = []
+    found: list[tuple[str, str]] = []
     for match in _CITED_COMMIT.finditer(str(body or "")):
         token = match.group("commit")
         if token:
-            tokens.append(token)
+            found.append(("long", token))
             continue
         token = match.group("qcommit")
-        if not token:
+        if token:
+            named = str(match.group("repo") or "").strip().casefold()
+            if (not own or named == own
+                    or ("/" not in named and named == own_name)):
+                found.append(("long", token))
             continue
-        named = str(match.group("repo") or "").strip().casefold()
-        if (not own or named == own
-                or ("/" not in named and named == own_name)):
-            tokens.append(token)
-    return tokens
+        token = match.group("short")
+        if token:
+            found.append(("short", token))
+    shorts = [token for kind, token in found if kind == "short"]
+    present: dict[str, str] = {}
+    if shorts and str(repo or "").strip():
+        present = _present_commits(str(repo).strip(), shorts) or {}
+    return [token for kind, token in found
+            if kind == "long" or token.lower() in present]
 
 
 #: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
@@ -5709,8 +5727,9 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             # #7576 : une empreinte explicitement nommée n'est pas une
             # citation Git, même si sa longueur ressemble à un SHA abrégé.
             # #7721 : seuls les jetons qualifiés sont des citations (12 hex
-            # ou plus, ou `dépôt@sha` du dépôt lu).
-            tokens = _cited_tokens(body, own_repository)
+            # ou plus, `dépôt@sha` du dépôt lu, ou abrégé local de 7 à 11
+            # caractères présent comme commit — B auditeur sur 474fe7c9).
+            tokens = _cited_tokens(body, own_repository, repo=repo)
             if not tokens:
                 continue
             check()

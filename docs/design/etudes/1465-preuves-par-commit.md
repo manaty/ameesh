@@ -542,13 +542,19 @@ Quand un relecteur corrige et que l'auteur réécrit depuis le B, le commit du
 relecteur n'est plus dans l'histoire ; le message de réécriture doit le citer
 pour que l'exclusion par son nom survive (#7252). Le lecteur
 (`review_authors._cited_tokens`) ne retient que des citations **qualifiées** :
-un SHA de 12 à 40 caractères hexadécimaux, ou la forme `dépôt@sha` quand le
-dépôt nommé est celui du clone lu (`owner/repo`, ou son seul nom). Un jeton
-plus court et non qualifié (`ed25519`, `deadbeef`, `correctif-1234abcd`) n'est
-pas une citation : il n'interroge jamais la forge et ne peut donc pas faire
-refuser la lecture de provenance. Les empreintes explicitement nommées
-(`checksum`, `sha256`), le nom complet d'un paquet horaire (`h-AAAAMMJJ-NN`)
-et une suite noyée dans un mot (`succeeded`, #7770) restent écartés.
+un SHA de 12 à 40 caractères hexadécimaux, la forme `dépôt@sha` quand le dépôt
+nommé est celui du clone lu (`owner/repo`, ou son seul nom), ou un abrégé de 7
+à 11 caractères **présent localement comme commit** dans le clone lu. La
+dernière forme couvre l'abrégé usuel de Git (9 caractères dans ce dépôt) : sans
+elle, une réécriture citant `reprend 4c39e880a` ne serait plus lue et le
+correcteur retiré pourrait compter comme un avis indépendant (B auditeur sur
+474fe7c9). La présence locale est lue sans réseau (`_present_commits`) ; un mot
+hexadécimal absent (`ed25519`, `deadbeef`, `correctif-1234abcd`) ou un SHA
+d'un autre dépôt nommé n'est pas une citation : il n'interroge jamais la forge
+et ne peut donc pas faire refuser la lecture de provenance. Les empreintes
+explicitement nommées (`checksum`, `sha256`), le nom complet d'un paquet
+horaire (`h-AAAAMMJJ-NN`) et une suite noyée dans un mot (`succeeded`, #7770)
+restent écartés.
 
 Une citation qualifiée n'est lue que si le dépôt ou la forge la confirme comme
 commit. Un objet local d'un autre type (arbre, blob, étiquette) est écarté sans
@@ -561,7 +567,8 @@ est écarté localement, sans forge.
 
 Pour les auteurs : citez le commit retiré par au moins 12 caractères
 hexadécimaux de son SHA, ou par `dépôt@sha` si vous devez utiliser une
-abréviation plus courte ; ne citez jamais un mot hexadécimal ordinaire
-(`ed25519`, `deadbeef`). Le gel prépare ces citations hors transaction
-(`prefetch_prior_freezes`) ; une citation non préparée est dite, jamais
-silencieusement exclue.
+abréviation plus courte ; un abrégé de 7 à 11 caractères n'est lu que si le
+commit est encore présent dans le clone (la forge n'est pas interrogée pour
+lui). Ne citez jamais un mot hexadécimal ordinaire (`ed25519`, `deadbeef`). Le
+gel prépare ces citations hors transaction (`prefetch_prior_freezes`) ; une
+citation non préparée est dite, jamais silencieusement exclue.

@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import tempfile
 import unittest
 import urllib.error
 import subprocess
@@ -383,18 +384,43 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
                     forge.assert_not_called()
 
     def test_hex_word_is_not_a_citation_and_never_asks_the_forge(self):
-        # #7721 : `ed25519` n'est pas un SHA qualifié (moins de 12 caractères,
-        # pas de forme dépôt@sha) : il n'est jamais lu, donc une forge
-        # inaccessible ou ambiguë ne peut plus le refuser.
-        _fix, head = self._rewrite(cite="ed25519")
-        with mock.patch.object(review_authors, "_forge_commit") as forge, \
-                mock.patch.object(review_authors, "_forge_fetch") as fetch:
+        # #7721 (B auditeur sur 474fe7c9) : `ed25519` (7 hex) et un abrégé de
+        # 9 caractères absent du clone ne sont pas des citations. La présence
+        # locale est lue sans réseau : une forge inaccessible ou ambiguë ne
+        # peut plus les refuser.
+        for token in ("ed25519", "deadbeef1"):
+            with self.subTest(token=token):
+                self.repo.git("reset", "--hard", self.head_a)
+                _fix, head = self._rewrite(cite=token)
+                with mock.patch.object(review_authors, "_forge_commit") as forge, \
+                        mock.patch.object(review_authors, "_forge_fetch") as fetch:
+                    (_authors, unknown, correctors), _freeze = self._reading(
+                        head, strict=True)
+                self.assertEqual(unknown, [])
+                self.assertEqual(correctors, [])
+                forge.assert_not_called()
+                fetch.assert_not_called()
+
+    def test_short_local_citation_still_excludes_its_reviewer(self):
+        # B auditeur sur 474fe7c9 : l'abrégé usuel de Git (9 caractères ici)
+        # d'un correctif encore présent dans le clone reste une citation ; le
+        # correcteur est exclu par son nom et la forge n'est pas interrogée.
+        fix, _head = self._rewrite()
+        short = fix[:9]
+        self.repo.git("commit", "--amend", "-m",
+                      "author: reprise ; correctif %s retiré" % short)
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        with mock.patch.object(review_authors, "_forge_commit") as forge:
             (_authors, unknown, correctors), _freeze = self._reading(
                 head, strict=True)
         self.assertEqual(unknown, [])
-        self.assertEqual(correctors, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head)
+        # La citation courte est qualifiée par la présence locale : elle
+        # n'appelle jamais le résolveur d'abrégé de la forge.
         forge.assert_not_called()
-        fetch.assert_not_called()
 
     def test_ambiguous_forge_still_refuses_a_qualified_citation(self):
         # La garantie de provenance reste : une vraie citation (12 hex) que
@@ -587,13 +613,32 @@ class ForgeCitationResolutionTest(unittest.TestCase):
                          ["1234abcd5678"])
 
     def test_short_hex_word_is_not_a_commit_citation(self):
-        # #7721 : un jeton non qualifié de moins de 12 caractères n'est jamais
-        # une citation, même entier et borné (`ed25519`, `deadbeef`).
+        # #7721 : sans dépôt local, un jeton non qualifié de moins de 12
+        # caractères n'est jamais une citation, même entier et borné
+        # (`ed25519`, `deadbeef`, `correctif-1234abcd`).
         for text in ("ed25519", "deadbeef", "correctif-1234abcd",
                      "paquet h-20261117-05"):
             with self.subTest(text=text):
                 self.assertEqual(
                     review_authors._cited_tokens(text, "owner/repo"), [])
+
+    def test_a_short_citation_is_qualified_by_local_presence_only(self):
+        # B auditeur sur 474fe7c9 : l'abrégé de 9 caractères d'un commit
+        # présent dans le clone est une citation ; le même type de jeton
+        # absent localement ne l'est pas, sans interroger la forge.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _Repo(os.path.join(tmp, "depot"))
+            repo.write("f.txt", "base\n")
+            sha = repo.commit("base")
+            self.assertEqual(
+                review_authors._cited_tokens(
+                    "reprend %s" % sha[:9], "owner/repo", repo=repo.root),
+                [sha[:9]])
+            self.assertEqual(
+                review_authors._cited_tokens(
+                    "ed25519 deadbeef1 correctif-1234abcd", "owner/repo",
+                    repo=repo.root),
+                [])
 
     def test_qualified_repository_citation_keeps_a_short_sha(self):
         # La forme `dépôt@sha` qualifie un SHA court ; un autre dépôt nommé
