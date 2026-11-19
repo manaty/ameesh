@@ -4744,9 +4744,11 @@
     "recent"
    ],
    "authenticators": [
+    "accord_claim",
     "active_holders",
     "append_sync",
     "canon_refs",
+    "claim_accord",
     "for_approver",
     "insert",
     "journal_head",
@@ -4862,6 +4864,7 @@
     "create",
     "get",
     "history",
+    "mark_key_provenance",
     "pending",
     "pending_for_lot",
     "prose_candidates",
@@ -4893,6 +4896,7 @@
    "grants": [
     "candidates",
     "get",
+    "listed",
     "live_reservations",
     "register",
     "release",

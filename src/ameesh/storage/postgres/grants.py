@@ -93,6 +93,24 @@ class Grants(interface.Grants):
             "WHERE id = %s AND revoked_at IS NULL RETURNING id", (by, int(grant_id)))
         return bool(rows)
 
+    def listed(self, *, include_inactive=False) -> list[dict]:
+        sql = """
+            SELECT s.id, s.approver, s.connector, s.operations, s.action_class,
+                   s.max_amount, s.currency, s.consumed_amount, s.uses,
+                   s.receipt AS receipt_json,
+                   a.facade,
+                   s.beneficiary_kind, s.beneficiary, s.beneficiary_clones,
+                   s.targets, s.charter_line, s.charter_version,
+                   extract(epoch from s.valid_until)::float8 AS until_ts,
+                   extract(epoch from s.revoked_at)::float8  AS revoked_ts, s.revoked_by
+              FROM standing_approvals s
+              LEFT JOIN authenticators a ON a.id = s.authenticator_id
+        """
+        if not include_inactive:
+            sql += (" WHERE s.revoked_at IS NULL"
+                    " AND s.valid_until > clock_timestamp()")
+        return self.db.query(sql + " ORDER BY s.valid_until, s.id")
+
     def get(self, grant_id) -> dict | None:
         rows = self.db.query(
             """

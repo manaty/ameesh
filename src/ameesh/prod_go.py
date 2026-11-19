@@ -97,8 +97,12 @@ def export_proof(cfg, db, decision_id, *, now=None):
         raise ProdGoError("production window exceeds signed approval expiry")
     info = authority.key_info(db, row["approver"])
     answer = view["answer"]
+    # #7631 : la signature d'avatar entre dans le document signé (`signer`) ;
+    # le document exporté doit donc le porter pour que l'empreinte concorde.
     return {"schema": "ameesh-prod-go-proof/1", "decision": view,
-            "answer_document": decisions.answer_document(view, answer["text"], answer.get("option"), answer["by"]),
+            "answer_document": decisions.answer_document(
+                view, answer["text"], answer.get("option"), answer["by"],
+                answer.get("signer")),
             "signed_payload": row["signed_payload"], "signature": row["signature"],
             "public_key": info["public_key"], "public_key_fingerprint": info["public_key_fingerprint"]}
 

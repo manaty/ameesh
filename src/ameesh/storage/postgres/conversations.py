@@ -50,6 +50,12 @@ class Conversations(Contract):
                              json.dumps(meta, ensure_ascii=False, allow_nan=False),
                              event_id, project, lot, thread_text))[0]
 
+    def entry(self, agent, seq):
+        rows = self.db.query("SELECT " + _FIELDS + " FROM conversation_log"
+                             " WHERE agent = %s AND seq = %s AND " + _TRUSTED,
+                             (agent, int(seq)))
+        return rows[0] if rows else None
+
     def read(self, agent, *, after=0, limit=100):
         return self.db.query("""
             WITH page AS (SELECT """ + _FIELDS + """ FROM conversation_log

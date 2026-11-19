@@ -204,9 +204,11 @@ def summary_digest(action, *, assume_duplicate: bool = False) -> str:
 def approval_request(action, approver: str, *, decision: str = "approve",
                      assume_duplicate: bool = False, requested_by: str | None = None,
                      ttl: int = DEFAULT_REQUEST_TTL, now: int | None = None,
-                     nonce: str | None = None) -> dict:
+                     nonce: str | None = None, accord: dict | None = None) -> dict:
     """La demande à signer (spec §8.1) pour approuver `action` — ou, avec
-    `assume_duplicate`, pour assumer le doublon et la remplacer."""
+    `assume_duplicate`, pour assumer le doublon et la remplacer. `accord`
+    (#7631) : {agent, seq}, l'entrée du journal de conversation où l'humain a
+    donné son accord (exigée pour un reçu par clé fichier)."""
     if not _HUMAN_RE.fullmatch(approver or ""):
         raise ActionError(INVALID, "approver \"human:<id>\" expected, not %r" % (approver,))
     moment = int(time.time()) if now is None else int(now)
@@ -222,6 +224,8 @@ def approval_request(action, approver: str, *, decision: str = "approve",
         "iat": moment,
         "exp": moment + int(ttl),
     }
+    if accord is not None:
+        request["accord"] = accord
     try:
         receipts.check_request(request)
     except receipts.ReceiptError as exc:
@@ -705,7 +709,8 @@ def _verify(db: Db, action: dict, receipt, policy, *, expected_digest: str,
     verdict = receipts.verify_receipt(
         db, receipt, policy_for(action, policy), kind="action",
         expected_digest=expected_digest, expected_action_id=action["action_id"],
-        expect_decision=expect_decision, consume_by=None, now=now)
+        expect_decision=expect_decision, consume_by=None, now=now,
+        expected_operation=action["operation"])
     if not verdict.ok:
         raise ActionError(verdict.code, "receipt refused: %s" % verdict.reason)
     allowed = action.get("approvers") or []
@@ -730,8 +735,11 @@ def _authorize(db: Db, action: dict, receipt, *, standing: bool, policy, now,
             "auth_challenge": verdict.challenge,
             "auth_authenticator_id": verdict.authenticator_id, "auth_expires": verdict.exp,
             "auth_grant_id": None,
-            "note": "approved by %s (%s, receipt %s…)" % (
-                verdict.approver, verdict.facade, verdict.challenge[:12]),
+            "accord": verdict.accord, "challenge": verdict.challenge,
+            "note": "approved by %s (%s, receipt %s…%s)" % (
+                verdict.approver, verdict.facade, verdict.challenge[:12],
+                ", accord %s#%d" % (verdict.accord["agent"], verdict.accord["seq"])
+                if verdict.accord else ""),
         }
     if standing:
         grant = _covering_grant(db, action)
@@ -794,6 +802,18 @@ def _bind(db: Db, action: dict, auth: dict, *, from_states: tuple, by: str) -> d
     return _require(db, action["action_id"])
 
 
+def _claim_action_accord(db: Db, accord: dict | None, ref: str, action_id: str) -> None:
+    """#7631 : le go cité par un reçu d'action ne vaut que pour CE reçu.
+    `accord_claims` refuse la réutilisation par un autre geste ; la course
+    entre deux reçus est tranchée par la clé primaire."""
+    if accord is None:
+        return
+    if not receipts.claim_accord(db, accord, kind="action", ref=ref):
+        raise ActionError(receipts.ACCORD, "accord %s#%d already cited by another "
+                          "gesture (action %s): a go authorizes one receipt"
+                          % (accord["agent"], accord["seq"], action_id))
+
+
 def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, policy=None,
             by: str = "", now: float | None = None) -> dict:
     """`proposed → approved` (ou nouvelle liaison si déjà `approved`).
@@ -819,6 +839,7 @@ def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, pol
                             allow_deny=True)
     if kind == "deny":
         verdict = auth["verdict"]
+        _claim_action_accord(db, verdict.accord, verdict.challenge, action_id)
         try:
             consumed = receipts.consume_nonce(
                 db, verdict.approver, verdict.nonce,
@@ -834,6 +855,7 @@ def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, pol
             raise ActionError(receipts.REVOKED, "signed refusal: authenticator revoked before "
                               "the nonce was consumed")
         return cancel(db, action_id, by=by, note="refused by %s (deny receipt)" % verdict.approver)
+    _claim_action_accord(db, auth.get("accord"), auth.get("challenge") or "", action_id)
     return _bind(db, action, auth, from_states=("proposed", "approved"), by=by)
 
 
@@ -1209,6 +1231,7 @@ def retry(db: Db, action_id: str, receipt=None, *, connector=None, standing: boo
                           "with guaranteed deduplication" % (action_id, state))
     _kind, auth = _authorize(db, action, receipt, standing=standing, policy=policy, now=now,
                              allow_deny=False)
+    _claim_action_accord(db, auth.get("accord"), auth.get("challenge") or "", action_id)
     auth["note"] = "retry authorized after %s — %s" % (state, auth["note"])
     return _bind(db, action, auth, from_states=(state,), by=by)
 
@@ -1240,6 +1263,7 @@ def replace(db: Db, action_id: str, receipt, *, policy=None, by: str = "",
     verdict = _verify(db, action, receipt, policy,
                       expected_digest=assume_duplicate_digest(action),
                       expect_decision="approve", now=now)
+    _claim_action_accord(db, verdict.accord, verdict.challenge, action_id)
     document = receipts.parse_receipt(receipt).document
     new_id = new_action_id()
     new_digest = receipts.action_digest(dict(digest_fields(action), action_id=new_id))

@@ -46,6 +46,8 @@
 --   * authenticators : le registre de confiance — credential_id et clé
 --     publique servent à vérifier l'assertion ; révocation et niveau ; canon
 --     déclarant (L44 : seul le canon de l'action, `actions.canon`, compte) ;
+--     opérations admises sous accord pour une clé fichier (#7631, 0586 :
+--     `accord_operations`, vérifiées avec le reçu) ;
 --   * mesh_consumed_nonces : refuser à la signature un nonce déjà consommé
 --     (sans jamais en consommer : c'est l'exécuteur qui consomme, sous la
 --     porte) — pas le challenge.
@@ -80,7 +82,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'key_fingerprint', 'aaguid', 'level', 'canon_ref', 'enrolled_at',
         'updated_at', 'revoked_at', 'revoked_reason',
         -- L44 (0035) : canon déclarant
-        'canon'
+        'canon',
+        -- #7631 (0586) : opérations sous accord d'une clé fichier
+        'accord_operations'
     ]),
     ('mesh_consumed_nonces', ARRAY[
         'approver', 'nonce', 'consumed_by', 'consumed_at'

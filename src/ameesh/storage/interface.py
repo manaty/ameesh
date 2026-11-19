@@ -2153,6 +2153,11 @@ class Approvals(Domain):
                limit: int, proof_only: bool = False) -> list[dict]:
         """Approvals newest first; proof_only exposes consumed decision proofs only."""
 
+    def decision_signatures(self, *, since_ts: float, until_ts: float) -> list[dict]:
+        """#7631 : approbations de décision consommées par une décision dans
+        [since, until[ (meta comprise, `key_is_owner`)."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     def get(self, approval_id: int) -> dict | None:
         """L'approbation `approval_id`, meta compris, ou None."""
@@ -3707,6 +3712,11 @@ class Actions(Domain):
     def recent(self, *, state: str | None, project: str | None, limit: int) -> list[dict]:
         """Actions, de la plus récente à la plus ancienne."""
 
+    def reserved(self, operations, *, since_ts: float, until_ts: float) -> list[dict]:
+        """#7631 : actions des `operations` proposées dans [since, until[, de
+        la plus ancienne à la plus récente, avec `auth_receipt`."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     def attempts(self, action_id: str) -> list[dict]:
         """Tentatives de l'action, dans l'ordre."""
@@ -4255,8 +4265,21 @@ class Authenticators(Domain):
 
     @abc.abstractmethod
     def update_meta(self, authenticator_id: int, *, level: str, aaguid: str | None,
-                    canon_ref: str) -> bool:
-        """Niveau, aaguid et provenance d'une ligne active (même clé)."""
+                    canon_ref: str, accord_operations=()) -> bool:
+        """Niveau, aaguid, provenance et opérations sous accord (#7631) d'une
+        ligne active (même clé)."""
+
+    # -- #7631 : un « go » du journal ne cite qu'un geste -------------------
+    @abc.abstractmethod
+    def accord_claim(self, agent: str, seq: int) -> dict | None:
+        """Le geste qui a déjà cité l'accord (agent, seq), ou None : `kind`,
+        `ref`."""
+
+    @abc.abstractmethod
+    def claim_accord(self, agent: str, seq: int, kind: str, ref: str) -> bool:
+        """Réclame l'accord (agent, seq) pour le geste (`kind`, `ref`) — vrai
+        s'il est libre ou déjà réclamé par CE geste, faux s'il est cité par un
+        autre. La clé primaire tranche la course entre deux reçus."""
 
     @abc.abstractmethod
     def revoke(self, authenticator_id: int, *, reason: str, canon_ref: str | None) -> bool:
@@ -4324,6 +4347,11 @@ class Grants(Domain):
     @abc.abstractmethod
     def get(self, grant_id: int) -> dict | None:
         """Un grant, ou None (avec sa portée et sa charte, #7629)."""
+
+    @abc.abstractmethod
+    def listed(self, *, include_inactive: bool = False) -> list[dict]:
+        """#7631 : les grants (actifs : ni révoqués ni échus, à l'heure de la
+        base), avec `receipt_json` et la façade de leur authentificateur."""
 
 
 # --------------------------------------------------------------------------
@@ -4781,6 +4809,12 @@ class Decisions(Domain):
         neither a request, a reply, an alert (`event`) nor a receipt, and that
         no request names as its source (`payload.decision.source_mail`): the
         `limit` most recent, oldest first, same columns as `source_mail`."""
+
+    @abc.abstractmethod
+    def mark_key_provenance(self, decision_id: int) -> dict | None:
+        """#7631 : marque une demande EN ATTENTE comme portant sur la clé owner
+        ou la provenance (jamais l'inverse) ; rend la ligne, ou None."""
+        raise NotImplementedError
 
     @abc.abstractmethod
     def register_chat(self, name: str, *, human: str, host: str, harness: str,
