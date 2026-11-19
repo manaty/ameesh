@@ -1496,16 +1496,45 @@ def verify_proof(db, view: dict, *, live: bool = False, public_only: bool = Fals
         ok = False
     if not ok:
         return False, "invalid Ed25519 signature"
-    # #7684 : une signature sous grant porte la réservation qui l'a financée ;
-    # l'action de porte doit décrire CETTE décision et CETTE réponse, et le
-    # grant de la réservation vivante doit être celui de la preuve.
+    # #7684 (B, relecture cx2) : le grant cité est DANS la réponse signée
+    # (`answer.signer.accord`, couvert par l'empreinte) ; `proof.standing` ne
+    # l'est pas. Retirer ce champ laissait donc passer la preuve sans
+    # contrôler le grant ni la réservation vivante. Si l'accord signé cite un
+    # grant, la preuve doit porter la réservation de CE grant ; inversement,
+    # une réservation sans grant cité est incohérente.
+    answer_signer = answer.get("signer")
+    signed_cited = 0
+    if (isinstance(answer_signer, dict)
+            and answer_signer.get("by") == SIGNED_BY_AVATAR):
+        signed_accord = answer_signer.get("accord")
+        if isinstance(signed_accord, dict) and "grant" in signed_accord:
+            try:
+                signed_cited = int(signed_accord["grant"])
+            except (TypeError, ValueError):
+                return False, "unreadable grant in the signed answer's accord"
+            if signed_cited <= 0:
+                return False, "unreadable grant in the signed answer's accord"
     standing = proof.get("standing")
+    if signed_cited and not isinstance(standing, dict):
+        return False, ("the signed answer cites grant #%d but the proof carries no "
+                       "standing reservation" % signed_cited)
+    if not signed_cited and standing is not None:
+        return False, ("a standing reservation without a grant cited in the signed "
+                       "answer")
+    # #7684 : une signature sous grant porte la réservation qui l'a financée ;
+    # l'action de porte doit décrire CETTE décision et CETTE réponse, le grant
+    # de la preuve doit être celui de l'accord signé, et la réservation vivante
+    # doit être exactement celle de la preuve.
     if standing is not None:
         try:
             grant = int(standing["grant"])
+            reservation = int(standing["reservation"])
             key = str(standing["key"])
         except (KeyError, TypeError, ValueError):
             return False, "unreadable standing reservation"
+        if grant != signed_cited:
+            return False, ("the standing grant is not the grant cited in the signed "
+                           "answer")
         action = storage.of(db).actions.get(key, with_receipts=False)
         if action is None:
             return False, "standing action not found"
@@ -1534,10 +1563,11 @@ def verify_proof(db, view: dict, *, live: bool = False, public_only: bool = Fals
             cited = 0
         if cited != grant:
             return False, "the standing grant is not the cited accord"
-        live_rows = [int(r["grant_id"]) for r in
-                     storage.of(db).grants.live_reservations(key)]
-        if grant not in live_rows:
-            return False, "standing reservation on grant #%d not found" % grant
+        live_rows = storage.of(db).grants.live_reservations(key)
+        if not any(int(r["id"]) == reservation and int(r["grant_id"]) == grant
+                   for r in live_rows):
+            return False, ("standing reservation #%d on grant #%d not found"
+                           % (reservation, grant))
     if live:
         # A replacement takes effect now, so a historical valid signature is
         # insufficient: require its exact, still-live approval and nonce.

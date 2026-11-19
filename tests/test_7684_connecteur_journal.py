@@ -398,6 +398,63 @@ class DecisionGrantTest(DecisionGrantBase):
             proof["approval_id"], {"accord": {"grant": first}})
         self.assertFalse(decisions.verify_proof(self.db, signed["decision"])[0])
 
+    def test_removed_standing_reservation_is_refused(self):
+        """B (relecture cx2) : `proof.standing` n'est pas signé ; le retirer
+        laissait la preuve valide sans contrôle du grant cité ni de la
+        réservation. L'accord signé cite le grant : la preuve doit le porter."""
+        verdict, grant_id = self.grant()
+        self.assertTrue(verdict.ok, verdict.reason)
+        view = self.ask(needs_signature=True)
+        signed = self.sign(view, grant_id)
+        forged = json.loads(json.dumps(signed["decision"]))
+        del forged["answer"]["proof"]["standing"]
+        # ni l'empreinte ni la signature ne changent : seul le champ non signé
+        # a disparu
+        self.assertEqual(forged["answer"]["proof"]["digest"],
+                         signed["decision"]["answer"]["proof"]["digest"])
+        ok, why = decisions.verify_proof(self.db, forged)
+        self.assertFalse(ok)
+        self.assertIn("no standing reservation", why)
+
+    def test_substituted_standing_reservation_is_refused(self):
+        """B (relecture cx2) : substituer la réservation ne passe pas — le
+        grant doit être celui de l'accord signé, et la réservation vivante
+        exactement celle de la preuve."""
+        verdict, first = self.grant()
+        self.assertTrue(verdict.ok, verdict.reason)
+        verdict, second = self.grant()
+        self.assertTrue(verdict.ok, verdict.reason)
+        view = self.ask(needs_signature=True)
+        signed = self.sign(view, second)
+        proof = signed["decision"]["answer"]["proof"]
+        self.assertEqual(proof["standing"]["grant"], second)
+
+        # (a) un autre grant valide, mais pas celui de l'accord signé
+        forged = json.loads(json.dumps(signed["decision"]))
+        forged["answer"]["proof"]["standing"]["grant"] = first
+        ok, why = decisions.verify_proof(self.db, forged)
+        self.assertFalse(ok)
+        self.assertIn("grant cited in the signed answer", why)
+
+        # (b) la réservation d'une AUTRE signature, sous le MÊME grant : le
+        # grant cité concorde, mais l'action ne décrit pas cette réponse
+        other_view = self.ask(needs_signature=True)
+        other = self.sign(other_view, second)
+        forged = json.loads(json.dumps(signed["decision"]))
+        forged["answer"]["proof"]["standing"] = (
+            other["decision"]["answer"]["proof"]["standing"])
+        ok, why = decisions.verify_proof(self.db, forged)
+        self.assertFalse(ok)
+        self.assertIn("not tied to this answer", why)
+
+        # (c) la réservation vivante de l'action n'est pas celle de la preuve
+        forged = json.loads(json.dumps(signed["decision"]))
+        forged["answer"]["proof"]["standing"]["reservation"] = (
+            other["decision"]["answer"]["proof"]["standing"]["reservation"])
+        ok, why = decisions.verify_proof(self.db, forged)
+        self.assertFalse(ok)
+        self.assertIn("not found", why)
+
     def test_absent_or_revoked_cited_grant_is_refused_even_with_another(self):
         """B (relecture P1) : un grant cité inexistant ou révoqué refuse la
         signature, même si un autre grant valide couvrirait la décision."""
