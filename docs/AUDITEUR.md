@@ -118,7 +118,14 @@ actionnable avant. À l'échéance, le hold redevient une attente ordinaire et
 le réveil échu la signale. Une simple
 mention d'une règle ou d'une consigne de l'owner, ou d'une décision déjà
 signée, ne classe pas l'attente humaine ; un `hold_undeployed` ne l'est jamais
-(canon §11 bis).
+(canon §11 bis). #7847 : un `hold_undeployed` n'est reconnu que si le `#N`
+cité est un lot réellement fusionné (jalon `merged`/`delivered` ou état du
+journal `merged`/`delivered`/`promoted`). Un `#N` cité dont la fusion n'est
+pas constatée (lot encore ouvert, ou fermé sans fusion) n'a pas de correctif
+dans `main` : le hold redevient ordinaire et son geste est « relancer le
+détenteur », jamais « staging hors créneau ». Un `#N` qui ne résout aucun lot
+lu (PR, ticket, lot hors fenêtre) ne prouve rien et ne change pas la
+classification.
 
 #### Capacité au repos (#3256, owner 28/10/2026)
 
