@@ -307,6 +307,58 @@ class HoldsAndWakesTest(unittest.TestCase):
         self.assertTrue(all(row["kind"] == "hold_undeployed"
                             for row in report["slow_waits"]))
 
+    def test_hold_non_deploye_dont_le_correctif_cite_n_est_pas_fusionne_7847(self):
+        # #7847, témoin #6002 (18/11 19:16Z) : le texte dit « après ce
+        # déploiement » et cite #7799, encore en build, et #7673, validé mais
+        # non fusionné ; seul #7760 est dans main. Le hold n'attend pas le
+        # staging d'un correctif fusionné : il reste ordinaire, et le geste
+        # « staging hors créneau » ne s'adresse pas à lui.
+        note = ("hold: no-go du pilote sur le repli du 19/11 à 02:00Z. "
+                "#7799, cause racine du no-go R1 bis, n'est pas encore démarré : "
+                "runner.py est tenu par #7673, validé mais non fusionné, et la "
+                "prise « démarrer sur » (#7760) est sur main sans être déployée. "
+                "Il ne peut être ni fusionné avant la coupure de 22:00Z ni "
+                "déployé en staging avant 02:00Z.")
+        report = run(
+            items=[item(6002, assignee="mesh-design"), item(7799),
+                   item(7673), item(7760)],
+            milestones=[{"work_item_id": 7760, "id": 20, "kind": "merged",
+                         "at_ts": T - 30 * H, "sha": "f" * 40}],
+            events=[event(6002, 1, T - 3 * H, note, actor="mesh-design",
+                          state="build"),
+                    event(7799, 1, T - 5 * H, "démarrage", state="build"),
+                    event(7673, 1, T - 6 * H, "gel", state="validated"),
+                    event(7760, 1, T - 30 * H, "fusion", state="merged")])
+        self.assertEqual(report["undeployed_holds"], [])
+        self.assertEqual(report["totals"]["undeployed_holds"], 0)
+        self.assertEqual(report["totals"]["holds"], 1)
+        self.assertEqual([(row["lot"], row["kind"])
+                          for row in report["slow_waits"]],
+                         [(6002, "hold")])
+
+    def test_hold_non_deploye_dont_le_correctif_cite_est_fusionne_7847(self):
+        note = "hold: correctif #7799 fusionné, pas encore déployé en staging"
+        report = run(
+            items=[item(6002), item(7799)],
+            milestones=[{"work_item_id": 7799, "id": 20, "kind": "merged",
+                         "at_ts": T - 5 * H, "sha": "f" * 40}],
+            events=[event(6002, 1, T - 3 * H, note, state="build")])
+        self.assertEqual([row["lot"] for row in report["undeployed_holds"]],
+                         [6002])
+        self.assertEqual([row["kind"] for row in report["slow_waits"]],
+                         ["hold_undeployed"])
+
+    def test_hold_non_deploye_citant_un_numero_inconnu_ne_change_pas_7847(self):
+        # Un `#N` qui ne résout aucun lot lu (PR, ticket) ne prouve pas qu'un
+        # correctif est ouvert : il ne fait pas retomber la ligne.
+        note = "hold: attente du déploiement de #999999 (PR #6025)"
+        report = run(
+            items=[item(1)],
+            events=[event(1, 1, T - 3 * H, note, state="build")])
+        self.assertEqual([row["lot"] for row in report["undeployed_holds"]], [1])
+        self.assertEqual([row["kind"] for row in report["slow_waits"]],
+                         ["hold_undeployed"])
+
     def test_hold_ipv4_reste_une_attente_externe_7316(self):
         for address in ("51.158.121.89", "51.15.141.186"):
             with self.subTest(address=address):
