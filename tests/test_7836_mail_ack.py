@@ -131,13 +131,59 @@ class MailAckTest(PgTestCase):
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("ack: 5 acknowledged, 0 already delivered, 0 reserved, "
-                      "0 not addressed (by ack@bureau-goal:526a0a74)", proc.stdout)
+                      "0 not addressed, 0 STOP skipped (open lot) "
+                      "(by ack@bureau-goal:526a0a74)", proc.stdout)
         self.assertIn("ack: 2/5", proc.stderr)      # progrès des lots
         for message_id in ids:
             row = self._row(message_id)
             self.assertIsNotNone(row["delivered_at"])
             self.assertEqual(
                 row["meta"]["consigne"]["porteur"], "ack@bureau-goal:526a0a74")
+
+    def test_ack_stock_skips_a_stop_on_an_open_lot(self):
+        lot = self._lot()
+        stop_id = mail.send(self.db, "alpha", "bureau",
+                            "STOP #%d : ne pas importer" % lot,
+                            work_item_id=str(lot), thread=False)
+        ok_id = mail.send(self.db, "alpha", "bureau", "information-7836",
+                          thread=False)
+
+        proc = self._ack("--ids-from", "-", "--skip-stop",
+                         stdin="%d\n%d\n" % (stop_id, ok_id))
+
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("#%d skipped: STOP on open lot #%d" % (stop_id, lot),
+                      proc.stdout)
+        self.assertIn("#%d acknowledged" % ok_id, proc.stdout)
+        self.assertIn("1 STOP skipped (open lot)", proc.stdout)
+        self.assertIsNone(self._row(stop_id)["delivered_at"])
+        self.assertIsNotNone(self._row(ok_id)["delivered_at"])
+        # Le courrier du lot reste non lu : la porte pre-act le voit encore.
+        with self.assertRaisesRegex(pre_act.Refused, "unread lot mail"):
+            self._pre_act(lot)
+
+    def test_ack_stock_skips_stop_without_the_flag(self):
+        lot = self._lot()
+        stop_id = mail.send(self.db, "alpha", "bureau",
+                            "arrêt demandé pour #%d" % lot,
+                            work_item_id=str(lot), thread=False)
+
+        proc = self._ack("--ids-from", "-", stdin="%d\n" % stop_id)
+
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("#%d skipped: STOP on open lot #%d" % (stop_id, lot),
+                      proc.stdout)
+        self.assertIsNone(self._row(stop_id)["delivered_at"])
+
+    def test_ack_named_still_delivers_a_stop_after_reading_it(self):
+        lot = self._lot()
+        stop_id = mail.send(self.db, "alpha", "bureau", "STOP #%d" % lot,
+                            work_item_id=str(lot), thread=False)
+
+        proc = self._ack(str(stop_id))
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(self._row(stop_id)["delivered_at"])
 
     def test_ack_reads_stdin_and_limit_bounds_the_bulk(self):
         ids = [mail.send(self.db, "alpha", "bureau", "stdin-%d" % n,

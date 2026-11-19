@@ -66,10 +66,13 @@
                                                  copy only), read from the database without
                                                  marking it read (#5215)
   agent-mail ack <id> [<id>…] [--ids-from FILE|-] [--batch N] [--limit N]
-                 [--by LABEL] [--dry-run]        acknowledge (deliver) received messages by their
+                 [--by LABEL] [--skip-stop] [--dry-run]
+                                                 acknowledge (deliver) received messages by their
                                                  number, through the same reservation as the
                                                  runners; idempotent, never steals another
-                                                 delivery, leaves the message readable (#7836)
+                                                 delivery, leaves the message readable (#7836);
+                                                 a stock (`--ids-from`) skips and lists the STOPs
+                                                 of open lots, to settle one by one
   agent-mail whoami [--session ID --harness H]   bound identity and its source (runner, explicit,
                                                  session); --cwd DIR = diagnostic
   agent-mail bind <NAME> --session ID --harness claude|codex|deepseek [--pid N] [--force]
@@ -1034,13 +1037,13 @@ def cmd_show(bk, cfg: Config, rest: list[str]) -> int:
 
 
 _ACK_USAGE = ("usage: agent-mail ack <id> [<id> ...] [--ids-from FILE|-] "
-              "[--batch N] [--limit N] [--by LABEL] [--dry-run]")
+              "[--batch N] [--limit N] [--by LABEL] [--skip-stop] [--dry-run]")
 _ACK_BY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,119}$")
 _ACK_BATCH_MAX = 1000
 _ACK_LIMIT_MAX = 10000
 
 
-def _ack_ids(rest: list[str]) -> tuple[list[int], str | None, int, int, str, bool]:
+def _ack_ids(rest: list[str]) -> tuple[list[int], str | None, int, int, str, bool, bool]:
     """#7836 : lire les ids d'un acquittement, sans écriture.
 
     Les ids positionnels et ceux d'un fichier (ou de l'entrée standard, `-`)
@@ -1049,10 +1052,12 @@ def _ack_ids(rest: list[str]) -> tuple[list[int], str | None, int, int, str, boo
     une ligne vide ou commençant par `#` est un commentaire.
     """
     ids: list[int] = []
+    seen: set[int] = set()
     source: str | None = None
     batch, limit = 200, _ACK_LIMIT_MAX
     by = ""
     dry_run = False
+    skip_stop = False
 
     def add(value: str) -> None:
         try:
@@ -1061,7 +1066,8 @@ def _ack_ids(rest: list[str]) -> tuple[list[int], str | None, int, int, str, boo
             raise ValueError("invalid message number: %r" % (value,)) from None
         if message_id <= 0:
             raise ValueError("invalid message number: %r" % (value,))
-        if message_id not in ids:
+        if message_id not in seen:
+            seen.add(message_id)
             ids.append(message_id)
 
     i = 0
@@ -1069,6 +1075,8 @@ def _ack_ids(rest: list[str]) -> tuple[list[int], str | None, int, int, str, boo
         arg = rest[i]
         if arg == "--dry-run":
             dry_run = True
+        elif arg == "--skip-stop":
+            skip_stop = True
         elif arg in ("--ids-from", "--batch", "--limit", "--by"):
             if i + 1 >= len(rest):
                 raise ValueError("%s requires a value" % arg)
@@ -1126,7 +1134,52 @@ def _ack_ids(rest: list[str]) -> tuple[list[int], str | None, int, int, str, boo
         raise ValueError("no message number")
     if len(ids) > limit:
         raise ValueError("%d message number(s) exceed --limit %d" % (len(ids), limit))
-    return ids, source, batch, limit, by, dry_run
+    return ids, source, batch, limit, by, dry_run, skip_stop
+
+
+def _stop_hits(bk, ids: list[int], recipient: str) -> dict[int, int]:
+    """#7836 : messages d'un lot OUVERT portant un STOP, à ne pas remettre en bloc.
+
+    La porte pre-act ne cherche un STOP que dans le courrier du lot postérieur
+    à `--since` : un ancien STOP adressé au bureau, acquitté avec le stock,
+    disparaîtrait de la porte. Le stock les liste donc sans les remettre ; ils
+    se relisent et se règlent un par un (levée du STOP par son auteur, ou ack
+    nominatif après lecture).
+    """
+    from . import planned_waits, work
+    hits: dict[int, int] = {}
+    open_lots: dict[int, bool] = {}
+    reference = re.compile(r"(?<![0-9])#(\d+)(?![0-9])")
+
+    def open_lot(value) -> int | None:
+        try:
+            number = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        if number not in open_lots:
+            item = work.get(bk.db, number) or {}
+            open_lots[number] = (item.get("state") or "") in work.OPEN_STATES
+        return number if open_lots[number] else None
+
+    for message_id in ids:
+        row = mail.get(bk.db, message_id)
+        if row is None or (row.get("recipient") or "") != recipient:
+            continue
+        if row.get("delivered_ts") is not None:
+            continue
+        body = row.get("body") or ""
+        if not planned_waits.contains_stop(body):
+            continue
+        lots: list = []
+        if row.get("work_item_id"):
+            lots.append(row["work_item_id"])
+        lots.extend(match.group(1) for match in reference.finditer(body))
+        for lot in lots:
+            number = open_lot(lot)
+            if number is not None:
+                hits[message_id] = number
+                break
+    return hits
 
 
 def cmd_ack(bk, cfg: Config, rest: list[str]) -> int:
@@ -1145,9 +1198,15 @@ def cmd_ack(bk, cfg: Config, rest: list[str]) -> int:
     nombre total ; un acquittement en bloc reste donc borné et reprenable.
     `--by` nomme la session qui a affiché le message dans le journal de
     réservation (`meta.consigne.porteur`) : `ack@bureau-goal:526a0a74`.
+
+    Le stock n'acquitte pas les messages d'un lot encore ouvert qui portent un
+    STOP (`--skip-stop`, actif par défaut avec `--ids-from`) : la porte
+    pre-act ne cherche un STOP que dans le courrier postérieur à `--since`,
+    et les remettre en bloc effacerait un ancien STOP de la porte. Ils sont
+    listés au bilan et restent non lus, à régler un par un.
     """
     try:
-        ids, source, batch, _limit, by, dry_run = _ack_ids(rest)
+        ids, source, batch, _limit, by, dry_run, skip_stop = _ack_ids(rest)
     except (ValueError, OSError) as exc:
         print("ack: %s" % exc, file=sys.stderr)
         print(_ACK_USAGE, file=sys.stderr)
@@ -1189,14 +1248,23 @@ def cmd_ack(bk, cfg: Config, rest: list[str]) -> int:
                 print("no message #%d addressed to %s: only its recipient (or a copy) "
                       "can acknowledge it" % (message_id, binding.name), file=sys.stderr)
                 return 1
+    # Le stock est le seul mode qui remet des messages que personne n'a
+    # affichés : il applique le tri STOP par défaut (#7836, B1 auditeur).
+    skip_stop = skip_stop or source is not None
+    skipped = _stop_hits(bk, ids, binding.name) if skip_stop else {}
+    todo = [message_id for message_id in ids if message_id not in skipped]
     if dry_run:
-        print("ack: would process %d message(s) in %d batch(es); no write"
-              % (len(ids), (len(ids) + batch - 1) // batch))
+        for message_id in sorted(skipped):
+            print("#%d would be skipped: STOP on open lot #%d, read and "
+                  "acknowledge it by name" % (message_id, skipped[message_id]))
+        print("ack: would process %d message(s) in %d batch(es)%s; no write"
+              % (len(todo), (len(todo) + batch - 1) // batch,
+                 ", %d STOP skipped (open lot)" % len(skipped) if skipped else ""))
         return 0
     delivered: set[int] = set()
-    total = len(ids)
+    total = len(todo)
     for start in range(0, total, batch):
-        chunk = ids[start:start + batch]
+        chunk = todo[start:start + batch]
         token = mail.new_token()
         with bk.db.transaction() as tx:
             reserved = mail.reserve(tx, binding.name, owner, epoch, token,
@@ -1216,7 +1284,7 @@ def cmd_ack(bk, cfg: Config, rest: list[str]) -> int:
     already: list[int] = []
     busy: list[int] = []
     unknown: list[int] = []
-    for message_id in ids:
+    for message_id in todo:
         if message_id in delivered:
             continue
         row = mail.get(bk.db, message_id)
@@ -1233,13 +1301,17 @@ def cmd_ack(bk, cfg: Config, rest: list[str]) -> int:
             print("#%d already delivered" % message_id)
         for message_id in busy:
             print("#%d reserved by another delivery" % message_id)
+    for message_id in sorted(skipped):
+        print("#%d skipped: STOP on open lot #%d, read and acknowledge it by name"
+              % (message_id, skipped[message_id]))
     for message_id in unknown:
         print("#%d not addressed to %s: not acknowledged"
               % (message_id, binding.name), file=sys.stderr)
-    print("ack: %d acknowledged, %d already delivered, %d reserved, %d not addressed%s"
-          % (len(delivered), len(already), len(busy), len(unknown),
+    print("ack: %d acknowledged, %d already delivered, %d reserved, %d not addressed, "
+          "%d STOP skipped (open lot)%s"
+          % (len(delivered), len(already), len(busy), len(unknown), len(skipped),
              " (by %s)" % by if by else ""))
-    return 0 if not (unknown or busy) else 1
+    return 0 if not (unknown or busy or skipped) else 1
 
 
 def cmd_list(bk) -> int:

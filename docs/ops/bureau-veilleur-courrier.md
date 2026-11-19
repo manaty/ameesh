@@ -47,6 +47,13 @@ réservation. Aucun `UPDATE` direct de `delivered_at` n'est nécessaire.
   par ligne), `--batch` borne chaque transaction (200 par défaut, 1 000 au
   plus), `--limit` borne le total (10 000 au plus). Un lot interrompu se
   reprend : les messages déjà remis sont ignorés.
+- **STOP protégés** : en mode stock (`--ids-from`, ou `--skip-stop`), un
+  message lié à un lot encore ouvert dont le corps contient un STOP
+  (`stop`, `arrêt`, `suspend…`, `annul…`, `halt`) n'est **pas** remis : il
+  est listé « STOP on open lot #N » et reste non lu. La porte pre-act ne
+  cherche un STOP que dans le courrier postérieur à `--since` ; acquitter en
+  bloc un ancien STOP le ferait disparaître de la porte. On le relit et on le
+  règle par son auteur (levée) ou par un ack nominatif après lecture.
 
 ## Procédure (geste du bureau)
 
@@ -85,19 +92,35 @@ champ est l'id.
 ```sh
 # contrôle sans écriture
 ssh root@AG2 'runuser -u ameesh -- env AGENT_MAIL_NAME=bureau /…/venv-courant/bin/agent-mail ack \
-  --ids-from - --by "ack@bureau-goal:<session>" --dry-run' \
+  --ids-from - --skip-stop --by "ack@bureau-goal:<session>" --dry-run' \
   < inventaire-non-livre-20261119T0528Z.tsv
 
 # acquittement borné, reprenable
 ssh root@AG2 'runuser -u ameesh -- env AGENT_MAIL_NAME=bureau /…/venv-courant/bin/agent-mail ack \
-  --ids-from - --batch 200 --by "ack@bureau-goal:<session>"' \
+  --ids-from - --skip-stop --batch 200 --by "ack@bureau-goal:<session>"' \
   < inventaire-non-livre-20261119T0528Z.tsv
 ```
 
-Le compte final (`ack: N acknowledged, …`) et les compteurs de progression
-sont sur la sortie ; chaque message porte son `porteur` dans
-`meta.consigne`. Un message qui n'est pas adressé au bureau n'est pas
-acquitté et ressort au bilan ; un message déjà remis n'est pas réécrit.
+Le compte final (`ack: N acknowledged, …, N STOP skipped (open lot)`) et les
+compteurs de progression sont sur la sortie ; chaque message porte son
+`porteur` dans `meta.consigne`. Un message qui n'est pas adressé au bureau
+n'est pas acquitté et ressort au bilan ; un message déjà remis n'est pas
+réécrit. Le tri STOP est actif par défaut en mode stock ; `--skip-stop` le
+rend explicite.
+
+### 2 bis. Régler les STOP protégés
+
+Le `--dry-run` puis le stock listent les ids « skipped: STOP on open lot
+#N ». Pour chacun :
+
+1. lire le message (`agent-mail show <id>`) et l'état du lot #N ;
+2. si le STOP est encore valable, laisser le message non lu et le faire
+   lever par son auteur (ou par le pilote) ; ne pas l'acquitter ;
+3. s'il est caduc (décision prise, STOP déjà levé), l'acquitter par son
+   numéro **après lecture** : `agent-mail ack <id> --by …`. Un id
+   positionnel n'applique pas le tri STOP — c'est le geste de lecture ;
+4. relancer le stock : les messages réglés ne reviennent plus, les autres
+   sont « déjà remis » et ignorés.
 
 ### 3. Identité partagée BG/PC
 
@@ -118,12 +141,16 @@ agent-mail show <id>                 # lisible après acquittement
 psql … -c "select count(*) from agent_mailbox
            where recipient='bureau' and delivered_at is null"   # décroît
 ameesh gate pre-act --lot <lot> --kind kms --since <ISO> --dry-run
-                                     # ne refuse plus sur ce courrier (dès #7831)
+                                     # une fois #7831 fusionné (borne 24 h),
+                                     # ne refuse plus sur un ancien courrier ;
+                                     # avant, la porte peut encore refuser
+                                     # sur ce message non remis
 ```
 
 Les tests du dépôt : `tests/test_7836_mail_ack.py` (remise, porte pre-act,
 tiers refusé, idempotence BG/PC, réservation active, inventaire TSV, lots
-bornés, identité `execute` refusée, repli fichier refusé).
+bornés, STOP de lot ouvert en stock et en nominatif, identité `execute`
+refusée, repli fichier refusé).
 
 ### 5. Retour
 
