@@ -3,7 +3,9 @@
 # #7694 (design 7633 §5.3) — témoin kind de l'isolation des comptes d'un hôte
 # pod : identité (UID du chart = UID du processus = entrée passwd), montage
 # (le PVC de B n'est pas dans le conteneur de A), permissions (le dossier de
-# comptes 0700 de B refuse l'UID de A, même monté en lecture seule).
+# comptes 0700 de B refuse l'UID de A, même monté en lecture seule), canon
+# (dépôt cloné sous 10001 et lu sous l'UID du tenant avec la paire
+# `safe.directory` du plan — B1 de #44265).
 #
 # Ce script est un geste de BUREAU/OPÉRATEUR, pas de l'agent intéressé : il
 # crée un cluster kind jetable, applique les gabarits du dossier, exécute les
@@ -17,7 +19,7 @@
 #
 # Sortie 77 si kind/kubectl/docker manque : le témoin est alors « non exécuté »
 # (non-concluant), jamais « vert ». Variables/options : --uid-a, --uid-b,
-# --fs-group, --image, --cluster, --namespace.
+# --fs-group, --image, --git-image, --cluster, --namespace.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -26,12 +28,16 @@ NS=${NS:-ameesh-pod-witness}
 UID_A=${UID_A:-2519}
 UID_B=${UID_B:-2520}
 FS_GROUP=${FS_GROUP:-10000}
+SUPERVISOR_UID=${SUPERVISOR_UID:-10001}
 IMAGE=${IMAGE:-busybox:1.36}
+#: image avec Git pour le témoin du canon (le dépôt est cloné sous
+#: SUPERVISOR_UID puis lu sous UID_A).
+GIT_IMAGE=${GIT_IMAGE:-alpine/git:2.45.2}
 KEEP=0
 RENDER_ONLY=0
 
 usage() {
-    sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -44,13 +50,14 @@ while [ $# -gt 0 ]; do
         --uid-b) UID_B=${2:?}; shift ;;
         --fs-group) FS_GROUP=${2:?}; shift ;;
         --image) IMAGE=${2:?}; shift ;;
+        --git-image) GIT_IMAGE=${2:?}; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "option inconnue: $1" >&2; usage >&2; exit 2 ;;
     esac
     shift
 done
 
-for valeur in UID_A UID_B FS_GROUP; do
+for valeur in UID_A UID_B FS_GROUP SUPERVISOR_UID; do
     eval "v=\${$valeur}"
     case "$v" in
         ''|*[!0-9]*) echo "$valeur doit être un entier: $v" >&2; exit 2 ;;
@@ -59,8 +66,8 @@ done
 [ "$UID_A" != "$UID_B" ] || { echo "UID_A et UID_B doivent différer" >&2; exit 2; }
 [ "$FS_GROUP" -gt 0 ] || { echo "FS_GROUP doit être > 0" >&2; exit 2; }
 for uid in "$UID_A" "$UID_B"; do
-    if [ "$uid" -eq 0 ] || [ "$uid" -eq "$FS_GROUP" ] || [ "$uid" -eq 10001 ]; then
-        echo "UID de tenant refusé : $uid (0, fsGroup et superviseur 10001 sont réservés)" >&2
+    if [ "$uid" -eq 0 ] || [ "$uid" -eq "$FS_GROUP" ] || [ "$uid" -eq "$SUPERVISOR_UID" ]; then
+        echo "UID de tenant refusé : $uid (0, fsGroup et superviseur $SUPERVISOR_UID sont réservés)" >&2
         exit 2
     fi
 done
@@ -69,12 +76,14 @@ render() {
     sed -e "s#__UID_A__#${UID_A}#g" \
         -e "s#__UID_B__#${UID_B}#g" \
         -e "s#__FS_GROUP__#${FS_GROUP}#g" \
+        -e "s#__SUPERVISOR_UID__#${SUPERVISOR_UID}#g" \
         -e "s#__IMAGE__#${IMAGE}#g" \
+        -e "s#__GIT_IMAGE__#${GIT_IMAGE}#g" \
         "$HERE/$1"
 }
 
 if [ "$RENDER_ONLY" -eq 1 ]; then
-    echo "# #7694 témoin kind — UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE"
+    echo "# #7694 témoin kind — UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE git_image=$GIT_IMAGE"
     echo "# kubectl create namespace $NS && kubectl -n $NS apply -f -"
     echo "---"
     render temoin-pvc.yaml
@@ -82,6 +91,8 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
     render temoin-deux.yaml
     echo "---"
     render temoin-lecture.yaml
+    echo "---"
+    render temoin-canon.yaml
     exit 0
 fi
 
@@ -108,6 +119,7 @@ diagnostic() {
         k logs temoin-deux -c "$conteneur" >&2 || true
     done
     k logs temoin-lecture >&2 || true
+    k logs temoin-canon >&2 || true
 }
 
 cleanup() {
@@ -138,6 +150,7 @@ trace() {
     echo "trace: date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "trace: kubernetes=$(kubectl version -o jsonpath='{.serverVersion.gitVersion}' 2>/dev/null || echo '?')"
     echo "trace: image=$IMAGE"
+    echo "trace: git_image=$GIT_IMAGE"
     echo "trace: image_id=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo '?')"
     echo "trace: uid_a=$UID_A uid_b=$UID_B fs_group=$FS_GROUP"
     echo "trace: pod_uid=$(pod_uid temoin-deux)"
@@ -238,22 +251,51 @@ check_lecture() {
     pass "lecture: A lit son compte, B (0700, monté sans fsGroup) le refuse"
 }
 
-echo "== témoin kind #7694 : UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE =="
+# --- contrôle 4 : canon lu sous un UID différent du clone (B1 de #44265) ----
+# Le dépôt est créé par l'init sous SUPERVISOR_UID ; la lecture par l'UID du
+# tenant passe seulement grâce à la paire `safe.directory` du plan, bornée à
+# ce dépôt. Sans elle, Git refuse « dubious ownership » (contrôle négatif).
+check_canon() {
+    apply_manifest temoin-canon.yaml
+    if ! k wait --for=jsonpath='{.status.phase}'=Succeeded pod/temoin-canon --timeout=180s >/dev/null; then
+        k logs temoin-canon >&2 || true
+        fail "canon: le pod temoin-canon n'a pas réussi"
+    fi
+    local logs code
+    logs=$(k logs temoin-canon)
+    printf '%s\n' "$logs"
+    grep -q "^PASS canon-lecture: uid=$UID_A clone_uid=$SUPERVISOR_UID$" <<<"$logs" \
+        || fail "canon: lecture du dépôt sous l'UID du tenant (clone sous $SUPERVISOR_UID) absente"
+    grep -q '^PASS canon-refus: sans safe.directory' <<<"$logs" \
+        || fail "canon: le refus sans safe.directory n'est pas prouvé"
+    if grep -q '^FAIL' <<<"$logs"; then
+        fail "canon: au moins un contrôle du pod temoin-canon a échoué"
+    fi
+    code=$(k get pod temoin-canon -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}')
+    [ "$code" = "0" ] || fail "canon: code de sortie $code"
+    pass "canon: dépôt clone sous $SUPERVISOR_UID lu sous $UID_A, confiance bornée au dépôt"
+}
+
+echo "== témoin kind #7694 : UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE git_image=$GIT_IMAGE =="
 docker pull --quiet "$IMAGE" >/dev/null
+docker pull --quiet "$GIT_IMAGE" >/dev/null
 kind create cluster --name "$CLUSTER" --wait 120s >/dev/null
 kind load docker-image "$IMAGE" --name "$CLUSTER" >/dev/null
+kind load docker-image "$GIT_IMAGE" --name "$CLUSTER" >/dev/null
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 # PSA restricted : si le cluster l'applique, le gabarit doit y être admis.
 kubectl label namespace "$NS" \
     pod-security.kubernetes.io/enforce=restricted \
     pod-security.kubernetes.io/enforce-version=latest >/dev/null
 
+# B2 de #44265 : kind installe une StorageClass `WaitForFirstConsumer` ; un PVC
+# ne passe `Bound` qu'une fois un pod consommateur planifié. On crée donc le
+# consommateur AVANT d'attendre le binding — l'ordre inverse expirait à 120 s.
 apply_manifest temoin-pvc.yaml
+apply_manifest temoin-deux.yaml
 k wait --for=jsonpath='{.status.phase}'=Bound \
     pvc/pvc-temoin-a pvc/pvc-temoin-b --timeout=120s >/dev/null
-pass "PVC: pvc-temoin-a et pvc-temoin-b liés"
-
-apply_manifest temoin-deux.yaml
+pass "PVC: pvc-temoin-a et pvc-temoin-b liés (consommateur temoin-deux créé d'abord)"
 wait_ready
 pass "pod: temoin-deux prêt (A et B)"
 trace
@@ -300,4 +342,6 @@ kexec a sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-a")" = temoin
     || fail "rejeu final: temoin de A illisible apres le pod sans fsGroup"
 pass "rejeu final: identite et modes intacts apres un montage sans fsGroup"
 
-echo "TOUS LES TEMOINS PASSENT (#7694 : identité, montage, permissions)"
+check_canon
+
+echo "TOUS LES TEMOINS PASSENT (#7694 : identité, montage, permissions, canon)"

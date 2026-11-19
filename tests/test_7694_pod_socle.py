@@ -14,7 +14,9 @@ import dataclasses
 import io
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 import types
 import unittest
@@ -245,6 +247,13 @@ class PodPlanTest(unittest.TestCase):
         self.assertEqual(env["AMEESH_TENANT"], ALICE)
         self.assertEqual(env["AMEESH_CONFIG"], "/etc/ameesh/tenant/config.json")
         self.assertEqual(env["AMEESH_CANON_SYNC_INTERVAL"], "0")
+        # B1 de #44265 : le canon est cloné sous 10001 et lu sous l'UID du
+        # tenant ; la confiance Git est bornée à CE dépôt, jamais `*`.
+        self.assertEqual(env["AMEESH_CANON"], tenancy.POD_CANON_REPO)
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "safe.directory")
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], tenancy.POD_CANON_REPO)
+        self.assertNotIn("*", [env["GIT_CONFIG_VALUE_0"]])
         mounts = {m["name"]: m for m in plan["container"]["volumeMounts"]}
         self.assertEqual(mounts["home-alice"]["mountPath"], "/home/ameesh-alice")
         self.assertTrue(mounts["passwd"]["readOnly"])
@@ -566,6 +575,25 @@ class ChartTest(unittest.TestCase):
                           "/etc/ameesh/tenant/config.json"))
         self.assertEqual(env["AMEESH_CANON_SYNC_INTERVAL"], "0")
 
+    def test_tenant_safe_directory_borne_au_canon(self):
+        """B1 de #44265 : le chart porte la même paire que le plan, bornée au
+        dépôt du canon (le clone est sous 10001, la lecture sous l'UID du
+        tenant) — jamais `*`, jamais un fichier global."""
+        tenant = next(c for c in self.pod_spec()["containers"]
+                      if c["name"] == "tenant-alice")
+        chart = {e["name"]: e.get("value") for e in tenant["env"]}
+        plan = {e["name"]: e.get("value") for e in self.plan["container"]["env"]}
+        cles = ("AMEESH_CANON", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0")
+        self.assertEqual({k: chart[k] for k in cles}, {k: plan[k] for k in cles})
+        self.assertEqual(chart["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(chart["GIT_CONFIG_KEY_0"], "safe.directory")
+        self.assertEqual(chart["GIT_CONFIG_VALUE_0"], tenancy.POD_CANON_REPO)
+        self.assertNotEqual(chart["GIT_CONFIG_VALUE_0"], "*")
+        self.assertFalse([k for k in chart
+                          if k.startswith("GIT_CONFIG_KEY_")
+                          and k != "GIT_CONFIG_KEY_0"])
+
     def test_uid_et_security_context_du_tenant(self):
         tenant = next(c for c in self.pod_spec()["containers"]
                       if c["name"] == "tenant-alice")
@@ -615,6 +643,51 @@ class ChartTest(unittest.TestCase):
         self.assertIn("configmaps.yaml", self.kustomization["resources"])
 
 
+class SafeDirectoryTest(unittest.TestCase):
+    """B1 de #44265 : la paire du plan lève « dubious ownership » sans `*`.
+
+    `GIT_TEST_ASSUME_DIFFERENT_OWNER` force le contrôle d'appropriation que le
+    tenant rencontre face au clone du superviseur ; la preuve à UID réellement
+    différent est le témoin kind (`temoin-canon.yaml`).
+    """
+
+    def env_base(self, tmp: str) -> dict:
+        return {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": tmp,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TEST_ASSUME_DIFFERENT_OWNER": "true",
+        }
+
+    def test_dubious_ownership_leve_par_la_paire_du_plan(self):
+        if shutil.which("git") is None:  # pragma: no cover - environnement
+            self.skipTest("git absent")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "repo")
+            subprocess.run(["git", "init", "-q", repo], check=True)
+            base = self.env_base(tmp)
+            refus = subprocess.run(["git", "-C", repo, "rev-parse", "--git-dir"],
+                                   env=base, capture_output=True, text=True)
+            self.assertNotEqual(refus.returncode, 0)
+            self.assertIn("dubious ownership", refus.stderr)
+            plan = tenancy.pod_plan(POD_HOST, ALICE)
+            pair = {e["name"]: e["value"] for e in plan["container"]["env"]
+                    if e["name"].startswith("GIT_CONFIG_") or e["name"] == "AMEESH_CANON"}
+            self.assertEqual(pair["GIT_CONFIG_VALUE_0"], tenancy.POD_CANON_REPO)
+            self.assertEqual(pair["GIT_CONFIG_COUNT"], "1")
+            self.assertNotEqual(pair["GIT_CONFIG_VALUE_0"], "*")
+            accepte = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "--git-dir"],
+                env={**base,
+                     "GIT_CONFIG_COUNT": pair["GIT_CONFIG_COUNT"],
+                     "GIT_CONFIG_KEY_0": pair["GIT_CONFIG_KEY_0"],
+                     "GIT_CONFIG_VALUE_0": repo},
+                capture_output=True, text=True)
+            self.assertEqual(accepte.returncode, 0, accepte.stderr)
+            self.assertEqual(accepte.stdout.strip(), ".git")
+
+
 @unittest.skipIf(yaml is None, "PyYAML absent : témoin non vérifié (bash -n reste possible)")
 class WitnessTest(unittest.TestCase):
     """Témoin kind : manifestes, script, absence de fsGroup au contrôle 3."""
@@ -642,13 +715,15 @@ class WitnessTest(unittest.TestCase):
 
     def test_rendu_placeholders_remplaces(self):
         self.assertEqual(len(self.of_kind("PersistentVolumeClaim")), 2)
-        self.assertEqual(len(self.of_kind("Pod")), 2)
+        self.assertEqual(len(self.of_kind("Pod")), 3)
         rendered = self.rendu.stdout
-        for placeholder in ("__UID_A__", "__UID_B__", "__FS_GROUP__", "__IMAGE__"):
+        for placeholder in ("__UID_A__", "__UID_B__", "__FS_GROUP__", "__IMAGE__",
+                            "__GIT_IMAGE__", "__SUPERVISOR_UID__"):
             self.assertNotIn(placeholder, rendered)
         self.assertIn("2519", rendered)
         self.assertIn("2520", rendered)
         self.assertIn("10000", rendered)
+        self.assertIn("alpine/git", rendered)
 
     def test_temoin_deux_un_seul_fsgroup(self):
         pod = next(d for d in self.of_kind("Pod") if d["metadata"]["name"] == "temoin-deux")
@@ -674,6 +749,43 @@ class WitnessTest(unittest.TestCase):
         self.assertTrue(mounts["/mnt/a"]["readOnly"])
         self.assertTrue(mounts["/mnt/b"]["readOnly"])
         self.assertNotIn("fsGroup", pod["spec"]["containers"][0]["securityContext"])
+
+    def test_temoin_canon_clone_et_lecture_sous_deux_uid(self):
+        """B1 de #44265 : clone sous le superviseur, lecture sous le tenant,
+        la paire `safe.directory` du plan bornée à CE dépôt et le montage
+        de lecture en lecture seule."""
+        pod = next(d for d in self.of_kind("Pod")
+                   if d["metadata"]["name"] == "temoin-canon")
+        init = next(c for c in pod["spec"]["initContainers"] if c["name"] == "clone")
+        lecture = next(c for c in pod["spec"]["containers"] if c["name"] == "lecture")
+        self.assertEqual(init["securityContext"]["runAsUser"], 10001)
+        self.assertEqual(lecture["securityContext"]["runAsUser"], 2519)
+        self.assertNotEqual(init["securityContext"]["runAsUser"],
+                            lecture["securityContext"]["runAsUser"])
+        env = {e["name"]: e["value"] for e in lecture["env"]}
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "safe.directory")
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], "/canon/repo")
+        self.assertNotEqual(env["GIT_CONFIG_VALUE_0"], "*")
+        self.assertFalse([k for k in env
+                          if k.startswith("GIT_CONFIG_KEY_") and k != "GIT_CONFIG_KEY_0"])
+        mounts = {m["name"]: m for m in lecture["volumeMounts"]}
+        self.assertTrue(mounts["canon"]["readOnly"])
+        self.assertFalse([m for m in init["volumeMounts"]
+                          if m["name"] == "canon" and m.get("readOnly")])
+
+    def test_temoin_canon_ordre_binding_wait_for_first_consumer(self):
+        """B2 de #44265 : le consommateur (temoin-deux) est créé AVANT
+        l'attente `Bound` — kind installe une StorageClass
+        WaitForFirstConsumer, un PVC seul resterait Pending."""
+        with open(self.script, encoding="utf-8") as fh:
+            text = fh.read()
+        pvc = text.index("apply_manifest temoin-pvc.yaml")
+        pod = text.index("apply_manifest temoin-deux.yaml")
+        bound = text.index("pvc/pvc-temoin-a")
+        self.assertLess(pvc, pod)
+        self.assertLess(pod, bound)
+        self.assertIn("WaitForFirstConsumer", text)
 
 
 if __name__ == "__main__":

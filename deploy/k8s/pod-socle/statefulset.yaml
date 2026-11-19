@@ -246,6 +246,18 @@ spec:
               value: /var/lib/ameesh/canon/repo
             - name: AMEESH_CANON_SYNC_INTERVAL
               value: "0"
+            # B1 de #44265 : le dépôt du canon est cloné par l'init
+            # « canon » sous 10001 puis lu par ce conteneur sous 2519. Git
+            # refuse « dubious ownership » sans `safe.directory` ; la
+            # confiance est bornée à CE dépôt (jamais `*`), portée par la
+            # configuration d'environnement de Git — même paire que le plan
+            # `ameesh host tenant add --pod`. Preuve : temoin-canon.yaml.
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: safe.directory
+            - name: GIT_CONFIG_VALUE_0
+              value: /var/lib/ameesh/canon/repo
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:

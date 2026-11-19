@@ -55,6 +55,10 @@ POD_SUPERVISOR_UID = 10001
 #: plage d'allocation automatique des UID de tenant (stable par personne).
 POD_UID_BASE = 2000
 POD_UID_SPAN = 1000
+#: #7694 (B1 de #44265) : montage du canon dans le pod (lecture seule) et
+#: dépôt cloné par l'init du superviseur, lu par le tenant sous SON UID.
+POD_CANON = "/var/lib/ameesh/canon"
+POD_CANON_REPO = POD_CANON + "/repo"
 
 
 class TenancyError(ValueError):
@@ -188,10 +192,20 @@ def pod_plan(host: str, tenant: str, *, uid: int | None = None,
         {"name": "AMEESH_TENANT", "value": tenant},
         {"name": "AMEESH_RUNNER_ID", "value": runner},
         {"name": "AMEESH_CONFIG", "value": config_path},
-        {"name": "AMEESH_CANON", "value": "/var/lib/ameesh/canon/repo"},
+        {"name": "AMEESH_CANON", "value": POD_CANON_REPO},
         # Le canon est monté en lecture seule par le superviseur : le runner
         # du tenant ne le synchronise jamais (design 7633 §3.1).
         {"name": "AMEESH_CANON_SYNC_INTERVAL", "value": "0"},
+        # B1 de #44265 : le dépôt est cloné par l'init du superviseur (10001)
+        # puis lu par ce tenant (UID du plan). Git refuse « dubious ownership »
+        # sans `safe.directory` ; la confiance est déclarée par la configuration
+        # d'environnement de Git, bornée à CE dépôt (jamais `*`) et sans
+        # fichier global. Le chart porte les mêmes variables ; le témoin kind
+        # (`deploy/k8s/pod-witness/temoin-canon.yaml`) prouve la lecture sous
+        # un UID différent de celui du clone.
+        {"name": "GIT_CONFIG_COUNT", "value": "1"},
+        {"name": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+        {"name": "GIT_CONFIG_VALUE_0", "value": POD_CANON_REPO},
     ]
     return {
         "host": host,
@@ -217,7 +231,7 @@ def pod_plan(host: str, tenant: str, *, uid: int | None = None,
                  "readOnly": True},
                 # Canon alimenté par l'init/`canon-fetch` du superviseur ; le
                 # runner du tenant le lit, ne l'écrit jamais.
-                {"name": "canon", "mountPath": "/var/lib/ameesh/canon",
+                {"name": "canon", "mountPath": POD_CANON,
                  "readOnly": True},
                 {"name": "tenant-tmp", "mountPath": "/tmp"},
             ],
