@@ -47,13 +47,15 @@ référence).
 - **Le canon est alimenté par l'init/`canon-fetch` du superviseur** ; les
   conteneurs de tenant le lisent en lecture seule et `canon_sync_once` saute
   un runner de tenant.
-- **Confiance Git bornée au dépôt du canon** (B1 de #44265) : le dépôt est
-  cloné par l'init sous `10001` et lu par le tenant sous **son** UID ; sans
-  `safe.directory`, Git refuse « detected dubious ownership », même en
-  lecture seule. Le lecteur réel, `canon._git`, ajoute donc lui-même
-  `-c safe.directory=<chemin canonique du dépôt>` : la confiance ne dépend
-  pas de l'environnement, que `_git_env` filtre (les `GIT_CONFIG_*` injectées
-  restent retirées). Le conteneur du tenant porte en plus la paire
+- **Confiance Git bornée au dépôt du canon** (B1 de #44265, #44282/#44283) :
+  le dépôt est cloné par l'init sous `10001` et lu par le tenant sous **son**
+  UID ; sans `safe.directory`, Git refuse « detected dubious ownership », même
+  en lecture seule. Le lecteur réel, `canon._git`, ajoute lui-même
+  `-c safe.directory=<ce dépôt>` **seulement** dans un conteneur de tenant
+  (`AMEESH_TENANT`) et pour le seul dépôt provisionné
+  `/var/lib/ameesh/canon/repo` : tout autre dépôt, et tout hôte hors pod,
+  gardent le refus de Git ; le filtrage des `GIT_CONFIG_*` par `_git_env`
+  reste entier. Le conteneur du tenant porte en plus la paire
   `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=safe.directory`,
   `GIT_CONFIG_VALUE_0=/var/lib/ameesh/canon/repo` pour les git directs des
   outils du tenant — le chemin exact, jamais `*`, aucun fichier global. Le

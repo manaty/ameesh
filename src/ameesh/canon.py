@@ -2431,16 +2431,28 @@ def _git_env() -> dict:
     return env
 
 
-def _git_safe_directory(repo: str) -> str:
-    """#7694 (B1 de #44265) : dépôt du canon, chemin canonique, pour Git.
+#: #7694 : montage du canon d'un tenant pod, posé par le plan et le chart
+#: (`tenancy.POD_CANON_REPO`). Un test vérifie que les deux valeurs coïncident.
+POD_CANON_REPO = "/var/lib/ameesh/canon/repo"
+
+
+def _git_safe_directory(repo: str) -> str | None:
+    """#7694 (B de #44282/#44283) : dépôt du canon d'un tenant pod, ou None.
 
     Un hôte pod clone le canon sous l'UID du superviseur et le lit sous celui
     du tenant : Git refuse alors « detected dubious ownership », même en
-    lecture seule. `_git` déclare donc la confiance **en argument** — `-c
-    safe.directory=<ce dépôt>`, jamais `*` — et non par l'environnement : le
+    lecture seule. La confiance n'est déclarée — en argument, `-c
+    safe.directory=<ce dépôt>`, jamais `*` — que dans un conteneur de tenant
+    (`AMEESH_TENANT`) et pour le **seul** dépôt provisionné `POD_CANON_REPO` :
+    tout autre dépôt, et tout hôte hors pod, gardent le refus de Git. Le
     filtrage de `_git_env` (GIT_CONFIG_COUNT/KEY/VALUE retirés) reste entier.
     """
-    return os.path.realpath(os.path.abspath(str(repo)))
+    if not (os.environ.get("AMEESH_TENANT") or "").strip():
+        return None
+    path = os.path.realpath(os.path.abspath(str(repo)))
+    if path != os.path.realpath(POD_CANON_REPO):
+        return None
+    return path
 
 
 #: #1749 : une **sonde de présence** (l'objet est-il là ?) ne doit pas
@@ -3033,12 +3045,14 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
                               % (args[0] if args else "?"))
         timeout = deadline.timeout(timeout)
     cmd = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",
-           "-c", "core.fsmonitor=false", "-c", "core.hooksPath=%s" % os.devnull,
-           # #7694 : confiance bornée à CE dépôt (le canon d'un hôte pod est
-           # cloné sous un autre UID que celui qui le lit) ; en argument, donc
-           # insensible au filtrage des GIT_CONFIG_* de `_git_env`.
-           "-c", "safe.directory=%s" % _git_safe_directory(repo),
-           *args]
+           "-c", "core.fsmonitor=false", "-c", "core.hooksPath=%s" % os.devnull]
+    # #7694 : confiance bornée au canon provisionné d'un tenant pod, en
+    # argument (donc insensible au filtrage des GIT_CONFIG_* de `_git_env`) ;
+    # aucun autre dépôt n'est autorisé.
+    safe = _git_safe_directory(repo)
+    if safe is not None:
+        cmd += ["-c", "safe.directory=%s" % safe]
+    cmd += list(args)
     key = _content_cache_key(repo, args, stdin, env_extra)
     if key is not None:
         hit = _content_cache_take(key)

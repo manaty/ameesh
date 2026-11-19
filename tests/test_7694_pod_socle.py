@@ -687,22 +687,45 @@ class SafeDirectoryTest(unittest.TestCase):
             self.assertEqual(accepte.returncode, 0, accepte.stderr)
             self.assertEqual(accepte.stdout.strip(), ".git")
 
-    def test_canon_git_porte_lui_meme_la_confiance_bornee(self):
-        """Le lecteur RÉEL du canon (`canon._git`, dont l'environnement filtre
-        les `GIT_CONFIG_*`) déclare lui-même `-c safe.directory=<ce dépôt>` :
-        sans cet argument, Git refuserait le clone d'un autre UID."""
+    def test_canon_git_ne_fait_confiance_qu_au_canon_provisionne(self):
+        """Le lecteur RÉEL (`canon._git`, dont l'environnement filtre les
+        `GIT_CONFIG_*`) ne déclare `safe.directory` que pour le dépôt du canon
+        d'un tenant pod : un dépôt étranger, ou un hôte hors pod, gardent le
+        refus de Git pour un propriétaire différent (B de #44282/#44283)."""
         if shutil.which("git") is None:  # pragma: no cover - environnement
             self.skipTest("git absent")
+        self.assertEqual(canon.POD_CANON_REPO, tenancy.POD_CANON_REPO)
         with tempfile.TemporaryDirectory() as tmp:
             repo = os.path.join(tmp, "canon")
-            subprocess.run(["git", "init", "-q", repo], check=True)
-            self.assertEqual(canon._git_safe_directory(repo), os.path.realpath(repo))
-            self.assertNotEqual(canon._git_safe_directory(repo), "*")
-            with mock.patch.dict(os.environ,
-                                 {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "true"}):
-                proc = canon._git(repo, "rev-parse", "--git-dir")
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(proc.stdout.strip(), b".git")
+            other = os.path.join(tmp, "autre")
+            for path in (repo, other):
+                subprocess.run(["git", "init", "-q", path], check=True)
+            # hors pod : jamais de confiance, même sur le chemin provisionné
+            with mock.patch.object(canon, "POD_CANON_REPO", repo), \
+                    mock.patch.dict(os.environ, {"AMEESH_TENANT": ""}):
+                self.assertIsNone(canon._git_safe_directory(repo))
+            with mock.patch.object(canon, "POD_CANON_REPO", repo):
+                # pod, mais dépôt étranger : refusé
+                with mock.patch.dict(os.environ, {"AMEESH_TENANT": ALICE}):
+                    self.assertEqual(canon._git_safe_directory(repo),
+                                     os.path.realpath(repo))
+                    self.assertIsNone(canon._git_safe_directory(other))
+                    with mock.patch.dict(
+                            os.environ,
+                            {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "true"}):
+                        proc = canon._git(repo, "rev-parse", "--git-dir")
+                        refus = canon._git(other, "rev-parse", "--git-dir")
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout.strip(), b".git")
+                    self.assertNotEqual(refus.returncode, 0)
+                    self.assertIn(b"dubious ownership", refus.stderr)
+            # hors pod, même chemin : le dépôt d'un autre propriétaire est refusé
+            with mock.patch.object(canon, "POD_CANON_REPO", repo), \
+                    mock.patch.dict(os.environ, {"AMEESH_TENANT": "",
+                                                 "GIT_TEST_ASSUME_DIFFERENT_OWNER": "true"}):
+                refus = canon._git(repo, "rev-parse", "--git-dir")
+            self.assertNotEqual(refus.returncode, 0)
+            self.assertIn(b"dubious ownership", refus.stderr)
             # …sans relâcher le filtrage de la configuration Git injectée.
             with mock.patch.dict(os.environ,
                                  {"GIT_CONFIG_COUNT": "1",
