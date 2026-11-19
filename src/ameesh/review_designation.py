@@ -835,11 +835,214 @@ def _advance_of(candidate, pace: Mapping) -> float:
     return general if general is not None else 0.0
 
 
+def _fixer_provenance_text(rows: Iterable) -> str:
+    """#4679/#7252 : ce que le gel dit d'un correcteur écarté sur preuve.
+
+    Un reçu de correction introuvable (rebase/amend avant push) est un doute :
+    le nom et le SHA local sont dits. Un correctif retiré retrouvé par la
+    citation de l'auteur dit le SHA et la citation. Chaîne vide sans preuve.
+    """
+    doubts: dict = {}
+    rewrites: dict = {}
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        if row.get("unresolved"):
+            doubts[name] = str(row.get("unresolved") or "").strip()
+        if row.get("rewritten"):
+            rewrites[name] = (str(row.get("rewritten") or "").strip(),
+                              str(row.get("cited") or "").strip())
+    text = ""
+    if doubts:
+        text += (" (unresolved correction: %s — commit not recoverable,"
+                 " excluded by doubt)" % ", ".join(
+                     "%s %s" % (name, sha[:12])
+                     for name, sha in sorted(doubts.items())))
+    if rewrites:
+        text += (" (rewritten correction: %s)" % ", ".join(
+            "%s %s%s" % (name, sha[:12],
+                         " cited by %s" % cited[:12] if cited else "")
+            for name, (sha, cited) in sorted(rewrites.items())))
+    return text
+
+
+def _by_delta_select(*, required: int, authors, candidates, families, already,
+                     fixers, hypothetical=(), deltas, global_families=(),
+                     advances=None, automatic=(), preferred=()):
+    """#7745 : la sélection quand la provenance se lit par delta d'auteur.
+
+    Même sortie que `select`, mais l'indépendance se juge par delta : la
+    famille d'un auteur d'un commit n'interdit un relecteur que pour ce
+    commit, jamais pour les autres. La couverture peut donc demander
+    `required + 1` familles — une tête à deux familles d'auteurs en demande
+    trois — et `review_deltas.minimal_seats` en choisit le plus petit ensemble
+    dans l'ordre de préférence des candidats (plan, charge, nom).
+
+    Un siège manuel ou automatique de la famille d'un auteur d'un **autre**
+    delta reste valable : il couvre les deltas que sa famille n'a pas écrits.
+    Seule une famille qui a écrit **tous** les deltas (ou une famille globale,
+    #7324/#2924) ne couvre rien. Les noms restent exclus partout : un auteur
+    ou un correcteur de la tête ne relit aucun de ses commits (#2888).
+    """
+    from . import review_deltas
+    deltas = [frozenset(str(value).strip().lower() for value in delta or ()
+                        if str(value).strip()) for delta in deltas or ()]
+    if not deltas:
+        return None                      # pas de lecture : chemin historique
+    glob = {str(value).strip().lower() for value in global_families or ()
+            if str(value).strip()}
+    common = set(deltas[0])
+    for delta in deltas[1:]:
+        common &= set(delta)
+    common |= glob
+    names, author_families = families_of(authors)
+    registered_fixers = list(fixers or ())
+    simulated_fixers = list(hypothetical or ())
+    fixer_names = names_of(registered_fixers)
+    hypothetical_names = names_of(simulated_fixers) - fixer_names
+    # #4679/#7252 : le doute ou la réécriture d'un correcteur est dit au gel,
+    # quel que soit le chemin de sélection (par delta ou historique).
+    fixer_provenance = _fixer_provenance_text(
+        registered_fixers + simulated_fixers)
+    forbidden_names = names | fixer_names | hypothetical_names
+    out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
+           "manual": [], "why": "no review required",
+           "forbidden": sorted(common),
+           "author_families": sorted(author_families),
+           "seat_families": [], "seats": [], "families": [],
+           "fixers": sorted(fixer_names)}
+    if required == 0:
+        return out
+    unknown = unknown_families(authors)
+    if unknown:
+        out.update({"state": WAITING, "missing": required,
+                    "why": "author family unknown: %s" % ", ".join(unknown)})
+        return out
+    declared = {str(value).strip().lower() for value in families or ()
+                if str(value).strip()}
+
+    def valid_seat(row):
+        row = dict(row or {})
+        name = str(row.get("name") or "").strip()
+        family = str(row.get("family") or "").strip().lower()
+        if (not name or name in forbidden_names or not family
+                or family in PLACEHOLDER_FAMILIES or family in common
+                or (declared and family not in declared)):
+            return None
+        return {"name": name, "family": family}
+
+    seats: list = []
+    kept: list = []
+    seat_families: set = set()
+    seat_names: set = set()
+    for row in already or ():
+        seat = valid_seat(row)
+        if seat is None or seat["family"] in seat_families:
+            continue
+        seats.append(seat)
+        seat_families.add(seat["family"])
+        seat_names.add(seat["name"])
+    for row in automatic or ():
+        seat = valid_seat(row)
+        if (seat is None or seat["name"] in seat_names
+                or seat["family"] in seat_families):
+            continue
+        kept.append(seat)
+        seat_families.add(seat["family"])
+        seat_names.add(seat["name"])
+    out.update({"manual": seats, "seat_families": sorted(seat_families),
+                "seats": [dict(row) for row in seats + kept]})
+    pace = _normalise_advances(advances)
+    preferred_order = {str(name): index for index, name in enumerate(preferred or ())}
+
+    def order(candidate):
+        return (preferred_order.get(candidate.name, len(preferred_order)),
+                _advance_of(candidate, pace), candidate.load, candidate.name)
+
+    eligible = [c for c in candidates or ()
+                if c.eligible(forbidden_names=forbidden_names | seat_names,
+                              forbidden_families=common | seat_families,
+                              families=families)]
+    best: dict = {}
+    for candidate in eligible:
+        family = str(candidate.family or "").strip().lower()
+        if not family:
+            continue
+        current = best.get(family)
+        if current is None or order(candidate) < order(current):
+            best[family] = candidate
+    ordered = sorted(best.values(), key=order)
+    available = [str(candidate.family or "").strip().lower() for candidate in ordered]
+    target = review_deltas.minimal_seats(
+        deltas, available, required, already=seat_families)
+    if target is None:
+        # #3596/#2447 : la couverture complète est hors de portée, mais les
+        # familles présentes sont pourvues tout de suite (au plus les sièges
+        # requis) ; le gel attend le reste au lieu de ne rien désigner. Un
+        # harnais emprunté ne doit pas écarter la seule famille indépendante.
+        target = available[:max(required - len(seat_families), 0)]
+    chosen = [best[family] for family in (target or ()) if family in best]
+    reviewers = [dict(row) for row in kept]
+    reviewers.extend({"name": c.name, "family": c.family} for c in chosen)
+    out["reviewers"] = reviewers
+    out["families"] = sorted(set(available) - seat_families)
+    families_now = list(seat_families) + [
+        str(candidate.family or "").strip().lower() for candidate in chosen]
+    if target is not None and review_deltas.covered(deltas, families_now, required):
+        why = ("designated %d reviewer(s) covering %d author delta(s)"
+               % (len(chosen), len(deltas)))
+        if kept:
+            why += " (kept %d already designated for this freeze)" % len(kept)
+        if fixer_names or hypothetical_names:
+            why += (" (corrector(s) excluded: %s)"
+                    % (", ".join(sorted(fixer_names | hypothetical_names))))
+        why += fixer_provenance
+        if pace and chosen:
+            reading = ["%s %+.0f pt" % (c.family.strip().lower(),
+                                        _advance_of(c, pace) * 100)
+                       for c in chosen if c.family.strip().lower() in pace]
+            if reading:
+                why += " (plan pace: %s)" % ", ".join(reading)
+        if chosen:
+            why += " (load: %s)" % ", ".join(
+                "%s %d" % (c.name, max(int(c.load or 0), 0)) for c in chosen)
+        out.update({"state": DESIGNATED, "missing": 0, "why": why})
+        return out
+    # Le manque se lit avec **toutes** les familles candidates disponibles :
+    # un delta peut n'avoir qu'un avis alors que d'autres familles restent
+    # libres pour les autres deltas.
+    gaps = review_deltas.uncovered(deltas, families_now + available, required)
+    why = ("%d independent review(s) missing by author delta "
+           "(eligible families: %s; forbidden author families: %s; "
+           "uncovered deltas: %s)"
+           % (sum(row["missing"] for row in gaps) or required,
+              ", ".join(sorted(set(available) - seat_families)) or "none",
+              ", ".join(sorted(common)) or "none",
+              "; ".join("%d (author families: %s; %d missing)"
+                        % (row["index"] + 1,
+                           ", ".join(row["families"]) or "none",
+                           row["missing"])
+                        for row in gaps) or "none"))
+    if fixer_names or hypothetical_names:
+        why += (" (corrector(s) excluded: %s)"
+                % (", ".join(sorted(fixer_names | hypothetical_names))))
+    why += fixer_provenance
+    out.update({
+        "state": WAITING,
+        "missing": max((row["missing"] for row in gaps), default=required),
+        "why": why,
+    })
+    return out
+
+
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
            families, already: Iterable = (), fixers: Iterable = (),
            hypothetical: Iterable = (),
            advances: Optional[Mapping] = None, automatic: Iterable = (),
-           preferred: Iterable = ()) -> dict:
+           preferred: Iterable = (), deltas=None, global_families=()) -> dict:
     """Chooses `required` (1 or 2) independent reviewers, by plan pace then load.
 
     - each reviewer's family differs from that of **every** author, and for two
@@ -891,6 +1094,14 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
       exactly like `fixers` (name and family), but reported apart from the
       registered correctors so a projection never reads as a fact. The
       returned `fixers` keeps the registered ones alone.
+    - `deltas` (#7745) bascule sur la règle **par delta d'auteur** : chaque
+      élément porte les familles d'auteur d'un commit contigu (`review_deltas.
+      delta_families`). Une famille n'est alors exclue que du delta qu'elle a
+      écrit ; `required + 1` familles peuvent couvrir une tête à deux familles
+      d'auteurs. `global_families` (commit réattribué #7324, contenu d'un gel
+      antérieur réécrit #2924) reste exclue de tous les deltas. Sans `deltas`
+      (provenance illisible), la règle historique s'applique : la famille de
+      tout auteur de la tête est exclue.
 
     Returns `{state, required, reviewers, missing, manual, why, forbidden,
     families, fixers}`: `waiting` when independent families are missing or an author
@@ -906,44 +1117,26 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
+    if deltas is not None:
+        selected = _by_delta_select(
+            required=required, authors=authors, candidates=candidates,
+            families=families, already=already, fixers=fixers,
+            hypothetical=hypothetical, deltas=deltas,
+            global_families=global_families, advances=advances,
+            automatic=automatic, preferred=preferred)
+        if selected is not None:
+            return selected
     registered_fixers = list(fixers or ())
     simulated_fixers = list(hypothetical or ())
     all_fixers = registered_fixers + simulated_fixers
     names, forbidden = families_of(authors)
     fixer_names = names_of(registered_fixers)
     hypothetical_names = names_of(simulated_fixers) - fixer_names
-    #: #4679 : un correcteur dont le commit local (avant rebase/amend) est
-    #: introuvable reste exclu par son nom ; le gel dit le doute et le SHA,
-    #: au lieu de le redésigner en silence.
-    fixer_doubts: dict[str, str] = {}
-    for row in all_fixers:
-        if isinstance(row, Mapping) and row.get("unresolved"):
-            name = str(row.get("name") or "").strip()
-            if name:
-                fixer_doubts[name] = str(row.get("unresolved") or "").strip()
-    #: #7252 : un correctif retiré retrouvé par la citation de l'auteur. Le
-    #: nom suffit à exclure ; le SHA et la citation disent la preuve au gel.
-    fixer_rewrites: dict[str, tuple[str, str]] = {}
-    for row in all_fixers:
-        if not isinstance(row, Mapping) or not row.get("rewritten"):
-            continue
-        name = str(row.get("name") or "").strip()
-        if name:
-            fixer_rewrites[name] = (str(row.get("rewritten") or "").strip(),
-                                    str(row.get("cited") or "").strip())
+    fixer_provenance = _fixer_provenance_text(all_fixers)
 
     def excluded_fixers_text() -> str:
         text = "%s registered" % (", ".join(sorted(fixer_names)) or "none")
-        if fixer_doubts:
-            text += (" (unresolved correction: %s — commit not recoverable,"
-                     " excluded by doubt)" % ", ".join(
-                         "%s %s" % (name, sha[:12])
-                         for name, sha in sorted(fixer_doubts.items())))
-        if fixer_rewrites:
-            text += (" (rewritten correction: %s)" % ", ".join(
-                "%s %s%s" % (name, sha[:12],
-                             " cited by %s" % cited[:12] if cited else "")
-                for name, (sha, cited) in sorted(fixer_rewrites.items())))
+        text += fixer_provenance
         if hypothetical_names:
             text += ("; hypothetical corrector: %s"
                      % ", ".join(sorted(hypothetical_names)))
@@ -1555,7 +1748,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           unknown_authors: Iterable = (), families,
           already: Iterable = (), fixers: Iterable = (), required: Optional[int] = None,
           advances: Optional[Mapping] = None, held: Iterable = (),
-          answered: Iterable = (), doubts: Iterable = ()) -> dict:
+          answered: Iterable = (), doubts: Iterable = (),
+          deltas=None, global_families=()) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -1710,7 +1904,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     else:
         selection = select(required=required, authors=authors, candidates=candidates,
                            families=families, already=already, fixers=fixers,
-                           advances=advances, automatic=previous, preferred=preferred)
+                           advances=advances, automatic=previous, preferred=preferred,
+                           deltas=deltas, global_families=global_families)
     # #4679 B/P2 : un reçu de correctif introuvable **sans rattachement de lot**
     # ne prouve rien sur cette tête. Il n'entre ni dans `fixers` ni dans la
     # porte ; le gel le dit, pour que l'objet absent ne disparaisse pas en

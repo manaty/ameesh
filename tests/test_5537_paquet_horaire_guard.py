@@ -38,7 +38,10 @@ class PaquetHoraireGuardTest(unittest.TestCase):
         self.assertIn("no project resolves", text)
         self.assertIn("radar.projects", text)
         self.assertIn("packet_watch.projects.<p>.repo", text)
-        self.assertIn('"role": "mesh-design"', text)
+        # #7792 : le conseil ne fixe plus un nom de rôle (le bail du composeur
+        # est le rôle élu, configuré dans packet_watch.role).
+        self.assertIn("configured elected role (packet_watch.role)", text)
+        self.assertNotIn('"role":', text)
 
     def test_inactive_or_unreadable_timer_is_silent(self):
         for state in ("inactive", "failed", "unknown", None, ""):

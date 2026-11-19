@@ -219,6 +219,7 @@ def send(
     idempotency_key: str | None = None,
     report: str | None = None,
     report_fingerprint: str | None = None,
+    in_reply_to: int | None = None,
 ) -> int | None:
     """Dépose un message pour UN destinataire, l'écrit dans son fil. Renvoie son id.
 
@@ -256,6 +257,11 @@ def send(
     (`payload.report` et `payload.report_fingerprint`) est posé par ce module.
     `idempotency_key` l'emporte : un envoi déjà dédoublonné par sa clé n'est
     pas réévalué.
+
+    #7672 : `in_reply_to`, réservé à la surface publique de réponse, nomme la
+    demande (`agent_mailbox.id`, `kind = 'request'`) à laquelle ce message
+    répond. L'index unique partiel 0594 en fait l'autorité de l'unicité ; le
+    dépôt ordinaire ne le pose jamais.
     """
     from .agent_names import resolve as resolve_agent_name
     sender = resolve_agent_name(sender, db=db, operation="mail.send")
@@ -290,11 +296,18 @@ def send(
             raise ValueError("payload.idempotency_key does not match the key")
         payload["idempotency_key"] = idempotency_key
     fil.ensure_readable(body, allow_structured)
-    row = storage.of(db).mailbox.send(
-        sender, recipient, body, host=host, kind=kind, payload=payload,
-        work_item_id=work_item_id, signature=signature, signature_key=signature_key,
-        signed_payload=signed_payload, nonce=nonce, created_us=created_us,
-        expires_us=expires_us)
+    mailbox = storage.of(db).mailbox
+    args = dict(host=host, kind=kind, payload=payload,
+                work_item_id=work_item_id, signature=signature,
+                signature_key=signature_key, signed_payload=signed_payload,
+                nonce=nonce, created_us=created_us, expires_us=expires_us)
+    if in_reply_to is None:
+        row = mailbox.send(sender, recipient, body, **args)
+    else:
+        # #7672 : la corrélation a son propre dépôt, refusé à l'exécuteur
+        # médié ; le chemin ordinaire ne change pas de signature.
+        row = mailbox.send_reply(sender, recipient, body,
+                                 in_reply_to=in_reply_to, **args)
     message_id = int(row["id"])
     # #1689 (N1) : tout dépôt local réveille le chemin rapide du destinataire
     # (#1604), pas seulement `mail send` : approbations, exécuteur, veille,
@@ -537,6 +550,22 @@ def release(db: Db, recipient: str, token: str, ids: Sequence[int]) -> int:
     from .agent_names import resolve as resolve_agent_name
     recipient = resolve_agent_name(recipient, db=db, operation="mail.release")
     return storage.of(db).mailbox.release(recipient, token, ids)
+
+
+def requeue_interrupted(db: Db, recipient: str, owner: str, epoch: int, token: str,
+                        turn_id: str | None, ids: Sequence[int]) -> dict:
+    """#7673 (E2c) : remet en attente les demandes d'un tour coupé par le cœur.
+
+    Le tour était lancé (remise soldée) puis interrompu — arrêt, drainage,
+    retrait d'hôte, redémarrage, préemption, bail perdu : seules ses demandes
+    exactes (`ids`, sous la consigne `owner`/`epoch`/`token`/`turn_id`), sans
+    réponse corrélée, redeviennent non lues, signalées « re-livrées ». Garde
+    de bail : rien n'est écrit si un autre détenteur a pris le bail depuis.
+    """
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.requeue_interrupted")
+    return storage.of(db).mailbox.requeue_interrupted(
+        recipient, owner, int(epoch), token, turn_id, ids)
 
 
 def maybe_redelivered(row: Any) -> bool:

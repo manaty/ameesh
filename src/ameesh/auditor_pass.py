@@ -42,13 +42,13 @@ from . import config as config_mod
 from . import db as db_mod
 from . import events, mail, storage
 from . import work as work_mod
-from .role_timers import AUDITOR_INTERVAL_S, AUDITOR_MAIL
+from .role_timers import AUDITOR_INTERVAL_S, AUDITOR_MAIL, AUDITOR_PASS
 
 #: the journal type of one tick (played or skipped); see `events.TYPES`
 EVENT = "auditor.pass"
 SCHEMA = "ameesh-auditor-pass/1"
 #: the payload mark of the pass mail, so the next tick never counts it as news
-PASS_TAG = "auditeur-court"
+PASS_TAG = AUDITOR_PASS
 
 #: the milestone kinds that are a gate: a lot frozen, reviewed, fired or merged
 GATE_MILESTONES = ("frozen", "verdict", "fire", "unfire", "merged")

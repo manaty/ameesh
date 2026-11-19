@@ -501,6 +501,26 @@ def _owners(db) -> dict[str, str]:
             for row in rows if row["comment"]}
 
 
+_LOCAL_FQDN: str | None = None
+
+
+def _local_fqdn() -> str:
+    """FQDN de l'hôte, résolu une seule fois.
+
+    `socket.getfqdn()` peut bloquer des dizaines de secondes (DNS/mDNS macOS) :
+    il n'est donc appelé que pour un hôte qui n'est ni une adresse de boucle
+    locale ni le nom rendu par `socket.gethostname()`. Le cache évite de payer
+    la résolution à chaque classe de test (`_bench_roles`/`_bench_satellites`).
+    """
+    global _LOCAL_FQDN
+    if _LOCAL_FQDN is None:
+        try:
+            _LOCAL_FQDN = socket.getfqdn().lower().rstrip(".")
+        except OSError:
+            _LOCAL_FQDN = ""
+    return _LOCAL_FQDN
+
+
 def _local_dsn(dsn: str) -> bool:
     """La preuve de propriété est un PID de l'hôte : le banc doit être local."""
     if not dsn:
@@ -508,13 +528,20 @@ def _local_dsn(dsn: str) -> bool:
     if not dsn.startswith(("postgresql://", "postgres://")):
         return False  # forme mot-clé/hôte inconnu : refus conservateur
     try:
-        host = urlsplit(dsn).hostname
+        host = (urlsplit(dsn).hostname or "").lower().rstrip(".")
     except ValueError:
         return False
     if not host:
         return True  # socket local
-    return host in ("127.0.0.1", "localhost", "::1",
-                    socket.gethostname(), socket.getfqdn())
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return True
+    nom = socket.gethostname().lower().rstrip(".")
+    if host == nom:
+        return True
+    # Jamais le premier label d'un nom qualifié (`bench` pour `bench.local`) :
+    # il peut résoudre ailleurs, et ces purges utilisent un PID local comme
+    # preuve de propriété. Seul le FQDN rendu par la résolution fait foi.
+    return host == _local_fqdn()
 
 
 def _creation_rows(db) -> list[dict]:

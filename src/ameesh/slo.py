@@ -32,6 +32,7 @@ aucun dépassement n'est notifié à l'owner.
 from __future__ import annotations
 
 from ameesh import work_lifecycle as lifecycle
+from .roles import AUDITOR_ROLES
 
 import re
 import time
@@ -125,11 +126,11 @@ BY_KEY = {step.key: step for step in STEPS}
 LEVEL_TARGETS = {
     1: ("assignee",),
     2: ("pilot",),
-    3: ("avatar", "auditeur"),
+    3: ("avatar", AUDITOR_ROLES[0]),
 }
 #: #2395 : le niveau 4 n'a pas de seuil propre — un P1 le déclenche. Il vise le
 #: l'avatar et l'auditeur, jamais l'owner (canon §9, décision owner 18/10).
-CRITICAL_TARGETS = ("avatar", "auditeur")
+CRITICAL_TARGETS = ("avatar", AUDITOR_ROLES[0])
 
 
 def step_of(key: str) -> Step:

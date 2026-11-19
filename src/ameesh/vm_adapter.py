@@ -319,7 +319,13 @@ def stop_evidence(cfg, db, host, control, *, now, quiet_s=None):
             raise Refused('elected leader or reserve protected')
     reason = host_release.release_blocker(control, listing, reading,
                                           footprint=fp, cfg=cfg, now=now, adapter_wait=True)
-    if reason or fp.get('state') != 'idle':
+    if reason:
+        # #7799: the R1 entry guard. `release_blocker` names the placed agents
+        # whose lease is still live ("a lease is still held: <agents>"), so the
+        # adapter refuses the halt at effect time and the journal says who
+        # keeps the host up instead of an anonymous "no longer idle".
+        raise Refused('host no longer idle: ' + reason)
+    if fp.get('state') != 'idle':
         raise Refused('host no longer idle')
     return fp
 
@@ -567,7 +573,9 @@ def halted(q, request, target, policy, provider, state, probe):
 def failure_cause(error):
     """Keep exception values, filenames, URLs and credentials out of logs."""
     if isinstance(error, Refused):
-        return str(error)  # All Refused messages in this module are fixed literals.
+        # Fixed literals, except #7799's bounded list of placed agent names
+        # added by `release_blocker` (registry names, no secret).
+        return str(error)
     cause = type(error).__name__
     if isinstance(error, KeyError) and len(error.args) == 1:
         key = error.args[0]

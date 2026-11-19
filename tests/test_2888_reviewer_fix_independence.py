@@ -199,11 +199,16 @@ class GateMandatoryWitnessTest(PgTestCase):
         self.assertFalse(out["ok"], out["why"])
         self.assertEqual(out["corrections"], ["cx2"])
         self.assertIn("cx2", {entry["name"] for entry in out["authors"]})
-        # cx2 (author of the fix) and cx3 (same codex family) are excluded;
-        # only dev1/DeepSeek remains for two required opinions.
+        # cx2 (author of the fix) is excluded by name. cx3 (same codex family)
+        # is out for the codex delta but counts on the claude one, while
+        # dev1/DeepSeek is the only reader of the codex delta: the head still
+        # lacks a second independent opinion there (#7745).
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
-                         ["dev1"])
+                         ["cx3", "dev1"])
         self.assertIn("2 independent review verdict(s) required", out["why"])
+        rows = {row["sha"]: row for row in out["deltas"]}
+        self.assertFalse(rows[self.frozen]["covered"])
+        self.assertEqual(rows[self.frozen]["eligible"], ["deepseek"])
 
 
 class MessageCorrectorRuleTest(TestCase):

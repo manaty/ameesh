@@ -585,6 +585,8 @@ class VmAgentsHarness(unittest.TestCase):
                                   '--ignored'), '')
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "systemd VM install proves the venv through /proc (Linux)")
 class VmAgentsInstallTest(VmAgentsHarness):
     """The commit is already in the VM's clone: checkout and install it."""
 

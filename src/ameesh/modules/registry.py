@@ -330,31 +330,38 @@ def delivery_connectors():
     return found
 
 
-def _release_providers():
-    """`{model: (module_name, getter)}` of the built-in release providers.
+def _providers(declared, getter_name, what):
+    """`{name: (module_name, getter)}` of one kind of built-in provider.
 
-    Release is a core runtime path, like the delivery and merge connectors:
-    only built-in tooling modules are read here. An installed entry point is
-    loaded by discovery and selected by the canon, never by this path. A model
-    declared twice is refused rather than silently ordered."""
+    Release, notification and train contracts are core runtime paths, like the
+    delivery and merge connectors: only built-in tooling modules are read here.
+    An installed entry point is loaded by discovery and selected by the canon,
+    never by this path. A name declared twice is refused rather than silently
+    ordered. ``declared`` is the module attribute listing the names,
+    ``getter_name`` the lazy getter returning one provider."""
     found = {}
     for provider, module in sorted(_builtin().items()):
-        models = getattr(module, "RELEASE_MODELS", ()) or ()
-        if not isinstance(models, (list, tuple)) or any(
-                not isinstance(model, str) or not NAME.fullmatch(model) for model in models):
-            raise ValueError("module %r: RELEASE_MODELS must be unique names" % provider)
-        if len(set(models)) != len(models):
-            raise ValueError("module %r: RELEASE_MODELS must be unique names" % provider)
-        getter = getattr(module, "release_model", None)
-        if models and not callable(getter):
-            raise ValueError("module %r: RELEASE_MODELS without release_model(name)"
-                             % provider)
-        for model in models:
-            if model in found:
-                raise ValueError("duplicate release model: %r (modules %s and %s)"
-                                 % (model, found[model][0], provider))
-            found[model] = (provider, getter)
+        names = getattr(module, declared, ()) or ()
+        if not isinstance(names, (list, tuple)) or any(
+                not isinstance(name, str) or not NAME.fullmatch(name) for name in names):
+            raise ValueError("module %r: %s must be unique names" % (provider, declared))
+        if len(set(names)) != len(names):
+            raise ValueError("module %r: %s must be unique names" % (provider, declared))
+        getter = getattr(module, getter_name, None)
+        if names and not callable(getter):
+            raise ValueError("module %r: %s without %s(name)"
+                             % (provider, declared, getter_name))
+        for name in names:
+            if name in found:
+                raise ValueError("duplicate %s: %r (modules %s and %s)"
+                                 % (what, name, found[name][0], provider))
+            found[name] = (provider, getter)
     return found
+
+
+def _release_providers():
+    """`{model: (module_name, getter)}` of the built-in release providers."""
+    return _providers("RELEASE_MODELS", "release_model", "release model")
 
 
 def release_models():
@@ -371,6 +378,51 @@ def release_model(name):
     core only knows the model name from its configuration (``ProjectRelease``)
     and reads the provider here, never by importing ``ameesh.modules.nexlink``."""
     found = _release_providers().get(name)
+    if found is None:
+        return None
+    _provider, getter = found
+    return getter(name)
+
+
+def _notify_providers():
+    """`{kind: (module_name, getter)}` of the built-in notification channels
+    (#7793)."""
+    return _providers("NOTIFY_CHANNELS", "notify_channel", "notification channel")
+
+
+def notify_channel_kinds():
+    """Names of the notification channel kinds the built-in modules provide."""
+    return tuple(sorted(_notify_providers()))
+
+
+def notify_channel(kind):
+    """The provider object of one notification channel kind, or ``None``
+    (#7793).
+
+    The module returns its implementation lazily; importing this function never
+    imports a channel implementation, so the bare profile and discovery stay
+    light. The core reads channel configuration and sends through this provider,
+    never by importing a module package."""
+    found = _notify_providers().get(kind)
+    if found is None:
+        return None
+    _provider, getter = found
+    return getter(kind)
+
+
+def train_contract_names():
+    """Names of the train CI contracts the built-in modules provide (#7794)."""
+    return tuple(sorted(_providers("TRAIN_CONTRACTS", "train_contract",
+                                   "train contract")))
+
+
+def train_contract(name):
+    """The factory of one module train CI contract, or ``None`` (#7794).
+
+    ``train_assembly`` selects a contract by the name the host configuration
+    gives (``ci_contract``); a project contract lives in its module and is
+    imported lazily by the module getter, never by the core."""
+    found = _providers("TRAIN_CONTRACTS", "train_contract", "train contract").get(name)
     if found is None:
         return None
     _provider, getter = found

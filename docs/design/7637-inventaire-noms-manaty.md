@@ -41,7 +41,11 @@ l'organisation `manaty`.
 - **Tests, docstrings, commentaires, notes, `COMMENT ON` SQL** : le corps du lot exclut les
   notes. Le scan lit le code exécutable, pas les explications.
 - **`deploy/`, `scripts/`, `docs/`, `.json`, `.css`, `.md`** : hors du périmètre `src/ameesh/`
-  ou non exécutables.
+  ou non exécutables, sauf les consignes (#7796, ci-dessous).
+- **Consignes lues par les agents (`src/ameesh/consignes/*.md`)** : lues en entier par la
+  garde (#7796). Leurs noms viennent du canon (variable `$staging_hosts` de `veille.md`,
+  lue à la séquence staging des fiches Host) ou de mots génériques ; seule exception
+  justifiée : le chemin `docs/ORCHESTRATEUR.md`, nom d'un document du dépôt.
 
 ## 2. Méthode de recherche
 
@@ -50,8 +54,10 @@ Le scan est celui de `tests/test_7660_coeur_sans_noms_manaty.py` ; l'inventaire 
 1. Fichiers : `src/ameesh/**` de suffixe `.py`, `.sql`, `.html`, `.js`, `.cjs`, sauf
    `src/ameesh/modules/**`.
 2. Python : `ast.parse` ; sont lus les littéraux de chaîne hors docstrings,
-   les identifiants (`Name`, `Attribute`, `arg`, `keyword`), les noms de
-   fonctions/classes et les imports (module et alias). Un littéral multi-ligne
+   les identifiants (`Name`, `Attribute`, `arg`, `keyword`, et depuis #7796
+   `Global`, `Nonlocal`), les noms de fonctions/classes et les imports (module
+   et alias). Un identifiant est lu `_` → `-` : `bureau_goal` est l'hôte
+   `bureau-goal`, jamais le rôle `bureau`. Un littéral multi-ligne
    qui ressemble à du SQL voit ses commentaires `--` retirés avant lecture. La
    ligne est celle du littéral, décalage des multi-lignes compris.
 3. SQL : commentaires `--`, `/* */` et instructions `COMMENT ON …;` retirés (notes de base) ;
@@ -529,6 +535,17 @@ même nom sur la même ligne.
    `release_cutoff.py` (0) et `work.py` (0) ne l'importent plus. La dette `#7663` du test descend
    de 228 à 134 ; les 129 occurrences hors empreinte restent, surtout le canal d'alertes de
    `notify.py` (78), à ouvrir en lot séparé.
+   **Tranche 3b faite (#7793)** : le canal d'alertes de `notify.py` (78 occurrences) est porté
+   par `src/ameesh/modules/nexlink/notify.py`, avec l'enveloppe et le transport signé dans
+   `src/ameesh/modules/nexlink/alerts.py` (ex-`src/ameesh/nexlink_alerts.py`) ; le cœur lit le
+   canal par `registry.notify_channel(kind)`. `notify.py` ne porte plus aucun nom du lexique ; la
+   dette `#7663` du test descend de 134 à 55 (dont `cli.py` 8, le reste hors empreinte). Le
+   tableau par fichier ci-dessus reste l'instantané initial de l'inventaire, comme pour #7663.
+   **Tranche 3c faite (#7794)** : le contrat CI dynamique du train Nexlink (`train_contracts.py`,
+   28 occurrences) est porté par `src/ameesh/modules/nexlink/packet_ci.py` ; le cœur le lit par
+   `registry.train_contract(name)` (`train_assembly.contracts()`, 2 occurrences retirées) et le
+   doctor (`cli.py`, 8) nomme le canal de module sans nom de projet. La dette `#7663` du test
+   descend de 55 à 17.
 5. **`manaty` n'a aucune tranche** : 9 occurrences dans 4 fichiers (migrations.py 3,
    alert_briefs.py 2, incident.py 2, packet_guard.py 2). `manaty/ameesh` est le dépôt du cœur,
    `manaty/home` le canon, `manaty/nexlink` un dépôt de projet. Recommandation : les traiter

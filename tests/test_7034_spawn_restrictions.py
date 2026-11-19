@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 
@@ -222,6 +223,8 @@ class SpawnApplyTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "spawn-context-invalid")
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "child-report cleanup proves identity through /proc (Linux)")
 class ChildReportTest(_CanonDbCase):
     """C2: the child → parent channel, its idempotence and the expiry report."""
 
@@ -514,6 +517,8 @@ class ChildReportTest(_CanonDbCase):
         self.assertEqual(child_reports.sweep_expired(self.db, self.cfg, "orchestre"), [])
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "spawned turn identity and subreaper are Linux")
 class SpawnRunnerTest(PgTestCase):
     """C1/C3 end-to-end: the runner applies the policy and the context file."""
 
@@ -715,6 +720,8 @@ class RestrictedNeverResidentTest(PgTestCase):
         self.assertIn("restricted child", error.getvalue())
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "spawned turn identity and subreaper are Linux")
 class ContextOnlyRunnerTest(PgTestCase):
     """B 40580 : `spawn --context` seul n'écrit pas de profil."""
 

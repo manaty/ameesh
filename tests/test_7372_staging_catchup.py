@@ -489,7 +489,7 @@ class AnnotateAndReportTest(unittest.TestCase):
 
 class ActorTest(unittest.TestCase):
     def actor(self, *, name="", ok=True, source="session", explicit="",
-              bureau=True, human="human:smichea"):
+              bureau=True, human="human:smichea", right=None):
         binding = types.SimpleNamespace(ok=ok, name=name, source=source,
                                         reason="unbound" if not ok else "")
         with mock.patch("ameesh.identity.resolve_binding", return_value=binding), \
@@ -500,10 +500,32 @@ class ActorTest(unittest.TestCase):
                         side_effect=lambda canons, name: bool(bureau)), \
              mock.patch("ameesh.work.known_human",
                         return_value=human if human else None):
-            return release._catchup_actor(types.SimpleNamespace(), object(), explicit)
+            return release._catchup_actor(types.SimpleNamespace(), object(), explicit,
+                                          right)
 
     def test_the_bound_bureau_declares(self):
         self.assertEqual(self.actor(name="bureau"), "bureau")
+
+    def test_the_holder_of_the_active_right_declares_without_being_an_avatar(self):
+        """#7788 : #219407 a donne le geste au bureau, qui n'est pas avatar."""
+        self.assertEqual(self.actor(name="bureau", bureau=False, right=active()),
+                         "bureau")
+
+    def test_a_non_holder_agent_is_refused_even_with_an_active_right(self):
+        with self.assertRaises(release_cutoff.ReleaseError):
+            self.actor(name="mty-amh-impl-05", bureau=False, right=active())
+        with self.assertRaises(release_cutoff.ReleaseError):
+            self.actor(name="mty-amh-impl-05", explicit="bureau", bureau=False,
+                       right=active())
+
+    def test_an_expired_or_revoked_right_names_no_holder(self):
+        for right in (expired(), active(active=False, why="decision superseded"), None):
+            with self.assertRaises(release_cutoff.ReleaseError):
+                self.actor(name="bureau", bureau=False, right=right)
+
+    def test_the_holder_must_still_be_bound(self):
+        with self.assertRaises(release_cutoff.ReleaseError):
+            self.actor(name="bureau", source="explicit", bureau=False, right=active())
 
     def test_another_agent_cannot_declare_or_act_for_the_bureau(self):
         with self.assertRaises(release_cutoff.ReleaseError):

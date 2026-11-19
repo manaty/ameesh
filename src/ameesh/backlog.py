@@ -157,6 +157,7 @@ from datetime import datetime
 
 from . import storage
 from .db import Db, DbError, is_deadlock
+from .roles import AUDITOR_ROLES, ORCHESTRATOR_ROLES
 from .storage import interface
 
 ITEM_TYPE = "improvement"
@@ -767,13 +768,19 @@ def auditor_may_take(item: dict, name: str, card=None) -> bool:
         return False
     text = " ".join(str(item.get(k) or "") for k in
                     ("title", "body", "package_id", "package_parent", "branch")).casefold()
-    protected = ("auditeur.md", "0036", "agents/auditeur", "agents/%s" % name.casefold(),
+    # #7792 : les marqueurs de la fiche viennent du canon (`card_markers`) et
+    # du rôle déclaré, jamais d'un nom de persona : `0036` reste le numéro de
+    # la décision historique, indépendant d'un nom du lexique.
+    role_markers = tuple(marker for role in AUDITOR_ROLES
+                         for marker in (role + ".md", "agents/" + role))
+    protected = ("0036", "agents/%s" % name.casefold(), *role_markers,
                  "capabilities", "capacités", "permissions")
     from . import auditor as auditor_mod
     if any(marker in text for marker in (*protected, *auditor_mod.card_markers(card))):
         return False
     # La fiche d'un autre agent n'est pas celle de l'auditeur.
-    names = r"(?:auditeur|auditor|%s)" % re.escape(name.casefold())
+    names = r"(?:%s|%s)" % ("|".join(re.escape(role) for role in AUDITOR_ROLES),
+                            re.escape(name.casefold()))
     return not re.search(r"(?:fiche|card)[^.;\n]{0,80}" + names
                          + r"|(?:sa|ses|own)\s+(?:fiche|card)", text)
 
@@ -1779,7 +1786,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     break                   # agent non réveillable : au suivant
                 note = "%s par %s, au repos" % (LOT_TAKE_NOTE, check["assignee"])
                 if fallback:
-                    note += " (aucun autre preneur ; orchestrateur)"
+                    note += " (aucun autre preneur ; %s)" % ORCHESTRATOR_ROLES[0]
                 try:
                     # #540 : sous le verrou de l'agent, pas de second lot
                     # non démarré (il en a reçu un depuis sa sélection).

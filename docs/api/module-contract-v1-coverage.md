@@ -4,14 +4,18 @@ Each element of the [contract](module-contract-v1.md) maps to the test of the
 ameesh CI that fails when that element breaks
 ([#7665 / #5857](https://github.com/manaty/ameesh/issues/5857)). The frozen
 baseline is [module-contract-v1.surface.json](module-contract-v1.surface.json);
-the witness is the [contract-witness](../../examples/modules/contract-witness)
-distribution, outside `src/`, which imports neither ameesh nor `tests`.
+the witnesses are the [contract-witness](../../examples/modules/contract-witness)
+distribution (outside `src/`, imports neither ameesh nor `tests`) and the
+[public-fixture-witness](../../examples/fixtures/public-fixture-witness)
+distribution (outside `src/`, imports only `ameesh.public.*` and the standard
+library, never `tests.support`).
 `tests.test_7665_module_contract.CoverageTableTest` checks that every element
 has exactly one row and that every cited test exists.
 
-The surface freezes revision 1.0 at its baseline commit; the elements that
-revisions 1.1 and 1.2 add are not frozen in it yet. The comparison is
-additive-compatible, as the contract's compatibility rule states:
+The surface freezes revision 1.5; its baseline commit stays the revision 1.0
+comparison point, and the elements that revisions 1.1, 1.2, 1.3 and 1.5 add are
+now listed (revision 1.4 adds no name). The comparison is additive-compatible, as the contract's compatibility
+rule states:
 
 - HTTP: every schema is flattened per field (type, `const`, `enum`, bounds,
   `pattern`, `format`, `required`, `additionalProperties`), for parameters,
@@ -35,8 +39,12 @@ additive-compatible, as the contract's compatibility rule states:
 | `cli:ameesh module` | `tests.test_7665_module_contract.CliContractTest.test_module_list_is_reserved_installation_evidence`, `tests.test_7665_module_contract.CliContractTest.test_module_help_runs_without_a_database_and_dispatch_needs_one`, `tests.test_7665_module_contract.StoreAndViewsTest.test_activation_dispatch_and_named_store_operations` |
 | `cli:ameesh canon check` | `tests.test_7665_module_contract.CliContractTest.test_canon_selection_validates_the_witness_options` |
 | `cli:ameesh canon sync` | `tests.test_7665_module_contract.StoreAndViewsTest.test_activation_dispatch_and_named_store_operations` |
+| `cli:ameesh canon snapshot` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7669_canon_snapshot.SnapshotContract` |
 | `cli:ameesh turn current` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_l2894_turn_context` |
 | `cli:ameesh turn observe` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_l2894_turn_observe` |
+| `cli:ameesh agent observe` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7670_agent_observation.AgentObservationTest.test_cli_and_http_use_the_builder` |
+| `cli:ameesh list` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7675_deferral.PublicViewsTest.test_list_json_carries_the_same_block` |
+| `cli:ameesh show` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7675_deferral.PublicViewsTest.test_show_json_carries_the_block` |
 | `cli:ameesh migrate` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_migrations_additives` |
 | `cli:ameesh action propose` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options` |
 | `cli:ameesh action approve` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options` |
@@ -49,6 +57,7 @@ additive-compatible, as the contract's compatibility rule states:
 | `http:operations` | `tests.test_7665_module_contract.CompatibilityTest.test_the_served_openapi_keeps_every_baseline_operation`, `tests.test_7665_module_contract.HttpContractTest.test_discovery_then_openapi_without_a_token` |
 | `http:authentication` | `tests.test_7665_module_contract.HttpContractTest.test_every_other_documented_path_requires_the_token`, `tests.test_l84_serve.DefencesTest.test_token_required_and_compared` |
 | `http:schemas` | `tests.test_7665_module_contract.CompatibilityTest.test_the_comparator_tells_additions_from_breaks`, `tests.test_7665_module_contract.HttpContractTest.test_an_authenticated_read_answers_its_documented_schema`, `tests.test_l84_serve.OpenApiTest.test_every_route_documented_with_its_schema`, `tests.test_l84_serve.ServePgTest.test_every_route_answers_in_line_with_its_schema` |
+| `http:agent-observation` | `tests.test_7665_module_contract.CompatibilityTest.test_the_served_openapi_keeps_every_baseline_operation`, `tests.test_7665_module_contract.HttpContractTest.test_every_other_documented_path_requires_the_token`, `tests.test_7670_agent_observation.AgentObservationTest.test_cli_and_http_use_the_builder` |
 | `http:idempotency` | `tests.test_l87_serve_actions.GuardsTest.test_one_idempotency_key_required`, `tests.test_l87c_alert_ack.AcknowledgementTest.test_idempotent_and_durable_with_actor_and_principal` |
 | `http:events` | `tests.test_l85_events.StreamPgTest.test_without_last_event_id_only_new_events`, `tests.test_l85_events.StreamPgTest.test_reset_when_events_were_lost`, `tests.test_l85_events.StreamPgTest.test_delayed_is_observable_while_a_transaction_holds_events` |
 | `module:name_pattern` | `tests.test_7665_module_contract.ModuleInterfaceTest.test_names_follow_the_published_pattern` |
@@ -59,16 +68,28 @@ additive-compatible, as the contract's compatibility rule states:
 | `module:discover` | `tests.test_7665_module_contract.ModuleInterfaceTest.test_discover_signature_and_registry_record`, `tests.test_7665_module_contract.ModuleInterfaceTest.test_the_interface_comparators_tell_additions_from_breaks` |
 | `module:registry` | `tests.test_7665_module_contract.ModuleInterfaceTest.test_discover_signature_and_registry_record` |
 | `module:record_fields` | `tests.test_7665_module_contract.ModuleInterfaceTest.test_discover_signature_and_registry_record`, `tests.test_7665_module_contract.CliContractTest.test_modules_json_describes_the_installed_witness`, `tests.test_7665_module_contract.ModuleInterfaceTest.test_the_interface_comparators_tell_additions_from_breaks` |
+| `module:storage_attributes` | `tests.test_7665_module_contract.ModuleStorageContractTest.test_the_frozen_storage_attributes_are_the_module_declaration`, `tests.test_7649_schema_modules.DeclarationTest.test_declaration_reads_schema_migrations_and_requires` |
 | `module:selection_scopes` | `tests.test_7665_module_contract.CliContractTest.test_canon_selection_validates_the_witness_options`, `tests.test_7665_module_contract.CliContractTest.test_the_bare_profile_keeps_installed_entry_points_only`, `tests.test_l98_modules_activation.ActivationStorageTest.test_sync_stores_the_resolved_rows_and_active_reads_them` |
 | `module:store_operations` | `tests.test_7665_module_contract.ModuleInterfaceTest.test_store_named_operations_keep_their_signatures`, `tests.test_7665_module_contract.StoreAndViewsTest.test_activation_dispatch_and_named_store_operations`, `tests.test_7665_module_contract.ModuleInterfaceTest.test_the_interface_comparators_tell_additions_from_breaks` |
 | `runner:agents-file` | `tests.test_3925_admission_dynamique` |
 | `runner:turn-context` | `tests.test_l2894_turn_context` |
 | `runner:turn-observation` | `tests.test_l2894_turn_observe`, `tests.test_l84_serve` |
+| `canon:session-policy` | `tests.test_7665_module_contract.CanonPolicyContractTest.test_the_frozen_session_keys_are_the_declared_policy`, `tests.test_7674_politique_declarative.DeclaredPolicyCardTest.test_politique_lue_et_serialisee` |
+| `canon:resource-policy` | `tests.test_7665_module_contract.CanonPolicyContractTest.test_the_frozen_resource_keys_are_native_thresholds`, `tests.test_7675_qualification.PressureTest.test_cpu_used_is_the_ima_cpu_gate_and_needs_the_new_key`, `tests.test_7675_qualification.PressureTest.test_throttled_periods_and_wall_time_are_distinct_and_both_kept`, `tests.test_7675_qualification.PressureTest.test_the_new_keys_accept_fractions_like_the_other_ceilings` |
+| `deferral` | `tests.test_7665_module_contract.DeferralContractTest.test_the_frozen_block_shape_and_closed_enums`, `tests.test_7675_deferral.MappingTest.test_the_block_validates_against_the_public_schema`, `tests.test_7675_deferral.PublicViewsTest.test_show_json_carries_the_block`, `tests.test_7675_deferral.PublicViewsTest.test_list_json_carries_the_same_block` |
+| `python:mail` | `tests.test_7665_module_contract.PythonMailContractTest.test_the_public_mail_signatures_are_frozen`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_value_objects_keep_their_frozen_fields`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_published_bounds_enums_and_errors_are_frozen`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_served_contract_version_is_frozen`, `tests.test_7671_mail_contract.ContractSurfaceTest.test_version_and_exported_surface`, `tests.test_7671_mail_contract.BatchTest.test_a_batch_is_bounded_before_any_deposit`, `tests.test_7671_mail_contract.HistoryTest.test_cursor_is_bounded_and_stable_under_new_mail`, `tests.test_7706_mail_contract.ReservedActorTest.test_core_sender_identities_are_refused_before_deposit`, `tests.test_7672_pending_reply_contract.ContractSurfaceTest.test_version_and_exported_surface`, `tests.test_7672_pending_reply_contract.ContractSurfaceTest.test_values_are_json_ready`, `tests.test_7672_pending_reply_contract.PendingTest.test_pending_lists_the_current_turn_request`, `tests.test_7672_pending_reply_contract.ReplyTest.test_reply_is_correlated_addressed_and_inherits_the_lot`, `tests.test_7672_pending_reply_contract.ReplyTest.test_another_body_or_payload_is_a_deterministic_conflict`, `tests.test_7672_pending_reply_contract.ConcurrencyTest.test_concurrent_identical_replies_make_one_durable_row`, `tests.test_7673_interrupted_requeue.RequeueContractTest.test_requeued_request_is_no_longer_pending_and_refuses_a_late_reply` |
+| `python:fixture` | `tests.test_7665_module_contract.PythonFixtureContractTest.test_the_public_fixture_signatures_and_constants_are_frozen`, `tests.test_7665_module_contract.PythonFixtureContractTest.test_the_published_error_codes_are_frozen`, `tests.test_7665_module_contract.PythonFixtureContractTest.test_the_served_contract_version_is_frozen`, `tests.test_7665_module_contract.PythonFixtureContractTest.test_the_external_fixture_witness_is_its_own_distribution`, `tests.test_7701_public_fixture.DatabaseNameTest`, `tests.test_7701_public_fixture.FixtureBoundaryTest`, `tests.test_7701_public_fixture.WitnessBoundaryTest`, `tests.test_7701_public_fixture.DeliberateBreakTest` |
 | `view:agent_mesh_overview` | `tests.test_7665_module_contract.StoreAndViewsTest.test_named_views_keep_their_admitted_columns`, `tests.test_cluster.ContratDesColonnesTest` |
 | `view:mesh_keys` | `tests.test_7665_module_contract.StoreAndViewsTest.test_named_views_keep_their_admitted_columns`, `tests.test_cluster.ContratDesColonnesTest` |
 | `view:mesh_approvals_status` | `tests.test_7665_module_contract.StoreAndViewsTest.test_named_views_keep_their_admitted_columns`, `tests.test_cluster.ContratDesColonnesTest` |
-| `fixture` | Not covered yet: the published fixture kit (consumer-owned disposable database, no `tests.support`) is lot #7701 ([#5902](https://github.com/manaty/ameesh/issues/5902)). |
+| `fixture` | `tests.test_7701_public_fixture.FixtureDatabaseTest.test_the_external_witness_qualifies_through_the_public_fixture`, `tests.test_7701_public_fixture.WitnessBoundaryTest`, `tests.test_7701_public_fixture.FixtureBoundaryTest` ([#7701 / #5902](https://github.com/manaty/ameesh/issues/5902)) |
 | `stable-pin` | `tests.test_7666_stable_channel.StableChannelTest.test_witness_moves_from_one_stable_to_the_next_by_its_pin_alone`, `tests.test_7666_stable_channel.StableChannelTest.test_verify_refuses_an_edited_pin_or_another_installation` ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) |
 
-E1–E3 runner extension points get their rows when they are released
-(mapping, [IMA public contract](../design/ima-public-contract-mapping.md)).
+The 1.1 elements (E1a snapshot, E1b observation), the 1.2 elements (module
+schema/migrations, E2a mail, E3a session policy, E3b bounded deferral) and the
+1.3 elements (E2b pending requests and correlated replies) are frozen in the
+same surface and have their rows above (mapping,
+[IMA public contract](../design/ima-public-contract-mapping.md)). Revision 1.4
+(E2c, #7673) adds no name; its witness joins the `python:mail` row. Revision 1.5
+(F2, #7701) adds the public fixture; its external witness and the deliberate
+break join the `python:fixture` and `fixture` rows.

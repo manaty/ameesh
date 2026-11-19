@@ -24,6 +24,7 @@ import io
 import os
 import pathlib
 import stat
+import sys
 import tempfile
 import time
 import unittest
@@ -355,6 +356,8 @@ def _killpg(pgid: int) -> None:
         os.killpg(pgid, 9)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "process-tree proof reads /proc (Linux)")
 class ArbreHeavyTest(unittest.TestCase):
     """Relectures cx3 (#161273) et dev3 (jalon 24994) : `ameesh heavy` place
     sa série dans son propre groupe ; tuer la session du wrapper la laissait

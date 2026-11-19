@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ameesh-public-fixture-witness"
+version = "1.5.0"
+description = "External witness of the ameesh public fixture surface (contract 1.5)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+public-fixture-witness = "fixture_witness:main"
+
+[tool.setuptools]
+py-modules = ["fixture_witness"]

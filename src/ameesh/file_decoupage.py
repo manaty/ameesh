@@ -86,13 +86,14 @@ from . import planned_waits, storage
 from . import sous_utilisation as su
 from . import work
 from .agent_pause import FILE_DECOUPAGE_ACTOR as SLEEP_ACTOR
+from .roles import AUDITOR_ROLES
 
 #: identité du lot de découpage d'un projet (un seul ouvert)
 SOURCE_PREFIX = "file-decoupage:"
 #: repli de l'auditeur : une heure après la création (§2.2, 3)
 FALLBACK_S = 3600.0
 #: marque du repli, posée une fois sur le lot de découpage
-FALLBACK_MARK = "repli auditeur"
+FALLBACK_MARK = "repli " + AUDITOR_ROLES[0]
 #: la note du pilote (§1, « Feuille de route épuisée »)
 EXHAUSTED_PREFIX = "roadmap: épuisée"
 EXHAUSTED_RE = re.compile(r"^\s*roadmap\s*:\s*épuisée\s+(\S+)", re.IGNORECASE)
@@ -432,7 +433,8 @@ def body_of(project: str, item: Measure, since_ts: float, now: float,
         "prochain lot démarrable, l'owner reçoit une alerte). Pour rouvrir : notez "
         "« %s %s » sur ce lot, le sommeil est levé à la passe suivante." % (
             len(item.idle), EXHAUSTED_PREFIX, project, REOPENED_PREFIX, project),
-        "Repli : sans lot démarrable créé dans l'heure, l'auditeur crée les lots.",
+        "Repli : sans lot démarrable créé dans l'heure, l'%s crée les lots."
+        % AUDITOR_ROLES[0],
     ]
     return "\n".join(lines)
 

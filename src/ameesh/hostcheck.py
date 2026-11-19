@@ -544,11 +544,11 @@ def paquet_horaire_lines(cfg, run=_systemctl) -> list[str]:
         detail = " (%s)" % "; ".join(errors)
     return [
         "warning    : %s is active but %s%s: a takeover of the "
-        "mesh-design lease would compose without a declared project on this host"
+        "elected role's lease would compose without a declared project on this host"
         % (PAQUET_HORAIRE_TIMER, subject, detail),
-        "             declare packet_watch.projects.<p>.repo with \"role\": "
-        "\"mesh-design\", or radar.projects.<p>.repo (stop the timer on a host "
-        "that is not a candidate)",
+        "             declare packet_watch.projects.<p>.repo with its configured "
+        "elected role (packet_watch.role), or radar.projects.<p>.repo (stop the "
+        "timer on a host that is not a candidate)",
     ]
 
 
@@ -1005,6 +1005,40 @@ def _sql_name(name: str) -> str:
     return '"%s"' % str(name).replace('"', '""')
 
 
+def interactive_lines(cfg) -> list[str]:
+    """#7676 : les profils Claude déclarés, prêts pour une session interactive.
+
+    Un compte dont le `.claude.json` ne porte pas `hasCompletedOnboarding: true`
+    s'ouvre sur l'accueil (choix du thème) au premier `ameesh attach` : le
+    premier message de l'humain part dans ce menu. L'attach refuse désormais en
+    le disant (`accounts.interactive_problem`) ; ce constat le montre avant.
+
+    Ligne d'information, pas de verdict : un profil déclaré peut n'être utilisé
+    que par des tours non interactifs, et `doctor --harness` est une garde de
+    déploiement — aucun compte ne doit le faire échouer pour un accueil à faire.
+    """
+    from . import accounts
+    try:
+        items = accounts.profiles(cfg, "claude")
+    except accounts.AccountError as exc:
+        return ["interactive : not checked (%s)" % exc]
+    declared = [p for p in items if p.declared and p.kind == "config_dir"]
+    if not declared:
+        return ["interactive : no declared claude profile"]
+    problems = [(profile, accounts.interactive_problem(profile))
+                for profile in declared]
+    problems = [(profile, why) for profile, why in problems if why]
+    if not problems:
+        return ["interactive : %d declared claude profile(s) ready"
+                % len(declared)]
+    lines = []
+    for profile, why in problems:
+        lines.append("interactive : warning — claude/%s not ready: %s"
+                     % (profile.name, why))
+        lines.append("              %s" % accounts.interactive_init_hint(profile))
+    return lines
+
+
 def cmd_harness(cfg, db=None) -> int:
     """`ameesh doctor --harness` : 0 si chaque harnais servi est trouvé."""
     adapters.configure(cfg)
@@ -1044,6 +1078,10 @@ def cmd_harness(cfg, db=None) -> int:
         print(line)
     if not hooks["ok"]:
         verdict = 1
+    # #7676 : l'accueil interactif de Claude se vérifie ici ; une ligne
+    # d'information seulement, le verdict reste celui de l'installation.
+    for line in interactive_lines(cfg):
+        print(line)
     if db is not None and agents is not None:
         for line in missing_runner_lines(cfg, db) + memory_cap_lines(cfg, db):
             print(line)

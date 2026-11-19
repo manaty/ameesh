@@ -4,7 +4,7 @@ import json
 from contextlib import nullcontext
 from unittest import mock
 
-from ameesh import pre_act
+from ameesh import planned_waits, pre_act
 from tests import support
 
 
@@ -54,12 +54,15 @@ class PreActTest(unittest.TestCase):
         self.assertTrue(tx.writes)
 
     def test_wait_until_detects_stop_before_executing(self):
-        tx = Transaction(events=[{"id": 2, "actor": "owner", "note": "STOP", "ts": 150}])
+        # Host clock one hour ahead of the database: a bound taken on the host
+        # would miss the STOP written after the guard started (db clock 100).
+        tx = Transaction(events=[{"id": 2, "actor": "owner", "note": "STOP", "ts": 105}])
         db = mock.Mock()
+        db.query.return_value = [{"now_ts": 100}]
         db.transaction.return_value = nullcontext(tx)
         binding = mock.Mock(ok=True, name="bureau")
         binding.name = "bureau"
-        with mock.patch.object(pre_act.time, "time", side_effect=[100, 100, 160]), \
+        with mock.patch.object(pre_act.time, "time", side_effect=[1000, 1060]), \
              mock.patch.object(pre_act.time, "sleep") as sleep, \
              mock.patch.object(pre_act.config, "load", return_value=object()), \
              mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
@@ -67,7 +70,7 @@ class PreActTest(unittest.TestCase):
              mock.patch.object(pre_act.identity, "resolve_binding", return_value=binding), \
              mock.patch.object(pre_act.os, "execvp") as execute:
             result = pre_act.main(["--lot", "5772", "--kind", "kms", "--wait-until",
-                                   "1970-01-01T00:02:40Z", "--", "true"])
+                                   "1970-01-01T00:17:40Z", "--", "true"])
         self.assertEqual(result, 1)
         sleep.assert_called_once_with(60)
         execute.assert_not_called()
@@ -76,10 +79,39 @@ class PreActTest(unittest.TestCase):
     def test_wait_until_clear_executes_after_wait(self):
         tx = Transaction()
         db = mock.Mock()
+        db.query.return_value = [{"now_ts": 100}]
         db.transaction.return_value = nullcontext(tx)
         binding = mock.Mock(ok=True)
         binding.name = "bureau"
-        with mock.patch.object(pre_act.time, "time", side_effect=[100, 100, 160]), \
+        with mock.patch.object(pre_act.time, "time", side_effect=[1000, 1060]), \
+             mock.patch.object(pre_act.time, "sleep") as sleep, \
+             mock.patch.object(pre_act.config, "load", return_value=object()), \
+             mock.patch.object(pre_act.db_mod, "open_db", return_value=db) as open_db, \
+             mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
+             mock.patch.object(pre_act.identity, "resolve_binding", return_value=binding), \
+             mock.patch.object(pre_act.os, "execvp") as execute:
+            result = pre_act.main(["--lot", "5772", "--kind", "kms", "--wait-until",
+                                   "1970-01-01T00:17:40Z", "--", "true"])
+        self.assertEqual(result, 0)
+        sleep.assert_called_once_with(60)
+        execute.assert_called_once_with("true", ["true"])
+        # The connection is closed for the wait and reopened for the check.
+        self.assertEqual(open_db.call_count, 2)
+        self.assertEqual(db.close.call_count, 2)
+        db.query.assert_called_once_with("SELECT extract(epoch from now())::float8 AS now_ts")
+        # The receipt carries the database bound, not the host one.
+        self.assertIn("since=100", tx.writes[0][1][2])
+
+    def test_wait_until_ignores_event_before_database_bound(self):
+        # Host clock behind the database: the STOP at 150 is before the guard
+        # started on the database clock (200) and must not refuse the act.
+        tx = Transaction(events=[{"id": 2, "actor": "owner", "note": "STOP", "ts": 150}])
+        db = mock.Mock()
+        db.query.return_value = [{"now_ts": 200}]
+        db.transaction.return_value = nullcontext(tx)
+        binding = mock.Mock(ok=True)
+        binding.name = "bureau"
+        with mock.patch.object(pre_act.time, "time", side_effect=[100, 160]), \
              mock.patch.object(pre_act.time, "sleep") as sleep, \
              mock.patch.object(pre_act.config, "load", return_value=object()), \
              mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
@@ -91,7 +123,21 @@ class PreActTest(unittest.TestCase):
         self.assertEqual(result, 0)
         sleep.assert_called_once_with(60)
         execute.assert_called_once_with("true", ["true"])
-        self.assertIn("since=100", tx.writes[0][1][2])
+
+    def test_wait_until_unreadable_database_clock_refuses(self):
+        for rows in ([], [{"now_ts": float("nan")}], [{"now_ts": "not-a-date"}]):
+            with self.subTest(rows=rows):
+                db = mock.Mock()
+                db.query.return_value = rows
+                with mock.patch.object(pre_act.config, "load", return_value=object()), \
+                     mock.patch.object(pre_act.db_mod, "open_db", return_value=db), \
+                     mock.patch.object(pre_act.storage, "is_remote", return_value=False), \
+                     mock.patch.object(pre_act.os, "execvp") as execute:
+                    result = pre_act.main(["--lot", "5772", "--kind", "kms",
+                                           "--wait-until", "1970-01-01T00:17:40Z",
+                                           "--", "true"])
+                self.assertEqual(result, 1)
+                execute.assert_not_called()
 
     def test_unhold_only_clears_its_author(self):
         tx = Transaction(events=[
@@ -207,10 +253,27 @@ class PreActTest(unittest.TestCase):
         self.assertEqual(result, 1)
 
     def test_hold_on_act_lot_5772_refuses(self):
-        tx = Transaction(events=[{"id": 8, "note": "hold: séance suspendue", "ts": 150}])
+        tx = Transaction(events=[{"id": 8, "note": "hold: STOP séance suspendue", "ts": 150}])
         with self.assertRaises(pre_act.Refused):
             pre_act.inspect(tx, 5772, "bureau", 100, "kms")
         self.assertFalse(tx.writes)
+
+    def test_ordinary_hold_without_stop_word_does_not_block(self):
+        # The structured form is `hold: STOP …`; a parked hold stays a wait.
+        tx = Transaction(events=[{"id": 8, "note": "hold: aucun geste avant le go owner",
+                                  "ts": 150}])
+        pre_act.inspect(tx, 5772, "bureau", 100, "kms")
+        self.assertTrue(tx.writes)
+
+    def test_stop_hold_is_recognized_at_the_head_only(self):
+        for note, expected in (
+                ("hold: STOP séance", True),
+                ("Hold: arrêt de la séance", True),
+                ("hold: aucun geste avant le go owner", False),
+                ("hold: on attend le go owner, pas d'arrêt", False),
+                ("hold-up: pas un hold", False)):
+            with self.subTest(note=note):
+                self.assertEqual(planned_waits.is_stop_hold(note), expected)
 
     def test_guard_executes_only_after_receipt_and_closes_connection(self):
         tx = Transaction()

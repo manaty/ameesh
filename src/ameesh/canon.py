@@ -2988,9 +2988,14 @@ def _diff_name_status(repo: str, base: str, head: str | None = None) -> set[str]
     return _name_status_paths(proc.stdout)
 
 
-def _name_status_paths(raw: bytes) -> set[str]:
-    """Chemins d'une sortie `git diff --name-status -z` (renommages : les deux)."""
-    paths: set[str] = set()
+def _name_status_entries(raw: bytes) -> list[tuple[str, tuple[str, ...]]]:
+    """Entrées `(statut, chemins)` d'une sortie `git diff --name-status -z`.
+
+    Un renommage ou une copie porte ses **deux** chemins (ancien, nouveau) ;
+    les autres statuts n'en portent qu'un. Une sortie tronquée s'arrête sans
+    inventer d'entrée.
+    """
+    entries: list[tuple[str, tuple[str, ...]]] = []
     fields = raw.decode("utf-8", "replace").split("\0")
     index = 0
     while index < len(fields):
@@ -3000,14 +3005,21 @@ def _name_status_paths(raw: bytes) -> set[str]:
         if status[0] in ("R", "C"):
             if index + 2 >= len(fields):
                 break
-            paths.add(fields[index + 1])
-            paths.add(fields[index + 2])
+            entries.append((status, (fields[index + 1], fields[index + 2])))
             index += 3
         else:
             if index + 1 >= len(fields):
                 break
-            paths.add(fields[index + 1])
+            entries.append((status, (fields[index + 1],)))
             index += 2
+    return entries
+
+
+def _name_status_paths(raw: bytes) -> set[str]:
+    """Chemins d'une sortie `git diff --name-status -z` (renommages : les deux)."""
+    paths: set[str] = set()
+    for _status, names in _name_status_entries(raw):
+        paths.update(names)
     return paths
 
 
@@ -3069,14 +3081,8 @@ def git_changed_paths_between(repo: str, base: str, tip: str) -> list[str]:
     return sorted(_name_status_paths(proc.stdout))
 
 
-def git_range_paths(repo: str, base: str, head: str) -> list[str]:
-    """Les chemins changés entre `base` et `head` (renommage : les deux).
-
-    `base` est ramené à son **merge-base avec `head`** : c'est le diff qu'un lot
-    gelé emporte depuis sa cible, donc ce que sa classe de revue couvre (canon
-    §1). Toute erreur git — référence inconnue, dépôt illisible — lève
-    [`GitError`] : jamais une liste vide qui se lirait « rien à relire ».
-    """
+def _range_entries(repo: str, base: str, head: str):
+    """Les entrées `git diff -M` entre le merge-base de `base` et `head`."""
     verified_base = git_commit(repo, base)
     if verified_base is None:
         raise GitError("unknown git reference: %s" % base)
@@ -3088,7 +3094,43 @@ def git_range_paths(repo: str, base: str, head: str) -> list[str]:
         start = proc.stdout.decode("utf-8", "replace").strip()
     else:
         start = verified_base
-    return sorted(_diff_name_status(repo, start, verified_head))
+    args = ["diff", "--name-status", "-z", "--find-renames", start, verified_head]
+    proc = _git(repo, *args)
+    if proc.returncode != 0:
+        raise GitError("git diff %s %s: %s"
+                       % (start, verified_head, _git_message(proc)))
+    return _name_status_entries(proc.stdout)
+
+
+def git_range_paths(repo: str, base: str, head: str) -> list[str]:
+    """Les chemins changés entre `base` et `head` (renommage : les deux).
+
+    `base` est ramené à son **merge-base avec `head`** : c'est le diff qu'un lot
+    gelé emporte depuis sa cible, donc ce que sa classe de revue couvre (canon
+    §1). Toute erreur git — référence inconnue, dépôt illisible — lève
+    [`GitError`] : jamais une liste vide qui se lirait « rien à relire ».
+    """
+    paths: set[str] = set()
+    for _status, names in _range_entries(repo, base, head):
+        paths.update(names)
+    return sorted(paths)
+
+
+def git_range_renames(repo: str, base: str, head: str) -> list[tuple[str, str]]:
+    """Les renommages entre `base` et `head` : `(ancien, nouveau)`, triés.
+
+    Même diff que [`git_range_paths`] (merge-base avec `head`, `git diff -M`) ;
+    seuls les couples que git **détecte** comme renommages sont rendus. Un
+    déplacement trop réécrit passe sous le seuil de similarité et se lit comme
+    une suppression et un ajout : il n'est pas deviné ici (la politique de
+    revue, elle, couvre encore l'ancien chemin tant qu'il est dans le diff).
+    Toute erreur git lève [`GitError`], jamais une liste vide rassurante.
+    """
+    found = []
+    for status, names in _range_entries(repo, base, head):
+        if status[0] == "R" and len(names) == 2:
+            found.append((names[0], names[1]))
+    return sorted(found)
 
 
 def git_toplevel(directory: str, *, timeout: float = GIT_TIMEOUT,
@@ -4031,7 +4073,10 @@ class _Loader:
                 declared.append((member, entry.get(SCOPE_KEY), "members[%s].%s" % (member,
                                                                                   SCOPE_KEY)))
         for member, raw, label in declared:
-            where = {"member": root.member, "path": "federation.yaml"}
+            # The finding is about this member's scope, so it names that
+            # member: a root-only snapshot can then tell a sibling's unreadable
+            # scope (no content, listed as omitted) from the root's (refusal).
+            where = {"member": member, "path": "federation.yaml"}
             if raw is None:
                 continue
             if not isinstance(raw, dict):
@@ -4875,7 +4920,7 @@ class _Loader:
             if not isinstance(value, dict) or not all(caps.values()):
                 self.add("host-policy-invalid", ERROR,
                          "`policy.resources.agent_memory_max_by_agent`: mapping "
-                         "{agent: size} expected (e.g. mesh-design: 8G)", **where, **subject)
+                         "{agent: size} expected (e.g. <agent>: 8G)", **where, **subject)
                 continue
             parsed[key] = caps
         for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)

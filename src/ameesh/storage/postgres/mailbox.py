@@ -28,6 +28,7 @@ PROJECT_SQL = (
 MAIL_COLUMNS = """
     id, sender, recipient, body, kind, payload, status, host,
     coalesce(btrim(work_item_id), '') as work_item_id,
+    in_reply_to,
     signature, signature_key, signed_payload, nonce,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from delivered_at)::float8 as delivered_ts,
@@ -163,6 +164,17 @@ class Mailbox(interface.Mailbox):
                                         automatic=isinstance(review, dict))
         return self._insert(sender, recipient, body, **args)
 
+    def send_reply(self, sender, recipient, body, *, host, kind, payload,
+                   work_item_id, signature, signature_key, signed_payload,
+                   nonce, created_us, expires_us, in_reply_to) -> dict:
+        """#7672 : dépôt corrélé, réservé au chemin public (voir l'interface)."""
+        return self._insert(
+            sender, recipient, body, host=host, kind=kind, payload=payload,
+            work_item_id=work_item_id, signature=signature,
+            signature_key=signature_key, signed_payload=signed_payload,
+            nonce=nonce, created_us=created_us, expires_us=expires_us,
+            in_reply_to=in_reply_to)
+
     def _send_review(self, sender, recipient, body, args, *, automatic):
         from ...review_designation import _request_sha
         lot = int(args['work_item_id'])
@@ -241,12 +253,20 @@ class Mailbox(interface.Mailbox):
 
     def _insert(self, sender, recipient, body, *, host, kind, payload, work_item_id,
                 signature, signature_key, signed_payload, nonce, created_us,
-                expires_us) -> dict:
+                expires_us, in_reply_to=None) -> dict:
         # #3460 : un retiré n'est jamais destinataire. Le retrait est relu
         # dans l'instruction qui dépose, sous un verrou partagé de sa ligne
         # (`retire` la prend en exclusif) : un retrait committé après un
         # précontrôle gagne, un retrait en cours attend ce dépôt. Un nom hors
         # du registre (humain, service) n'a pas de ligne et reste déposé.
+        #
+        # #7672/#6881 : le courrier ordinaire ne NOMME pas `in_reply_to`.
+        # Postgres contrôle une colonne nommée dans l'INSERT même quand sa
+        # valeur est NULL, et le droit d'INSERT par colonne du bureau ne
+        # l'inclut pas (aucun GRANT élargi pour un détail de corrélation).
+        # Seul `send_reply` nomme la colonne ; le chemin ordinaire ne la lit
+        # pas non plus dans son RETURNING.
+        reply = in_reply_to is not None
         rows = self.db.query(
             """
             WITH registered AS (
@@ -254,22 +274,28 @@ class Mailbox(interface.Mailbox):
                  WHERE name = %s OR %s = ANY(aliases) FOR SHARE)
             INSERT INTO agent_mailbox
                 (sender, recipient, body, host, kind, payload, work_item_id,
-                 signature, signature_key, signed_payload, nonce,
+                 __REPLY_COLUMN__signature, signature_key, signed_payload, nonce,
                  created_at, signature_expires_at)
-            SELECT %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s,
+            SELECT %s, %s, %s, %s, %s, %s::jsonb, %s, __REPLY_VALUE__%s, %s, %s, %s,
                    coalesce(to_timestamp(%s::bigint / 1000000.0), now()),
                    to_timestamp(%s::bigint / 1000000.0)
              WHERE NOT EXISTS (SELECT 1 FROM registered WHERE retired_at IS NOT NULL)
             RETURNING id, extract(epoch from created_at)::float8 AS created_ts,
-                      (__SENDER_PROJECT__) AS sender_project,
+                      __REPLY_RETURN__(__SENDER_PROJECT__) AS sender_project,
                       (__RECIPIENT_PROJECT__) AS recipient_project
-            """.replace("__SENDER_PROJECT__", PROJECT_SQL % "agent_mailbox.sender")
+            """.replace("__REPLY_COLUMN__",
+                        "in_reply_to,\n                 " if reply else "")
+               .replace("__REPLY_VALUE__", "%s, " if reply else "")
+               .replace("__REPLY_RETURN__",
+                        "in_reply_to,\n                      " if reply else "")
+               .replace("__SENDER_PROJECT__", PROJECT_SQL % "agent_mailbox.sender")
                .replace("__RECIPIENT_PROJECT__", PROJECT_SQL % "agent_mailbox.recipient"),
             # #4299: the stored names, which 0516 maps from an alias.
             (recipient, recipient, sender, recipient, body, host, kind,
-             json.dumps(payload or {}, ensure_ascii=False), work_item_id,
-             signature, signature_key, signed_payload, nonce,
-             created_us, expires_us),
+             json.dumps(payload or {}, ensure_ascii=False), work_item_id)
+            + (() if in_reply_to is None else (int(in_reply_to),))
+            + (signature, signature_key, signed_payload, nonce,
+               created_us, expires_us),
         )
         if not rows:
             raise interface.RecipientRetired(
@@ -582,6 +608,73 @@ class Mailbox(interface.Mailbox):
         )
         return len(rows)
 
+    def requeue_interrupted(self, recipient, owner, epoch, token, turn_id,
+                            ids) -> dict:
+        """#7673 (E2c) : voir `interface.Mailbox.requeue_interrupted`.
+
+        Deux instructions dans une transaction, jamais une seule : la réponse
+        corrélée (`public.mail.reply`) verrouille la même ligne du registre
+        avant d'écrire, donc une réponse concurrente est soit validée avant
+        notre verrou — et l'instantané de la SECONDE instruction, pris après
+        lui, la voit —, soit attend notre commit et trouve une demande dont la
+        consigne a disparu (refus « pas la consigne du tour courant »). Une
+        seule instruction garderait l'instantané d'avant l'attente et
+        remettrait en attente une demande déjà répondue.
+        """
+        clean = sorted({int(i) for i in ids})
+        result = {"guard": "missing", "requeued": [], "replied": []}
+        if not clean:
+            return result
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT lease_owner, lease_epoch FROM agent_registry"
+                " WHERE name = %s FOR UPDATE", (recipient,))
+            if not rows:
+                return result
+            held, at = rows[0]["lease_owner"], rows[0]["lease_epoch"]
+            if held == owner and int(at) == int(epoch):
+                result["guard"] = "held"
+            elif held is None and int(at) == int(epoch) + 1:
+                result["guard"] = "released"
+            else:
+                result["guard"] = "refused"
+                return result
+            capture = """
+                m.recipient = %s AND m.id = ANY(%s::bigint[])
+                AND m.kind = 'request'
+                AND m.meta->'consigne'->>'runner' = %s
+                AND m.meta->'consigne'->>'epoch' = %s
+                AND m.meta->'consigne'->>'jeton' = %s
+                AND (%s::text IS NULL OR m.meta->'consigne'->>'turn' = %s::text)
+                AND NOT coalesce((m.meta ? 'retire'), false)
+            """
+            params = (recipient, clean, owner, str(int(epoch)), token,
+                      turn_id, turn_id)
+            requeued = tx.query(
+                """
+                UPDATE agent_mailbox AS m
+                   SET delivered_at = NULL, status = 'pending',
+                       meta = (m.meta - 'consigne') || jsonb_build_object(
+                           'deja_consigne', true,
+                           'remise_interrompue', jsonb_build_object(
+                               'runner', %%s::text, 'epoch', %%s::bigint,
+                               'turn', %%s::text,
+                               'ts', extract(epoch from clock_timestamp())::float8))
+                 WHERE %s
+                   AND NOT EXISTS (SELECT 1 FROM agent_mailbox r
+                                    WHERE r.in_reply_to = m.id)
+                RETURNING m.id
+                """ % capture,
+                (owner, int(epoch), turn_id) + params)
+            replied = tx.query(
+                "SELECT m.id FROM agent_mailbox m WHERE " + capture
+                + " AND EXISTS (SELECT 1 FROM agent_mailbox r"
+                  " WHERE r.in_reply_to = m.id)",
+                params)
+        result["requeued"] = sorted(int(row["id"]) for row in requeued)
+        result["replied"] = sorted(int(row["id"]) for row in replied)
+        return result
+
     def unread_counts(self) -> dict[str, int]:
         rows = self.db.query(
             """
@@ -640,6 +733,115 @@ class Mailbox(interface.Mailbox):
             + " FROM agent_mailbox m WHERE " + " AND ".join(clauses)
             + " ORDER BY m.id ASC LIMIT %s",
             params)
+
+    def pending_requests(self, recipient, owner, epoch, *, sender=None,
+                         limit=50) -> list[dict]:
+        """Contrat public 1.3 (E2b) : voir `interface.Mailbox.pending_requests`.
+
+        Le marqueur comptable (`spend_pending`) est joint par destinataire :
+        il nomme le tour courant. La consigne de la demande doit porter le
+        MÊME `turn_id` que ce marqueur (le tour qui l'a réservée), le bail doit
+        être vivant et détenu par `owner`/`epoch` dans la même requête, et la
+        remise doit être dans la fenêtre du marqueur. Une demande d'un tour
+        antérieur, dont la consigne a survécu à une reprise, n'est donc jamais
+        « en attente » pour le tour suivant : elle sera re-livrée par le
+        protocole de réservation, pas répondue sous un bail périmé.
+        """
+        limit = max(1, min(int(limit), 200))
+        clauses = [
+            "m.recipient = %s",
+            "m.kind = 'request'",
+            "v.lease_owner = %s",
+            "v.lease_epoch = %s",
+            "v.lease_expires_at > clock_timestamp()",
+            "m.meta->'consigne'->>'runner' = %s",
+            "m.meta->'consigne'->>'epoch' = %s",
+            "m.meta->'consigne'->>'turn' = p.turn_id",
+            "(m.delivered_at IS NULL OR m.delivered_at >= p.created_at)",
+            "NOT coalesce((m.meta ? 'retire'), false)",
+            "NOT EXISTS (SELECT 1 FROM agent_mailbox r WHERE r.in_reply_to = m.id)",
+        ]
+        params: list = [recipient, owner, int(epoch), owner, str(int(epoch))]
+        if sender is not None:
+            clauses.append("m.sender = %s")
+            params.append(sender)
+        params.append(limit + 1)
+        return self.db.query(
+            """
+            SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.payload,
+                   coalesce(btrim(m.work_item_id), '') AS work_item_id,
+                   m.in_reply_to,
+                   extract(epoch from m.created_at)::float8 AS created_ts,
+                   extract(epoch from m.delivered_at)::float8 AS delivered_ts,
+                   p.turn_id AS turn_id
+              FROM agent_mailbox m
+              JOIN spend_pending p ON p.agent = m.recipient
+              JOIN agent_registry v ON v.name = m.recipient
+             WHERE """ + " AND ".join(clauses)
+            + " ORDER BY m.id ASC LIMIT %s",
+            params)
+
+    def reply_target(self, request_id) -> dict | None:
+        """#7672 : voir `interface.Mailbox.reply_target`.
+
+        La demande est verrouillée `FOR SHARE` avant toute décision : un
+        retrait concurrent (qui prend la ligne en écriture) attend la réponse.
+        Le marqueur comptable est lu ensuite, lui aussi `FOR SHARE`, dans la
+        même transaction : `pending_spend_clear` ou `pending_spend_begin`
+        attendent le commit de la réponse, donc le marqueur qui a autorisé le
+        tour ne peut pas disparaître ni changer sous la réponse déjà décidée
+        (constat B de #7672). Absent, il n'y a rien à verrouiller : la réponse
+        est refusée, jamais déposée sans tour courant. La consigne, elle,
+        n'est pas réécrite après la remise (le protocole de réservation la
+        fige), donc la lire sans verrou ne peut pas changer sous les pieds de
+        l'appelant.
+        """
+        rows = self.db.query(
+            """
+            SELECT m.id, m.sender, m.recipient, m.kind, m.body, m.payload,
+                   coalesce(btrim(m.work_item_id), '') AS work_item_id,
+                   m.in_reply_to,
+                   extract(epoch from m.created_at)::float8 AS created_ts,
+                   extract(epoch from m.delivered_at)::float8 AS delivered_ts,
+                   m.meta->'consigne'->>'runner' AS consigne_runner,
+                   m.meta->'consigne'->>'epoch' AS consigne_epoch,
+                   m.meta->'consigne'->>'turn' AS consigne_turn,
+                   coalesce((m.meta ? 'retire'), false) AS withdrawn
+              FROM agent_mailbox m
+             WHERE m.id = %s
+             FOR SHARE OF m
+            """,
+            (int(request_id),))
+        if not rows:
+            return None
+        request = dict(rows[0])
+        # Verrou pris jusqu'au commit : le marqueur qui autorise la réponse ne
+        # peut plus être effacé ni remplacé avant que celle-ci soit écrite.
+        marker = self.db.query(
+            """
+            SELECT agent, turn_id,
+                   extract(epoch from created_at)::float8 AS marker_created_ts
+              FROM spend_pending
+             WHERE agent = %s
+             FOR SHARE
+            """,
+            (request["recipient"],))
+        request["marker_present"] = bool(marker)
+        request["marker_turn_id"] = marker[0]["turn_id"] if marker else None
+        request["marker_created_ts"] = (marker[0]["marker_created_ts"]
+                                        if marker else None)
+        replies = self.db.query(
+            """
+            SELECT id, sender, recipient, body, kind, payload, in_reply_to,
+                   coalesce(btrim(work_item_id), '') AS work_item_id,
+                   extract(epoch from created_at)::float8 AS created_ts,
+                   extract(epoch from delivered_at)::float8 AS delivered_ts
+              FROM agent_mailbox
+             WHERE in_reply_to = %s
+             FOR SHARE
+            """,
+            (int(request_id),))
+        return {"request": request, "replies": replies}
 
     def staging_emission(self, recipient, sender, key) -> int | None:
         rows = self.db.query(

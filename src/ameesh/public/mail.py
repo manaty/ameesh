@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Public mail surface, contract v1.2 (tranche E2a, #7636/#5827/#7706).
+"""Public mail surface, contract v1.4 (tranches E2a/E2b/E2c, #7636/#5827/#7706).
 
 An installed external module already trusted with a database identity submits
-typed mail and reads its own bounded history through this module instead of
-writing ``agent_mailbox`` SQL.  The written contract is
+typed mail, reads its own bounded history, lists the requests a live turn is
+holding and answers one of them through this module instead of writing
+``agent_mailbox`` SQL.  The written contract is
 ``docs/api/module-contract-v1.md``; internal helpers of this package are not
 part of it.
 
@@ -21,6 +22,14 @@ What the core owns here:
   index of migration 0497 is the authority);
 * **history** is bounded by a cursor and restricted to conversations the actor
   takes part in;
+* **pending requests** are the ones reserved as the prompt of the actor's
+  current native turn (the ``spend_pending`` marker is the authority) and not
+  yet answered; the caller presents the live lease it acts under, and a stale
+  or replaced owner/epoch refuses;
+* **reply correlation**: one reply per request, tied by ``in_reply_to`` and
+  protected by the unique index of migration 0594; an identical retry reuses
+  the durable reply, a different content refuses, and the reply is addressed
+  to the request's sender, never to a caller-named recipient;
 * the module-owned payload is a JSON object under the imposed
   ``payload["module"]`` namespace; every other top-level key is core-owned and
   refused, so a core marker added in a later release is closed to modules by
@@ -41,12 +50,12 @@ import re
 import time
 from typing import Any, Mapping, Sequence
 
-from .. import agent_names, cost_attribution, fil, mail, storage
+from .. import agent_names, cost_attribution, fil, mail, registry, storage
 from ..config import NAME_RE
 from ..db import Db, DbError, is_unique_violation
 
 #: revision of the written contract implemented by this module
-CONTRACT_VERSION = "1.2"
+CONTRACT_VERSION = "1.4"
 
 #: maximum size of one body, in UTF-8 bytes
 MAX_BODY_BYTES = 64 * 1024
@@ -58,6 +67,10 @@ MAX_BATCH = 50
 MAX_HISTORY = 200
 #: default number of entries read by one :func:`history` page
 DEFAULT_HISTORY = 100
+#: maximum number of requests read by one :func:`pending` page
+MAX_PENDING = 200
+#: default number of requests read by one :func:`pending` page
+DEFAULT_PENDING = 50
 
 #: mail natures admitted by the public surface
 KINDS = ("request", "reply", "notify", "event")
@@ -67,6 +80,9 @@ _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 
 #: unique index that carries idempotency in the core mailbox (migration 0497)
 _IDEMPOTENCY_INDEX = "agent_mailbox_idempotency_key_idx"
+
+#: unique index that carries reply correlation (migration 0594, E2b)
+_REPLY_INDEX = "agent_mailbox_in_reply_to_idx"
 
 #: known payload keys the core reads for delivery, review, decisions,
 #: accounting or threading.  They are listed for diagnostics and for the
@@ -165,11 +181,14 @@ class Submission:
 
 @dataclasses.dataclass(frozen=True)
 class Receipt:
-    """The durable result of one submission.
+    """The durable result of one submission or reply.
 
     ``id`` is the mailbox row id, stable across retries; for a ``request`` it
     is also the request id a reply correlates with.  ``reused`` is true when
     this call returned an already deposited submission instead of creating one.
+    For a ``reply``, ``in_reply_to`` is the answered request id; it is None for
+    every other nature.  ``request_id`` keeps its E2a meaning: the id of this
+    message when it is a request, None otherwise.
     """
 
     id: int
@@ -178,6 +197,7 @@ class Receipt:
     kind: str
     created_ts: float
     reused: bool
+    in_reply_to: int | None = None
 
     @property
     def request_id(self) -> int | None:
@@ -188,6 +208,7 @@ class Receipt:
         return {
             "id": self.id,
             "request_id": self.request_id,
+            "in_reply_to": self.in_reply_to,
             "actor": self.actor,
             "recipient": self.recipient,
             "kind": self.kind,
@@ -209,6 +230,7 @@ class HistoryEntry:
     work_item_id: str
     created_ts: float
     delivered_ts: float | None
+    in_reply_to: int | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -221,6 +243,85 @@ class HistoryEntry:
             "work_item_id": self.work_item_id,
             "created_ts": self.created_ts,
             "delivered_ts": self.delivered_ts,
+            "in_reply_to": self.in_reply_to,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class Lease:
+    """The native lease a caller acts under: runner id and epoch.
+
+    Build it from ``ameesh turn current --json`` (``lease.owner`` and
+    ``lease.epoch``).  It is a claim the core rechecks against the registry
+    under a row lock; it never grants authority by itself.
+    """
+
+    owner: str
+    epoch: int
+
+    def as_dict(self) -> dict:
+        return {"owner": self.owner, "epoch": self.epoch}
+
+
+@dataclasses.dataclass(frozen=True)
+class Reply:
+    """The content of one answer to a pending request.
+
+    ``payload`` is the module-owned JSON object, validated like a submission's.
+    ``thread=False`` keeps the answer out of the readable project thread.  The
+    recipient is the request's sender and the lot is the request's lot; neither
+    is chosen here.
+    """
+
+    body: str
+    payload: Mapping[str, Any] | None = None
+    thread: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
+class PendingRequest:
+    """One request held by the actor's live lease and current native turn."""
+
+    id: int
+    sender: str
+    recipient: str
+    body: str
+    payload: dict
+    work_item_id: str
+    created_ts: float
+    delivered_ts: float | None
+    turn_id: str
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "sender": self.sender,
+            "recipient": self.recipient,
+            "body": self.body,
+            "payload": dict(self.payload),
+            "work_item_id": self.work_item_id,
+            "created_ts": self.created_ts,
+            "delivered_ts": self.delivered_ts,
+            "turn_id": self.turn_id,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class PendingPage:
+    """One bounded page of :func:`pending`, oldest request first.
+
+    ``has_more`` says another request exists after this page; call
+    :func:`pending` again after answering to get it.  There is no cursor:
+    pending is a live set, not an append-only history.
+    """
+
+    entries: tuple[PendingRequest, ...]
+    has_more: bool
+
+    def as_dict(self) -> dict:
+        return {
+            "entries": [entry.as_dict() for entry in self.entries],
+            "has_more": self.has_more,
         }
 
 
@@ -312,8 +413,24 @@ class IdempotencyConflict(PublicMailError, ValueError):
     code = "conflict"
 
 
+class ReplyConflict(PublicMailError, ValueError):
+    """The request already has one correlated reply with other content.
+
+    A retry of the same reply returns its durable receipt with ``reused=True``;
+    a different body or payload is refused instead of being deposited as a
+    second answer.
+    """
+
+    code = "conflict"
+
+
 class ScopeRefused(PublicMailError, PermissionError):
-    """The actor is not allowed to submit or read under this scope."""
+    """The actor, its lease or the target request is outside this scope.
+
+    Covers a lease whose owner/epoch was replaced or has expired, a request
+    that is not the actor's live current-turn prompt, and a request already
+    answered when the caller is not retrying the same reply.
+    """
 
     code = "refused"
 
@@ -355,6 +472,13 @@ class _Prepared:
     work_item_id: str | None
     thread: bool
     idempotency_key: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedReply:
+    body: str
+    payload: dict
+    thread: bool
 
 
 def _canonical(value: Any) -> str:
@@ -669,6 +793,42 @@ def _prepare(db: Db, actor: str, submission: Any) -> _Prepared:
     )
 
 
+def _lease(value: Any) -> Lease:
+    """Validate the caller's native lease claim (rechecked against the registry)."""
+    if not isinstance(value, Lease):
+        raise InvalidSubmission("lease must be a public mail Lease")
+    owner = value.owner
+    if not isinstance(owner, str):
+        raise InvalidSubmission("lease.owner must be a string")
+    owner = owner.strip()
+    if not owner or len(owner) > 200 or any(ch.isspace() or not ch.isprintable()
+                                            for ch in owner):
+        raise InvalidSubmission(
+            "lease.owner must be a non-empty runner id without whitespace")
+    epoch = value.epoch
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        raise InvalidSubmission("lease.epoch must be a positive integer")
+    return Lease(owner=owner, epoch=epoch)
+
+
+def _request_id(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise InvalidSubmission("request_id must be a positive mailbox id")
+    return value
+
+
+def _prepare_reply(reply: Any) -> _PreparedReply:
+    if not isinstance(reply, Reply):
+        raise InvalidSubmission("reply must be a public mail Reply")
+    if not isinstance(reply.thread, bool):
+        raise InvalidSubmission("thread must be true or false")
+    return _PreparedReply(
+        body=_body(reply.body),
+        payload=_payload(reply.payload),
+        thread=reply.thread,
+    )
+
+
 # ---------------------------------------------------------------------------
 # idempotency
 # ---------------------------------------------------------------------------
@@ -699,6 +859,7 @@ def _same_content(row: dict, prepared: _Prepared) -> bool:
 
 
 def _receipt(row: dict, *, reused: bool) -> Receipt:
+    replied_to = row.get("in_reply_to")
     return Receipt(
         id=int(row["id"]),
         actor=str(row.get("sender") or ""),
@@ -706,6 +867,7 @@ def _receipt(row: dict, *, reused: bool) -> Receipt:
         kind=str(row.get("kind") or ""),
         created_ts=float(row.get("created_ts") or 0.0),
         reused=bool(reused),
+        in_reply_to=None if replied_to is None else int(replied_to),
     )
 
 
@@ -836,6 +998,7 @@ def find(db: Db, actor: str, recipient: str, idempotency_key: str) -> Receipt | 
 
 def _history_entry(row: dict) -> HistoryEntry:
     payload = row.get("payload")
+    replied_to = row.get("in_reply_to")
     return HistoryEntry(
         id=int(row["id"]),
         sender=str(row.get("sender") or ""),
@@ -847,6 +1010,7 @@ def _history_entry(row: dict) -> HistoryEntry:
         created_ts=float(row.get("created_ts") or 0.0),
         delivered_ts=(None if row.get("delivered_ts") is None
                       else float(row["delivered_ts"])),
+        in_reply_to=None if replied_to is None else int(replied_to),
     )
 
 
@@ -904,13 +1068,184 @@ def history(db: Db, actor: str, *, peer: str | None = None,
     return HistoryPage(entries=entries, next_cursor=cursor, has_more=has_more)
 
 
+def _pending_entry(row: dict) -> PendingRequest:
+    payload = row.get("payload")
+    return PendingRequest(
+        id=int(row["id"]),
+        sender=str(row.get("sender") or ""),
+        recipient=str(row.get("recipient") or ""),
+        body=str(row.get("body") or ""),
+        payload=dict(payload) if isinstance(payload, Mapping) else {},
+        work_item_id=str(row.get("work_item_id") or ""),
+        created_ts=float(row.get("created_ts") or 0.0),
+        delivered_ts=(None if row.get("delivered_ts") is None
+                      else float(row["delivered_ts"])),
+        turn_id=str(row.get("turn_id") or ""),
+    )
+
+
+def pending(db: Db, actor: str, lease: Lease, *, sender: str | None = None,
+            limit: int = DEFAULT_PENDING) -> PendingPage:
+    """Requests held for ``actor`` by this live lease and its native turn.
+
+    Only requests reserved as the prompt of the current turn
+    (``meta.consigne``) under the live lease and the current accounting marker
+    (``spend_pending``) are returned, oldest first; an unanswered request
+    delivered in an earlier turn is not current and never appears.  The
+    native spend marker stays authoritative: this call only observes it, it
+    never reserves, settles or spends.  A stale or replaced lease raises
+    :class:`ScopeRefused`; an absent current-turn marker yields an empty page.
+    ``sender`` restricts the page to requests from that agent; ``limit`` is
+    bounded by :data:`MAX_PENDING`.
+    """
+    _direct(db)
+    name = _actor(db, actor)
+    claim = _lease(lease)
+    if sender is not None:
+        sender = _resolve(db, _name(sender, "sender"), "public_mail.pending")
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise InvalidSubmission("limit must be an integer")
+    if limit < 1 or limit > MAX_PENDING:
+        raise InvalidSubmission(
+            "limit must be between 1 and %d" % MAX_PENDING)
+    ok, reason, _row = registry.lease_agent(db, name, claim.owner, claim.epoch)
+    if not ok:
+        raise ScopeRefused(
+            "lease refused for %s: %s" % (name, reason))
+    rows = storage.of(db).mailbox.pending_requests(
+        name, claim.owner, claim.epoch, sender=sender, limit=limit)
+    has_more = len(rows) > limit
+    return PendingPage(
+        entries=tuple(_pending_entry(row) for row in rows[:limit]),
+        has_more=has_more,
+    )
+
+
+def _same_reply(row: dict, prepared: _PreparedReply) -> bool:
+    if (row.get("body") or "") != prepared.body:
+        return False
+    stored = dict(row.get("payload") or {})
+    try:
+        return _canonical(stored) == _canonical(prepared.payload)
+    except (TypeError, ValueError):
+        return False
+
+
+def _correlated(replies: Sequence[dict], prepared: _PreparedReply) -> Receipt:
+    """The durable receipt of the one reply, after checking its content."""
+    if not replies:
+        raise PublicMailError(
+            "the correlated reply disappeared after its insert")
+    existing = replies[0]
+    if not _same_reply(existing, prepared):
+        raise ReplyConflict(
+            "request %s already has another reply (message %s)"
+            % (existing.get("in_reply_to"), existing.get("id")))
+    return _receipt(existing, reused=True)
+
+
+def _check_reply_scope(request: dict, name: str, claim: Lease) -> None:
+    """Refuse a request that is not this lease's live current-turn prompt."""
+    ident = request.get("id")
+    if (request.get("kind") or "") != "request":
+        raise ScopeRefused("message %s is not a request" % ident)
+    if (request.get("recipient") or "") != name:
+        raise ScopeRefused("request %s is not addressed to %s" % (ident, name))
+    if request.get("withdrawn"):
+        raise ScopeRefused("request %s was withdrawn" % ident)
+    if not request.get("marker_present"):
+        raise ScopeRefused(
+            "no live accounting marker: request %s is not held by a turn" % ident)
+    if (request.get("consigne_runner") or "") != claim.owner:
+        raise ScopeRefused(
+            "request %s is held by %s, not %s"
+            % (ident, request.get("consigne_runner") or "nobody", claim.owner))
+    if str(request.get("consigne_epoch") or "") != str(claim.epoch):
+        raise ScopeRefused(
+            "request %s was reserved at epoch %s, not %s"
+            % (ident, request.get("consigne_epoch"), claim.epoch))
+    if (not request.get("consigne_turn")
+            or request.get("consigne_turn") != request.get("marker_turn_id")):
+        raise ScopeRefused(
+            "request %s is not the prompt of the current native turn" % ident)
+    delivered = request.get("delivered_ts")
+    marker = request.get("marker_created_ts")
+    if delivered is not None and (marker is None or float(delivered) < float(marker)):
+        raise ScopeRefused(
+            "request %s was delivered before the current turn" % ident)
+
+
+def reply(db: Db, actor: str, request_id: int, answer: Reply, *,
+          lease: Lease) -> Receipt:
+    """Answer one pending request under the caller's live lease.
+
+    The request must be addressed to ``actor`` and be the current native
+    turn's prompt under the same live ``(owner, epoch)`` lease; an expired or
+    replaced lease, an old delivery or a withdrawn request raises
+    :class:`ScopeRefused`.  The reply is deposited to the request's sender,
+    linked to the request's lot, and correlated by ``in_reply_to``; one
+    request accepts one reply.  An identical retry returns the durable
+    receipt with ``reused=True``; another body or payload raises
+    :class:`ReplyConflict`.  The native spend marker and reservation remain
+    authoritative: this surface never reserves or settles spend.
+    """
+    _direct(db)
+    name = _actor(db, actor)
+    claim = _lease(lease)
+    ident = _request_id(request_id)
+    prepared = _prepare_reply(answer)
+    cfg = getattr(db, "cfg", None)
+    try:
+        with db.transaction() as tx:
+            ok, reason, _row = registry.lease_agent_locked(
+                tx, name, claim.owner, claim.epoch)
+            if not ok:
+                raise ScopeRefused(
+                    "lease refused for %s: %s" % (name, reason))
+            target = storage.of(tx).mailbox.reply_target(ident)
+            if target is None:
+                raise ScopeRefused(
+                    "request %s is not pending for %s" % (ident, name))
+            request = target["request"]
+            _check_reply_scope(request, name, claim)
+            if target["replies"]:
+                return _correlated(target["replies"], prepared)
+            try:
+                message_id = mail.send(
+                    tx, name, str(request.get("sender") or ""), prepared.body,
+                    host=getattr(cfg, "host", None), kind="reply",
+                    payload=prepared.payload,
+                    work_item_id=(request.get("work_item_id") or None),
+                    thread=prepared.thread, in_reply_to=ident)
+            except storage.RecipientRetired as exc:
+                raise RecipientRefused(str(exc)) from exc
+            except fil.UnreadableBody as exc:
+                raise InvalidSubmission(str(exc)) from exc
+            if message_id is None:
+                raise PublicMailError("the core mailbox refused the reply")
+            return _receipt(_row_of(tx, int(message_id)), reused=False)
+    except DbError as exc:
+        if not is_unique_violation(exc, _REPLY_INDEX):
+            raise
+    # A concurrent writer committed the one reply between our read and our
+    # insert.  Re-read outside the aborted transaction: identical content
+    # reuses its id, different content is the deterministic conflict.
+    target = storage.of(db).mailbox.reply_target(ident)
+    if target is None:
+        raise ScopeRefused(
+            "request %s is not pending for %s" % (ident, name))
+    return _correlated(target["replies"], prepared)
+
+
 __all__ = [
     "CONTRACT_VERSION", "MAX_BODY_BYTES", "MAX_PAYLOAD_BYTES", "MAX_BATCH",
-    "MAX_HISTORY", "DEFAULT_HISTORY", "KINDS", "RESERVED_PAYLOAD_KEYS",
-    "MODULE_PAYLOAD_KEY", "ADMITTED_PAYLOAD_KEYS", "RESERVED_ACTORS",
-    "RESERVED_ACTOR_PREFIXES", "reserved_actors",
+    "MAX_HISTORY", "DEFAULT_HISTORY", "MAX_PENDING", "DEFAULT_PENDING",
+    "KINDS", "RESERVED_PAYLOAD_KEYS", "MODULE_PAYLOAD_KEY",
+    "ADMITTED_PAYLOAD_KEYS", "RESERVED_ACTORS", "RESERVED_ACTOR_PREFIXES",
+    "reserved_actors",
     "Submission", "Receipt", "HistoryEntry", "HistoryPage", "SubmissionResult",
-    "BatchResult", "PublicMailError", "InvalidSubmission", "IdempotencyConflict",
-    "ScopeRefused", "RecipientRefused", "UnsupportedStorage",
-    "submit", "submit_many", "find", "history",
+    "BatchResult", "Lease", "Reply", "PendingRequest", "PendingPage",
+    "PublicMailError", "InvalidSubmission", "IdempotencyConflict",
+    "ReplyConflict", "ScopeRefused", "RecipientRefused", "UnsupportedStorage",
+    "submit", "submit_many", "find", "history", "pending", "reply",
 ]

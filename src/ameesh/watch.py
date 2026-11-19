@@ -141,10 +141,27 @@ class _ReportJustSent(Exception):
     """#7625 : le dépôt a été dédoublonné dans la fenêtre des comptes rendus."""
 
 
-def instruction(agent: str) -> str:
-    """The instruction sent to `agent`, from the versioned text."""
+def staging_hosts_text(topology=None) -> str:
+    """#7796: the staging hosts named by the instruction, read from the canon.
+
+    The bare profile declares none: the text says so instead of naming the
+    hosts of one mesh."""
+    hosts = tuple(getattr(topology, "hosts", ()) or ())
+    if not hosts:
+        return "none declared by the canon yet"
+    workstation = getattr(topology, "workstation", None)
+    return ", ".join("%s (workstation)" % host if host == workstation else host
+                     for host in hosts)
+
+
+def instruction(agent: str, topology=None) -> str:
+    """The instruction sent to `agent`, from the versioned text.
+
+    `topology` is the canon's staging sequence (`release_cutoff.
+    staging_topology_of`); without it the text names no host (#7796)."""
     with open(CONSIGNE_PATH, encoding="utf-8") as fh:
-        return string.Template(fh.read()).safe_substitute(agent=agent).strip()
+        return string.Template(fh.read()).safe_substitute(
+            agent=agent, staging_hosts=staging_hosts_text(topology)).strip()
 
 
 #: L148 (stage 2c): old spelling kept for the callers not yet renamed.
@@ -943,7 +960,11 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
             # turn is older sends the instruction.
             return ("watch of %s: changed, but a turn within %d min: nothing sent "
                     "(change kept pending)" % (agent, RECENT_TURN_S // 60))
-    text = UNCHANGED_TEXT % agent if passive else instruction(agent)
+    if passive:
+        text = UNCHANGED_TEXT % agent
+    else:
+        from . import release_cutoff
+        text = instruction(agent, release_cutoff.staging_topology_of(cfg))
     payload = {"info": True} if passive else None
     report_fp = mail.report_digest(text) if passive else None
     if passive:

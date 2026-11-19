@@ -53,6 +53,7 @@ import time
 import unicodedata
 
 from . import mail, storage
+from .roles import ORCHESTRATOR_ROLES
 
 SCHEMA = "ameesh-unrecorded/1"
 DEFAULT_SINCE = "24h"
@@ -208,7 +209,8 @@ CHANNEL_LABELS = {"mail": "mail", "decision": "decision", "chat": "chat"}
 HINT = ("For each one: record the lot, with the exact sentence as source (ameesh work add "
         "--title \"REF: title\" --source \"<who>: '<exact sentence>'\" --priority 1|2|3 "
         "[--assignee <agent>]), then cite its number in the reply to the human "
-        "(docs/ORCHESTRATEUR.md, \"Every request from a human becomes a lot\").")
+        "(docs/%s.md, \"Every request from a human becomes a lot\")."
+        % ORCHESTRATOR_ROLES[0].upper())
 
 
 def add_parser(work_sub, func) -> None:

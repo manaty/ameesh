@@ -13,8 +13,10 @@ red, never the production of a module.
 from __future__ import annotations
 
 import ast
+import atexit
 import configparser
 import copy
+import dataclasses
 from importlib import metadata, util
 import inspect
 import json
@@ -22,21 +24,27 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from unittest import mock
 
 from tests import support  # isolate host config before product imports
 from tests.support import PgTestCase
 from tests.test_canon import commit_all, publish, write
-from ameesh import db as db_mod, serve
+from ameesh import (accounts, auth_failure, budget, canon, db as db_mod,
+                    deferral_observation, migrations, provider_credits, public,
+                    resources, serve)
 from ameesh.modules import registry
 from ameesh.modules.storage import ModuleStore
+from ameesh.public import fixture, mail
 
 ROOT = Path(__file__).resolve().parents[1]
 WITNESS = ROOT / "examples" / "modules" / "contract-witness"
+FIXTURE = ROOT / "examples" / "fixtures" / "public-fixture-witness"
 CONTRACT = ROOT / "docs" / "api" / "module-contract-v1.md"
 SURFACE_FILE = ROOT / "docs" / "api" / "module-contract-v1.surface.json"
 COVERAGE = ROOT / "docs" / "api" / "module-contract-v1-coverage.md"
@@ -73,8 +81,61 @@ def package():
     return project, entries
 
 
-def install(directory, entries=None, name=None, version=None):
-    """Install a distribution's metadata in `directory`, as pip would."""
+#: The witness as pip installs it, built once per test process; install() hands
+#: each test its own copy of this site (#7704 N3: a real distribution, not
+#: synthetic metadata, and code loaded from the installed wheel).
+_WITNESS_SITE = None
+
+
+def _pip(*args):
+    """Run pip in this interpreter; a missing pip leaves the test non-conclusive."""
+    if util.find_spec("pip") is None:
+        raise unittest.SkipTest("pip absent: the witness wheel cannot be built")
+    result = subprocess.run([PY, "-m", "pip", "--disable-pip-version-check",
+                             "--no-input"] + list(args),
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise AssertionError("pip %s failed:\n%s%s"
+                             % (args[0], result.stdout, result.stderr))
+    return result
+
+
+def _built_site():
+    """Build the witness wheel and install it, from a copy outside the repository.
+
+    The copy is what a consumer gets: building in place would let files that
+    `examples/` keeps beside the sources hide a packaging defect. Pip builds
+    with the backend and requirements declared by the witness's [build-system],
+    then installs the wheel the distribution actually ships."""
+    global _WITNESS_SITE
+    if _WITNESS_SITE is None:
+        build = Path(tempfile.mkdtemp(prefix="w7665-build-"))
+        atexit.register(shutil.rmtree, build, True)
+        source = build / "source"
+        shutil.copytree(WITNESS, source,
+                        ignore=shutil.ignore_patterns("__pycache__", "build", "*.egg-info"))
+        wheels = build / "wheels"
+        wheels.mkdir()
+        # Pas de --no-build-isolation : le venv de test ne porte pas
+        # setuptools ; pip fournit le backend déclaré, comme chez un consommateur.
+        _pip("wheel", "--no-deps", "--wheel-dir", str(wheels), str(source))
+        (wheel,) = wheels.glob("*.whl")
+        _WITNESS_SITE = build / "site"
+        _pip("install", "--no-deps", "--no-index", "--target", str(_WITNESS_SITE), str(wheel))
+    return _WITNESS_SITE
+
+
+def install(directory):
+    """Install the witness distribution into `directory`, from its built wheel."""
+    shutil.copytree(_built_site(), directory)
+    return directory
+
+
+def fake_installation(directory, entries=None, name=None, version=None):
+    """Write distribution metadata by hand: the refusal paths only.
+
+    A real witness build never declares a reserved or mismatched entry point,
+    so those tests need arbitrary metadata, not the shipped distribution."""
     project, declared = package()
     name, version = name or project["name"], version or project["version"]
     info = Path(directory) / ("%s-%s.dist-info" % (name.replace("-", "_"), version))
@@ -87,7 +148,7 @@ def install(directory, entries=None, name=None, version=None):
 
 
 def witness_path(site):
-    return os.pathsep.join([str(site), str(WITNESS), support.SRC])
+    return os.pathsep.join([str(site), support.SRC])
 
 
 def command(name):
@@ -130,6 +191,42 @@ def signature_breaks(frozen, signature):
     breaks += ["%s: added without a default" % name for name, after in new.items()
                if name not in old and after.default is kinds.empty
                and after.kind not in (kinds.VAR_POSITIONAL, kinds.VAR_KEYWORD)]
+    return breaks
+
+
+_MISSING = object()
+
+
+def fixture_breaks(module):
+    """Incompatibilities of a fixture surface candidate against revision 1.5.
+
+    One list for the deliberate-break witness of #7701: a removed parameter, a
+    renamed or changed constant, an error code or a removed public operation is
+    named here. The surface module is passed, so a mutated copy proves the
+    comparator itself detects a break."""
+    spec = SURFACE["python"]["fixture"]
+    breaks = []
+    for name, frozen in sorted(spec["signatures"].items()):
+        target = module.Fixture if name == "Fixture" else getattr(
+            module.Fixture, name, _MISSING)
+        if target is _MISSING:
+            breaks.append("%s: removed" % name)
+            continue
+        breaks += ["%s: %s" % (name, reason) for reason in signature_breaks(
+            frozen_signature(frozen), inspect.signature(target))]
+    for name, expected in sorted(spec["constants"].items()):
+        actual = getattr(module, name, _MISSING)
+        if isinstance(expected, list) and isinstance(actual, (list, tuple)):
+            actual = list(actual)
+        if actual != expected:
+            breaks.append("%s: %r → %r" % (name, expected, actual))
+    for name, code in sorted(spec["errors"].items()):
+        actual = getattr(module, name, _MISSING)
+        if actual is _MISSING:
+            breaks.append("%s: removed" % name)
+        elif getattr(actual, "code", None) != code:
+            breaks.append("%s: code %r → %r" % (name, code,
+                                                getattr(actual, "code", None)))
     return breaks
 
 
@@ -269,6 +366,22 @@ class CliContractTest(unittest.TestCase):
     def ameesh(self, *args, env=None):
         return client.run(EXECUTABLES["ameesh"], args, env=env or self.env)
 
+    def test_the_witness_is_installed_from_its_built_wheel(self):
+        """#7704 N3: no source shortcut — pip built the wheel from a copy outside
+        the repository and the executable imports the installed distribution."""
+        self.assertNotIn(str(WITNESS), self.env["PYTHONPATH"].split(os.pathsep))
+        (record,) = self.site.glob("ameesh_contract_witness-*.dist-info/RECORD")
+        recorded = {line.split(",")[0]
+                    for line in record.read_text(encoding="utf-8").splitlines()}
+        self.assertLessEqual({"ameesh_contract_witness.py", "contract_witness_client.py"},
+                             recorded)
+        probe = subprocess.run(
+            [PY, "-c", "import ameesh_contract_witness as m; print(m.__file__)"],
+            env=self.env, capture_output=True, text=True)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(Path(probe.stdout.strip()),
+                         self.site / "ameesh_contract_witness.py")
+
     def test_the_help_documents_exactly_the_frozen_options(self):
         """A frozen option missing from `--help` is a break; an option the help
         documents beyond the surface is compatible, but it is a public element as
@@ -305,6 +418,9 @@ class CliContractTest(unittest.TestCase):
                           "distribution": "ameesh-contract-witness",
                           "entry_point": "ameesh_contract_witness", "card_ref": None})
         self.assertRegex(row["descriptor_sha256"], r"^[0-9a-f]{64}$")
+        # Revision 1.2 storage facts: the witness declares no migrations.
+        self.assertEqual((row["schema"], row["migrations"], row["requires"]),
+                         (None, [], []))
 
     def test_module_list_is_reserved_installation_evidence(self):
         code, rows = client.run_json(EXECUTABLES["ameesh"], ["module", "list"], env=self.env)
@@ -330,7 +446,7 @@ class CliContractTest(unittest.TestCase):
         self.assertEqual([row["name"] for row in document["modules"]], [witness.NAME])
 
     def test_a_reserved_or_mismatched_entry_point_is_refused(self):
-        site = install(self.tmp / "refused", entries={
+        site = fake_installation(self.tmp / "refused", entries={
             "list": "ameesh_contract_witness", "other-name": "ameesh_contract_witness"},
             name="ameesh-witness-refused")
         env = dict(self.env, PYTHONPATH=os.pathsep.join([str(site), self.env["PYTHONPATH"]]))
@@ -363,9 +479,9 @@ class ModuleInterfaceTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.site = install(Path(tmp.name))
+        self.site = install(Path(tmp.name) / "site")
         self.addCleanup(sys.modules.pop, "ameesh_contract_witness", None)
-        patcher = mock.patch.object(sys, "path", [str(WITNESS)] + sys.path)
+        patcher = mock.patch.object(sys, "path", [str(self.site)] + sys.path)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -389,6 +505,9 @@ class ModuleInterfaceTest(unittest.TestCase):
         # Two representations of the same declared types.
         self.assertEqual(module.storage, witness.TYPES)
         self.assertEqual(module.as_dict()["storage"], {"types": list(witness.TYPES)})
+        # Revision 1.2 storage facts, absent on the witness distribution.
+        self.assertEqual((module.schema, module.migrations, module.requires),
+                         (None, (), ()))
 
     def test_descriptor_keys_and_options(self):
         self.assertEqual(sorted(witness.descriptor()), sorted(SURFACE["module"]["descriptor_keys"]))
@@ -416,6 +535,22 @@ class ModuleInterfaceTest(unittest.TestCase):
         self.assertEqual(found.names(), [])
         self.assertIn("declares workspaces without providing it", found.refused[0]["error"])
 
+    def test_release_capability_is_refused_to_an_external_module(self):
+        # #7784: `release` is built-in only; contract v1 does not publish it.
+        self.assertNotIn("release", SURFACE["module"]["capabilities"])
+        provider = lambda name: object()
+        for patches in ({"CAPABILITIES": ("lifecycle", "release")},
+                        {"RELEASE_MODELS": ("nexlink-train",), "release_model": provider},
+                        {"RELEASE_MODELS": ("nexlink-train",), "release_model": provider,
+                         "CAPABILITIES": ("lifecycle", "release")}):
+            with self.subTest(sorted(patches)), \
+                    mock.patch.multiple(witness, create=True, **patches), \
+                    mock.patch.dict(sys.modules, {"ameesh_contract_witness": witness}):
+                found = self.discover()
+                self.assertEqual(found.names(), [])
+                self.assertIn("release capability is reserved to built-in modules",
+                              found.refused[0]["error"])
+
     def test_names_follow_the_published_pattern(self):
         pattern = re.compile(SURFACE["module"]["name_pattern"])
         for name, valid in (("a" * 64, True), ("a" * 65, False), ("w.it_-1", True),
@@ -425,7 +560,7 @@ class ModuleInterfaceTest(unittest.TestCase):
                 entries = {name: "ameesh_contract_witness"}
                 tmp = tempfile.TemporaryDirectory()
                 self.addCleanup(tmp.cleanup)
-                site = install(Path(tmp.name), entries=entries, name="ameesh-witness-n")
+                site = fake_installation(Path(tmp.name), entries=entries, name="ameesh-witness-n")
                 with mock.patch.object(witness, "NAME", name), \
                         mock.patch.dict(sys.modules, {"ameesh_contract_witness": witness}), \
                         installed_points(site):
@@ -471,6 +606,208 @@ class ModuleInterfaceTest(unittest.TestCase):
             with self.subTest(candidate):
                 self.assertEqual(signature_breaks(frozen, frozen_signature(candidate)),
                                  expected)
+
+
+def policy_card(**fields):
+    """A minimal Agent card declaring the given top-level fields (E3a)."""
+    lines = ["---", "type: Agent", "title: doc", "responsible: human:alice",
+             "team: acme", "capabilities: [read]"]
+    for key, value in fields.items():
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        lines.append("%s: %s" % (key, value))
+    return "\n".join(lines + ["---", "", "# doc", ""])
+
+
+class CanonPolicyContractTest(unittest.TestCase):
+    """The declarative per-agent policy keys frozen by revision 1.1/1.2."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="w7665-policy-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        os.makedirs(os.path.join(self.root, "agents"))
+        with open(os.path.join(self.root, "index.md"), "w", encoding="utf-8") as handle:
+            handle.write("---\ntype: Index\ntitle: x\n---\n")
+
+    def test_the_frozen_session_keys_are_the_declared_policy(self):
+        spec = SURFACE["canon"]["session_policy"]
+        declared = {"session_policy": "jamais", "fresh_session": "true",
+                    "context_max_tokens": "15M", "failure_wait_min": "60s"}
+        self.assertEqual(sorted(spec), sorted(declared))
+        write(self.root, "agents/doc.md", policy_card(**declared))
+        policy = canon.load(self.root, untrusted=True).agent("doc").declared_policy()
+        self.assertEqual(sorted(policy), sorted(spec))
+        self.assertEqual(policy, {"session_policy": "jamais", "fresh_session": True,
+                                  "context_max_tokens": 15_000_000,
+                                  "failure_wait_min": 60})
+
+    def test_the_frozen_resource_keys_are_native_thresholds(self):
+        spec = SURFACE["canon"]["resource_policy"]
+        for key, item in sorted(spec.items()):
+            with self.subTest(key):
+                self.assertIn(key, resources.THRESHOLD_KEYS)
+                limits = resources.thresholds({"resources": {key: item["sample"]}})
+                self.assertEqual(limits[key], item["value"])
+
+
+class ModuleStorageContractTest(unittest.TestCase):
+    """SCHEMA, MIGRATIONS and REQUIRES are read from the installed descriptor."""
+
+    def test_the_frozen_storage_attributes_are_the_module_declaration(self):
+        names = SURFACE["module"]["storage_attributes"]
+        self.assertEqual(names, ["SCHEMA", "MIGRATIONS", "REQUIRES"])
+        values = {"SCHEMA": "witness-schema", "MIGRATIONS": "migrations",
+                  "REQUIRES": ["core"]}
+        with tempfile.TemporaryDirectory() as directory:
+            package = os.path.join(directory, "package")
+            os.makedirs(os.path.join(package, "migrations"))
+            source = os.path.join(package, "sample.py")
+            with open(source, "w", encoding="utf-8") as handle:
+                handle.write("")
+            with open(os.path.join(package, "migrations", "0001_init.sql"),
+                      "w", encoding="utf-8") as handle:
+                handle.write("create table sample (id int);")
+            module = types.ModuleType("sample")
+            module.__file__ = source
+            for name in names:
+                setattr(module, name, values[name])
+            declaration = migrations.module_metadata("sample", module)
+        self.assertEqual(declaration["schema"], "witness-schema")
+        self.assertEqual([migration.label for migration in declaration["migrations"]],
+                         ["sample/0001_init"])
+        self.assertEqual(declaration["requires"], ("core",))
+
+
+class DeferralContractTest(unittest.TestCase):
+    """The bounded `ameesh-deferral/1` block of `list --json`, `show --json`."""
+
+    def cases(self):
+        """One row per closed reason, so the enum cannot grow unnoticed."""
+        return (
+            ("operator", {"status": "blocked", "operator_paused": True,
+                          "operator_pause_ts": 100.0}),
+            ("pressure", {"status": "queued", "status_text": (
+                "waiting: pressure on host h1 (own cgroup) — memory pressure "
+                "(PSI some 60 s, own cgroup); queued 42 s; capacity requested; "
+                "retry in 10 s")}),
+            ("authentication", {"status": "blocked",
+                                "status_text": auth_failure.STATUS_PREFIX + " x"}),
+            ("provider_credits", {"status": "blocked",
+                                  "status_text": provider_credits.STATUS_PREFIX + " x"}),
+            ("budget", {"status": "blocked",
+                        "status_text": budget.PAUSE_PREFIX + "hourly budget reached"}),
+            ("account", {"status": "blocked",
+                         "status_text": accounts.CONFIG_BLOCK_PREFIX + "no valid account"}),
+            ("account_window", {"status": "blocked",
+                                "status_text": "account window: short-window cooldown"}),
+            ("session", {"status": "blocked",
+                         "status_text": deferral_observation.SESSION_STATUS + " on h1"}),
+            ("database", {"status": "blocked",
+                          "status_text": deferral_observation.DATABASE_STATUS + " : refused"}),
+            ("host", {"status": "blocked",
+                      "status_text": deferral_observation.HOST_STATUS + " : missing"}),
+            ("workdir", {"status": "blocked",
+                         "status_text": deferral_observation.WORKDIR_STATUS + " : /missing"}),
+            ("shutdown", {"status": "queued", "status_text": (
+                deferral_observation.SHUTDOWN_PREFIX + " put back in the queue")}),
+            ("restart", {"status": "queued", "status_text": (
+                deferral_observation.RESTART_PREFIX + " put back in the queue")}),
+            ("other", {"status": "blocked", "status_text": "turn context unavailable"}),
+        )
+
+    def test_the_frozen_block_shape_and_closed_enums(self):
+        spec = SURFACE["deferral"]
+        self.assertEqual(deferral_observation.SCHEMA, spec["schema"])
+        self.assertEqual(list(deferral_observation.STATES), spec["states"])
+        self.assertEqual(list(deferral_observation.REASONS), spec["reasons"])
+        seen = set()
+        for reason, row in self.cases():
+            with self.subTest(reason):
+                block = deferral_observation.classify(row, now=1000.0)
+                self.assertIsNotNone(block)
+                self.assertEqual(block["reason"], reason)
+                self.assertIn(block["state"], spec["states"])
+                self.assertLessEqual(set(block), set(spec["fields"]))
+                self.assertLessEqual(set(spec["required_fields"]), set(block))
+                self.assertTrue(block["age_s"] is None or isinstance(block["age_s"], int))
+                self.assertTrue(block["since_ts"] is None
+                                or isinstance(block["since_ts"], (int, float)))
+                if "queue" in block:
+                    queue = block["queue"]
+                    self.assertLessEqual(set(queue), set(spec["queue_fields"]))
+                    self.assertLessEqual(set(spec["queue_required_fields"]), set(queue))
+                seen.add(reason)
+        self.assertEqual(seen, set(spec["reasons"]))
+
+
+class PythonMailContractTest(unittest.TestCase):
+    """The 1.2/1.3/1.4 Python surface: signatures, records, published bounds and codes."""
+
+    spec = SURFACE["python"]["mail"]
+
+    def test_the_public_mail_signatures_are_frozen(self):
+        for name, frozen in sorted(self.spec["signatures"].items()):
+            with self.subTest(name):
+                self.assertEqual(signature_breaks(
+                    frozen_signature(frozen),
+                    inspect.signature(getattr(mail, name))), [])
+
+    def test_the_value_objects_keep_their_frozen_fields(self):
+        for name, fields in sorted(self.spec["records"].items()):
+            with self.subTest(name):
+                self.assertEqual([field.name for field in
+                                  dataclasses.fields(getattr(mail, name))], fields)
+
+    def test_the_published_bounds_enums_and_errors_are_frozen(self):
+        for name, value in sorted(self.spec["bounds"].items()):
+            with self.subTest(name):
+                self.assertEqual(getattr(mail, name), value)
+        self.assertEqual(list(mail.KINDS), self.spec["kinds"])
+        self.assertEqual(mail.MODULE_PAYLOAD_KEY, self.spec["module_payload_key"])
+        self.assertEqual(sorted(mail.ADMITTED_PAYLOAD_KEYS),
+                         self.spec["admitted_payload_keys"])
+        self.assertEqual(sorted(mail.RESERVED_PAYLOAD_KEYS),
+                         self.spec["reserved_payload_keys"])
+        self.assertEqual(sorted(mail.RESERVED_ACTORS), self.spec["reserved_actors"])
+        self.assertEqual(list(mail.RESERVED_ACTOR_PREFIXES),
+                         self.spec["reserved_actor_prefixes"])
+        for name, code in sorted(self.spec["errors"].items()):
+            with self.subTest(name):
+                self.assertEqual(getattr(mail, name).code, code)
+
+    def test_the_served_contract_version_is_frozen(self):
+        self.assertEqual(mail.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.mail.CONTRACT_VERSION, mail.CONTRACT_VERSION)
+        self.assertEqual(public.CONTRACT_VERSION, SURFACE["contract"])
+
+
+class PythonFixtureContractTest(unittest.TestCase):
+    """The 1.5 fixture surface: signatures, constants, error codes."""
+
+    spec = SURFACE["python"]["fixture"]
+
+    def test_the_public_fixture_signatures_and_constants_are_frozen(self):
+        self.assertEqual(fixture_breaks(fixture), [])
+
+    def test_the_published_error_codes_are_frozen(self):
+        for name, code in sorted(self.spec["errors"].items()):
+            with self.subTest(name):
+                self.assertEqual(getattr(fixture, name).code, code)
+
+    def test_the_served_contract_version_is_frozen(self):
+        self.assertEqual(fixture.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.fixture.CONTRACT_VERSION, fixture.CONTRACT_VERSION)
+        self.assertEqual(public.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.CONTRACT_VERSION, SURFACE["contract"])
+
+    def test_the_external_fixture_witness_is_its_own_distribution(self):
+        self.assertNotIn(ROOT / "src", FIXTURE.parents)
+        self.assertNotIn(ROOT / "tests", FIXTURE.parents)
+        parser = configparser.ConfigParser()
+        parser.read(FIXTURE / "pyproject.toml")
+        project = {key: json.loads(value) for key, value in parser["project"].items()}
+        self.assertEqual(project["name"], "ameesh-public-fixture-witness")
+        self.assertEqual(project["version"], "1.5.0")
 
 
 class HttpContractTest(unittest.TestCase):
@@ -608,9 +945,13 @@ class CoverageTableTest(unittest.TestCase):
         names.update("cli:" + name for name in SURFACE["cli"])
         names.update("module:" + name for name in SURFACE["module"])
         names.update({"http:discovery", "http:operations", "http:authentication",
-                      "http:idempotency", "http:events", "http:schemas"})
+                      "http:idempotency", "http:events", "http:schemas",
+                      "http:agent-observation"})
         names.update({"runner:agents-file", "runner:turn-context", "runner:turn-observation"})
         names.update("view:" + name for name in SURFACE["views"])
+        names.update({"deferral"})
+        names.update("canon:" + name.replace("_", "-") for name in SURFACE["canon"])
+        names.update("python:" + name for name in SURFACE["python"])
         names.update({"fixture", "stable-pin"})
         return names
 

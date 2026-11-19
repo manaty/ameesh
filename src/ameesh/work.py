@@ -42,6 +42,7 @@ from urllib.parse import quote
 
 from . import storage
 from .db import Db, DbError, is_unique_violation
+from .roles import DESIGN_ROLES, ORCHESTRATOR_ROLES
 from .storage import interface
 from .storage.postgres import work as _pg
 
@@ -102,7 +103,7 @@ def development_transitions() -> dict:
 
 
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
-CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
+CORRECTOR_ROLES = ORCHESTRATOR_ROLES + DESIGN_ROLES
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
 #: portée par la note de la dernière attribution du lot (jamais une exemption
 #: silencieuse de qui a assigné le lot).
@@ -502,8 +503,8 @@ def publisher(cfg, db, explicit: str | None = None) -> str:
         raise WorkError("--publish refused: invalid session identity (%s)"
                         % (binding.reason or "unbound identity"))
     refus = ("--publish refused: %s is not the auditor; the reference table (L157b) "
-             "is the auditor's pass (the auditeur role on its Agent card in the canon); "
-             "work estimates without --publish reads it")
+             "is the auditor's pass (the declared audit role on its Agent card in "
+             "the canon); work estimates without --publish reads it")
     if binding.name:
         if text and text != binding.name:
             raise WorkError("--publish refused: this session belongs to %s, it does "
@@ -1381,6 +1382,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     `issue reference changed meanwhile, retry`), jamais écrite en silence."""
     from . import migrations
 
+    # #7795 : la disposition du dépôt se lit à la configuration de l'hôte,
+    # comme les autres lectures ; l'appelant peut la remplacer.
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -1438,12 +1442,15 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         slug = migrations.repo_key(repository)
     else:
         slug = lot_repository(item, cfg)
-    layout = migrations.layout_for(slug, cfg)
+    checkout = _checkout(slug, repo, cfg)
+    # #7795 (B1) : la configuration d'abord, sinon le clone du dépôt lui-même,
+    # qui porte ses fichiers ; jamais une table de dépôts compilée.
+    layout = migrations.layout_for(slug, cfg) or migrations.inferred_layout(checkout, slug)
     if layout is None:
         raise WorkError("repository %s: migrations directory unknown (declare it in the host "
                         "configuration: radar.projects.<project> with github %s and "
-                        "migrations <dir>)" % (slug, slug))
-    checkout = _checkout(slug, repo, cfg)
+                        "migrations <dir>, or give a readable clone with --repo)"
+                        % (slug, slug))
     trunks = sorted(set(skip_branches) & migrations.trunk_branches(checkout))
     if trunks:
         # ignorer le tronc cacherait les migrations déjà fusionnées (#1603)
@@ -1511,28 +1518,37 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                 and (again.get("issue_ref") or "") != (item.get("issue_ref") or "")):
             raise WorkError("lot %s: issue reference changed meanwhile, retry" % item_id)
         raise WorkError("lot %s is no longer open: no reservation" % item_id)
-    return _with_file(row, cfg)
+    return _with_file(row, cfg, checkout=checkout)
 
 
-def migration_layout(item: dict, cfg=None, repo: str | None = None):
+def migration_layout(item: dict, cfg=None, repo: str | None = None,
+                     checkout: str | None = None):
     """La disposition des migrations du dépôt réservé (défaut : 4 chiffres).
     `repo` (#1567) : le dépôt du numéro **atterri**, quand il diffère de la
-    réservation (celle-ci peut avoir été libérée depuis, #956)."""
+    réservation (celle-ci peut avoir été libérée depuis, #956). `checkout`
+    (#7795) : le clone lu par l'appelant, quand la configuration ne le nomme
+    pas ; sinon le clone déclaré à l'hôte est lu."""
     from . import migrations
 
     slug = repo or item.get("migration_repo") or ""
-    return migrations.layout_for(slug, cfg) or migrations.Layout(slug, "", 4)
+    layout = migrations.layout_for(slug, cfg)
+    if layout is None:
+        if checkout is None:
+            checkout = migrations.checkout_for(slug, cfg)
+        if checkout:
+            layout = migrations.inferred_layout(checkout, slug)
+    return layout or migrations.Layout(slug, "", 4)
 
 
-def _with_file(item: dict, cfg=None) -> dict:
+def _with_file(item: dict, cfg=None, *, checkout: str | None = None) -> dict:
     """#2481 : ajoute les libellés et fichiers de toutes les réservations."""
     reservations = reserved_migrations(item)
     if item.get("migration") is None:
         return dict(item, migrations=reservations)
-    layout = migration_layout(item, cfg)
+    layout = migration_layout(item, cfg, checkout=checkout)
     enriched = []
     for row in reservations:
-        row_layout = migration_layout({}, cfg, repo=row["repo"])
+        row_layout = migration_layout({}, cfg, repo=row["repo"], checkout=checkout)
         enriched.append(dict(
             row,
             label=row_layout.label(row["number"]),
@@ -4165,6 +4181,9 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
            announce=None, pr: str | None = None) -> dict:
     """`ameesh work merged` : la livraison `git-merge` de `deliver` (L99 T2),
     preuve `{sha, pr}` ; voir `record_merge`."""
+    # #7795 : le libellé d'un numéro atterri se lit à la configuration de
+    # l'hôte, comme la réservation ; l'appelant peut la remplacer.
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     evidence = {"sha": sha}
     if pr is not None:
         evidence["pr"] = pr
@@ -4216,6 +4235,9 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
     d'un lot léger ne s'ouvrait jamais. Le même dépôt rejoue une relecture
     manquante sur un lot déjà fusionné (dans les bornes du rattrapage).
 
+    #7795 : même défaut que `merged`, le libellé du numéro atterri se lit à
+    # la configuration de l'hôte.
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     #6826 : sur un lot déjà livré, le clone explicite fait autorité pour
     l'intervalle de relecture, même si son origin diffère du dépôt du ticket.
     La classe doit toujours prouver un delta Git ; une première livraison
@@ -4372,7 +4394,7 @@ def _landing_probe(db: Db, item: dict, reserved, slug, sha: str, repo: str | Non
     reserved = int(reserved)
     try:
         target = _migration_target(item, repo, cfg)
-        layout = migrations.layout_for(slug, cfg)
+        layout = migrations.layout_for(slug, cfg) or migrations.inferred_layout(repo, slug)
         if not target:
             return None
         origin = migrations.origin_repo(repo)

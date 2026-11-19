@@ -45,13 +45,14 @@ class Layout:
 
 
 def layout(project) -> Layout | None:
-    """The migration layout of a radar project, or None when it has none."""
+    """The migration layout of a radar project, or None when it has none.
+
+    #7795: the width is declared (`migrations_width`) or read from the
+    project's own migration files; no repository slug is compiled."""
     directory = (getattr(project, "migrations", "") or "").strip().strip("/")
     if not directory:
         return None
-    known = migrations.LAYOUTS.get(migrations.repo_key(
-        getattr(project, "github", "") or ""))
-    return Layout(directory, migrations.width_of(project, known))
+    return Layout(directory, migrations.width_of(project))
 
 
 def _run(path: str, *args: str):

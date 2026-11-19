@@ -94,6 +94,7 @@ import time
 from typing import Any, Iterable, Mapping
 
 from . import work_lifecycle
+from .roles import AUDITOR_ROLES
 
 SCHEMA = "ameesh-debit/1"
 
@@ -2598,8 +2599,8 @@ def _capacity_gesture(project: str, entry: Mapping[str, Any]) -> str:
         return head + _footprint_gesture(entry["footprint_lots"])
     if entry.get("decoupage"):
         return head + ("le lot de découpage #%d a plus d'une heure sans lot démarrable "
-                       "— l'auditeur crée les lots (niveau 1, spec §2.2)"
-                       % entry["decoupage"]["lot"])
+                       "— l'%s crée les lots (niveau 1, spec §2.2)"
+                       % (entry["decoupage"]["lot"], AUDITOR_ROLES[0]))
     return head + "aucun lot de découpage ouvert — l'ouvrir au pilote (spec #3256 §2.2)"
 
 

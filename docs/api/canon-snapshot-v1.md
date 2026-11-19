@@ -37,23 +37,28 @@ Optional checks:
   the repository root with its federation manifest to retain its scope
   declarations; the normal canon loader interprets that manifest.
 - `--single-source`: explicitly request only the root source; refuse any
-  additional loaded source. Unloaded sibling bundles are listed in
-  `omitted_members` and acquire no authority from the result. Without this
-  flag an absent federation member refuses the snapshot; every loaded source
-  is pinned and checked independently. The root pin alone is not a promise
-  that all sources come from one repository.
+  additional source whose declared scope is readable. A declared sibling
+  bundle that stays unloaded — absent locally, not a Git repository, missing
+  the selected ref, outside the workspace, or with an unreadable scope — is
+  listed in `omitted_members`, and a diagnostic that concerns only that
+  sibling neither refuses the snapshot nor appears in `findings`; it acquires
+  no authority from the result. An error of the root still refuses. Without
+  this flag an absent federation member refuses the snapshot; every loaded
+  source is pinned and checked independently. The root pin alone is not a
+  promise that all sources come from one repository.
 - `--fetch`: explicitly fetch before loading, using the existing canon loader.
   A failed fetch refuses the result instead of authorizing cached refs.
   Without it, there is no network refresh. Fetch updates local tracking refs;
   all other snapshot processing is read-only.
 
-For every source, the selected ref and HEAD must match the loaded immutable
-commit, and the working tree must be clean (including ordinary untracked
-files). These conditions are checked before validation/projection and again
-before success. A moving ref or checkout, dirty tree, unreadable/untrusted
-source, unavailable Git observation, repository mismatch, omitted requested federation
-member or validation error yields a refusal. Content is read from commit
-objects, never from working-file edits.
+For every source the snapshot exports, the selected ref and HEAD must match
+the loaded immutable commit, and the working tree must be clean (including
+ordinary untracked files). These conditions are checked before
+validation/projection and again before success. A moving ref or checkout,
+dirty tree, unreadable/untrusted source, unavailable Git observation,
+repository mismatch, omitted requested federation member (without
+`--single-source`) or validation error yields a refusal. Content is read from
+commit objects, never from working-file edits.
 
 Trust means **Git content pinned to the caller's expectation and selected
 canon refs**, not an owner signature, a live lease, synchronization to a host,

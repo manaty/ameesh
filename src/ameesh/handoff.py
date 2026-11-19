@@ -47,6 +47,7 @@ import os
 import time
 
 from . import storage
+from .roles import ORCHESTRATOR_ROLES
 from .storage import interface
 
 #: début commun des notes de reprise (le plafond horaire compte ces lignes,
@@ -289,10 +290,11 @@ def _noted_since(events: list, since_ts: float) -> bool:
 
 def handoff_note(item: dict, source: str, target: str, reason: str) -> str:
     return ("%s par %s : %s est en pause budget (%s). Lot en %s%s. À la fin de la "
-            "pause, rien ne revient seul : l'orchestrateur décide de rendre le lot "
+            "pause, rien ne revient seul : l'%s décide de rendre le lot "
             "ou de le laisser." % (
                 HANDOFF_NOTE, target, source, reason or "plafond atteint", item["state"],
-                ", branche %s" % item["branch"] if item.get("branch") else ""))
+                ", branche %s" % item["branch"] if item.get("branch") else "",
+                ORCHESTRATOR_ROLES[0]))
 
 
 def return_note(item: dict, source: str, reason: str) -> str:
@@ -300,8 +302,9 @@ def return_note(item: dict, source: str, reason: str) -> str:
     return ("%s : %s est en pause budget (%s). Le lot n'était pas démarré : il "
             "retourne à la file d'équipe, sans assigné, où la prise automatique "
             "peut le confier à tout agent libre capable de l'équipe, DeepSeek ou "
-            "Codex. À la fin de la pause, il ne revient pas seul : l'orchestrateur "
-            "décide." % (RETURN_NOTE, source, reason or "plafond atteint"))
+            "Codex. À la fin de la pause, il ne revient pas seul : l'%s "
+            "décide." % (RETURN_NOTE, source, reason or "plafond atteint",
+                         ORCHESTRATOR_ROLES[0]))
 
 
 def target_message(item: dict, source: str) -> str:

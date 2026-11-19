@@ -397,11 +397,15 @@ class ModulePayloadNamespaceTest(PublicMailBase):
 
 
 class ContractVersionTest(unittest.TestCase):
-    def test_the_package_and_mail_surface_agree_on_1_2(self):
+    def test_the_package_and_mail_surface_keep_their_revisions(self):
         from ameesh import public
 
-        self.assertEqual(public.CONTRACT_VERSION, "1.2")
-        self.assertEqual(public_mail.CONTRACT_VERSION, public.CONTRACT_VERSION)
+        # The package revision moves with the whole contract (#7701 adds the
+        # fixture in 1.5); the mail surface keeps the revision that last
+        # changed it, so a caller's 1.4 gate stays true.
+        self.assertEqual(public.CONTRACT_VERSION, "1.5")
+        self.assertEqual(public_mail.CONTRACT_VERSION, "1.4")
+        self.assertEqual(public.fixture.CONTRACT_VERSION, "1.5")
         self.assertEqual(public_mail.ADMITTED_PAYLOAD_KEYS,
                          frozenset(("module", "attribution")))
         self.assertEqual(public_mail.MODULE_PAYLOAD_KEY, "module")

@@ -9,22 +9,37 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
-import re
 import sys
 import time
 import uuid
 
 from . import config, db as db_mod, identity, planned_waits, storage
 
-_STOP = re.compile(r"\b(?:stop|arr[êe]t|suspend(?:re|u|ue|us|ues|ez|ons)?|"
-                   r"annul(?:er|e|é|ée|ez)|halt)\b", re.I)
-
 
 class Refused(Exception):
     pass
+
+
+def database_now(db):
+    """La borne de lecture lue sur l'horloge de la base (#7775).
+
+    Les `created_at` du journal et du courrier sont écrits par la base ; une
+    borne prise sur l'horloge de l'hôte peut donc manquer un STOP (hôte en
+    retard) ou en inventer un (hôte en avance). On lit `now()` dans la même
+    horloge que les événements, avant l'attente, puis on ferme la connexion.
+    """
+    rows = db.query("SELECT extract(epoch from now())::float8 AS now_ts")
+    try:
+        value = float(rows[0]["now_ts"])
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise Refused("database clock unavailable") from exc
+    if not math.isfinite(value):
+        raise Refused("database clock unreadable")
+    return value
 
 
 def parse_since(value):
@@ -37,7 +52,8 @@ def parse_since(value):
         raise Refused("--since must be an ISO timestamp with timezone") from exc
 
 
-def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *, cfg=None):
+def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
+            request_id="", cfg=None):
     """Read the journal and mailbox and record a receipt in one transaction."""
     item = tx.query("SELECT state, extract(epoch from now())::float8 AS now_ts "
                     "FROM work_items WHERE id = %s FOR NO KEY UPDATE", (lot,))
@@ -60,20 +76,21 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *, cfg=Non
         hold_events.append(dict(event, note="" if own else note))
         if own:
             continue
-        stop_hold = planned_waits.is_hold_note(note) and bool(_STOP.search(note))
-        if float(event["created_ts"]) >= since and (stop_hold or (not planned_waits.is_hold_note(note)
-                                                                  and _STOP.search(note))):
+        stop_hold = planned_waits.is_stop_hold(note)
+        if float(event["created_ts"]) >= since and (
+                stop_hold or (not planned_waits.is_hold_note(note)
+                              and planned_waits.contains_stop(note))):
             raise Refused("hold or STOP in lot event #%s" % event["id"])
     def preserve_stop(event, hold):
         who = (event.get("actor") or "").removeprefix("agent:")
         author = (hold.get("by") or "").removeprefix("agent:")
         return (who == actor.removeprefix("agent:") and author != who
-                and bool(_STOP.search(hold.get("note") or "")))
+                and planned_waits.is_stop_hold(hold.get("note") or ""))
 
     holds = planned_waits.active_holds(
         tx, hold_events, cfg=cfg, strict=True, preserve_on_transition=preserve_stop).get(lot, {})
     for hold in holds.values():
-        if _STOP.search(hold.get("note") or ""):
+        if planned_waits.is_stop_hold(hold.get("note") or ""):
             raise Refused("active STOP hold by %s" % hold.get("by"))
 
     # Include both structured lot mail and prose references, and inspect STOPs
@@ -91,7 +108,8 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *, cfg=Non
             continue
         if message.get("recipient") == actor and message.get("unread"):
             raise Refused("unread lot mail #%s" % message["id"])
-        if float(message["ts"]) >= since and _STOP.search(message.get("body") or ""):
+        if float(message["ts"]) >= since and planned_waits.contains_stop(
+                message.get("body") or ""):
             raise Refused("STOP in lot mail #%s" % message["id"])
         if message.get("decision_state") == "withdrawn":
             try:
@@ -105,15 +123,102 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *, cfg=Non
 
     note = "pre-act: kind=%s actor=%s since=%s" % (kind, actor, since)
     pregeste_id = pregeste_id or str(uuid.uuid4())
-    evidence = json.dumps({"type": "pre-act/1", "kind": kind, "lot": lot,
-                           "actor": actor, "target": target,
-                           "pregeste_id": pregeste_id})
+    record = {"type": "pre-act/1", "kind": kind, "lot": lot,
+              "actor": actor, "target": target, "pregeste_id": pregeste_id}
+    if request_id:
+        record["request_id"] = request_id
+    evidence = json.dumps(record, sort_keys=True)
     tx.execute("INSERT INTO work_item_events "
                "(work_item_id, state, note, actor, evidence, created_at) "
                "VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp())",
                (lot, item[0]["state"], note, actor, evidence))
     tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (lot,))
     return pregeste_id
+
+
+#: Evidence written by the imposed credential path (#7767): the receipt above
+#: proves the check, these two events prove the act it guarded. A start without
+#: an end is an interrupted or unrecorded act, which the audit reports.
+EFFECT_TYPE = "pre-act/2"
+EFFECT_SCHEMA = "pre-act-effect/1"
+
+
+def _state_of(tx, lot):
+    rows = tx.query("SELECT state FROM work_items WHERE id = %s", (lot,))
+    if not rows:
+        raise Refused("lot not found")
+    return rows[0]["state"]
+
+
+def _record_effect(tx, lot, actor, evidence):
+    state = _state_of(tx, lot)
+    phase = evidence.get("phase", "?")
+    note = "pre-act effect: %s kind=%s" % (phase, evidence.get("kind", "?"))
+    tx.execute("INSERT INTO work_item_events "
+               "(work_item_id, state, note, actor, evidence, created_at) "
+               "VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp())",
+               (lot, state, note, actor, json.dumps(evidence, sort_keys=True)))
+
+
+def _argv_digest(argv):
+    return hashlib.sha256(json.dumps(list(argv), separators=(",", ":"),
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def record_effect_start(tx, lot, actor, pregeste_id, request_id, kind, target,
+                        rule, argv, started):
+    """Write the start of a guarded act, tied to its receipt.
+
+    Only a digest and a short, bounded head of the command are kept: the
+    argument list can name a file and is not needed to audit the act.
+    """
+    if not pregeste_id or not request_id:
+        raise Refused("a receipt and a request id are required")
+    evidence = {
+        "type": EFFECT_TYPE,
+        "schema": EFFECT_SCHEMA,
+        "phase": "start",
+        "pregeste_id": pregeste_id,
+        "request_id": request_id,
+        "kind": kind,
+        "lot": lot,
+        "actor": actor,
+        "target": target,
+        "rule": rule,
+        "argv_sha256": _argv_digest(argv),
+        "argv_head": [str(arg)[:120] for arg in list(argv)[:4]],
+        "started": started,
+    }
+    _record_effect(tx, lot, actor, evidence)
+
+
+def record_effect_end(tx, lot, actor, pregeste_id, request_id, kind, target,
+                      exit_code, timed_out, started, finished,
+                      stdout_sha256=None, stderr_sha256=None):
+    """Write the end of a guarded act; the start must already be recorded."""
+    if not pregeste_id or not request_id:
+        raise Refused("a receipt and a request id are required")
+    evidence = {
+        "type": EFFECT_TYPE,
+        "schema": EFFECT_SCHEMA,
+        "phase": "end",
+        "pregeste_id": pregeste_id,
+        "request_id": request_id,
+        "kind": kind,
+        "lot": lot,
+        "actor": actor,
+        "target": target,
+        "exit": exit_code,
+        "timed_out": bool(timed_out),
+        "started": started,
+        "finished": finished,
+        "duration_ms": int(round((float(finished) - float(started)) * 1000)),
+    }
+    if stdout_sha256 is not None:
+        evidence["stdout_sha256"] = stdout_sha256
+    if stderr_sha256 is not None:
+        evidence["stderr_sha256"] = stderr_sha256
+    _record_effect(tx, lot, actor, evidence)
 
 
 def main(argv=None):
@@ -146,15 +251,24 @@ def main(argv=None):
             if not command:
                 raise Refused("--wait-until requires a command after --")
             deadline = parse_since(args.wait_until)
-            since = time.time()
+        else:
+            since = parse_since(args.since)
+        cfg = config.load()
+        if args.wait_until:
+            # The reading bound must share the clock of the created_at it is
+            # compared to. Read it in the database, before waiting, then close
+            # the connection: the check reopens a fresh one (#7775).
+            db = db_mod.open_db(cfg)
+            if storage.is_remote(db):
+                raise Refused("transactional database connection required")
+            since = database_now(db)
+            db.close()
+            db = None
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
                 time.sleep(remaining)
-        else:
-            since = parse_since(args.since)
-        cfg = config.load()
         db = db_mod.open_db(cfg)
         if storage.is_remote(db):
             raise Refused("transactional database connection required")

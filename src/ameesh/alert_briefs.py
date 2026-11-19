@@ -51,6 +51,7 @@ import re
 import time
 
 from . import sous_utilisation, vocab, work_lifecycle as lifecycle
+from .roles import AUDITOR_ROLES
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
@@ -120,8 +121,8 @@ LEASE_GRACE_S = 90.0
 #: 62 des 78 L1 du 09/11 étaient en retard de 0 à 4 min (auditeur #206650)
 SLO_L1_GRACE_S = 300
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur ; le rôle se lit
-#: sur la fiche (`roles:`), jamais sur le nom de la persona
-AUDITOR_ROLES = ("auditeur", "auditor")
+#: sur la fiche (`roles:`), jamais sur le nom de la persona. Le jeton est dans
+#: `roles.py` (#7792), comme tous les rôles de gouvernance.
 
 
 def claims_closed_hosts(db) -> set:
@@ -731,9 +732,14 @@ def _slo_breach(alert: dict, *, level: int | None = None,
     holder = " --if-holder %s" % who if who else ""
     waiting = alert.get("waiting") or {}
     what = waiting.get("what") if isinstance(waiting, dict) else None
-    # #2511 : le lot cible le dépôt canon (manaty/home) ; un paquet ameesh ne
-    # le porte pas, la fusion est celle du bureau.
+    # #2511 : le lot cible le dépôt du canon ; un paquet ameesh ne le porte
+    # pas, la fusion est celle du bureau. #7795 : le dépôt se lit à la
+    # configuration et voyage dans l'alerte (`canon_repo`) ; sans lui, le
+    # texte dit « le dépôt du canon », jamais un nom compilé.
     canon = bool(isinstance(waiting, dict) and waiting.get("canon"))
+    canon_repo = str(alert.get("canon_repo") or "").strip()
+    canon_where = ("the canon repository (%s)" % canon_repo if canon_repo
+                   else "the canon repository")
     # #2378 : une demande ouverte et échue (sinon le lot serait en attente
     # prévue) ; les cibles sont passées au pilote à toute étape
     # (`exploitation._slo_targets`), le brief les suit. Sans demande,
@@ -754,14 +760,14 @@ def _slo_breach(alert: dict, *, level: int | None = None,
     if what in ("merge", "merge-approval", "merge-outcome"):
         if canon:
             if level >= 3:
-                move = ("avatar: merge it directly — its `canon/…` branch targets the canon "
-                        "repository (manaty/home), which an ameesh package does not carry; "
+                move = ("avatar: merge it directly — its `canon/…` branch targets %s, "
+                        "which an ameesh package does not carry; "
                         "auditor: see that the avatar does it, do not reassign or nudge the "
-                        "holder")
+                        "holder" % canon_where)
             else:
-                move = ("avatar: merge it directly — its `canon/…` branch targets the canon "
-                        "repository (manaty/home), outside the ameesh package; the "
-                        "pilot/composer cannot carry it, do not wait for them")
+                move = ("avatar: merge it directly — its `canon/…` branch targets %s, "
+                        "outside the ameesh package; the "
+                        "pilot/composer cannot carry it, do not wait for them" % canon_where)
         elif cause and cause.get("code") and cause.get("owner") == "author":
             author = who or alert.get("responsible") or "the author"
             code = str(cause["code"])
@@ -1381,7 +1387,7 @@ def _target_names(role: str, alert: dict, by_name: dict, orchestras, teams: set,
     if role == "avatar":
         return [name for name in dict.fromkeys(str(n) for n in avatar_names or ())
                 if name in by_name and not _external(by_name, name)]
-    if role == "auditeur":
+    if role == AUDITOR_ROLES[0]:
         return [name for name in auditor_names or ()
                 if name in by_name and not _external(by_name, name)]
     if role in by_name:
@@ -1457,7 +1463,8 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
     known = {"assignee", "pilot", AUDITOR_ROLES[0], "avatar"}
-    current = (3 if roles & {"avatar", "auditeur"} or any(r not in known for r in roles)
+    current = (3 if roles & {"avatar", AUDITOR_ROLES[0]}
+               or any(r not in known for r in roles)
                else 2 if "pilot" in roles else 1)
     for next_level in range(current + 1, 4):
         next_text = _slo_breach(alert, level=next_level)
@@ -1467,7 +1474,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         else:
             names = (_target_names("avatar", alert, by_name, orchestras, teams,
                                    auditor_names, avatar_names)
-                     + _target_names("auditeur", alert, by_name, orchestras, teams,
+                     + _target_names(AUDITOR_ROLES[0], alert, by_name, orchestras, teams,
                                      auditor_names, avatar_names))
             if not names:
                 names = list(desk)

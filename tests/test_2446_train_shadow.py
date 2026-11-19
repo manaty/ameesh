@@ -547,9 +547,13 @@ class ShadowPassageTest(PgTestCase):
         calls = []
 
         class Consumer:
-            INTEGRATION = {"o/r": "main"}
+            # #7795 : la table d'intégration se lit à la configuration de
+            # l'hôte ; le faux consommateur la déclare comme le vrai.
+            def integrations(self, cfg):
+                return {"o/r": ("main", "o")}
 
-            def consume(self, db, *, lands, diagnoses, links_for):
+            def consume(self, db, *, integration, lands, diagnoses, links_for):
+                self.integration = integration
                 calls.append(db)
                 return []
 

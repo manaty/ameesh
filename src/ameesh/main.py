@@ -102,6 +102,12 @@
   ameesh export-v0            export to the v0 file mailbox;
   ameesh fil list | show <project> [<lot>] [--last N] | tail <project> [<lot>]
         readable threads: every message that went through ameesh, in clear (R12);
+  ameesh gate act --lot ID --kind kms|key|prod [--target T] [--wait-until ISO] -- COMMAND
+        the imposed credential path: the gate checks the lot, then runs the command (#7767);
+  ameesh gate audit --since ISO [--stale-seconds N] [--json]
+        KMS/IAM and production acts whose broker trace is incomplete (#7767);
+  ameesh gate broker serve|check [--config F] [--json]
+        the credential-gate service, run by its own Unix account (#7767);
   ameesh gate pre-act --lot ID --kind kms|key|prod --since ISO  check before an act;
   ameesh github gestes [--since 24h] [--agent A] [--match 'run cancel'] [--json]
         | identity <agent> [--json]
@@ -405,6 +411,15 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "staging-migrations":
         from . import staging_migrations
         return staging_migrations.main(rest)
+    if command == "gate" and rest[:1] == ["act"]:
+        from . import credential_gate
+        return credential_gate.client_main(rest[1:])
+    if command == "gate" and rest[:1] == ["audit"]:
+        from . import credential_gate
+        return credential_gate.audit_main(rest[1:])
+    if command == "gate" and rest[:1] == ["broker"]:
+        from . import credential_gate
+        return credential_gate.broker_main(rest[1:])
     if command == "gate" and rest[:1] == ["pre-act"]:
         from . import pre_act
         return pre_act.main(rest[1:])

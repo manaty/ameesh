@@ -3019,6 +3019,12 @@ class WorkItems(interface.WorkItems):
         The partial unique index makes a retry of the same pending reading
         return the existing row instead of stacking duplicates. The lot is a
         real trace target (foreign key); the caller checks it before asking.
+
+        #7806: a *new* deposit also wakes the live train service holder in this
+        transaction. The hint is project-scoped and carries no authority: the
+        holder still applies the request with the reviewed guards at its next
+        passage. A retry that hits the unique index is not a new deposit and
+        emits nothing; a rollback discards the request and the hint together.
         """
         if not isinstance(reviews, (list, tuple)) or not reviews:
             return None
@@ -3034,13 +3040,22 @@ class WorkItems(interface.WorkItems):
                 "   WHERE state = 'requested' DO NOTHING"
                 " RETURNING" + self._REQUALIFY_COLUMNS,
                 (project, pin, gate, evidence, int(lot), requester))
-            if not rows:
-                rows = tx.query(
-                    "SELECT" + self._REQUALIFY_COLUMNS
-                    + " FROM integration_train_requalifications"
-                    " WHERE project = %s AND pin = %s AND gate = %s"
-                    " AND reviews = %s::jsonb AND state = 'requested'",
-                    (project, pin, gate, evidence))
+            if rows:
+                from ... import train_events
+                try:
+                    train_events.emit(tx, kind="requalification-request",
+                                      project=project, target="")
+                except ValueError:
+                    # A project name outside the wake envelope's closed set is
+                    # still a valid durable request; the hourly pass applies it.
+                    pass
+                return _requalify_row(rows[0])
+            rows = tx.query(
+                "SELECT" + self._REQUALIFY_COLUMNS
+                + " FROM integration_train_requalifications"
+                " WHERE project = %s AND pin = %s AND gate = %s"
+                " AND reviews = %s::jsonb AND state = 'requested'",
+                (project, pin, gate, evidence))
             return _requalify_row(rows[0]) if rows else None
 
     def train_requalify_requests(self, project) -> list[dict]:
