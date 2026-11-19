@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.4",
+  "contract": "1.5",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -4920,6 +4920,48 @@
     ]
   },
   "python": {
+    "fixture": {
+      "module": "ameesh.public.fixture",
+      "contract_version": "1.5",
+      "constants": {
+        "CONTRACT_VERSION": "1.5",
+        "DATABASE_PREFIX": "ameesh_fixture_",
+        "ADMITTED_VIEWS": [
+          "agent_mesh_overview",
+          "mesh_keys",
+          "mesh_approvals_status"
+        ],
+        "ENV_KEYS": [
+          "AMEESH_DSN",
+          "AMEESH_CONFIG",
+          "AMEESH_STATE",
+          "AGENT_MAIL_STATE",
+          "AGENT_MAIL_CONFIG",
+          "AMEESH_SCHEMA"
+        ],
+        "DEFAULT_TIMEOUT": 120
+      },
+      "signatures": {
+        "Fixture": "(admin_dsn, *, executable=None, mail_executable=None, root=None, prefix='ameesh_fixture_', keep=False)",
+        "create": "(self)",
+        "close": "(self)",
+        "env": "(self, **extra)",
+        "run": "(self, command, *args, env=None, stdin=None, timeout=120)",
+        "cli": "(self, *args, env=None, stdin=None, timeout=120)",
+        "mail": "(self, *args, env=None, stdin=None, timeout=120)",
+        "connect": "(self)",
+        "read_view": "(self, view, columns)",
+        "canon": "(self, files, *, message='fixture canon', ref='main')",
+        "write": "(self, relative, text)",
+        "path": "(self, relative)",
+        "read": "(self, relative)",
+        "git": "(self, *args)"
+      },
+      "errors": {
+        "FixtureError": "fixture",
+        "FixtureRefused": "refused"
+      }
+    },
     "mail": {
       "module": "ameesh.public.mail",
       "contract_version": "1.4",
