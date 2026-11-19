@@ -6,7 +6,9 @@
 -- si elles existent (ajoutées par un lot pas encore dans la base visée).
 -- Ce que chaque droit sert (chemins tracés, #6881) :
 --   lecture des lots exécutés (`work show`), liaison L41 (`mail bind`), prise
---   #6839 (`work claim`), reçus de provenance (hooks), `agent-mail send|inbox|list`.
+--   #6839 (`work claim`) et levée de SA réservation par l'exécutant réservé
+--   (#7870, `work external-executor <lot> --clear`), reçus de provenance
+--   (hooks), `agent-mail send|inbox|list`.
 --   #7565 : `release catchup` lit les attestations via la vue barrière
 --   ameesh_staging_attestations (staging.attested seulement), et les preuves
 --   publiques des décisions approuvées déjà consommées via la vue barrière
@@ -68,9 +70,12 @@ INSERT INTO pg_temp.bureau_spec(rel, priv, cols) VALUES
   ('decision_supersessions','SELECT',NULL),
   ('ameesh_events','SELECT',ARRAY['id']),
   ('ameesh_events','INSERT',ARRAY['type','object','project','data','created_at']),
-  -- lots (lecture) et prise #6839 (écriture bornée par 0567)
+  -- lots (lecture), prise #6839 et levée de SA réservation par l'exécutant
+  -- réservé (#7870) : la garde 0567 borne les lignes aux lots réservés à
+  -- l'agent ; `external_executor` et `external_session` ne servent qu'à les
+  -- effacer, jamais à réserver (la pose reste un geste de pilote).
   ('work_items','SELECT',NULL),
-  ('work_items','UPDATE',ARRAY['external_claim_session','external_claimed_at','external_claim_actor','external_claim_host','external_claim_proof','updated_at']),
+  ('work_items','UPDATE',ARRAY['external_executor','external_session','external_claim_session','external_claimed_at','external_claim_actor','external_claim_host','external_claim_proof','updated_at']),
   ('work_item_events','SELECT',NULL),
   ('work_item_events','INSERT',ARRAY['work_item_id','state','note','actor','evidence']),
   ('work_item_milestones','SELECT',NULL),

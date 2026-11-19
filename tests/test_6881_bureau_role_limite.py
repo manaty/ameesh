@@ -11,6 +11,11 @@ chacun témoigné : DDL, tables d'approbation et de clés, écriture du registre
 courrier ou reçu au nom d'un autre, prise d'une autre session ou d'un lot non
 réservé, changement d'état d'un lot, événement direct, suppression, SET ROLE ;
 et l'audit qui refuse un droit en trop.
+
+#7870 : le registre des schémas de module (`module_schemas`, 0591) est lisible
+et l'audit échoue s'il manque ; l'exécutant réservé lève SA propre réservation
+avec sa liaison vérifiée (et seulement elle), la garde refuse la pose d'un
+autre exécutant, et la clôture reste un geste de pilote nommé comme tel.
 """
 from __future__ import annotations
 
@@ -339,6 +344,228 @@ class BureauRoleLimiteTest(PgTestCase):
             self.db.execute('DROP ROLE "%s"' % other)
 
     # -- les gestes du bureau, sous la connexion limitée --------------------
+    def test_work_close_refuse_le_role_limite_en_nommant_le_geste_pilote(self):
+        """#7870 : la clôture reste un geste de pilote, et le dit.
+
+        Le rôle bureau_goal ne peut pas écrire `work_items.state` : le refus
+        nomme le geste de pilote au lieu de « permission denied for table
+        work_items » (ou, avant le droit registre, une erreur de schéma de
+        module). Le lot n'est pas fermé par cette connexion.
+        """
+        lot = self.reserve()
+        proc = self.as_bureau("work", "close", str(lot), "--done", "--actor", "bureau")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("closure is a pilot gesture", proc.stderr)
+        self.assertNotIn("permission denied", proc.stderr)
+        self.assertEqual(work.get(self.db, lot)["state"], "intake")
+
+    def test_l_audit_refuse_un_registre_de_module_illisible(self):
+        """#7870 : une table lue par les commandes du bureau manquante au rôle
+        fait échouer l'audit ; la réinstallation la rétablit."""
+        self.db.execute('REVOKE SELECT (module, schema_name, schema_sha256, created_at)'
+                        ' ON module_schemas FROM "%s"' % self.login)
+        try:
+            proc = self.script("_contrat-bureau.sql")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("missing SELECT on module_schemas", proc.stderr)
+        finally:
+            replay = self.script("role-bureau.sql")
+            self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(self.script("_contrat-bureau.sql").returncode, 0)
+
+    def test_l_executant_externe_leve_sa_propre_reservation(self):
+        """#7870 : l'exécutant réservé lève lui-même, avec sa liaison vérifiée."""
+        lot = self.reserve()
+        self.bind("BG")
+        proc = self.as_bureau("work", "external-executor", str(lot), "--clear",
+                              "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["previous"], "bureau")
+        self.assertIsNone(out["item"]["external_executor"])
+        self.assertIsNone(work.get(self.db, lot)["external_executor"])
+        event = self.db.query(
+            "SELECT actor, note FROM work_item_events WHERE work_item_id = %s"
+            " ORDER BY id DESC LIMIT 1", (lot,))[0]
+        self.assertEqual(event["actor"], "bureau")
+        self.assertIn("external executor cleared", event["note"])
+        self.assertIn("by the reserved executor", event["note"])
+
+    def test_le_role_limite_ne_change_pas_l_executeur(self):
+        """#7870 : la garde 0567 ne laisse que la levée, jamais la pose.
+
+        Le droit de colonne accordé pour la levée ne doit pas ouvrir le
+        changement d'exécutant ou de session par un UPDATE direct.
+        """
+        lot = self.reserve()
+        self.bind("BG")
+        self.refused(
+            "UPDATE work_items SET external_executor = 'orchestrateur'"
+            " WHERE id = %d" % lot,
+            "external executor is set by a pilot only")
+        self.refused(
+            "UPDATE work_items SET external_session = 'PC' WHERE id = %d" % lot,
+            "external session is set by a pilot only")
+        self.db.execute("UPDATE work_items SET external_session = 'BG' WHERE id = %s",
+                        (lot,))
+        self.refused(
+            "UPDATE work_items SET external_executor = NULL WHERE id = %d" % lot,
+            "clearing the reservation clears its session and claim")
+        self.assertEqual(work.get(self.db, lot)["external_executor"], "bureau")
+
+    def test_le_role_limite_ne_retire_pas_la_session_seule(self):
+        """#7870 B1 : retirer la session seule n'est pas une levée.
+
+        Sinon la réservation garde l'exécutant mais perd la session nommée ;
+        une autre session du même agent pourrait ensuite se lever (le test
+        #227982 : lot bureau/BG, `external_session = NULL`, puis `--clear`
+        from PC).
+        """
+        lot = self.reserve()
+        self.db.execute("UPDATE work_items SET external_session = 'BG' WHERE id = %s",
+                        (lot,))
+        self.bind("PC")
+        self.refused(
+            "UPDATE work_items SET external_session = NULL WHERE id = %d" % lot,
+            "external session is set by a pilot only")
+        row = work.get(self.db, lot)
+        self.assertEqual(row["external_executor"], "bureau")
+        self.assertEqual(row["external_session"], "BG")
+        proc = self.as_bureau("work", "external-executor", str(lot), "--clear")
+        self.assertNotEqual(proc.returncode, 0, "PC a levé la réservation de BG")
+        self.assertEqual(work.get(self.db, lot)["external_executor"], "bureau")
+
+    def test_la_levee_exige_une_liaison_verifiee(self):
+        """#7870 : sans liaison L41 vérifiée, la levée reste un geste de pilote."""
+        lot = self.reserve()
+        self.db.execute("UPDATE work_items SET external_session = 'BG' WHERE id = %s",
+                        (lot,))
+        proc = self.as_bureau("work", "external-executor", str(lot), "--clear")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("neither a human, an orchestrator nor a design agent",
+                      proc.stderr)
+        row = work.get(self.db, lot)
+        self.assertEqual(row["external_executor"], "bureau")
+        self.assertEqual(row["external_session"], "BG")
+
+    def test_le_sql_brut_ne_leve_pas_sans_liaison_active(self):
+        """#7870 B3 : le SQL direct ne contourne pas la preuve de session.
+
+        `UPDATE work_items SET external_executor = NULL, external_session =
+        NULL` est la levée atomique ; le login limité ne peut la faire que si
+        la session réservée (ou, sans session nommée, une session de l'agent)
+        a une liaison L41 active sur cet hôte. Sans liaison, ou avec une autre
+        session liée, la garde refuse et la réservation reste intacte.
+        """
+        lot = self.reserve()
+        self.db.execute("UPDATE work_items SET external_session = 'BG' WHERE id = %s",
+                        (lot,))
+        self.refused(
+            "UPDATE work_items SET external_executor = NULL, external_session = NULL"
+            " WHERE id = %d" % lot,
+            "requires an active session binding")
+        # une réservation sans session nommée exige aussi une liaison de
+        # l'agent sur cet hôte (même contrôle, branche sans session)
+        autre = self.reserve()
+        self.refused(
+            "UPDATE work_items SET external_executor = NULL WHERE id = %d" % autre,
+            "requires an active session binding")
+        # une liaison d'une AUTRE session du même agent ne vaut pas pour la
+        # session nommée par le feu
+        self.bind("PC")
+        self.refused(
+            "UPDATE work_items SET external_executor = NULL, external_session = NULL"
+            " WHERE id = %d" % lot,
+            "requires an active session binding")
+        row = work.get(self.db, lot)
+        self.assertEqual(row["external_executor"], "bureau")
+        self.assertEqual(row["external_session"], "BG")
+        self.assertEqual(work.get(self.db, autre)["external_executor"], "bureau")
+
+    def test_la_levee_relit_la_reservation_sous_le_verrou(self):
+        """#7870 B2 : la preuve ne vaut que pour la réservation qu'elle a lue.
+
+        Le pilote renomme BG en PC entre la preuve et le verrou de la levée :
+        la levée de BG ne doit pas effacer la réservation PC, et aucune trace
+        de levée ne doit être écrite.
+        """
+        lot = self.reserve()
+        self.db.execute("UPDATE work_items SET external_session = 'BG' WHERE id = %s",
+                        (lot,))
+        self.bind("BG")
+        cfg = dataclasses.replace(self.cfg, dsn=self.dsn)
+        limited = db_mod.connect(cfg)
+        raced = {"done": False}
+        try:
+            original = work._self_clear_reservation
+
+            def renomme(cfg_, db_, item, actor):
+                self.db.execute(
+                    "UPDATE work_items SET external_session = 'PC' WHERE id = %s",
+                    (lot,))
+                raced["done"] = True
+                return original(cfg_, db_, item, actor)
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGENT_MAIL_NAME", None)
+                with mock.patch.object(work, "_self_clear_reservation",
+                                       side_effect=renomme):
+                    with self.assertRaises(work.WorkError) as caught:
+                        work.set_external_executor(limited, lot, None, clear=True,
+                                                   cfg=cfg, actor="bureau")
+            self.assertTrue(raced["done"])
+            self.assertIn("changed, closed or was claimed",
+                          str(caught.exception))
+            row = work.get(self.db, lot)
+            self.assertEqual(row["external_executor"], "bureau")
+            self.assertEqual(row["external_session"], "PC")
+            events = self.db.query(
+                "SELECT count(*) AS n FROM work_item_events"
+                " WHERE work_item_id = %s AND note LIKE '%%external executor cleared%%'",
+                (lot,))[0]["n"]
+            self.assertEqual(events, 0)
+        finally:
+            limited.close()
+
+    def test_une_autre_session_du_meme_agent_ne_leve_pas_la_reservation_nommee(self):
+        """#7870 : quand le feu nomme une session, seule celle-là se lève."""
+        lot = work.add(self.db, title="geste hôte du bureau", app="ameesh",
+                       actor="human:proprio", cfg=self.cfg,
+                       external_executor="bureau", external_session="BG")
+        self.bind("PC")
+        proc = self.as_bureau("work", "external-executor", str(lot["id"]), "--clear")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("neither a human, an orchestrator nor a design agent",
+                      proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["external_executor"], "bureau")
+
+    def test_un_autre_agent_ne_leve_pas_la_reservation(self):
+        """#7870 : la levée d'un autre reste un geste de pilote."""
+        lot = self.reserve()
+        self.db.execute(
+            "INSERT INTO agent_registry (name, harness, host, mode, responsible)"
+            " VALUES ('claude1', 'codex', %s, 'execute', 'human:proprio')"
+            " ON CONFLICT (name) DO UPDATE SET mode = 'execute'", (self.cfg.host,))
+        self.db.execute(
+            "INSERT INTO session_bindings"
+            " (session_id, harness, host, agent, pid, created_by)"
+            " VALUES ('AG1', 'codex', %s, 'claude1', %s, 'test')",
+            (self.cfg.host, os.getpid()))
+        proc = self.mesh("work", "external-executor", str(lot), "--clear")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("claude1 is neither a human", proc.stderr)
+        self.assertEqual(work.get(self.db, lot)["external_executor"], "bureau")
+
+    def test_l_executant_ne_pose_pas_ni_ne_change_pas_la_reservation(self):
+        """#7870 : seule la levée de SA réservation est ouverte à l'exécutant."""
+        lot = self.reserve()
+        self.bind("BG")
+        proc = self.as_bureau("work", "external-executor", str(lot), "bureau")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("neither a human, an orchestrator nor a design agent",
+                      proc.stderr)
+        self.assertEqual(work.get(self.db, lot)["external_executor"], "bureau")
+
     def test_liaison_prise_courrier_et_lecture_du_lot(self):
         lot = self.reserve()
         self.bind("BG")
