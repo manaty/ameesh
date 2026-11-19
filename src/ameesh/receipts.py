@@ -75,6 +75,7 @@ import binascii
 import dataclasses
 import hashlib
 import hmac
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -1411,6 +1412,50 @@ def _standing_scope(standing: dict, *, avatar: str | None) -> tuple[dict | None,
             "beneficiary_clones": False}, ""
 
 
+def standing_request(*, approver: str, connector: str, operations, action_class: str,
+                     until: int, max_amount: int = 0, currency: str | None = None,
+                     beneficiary: str | None = None, targets=(),
+                     charter_line: str | None = None, charter_version: str | None = None,
+                     charter: dict | None = None, accord: dict | None = None,
+                     requested_by: str, ttl: int = 600,
+                     now: float | None = None) -> dict:
+    """La demande à signer d'une approbation permanente bornée (#7684).
+
+    Même forme que `request` d'une action (`ameesh-receipt/1`), avec
+    `standing` au lieu de `action_id`/`digest` ; `check_request` la valide
+    avant de la rendre. L'appelant la fait signer par la clé fichier
+    (`ameesh receipt sign`) puis l'enregistre (`ameesh action standing
+    register`). `accord = {agent, seq}` cite le « go » de l'humain au journal
+    quand la clé fichier ne vaut que sous accord (#7631). `charter` est le
+    cadre `{frame, version}` de la charte (#7631), distinct de la ligne et de
+    la version exigées par le plafond du canon (#7629).
+    """
+    moment = int(time.time()) if now is None else int(now)
+    standing = {"connector": connector, "operations": list(operations),
+                "class": action_class, "max_amount": int(max_amount),
+                "currency": currency, "until": int(until)}
+    if beneficiary is not None:
+        standing["beneficiary"] = beneficiary
+    if targets:
+        standing["targets"] = list(targets)
+    if charter_line is not None:
+        standing["charter_line"] = charter_line
+    if charter_version is not None:
+        standing["charter_version"] = charter_version
+    if charter is not None:
+        standing["charter"] = dict(charter)
+    request = {
+        "v": REQUEST_VERSION, "approver": approver, "decision": "approve",
+        "summary_digest": "sha256:" + authority.hash_artifact(jcs.dumps(standing)),
+        "requested_by": requested_by, "nonce": b64u_encode(os.urandom(16)),
+        "iat": moment, "exp": moment + int(ttl), "standing": standing,
+    }
+    if accord is not None:
+        request["accord"] = dict(accord)
+    check_request(request)
+    return request
+
+
 def register_standing(db: Db, receipt, policy: Policy | None = None, *, registered_by: str,
                       limits: standing_policy.Policy | None = None,
                       avatar: str | None = None,
@@ -1432,6 +1477,12 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
     """
     policy = policy or Policy()
     limits = limits if limits is not None else standing_policy.empty()
+    # #7684 : le plafond de durée est celui du canon (le défaut de 30 jours
+    # reste quand aucune règle n'existe, et `limits.check` tranche alors par
+    # opération, la règle la plus stricte gagnant). La CLI n'a pas son mot.
+    if limits.rules:
+        policy = dataclasses.replace(
+            policy, max_standing=max(policy.max_standing, limits.max_duration()))
     verdict, parsed = _verify(
         db, receipt, policy, kind="standing", expected_digest=None, expected_action_id=None,
         expected_login=None, expect_decision="approve", consume_by=None, now=now)

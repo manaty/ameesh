@@ -556,10 +556,17 @@ def last_approval_request(db: Db, action_id: str) -> str | None:
     return match.group(0) if match else None
 
 
-def to_action(row: dict, attempt: int | None = None) -> Action:
+def to_action(row: dict, attempt: int | None = None,
+              proof: dict | None = None) -> Action:
+    args = dict(row["args"] or {})
+    # #7684 : la preuve d'exécution d'un connecteur journal est fournie au
+    # lancement, pas au dépôt : elle n'entre ni dans l'empreinte ni dans la
+    # ligne `actions.args`, et n'autorise donc rien.
+    if proof is not None:
+        args["proof"] = dict(proof)
     return Action(
         action_id=row["action_id"], project=row["project"], connector=row["connector"],
-        operation=row["operation"], target=row.get("target") or "", args=dict(row["args"] or {}),
+        operation=row["operation"], target=row.get("target") or "", args=args,
         action_class=row["class"], amount=row.get("amount"), currency=row.get("currency"),
         policy_version=row.get("policy_version") or "1",
         attempt=int(row.get("attempts") or 0) if attempt is None else int(attempt),
@@ -1012,7 +1019,7 @@ def _refuse_state(action: dict) -> ActionError:
 
 
 def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
-            now: float | None = None) -> dict:
+            now: float | None = None, proof: dict | None = None) -> dict:
     """Lance UNE tentative de l'action approuvée ; renvoie son issue.
 
     1. revérifie l'autorisation liée (reçu : forme, échéance, registre,
@@ -1029,6 +1036,11 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
        l'action reste `launched` : `recover` la traitera comme inconnue.
        Délai dépassé : `unknown` ; si l'appel abandonné rend la main plus tard
        avec une issue certaine, son fil l'inscrit (`_record_late`).
+
+    `proof` (#7684) : la preuve d'exécution fournie au lancement, remise au
+    connecteur dans `action.args["proof"]` ; elle n'entre pas dans l'empreinte
+    de l'action (elle est postérieure à l'accord) et le connecteur décide de
+    la refuser ou de l'inscrire.
     """
     connectors_mod.check(connector)
     policy = policy if policy is not None else policy_from_env()
@@ -1091,7 +1103,7 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
         _record_late(db, action_id, attempt, value, error, by=by)
 
     # --- l'état `launched` est validé en base : l'appel externe peut partir ---
-    outcome = _call(connector, to_action(action, attempt), timeout, late=late)
+    outcome = _call(connector, to_action(action, attempt, proof), timeout, late=late)
     note = _note(outcome, "attempt %d" % attempt)
     try:
         settled = _settle(db, action_id, attempt, "launched", outcome, by=by,

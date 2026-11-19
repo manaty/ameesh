@@ -25,8 +25,8 @@ migration 0515; ``decide validation-history`` requires the owner's key.
   ameesh decide <id> <option | "free text"> --key FILE --accord AGENT#SEQ|grant:ID
         #7631: the human's declared avatar (card section `avatar`) signs for
         them with the owner key, on the go in the journal (AGENT#SEQ, at most
-        24 h old); `grant:ID` is refused until decision signatures go through
-        the gate with reservation;
+        24 h old); `grant:ID` reserves the decision-sign grant of the canon
+        (#7684, never for a decision on the owner key or the provenance);
         the proof says `signed_by: avatar` and cites the accord;
   ameesh decide reclassify <id> key-provenance
         #7631: the request concerns the owner key or a provenance attestation
@@ -1174,27 +1174,26 @@ def check_accord(db, view: dict, human: str, accord: dict, *, now: float,
     connaît). Elle couvre aussi une décision sur la clé owner ou la
     provenance.
 
-    Forme (b) (`grant:ID`) : REFUSÉE dans cette tranche (relecture cx2 de
-    #7631, B). Un grant ne vaut que par le contrat complet des approbations
-    permanentes — connecteur, classe, plafond, réservation atomique liée à
-    la signature, bénéficiaire et cible (#7629) — que la signature d'une
-    décision ne suit pas encore ; elle le suivra quand elle passera par la
-    porte comme opération `decision-sign` (point 2, lot de suite)."""
-    from . import receipts
-    if "grant" in accord:
-        kind = ("a decision on the owner key or a provenance attestation is never "
-                "covered by a standing approval; "
-                if decision_operation(view) == OP_DECISION_SIGN_KEY else "")
-        raise DecisionError("accord grant #%d refused: %sa standing approval does not yet "
-                            "cover a decision signature (it must go through the gate with "
-                            "reservation); cite the human's go: --accord AGENT#SEQ"
-                            % (accord["grant"], kind))
+    Forme (b) (`grant:ID`, #7684) : la réservation sur le grant est faite
+    dans la transaction de la signature (`_sign`), avec une clé liée à
+    l'empreinte de la réponse ; un grant échu, révoqué, épuisé, d'un autre
+    bénéficiaire ou d'une autre cible est refusé par la porte. Une décision
+    sur la clé owner ou la provenance (`decision-sign-key`) n'est JAMAIS
+    couverte par un grant, même si le canon nomme l'opération."""
     if not option:
         # B2 auditeur : un texte libre ne nomme aucune option, donc rien ne
         # rattache le go à la réponse ; c'est l'owner qui la signe.
         raise DecisionError("a free-text answer cannot be signed by an avatar (the go "
                             "names no option): the owner signs it, or answer with an "
                             "option key")
+    if "grant" in accord:
+        if decision_operation(view) == OP_DECISION_SIGN_KEY:
+            raise DecisionError("accord grant #%d refused: a decision on the owner key or "
+                                "a provenance attestation is never covered by a standing "
+                                "approval; cite the human's go: --accord AGENT#SEQ"
+                                % accord["grant"])
+        return "grant #%d (reserved at signature)" % accord["grant"]
+    from . import receipts
     gesture = {
         "kind": "decision",
         "decision_id": str(view.get("id") or ""),
@@ -1297,45 +1296,161 @@ def signature_hint(view: dict, text: str, option: str | None, human: str) -> str
                view["id"], answer))
 
 
+def _decision_grant_action(db, view: dict, human: str, signer: dict,
+                           digest: str) -> dict:
+    """#7684 : la description de l'action de porte d'une signature de décision.
+
+    La signature passe par le connecteur `journal`, opération
+    `decision-sign` (jamais `decision-sign-key`) ; la classe vient du canon
+    du projet, comme pour toute action de module. La cible est l'humain
+    destinataire, le bénéficiaire l'avatar qui signe : un grant d'un autre
+    bénéficiaire ou d'une autre cible n'est pas couvert (#7629). La `class`
+    et le `canon` de l'action sont relus par la porte ; la réservation est
+    liée à l'action, dans la transaction de la signature (`_sign`).
+    """
+    from . import actions as actions_mod, connectors, module_actions
+    operation = decision_operation(view)
+    if operation == OP_DECISION_SIGN_KEY:
+        raise DecisionError("a decision on the owner key or a provenance attestation "
+                            "is never covered by a standing approval")
+    agent = str((signer or {}).get("agent") or "")
+    if not agent:
+        raise DecisionError("accord grant: the avatar's agent is required")
+    project = str(view.get("project") or "")
+    if not project:
+        raise DecisionError("accord grant refused: decision #%d has no project, so no "
+                            "canon declares the journal classes" % int(view["id"]))
+    try:
+        connector = connectors.get("journal")
+        action_class = module_actions.policy_class(db, connector, project, operation)
+    except (connectors.ConnectorError, actions_mod.ActionError) as exc:
+        raise DecisionError("accord grant refused: the journal connector's %s class is "
+                            "not declared by the canon for project %s (%s)"
+                            % (operation, project, exc)) from exc
+    lot = view.get("lot")
+    return {
+        "project": project, "operation": operation, "class": action_class,
+        "proposed_by": "agent:%s" % agent,
+        "target": view.get("owner") or human,
+        "work_item": int(lot) if str(lot if lot is not None else "").isdigit() else None,
+        "args": {"decision": int(view["id"]), "answer": digest},
+    }
+
+
+def _abandon_decision_grant(db, standing: dict | None, reason: str) -> None:
+    """Rend le plafond d'une réservation dont la signature n'a pas eu lieu.
+
+    Un échec CERTAIN seulement (la signature est refusée ou la décision a
+    été close ailleurs) ; une erreur de libération ne masque pas l'erreur
+    d'origine. L'action de porte qui a porté la réservation est annulée hors
+    transaction (exécuteur médié), où elle serait restée approuvée ; en
+    transaction, l'annulation est le retour arrière lui-même.
+    """
+    if not standing:
+        return
+    from . import actions as actions_mod, receipts
+    if standing.get("reservation") is not None:
+        try:
+            receipts.standing_release(db, int(standing["reservation"]), outcome="failed",
+                                      reason=reason)
+        except Exception:  # noqa: BLE001 - l'erreur d'origine reste la bonne
+            pass
+    if storage.is_remote(db) and standing.get("key"):
+        try:
+            actions_mod.cancel(db, str(standing["key"]), by="", note=reason)
+        except Exception:  # noqa: BLE001 - l'erreur d'origine reste la bonne
+            pass
+
+
 def _sign(db, view: dict, text: str, option: str | None, human: str, *,
-          key_path: str | None, approver: str | None, signer: dict | None = None) -> dict:
+          key_path: str | None, approver: str | None, signer: dict | None = None,
+          standing: bool = False) -> dict:
     """La preuve d'une réponse signée : approbation `mesh_approvals` (clé de
     rôle `owner`) sur l'empreinte de la réponse, CONSOMMÉE par la décision.
     #7631 : `meta.signed_by` (owner | avatar) et `meta.accord` disent qui a
-    tenu la clé et sur quel accord."""
-    from . import authority, signing
+    tenu la clé et sur quel accord. #7684 : avec `standing`, la signature
+    passe d'abord la porte (`journal decision-sign`, action liée à la
+    décision et à l'empreinte de la réponse) et y réserve le grant ; la
+    réservation et la signature sont dans la même transaction, et un échec
+    certain la libère."""
+    from . import authority, connectors, receipts, signing
     digest = answer_digest(view, text, option, human, signer)
     signer = signer or {"by": SIGNED_BY_OWNER}
+    reservation = None
+    if standing:
+        if signer.get("by") != SIGNED_BY_AVATAR or "grant" not in (
+                signer.get("accord") or {}):
+            raise DecisionError("accord grant: only the avatar's signature can reserve "
+                                "a standing approval")
+        if not key_path:
+            raise DecisionError("accord grant: the avatar signs with the owner key")
+        description = _decision_grant_action(db, view, human, signer, digest)
+        from . import actions as actions_mod
+        proposal = None
+        try:
+            proposal = actions_mod.propose(
+                db, connectors.get("journal"), project=description["project"],
+                operation=description["operation"], target=description["target"],
+                args=description["args"], proposed_by=description["proposed_by"],
+                action_class=description["class"],
+                work_item=description["work_item"])
+            actions_mod.approve(db, proposal["action_id"], standing=True,
+                                by=description["proposed_by"].split(":", 1)[-1])
+            reserved = receipts.standing_cover(db, proposal)
+        except (actions_mod.ActionError, receipts.ReceiptError) as exc:
+            _abandon_decision_grant(
+                db, {"key": proposal["action_id"]} if proposal else None,
+                "decision signature refused: %s" % exc)
+            raise DecisionError("accord grant refused: %s" % exc) from exc
+        if reserved is None:
+            _abandon_decision_grant(db, {"key": proposal["action_id"]},
+                                    "decision signature: no covering grant")
+            raise DecisionError(
+                "accord grant refused: no active standing approval covers decision #%d "
+                "for %s on %s (grant %s) — exhausted, revoked, expired, or for another "
+                "beneficiary or target"
+                % (int(view["id"]), description["operation"],
+                   description["target"] or "?", signer["accord"]["grant"]))
+        reservation = {"grant": int(reserved["standing_id"]),
+                       "reservation": int(reserved["reservation_id"]),
+                       "key": proposal["action_id"]}
     from . import prod_go
     production = prod_go.parse(view.get("question"), view.get("options") or ())
     ttl = max(SIGN_TTL_S, production["until"] - time.time() + 1) if production else SIGN_TTL_S
+    meta = dict({"decision": int(view["id"]), "by": human,
+                 "signed_by": signer["by"],
+                 "operation": decision_operation(view)},
+                **({"agent": signer["agent"], "accord": signer["accord"]}
+                   if signer["by"] == SIGNED_BY_AVATAR else {}),
+                **({"standing": reservation} if reservation else {}))
     if key_path:
         try:
             seed = signing.read_private(os.path.expanduser(key_path))
         except (OSError, ValueError) as exc:
+            _abandon_decision_grant(db, reservation, "unreadable private key")
             raise DecisionError("unreadable private key: %s" % exc) from exc
         try:
             authority.create_approval(
                 db, seed, approver=_approver_of(human, approver), action=APPROVAL_ACTION,
-                artifact_kind=APPROVAL_KIND, artifact_hash=digest, ttl=ttl,
-                meta=dict({"decision": int(view["id"]), "by": human,
-                           "signed_by": signer["by"]},
-                          **({"agent": signer["agent"], "accord": signer["accord"]}
-                             if signer["by"] == SIGNED_BY_AVATAR else {})))
+                artifact_kind=APPROVAL_KIND, artifact_hash=digest, ttl=ttl, meta=meta)
         except authority.AuthorityError as exc:
+            _abandon_decision_grant(db, reservation, "signature rejected")
             raise DecisionError("signature rejected: %s" % exc) from exc
     row, verdict = authority.find_approval(db, APPROVAL_ACTION, digest,
                                            consume_by="decision:%d" % int(view["id"]))
     if row is None or not verdict.ok:
+        _abandon_decision_grant(db, reservation, "signed answer rejected")
         raise DecisionError("signed answer rejected: %s\n%s" % (
             verdict.reason, signature_hint(view, text, option, human)))
     if production:
         signed = json.loads(row["signed_payload"].split("|", 2)[2])
         if type(signed.get("expires")) is not int or production["until"] * 1e6 > signed["expires"]:
+            _abandon_decision_grant(db, reservation, "production expiry refused")
             raise DecisionError("production until exceeds signed approval expiry")
     return {"approval_id": int(row["id"]), "approver": row.get("approver"),
             "signature_key": row.get("signature_key"), "digest": digest,
-            "signed_by": signer["by"]}
+            "signed_by": signer["by"],
+            **({"standing": reservation} if reservation else {})}
 
 
 def verify_proof(db, view: dict, *, live: bool = False, public_only: bool = False) -> tuple[bool, str]:
@@ -1377,6 +1492,32 @@ def verify_proof(db, view: dict, *, live: bool = False, public_only: bool = Fals
         ok = False
     if not ok:
         return False, "invalid Ed25519 signature"
+    # #7684 : une signature sous grant porte la réservation qui l'a financée ;
+    # l'action de porte doit décrire CETTE décision et CETTE réponse, et le
+    # grant de la réservation vivante doit être celui de la preuve.
+    standing = proof.get("standing")
+    if standing is not None:
+        try:
+            grant = int(standing["grant"])
+            key = str(standing["key"])
+        except (KeyError, TypeError, ValueError):
+            return False, "unreadable standing reservation"
+        action = storage.of(db).actions.get(key, with_receipts=False)
+        if action is None:
+            return False, "standing action not found"
+        args = action.get("args") or {}
+        try:
+            action_decision = int(args.get("decision") or 0)
+        except (TypeError, ValueError):
+            return False, "the standing reservation is not tied to this answer"
+        if (action.get("operation") != OP_DECISION_SIGN
+                or action_decision != int(view["id"])
+                or args.get("answer") != digest):
+            return False, "the standing reservation is not tied to this answer"
+        live_rows = [int(r["grant_id"]) for r in
+                     storage.of(db).grants.live_reservations(key)]
+        if grant not in live_rows:
+            return False, "standing reservation on grant #%d not found" % grant
     if live:
         # A replacement takes effect now, so a historical valid signature is
         # insufficient: require its exact, still-live approval and nonce.
@@ -1635,6 +1776,7 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
                                   human=human, now=now)
         raise DecisionError(_closed_reason(view))
     signed_requested = bool(key_path or signed)
+    standing_signature = False
     if signer is not None:
         if not key_path:
             raise DecisionError("an avatar signs with the owner key (--key), on an accord "
@@ -1648,6 +1790,7 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         check_accord(db, view, human, accord, now=now, option=option,
                      ref="decision:%s:%s" % (
                          view["id"], answer_digest(view, text, option, human, signer)))
+        standing_signature = "grant" in accord
     if signed_requested:
         if channel == "chat":
             raise DecisionError("a signed answer is given in your terminal, not in the "
@@ -1674,10 +1817,13 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         # écriture conditionnelle ; le courrier garde sa clé d'idempotence et
         # la re-saisie identique est un rejeu.
         proof = _sign(db, view, text, option, human, key_path=key_path,
-                      approver=approver, signer=signer) if signed_requested else None
+                      approver=approver, signer=signer,
+                      standing=standing_signature) if signed_requested else None
         closed = storage.of(db).decisions.close(int(view["id"]), status="answered",
                                                 record=record_for(proof))
         if closed is None:
+            _abandon_decision_grant(db, (proof or {}).get("standing"),
+                                    "decision closed elsewhere")
             latest = get(db, decision_id, now)
             if latest is not None and _same_answer(latest, text, option, human):
                 return _replay_answer(cfg, db, latest, text=text, option=option,
@@ -1695,7 +1841,8 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     try:
         with db.transaction() as tx:
             proof = _sign(tx, view, text, option, human, key_path=key_path,
-                          approver=approver, signer=signer) if signed_requested else None
+                          approver=approver, signer=signer,
+                          standing=standing_signature) if signed_requested else None
             closed = storage.of(tx).decisions.close(int(view["id"]), status="answered",
                                                     record=record_for(proof))
             if closed is None:
@@ -2061,7 +2208,8 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
                         help="name of the owner key in the registry (default: your name)")
     parser.add_argument("--accord", default=None, metavar="AGENT#SEQ|grant:ID",
                         help="#7631: the human's avatar signs with --key on this accord "
-                             "(the go in the journal; grant:ID is refused for now)")
+                             "(the go in the journal, or grant:ID for a standing "
+                             "approval of decision-sign; #7684)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     decision_id = _decision_id(args.id)
