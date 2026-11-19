@@ -52,7 +52,8 @@ class AliasTest(unittest.TestCase):
 class RegistryTest(unittest.TestCase):
     def test_connectors_get_lit_par_le_registre(self):
         found = registry.action_connectors()
-        self.assertEqual(found, {"git-merge": ("dev", dev.git_merge.GitMergeConnector)})
+        self.assertEqual(found, {"git-merge": ("dev", dev.git_merge.GitMergeConnector),
+                                 "journal": ("dev", dev.journal.JournalConnector)})
         connector = connectors.get("git-merge")
         self.assertIsInstance(connector, dev.git_merge.GitMergeConnector)
         self.assertEqual((connector.name, connector.dedupe), ("git-merge", "none"))

@@ -556,10 +556,17 @@ def last_approval_request(db: Db, action_id: str) -> str | None:
     return match.group(0) if match else None
 
 
-def to_action(row: dict, attempt: int | None = None) -> Action:
+def to_action(row: dict, attempt: int | None = None,
+              proof: dict | None = None) -> Action:
+    args = dict(row["args"] or {})
+    # #7684 : la preuve d'exécution d'un connecteur journal est fournie au
+    # lancement, pas au dépôt : elle n'entre ni dans l'empreinte ni dans la
+    # ligne `actions.args`, et n'autorise donc rien.
+    if proof is not None:
+        args["proof"] = dict(proof)
     return Action(
         action_id=row["action_id"], project=row["project"], connector=row["connector"],
-        operation=row["operation"], target=row.get("target") or "", args=dict(row["args"] or {}),
+        operation=row["operation"], target=row.get("target") or "", args=args,
         action_class=row["class"], amount=row.get("amount"), currency=row.get("currency"),
         policy_version=row.get("policy_version") or "1",
         attempt=int(row.get("attempts") or 0) if attempt is None else int(attempt),
@@ -672,7 +679,7 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
 # autorisation : reçu, grant, ou rien (classes non gardées)
 # --------------------------------------------------------------------------
 
-def _covering_grant(db: Db, action: dict) -> dict | None:
+def _covering_grant(db: Db, action: dict, *, grant_id: int | None = None) -> dict | None:
     """Un grant qui couvre l'action (lecture seule, sans verrou : simple
     pré-filtre ; la réservation se fait au lancement, atomiquement, et y
     recontrôle tout sous verrou). Une réservation vivante de l'action passe en
@@ -680,7 +687,9 @@ def _covering_grant(db: Db, action: dict) -> dict | None:
 
     #7629 : le bénéficiaire (`proposed_by`) et la cible font partie du
     pré-filtre ; un grant d'une autre personne ou hors cible n'est jamais
-    proposé."""
+    proposé. `grant_id` (#7684) borne la liaison à CE grant : la signature
+    d'une décision ne peut pas être couverte par un autre grant que celui
+    qu'elle cite."""
     amount = int(action.get("amount") or 0)
     # L44 (0031) : seuls les grants d'un authentificateur du canon de l'action
     rows = storage.of(db).actions.covering_grants(
@@ -688,6 +697,8 @@ def _covering_grant(db: Db, action: dict) -> dict | None:
         action["class"], action.get("currency"), canon=canon_of(action),
         proposed_by=action.get("proposed_by") or "",
         target=action.get("target") or "")
+    if grant_id is not None:
+        rows = [row for row in rows if int(row["id"]) == int(grant_id)]
     allowed = action.get("approvers") or []
     usable = []
     for row in rows:
@@ -721,7 +732,7 @@ def _verify(db: Db, action: dict, receipt, policy, *, expected_digest: str,
 
 
 def _authorize(db: Db, action: dict, receipt, *, standing: bool, policy, now,
-               allow_deny: bool) -> tuple[str, dict]:
+               allow_deny: bool, grant_id: int | None = None) -> tuple[str, dict]:
     """("approve", champs à lier) ou ("deny", verdict)."""
     if receipt is not None:
         verdict = _verify(db, action, receipt, policy, expected_digest=digest(action),
@@ -742,7 +753,7 @@ def _authorize(db: Db, action: dict, receipt, *, standing: bool, policy, now,
                 if verdict.accord else ""),
         }
     if standing:
-        grant = _covering_grant(db, action)
+        grant = _covering_grant(db, action, grant_id=grant_id)
         if grant is None:
             raise ActionError(NO_COVER, "no standing approval covers %s (%s %s, "
                               "class %s, amount %s, proposed by %s, target %s)" % (
@@ -815,7 +826,8 @@ def _claim_action_accord(db: Db, accord: dict | None, ref: str, action_id: str) 
 
 
 def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, policy=None,
-            by: str = "", now: float | None = None) -> dict:
+            by: str = "", now: float | None = None,
+            grant_id: int | None = None) -> dict:
     """`proposed → approved` (ou nouvelle liaison si déjà `approved`).
 
     Le reçu est vérifié contre l'empreinte recalculée et l'`action_id`, son
@@ -824,7 +836,9 @@ def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, pol
     échéances recontrôlées en SQL, à l'heure réelle) ; non consommé (échu,
     rejoué, authentificateur révoqué entre-temps), il est refusé et l'action
     ne change pas. Sans reçu : un grant qui couvre l'action
-    (`standing=True`), ou rien pour une classe non gardée.
+    (`standing=True`), ou rien pour une classe non gardée. `grant_id`
+    (#7684) lie l'action à CE grant seulement, ou refuse : un appelant qui
+    cite un accord ne peut pas être couvert par un autre.
     """
     action = _require(db, action_id)
     from . import module_actions
@@ -836,7 +850,7 @@ def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, pol
                           % (action_id, action["state"], hint.get(action["state"], "")))
     policy = policy if policy is not None else policy_from_env()
     kind, auth = _authorize(db, action, receipt, standing=standing, policy=policy, now=now,
-                            allow_deny=True)
+                            allow_deny=True, grant_id=grant_id)
     if kind == "deny":
         verdict = auth["verdict"]
         _claim_action_accord(db, verdict.accord, verdict.challenge, action_id)
@@ -1012,7 +1026,7 @@ def _refuse_state(action: dict) -> ActionError:
 
 
 def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
-            now: float | None = None) -> dict:
+            now: float | None = None, proof: dict | None = None) -> dict:
     """Lance UNE tentative de l'action approuvée ; renvoie son issue.
 
     1. revérifie l'autorisation liée (reçu : forme, échéance, registre,
@@ -1029,6 +1043,11 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
        l'action reste `launched` : `recover` la traitera comme inconnue.
        Délai dépassé : `unknown` ; si l'appel abandonné rend la main plus tard
        avec une issue certaine, son fil l'inscrit (`_record_late`).
+
+    `proof` (#7684) : la preuve d'exécution fournie au lancement, remise au
+    connecteur dans `action.args["proof"]` ; elle n'entre pas dans l'empreinte
+    de l'action (elle est postérieure à l'accord) et le connecteur décide de
+    la refuser ou de l'inscrire.
     """
     connectors_mod.check(connector)
     policy = policy if policy is not None else policy_from_env()
@@ -1091,7 +1110,7 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
         _record_late(db, action_id, attempt, value, error, by=by)
 
     # --- l'état `launched` est validé en base : l'appel externe peut partir ---
-    outcome = _call(connector, to_action(action, attempt), timeout, late=late)
+    outcome = _call(connector, to_action(action, attempt, proof), timeout, late=late)
     note = _note(outcome, "attempt %d" % attempt)
     try:
         settled = _settle(db, action_id, attempt, "launched", outcome, by=by,

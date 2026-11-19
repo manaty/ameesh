@@ -314,6 +314,39 @@ def action_policy(db, project, provider):
     return ModuleStore(db).action_policy(project, provider)
 
 
+def reserved_gesture_detectors():
+    """`{operation: (provider, detector)}` of the built-in modules that bring
+    the detection of a reserved gesture done outside the gate (#7684).
+
+    A module declares the operations in ``RESERVED_GESTURES`` and serves
+    ``detect_reserved_gesture(operation, *, since_ts, until_ts)``; the core
+    keeps only the view (`reserved_gestures.journal`) and never imports the
+    implementation. A detector that is declared but not callable, or an
+    operation declared twice, is refused: a detection hole must not be silent.
+    """
+    found = {}
+    for provider, module in sorted(_builtin().items()):
+        declared = getattr(module, "RESERVED_GESTURES", ()) or ()
+        if not isinstance(declared, (list, tuple)):
+            raise ValueError("module %r: RESERVED_GESTURES must be a list of operations"
+                             % provider)
+        if not declared:
+            continue
+        detector = getattr(module, "detect_reserved_gesture", None)
+        if not callable(detector):
+            raise ValueError("module %r: RESERVED_GESTURES without detect_reserved_gesture"
+                             % provider)
+        for operation in declared:
+            if not isinstance(operation, str) or not NAME.fullmatch(operation):
+                raise ValueError("module %r: invalid reserved gesture %r"
+                                 % (provider, operation))
+            if operation in found:
+                raise ValueError("duplicate reserved gesture detector: %r"
+                                 % (operation,))
+            found[operation] = (provider, detector)
+    return found
+
+
 def delivery_connectors():
     """`{name: (provider, deliver)}` of the connectors modules declare in
     ``DELIVERY_CONNECTORS``; a name taken twice, or by the core, is refused."""

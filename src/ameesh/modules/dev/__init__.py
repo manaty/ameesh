@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from ... import vocab
 from .git_merge import GitMergeConnector
+from .journal import JournalConnector
 
 NAME = "dev"
 
@@ -190,6 +191,9 @@ def audit(store, project=None):
 
 #: connector of a merge on the lot's target; also the gate actions' connector
 MERGE_CONNECTOR = "git-merge"
+#: #7684 : connecteur des gestes réservés de Manaty (il n'agit pas : il
+#: inscrit la preuve d'exécution fournie par le bureau).
+JOURNAL_CONNECTOR = "journal"
 
 
 def deliver_git_merge(db, item_id, *, evidence, actor="", **options):
@@ -241,7 +245,26 @@ def deliver_git_merge(db, item_id, *, evidence, actor="", **options):
 
 
 #: action connectors this provider declares, by name (`connectors.get`)
-ACTION_CONNECTORS = {MERGE_CONNECTOR: GitMergeConnector}
+ACTION_CONNECTORS = {MERGE_CONNECTOR: GitMergeConnector,
+                     JOURNAL_CONNECTOR: JournalConnector}
+
+#: #7684 : opérations dont ce module apporte la détection hors porte. Le
+#: connecteur `journal` inscrit les gestes ; un déploiement de production fait
+#: sans lui est signalé par le journal externe que ce module relit.
+RESERVED_GESTURES = ("prod-deploy",)
+
+
+def detect_reserved_gesture(operation, *, since_ts, until_ts):
+    """#7684 : les gestes réservés détectés hors porte pour ce module.
+
+    Le cœur ne tient pas de journal des déploiements de production ; le
+    module qui déclare `prod-deploy` lit le sien (`AMEESH_PROD_DEPLOY_JOURNAL`)
+    et rend une liste de déploiements. Une panne de lecture ne lève pas : la
+    vue des gestes réservés reste disponible, seulement sans détection."""
+    from . import journal
+    if operation != "prod-deploy":
+        return []
+    return journal.detect_prod_deploys(since_ts=since_ts, until_ts=until_ts)
 
 #: delivery connectors this provider declares, by name (`work.deliver`)
 DELIVERY_CONNECTORS = {MERGE_CONNECTOR: deliver_git_merge}

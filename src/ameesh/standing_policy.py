@@ -93,6 +93,16 @@ class Policy:
         return [rule for rule in self.rules
                 if rule.matches(approver, connector, operation)]
 
+    def max_duration(self) -> int:
+        """La plus longue durée que le canon permet, en secondes (0 sans règle).
+
+        #7684 : c'est le canon qui fixe le plafond d'un grant, pas la CLI ;
+        le défaut de `receipts.Policy` (30 jours) ne doit pas refuser un grant
+        que le canon autorise. La règle applicable est ensuite vérifiée
+        opération par opération (`check`), la plus stricte gagnant.
+        """
+        return max((rule.max_duration for rule in self.rules), default=0)
+
     def check(self, *, approver: str, standing: dict, iat: int) -> str | None:
         """None si le grant demandé tient sous le plafond, sinon la raison.
 
