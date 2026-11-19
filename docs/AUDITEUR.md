@@ -167,10 +167,13 @@ attente de plus de 2 h. Le geste dépend de l'état :
   ci-dessous.
 
 Une feuille de route notée épuisée (`roadmap: épuisée <projet>` sur le lot de
-découpage) retire le projet de l'alerte et de ses heures au repos. Sans bloc
-`file` au canon (`processus/mecanique.yaml`), la mesure est rendue sans
-seuil et `capacity.rule_error` le dit : l'auditeur juge alors la part au repos
-lui-même contre 20 % et le signale au pilote.
+découpage) retire le projet de l'alerte et de ses heures au repos. Une mesure
+exclue s'affiche `exclu (raison)` et porte `idle_agent_hours_excluded` : un
+0,0 ne représente jamais une mesure absente. Le mesh donne les heures
+imputées et, à part, les agents hors mesure (`idle_agents_excluded`) avec
+leurs raisons. Sans bloc `file` au canon (`processus/mecanique.yaml`), la
+mesure est rendue sans seuil et `capacity.rule_error` le dit : l'auditeur juge
+alors la part au repos lui-même contre 20 % et le signale au pilote.
 
 ### Liste de contrôle
 

@@ -2649,7 +2649,11 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       disponible : ses trous ne comptent pas, pour que la perte affichée soit
       celle des agents qu'on peut réellement réveiller.
       L'état réveillable est celui de l'instant ; un agent d'un projet à la
-      feuille de route épuisée ne compte d'heures ni dans son projet ni au mesh.
+      feuille de route épuisée ne compte d'heures ni dans son projet ni au mesh
+      tant qu'aucun lot démarrable daté ne borne la reprise (#7249). La ligne
+      du projet porte alors `idle_agent_hours_excluded` avec la raison, et le
+      mesh `idle_agents_excluded` : une mesure absente n'est jamais rendue
+      comme un 0,0 mesuré (le texte affiche « exclu »).
     * `startable` : les lots démarrables (`split_startable`) ; `footprint` :
       `{lot: [bloqueurs]}` des lots d'intake retenus par la garde d'empreinte
       (#3185, #4561) — ils ne sont jamais démarrables, ils attendent la fusion
@@ -2770,12 +2774,33 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     # travail sans réécrire cette note, ni facturer les heures de sommeil
     # précédant sa création. Sans date connue, aucune heure n'est inventée.
     available_since: dict[str, float] = {}
+    undated_startable: set[str] = set()
     for lot in startable:
         project = projects_mod.lot_project(lot) or ""
+        if project not in exhausted:
+            continue
         at = _epoch(lot.get("created_ts"))
-        if project in exhausted:
-            since = max(start, float(at) if at is not None else now)
-            available_since[project] = min(available_since.get(project, now), since)
+        if at is None:
+            undated_startable.add(project)
+            continue
+        since = max(start, float(at))
+        available_since[project] = min(available_since.get(project, now), since)
+
+    def hours_exclusion(project: str | None) -> str | None:
+        """Pourquoi les heures de ce projet ne sont pas imputées (#7849).
+
+        L'épuisement de la feuille de route est voulu (#7249) : les heures de
+        sommeil ne sont pas une perte. On le dit au lieu de rendre un 0,0 qui
+        se lirait comme une mesure ; un lot ponctuel daté borne la reprise et
+        lève l'exclusion à partir de sa date.
+        """
+        if not project or project not in exhausted:
+            return None
+        if project in available_since:
+            return None
+        if project in undated_startable:
+            return "date de création du lot démarrable inconnue"
+        return "feuille de route épuisée"
 
     by_project: dict[str, list[dict]] = {}
     primary: dict[str, str] = {}
@@ -2798,10 +2823,16 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
             if primary.get(name) in exhausted else start, now, min_gap)
             for name in idle)
         share = (len(idle) / len(names)) if names else 0.0
-        return {"wakeable": len(names), "idle": len(idle), "idle_agents": idle,
-                "idle_share": round(share, 4),
-                "idle_agent_hours": round(seconds / 3600.0, 2),
-                "roadmap_exhausted": exhausted.get(project) if project else None}
+        row = {"wakeable": len(names), "idle": len(idle), "idle_agents": idle,
+               "idle_share": round(share, 4),
+               "idle_agent_hours": round(seconds / 3600.0, 2),
+               "roadmap_exhausted": exhausted.get(project) if project else None}
+        excluded = hours_exclusion(project)
+        if excluded:
+            # #7849 : le 0,0 n'est pas une mesure, c'est une exclusion voulue ;
+            # la ligne porte la raison et le texte affiche « exclu ».
+            row["idle_agent_hours_excluded"] = excluded
+        return row
 
     projects_out = []
     alerts = []
@@ -2837,6 +2868,17 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     mesh = summary(awake, None)
     mesh["startable_lots"] = sum(len(v) for v in startable_by.values())
     mesh["footprint_lots"] = sum(len(v) for v in footprint_by.values())
+    # #7849 : le total du mesh est la somme des heures imputées ; les agents
+    # dont la mesure est exclue sont comptés à part, avec la raison, pour que
+    # le 0,0 ne se lise pas comme « aucune capacité perdue ».
+    excluded_projects = {
+        row["project"]: row["idle_agent_hours_excluded"]
+        for row in projects_out if row.get("idle_agent_hours_excluded")}
+    excluded_idle = [name for name in mesh["idle_agents"]
+                     if primary.get(name) in excluded_projects]
+    mesh["idle_agents_excluded"] = len(excluded_idle)
+    mesh["idle_hours_excluded_reasons"] = sorted(
+        {excluded_projects[primary[name]] for name in excluded_idle})
     loss_rows = sorted((dict(row) for row in losses or ()),
                        key=lambda r: (str(r.get("harness")), str(r.get("account"))))
     return {
@@ -3649,22 +3691,38 @@ def _capacity_text(cap: Mapping[str, Any] | None) -> list[str]:
         return []
     rule = cap.get("rule")
     mesh = cap.get("mesh") or {}
+    excluded_count = int(mesh.get("idle_agents_excluded") or 0)
+    excluded_reasons = ", ".join(mesh.get("idle_hours_excluded_reasons") or ())
+    # #7849 : un 0,0 d'exclusion n'est pas une mesure ; le dire.
+    if excluded_count and excluded_count >= int(mesh.get("idle") or 0):
+        hours_text = "heures-agent exclues (%d agent(s) : %s)" % (
+            excluded_count, excluded_reasons)
+    elif excluded_count:
+        hours_text = "%.1f heure(s)-agent mesurées (%d agent(s) exclus : %s)" % (
+            float(mesh.get("idle_agent_hours") or 0), excluded_count,
+            excluded_reasons)
+    else:
+        hours_text = "%.1f heure(s)-agent au repos" % float(
+            mesh.get("idle_agent_hours") or 0)
     lines = ["", "Capacité (%s) — %d/%d agent(s) réveillable(s) au repos (%s), "
-             "%.1f heure(s)-agent au repos, %d lot(s) démarrable(s), "
+             "%s, %d lot(s) démarrable(s), "
              "%d en attente d'empreinte"
              % ("seuil %s depuis %s" % (_share(rule["repos_part"]),
                                         _duration(rule["repos_s"]))
                 if rule else "sans seuil, aucune alerte : %s"
                 % (cap.get("rule_error") or "bloc `file` absent du canon"),
                 mesh.get("idle", 0), mesh.get("wakeable", 0),
-                _share(mesh.get("idle_share")), float(mesh.get("idle_agent_hours") or 0),
+                _share(mesh.get("idle_share")), hours_text,
                 int(mesh.get("startable_lots") or 0),
                 int(mesh.get("footprint_lots") or 0))]
     for row in cap.get("projects") or []:
         decoupage = row.get("decoupage")
-        parts = ["  %-14s %2d/%-2d au repos (%s) · %5.1f h-agent · %d démarrable(s)"
+        excluded = row.get("idle_agent_hours_excluded")
+        hours = ("exclu (%s)" % excluded if excluded
+                 else "%5.1f h-agent" % float(row["idle_agent_hours"]))
+        parts = ["  %-14s %2d/%-2d au repos (%s) · %s · %d démarrable(s)"
                  % (row["project"][:14], row["idle"], row["wakeable"],
-                    _share(row["idle_share"]), float(row["idle_agent_hours"]),
+                    _share(row["idle_share"]), hours,
                     len(row.get("startable_lots") or ()))]
         if row.get("footprint_lots"):
             parts.append("%d en attente d'empreinte" % len(row["footprint_lots"]))
@@ -3675,7 +3733,7 @@ def _capacity_text(cap: Mapping[str, Any] | None) -> list[str]:
                     and decoupage.get("quiet_s") != decoupage.get("age_s")):
                 text += ", dernier mouvement il y a %s" % _duration(decoupage["quiet_s"])
             parts.append(text + ")")
-        if row.get("roadmap_exhausted"):
+        if row.get("roadmap_exhausted") and excluded != "feuille de route épuisée":
             parts.append("feuille de route épuisée")
         lines.append(" · ".join(parts))
     losses = [row for row in cap.get("plan_loss_at_reset") or []]
