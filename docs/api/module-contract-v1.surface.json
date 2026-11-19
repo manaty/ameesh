@@ -74,6 +74,7 @@
       "--level",
       "--noop-dir",
       "--origin",
+      "--proof",
       "--rp-id",
       "--timeout"
     ],

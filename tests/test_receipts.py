@@ -1192,9 +1192,15 @@ class StandingTest(StandingBase):
             "SELECT count(*)::int AS n FROM mesh_consumed_nonces")[0]["n"], 0)
 
     def test_grant_trop_long(self):
+        # #7684 : le plafond de durée est celui du canon quand des règles
+        # existent (`standing_limits()` par défaut vaut un an) ; ce cas lie
+        # donc le grant au plafond de 30 jours qu'il prétend dépasser.
         receipt = self.alice.receipt(make_request(
-            ALICE, standing=standing(until=int(time.time()) + receipts.DEFAULT_MAX_STANDING + 60)))
-        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="x", limits=STANDING_LIMITS)
+            ALICE, standing=standing(
+                until=int(time.time()) + receipts.DEFAULT_MAX_STANDING + 60)))
+        verdict, grant = receipts.register_standing(
+            self.db, receipt, POLICY, registered_by="x",
+            limits=standing_limits(max_duration_hours=30 * 24))
         self.assertIsNone(grant)
         self.assertRefused(verdict, receipts.TTL)
 
