@@ -1239,7 +1239,7 @@ def cmd_ack(bk, cfg: Config, rest: list[str]) -> int:
     print("ack: %d acknowledged, %d already delivered, %d reserved, %d not addressed%s"
           % (len(delivered), len(already), len(busy), len(unknown),
              " (by %s)" % by if by else ""))
-    return 0 if not unknown else 1
+    return 0 if not (unknown or busy) else 1
 
 
 def cmd_list(bk) -> int:

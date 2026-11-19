@@ -36,8 +36,8 @@ réservation. Aucun `UPDATE` direct de `delivered_at` n'est nécessaire.
   sans réécrire son horodatage ; une seconde session de la même identité
   peut donc le présenter sans le compter deux fois.
 - **Sans vol** : une réservation active d'une autre remise n'est jamais
-  prise ; le message ressort « reserved by another delivery » et reste à
-  la remise qui le tient (ou à la suivante après expiration).
+  prise ; le message ressort « reserved by another delivery », la commande échoue et
+  il reste à la remise qui le tient (ou à la suivante après expiration).
 - **Sans perte** : le message reste en base et lisible par
   `agent-mail show <id>` pour l'autre session de l'identité partagée.
 - **Tracé** : `meta.consigne.porteur` porte le lecteur qui a affiché le
@@ -84,12 +84,12 @@ champ est l'id.
 
 ```sh
 # contrôle sans écriture
-ssh root@AG2 'runuser -u ameesh -- /…/venv-courant/bin/agent-mail ack \
+ssh root@AG2 'runuser -u ameesh -- env AGENT_MAIL_NAME=bureau /…/venv-courant/bin/agent-mail ack \
   --ids-from - --by "ack@bureau-goal:<session>" --dry-run' \
   < inventaire-non-livre-20261119T0528Z.tsv
 
 # acquittement borné, reprenable
-ssh root@AG2 'runuser -u ameesh -- /…/venv-courant/bin/agent-mail ack \
+ssh root@AG2 'runuser -u ameesh -- env AGENT_MAIL_NAME=bureau /…/venv-courant/bin/agent-mail ack \
   --ids-from - --batch 200 --by "ack@bureau-goal:<session>"' \
   < inventaire-non-livre-20261119T0528Z.tsv
 ```

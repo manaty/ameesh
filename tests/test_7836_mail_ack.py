@@ -110,7 +110,7 @@ class MailAckTest(PgTestCase):
 
         proc = self._ack(str(message_id))
 
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("#%d reserved by another delivery" % message_id, proc.stdout)
         self.assertIsNone(self._row(message_id)["delivered_at"])
         self.assertEqual(mail.deliver(self.db, "bureau", None, None, token,
