@@ -147,9 +147,12 @@ def inspect(tx, lot, actor, since, kind, target="", pregeste_id=None, *,
     if request_id:
         record["request_id"] = request_id
     evidence = json.dumps(record, sort_keys=True)
+    # #7855 : created_at n'est pas nommé : son défaut serveur est déjà
+    # clock_timestamp() (0463), et le rôle limité du bureau n'a l'INSERT que
+    # sur ces cinq colonnes (deploy/sql/_bureau-droits.sql).
     tx.execute("INSERT INTO work_item_events "
-               "(work_item_id, state, note, actor, evidence, created_at) "
-               "VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp())",
+               "(work_item_id, state, note, actor, evidence) "
+               "VALUES (%s, %s, %s, %s, %s::jsonb)",
                (lot, item[0]["state"], note, actor, evidence))
     tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (lot,))
     return pregeste_id
@@ -173,9 +176,10 @@ def _record_effect(tx, lot, actor, evidence):
     state = _state_of(tx, lot)
     phase = evidence.get("phase", "?")
     note = "pre-act effect: %s kind=%s" % (phase, evidence.get("kind", "?"))
+    # #7855 : mêmes cinq colonnes que le reçu ; created_at vient du serveur.
     tx.execute("INSERT INTO work_item_events "
-               "(work_item_id, state, note, actor, evidence, created_at) "
-               "VALUES (%s, %s, %s, %s, %s::jsonb, clock_timestamp())",
+               "(work_item_id, state, note, actor, evidence) "
+               "VALUES (%s, %s, %s, %s, %s::jsonb)",
                (lot, state, note, actor, json.dumps(evidence, sort_keys=True)))
 
 

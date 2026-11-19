@@ -18,6 +18,7 @@ import json
 import hashlib
 from pathlib import Path
 import dataclasses
+import datetime
 import types
 from unittest import mock
 import os
@@ -381,6 +382,26 @@ class BureauRoleLimiteTest(PgTestCase):
         proc = self.as_bureau("mail", "list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("orchestrateur", proc.stdout)
+
+    def test_pre_act_ecrit_son_recu_sous_la_connexion_limitee(self):
+        """#7855 : le reçu pre-act ne nomme que les colonnes que le rôle
+        limité peut écrire ; `created_at` vient du serveur (0463)."""
+        lot = self.reserve()
+        self.bind("BG")
+        since = self.db.query(
+            "SELECT to_char(now() - interval '5 minutes',"
+            " 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS since")[0]["since"]
+        proc = self.as_bureau("gate", "pre-act", "--lot", str(lot), "--kind", "prod",
+                              "--target", "fixture", "--since", since)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("receipt recorded", proc.stdout)
+        row = self.db.query(
+            "SELECT actor, state, created_at IS NOT NULL AS dated"
+            " FROM work_item_events WHERE work_item_id = %s"
+            " AND evidence->>'type' = 'pre-act/1' ORDER BY id DESC LIMIT 1", (lot,))[0]
+        self.assertEqual(row["actor"], "bureau")
+        self.assertEqual(row["state"], "intake")
+        self.assertTrue(row["dated"])
 
     def test_prise_identite_complete_check_puis_levee(self):
         """#6877 (0566) sur l'arbre intégré : la prise écrit le harnais et la
