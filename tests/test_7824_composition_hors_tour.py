@@ -141,7 +141,7 @@ class DetachTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
-    def run_main(self, argv, **patches):
+    def run_main(self, argv, refuse=None, **patches):
         clone = tempfile.TemporaryDirectory(prefix="paquet-7824-")
         self.addCleanup(clone.cleanup)
         (pathlib.Path(clone.name) / ".git").mkdir()
@@ -149,7 +149,7 @@ class MainTest(unittest.TestCase):
         zone = mock.Mock(timezone="Europe/Paris")
         with mock.patch.object(ph, "pose_git_identity"), \
                 mock.patch.object(ph, "check_fresh"), mock.patch.object(ph, "align_schema"), \
-                mock.patch.object(ph, "refuse_agent_clone"), \
+                mock.patch.object(ph, "refuse_agent_clone", side_effect=refuse), \
                 mock.patch("ameesh.config.load", return_value=None), \
                 mock.patch("ameesh.mechanics.configured", return_value=zone), \
                 mock.patch.object(ph, "detach", return_value="unité") as detached, \
@@ -207,6 +207,15 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         detached.assert_not_called()
         ticked.assert_called_once()
+
+    def test_compose_attache_refuse_le_clone_d_agent(self):
+        """#7827 : `compose --attached` rejoue la garde #4562, comme recompose."""
+        refus = ph.InputError("--repo est le dossier de travail de l'agent x")
+        rc, detached, _, ticked = self.run_main(["compose", "--repo", "CLONE", "--attached"],
+                                                refuse=refus)
+        self.assertEqual(rc, 2)
+        detached.assert_not_called()
+        ticked.assert_not_called()
 
     def test_as_role_relance_sous_role_run_sans_options_d_unite(self):
         clone = tempfile.mkdtemp(prefix="paquet-7824-")
