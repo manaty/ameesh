@@ -17705,6 +17705,7 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     """
     from . import attach as attach_mod
     from . import attach_session as attach_session_mod
+    from . import attach_wake
     from .platform import session_lock
     from .agent_names import resolve
     stop_event = stop_event or threading.Event()
@@ -17970,6 +17971,7 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
 
     inputs = threading.Thread(target=check_inputs, daemon=True, name="%s-attach-inputs" % name)
     terminal: _HarnessTerminal | None = None
+    wake = None
     try:
         # codex verdict #182 (P2): everything after taking the lease is under the
         # `finally` — an error or a Ctrl-C while preparing (unreadable setting,
@@ -18015,6 +18017,28 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                 db, name, outcome="accepted", owner=lease_owner, host=cfg.host,
                 tenant=tenant, device=device, human=human, attach_id=attach_id,
                 epoch=epoch, session=(agent.get("session_id") or ""))
+        # #7863 : réveil natif de la session idle. Le hook `asyncRewake` de
+        # Claude Code sort en 2 quand `agent-mail wait` voit un courrier non
+        # passif ; la veille ne réserve ni ne marque lu (le hook ordinaire
+        # reste le seul chemin d'acquittement). La version réellement lancée
+        # est relue ici et consignée ; sans preuve, repli #7861 (aucun
+        # réglage posé, la session est prévenue autrement).
+        wake = attach_wake.prepare(
+            cfg, name, harness=harness_revendique, binary=argv[0], env=env,
+            seconds=max(5.0, max_seconds - (time.monotonic() - started)),
+            tag=str(epoch))
+        if wake.path and "--settings" not in argv:
+            argv += ["--settings", wake.path]
+            log_async("[%s] native wake hook armed (claude %s): %s"
+                      % (name, wake.version, wake.command))
+        elif wake.path:
+            # une autre source de réglages occupe déjà le drapeau : ne jamais
+            # la remplacer par la nôtre (le hook de livraison y vit peut-être)
+            attach_wake.cleanup(wake)
+            wake = None
+            log_async("[%s] native wake hook skipped: --settings already present" % name)
+        else:
+            log_async("[%s] native wake hook skipped: %s" % (name, wake.reason))
         log_async("[%s] interactive session: %s" % (name, " ".join(argv)))
         from . import auditor as auditor_mod, canon as canon_mod
         from .platform import child_environment
@@ -18102,6 +18126,8 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                     _attach_session_summary(terminal, attente["since"], remote=remote)
                 except Exception:  # noqa: BLE001 — la sortie ne retient jamais le bail
                     pass
+        # #7863 : les réglages de réveil de CET attach ne servent plus.
+        attach_wake.cleanup(wake)
         log_async("[%s] attach lease returned" % name)
     return code
 

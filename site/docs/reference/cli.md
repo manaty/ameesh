@@ -45,6 +45,9 @@ agent-mail send <dest|all> <text…|-> [--from NAME] [--lot ID|REF]
 agent-mail forward <OLD> <NEW> [--dry-run] [--json]   # redeliver a dead mailbox
 agent-mail list                       # agents, host, lease, unread
 agent-mail inbox [NAME]               # unread messages of NAME, without marking them read
+agent-mail wait [--agent NAME] [--timeout S] [--poll S] [--delay S] [--since ID]
+                                      # read-only watch (attach wake hook, #7863): exit 2 on a
+                                      # non-passive arrival, 0 at the timeout; never marks read
 agent-mail whoami [--session ID --harness H]   # bound identity and its source (runner, explicit,
                                                # session); --cwd = diagnostic
 agent-mail bind <NAME> --session ID --harness claude|codex|deepseek [--pid N] [--force]
