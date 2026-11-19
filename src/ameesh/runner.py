@@ -8922,7 +8922,10 @@ class AgentWorker(threading.Thread):
         if applied is not None:
             offset = getattr(self, "_avatar_tools_offset", 1)
             argv = [*argv[:offset], *applied.args, *argv[offset:]]
-            avatar_tools.record(self.db, self.name, applied, "resident")
+            try:
+                avatar_tools.record(self.db, self.name, applied, "resident")
+            except spawn_policy.SpawnToolsError as exc:
+                raise _LancementImpossible("tool policy proof not recorded: %s" % exc) from exc
         with self.runner.launch_lock:
             # jamais moissonné hors de l'arrêt de son groupe (codex r2, #417)
             proc = resident.spawn_leader(argv, **kwargs)
@@ -9024,6 +9027,9 @@ class AgentWorker(threading.Thread):
         driver.on_event = rp.on_event
         try:
             driver.start()
+        except _LancementImpossible:
+            stderr.close()
+            raise
         except resident.ResidentError as exc:
             rp.close(0)
             with self.lock:
@@ -10384,7 +10390,7 @@ class AgentWorker(threading.Thread):
                                 pass_fds=(ready_w,) if ready_w is not None else (),
                             )
                             self.runner.harness_pids.add(proc.pid)
-                    except RuntimeError as exc:
+                    except (RuntimeError, spawn_policy.SpawnToolsError) as exc:
                         raise _LancementImpossible(str(exc)) from exc
                     except OSError as exc:
                         raise _LancementImpossible("could not launch %s: %s"
