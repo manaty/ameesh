@@ -18,6 +18,8 @@ from unittest import mock
 from ameesh import accounts as accounts_mod
 from ameesh import login
 from ameesh import login_cli
+from ameesh import setup_token
+from ameesh import tenancy
 
 
 def args(**overrides):
@@ -106,6 +108,55 @@ class ProfileTest(unittest.TestCase):
             with self.assertRaises(login.LoginError) as caught:
                 login_cli.pinned_version("gh", probe=lambda harness, r=result: r)
             self.assertEqual(caught.exception.category, "unsupported_version")
+
+
+class TenantLoginTest(unittest.TestCase):
+    def test_tenant_login_stays_in_its_private_home(self):
+        with tempfile.TemporaryDirectory() as root:
+            own_home = os.path.join(root, "alice")
+            other_home = os.path.join(root, "bruno")
+            os.mkdir(own_home, 0o700)
+            os.mkdir(other_home, 0o700)
+            os.mkdir(os.path.join(own_home, ".claude"), 0o700)
+            os.mkdir(os.path.join(other_home, ".claude"), 0o700)
+            cfg = SimpleNamespace(tenant="human:alice")
+            entry = SimpleNamespace(pw_uid=os.getuid(), pw_dir=own_home)
+            with mock.patch.object(tenancy, "tenant_home", return_value=own_home), \
+                    mock.patch.object(tenancy.pwd, "getpwnam", return_value=entry):
+                own = SimpleNamespace(home=lambda _env: os.path.join(own_home, ".claude"))
+                peer = SimpleNamespace(home=lambda _env: os.path.join(other_home, ".claude"))
+                self.assertEqual(login_cli.tenant_login_problems(cfg, own, {}), [])
+                self.assertIn("inside the tenant home", " ".join(
+                    login_cli.tenant_login_problems(cfg, peer, {})))
+                entry.pw_uid = os.getuid() + 1
+                self.assertIn("tenant Unix user", " ".join(
+                    login_cli.tenant_login_problems(cfg, own, {})))
+
+    def test_invalid_tenant_home_refused_before_cli_probe(self):
+        cfg = SimpleNamespace(tenant="human:alice", accounts={"claude": [
+            {"name": "main", "type": "config_dir", "path": "/tmp/not-a-tenant-home"}]})
+        with mock.patch.object(login_cli, "pinned_version") as probe:
+            self.assertEqual(login_cli.cmd_accounts_login(cfg, args(harness="claude")), 1)
+        probe.assert_not_called()
+
+    def test_setup_token_refused_before_read_outside_tenant_home(self):
+        cfg = SimpleNamespace(tenant="human:alice", accounts={"claude": [
+            {"name": "main", "type": "config_dir", "path": "/tmp/not-a-tenant-home"}]})
+        with mock.patch.object(setup_token, "private_read") as read, \
+                mock.patch.object(setup_token, "install") as install:
+            result = login_cli.cmd_accounts_login(cfg, args(
+                harness="claude", token_file="/tmp/unused-token"))
+        self.assertEqual(result, 1)
+        read.assert_not_called()
+        install.assert_not_called()
+
+    def test_tenant_unix_user_without_tenant_identity_is_refused(self):
+        cfg = SimpleNamespace(tenant="")
+        profile = SimpleNamespace(home=lambda _env: "/tmp/unused")
+        with mock.patch.object(tenancy.pwd, "getpwuid", return_value=SimpleNamespace(
+                pw_name="ameesh-alice")):
+            self.assertIn("tenant identity required", " ".join(
+                login_cli.tenant_login_problems(cfg, profile, {})))
 
 
 class CommandTest(unittest.TestCase):

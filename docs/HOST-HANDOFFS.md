@@ -562,10 +562,13 @@ the epoch remain the only arbiters, so two holders never serve a turn.
 A Host card may declare `policy.shared: true` with `policy.tenants:
 [human:<id>, …]` (docs/design/5322-avatar-humain.md §3.4). `canon check`
 refuses tenants without `shared`, `shared` without tenants, a tenant that is
-not a Member, and any `credential_modes` other than `[api-key]`: decision Q2
-(#213954) allows organization keys only on a shared host; personal
-subscriptions stay on the workstation. Placement admits on that host only an
-agent whose `responsible` is a tenant.
+not a Member. Organization API keys remain allowed. Under the amended Q2
+(#224052, #5901), personal subscriptions are allowed only when the shared
+Host explicitly declares both `policy.allow_subscription: true` and
+`policy.require_isolation: true`. `canon check` refuses the opt-in without
+isolation, or on a non-shared Host. Without the opt-in, subscription agents
+cannot be placed on that shared Host. Placement admits on a shared Host only an
+agent whose `responsible` is a declared tenant.
 
 Each tenant has its own system user (`ameesh-<id>`, own group, home 0700,
 linger), its own runner (`AMEESH_TENANT=human:<id>`, unit
@@ -590,7 +593,7 @@ refused.
 Provisioning is a bureau or human gesture, never an agent:
 
     ameesh host tenant add human:alice --host banc          # prints the plan
-    # (run the plan as root, install the organization keys as the tenant)
+    # (run the plan as root, install each tenant's own credentials as that tenant)
     # then ON the shared host (the UID is read from its passwd):
     ameesh host tenant add human:alice --host banc --register --actor human:<id>
     ameesh host tenant list [--host banc] [--json]

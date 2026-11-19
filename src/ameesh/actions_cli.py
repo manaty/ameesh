@@ -21,7 +21,9 @@
         fetches the receipt (GET /receipts/<id>), VERIFIES it, then attaches it to the action
         (approve; retry after failed; replace for an assumed duplicate)
   ameesh action approve <id> (--receipt F | --standing) [--by NAME]
-  ameesh action execute <id> [--by NAME] [--timeout S]
+  ameesh action execute <id> [--proof KEY=VALUE]… [--by NAME] [--timeout S]
+        #7684: the journal connector records the execution proof
+        (run=URL, sha=SHA, resource=ID) after the bureau's own gesture
   ameesh action reconcile <id> [--force] [--by NAME]
   ameesh action retry <id> (--receipt F | --standing) [--by NAME]
   ameesh action replace <id> --receipt F [--by NAME]   (decision that assumes the duplicate)
@@ -290,19 +292,33 @@ def cmd_journal(cfg: Config, args: argparse.Namespace) -> int:
     for g in view["gestures"]:
         accord = reserved_gestures.accord_text(g.get("accord"))
         if g["kind"] == "action":
+            extra = ""
+            if g.get("reservation") is not None:
+                extra += ", reservation #%s" % g["reservation"]
+            if g.get("proof"):
+                extra += ", proof %s" % reserved_gestures.proof_text(g["proof"])
             print("  %s  %-11s %s %s on %s — proposed by %s, approved by %s (%s, receipt "
-                  "%s), %s" % (_moment(g["ts"]), g["gesture"], g["action_id"], g["operation"],
-                               g.get("target") or "?", g.get("proposed_by") or "?",
-                               g.get("approver") or "-", accord, g.get("receipt") or "-",
-                               g.get("state")))
+                  "%s), %s%s" % (_moment(g["ts"]), g["gesture"], g["action_id"],
+                                 g["operation"], g.get("target") or "?",
+                                 g.get("proposed_by") or "?", g.get("approver") or "-",
+                                 accord, g.get("receipt") or "-", g.get("state"), extra))
         else:
             who = {"owner": "by the owner", "avatar": "by avatar %s (%s)" % (
                 g.get("agent"), accord)}.get(g.get("signed_by"), "signer UNRECORDED")
-            print("  %s  %-11s decision #%s signed with the key of %s, %s" % (
-                _moment(g["ts"]), g["gesture"], g.get("decision"), g.get("approver"), who))
+            extra = ""
+            if g.get("grant"):
+                extra = ", granted by reservation #%s" % g.get("reservation")
+            print("  %s  %-11s decision #%s [%s] signed with the key of %s, %s%s" % (
+                _moment(g["ts"]), g["gesture"], g.get("decision"),
+                g.get("operation") or "decision-sign", g.get("approver"), who, extra))
     for sig in view["signals"]:
-        print("signal [%s] decision #%s: %s" % (sig["code"], sig.get("decision"),
-                                                sig["reason"]), file=sys.stderr)
+        if sig["code"] == reserved_gestures.UNRECORDED_PROD_DEPLOY:
+            print("signal [%s] deploy %s on %s (%s): %s" % (
+                sig["code"], sig.get("deploy"), sig.get("target"), sig.get("ref"),
+                sig["reason"]), file=sys.stderr)
+        else:
+            print("signal [%s] decision #%s: %s" % (sig["code"], sig.get("decision"),
+                                                    sig["reason"]), file=sys.stderr)
     return 0
 
 
@@ -611,6 +627,57 @@ def cmd_standing_register(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_standing_request(cfg: Config, args: argparse.Namespace) -> int:
+    """#7684 : compose la demande d'un grant, à faire signer par la clé fichier.
+
+    Le canon garde le plafond : cette commande ne fait que construire la
+    demande (durée, montant, bénéficiaire, cibles, charte, accord) ; c'est
+    `ameesh action standing register` qui applique `standing_approvals` du
+    canon à l'enregistrement. La sortie est le JSON à signer par
+    `ameesh receipt sign <demande> --key <clé 0600> --credential-id <id>`.
+    """
+    try:
+        until = int(_epoch(args.until))
+    except ValueError:
+        print("error: --until: epoch or YYYY-MM-DD expected, not %r" % args.until,
+              file=sys.stderr)
+        return 2
+    if until <= time.time():
+        print("error: --until is already past (%s)" % _moment(until), file=sys.stderr)
+        return 2
+    charter = None
+    if args.charter_frame or args.frame_version:
+        if not (args.charter_frame and args.frame_version):
+            print("error: --charter-frame and --frame-version go together", file=sys.stderr)
+            return 2
+        charter = {"frame": args.charter_frame, "version": args.frame_version}
+    try:
+        request = receipts.standing_request(
+            approver=args.approver, connector=args.connector,
+            operations=args.operation, action_class=args.action_class,
+            until=until, max_amount=args.max_amount, currency=args.currency,
+            beneficiary=args.beneficiary, targets=args.target,
+            charter_line=args.charter_line, charter_version=args.charter_version,
+            charter=charter, accord=_accord(args.accord),
+            requested_by=args.requested_by, ttl=args.ttl)
+    except (receipts.ReceiptError, actions.ActionError) as exc:
+        print("refused [%s]: %s" % (getattr(exc, "code", receipts.FORMAT),
+                                    getattr(exc, "reason", str(exc))),
+              file=sys.stderr)
+        return 1
+    text = json.dumps(request, ensure_ascii=False, indent=2) + "\n"
+    if args.out:
+        _write_private(args.out, text.encode("utf-8"))
+        print("standing request saved (0600): %s" % args.out)
+        print("next: ameesh receipt sign %s --key <owner key> --credential-id <id>"
+              % args.out)
+    else:
+        print(text, end="")
+        print("next: ameesh receipt sign <file> --key <owner key> --credential-id <id>",
+              file=sys.stderr)
+    return 0
+
+
 def _requester(args: argparse.Namespace, action: dict) -> str:
     """Qui demande : --requested-by, sinon l'agent de la session, sinon le proposant.
     Une session d'agent ne demande qu'en son propre nom."""
@@ -662,6 +729,27 @@ def _accord(text: str | None) -> dict | None:
     if not sep or not agent or not seq.isdigit():
         raise SystemExit("error: --accord AGENT#SEQ expected, not %r" % text)
     return {"agent": agent, "seq": int(seq)}
+
+
+def _proof(values) -> dict | None:
+    """#7684 : `--proof run=… --proof sha=…` → la preuve d'exécution.
+
+    Les clés admises et les valeurs sont validées par le connecteur `journal`
+    au moment de l'exécution : la porte ne connaît pas la forme d'une preuve
+    de module."""
+    if not values:
+        return None
+    proof = {}
+    for item in values:
+        key, sep, value = str(item).partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise actions.ActionError(actions.INVALID,
+                                      "--proof KEY=VALUE expected, not %r" % item)
+        if key in proof:
+            raise actions.ActionError(actions.INVALID, "--proof %s given twice" % key)
+        proof[key] = value
+    return proof
 
 
 def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
@@ -804,7 +892,8 @@ def cmd_execute(cfg: Config, args: argparse.Namespace) -> int:
             print("error: action %s not found" % args.id, file=sys.stderr)
             return 1
         connector = _connector(cfg, action["connector"], args)
-        result = actions.execute(db, args.id, connector, policy=_policy(args), by=_actor(args))
+        result = actions.execute(db, args.id, connector, policy=_policy(args),
+                                 by=_actor(args), proof=_proof(args.proof))
     finally:
         db.close()
     if args.json:
@@ -1127,6 +1216,37 @@ def build_parser() -> argparse.ArgumentParser:
     _verify_options(p)
     p.set_defaults(func=cmd_standing_register)
 
+    p = standing_sub.add_parser("request", help="compose a standing approval request (#7684)")
+    p.add_argument("--approver", required=True, metavar="human:ID")
+    p.add_argument("--connector", required=True)
+    p.add_argument("--operation", action="append", required=True, dest="operation",
+                   help="operation covered by the grant (repeatable)")
+    p.add_argument("--class", dest="action_class", required=True,
+                   choices=list(actions.ACTION_CLASSES))
+    p.add_argument("--until", required=True,
+                   help="grant expiry: epoch or YYYY-MM-DD (the canon policy caps it)")
+    p.add_argument("--max-amount", type=int, default=0, help="minor units (default 0)")
+    p.add_argument("--currency", default=None)
+    p.add_argument("--beneficiary", default=None,
+                   help="agent:<id> or avatar (the canon policy may require it)")
+    p.add_argument("--target", action="append", default=[], dest="target",
+                   help="target pattern (repeatable; * and ? only)")
+    p.add_argument("--charter-line", default=None,
+                   help="canon charter line (#7629 policy)")
+    p.add_argument("--charter-version", default=None,
+                   help="canon charter version (#7629 policy)")
+    p.add_argument("--charter-frame", default=None,
+                   help="signed charter frame (#7631), e.g. sign-decisions")
+    p.add_argument("--frame-version", default=None,
+                   help="version of the signed charter frame")
+    p.add_argument("--accord", default=None, metavar="AGENT#SEQ",
+                   help="journal entry of the human's go (#7631, file-key receipt)")
+    p.add_argument("--requested-by", required=True, metavar="AGENT|HUMAN")
+    p.add_argument("--ttl", type=int, default=actions.DEFAULT_REQUEST_TTL,
+                   help="lifetime of the request itself (s)")
+    p.add_argument("--out", default=None, help="also save the request (0600)")
+    p.set_defaults(func=cmd_standing_request)
+
     p = act.add_parser("request", help="approval request (ameesh-approve)")
     p.add_argument("id")
     p.add_argument("--approver", required=True)
@@ -1169,6 +1289,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = act.add_parser("execute")
     p.add_argument("id")
+    p.add_argument("--proof", action="append", default=None, metavar="KEY=VALUE",
+                   help="execution proof recorded by the journal connector (#7684): "
+                        "run=URL, sha=SHA, resource=ID; repeatable")
     p.add_argument("--by", default=None)
     p.add_argument("--json", action="store_true")
     _verify_options(p)

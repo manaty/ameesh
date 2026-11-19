@@ -112,6 +112,46 @@ def home_problems(profile, environ=None) -> list:
     return problems
 
 
+def tenant_login_problems(cfg: Config, profile, environ=None) -> list[str]:
+    """Keep a tenant runner's OAuth files under its own Unix home (#5901).
+
+    This runs before probing or starting the CLI. A misconfigured account path
+    must not make the tenant's login write into a shared or peer directory.
+    The Unix UID and 0700 home are checked independently of the canon flags.
+    """
+    from . import tenancy
+    tenant = getattr(cfg, "tenant", "")
+    if not tenant:
+        try:
+            current_user = tenancy.pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            current_user = ""
+        if current_user.startswith(tenancy.USER_PREFIX):
+            return ["tenant identity required for a tenant Unix user"]
+        return []
+    try:
+        user = tenancy.unix_user(tenant)
+        expected_home = tenancy.tenant_home(tenant)
+        entry = tenancy.pwd.getpwnam(user)
+    except (tenancy.TenancyError, KeyError):
+        return ["tenant Unix user missing or invalid"]
+    uid = os.getuid()
+    if entry.pw_uid != uid or entry.pw_dir != expected_home:
+        return ["login must run as the tenant Unix user in its own home"]
+    if os.path.islink(expected_home):
+        return ["tenant home must not be a symlink"]
+    try:
+        info = os.stat(expected_home)
+    except OSError:
+        return ["tenant home missing"]
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700:
+        return ["tenant home must be owned by its user and mode 0700"]
+    target = os.path.realpath(profile.home(environ))
+    if os.path.commonpath((expected_home, target)) != expected_home or target == expected_home:
+        return ["account directory must be inside the tenant home"]
+    return []
+
+
 def pinned_version(harness: str, *, probe=None, environ=None, home: str = "") -> dict:
     """La version installée, refusée si absente ou hors épinglage (L120).
 
@@ -304,6 +344,9 @@ def _run(cfg: Config, args) -> int:
                                    "no login adapter for %r" % harness)
     environ = os.environ
     profile = resolve_profile(cfg, harness, getattr(args, "account", None), environ=environ)
+    problems = tenant_login_problems(cfg, profile, environ)
+    if problems:
+        raise login_mod.LoginError("failed", "; ".join(problems))
     problems = home_problems(profile, environ)
     if problems:
         raise login_mod.LoginError("failed", "; ".join(problems))
@@ -384,7 +427,15 @@ def import_setup_token(cfg, args):
     from . import db as db_mod, setup_token
     if args.harness != "claude":
         raise _error("failed", "--token-file is only for Claude setup-token; Codex uses device-auth")
-    profile = resolve_profile(cfg, "claude", getattr(args, "account", None))
+    environ = os.environ
+    profile = resolve_profile(cfg, "claude", getattr(args, "account", None),
+                              environ=environ)
+    problems = tenant_login_problems(cfg, profile, environ)
+    if problems:
+        raise _error("failed", "; ".join(problems))
+    problems = home_problems(profile, environ)
+    if problems:
+        raise _error("failed", "; ".join(problems))
     try:
         content = (sys.stdin.read(setup_token.MAX_BYTES + 1) if args.token_file == "-"
                    else setup_token.private_read(args.token_file))

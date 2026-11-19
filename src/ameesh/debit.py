@@ -2712,9 +2712,16 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         if not project:
             continue
         created = _epoch(lot.get("created_ts"))
+        # #7848 : le délai de repli court depuis le dernier mouvement utile
+        # (note du pilote, lot créé qui cite le découpage), jamais avant la
+        # création du lot ; sans mouvement lu, c'est l'âge.
+        moved = _epoch(lot.get("moved_ts"))
+        if created is not None and (moved is None or moved < created):
+            moved = created
         entry = {"lot": int(lot["id"]), "state": lot.get("state"),
                  "assignee": lot.get("assignee") or None,
-                 "created_ts": created, "age_s": _age(now, created)}
+                 "created_ts": created, "age_s": _age(now, created),
+                 "moved_ts": moved, "quiet_s": _age(now, moved)}
         current = decoupage.get(project)
         if current is None or (created or 0.0) > (current.get("created_ts") or 0.0):
             decoupage[project] = entry
@@ -2769,7 +2776,7 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         entry["decoupage"] = decoupage.get(project)
         projects_out.append(entry)
         fresh = entry["decoupage"] is not None and (
-            entry["decoupage"].get("age_s") or 0.0) < file_decoupage.FALLBACK_S
+            entry["decoupage"].get("quiet_s") or 0.0) < file_decoupage.FALLBACK_S
         # #6215 : une route épuisée ne tait un projet que si rien n'y attend.
         # Un lot démarrable ponctuel ou un lot retenu par la
         # garde d'empreinte est du travail réel : l'alerte le nomme et porte
@@ -2817,9 +2824,9 @@ def _capacity_gesture(project: str, entry: Mapping[str, Any]) -> str:
     if entry.get("footprint_lots"):
         return head + _footprint_gesture(entry["footprint_lots"])
     if entry.get("decoupage"):
-        return head + ("le lot de découpage #%d a plus d'une heure sans lot démarrable "
-                       "— l'%s crée les lots (niveau 1, spec §2.2)"
-                       % (entry["decoupage"]["lot"], AUDITOR_ROLES[0]))
+        return head + ("le lot de découpage #%d est sans mouvement depuis plus d'une "
+                       "heure, sans lot démarrable — l'%s crée les lots (niveau 1, "
+                       "spec §2.2)" % (entry["decoupage"]["lot"], AUDITOR_ROLES[0]))
     return head + "aucun lot de découpage ouvert — l'ouvrir au pilote (spec #3256 §2.2)"
 
 
@@ -3053,6 +3060,27 @@ _SPLIT_SOURCES_SQL = """
       FROM work_items
      WHERE id = ANY(string_to_array(%s, ',')::bigint[])
        AND source LIKE 'file-decoupage:%%'
+"""
+
+#: #7848 : le dernier mouvement utile de chaque lot de découpage ouvert —
+#: une note de son assigné (le pilote), ou la création d'un lot qui le cite
+#: (`#<id>` dans le titre, le corps ou la source). Les notes automatiques
+#: (`ameesh`, `ameesh:*` : réveils, repli) n'en sont pas : elles ne disent
+#: rien du découpage. Sans mouvement, `moved_ts` est NULL et l'âge fait foi.
+_SPLIT_MOVES_SQL = """
+    SELECT s.id,
+           extract(epoch FROM greatest(
+               (SELECT max(e.created_at) FROM work_item_events e
+                 WHERE e.work_item_id = s.id
+                   AND coalesce(btrim(e.note), '') <> ''
+                   AND e.actor = s.assignee
+                   AND e.actor <> 'ameesh' AND e.actor NOT LIKE 'ameesh:%%'),
+               (SELECT max(w.created_at) FROM work_items w
+                 WHERE w.id > s.id AND w.created_at >= s.created_at
+                   AND concat_ws(' ', w.title, w.body, w.source)
+                       ~ ('#' || s.id::text || '([^0-9]|$)'))))::float8 AS moved_ts
+      FROM work_items s
+     WHERE s.id = ANY(string_to_array(%s, ',')::bigint[])
 """
 
 _MERGES_SQL = """
@@ -3471,6 +3499,16 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
                 db, _SPLIT_SOURCES_SQL, (",".join(str(int(l["id"])) for l in lots),))}, {})
         lots = [dict(lot, source=sources.get(int(lot["id"]), lot.get("source")))
                 for lot in lots]
+        # #7848 : le dernier mouvement du lot de découpage, pas son âge. Une
+        # lecture en échec ne ferme pas l'alerte : l'âge seul reste la mesure.
+        splits = [str(int(lot["id"])) for lot in lots if _decoupage_project(lot)]
+        moves = (attempt("split lot moves", lambda: {
+            int(row["id"]): row.get("moved_ts") for row in _rows(
+                db, _SPLIT_MOVES_SQL, (",".join(splits),))}, {}, gating=False)
+            if splits else {})
+        lots = [dict(lot, moved_ts=moves[int(lot["id"])])
+                if moves.get(int(lot["id"])) is not None else lot
+                for lot in lots]
     # B de cx1 sur ac79c550 : `waiting_project_lots(db=…)` et `_budget_held`
     # absorbent l'échec de leur lecteur (contrat conservateur de leurs autres
     # appelants). Ici, les lecteurs sont appelés en direct : un échec ferme
@@ -3590,8 +3628,12 @@ def _capacity_text(cap: Mapping[str, Any] | None) -> list[str]:
         if row.get("footprint_lots"):
             parts.append("%d en attente d'empreinte" % len(row["footprint_lots"]))
         if decoupage:
-            parts.append("découpage #%d (%s)" % (decoupage["lot"],
-                                                 _duration(decoupage.get("age_s"))))
+            text = "découpage #%d (%s" % (decoupage["lot"],
+                                          _duration(decoupage.get("age_s")))
+            if (decoupage.get("quiet_s") is not None
+                    and decoupage.get("quiet_s") != decoupage.get("age_s")):
+                text += ", dernier mouvement il y a %s" % _duration(decoupage["quiet_s"])
+            parts.append(text + ")")
         if row.get("roadmap_exhausted"):
             parts.append("feuille de route épuisée")
         lines.append(" · ".join(parts))

@@ -69,7 +69,9 @@ class Grants(interface.Grants):
 
     def live_reservations(self, action_id) -> list[dict]:
         return self.db.query(
-            "SELECT grant_id FROM standing_reservations WHERE action_id = %s "
+            "SELECT id, grant_id, action_id, amount, connector, operation, action_class, "
+            "currency, reserved_by, extract(epoch from reserved_at)::float8 AS reserved_ts "
+            "FROM standing_reservations WHERE action_id = %s "
             "AND released_at IS NULL ORDER BY id", (action_id,))
 
     def candidates(self, connector, operation, action_class, amount, currency,
