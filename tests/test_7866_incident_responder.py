@@ -17,6 +17,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -676,7 +677,9 @@ class LiveSignalsTest(unittest.TestCase):
 
     def test_a_fresh_journal_interaction_is_available(self):
         epoch = self.NOW.timestamp() - 60
-        signals = responder.LiveSignals(db=self.Db([{"ts": epoch}]), env={})
+        signals = responder.LiveSignals(db=self.Db([
+            {"source": "sent", "ts": epoch, "proof": "alice@pc",
+             "host": "pc"}]), env={})
         self.assertTrue(signals.interaction(self.member(), self.NOW))
 
     def test_a_stale_journal_interaction_passes_to_memoria(self):
@@ -691,10 +694,51 @@ class LiveSignalsTest(unittest.TestCase):
                 "last_interaction": "2026-11-19T08:59:00Z"}).encode("utf-8")
 
         env = {"AMEESH_INCIDENT_MEMORIA_URL": "https://memoria.example"}
-        signals = responder.LiveSignals(db=self.Db([{"ts": epoch}]), env=env,
-                                        transport=transport)
+        signals = responder.LiveSignals(db=self.Db([
+            {"source": "sent", "ts": epoch, "proof": "alice@pc",
+             "host": "pc"}]), env=env, transport=transport)
         self.assertTrue(signals.interaction(self.member(), self.NOW))
         self.assertEqual(len(calls), 1)
+
+    def test_a_relayed_mail_from_another_host_is_not_the_humans_activity(self):
+        epoch = self.NOW.timestamp() - 60
+        signals = responder.LiveSignals(db=self.Db([
+            {"source": "sent", "ts": epoch, "proof": None,
+             "host": "ameesh-agents-2"}]), env={})
+        self.assertIsNone(signals.journal_last(self.member()))
+        self.assertIsNone(signals.interaction(self.member(), self.NOW))
+
+    def test_a_mail_sent_from_a_declared_host_counts_without_a_proof(self):
+        epoch = self.NOW.timestamp() - 60
+        signals = responder.LiveSignals(db=self.Db([
+            {"source": "sent", "ts": epoch, "proof": "", "host": "pc"}]), env={})
+        self.assertTrue(signals.interaction(self.member(), self.NOW))
+
+    def test_a_bureau_answer_is_never_the_owners_own_activity(self):
+        # B1 de l'auditeur : une réponse « saisie par le bureau, délégation
+        # §10 » ne compte pas — même si son hôte est déclaré — et la plus
+        # récente réponse humaine, elle, compte.
+        human = self.NOW.timestamp() - 120
+        bureau = self.NOW.timestamp() - 30
+        signals = responder.LiveSignals(db=self.Db([
+            {"source": "answer", "ts": human, "proof": "alice@pc", "host": "pc",
+             "answer_text": "a"},
+            {"source": "answer", "ts": bureau, "host": "pc",
+             "answer_text": "a — saisi par le bureau, délégation §10"},
+            {"source": "answer", "ts": bureau, "host": "ameesh-agents-2",
+             "answer_text": "a — réponse de l'owner relayée par le bureau, "
+                            "source session-1"},
+        ]), env={})
+        last = signals.journal_last(self.member())
+        self.assertIsNotNone(last)
+        self.assertEqual(last.timestamp(), human)
+
+    def test_a_decision_answer_needs_a_declared_device(self):
+        epoch = self.NOW.timestamp() - 30
+        signals = responder.LiveSignals(db=self.Db([
+            {"source": "answer", "ts": epoch, "proof": None,
+             "host": "ameesh-agents-2", "answer_text": "a"}]), env={})
+        self.assertIsNone(signals.journal_last(self.member()))
 
     def test_missing_memoria_and_slack_degrade_cleanly(self):
         signals = responder.LiveSignals(db=self.Db([]), env={})
@@ -750,9 +794,73 @@ class LiveSignalsTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class JournalAttributionPgTest(PgTestCase):
+    """#7866 (B1 auditeur) : la requête réelle du journal ne retient que
+    l'activité du poste de l'humain ; une réponse « saisie par le bureau » et
+    un courrier relayé sous `human:<id>` ne comptent pas."""
+
+    def member(self, accounts=("alice@pc-smichea",)):
+        return SimpleNamespace(title="alice", local_accounts=list(accounts),
+                               timezone="Europe/Paris",
+                               fiche=SimpleNamespace(data={}))
+
+    def add_answer(self, *, ts, text, host=None, proof=None):
+        answer = {"by": "human:alice", "channel": "signed", "text": text,
+                  "option": "a", "ts": ts}
+        if host:
+            answer["host"] = host
+        if proof:
+            answer["human_account"] = proof
+        payload = {"decision": {"state": "answered", "answer": answer}}
+        self.db.execute(
+            "insert into agent_mailbox (sender, recipient, body, kind, payload, host)"
+            " values (%s, %s, %s, 'request', %s::jsonb, %s)",
+            ("orch", "human:alice", "question", json.dumps(payload), host))
+
+    def test_a_bureau_answer_does_not_count_as_a_recent_interaction(self):
+        human = time.time() - 120
+        bureau = time.time() - 30
+        self.add_answer(ts=human, text="a", host="pc-smichea",
+                        proof="alice@pc-smichea")
+        self.add_answer(ts=bureau, text="a — saisi par le bureau, délégation §10",
+                        host="ameesh-agents-2")
+        last = responder.LiveSignals(db=self.db).journal_last(self.member())
+        self.assertIsNotNone(last)
+        self.assertAlmostEqual(last.timestamp(), human, delta=1)
+
+    def test_a_relayed_mail_does_not_count(self):
+        self.db.execute(
+            "insert into agent_mailbox (sender, recipient, body, payload, host)"
+            " values ('human:alice', 'orch', 'hello', %s::jsonb, %s)",
+            (json.dumps({}), "ameesh-agents-2"))
+        self.assertIsNone(
+            responder.LiveSignals(db=self.db).journal_last(self.member()))
+
+    def test_mail_sent_from_the_owners_account_counts(self):
+        self.db.execute(
+            "insert into agent_mailbox (sender, recipient, body, payload, host)"
+            " values ('human:alice', 'orch', 'hello', %s::jsonb, %s)",
+            (json.dumps({"human_account": "alice@pc-smichea"}), "pc-smichea"))
+        self.assertIsNotNone(
+            responder.LiveSignals(db=self.db).journal_last(self.member()))
+
+
+class HumanAccountProofTest(fixtures._Base):
+    """#7866 (B1) : la réponse d'un humain interactif porte la preuve
+    `user@host`, celle qui distingue son poste d'un relais."""
+
+    def test_an_interactive_human_answer_carries_the_local_account_proof(self):
+        from ameesh import resident_queue
+        view = self.ask()
+        answer = self.answer(view["id"], "a")["decision"]["answer"]
+        user, host = resident_queue.local_account(self.cfg)
+        self.assertEqual(answer.get("human_account"), "%s@%s" % (user, host))
+
+
 class CliResponderTest(PgTestCase):
     """The end-to-end contract: a P1 picks the French member while the UTC+8
-    owner is asleep, journals the choice and writes nothing about activity."""
+    owner is asleep; a simulation writes nothing, and the live journal event
+    keeps only the choice, the reason and the signal kinds."""
 
     def setUp(self):
         super().setUp()
@@ -787,8 +895,9 @@ class CliResponderTest(PgTestCase):
             code = responder.main(list(args))
         return code, out.getvalue(), err.getvalue()
 
-    def test_a_p1_picks_the_available_french_member_and_journals_it(self):
-        # 18:00 UTC = 02:00 Shanghai (owner asleep), 19:00 Paris (at work)
+    def test_a_p1_picks_the_available_french_member_without_writing_anything(self):
+        # 18:00 UTC = 02:00 Shanghai (owner asleep), 19:00 Paris (at work).
+        # `--now` is a simulation: no call, no real journal event (#7866 N1).
         code, out, err = self.run_cli(
             "acme", "--severity", "P1", "--canon", self.root,
             "--now", "2026-11-19T18:00:00Z", "--json")
@@ -800,11 +909,41 @@ class CliResponderTest(PgTestCase):
         self.assertEqual(document["reason"], "usual-hours")
         self.assertEqual(document["signals"], ["timezone"])
         self.assertEqual(document["wake"]["plan"], "none")
-        self.assertEqual(document["wake"]["status"], "not-needed")
-        self.assertIsInstance(document["journal"]["event"], int)
+        self.assertEqual(document["wake"]["status"], "simulated")
+        self.assertIsNone(document["journal"])
         rows = self.db.query(
-            "select data from ameesh_events where type = %s order by id desc limit 1",
-            (responder.EVENT,))
+            "select id from ameesh_events where type = %s", (responder.EVENT,))
+        self.assertEqual(rows, [])
+
+    def test_a_simulation_never_calls_even_with_the_flag_and_a_go(self):
+        env = dict(self.env(), AMEESH_INCIDENT_CALL="1",
+                   AMEESH_INCIDENT_CALL_GO="42",
+                   AMEESH_INCIDENT_VOICE_URL="https://voice.example/call",
+                   AMEESH_INCIDENT_VOICE_TOKEN="secret")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(responder, "request_call") as call, \
+                mock.patch.object(responder, "journal_route") as journal, \
+                contextlib.redirect_stdout(out):
+            code = responder.main(["acme", "--severity", "P1", "--canon",
+                                   self.root, "--now", "2026-11-19T18:00:00Z",
+                                   "--json"])
+        self.assertEqual(code, 0)
+        call.assert_not_called()
+        journal.assert_not_called()
+        self.assertIsNone(json.loads(out.getvalue())["journal"])
+
+    def test_the_journal_event_keeps_only_the_choice_reason_and_signal_kinds(self):
+        loaded = canon.load(self.root, untrusted=True)
+        application = loaded.application("acme")
+        now = _dt.datetime(2026, 11, 19, 18, 0, tzinfo=_dt.timezone.utc)
+        resolution = responder.resolve(loaded, application, "P1",
+                                       incident_routing.NoSignals(), now)
+        self.assertEqual(resolution.responder.title, "alice")
+        event_id = responder.journal_route(
+            self.db, resolution, responder.Wake(plan="none", status="not-needed"))
+        rows = self.db.query(
+            "select data from ameesh_events where id = %s", (event_id,))
         self.assertEqual(len(rows), 1)
         data = rows[0]["data"]
         if isinstance(data, str):
@@ -831,7 +970,7 @@ class CliResponderTest(PgTestCase):
         self.assertIsNone(document["responder"])
         self.assertEqual(document["reason"], "no-responder")
         self.assertEqual(document["wake"]["plan"], "no-responder")
-        self.assertEqual(document["wake"]["status"], "disabled")
+        self.assertEqual(document["wake"]["status"], "simulated")
 
     def test_an_unknown_application_is_refused_with_a_code(self):
         code, out, _err = self.run_cli(
@@ -912,6 +1051,11 @@ class ContractConsumerTest(unittest.TestCase):
             responder.Wake(plan="no-responder", status="disabled", reason="flag-off"),
             journal_id=2)
         jsonschema.validate(nobody, schema)
+        simulated = responder.document(
+            responder.Resolution(application=application, severity="P1",
+                                 reason="no-responder", consulted=("timezone",)),
+            responder.Wake(plan="no-responder", status="simulated"))
+        jsonschema.validate(simulated, schema)
         jsonschema.validate({"schema": responder.SCHEMA, "ok": False,
                              "error": {"code": "application-not-found",
                                        "message": "nope"}}, schema)

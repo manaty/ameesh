@@ -57,7 +57,7 @@
       "properties": {
         "plan": {"enum": ["none", "immediate", "no-responder"]},
         "status": {"enum": ["not-needed", "requested", "disabled", "refused",
-                            "unconfigured", "failed"]},
+                            "unconfigured", "failed", "simulated"]},
         "reason": {"type": "string"},
         "request_id": {"type": "string"}
       }

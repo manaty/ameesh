@@ -15,13 +15,20 @@ presence (`active` / `away`), then the timezone and usual hours fallback.  An
 absent or stale signal passes to the next one; a present `away` presence and
 the local-hours fallback can rule a human out.
 
+Only the human's **own activity** counts. A journal row proves it with the
+`user@host` proof (`payload.human_account`) or, failing that, a host declared
+in `Member.local_accounts`; a decision answer typed by the bureau under the
+§10 delegation carries its mention and is never counted, nor is an actor-only
+`action_events` row (it has no device). Fewer signals, never a false one.
+
 The phone wake is **off by default** and is a new expense: it requires
 `AMEESH_INCIDENT_CALL=1`, a configured voice endpoint, and a signed owner
 decision whose id is given by `AMEESH_INCIDENT_CALL_GO`.  The resolver only
 asks for a call with a short reason; the phone number stays in the voice
 service's secrets, never in the canon, the journal or this process.  A call is
 requested immediately for `security`, `data-loss` and `outage`, and for a P1
-when nobody is available; no other severity wakes anyone.
+when nobody is available; no other severity wakes anyone.  `--now` is a
+simulation: it never calls and writes no real event.
 
 Public contract: `docs/api/incident-responder-v1.md` (`ameesh-responder/1`).
 """
@@ -52,7 +59,7 @@ EVENT = "incident.routed"
 #: the wake reasons this resolver can produce, as codes (never free text that
 #: could carry a phone number)
 WAKE_STATUSES = ("not-needed", "requested", "disabled", "refused", "unconfigured",
-                 "failed")
+                 "failed", "simulated")
 #: the only reason text sent to the voice service
 REASON_MAX = 200
 
@@ -167,6 +174,19 @@ def _fresh(moment: _dt.datetime | None, now: _dt.datetime, window_s: int) -> boo
     return moment is not None and 0 <= (now - moment).total_seconds() <= window_s
 
 
+def delegated_answer(text: Any) -> bool:
+    """Is a signed decision answer the bureau's/relay's, not the owner's own?
+
+    `signer-owner.sh` (§10) refuses to sign without the exact mention it
+    writes — "<option> — saisi par le bureau, délégation §10" or "… réponse de
+    l'owner relayée par le bureau, source <session>" — and `match_option`
+    already reads those two forms. A delegated answer is never the human's own
+    activity, whatever host recorded it (#7866, B1 de l'auditeur)."""
+    value = str(text or "")
+    return bool(decisions_mod.AVATAR_SAISI_RE.search(value)
+                or decisions_mod.AVATAR_RELAY_RE.search(value))
+
+
 def _http(method: str, url: str, headers: Mapping[str, str] | None = None,
           data: bytes | None = None, timeout: float = 2.0) -> tuple[int, bytes]:
     request = urllib.request.Request(url, data=data, headers=dict(headers or {}),
@@ -195,8 +215,7 @@ class LiveSignals:
 
     # -- attach --------------------------------------------------------------
     def attach(self, member: Any) -> bool | None:
-        accounts = [str(a).strip() for a in (getattr(member, "local_accounts", None) or [])
-                    if str(a).strip()]
+        accounts = self._accounts(member)
         if self.db is None or not accounts:
             return None
         try:
@@ -213,42 +232,90 @@ class LiveSignals:
         return None
 
     # -- last interaction ----------------------------------------------------
+    @staticmethod
+    def _accounts(member: Any) -> list[str]:
+        """The member's declared `user@host` accounts (the device proof)."""
+        return [str(a).strip()
+                for a in (getattr(member, "local_accounts", None) or [])
+                if str(a).strip()]
+
+    @staticmethod
+    def _own_device(row: Mapping[str, Any], accounts: list[str]) -> bool:
+        """Did this journal row happen on one of the member's own devices?
+
+        The exact `user@host` proof (`payload.human_account`, written by the
+        CLI for an unbound human entry) wins over the coarser host column.
+        A bureau or an avatar answering/acting under `human:<id>` is bound to
+        its agent: it carries no proof and runs on its own host, so it is not
+        the human's own activity (#7866, B1 de l'auditeur). A row with neither
+        proof nor a declared host proves nothing and is ignored — a missing
+        signal passes to the next one, it is not an absence.
+        """
+        proof = str(row.get("proof") or "").strip()
+        if proof:
+            return proof in accounts
+        host = str(row.get("host") or "").strip()
+        if not host:
+            return False
+        return any(account.rsplit("@", 1)[1] == host
+                   for account in accounts if "@" in account)
+
     def journal_last(self, member: Any) -> _dt.datetime | None:
         if self.db is None:
             return None
         human = "human:%s" % getattr(member, "title", "")
+        accounts = self._accounts(member)
         try:
             rows = self.db.query(
-                "select max(ts) as ts from ("
-                " select extract(epoch from m.created_at) as ts"
-                "   from agent_mailbox m"
-                "  where m.sender = %s and m.created_at > now() - interval '1 day'"
+                "select 'sent' as source,"
+                "       extract(epoch from m.created_at) as ts,"
+                "       m.host as host,"
+                "       m.payload->>'human_account' as proof,"
+                "       null::text as answer_text"
+                "  from agent_mailbox m"
+                " where m.sender = %s and m.created_at > now() - interval '1 day'"
                 " union all"
-                " select extract(epoch from m.delivered_at) as ts"
+                " select 'read', extract(epoch from m.delivered_at), m.host,"
+                "        m.payload->>'human_account', null::text"
                 "   from agent_mailbox m"
                 "  where m.recipient = %s and m.delivered_at is not null"
                 "    and m.delivered_at > now() - interval '1 day'"
                 " union all"
-                " select (m.payload->'decision'->'answer'->>'ts')::float8 as ts"
+                " select 'answer',"
+                "        (m.payload->'decision'->'answer'->>'ts')::float8,"
+                "        m.payload->'decision'->'answer'->>'host',"
+                "        m.payload->'decision'->'answer'->>'human_account',"
+                "        m.payload->'decision'->'answer'->>'text'"
                 "   from agent_mailbox m"
                 "  where m.kind = 'request'"
                 "    and m.payload->'decision'->'answer'->>'by' = %s"
-                "    and m.created_at > now() - interval '1 day'"
-                " union all"
-                " select extract(epoch from e.created_at) as ts"
-                "   from action_events e"
-                "  where e.actor = %s and e.created_at > now() - interval '1 day'"
-                ") q", (human, human, human, human))
+                "    and m.created_at > now() - interval '1 day'",
+                (human, human, human))
         except Exception:
             return None
-        if not rows:
-            return None
-        value = rows[0].get("ts")
-        try:
-            return _dt.datetime.fromtimestamp(float(value), _dt.timezone.utc) \
-                if value is not None else None
-        except (TypeError, ValueError, OSError):
-            return None
+        # `action_events` is deliberately absent: it names an actor but no
+        # device, so a relay acting under `human:<id>` cannot be told apart
+        # (same finding). Fewer signals, never a false one.
+        newest: _dt.datetime | None = None
+        for row in rows:
+            source = str(row.get("source") or "")
+            if source not in ("sent", "read", "answer"):
+                continue
+            if source == "answer" and delegated_answer(row.get("answer_text")):
+                # A bureau/relay answer is never the human's own activity,
+                # whatever host recorded it. The signed text carries the
+                # mention that `match_option` already relies on.
+                continue
+            if source != "read" and not self._own_device(row, accounts):
+                continue
+            try:
+                moment = _dt.datetime.fromtimestamp(float(row.get("ts")),
+                                                    _dt.timezone.utc)
+            except (TypeError, ValueError, OSError):
+                continue
+            if newest is None or moment > newest:
+                newest = moment
+        return newest
 
     def memoria_last(self, member: Any) -> _dt.datetime | None:
         base = str(self.env.get("AMEESH_INCIDENT_MEMORIA_URL") or "").strip()
@@ -619,7 +686,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="P1..P4, security, data-loss or outage")
     parser.add_argument("--json", action="store_true", help="one JSON document")
     parser.add_argument("--now", default=None, metavar="ISO",
-                        help="simulation instant (default: now, UTC)")
+                        help="simulation instant (default: now, UTC); a "
+                             "simulation never calls and writes no event")
     parser.add_argument("--canon", default=None, help="canon directory or configured id")
     parser.add_argument("--ref", default=None, help="canon ref (default: configured ref)")
     return parser
@@ -698,8 +766,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         signals = LiveSignals(db=db)
         resolution = resolve(loaded, application, severity, signals, now)
-        wake = request_call(application, severity, resolution, db=db, env=os.environ)
-        journal_id = journal_route(db, resolution, wake)
+        if args.now is not None:
+            # #7866 (N1 auditeur) : une simulation ne demande AUCUN appel (une
+            # fois le drapeau et le go actifs, un P1 simulé réveillerait
+            # l'owner) et n'écrit aucun événement réel. Elle rend le routage
+            # seulement ; le statut dit qu'aucun appel n'a été demandé.
+            wake = Wake(plan=routing.wake_plan(severity, resolution.responder),
+                        status="simulated")
+            journal_id = None
+        else:
+            wake = request_call(application, severity, resolution, db=db, env=os.environ)
+            journal_id = journal_route(db, resolution, wake)
         out = document(resolution, wake, journal_id=journal_id)
     except Exception as exc:
         return _refuse(args, "resolver-error", "%s: %s" % (type(exc).__name__, exc))
