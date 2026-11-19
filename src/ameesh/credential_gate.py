@@ -739,14 +739,33 @@ class Broker:
         if rows:
             raise Refused("this request was already consumed")
 
+    def _database_now(self):
+        """The reading bound taken on the database clock (#7815).
+
+        The journal and mailbox `created_at` are written by the database; a
+        bound taken on the host clock can miss a STOP written during the
+        wait. Read `now()` in the same clock before the wait, close this
+        connection, and let the check reopen a fresh one, as in #7775.
+        """
+        db = self._database()
+        try:
+            return pre_act.database_now(db)
+        except pre_act.Refused as exc:
+            raise _Unavailable("the mesh database clock is unavailable") from exc
+        finally:
+            db.close()
+
     def _check(self, request, target, since):
         db = self._database()
         try:
             with db.transaction(isolation="READ COMMITTED") as tx:
                 self._refuse_duplicate(tx, request)
-                return pre_act.inspect(
-                    tx, request["lot"], self.policy.agent, since, request["kind"],
-                    target, request_id=request["request_id"], cfg=self.cfg)
+                try:
+                    return pre_act.inspect(
+                        tx, request["lot"], self.policy.agent, since, request["kind"],
+                        target, request_id=request["request_id"], cfg=self.cfg)
+                except pre_act.Refused as exc:
+                    raise Refused(str(exc)) from exc
         finally:
             db.close()
 
@@ -831,10 +850,14 @@ class Broker:
             self._authorize(uid, gid)
             request = _parse_request(value)
             rule, argv, target, inject = self._validate(request)
-            since = self._clock()
             wait_until = request["wait_until_epoch"]
+            # The bound is read before the wait and in the clock of the
+            # `created_at` it is compared to; the wait itself stays on the
+            # host clock, as the caller's absolute deadline was formed there
+            # (#7815).
+            since = self._database_now()
             if wait_until is not None:
-                delay = wait_until - since
+                delay = wait_until - self._clock()
                 if delay > self.policy.max_wait_seconds:
                     raise Refused("the scheduled wait is longer than the gate admits")
                 if delay > 0:

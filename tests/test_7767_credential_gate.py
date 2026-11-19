@@ -58,18 +58,22 @@ def _request(**over):
 
 
 class Transaction:
-    """The two queries pre_act.inspect needs, plus the evidence inserts."""
+    """The queries pre_act.inspect needs, plus the evidence inserts."""
 
-    def __init__(self, state="build", duplicate=False, events=(), messages=()):
+    def __init__(self, state="build", duplicate=False, events=(), messages=(),
+                 now=100.0):
         self.state = state
         self.duplicate = duplicate
         self.events = events
         self.messages = messages
+        self.now = now
         self.writes = []
 
-    def query(self, sql, params):
+    def query(self, sql, params=None):
         if "FROM work_items" in sql:
-            return [{"state": self.state, "now_ts": 200}]
+            return [{"state": self.state, "now_ts": self.now}]
+        if "extract(epoch from now())" in sql:
+            return [{"now_ts": self.now}]
         if "FROM work_item_events" in sql:
             if "evidence->>'type'" in sql:
                 return [{"id": 1}] if self.duplicate else []
@@ -86,6 +90,9 @@ class Database:
     def __init__(self, tx):
         self.tx = tx
         self.closed = 0
+
+    def query(self, sql, *args, **kwargs):
+        return self.tx.query(sql, *args, **kwargs)
 
     def transaction(self, **_kwargs):
         return nullcontext(self.tx)
@@ -423,6 +430,31 @@ class BrokerTest(unittest.TestCase):
         self.assertIn("since=100.0", tx.writes[0][1][2])
         self.assertEqual(receipt["request_id"], request["request_id"])
 
+    def test_wait_until_bound_uses_the_database_clock(self):
+        # The host clock is 40 s ahead of the database. A bound taken on the
+        # host (140) would miss the STOP at 110, written in the first 40 s
+        # of a 60 s wait; the database bound (100) catches it (#7815).
+        policy = _policy(self.directory)
+        tx = Transaction(now=100.0, events=[
+            {"id": 7, "work_item_id": 5772, "state": "build", "actor": "owner",
+             "note": "STOP", "created_ts": 110.0}])
+        sleeps = []
+
+        def sleep(delay):
+            # The clock connection is closed before the wait; the check
+            # reopens its own.
+            self.assertEqual(broker.test_database.closed, 1)
+            sleeps.append(delay)
+            tx.now += delay
+
+        broker = _broker(policy, tx, clock=lambda: 140.0, sleep=sleep)
+        request = _request(wait_until="1970-01-01T00:03:20Z")
+        result = broker.handle(request, os.geteuid(), os.getegid())
+        self.assertFalse(result["ok"], result)
+        self.assertIn("STOP", result["error"])
+        self.assertEqual(sleeps, [60.0])
+        self.assertEqual(tx.writes, [])
+
     def test_too_long_wait_is_refused(self):
         policy = _policy(self.directory, max_wait_seconds=10)
         tx = Transaction()
@@ -432,6 +464,17 @@ class BrokerTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("longer", result["error"])
         self.assertEqual(tx.writes, [])
+
+    def test_unreadable_database_clock_is_refused(self):
+        policy = _policy(self.directory)
+        for now in (float("nan"), "not-a-date", None):
+            with self.subTest(now=now):
+                tx = Transaction(now=now)
+                broker = _broker(policy, tx)
+                result = broker.handle(_request(), os.geteuid(), os.getegid())
+                self.assertFalse(result["ok"])
+                self.assertIn("clock", result["error"])
+                self.assertEqual(tx.writes, [])
 
     def test_stale_check_does_not_start_the_act(self):
         policy = _policy(self.directory)
