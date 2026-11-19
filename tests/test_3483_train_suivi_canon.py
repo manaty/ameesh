@@ -74,8 +74,34 @@ merge:
 projects: {}
 """
 
+#: The canon's own pilot: the orchestrator of the project the canon is applied
+#: for (``cfg.project``), distinct from the train project's orchestrator below.
+CANON_PILOT = """---
+type: Agent
+title: canon-pilot
+team: ameesh
+roles: [orchestrateur]
+harness: claude
+---
+"""
+
+TRAIN_PILOT = """---
+type: Agent
+title: train-pilot
+team: nexlink
+roles: [orchestrateur]
+harness: claude
+---
+"""
+
 FEDERATION = """federation: "0.1"
 id: fixture
+root: home
+members:
+  - id: home
+    ref: main
+    bundle: .
+    entrypoint: index.md
 review_policies:
   risk_classes:
     default: normal
@@ -115,6 +141,7 @@ class _Repo:
         self.env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
         self.git("init", "-q")
+        self.write("index.md", "# test canon\n")
         self.write("processus/mecanique.yaml", mechanics)
         self.write("federation.yaml", federation)
         self.commit("initial")
@@ -187,7 +214,9 @@ class _Fixture:
     def __init__(self, tmp):
         self.tmp = tmp
         self.canon = _Repo(os.path.join(tmp, "canon"))
-        self.pin = self.canon.git("rev-parse", "HEAD")
+        self.canon.write("agents/canon-pilot.md", CANON_PILOT)
+        self.canon.write("agents/train-pilot.md", TRAIN_PILOT)
+        self.pin = self.canon.commit("agents")
         self.project = {
             "repo": os.path.join(tmp, "project"),
             "target": "main",
@@ -210,6 +239,8 @@ class _Fixture:
         self.write_config()
         self.cfg = types.SimpleNamespace(
             host="host-a", config_base=self.base, config_path=self.profile,
+            project="ameesh", canon=self.canon.root, canon_ref="HEAD",
+            canon_untrusted=False,
             train={"schema": "ameesh-train-host/1", "host": "host-a",
                    "mode": "shadow", "projects": self.projects})
 
@@ -349,7 +380,13 @@ class CarrierLotTest(PgTestCase):
         self.addCleanup(self.tmpdir.cleanup)
         self.fixture = _Fixture(self.tmpdir.name)
         self.cfg = self.fixture.cfg
-        registry.upsert(self.db, "pilot", harness="claude", host=self.cfg.host)
+        # The canon's pilot (project ameesh) and the train project's (nexlink)
+        # are both real registered orchestrators declared in the canon; the
+        # carrier must go to the first, the drift alert to the second.
+        registry.upsert(self.db, "canon-pilot", chantier="ameesh",
+                        harness="claude", host=self.cfg.host)
+        registry.upsert(self.db, "train-pilot", chantier="nexlink",
+                        harness="claude", host=self.cfg.host)
 
     def gate(self, federation, message="gate"):
         self.fixture.canon.write("federation.yaml", federation)
@@ -357,9 +394,7 @@ class CarrierLotTest(PgTestCase):
 
     def automatic(self, gate):
         with mock.patch.object(config, "_config_dir_default",
-                               return_value=self.fixture.profile_dir), \
-             mock.patch.object(train_canon, "pilot_of",
-                               return_value=lambda db: "pilot"):
+                               return_value=self.fixture.profile_dir):
             return train_requalify.automatic(
                 self.cfg, self.db, "nexlink",
                 gate_reader=lambda *args: (gate, ""))
@@ -377,7 +412,7 @@ class CarrierLotTest(PgTestCase):
         self.assertEqual(len(rows), 1, rows)
         lot = rows[0]
         self.assertEqual(lot["state"], "intake")
-        self.assertEqual(lot["assignee"], "pilot")
+        self.assertEqual(lot["assignee"], "canon-pilot")
         self.assertIn("requalification relue du pin canon", lot["title"])
         self.assertIn(self.fixture.pin[:12], lot["title"])
         self.assertIn(gate[:12], lot["title"])
@@ -393,6 +428,28 @@ class CarrierLotTest(PgTestCase):
             changed=("federation.yaml",), guard=("federation.yaml",),
             gap="nexlink : rules"), lot["id"])
         self.assertEqual(len(self.carriers()), 1)
+
+    def test_carrier_goes_to_the_canon_pilot_not_the_train_project_pilot(self):
+        """The two orchestrators are distinct and both readable from the canon.
+
+        ``pilot_of`` keeps naming the train project's orchestrator (the drift
+        alert's recipient); the carrier is opened for the canon's project
+        pilot. A named-in-code or train-project pilot would assign the wrong
+        agent here.
+        """
+        gate = self.gate(_with_nexlink_review_count(FEDERATION, 2))
+        self.assertEqual(
+            train_canon.pilot_of(self.cfg, "nexlink")(self.db), "train-pilot")
+        self.assertEqual(
+            train_canon.pilot_of(self.cfg, "ameesh")(self.db), "canon-pilot")
+        with self.assertRaises(train_requalify.RequalifyReviewRequired):
+            self.automatic(gate)
+        rows = self.carriers()
+        self.assertEqual(len(rows), 1, rows)
+        lot = rows[0]
+        self.assertEqual(lot["assignee"], "canon-pilot")
+        self.assertNotEqual(lot["assignee"], "train-pilot")
+        self.assertIn("Pilote du canon : canon-pilot", lot["body"])
 
     def test_a_new_gate_updates_the_open_lot_without_a_pile(self):
         first = self.gate(_with_nexlink_review_count(FEDERATION, 2), "first")
@@ -429,15 +486,18 @@ class CarrierLotTest(PgTestCase):
         sent = []
         watch = train_canon.Watch(
             "nexlink", self.fixture.pin,
-            lambda db: (gate, ""), pilot=lambda db: "pilot",
+            lambda db: (gate, ""), pilot=train_canon.pilot_of(self.cfg, "nexlink"),
             mailer=lambda db, recipient, body, reading: sent.append((recipient, body)),
             carrier=lambda db, reading:
                 train_requalify.ensure_requalification_lot_for_reading(
                     self.cfg, db, "nexlink", reading))
         reading = watch.read(self.db)
-        self.assertEqual(watch.alert(self.db, reading, "active"), "pilot")
+        # The alert keeps the train project's pilot; the carrier lot belongs to
+        # the canon project's pilot.
+        self.assertEqual(watch.alert(self.db, reading, "active"), "train-pilot")
         rows = self.carriers()
         self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["assignee"], "canon-pilot")
         self.assertIn("Porteur : lot #%d" % int(rows[0]["id"]), sent[0][1])
 
 

@@ -304,10 +304,12 @@ def ensure_requalification_lot(cfg, db, project, *, pin, gate, canon="",
 
     Idempotent by ``unique_ref`` project+pin+gate. A newer gate on the same pin
     updates the open lot (source project+pin) instead of stacking another one.
-    The lot is assigned to the canon's declared pilot role when that agent is
+    The lot is assigned to the canon's declared pilot role (the orchestrator of
+    the canon's project, ``train_canon.canon_pilot_of``) when that agent is
     wakeable; otherwise it stays in the team queue and the body names the role,
-    never dropped. Returns the lot id, or None when there is nothing to carry
-    (same commit, no guard file, or compiled rules unchanged).
+    never dropped. The train project's own orchestrator is a different role
+    (the drift alert's recipient). Returns the lot id, or None when there is
+    nothing to carry (same commit, no guard file, or compiled rules unchanged).
     """
     pin = str(pin or "").strip().lower()
     gate = str(gate or "").strip().lower()
@@ -335,7 +337,7 @@ def ensure_requalification_lot(cfg, db, project, *, pin, gate, canon="",
     if not gap:
         return None
     try:
-        pilot = train_canon.pilot_of(cfg, project)(db)
+        pilot = train_canon.canon_pilot_of(cfg)(db)
     except Exception:  # noqa: BLE001 - no readable role: unassigned carrier
         pilot = ""
     source = _carrier_source(project, pin)

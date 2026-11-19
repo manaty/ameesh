@@ -313,3 +313,20 @@ def pilot_of(cfg, project):
         return review_designation_activation._notify(cfg, db, project,
                                                      registry.overview(db))
     return read
+
+
+def canon_pilot_of(cfg):
+    """A reader of the canon's pilot: the orchestrator of the canon's project.
+
+    The canon belongs to the project the host applies it for (``cfg.project``).
+    The train may serve another project: ``pilot_of(cfg, project)`` names that
+    project's orchestrator, the one the drift alert mails, while the
+    requalification carrier opened for a canon move belongs to the canon
+    project's pilot. The role is the canon's declared ``orchestrateur``, never
+    a name in code; without a configured project the reader returns ``""`` and
+    the carrier stays in the team queue.
+    """
+    project = str(getattr(cfg, "project", "") or "").strip()
+    if not project:
+        return lambda db: ""
+    return pilot_of(cfg, project)

@@ -262,10 +262,12 @@ commentaire, ne bloque donc plus le train. Si une règle compilée d'un projet d
 train change, le refus reste : aucune écriture, et le train ouvre (ou met à
 jour) un seul lot porteur par projet et pin, `Train <p> : requalification relue
 du pin canon X → Y`, avec le diff et la commande de dry-run. Le lot est assigné
-au rôle de pilote lu dans le canon, jamais à un nom en dur ; une nouvelle
-avance de la porte met à jour ce lot ouvert au lieu d'en empiler un autre, et
-une lecture plus ancienne ne le rétrograde pas. L'alerte de dérive cite ce lot.
-Une porte illisible ne fournit aucun repli.
+au pilote du projet du canon — le projet de l'hôte (`cfg.project`), dont le
+rôle `orchestrateur` est lu dans le canon, jamais un nom en dur — et non au
+pilote du projet du train, qui reste le destinataire de l'alerte de dérive ;
+une nouvelle avance de la porte met à jour ce lot ouvert au lieu d'en empiler
+un autre, et une lecture plus ancienne ne le rétrograde pas. L'alerte de dérive
+cite ce lot. Une porte illisible ne fournit aucun repli.
 
 L'écriture couvre `config.json` et tous les profils hérités qui déclarent une
 épingle ; les autres héritent. Le verrou `.train-canon.lock` dans le dossier
