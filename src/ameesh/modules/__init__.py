@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from importlib import metadata
@@ -258,7 +259,9 @@ class Resolution:
     ``rows`` is one mapping per active ``(project, module)`` pair — the same
     rows ``project_modules`` stores — carrying the winning ``scope`` (and the
     ``team`` name for a team scope). ``warnings`` lists refused entry points
-    that no scope activates: the canon stays usable and only says so."""
+    that no scope activates, and (#7860) the modules a team or a project
+    selects that this host does not have (`project-module-missing`, their
+    rows left out): the canon stays usable and only says so."""
 
     rows: tuple
     warnings: tuple
@@ -396,9 +399,12 @@ def resolve(federation, canon=None, *, discovery=None):
         if name in refused_by_name:
             raise ValueError("installed module %r is activated but refused: %s"
                              % (name, refused_by_name[name]["error"]))
-        if name not in by_name:
+        # #7860: the whole canon needs a federation module, so its absence
+        # still refuses the canon; a team or project one is a warning below.
+        if name not in by_name and name in federation_modules:
             raise ValueError("unknown installed module: %s (neither installed nor a "
                              "valid Pipeline card)" % name)
+    missing = set(requested) - set(by_name)
     warnings = []
     for name, row in sorted(refused_by_name.items()):
         # L103 T2: an invalid Pipeline card is already a `pipeline-*` finding.
@@ -418,6 +424,15 @@ def resolve(federation, canon=None, *, discovery=None):
                        "the card is not a module" % (row.get("card_ref"), row["name"])})
     team_projects = _team_projects(canon) if canon is not None else {}
     universe = _project_universe(canon, projects, teams, team_projects)
+    # #7860: a module a team or a project selects and this host lacks closes
+    # only the agents of those projects (`agent_needs`), never the canon.
+    for team in sorted(teams):
+        for name in sorted(missing.intersection(teams[team])):
+            warnings.append(_missing_warning(
+                name, "team", team, sorted(team_projects.get(team, ()))))
+    for project in sorted(projects):
+        for name in sorted(missing.intersection(projects[project])):
+            warnings.append(_missing_warning(name, "project", project, [project]))
     result = []
     for project in sorted(universe):
         selected = {}
@@ -437,6 +452,8 @@ def resolve(federation, canon=None, *, discovery=None):
             raise ValueError("invalid module project: %r" % (project,))
         seen_types = set()
         for name, (scope, team, options) in selected.items():
+            if name in missing:
+                continue
             module = implementations[name]
             from ..module_actions import compile_policy
             module_options = dict(options)
@@ -460,6 +477,96 @@ def resolve(federation, canon=None, *, discovery=None):
     return Resolution(tuple(result), tuple(warnings))
 
 
+#: #7860: code of the warning a module declared but absent from the host gets.
+MISSING = "project-module-missing"
+
+#: #7860: stable head of the placement diagnostic of an agent refused for it.
+MISSING_PREFIX = "module missing on this host"
+
+
+def install_hint(name):
+    """The installation gesture of a missing module (its distribution is not
+    known until it is installed: the entry point names it)."""
+    return ("install the distribution exposing the %r entry point %r in this "
+            "environment (%s -m pip install <distribution>), then `ameesh canon sync`"
+            % (ENTRY_POINT_GROUP, name, sys.executable))
+
+
+def _missing_warning(name, scope, target, affected):
+    label = "%s %s" % (scope, target)
+    return {
+        "code": MISSING, "name": name, "scope": scope, scope: target,
+        "projects": list(affected), "distribution": None, "version": None,
+        "error": "not installed",
+        "install": install_hint(name),
+        "message": "module %s selected by %s is not installed on this host: agents of "
+                   "%s are refused here, the others run — %s"
+                   % (name, label, ", ".join(affected) or "no project",
+                      install_hint(name))}
+
+
+def agent_needs(warnings, projects):
+    """`[(module, project)]`: the missing modules an agent of `projects` needs."""
+    mine = set(projects or ())
+    out = set()
+    for warning in warnings:
+        if warning.get("code") != MISSING:
+            continue
+        for project in mine.intersection(warning.get("projects") or ()):
+            out.add((warning["name"], project))
+    return sorted(out)
+
+
+def missing_text(needed):
+    """Stable placement diagnostic of an agent refused for missing modules."""
+    return "%s: %s" % (MISSING_PREFIX, ", ".join(
+        "%s (project %s)" % pair for pair in needed))
+
+
+def refuse_missing(verdict, agent, absent):
+    """#7860: refuse `agent`'s placement verdict on this host when one of its
+    projects selects a module of `absent` (`missing()`); the stable reason
+    heads the diagnostic, the canon stays valid and the other agents run."""
+    needed = agent_needs(absent, agent.effective_projects)
+    if needed:
+        verdict.ok = False
+        verdict.diagnostic = missing_text(needed) + (
+            "; " + verdict.diagnostic if verdict.diagnostic else "")
+
+
+#: #7860: head of the verdict of an avatar child placed on another host while
+#: a module of its projects depends on what that host installed.
+UNCONFIRMED_PREFIX = "module availability to be confirmed by its host"
+
+
+def host_dependent(canon, projects):
+    """Modules selected for `projects` whose presence depends on the host: an
+    installed entry point, or a module missing here. Built-in modules ship
+    with ameesh and Pipeline cards with the canon: they are the same on every
+    host. Only the host itself can confirm the others (its `canon sync`)."""
+    try:
+        resolution = resolve(canon.federation, canon)
+    except ValueError:
+        return []
+    mine = set(projects or ())
+    shipped = set(_builtin())
+    names = {row["module"] for row in resolution.rows
+             if row["project"] in mine and row["module"] not in shipped
+             and canon.pipeline(row["module"]) is None}
+    names.update(name for name, _project in agent_needs(resolution.warnings, mine))
+    return sorted(names)
+
+
+def missing(canon):
+    """The `project-module-missing` warnings of `canon` on this host; none when
+    the declaration is invalid (`canon check` already refuses it)."""
+    try:
+        resolution = resolve(canon.federation, canon)
+    except ValueError:
+        return []
+    return [warning for warning in resolution.warnings if warning["code"] == MISSING]
+
+
 def declarations(federation, canon=None, *, discovery=None):
     """Validate and compile module activation without side effects."""
     return list(resolve(federation, canon, discovery=discovery).rows)
@@ -468,7 +575,12 @@ def declarations(federation, canon=None, *, discovery=None):
 def sync(db, canon):
     """Called only inside successful, trusted canon application."""
     from .storage import ModuleStore
-    ModuleStore(db).replace(canon.state_key, declarations(canon.federation, canon))
+    resolution = resolve(canon.federation, canon)
+    # #7860: a host without a module never removes the rows another host
+    # applied for it; a removed declaration is no longer missing, so it goes.
+    keep = {(project, warning["name"]) for warning in resolution.warnings
+            if warning["code"] == MISSING for project in warning["projects"]}
+    ModuleStore(db).replace(canon.state_key, list(resolution.rows), keep=keep)
 
 
 def active(db=None, canons=()):
@@ -560,6 +672,7 @@ def doctor_lines(db, canons=()):
                      % (PROFILE_ENV, current))
     resolved = {}
     seen_refused = set()
+    absent = set()
     for canon in canons:
         label = canon.id or "default"
         # L103 T2: a stored Pipeline module is known through its canon's card.
@@ -578,6 +691,18 @@ def doctor_lines(db, canons=()):
             if warning["code"] == "pipeline-module-duplicate":
                 warnings += 1
                 lines.append("warning    : canon %s: %s" % (label, warning["message"]))
+                continue
+            if warning["code"] == MISSING:
+                # #7860: only the agents of these projects are refused here.
+                warnings += 1
+                absent.update((canon.state_key, project, warning["name"])
+                              for project in warning["projects"])
+                lines.append("warning    : canon %s: module %s (%s %s) is not installed "
+                             "on this host — agents of %s refused here; %s"
+                             % (label, warning["name"], warning["scope"],
+                                warning[warning["scope"]],
+                                ", ".join(warning["projects"]) or "no project",
+                                warning["install"]))
                 continue
             if warning["name"] in seen_refused:
                 continue
@@ -604,6 +729,8 @@ def doctor_lines(db, canons=()):
     for row in stored:
         key = (row.get("canon") or "", row["project"], row["module"])
         stored_keys.add(key)
+        if key in absent:
+            continue  # #7860: reported above, the row is kept for other hosts
         if row["module"] not in by_name:
             ok = False
             if row["module"] in refused_by_name:

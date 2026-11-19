@@ -137,9 +137,13 @@ class ModuleConfigurationTest(unittest.TestCase):
             modules.declarations(federation(names=["it", "dev"]))
 
     def test_unknown_duplicate_and_malformed_modules_refused(self):
-        for names in (["not.installed"], ["it", "it"], "it", [3]):
+        for names in (["it", "it"], "it", [3]):
             with self.subTest(names=names), self.assertRaises(ValueError):
                 modules.declarations(federation(names=names))
+        # #7860: a name this host does not have is a warning, not a refusal
+        [warning] = modules.resolve(federation(names=["not.installed"])).warnings
+        self.assertEqual((warning["code"], warning["name"]),
+                         ("project-module-missing", "not.installed"))
         for raw in ({"extensions": []}, {"extensions": {"ameesh": []}},
                     {"extensions": {"ameesh": {"projects": []}}}):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
@@ -274,8 +278,13 @@ class ModuleConfigurationTest(unittest.TestCase):
                             for row in rows))
 
     def test_canon_check_reports_module_errors(self):
-        c = canon.Canon(root=".", readable=True, federation=federation(names=["missing"]))
+        c = canon.Canon(root=".", readable=True, federation=federation(names=["it", "it"]))
         self.assertTrue(any(f.code == "project-modules-invalid" for f in canon.validate(c)))
+        # #7860: a module missing on this host only warns
+        c = canon.Canon(root=".", readable=True, federation=federation(names=["missing"]))
+        self.assertEqual({(f.code, f.severity) for f in canon.validate(c)
+                          if "module" in f.code},
+                         {("project-module-missing", canon.WARNING)})
 
     def test_refused_canon_does_not_apply_module_policies(self):
         c = canon.Canon(root=".", readable=True, federation=federation())

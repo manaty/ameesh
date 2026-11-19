@@ -77,7 +77,7 @@ REFUSAL_SCHEMAS = ("ameesh-refusal/1",)
 REFUSAL_KEYS = ("schema", "exit_code")
 #: #7034 : contrat d'application des outils/MCP restreints d'un enfant
 SPAWN_CONTRACTS = ("ameesh-spawn-tools/1",)
-SPAWN_KEYS = ("contract", "tools", "mcp", "deny")
+SPAWN_KEYS = ("contract", "tools", "mcp", "deny", "connectors")
 #: known keys of `ameesh.interactive_permission` (L223: permission mode of an
 #: interactive session, `ameesh attach` and `ameesh chat`); `modes` maps a mode
 #: to fixed arguments for a harness whose flag carries no `{mode}` (L685: codex
@@ -997,6 +997,44 @@ def _check_spawn(value: Any, path: str) -> list[Finding]:
                     findings.append(Finding("harness-spawn-invalid", ERROR,
                                             "`ameesh.spawn.mcp.source`: a project-relative "
                                             "file expected", path))
+    findings.extend(_check_spawn_connectors(value.get("connectors"), path))
+    return findings
+
+
+def _check_spawn_connectors(block: Any, path: str) -> list[Finding]:
+    """`ameesh.spawn.connectors` (#6085): account connectors of an avatar.
+
+    `flag` carries a `{path}` placeholder (the private settings file),
+    `replaces` lists the arguments it substitutes (Claude: the strict MCP
+    flag, which drops claude.ai connectors), `servers` maps each connector
+    name to the HTTPS URL pattern its server is admitted by.
+    """
+    if block is None:
+        return []
+    if not isinstance(block, dict):
+        return [Finding("harness-spawn-invalid", ERROR,
+                        "`ameesh.spawn.connectors`: object expected", path)]
+    findings = []
+    for inner in block:
+        if inner not in ("flag", "replaces", "servers"):
+            findings.append(Finding("harness-key-unknown", WARNING,
+                                    "`ameesh.spawn.connectors.%s`: unknown key (ignored)"
+                                    % inner, path))
+    flag = _strings(block.get("flag"))
+    if not flag or "{path}" not in "\n".join(flag):
+        findings.append(Finding("harness-spawn-invalid", ERROR,
+                                "`ameesh.spawn.connectors.flag`: list of strings with a "
+                                "`{path}` placeholder expected", path))
+    if block.get("replaces") is not None and _strings(block.get("replaces")) is None:
+        findings.append(Finding("harness-spawn-invalid", ERROR,
+                                "`ameesh.spawn.connectors.replaces`: list of strings expected",
+                                path))
+    servers = block.get("servers")
+    if not isinstance(servers, dict) or any(
+            not isinstance(url, str) or not url.startswith("https://") for url in servers.values()):
+        findings.append(Finding("harness-spawn-invalid", ERROR,
+                                "`ameesh.spawn.connectors.servers`: object of HTTPS URL "
+                                "patterns expected", path))
     return findings
 
 

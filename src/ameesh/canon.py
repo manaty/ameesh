@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import harnesses
+from . import incident_routing
 from . import review as review_mod
 from . import reveil as reveil_mod
 from .config import NAME_RE, SESSION_POLICIES
@@ -73,8 +74,14 @@ except Exception:  # pragma: no cover - dépend de l'environnement
 #: readable during the transition. `Process` (#538) carries the working rules
 #: (`processus/*.md`), read to open every agent's brief. `Pipeline` (L103,
 #: #4395) declares a pipeline (`pipelines/*.md`), a module without code.
+#: `Application` (#7866) declares an application's incident responders
+#: (`applications/*.md`), read by `ameesh responder`.
 PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage",
-                 "Process", "Pipeline")
+                 "Process", "Pipeline", "Application")
+#: #7866 : une fiche Application (`applications/*.md`) porte le bloc
+#: `incident:` (répondants ordonnés, sévérités, escalade).
+APPLICATION_TYPE = "Application"
+APPLICATION_DIR = "applications"
 #: #538 : une fiche Process (`processus/*.md`) porte les règles de travail.
 PROCESS_TYPE = "Process"
 #: L103 (#4395) : une carte Pipeline (`pipelines/*.md`) porte un bloc
@@ -866,6 +873,7 @@ class Finding:
     package: str = ""       # fiche WorkPackage concernée (ne bloque aucun agent)
     process: str = ""       # fiche Process concernée (ne bloque aucun agent)
     pipeline: str = ""      # carte Pipeline concernée (ne bloque aucun agent)
+    application: str = ""   # #7866 : fiche Application concernée (ne bloque aucun agent)
 
     def to_dict(self) -> dict:
         out = {"code": self.code, "severity": self.severity, "member": self.member,
@@ -882,6 +890,8 @@ class Finding:
             out["process"] = self.process
         if self.pipeline:
             out["pipeline"] = self.pipeline
+        if self.application:
+            out["application"] = self.application
         if self.untrusted:
             out["untrusted"] = True
         return out
@@ -946,6 +956,11 @@ class Member:
     #: The declaration bounds the claim to this machine and this Unix user
     #: (decision 0033 §9; OIDC is the v2 path, absent in v1).
     local_accounts: list[str] | None = None
+    #: #7866 : IANA time zone (`Europe/Paris`) and the explicit opt-in to
+    #: incident routing.  No time zone = never reachable by the timezone
+    #: fallback; missing `incident_eligible` = never a responder.
+    timezone: str | None = None
+    incident_eligible: bool = False
 
 
 @dataclass
@@ -1510,6 +1525,38 @@ class Pipeline:
 
 
 @dataclass
+class Application:
+    """#7866 : une fiche `Application` (`applications/*.md`).
+
+    Elle déclare le bloc `incident:` — les répondants humains, dans l'ordre,
+    les sévérités couvertes et l'escalade de réveil (un humain, jamais un
+    numéro : le numéro reste dans les secrets du service vocal).  Une fiche
+    sans bloc reste valide (`incident` vaut None) ; un bloc mal formé rend la
+    fiche invalide, avec un nom de défaut dans `canon check`, sans bloquer les
+    agents (comme une carte Pipeline)."""
+
+    fiche: Fiche
+    id: str = ""
+    responsible: str | None = None
+    incident: incident_routing.IncidentPolicy | None = None
+    valid: bool = True
+
+    @property
+    def title(self) -> str:
+        return self.fiche.title
+
+    def to_dict(self) -> dict:
+        out = {"title": self.title, "id": self.id, "member": self.fiche.member,
+               "path": self.fiche.path, "ref": self.fiche.ref,
+               "responsible": self.responsible, "valid": self.valid}
+        if self.incident is not None:
+            out["incident"] = self.incident.to_dict()
+        if self.fiche.untrusted:
+            out["untrusted"] = True
+        return out
+
+
+@dataclass
 class Canon:
     root: str
     sources: list[Source] = field(default_factory=list)
@@ -1525,6 +1572,9 @@ class Canon:
     #: L103 (#4395) : cartes Pipeline (modules déclaratifs), validées par
     #: `canon check`
     pipelines: list[Pipeline] = field(default_factory=list)
+    #: #7866 : fiches Application (routage d'incident), validées par
+    #: `canon check` et lues par `ameesh responder`
+    applications: list[Application] = field(default_factory=list)
     federation: dict | None = None
     #: constats de lecture (source, fédération, frontmatter, champs)
     load_findings: list[Finding] = field(default_factory=list)
@@ -1669,6 +1719,26 @@ class Canon:
                 return pipeline
         return None
 
+    def application(self, name: str) -> Application | None:
+        """#7866 : la fiche Application dont l'`id` ou le `title` est `name`.
+
+        Exact d'abord (identifiant, puis titre), insensible à la casse
+        ensuite ; un nom ambigu rend None (fail closed : le résolveur ne
+        choisit pas une application au hasard)."""
+        value = str(name or "").strip()
+        if not value:
+            return None
+        for key in ("id", "title"):
+            exact = [a for a in self.applications if getattr(a, key) == value]
+            if len(exact) == 1:
+                return exact[0]
+            if len(exact) > 1:
+                return None
+        folded = value.casefold()
+        matches = [a for a in self.applications
+                   if a.id.casefold() == folded or a.title.casefold() == folded]
+        return matches[0] if len(matches) == 1 else None
+
     def placements_of(self, agent: str) -> list[Placement]:
         from .agent_names import resolve
         try:
@@ -1716,7 +1786,10 @@ class Canon:
             "sources": [s.to_dict() for s in self.sources],
             "members": [dict(title=m.title, roles=m.roles, deputies=m.deputies,
                              superiors=m.superiors,
-                             local_accounts=m.local_accounts, **fiche(m.fiche))
+                             local_accounts=m.local_accounts,
+                             timezone=m.timezone,
+                             incident_eligible=m.incident_eligible,
+                             **fiche(m.fiche))
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
                            admins=h.admins, occupants=h.occupants,
@@ -1747,6 +1820,7 @@ class Canon:
                          for w in self.packages],
             "processes": [p.to_dict() for p in self.processes],
             "pipelines": [p.to_dict() for p in self.pipelines],
+            "applications": [a.to_dict() for a in self.applications],
             "federation": {"id": (self.federation or {}).get("id"),
                            "roles": self.roles, "review_policies": self.review_policies,
                            "naming": self.naming.to_dict() if self.naming else None},
@@ -4264,6 +4338,9 @@ class _Loader:
             if typed and typed.group(1) == PIPELINE_TYPE:
                 # L103 (#4395) : une carte Pipeline illisible ne bloque aucun agent
                 subject = {"pipeline": path}
+            elif typed and typed.group(1) == APPLICATION_TYPE:
+                # #7866 : une carte Application illisible ne bloque aucun agent
+                subject = {"application": path}
             self.add("frontmatter-invalid", ERROR if typed else WARNING,
                      "unreadable frontmatter: %s%s" % (
                          exc, "" if typed else " (unknown type: card ignored)"),
@@ -4289,6 +4366,10 @@ class _Loader:
                 subject = {"process": path}
             elif kind == PIPELINE_TYPE:
                 subject = {"pipeline": path}
+            elif kind == APPLICATION_TYPE:
+                # #7866 : a broken application card blocks no agent; the
+                # resolver refuses the card itself.
+                subject = {"application": path}
             self.add("fiche-title-missing", ERROR, "%s card without `title`" % kind, **where,
                      **subject)
             return
@@ -4315,6 +4396,33 @@ class _Loader:
     def _build_member(self, fiche: Fiche, where: dict) -> None:
         roles = self._list(fiche, "roles", where, "member-invalid")
         authenticators = fiche.data.get("authenticators")
+        # #7866 : le fuseau est un nom IANA (jamais un décalage deviné) ; une
+        # valeur illisible est une erreur nommée et vaut None — un membre sans
+        # fuseau n'est jamais réputé joignable par le repli horaire.
+        timezone = _text(fiche.data.get("timezone"))
+        if timezone is not None:
+            timezone = timezone.strip()
+        if timezone:
+            try:
+                from zoneinfo import ZoneInfo
+                ZoneInfo(timezone)
+            except Exception:
+                self.add("member-timezone-invalid", ERROR,
+                         "`timezone`: IANA time zone expected (e.g. `Europe/Paris`), "
+                         "not %r" % (fiche.data.get("timezone"),), **where)
+                timezone = None
+        else:
+            timezone = None
+        eligible = fiche.data.get("incident_eligible")
+        if eligible is None:
+            incident_eligible = False
+        elif isinstance(eligible, bool):
+            incident_eligible = eligible
+        else:
+            self.add("member-incident-eligible-invalid", ERROR,
+                     "`incident_eligible`: boolean expected, not %r (absent = not "
+                     "eligible)" % (eligible,), **where)
+            incident_eligible = False
         self.canon.members.append(Member(
             title=fiche.title, roles=roles,
             authenticators=authenticators if isinstance(authenticators, list) else None,
@@ -4322,7 +4430,9 @@ class _Loader:
             deputies=self._list(fiche, "deputies", where, "member-deputies-invalid"),
             superiors=self._list(fiche, "superiors", where, "member-superiors-invalid"),
             local_accounts=self._list(fiche, "local_accounts", where,
-                                      "member-local-accounts-invalid")))
+                                      "member-local-accounts-invalid"),
+            timezone=timezone,
+            incident_eligible=incident_eligible))
 
     def _roles(self, fiche: Fiche, where: dict, subject: dict) -> list[str] | None:
         """L244 (#420) : les rôles déclarés d'une fiche Agent/Persona.
@@ -5311,6 +5421,41 @@ class _Loader:
             responsible=responsible or "", updated=updated or "",
             artifact=artifact, error=error, valid=valid))
 
+    def _build_application(self, fiche: Fiche, where: dict) -> None:
+        """#7866 : une fiche Application (`applications/*.md`).
+
+        `id` facultatif (défaut : nom du fichier, grammaire NAME_RE), bloc
+        `incident:` facultatif — une fiche sans bloc reste valide. Le bloc est
+        analysé par `incident_routing.parse_incident` ; chaque défaut devient
+        une erreur NOMMÉE portant `application`, donc `canon check` échoue sans
+        bloquer les agents. Les répondants (rôle ou membre) et l'escalade sont
+        résolus dans `validate`, quand tous les Members sont connus."""
+        stem = posixpath.splitext(posixpath.basename(fiche.path))[0]
+        ident = _text(fiche.data.get("id")) or stem
+        subject = {"application": ident}
+        valid = True
+        if not process_path_ok(fiche.bundle_path or fiche.path,
+                               self.canon.scopes.get(fiche.member), APPLICATION_DIR):
+            scope = [d for d in self.canon.scopes.get(fiche.member) or () if d]
+            dossiers = "`, `".join([APPLICATION_DIR + "/"]
+                                   + ["%s/%s/" % (d, APPLICATION_DIR) for d in scope])
+            self.add("application-path", ERROR,
+                     "Application card outside `%s`: %s" % (dossiers, fiche.path),
+                     **where, **subject)
+            valid = False
+        if not NAME_RE.fullmatch(ident or ""):
+            self.add("application-id-invalid", ERROR,
+                     "Application card: id %r is not a NAME (letters, digits, `.`, "
+                     "`_`, `-`; 64 characters at most)" % ident, **where, **subject)
+            valid = False
+        policy, defects = incident_routing.parse_incident(fiche.data.get("incident"))
+        for code, message in defects:
+            self.add(code, ERROR, message, **where, **subject)
+            valid = False
+        self.canon.applications.append(Application(
+            fiche=fiche, id=ident or "", responsible=_text(fiche.data.get("responsible")),
+            incident=policy, valid=valid))
+
     def _process_day(self, fiche: Fiche, key: str, where: dict, *, required: bool,
                      prefix: str = "process", label: str = "Process",
                      **subject) -> str | None:
@@ -5762,7 +5907,8 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     # -- doublons --------------------------------------------------------------
     for kind, items, subject in (("member", canon.members, None),
                                  ("agent", canon.agents, "agent"),
-                                 ("host", canon.hosts, "host")):
+                                 ("host", canon.hosts, "host"),
+                                 ("application", canon.applications, "application")):
         by_title: dict[str, list] = defaultdict(list)
         for item in items:
             by_title[item.title].append(item)
@@ -5797,6 +5943,60 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
             add("member-agent-clash", ERROR,
                 "human member %s has the name of an agent: ambiguous responsible"
                 % member.title, member.fiche, agent=member.title)
+
+    # -- applications (#7866) ----------------------------------------------------
+    # Une fiche sans `incident:` reste valide.  Dans un bloc, chaque répondant
+    # et l'escalade doivent désigner un humain du canon ou un rôle porté par au
+    # moins un Member : un nom inconnu est refusé, jamais ignoré en silence.
+    by_id: dict[str, list] = defaultdict(list)
+    for application in canon.applications:
+        by_id[application.id].append(application)
+    for ident, group in by_id.items():
+        if ident and len(group) > 1:
+            for application in group:
+                add("application-id-duplicate", ERROR,
+                    "application id %r declared %d times (%s)" % (
+                        ident, len(group),
+                        ", ".join("%s:%s" % (a.fiche.member, a.fiche.path) for a in group)),
+                    application.fiche, application=ident)
+
+    def member_roles(member: Member) -> set[str]:
+        return {str(role).strip().lower() for role in (member.roles or [])
+                if str(role).strip()}
+
+    for application in canon.applications:
+        subject = {"application": application.id or application.title}
+        if application.responsible is not None \
+                and canon.resolve_human(application.responsible) is None:
+            add("application-responsible-unresolved", ERROR,
+                "application %s: responsible %r does not resolve to a human Member"
+                % (application.title, application.responsible),
+                application.fiche, **subject)
+            application.valid = False
+        policy = application.incident
+        if policy is None:
+            continue
+        for index, responder in enumerate(policy.responders):
+            where = "`incident.responders[%d]`" % index
+            if responder.member is not None:
+                if canon.resolve_human(responder.member) is None:
+                    add("application-incident-member-unknown", ERROR,
+                        "%s: member %r does not resolve to a human Member"
+                        % (where, responder.member), application.fiche, **subject)
+                    application.valid = False
+            elif responder.role is not None:
+                if not any(responder.role in member_roles(member)
+                           for member in canon.members):
+                    add("application-incident-role-unknown", ERROR,
+                        "%s: role %r is held by no Member in this canon"
+                        % (where, responder.role), application.fiche, **subject)
+                    application.valid = False
+        if policy.escalation is not None \
+                and canon.resolve_human(policy.escalation) is None:
+            add("application-incident-escalation-unknown", ERROR,
+                "`incident.escalation.wake`: %r does not resolve to a human Member"
+                % (policy.escalation,), application.fiche, **subject)
+            application.valid = False
 
     # -- agents ------------------------------------------------------------------
     # L16 (R22) : plus de liste fermée de harnais ; les identifiants valides sont
@@ -6186,7 +6386,10 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 add("pipeline-module-duplicate", ERROR, warning["message"],
                     card.fiche if card is not None else None, pipeline=warning["name"])
                 continue
-            add("module-refused", WARNING, warning["message"],
+            # #7860: a module a team or a project selects, absent from this
+            # host, is a warning; `canon sync` refuses the placement of the
+            # agents of those projects here (`placement_diagnostic`).
+            add(warning["code"], WARNING, warning["message"],
                 **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
     _scoped = review_mod.scoped_from_federation(canon.federation)
     for code, severity, message in _scoped.problems:
@@ -6573,11 +6776,13 @@ class Blocking:
 def blocking(findings: Iterable[Finding]) -> Blocking:
     """Une erreur liée à un agent bloque cet agent ; à un hôte, les agents qui y
     sont placés ; à une fiche du plan (WorkPackage, L29) ou à une règle de
-    travail (Process, #538) ou à une carte Pipeline (L103), aucun agent ; sinon
-    (fédération, frontmatter d'une fiche du profil, …) tous."""
+    travail (Process, #538), à une carte Pipeline (L103) ou à une fiche
+    Application (#7866), aucun agent ; sinon (fédération, frontmatter d'une
+    fiche du profil, …) tous."""
     result = Blocking([], defaultdict(list), defaultdict(list), defaultdict(list))
     for finding in errors(findings):
-        if finding.package or finding.process or finding.pipeline:
+        if finding.package or finding.process or finding.pipeline \
+                or finding.application:
             continue
         if finding.candidate and finding.host:
             result.by_candidate[(finding.candidate, finding.host)].append(finding)

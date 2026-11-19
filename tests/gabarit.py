@@ -16,7 +16,9 @@ classes suivantes rejouent ce DDL final sous leur propre nom de schéma
 - **Clé** (`empreinte`) : version, nom et somme de chaque migration, version
   du serveur, rôle courant et rôles de contrat `ameesh_*` du cluster (une
   migration accorde des droits aux rôles qui existent, 0427). Une migration
-  ajoutée ou modifiée invalide le gabarit.
+  ajoutée ou modifiée invalide le gabarit. Les rôles éphémères des tests
+  (`EPHEMERES`), qu'aucune migration ne nomme, n'y entrent pas : un worker
+  parallèle les crée et les détruit à tout instant (#7871).
 - **Durée de vie bornée** (`TTL_S`) : des migrations écrivent `now()` (borne
   du rattrapage, 0438) ; un clone a au plus `TTL_S` de retard sur un schéma
   migré à l'instant, très en deçà des écarts que posent les tests (un jour).
@@ -52,6 +54,11 @@ TTL_S = 20 * 60
 SCHEMA = "ameesh_test_gabarits"
 TABLE = SCHEMA + ".gabarit"
 _LOCK = "ameesh_test_gabarit"
+#: rôles `ameesh_*` qu'un test crée puis détruit sur le cluster partagé
+#: (propriétaire de la porte de décision, #6377 ; écrivains suffixés par
+#: processus, test_l56) : aucune migration ne les nomme, et les compter
+#: changeait l'empreinte entre deux préparations d'un même processus (#7871)
+EPHEMERES = r"^ameesh_(decision_owner|it_qa|it_proof)_"
 #: un nom que `pg_dump` écrit tel quel, sans guillemets : le remplacement
 #: textuel du nom source par le nom cible est alors exact
 _SIMPLE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -84,7 +91,8 @@ def empreinte(db, directory: str = migrations.MIGRATIONS_DIR) -> str:
     row = db.query(
         "SELECT current_setting('server_version_num') AS version, current_user AS moi, "
         "coalesce((SELECT string_agg(rolname, ',' ORDER BY rolname) FROM pg_roles "
-        "WHERE left(rolname, 7) = 'ameesh_'), '') AS roles")[0]
+        "WHERE left(rolname, 7) = 'ameesh_' AND rolname !~ %s), '') AS roles",
+        (EPHEMERES,))[0]
     h.update(("%s\n%s\n%s\n" % (row["version"], row["moi"], row["roles"])).encode())
     return h.hexdigest()
 

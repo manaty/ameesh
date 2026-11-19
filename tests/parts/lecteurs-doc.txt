@@ -12,6 +12,7 @@ test_3540_git_agents  # docs/EXPLOITATION.md (git des exécuteurs en HTTPS+gh ap
 test_5696_recompose_attente  # docs/EXPLOITATION.md (ligne de recomposition du pilote au parseur, #5696)
 test_7665_module_contract  # docs/api/module-contract-v1*, examples/modules/contract-witness (external module contract v1, #7665)
 test_7701_public_fixture  # docs/api/module-contract-v1*, examples/fixtures/public-fixture-witness (public fixture kit, #7701)
+test_7866_incident_responder  # docs/schemas/ameesh-responder-1.schema.json (contrat ameesh-responder/1, #7866)
 test_doc_links  # docs/ (liens internes et ancres, vérificateur scripts/doc-links.py, #775)
 test_l107_executor_contract  # docs/EXECUTEUR-MEDIEE.md (compteurs du contrat de l'exécuteur, L107)
 test_l1124_explorations  # docs/design/explorations and plan/roadmap/lot cards (exploration inbox off the roadmap, #1124)

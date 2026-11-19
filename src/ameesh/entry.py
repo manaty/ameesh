@@ -61,6 +61,16 @@ def _rapide_statusline(cfg, fastmail, rest: list) -> int | None:
     return 0
 
 
+def _read_journal(cfg, raw: str) -> int:
+    """#7859 : journal one allowed MCP read; never fails its hook."""
+    try:
+        from . import avatar_reads
+        avatar_reads.journal(cfg, raw)
+    except Exception:  # noqa: BLE001 - the hook never blocks the read
+        pass
+    return 0
+
+
 def _rapide_hook(cfg, fastmail, rest: list) -> int | None:
     if len(rest) != 1:
         return None
@@ -78,6 +88,16 @@ def _rapide_hook(cfg, fastmail, rest: list) -> int | None:
 def main(argv: list | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     from .platform.child_environment import install, managed_entry
+    if argv[:1] == ["read-journal"]:
+        # #7859 : a PostToolUse hook runs in the harness's environment, not as
+        # a service MainPID; keep the child filter and serve it without the
+        # heavy CLI. It writes an event and always exits 0.
+        install()
+        try:
+            cfg = _charge_config()
+        except Exception:  # noqa: BLE001 - no config: nothing journaled
+            return 0
+        return _read_journal(cfg, sys.stdin.read())
     if argv[:1] in (["statusline"], ["hook"]):
         # Hooks inherit INVOCATION_ID from the runner, but are not service
         # MainPIDs. Keep their child filter without querying systemd, including

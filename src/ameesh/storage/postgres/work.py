@@ -1683,7 +1683,8 @@ class WorkItems(interface.WorkItems):
             return work._unassign_locked(item_id, agent, note, actor)
 
     def set_external_executor(self, item_id, executor, *, session=None, note,
-                              actor) -> dict | None:
+                              actor, expect_executor=None,
+                              expect_session=None) -> dict | None:
         """#3447 : pose (ou efface, `executor=None`) l'exécutant externe d'un lot
         ouvert, avec sa ligne de journal, en une transaction.
 
@@ -1695,7 +1696,12 @@ class WorkItems(interface.WorkItems):
         #6839 : `session` nomme la session exécutante du feu (facultative). Une
         pose concurrente d'une prise exclusive est refusée (`external_claim_session`
         relu sous le même verrou) ; une levée efface la prise, sa session et son
-        instant dans la même écriture."""
+        instant dans la même écriture.
+
+        #7870 B2 : `expect_executor`/`expect_session` (levée par l'exécutant
+        réservé) sont comparés à la ligne RELUE sous `FOR UPDATE` ; une
+        réservation renommée entre la preuve et le verrou rend None sans rien
+        écrire (ni journal, ni effacement)."""
         closed = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
         with self.db.transaction() as tx:
             if executor:
@@ -1708,21 +1714,49 @@ class WorkItems(interface.WorkItems):
                      " RETURNING __COLUMNS__").replace(
                          "__COLUMNS__", item_columns(self.db)),
                     (executor, session or None, int(item_id)))
-            else:
-                rows = tx.query(
-                    ("UPDATE work_items SET external_executor = NULL,"
-                     " external_session = NULL, external_claim_session = NULL,"
-                     " external_claimed_at = NULL, external_claim_actor = NULL,"
-                     " external_claim_host = NULL, external_claim_proof = NULL,"
-                     " external_claim_harness = NULL, external_claim_binding = NULL,"
-                     " updated_at = now()"
-                     f" WHERE id = %s AND state NOT IN {closed}"
-                     " RETURNING __COLUMNS__").replace(
-                         "__COLUMNS__", item_columns(self.db)),
-                    (int(item_id),))
-            if not rows:
+                if not rows:
+                    return None
+                WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+                return rows[0]
+            # #7870 : la ligne de journal de la levée est écrite AVANT
+            # l'effacement de la réservation. La garde 0567 des connexions
+            # limitées lit `work_items.external_executor` au moment de
+            # l'INSERT : après la levée, le lot n'est plus réservé et la
+            # garde refuserait la trace à l'exécutant qui vient de se lever.
+            # Sous le verrou de la ligne, l'état lu ici ne bouge plus jusqu'à
+            # l'écriture ; un échec de l'UPDATE annule tout.
+            current = tx.query(
+                "SELECT state, external_executor, external_session"
+                f" FROM work_items WHERE id = %s AND state NOT IN {closed}"
+                " FOR UPDATE", (int(item_id),))
+            if not current:
                 return None
-            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            # #7870 B2 : la preuve de self-clear a lu la réservation AVANT ce
+            # verrou ; si un pilote l'a renommée entre-temps (session ou
+            # exécutant), elle ne vaut plus pour cette ligne. Rien n'est écrit,
+            # pas même la trace : la levée sera relue et retentée.
+            if expect_executor is not None:
+                held = (current[0]["external_executor"] or "").strip()
+                held_session = (current[0]["external_session"] or "").strip()
+                if held != expect_executor \
+                        or held_session != (expect_session or ""):
+                    return None
+            WorkItems(tx)._event(int(item_id), current[0]["state"], note, actor)
+            rows = tx.query(
+                ("UPDATE work_items SET external_executor = NULL,"
+                 " external_session = NULL, external_claim_session = NULL,"
+                 " external_claimed_at = NULL, external_claim_actor = NULL,"
+                 " external_claim_host = NULL, external_claim_proof = NULL,"
+                 " external_claim_harness = NULL, external_claim_binding = NULL,"
+                 " updated_at = now()"
+                 " WHERE id = %s RETURNING __COLUMNS__").replace(
+                     "__COLUMNS__", item_columns(self.db)),
+                (int(item_id),))
+            if not rows:
+                # sous le verrou, une disparition est anormale : la trace
+                # sans levée ne doit pas être commitée
+                raise DbError("lot %s changed while clearing its external "
+                              "executor: nothing changed" % item_id)
             return rows[0]
 
     #: #6839 : les états d'un lot qui ne prennent plus de geste externe

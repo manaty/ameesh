@@ -206,6 +206,27 @@ class GabaritTest(PgTestCase):
         self.assertEqual(b.query("SELECT count(*) AS n FROM agent_registry")[0]["n"], 0)
         self.assertEqual(a.query("SELECT count(*) AS n FROM agent_registry")[0]["n"], 1)
 
+    def test_un_role_ephemere_d_un_autre_worker_garde_l_empreinte(self):
+        """#7871 : un worker parallèle crée et détruit des rôles `ameesh_*`
+        de test (porte de décision, écrivains suffixés) ; l'empreinte, donc
+        le gabarit, ne doit pas changer entre deux préparations."""
+        cle = gabarit.empreinte(self.db)
+        suffixe = uuid.uuid4().hex[:12]
+        for role in ("ameesh_decision_owner_" + suffixe, "ameesh_it_qa_" + suffixe,
+                     "ameesh_it_proof_" + suffixe):
+            with self.subTest(role=role):
+                self.db.execute("CREATE ROLE %s NOLOGIN" % db_mod.quote_ident(role))
+                try:
+                    self.assertEqual(gabarit.empreinte(self.db), cle)
+                finally:
+                    self.db.execute("DROP ROLE %s" % db_mod.quote_ident(role))
+        # les rôles de contrat que nomment les migrations restent comptés
+        for role in ("ameesh_it_qa", "ameesh_it_proof", "ameesh_canon_sync",
+                     "ameesh_release_controller", "ameesh_release_controller_bureau"):
+            with self.subTest(contrat=role):
+                self.assertFalse(self.db.query("SELECT %s ~ %s AS ok",
+                                               (role, gabarit.EPHEMERES))[0]["ok"])
+
     def test_le_verrou_d_une_autre_empreinte_ne_bloque_pas(self):
         """#6785 : témoin de la course vue en CI — un autre job du même
         serveur range le gabarit d'une autre empreinte pendant que celui-ci

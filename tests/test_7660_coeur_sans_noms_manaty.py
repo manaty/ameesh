@@ -90,12 +90,16 @@ RECORDED_BY_TRANCHE = {
 #: (path relative to src/ameesh, canonical name) -> allowed occurrences.
 #: Generated from the inventory; each entry is a debt the owning tranche pays.
 EXCEPTIONS = {
-    # -- le nom « bureau » sort du cœur (#7634) : 3
+    # -- le nom « bureau » sort du cœur (#7634) : 5
     # Migrations déjà appliquées : leur SQL est figé (rollback compris), le
     # nom y reste une donnée du déploiement, pas une décision du cœur.
     ("migrations/0583_bureau_staging_catchup.sql", "bureau"): 1,
     ("migrations/0584_bureau_catchup_timestamp.sql", "bureau"): 1,
     ("migrations/rollback/0584_restore.sql", "bureau"): 1,
+    # #7870 : la garde remplace celle de 0584 et garde son contrôle du rôle
+    # sur les déclarations de catchup ; le rollback rend la garde 0584.
+    ("migrations/0598_bureau_clear_only.sql", "bureau"): 1,
+    ("migrations/rollback/0598_restore.sql", "bureau"): 1,
     # -- vocabulaire des rôles (#7661, #7792) : 2
     # Les jetons que lisent les fiches Agent ; tous les lecteurs les importent
     # de `roles.py`, ils ne les recopient plus (#7792 : 47 → 2).
