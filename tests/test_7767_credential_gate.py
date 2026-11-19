@@ -21,7 +21,7 @@ def _group_name():
 
 
 def _rule(**over):
-    rule = {"id": "echo", "kind": "kms", "exe": "/bin/echo", "argv": ["hello"]}
+    rule = {"id": "echo", "kind": "kms", "exe": "/bin/echo", "argv": ["hello"], "lots": [5772]}
     rule.update(over)
     return rule
 
@@ -132,6 +132,23 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(policy.agent, "bureau")
         self.assertEqual(policy.rules[0].exe, "/bin/echo")
         self.assertEqual(policy.callers_uids, (os.geteuid(),))
+
+    def test_lots_are_required_and_validated(self):
+        missing = _rule()
+        del missing["lots"]
+        with self.assertRaisesRegex(gate.PolicyError, "lots"):
+            _policy(self.directory, rules=[missing])
+        for lots in (None, [True], [0], ["5772"]):
+            with self.subTest(lots=lots), self.assertRaisesRegex(gate.PolicyError, "lots"):
+                _policy(self.directory, rules=[_rule(lots=lots)])
+
+    def test_unrelated_lot_is_refused_before_pre_act(self):
+        broker = _broker(_policy(self.directory))
+        request = _request(lot=1234)
+        with self.assertRaisesRegex(gate.Refused, "lot is not authorized"):
+            broker._validate(request)
+        self.assertEqual(broker.test_database.closed, 0)
+        self.assertEqual(broker._validate(_request())[0].lots, (5772,))
 
     def test_unknown_top_level_key_is_refused(self):
         with self.assertRaisesRegex(gate.PolicyError, "unknown key"):

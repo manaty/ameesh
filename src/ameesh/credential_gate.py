@@ -165,6 +165,7 @@ class Rule:
     free: tuple[str, ...] = ()
     #: exact positional arguments after the argv prefix; None leaves them free
     targets: tuple = None
+    lots: tuple[int, ...] = ()
 
     @property
     def injects_pregeste(self):
@@ -268,8 +269,11 @@ def _int(value, where, low, high):
 def _rule(value, where):
     data = _mapping(value, where, ("id", "kind", "exe", "argv", "project", "repo",
                                    "inputs", "fixed", "allow", "required", "forbid",
-                                   "free", "targets"))
+                                   "free", "targets", "lots"))
     ident = data.get("id")
+    lots = data.get("lots")
+    if not isinstance(lots, list) or not all(type(lot) is int and lot > 0 for lot in lots):
+        raise PolicyError("%s.lots: a list of positive lot IDs is required" % where)
     if not isinstance(ident, str) or not _NAME.fullmatch(ident):
         raise PolicyError("%s.id: a simple name is required" % where)
     kind = data.get("kind")
@@ -342,7 +346,7 @@ def _rule(value, where):
         raise PolicyError("%s: prod rules take no fixed/allow/required/forbid/free/targets" % where)
     return Rule(ident, kind, exe, tuple(argv), project, repo, tuple(inputs),
                 tuple(fixed_items), tuple(allow_items), tuple(required), tuple(forbid),
-                tuple(free), targets)
+                tuple(free), targets, tuple(lots))
 
 
 def load_policy(path=DEFAULT_POLICY):
@@ -707,6 +711,8 @@ class Broker:
     def _validate(self, request):
         _check_argv(request["argv"])
         rule = _match_rule(self.policy, request["kind"], request["argv"])
+        if request["lot"] not in rule.lots:
+            raise Refused("lot is not authorized for this rule")
         if rule.kind == "prod":
             argv, target = _parse_prod(rule, request["argv"], self._document_value())
             if request["target"] and request["target"] != target:

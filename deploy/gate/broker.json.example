@@ -17,6 +17,7 @@
   "rules": [
     {
       "id": "kms-keyring-describe",
+      "lots": [],
       "kind": "kms",
       "exe": "/usr/bin/gcloud",
       "argv": ["kms", "keyrings", "describe"],
@@ -25,6 +26,7 @@
     },
     {
       "id": "kms-keys-list",
+      "lots": [],
       "kind": "kms",
       "exe": "/usr/bin/gcloud",
       "argv": ["kms", "keys", "list"],
@@ -33,6 +35,7 @@
     },
     {
       "id": "prod-workflow-run",
+      "lots": [],
       "kind": "prod",
       "exe": "/usr/bin/gh",
       "argv": ["workflow", "run"],
