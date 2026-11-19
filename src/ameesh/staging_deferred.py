@@ -98,11 +98,12 @@ def _recipients(cfg, db, project) -> list[str]:
     #7634 : l'avatar est lu au canon (bloc `avatar:`). Sans avatar déclaré,
     la route humaine d'avant reste l'agent configuré du projet (`report`) :
     c'est le comportement que le mesh Manaty garde tant que sa fiche ne porte
-    pas le bloc `avatar`."""
+    pas le bloc `avatar`. #7851 : un avatar retiré ou non admis ne prend pas
+    la route (`RecipientRetired` au dépôt) ; le `report` reprend."""
     from . import alert_briefs, avatars
     rows = _registry_rows(db)
     owner = owner_human(cfg, db, project, rows)
-    avatar = avatars.name_for(cfg, owner) if owner else None
+    avatar = avatars.name_for(cfg, owner, rows) if owner else None
     names = [avatar] if avatar else []
     if not names and getattr(project, "report", ""):
         names.append(str(project.report))
@@ -638,10 +639,16 @@ def tick(cfg, db, project, today=None) -> dict:
             report["result"] = "already-sent"
             return report
         text = _text(project, tag, data, deferred, proofs, declared, rights)
-        from . import mail, work
+        from . import mail, staging_pending, storage, work
         for target in targets:
-            mail.send(db, work.SYSTEM_SENDER, target, text, kind="event",
-                      payload={"urgent": True, "staging_deferred": report})
+            try:
+                mail.send(db, work.SYSTEM_SENDER, target, text, kind="event",
+                          payload={"urgent": True, "staging_deferred": report})
+            except storage.RecipientRetired:
+                # #7851 : retiré entre la lecture du registre et le dépôt ;
+                # la cible est écartée et tracée, le pilote reçoit la sienne.
+                staging_pending.skipped_retired(
+                    project, "deferred", target, report)
             sent[target] = key
         rc.save_state(cfg, state)
         report.update({"result": "alerted", "recipients": targets})

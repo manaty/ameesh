@@ -89,11 +89,51 @@ def configured(cfg) -> dict[str, str]:
     return merged
 
 
-def name_for(cfg, human: str | None) -> str | None:
-    """L'agent avatar de ``human:<id>``, ou None (pas d'avatar, canon illisible)."""
+def _retired(row) -> bool:
+    """La ligne de registre dit-elle l'agent retiré (#3460, #7851) ?
+
+    ``retired_ts`` est la colonne des vues ``operations.listing`` et
+    ``registry.overview`` ; ``retired`` est la forme rendue par
+    ``ameesh agent observe``. Une ligne absente n'est pas jugée ici : c'est
+    ``is_admitted`` qui refuse un nom hors registre."""
+    if not isinstance(row, dict):
+        return False
+    return row.get("retired_ts") is not None or bool(row.get("retired"))
+
+
+def is_admitted(name: str | None, rows) -> bool:
+    """``name`` est-il un agent admis du registre (présent, non retiré) ?
+
+    #7851 : une route humaine ne vise ni un agent retiré (``mail.send`` lève
+    ``RecipientRetired``) ni un nom qui n'a jamais été admis. Un registre
+    illisible (liste vide) n'admet personne : l'appelant garde sa route
+    configurée.
+    """
+    if not name:
+        return False
+    for row in rows or ():
+        if isinstance(row, dict) and row.get("name") == str(name):
+            return not _retired(row)
+    return False
+
+
+def name_for(cfg, human: str | None, rows=None) -> str | None:
+    """L'agent avatar de ``human:<id>``, ou None (pas d'avatar, canon illisible).
+
+    #7851 : quand l'appelant donne le registre lu (``rows``, les lignes de
+    ``operations.listing`` ou ``registry.overview``), un avatar retiré ou
+    absent du registre n'est pas une route : None, la route configurée
+    (``project.report``) reprend, comme sans avatar déclaré. ``rows=None``
+    garde la lecture canon seule pour les appelants sans registre
+    (autorisation, affichage) ; une liste vide est un registre lu et vide,
+    donc aucun avatar admis.
+    """
     if not human:
         return None
-    return configured(cfg).get(str(human))
+    name = configured(cfg).get(str(human))
+    if name is None or rows is None:
+        return name
+    return name if is_admitted(name, rows) else None
 
 
 def by_name(cfg) -> dict[str, str]:
@@ -122,7 +162,9 @@ def configured_desks(cfg, human: str | None, rows=(), project=None) -> list[str]
     .report`, le bureau pour ameesh). Un agent n'est retenu que si le registre
     le dit `responsible` DE CET humain : le mode `externe` seul ne fait pas une
     route, et la session d'un autre humain ne reçoit jamais son courrier
-    (#7634, relecture cx1 B1). `project` restreint au projet de l'alerte."""
+    (#7634, relecture cx1 B1). `project` restreint au projet de l'alerte.
+    #7851 : une route retirée ne reçoit plus rien (`RecipientRetired` au
+    dépôt) ; elle n'est pas retenue, la suivante ou l'auditeur prend le geste."""
     if not human:
         return []
     release = getattr(cfg, "release", None) or {}
@@ -137,7 +179,8 @@ def configured_desks(cfg, human: str | None, rows=(), project=None) -> list[str]
     for entry in chosen:
         report = str((entry or {}).get("report") or "")
         row = by_name.get(report)
-        if report and row is not None and row.get("responsible") == str(human):
+        if (report and row is not None and row.get("responsible") == str(human)
+                and not _retired(row)):
             found.append(report)
     return list(dict.fromkeys(found))
 
