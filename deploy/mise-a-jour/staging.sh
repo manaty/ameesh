@@ -788,13 +788,18 @@ d="$snap/snap-${R:0:8}"
 rm -rf -- "$d"
 mkdir -p -- "$d"
 git -C "$depot" fetch -q origin
-git -C "$depot" archive "$R" src | tar -x -C "$d"
+git -C "$depot" archive "$R" src deploy/sql | tar -x -C "$d"
 cd "$d"
 # #7368 : contrôle bloquant de la liste réellement en attente (lecture seule),
 # puis dry-run additif ; un refus laisse la base intacte et ne relance rien.
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh.staging_migrations_preflight --repo "$depot" --sha "$R" --project ameesh
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --dry-run --additive-only
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --additive-only
+# #7873 : droits des connexions limitées rejoués sous la même connexion, puis
+# audités (_contrat-bureau.sql) ; un refus (code 5) arrête la séquence avant
+# toute installation : aucun exécuteur n'est relancé, la version reste la
+# précédente (§14).
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh.droits_limites --sql-dir "$d/deploy/sql" || exit 5
 REMOTE
 }
 # #5692 : preflight de la base que le chemin sans poste va migrer. Meme
@@ -1596,12 +1601,20 @@ if [ "$POSTE_ABSENT" = 1 ]; then
   # est choisi et valide avant le plan, avec HOTE_OUTILS).
   etape "migrations de $SHA_TRAVE depuis $HOTE_MIGRATIONS (poste absent, additives seulement)"
   debut_etape "$HOTE_MIGRATIONS" migrations
-  if ! migrer_depuis_vm "$HOTE_MIGRATIONS" "$SHA"; then
+  rc_migrer=0
+  migrer_depuis_vm "$HOTE_MIGRATIONS" "$SHA" || rc_migrer=$?
+  if [ "$rc_migrer" = 5 ]; then
+    # #7873 : base migree, mais droits des connexions limitees refuses par
+    # l'audit (le droit est nomme plus haut) : rien n'est installe.
+    trace "$HOTE_MIGRATIONS" droits ko "droits des connexions limitees refuses par _contrat-bureau.sql apres les migrations"
+    echo "droits des connexions limitees en echec : aucune installation, version precedente conservee" >&2
+    exit 1
+  elif [ "$rc_migrer" != 0 ]; then
     trace "$HOTE_MIGRATIONS" migrations ko "migrations en echec depuis la VM"
     echo "migrations en echec : aucune installation" >&2
     exit 1
   fi
-  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord)"
+  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord), droits limites rejoues et audites"
 else
   etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
   debut_etape poste migrations

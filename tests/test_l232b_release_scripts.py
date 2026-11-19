@@ -157,6 +157,12 @@ class MigrationPinningTest(unittest.TestCase):
             # distinct de « migrate » ; ce banc suit l'ordonnancement de
             # poste.sh, le classement SQL est couvert par test_7368.
             'if [ "$1" = -m ] && [ "$2" = ameesh.staging_migrations_preflight ]; then exit 0; fi\n'
+            # #7873 : rejeu des droits limités puis audit, appel distinct
+            # aussi ; le SQL est couvert par test_7873.
+            'if [ "$1" = -m ] && [ "$2" = ameesh.droits_limites ]; then\n'
+            '  printf \'%s\\n\' "$*" >> "${DROITS_CALLS:-/dev/null}"\n'
+            '  exit "${DROITS_LIMITES_STATUS:-0}"\n'
+            'fi\n'
             'exec ' + shlex.quote(sys.executable) + ' "$@"\n')
         (venv / "python").chmod(0o755)
         config = Path(self.env["HOME"]) / ".config/ameesh/config.json"
@@ -191,6 +197,20 @@ class MigrationPinningTest(unittest.TestCase):
     def systemd_run_calls(self):
         path = self.root / "systemd-run.calls"
         return path.read_text().splitlines() if path.exists() else []
+
+    def test_7873_droits_limites_rejoues_apres_la_base_du_mesh(self):
+        trace = self.root / "droits.calls"
+        done = self.run_script("migrer", self.a, DROITS_CALLS=str(trace))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        appel = trace.read_text().splitlines()
+        self.assertEqual(len(appel), 1)
+        self.assertRegex(appel[0], r"^-m ameesh\.droits_limites --sql-dir .*/src-[0-9a-f]{7}/deploy/sql$")
+
+    def test_7873_audit_refuse_arrete_avant_installation(self):
+        done = self.run_script("migrer", self.a, DROITS_LIMITES_STATUS="1",
+                               MIGRER_SANS_REDEMARRAGE="1")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("droits des connexions limitées refusés par l'audit", done.stderr)
 
     def test_approved_a_with_head_b_only_runs_a(self):
         done = self.run_script("migrer", self.a)
