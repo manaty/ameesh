@@ -1047,25 +1047,21 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         request["decision"], approver, parsed.facade), **ctx), parsed
 
 
-#: #7631 (B cx2, dev3, auditeur) : un « go » est explicite et AFFIRMATIF — le
-#: message commence par `go` (mot isolé, pas `golang`), ne pose pas de question
-#: et ne porte aucune négation. Il nomme ensuite le geste signé : identifiant
-#: d'action, ou cible ET opération, ou lot pour une action ; le connecteur,
-#: TOUTES ses opérations et le mot « mandat » pour un grant ; l'identifiant de
-#: la décision ET l'option signée pour `decide`. L'opération seule, une autre
-#: cible, une question ou un refus ne suffisent jamais.
+#: #7631 (B1, 2e tour auditeur) : grammaire FERMÉE. Le message vaut « go »
+#: (mot isolé, pas `golang`) suivi SEULEMENT des références du geste signé —
+#: identifiant d'action, cible, opération, lot ; connecteur, opérations, mot
+#: de mandat ; identifiant de décision, option et libellé — séparées par des
+#: espaces ou une ponctuation simple. Tout autre mot refuse l'accord : un
+#: report (« demain », « attends », « later »), une négation (« pas »,
+#: « don't ») ou une question ne peuvent pas se cacher dans une liste noire.
+#: L'opération seule, une autre cible ou un mot hors références ne suffisent
+#: jamais.
 _GO_RE = re.compile(r"^\s*go(?![0-9A-Za-z])(?P<rest>.*)$",
                     re.IGNORECASE | re.DOTALL)
-#: les mots du message, ponctuation finale retirée (`prod-deploy.` vaut
-#: `prod-deploy`, N de la relecture auditeur) ; les lettres accentuées comptent
-#: pour les libellés d'option.
-_GO_TOKEN_RE = re.compile(r"\w[\w.:#/@-]*", re.UNICODE)
-#: une question ou une négation ne vaut jamais accord, même commençant par go
-_NEGATIONS = frozenset({
-    "non", "pas", "jamais", "aucun", "aucune", "nul", "nulle", "rien",
-    "refus", "refuse", "refusé", "refusee", "refusée", "ne", "n",
-    "no", "not", "never", "none", "nope",
-})
+#: un mot du message : les références gardent leurs `: / # @ . -` internes ;
+#: la ponctuation simple sépare. Le point final d'un jeton est retiré
+#: (N auditeur : « go prod-deploy. » vaut « go prod-deploy »).
+_GO_WORD_RE = re.compile(r"[^\s,;!?()\[\]{}<>\"'`|]+", re.UNICODE)
 #: un grant ne s'inscrit que sur un go qui le nomme comme mandat
 _MANDATE_WORDS = frozenset({
     "mandat", "mandate", "grant", "standing", "permanent", "permanente",
@@ -1073,20 +1069,52 @@ _MANDATE_WORDS = frozenset({
 })
 
 
-def _go_tokens(text: str) -> dict[str, int]:
-    """Les mots du message (casés) et leur première position ; la ponctuation
-    finale ne fait pas partie du jeton, ni le préfixe `#`/`@` d'une cible."""
-    tokens: dict[str, int] = {}
-    for match in _GO_TOKEN_RE.finditer(text):
-        token = _token_key(match.group(0).rstrip(".,;:!?)]}\"'"))
-        if token:
-            tokens.setdefault(token, match.start())
-    return tokens
-
-
 def _token_key(value) -> str:
     """La forme comparée d'un jeton : casée, sans `#`/`@` de tête."""
     return str(value or "").strip().lstrip("#@").casefold()
+
+
+def _go_words(text: str) -> list[str]:
+    """Les mots du message, casés ; ponctuation simple en séparateurs, point
+    final d'un jeton retiré."""
+    words: list[str] = []
+    for match in _GO_WORD_RE.finditer(text):
+        token = _token_key(match.group(0).rstrip("."))
+        if token:
+            words.append(token)
+    return words
+
+
+def _go_tokens(text: str) -> dict[str, int]:
+    """Les mots du message (casés), pour `_gesture_match`."""
+    return {word: index for index, word in enumerate(_go_words(text))}
+
+
+def _reference_tokens(value) -> set[str]:
+    """Les mots d'une référence de geste (un libellé d'option en a plusieurs)."""
+    return set(_go_words(str(value or "")))
+
+
+def _gesture_allowed(gesture: dict) -> set[str]:
+    """La grammaire fermée : les seuls mots que le go peut porter pour CE
+    geste. Aucune autre référence n'est admise."""
+    kind = gesture.get("kind")
+    allowed: set[str] = set()
+    if kind == "action":
+        for key in ("action_id", "target", "operation", "lot"):
+            allowed |= _reference_tokens(gesture.get(key))
+    elif kind == "standing":
+        allowed |= _reference_tokens(gesture.get("connector"))
+        for value in gesture.get("operations") or ():
+            allowed |= _reference_tokens(value)
+        allowed |= set(_MANDATE_WORDS)
+    elif kind == "decision":
+        for key in ("decision_id", "option", "option_label", "lot"):
+            allowed |= _reference_tokens(gesture.get(key))
+    else:
+        for value in gesture.get("references") or ():
+            allowed |= _reference_tokens(value)
+    return allowed
 
 
 def _phrase_in(text: str, phrase: str) -> bool:
@@ -1135,7 +1163,13 @@ def _gesture_match(gesture: dict, tokens: dict[str, int],
                    text: str) -> tuple[bool, list[str]]:
     """(le message nomme le geste, références attendues). Une seule référence
     suffit ; `target` et `operation` vont ensemble, jamais l'un sans l'autre.
+    La grammaire fermée est revérifiée ici : un mot hors références ne nomme
+    pas le geste, même si un appelant a omis le contrôle amont.
     """
+    words = set(tokens)
+    words.discard("go")
+    if words - _gesture_allowed(gesture):
+        return False, []
     kind = gesture.get("kind")
     expected: list[str] = []
     if kind == "action":
@@ -1195,11 +1229,11 @@ def check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
                        ref: str = "") -> tuple[str, str]:
     """("", "") si l'entrée (agent, seq) du journal L78 porte un accord de
     `approver` rattaché au geste : message humain de confiance, de cet humain,
-    commençant par un « go » explicite et affirmatif, qui nomme le geste signé
-    (voir `_gesture_match`) ; écrit au plus `clock_skew` après `iat` et au plus
-    `max_ttl` avant. `kind`/`ref` : le reçu qui cite l'accord ; un accord déjà
-    cité par un autre geste est refusé. Sinon (code, raison) — le refus dit
-    quoi citer.
+    commençant par « go » et ne portant QUE les références du geste signé
+    (grammaire fermée, voir `_gesture_allowed` et `_gesture_match`) ; écrit au
+    plus `clock_skew` après `iat` et au plus `max_ttl` avant. `kind`/`ref` : le
+    reçu qui cite l'accord ; un accord déjà cité par un autre geste est
+    refusé. Sinon (code, raison) — le refus dit quoi citer.
     """
     where = "%s#%d" % (accord["agent"], accord["seq"])
     entry = storage.of(db).conversations.entry(accord["agent"], accord["seq"])
@@ -1215,19 +1249,24 @@ def check_accord_entry(db: Db, accord: dict, approver: str, iat: int,
         return ACCORD, ("accord %s: older than %d s before the signature (a lasting go "
                         "is a standing approval)" % (where, policy.max_ttl))
     text = str(entry.get("text") or "")
-    if not _GO_RE.match(text):
+    match = _GO_RE.match(text)
+    if not match:
         return ACCORD, ("accord %s: not an explicit go (the human message must start "
                         "with \"go\" and name the gesture)" % where)
     if "?" in text:
         return ACCORD, ("accord %s: a question cannot be an accord (the go is "
                         "affirmative)" % where)
-    tokens = _go_tokens(text)
-    if any(token in _NEGATIONS for token in tokens):
-        return ACCORD, ("accord %s: a negation cannot be an accord (the go is "
-                        "affirmative)" % where)
     if not isinstance(gesture, dict):
         return ACCORD, "accord %s: no gesture reference to check" % where
-    named, expected = _gesture_match(gesture, tokens, text)
+    words = _go_words(match.group("rest"))
+    allowed = _gesture_allowed(gesture)
+    unknown = [word for word in words if word not in allowed]
+    if unknown:
+        return ACCORD, ("accord %s: the go carries words outside the gesture references "
+                        "(%s); write only \"go\" followed by the references (%s)"
+                        % (where, ", ".join(unknown[:5]),
+                           ", ".join(sorted(allowed)) or "?"))
+    named, expected = _gesture_match(gesture, _go_tokens(match.group("rest")), text)
     if not expected:
         return ACCORD, "accord %s: no gesture reference to check" % where
     if not named:

@@ -176,8 +176,9 @@ class VerificationTest(AccordBase):
         self.assertRefused(self.verify(late), receipts.ACCORD)
 
     def test_go_doit_etre_explicite(self):
-        """B cx2/dev3/auditeur : une question, un refus ou un message sans
-        rapport ne vaut pas accord, même récent et écrit par l'humain."""
+        """B cx2/dev3/auditeur : une question, un refus, un report ou un
+        message sans rapport ne vaut pas accord, même récent et écrit par
+        l'humain. Grammaire fermée : seules les références du geste."""
         cases = {
             "question": "go {action} ?",
             "refus": "go {action}, non, pas ce soir",
@@ -186,6 +187,13 @@ class VerificationTest(AccordBase):
             "go d'un autre geste": "go spend",
             "opération seule": "go prod-deploy",
             "cible seule": "go prod:ameesh",
+            # B1 2e tour auditeur : un report ou un refus hors références
+            "report anglais": "go {action} tomorrow, wait for my signal",
+            "refus anglais": "Go for {action}, but don't {action} it yet",
+            "report français": "go {action} après le gel de demain, attends",
+            "réserve": "go {action} sauf la nuit",
+            "except": "go {action} except friday",
+            "later": "go {action} later",
         }
         for label, template in cases.items():
             with self.subTest(label):
@@ -288,6 +296,39 @@ class PorteTest(AccordBase):
                             policy=POLICY, by="bureau")
         self.assertEqual(caught.exception.code, receipts.ACCORD)
         self.assertEqual(actions.get(self.db, action["action_id"])["state"], "proposed")
+
+    def test_grammaire_fermee_refuse_un_report(self):
+        """B1 2e tour auditeur : les phrases qui ajoutent un report ou un
+        refus aux références sont refusées, même si aucun mot de la liste
+        noire n'y figure (« don't », « tomorrow », « après »)."""
+        action = self.propose("prod-deploy")
+        cases = (
+            "Go for prod:ameesh, but don't prod-deploy it yet",
+            "go prod:ameesh prod-deploy tomorrow, wait for my signal",
+            "go prod:ameesh prod-deploy après le gel de demain, attends",
+            "go prod:ameesh prod-deploy sauf la nuit",
+            "go prod:ameesh prod-deploy except friday",
+            "go prod:ameesh prod-deploy later",
+        )
+        for text in cases:
+            with self.subTest(text):
+                request = actions.approval_request(
+                    action, ALICE, accord=self.go(text=text))
+                with self.assertRaises(ActionError) as caught:
+                    actions.approve(self.db, action["action_id"],
+                                    self.key.receipt(request), policy=POLICY, by="bureau")
+                self.assertEqual(caught.exception.code, receipts.ACCORD)
+        self.assertEqual(actions.get(self.db, action["action_id"])["state"], "proposed")
+
+    def test_grammaire_fermee_accepte_les_references(self):
+        """La grammaire fermée accepte « go » suivi des seules références,
+        séparées par une ponctuation simple (virgule, point final)."""
+        action = self.propose("prod-deploy")
+        accord = self.go(text="go prod:ameesh, prod-deploy.")
+        request = actions.approval_request(action, ALICE, accord=accord)
+        bound = actions.approve(self.db, action["action_id"], self.key.receipt(request),
+                                policy=POLICY, by="bureau")
+        self.assertEqual(bound["state"], "approved")
 
     def test_reutilisation_refusee(self):
         """Auditeur : un go cité par un reçu ne peut pas en autoriser un autre.

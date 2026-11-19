@@ -712,15 +712,17 @@ Façades vérifiées en v1 :
   `accord = {agent, seq}` est admis si le canon nomme l'opération approuvée
   (toutes celles du grant) dans `accord_operations` de CET authentificateur
   (§8.2), et si `accord` désigne une entrée du journal de conversation (L78) :
-  message humain de confiance, écrit par l'approbateur lui-même, go explicite
-  et affirmatif (le message commence par « go », sans « ? » ni négation) qui
-  nomme le geste — identifiant d'action, ou cible ET opération, ou lot pour
-  une action ; connecteur, toutes ses opérations et un mot de mandat
-  (« mandat », « grant », « permanent »…) pour un grant ; identifiant de la
-  décision ET option signée pour `decide` — au plus 120 s après `iat` et au
-  plus `max_ttl` avant. Un accord ne cite qu'un reçu (`accord_claims`, même
-  migration 0586) : la réutilisation par un autre geste est refusée. Sinon
-  refus (`facade_refused`, `accord_operation`, `accord_ref`), comme avant.
+  message humain de confiance, écrit par l'approbateur lui-même, de
+  **grammaire fermée** : il commence par « go » et ne porte ensuite que les
+  références du geste — identifiant d'action, cible, opération, lot pour une
+  action ; connecteur, toutes ses opérations et un mot de mandat (« mandat »,
+  « grant », « permanent »…) pour un grant ; identifiant de la décision,
+  option et libellé pour `decide` — séparées par des espaces ou une
+  ponctuation simple ; tout autre mot (question, report, négation) refuse
+  l'accord. Écrit au plus 120 s après `iat` et au plus `max_ttl` avant. Un
+  accord ne cite qu'un reçu (`accord_claims`, même migration 0586) : la
+  réutilisation par un autre geste est refusée. Sinon refus (`facade_refused`,
+  `accord_operation`, `accord_ref`), comme avant.
 - **`device-es256`** : signature ES256 brute sur `challenge` par une clé
   d'appareil (application Nexlink ou application native tierce, 0015).
 

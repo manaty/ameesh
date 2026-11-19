@@ -86,6 +86,16 @@ class AvatarDecisionTest(_Base):
                              signer=self.avatar(self.go(view["id"])))
         self.assertEqual(signed["decision"]["answer"]["by"], ALICE)
 
+    def test_option_non_est_couvrable(self):
+        """B1 2e tour auditeur (N) : la grammaire fermée laisse couvrir une
+        option nommée « non » — elle n'est plus prise pour une négation."""
+        view = self.ask(needs_signature=True,
+                        options=["a=oui, fusionner", "non=refuser"])
+        accord = self.go(view["id"], text="go %d non" % view["id"])
+        signed = self.answer(view["id"], "non", key_path=self.private,
+                             signer=self.avatar(accord))
+        self.assertEqual(signed["decision"]["answer"]["by"], ALICE)
+
     def test_avatar_signe_avec_la_cle(self):
         view = self.ask()
         with self.assertRaises(DecisionError):
@@ -110,7 +120,8 @@ class AvatarDecisionTest(_Base):
         # forme (a) : couvre aussi la clé et la provenance
         self.assertEqual(decisions.check_accord(self.db, key, ALICE,
                                                 self.go(key["id"]),
-                                                now=time.time())[:len(AVATAR)], AVATAR)
+                                                now=time.time(),
+                                                option="a")[:len(AVATAR)], AVATAR)
 
     def test_reclassement_vers_cle_seulement(self):
         view = self.ask()

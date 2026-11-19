@@ -22,13 +22,16 @@
   être un `human_message` de confiance de l'approbateur, écrite au plus 120 s
   après `iat` et au plus `max_ttl` (24 h) avant. Un « go » plus ancien est une
   approbation permanente (point 3).
-  Le message est un go **explicite et affirmatif** (il commence par « go »,
-  sans « ? » ni négation) et **nomme le geste** : identifiant d'action, ou
-  cible ET opération, ou lot pour une action ; connecteur, toutes ses
-  opérations et un mot de mandat (« mandat », « grant », « permanent »…) pour
-  un grant ; identifiant de la décision ET option signée pour `decide`.
-  L'opération seule, une autre cible, une question ou un refus sont refusés
-  (`accord_ref`) — relectures cx2, dev3 et auditeur du 18/11.
+  Le message suit une **grammaire fermée** : il commence par « go » et ne
+  porte ensuite QUE les références du geste signé — identifiant d'action,
+  cible, opération, lot pour une action ; connecteur, toutes ses opérations
+  et un mot de mandat (« mandat », « grant », « permanent »…) pour un grant ;
+  identifiant de la décision, option et libellé pour `decide` — séparées par
+  des espaces ou une ponctuation simple. Tout autre mot refuse l'accord
+  (`accord_ref`) : une question, un report (« demain », « attends », « later »)
+  ou une négation (« pas », « don't ») ne peut pas se cacher dans la phrase.
+  L'opération seule et une autre cible sont refusées — relectures cx2, dev3 et
+  auditeur du 18/11 (B1, 2e tour).
 - Un accord (`agent`, `seq`) ne cite **qu'un reçu** : la table
   `accord_claims` (même migration 0586, additive) réserve l'accord au geste
   (`kind`, `ref`) ; la clé primaire tranche la course entre deux reçus et la
@@ -84,9 +87,9 @@ Accord d'une décision (point 4, validé par le bureau le 17/11) : forme (a)
   sa fiche, `responsible` résolu) passe la garde « seul un humain répond ».
   Sans `--accord`, la garde est inchangée.
 - Accord vérifié avant de signer : message de l'humain au journal, au plus
-  24 h avant, go explicite et affirmatif qui nomme l'identifiant de la
-  décision ET l'option signée (comme au point 1) — un go qui nomme une autre
-  option ne couvre pas la signature.
+  24 h avant, go de grammaire fermée qui nomme l'identifiant de la décision
+  ET l'option signée (comme au point 1) — un go qui nomme une autre option ne
+  couvre pas la signature.
 - Forme (b), `grant:ID`, refusée dans cette tranche (relecture cx2, B) : un
   grant ne vaut que par le contrat complet des approbations permanentes
   (connecteur, classe, plafond, réservation atomique liée à la signature,
