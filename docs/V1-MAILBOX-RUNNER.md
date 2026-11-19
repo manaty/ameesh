@@ -89,7 +89,11 @@ An **undelivered** message is `delivered_at IS NULL`; the partial index
 `agent_mailbox_unread_idx (recipient, id) WHERE delivered_at IS NULL` serves the
 hot query. Delivery is done by the harness hook (as in v0) or by
 the runner at the end of a successful message turn: a message is never
-lost if the turn fails.
+lost if the turn fails. A reader that displays messages outside a harness
+hook (the bureau's watcher, #7836) delivers them with `agent-mail ack
+<id>…`: the same reserve-then-deliver protocol, idempotent, without
+stealing an active reservation, and the message remains readable by
+`agent-mail show`.
 
 ### `agent_mesh_overview` view
 

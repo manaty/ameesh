@@ -149,10 +149,12 @@
   ameesh list                 agents, hosts, leases, unread messages and budgets;
   ameesh mail <bind|unbind|bindings>
         explicit binding of an external session to an agent (L41, 0030);
-  ameesh mail <send|show|inbox|list|status|alias|hook|statusline|whoami>
+  ameesh mail <send|show|inbox|ack|list|status|alias|hook|statusline|whoami>
         the mailbox; `agent-mail` remains an alias (harness hooks call it);
-        `send` refuses an unknown recipient (close names suggested) or a
-        stopped one (unless --queue);
+        `ack` delivers received messages by number through the runners'
+        reservation protocol, for a reader that displays them outside a hook
+        (#7836); `send` refuses an unknown recipient (close names suggested)
+        or a stopped one (unless --queue);
   ameesh mail forward <old> <new> [--dry-run]
         re-delivers the pending mail of a stopped agent to a live agent;
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
