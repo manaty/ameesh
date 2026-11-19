@@ -151,6 +151,38 @@ class AncestorCandidateTest(unittest.TestCase):
         self.assertIsNone(nx.cutoff_tag(self.project, CUTOFF, 4600.0,
                                         window_s=1800.0))
 
+    def test_a_tick_with_main_already_merged_records_a_durable_candidate(self):
+        # The tick itself (not just `merge_candidate`) must freeze a candidate
+        # that names the slot when `main` is already inside `develop`.
+        cfg = types.SimpleNamespace(state_dir=str(Path(self.repo).parent / "state"))
+        with mock.patch.object(
+                rc, "compiled_rules",
+                return_value=(object(), types.SimpleNamespace(commit="d" * 40))), \
+                mock.patch.object(rc, "cutoff_slot", return_value=(CUTOFF, "11:00")), \
+                mock.patch.object(rc, "fetch"), \
+                mock.patch.object(
+                    nx, "snapshot",
+                    return_value=("h" * 40, self.develop, self.main, {}, None)), \
+                mock.patch.object(nx, "previous_release", return_value=self.develop), \
+                mock.patch.object(nx, "choose_version", return_value="11bt"), \
+                mock.patch.object(nx, "ensure_ref"), \
+                mock.patch.object(nx, "ci_plan",
+                                  return_value={"parts": [], "max_inflight": 1}), \
+                mock.patch.object(nx, "publish",
+                                  return_value="https://example/pr/1"), \
+                mock.patch.dict(os.environ, {"GIT_AUTHOR_DATE": "@1005 +0000",
+                                             "GIT_COMMITTER_DATE": "@1005 +0000"}):
+            report = rc.execute(cfg, None, self.project, now=1100)
+        self.assertEqual(report["result"], "empty")
+        sha = report["sha"]
+        self.assertNotEqual(sha, self.develop)
+        self.assertEqual(self.git("show", "-s", "--format=%B", sha),
+                         "Nexlink cutoff 11bt: merge pinned main\n\n"
+                         "cutoff-at: 1000")
+        self.git("tag", "release-11bt", sha)
+        found = nx.cutoff_tag(self.project, CUTOFF, 4600.0, window_s=1800.0)
+        self.assertEqual(found["commit"], sha)
+
 
 class ReconciledCutoffTest(unittest.TestCase):
     def setUp(self):
