@@ -91,6 +91,8 @@
   agent-mail alias <NAME> <DIR> [WORKSPACE]      names the sessions whose directory starts with DIR
   agent-mail status "<current work>"             status text (registry + terminal title); the status stays the runner's
   agent-mail hook <claude|codex|deepseek>        hook: reads the JSON on stdin, delivers the unread
+  agent-mail read-journal                        hook (#7859): journals one allowed avatar MCP read,
+                                                 tool and target identifiers only, never content
   agent-mail statusline                          Claude Code status bar: [workspace/name] work · directory
   agent-mail migrate [--dry-run | --additive-only] [--allow-live-executors REASON]
                                                  applies the versioned migrations

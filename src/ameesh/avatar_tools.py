@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from . import canon as canon_mod, events, spawn
+from . import avatar_connectors, canon as canon_mod, events, spawn
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,11 @@ def lists(card, canon):
                                              or v.startswith('-') for v in value):
             raise spawn.SpawnToolsError('avatar-tools-invalid', '%s must be a list of nonempty tool names' % key)
         values.append(value)
-    return *spawn.normalize(values[0], None), values[1]
+    tools, mcp = spawn.normalize(values[0], None)
+    # #6085/#7859: `connector:<name>` and the exact `mcp__<server>__<tool>`
+    # read tools of every declared server.
+    tools, mcp_tools, connectors = avatar_connectors.split(tools, mcp, strict=strict)
+    return tools, mcp, values[1], mcp_tools, connectors
 
 
 def prepare(cfg, agent, state_dir, cwd, *, harness=None) -> Applied | None:
@@ -67,26 +72,82 @@ def prepare(cfg, agent, state_dir, cwd, *, harness=None) -> Applied | None:
     policy = lists(card, owner)
     if policy is None:
         return None
-    tools, mcp, deny = policy
+    tools, mcp, deny, mcp_tools, connectors = policy
     harness = harness or agent.get('harness') or ''
     block = spawn.support(harness)
     # Empty allow-lists still require BOTH mechanisms: no inherited tools/MCP.
-    if block is None or not block.tools or not block.mcp or (deny and not block.deny_flag):
+    # A read-tool/connector policy also needs the private settings transport.
+    if (block is None or not block.tools or not block.mcp
+            or (deny and not block.deny_flag)
+            or ((connectors or mcp_tools) and not block.connectors_flag)):
         raise spawn.SpawnToolsError('avatar-tools-unsupported',
                                    'harness cannot apply the complete avatar tool policy')
     profile = dict(child=agent['name'], harness=harness, tools=tools, mcp=mcp, deny=deny)
     path, mcp_path = spawn.write_profile(state_dir, profile, cwd)
-    args = tuple(spawn.argv(profile, path))
-    # Hash configuration contents, including MCP transport changes, not just names.
+    args = spawn.argv(profile, path)
+    files = [path, mcp_path]
+    if connectors or mcp_tools:
+        settings_path, args = avatar_connectors.apply(
+            block, connectors, mcp, mcp_tools, state_dir, args)
+        files.append(settings_path)
+    else:
+        avatar_connectors.remove(state_dir)
+    args = tuple(args)
+    proof = dict(contract='ameesh-avatar-tools/1', harness=harness, tools=tools,
+                 mcp=mcp, deny_tools=deny, digest=_digest(args, files),
+                 card=card.fiche.ref, host=getattr(cfg, 'host', None))
+    if connectors:
+        # #6085: names only (connector and read tools), never content.
+        proof['connectors'] = {name: list(allowed) for name, allowed in connectors.items()}
+    if mcp_tools:
+        # #7859: the exact read tools of each local MCP server.
+        proof['mcp_tools'] = {name: list(allowed) for name, allowed in mcp_tools.items()}
+    return Applied(args, proof)
+
+
+def _digest(args, files) -> str:
+    """Hash the arguments and the configuration contents, not just names."""
     digest = hashlib.sha256()
-    digest.update(repr(args).encode('utf-8'))
-    for file in (path, mcp_path):
+    digest.update(repr(list(args)).encode('utf-8'))
+    for file in files:
         with open(file, 'rb') as handle:
             digest.update(handle.read())
-    proof = dict(contract='ameesh-avatar-tools/1', harness=harness, tools=tools,
-                 mcp=mcp, deny_tools=deny, digest=digest.hexdigest(),
-                 card=card.fiche.ref, host=getattr(cfg, 'host', None))
-    return Applied(args, proof)
+    return digest.hexdigest()
+
+
+def settings_path(applied: Applied | None) -> str | None:
+    """The private settings file of an applied policy, or None."""
+    if applied is None:
+        return None
+    args = list(applied.args)
+    try:
+        index = args.index('--settings')
+    except ValueError:
+        return None
+    return args[index + 1] if index + 1 < len(args) else None
+
+
+def rehash(applied: Applied, state_dir: str) -> Applied:
+    """Recompute the proof digest after a settings hook merge (#7863 attach)."""
+    args = list(applied.args)
+    files = [os.path.join(state_dir, spawn.PROFILE_FILE)]
+    if '--mcp-config' in args:
+        files.append(os.path.join(state_dir, spawn.MCP_FILE))
+    settings = settings_path(applied)
+    if settings:
+        files.append(settings)
+    proof = dict(applied.proof)
+    proof['digest'] = _digest(args, files)
+    return Applied(applied.args, proof)
+
+
+def read_tools(applied: Applied | None) -> list[str]:
+    """The exact MCP read tools an applied policy journals (#7859)."""
+    if applied is None:
+        return []
+    proof = applied.proof
+    return avatar_connectors.read_tools(proof.get('connectors') or {},
+                                        proof.get('mcp_tools') or {})
 
 
 def record(db, name, applied, mode):

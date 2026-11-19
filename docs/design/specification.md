@@ -173,6 +173,57 @@ rules and configuration digest, without MCP credentials. A changed policy
 restarts the resident before its next turn. Attach rereads the card after
 waiting for the resident to release the session.
 
+**Read-only MCP tools and account connectors** (#6085, #7859). An MCP server
+that needs a credential takes it from the harness environment
+(`"Authorization": "Bearer ${MEMORIA_TOKEN}"`); a literal credential in a
+header, an environment entry or a URL query of `.mcp.json` is refused
+(`spawn-context-secret`). Account-level connectors (claude.ai Slack, Gmail…)
+are not in `.mcp.json`, and Claude Code does not load them under
+`--strict-mcp-config`. A card declares a connector with `connector:<name>` and
+names each tool it may call. A local server is declared with `mcp:<server>`,
+then its read tools one by one as `mcp__<server>__<tool>`; the exact names are
+the allow-list, never the whole server, so a later server or connector version
+cannot silently add a write tool:
+
+```yaml
+tools:
+  - Read
+  - mcp:memoria
+  - mcp__memoria__inbox
+  - mcp__memoria__search
+  - mcp__memoria__ask
+  - mcp__memoria__read                 # whole message and thread, Memoria #125
+  - connector:claude_ai_Slack
+  - mcp__claude_ai_Slack__slack_read_thread
+  - mcp__claude_ai_Slack__slack_search_public_and_private
+  - connector:claude_ai_Gmail
+  - mcp__claude_ai_Gmail__search_threads
+  - mcp__claude_ai_Gmail__get_thread
+```
+
+A connector without a named tool, a tool of an undeclared server or connector,
+a server declared both `mcp:` and `connector:`, and a connector unknown to the
+harness descriptor (`ameesh.spawn.connectors.servers`) are refused. In
+`enforce` mode every `mcp:` server must name at least one read tool
+(`avatar-mcp-without-tools`); in `journal` mode a server without an exact list
+keeps the historical whole-server behavior.
+
+An exact-tool policy writes a private settings file (`--settings`; flag
+settings outrank user settings). `allowedMcpServers` admits the declared
+`mcp:` servers by name and each connector by its descriptor URL pattern; a
+`PreToolUse` hook refuses every other `mcp__` tool; a `PostToolUse` hook, whose
+matcher is exactly the declared read tools, calls `agent-mail read-journal`.
+A connector policy also drops `--strict-mcp-config`, which would not load
+connectors; an `mcp:`-only policy keeps it.
+
+Each allowed read is journaled as one `agent.read` event: agent, tool, target
+identifiers (channel, thread, message, file…), outcome and date; the prompt,
+query, message text and response are never recorded. The runner exports the
+same exact list as `AMEESH_AVATAR_READ_TOOLS`, and the hook ignores a tool it
+does not hold: a journal failure never fails the read. `agent.tools` records
+the connector, MCP server and exact tool names. A managed Claude policy
+(`allowManagedHooksOnly`, its own `allowedMcpServers`) outranks this file.
+
 The mesh's `federation.yaml` can require an explicit avatar list:
 
 ```yaml

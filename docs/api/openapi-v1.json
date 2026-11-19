@@ -2006,6 +2006,7 @@
               "agent.moved",
               "agent.attach",
               "agent.tools",
+              "agent.read",
               "host.memory_unavailable",
               "cost.recorded",
               "thread.entry",
