@@ -13,9 +13,11 @@ not merely be put on any commit created in the window.
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from ameesh import release_cutoff as rc
@@ -83,6 +85,71 @@ class CutoffTagTest(unittest.TestCase):
 
     def test_a_tag_created_after_the_window_does_not_reconcile_this_one(self):
         self.assertIsNone(self.read({SHA: "3000"}, {"11bt": SHA}))
+
+
+class AncestorCandidateTest(unittest.TestCase):
+    """B follow-up (#44156): `main` is already an ancestor of `develop`.
+
+    `git merge --no-ff` then answers "Already up to date" and creates no
+    commit; the candidate would be `develop` itself, so the published tag
+    could never name the slot and the next host would announce the released
+    cutoff missed. The full path is exercised on a real repository: merge
+    candidate, lightweight tag, then the missed path's `cutoff_tag`.
+    """
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(temp.cleanup)
+        self.repo = Path(temp.name) / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "test")
+        self.git("config", "user.email", "test@localhost")
+        self.main = self.commit("base", "base", 1000)
+        self.git("checkout", "-q", "-b", "develop")
+        self.develop = self.commit("develop", "develop", 1002)
+        self.project = rc.ProjectRelease("nexlink", str(self.repo),
+                                         target="develop", remote=str(self.repo),
+                                         model="nexlink")
+
+    def git(self, *args):
+        return subprocess.check_output(
+            ["git", "-C", str(self.repo), *args], text=True,
+            stderr=subprocess.STDOUT).strip()
+
+    def commit(self, name, text, at):
+        (self.repo / name).write_text(text)
+        self.git("add", ".")
+        with mock.patch.dict(os.environ, {"GIT_AUTHOR_DATE": "@%d +0000" % at,
+                                          "GIT_COMMITTER_DATE": "@%d +0000" % at}):
+            self.git("commit", "-qm", name)
+        return self.git("rev-parse", "HEAD")
+
+    def test_the_ancestor_candidate_names_the_cutoff_and_its_tag_reconciles(self):
+        with mock.patch.dict(os.environ, {"GIT_AUTHOR_DATE": "@1005 +0000",
+                                          "GIT_COMMITTER_DATE": "@1005 +0000"}):
+            sha = nx.merge_candidate(self.project, self.develop, self.main,
+                                     version="11bt", cutoff_at=1000)
+            self.git("tag", "release-11bt", sha)
+        self.assertNotEqual(sha, self.develop)
+        self.assertEqual(self.git("rev-list", "--parents", "-1", sha).split()[1:],
+                         [self.develop, self.main])
+        self.assertEqual(self.git("rev-parse", sha + "^{tree}"),
+                         self.git("rev-parse", self.develop + "^{tree}"))
+        self.assertEqual(self.git("show", "-s", "--format=%B", sha),
+                         "Nexlink cutoff 11bt: merge pinned main\n\n"
+                         "cutoff-at: 1000")
+        found = nx.cutoff_tag(self.project, CUTOFF, 4600.0, window_s=1800.0)
+        self.assertIsNotNone(found)
+        self.assertEqual(found["tag"], "release-11bt")
+        self.assertEqual(found["commit"], sha)
+
+    def test_a_manual_tag_on_the_ancestor_tree_does_not_reconcile(self):
+        # The `develop` head is in the window too; only the missing slot
+        # evidence (subject/marker) keeps it from reconciling.
+        self.git("tag", "release-11bt", self.develop)
+        self.assertIsNone(nx.cutoff_tag(self.project, CUTOFF, 4600.0,
+                                        window_s=1800.0))
 
 
 class ReconciledCutoffTest(unittest.TestCase):

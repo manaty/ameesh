@@ -536,6 +536,13 @@ def merge_candidate(project, base, main, *, version="", cutoff_at=None):
     evidence of the cutoff's own execution: the subject carries the version
     and the `cutoff-at:` trailer carries the slot's UTC epoch. Without
     `version` the legacy subject is kept (the tests and old candidates).
+
+    `git merge --no-ff` creates nothing when `main` is already an ancestor of
+    `base` ("Already up to date"): the candidate would then be `base` itself,
+    an ordinary commit whose message never names the slot, and the next host
+    would call a released cutoff missed. The same final tree is therefore
+    recorded in a merge commit carrying the message (both parents kept), so
+    the tag always lands on durable slot evidence (#7856, B).
     """
     message = _LEGACY_CANDIDATE
     if version:
@@ -549,7 +556,19 @@ def merge_candidate(project, base, main, *, version="", cutoff_at=None):
                        "--no-edit", "-m", message, main)
         if proc.returncode:
             raise rc.ReleaseError("Nexlink final-tree merge conflicts; resolve before cutoff")
-        return rc.commit_of(path, "HEAD")
+        merged = rc.commit_of(path, "HEAD")
+        if merged != base:
+            return merged
+        tree = (rc._git(path, "rev-parse", "HEAD^{tree}", check=True).stdout
+                or "").strip()
+        args = ["-c", "user.name=ameesh release", "-c",
+                "user.email=ameesh-release@localhost", "commit-tree", tree]
+        for parent in [base] + ([main] if main != base else []):
+            args += ["-p", parent]
+        proc = rc._git(path, *args, "-m", message)
+        if proc.returncode:
+            raise rc.ReleaseError("Nexlink final-tree candidate could not be recorded")
+        return (proc.stdout or "").strip()
     finally:
         rc._drop_worktree(project.repo, folder, path)
 
