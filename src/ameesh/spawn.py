@@ -293,12 +293,19 @@ def literal_credential(server) -> str | None:
             if not _SCHEME_ONLY.fullmatch(_PLACEHOLDER.sub("", str(value))):
                 return "%s.%s" % (field, key)
     url = server.get("url")
-    if isinstance(url, str) and "?" in url:
-        from urllib.parse import parse_qsl
-        query = url.split("?", 1)[1].split("#", 1)[0]
-        for key, value in parse_qsl(query, keep_blank_values=True):
-            if _CREDENTIAL_NAME.search(key) and _PLACEHOLDER.sub("", value).strip():
-                return "url query %s" % key
+    if isinstance(url, str):
+        from urllib.parse import parse_qsl, urlsplit
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return "url"
+        if parts.username or parts.password:
+            return "url userinfo"
+        if "?" in url:
+            query = url.split("?", 1)[1].split("#", 1)[0]
+            for key, value in parse_qsl(query, keep_blank_values=True):
+                if _CREDENTIAL_NAME.search(key) and _PLACEHOLDER.sub("", value).strip():
+                    return "url query %s" % key
     return None
 
 

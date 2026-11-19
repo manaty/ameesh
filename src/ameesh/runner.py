@@ -73,7 +73,7 @@ from . import account_window
 from . import provider_credits
 from . import persona_memory as memory_mod
 from . import spawn as spawn_policy
-from . import child_reports, avatar_tools
+from . import avatar_connectors, child_reports, avatar_tools
 from . import train_events
 from . import migrations
 from . import turn_context
@@ -9989,6 +9989,10 @@ class AgentWorker(threading.Thread):
         identite.update(identity.git_identity(self.name))
         if self._avatar_tools is not None:
             identite["AMEESH_AVATAR_TOOLS_DIGEST"] = self._avatar_tools.proof["digest"]
+            read_tools = avatar_tools.read_tools(self._avatar_tools)
+            if read_tools:
+                # #7859: the exact read tools the PostToolUse hook journals.
+                identite["AMEESH_AVATAR_READ_TOOLS"] = ",".join(read_tools)
         env.update(identite)
         # #1645 : chaque geste gh du tour est consigné (agent, tour, lot), et
         # le tour porte le jeton de son rôle GitHub quand il est configuré.
@@ -17996,6 +18000,13 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
             argv = [*argv[:offset], *avatar_applied.args, *argv[offset:]]
         env = _attach_env(cfg, name, lease_owner, epoch,
                           agent.get("harness") or "", human=human)
+        if avatar_applied is not None:
+            # #7859: same read journal as a driven turn; the attach wake hook
+            # below adds its own SessionStart/Stop settings.
+            env["AMEESH_AVATAR_TOOLS_DIGEST"] = avatar_applied.proof["digest"]
+            read_tools = avatar_tools.read_tools(avatar_applied)
+            if read_tools:
+                env["AMEESH_AVATAR_READ_TOOLS"] = ",".join(read_tools)
         env.update(adapter.env())
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         env.update(_attach_tmp_env(cfg, name, env, holds))
@@ -18031,6 +18042,25 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
             argv += ["--settings", wake.path]
             log_async("[%s] native wake hook armed (claude %s): %s"
                       % (name, wake.version, wake.command))
+        elif wake.path and avatar_tools.settings_path(avatar_applied):
+            # #7859 × #7863: the avatar read policy already occupies
+            # `--settings`. Merge the wake hooks into that private file instead
+            # of dropping them, then rehash the recorded proof.
+            try:
+                with open(wake.path, encoding="utf-8") as handle:
+                    extra = json.load(handle)
+                avatar_connectors.merge(avatar_tools.settings_path(avatar_applied), extra)
+                avatar_applied = avatar_tools.rehash(avatar_applied, cfg.agent_dir(name))
+                version, command = wake.version, wake.command
+                attach_wake.cleanup(wake)
+                wake = None
+                log_async("[%s] native wake hook merged into the avatar settings "
+                          "(claude %s): %s" % (name, version or "?", command))
+            except (OSError, ValueError, TypeError) as exc:
+                attach_wake.cleanup(wake)
+                wake = None
+                log_async("[%s] native wake hook skipped: avatar settings merge "
+                          "failed (%s)" % (name, exc))
         elif wake.path:
             # une autre source de réglages occupe déjà le drapeau : ne jamais
             # la remplacer par la nôtre (le hook de livraison y vit peut-être)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#6085: read-only account connectors of an avatar, named tool by tool."""
+"""#6085/#7859: read-only account connectors and MCP tools of an avatar."""
 import json
 import os
 import re
@@ -11,6 +11,8 @@ from ameesh import avatar_connectors, avatar_tools as policy, canon, harnesses, 
 from . import support  # noqa: F401  (isolated environment, L142)
 from .test_7630_avatar_tools import avatar, mesh
 
+MEMORIA_READ = ['mcp__memoria__inbox', 'mcp__memoria__search', 'mcp__memoria__ask',
+                'mcp__memoria__read']
 SLACK_READ = ['mcp__claude_ai_Slack__slack_read_thread',
               'mcp__claude_ai_Slack__slack_search_public_and_private']
 GMAIL_READ = ['mcp__claude_ai_Gmail__search_threads', 'mcp__claude_ai_Gmail__get_thread']
@@ -21,7 +23,8 @@ class ConnectorPolicyTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.agent = dict(name='avatar', canon_governed=True, harness='claude')
-        self.card = avatar(dict(tools=['Read', 'mcp:memoria', 'connector:claude_ai_Slack', *SLACK_READ,
+        self.card = avatar(dict(tools=['Read', 'mcp:memoria', *MEMORIA_READ,
+                                       'connector:claude_ai_Slack', *SLACK_READ,
                                        'connector:claude_ai_Gmail', *GMAIL_READ]))
         self.mesh = mesh(self.card, mode='enforce')
         self.write_mcp({'memoria': {'type': 'http', 'url': 'https://memoria.example/mcp',
@@ -59,38 +62,97 @@ class ConnectorPolicyTest(unittest.TestCase):
             {'serverUrl': 'https://mcp.slack.com/*'},
             {'serverUrl': 'https://gmailmcp.googleapis.com/*'}])
         self.assertIs(self.settings()['disableAllHooks'], False)
+        self.assertIn('PostToolUse', self.settings()['hooks'])
+
+    def test_exact_mcp_read_tools_keep_strict_and_add_private_settings(self):
+        self.card.fiche.data['tools'] = ['Read', 'mcp:memoria', *MEMORIA_READ]
+        applied = self.prepare()
+        path = os.path.join(self.tmp.name, avatar_connectors.SETTINGS_FILE)
+        self.assertIn('--strict-mcp-config', applied.args)
+        self.assertEqual(applied.args[-2:], ('--settings', path))
+        self.assertEqual(self.settings()['allowedMcpServers'], [{'serverName': 'memoria'}])
+        self.assertEqual(applied.proof['mcp_tools'], {'memoria': MEMORIA_READ})
+        self.assertNotIn('connectors', applied.proof)
 
     def test_hook_refuses_every_mcp_tool_not_named_in_the_card(self):
         self.prepare()
         (rule,) = self.settings()['hooks']['PreToolUse']
         self.assertIn('exit 2', rule['hooks'][0]['command'])
         refused = re.compile(rule['matcher'])  # same lookahead syntax in JavaScript
-        for allowed in [*SLACK_READ, *GMAIL_READ, 'mcp__memoria__search', 'mcp__memoria__read', 'Read', 'Bash']:
+        for allowed in [*MEMORIA_READ, *SLACK_READ, *GMAIL_READ, 'Read', 'Bash']:
             self.assertIsNone(refused.search(allowed), allowed)
-        for tool in ('mcp__claude_ai_Slack__slack_send_message',
+        for tool in ('mcp__memoria__delete', 'mcp__memoria__write',
+                     'mcp__claude_ai_Slack__slack_send_message',
                      'mcp__claude_ai_Slack__slack_read_thread_and_reply',  # an upgrade's new tool
                      'mcp__claude_ai_Gmail__send_message', 'mcp__claude_ai_Gmail__create_draft',
+                     'mcp__claude_ai_Gmail__get_attachment',  # not named by this card
                      'mcp__claude_ai_Notion__search', 'mcp__memoria2__search', 'mcp__other__x'):
             self.assertIsNotNone(refused.search(tool), tool)
 
-    def test_proof_journals_connector_tool_names_and_digest(self):
+    def test_journal_hook_is_limited_to_the_exact_read_tools(self):
+        self.prepare()
+        (rule,) = self.settings()['hooks']['PostToolUse']
+        journaled = re.compile(rule['matcher'])
+        for tool in [*MEMORIA_READ, *SLACK_READ, *GMAIL_READ]:
+            self.assertIsNotNone(journaled.search(tool), tool)
+        for tool in ('mcp__memoria__delete', 'mcp__claude_ai_Gmail__send_message', 'Read'):
+            self.assertIsNone(journaled.search(tool), tool)
+        self.assertEqual(rule['hooks'][0]['command'], avatar_connectors.JOURNAL)
+
+    def test_proof_journals_connector_and_mcp_tool_names_and_digest(self):
         applied = self.prepare()
         self.assertEqual(applied.proof['connectors'], {'claude_ai_Slack': SLACK_READ,
                                                        'claude_ai_Gmail': GMAIL_READ})
+        self.assertEqual(applied.proof['mcp_tools'], {'memoria': MEMORIA_READ})
         self.assertEqual(applied.proof['tools'], ['Read'])
         self.assertEqual(applied.proof['mcp'], ['memoria'])
         self.card.fiche.data['tools'] = [t for t in self.card.fiche.data['tools']
                                          if t != GMAIL_READ[1]]
         self.assertNotEqual(applied.proof['digest'], self.prepare().proof['digest'])
 
-    def test_card_without_connectors_is_unchanged_and_clears_stale_settings(self):
+    def test_attach_wake_hooks_merge_into_the_same_settings_and_rehash(self):
+        applied = self.prepare()
+        settings = policy.settings_path(applied)
+        self.assertTrue(settings)
+        avatar_connectors.merge(settings, {'hooks': {'SessionStart': [
+            {'hooks': [{'type': 'command', 'command': 'agent-mail wait',
+                        'asyncRewake': True}]}]}})
+        rehashed = policy.rehash(applied, self.tmp.name)
+        self.assertNotEqual(applied.proof['digest'], rehashed.proof['digest'])
+        self.assertEqual(rehashed.args, applied.args)
+        document = self.settings()
+        self.assertIn('PreToolUse', document['hooks'])
+        self.assertIn('PostToolUse', document['hooks'])
+        self.assertIn('SessionStart', document['hooks'])
+
+    def test_card_without_read_policy_is_unchanged_and_clears_stale_settings(self):
         self.prepare()
-        self.card.fiche.data['tools'] = ['Read', 'mcp:memoria']
+        self.card.fiche.data['tools'] = ['Read']
         applied = self.prepare()
         self.assertIn('--strict-mcp-config', applied.args)
         self.assertNotIn('--settings', applied.args)
         self.assertNotIn('connectors', applied.proof)
+        self.assertNotIn('mcp_tools', applied.proof)
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, avatar_connectors.SETTINGS_FILE)))
+
+    def test_enforce_requires_an_exact_list_for_each_mcp_server(self):
+        self.card.fiche.data['tools'] = ['Read', 'mcp:memoria']
+        self.refused('avatar-mcp-without-tools')
+
+    def test_journal_mode_keeps_the_whole_server_prefix(self):
+        self.mesh.federation['extensions']['ameesh']['action_gate']['mode'] = 'journal'
+        self.card.fiche.data['tools'] = ['Read', 'mcp:memoria']
+        applied = self.prepare()
+        # A journal-mode server without an exact list keeps the historical
+        # strict MCP configuration (all its tools); no private settings needed.
+        self.assertIn('--strict-mcp-config', applied.args)
+        self.assertNotIn('--settings', applied.args)
+        self.assertNotIn('mcp_tools', applied.proof)
+        block = spawn.support('claude')
+        document = avatar_connectors.settings(block, {}, ['memoria'], {})
+        refused = re.compile(document['hooks']['PreToolUse'][0]['matcher'])
+        self.assertIsNone(refused.search('mcp__memoria__delete'))
+        self.assertNotIn('PostToolUse', document['hooks'])
 
     def test_journal_mode_applies_the_same_card(self):
         self.mesh.federation['extensions']['ameesh']['action_gate']['mode'] = 'journal'
@@ -100,11 +162,16 @@ class ConnectorPolicyTest(unittest.TestCase):
         self.card.fiche.data['tools'] = ['Read', 'connector:claude_ai_Slack']
         self.refused('avatar-connector-without-tools')
 
-    def test_tool_of_an_undeclared_connector_is_refused(self):
+    def test_tool_of_an_undeclared_server_is_refused(self):
         self.card.fiche.data['tools'] = ['Read', *SLACK_READ]
         self.refused('avatar-connector-tool-orphan')
-        self.card.fiche.data['tools'] = ['mcp:memoria', 'mcp__memoria__search']
+        self.card.fiche.data['tools'] = ['mcp:memoria', 'mcp__other__search']
         self.refused('avatar-connector-tool-orphan')
+
+    def test_server_declared_twice_is_refused(self):
+        self.card.fiche.data['tools'] = ['mcp:claude_ai_Slack',
+                                         'connector:claude_ai_Slack', *SLACK_READ]
+        self.refused('avatar-connector-conflict')
 
     def test_unknown_or_malformed_connector_is_refused(self):
         self.card.fiche.data['tools'] = ['connector:claude_ai_Notion', 'mcp__claude_ai_Notion__search']
@@ -151,7 +218,8 @@ class McpCredentialTest(unittest.TestCase):
                         'headers': {'X-Api-Key': '${MEMORIA_TOKEN}x'}},
                        {'command': 'memoria-mcp', 'env': {'MEMORIA_TOKEN': 'opaque'}},
                        {'command': 'memoria-mcp', 'env': {'MEMORIA_TOKEN': '${UNSET:-opaque}'}},
-                       {'type': 'http', 'url': 'https://m.example/mcp?access_token=opaque'}):
+                       {'type': 'http', 'url': 'https://m.example/mcp?access_token=opaque'},
+                       {'type': 'http', 'url': 'https://user:opaque@m.example/mcp'}):
             with self.subTest(server=server), self.assertRaises(spawn.SpawnToolsError) as error:
                 self.copy(server)
             self.assertEqual(error.exception.code, 'spawn-context-secret')
