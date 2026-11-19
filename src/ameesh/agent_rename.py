@@ -66,7 +66,8 @@ REWRITTEN = (
     "sandbox_turns.agent", "session_bindings.agent",
     "tranche_reservations.agent", "tranche_reservations.closed_by", "tranche_events.actor",
     "tranche_limits.admitted_by",
-    "session_bindings.created_by", "spend_pending.agent", "spend_marker_events.agent",
+    "session_bindings.created_by", "spend_ledger.decided_by", "spend_marker_events.agent",
+    "spend_pending.agent",
     "standing_reservations.reserved_by",
     "turn_costs.agent", "turn_resources.agent", "visibility_checks.persona",
     "work_item_delegations.delegate", "work_item_delegations.delegated_by",
@@ -136,6 +137,13 @@ KEPT = (
     # preuve historique ; sa colonne vit avec le module `dev` (P1b #7650).
     "schema_migrations.name",
     "schema_non_additive_migrations.name",
+    # #7865 (0596) : le ledger de dépense garde les acteurs d'approbation, de
+    # confirmation et d'arrêt comme preuves datées, comme les actions et
+    # `standing_approvals` ; seul `decided_by`, lu par le relevé de l'agent
+    # (`spend.recap`), suit le renommage.
+    "spend_ledger.approver", "spend_ledger.confirmed_by",
+    "spend_ledger.stop_requested_by", "spend_ledger.stopped_by",
+    "spend_review_confirmations.confirmed_by",
     "spend_marker_events.actor",  # Human resolution / runner audit evidence.
     "sandbox_turns.owner",  # Runner lease owner, never an agent identity.
     "standing_approvals.approver", "standing_approvals.registered_by",

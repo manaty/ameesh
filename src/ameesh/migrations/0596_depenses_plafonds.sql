@@ -255,6 +255,13 @@ create index if not exists spend_ledger_grant_idx
     on spend_ledger (grant_id, state, started_on);
 create index if not exists spend_ledger_decided_idx
     on spend_ledger (decided_by, created_at desc);
+-- #7865 (#4299) : `decided_by` désigne l'agent qui a décidé la dépense ; le
+-- relevé (`spend.recap`) le lit sous le nouveau nom après un renommage. Les
+-- autres acteurs du ledger restent des preuves datées (`agent_rename.KEPT`).
+drop trigger if exists ameesh_agent_spelling on spend_ledger;
+create trigger ameesh_agent_spelling before insert or update of decided_by
+on spend_ledger for each row
+execute function ameesh_agent_spelling('decided_by');
 -- #7865 (B3) : une action d'arrêt ne peut être liée qu'à UNE ressource ; une
 -- même action ne doit donc jamais arrêter comptablement plusieurs lignes.
 create unique index if not exists spend_ledger_stop_action_once
