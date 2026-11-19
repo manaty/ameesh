@@ -83,8 +83,12 @@ begin
             raise exception 'limited login %: external executor is set by a pilot only',
                 session_user using errcode = 'insufficient_privilege';
         end if;
+        -- #7870 B1 : retirer la session seule (executor conservé) n'est pas
+        -- une levée ; sinon la session nommée tomberait à NULL et une autre
+        -- session du même agent pourrait ensuite se lever. Seule la levée
+        -- atomique (executor, session et prise ensemble) est ouverte.
         if new.external_session is distinct from old.external_session
-           and new.external_session is not null then
+           and new.external_executor is not null then
             raise exception 'limited login %: external session is set by a pilot only',
                 session_user using errcode = 'insufficient_privilege';
         end if;

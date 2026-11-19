@@ -10,6 +10,11 @@
       "checksum": "8a8bfc9ac37192a7d9c378ab2707a455aee98edd751fd46468354a09e5ac2085",
       "restore": "src/ameesh/migrations/rollback/0584_restore.sql",
       "lot": 7566
+    },
+    "src/ameesh/migrations/0598_bureau_clear_only.sql": {
+      "checksum": "8c856df894d7e75d703ec820850d64a0d11fb0e0c3d55515efb92a7480ebf654",
+      "lot": 7870,
+      "restore": "src/ameesh/migrations/rollback/0598_restore.sql"
     }
   },
   "exceptions": {

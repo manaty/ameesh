@@ -413,6 +413,86 @@ class BureauRoleLimiteTest(PgTestCase):
             "clearing the reservation clears its session and claim")
         self.assertEqual(work.get(self.db, lot)["external_executor"], "bureau")
 
+    def test_le_role_limite_ne_retire_pas_la_session_seule(self):
+        """#7870 B1 : retirer la session seule n'est pas une levée.
+
+        Sinon la réservation garde l'exécutant mais perd la session nommée ;
+        une autre session du même agent pourrait ensuite se lever (le test
+        #227982 : lot bureau/BG, `external_session = NULL`, puis `--clear`
+        from PC).
+        """
+        lot = self.reserve()
+        self.db.execute("UPDATE work_items SET external_session = 'BG' WHERE id = %s",
+                        (lot,))
+        self.bind("PC")
+        self.refused(
+            "UPDATE work_items SET external_session = NULL WHERE id = %d" % lot,
+            "external session is set by a pilot only")
+        row = work.get(self.db, lot)
+        self.assertEqual(row["external_executor"], "bureau")
+        self.assertEqual(row["external_session"], "BG")
+        proc = self.as_bureau("work", "external-executor", str(lot), "--clear")
+        self.assertNotEqual(proc.returncode, 0, "PC a levé la réservation de BG")
+        self.assertEqual(work.get(self.db, lot)["external_executor"], "bureau")
+
+    def test_la_levee_exige_une_liaison_verifiee(self):
+        """#7870 : sans liaison L41 vérifiée, la levée reste un geste de pilote."""
+        lot = self.reserve()
+        self.db.execute("UPDATE work_items SET external_session = 'BG' WHERE id = %s",
+                        (lot,))
+        proc = self.as_bureau("work", "external-executor", str(lot), "--clear")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("neither a human, an orchestrator nor a design agent",
+                      proc.stderr)
+        row = work.get(self.db, lot)
+        self.assertEqual(row["external_executor"], "bureau")
+        self.assertEqual(row["external_session"], "BG")
+
+    def test_la_levee_relit_la_reservation_sous_le_verrou(self):
+        """#7870 B2 : la preuve ne vaut que pour la réservation qu'elle a lue.
+
+        Le pilote renomme BG en PC entre la preuve et le verrou de la levée :
+        la levée de BG ne doit pas effacer la réservation PC, et aucune trace
+        de levée ne doit être écrite.
+        """
+        lot = self.reserve()
+        self.db.execute("UPDATE work_items SET external_session = 'BG' WHERE id = %s",
+                        (lot,))
+        self.bind("BG")
+        cfg = dataclasses.replace(self.cfg, dsn=self.dsn)
+        limited = db_mod.connect(cfg)
+        raced = {"done": False}
+        try:
+            original = work._self_clear_reservation
+
+            def renomme(cfg_, db_, item, actor):
+                self.db.execute(
+                    "UPDATE work_items SET external_session = 'PC' WHERE id = %s",
+                    (lot,))
+                raced["done"] = True
+                return original(cfg_, db_, item, actor)
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGENT_MAIL_NAME", None)
+                with mock.patch.object(work, "_self_clear_reservation",
+                                       side_effect=renomme):
+                    with self.assertRaises(work.WorkError) as caught:
+                        work.set_external_executor(limited, lot, None, clear=True,
+                                                   cfg=cfg, actor="bureau")
+            self.assertTrue(raced["done"])
+            self.assertIn("changed, closed or was claimed",
+                          str(caught.exception))
+            row = work.get(self.db, lot)
+            self.assertEqual(row["external_executor"], "bureau")
+            self.assertEqual(row["external_session"], "PC")
+            events = self.db.query(
+                "SELECT count(*) AS n FROM work_item_events"
+                " WHERE work_item_id = %s AND note LIKE '%%external executor cleared%%'",
+                (lot,))[0]["n"]
+            self.assertEqual(events, 0)
+        finally:
+            limited.close()
+
     def test_une_autre_session_du_meme_agent_ne_leve_pas_la_reservation_nommee(self):
         """#7870 : quand le feu nomme une session, seule celle-là se lève."""
         lot = work.add(self.db, title="geste hôte du bureau", app="ameesh",

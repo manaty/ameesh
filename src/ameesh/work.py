@@ -2976,8 +2976,14 @@ def set_external_executor(db: Db, item_id: int, executor: str | None, *,
         if named:
             note += " (session %s)" % named
     try:
+        # #7870 B2 : une levée par l'exécutant réservé passe la réservation
+        # qu'elle a vérifiée ; le stockage la relit sous le verrou et n'écrit
+        # rien si un pilote l'a renommée entre-temps. Le geste pilote, lui,
+        # lève la réservation courante (sous le même verrou).
         row = storage.of(db).work.set_external_executor(
-            item_id, name, session=None if clear else named, note=note, actor=who)
+            item_id, name, session=None if clear else named, note=note, actor=who,
+            expect_executor=previous if self_clear is not None else None,
+            expect_session=previous_session if self_clear is not None else None)
     except interface.ExternalExecutorUnavailable as exc:
         raise WorkError("lot %s: external executor %s was retired before the reservation "
                         "was written; nothing changed — declare a current system instead"

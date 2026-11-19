@@ -1683,7 +1683,8 @@ class WorkItems(interface.WorkItems):
             return work._unassign_locked(item_id, agent, note, actor)
 
     def set_external_executor(self, item_id, executor, *, session=None, note,
-                              actor) -> dict | None:
+                              actor, expect_executor=None,
+                              expect_session=None) -> dict | None:
         """#3447 : pose (ou efface, `executor=None`) l'exécutant externe d'un lot
         ouvert, avec sa ligne de journal, en une transaction.
 
@@ -1695,7 +1696,12 @@ class WorkItems(interface.WorkItems):
         #6839 : `session` nomme la session exécutante du feu (facultative). Une
         pose concurrente d'une prise exclusive est refusée (`external_claim_session`
         relu sous le même verrou) ; une levée efface la prise, sa session et son
-        instant dans la même écriture."""
+        instant dans la même écriture.
+
+        #7870 B2 : `expect_executor`/`expect_session` (levée par l'exécutant
+        réservé) sont comparés à la ligne RELUE sous `FOR UPDATE` ; une
+        réservation renommée entre la preuve et le verrou rend None sans rien
+        écrire (ni journal, ni effacement)."""
         closed = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
         with self.db.transaction() as tx:
             if executor:
@@ -1720,10 +1726,21 @@ class WorkItems(interface.WorkItems):
             # Sous le verrou de la ligne, l'état lu ici ne bouge plus jusqu'à
             # l'écriture ; un échec de l'UPDATE annule tout.
             current = tx.query(
-                f"SELECT state FROM work_items WHERE id = %s AND state NOT IN {closed}"
+                "SELECT state, external_executor, external_session"
+                f" FROM work_items WHERE id = %s AND state NOT IN {closed}"
                 " FOR UPDATE", (int(item_id),))
             if not current:
                 return None
+            # #7870 B2 : la preuve de self-clear a lu la réservation AVANT ce
+            # verrou ; si un pilote l'a renommée entre-temps (session ou
+            # exécutant), elle ne vaut plus pour cette ligne. Rien n'est écrit,
+            # pas même la trace : la levée sera relue et retentée.
+            if expect_executor is not None:
+                held = (current[0]["external_executor"] or "").strip()
+                held_session = (current[0]["external_session"] or "").strip()
+                if held != expect_executor \
+                        or held_session != (expect_session or ""):
+                    return None
             WorkItems(tx)._event(int(item_id), current[0]["state"], note, actor)
             rows = tx.query(
                 ("UPDATE work_items SET external_executor = NULL,"
