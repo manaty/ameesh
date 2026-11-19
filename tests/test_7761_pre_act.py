@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import unittest
 import json
+import re
 from contextlib import nullcontext
+from pathlib import Path
 from unittest import mock
 
 from ameesh import planned_waits, pre_act
@@ -60,6 +62,26 @@ class PreActTest(unittest.TestCase):
             self.assertEqual(pre_act.main(["--lot", "5772", "--kind", "kms", "--since",
                                            "1970-01-01T00:01:40Z", "--dry-run", "--", "true"]), 1)
         execute.assert_not_called()
+
+    def test_receipts_name_only_columns_granted_to_the_bureau_role(self):
+        """#7855 : le rôle limité n'a l'INSERT que sur cinq colonnes ; le reçu
+        et la preuve d'effet ne doivent en nommer aucune autre (`created_at`
+        vient du défaut serveur, 0463)."""
+        spec = (Path(support.REPO) / "deploy" / "sql" / "_bureau-droits.sql").read_text(
+            encoding="utf-8")
+        grant = re.search(r"\('work_item_events','INSERT',ARRAY\[([^\]]*)\]\)", spec)
+        self.assertIsNotNone(grant)
+        granted = {column.strip().strip("'") for column in grant.group(1).split(",")}
+        tx = Transaction()
+        self.check(tx)
+        pre_act._record_effect(tx, 5772, "bureau", {"phase": "start", "kind": "kms"})
+        inserts = [sql for sql, _ in tx.writes if "INSERT INTO work_item_events" in sql]
+        self.assertEqual(len(inserts), 2)
+        for sql in inserts:
+            named = re.search(r"\(([^)]*)\)\s*VALUES", sql)
+            self.assertIsNotNone(named, sql)
+            columns = {column.strip() for column in named.group(1).split(",")}
+            self.assertEqual(columns, granted, sql)
 
     def test_stop_delivered_during_wait_refuses_without_receipt(self):
         tx = Transaction(messages=[{"id": 42, "recipient": "bureau", "unread": False,
