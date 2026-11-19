@@ -221,6 +221,12 @@
   ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
         trois {works} {delivered} sur leur base gelée, version installée et version
         évaluée, relecture croisée à l'aveugle ;
+  ameesh responder <application> --severity S [--json] [--now ISO]
+        #7866 : route un incident vers le premier humain disponible déclaré
+        par la fiche Application du canon (schéma ameesh-responder/1) ; les
+        signaux de disponibilité ne servent qu'au routage, le journal ne garde
+        que le répondant, la raison et les types de signaux ; le réveil
+        téléphonique est éteint par défaut et exige un go owner signé ;
   ameesh restart <agent> --brief FILE|-   fresh session on a brief;
   ameesh resume <agent> [--brief FILE|-] [--fresh]
         restarts a stopped, dead or idle agent: same session if the next
@@ -600,6 +606,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L124 : demandes de décision au propriétaire, et ses réponses
         from . import decisions
         return decisions.main(rest)
+    if command == "responder":
+        # #7866 : routage d'incident vers un humain disponible, déclaré au canon
+        from . import responder
+        return responder.main(rest)
     if command == "session":
         from . import session_backup
         return session_backup.main(rest)

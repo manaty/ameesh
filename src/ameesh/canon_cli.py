@@ -478,6 +478,16 @@ def _show_one(canon: canon_mod.Canon, args: argparse.Namespace) -> int:
                 "%d stages, %d transitions" % (len(pl.artifact.stages),
                                                len(pl.artifact.transitions))
                 if pl.artifact is not None and pl.valid else "INVALID"))
+    if canon.applications:
+        # #7866 : fiches Application (routage d'incident)
+        print("applications:")
+        for app in canon.applications:
+            policy = app.incident
+            chain = " → ".join(r.member or "role:%s" % r.role
+                               for r in (policy.responders if policy else ())) or "—"
+            print("  %-20s %-18s %s%s" % (
+                app.id or "?", app.responsible or "NO RESPONSIBLE", chain,
+                "" if app.valid else "  INVALID"))
     print("findings   : %s (details: ameesh canon check)" % _summary(findings))
     return 0
 

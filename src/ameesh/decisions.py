@@ -1702,6 +1702,26 @@ def _reply_for(db, view: dict, human: str) -> dict | None:
         return None
 
 
+def human_account_proof(cfg: Config, db) -> str:
+    """L77 : la preuve `user@host` d'une entrée humaine interactive, ou ''.
+
+    Même preuve que le courrier humain (`payload.human_account`, #286) : le
+    couple **compte Unix réel + hôte** de CE processus, lu seulement quand
+    aucune liaison (exécuteur, session, identité annoncée) ne porte le
+    processus. Un bureau ou un avatar qui répond sous `human:<id>` est lié à
+    son agent : il ne produit donc aucune preuve, et son activité ne se
+    confond pas avec celle de l'humain (#7866, B1 de l'auditeur)."""
+    try:
+        from . import identity, resident_queue
+        binding = identity.resolve_binding(cfg, db)
+        if binding.source != "none":
+            return ""
+        user, host = resident_queue.local_account(cfg)
+        return "%s@%s" % (user or "?", host or "?")
+    except Exception:  # noqa: BLE001 — l'absence de preuve n'empêche pas de répondre
+        return ""
+
+
 def _answer_mail(cfg: Config, db, view: dict, *, human: str,
                  after: list | None = None) -> tuple[int | None, str | None, bool]:
     """Dépose le courrier de la réponse gardée, ou rend celui déjà déposé.
@@ -1710,15 +1730,11 @@ def _answer_mail(cfg: Config, db, view: dict, *, human: str,
     courrier manquant (panne entre la réponse et lui) est renvoyé, un courrier
     déjà déposé n'est jamais doublé. Une panne de base lève : la transaction
     de la réponse est annulée et la re-saisie la refait."""
-    from . import identity, mail, resident_queue
+    from . import mail
     existing = _reply_for(db, view, human)
     if existing is not None:
         return int(existing["id"]), None, False
-    binding = identity.resolve_binding(cfg, db)
-    human_account = ""
-    if binding.source == "none":
-        user, host = resident_queue.local_account(cfg)
-        human_account = "%s@%s" % (user or "?", host or "?")
+    human_account = human_account_proof(cfg, db)
     answer = view.get("answer") or {}
     payload = {"human": True, "urgent": True,
                **({"human_account": human_account} if human_account else {}),
@@ -1852,12 +1868,17 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         raise DecisionError(signature_hint(view, text, option, human))
     if signed_requested:
         channel = "signed"
+    # #7866 (B1) : la preuve du poste humain est écrite avec la réponse, comme
+    # pour le courrier. Un bureau/avatar lié n'en produit pas ; le résolveur
+    # d'incident ne compte donc pas sa réponse comme une activité de l'owner.
+    human_account = human_account_proof(cfg, db)
 
     def record_for(proof) -> dict:
         return {"state": "answered", "answer": {
             "by": human, "channel": channel, "text": text, "option": option,
             "option_label": _option_label(view, option), "ts": round(now, 3),
             "host": cfg.host, "proof": proof,
+            **({"human_account": human_account} if human_account else {}),
             **({"signer": signer or {"by": SIGNED_BY_OWNER}} if proof else {})}}
 
     def said(view: dict) -> str:
