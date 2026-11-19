@@ -168,22 +168,16 @@ def gate_state(db) -> dict:
                  WHERE kind IN (%s))::bigint AS milestones,
                (SELECT coalesce(max(id), 0) FROM work_item_milestones
                  WHERE kind = 'merged')::bigint AS merged,
-               (SELECT coalesce(max(extract(epoch from first_seen_at)), 0)::float8
-                  FROM ci_runs) AS ci_seen,
-               (SELECT coalesce(max(extract(epoch from concluded_at)), 0)::float8
-                  FROM ci_runs) AS ci_concluded,
-               (SELECT count(*) FROM ci_runs WHERE status = 'running')::bigint
-                   AS ci_running,
                (SELECT coalesce(max(id), 0) FROM ameesh_events
                  WHERE type IN ('staging.attested', 'staging.sequence',
                                 'staging.request'))::bigint AS staging
         """ % ", ".join("'%s'" % kind for kind in GATE_MILESTONES))[0]
-    return {"milestones": int(row.get("milestones") or 0),
-            "merged": int(row.get("merged") or 0),
-            "ci_seen": float(row.get("ci_seen") or 0.0),
-            "ci_concluded": float(row.get("ci_concluded") or 0.0),
-            "ci_running": int(row.get("ci_running") or 0),
-            "staging": int(row.get("staging") or 0)}
+    # #7650 : les témoins de `ci_runs` sont lus par le domaine `dev`.
+    state = {"milestones": int(row.get("milestones") or 0),
+             "merged": int(row.get("merged") or 0),
+             "staging": int(row.get("staging") or 0)}
+    state.update(storage.of(db).ci.gate_state())
+    return state
 
 
 def _due(value) -> float | None:

@@ -60,6 +60,13 @@ class _Conn:
         self.db = db
         self.own = own
 
+    @property
+    def cfg(self):
+        # #7650 : le stockage du module `dev` qualifie ses tables avec le
+        # schéma noyau configuré ; la connexion factice le porte comme la
+        # vraie, sans quoi le résolveur retomberait sur `public`.
+        return self.db.cfg
+
     def query(self, sql, params=None):
         if params is None:
             return self.db.query(sql)

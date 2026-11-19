@@ -553,10 +553,13 @@ def _lock_lot(tx: Any, work_item_id: int) -> Mapping[str, Any]:
     `reviewer` comes from `to_jsonb`, like the other #705 reads: a database
     from before 0421 returns `''` instead of breaking.
     """
+    # #7650 : la présence de la table des créneaux est un fait du module `dev`
+    # (nom physique lu au registre), pas un littéral du noyau.
+    from . import storage
+    has_slots = storage.of(tx).work.slots_available(tx)
     rows = tx.query(
         "SELECT w.id, w.state, w.assignee, w.type, w.app, w.workstream, w.loops,"
         "       w.title, w.closed_at, w.migration, w.migration_repo,"
-        "       to_regclass('work_migration_reservations') IS NOT NULL AS migration_slots,"
         "       coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer,"
         "       w.workflow_ref, w.workflow_stage, w.workflow_version,"
         "       to_jsonb(w)->>'legacy_state' AS legacy_state"
@@ -565,6 +568,7 @@ def _lock_lot(tx: Any, work_item_id: int) -> Mapping[str, Any]:
     if not rows:
         raise RegistryRefusal("lot-unknown", "lot %s not found" % work_item_id)
     row = dict(rows[0])
+    row["migration_slots"] = has_slots
     row["state"] = lifecycle.phase(row)
     return row
 
@@ -1090,19 +1094,14 @@ def _release_migration(tx: Any, command: Command, row: Mapping[str, Any],
     numbers = set()
     if row.get("migration") is not None:
         numbers.add(int(row["migration"]))
+    from . import storage
+    work_store = storage.of(tx).work
     if row.get("migration_slots"):
-        numbers.update(int(slot["number"]) for slot in tx.query(
-            "SELECT number FROM work_migration_reservations"
-            " WHERE work_item_id = %s AND status = 'reserved' ORDER BY number",
-            (int(command.work_item_id),)))
+        numbers.update(work_store.reserved_numbers(command.work_item_id))
     if not numbers:
         return
     if row.get("migration_slots"):
-        tx.execute(
-            "UPDATE work_migration_reservations SET status = 'released',"
-            "       updated_at = now()"
-            " WHERE work_item_id = %s AND status = 'reserved'",
-            (int(command.work_item_id),))
+        work_store.release_reserved_slots(command.work_item_id)
     tx.execute(
         "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
         "       updated_at = now() WHERE id = %s", (int(command.work_item_id),))

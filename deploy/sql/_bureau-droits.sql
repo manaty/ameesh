@@ -23,6 +23,11 @@ INSERT INTO pg_temp.bureau_spec(rel, priv, cols) VALUES
   -- admission d'écriture et sonde de schéma (db.connect)
   ('schema_migrations','SELECT',NULL),
   ('schema_non_additive_migrations','SELECT',NULL),
+  -- P1b #7650 : résolution du schéma physique des modules (`relation`,
+  -- `schema_name`) ; noms et empreintes de schéma, aucun contenu d'agent,
+  -- les mêmes colonnes que role-superviseur (#7649) — la sonde accepte les
+  -- deux formes de droit depuis la revue B2 de #7650
+  ('module_schemas','SELECT',ARRAY['module','schema_name','schema_sha256','created_at']),
   -- registre et noms (résolution, orthographe, réveil)
   ('agent_registry','SELECT',NULL),
   -- verrou de ligne seulement (FOR SHARE / FOR KEY SHARE) : toute écriture

@@ -247,6 +247,138 @@
         "scripts/paquet-inclusion.py"
       ]
     },
+    "src/ameesh/modules/dev/storage/agent_columns.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/ci.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/github_watch.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/landings.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/migration_reservations.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/prevalidation.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/provenance.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/reports.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/reviews.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/work.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/work_footprints.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/modules/dev/storage/worktrees.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
     "src/ameesh/plan_git.py": {
       "class": "sensitive",
       "rule": [
@@ -336,6 +468,138 @@
         "scripts/freeze-checks.py",
         "scripts/garde-mecanique.py",
         "scripts/paquet-inclusion.py"
+      ]
+    },
+    "src/ameesh/storage/postgres/agent_columns.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/ci.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/github_watch.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/landings.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/migration_reservations.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/prevalidation.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/provenance.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/reports.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/reviews.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/work_dev.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/work_footprints.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
+      ]
+    },
+    "src/ameesh/storage/postgres/worktrees.py": {
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/migrations/**",
+        "src/ameesh/migrations.py",
+        "src/ameesh/db.py",
+        "src/ameesh/storage/**",
+        "deploy/sql/**",
+        "**/*.sql"
       ]
     }
   },

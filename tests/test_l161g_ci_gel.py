@@ -58,6 +58,7 @@ from urllib.parse import unquote
 
 from ameesh import ci, mesh_cli, plan_github, prevalidation, work  # noqa: E402
 from ameesh import prevalidation_calls  # noqa: E402
+from tests import support  # noqa: E402
 
 DEPOT = "manaty/ameesh"
 GEL = "a" * 40
@@ -200,7 +201,10 @@ class FakeDb:
         self.tx_open = False
 
     def query(self, sql, params=()):
-        if "to_regclass('work_packet_snapshots')" in sql:
+        probe = support.registry_absent(sql)
+        if probe is not None:
+            return probe
+        if "to_regclass" in sql and "AS ready" in sql:
             return [{"ready": False}]  # legacy database before migration 0580
         raise AssertionError("unexpected database read: " + sql)
 

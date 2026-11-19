@@ -4851,6 +4851,7 @@
     "set_failure_message",
     "set_message",
     "stuck_runners",
+    "suite",
     "supersede"
    ],
    "credentials": [

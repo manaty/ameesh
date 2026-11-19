@@ -49,13 +49,65 @@ MODULE_PACKAGES = {p.stem for p in (SOURCE / "modules").iterdir()
 #: the core keeps. Each entry is a pure `sys.modules` alias of the `dev` module:
 #: old path -> (origin lot, date declared, reason). Their removal is L104b.
 COMPATIBILITY_ALIASES = {
-    "connectors/git_merge.py": ("#4382", "2026-10-29", "importers and patchers of the connector path"),
-    "lot_class.py": ("#4385", "2026-10-29", "importers and patchers of the classification"),
-    "merge_pr.py": ("#4382", "2026-10-29", "importers and patchers of the merge gesture"),
-    "plan_git.py": ("#4383", "2026-10-29", "importers and patchers of the merge plan"),
-    "plan_github.py": ("#4384", "2026-10-29", "importers and patchers of the GitHub plan"),
-    "review.py": ("#4385", "2026-10-29", "importers and patchers of the review policy"),
-    "review_target.py": ("#4385", "2026-10-29", "importers and patchers of the review target"),
+    "connectors/git_merge.py": ("#4382", "2026-10-29", "importers and patchers of the connector path",
+                                "modules/dev/git_merge.py"),
+    "lot_class.py": ("#4385", "2026-10-29", "importers and patchers of the classification",
+                     "modules/dev/lot_class.py"),
+    "merge_pr.py": ("#4382", "2026-10-29", "importers and patchers of the merge gesture",
+                    "modules/dev/merge_pr.py"),
+    "plan_git.py": ("#4383", "2026-10-29", "importers and patchers of the merge plan",
+                    "modules/dev/plan_git.py"),
+    "plan_github.py": ("#4384", "2026-10-29", "importers and patchers of the GitHub plan",
+                       "modules/dev/plan_github.py"),
+    "review.py": ("#4385", "2026-10-29", "importers and patchers of the review policy",
+                  "modules/dev/review.py"),
+    "review_target.py": ("#4385", "2026-10-29", "importers and patchers of the review target",
+                         "modules/dev/review_target.py"),
+    # P1b #7650 : le stockage du module `dev` a rejoint `modules/dev/storage/` ;
+    # les anciens chemins restent des alias purs, datés, pour les importeurs et
+    # les tests qui patchent un global par l'ancien chemin.
+    "storage/postgres/agent_columns.py": ("#7650", "2026-11-18",
+                                          "importers of the dev agent columns",
+                                          "modules/dev/storage/agent_columns.py"),
+    "storage/postgres/ci.py": ("#7650", "2026-11-18", "importers and patchers of the CI storage",
+                               "modules/dev/storage/ci.py"),
+    "storage/postgres/github_watch.py": ("#7650", "2026-11-18",
+                                         "importers and patchers of the watch storage",
+                                         "modules/dev/storage/github_watch.py"),
+    "storage/postgres/landings.py": ("#7650", "2026-11-18",
+                                     "importers and patchers of the landings storage",
+                                     "modules/dev/storage/landings.py"),
+    "storage/postgres/migration_reservations.py": (
+        "#7650", "2026-11-18", "importers of the migration reservation storage",
+        "modules/dev/storage/migration_reservations.py"),
+    "storage/postgres/prevalidation.py": ("#7650", "2026-11-18",
+                                          "importers of the prevalidation storage",
+                                          "modules/dev/storage/prevalidation.py"),
+    "storage/postgres/provenance.py": ("#7650", "2026-11-18",
+                                       "importers and patchers of the provenance storage",
+                                       "modules/dev/storage/provenance.py"),
+    "storage/postgres/reports.py": ("#7650", "2026-11-18",
+                                    "importers of the model evaluation report storage",
+                                    "modules/dev/storage/reports.py"),
+    "storage/postgres/reviews.py": ("#7650", "2026-11-18",
+                                    "importers and patchers of the review storage",
+                                    "modules/dev/storage/reviews.py"),
+    "storage/postgres/work_dev.py": ("#7650", "2026-11-18",
+                                     "importers and patchers of the dev work storage",
+                                     "modules/dev/storage/work.py"),
+    "storage/postgres/work_footprints.py": ("#7650", "2026-11-18",
+                                            "importers of the footprint storage",
+                                            "modules/dev/storage/work_footprints.py"),
+    "storage/postgres/worktrees.py": ("#7650", "2026-11-18",
+                                      "importers and patchers of the worktree storage",
+                                      "modules/dev/storage/worktrees.py"),
+}
+
+#: L104 T6 (P1b #7650) : les déclarations de données du module `dev` ne sont
+#: pas du stockage ; le noyau les lit par ce chemin, daté et motivé.
+DECLARED_IMPORTS = {
+    "agent_rename.py": ("#7650", "2026-11-18",
+                        "déclarations des colonnes d'agent du module `dev`"),
 }
 
 
@@ -145,6 +197,7 @@ class GenericCoreTest(unittest.TestCase):
     def test_core_does_not_import_module_implementations(self):
         # L98 T3 (#4406) emptied the storage adapters; only declared aliases remain.
         exceptions = Counter({(path, "module-import"): 1 for path in COMPATIBILITY_ALIASES})
+        exceptions.update({(path, "module-import"): 1 for path in DECLARED_IMPORTS})
         actual = Counter({key: count for key, count in scan_core().items()
                           if key[1] == "module-import"})
         self.assertFalse(actual - exceptions,
@@ -153,7 +206,7 @@ class GenericCoreTest(unittest.TestCase):
                          "Remove obsolete module-import exceptions: %s" % (exceptions - actual))
 
     def test_declared_aliases_are_dated_and_import_nothing_else(self):
-        for path, (lot, declared, reason) in COMPATIBILITY_ALIASES.items():
+        for path, (lot, declared, reason, implementation) in COMPATIBILITY_ALIASES.items():
             with self.subTest(path=path):
                 self.assertRegex(lot, r"^#\d+$")
                 self.assertRegex(declared, r"^\d{4}-\d{2}-\d{2}$")
@@ -165,8 +218,17 @@ class GenericCoreTest(unittest.TestCase):
                         or (isinstance(node, ast.ImportFrom) and node.module == "__future__"))],
                     [ast.Import, ast.ImportFrom, ast.Assign], "not a pure alias")
                 self.assertEqual(body[-1].targets[0].value.value.id, "sys")
-                implementation = SOURCE / "modules" / "dev" / Path(path).name
-                self.assertTrue(implementation.is_file())
+                self.assertTrue((SOURCE / implementation).is_file())
+
+    def test_declared_imports_are_dated_and_motivated(self):
+        """P1b #7650 : les déclarations de données du module sont datées."""
+        names = {path.name for path in SOURCE.rglob("*.py")}
+        for path, (lot, declared, reason) in DECLARED_IMPORTS.items():
+            with self.subTest(path=path):
+                self.assertRegex(lot, r"^#\d+$")
+                self.assertRegex(declared, r"^\d{4}-\d{2}-\d{2}$")
+                self.assertTrue(reason)
+                self.assertIn(path, names)
 
     def test_scanner_distinguishes_docs_from_executable_vocabulary(self):
         counts = scan_python('"""github worktree"""\n# pnpm\n'

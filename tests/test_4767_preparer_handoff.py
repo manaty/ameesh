@@ -29,6 +29,9 @@ class Registry:
         self.rows = [dict(name='canary', host='fixture-host')]
 
     def query(self, sql, params):
+        probe = support.registry_absent(sql)
+        if probe is not None:
+            return probe
         if params != ('canary',):
             raise AssertionError('unexpected registry query')
         return self.rows
