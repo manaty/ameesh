@@ -3310,6 +3310,9 @@ def main(argv: list[str] | None = None) -> int:
                                   expect_head=args.expect_head),
                   flush=True)
         else:
+            if args.command == "compose":
+                # #7827 : `compose --attached` sur place, gardé comme recompose
+                refuse_agent_clone(ctx)
             print(run(ctx), flush=True)
         return 0
     except InputError as error:
