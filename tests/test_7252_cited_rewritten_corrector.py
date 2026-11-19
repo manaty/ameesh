@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import tempfile
 import unittest
 import urllib.error
 import subprocess
@@ -367,7 +368,7 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
     def test_strict_reading_ignores_non_commit_objects_and_run_numbers(self):
         blob = self.repo.git("rev-parse", "HEAD:src/ameesh/mail.py")
         tree = self.repo.git("rev-parse", "HEAD^{tree}")
-        for token in (blob[:8], tree[:12]):
+        for token in (blob[:12], tree[:12]):
             for fetch in (False, True):
                 with self.subTest(token=token, fetch=fetch):
                     self.repo.git("reset", "--hard", self.head_a)
@@ -382,29 +383,102 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
                     self.assertEqual(correctors, [])
                     forge.assert_not_called()
 
-    def test_hex_word_requires_a_definitive_forge_negative(self):
-        from ameesh import plan_github
-
-        _fix, head = self._rewrite(cite="ed25519")
-        for status, message, accepted in (
-                (404, "No commit found for SHA: ed25519", True),
-                (422, "No commit found for SHA: ed25519", True),
-                (404, "Not Found", False),
-                (422, "Ambiguous SHA", False),
-                (403, "API rate limit exceeded", False),
-                (503, "Service unavailable", False)):
-            with self.subTest(status=status, message=message):
-                def unavailable(*args, **kwargs):
-                    raise urllib.error.HTTPError(
-                        "https://api.invalid", status, "failure", {},
-                        io.BytesIO(json.dumps({"message": message}).encode()))
-
-                api = plan_github.Api(token="test", opener=unavailable)
-                with mock.patch.object(review_authors, "_repository_slug",
-                                       return_value="owner/repo"), \
-                        mock.patch.object(plan_github, "client", return_value=api), \
+    def test_hex_word_is_not_a_citation_and_never_asks_the_forge(self):
+        # #7721 (B auditeur sur 474fe7c9) : `ed25519` (7 hex) et un abrégé de
+        # 9 caractères absent du clone ne sont pas des citations. La présence
+        # locale est lue sans réseau : une forge inaccessible ou ambiguë ne
+        # peut plus les refuser.
+        for token in ("ed25519", "deadbeef1"):
+            with self.subTest(token=token):
+                self.repo.git("reset", "--hard", self.head_a)
+                _fix, head = self._rewrite(cite=token)
+                with mock.patch.object(review_authors, "_forge_commit") as forge, \
                         mock.patch.object(review_authors, "_forge_fetch") as fetch:
-                    if accepted:
+                    (_authors, unknown, correctors), _freeze = self._reading(
+                        head, strict=True)
+                self.assertEqual(unknown, [])
+                self.assertEqual(correctors, [])
+                forge.assert_not_called()
+                fetch.assert_not_called()
+
+    def test_short_local_citation_still_excludes_its_reviewer(self):
+        # B auditeur sur 474fe7c9 : l'abrégé usuel de Git (9 caractères ici)
+        # d'un correctif encore présent dans le clone reste une citation ; le
+        # correcteur est exclu par son nom et la forge n'est pas interrogée.
+        fix, _head = self._rewrite()
+        short = fix[:9]
+        self.repo.git("commit", "--amend", "-m",
+                      "author: reprise ; correctif %s retiré" % short)
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        with mock.patch.object(review_authors, "_forge_commit") as forge:
+            (_authors, unknown, correctors), _freeze = self._reading(
+                head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head)
+        # La citation courte est qualifiée par la présence locale : elle
+        # n'appelle jamais le résolveur d'abrégé de la forge.
+        forge.assert_not_called()
+
+    def test_unreadable_local_presence_refuses_instead_of_opening_provenance(self):
+        # B2 auditeur/cx2 sur 3a7e2272 : quand la lecture groupée de présence
+        # rend None (git en échec, coupé ou délai), l'abrégé court n'est pas
+        # écarté en silence ; en lecture stricte, le doute refuse la porte.
+        _fix, head = self._rewrite(cite="deadbeef1")
+        real = review_authors._present_commits
+
+        def unreadable(repo, shas, **kwargs):
+            if "deadbeef1" in {str(sha).lower() for sha in shas}:
+                return None
+            return real(repo, shas, **kwargs)
+
+        with mock.patch.object(review_authors, "_present_commits", unreadable), \
+                mock.patch.object(review_authors, "_forge_commit",
+                                  return_value=""):
+            with self.assertRaisesRegex(
+                    review_provenance.ProvenanceError,
+                    "cited commit deadbeef1 .*forge-unreadable"):
+                self._reading(head, strict=True)
+
+    def test_a_locally_ambiguous_citation_is_a_doubt_whatever_the_forge_says(self):
+        # B cx2 sur 0c407b5f3f8c : le statut ambigu de la lecture locale ne
+        # doit pas être perdu dans _rewritten_after_freeze ; « No commit
+        # found » ne l'écarte pas et une résolution unique ne le choisit pas.
+        fix, head = self._rewrite(cite="deadbeef1")
+        real = review_authors._present_commits
+
+        def ambiguous(repo, shas, *, ambiguous=None, **kwargs):
+            words = {str(sha).lower() for sha in shas}
+            if ambiguous is not None and "deadbeef1" in words:
+                ambiguous.update(words)
+                return {}
+            return real(repo, shas, **kwargs)
+
+        for answer in (None, fix):
+            with self.subTest(forge=answer):
+                with mock.patch.object(review_authors, "_present_commits",
+                                       ambiguous), \
+                        mock.patch.object(review_authors, "_forge_commit",
+                                          return_value=answer) as forge, \
+                        mock.patch.object(review_authors, "_forge_fetch") as fetch:
+                    with self.assertRaisesRegex(
+                            review_provenance.ProvenanceError,
+                            "cited commit deadbeef1 .*ambiguous"):
+                        self._reading(head, strict=True)
+                forge.assert_not_called()
+                fetch.assert_not_called()
+
+    def test_ambiguous_forge_still_refuses_a_qualified_citation(self):
+        # La garantie de provenance reste : une vraie citation (12 hex) que
+        # la forge ne résout pas explicitement est un doute refusé.
+        _fix, head = self._rewrite(cite="deadbeef1234")
+        for resolved in (None, ""):
+            with self.subTest(resolved=resolved):
+                with mock.patch.object(review_authors, "_forge_commit",
+                                       return_value=resolved):
+                    if resolved is None:
                         (_authors, unknown, correctors), _freeze = self._reading(
                             head, strict=True)
                         self.assertEqual(unknown, [])
@@ -412,12 +486,62 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
                     else:
                         with self.assertRaisesRegex(
                                 review_provenance.ProvenanceError,
-                                "cited commit ed25519 .*forge-unreadable"):
+                                "cited commit deadbeef1234 .*forge-unreadable"):
                             self._reading(head, strict=True)
-                    fetch.assert_not_called()
+
+    def test_foreign_repository_sha_is_ignored_on_a_definitive_forge_negative(self):
+        """#7721 : un SHA d'un autre dépôt, cité en entier dans le message,
+        n'est pas un commit de ce clone. La forge qui répond explicitement
+        « No commit found » l'écarte sans refus ni exclusion."""
+        from ameesh import plan_github
+
+        foreign = "0123456789abcdef0123456789abcdef01234567"
+        _fix, _head = self._rewrite(cite=False)
+        self.repo.git("commit", "--amend", "-m",
+                      "author: reprise\n\nSHA d'un autre dépôt %s cité pour"
+                      " mémoire." % foreign)
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+
+        def unavailable(*args, **kwargs):
+            raise urllib.error.HTTPError(
+                "https://api.invalid", 422, "failure", {},
+                io.BytesIO(json.dumps(
+                    {"message": "No commit found for SHA: " + foreign}).encode()))
+
+        api = plan_github.Api(token="test", opener=unavailable)
+        with mock.patch.object(review_authors, "_repository_slug",
+                               return_value="owner/repo"), \
+                mock.patch.object(plan_github, "client", return_value=api), \
+                mock.patch.object(review_authors, "_forge_fetch") as fetch:
+            (_authors, unknown, correctors), _freeze = self._reading(
+                head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual(correctors, [])
+        fetch.assert_not_called()
+
+    def test_foreign_qualified_repository_is_ignored_without_the_forge(self):
+        """#7721 : `dépôt@sha` nommant un autre dépôt n'est pas une citation
+        de cette tête ; aucune forge n'est interrogée pour lui."""
+        foreign = "0123456789abcdef0123456789abcdef01234567"
+        _fix, _head = self._rewrite(cite=False)
+        self.repo.git("commit", "--amend", "-m",
+                      "author: reprise\n\nVoir le dépôt other/foreign@%s." % foreign)
+        head = self.repo.git("rev-parse", "HEAD")
+        self._receipt("author", "deepseek", [head])
+        with mock.patch.object(review_authors, "_repository_slug",
+                               return_value="owner/repo"), \
+                mock.patch.object(review_authors, "_forge_commit") as forge, \
+                mock.patch.object(review_authors, "_forge_fetch") as fetch:
+            (_authors, unknown, correctors), _freeze = self._reading(
+                head, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual(correctors, [])
+        forge.assert_not_called()
+        fetch.assert_not_called()
 
     def test_numeric_citation_requires_a_definitive_forge_negative(self):
-        _fix, head = self._rewrite(cite="43969930787")
+        _fix, head = self._rewrite(cite="439699307871")
         with mock.patch.object(review_authors, "_forge_commit", return_value=None):
             self._reading(head, strict=True)
         for fetch in (False, True):
@@ -428,7 +552,7 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
 
     def test_numeric_abbreviation_resolved_by_forge_excludes_corrector(self):
         fix, head = self._remote_rewrite()
-        body = self.repo.git("log", "-1", "--format=%B").replace(fix[:12], "1234567")
+        body = self.repo.git("log", "-1", "--format=%B").replace(fix[:12], "123456789012")
         self.repo.git("commit", "--amend", "-m", body)
         head = self.repo.git("rev-parse", "HEAD")
         self._receipt("author", "deepseek", [head])
@@ -436,7 +560,7 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
             (_authors, unknown, correctors), _freeze = self._reading(head, strict=True)
         self.assertEqual(unknown, [])
         self.assertEqual([row["name"] for row in correctors], ["cx3"])
-        self.assertEqual(forge.call_args.args[1], "1234567")
+        self.assertEqual(forge.call_args.args[1], "123456789012")
 
     def test_strict_reading_ignores_explicit_checksums(self):
         for label in ("checksum", "sha256", "SHA256"):
@@ -517,28 +641,112 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
         self.repo.git("reset", "--hard", self.head_a)
         self.repo.write("src/ameesh/mail.py", "package\n")
         head = self.repo.commit(
-            "author: correctif-43969930787 ; paquet h-20261117-05",
+            "author: correctif-439699307871 ; paquet h-20261117-05",
             agent="author")
         self._receipt("author", "deepseek", [head])
         with mock.patch.object(review_authors, "_forge_commit",
                                return_value="") as forge:
             with self.assertRaisesRegex(
                     review_provenance.ProvenanceError,
-                    "cited commit 43969930787 .*forge-unreadable"):
+                    "cited commit 439699307871 .*forge-unreadable"):
                 self._reading(head, strict=True)
         self.assertEqual([call.args[1] for call in forge.call_args_list],
-                         ["43969930787"])
+                         ["439699307871"])
 
 
 class ForgeCitationResolutionTest(unittest.TestCase):
     def test_hex_suffix_in_a_word_is_not_a_commit_citation(self):
-        text = "owner-decision job succeeded; correctif-1234abcd retiré"
-        citations = [
-            match["commit"]
-            for match in review_authors._CITED_COMMIT.finditer(text)
-            if match["commit"]
-        ]
-        self.assertEqual(citations, ["1234abcd"])
+        text = "owner-decision job succeeded; correctif-1234abcd5678 retiré"
+        self.assertEqual(review_authors._cited_tokens(text, "owner/repo"),
+                         ["1234abcd5678"])
+
+    def test_short_hex_word_is_not_a_commit_citation(self):
+        # #7721 : sans dépôt local, un jeton non qualifié de moins de 12
+        # caractères n'est jamais une citation, même entier et borné
+        # (`ed25519`, `deadbeef`, `correctif-1234abcd`).
+        for text in ("ed25519", "deadbeef", "correctif-1234abcd",
+                     "paquet h-20261117-05"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    review_authors._cited_tokens(text, "owner/repo"), [])
+
+    def test_a_short_citation_is_qualified_by_local_presence_only(self):
+        # B auditeur sur 474fe7c9 : l'abrégé de 9 caractères d'un commit
+        # présent dans le clone est une citation ; le même type de jeton
+        # absent localement ne l'est pas, sans interroger la forge.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _Repo(os.path.join(tmp, "depot"))
+            repo.write("f.txt", "base\n")
+            sha = repo.commit("base")
+            self.assertEqual(
+                review_authors._cited_tokens(
+                    "reprend %s" % sha[:9], "owner/repo", repo=repo.root),
+                [sha[:9]])
+            self.assertEqual(
+                review_authors._cited_tokens(
+                    "ed25519 deadbeef1 correctif-1234abcd", "owner/repo",
+                    repo=repo.root),
+                [])
+
+    def test_unreadable_local_presence_keeps_the_short_citation(self):
+        # B2 auditeur/cx2 sur 3a7e2272 : None de _present_commits est une
+        # lecture non concluante, pas une absence ; l'abrégé court reste un
+        # jeton, et le chemin existant en fait un doute (refus en strict).
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(review_authors, "_present_commits",
+                                   return_value=None):
+                self.assertEqual(
+                    review_authors._cited_tokens(
+                        "reprend 4c39e880a", "owner/repo", repo=tmp),
+                    ["4c39e880a"])
+
+    def test_ambiguous_local_abbreviation_keeps_the_short_citation(self):
+        # B2 cx2 : une abréviation ambiguë ne prouve ni présence ni absence ;
+        # elle reste un jeton, dit au gel ou refusé en lecture stricte.
+        with tempfile.TemporaryDirectory() as tmp:
+            def probe(repo, shas, *, ambiguous=None, timeout=None):
+                if ambiguous is not None:
+                    ambiguous.update(str(sha).lower() for sha in shas)
+                return {}
+
+            with mock.patch.object(review_authors, "_present_commits",
+                                   side_effect=probe):
+                self.assertEqual(
+                    review_authors._cited_tokens(
+                        "reprend deadbeef1", "owner/repo", repo=tmp),
+                    ["deadbeef1"])
+
+    def test_present_commits_reports_an_ambiguous_abbreviation(self):
+        # `cat-file --batch-check` répond « <jeton> ambiguous » pour une
+        # abréviation ambiguë ; ce n'est pas une absence.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _Repo(os.path.join(tmp, "depot"))
+            repo.write("f.txt", "base\n")
+            repo.commit("base")
+            proc = mock.Mock(returncode=0, stdout=b"deadbeef1 ambiguous\n")
+            ambiguous: set[str] = set()
+            with mock.patch.object(review_authors, "_read_git",
+                                   return_value=proc):
+                self.assertEqual(
+                    review_authors._present_commits(
+                        repo.root, ["deadbeef1"], ambiguous=ambiguous), {})
+            self.assertEqual(ambiguous, {"deadbeef1"})
+
+    def test_qualified_repository_citation_keeps_a_short_sha(self):
+        # La forme `dépôt@sha` qualifie un SHA court ; un autre dépôt nommé
+        # n'est pas une citation de cette tête.
+        for text in ("manaty/ameesh@1234abcd", "ameesh@1234abcd"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    review_authors._cited_tokens(text, "manaty/ameesh"),
+                    ["1234abcd"])
+        self.assertEqual(
+            review_authors._cited_tokens("other/repo@1234abcd", "manaty/ameesh"),
+            [])
+        # Un fork qui ne diffère que par le propriétaire n'est pas le dépôt lu.
+        self.assertEqual(
+            review_authors._cited_tokens("other/ameesh@1234abcd", "manaty/ameesh"),
+            [])
 
     def test_gh_without_shared_reads_preserves_commit_absence(self):
         from ameesh import plan_github

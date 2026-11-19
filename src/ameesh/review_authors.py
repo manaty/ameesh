@@ -195,14 +195,24 @@ def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str
     if sweep is not None:
         sweep.check(step)
     try:
+        # #7779 : un clone partiel peut rendre un `git grep` tronqué avec
+        # rc 0 et un stderr vide (le blob absent est sauté sans erreur).
+        # L'arbre de `rev` est exactement ce que grep lit : un objet qui y
+        # manque rend le balayage incomplet, jamais une absence prouvée.
+        missing = _tree_missing_objects(repo, rev)
+        if missing is None:
+            raise canon.GitError("tree unreadable")
+        if missing:
+            raise canon.GitError(
+                "tree has %d missing object(s): grep would be incomplete" % missing)
         with _local_object_repo(repo) as (reader, local_env):
             proc = plan_git._git(
                 reader, "grep", *args, "-f", "-", str(rev), stdin=stdin,
                 timeout=sweep.deadline.remaining() if sweep is not None else canon.GIT_TIMEOUT,
                 deadline=sweep.deadline if sweep is not None else None,
                 env_extra={**env, **local_env})
-            # Missing blobs can yield rc=1 (no matches) or rc=0 (partial
-            # matches). Neither proves absence and neither may be shared.
+            # Missing blobs can also yield rc=1 (no matches) or rc=0 with a
+            # stderr; neither proves absence and neither may be shared.
             if proc.stderr:
                 raise canon.GitError(proc.stderr.decode("utf-8", "replace"))
             return proc
@@ -1143,6 +1153,128 @@ def _read_git(repo, *args, **kwargs):
             sweep.check("git " + str(args[0]))
 
 
+def _bounded_git(repo, *args, limit=None, **kwargs):
+    """A bounded git read, on the current sweep budget when there is one."""
+    sweep = _SWEEP.get()
+    if sweep is not None:
+        kwargs["timeout"] = sweep.deadline.remaining()
+        kwargs["deadline"] = sweep.deadline
+    else:
+        kwargs["timeout"] = canon.GIT_TIMEOUT if limit is None else limit
+    return plan_git._git(repo, *args, **kwargs)
+
+
+def _partial_clone(repo: str) -> bool:
+    """Does this clone declare a promisor/partial object store?
+
+    Read on every call: a repository can become partial in the same process
+    (the clone is configured, or a promisor remote is added) and a cached
+    "complete" answer would then skip the completeness checks.
+
+    Doubt (unreadable config, unknown value) returns True: the completeness
+    checks then run, and a complete clone simply passes them.
+    """
+    partial = True
+    try:
+        proc = _bounded_git(
+            repo, "config", "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+            limit=plan_git.PROBE_TIMEOUT_S,
+            env_extra=plan_git.NO_LAZY_FETCH)
+    except canon.GitDeadline:
+        raise
+    except Exception:  # noqa: BLE001 - unreadable: run the checks
+        proc = None
+    if proc is not None and proc.returncode in (0, 1):
+        partial = False
+        for line in proc.stdout.decode("utf-8", "replace").splitlines():
+            name, _, value = line.partition(" ")
+            name = name.strip().lower()
+            value = value.strip().lower()
+            if name == "extensions.partialclone":
+                partial = True
+                break
+            if name.endswith(".promisor") and value not in (
+                    "false", "0", "no", "off"):
+                # An empty value is git's boolean true.
+                partial = True
+                break
+    return partial
+
+
+#: raw diff line of `git log --raw`/`git diff --raw`: old mode, new mode,
+#: old object, new object; the path follows a tab.
+_RAW_DIFF_LINE = re.compile(
+    rb"^:(\d{6}) (\d{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) [A-Z]")
+
+
+def _raw_blob_ids(output: bytes) -> set:
+    """The blobs a raw diff output reads, with submodule links excluded."""
+    ids = set()
+    for line in output.splitlines():
+        match = _RAW_DIFF_LINE.match(line)
+        if not match:
+            continue
+        old_mode, new_mode, old, new = match.groups()
+        for mode, oid in ((old_mode, old), (new_mode, new)):
+            if mode == b"160000":
+                continue                # gitlink: no blob is read
+            if oid.strip(b"0"):
+                ids.add(oid.decode("ascii"))
+    return ids
+
+
+def _missing_blobs(repo: str, oids) -> Optional[int]:
+    """How many of these blob ids are absent, or None if unreadable.
+
+    The check runs in the isolated object reader (no promisor, no remote):
+    a missing object is answered `missing` there instead of waking a lazy
+    fetch, and the answer cannot be a partial read."""
+    oids = sorted(str(oid) for oid in oids if oid)
+    if not oids:
+        return 0
+    stdin = ("\n".join(oids) + "\n").encode("ascii")
+    try:
+        with _local_object_repo(repo) as (reader, env):
+            proc = _bounded_git(reader, "cat-file", "--batch-check",
+                                stdin=stdin, env_extra=env)
+    except canon.GitDeadline:
+        raise
+    except Exception:  # noqa: BLE001 - unreadable: doubt
+        return None
+    if proc.returncode:
+        return None
+    lines = [line for line in
+             proc.stdout.decode("utf-8", "replace").splitlines() if line]
+    if len(lines) != len(oids):
+        return None
+    return sum(1 for line in lines if line.endswith(" missing"))
+
+
+def _tree_missing_objects(repo: str, rev: str) -> Optional[int]:
+    """Objects missing from the tree `rev`, or None if unreadable.
+
+    `git rev-list --objects --quiet <rev>^{tree}` walks exactly the objects
+    `git grep <rev>` reads and prints only the missing ones. In a complete
+    clone no check is needed: an absent object there is a git error, not a
+    silent truncation."""
+    if not _partial_clone(repo):
+        return 0
+    try:
+        proc = _bounded_git(repo, "rev-list", "--objects", "--missing=print",
+                            "--quiet", "%s^{tree}" % rev,
+                            env_extra=plan_git.NO_LAZY_FETCH)
+    except canon.GitDeadline:
+        raise
+    except Exception:  # noqa: BLE001 - unreadable: doubt
+        return None
+    if proc.returncode:
+        return None
+    return sum(1 for line in
+               proc.stdout.decode("utf-8", "replace").splitlines()
+               if line.startswith("?"))
+
+
 def _read_out(repo, *args):
     try:
         if args[0] in {"log", "show", "diff"}:
@@ -1234,12 +1366,25 @@ def _touches_only_files_absent_from(repo: str, sha: str, heads) -> bool:
 
 
 def _read_patch_ids(repo, *args):
-    log = _read_git(repo, "log", "-p", "--no-merges", "--no-color",
-                    "--format=commit %H", *args)
+    partial = _partial_clone(repo)
+    options = ["log", "-p", "--no-merges", "--no-color", "--format=commit %H"]
+    if partial:
+        # #7779 : `--raw` lists the blobs the patch reads. A partial clone
+        # can silently truncate the patch (rc 0, empty stderr); the raw line
+        # still names the missing blob, so the read becomes a doubt.
+        options[1:1] = ["--raw", "--no-abbrev"]
+    log = _read_git(repo, *options, *args)
     if log.returncode:
         raise plan_git.MergeProbeError("patch history unreadable")
     if not log.stdout.strip():
         return {}
+    if partial:
+        missing = _missing_blobs(repo, _raw_blob_ids(log.stdout))
+        if missing is None:
+            raise plan_git.MergeProbeError("patch history unreadable")
+        if missing:
+            raise plan_git.MergeProbeError(
+                "patch history incomplete: %d missing object(s)" % missing)
     proc = _read_git(repo, *plan_git.PATCH_ID, stdin=log.stdout)
     if proc.returncode:
         raise plan_git.MergeProbeError("patch ids unreadable")
@@ -1249,9 +1394,19 @@ def _read_patch_ids(repo, *args):
 def _read_diff_patch_id(repo, before, after):
     if not _local_reads(repo, [before, after], {}):
         return None
-    diff = _read_git(repo, "diff", "--no-ext-diff", "--no-color", before, after)
+    partial = _partial_clone(repo)
+    options = ["diff", "--no-ext-diff", "--no-color"]
+    if partial:
+        # `--raw` replaces the default patch on `git diff`: keep `-p` so the
+        # patch-id still has a patch to hash.
+        options[1:1] = ["-p", "--raw", "--no-abbrev"]
+    diff = _read_git(repo, *options, before, after)
     if diff.returncode:
         return None
+    if partial:
+        missing = _missing_blobs(repo, _raw_blob_ids(diff.stdout))
+        if missing is None or missing:
+            return None
     proc = _read_git(repo, *plan_git.PATCH_ID,
                      stdin=b"commit " + after.encode() + b"\n" + diff.stdout)
     if proc.returncode:
@@ -1304,6 +1459,7 @@ def _is_ancestor(repo: str, before: str, after: str, cache=None) -> Optional[boo
 
 def _present_commits(repo: str, shas: Sequence[str], *,
                      non_commits: Optional[set[str]] = None,
+                     ambiguous: Optional[set[str]] = None,
                      timeout: Optional[float] = None) -> Optional[dict[str, str]]:
     """Les SHA de commits présents **localement**, en une seule commande git.
 
@@ -1312,8 +1468,11 @@ def _present_commits(repo: str, shas: Sequence[str], *,
     CI. `cat-file --batch-check` lit la présence des objets en un passage, sans
     fetch paresseux (magasin sans remote), et rend `{sha: sha complet}`.
     `non_commits`, si fourni, reçoit les objets résolus de type blob, tree
-    ou tag (#7618) ; les objets absents ou ambigus restent non concluants.
-    `None` quand la lecture échoue : la preuve locale reste non concluante.
+    ou tag (#7618) ; `ambiguous`, si fourni, reçoit les abréviations ambiguës
+    (`cat-file` répond `<jeton> ambiguous`), qui ne prouvent ni présence ni
+    absence (#7721 B2 cx2). Une abréviation absente reste hors des deux
+    ensembles. `None` quand la lecture échoue : la preuve locale reste non
+    concluante.
     """
     wanted = list(dict.fromkeys(str(sha).lower() for sha in shas or ()
         if re.fullmatch(r"[0-9a-fA-F]{7,64}(?:\^[0-9]*)?", str(sha))))
@@ -1340,6 +1499,9 @@ def _present_commits(repo: str, shas: Sequence[str], *,
         elif (len(fields) == 2 and fields[1] in {"blob", "tree", "tag"}
               and non_commits is not None):
             non_commits.add(rev)
+        elif (len(fields) == 2 and fields[1] == "ambiguous"
+              and ambiguous is not None):
+            ambiguous.add(rev)
     return present
 
 
@@ -5242,19 +5404,84 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
 
 
 #: #7252 : une citation de commit retiré dans le message de réécriture de
-#: l'auteur (7 à 40 caractères hexadécimaux). Un identifiant de B (`#40556`)
-#: n'a pas cette longueur. Les empreintes nommées checksum/sha256 sont
-#: écartées avant toute résolution Git (#7576). Le nom complet d'un paquet
-#: horaire (`h-AAAAMMJJ-NN`) est un identifiant, pas une citation : sa date
-#: (huit chiffres hexadécimaux) est consommée avec lui (#7709). Une citation
-#: avec tiret (`correctif-<sha>`) reste lue et résolue. Une suite hexadécimale
-#: noyée dans un mot (par exemple `succeeded`, #7770) n'est pas un jeton de
-#: commit.
+#: l'auteur. #7721 : seuls les jetons **qualifiés** sont des citations — un
+#: SHA de 12 à 40 caractères hexadécimaux, la forme `dépôt@sha` (le dépôt lu,
+#: ou le dépôt lu illisible), ou un abrégé de 7 à 11 caractères **présent
+#: localement comme commit** quand le dépôt lu est fourni. L'abrégé par défaut
+#: de Git dans ce dépôt fait 9 caractères : une réécriture qui cite
+#: `reprend 4c39e880a` doit rester lue, sinon le correcteur n'est plus exclu
+#: (B auditeur). La présence locale est lue sans réseau (`_present_commits`) :
+#: un mot hexadécimal absent (`ed25519`, `deadbeef`) ou un SHA d'un autre
+#: dépôt nommé n'est pas une citation et n'interroge jamais la forge. Un
+#: identifiant de B (`#40556`) n'a pas cette longueur. Les empreintes nommées
+#: checksum/sha256 sont écartées avant toute résolution Git (#7576). Le nom
+#: complet d'un paquet horaire (`h-AAAAMMJJ-NN`) est un identifiant, pas une
+#: citation : sa date (huit chiffres hexadécimaux) est consommée avec lui
+#: (#7709). Une suite hexadécimale noyée dans un mot (par exemple `succeeded`,
+#: #7770) n'est pas un jeton de commit.
 _CITED_COMMIT = re.compile(
     r"\b(?:checksum|sha256)\s+[0-9a-f]+\b"
     r"|\bh-\d{8}-\d+\b"
-    r"|(?P<commit>(?<![0-9a-z])[0-9a-f]{7,40}(?![0-9a-z]))",
+    r"|(?P<qualified>(?<![0-9a-z])"
+    r"(?P<repo>[a-z0-9_.-]+(?:/[a-z0-9_.-]+)?)@"
+    r"(?P<qcommit>[0-9a-f]{7,40})(?![0-9a-z]))"
+    r"|(?P<commit>(?<![0-9a-z])[0-9a-f]{12,40}(?![0-9a-z]))"
+    r"|(?P<short>(?<![0-9a-z])[0-9a-f]{7,11}(?![0-9a-z]))",
     re.IGNORECASE)
+
+
+def _cited_tokens(body: str, own_repository: str = "",
+                  repo: str = "", *, timeout: Optional[float] = None) -> list[str]:
+    """Les citations de commit d'un message (#7252, #7721).
+
+    Un jeton de 12 à 40 caractères hexadécimaux est une citation. Un jeton plus
+    court ne l'est que sous deux formes : `dépôt@sha` quand `dépôt` est le
+    dépôt lu (`own_repository`, `owner/repo` ou son seul nom ; un dépôt lu
+    illisible le garde, par prudence), ou un abrégé de 7 à 11 caractères
+    **présent localement comme commit** dans `repo`. La seconde forme couvre
+    l'abrégé usuel de Git (9 caractères ici) sans transformer `ed25519` ou
+    `deadbeef` en citations : la résolution est locale et sans réseau
+    (`_present_commits`, sans fetch paresseux) ; un jeton absent du clone ou
+    d'un autre type que commit est écarté sans interroger la forge.
+
+    Une lecture locale **non concluante** (`_present_commits` rend None) ou
+    ambiguë ne prouve pas l'absence : l'abrégé court reste alors un jeton, et
+    le chemin existant en fait un doute (refus en lecture stricte) plutôt
+    qu'une exclusion silencieuse (B2 auditeur/cx2 sur 3a7e2272). Un SHA d'un
+    autre dépôt nommé n'est jamais lu ici (#7721).
+    """
+    own = str(own_repository or "").strip().casefold()
+    own_name = own.rpartition("/")[2]
+    found: list[tuple[str, str]] = []
+    for match in _CITED_COMMIT.finditer(str(body or "")):
+        token = match.group("commit")
+        if token:
+            found.append(("long", token))
+            continue
+        token = match.group("qcommit")
+        if token:
+            named = str(match.group("repo") or "").strip().casefold()
+            if (not own or named == own
+                    or ("/" not in named and named == own_name)):
+                found.append(("long", token))
+            continue
+        token = match.group("short")
+        if token:
+            found.append(("short", token))
+    shorts = [token for kind, token in found if kind == "short"]
+    present: Optional[dict[str, str]] = {}
+    ambiguous: set[str] = set()
+    if shorts and str(repo or "").strip():
+        present = _present_commits(str(repo).strip(), shorts,
+                                   ambiguous=ambiguous, timeout=timeout)
+    if present is None:
+        # La présence locale n'a pas pu être lue : ne pas écarter en silence
+        # un abrégé qui peut être la citation du correctif.
+        return [token for _kind, token in found]
+    return [token for kind, token in found
+            if kind == "long" or token.lower() in present
+            or token.lower() in ambiguous]
+
 
 #: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
 #: Le relecteur corrige dans son tour : 6 h avant l'avis couvrent un tour
@@ -5356,6 +5583,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     if db is None or not repo or packet_composer(item):
         return {}
     state_dir = str(getattr(getattr(db, "cfg", None), "state_dir", "") or "")
+    own_repository = _repository_slug(repo)
     lot = int(item.get("id") or 0)
     if not lot:
         return {}
@@ -5672,9 +5900,12 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 continue
             # #7576 : une empreinte explicitement nommée n'est pas une
             # citation Git, même si sa longueur ressemble à un SHA abrégé.
-            tokens = [match.group("commit")
-                      for match in _CITED_COMMIT.finditer(body)
-                      if match.group("commit")]
+            # #7721 : seuls les jetons qualifiés sont des citations (12 hex
+            # ou plus, `dépôt@sha` du dépôt lu, ou abrégé local de 7 à 11
+            # caractères présent comme commit — B auditeur sur 474fe7c9) ;
+            # une lecture locale non concluante garde l'abrégé (B2).
+            tokens = _cited_tokens(body, own_repository, repo=repo,
+                                   timeout=remaining())
             if not tokens:
                 continue
             check()
@@ -5688,8 +5919,10 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             return {}
         check()
         non_commits: set[str] = set()
+        ambiguous: set[str] = set()
         present = _present_commits(repo, sorted(cited),
-                                   non_commits=non_commits, timeout=remaining())
+                                   non_commits=non_commits,
+                                   ambiguous=ambiguous, timeout=remaining())
         check()
         found: dict[str, dict] = {}
 
@@ -5710,6 +5943,14 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
 
         for token, citing in sorted(cited.items()):
             check()
+            # B cx2 sur 0c407b5f : une abréviation ambiguë localement n'est
+            # ni une absence ni une résolution univoque. Interroger la forge
+            # laisserait « No commit found » l'écarter, ou un seul objet
+            # résolu la choisir malgré les objets concurrents : le doute
+            # local se dit au gel et refuse la lecture stricte.
+            if token in ambiguous:
+                cite_doubt(token, citing, reason="ambiguous")
+                continue
             full = (_read_local_commit(repo, token) if present is None
                     else present.get(token))
             if not full:

@@ -88,6 +88,31 @@ class CanonReviewRefreshTest(base._ActivationFixture, PgTestCase):
         self.assertEqual(len(designated(work.get(self.db, self.lot))), 2)
         self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["pilot", other])
 
+    def test_stale_result_is_silent_and_retried_on_the_next_pass(self):
+        """#7662 : un gel ou un siège déplacé pendant la complétion rend
+        `stale` ; ce n'est pas un échec de politique. Aucune note, aucun
+        courrier au pilote, aucune clé `checked:` — la passe suivante relit."""
+        self.freeze()
+        self.raise_policy()
+        calls = []
+
+        def stale(*args, **kwargs):
+            calls.append(1)
+            return {"state": "stale", "reviewers": [],
+                    "why": "the designation moved during the floor completion"}
+
+        before = len(self.mailbox())
+        with mock.patch.object(act, "designate", side_effect=stale):
+            first = refresh.after_sync(self.cfg, self.db)
+            second = refresh.after_sync(self.cfg, self.db)
+        self.assertEqual(first["errors"], [], first)
+        self.assertEqual(second["errors"], [], second)
+        self.assertEqual(len(calls), 2)          # rien de `checked:` : relu
+        self.assertEqual(first["refreshed"], 0)  # aucun siège complété
+        self.assertEqual(second["refreshed"], 0)
+        self.assertEqual(self.notes(refresh.PREFIX), [])
+        self.assertEqual(len(self.mailbox()), before)
+
     def test_unreadable_policy_notices_pilot_and_remains_retryable(self):
         self.freeze()
         before = len(self.mailbox())

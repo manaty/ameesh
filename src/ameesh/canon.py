@@ -1189,10 +1189,15 @@ class HostPolicy:
     #: #7106 (avatar B3, docs/design/5322-avatar-humain.md §3.4) : hôte
     #: partagé multi-tenant. Chaque tenant (`human:<id>`) a son utilisateur
     #: système, son runner et ses dossiers de comptes ; seul un agent dont le
-    #: `responsible` est un tenant y est admis, avec des clés d'organisation
-    #: (décision Q2 #213954). `tenants` sans `shared` est une erreur.
+    #: `responsible` est un tenant y est admis. Par défaut : clés
+    #: d'organisation ; l'abonnement exige l'opt-in et l'isolation (décision
+    #: Q2 amendée #224052). `tenants` sans `shared` est une erreur.
     shared: bool = False
     tenants: list[str] | None = None
+    #: #5901 : l'abonnement personnel sur un hôte partagé est opt-in et exige
+    #: l'isolation de chaque tenant par UID, home et dossier de comptes.
+    allow_subscription: bool = False
+    require_isolation: bool = False
 
     def to_dict(self) -> dict:
         """Politique sérialisable (`canon show --json`) : le bloc sandbox est
@@ -1978,10 +1983,9 @@ def _get(obj: Any, key: str) -> Any:
     return getattr(obj, key, None)
 
 
-#: #7106 : décision Q2 (#213954, signée 12/11) — sur un hôte partagé, des
-#: clés d'organisation seulement ; l'abonnement personnel reste sur le poste.
+#: #7106/#5901 : par défaut, seules les clés d'organisation sont admises.
 SHARED_CREDENTIAL_MODES = ("api-key",)
-SHARED_DECISION = "#213954"
+SHARED_DECISION = "#224052"
 
 
 def tenant_key(ref: Any) -> str:
@@ -1997,7 +2001,7 @@ def shared_violations(agent: Any, host: Any, mode: Any) -> list[str]:
     """#7106 : raisons pour lesquelles un hôte partagé refuse cet agent.
 
     Seul un agent dont le `responsible` est un tenant déclaré de l'hôte y est
-    admis, avec un mode d'identifiants d'organisation (Q2, #213954). Une liste
+    admis, avec un mode d'identifiants autorisé (Q2, #224052). Une liste
     de tenants absente n'admet personne (fail closed)."""
     policy = _get(host, "policy")
     if policy is None or not _get(policy, "shared"):
@@ -2010,14 +2014,13 @@ def shared_violations(agent: Any, host: Any, mode: Any) -> list[str]:
         out.append("responsible %s is not a tenant of shared host %s (tenants: %s)" % (
             responsible or "undeclared", host_name, ", ".join(sorted(tenants)) or "none"))
     text = None if mode is None or mode == "" else str(mode)
-    restricted = _get(policy, "credential_modes")
-    if isinstance(restricted, str):
-        restricted = [restricted]
-    already = restricted is not None and text not in [str(m) for m in restricted]
-    if text not in SHARED_CREDENTIAL_MODES and not already:
-        out.append("credential mode %s not allowed on shared host %s: organization "
-                   "keys only (decision %s)" % (text or "undeclared", host_name,
-                                                 SHARED_DECISION))
+    subscription_ok = (_get(policy, "allow_subscription") is True
+                       and _get(policy, "require_isolation") is True)
+    allowed_modes = SHARED_CREDENTIAL_MODES + (("subscription",) if subscription_ok else ())
+    if text not in allowed_modes:
+        out.append("credential mode %s not allowed on shared host %s: "
+                   "subscription requires explicit tenant isolation (decision %s)"
+                   % (text or "undeclared", host_name, SHARED_DECISION))
     return out
 
 
@@ -2029,6 +2032,14 @@ def _validate_tenancy(canon: "Canon", host: Any, add) -> None:
         add("host-tenants-not-shared", ERROR,
             "policy of host %s declares `tenants` without `shared: true`" % host.title,
             host.fiche, host=host.title)
+    if policy.allow_subscription and not policy.shared:
+        add("host-subscription-not-shared", ERROR,
+            "host %s: `policy.allow_subscription` requires `policy.shared: true`"
+            % host.title, host.fiche, host=host.title)
+    if policy.allow_subscription and not policy.require_isolation:
+        add("host-subscription-no-isolation", ERROR,
+            "host %s: `policy.allow_subscription` requires `policy.require_isolation: true`"
+            % host.title, host.fiche, host=host.title)
     if not policy.shared:
         return
     if not tenants:
@@ -2059,11 +2070,13 @@ def _validate_tenancy(canon: "Canon", host: Any, add) -> None:
             "system users; use `~/…` (the home of each agent's tenant)"
             % (host.title, ", ".join(absolute)), host.fiche, host=host.title)
     modes = policy.credential_modes
-    if modes is None or any(m not in SHARED_CREDENTIAL_MODES for m in modes):
+    allowed_modes = SHARED_CREDENTIAL_MODES + (("subscription",)
+        if policy.allow_subscription and policy.require_isolation else ())
+    if modes is None or any(m not in allowed_modes for m in modes):
         add("host-shared-credential-mode", ERROR,
             "shared host %s must restrict `policy.credential_modes` to %s: "
-            "organization keys only on a shared host (decision %s)"
-            % (host.title, ", ".join(SHARED_CREDENTIAL_MODES), SHARED_DECISION),
+            "subscription requires explicit tenant isolation (decision %s)"
+            % (host.title, ", ".join(allowed_modes), SHARED_DECISION),
             host.fiche, host=host.title)
 
 
@@ -4648,6 +4661,16 @@ class _Loader:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.shared`: boolean expected", **where, **subject)
                     policy.shared = True
+            for key in ("allow_subscription", "require_isolation"):
+                if raw.get(key) is None:
+                    continue
+                if isinstance(raw[key], bool):
+                    setattr(policy, key, raw[key])
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.%s`: boolean expected" % key, **where, **subject)
+                    # Invalid input never enables subscriptions.
+                    setattr(policy, key, False)
             if raw.get("tenants") is not None:
                 value = raw["tenants"]
                 if isinstance(value, str):

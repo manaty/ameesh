@@ -1226,7 +1226,8 @@ def milestone(
                 if carried:
                     on_frozen = activation.hook(cfg, outcome, carried=carried)
                 else:
-                    target = activation.prepare_target(cfg, db, item, sha)
+                    target = activation.prepare_target(cfg, db, item, sha,
+                                                         hint=carry_repo)
                     activation.prefetch_freeze_objects(db, item, target, sha)
                     prepared = activation.prepare_for_freeze(
                         cfg, db, item, sha, target=target, actor=actor, proof=proof)
@@ -1250,7 +1251,8 @@ def milestone(
                 # #3250: a locally present head does not certify a fresh target.
                 # Pin the exact published target before taking the lot's lock.
                 target = (None if carried else
-                          activation.prepare_target(cfg, db, item, sha))
+                          activation.prepare_target(cfg, db, item, sha,
+                                                    hint=carry_repo))
                 # #3836 : la désignation lit les gels antérieurs du lot dans la
                 # transaction du jalon ; ses objets absents se rapatrient ici, hors
                 # transaction. Un `git fetch` de forge dans la transaction laissait
