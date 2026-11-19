@@ -511,7 +511,8 @@ class OwnerGoTest(fixtures._Base):
         super().setUp()
         # reuse the owner-key fixture without inheriting its own test methods
         self.key = fixtures.SignatureTest.owner_key(self)
-        self.now = _dt.datetime.now(_dt.timezone.utc)
+        # a fixed instant: the wire is deterministic (H3, no clock dependency)
+        self.now = _dt.datetime(2026, 11, 19, 18, 0, tzinfo=_dt.timezone.utc)
 
     def go(self, *, application="acme", option="call",
            until=None, options=("call=Oui, autoriser les appels", "no=Non")):
