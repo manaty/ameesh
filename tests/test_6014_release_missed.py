@@ -272,9 +272,9 @@ class TrainStuckAlertTest(unittest.TestCase):
                                   "failures": 0, "plan": {"id": "plan-1"}},
                                  **document)}
 
-    def test_draining_for_more_than_a_day_raises_train_stuck(self):
+    def test_draining_for_more_than_an_hour_raises_train_stuck(self):
         db = self.Db([self.row("draining", error="ci unreadable")])
-        alerts = exploitation._train_stuck(db, 1000.0 + 25 * 3600)
+        alerts = exploitation._train_stuck(db, 1000.0 + 61 * 60)
         self.assertEqual(len(alerts), 1)
         alert = alerts[0]
         self.assertEqual(alert["type"], "train_stuck")
@@ -292,15 +292,15 @@ class TrainStuckAlertTest(unittest.TestCase):
                       "composing", "promoting"):
             with self.subTest(phase=phase):
                 db = self.Db([self.row(phase)])
-                self.assertEqual(len(exploitation._train_stuck(db, 1000.0 + 25 * 3600)), 1)
+                self.assertEqual(len(exploitation._train_stuck(db, 1000.0 + 61 * 60)), 1)
 
     def test_terminal_phases_and_young_trains_are_not_stuck(self):
         for phase in ("landed", "empty", "paused", "invalidated"):
             with self.subTest(phase=phase):
                 db = self.Db([self.row(phase)])
-                self.assertEqual(exploitation._train_stuck(db, 1000.0 + 48 * 3600), [])
+                self.assertEqual(exploitation._train_stuck(db, 1000.0 + 2 * 3600), [])
         db = self.Db([self.row("draining")])
-        self.assertEqual(exploitation._train_stuck(db, 1000.0 + 23 * 3600), [])
+        self.assertEqual(exploitation._train_stuck(db, 1000.0 + 59 * 60), [])
 
     def test_unreadable_state_is_not_stuck(self):
         db = types.SimpleNamespace(query=mock.Mock(side_effect=RuntimeError("db down")))

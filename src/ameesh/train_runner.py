@@ -261,7 +261,10 @@ class Passage:
 
     def maintain(self, db, now):
         with (self.guard() if self.guard is not None else contextlib.nullcontext()):
-            self.maintenance_at = self.reservation_ledger(db).maintain(now)
+            # #7967 : l'époque ordinaire tenue par ce moteur, pour renouveler
+            # l'exclusion d'une cible dont la réservation a expiré.
+            self.maintenance_at = self.reservation_ledger(db).maintain(
+                now, epoch=self.epoch)
         return self.maintenance_at
 
     def repository_path(self):
@@ -558,11 +561,15 @@ class Service:
         db = ScopedDb(self.cfg, family="runner.scoped.train.pass")
         try:
             result, deadline = self.passages[index].scheduled_step(db, now)
-            if isinstance(result, dict) and result.get("result") == "landed":
+            if isinstance(result, dict) and result.get("result") in (
+                    "landed", "invalidated"):
                 # #2965: the target just freed. A cutoff the landed packet
                 # overran is composed at once, with the candidates admissible
                 # at that cutoff, instead of waiting for the next calendar
                 # hour (the "créneau manqué, traité dans la foulée" rule).
+                # #7967: an expiry-invalidated plan also frees the target; the
+                # pass that invalidated it must compose the due cutoff itself,
+                # not wait for the next hourly event.
                 with self.condition:
                     self.pending.add(index)
             return deadline
