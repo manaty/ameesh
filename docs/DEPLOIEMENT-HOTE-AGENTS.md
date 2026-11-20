@@ -353,8 +353,11 @@ n’est jamais compté non plus. Côté exécuteur, un courrier actif non remis
 depuis plus de `MAIL_OVERDUE_S` (300 s, sous la borne de 900 s de la sonde)
 ouvre son tour dès la fin du tour en cours : sans fenêtre de regroupement, et
 avant la suite après plafond, la consigne en attente et le réveil programmé
-(#7976). Un agent en tours enchaînés ne laisse donc plus son courrier en
-souffrance ; la borne de la sonde n’est pas élargie.
+(#7976). Ce tour écoule tout l’arriéré en retard dans le budget de la
+consigne : un message en retard qui ne tient pas en entier est remis en
+aperçu (400 octets, texte intégral par `agent-mail show <id>`), plutôt que de
+coûter un tour par message lourd. Un agent en tours enchaînés ne laisse donc
+plus son courrier en souffrance ; la borne de la sonde n’est pas élargie.
 Le courrier actif d’une persona **opérationnelle sans bail vivant** n’est pas
 une souffrance de la chaîne : aucun exécuteur ne peut ouvrir son tour. Il est
 néanmoins un KO, dans `sans_executeur`, parce qu’un courrier opérationnel doit

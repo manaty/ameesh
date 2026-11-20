@@ -16,6 +16,8 @@ from __future__ import annotations
 import time
 import unittest
 
+from .test_l125_courrier_regroupe import _ligne
+
 from ameesh import mail, registry
 from ameesh.runner import AgentWorker
 
@@ -80,6 +82,47 @@ class CourrierEnRetardTest(_Base):
         ident = self._en_retard("dev-w")
         worker._turn_end_mono = time.monotonic() - 1  # #3451 : fenêtre en cours
         self.assertEqual(worker.pick()["ids"], [ident])
+
+
+    def test_un_arriere_lourd_s_ecoule_en_un_tour(self):
+        # 12 messages de 6 Ko, en retard : le budget (20 Ko) n'en tient que 2
+        # en entier ; les autres entrent en aperçu, tous dans ce tour.
+        _runner, worker = self._worker("dev-a")
+        ids = [mail.send(self.db, "dev%d" % i, "dev-a", ("avis %d " % i) + "x" * 6000)
+               for i in range(12)]
+        self._vieillir("dev-a", AgentWorker.MAIL_OVERDUE_S + 60)
+        worker.suite = "turn ceiling"
+        spec = worker.pick()
+        self.assertEqual((spec["kind"], spec["remaining"]), ("mail", 0))
+        self.assertEqual(spec["ids"], ids)
+        self.assertLessEqual(mail.octets(spec["prompt"]), worker._budget_courrier())
+        self.assertIn("agent-mail show %d" % ids[-1], spec["prompt"])
+        # la réservation refait le même choix (run_turn)
+        _t, retenus, reste = mail.prompt_for(
+            self.db, spec["candidats"], kind="mail", budget=worker._budget_courrier(),
+            en_retard_avant=worker._retard_avant())
+        self.assertEqual(([int(m["id"]) for m in retenus], reste), (ids, 0))
+
+
+class ApercuEnRetardTest(unittest.TestCase):
+    def _lignes(self, n, created_ts):
+        return [dict(_ligne(body="corps %d " % i + "y" * 6000), id=i + 1,
+                     created_ts=created_ts) for i in range(n)]
+
+    def test_le_courrier_frais_lourd_attend_le_tour_suivant(self):
+        lignes = self._lignes(6, time.time())
+        _t, retenus, reste = mail.prompt_for(None, lignes, kind="mail", budget=20000,
+                                             en_retard_avant=time.time() - 300)
+        self.assertLess(len(retenus), 6)
+        self.assertEqual(reste, 6 - len(retenus))
+
+    def test_le_courrier_en_retard_entre_en_apercu(self):
+        lignes = self._lignes(6, time.time() - 3600)
+        texte, retenus, reste = mail.prompt_for(None, lignes, kind="mail", budget=20000,
+                                                en_retard_avant=time.time() - 300)
+        self.assertEqual((len(retenus), reste), (6, 0))
+        self.assertLessEqual(mail.octets(texte), 20000)
+        self.assertIn("agent-mail show 6", texte)
 
 
 if __name__ == "__main__":  # pragma: no cover

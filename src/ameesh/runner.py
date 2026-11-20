@@ -7810,6 +7810,12 @@ class AgentWorker(threading.Thread):
                    and now - float(m.get("created_ts") or now) >= seuil
                    for m in rows)
 
+    def _retard_avant(self) -> float | None:
+        """#7976 : l'instant (epoch) avant lequel un message est en retard,
+        pour l'aperçu de `mail.prompt_for` ; None si le seuil est nul."""
+        seuil = float(self.MAIL_OVERDUE_S)
+        return time.time() - seuil if seuil > 0 else None
+
     def _reveil_due(self, policy: dict, rows: list[dict]) -> bool:
         """#7632 : le courrier actif en attente ouvre-t-il un tour sous la
         cadence déclarée ? Oui si l'un des messages est d'une nature
@@ -8143,7 +8149,8 @@ class AgentWorker(threading.Thread):
         refait le choix au moment de réserver.
         """
         prompt, retenus, reste = mail.prompt_for(self.db, messages, kind=kind,
-                                                 budget=self._budget_courrier())
+                                                 budget=self._budget_courrier(),
+                                                 en_retard_avant=self._retard_avant())
         ids = [int(m["id"]) for m in retenus if m.get("id") is not None]
         # #6005 : l'attribution d'appelant du tour est celle des messages
         # réellement servis ; plusieurs attributions différentes = ambigu, le
@@ -8635,8 +8642,10 @@ class AgentWorker(threading.Thread):
         kind = spec["kind"]
         budget = self._budget_courrier()
         envelopes = spec.get("envelopes")
+        retard = self._retard_avant()
         _texte, retenus, reste = mail.prompt_for(self.db, candidats, kind=kind,
-                                                 budget=budget, envelopes=envelopes)
+                                                 budget=budget, envelopes=envelopes,
+                                                 en_retard_avant=retard)
         jeton = mail.new_token()
         try:
             reserves = mail.reserve(
@@ -8656,7 +8665,8 @@ class AgentWorker(threading.Thread):
         # La consigne est rendue sur les messages RÉSERVÉS (leur état exact :
         # « re-livré » compris), dans le même budget.
         prompt, inclus, _ = mail.prompt_for(self.db, reserves, kind=kind, budget=budget,
-                                            extra_remaining=reste, envelopes=envelopes)
+                                            extra_remaining=reste, envelopes=envelopes,
+                                            en_retard_avant=retard)
         ids = [int(m["id"]) for m in inclus]
         # #2810 : ce tour sert exactement ces messages (la réservation peut
         # différer de la sélection).

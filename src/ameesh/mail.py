@@ -730,9 +730,22 @@ def _envelope_for(envelopes: dict[int, str] | None, row: dict) -> str | None:
     return envelopes.get(key)
 
 
+#: #7976 : octets du corps cités pour un message en retard qui ne tient pas
+#: en entier ; le texte intégral reste à `agent-mail show` (note de troncature)
+APERCU_RETARD_BYTES = 400
+
+
+def _en_retard(row: dict, avant: float | None) -> bool:
+    """#7976 : message créé avant `avant` (epoch, horloge de la base)."""
+    if avant is None or row.get("created_ts") is None:
+        return False
+    return float(row["created_ts"]) <= float(avant)
+
+
 def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
                budget: int = PROMPT_MAX_BYTES, extra_remaining: int = 0,
-               envelopes: dict[int, str] | None = None
+               envelopes: dict[int, str] | None = None,
+               en_retard_avant: float | None = None
                ) -> tuple[str, list[dict], int]:
     """La consigne d'un tour de courrier, bornée sur son rendu RÉEL complet.
 
@@ -742,17 +755,39 @@ def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
     premier message entre toujours, tronqué au besoin : un message trop long
     ne bloque jamais la boîte. Rend (texte, retenus, reste) ; `reste` (plus
     `extra_remaining`) est le nombre de messages laissés au tour suivant.
+
+    #7976 : un message créé avant `en_retard_avant` qui ne tient pas en entier
+    entre en aperçu (`APERCU_RETARD_BYTES`, texte intégral à `agent-mail
+    show`) au lieu d'attendre : un arriéré en retard s'écoule en un tour, pas
+    un tour par message lourd. Le budget reste la borne.
     """
     budget = max(PROMPT_MIN_BYTES, int(budget))
     total = len(rows) + extra_remaining
     blocks: list[str] = []
+    # #7976 : la place des aperçus des messages en retard qui suivent est
+    # réservée : un message entier ne la prend pas, sinon trois longs
+    # messages remplissent encore le tour et l'arriéré attend.
+    # Marge de 100 octets par aperçu : note de signature, séparateurs.
+    reserve = [0] * (len(rows) + 1)
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
+        reserve[index] = reserve[index + 1] + (
+            octets(_block(db, row, APERCU_RETARD_BYTES, note="",
+                          envelope=_envelope_for(envelopes, row))) + 100
+            if _en_retard(row, en_retard_avant) else 0)
     for index, row in enumerate(rows):
         note = _verdict_note(db, row)  # une vérification par message, pas par essai
         env = _envelope_for(envelopes, row)
         bloc = _block(db, row, note=note, envelope=env)
-        if octets(_assemble(kind, blocks + [bloc], total - index - 1)) <= budget:
+        if (octets(_assemble(kind, blocks + [bloc], total - index - 1))
+                + reserve[index + 1] <= budget):
             blocks.append(bloc)
             continue
+        if _en_retard(row, en_retard_avant):
+            bloc = _block(db, row, APERCU_RETARD_BYTES, note=note, envelope=env)
+            if octets(_assemble(kind, blocks + [bloc], total - index - 1)) <= budget:
+                blocks.append(bloc)
+                continue
         if blocks:
             break
         # Premier message trop long à lui seul : corps tronqué jusqu'à tenir.
