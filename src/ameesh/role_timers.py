@@ -1345,12 +1345,17 @@ def _owns_dropin(report: dict) -> bool:
 
 
 def install(report: dict, *, directory: Path, bin_path: str = DEFAULT_BIN,
-            apply: bool = True, out=None) -> dict:
+            apply: bool = True, out=None, db=None) -> dict:
     """Write the units of a candidate host and enable the timers.
 
     A blocked pass is reported and left without units; existing units of a
     blocked pass are removed so a timer cannot stay green while reading
     nothing. Returns the same report with ``installed``/``blocked`` lists.
+
+    #7933: with ``db``, also reconciles the elected-role watch units of this
+    candidate (``watch.reconcile_host``). A host that joins the candidates
+    therefore gets the watch timer from its ordinary deployment gesture, with
+    no second ``watch enable``; the watch row still comes from `enable` once.
     """
     out = out or (lambda _line: None)
     if not report.get("candidate"):
@@ -1384,10 +1389,26 @@ def install(report: dict, *, directory: Path, bin_path: str = DEFAULT_BIN,
             out("wrote %s" % spec.timer)
         timers.append(spec.timer)
 
+    # the notifier drop-in belongs to the role timers only: a watch timer does
+    # not carry the github-watch/issues/ci passes and must not silence them.
+    role_timers = list(timers)
+    if db is not None:
+        # #7933 : la pose des minuteries de rôle est le geste de déploiement
+        # de chaque candidat ; elle réconcilie aussi les veilles des rôles
+        # élus, sinon un hôte qui rejoint les candidats resterait sans
+        # émetteur jusqu'à un `ameesh watch enable` manuel.
+        from . import watch as watch_mod
+        watched = watch_mod.reconcile_host(report["host"], db, directory=str(directory),
+                                           bin_path=bin_path)
+        for name in watched["installed"]:
+            installed.append(name)
+            out("wrote %s" % name)
+        timers.extend(watched["timers"])
+
     dropin = directory / "ameesh-notify.service.d" / "10-role-timers.conf"
     if not _owns_dropin(report):
         pass
-    elif timers and _notify_unit(directory):
+    elif role_timers and _notify_unit(directory):
         if _write(dropin, render_notify_dropin(bin_path, dropin_skips(report))):
             installed.append(str(dropin.relative_to(directory)))
     elif dropin.exists():
@@ -1408,12 +1429,16 @@ def install(report: dict, *, directory: Path, bin_path: str = DEFAULT_BIN,
 
 
 def check(report: dict, *, directory: Path, apply: bool = True,
-          bin_path: str = DEFAULT_BIN) -> list[str]:
+          bin_path: str = DEFAULT_BIN, db=None) -> list[str]:
     """Problems that would leave the observation silent on this host.
 
     Also detects a unit left over from another configuration (cadence, role or
     binary): a green timer that runs an old command is the same silence as a
     missing one, so the operator has to rerun ``--install``.
+
+    #7933: with ``db``, also checks the elected-role watch units this
+    candidate must carry (files, then their systemd state). A candidate with
+    no watch unit would stand by while the lease holder has no emitter.
     """
     if not report.get("candidate"):
         return []
@@ -1456,6 +1481,25 @@ def check(report: dict, *, directory: Path, apply: bool = True,
                 reason = stalled(spec.timer)
                 if reason:
                     problems.append("%s: %s" % (spec.name, reason))
+    if db is not None:
+        from . import watch as watch_mod
+        watched = watch_mod.check_host(report["host"], db, directory=str(directory),
+                                       bin_path=bin_path)
+        problems.extend(watched["problems"])
+        if apply:
+            for agent, timer in watched["timers"]:
+                if not (directory / timer).is_file():
+                    continue  # already named as missing above
+                enabled = _systemctl("is-enabled", "--quiet", timer)
+                if enabled.returncode != 0:
+                    problems.append("watch of %s: %s is not enabled" % (agent, timer))
+                active = _systemctl("is-active", "--quiet", timer)
+                if active.returncode != 0:
+                    problems.append("watch of %s: %s is not active" % (agent, timer))
+                else:
+                    reason = stalled(timer)
+                    if reason:
+                        problems.append("watch of %s: %s" % (agent, reason))
     dropin = directory / "ameesh-notify.service.d" / "10-role-timers.conf"
     has_timer = any(not item.get("blocked") for item in report.get("timers") or ())
     if has_timer and _owns_dropin(report) and _notify_unit(directory):
@@ -1574,7 +1618,7 @@ def _run_action(args, report: dict, *, db) -> int:
     directory = systemd_dir(args.systemd_dir)
     if args.check:
         problems = check(report, directory=directory, apply=not args.no_apply,
-                         bin_path=args.bin)
+                         bin_path=args.bin, db=db)
         notes = warnings(report)
         paused = paquet_pause_note(db, report) if report.get("observation") else ""
         if paused:
@@ -1595,7 +1639,7 @@ def _run_action(args, report: dict, *, db) -> int:
         result = remove(report, directory=directory, apply=not args.no_apply)
     elif args.install:
         result = install(report, directory=directory, bin_path=args.bin,
-                         apply=not args.no_apply,
+                         apply=not args.no_apply, db=db,
                          out=(lambda _line: None) if args.json else print)
     else:
         result = report

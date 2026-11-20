@@ -118,6 +118,10 @@ READING_KEY = "watch"
 #: #7933 : un rôle élu n'appartient à aucun hôte inscrit ; `releve` le dit sur
 #: la fiche de l'agent (`role_run.live`), et le détenteur du bail émet.
 ELECTED_RELEVE = "election"
+#: #7933 (ameesh-cx2) : l'unité d'un rôle élu tique à ce pas, bien plus court
+#: que la période d'envoi, pour voir une relève dans les 5 min du canon §11 ;
+#: `send` ne dépose qu'une fois `every_s` écoulé (et bat à chaque autre tir).
+ROLE_TICK_S = 60
 #: #5698 : la note passive déposée quand la lecture n'a pas changé (elle
 #: n'ouvre pas de tour : elle est lue au tour suivant).
 UNCHANGED_TEXT = (
@@ -252,7 +256,9 @@ def units(agent: str, every_s: int, ameesh: str, path: str,
     `role` (the agent's elected role, #7933) wraps the firing in
     ``ameesh role run <role> -- … watch send``: only the lease holder reaches
     the sending code, and the child carries the lease epoch as its fencing
-    token. A plain watch keeps its direct exec line."""
+    token. Its timer ticks every `ROLE_TICK_S` so a handover is seen well
+    inside the canon's five minutes; `send` gates the actual deposit on
+    `every_s`. A plain watch keeps its direct exec line and its period."""
     if role:
         exec_line = ("\"%(ameesh)s\" role run %(role)s -- \"%(ameesh)s\" "
                      "watch send --agent %(agent)s"
@@ -273,6 +279,9 @@ def units(agent: str, every_s: int, ameesh: str, path: str,
         % {"agent": agent, "path": path, "host_env": HOST_ENV_FILE,
            "own_env": os.path.join(directory, env_name(agent)),
            "timeout": FIRING_TIMEOUT_S, "exec_line": exec_line})
+    tick_s = min(every_s, ROLE_TICK_S) if role else every_s
+    tick_text = ("%s, lease tick every %s" % (every_text(every_s), every_text(tick_s))
+                 if tick_s != every_s else every_text(every_s))
     timer = (
         "[Unit]\n"
         "Description=ameesh watch of %(agent)s, every %(every)s\n"
@@ -281,8 +290,114 @@ def units(agent: str, every_s: int, ameesh: str, path: str,
         "OnUnitActiveSec=%(s)d\n"
         "[Install]\n"
         "WantedBy=timers.target\n"
-        % {"agent": agent, "every": every_text(every_s), "s": every_s})
+        % {"agent": agent, "every": tick_text, "s": tick_s})
     return {unit_name(agent, "service"): service, unit_name(agent, "timer"): timer}
+
+
+def _write_unit_files(files: dict[str, str], directory: str) -> list[str]:
+    """Atomically write the watch files that changed; return their names.
+
+    The environment file may hold a DSN with its password: owner only, like
+    `enable` writes it."""
+    os.makedirs(directory, exist_ok=True)
+    changed: list[str] = []
+    for name, text in files.items():
+        path = os.path.join(directory, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                if fh.read() == text:
+                    continue
+        except OSError:
+            pass
+        tmp = os.path.join(directory, "." + name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+        changed.append(name)
+    return changed
+
+
+def elected_watch_files(host: str, db, *, directory: str, bin_path: str,
+                        env: dict | None = None) -> list[dict]:
+    """#7933 : the watch units this host must carry for the elected roles.
+
+    Every `agent_watches` row whose agent's card carries `releve: election`
+    and whose `candidats` name this host gets its timer, whether or not the
+    row was recorded here: the lease holder emits, the others stand by. The
+    caller is the candidate reconciliation (`ameesh role timers --install`),
+    so a host that joins the candidates needs no second `watch enable` — the
+    row (period, who enabled it) stays the one gesture that creates a watch.
+    """
+    from . import role_run
+    source = dict(os.environ if env is None else env)
+    path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
+    out = []
+    for watched in storage.of(db).watches.list():
+        agent = str(watched.get("agent") or "")
+        if not agent:
+            continue
+        try:
+            report = role_run.live(db, agent)
+        except role_run.RoleError:
+            continue
+        if str(report.get("releve") or "") != ELECTED_RELEVE:
+            continue
+        if host not in (report.get("candidates") or ()):
+            continue
+        role = str(report.get("role") or agent)
+        files = units(agent, int(watched["every_s"]), bin_path, path, directory,
+                      role=role)
+        files[env_name(agent)] = pinned_env(source, host)
+        out.append({"agent": agent, "role": role,
+                    "every_s": int(watched["every_s"]), "files": files})
+    return out
+
+
+def reconcile_host(host: str, db, *, directory: str, bin_path: str,
+                   env: dict | None = None) -> dict:
+    """Write the elected-role watch units of this candidate host (#7933).
+
+    Returns the files written and the timers to enable; the caller applies
+    systemd (``role timers --install`` does it in its own transaction of
+    gestures). No database row is written: installation is not a re-enable.
+    """
+    installed, timers, agents = [], [], []
+    for entry in elected_watch_files(host, db, directory=directory,
+                                     bin_path=bin_path, env=env):
+        installed.extend(_write_unit_files(entry["files"], directory))
+        timers.append(unit_name(entry["agent"], "timer"))
+        agents.append(entry["agent"])
+    return {"installed": installed, "timers": timers, "agents": agents}
+
+
+def check_host(host: str, db, *, directory: str, bin_path: str,
+               env: dict | None = None) -> dict:
+    """#7933 : gaps of the elected-role watch units on this candidate host.
+
+    Compares the service and timer with what `reconcile_host` would write and
+    names a missing environment file; the caller checks systemd. A watch row
+    whose agent is not a candidate here is not a gap."""
+    problems: list[str] = []
+    timers: list[tuple[str, str]] = []
+    for entry in elected_watch_files(host, db, directory=directory,
+                                     bin_path=bin_path, env=env):
+        agent = entry["agent"]
+        for name in (unit_name(agent, "service"), unit_name(agent, "timer")):
+            path = os.path.join(directory, name)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    content = fh.read()
+            except OSError:
+                problems.append("watch of %s: missing %s" % (agent, name))
+                continue
+            if content != entry["files"][name]:
+                problems.append("watch of %s: %s is out of date; rerun `ameesh "
+                                "role timers --install`" % (agent, name))
+        if not os.path.isfile(os.path.join(directory, env_name(agent))):
+            problems.append("watch of %s: missing %s" % (agent, env_name(agent)))
+        timers.append((agent, unit_name(agent, "timer")))
+    return {"problems": problems, "timers": timers}
 
 
 def wake_name(agent: str, slug: str, suffix: str) -> str:
@@ -707,8 +822,9 @@ def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subproc
             warnings.append(
                 "the watch of %s follows the elected role %s: it emits from the "
                 "lease holder, not from the host recorded at enable time (%s); this "
-                "host now has its own timer, install it on every candidate. The other "
-                "timers send only when their host holds the lease."
+                "host now has its own timer. `ameesh role timers --install` "
+                "reconciles it on every candidate; the other timers send only when "
+                "their host holds the lease."
                 % (agent, role.get("role") or agent, before[0]["host"]))
         else:
             warnings.append(
@@ -969,6 +1085,21 @@ def _recent_turn(board: dict | None, agent: str, now: float) -> bool:
     return last > 0 and now - last < RECENT_TURN_S
 
 
+def _beat(db, agent: str, host: str, reason: str, *, takeover: bool = False,
+          epoch: int | None = None, attempt: bool = False) -> dict | None:
+    """#7933 (B1) : enregistre un tir qui ne dépose rien, sous le même fencing
+    que le message. Une erreur échoue le tir (la minuterie réessaiera), elle
+    ne doit jamais être avalée en silence : le battement est ce qui distingue
+    une veille saine d'une veille morte."""
+    try:
+        return storage.of(db).watches.deliver(
+            agent, host, None, takeover=takeover, epoch=epoch,
+            fired=reason, attempt=attempt)
+    except Exception as exc:  # noqa: BLE001 — un battement non écrit est un échec
+        raise WatchError("recording the firing of %s failed: %s"
+                         % (agent, exc)) from exc
+
+
 def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
          env: dict | None = None, now: float | None = None) -> str:
     """One firing: the instruction to `agent` when this host may emit its
@@ -1025,6 +1156,18 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
         return "the watch of %s is on %s: nothing sent from here" % (agent, watch["host"])
     if watch is None:
         return "no watch of %s: nothing sent" % agent
+    # #7933 (ameesh-cx2) : l'unité d'un rôle élu tique toutes les 60 s pour
+    # voir une relève ; la veille elle-même ne relit qu'une fois `every_s`
+    # écoulé. Le battement « pas encore dû » entretient la vivacité sans
+    # avancer `last_attempt_at`, sinon l'échéance reculerait à chaque tick.
+    if role is not None and not takeover:
+        last_attempt = watch.get("last_attempt_ts")
+        every = float(watch.get("every_s") or DEFAULT_EVERY_S)
+        if last_attempt is not None and now < float(last_attempt) + every:
+            _beat(db, agent, host, "not-due", takeover=takeover, epoch=epoch)
+            due_in = max(0, int(float(last_attempt) + every - now))
+            return ("watch of %s: next instruction in %ds: nothing sent"
+                    % (agent, due_in))
     # the project of the thread, read BEFORE the delivery (codex #303 r3): once
     # the message is committed, nothing may fail the firing (the timer would
     # retry, and send it twice)
@@ -1055,9 +1198,13 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
         digest, changed, recent = None, True, False
     if not changed:
         if recent:
+            _beat(db, agent, host, "recent-turn", takeover=takeover,
+                  epoch=epoch, attempt=True)
             return ("watch of %s: unchanged and a turn within %d min: nothing sent"
                     % (agent, RECENT_TURN_S // 60))
         if _unread_note(db, agent):
+            _beat(db, agent, host, "unread-note", takeover=takeover,
+                  epoch=epoch, attempt=True)
             return ("watch of %s: unchanged, its last note is not read yet: "
                     "nothing sent" % agent)
         passive = True
@@ -1066,6 +1213,8 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
         # turn. The change may be external or have happened after the
         # agent's last turn; it stays pending, and the first firing whose
         # turn is older sends the instruction.
+        _beat(db, agent, host, "change-pending", takeover=takeover,
+              epoch=epoch, attempt=True)
         return ("watch of %s: changed, but a turn within %d min: nothing sent "
                 "(change kept pending)" % (agent, RECENT_TURN_S // 60))
     if passive:
@@ -1081,6 +1230,8 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
         # la veille elle-même n'est pas muette pour autant, un changement de
         # lecture part toujours (sa propre empreinte, cas passif ci-dessous).
         if not mail.report_due(db, SENDER, agent, "info", report_fp, now=now):
+            _beat(db, agent, host, "report-reminder", takeover=takeover,
+                  epoch=epoch, attempt=True)
             return ("watch of %s: unchanged, the same note was sent less than %d h "
                     "ago: nothing sent" % (agent, int(mail.REPORT_REMIND_S // 3600)))
     if mail_send is None:
@@ -1103,6 +1254,8 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
         row = storage.of(db).watches.deliver(agent, host, deliver, reading=digest,
                                              takeover=takeover, epoch=epoch)
     except _ReportJustSent:
+        _beat(db, agent, host, "report-reminder", takeover=takeover,
+              epoch=epoch, attempt=True)
         return ("watch of %s: the same report was just sent: nothing sent" % agent)
     except WatchError:
         raise

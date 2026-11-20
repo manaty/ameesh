@@ -22,11 +22,14 @@ import dataclasses
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from ameesh import exploitation, registry, role_run, storage, watch
+from ameesh import db as db_mod
+from ameesh import exploitation, role_run, role_timers, storage, watch
 
 from .support import PgTestCase
 
@@ -76,9 +79,10 @@ class WatchRoleLeaseTest(PgTestCase):
         return [m for m in storage.of(self.db).mailbox.unread(NAME, 200)
                 if m["sender"] == "veille"]
 
-    def send(self, cfg):
+    def send(self, cfg, now=None):
         with mock.patch.object(watch.fil, "record"):
-            return watch.send(cfg, self.db, NAME, now=self.now)
+            return watch.send(cfg, self.db, NAME,
+                              now=self.now if now is None else now)
 
     # -- émission ---------------------------------------------------------
     def test_the_lease_holder_emits_even_when_recorded_elsewhere(self):
@@ -150,7 +154,7 @@ class WatchRoleLeaseTest(PgTestCase):
         self.assertEqual(alert["agent"], NAME)
         self.assertEqual(alert["host"], "atelier")
         self.assertGreaterEqual(alert["value"], alert["threshold"])
-        self.assertGreaterEqual(alert["threshold"], 13)
+        self.assertEqual(alert["threshold"], 3)
         self.assertIn("lease holder banc", alert["detail"])
         # the same alert while the silence lasts: a growing `value` does not
         # open a new episode (`since` is the last send)
@@ -186,6 +190,153 @@ class WatchRoleLeaseTest(PgTestCase):
         self.assertEqual([a for a in exploitation.alerts(
             self.cfg, self.db, now=self.now, local_pool=False)
             if a["type"] == "watch_silent"], [])
+
+    # -- battement des tirs qui ne déposent rien (B1) ---------------------
+    def watched(self):
+        return storage.of(self.db).watches.list(NAME)[0]
+
+    def watch_silent(self, now=None):
+        return [a for a in exploitation.alerts(
+            self.cfg, self.db, now=time.time() if now is None else now,
+            local_pool=False) if a["type"] == "watch_silent"]
+
+    def test_a_not_due_tick_beats_without_moving_the_cadence(self):
+        self.put("banc")
+        self.hold("banc")
+        self.assertEqual(self.send(self.banc), "instruction sent to %s" % NAME)
+        before = self.watched()
+        out = self.send(self.banc, now=time.time() + watch.ROLE_TICK_S)
+        self.assertIn("next instruction", out)
+        after = self.watched()
+        self.assertEqual(after["last_fired_reason"], "not-due")
+        self.assertEqual(after["last_attempt_ts"], before["last_attempt_ts"])
+        self.assertGreaterEqual(after["last_fired_ts"], before["last_fired_ts"])
+        # the heartbeat keeps a healthy watch out of `watch_silent` even when
+        # its last deposit is older than the limit
+        old = self.now - exploitation.watch_silence_limit(EVERY) - 60
+        self.db.execute("UPDATE agent_watches SET last_sent_at = to_timestamp(%s)"
+                        " WHERE agent = %s", (old, NAME))
+        self.assertEqual(self.watch_silent(), [])
+
+    def test_a_recent_turn_skip_beats(self):
+        self.put("banc")
+        self.hold("banc")
+        self.send(self.banc)
+        before = self.watched()
+        later = time.time() + EVERY + 10
+        self.db.execute("UPDATE agent_registry SET last_turn_at = to_timestamp(%s)"
+                        " WHERE name = %s", (later - 60, NAME))
+        out = self.send(self.banc, now=later)
+        self.assertIn("turn within", out)
+        row = self.watched()
+        self.assertEqual(row["last_fired_reason"], "recent-turn")
+        self.assertGreaterEqual(row["last_attempt_ts"], before["last_attempt_ts"])
+        old = self.now - exploitation.watch_silence_limit(EVERY) - 60
+        self.db.execute("UPDATE agent_watches SET last_sent_at = to_timestamp(%s)"
+                        " WHERE agent = %s", (old, NAME))
+        self.assertEqual(self.watch_silent(), [])
+
+    def test_an_unread_note_skip_beats(self):
+        self.put("banc")
+        self.hold("banc")
+        self.send(self.banc)  # deposits an unread instruction
+        out = self.send(self.banc, now=time.time() + EVERY + 10)
+        self.assertIn("not read yet", out)
+        row = self.watched()
+        self.assertEqual(row["last_fired_reason"], "unread-note")
+        # a beat after the last deposit keeps the alert quiet
+        old = self.now - exploitation.watch_silence_limit(EVERY) - 60
+        self.db.execute("UPDATE agent_watches SET last_sent_at = to_timestamp(%s)"
+                        " WHERE agent = %s", (old, NAME))
+        self.assertEqual(self.watch_silent(), [])
+        # the same row without the beat is mute: the alert still measures the
+        # most recent firing, not the agent's turns
+        self.db.execute(
+            "UPDATE agent_watches SET enabled_at = to_timestamp(%s),"
+            " last_fired_at = to_timestamp(%s), last_attempt_at = to_timestamp(%s)"
+            " WHERE agent = %s", (old - 60, old, old, NAME))
+        self.assertEqual(len(self.watch_silent()), 1)
+
+    # -- concurrence bail / dépôt (ameesh-cx2) ---------------------------
+    def test_a_handover_waits_for_the_deposit(self):
+        self.put("atelier")
+        self.hold("banc", epoch=7)
+        started, release = threading.Event(), threading.Event()
+        fire_db = self.connect()
+        result: dict = {}
+        deposits: list = []
+
+        def deposit(tx):
+            deposits.append(tx)
+            started.set()
+            self.assertTrue(release.wait(10))
+
+        def fire():
+            try:
+                result["row"] = storage.of(fire_db).watches.deliver(
+                    NAME, "banc", deposit, takeover=True, epoch=7)
+            except Exception as exc:  # noqa: BLE001 — reported to the test
+                result["error"] = exc
+
+        thread = threading.Thread(target=fire)
+        thread.start()
+        self.assertTrue(started.wait(10))
+        # a handover trying to commit between the epoch check and the deposit
+        # waits on the registry row lock; it cannot interleave
+        mover = self.connect(statement_timeout_ms=400)
+        try:
+            with self.assertRaises(db_mod.DbError):
+                mover.execute(
+                    "UPDATE agent_registry SET lease_owner = 'next', lease_epoch = 8,"
+                    " lease_expires_at = clock_timestamp() + interval '300 seconds'"
+                    " WHERE name = %s", (NAME,))
+        finally:
+            mover.close()
+        release.set()
+        thread.join(20)
+        fire_db.close()
+        self.assertNotIn("error", result)
+        self.assertTrue(result["row"]["sent"])
+        # the deposit is committed; the handover now goes through and the
+        # watch follows the new epoch without a second copy
+        self.db.execute(
+            "UPDATE agent_registry SET lease_owner = 'next', lease_epoch = 8,"
+            " lease_expires_at = clock_timestamp() + interval '300 seconds'"
+            " WHERE name = %s", (NAME,))
+        self.assertEqual(len(deposits), 1)
+
+    # -- réconciliation par les minuteries de rôle (ameesh-cx2) ----------
+    def test_role_timers_install_reconciles_the_watch_without_enable(self):
+        self.put("atelier")  # the row keeps the host of the original enable
+        self.hold("banc")
+        directory = Path(self.env[watch.UNIT_DIR_ENV])
+        report = {"schema": "ameesh-role-timers/1", "host": "banc",
+                  "role": NAME, "releve": "election",
+                  "candidates": ["banc", "atelier"], "candidate": True,
+                  "observation": False, "auditor": False, "timers": [],
+                  "missing_projects": []}
+        result = role_timers.install(
+            report, directory=directory, bin_path="/opt/ameesh/bin/ameesh",
+            apply=False, db=self.db)
+        timer = directory / watch.unit_name(NAME, "timer")
+        service = directory / watch.unit_name(NAME, "service")
+        self.assertIn(timer.name, result["installed"])
+        self.assertIn("OnUnitActiveSec=60\n", timer.read_text(encoding="utf-8"))
+        self.assertIn("role run %s --" % NAME, service.read_text(encoding="utf-8"))
+        # installation did not re-enable the watch: its row still names atelier
+        self.assertEqual(self.watched()["host"], "atelier")
+        self.assertEqual(role_timers.check(
+            report, directory=directory, apply=False,
+            bin_path="/opt/ameesh/bin/ameesh", db=self.db), [])
+        # a candidate without its unit is a named gap
+        timer.unlink()
+        problems = role_timers.check(
+            report, directory=directory, apply=False,
+            bin_path="/opt/ameesh/bin/ameesh", db=self.db)
+        self.assertTrue(any("missing %s" % timer.name in problem
+                            for problem in problems), problems)
+        # and the holder still emits from that unit, without `watch enable`
+        self.assertEqual(self.send(self.banc), "instruction sent to %s" % NAME)
 
     # -- unité et affichage ----------------------------------------------
     def test_enable_of_an_elected_role_wraps_the_unit_and_names_the_holder(self):
