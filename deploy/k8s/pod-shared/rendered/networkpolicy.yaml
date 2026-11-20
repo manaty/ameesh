@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# GÉNÉRÉ par deploy/k8s/pod-shared/render.py — ne pas editer a la main.
+# Source : deploy/k8s/pod-shared/host.exemple.yaml ; `render.py --check` verifie la fraicheur.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ameesh-pod-alice-default-deny
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
+    app.kubernetes.io/component: pod-host
+    app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
+    ameesh.dev/policy: default-deny
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh
+      app.kubernetes.io/instance: ameesh-pod-alice
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ameesh-pod-alice-egress-dns
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
+    app.kubernetes.io/component: pod-host
+    app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
+    ameesh.dev/policy: egress-dns
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh
+      app.kubernetes.io/instance: ameesh-pod-alice
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ameesh-pod-alice-egress-base
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
+    app.kubernetes.io/component: pod-host
+    app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
+    ameesh.dev/policy: egress-base
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh
+      app.kubernetes.io/instance: ameesh-pod-alice
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 192.0.2.0/24
+    ports:
+    - protocol: TCP
+      port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ameesh-pod-alice-egress-canon
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
+    app.kubernetes.io/component: pod-host
+    app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
+    ameesh.dev/policy: egress-canon
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh
+      app.kubernetes.io/instance: ameesh-pod-alice
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 198.51.100.0/24
+    ports:
+    - protocol: TCP
+      port: 22
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ameesh-pod-alice-egress-fournisseurs
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
+    app.kubernetes.io/component: pod-host
+    app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
+    ameesh.dev/policy: egress-fournisseurs
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh
+      app.kubernetes.io/instance: ameesh-pod-alice
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 169.254.0.0/16
+    ports:
+    - protocol: TCP
+      port: 443

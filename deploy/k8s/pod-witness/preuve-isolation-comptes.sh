@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# #7694/#7695/#7698 (design 7633 §5.3, §9.3) — témoin kind d'un hôte pod :
-# identité (UID du chart = UID du processus = entrée passwd), montage (le PVC
-# de B n'est pas dans le conteneur de A), permissions (le dossier de comptes
-# 0700 de B refuse l'UID de A, même monté en lecture seule), superviseur (uid
-# 10001, aucun volume de tenant, /tmp propre), base (réclamation par tenant,
-# attach, isolation UID, bail superviseur et préflight de déplacement pod sur
-# un PostgreSQL migré — 0601 comprise). En plus des cinq contrôles de #7695, le
-# canon (#7694, B1 de #44265) est rejoué : clone sous 10001, lecture sous l'UID
-# du tenant avec la paire `safe.directory` du plan. #7698 ajoute le déplacement
-# `pod partagé -> pod dédié` : le MÊME PVC est ré-attaché à un pod recréé
-# (UID Kubernetes neuf, UID de personne inchangé, témoin intact), puis le
-# retour au pod partagé. Un UID différent ne lit pas le dossier de comptes
-# (témoin 3) : c'est le repli « compte re-login » quand le PVC ne peut pas
-# être ré-attaché, jamais une copie.
+# #7694/#7695/#7698/#7699 (design 7633 §5.3, §6, §9.3) — témoin kind d'un
+# hôte pod : identité (UID du chart = UID du processus = entrée passwd),
+# montage (le PVC de B n'est pas dans le conteneur de A), permissions (le
+# dossier de comptes 0700 de B refuse l'UID de A, même monté en lecture
+# seule), superviseur (uid 10001, aucun volume de tenant, /tmp propre), base
+# (réclamation par tenant, attach, isolation UID, bail superviseur et préflight
+# de déplacement pod sur un PostgreSQL migré — 0601 comprise). En plus des cinq
+# contrôles de #7695, le canon (#7694, B1 de #44265) est rejoué : clone sous
+# 10001, lecture sous l'UID du tenant avec la paire `safe.directory` du plan.
+# #7698 ajoute le déplacement `pod partagé -> pod dédié` : le MÊME PVC est
+# ré-attaché à un pod recréé (UID Kubernetes neuf, UID de personne inchangé,
+# témoin intact), puis le retour au pod partagé. Un UID différent ne lit pas le
+# dossier de comptes (témoin 3) : c'est le repli « compte re-login » quand le
+# PVC ne peut pas être ré-attaché, jamais une copie. #7699 ajoute le contrôle
+# du chart de référence : objets P6 acceptés par l'API, quota qui mord, PDB
+# 1 pod / 0 interruption, image par digest, preStop et labels.
 #
 # Ce script est un geste de BUREAU/OPÉRATEUR, pas de l'agent intéressé : il
 # crée un cluster kind jetable, applique les gabarits du dossier, exécute les
@@ -35,6 +37,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$HERE/../../.." && pwd)
 CLUSTER=${CLUSTER:-ameesh-pod-witness}
 NS=${NS:-ameesh-pod-witness}
+#: Namespace jetable du contrôle du chart de référence (#7699).
+NS_REF=${NS_REF:-${NS}-reference}
 UID_A=${UID_A:-2519}
 UID_B=${UID_B:-2520}
 FS_GROUP=${FS_GROUP:-10000}
@@ -363,6 +367,126 @@ check_canon() {
     pass "canon: dépôt clone sous $SUPERVISOR_UID lu sous $UID_A, confiance bornée au dépôt"
 }
 
+# --- contrôle 6 (#7699) : chart de référence, objets acceptés et bornés -----
+# Ce contrôle ne rejoue pas les conteneurs : il prouve que le chart de
+# référence APPLIQUÉ est accepté par l'API et que ses gardes mordent (quota,
+# PDB), que l'image est épinglée, que le préStop et les labels sont présents.
+# L'application de la NetworkPolicy dépend du CNI : kind ne la prouve pas, la
+# qualification réelle est Q-TPK (runbook docs/ops/qualification-hote-pod.md).
+reference_pod() {
+    # Un pod conforme à PSA restricted, dans la quota du chart (1 pod).
+    cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $1
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 2519
+    runAsGroup: 10000
+    fsGroup: 10000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: temoin
+      image: $IMAGE
+      command: ["sleep", "300"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        readOnlyRootFilesystem: true
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 50m
+          memory: 64Mi
+EOF
+}
+
+check_reference() {
+    local render="python3 $REPO_ROOT/deploy/k8s/pod-shared/render.py"
+    local sts types out expected allowed manifest
+    python3 -c 'import yaml' 2>/dev/null \
+        || { echo "SKIP reference: PyYAML absent — contrôle non exécuté (non-concluant)" >&2; return 77; }
+    $render --check >/dev/null \
+        || fail "reference: le rendu du chart est périmé (./render.py --write)"
+    sts=$($render --stdout --kind StatefulSet) \
+        || fail "reference: rendu du StatefulSet impossible"
+    grep -Eq '@sha256:[0-9a-f]{64}' <<<"$sts" \
+        || fail "reference: image non épinglée par digest"
+    grep -q 'preStop' <<<"$sts" \
+        || fail "reference: preStop de drain absent"
+    grep -q 'terminationGracePeriodSeconds: 120' <<<"$sts" \
+        || fail "reference: grâce absente ou inférieure à 120 s"
+    grep -q 'app.kubernetes.io/version' <<<"$sts" \
+        || fail "reference: label de version absent"
+    manifest=$($render --stdout --kind NetworkPolicy --kind ResourceQuota \
+        --kind PodDisruptionBudget) \
+        || fail "reference: rendu des objets P6 impossible"
+    grep -q 'kind: NetworkPolicy' <<<"$manifest" \
+        || fail "reference: NetworkPolicy absente"
+    grep -q 'kind: ResourceQuota' <<<"$manifest" \
+        || fail "reference: ResourceQuota absente"
+    grep -q 'kind: PodDisruptionBudget' <<<"$manifest" \
+        || fail "reference: PodDisruptionBudget absente"
+    kubectl kustomize "$REPO_ROOT/deploy/k8s/pod-shared" >/dev/null \
+        || fail "reference: kubectl kustomize en échec"
+
+    kubectl create namespace "$NS_REF" --dry-run=client -o yaml \
+        | kubectl apply -f - >/dev/null
+    kubectl label namespace "$NS_REF" \
+        pod-security.kubernetes.io/enforce=restricted \
+        pod-security.kubernetes.io/enforce-version=latest --overwrite >/dev/null
+    printf '%s\n' "$manifest" \
+        | kubectl -n "$NS_REF" apply -f - >/dev/null \
+        || fail "reference: les objets P6 sont refusés par l'API"
+    types=$(kubectl -n "$NS_REF" get networkpolicy \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+        | grep -- '-default-deny$' | head -1)
+    [ -n "$types" ] || fail "reference: aucune NetworkPolicy default-deny"
+    types=$(kubectl -n "$NS_REF" get networkpolicy "$types" \
+        -o jsonpath='{.spec.policyTypes[*]}')
+    [ "$types" = "Ingress Egress" ] \
+        || fail "reference: default-deny ne couvre pas Ingress et Egress ($types)"
+    [ "$(kubectl -n "$NS_REF" get networkpolicy -o name | wc -l)" -ge 5 ] \
+        || fail "reference: règles de sortie manquantes"
+
+    reference_pod temoin-reference | kubectl -n "$NS_REF" apply -f - >/dev/null
+    kubectl -n "$NS_REF" wait --for=condition=Ready pod/temoin-reference \
+        --timeout=120s >/dev/null || fail "reference: pod témoin non prêt"
+    expected=0
+    for _ in $(seq 1 30); do
+        expected=$(kubectl -n "$NS_REF" get pdb \
+            -o jsonpath='{.items[0].status.expectedPods}' 2>/dev/null || true)
+        [ "$expected" = "1" ] && break
+        sleep 1
+    done
+    [ "$expected" = "1" ] \
+        || fail "reference: PDB expectedPods=$expected, attendu 1"
+    allowed=$(kubectl -n "$NS_REF" get pdb \
+        -o jsonpath='{.items[0].status.disruptionsAllowed}')
+    [ "$allowed" = "0" ] \
+        || fail "reference: PDB disruptionsAllowed=$allowed, attendu 0"
+    out=$(mktemp "${TMPDIR:-/tmp}/ameesh-reference-XXXXXX")
+    if reference_pod temoin-reference-2 | kubectl -n "$NS_REF" apply -f - >"$out" 2>&1; then
+        rm -f "$out"
+        fail "reference: un second pod n'est pas refusé par la quota"
+    fi
+    grep -q 'exceeded quota' "$out" \
+        || { cat "$out" >&2; rm -f "$out"; fail "reference: refus de quota inattendu"; }
+    rm -f "$out"
+    pass "reference: 5 NetworkPolicy (default-deny + DNS + sorties), quota mord (2e pod refusé), PDB 1 pod / 0 interruption, image@digest, preStop, label de version"
+    echo "trace: reference: NetworkPolicy acceptée ; son application par le CNI kind n'est pas prouvée, Q-TPK la qualifie"
+}
+
 # --- contrôle 5 : base réelle — réclamation et isolation d'un hôte pod ------
 # #7695 : les contrôles 1–4 prouvent les conteneurs ; celui-ci prouve la base
 # qui les gouverne, avec un vrai PostgreSQL migré (0599 comprise) :
@@ -500,13 +624,18 @@ pass "rejeu final: identite et modes intacts apres un montage sans fsGroup"
 
 check_canon
 
+# Le contrôle de référence rend 77 si PyYAML manque : non-concluant.
+ref_code=0
+check_reference || ref_code=$?
+[ "$ref_code" -eq 0 ] || [ "$ref_code" -eq 77 ] || exit "$ref_code"
+
 # Le contrôle base rend 77 quand le DSN manque : non-concluant, jamais vert.
 base_code=0
 check_base || base_code=$?
-if [ "$base_code" -eq 77 ]; then
-    echo "TEMOINS CONTENEURS PASSENT ; base NON EXÉCUTÉE (non-concluant)" >&2
+if [ "$ref_code" -eq 77 ] || [ "$base_code" -eq 77 ]; then
+    echo "TEMOINS CONTENEURS PASSENT ; référence/base NON EXÉCUTÉE(S) (non-concluant)" >&2
     exit 77
 fi
 [ "$base_code" -eq 0 ] || exit "$base_code"
 
-echo "TOUS LES TEMOINS PASSENT (#7695 : identité, montage, permissions, superviseur, base, canon #7694 ; #7698 : déplacement pod partagé -> dédié, PVC ré-attaché, présence pod)"
+echo "TOUS LES TEMOINS PASSENT (#7695 : identité, montage, permissions, superviseur, base, canon #7694 ; #7698 : déplacement pod partagé -> dédié, PVC ré-attaché, présence pod ; #7699 : chart de référence, quota, PDB, digest, preStop)"

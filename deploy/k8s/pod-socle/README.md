@@ -137,18 +137,28 @@ pod). Un `runtime.kind: pod-template` exige `max_agents: 1`, `volatile: true`,
 `account_isolation: per-pod-empty-dir` et aucun `subscription` : il n'est
 jamais un hôte plaçable.
 
-## Ce qui n'est pas encore livré
+## Tranches livrées et où les trouver
 
-- **P2** : livrée par [`../pod-shared/`](../pod-shared/README.md) (N conteneurs
-  de tenant, N PVC, publication des profils, bail « un seul superviseur »,
-  témoin complet) ; ce squelette P1 reste la référence pas à pas ;
-- **P3** : carte `subscription`, connexion du siège par pod dédié (jamais
-  `pods/exec` sur ce pod partagé), contrôle 6 du témoin ;
-- **P4** : pourvoyeur d'enfants (`pod_hosts`, RBAC, admission, TTL) ;
-- **P5** : déplacement poste ↔ pod partagé ↔ pod dédié, `preStop` de drain ;
-- **P6** : NetworkPolicy, quotas, PDB, sauvegardes, digest d'image épinglé,
-  runbook de qualification TPK.
+Ce squelette P1 reste la référence pas à pas (un tenant, objets minimaux) ; il
+n'est pas le chart d'exploitation.
+
+- **P2** : [`../pod-shared/`](../pod-shared/README.md) — N conteneurs de
+  tenant, N PVC, publication des profils, bail « un seul superviseur »,
+  témoin complet ;
+- **P3** : carte Host pod **sans abonnement** (décision owner du 20/11) :
+  `credential_modes: [api-key]`, `host-pod-subscription-unproven` refuse
+  `subscription` et `allow_subscription` ; connexion du siège par pod dédié,
+  jamais `pods/exec` sur ce pod partagé ;
+- **P4** : pourvoyeur d'enfants ([`../pod-provisioner/`](../pod-provisioner/README.md),
+  `pod_hosts`, RBAC, admission, TTL) ;
+- **P5** : déplacement poste ↔ pod partagé ↔ pod dédié, runbook
+  [`docs/ops/deplacement-hote-pod.md`](../../../docs/ops/deplacement-hote-pod.md) ;
+- **P6** : chart de référence complet (`../pod-shared/` : NetworkPolicy,
+  quota, PDB, `snapshot.py`, digest d'image, `preStop` et grâce, labels) et
+  runbook de qualification/passation TPK-IMA
+  [`docs/ops/qualification-hote-pod.md`](../../../docs/ops/qualification-hote-pod.md).
 
 Le témoin `kind` de la tranche P1 (identité, montage, permissions) est dans
 [`deploy/k8s/pod-witness/`](../pod-witness/) ; il porte aussi, depuis #7695,
-le superviseur, le canon et le contrôle base pour le chart `pod-shared`.
+le superviseur, le canon et le contrôle base pour le chart `pod-shared`, et
+depuis #7699 le contrôle du chart de référence (quota, PDB, digest, preStop).

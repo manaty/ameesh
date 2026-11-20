@@ -221,7 +221,11 @@ class PodSharedChartTest(unittest.TestCase):
 
     def test_aucun_secret_ni_droit_dans_le_chart(self):
         kinds = {d["kind"] for d in self.docs}
-        self.assertEqual(kinds, {"StatefulSet", "ConfigMap", "PersistentVolumeClaim"})
+        # #7699 (P6) ajoute les objets du chart de référence : réseau, quota
+        # et PDB. Aucun Secret, Role, Service ni volume hôte.
+        self.assertEqual(kinds, {"StatefulSet", "ConfigMap", "PersistentVolumeClaim",
+                                 "NetworkPolicy", "ResourceQuota",
+                                 "PodDisruptionBudget"})
         text = "\n".join(self.render.render(self.config, "source").values()).lower()
         for forbidden in ("hostpath", "privileged: true", "password:",
                           "ssh-privatekey:", "-----begin"):

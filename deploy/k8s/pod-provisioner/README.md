@@ -207,9 +207,10 @@ non pod n'ont aucune ligne `pod_hosts` et gardent la garde #7106 inchangée.
   plafond de la clé ; l'imputation au compte du parent et le plafond du parent
   viendront avec le **relais de modèle** (D6, tranche suivante). Le profil du
   parent (`budget_usd`) n'est pas encore appliqué au pod enfant.
-- **Réseau/IPC** : pas de NetworkPolicy intra-pod (P6) ; le pod enfant est
-  dédié (un seul tenant), donc la limite est plus faible que sur un pod
-  partagé, mais elle reste à traiter au chart de référence.
+- **Réseau/IPC** : le chart de référence #7699 ne filtre pas l'intra-pod
+  (une NetworkPolicy standard ne le peut pas) ; le pod enfant est dédié (un
+  seul tenant), donc la limite est plus faible que sur un pod partagé, mais
+  elle reste une limite assumée du design §5.1.
 - **Stockage** : `emptyDir` seulement ; aucun PVC, donc aucun travail durable
   hors rapports/artefacts remontés (design §8.4).
 - **Kind** : la preuve RBAC/template/quota/cycle de vie est un geste de
