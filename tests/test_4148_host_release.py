@@ -812,7 +812,7 @@ class HostReleaseTest(PgTestCase):
         self.assertEqual((control["release_state"], control["hook_state"]),
                          ("idle-drained", "idle-drained"))
 
-    def _return_after_resync(self, *, released):
+    def _return_after_resync(self, *, released, automatic=False):
         self._ag3_state()
         self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
         self.reading()
@@ -825,9 +825,16 @@ class HostReleaseTest(PgTestCase):
         self.assertEqual(self.states(), expected)
         self.assertEqual(self.control()["hook_state"], expected[-1])
         # #7913 (avis mty-amh-qa-01): the resync `busy` must not refuse the
-        # `busy` of a return later in the same withdrawal.
-        control = host_release.request_return(self.cfg, self.db, "vm",
-                                              actor="human:op")
+        # `busy` of a return later in the same withdrawal, explicit (undrain)
+        # or automatic (an agent that must come back, `return_targets`).
+        if automatic:
+            self.db.execute("UPDATE agent_registry SET restart_requested_at=now() "
+                            "WHERE name='worker'")
+            self.once(now=time.time())
+            control = self.control()
+        else:
+            control = host_release.request_return(self.cfg, self.db, "vm",
+                                                  actor="human:op")
         self.assertEqual(self.states(), expected + ["busy"])
         self.assertEqual(control["hook_state"], "busy")
         self.assertFalse(control["claims_open"])
@@ -843,6 +850,12 @@ class HostReleaseTest(PgTestCase):
 
     def test_return_after_the_resync_once_released(self):
         self._return_after_resync(released=True)
+
+    def test_automatic_return_after_the_resync_while_draining(self):
+        self._return_after_resync(released=False, automatic=True)
+
+    def test_automatic_return_after_the_resync_once_released(self):
+        self._return_after_resync(released=True, automatic=True)
 
     def test_stale_draining_ack_with_a_return_request_still_returns(self):
         self._ag3_state()
