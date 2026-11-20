@@ -1126,6 +1126,25 @@ def _held_by_own_run(job, free, now) -> bool:
     return now - float(progress) < GUARD_QUEUE_HELD_S
 
 
+def _github_hosted(job, known) -> bool:
+    """#7935 : le job en file attend la capacité **hébergée par GitHub**, pas
+    celle du dépôt — aucun runner auto-hébergé enregistré (en ligne ou hors
+    ligne) ne porte **tous** ses labels, et il ne demande pas `self-hosted`.
+
+    La suite macOS (`macos-26-intel`) et les jobs `ubuntu-latest` d'une PR de
+    fork ne peuvent pas être pris par nos runners : leur attente ne dit rien
+    de notre capacité et ne doit pas lever `ci_queue_saturated`.
+
+    Un job sans labels connus n'est pas prouvé GitHub : il reste compté. Un
+    job qui demande `self-hosted` ne peut jamais être pris par GitHub : même
+    sans runner correspondant, il compte — c'est une saturation (ou une
+    panne) du dépôt, pas une attente de capacité hébergée."""
+    labels = job.get("labels")
+    if not labels or "self-hosted" in labels:
+        return False
+    return not any(labels <= runner_labels for runner_labels in known)
+
+
 class Watcher:
     """Le relevé de la CI, mené par `ameesh notify` à chaque passage, sur
     l'hôte désigné (`github.host`). Une erreur (GitHub, base) d'un dépôt est
@@ -2154,7 +2173,13 @@ class Watcher:
         l'exécution — un job de la même exécution démarré ou fini dans les deux
         derniers SLO de file ; passé ce silence (plafond non lu), le job
         réintègre la file pour qu'un dispatch gelé finisse par alerter. Un job
-        sans labels connus reste compté.
+        sans labels connus reste compté. #7935 : un job dont **aucun** runner
+        auto-hébergé enregistré (en ligne ou hors ligne) ne porte les labels —
+        `macos-26-intel`, `ubuntu-latest` d'une PR de fork — attend la capacité
+        de GitHub, pas la nôtre ; il ne compte pas dans `ci_queue_state` et ne
+        lève pas `ci_queue_saturated`. Un job à labels `self-hosted` reste
+        compté même sans runner correspondant : GitHub ne le prendra jamais,
+        c'est une saturation (ou une panne) du dépôt.
 
         Le relevé est borné (revue N/P2 2328 ; arbitrage A du pilote, 14/10) :
         la fenêtre de 600 s est écrite dans la base avant le premier appel
@@ -2281,11 +2306,20 @@ class Watcher:
                         # job réintègre la file (un dispatch gelé ne reste pas
                         # muet). Un job sans labels connus reste compté : on ne
                         # peut pas prouver qu'un runner pourrait le prendre.
+                        # #7935 : un job qu'aucun runner auto-hébergé enregistré
+                        # (en ligne ou hors ligne) ne peut prendre — la suite
+                        # macOS `macos-26-intel`, un `ubuntu-latest` de PR de
+                        # fork — attend la capacité de GitHub, pas la nôtre : il
+                        # ne compte pas. Un job `self-hosted` reste compté même
+                        # sans runner correspondant, car GitHub ne le prendra
+                        # jamais.
+                        known = [_label_set(r.get("labels")) for r in runners]
                         free = [_label_set(r.get("labels")) for r in runners
                                 if (r.get("status") or "online") == "online"
                                 and not r.get("busy")]
                         waiting = [job for job in queued_jobs
-                                   if not _held_by_own_run(job, free, now)]
+                                   if not _github_hosted(job, known)
+                                   and not _held_by_own_run(job, free, now)]
                         if waiting:
                             oldest = min(waiting, key=lambda j: (
                                 str(j.get("created_at") or ""), int(j.get("id") or 0)))
