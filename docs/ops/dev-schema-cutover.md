@@ -58,6 +58,13 @@ restauration de la sauvegarde de la base cible.
    d'abord toutes les migrations en attente : la commande applique la passe
    entière. Le runner utilise une transaction, un verrou consultatif et
    `lock_timeout = 5s`. Une erreur annule toute la passe.
+
+   Après activation explicite de `MIGRATIONS` dans la release approuvée et
+   configuration de la base cible, la commande est :
+
+   ```sh
+   ameesh migrate
+   ```
 3. Comparer chaque compteur et empreinte de données avant/après ; vérifier
    les clés étrangères inter-schémas, les ACL de table et de colonne, les
    séquences possédées et la séquence explicite restée noyau. Conserver un
@@ -88,6 +95,14 @@ les écrivains arrêtés et le `search_path` fixé au schéma noyau, l'opérateu
 l'exécute en entier avec arrêt à la première erreur. Le fichier contient sa
 transaction, son verrou et son délai de verrouillage : ne pas l'englober
 avec une commande qui pourrait continuer après une erreur.
+
+Depuis la racine de la release approuvée, avec `DATABASE_URL` pointant sur la
+base cible et `PGOPTIONS` configuré pour placer son schéma noyau en premier
+dans le `search_path`, la commande est :
+
+```sh
+psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -f src/ameesh/modules/dev/migrations/rollback/0001_module_schema_cutover.sql
+```
 
 Il refuse les migrations de module postérieures à P2, exige les tables
 attendues, supprime uniquement les vues de compatibilité, remet les tables
