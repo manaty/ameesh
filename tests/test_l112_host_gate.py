@@ -40,7 +40,16 @@ from .test_l43_perimetre_hote import HOST, _Canons, host
 GOLDEN = os.path.join(os.path.dirname(__file__), "golden", "mediated_executor", "gate.json")
 
 
-def attendre(cond, timeout: float = 15.0, pas: float = 0.05):
+def attendre(cond, timeout: float = 60.0, pas: float = 0.05):
+    """Attend un *état*, pas une durée murale.
+
+    #3832 : la part tourne désormais à deux ou quatre processus sur l'hôte
+    (CI de paquet, --parallel), et le fil de l'exécuteur peut attendre
+    plusieurs secondes avant d'être ordonnancé. Le témoin reste l'état
+    observé ; 15 s était une borne de confort, pas la propriété testée (les
+    rouges de h-32 venaient de là). Le dernier appel hors boucle rend le
+    diagnostic quand la borne tombe vraiment.
+    """
     fin = time.monotonic() + timeout
     while time.monotonic() < fin:
         valeur = cond()
@@ -214,7 +223,7 @@ class SocketGateTest(unittest.TestCase):
         self.assertTrue(attendre(lambda: g.wait_change(0.2).state == "draining"))
         # coupure : l'état tient `lost_grace`, puis vaut le repli
         self.compute.coupe()
-        self.assertTrue(attendre(lambda: g.state().state == "stopped", timeout=3.0))
+        self.assertTrue(attendre(lambda: g.state().state == "stopped", timeout=30.0))
         # le runner revient : reconnexion et ack en attente renvoyé
         g.acknowledge(P.GateAck(seq=2, state="draining", drained=True))
         self.compute.accepte()
@@ -690,7 +699,7 @@ class ExecuteurTest(PgTestCase):
         def arret():
             runner.stop.set()
             runner.wake_all.set()
-            fil.join(timeout=20)
+            fil.join(timeout=60)
         self.addCleanup(arret)
         return runner
 
@@ -743,7 +752,9 @@ class ExecuteurTest(PgTestCase):
         ecrit_etat(self.state_path, etat("draining", 2, drain_deadline_ts=time.time() + 1.0))
         ack = attendre(lambda: (self.ack() or {}).get("drained") and self.ack())
         self.assertTrue(ack)
-        self.assertLess(time.monotonic() - debut, 12.0)
+        # #3832 : le harnais dure 60 s (L112_DUREE) ; 30 s distingue encore un
+        # retrait au point sûr d'une échéance ignorée, sans rougir sous charge.
+        self.assertLess(time.monotonic() - debut, 30.0)
         self.assertGreaterEqual(time.monotonic() - debut, 0.9)
         self.assertFalse(any("fini" in m for m in self.harnais()))
         row = registry.get(self.db, "enfant")
@@ -763,7 +774,9 @@ class ExecuteurTest(PgTestCase):
         ack = attendre(lambda: (self.ack() or {}).get("drained") and self.ack())
         self.assertTrue(ack)
         self.assertEqual(ack["state"], "stopped")
-        self.assertLess(time.monotonic() - debut, 8.0)
+        # #3832 : même marge que l'échéance : le harnais dure 60 s, 30 s suffit
+        # à prouver l'arrêt et absorbe l'ordonnancement de --parallel.
+        self.assertLess(time.monotonic() - debut, 30.0)
         self.assertEqual(registry.get(self.db, "enfant")["pending_prompt"], "travail")
         n = len(self.harnais())
         time.sleep(1.0)
@@ -807,7 +820,7 @@ class ExecuteurTest(PgTestCase):
         fil = threading.Thread(target=runner.run, daemon=True)
         fil.start()
         self.addCleanup(lambda: (runner.stop.set(), runner.wake_all.set(),
-                                 fil.join(timeout=20)))
+                                 fil.join(timeout=60)))
         self.assertTrue(attendre(lambda: any(m.get("fin") for m in self.harnais())))
         # le tour va à son terme, points sûrs compris
         self.assertEqual(sum(1 for m in self.harnais() if "fini" in m), 2)

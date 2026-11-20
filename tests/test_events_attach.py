@@ -253,16 +253,24 @@ class AttachTest(PgTestCase):
     def test_attach_meurt_a_l_echeance_meme_si_renew_echoue(self):
         """Verdict L8 B2 : une vraie erreur SQL de renouvellement ne doit pas
         laisser la session interactive vivante après l'expiration du bail
-        (un remplaçant peut réclamer)."""
+        (un remplaçant peut réclamer).
+
+        #3832 : le témoin est l'arrêt du harnais, pas 7,5 s de mur. Le faux
+        harnais dort 60 s : s'il survit à l'échéance, l'appel dure 60 s et le
+        plafond de 30 s le dit ; sous charge, l'ordonnancement ne fait plus
+        rougir un arrêt correct (h-32 : 8,35 s avec --parallel).
+        """
         self._agent("att")
-        env = dict(self._env(), AMEESH_TEST_SLEEP="8")
+        env = dict(self._env(), AMEESH_TEST_SLEEP="60")
         with mock.patch.dict(os.environ, env, clear=False), \
                 mock.patch.object(registry, "renew",
                                   side_effect=db_mod.DbError("panne SQL")):
             debut = time.monotonic()
             code = run_attach(self.cfg, self.db, "att", ttl=5)
             ecoule = time.monotonic() - debut
-        self.assertLess(ecoule, 7.5, "la session interactive a survécu à l'échéance")
+        self.assertLess(ecoule, 30.0,
+                        "la session interactive a survécu à l'échéance "
+                        "(le harnais devait être tué vers 5 s)")
         self.assertLess(code, 0, "le harnais devait être tué à l'échéance")
 
     def test_attach_coupe_sans_journal_sur_le_chemin_d_arret(self):
@@ -273,9 +281,13 @@ class AttachTest(PgTestCase):
         #2199 : le puits saturé reste confiné au test et son journal est vidé
         **avant** la sortie du patch de `log` ; aucun message ne peut donc
         atteindre la capture stdout d'un test suivant.
+
+        #3832 : même témoin d'état que le test précédent — le harnais dort
+        60 s et le plafond de 30 s distingue un chemin d'arrêt bloqué d'une
+        simple attente d'ordonnancement (h-32 : 8,03 s).
         """
         self._agent("att")
-        env = dict(self._env(), AMEESH_TEST_SLEEP="8")
+        env = dict(self._env(), AMEESH_TEST_SLEEP="60")
         puits = _PuitsJournalSature()
         resultat: list = []
         sortie = io.StringIO()
@@ -291,16 +303,18 @@ class AttachTest(PgTestCase):
             thread = threading.Thread(target=lance, daemon=True)
             try:
                 thread.start()
-                thread.join(timeout=12)
+                thread.join(timeout=30)
                 ecoule = time.monotonic() - debut
                 self.assertFalse(
                     thread.is_alive(),
                     "le chemin d'arrêt a été bloqué par un journal synchrone")
-                self.assertLess(ecoule, 8.0)
+                self.assertLess(ecoule, 30.0,
+                                "l'arrêt a attendu le harnais (60 s) au lieu "
+                                "de couper à l'échéance")
                 self.assertTrue(resultat and resultat[0] < 0)
                 # Témoin #2199 : run_attach a rendu la main alors que le puits
                 # était encore bloqué et que le journal gardait des messages.
-                self.assertTrue(puits.entree.wait(2.0),
+                self.assertTrue(puits.entree.wait(30.0),
                                 "le journal n'a pas atteint le puits")
                 self.assertFalse(puits.liberer.is_set())
                 self.assertFalse(
@@ -310,7 +324,7 @@ class AttachTest(PgTestCase):
                 with contextlib.redirect_stdout(sortie):
                     self.assertTrue(puits.vider(),
                                     "le journal ne s'est pas vidé dans le test")
-                thread.join(timeout=5)
+                thread.join(timeout=30)
         self.assertEqual(sortie.getvalue(), "",
                          "le journal a écrit hors du puits après le test")
         self.assertTrue(any("harness stopped" in message for message in puits.messages),
@@ -322,7 +336,7 @@ class AttachTest(PgTestCase):
         marqueur = "%s-apres-%d" % (_FIN_JOURNAL, time.monotonic_ns())
         with contextlib.redirect_stdout(apres):
             runner_mod.log_async(marqueur)
-            fin = time.monotonic() + 10.0
+            fin = time.monotonic() + 30.0
             while marqueur not in apres.getvalue() and time.monotonic() < fin:
                 time.sleep(0.01)
         self.assertIn(marqueur, apres.getvalue(),

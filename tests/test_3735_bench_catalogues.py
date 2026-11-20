@@ -15,6 +15,8 @@ minimal abaissé, les purges des témoins sont bornées à leurs propres schéma
 from __future__ import annotations
 
 import os
+import socket
+import stat
 import subprocess
 import sys
 import textwrap
@@ -306,11 +308,30 @@ class BenchCataloguesTest(PgTestCase):
         self.assertFalse(self._exists(name))
 
     def _client_connections(self) -> int:
-        row = self.db.query(
-            "SELECT count(*)::bigint AS n FROM pg_stat_activity "
-            "WHERE datname = current_database() "
-            "AND backend_type = 'client backend'")[0]
-        return int(row["n"])
+        """Connexions TCP de CE processus vers la base (#3832).
+
+        `pg_stat_activity` compte tous les backends de la base : sous
+        --parallel, les connexions des autres processus de la part font
+        fluctuer le témoin (rouge h-32). On ne compte que les sockets du
+        processus via `/proc/self/fd` ; le pair donne le port de la base.
+        """
+        from psycopg.conninfo import conninfo_to_dict
+        port = int(conninfo_to_dict(self.cfg.dsn).get("port") or 5432)
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("connexions du processus : /proc/self/fd requis")
+        total = 0
+        for nom in os.listdir("/proc/self/fd"):
+            try:
+                fd = int(nom)
+                if not stat.S_ISSOCK(os.fstat(fd).st_mode):
+                    continue
+                with socket.socket(fileno=os.dup(fd)) as sonde:
+                    pair = sonde.getpeername()
+            except OSError:
+                continue
+            if isinstance(pair, tuple) and pair[1] == port:
+                total += 1
+        return total
 
     def test_class_cleanup_does_not_leak_connections(self) -> None:
         """B/P1 pilote (#3735) : un cleanup de classe ne rouvre pas de connexion.
@@ -318,11 +339,23 @@ class BenchCataloguesTest(PgTestCase):
         Le cleanup `addClassCleanup` passe après `tearDownClass`, qui a fermé
         la base ; sous psycopg, un DROP sur la base fermée rouvrirait une
         connexion (`_live`) jamais refermée — une par classe. N classes
-        PgTestCase ne doivent pas faire croître `pg_stat_activity`.
+        PgTestCase ne doivent pas faire croître les connexions **du
+        processus** (le compteur global de `pg_stat_activity` voyait les
+        autres parts, #3832).
         """
         if os.environ.get("AMEESH_DRIVER") != "psycopg":
             self.skipTest("psycopg driver only (the leak is psycopg's _live)")
         baseline = self._client_connections()
+        # Le témoin se vérifie lui-même : une connexion ouverte dans CE
+        # processus doit se voir, puis disparaître à la fermeture.
+        sonde = db_mod.connect(self.cfg)
+        try:
+            self.assertEqual(
+                self._client_connections(), baseline + 1,
+                "le compteur ne voit pas une connexion ouverte par ce processus")
+        finally:
+            sonde.close()
+        self.assertEqual(self._client_connections(), baseline)
         classes = [
             type("LeakProbe%d" % index, (PgTestCase,), {
                 "test_nothing": lambda self: None,
