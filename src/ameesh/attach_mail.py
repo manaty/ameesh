@@ -104,6 +104,40 @@ def notify_mail(name: str, row) -> tuple[bool, str]:
     return True, ""
 
 
+#: taille d'une page de non-lus : la borne de `mail.unread_active` (L125)
+PAGE = mail.UNREAD_LIMIT
+
+
+def _active_pages(db, name: str, *, since: float | None = None):
+    """Itère les non-lus non passifs par pages bornées, curseur `id`.
+
+    #7861/B de relecture : `mail.unread_active` ne rend que `UNREAD_LIMIT`
+    lignes ; sans curseur, 200 non-lus anciens masquaient le nouveau DM, et
+    200 messages déjà notifiés masquaient le suivant. `since` filtre à la
+    source (avant LIMIT) pour ne pas relire tout le préfixe à chaque passe.
+    Le chemin médié reste borné par son contrat (voir `mail.unread_active`).
+    """
+    cursor = None
+    while True:
+        rows = mail.unread_active(db, name, limit=PAGE, after_id=cursor,
+                                  since=since)
+        if not rows:
+            return
+        for row in rows:
+            if mail.passive_reason(row):
+                continue  # défensif : le stockage filtre déjà
+            yield row
+        if len(rows) < PAGE:
+            return
+        try:
+            next_cursor = int(rows[-1]["id"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if next_cursor <= (cursor or 0):
+            return
+        cursor = next_cursor
+
+
 def new_mail(db, name: str, *, since: float, notified: set[int],
              notify=notify_mail) -> list[tuple[int, str]]:
     """Signale une fois chaque message non passif arrivé depuis `since`.
@@ -111,9 +145,10 @@ def new_mail(db, name: str, *, since: float, notified: set[int],
     `notified` est la mémoire du fil d'attach (ids déjà signalés) ; elle est
     mise à jour même si l'affichage échoue, pour ne pas réessayer toutes les
     30 s un backend absent. Rend les échecs `(id, raison)` pour le journal.
-    """
+    La lecture est paginée par curseur : un préfixe de plus de `PAGE`
+    non-lus ne cache ni le message suivant ni un DM plus récent."""
     failures: list[tuple[int, str]] = []
-    for row in mail.unread_active(db, name):
+    for row in _active_pages(db, name, since=since):
         if mail.passive_reason(row):
             # `unread_active` filtre déjà en SQL ; on refiltre ici avec la
             # règle unique (`passive_reason`), comme le fait le hook.
@@ -168,15 +203,14 @@ def mark_due(cfg, db, name: str) -> int | None:
 
     Lit les non-lus non passifs AVANT d'être appelé par le `finally` de
     `_run_attach` (donc avant que le bail ne soit rendu) et retient l'id
-    maximal. Rend cet id, ou None s'il n'y avait rien à traiter. Une erreur
-    d'écriture remonte à l'appelant, qui la journalise : le tour de courrier
-    ordinaire reste le filet.
+    maximal de TOUTES les pages — un maximum borné à la première page
+    laisserait les suivants retomber dans la fenêtre L125. Rend cet id, ou
+    None s'il n'y avait rien à traiter. Une erreur d'écriture remonte à
+    l'appelant, qui la journalise : le tour de courrier ordinaire reste le
+    filet.
     """
-    rows = mail.unread_active(db, name)
     ids = []
-    for row in rows:
-        if mail.passive_reason(row):
-            continue  # même règle que `new_mail` : le passif n'ouvre pas de tour
+    for row in _active_pages(db, name):
         try:
             ids.append(int(row["id"]))
         except (KeyError, TypeError, ValueError):

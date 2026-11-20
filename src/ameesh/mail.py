@@ -359,20 +359,49 @@ def unread(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
     return storage.of(db).mailbox.unread(recipient, limit)
 
 
-def unread_active(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
+def unread_active(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
+                  after_id: int | None = None,
+                  since: float | None = None) -> list[dict]:
     """L125 : les non-lus qui ouvriront un tour (hors courrier passif).
+
+    #7861 : `after_id` (curseur) et `since` (création, epoch) sont appliqués
+    AVANT la limite, donc un préfixe de plus de `limit` non-lus ne masque ni
+    les suivants ni les nouveaux messages.
 
     Path B: `mailbox.unread_active` is not in contract 1.1, so a mediated
     executor reads `mailbox.unread` (admitted) and drops passive mail here,
     with the same rule as the SQL (`passive_reason`). Only the first
-    `UNREAD_LIMIT` unread messages are looked at there."""
+    `UNREAD_LIMIT` unread messages are looked at there : le curseur ne
+    franchit pas cette borne sur le chemin médié, mais il la respecte."""
     from .agent_names import resolve as resolve_agent_name
     recipient = resolve_agent_name(recipient, db=db, operation="mail.unread_active")
     st = storage.of(db)
     if getattr(st, "driver", None) == "mediated":
         rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
-        return [row for row in rows if not passive_reason(row)][:int(limit)]
-    return st.mailbox.unread_active(recipient, limit)
+        rows = [row for row in rows if not passive_reason(row)]
+        if after_id is not None:
+            rows = [row for row in rows
+                    if _message_id(row) > int(after_id)]
+        if since is not None:
+            rows = [row for row in rows
+                    if _created_ts(row) >= float(since)]
+        return rows[:int(limit)]
+    return st.mailbox.unread_active(recipient, limit, after_id=after_id,
+                                    since=since)
+
+
+def _message_id(row) -> int:
+    try:
+        return int(row.get("id"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _created_ts(row) -> float:
+    try:
+        return float(row.get("created_ts") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:

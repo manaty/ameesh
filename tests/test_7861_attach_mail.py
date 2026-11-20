@@ -102,6 +102,57 @@ class NewMailTest(PgTestCase):
                              notified=notified, notify=broken)
         self.assertEqual(calls, [message])
 
+    def _bulk_unread(self, count: int, prefix: str = "vieux") -> list[int]:
+        """Des non-lus insérés directement, bornés à la première page."""
+        ids = []
+        for index in range(count):
+            row = self.db.query(
+                "INSERT INTO agent_mailbox (sender, recipient, body) "
+                "VALUES ('alice', 'att86', %s) RETURNING id",
+                ("%s %d" % (prefix, index),))[0]
+            ids.append(int(row["id"]))
+        return ids
+
+    def test_more_than_a_page_of_old_unread_does_not_hide_a_new_dm(self):
+        # B de relecture (ameesh-cx2) : 200 non-lus d'avant l'attach ne
+        # doivent pas remplir la fenêtre de `mail.unread_active`.
+        old = self._bulk_unread(mail.UNREAD_LIMIT)
+        self.db.execute(
+            "UPDATE agent_mailbox SET created_at = now() - interval '1 hour' "
+            "WHERE recipient = %s", ("att86",))
+        new = mail.send(self.db, "alice", "att86", "le DM du jour")
+        calls = []
+
+        def fake(name, row):
+            calls.append(int(row["id"]))
+            return True, ""
+
+        failures = attach_mail.new_mail(
+            self.db, "att86", since=time.time() - 60,
+            notified=set(), notify=fake)
+        self.assertEqual(failures, [])
+        self.assertEqual(calls, [new])
+        # la veille n'a rien marqué lu
+        self.assertEqual(len(mail.unread(self.db, "att86", limit=len(old) + 1)),
+                         len(old) + 1)
+
+    def test_a_full_page_of_notified_mail_does_not_hide_the_next(self):
+        # B de relecture : 200 messages déjà notifiés restent non lus par
+        # conception ; le 201e doit encore être vu.
+        old = self._bulk_unread(mail.UNREAD_LIMIT, "déjà notifié")
+        new = mail.send(self.db, "alice", "att86", "le suivant")
+        calls = []
+
+        def fake(name, row):
+            calls.append(int(row["id"]))
+            return True, ""
+
+        failures = attach_mail.new_mail(
+            self.db, "att86", since=time.time() - 60,
+            notified=set(old), notify=fake)
+        self.assertEqual(failures, [])
+        self.assertEqual(calls, [new])
+
 
 class DesktopChannelTest(PgTestCase):
     """Le canal notify de l'hôte : le faux `notify-send` du banc le prouve."""
@@ -272,6 +323,23 @@ class DetachMailTest(PgTestCase):
         mail.send(self.db, "alice", "att86", "une copie", payload={"cc": "att86"})
         self.assertEqual(self._run_attach(), 0)
         self.assertIsNone(attach_mail.due_marker(self.cfg, "att86"))
+
+    def test_marker_keeps_the_true_maximum_across_pages(self):
+        # B de relecture : le marqueur ne doit pas s'arrêter au maximum de la
+        # première page, sinon les non-lus suivants retombent dans L125.
+        ids = []
+        for index in range(mail.UNREAD_LIMIT + 5):
+            row = self.db.query(
+                "INSERT INTO agent_mailbox (sender, recipient, body) "
+                "VALUES ('alice', 'att86', %s) RETURNING id",
+                ("en attente %d" % index,))[0]
+            ids.append(int(row["id"]))
+        self.assertEqual(self._run_attach(), 0)
+        self.assertEqual(attach_mail.due_marker(self.cfg, "att86"), max(ids))
+        self.assertEqual(
+            sorted(int(r["id"]) for r in
+                   mail.unread(self.db, "att86", limit=len(ids))),
+            sorted(ids))
 
 
 class HookDeliveryTest(PgTestCase):
