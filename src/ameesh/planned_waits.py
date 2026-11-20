@@ -30,8 +30,10 @@ read by `observation_hold`; the debit lists it apart until the deadline.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import re
+import threading
 import time
 
 from . import plan, storage, work_lifecycle as lifecycle
@@ -700,6 +702,52 @@ def pilot_holds(db, events, *, cfg=None,
 #: depuis la note de hold elle-même, jamais depuis le dernier événement du lot.
 HUMAN_WAIT_BLOCK_HOURS = 24
 
+#: #7940 N2 : les routes humaines lues pendant une passe de prise automatique.
+#: La fenêtre est explicite et de courte durée (`human_routes_cache`) : un
+#: exécuteur au long cours relit le canon et le registre à la passe suivante.
+_HUMAN_ROUTES = threading.local()
+
+
+@contextlib.contextmanager
+def human_routes_cache():
+    """#7940 N2 : lire les routes humaines une fois par passe de planification.
+
+    `human_waits` était appelé par chaque plan et par chaque sélection, et
+    rechargeait à chaque fois les canons (`load_configured`) et les routes
+    humaines (`debit.human_route_names`). Dans cette fenêtre, la première
+    lecture est gardée pour la durée du bloc ; elle ne survit jamais à la
+    passe, pour qu'un changement de canon ou de registre soit vu à la
+    suivante. Hors fenêtre, chaque appel relit comme avant.
+
+    Une route illisible rend un ensemble vide (aucun nom deviné, #7634) ; il
+    est gardé pour la passe comme une lecture réussie — le sens sûr reste
+    « aucune route connue », donc aucune exemption."""
+    previous = getattr(_HUMAN_ROUTES, "window", None)
+    _HUMAN_ROUTES.window = {"routes": None}
+    try:
+        yield
+    finally:
+        _HUMAN_ROUTES.window = previous
+
+
+def _runtime_human_routes(db, cfg):
+    """#7634 : les routes humaines du runtime, lues une fois par passe."""
+    window = getattr(_HUMAN_ROUTES, "window", None)
+    if window is not None and window["routes"] is not None:
+        return window["routes"]
+    routes = set()
+    try:
+        from . import canon as canon_mod
+        from . import debit
+        canons = canon_mod.load_configured(cfg) if cfg is not None else []
+        routes = debit.human_route_names(
+            cfg, storage.of(db).progress.agents(None), canons)
+    except Exception:  # route illisible : aucun nom deviné (#7634)
+        routes = set()
+    if window is not None:
+        window["routes"] = routes
+    return routes
+
 
 def human_waits(db, item_ids=None, *, cfg=None, now=None,
                 human_routes=None) -> dict[int, dict]:
@@ -718,6 +766,11 @@ def human_waits(db, item_ids=None, *, cfg=None, now=None,
     l'outillage sans effet (#5758). L'âge est celui de la note de hold, pas du
     dernier événement du lot : les notes automatiques du runner ne remettent
     pas l'horloge à zéro (pilote, #7940).
+
+    #7943 N1 : **toutes** les retenues actives du lot doivent être cette
+    attente humaine. Une retenue ordinaire d'un autre auteur (« hold: attente
+    CI », par exemple) garde le chevauchement bloquant : le lot peut repartir
+    bientôt, le voisin ne doit pas démarrer sur son empreinte.
 
     Rend `{lot: {note, since, by, executor, gesture}}`, l'attente humaine
     active la plus récente par lot. Une route humaine illisible ne devine rien
@@ -745,35 +798,32 @@ def human_waits(db, item_ids=None, *, cfg=None, now=None,
     if not events:
         return {}
     if human_routes is None:
-        human_routes = set()
-        try:
-            from . import debit
-            canons = canon_mod.load_configured(cfg) if cfg is not None else []
-            human_routes = debit.human_route_names(
-                cfg, st.progress.agents(None), canons)
-        except Exception:  # route illisible : aucun nom deviné (#7634)
-            human_routes = set()
+        human_routes = _runtime_human_routes(db, cfg)
     cutoff = (time.time() if now is None else float(now)) \
         - HUMAN_WAIT_BLOCK_HOURS * 3600
     out: dict[int, dict] = {}
     with canon_mod.configured_cache():
         holds = active_holds(db, events, cfg=cfg)
     for ident, by_actor in holds.items():
+        chosen = None
         for who, hold in by_actor.items():
-            if not hold.get("pilot"):
-                continue
-            note = str(hold.get("note") or "")
-            declared = external_hold(note, executors=human_routes)
-            if declared is None:
-                continue
             since = float(hold.get("since") or 0.0)
-            if since > cutoff:
-                continue
-            if ident in out and since <= out[ident]["since"]:
-                continue
-            out[ident] = {"note": note, "since": since, "by": who or None,
+            declared = None
+            if hold.get("pilot"):
+                declared = external_hold(str(hold.get("note") or ""),
+                                         executors=human_routes)
+            # #7943 N1 : une retenue ordinaire, récente, ou d'un auteur non
+            # pilote n'est pas une attente humaine : elle garde le blocage.
+            if declared is None or since > cutoff:
+                chosen = None
+                break
+            if chosen is None or since > chosen["since"]:
+                chosen = {"note": str(hold.get("note") or ""), "since": since,
+                          "by": who or None,
                           "executor": declared["executor"],
                           "gesture": declared["gesture"]}
+        if chosen is not None:
+            out[ident] = chosen
     return out
 
 

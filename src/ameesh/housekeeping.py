@@ -6029,7 +6029,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                              dry_run=dry_run, worktrees=known_worktrees,
                                              budget=budget,
                                              reserve=reserve,
-                                             allow=policy.unreadable_ok):
+                                             allow=policy.unreadable_ok,
+                                             quota=policy.cache_quota,
+                                             pressure=deficit > 0):
             if line["action"] == "would-delete":
                 plan.append({"kind": "deps", "path": line["path"], "action": "suppression",
                              "bytes": line["bytes"], "detail": line["detail"]})

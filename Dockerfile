@@ -50,7 +50,7 @@ LABEL org.opencontainers.image.title="ameesh-runner" \
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends git openssh-client tini ca-certificates; \
+    apt-get install -y --no-install-recommends git openssh-client tini ca-certificates openssl; \
     if [ -n "$HARNESS_NPM" ]; then \
         apt-get install -y --no-install-recommends nodejs npm; \
         npm install --global --omit=dev --no-fund --no-audit $HARNESS_NPM; \
@@ -59,6 +59,9 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /wheels /wheels
+# #7697 : le template figé voyage dans l'image, pour que le webhook d'admission
+# ne dépende d'aucune ConfigMap que le pourvoyeur pourrait supprimer.
+COPY deploy/k8s/pod-provisioner/template.yaml /etc/ameesh/pod-provisioner/template.yaml
 RUN pip install --no-cache-dir /wheels/ameesh-*.whl 'psycopg[binary]>=3.2' \
     && rm -rf /wheels
 

@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7962 — plafond du journal json-file du banc `ameesh-pg`, sans arrêt ni
+# recréation du conteneur (Postgres n'est jamais arrêté).
+#
+# Le pilote `json-file` de Docker n'applique aucun plafond à un conteneur créé
+# sans `--log-opt max-size` : sur AG2 le journal d'`ameesh-pg` a atteint
+# 1 243 739 484 octets en 7 jours. Le script copie la fin (8 Mio par défaut),
+# la compresse en 0600 dans ~/.local/state/ameesh/journal-conteneur, puis
+# tronque le fichier à zéro.
+#
+# Sûreté de la troncature, prouvée sur AG2 le 20/11/2026 : dockerd rootless
+# (pid 3015992) tient le journal fd 22 avec flags 0o2102001
+# (O_WRONLY|O_LARGEFILE|O_APPEND|O_CLOEXEC) ; après le truncate de 17:50Z, la
+# première écriture (FATAL base absente, 19:09Z) est allée à l'offset 162 du
+# même inode 2420525. O_APPEND repart toujours à la fin du fichier : ni trou,
+# ni erreur, ni redémarrage.
+#
+# Prix de la troncature externe : Docker garde en mémoire l'ancienne taille,
+# donc `docker logs --tail`/`-f` peut se bloquer après une passe (moby #45728,
+# connu et attendu). `docker logs` sans --tail, `--since` et l'archive gzip
+# restent lisibles ; le blocage disparaît à la recréation avec les log-opts.
+# On ne redémarre ni Postgres ni Docker pour ce confort de lecture.
+#
+# Installation, sous le compte ameesh (minuterie UTILISATEUR, aucun root) :
+#   install -D -m 0755 scripts/plafond-journal-docker.py \
+#       ~/.local/bin/plafond-journal-docker.py
+#   install -D -m 0644 deploy/systemd/ameesh-pg-journal.service \
+#       deploy/systemd/ameesh-pg-journal.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ameesh-pg-journal.timer
+# Contrôle :
+#   systemctl --user list-timers ameesh-pg-journal.timer
+#   ~/.local/bin/plafond-journal-docker.py --etat
+#   journalctl --user -u ameesh-pg-journal.service -n 20 --no-pager
+#
+# La minuterie ne remplace pas les `log-opts` de la prochaine recréation
+# (voir docs/AMEESH-PG.md) : elle borne le journal du conteneur existant, dont
+# la configuration de création n'est pas modifiable à chaud.
+[Unit]
+Description=ameesh — plafond du journal json du banc ameesh-pg (#7962)
+After=docker.service
+ConditionPathExists=%t/docker.sock
+
+[Service]
+Type=oneshot
+Environment=DOCKER_HOST=unix://%t/docker.sock
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/plafond-journal-docker.py --conteneur ameesh-pg
+Nice=19
+IOSchedulingClass=idle
+NoNewPrivileges=yes

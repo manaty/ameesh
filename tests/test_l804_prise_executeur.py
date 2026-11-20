@@ -4,6 +4,7 @@ propres agents (canon « Processus de lot » §4) — mêmes garde-fous que L119
 L165, la distribution ne dépend plus d'un `ameesh notify` central."""
 from __future__ import annotations
 
+import contextlib
 import threading
 import unittest
 from unittest import mock
@@ -147,6 +148,29 @@ class PriseDeLExecuteurTest(_Lots):
         self.assertEqual(self.take({"a1"}, budget_check=budget_check), [])
         self.assertIsNone(work.get(self.db, un["id"])["assignee"])
         self.assertEqual(work.get(self.db, deux["id"])["assignee"], "a1")
+
+    def test_la_passe_ouvre_la_fenetre_des_routes_humaines(self):
+        """#7943 N2 : la fenêtre des routes humaines couvre la passe entière,
+        de la sélection à la dernière prise."""
+        from ameesh import planned_waits
+        events = []
+
+        @contextlib.contextmanager
+        def window():
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        def take(*args, **kwargs):
+            events.append("take")
+            return []
+
+        with mock.patch.object(planned_waits, "human_routes_cache", window), \
+                mock.patch.object(backlog, "auto_take", side_effect=take):
+            self.take({"a1"})
+        self.assertEqual(events, ["enter", "take", "exit"])
 
 
 class _Worker:

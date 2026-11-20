@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#7107 (avatar B5) : placement des enfants sur un hôte propre.
+"""#7107 (avatar B5) / #7697 (P4 de #7633) : placement des enfants.
 
 docs/design/5322-avatar-humain.md §3.6, §6 B5 ; décision Q6 (#213955,
 option a : l'enfant est payé par le budget/compte du parent, hôte dédié pour
-la première tranche). Le pod (B5b) est hors de ce lot.
+la première tranche). Le pod (`children: pod`) est livré par #7697 (design
+7633 §8) : il passe par `pod_children` et le pourvoyeur, jamais par l'API
+Kubernetes du parent.
 
 Un avatar est une carte qui porte un bloc `avatar`. Son `avatar.children` vaut
 `own-host` (défaut), `none` ou `pod` :
@@ -18,8 +20,12 @@ Un avatar est une carte qui porte un bloc `avatar`. Son `avatar.children` vaut
   l'enfant reçoit ce verdict, son profil évalué, et `admitted_hosts` réduit à
   cet hôte.
 * `none` : `spawn` refuse (`spawn-forbidden`).
-* `pod` : non implémenté ici (B5b) ; `spawn` refuse au lieu de replier
-  silencieusement sur un autre mode (`spawn-pod-unsupported`).
+* `pod` : l'enfant reçoit un hôte enfant (`pod-<parent>-<enfant>-<8 hex>`),
+  un UID neuf (30000+), un `emptyDir` et un Secret d'API par enfant ; la
+  demande part au pourvoyeur (`pod_requests`). Refus
+  `spawn-pod-unsupported` sans template/pourvoyeur vivant, ou
+  `spawn-pod-credential` pour un parent en abonnement (design §8.4, D6).
+  Sans pourvoyeur, `spawn` refuse au lieu de replier sur un autre mode.
 
 Rien n'est jamais replié sur l'hôte, l'UID ou le runner du parent : sans
 placement propre, `spawn` refuse (`spawn-no-placement`) et dit l'hôte/le
@@ -34,6 +40,7 @@ n'écrit aucune ligne système.
 from __future__ import annotations
 
 import os
+import secrets
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
@@ -54,6 +61,7 @@ CARD_KEY = "children"
 #: codes stables des refus (préfixe du message de `SpawnError`)
 SPAWN_FORBIDDEN = "spawn-forbidden"
 SPAWN_POD_UNSUPPORTED = "spawn-pod-unsupported"
+SPAWN_POD_CREDENTIAL = "spawn-pod-credential"
 SPAWN_NO_PLACEMENT = "spawn-no-placement"
 SPAWN_POLICY_INVALID = "spawn-policy-invalid"
 SPAWN_CANON_UNREADABLE = "spawn-canon-unreadable"
@@ -92,10 +100,25 @@ class ChildPlacement:
     #: déplacement ou un changement de tenant dans la fenêtre refuse l'écriture.
     evaluated_identity: dict
 
+    #: #7697 : `host` (hôte partagé/dédié existant) ou `pod` (enfant porté par
+    #: un pod, host logique écrit par le pourvoyeur). Pour un pod :
+    #: `template`, `namespace`, `credential_secret`, `child` et `parent`.
+    runtime: str = "host"
+    template: str | None = None
+    namespace: str | None = None
+    credential_secret: str | None = None
+    child: str | None = None
+    parent: str | None = None
+
     def describe(self) -> dict:
-        return {"host": self.host, "cwd": self.cwd, "tenant": self.tenant,
-                "unix_user": self.unix_user, "uid": self.uid,
-                "runner": self.runner_id}
+        described = {"host": self.host, "cwd": self.cwd, "tenant": self.tenant,
+                     "unix_user": self.unix_user, "uid": self.uid,
+                     "runner": self.runner_id, "runtime": self.runtime}
+        if self.runtime == "pod":
+            described.update({"template": self.template,
+                              "namespace": self.namespace,
+                              "credential_secret": self.credential_secret})
+        return described
 
 
 def policy_of(card: Any) -> tuple[str | None, str]:
@@ -303,13 +326,77 @@ def _failure(root_card: Any, policy: str, admitted: list[str],
            ", ".join(excluded) or "none", ", ".join(admitted) or "none", details)))
 
 
+def _place_pod(db: Db, root_card: Any, child: str, parent: dict,
+               tenant: str, evaluated: dict, identity: dict,
+               token: str | None = None) -> ChildPlacement:
+    """Placement d'un enfant `children: pod` : demande au pourvoyeur.
+
+    Le template et le heartbeat sont la condition de `spawn-pod-unsupported`
+    (design §8.5) : sans un pourvoyeur vivant, le refus reste, jamais un repli
+    sur l'hôte du parent. D6 (pilote 20/11) : repli clé d'API d'organisation
+    par enfant ; un parent en `subscription` est refusé (pas de siège copié).
+    """
+    from . import pod_children
+
+    ready, why = pod_children.ready(db)
+    if ready is None:
+        raise PlacementError(SPAWN_POD_UNSUPPORTED, (
+            "avatar %s declares `avatar.children: pod`, but %s; refusing instead "
+            "of falling back to the parent's host"
+            % (getattr(root_card, "title", "?"), why)))
+    mode = str(parent.get("credential_mode") or "").strip()
+    if mode != "api-key":
+        raise PlacementError(SPAWN_POD_CREDENTIAL, (
+            "avatar %s declares `avatar.children: pod` but its credential mode is "
+            "%r: a pod child never copies the parent's subscription directory "
+            "(design 7633 §8.4, D6); use an api-key account for the child"
+            % (getattr(root_card, "title", "?"), mode or "unset")))
+    parent_name = str(parent.get("name") or root_card.title)
+    harness = str(evaluated.get("harness") or "")
+    if not harness:
+        raise PlacementError(SPAWN_POD_UNSUPPORTED, (
+            "avatar %s has no harness: a pod child needs an api-key harness"
+            % getattr(root_card, "title", "?")))
+    host = tenancy.child_host(parent_name, child, token or secrets.token_hex(4))
+    try:
+        plan = tenancy.child_plan(
+            host, child, tenant, parent=parent_name, harness=harness,
+            provider=evaluated.get("provider"), model=evaluated.get("model"),
+            image=str(ready.get("image") or "ameesh-runner"))
+    except tenancy.TenancyError as exc:
+        code = (SPAWN_POD_CREDENTIAL if exc.code == "child-harness-key-env"
+                else SPAWN_POD_UNSUPPORTED)
+        raise PlacementError(code, (
+            "pod child %s of %s cannot be planned: %s"
+            % (child, parent_name, exc))) from exc
+    verdict = placement.Verdict(
+        agent=root_card.title, host=host, ok=True,
+        diagnostic=("pod child host from template %s (emptyDir, UID %d, no parent "
+                    "PVC)" % (ready["name"], plan["uid"])),
+        ref="pod-template:" + str(ready.get("fingerprint") or "")[:16],
+        credential_mode="api-key")
+    return ChildPlacement(
+        host=host, cwd=plan["cwd"], credential_mode="api-key", tenant=tenant,
+        unix_user=plan["unix_user"], uid=int(plan["uid"]),
+        runner_id=plan["runner_id"], verdict=verdict,
+        evaluated_profile=dict(evaluated), evaluated_identity=dict(identity),
+        runtime="pod", template=str(ready["name"]),
+        namespace=str(ready["namespace"]),
+        credential_secret=plan["credential_secret"], child=child,
+        parent=parent_name)
+
+
 def place_child(db: Db, canon, root_card: Any, child: str, *,
-                lineage_rows: list[dict], cwd: str | None = None) -> ChildPlacement | None:
+                lineage_rows: list[dict], cwd: str | None = None,
+                pod_token: str | None = None) -> ChildPlacement | None:
     """Placement propre de `child` sous `root_card`, ou None (pas un avatar).
 
-    Refuse (`PlacementError`) sur `avatar.children: none|pod`, politique
+    Refuse (`PlacementError`) sur `avatar.children: none`, politique
     illisible, `--cwd` explicite (le worktree doit être choisi sur l'hôte
-    d'arrivée), ou absence de placement propre."""
+    d'arrivée), absence de placement propre, ou `children: pod` sans
+    pourvoyeur/template vivant (`spawn-pod-unsupported`) ou avec un parent en
+    abonnement (`spawn-pod-credential`). `pod_token` n'est là que pour rendre
+    un nom d'hôte reproductible dans les témoins."""
     policy, problem = policy_of(root_card)
     if policy is None and problem:
         raise PlacementError(SPAWN_POLICY_INVALID, problem)
@@ -319,11 +406,6 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
         raise PlacementError(SPAWN_FORBIDDEN, (
             "avatar %s declares `avatar.children: none`: no child may be spawned from "
             "it" % root_card.title))
-    if policy == CHILDREN_POD:
-        raise PlacementError(SPAWN_POD_UNSUPPORTED, (
-            "avatar %s declares `avatar.children: pod`: pod placement is B5b, out of "
-            "this lot; refusing instead of falling back to the parent's host"
-            % root_card.title))
     if cwd:
         raise PlacementError(SPAWN_CWD_REFUSED, (
             "a child's worktree is chosen on its own host; `--cwd` is refused for an "
@@ -356,6 +438,9 @@ def place_child(db: Db, canon, root_card: Any, child: str, *,
             "a profile that was never evaluated (%s)"
             % (parent.get("name") or "?", actual, evaluated,
                "docs/design/5322-avatar-humain.md §3.6")))
+    if policy == CHILDREN_POD:
+        return _place_pod(db, root_card, child, parent, tenant, evaluated,
+                          identity, token=pod_token)
     admission = placement.admission_of(canon, root_card.title)
     if admission is None:
         raise PlacementError(SPAWN_NO_PLACEMENT, (

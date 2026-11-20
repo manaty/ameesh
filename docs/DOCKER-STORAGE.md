@@ -8,6 +8,12 @@ avoids `docker system df` and recursive volume-size scans, which were slow
 during the owner's concurrent prune. Podman and an absent Docker runtime are
 not measured by this feature.
 
+Container **logs** are outside this inventory. A `json-file` log has no size
+limit when the container was created without `log-opts`: the shared bench
+`ameesh-pg` reached 1.24 GB in 7 days on AG2. Its cap without restart, and the
+log options for the next recreation, are documented in
+[AMEESH-PG.md](AMEESH-PG.md) (#7962).
+
 The inventory records the measuring host's pass period (`pass_period_s`: the
 housekeeping interval plus the pass budget, #5861). It is reported stale
 (`docker_storage_unavailable`) once older than two such periods, so a single

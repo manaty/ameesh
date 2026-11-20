@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7697 (P4 de #7633) : plafond des enfants pod du namespace.
+#
+# Une demande sans budget de pods ne doit pas pouvoir remplir le nœud : le
+# quota est la borne grossière ; le template et la VAP portent les limites
+# par pod. Ajuster selon la capacité réelle du cluster (estimation P4 : un
+# enfant = 2 conteneurs, ~2,5 cœurs et ~2,5 Gi en limite).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ameesh-pod-children
+  namespace: ameesh
+  labels:
+    app.kubernetes.io/part-of: ameesh
+spec:
+  hard:
+    pods: "20"
+    requests.cpu: "20"
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+    count/configmaps: "80"

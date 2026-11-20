@@ -1,0 +1,302 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7697 (P4 de #7633) : l'autorité d'admission des pods enfants.
+#
+# Le B du gel #44541 (ameesh-cx2, #228610/#228620) : la VAP dérivait le
+# Secret du label `ameesh.dev/child`, choisi par le même SA que le pod. Ce
+# webhook est une identité DISTINCTE (`ameesh-pod-admission`), avec son
+# propre ServiceAccount, son propre Deployment et son propre accès en lecture
+# à `pod_requests` ; le Role du pourvoyeur ne peut ni le modifier, ni le
+# retirer, ni changer son `caBundle` (ClusterRole limité au nom
+# `ameesh-child-pods`, porté par le SA d'admission seulement).
+#
+# `failurePolicy: Fail` : si le webhook est indisponible, aucun pod enfant
+# n'est admis (preuve de refus, pas de repli silencieux). La VAP
+# `validatingadmissionpolicy.yaml` reste la seconde barrière.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ameesh-pod-admission
+  namespace: ameesh
+  labels:
+    app.kubernetes.io/name: ameesh-pod-admission
+    app.kubernetes.io/part-of: ameesh
+---
+# Le seul droit cluster-scoped : lire et mettre à jour le `caBundle` DE CE
+# webhook. Aucun autre objet d'admission, aucun Deployment, aucun Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ameesh-pod-admission-ca
+  labels:
+    app.kubernetes.io/part-of: ameesh
+rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations"]
+    resourceNames: ["ameesh-child-pods"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ameesh-pod-admission-ca
+  labels:
+    app.kubernetes.io/part-of: ameesh
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ameesh-pod-admission-ca
+subjects:
+  - kind: ServiceAccount
+    name: ameesh-pod-admission
+    namespace: ameesh
+---
+# Lecture seule de la ConfigMap enfant pour comparer passwd/group/config au
+# plan de `pod_requests`. Aucun Secret n'est lisible par cette identité.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ameesh-pod-admission
+  namespace: ameesh
+  labels:
+    app.kubernetes.io/part-of: ameesh
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ameesh-pod-admission
+  namespace: ameesh
+  labels:
+    app.kubernetes.io/part-of: ameesh
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ameesh-pod-admission
+subjects:
+  - kind: ServiceAccount
+    name: ameesh-pod-admission
+    namespace: ameesh
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ameesh-pod-admission
+  namespace: ameesh
+  labels:
+    app.kubernetes.io/name: ameesh-pod-admission
+    app.kubernetes.io/part-of: ameesh
+spec:
+  selector:
+    app.kubernetes.io/name: ameesh-pod-admission
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ameesh-pod-admission
+  namespace: ameesh
+  labels:
+    app.kubernetes.io/name: ameesh-pod-admission
+    app.kubernetes.io/part-of: ameesh
+spec:
+  # Un seul écrivain du caBundle : deux répliques généreraient deux CA et se
+  # remplaceraient l'une l'autre. Le refus est fail-closed, la reprise est un
+  # redémarrage du pod ; le déploiement à plusieurs répliques demandera un
+  # Secret TLS partagé (tranche suivante, hors de ce lot).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh-pod-admission
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ameesh-pod-admission
+        app.kubernetes.io/part-of: ameesh
+    spec:
+      serviceAccountName: ameesh-pod-admission
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10000
+        fsGroup: 10000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: tls-init
+          image: ameesh-runner
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-ec"]
+          args:
+            - |
+              set -eu
+              if [ ! -s /tls/tls.crt ] || [ ! -s /tls/tls.key ]; then
+                openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+                  -keyout /tls/tls.key -out /tls/tls.crt \
+                  -subj "/CN=ameesh-pod-admission.ameesh.svc" \
+                  -addext "subjectAltName=DNS:ameesh-pod-admission.ameesh.svc,DNS:ameesh-pod-admission.ameesh.svc.cluster.local" \
+                  -addext "basicConstraints=critical,CA:TRUE" \
+                  -addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
+                  -addext "extendedKeyUsage=serverAuth"
+                chmod 600 /tls/tls.key
+              fi
+              attempt=0
+              until ameesh pod-admission --set-ca --webhook ameesh-child-pods \
+                  --ca-file /tls/tls.crt; do
+                attempt=$((attempt + 1))
+                if [ "$attempt" -ge 30 ]; then
+                  echo "caBundle not set after 60s" >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+          env:
+            # OpenSSL écrit son état aléatoire : le rootfs est en lecture
+            # seule, /tmp est un emptyDir.
+            - name: HOME
+              value: /tmp
+            - name: RANDFILE
+              value: /tmp/.rnd
+            - name: AMEESH_POD_NAMESPACE
+              value: ameesh
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+      containers:
+        - name: admission
+          image: ameesh-runner
+          imagePullPolicy: IfNotPresent
+          command: ["ameesh", "pod-admission"]
+          args:
+            - "--template"
+            - "/etc/ameesh/pod-provisioner/template.yaml"
+            - "--cert"
+            - "/tls/tls.crt"
+            - "--key"
+            - "/tls/tls.key"
+            - "--image"
+            - "ameesh-runner"
+            - "--namespace"
+            - "ameesh"
+            - "--port"
+            - "8443"
+          env:
+            # Rôle DB distinct et lecture seule (`deploy/sql/role-pod-provisioner.sql`) :
+            # le webhook ne peut pas écrire `pod_requests`, même si son code le
+            # tentait. Le rôle du pourvoyeur n'a pas cette lecture seule.
+            - name: AMEESH_DSN
+              value: "postgresql://ameesh_pod_admission@ameesh-postgres:5432/ameesh?sslmode=require"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ameesh-db-pod-admission
+                  key: password
+            - name: AMEESH_POD_NAMESPACE
+              value: ameesh
+          ports:
+            - name: https
+              containerPort: 8443
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8443
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tls
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: ameesh-child-pods
+  labels:
+    app.kubernetes.io/part-of: ameesh
+webhooks:
+  - name: child-pods.ameesh.invalid
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ameesh
+    objectSelector:
+      matchExpressions:
+        - key: ameesh.dev/managed-by
+          operator: In
+          values: ["ameesh-pod-provisioner"]
+    clientConfig:
+      service:
+        name: ameesh-pod-admission
+        namespace: ameesh
+        path: /validate
+        port: 443
+      # Rempli par le conteneur `tls-init` (CA auto-signée de ce pod) ; le
+      # pourvoyeur n'a aucun droit sur cet objet.
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "configmaps"]
+        scope: Namespaced

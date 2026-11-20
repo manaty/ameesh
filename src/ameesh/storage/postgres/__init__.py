@@ -33,6 +33,7 @@ from .external_executors import ExternalExecutors
 from .grants import Grants
 from .host_lifecycle import HostLifecycle
 from .pod_hosts import PodHosts
+from .pod_provisioning import PodProvisioning
 from .pod_supervisor import PodSupervisor
 from .tenancy import Tenancy
 from .handoffs import Handoffs
@@ -126,6 +127,7 @@ class PostgresStorage(interface.Storage):
         self.host_lifecycle = HostLifecycle(db)
         self.tenancy = Tenancy(db)
         self.pod_hosts = PodHosts(db)
+        self.pod_provisioning = PodProvisioning(db)
         self.pod_supervisor = PodSupervisor(db)
         self.turn_resources = TurnResources(db)
         self.turn_observation = TurnObservation(db)

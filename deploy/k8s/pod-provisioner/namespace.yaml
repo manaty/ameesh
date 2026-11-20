@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7697 (P4 de #7633) : le namespace du mesh porte le paramètre de la VAP.
+#
+# La VAP n'accepte QUE l'image exacte inscrite dans l'annotation
+# `ameesh.dev/pod-child-image` ci-dessous (`c.image == params...`). Ce n'est
+# pas un préfixe : `ameesh-runner.attacker.example/x:latest` est refusée.
+#
+# Pourquoi le Namespace et pas une ConfigMap ? Le ServiceAccount du
+# pourvoyeur a `create/get/delete` sur les ConfigMaps de `ameesh` : une
+# compromission pourrait supprimer puis recréer une ConfigMap de paramètres et
+# y mettre son image. Le Namespace est cluster-scoped et le Role du
+# pourvoyeur est namespaced : il ne peut ni le modifier ni le supprimer. Seul
+# l'opérateur (kubectl) change ce paramètre. `kustomization.yaml` porte la
+# même référence d'image sur le Deployment ; le test du lot vérifie
+# l'égalité, pour qu'une montée d'image ne laisse pas le paramètre en
+# arrière.
+#
+# Le namespace existant est géré par l'opérateur : `kubectl apply -k` ajoute
+# l'annotation sans recréer le namespace. VAP `paramKind`/`paramRef` sont
+# immuables ; changer de support demanderait de recréer la policy.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ameesh
+  labels:
+    app.kubernetes.io/part-of: ameesh
+  annotations:
+    ameesh.dev/pod-child-image: "ameesh-runner"

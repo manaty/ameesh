@@ -11,6 +11,10 @@
 \else
   \set writer vm_probe_writer
 \endif
+-- #7951 : audit borné côté serveur, même lancé seul (hors transaction) ; un
+-- dépassement est explicite au lieu de faire tuer psql sans message.
+SET lock_timeout = '10s';
+SET statement_timeout = '30s';
 SELECT set_config('ameesh.vm_probe_role', :'role', false),
        set_config('ameesh.vm_probe_writer', :'writer', false) \g /dev/null
 DO $audit$

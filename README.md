@@ -111,6 +111,9 @@ scripts/pg-up.sh                    # container ameesh-pg, postgres:17, 127.0.0.
 # (PID 1) reaps it as a dead backend and restarts the bench. A container
 # created before this guard must be recreated once (docker stop/rm, then
 # scripts/pg-up.sh); the volume and its data are kept.
+# #7962: a new bench is born with bounded json logs (64m x 3); an existing
+# container created without log-opts is capped by the user timer
+# ameesh-pg-journal without stopping Postgres. See docs/AMEESH-PG.md.
 export PYTHONPATH=src
 # Aucun secret n'est codé dans le dépôt : le mot de passe du banc vient de
 # PGPASSWORD ou de ~/.pgpass (mode 600) ; sinon donnez le DSN complet.

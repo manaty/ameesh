@@ -205,7 +205,11 @@ ameesh attach <agent> [--wait] [--ttl S]
 ```
 
 Interactive session on the agent's lease, same session. `--wait` waits for the
-end of a running turn; `--ttl` sets the lease duration.
+end of a running turn; `--ttl` sets the lease duration. While the session is
+idle, a new non-passive message is announced by the host's desktop
+notification (sender, number, one subject line; nothing is marked read), and
+when the session ends the executor's mail turn serves the remaining unread
+messages immediately, without waiting for the batching window (#7861).
 
 ## Refusal proof: `ameesh refusal emit`
 
