@@ -192,6 +192,19 @@ class DevCutoverTest(support.PgTestCase):
         self.assertEqual(migrations.migrate(self.db, additive_only=True, modules=registry.discover()), [])
         self.assertEqual(self.db.query("SELECT * FROM module_schemas WHERE module='dev'"), [])
 
+    def test_code_only_cli_and_restarted_runner_keep_p1_schema(self):
+        """Exercise the staging migration commands and a fresh executor on a copy."""
+        for args in (("migrate", "--dry-run", "--additive-only"),
+                     ("migrate", "--additive-only")):
+            result = self.mesh(*args, timeout=180)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runner = self.runner("--once", "--agents", "nobody-7651", timeout=180)
+        self.assertIn(runner.returncode, (0, 3), runner.stdout + runner.stderr)
+        self.assertIn("no work available", runner.stdout + runner.stderr)
+        self.assertEqual(self.db.query("SELECT * FROM module_schemas WHERE module='dev'"), [])
+        self.assertEqual(self.db.query(
+            "SELECT relkind FROM pg_class WHERE oid='work_items'::regclass")[0]['relkind'], 'r')
+
     def test_additive_only_does_not_even_create_the_module_schema(self):
         with self.assertRaises(migrations.NonAdditiveMigration):
             migrations.migrate(self.db, additive_only=True, modules=cutover_modules())
