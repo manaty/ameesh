@@ -613,6 +613,10 @@ tentative `manual` (geste explicite), qui lève la retenue de `failover`.
 Le runner du poste prépare la cible ; la bascule attend la fin du tour
 source et ne révoque jamais un tour en cours.
 
+À la bascule d'une demande d'attach, une consigne de restauration est mise
+en attente sur la cible si aucune consigne n'y attend déjà ; une consigne
+interrompue à rejouer reste prioritaire. Ainsi, même un avatar au repos
+sans courrier démarre son premier tour local par le worker normal.
 L'attach attend ensuite le premier tour local vérifié avant d'ouvrir le
 harnais interactif : la conversation reste la même, restaurée depuis le
 journal ; l'identifiant natif source ne traverse pas les hôtes (§2.3).

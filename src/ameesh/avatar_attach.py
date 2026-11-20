@@ -51,10 +51,10 @@ def plan_return(db, name: str, host: str) -> dict | None:
         return None
     source = row["host"]
 
-    def recheck(locked):
+    def recheck(tx, locked):
         if locked["host"] != source:
             return "source changed during attach"
-        return _refusal(db, locked, host)
+        return _refusal(tx, locked, host)
 
     try:
         attempt = conversation_move.plan(

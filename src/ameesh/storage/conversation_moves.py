@@ -39,7 +39,7 @@ class ConversationMoves(abc.ABC):
     @abc.abstractmethod
     def plan(self, *, move_id: str, agent: str, target_host: str, reason: str,
              requested_by: str,
-             recheck: Callable[[Mapping], str | None] | None = None) -> dict | None:
+             recheck: Callable[[object, Mapping], str | None] | None = None) -> dict | None:
         """Open an attempt for the agent's current lease epoch, or reread it.
 
         The source (host, cwd, lease owner, session) is copied from the locked
@@ -47,7 +47,7 @@ class ConversationMoves(abc.ABC):
         another attempt is already open); None if the agent is unknown, not
         `execute`, or already on `target_host`.
 
-        `recheck(locked_row)` runs before any write under the registry lock;
+        `recheck(tx, locked_row)` runs before any write under the registry lock;
         a nonempty refusal raises `RecheckRefused`.
 
         #7833: a `preference` plan is refused while the current placement

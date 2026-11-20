@@ -95,6 +95,74 @@ class ReturnTest(Base):
             with mock.patch.object(A.time, "sleep"):
                 self.assertFalse(A.wait_return(self.db, move, max_seconds=1, out=io.StringIO()))
 
+    def test_switch_queues_restoration_only_on_target_without_overwriting_input(self):
+        move = A.plan_return(self.db, "pilote", self.POSTE)
+        self.assertIsNone(self.row()["pending_prompt"])
+        M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: self.tmp)
+        prompt = self.row()["pending_prompt"]
+        self.assertIn("Restore the conversation", prompt)
+        self.assertIsNotNone(self.row()["pending_prompt_id"])
+        M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: self.tmp)
+        self.assertEqual(self.row()["pending_prompt"], prompt)
+
+    def test_idle_source_with_expired_lease_also_gets_restoration_request(self):
+        self.hold(self.CLOUD, expires_in=-1)
+        move = A.plan_return(self.db, "pilote", self.POSTE)
+        M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: self.tmp)
+        self.assertEqual(self.moves().get(move["move_id"])["state"], "recovered")
+        self.assertIn("Restore the conversation", self.row()["pending_prompt"])
+
+    def test_switch_preserves_an_existing_request(self):
+        registry.set_pending_prompt(self.db, "pilote", "existing human input")
+        A.plan_return(self.db, "pilote", self.POSTE)
+        M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: self.tmp)
+        self.assertEqual(self.row()["pending_prompt"], "existing human input")
+
+    def test_recheck_uses_the_active_transaction_on_both_drivers(self):
+        from ameesh import db as db_mod
+        reads = []
+        original = A._refusal
+
+        def check(conn, row, host):
+            reads.append(db_mod.in_transaction(conn))
+            return original(conn, row, host)
+
+        with mock.patch.object(A, "_refusal", side_effect=check):
+            self.assertIsNotNone(A.plan_return(self.db, "pilote", self.POSTE))
+        self.assertEqual(reads, [False, True])
+
+    def test_idle_avatar_is_picked_and_verified_by_target_worker_without_mail(self):
+        from ameesh import adapters, harnesses, runner
+        from .support import FAKEBIN
+        cfg = dataclasses.replace(self.cfg, host=self.POSTE)
+        self.db.execute("UPDATE agent_candidates SET cwd = %s WHERE name = 'pilote'"
+                        " AND host = %s", (self.tmp, self.POSTE))
+        adapter = adapters.HarnessAdapter(harnesses.get("claude"),
+                                          os.path.join(FAKEBIN, "claude"))
+        move = A.plan_return(self.db, "pilote", self.POSTE)
+        self.assertIsNone(self.row()["pending_prompt"])
+        self.assertIsNone(self.row()["current_prompt"])
+        self.assertEqual(storage.of(self.db).mailbox.unread("pilote", limit=10), [])
+        M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: self.tmp)
+        target = runner.Runner(cfg, self.db)
+        lease = registry.claim(self.db, "pilote", target.runner_id, 120, host=self.POSTE)
+        worker = runner.AgentWorker(target, self.row(), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        self.addCleanup(worker.release_lease)
+        with mock.patch.object(adapters, "adapter_for", return_value=adapter):
+            with mock.patch.dict(os.environ, {"AMEESH_TEST_LOG": self.turns_log}):
+                spec = worker.pick()
+                self.assertIsNotNone(spec)
+                self.assertIn("Restore the conversation", spec["prompt"])
+                self.assertTrue(worker.run_turn(spec))
+                self.assertTrue(A.wait_return(self.db, move, max_seconds=1,
+                                              out=io.StringIO()))
+                self.assertEqual(runner.run_attach(cfg, self.db, "pilote",
+                                                   ttl=30, max_seconds=10), 0)
+        self.assertEqual(self.moves().get(move["move_id"])["state"], "verified")
+        self.assertNotEqual(self.row()["session_id"], "sess-source")
+        self.assertTrue(A.wait_return(self.db, move, max_seconds=1, out=io.StringIO()))
+
     def test_attach_waits_for_verified_target_session(self):
         move = A.plan_return(self.db, "pilote", self.POSTE)
         M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: "/work/local")

@@ -96,7 +96,7 @@ class ConversationMoves(Contract):
                 return None
             r = rows[0]
             if recheck is not None:
-                refusal = recheck(r)
+                refusal = recheck(tx, r)
                 if refusal:
                     raise RecheckRefused(refusal)
             # B (relecture 3) : une tentative d'avant la bascule plus vieille
@@ -402,11 +402,21 @@ class ConversationMoves(Contract):
             # (`pending_prompt_id`), la mention ouvre le texte rejoué.
             notice = (INTERRUPTED_TURN % move["source_host"]
                       if state == "recovered" and r.get("current_prompt") else None)
+            # #7897: an idle avatar has no input to start its first target
+            # turn. Queue the attach's restoration request at the switch,
+            # atomically; never wake the cloud or replace a waiting input.
+            resume = ("Restore the conversation on this workstation from its "
+                      "conversation segment. The human has requested an attach; "
+                      "finish this restoration turn so the local attach can open."
+                      if (state == "switched" or not r.get("current_prompt"))
+                      and move["reason"] == "manual"
+                      and str(move["requested_by"]).startswith("attach:") else None)
             moved = tx.query(
                 """UPDATE agent_registry
                       SET lease_owner = NULL, lease_expires_at = NULL,
                           lease_epoch = lease_epoch + 1,
                           host = %s, cwd = coalesce(%s, cwd),
+                          pending_prompt = coalesce(pending_prompt, %s::text),
                           current_prompt = CASE WHEN %s::text IS NULL
                                                 THEN current_prompt
                                                 ELSE %s::text || E'\\n\\n'
@@ -426,7 +436,7 @@ class ConversationMoves(Contract):
                           updated_at = now()
                     WHERE name = %s AND host = %s AND lease_epoch = %s
                 RETURNING lease_epoch""",
-                (move["target_host"], move["target_cwd"], notice, notice,
+                (move["target_host"], move["target_cwd"], resume, notice, notice,
                  move["agent"], move["source_host"], r["lease_epoch"]))
             if not moved:
                 return None

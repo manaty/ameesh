@@ -69,7 +69,7 @@ def _moves(db):
 
 def plan(db, agent: str, target_host: str, *, requested_by: str,
          reason: str = "manual", move_id: str | None = None,
-         recheck: Callable[[Mapping], str | None] | None = None) -> dict | None:
+         recheck: Callable[[object, Mapping], str | None] | None = None) -> dict | None:
     """Open (or reread) the attempt for the agent's current lease epoch.
 
     `move_id` is written before any effect: a replay with the same id, or a
