@@ -3,6 +3,7 @@ import json
 import os
 import grp
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -592,6 +593,10 @@ class SocketTest(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(self.directory, ignore_errors=True))
         self.policy = _policy(self.directory)
 
+    # le courtier identifie l'appelant par SO_PEERCRED (Linux) ; ailleurs
+    # (macOS) il refuse toute demande, sans repli (#7930)
+    @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"),
+                         "the broker needs SO_PEERCRED (Linux) to admit a caller")
     def test_one_request_round_trip(self):
         class Fake:
             def handle(self, value, uid, gid):
