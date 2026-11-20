@@ -747,6 +747,144 @@ class HostReleaseTest(PgTestCase):
         self.assertEqual(self.control()["mode"], "draining")
         self.assertFalse(self.control()["claims_open"])
 
+    def _ag3_state(self):
+        """#7913: replay ameesh-agents-3 on 20/11: a drain acknowledged
+        `draining`, then a return without any `busy` answer (no adapter at
+        the time) left it available, claims open, release and hook states
+        still `draining`."""
+        self.add_agent()
+        self.quiet_history()
+        self.once(local_host="vm", now=time.time())
+        self.assertEqual(self.states(), ["draining"])
+        hooked = self.cfg
+        self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        self.api.host_lifecycle.expire_returns(open_claims=False)
+        self.once(now=time.time())
+        self.api.host_lifecycle.complete_return("vm", self.control()["generation"])
+        self.cfg = hooked
+        # The binary of 19/11 did not move the release state with the gate.
+        self.db.execute("UPDATE host_lifecycle SET release_state='draining' "
+                        "WHERE host='vm'")
+        control = self.control()
+        self.assertEqual((control["mode"], control["claims_open"],
+                          control["release_state"], control["hook_state"]),
+                         ("available", True, "draining", "draining"))
+        self.clear_calls()
+        return control
+
+    def test_stale_draining_ack_resyncs_busy_before_a_new_drain(self):
+        old = self._ag3_state()
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
+        control = self.control()
+        self.assertEqual(control["generation"], old["generation"] + 1)
+        self.assertEqual(control["hook_state"], "draining")
+        self.reading()
+        for _ in range(5):
+            self.once(now=time.time())
+            control = self.control()
+            # A resync `busy` is not a return: the withdrawal goes on.
+            self.assertEqual(control["mode"], "draining")
+            self.assertFalse(control["claims_open"])
+            self.assertIsNone(registry.claim(self.db, "worker", "other",
+                                             ttl_seconds=60))
+        self.assertEqual(self.states(), ["busy", "draining", "idle-drained"])
+        self.assertTrue(all(call[2] == str(control["generation"])
+                            for call in self.calls() if call[0] != "runs"))
+        self.assertEqual((control["release_state"], control["hook_state"]),
+                         ("idle-drained", "idle-drained"))
+
+    def test_stale_draining_ack_resyncs_busy_before_an_automatic_drain(self):
+        old = self._ag3_state()
+        self.quiet_history()
+        for _ in range(5):
+            self.once(local_host="vm", now=time.time())
+            self.reading()
+            control = self.control()
+            self.assertEqual(control["mode"], "draining")
+            self.assertFalse(control["claims_open"])
+            self.assertIsNone(registry.claim(self.db, "worker", "other",
+                                             ttl_seconds=60))
+        self.assertTrue(control["automatic"])
+        self.assertEqual(control["generation"], old["generation"] + 1)
+        self.assertEqual(self.states(), ["busy", "draining", "idle-drained"])
+        self.assertEqual((control["release_state"], control["hook_state"]),
+                         ("idle-drained", "idle-drained"))
+
+    def _return_after_resync(self, *, released, automatic=False):
+        self._ag3_state()
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
+        self.reading()
+        self.once(now=time.time())
+        self.once(now=time.time())
+        expected = ["busy", "draining"]
+        if released:
+            self.once(now=time.time())
+            expected.append("idle-drained")
+        self.assertEqual(self.states(), expected)
+        self.assertEqual(self.control()["hook_state"], expected[-1])
+        # #7913 (avis mty-amh-qa-01): the resync `busy` must not refuse the
+        # `busy` of a return later in the same withdrawal, explicit (undrain)
+        # or automatic (an agent that must come back, `return_targets`).
+        if automatic:
+            self.db.execute("UPDATE agent_registry SET restart_requested_at=now() "
+                            "WHERE name='worker'")
+            self.once(now=time.time())
+            control = self.control()
+        else:
+            control = host_release.request_return(self.cfg, self.db, "vm",
+                                                  actor="human:op")
+        self.assertEqual(self.states(), expected + ["busy"])
+        self.assertEqual(control["hook_state"], "busy")
+        self.assertFalse(control["claims_open"])
+        self.reading()
+        self.once(now=time.time())
+        control = self.control()
+        self.assertEqual((control["mode"], control["claims_open"]),
+                         ("returning", True))
+        self.assertEqual(self.states(), expected + ["busy"])
+
+    def test_return_after_the_resync_while_draining(self):
+        self._return_after_resync(released=False)
+
+    def test_return_after_the_resync_once_released(self):
+        self._return_after_resync(released=True)
+
+    def test_automatic_return_after_the_resync_while_draining(self):
+        self._return_after_resync(released=False, automatic=True)
+
+    def test_automatic_return_after_the_resync_once_released(self):
+        self._return_after_resync(released=True, automatic=True)
+
+    def test_stale_draining_ack_with_a_return_request_still_returns(self):
+        self._ag3_state()
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
+        self.api.host_lifecycle.note_return_request("vm", actor="human:op")
+        self.once(now=time.time())
+        self.assertEqual(self.states(), ["busy"])
+        self.assertEqual(self.control()["release_state"], "busy")
+        self.reading()
+        self.once(now=time.time())
+        self.assertEqual(self.control()["mode"], "returning")
+        self.assertTrue(self.control()["claims_open"])
+        self.assertEqual(self.states(), ["busy"])
+
+    def test_return_without_adapter_moves_the_release_state_with_the_gate(self):
+        self.add_agent()
+        self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        self.api.host_lifecycle.drain("vm", actor="human:op", duration=3600,
+                                      close_claims=True)
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        self.api.host_lifecycle.expire_returns(open_claims=False)
+        self.assertEqual(self.control()["release_state"], "draining")
+        self.once(now=time.time())
+        self.api.host_lifecycle.complete_return("vm", self.control()["generation"])
+        control = self.control()
+        self.assertEqual((control["mode"], control["claims_open"],
+                          control["release_state"]), ("available", True, "busy"))
+
     def test_draining_hook_failure_keeps_claims_closed_and_alerts(self):
         self.add_agent()
         self.quiet_history()
