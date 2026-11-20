@@ -248,8 +248,26 @@ avant chaque passage et sur les hôtes en attente du rôle ou du bail. Chaque
 hôte vérifie localement l'avance : la porte doit descendre de l'épingle et le
 diff ne doit toucher aucun fichier de la liste fermée, versionnée dans
 `train_assembly.REQUALIFY_GUARD` : `processus/mecanique.yaml`, `federation.yaml`.
-Les renommages et suppressions sont vérifiés également. Sinon, refus explicite
-et requalification relue requise ; une porte illisible ne fournit aucun repli.
+Les renommages et suppressions sont vérifiés également.
+
+Un diff qui touche un fichier de garde ne refuse plus par le seul chemin
+(#7880) : le service compare, pour **chaque projet du train**, ce que le train
+compile au pin et à la porte (`mechanics.load`, égalité stricte de l'objet, à
+l'identité de commit et au chemin de source près), puis les autres lectures de
+la porte (`train_canon.gate_rules_gap`) au nouveau pin. Si tous les projets
+compilent les mêmes règles et que la porte n'ajoute aucun écart, l'avance est
+mécanique : même journal, même liste de fichiers écrits, avec le motif « règles
+compilées inchangées ». Un chemin ajouté pour un autre projet, ou un
+commentaire, ne bloque donc plus le train. Si une règle compilée d'un projet du
+train change, le refus reste : aucune écriture, et le train ouvre (ou met à
+jour) un seul lot porteur par projet et pin, `Train <p> : requalification relue
+du pin canon X → Y`, avec le diff et la commande de dry-run. Le lot est assigné
+au pilote du projet du canon — le projet de l'hôte (`cfg.project`), dont le
+rôle `orchestrateur` est lu dans le canon, jamais un nom en dur — et non au
+pilote du projet du train, qui reste le destinataire de l'alerte de dérive ;
+une nouvelle avance de la porte met à jour ce lot ouvert au lieu d'en empiler
+un autre, et une lecture plus ancienne ne le rétrograde pas. L'alerte de dérive
+cite ce lot. Une porte illisible ne fournit aucun repli.
 
 L'écriture couvre `config.json` et tous les profils hérités qui déclarent une
 épingle ; les autres héritent. Le verrou `.train-canon.lock` dans le dossier
@@ -268,7 +286,9 @@ paquets déjà en vol peuvent atteindre leur état terminal.
 La commande pilote `python -m ameesh.train_cli --project <p> requalify --lot
 <lot>` reste disponible avec sa trace sur le lot ; `--dry-run` montre le diff.
 Elle exige aussi que la porte descende de l’épingle et que le diff laisse les
-fichiers de garde intacts ; un retour arrière exige une requalification relue.
+fichiers de garde intacts, ou que les règles compilées de tous les projets du
+train soient inchangées (#7880) ; un retour arrière exige une requalification
+relue.
 Un changement de `mode`, de `canon`, de dépôt ou de cible exige toujours un
 redémarrage ; seul l'épinglage est relu.
 
