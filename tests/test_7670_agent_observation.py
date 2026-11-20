@@ -227,7 +227,12 @@ class AgentObservationTest(PgTestCase):
                     self.assertNotIn(canary, raw)
         self.assertEqual(set(document), {
             "schema", "observed_ts", "agent", "profile", "admission", "canon",
-            "placement", "lease", "limits", "budget", "native", "missing"})
+            "host", "placement", "lease", "limits", "budget", "native", "missing"})
+        # #7926 : la fiche Host de l'agent nomme ses capacités ; sans canon
+        # dans ce banc, l'absence est un fait nommé, jamais un zéro deviné.
+        self.assertEqual(document["host"], {
+            "name": HOST, "capabilities": [], "available": False,
+            "reason": "host_not_in_canon"})
         # the fields that could carry a prompt or a path are not selected
         for key in ("pending_prompt", "current_prompt", "cwd", "session_cwd",
                     "last_error", "operator_pause_reason", "election_brief",
