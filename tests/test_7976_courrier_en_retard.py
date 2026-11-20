@@ -21,6 +21,7 @@ from .test_l125_courrier_regroupe import _ligne
 from ameesh import mail, registry
 from ameesh.runner import AgentWorker
 
+from .test_7632_reveil_borne import AVATAR, _Base as _BaseReveil
 from .test_l125_courrier_regroupe import _Base
 
 
@@ -102,6 +103,33 @@ class CourrierEnRetardTest(_Base):
             self.db, spec["candidats"], kind="mail", budget=worker._budget_courrier(),
             en_retard_avant=worker._retard_avant())
         self.assertEqual(([int(m["id"]) for m in retenus], reste), (ids, 0))
+
+    def test_un_message_en_cours_de_remise_laisse_passer_la_suite(self):
+        # relecture deepseek : réservé (`deja_consigne`), il n'est pas
+        # réservable ; un tour de courrier vide retarderait la suite.
+        _runner, worker = self._worker("dev-r")
+        self._en_retard("dev-r")
+        self.db.execute(
+            "UPDATE agent_mailbox SET meta = coalesce(meta, '{}'::jsonb)"
+            " || '{\"deja_consigne\": true}'::jsonb WHERE recipient = 'dev-r'")
+        worker.suite = "turn ceiling"
+        self.assertEqual(worker.pick()["kind"], "suite")
+
+
+class CadenceReveilTest(_BaseReveil):
+    """Une cadence `reveil` déclarée (#7632) n'est jamais raccourcie : le
+    seuil de retard est sa fenêtre quand elle est plus longue."""
+
+    def test_la_fenetre_declaree_fait_le_seuil(self):
+        _runner, worker = self._worker("avatar-r", policy=AVATAR)
+        mail.send(self.db, "dev1", "avatar-r", "le lot 12 est prêt")
+        self._vieillir("avatar-r", 600)
+        self.assertIsNone(worker.pick())  # fenêtre de 1800 s en cours
+        worker.suite = "turn ceiling"
+        self.assertEqual(worker.pick()["kind"], "suite")
+        self._vieillir("avatar-r", AVATAR["fenetre_s"] + 60)
+        worker.suite = "turn ceiling"
+        self.assertEqual(worker.pick()["kind"], "mail")
 
 
 class ApercuEnRetardTest(unittest.TestCase):
