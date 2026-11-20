@@ -24,12 +24,24 @@ sous le verrou du graphe des dépendances (`_assign_locked`). Il attend la
 fusion de l'autre et part donc de la base à jour. Une empreinte trop large
 coûte une attente, jamais un conflit ; un lot sans empreinte connue n'est
 pas retenu (rien ne dit qu'il chevauche).
+
+#7940 : une attente humaine explicite et durable ne gèle plus les fichiers
+qu'elle touche. Un lot dont le dernier hold de pilote déclare une attente
+externe (#3498 : owner, propriétaire, avatar, ou un nom que le runtime
+résout comme route humaine, #7634) qui tient depuis plus de 24 h ne
+retient plus le démarrage d'un lot qui chevauche son empreinte : le
+chevauchement devient un avertissement journalisé sur les deux lots. Le lot
+en attente garde son empreinte pour l'information ; à son go, il se rebase
+sur la cible et sa relecture porte sur le delta (canon §2). La règle ne
+touche ni la réservation des numéros de migration, ni un lot gelé dans un
+paquet ouvert (§12, cible réservée).
 """
 from __future__ import annotations
 
 import json
 import posixpath
 import sys
+import time
 from typing import Iterable, Optional
 
 from . import storage, work, work_lifecycle as lifecycle
@@ -573,6 +585,14 @@ def _path_label(path: str) -> str:
             else str(path))
 
 
+def _hold_since(ts) -> str:
+    """L'instant lisible d'une note de hold (#7940), ou `?`."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(ts)))
+    except (TypeError, ValueError, OverflowError):
+        return "?"
+
+
 def refusal(item_id: int, rows: list, *, cap: int | None = None,
             in_flight: int | None = None) -> str:
     """Le message du refus d'attribution (`FootprintOverlap`), ou du plafond
@@ -912,6 +932,17 @@ def run(cfg, db, args) -> int:
         if int(row["id"]) in seen:
             continue
         seen.add(int(row["id"]))
+        if row.get("human_wait"):
+            # #7940 : le hold d'attente humaine tient depuis plus de 24 h ; le
+            # chevauchement reste visible pour l'information, mais ne retient
+            # plus un démarrage (avertissement journalisé des deux côtés).
+            print("human wait #%d (%s%s, hold since %s): %s ~ %s — not blocking "
+                  "(#7940)" % (
+                      int(row["id"]), row["state"],
+                      ", %s" % row["assignee"] if row.get("assignee") else "",
+                      _hold_since(row.get("human_hold_ts")),
+                      _path_label(row["path"]), _path_label(row["other_path"])))
+            continue
         if row.get("start_on"):
             # #7760 : la dépendance déclarée sur un lot validé permet de
             # démarrer sur sa tête gelée ; ce n'est pas une attente de fusion

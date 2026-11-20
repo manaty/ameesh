@@ -29,11 +29,13 @@
 #   --gate file          obey /run/ameesh-gate/state/state.json (L159e)
 #   --no-firewall        skip the nftables rules
 #   --host NAME          Host card title (default AMEESH_HOST, else hostname)
-#   --canon DIR          canon checkout holding the Host card
+#   --canon DIR          canon checkout holding the Host card, read at its
+#                        reviewed ref (AMEESH_CANON_REF, else origin/main)
 #                        (default AMEESH_CANON, else /home/ameesh/canon)
 #   --host-user NAME     account whose groups follow the Host card (ameesh)
 #
-# What it does (all of it undone by --uninstall):
+# What it does (all of it undone by --uninstall, except the host user's
+# capability groups: they belong to its Host card, not to the guest):
 #   * user NAME, no password, no sudo, no docker group, home = --root (0710),
 #     subuid/subgid range, linger (rootless Podman needs its user manager);
 #   * with --job-user: a second user (its own UID, no password, no sudo, its
@@ -53,7 +55,8 @@
 #   * /etc/ameesh-guest/offload.json and profiles (root-owned: the guest
 #     cannot raise its slots, its caps, nor write a profile hook);
 #   * the groups of the host's declared capabilities (`android-emulator`
-#     -> kvm), and only them: no chmod, ACL or udev rule on /dev/kvm.
+#     -> kvm), and only them: no chmod, ACL or udev rule on /dev/kvm;
+#     --uninstall leaves them on the host user, whose Host card owns them.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -130,7 +133,7 @@ while [ $# -gt 0 ]; do
     --check) MODE=check; shift; CHECK_PATHS=("$@"); break ;;
     --uninstall) MODE=uninstall; shift ;;
     --purge) PURGE=1; shift ;;
-    -h|--help) sed -n '3,56p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done

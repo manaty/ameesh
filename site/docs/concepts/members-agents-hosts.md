@@ -121,10 +121,14 @@ capabilities: [android-emulator]   # optional: needs the kvm group and /dev/kvm
 The only capability known today is `android-emulator`, which names the `kvm`
 Unix group. The host provisioning (`deploy/guest/install.sh`) grants that group
 only when the card declares it, idempotently and without widening `/dev/kvm`
-(no `chmod`, ACL or udev rule); without the card, nothing is applied.
+(no `chmod`, ACL or udev rule); without the card, nothing is applied. The card
+is read at the canon's reviewed head (`AMEESH_CANON_REF`, else `origin/main`),
+never from a writable working tree, and the search stays under `hotes/`.
 `ameesh doctor` compares the declaration with the host: a declared capability
-that is not applied is a KO, while a group granted without a declaration is a
-warning. `ameesh placement check --capability android-emulator` keeps only the
+that is not applied is a KO, a group granted without a declaration is a
+warning, and a group the account has but the running executor process does not
+yet carry is reported as a restart warning.
+`ameesh placement check --capability android-emulator` keeps only the
 hosts that declare it, and `ameesh agent observe` exposes the declaration in its
 `host` block.
 
