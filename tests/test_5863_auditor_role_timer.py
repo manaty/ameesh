@@ -17,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import role_timers
+from ameesh import role_timers, watch
 
 
 def row(candidates=("agents-a", "agents-b")):
@@ -100,7 +100,13 @@ class MainTest(unittest.TestCase):
                                return_value=SimpleNamespace(host="agents-a")), \
                 mock.patch.object(role_timers.db_mod, "connect", return_value=db), \
                 mock.patch.object(role_timers.registry, "get", return_value=registry_row), \
-                mock.patch.object(role_timers.plan_github, "settings_of") as settings:
+                mock.patch.object(role_timers.plan_github, "settings_of") as settings, \
+                mock.patch.object(watch, "reconcile_host",
+                                  return_value={"installed": [], "timers": [],
+                                                "agents": []}):
+            # #7933: `role timers --install` also reconciles the elected-role
+            # watch units, which read the watch storage; this fake database
+            # has none. The test is about the auditor pass, not the watch units.
             status = role_timers.main(argv)
         return status, settings
 

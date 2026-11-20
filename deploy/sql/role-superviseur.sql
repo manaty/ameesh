@@ -697,10 +697,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'one', 'journal'
     ]),
     -- L121 (0362): the watches ameesh manages (agent, period, host, when,
-    -- last reading fingerprint, #5698/0543)
+    -- last reading fingerprint, #5698/0543; last firing, reason and attempt,
+    -- #7933/0602 — state only, no content)
     ('agent_watches', ARRAY[
         'agent', 'every_s', 'host', 'enabled_by', 'enabled_at', 'last_sent_at',
-        'last_reading'
+        'last_reading', 'last_fired_at', 'last_fired_reason', 'last_attempt_at'
     ]),
     -- liaisons de session (L41, 0030) : quelle session externe parle au nom
     -- de quel agent ; même nature que agent_registry.session_id, aucun contenu
