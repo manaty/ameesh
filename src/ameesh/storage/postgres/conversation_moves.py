@@ -386,13 +386,22 @@ class ConversationMoves(Contract):
                                                 THEN current_prompt
                                                 ELSE %s::text || E'\\n\\n'
                                                      || current_prompt END,
-                          status = CASE WHEN status IN ('running', 'dead') THEN 'idle'
-                                        ELSE status END,
+                          status = CASE
+                              WHEN status IN ('running', 'dead') THEN 'idle'
+                              -- #7833 : l'arrêt automatique d'un avatar
+                              -- (échecs rapides du runner) n'est pas un arrêt
+                              -- humain ; la conversation est chez la cible,
+                              -- qui doit pouvoir réclamer. Un arrêt `manuel`
+                              -- ou de toute autre raison reste `stopped`.
+                              WHEN status = 'stopped' AND %s = 'preference'
+                                   AND stop_reason = 'erreur' THEN 'idle'
+                              ELSE status END,
                           updated_at = now()
                     WHERE name = %s AND host = %s AND lease_epoch = %s
                 RETURNING lease_epoch""",
                 (move["target_host"], move["target_cwd"], notice, notice,
-                 move["agent"], move["source_host"], r["lease_epoch"]))
+                 move["reason"], move["agent"], move["source_host"],
+                 r["lease_epoch"]))
             if not moved:
                 return None
             return self._set(tx, move_id, "state = %s, switched_at = clock_timestamp()",

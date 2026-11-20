@@ -569,6 +569,42 @@ tour : sous une pression d'hôte qui retient ses tours, la réclamation est
 différée et la tentative reste ouverte à sa cible (la source la referme à la
 fin de la pression).
 
+**Bascule quand le runner du poste s'arrête (#7833).** La présence de §3.2
+était celle d'un hôte : un runner qui s'arrête après des échecs rapides
+(`stop_after_failures`, L48) publie `status = 'stopped'` et
+`stop_reason = 'erreur'`, mais plus aucun hôte ne publie son standing et
+aucun candidat ne classe la ligne arrêtée : l'avatar restait muet alors que
+le poste était allumé et joignable. Pour un `releve: preference` seulement,
+un arrêt **automatique** (`stop_reason = 'erreur'`) est désormais distingué
+d'un arrêt humain (`manuel`, retrait de canon) : après `GRACE_S` (10 min,
+ticket #6055), le poste n'est plus présent et le premier autre hôte déclaré
+du Placement devient rang 0. Il planifie alors un `conversation_moves`
+`recovered` — la conversation suit, la session native ne traverse pas — et
+le `switch` réveille l'arrêt automatique (`stopped`/`erreur` → `idle`) pour
+que la cible puisse réclamer ; un arrêt `manuel` reste `stopped` et n'est
+jamais repris par la bascule. `elected_roles` publie le standing des autres
+hôtes dès l'arrêt (le poste arrêté ne publie jamais), pour que la cible soit
+fraîche à l'échéance ; avant la grâce, `candidacy` affiche « failover in Ns »
+et ne débloque rien. Un avis `avatar_failover` est émis une fois par épisode
+(clé = agent + hôte + `status_since`), avec la cause, la cible et le geste de
+réparation ; sans autre hôte déclaré, il nomme l'absence de repli. Le retour
+au poste reste celui du dwell B2 ci-dessus (poste de nouveau présent 120 s) :
+la bascule ne le modifie pas, et un `ameesh resume` sur le poste avant
+l'échéance annule simplement la bascule.
+
+*Retour au poste : décision owner non encore outillée.* Le commentaire du
+ticket #6055 (compte owner `smichea`, 19/11/2026) tranche : un `attach` sur
+le poste déclenche le retour à la fin du tour cloud, même session ; sans
+`attach`, l'avatar reste dans le cloud. Le lot livre le retour par présence
+(le dwell de 120 s ci-dessus) parce que l'`attach` demandé n'existe pas
+encore : `ameesh attach` est local et refuse un agent dont la ligne est sur
+un autre hôte (`runner.attach_main`), et l'`attach` distant (#5325 / #7035)
+doit d'abord atteindre une session tenue par un autre hôte. Tant que ce
+préalable n'est pas qualifié sur pc-smichea, exiger l'`attach` laisserait
+l'avatar dans le cloud sans moyen d'en revenir. Le déclencheur est donc à
+reprendre dans #7035/design avant d'être opposable ; le présent lot ne fait
+pas de l'`attach` une condition.
+
 ### 3.3 Ce qui n'est pas `election`
 
 `releve: election` reste pour les rôles de gouvernance : disponibilité sur
