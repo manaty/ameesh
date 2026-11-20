@@ -154,7 +154,11 @@ class Ports(Protocol):
     its own queue instant. `authorize` binds
     (source,target,base,head,tree,members,proof) to the compiled merge policy,
     or to a named pilot fire when that policy requires one. Named-fire
-    withdrawal is serialized with `promote`.
+    withdrawal is serialized with `promote`. `delivered` (#7885) is a
+    read-only lifecycle fact: every plan member already reached a terminal
+    delivery state outside this train, so the plan can no longer produce an
+    effect and must not keep the reservation waiting for a CI that can never
+    be promoted.
     """
     def acquire(self, epoch: int | None) -> int | None: ...
     def release(self, epoch: int) -> None: ...
@@ -171,6 +175,7 @@ class Ports(Protocol):
     def validate_transports(self, plan: dict) -> list[dict]: ...
     def publish(self, plan: dict, epoch: int) -> None: ...
     def published(self, plan: dict) -> str: ...
+    def delivered(self, plan: dict) -> bool: ...
     def start_ci(self, plan: dict) -> None: ...
     def ci(self, plan: dict) -> dict: ...
     def authorize(self, plan: dict) -> dict: ...
@@ -303,12 +308,38 @@ class Engine:
                     return abandoned
             if state is not None and state["phase"] == "paused":
                 return {"result": "paused"}
+            if state is not None and state["phase"] in (
+                    "publishing", "ci-intent", "ci", "ready", "draining") \
+                    and self._members_delivered(state):
+                # #7885 (2) : chaque membre est déjà livré, fusionné ou clos
+                # par une autre voie. Le plan ne peut plus rien produire : sa
+                # CI (si elle existe) n'est pas une promotion possible et
+                # l'attendre retiendrait la réservation pour toujours.
+                return self._drained_terminal(
+                    state, "all plan members are already delivered, merged or "
+                    "closed outside the train: obsolete plan invalidated without "
+                    "promotion")
             if state is not None and state["phase"] == "draining":
                 # Withdrawal or stale evidence invalidates admission, not a
                 # running CI. Keep the shared reservation until that exact
                 # packet has a complete terminal outcome. Never promote it.
                 ci = self._ci(state)
-                if ci["status"] in ("pending", "absent"):
+                if ci["status"] == "pending":
+                    return {"result": "draining", "plan": state["plan"]}
+                if ci["status"] == "absent" and not state.get("fire") \
+                        and self._unpublished(state):
+                    # #7885 (1) : ni feu ni publication, donc aucune CI n'a
+                    # été ni ne sera lancée pour cette composition exacte.
+                    # Attendre « absent » à jamais bloquait le train entier.
+                    return self._drained_terminal(
+                        state, "draining plan has no fire, no published train "
+                        "reference and no CI run: no terminal outcome will ever "
+                        "exist; plan invalidated without promotion")
+                if ci["status"] == "absent":
+                    # Une publication existe : la CI a pu partir et peut
+                    # encore apparaître. L'alerte de durée (option du
+                    # signalement) n'est pas retenue ici : elle relève du
+                    # suivi du train, avec son propre seuil et destinataire.
                     return {"result": "draining", "plan": state["plan"]}
                 state["attempts"][-1]["ci"] = ci
                 state["phase"] = "invalidated"
@@ -552,6 +583,32 @@ class Engine:
         self.ports.notify("plan abandoned at the pilot's request", saved)
         return {"result": "abandoned", "plan": saved["plan"], "abandoned": saved["abandoned"],
                 "state": saved}
+
+    def _members_delivered(self, state):
+        """#7885 : chaque membre du plan est-il déjà livré hors du train ?
+
+        Fait de cycle de vie, en lecture seule : un plan dont tous les membres
+        ont atteint un état terminal de livraison (`delivered`, `merged`,
+        `promoted`, `closed`) ne peut plus être promu. Un banc sans ce port ne
+        prouve rien et garde le comportement historique (attente)."""
+        check = getattr(self.ports, "delivered", None)
+        plan = (state or {}).get("plan")
+        if not callable(check) or not isinstance(plan, dict):
+            return False
+        return bool(check(plan))
+
+    def _drained_terminal(self, state, why):
+        """#7885 : termine un plan en attente qui n'aura jamais de résultat.
+
+        `invalidated` est terminal : le `finally` de `step` rend l'époque et
+        la réservation. Le diagnostic persiste la raison et la notification
+        suit, comme pour un refus de publication. Aucune promotion."""
+        state["error"] = why
+        state["diagnosis"] = {"stage": "draining", "why": why}
+        state["phase"] = "invalidated"
+        state = self._save(state)
+        self.ports.notify(why, state)
+        return {"result": "invalidated", "error": why, "plan": state["plan"]}
 
     def _unpublished(self, state):
         """#6978 (B cx2 #213473) : la preuve qu'aucune passe n'a publié le plan.

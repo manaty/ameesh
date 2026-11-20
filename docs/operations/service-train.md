@@ -82,6 +82,17 @@ indisponible (outillage absent au SHA) reste non bloquante. Seul un plan dont
 une passe antérieure a été incertaine (`publication_uncertain`) garde
 `publishing` et sa réservation, car il a pu être poussé.
 
+Un plan en attente (`publishing`, `ci-intent`, `ci`, `ready` ou `draining`)
+tient la réservation jusqu'au résultat terminal de la CI exacte quand elle
+existe. Deux situations n'attendent pas, car aucune CI ne peut plus produire de
+promotion. En `draining`, un plan sans feu ni publication dont la CI est absente
+n'aura jamais de run : il est terminé. Et si tous les membres du plan sont déjà
+livrés, fusionnés ou clos par une autre voie, le plan est terminé quelle que
+soit la phase en attente, même pendant une CI. Dans les deux cas il passe
+`invalidated` avec `diagnosis.stage = draining`, la réservation est rendue, le
+journal le nomme et le créneau suivant recompose. Une CI `pending` réelle reste
+attendue.
+
 `train_cli abandon` sur un plan non donné dont le service vivant tient le bail
 (#6978) pose une demande (`abandon_request`, visible par `show`) au lieu d'être
 refusé : sans bail, avec les mêmes gardes (plan exact, ni phase terminale sauf
