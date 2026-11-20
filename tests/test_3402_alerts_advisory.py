@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import role_timers
+from ameesh import role_timers, watch
 
 NO_ROUTE = "human:owner has no route on this host"
 WATCH = SimpleNamespace(project="ameesh", repo="manaty/ameesh", interval=900)
@@ -91,6 +91,11 @@ class MainExitTest(unittest.TestCase):
                                   return_value=settings), \
                 mock.patch.object(role_timers, "_watch_declarations",
                                   return_value=([WATCH], "")), \
+                mock.patch.object(watch, "reconcile_host",
+                                  return_value={"installed": [], "timers": [],
+                                                "agents": []}), \
+                mock.patch.object(watch, "check_host",
+                                  return_value={"problems": [], "timers": []}), \
                 redirect_stderr(err), redirect_stdout(out):
             code = role_timers.main(argv + ["--role", "mesh-design", "--no-apply",
                                             "--no-sync", "--systemd-dir", tmp])
