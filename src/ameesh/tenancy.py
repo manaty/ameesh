@@ -364,20 +364,58 @@ def admits(cfg, policy: Mapping, agent: Mapping) -> bool:
     return bool(tenant) and canon_mod.tenant_key(agent.get("responsible")) == tenant
 
 
+def pod_profile_problem(cfg, profile, *, home: str | None = None) -> str:
+    """#7695 (design 7633 §4.2) : sur un hôte pod, un dossier de compte ou un
+    fichier de clé hors du home du tenant est refusé (`""` si conforme).
+
+    Le PVC du tenant est la seule frontière de son état : un `config_dir` ou
+    un `key_file` absolu hors de son home monterait (ou lirait) un volume
+    d'un autre, ou la racine de l'image en lecture seule. Les comptes sans
+    dossier (`~/.claude`, `~/.codex`, `~/.dsh`) restent sous le home, donc
+    conformes. Hors hôte pod, rien ne change : `""`."""
+    if not getattr(cfg, "pod", False):
+        return ""
+    if home is None:
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+    root = os.path.realpath(os.path.expanduser(home))
+    declared = getattr(profile, "path", "") or ""
+    if declared and getattr(profile, "kind", "") == "config_dir":
+        target = os.path.realpath(os.path.expanduser(declared))
+        if target != root and not target.startswith(root + os.sep):
+            return ("account %s/%s: config_dir %s is outside the tenant home %s "
+                    "(a pod tenant only mounts its own volume)"
+                    % (getattr(profile, "harness", "?"), getattr(profile, "name", "?"),
+                       declared, home))
+    key_file = getattr(profile, "key_file", "") or ""
+    if key_file:
+        target = os.path.realpath(os.path.expanduser(key_file))
+        if target != root and not target.startswith(root + os.sep):
+            return ("account %s/%s: key_file %s is outside the tenant home %s "
+                    "(a pod tenant only mounts its own volume)"
+                    % (getattr(profile, "harness", "?"), getattr(profile, "name", "?"),
+                       key_file, home))
+    return ""
+
+
 def published_profiles(cfg) -> list[str]:
     """#7108 : profils de compte que CE runner peut offrir, `harnais/compte`.
 
     Le runner d'un tenant lit sa propre configuration (`accounts`), sous son
     home 0700 : le superviseur ne peut pas la lire. Seuls des noms passent au
     battement, jamais un chemin ni un secret. Une configuration illisible ne
-    publie rien (fail closed : le déplacement vers ce tenant est refusé)."""
+    publie rien (fail closed : le déplacement vers ce tenant est refusé).
+
+    #7695 : sur un hôte pod, un profil `config_dir` (ou un `key_file`) hors du
+    home du tenant n'est pas publié non plus : son volume est la seule
+    frontière de son état (design 7633 §4.2, §5.2)."""
     from . import accounts as accounts_mod
     try:
         declared = accounts_mod.parse(getattr(cfg, "accounts", None) or {})
     except accounts_mod.AccountError:
         return []
     out = {"%s/%s" % (harness, profile.name)
-           for harness, profiles in declared.items() for profile in profiles}
+           for harness, profiles in declared.items() for profile in profiles
+           if not pod_profile_problem(cfg, profile)}
     return sorted(out)
 
 
@@ -582,15 +620,21 @@ def shell_plan(host: str, tenant: str) -> str:
 
 
 def describe(rows: list[Mapping[str, Any]]) -> list[str]:
-    """Lignes de `ameesh host tenant list`."""
+    """Lignes de `ameesh host tenant list`.
+
+    #7695 : les profils de compte publiés par le battement (`harnais/compte`,
+    jamais un chemin ni un secret) sont affichés, pour voir d'un coup d'œil
+    quels harnais un tenant peut offrir au déplacement."""
     out = []
     for row in rows:
         seen = row.get("seen_ts")
         age = ("never" if seen is None
                else "%ds ago" % int(max(0.0, float(row.get("now_ts") or 0) - float(seen))))
-        out.append("%s  %s  user=%s uid=%s runner=%s  seen %s%s" % (
+        profiles = "  profiles=%s" % ",".join(row.get("profiles") or ()) \
+            if row.get("profiles") else ""
+        out.append("%s  %s  user=%s uid=%s runner=%s  seen %s%s%s" % (
             row["host"], row["tenant"], row["unix_user"], row["uid"], row["runner_id"],
-            age, "  (%s)" % row["version"] if row.get("version") else ""))
+            age, "  (%s)" % row["version"] if row.get("version") else "", profiles))
     return out
 
 

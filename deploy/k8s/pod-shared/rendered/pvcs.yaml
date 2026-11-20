@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# GÉNÉRÉ par deploy/k8s/pod-shared/render.py — ne pas editer a la main.
+# Source : deploy/k8s/pod-shared/host.exemple.yaml ; `render.py --check` verifie la fraicheur.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-alice
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-host
+    app.kubernetes.io/part-of: ameesh
+    ameesh.kubernetes.io/tenant: alice
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-bruno
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-host
+    app.kubernetes.io/part-of: ameesh
+    ameesh.kubernetes.io/tenant: bruno
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

@@ -4656,7 +4656,8 @@
    "turn_observation": "observation des tours et des requêtes (#2167) : document du serveur pour /api/v1, jamais servi à l'exécuteur médié",
    "repair_signals": "A1 journal privé (#6320) : stockage serveur seulement",
    "tenancy": "shared multi-tenant host (#7106): canon sync, host supervisor and tenant runners of the mesh only; a device is never a shared host",
-   "pod_hosts": "ephemeral pod hosts (#7694): provisioner state (P4), written by the pod provisioner, never a mediated device call"
+   "pod_hosts": "ephemeral pod hosts (#7694): provisioner state (P4), written by the pod provisioner, never a mediated device call",
+   "pod_supervisor": "pod supervisor lease (#7695): host role of the mesh, never a mediated device call"
   },
   "operations": {
    "account_windows": [
@@ -5367,6 +5368,13 @@
     "get",
     "record",
     "remove"
+   ],
+   "pod_supervisor": [
+    "acquire",
+    "holder",
+    "lease",
+    "release",
+    "renew"
    ]
   }
  },
