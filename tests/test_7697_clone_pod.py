@@ -24,10 +24,12 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
 import tempfile
 import time
 import types
 import unittest
+import uuid
 from unittest import mock
 
 try:
@@ -38,7 +40,7 @@ except ImportError:  # pragma: no cover - dépend de l'environnement
 from ameesh import (avatar_children, canon_sync, pod_admission, pod_children,
                     pod_provisioner, registry, storage, tenancy)
 
-from .support import REPO
+from .support import REPO, PgTestCase, TEST_DSN
 from .test_7107_avatar_enfants import avatar_card
 from .test_canon import _CanonDbCase, fiche, write
 
@@ -972,3 +974,124 @@ class PodAdmissionTest(unittest.TestCase):
     def load(name):
         with open(os.path.join(PROVISIONER_DIR, name), encoding="utf-8") as stream:
             return [doc for doc in yaml.safe_load_all(stream) if doc]
+
+
+class PodRoleSqlTest(PgTestCase):
+    """#44561 : les droits SQL du pourvoyeur sont bornés, sur la vraie base.
+
+    Le pourvoyeur partageait le rôle `ameesh` et pouvait réécrire les champs
+    d'autorisation d'une demande (`tenant`, Secret, expiration) avant de
+    soumettre le pod conforme : le webhook rendait alors le pod de la ligne
+    forgée. Les rôles dédiés de `deploy/sql/role-pod-provisioner.sql` font de
+    la source d'autorisation une ACL PostgreSQL, pas un drapeau applicatif.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.role = "t_vm_probe_" + uuid.uuid4().hex[:10]
+        cls.admission = cls.role + "_writer"
+        result = cls.script("role-pod-provisioner.sql")
+        if result.returncode:
+            raise AssertionError(result.stderr)
+        cls.addClassCleanup(cls.drop_roles)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.drop_roles()
+        finally:
+            super().tearDownClass()
+
+    @classmethod
+    def drop_roles(cls):
+        if cls.__dict__.get("_schema_dropped", False):
+            return
+        for name in (cls.role, cls.admission):
+            if not cls.db.query("SELECT FROM pg_roles WHERE rolname=%s", (name,)):
+                continue
+            cls.db.execute('DROP OWNED BY "' + name + '" CASCADE')
+            cls.db.execute('DROP ROLE "' + name + '"')
+
+    @classmethod
+    def script(cls, name):
+        return subprocess.run(
+            ["psql", "-X", "-w", TEST_DSN, "-q", "-v", "ON_ERROR_STOP=1",
+             "-v", "role=" + cls.role, "-v", "admission=" + cls.admission,
+             "-f", os.path.join(REPO, "deploy/sql", name)],
+            env=dict(os.environ, PGOPTIONS="-c search_path=" + cls.schema),
+            capture_output=True, text=True, timeout=60)
+
+    def role_sql(self, sql, *, role=None):
+        return subprocess.run(
+            ["psql", "-X", "-w", TEST_DSN, "-Atq", "-v", "ON_ERROR_STOP=1"],
+            input='SET ROLE "%s";\nSET search_path="%s";\n%s'
+                  % (role or self.role, self.schema, sql),
+            capture_output=True, text=True, timeout=20)
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("DELETE FROM pod_requests")
+        self.db.execute("DELETE FROM pod_templates")
+        self.db.execute(
+            "INSERT INTO pod_templates (name, namespace, image, fingerprint,"
+            " spec, registered_by) VALUES ('child-pod', 'ameesh',"
+            " 'ameesh-runner', %s, '{}'::jsonb, 'test')", ("a" * 64,))
+        self.db.execute(
+            "INSERT INTO pod_requests (child, parent, tenant, host, template,"
+            " namespace, harness, credential_secret, uid, unix_user, runner_id,"
+            " fingerprint, requested_by, expires_at) VALUES ('enfant1',"
+            " 'avatar', 'human:alice', 'hote1', 'child-pod', 'ameesh', 'claude',"
+            " 'ameesh-child-enfant1', 30001, 'enfant1', 'runner1', %s,"
+            " 'avatar', clock_timestamp() + interval '1 hour')", ("b" * 64,))
+
+    def test_champs_d_autorisation_immutables(self):
+        for column, value in (
+                ("tenant", "'human:mallory'"),
+                ("child", "'enfant2'"),
+                ("parent", "'autre'"),
+                ("credential_secret", "'ameesh-child-enfant2'"),
+                ("expires_at", "clock_timestamp() + interval '2 hours'"),
+                ("uid", "30002")):
+            with self.subTest(column=column):
+                result = self.role_sql(
+                    "UPDATE pod_requests SET %s = %s;" % (column, value))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("permission denied", result.stderr)
+
+    def test_colonnes_d_exploitation_modifiables(self):
+        result = self.role_sql(
+            "UPDATE pod_requests SET state='claimed',"
+            " claimed_by='system:ameesh-pod-provisioner',"
+            " claimed_at=clock_timestamp();")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.db.query("SELECT state, claimed_by FROM pod_requests")
+        self.assertEqual(row[0]["state"], "claimed")
+        self.assertEqual(row[0]["claimed_by"], "system:ameesh-pod-provisioner")
+
+    def test_insert_et_delete_refuses(self):
+        insert = self.role_sql(
+            "INSERT INTO pod_requests (child, parent, tenant, host, template,"
+            " namespace, harness, credential_secret, uid, unix_user, runner_id,"
+            " fingerprint, requested_by, expires_at) VALUES ('enfant2',"
+            " 'avatar', 'human:alice', 'hote2', 'child-pod', 'ameesh', 'claude',"
+            " 'ameesh-child-enfant2', 30002, 'enfant2', 'runner2', '%s',"
+            " 'avatar', clock_timestamp() + interval '1 hour');" % ("c" * 64,))
+        self.assertNotEqual(insert.returncode, 0)
+        self.assertIn("permission denied", insert.stderr)
+        delete = self.role_sql("DELETE FROM pod_requests;")
+        self.assertNotEqual(delete.returncode, 0)
+        self.assertIn("permission denied", delete.stderr)
+
+    def test_webhook_lecture_seule(self):
+        read = self.role_sql("SELECT count(*) FROM pod_requests;",
+                             role=self.admission)
+        self.assertEqual(read.returncode, 0, read.stderr)
+        write = self.role_sql("UPDATE pod_requests SET state='claimed';",
+                              role=self.admission)
+        self.assertNotEqual(write.returncode, 0)
+        self.assertIn("permission denied", write.stderr)
+
+    def test_contrat(self):
+        result = self.script("_contrat-pod-provisioner.sql")
+        self.assertEqual(result.returncode, 0, result.stderr)

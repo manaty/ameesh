@@ -4,7 +4,10 @@
 # Une seule réplique : le claim des demandes est atomique (`SKIP LOCKED`), mais
 # le heartbeat et le nettoyage sont plus simples avec un seul écrivain. Le
 # template est monté depuis la ConfigMap générée par kustomization.yaml ; le
-# mot de passe de la base vient du Secret `ameesh-db` (jamais dans un manifeste).
+# mot de passe de la base vient du Secret `ameesh-db-pod-provisioner` (jamais
+# dans un manifeste). Le rôle `ameesh_pod_provisioner` est créé et borné par
+# `deploy/sql/role-pod-provisioner.sql` : son UPDATE sur `pod_requests` ne
+# couvre pas les champs d'autorisation (#44561).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -48,11 +51,11 @@ spec:
             # DSN sans mot de passe : le mot de passe vient du Secret ci-dessous.
             # Adapter l'hôte/la base au cluster ; ne jamais y mettre de secret.
             - name: AMEESH_DSN
-              value: "postgresql://ameesh@ameesh-postgres:5432/ameesh?sslmode=require"
+              value: "postgresql://ameesh_pod_provisioner@ameesh-postgres:5432/ameesh?sslmode=require"
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: ameesh-db
+                  name: ameesh-db-pod-provisioner
                   key: password
           volumeMounts:
             - name: template

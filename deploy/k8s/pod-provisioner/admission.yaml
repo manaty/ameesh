@@ -211,14 +211,15 @@ spec:
             - "--port"
             - "8443"
           env:
-            # Même DSN que le pourvoyeur : le webhook lit `pod_requests` en
-            # lecture seule (aucune écriture, aucun autre appel).
+            # Rôle DB distinct et lecture seule (`deploy/sql/role-pod-provisioner.sql`) :
+            # le webhook ne peut pas écrire `pod_requests`, même si son code le
+            # tentait. Le rôle du pourvoyeur n'a pas cette lecture seule.
             - name: AMEESH_DSN
-              value: "postgresql://ameesh@ameesh-postgres:5432/ameesh?sslmode=require"
+              value: "postgresql://ameesh_pod_admission@ameesh-postgres:5432/ameesh?sslmode=require"
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: ameesh-db
+                  name: ameesh-db-pod-admission
                   key: password
             - name: AMEESH_POD_NAMESPACE
               value: ameesh

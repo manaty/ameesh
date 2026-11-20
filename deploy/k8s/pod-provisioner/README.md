@@ -66,9 +66,14 @@ cette frontière :
   un Deployment séparé ; le Role du pourvoyeur ne peut ni le modifier, ni le
   supprimer, ni toucher son `caBundle` (ClusterRole limité au nom
   `ameesh-child-pods`, porté par le seul SA d'admission) ;
-- il lit `pod_requests` en **lecture seule** (`get_by_id`) et rend le pod
-  attendu avec le template **copié dans son image** (`/etc/ameesh/pod-provisioner/template.yaml`),
-  pas depuis une ConfigMap que le pourvoyeur pourrait remplacer ;
+- il lit `pod_requests` en **lecture seule** (`get_by_id`) avec le rôle DB
+  `ameesh_pod_admission`, qui n'a que `SELECT` : la lecture seule est une ACL
+  PostgreSQL, pas seulement le drapeau `writer=False` ; le pourvoyeur, lui,
+  n'a qu'un UPDATE borné aux colonnes d'exploitation
+  (`role-pod-provisioner.sql`), jamais aux champs d'autorisation ;
+- il rend le pod attendu avec le template **copié dans son image**
+  (`/etc/ameesh/pod-provisioner/template.yaml`), pas depuis une ConfigMap que
+  le pourvoyeur pourrait remplacer ;
 - il vérifie request-id, tenant, enfant, nom du pod et Secret exact, puis
   compare la forme complète (image, commandes, env, volumes, montages,
   contexte de sécurité, labels/annotations) et la ConfigMap passwd/group/
@@ -91,14 +96,34 @@ ce n'est pas elle qui porte la frontière inter-tenant.
        --responsible human:<pilote-ou-bureau> --reason "#7697 enfant pod"
    ```
 
-2. **Secret de la base** (jamais dans un dépôt) :
+2. **Rôles de base dédiés** (une fois, superutilisateur PostgreSQL) :
+
+   Le pourvoyeur et le webhook ne se connectent plus avec le rôle `ameesh` :
+   le premier n'a qu'un UPDATE d'exploitation sur `pod_requests`, le second
+   n'a que SELECT (verdict #44561). Le script est idempotent et resserre un
+   rôle préexistant :
 
    ```sh
-   kubectl -n ameesh create secret generic ameesh-db \
-       --from-literal=password='…'       # fichier 0600
+   PGOPTIONS='-c search_path=<schéma mesh>' psql <DSN admin> -X \
+       -v ON_ERROR_STOP=1 -f deploy/sql/role-pod-provisioner.sql
+   # puis, dans psql, un mot de passe SCRAM par rôle (jamais en argument) :
+   #   \password ameesh_pod_provisioner
+   #   \password ameesh_pod_admission
+   # audit après chaque migration additive :
+   PGOPTIONS='-c search_path=<schéma mesh>' psql <DSN admin> -X \
+       -v ON_ERROR_STOP=1 -f deploy/sql/_contrat-pod-provisioner.sql
    ```
 
-3. **Appliquer le namespace et les objets** (geste d'opérateur) :
+3. **Secrets de la base** (jamais dans un dépôt) :
+
+   ```sh
+   kubectl -n ameesh create secret generic ameesh-db-pod-provisioner \
+       --from-literal=password='…'       # fichier 0600
+   kubectl -n ameesh create secret generic ameesh-db-pod-admission \
+       --from-literal=password='…'
+   ```
+
+4. **Appliquer le namespace et les objets** (geste d'opérateur) :
 
    ```sh
    kubectl create namespace ameesh --dry-run=client -o yaml | kubectl apply -f -
@@ -113,7 +138,7 @@ ce n'est pas elle qui porte la frontière inter-tenant.
    écrit le CA (deux répliques se remplaceraient l'une l'autre ; un Secret
    TLS partagé est une tranche suivante).
 
-4. **Vérifier le heartbeat** (le template est enregistré par le pourvoyeur à
+5. **Vérifier le heartbeat** (le template est enregistré par le pourvoyeur à
    chaque passe ; sans heartbeat frais, `children: pod` refuse
    `spawn-pod-unsupported`) :
 
@@ -122,7 +147,7 @@ ce n'est pas elle qui porte la frontière inter-tenant.
    ameesh pod-provisioner --templates
    ```
 
-5. **Créer le Secret d'API de l'enfant** avant le premier `spawn` (nom exact
+6. **Créer le Secret d'API de l'enfant** avant le premier `spawn` (nom exact
    dans `placement.describe()`, ou `ameesh host tenant list` après démarrage) :
 
    ```sh
@@ -130,7 +155,7 @@ ce n'est pas elle qui porte la frontière inter-tenant.
        --from-literal=api-key='…'        # clé d'organisation, plafond fournisseur
    ```
 
-6. **Prouver sur kind** (facultatif, geste de bureau) : le lot ne livre pas
+7. **Prouver sur kind** (facultatif, geste de bureau) : le lot ne livre pas
    de script kind ; les contrôles sont ceux du bureau — appliquer
    `kubectl apply -k deploy/k8s/pod-provisioner`, vérifier
    `kubectl auth can-i --list` du SA enfant (aucun droit), puis soumettre un
@@ -140,7 +165,7 @@ ce n'est pas elle qui porte la frontière inter-tenant.
    doit échouer sans pod admis (le webhook est `failurePolicy: Fail`) ;
    remettre `--replicas=1` ensuite.
 
-7. **Preuve inter-tenant négative** (geste de bureau) : avec un SA
+8. **Preuve inter-tenant négative** (geste de bureau) : avec un SA
    pourvoyeur compromis simulé, un pod portant le `request-id`/nom de
    l'enfant A mais le label/Secret de l'enfant B doit être refusé par le
    webhook (`child pod shape`) ; la ConfigMap de B référencée par A doit être
@@ -189,10 +214,12 @@ non pod n'ont aucune ligne `pod_hosts` et gardent la garde #7106 inchangée.
 - **SA pourvoyeur entièrement compromis** : le webhook
   `ameesh-pod-admission` recoupe chaque pod et ConfigMap étiqueté à sa
   demande `pod_requests` (lecture seule) et refuse tout écart ; le label d'un
-  autre enfant ne suffit donc plus. Résidus : le DSN partagé (limite L155)
-  laisse une écriture en base hors de la portée de la garde ; le SA du
-  webhook peut mettre à jour son propre `caBundle` (`resourceNames` borné au
-  nom `ameesh-child-pods`), une compromission du webhook peut donc le
+  autre enfant ne suffit donc plus : son rôle DB (`ameesh_pod_provisioner`)
+  n'a qu'un UPDATE d'exploitation sur `pod_requests`, et le webhook lit avec
+  `ameesh_pod_admission` en SELECT seul (`deploy/sql/role-pod-provisioner.sql`).
+  Résidus : le reste du mesh garde le rôle partagé `ameesh` (limite L155) ;
+  le SA du webhook peut mettre à jour son propre `caBundle` (`resourceNames`
+  borné au nom `ameesh-child-pods`), une compromission du webhook peut donc le
   désarmer ; une ConfigMap sans label `managed-by` échappe à
   l'`objectSelector`, mais elle est recoupée quand le pod la monte.
 - **Battement frais** : la garde de réclamation exige un battement de moins

@@ -1061,9 +1061,13 @@ agents différents ; P5 dépend des deux.
   nom du pod et Secret exact, et refuse absence, discordance ou demande
   périmée ; il n'admet que l'identité réelle du ServiceAccount pourvoyeur
   (`system:serviceaccount:<namespace>:ameesh-pod-provisioner`) et refuse tout
-  autre auteur ; `failurePolicy: Fail`. La VAP reste la seconde barrière. Avec le
-  DSN partagé (limite L155), une écriture en base reste hors du périmètre de
-  cette garde.
+  autre auteur ; `failurePolicy: Fail`. La VAP reste la seconde barrière. Le
+  webhook se connecte avec `ameesh_pod_admission` (SELECT seul) et le
+  pourvoyeur avec `ameesh_pod_provisioner` (UPDATE borné aux colonnes
+  d'exploitation de `pod_requests`) : `deploy/sql/role-pod-provisioner.sql`
+  et son contrat font de la source d'autorisation une ACL PostgreSQL, pas un
+  drapeau applicatif. Le reste du mesh garde le rôle partagé `ameesh`
+  (limite L155).
 - **Estimation** : 3 j pour #7633 est sous-évalué ; le pilote doit
   réestimer ou réduire le périmètre.
 
