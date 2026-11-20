@@ -134,6 +134,12 @@ la borne murale restante peut la couper. Les contrats gardent leur part
 (`series_share`). Le corps de la PR dit, lot par lot, si ses modules directs
 ont été joués jusqu'au bout (`_direct_lines`) ; une série coupée n'en
 revendique aucun et 0 module joué est un non-concluant nommé (#4814, #7740).
+#7950 : un module de contrat jamais lancé (arrêt après un contrat négatif,
+borne globale déjà atteinte) ou coupé par la borne murale ne sort plus « code
+de retour None » : il est dit « non lancé : … » ou « coupé par le délai
+global … », avec la durée, et ne compte jamais comme joué. Dans la fin de
+passe, le temps restant est réparti entre les modules pas encore partis pour
+qu'un module long ne consomme plus la borne des suivants (h-07).
 Le contrôle rapide du job plan « types clients à jour » passe avant la
 poussée : le vrai `gen-api --check` si Node et les dépendances sont là, sinon
 la garde déterministe « OpenAPI changé sans schéma » (#4831).
@@ -257,6 +263,12 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA_RE = re.compile(r"[0-9a-f]{7,64}", re.IGNORECASE)
 CONTRACT_ALWAYS = "tests/parts/toujours.txt"
 CONTRACT_MODULES = ("tests.test_l161f_plan", "tests.test_cluster")
+#: #7950 : sous cette fin de passe (secondes, ou un cinquième de la borne
+#: globale des contrats), le temps restant est réparti entre les modules pas
+#: encore partis au lieu d'être donné en entier au premier : un module long
+#: ne consomme plus la borne des suivants (h-07, test_7665 puis six modules
+#: jamais lancés).
+CONTRACT_TAIL_MIN_S = 60
 #: #7740 : témoins globaux qu'une empreinte touche, en plus de la sélection
 #: des voisins : une migration change les rôles et le schéma, un stockage
 #: change le contrat des écrivains, `alert_briefs.py` porte les alertes de
@@ -883,6 +895,17 @@ class TestRun:
     #: inutilisables par la sonde (`container_engine_state`) dans
     #: l'environnement de la série : `absent` ou `unreachable`.
     unusable_engines: frozenset = frozenset()
+    #: #7950 : la série n'a jamais été lancée ; la raison est dite en clair
+    #: (« délai global de la série atteint (N s) », « arrêt après le contrat
+    #: négatif X »). Une série non lancée n'est ni un module joué ni un
+    #: « code de retour None ».
+    not_started: str = ""
+    #: #7950 : la série a été lancée puis coupée par la borne murale globale
+    #: (secondes) : le processus n'a pas rendu de code, mais la série a tourné.
+    deadline_cut: int | None = None
+    #: #7950 : la série a été lancée puis coupée par sa part du délai global
+    #: (secondes), réservée aux modules pas encore partis.
+    share_cut: int | None = None
 
     @property
     def green(self) -> bool:
@@ -1037,6 +1060,16 @@ class TestRun:
             return ("test(s) rouge(s) sur la tête mais vert(s) sur tous les "
                     "préfixes (instable) : %s"
                     % ", ".join(self.flaky_tests[:3]))
+        # #7950 : un None ne dit pas la même chose selon que la série n'est
+        # jamais partie ou qu'elle a été coupée ; le journal doit le dire.
+        if self.not_started:
+            return "non lancé : %s" % self.not_started
+        if self.deadline_cut is not None:
+            return ("coupé par le délai global de la série après %d s "
+                    "(série lancée, code non rendu)" % self.deadline_cut)
+        if self.share_cut is not None:
+            return ("coupé par sa part (%d s) du délai global, réservée aux "
+                    "modules suivants" % self.share_cut)
         if self.timed_out:
             return "délai dépassé"
         if self.returncode not in (0, 1):
@@ -2969,7 +3002,8 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
                 label=label, modules=list(modules), returncode=None,
                 output="borne totale des tests par unité atteinte après %d s "
                        "(attente du créneau comprise) : série arrêtée (#4463)" % wall,
-                seconds=time.monotonic() - start, timed_out=True))
+                seconds=time.monotonic() - start, timed_out=True,
+                deadline_cut=wall))
         return save_test_log(probe_engines(TestRun(
             label=label, modules=list(modules), returncode=proc.returncode,
             output=_output(proc), seconds=time.monotonic() - start,
@@ -3100,6 +3134,15 @@ class FlowTestRun(TestRun):
         return int(self.flow.get("skipped") or 0)
 
     def motive(self) -> str:
+        # #7950 : les mêmes distinctions que TestRun avant le délai générique.
+        if self.not_started:
+            return "non lancé : %s" % self.not_started
+        if self.deadline_cut is not None:
+            return ("coupé par le délai global de la série après %d s "
+                    "(série lancée, code non rendu)" % self.deadline_cut)
+        if self.share_cut is not None:
+            return ("coupé par sa part (%d s) du délai global, réservée aux "
+                    "modules suivants" % self.share_cut)
         if self.timed_out:
             return "délai dépassé"
         if not self.flow.get("fins"):
@@ -3152,15 +3195,18 @@ def run_declared_contracts(worktree: Path, modules: list[str], *, end: float,
     start = time.monotonic()
     remaining = int(end - time.monotonic())
     if remaining <= 0:
-        run = budget_spent("contrats", modules)
+        run = budget_spent("contrats", modules,
+                           budget=max(0.0, end - start))
         return FlowTestRun(run.label, run.modules, None, run.output, 0.0,
-                           timed_out=True)
+                           timed_out=True, not_started=run.not_started)
     launcher = worktree / tooling.parts_script
     if not launcher.is_file():
         return save_test_log(FlowTestRun(
             "contrats", list(modules), None,
             "%s absent de l'arbre composé" % tooling.parts_script, 0.0,
-            timed_out=True))
+            timed_out=True,
+            not_started="lanceur de contrats %s absent de l'arbre composé"
+                        % tooling.parts_script))
     with tempfile.TemporaryDirectory(prefix="contrats-declares-") as temporary:
         plan = Path(temporary) / "plan.json"
         flow = Path(temporary) / "flux.jsonl"
@@ -3190,7 +3236,8 @@ def run_declared_contracts(worktree: Path, modules: list[str], *, end: float,
         return save_test_log(FlowTestRun(
             "contrats", list(modules), None,
             "borne des contrats atteinte après %d s (lanceur déclaré)" % remaining,
-            time.monotonic() - start, timed_out=True, flow=parsed))
+            time.monotonic() - start, timed_out=True, flow=parsed,
+            deadline_cut=remaining))
     capped = bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT
     output = _output(proc)
     if parsed["failed"]:
@@ -3198,6 +3245,23 @@ def run_declared_contracts(worktree: Path, modules: list[str], *, end: float,
     return save_test_log(FlowTestRun(
         "contrats", list(modules), proc.returncode, output,
         time.monotonic() - start, timed_out=capped, flow=parsed))
+
+
+def contract_tail_share(remaining: int, pending_after: int,
+                        budget: float) -> int:
+    """#7950 : la part d'un contrat quand la borne globale va couper la passe.
+
+    Hors de la fin de passe, le module garde le temps restant : les contrats
+    mesurés (les plus longs d'abord) ont besoin de leur durée entière. Quand
+    il reste moins d'un cinquième de la borne globale (et moins de
+    `CONTRACT_TAIL_MIN_S` secondes), le temps restant est réparti entre les
+    modules pas encore partis : un module long ne consomme plus la borne des
+    suivants (h-07 : test_7665, puis six modules jamais lancés).
+    """
+    if pending_after <= 0 or remaining > max(CONTRACT_TAIL_MIN_S,
+                                             int(budget) // 5):
+        return remaining
+    return max(1, remaining // (pending_after + 1))
 
 
 def run_contract_modules(worktree: Path, modules: list[str], *,
@@ -3209,19 +3273,44 @@ def run_contract_modules(worktree: Path, modules: list[str], *,
     tooling = tooling or _TOOLING
     if tooling.declared:
         return run_declared_contracts(worktree, modules, end=end, tooling=tooling)
+    start = time.monotonic()
+    budget = max(0.0, end - start)
     stop = threading.Event()
+    state_lock = threading.Lock()
+    state = {"started": 0, "negative": ""}
+
     def module_job(module):
         def run():
-            remaining = int(end - time.monotonic())
+            with state_lock:
+                state["started"] += 1
+                pending_after = max(0, len(modules) - state["started"])
             if stop.is_set():
+                with state_lock:
+                    culprit = state["negative"]
+                reason = ("arrêt après le contrat négatif %s" % culprit
+                          if culprit else "arrêt après un contrat négatif")
+                # #7950 : jamais lancé ; ce n'est pas un « code de retour
+                # None » et ce module ne compte pas comme joué.
                 return TestRun("contrats", [module], None,
-                               "module non joué après un contrat négatif", 0.0)
+                               reason + " : module non joué", 0.0,
+                               not_started=reason)
+            remaining = int(end - time.monotonic())
             if remaining <= 0:
-                return budget_spent("contrats", [module])
-            result = run_tests(worktree, "contrats " + module, [module], timeout=remaining,
-                               heavy=True, wall=remaining, failfast=True)
+                return budget_spent("contrats", [module], budget=budget)
+            share = contract_tail_share(remaining, pending_after, budget)
+            result = run_tests(worktree, "contrats " + module, [module],
+                               timeout=share, heavy=True, wall=remaining,
+                               failfast=True)
+            if share < remaining and result.timed_out \
+                    and result.deadline_cut is None:
+                # #7950 : coupé par la part de fin de passe, pas par une
+                # borne de série ordinaire.
+                result.share_cut = share
             if result.real_failure:
-                stop.set()
+                with state_lock:
+                    if not stop.is_set():
+                        state["negative"] = module
+                        stop.set()
             return result
         return run
     children = _run_series([module_job(m) for m in contract_order(worktree, modules)],
@@ -3493,12 +3582,16 @@ def prepublication_contracts(worktree: Path, *, base: str,
                           + cached["attestation"]["payload"]["source_sha"]
                           + "\nRan %d tests in 0.0s\nOK\n" % cached.get("tests", 0), 0.0)
         elif remaining <= 0:
-            run = budget_spent("contrats", modules)
+            run = budget_spent("contrats", modules,
+                               budget=max(0.0, end - start))
         else:
             run = run_contract_modules(worktree, modules, end=end, parallel=parallel)
     except PaquetAutoError as exc:
+        # #7950 : la passe n'a pas démarré (budget, créneau, arbre) : ses
+        # modules sont « non lancés », jamais un « code de retour None ».
         run = save_test_log(TestRun("contrats", modules, None, str(exc),
-                                   time.monotonic() - start, timed_out=True))
+                                   time.monotonic() - start, timed_out=True,
+                                   not_started=str(exc)))
     run.seconds = time.monotonic() - start
     report = ContractPass(head, tree, run)
     verify_contract_scope(worktree, report)
@@ -4432,12 +4525,20 @@ def series_share(timeout: int, deadline: float | None, pending: int,
     return max(1, min(timeout, left, usable // waves))
 
 
-def budget_spent(label: str, modules: list[str]) -> TestRun:
-    """#4463 : une série qui ne part plus, l'échéance totale passée (§3)."""
+def budget_spent(label: str, modules: list[str], *,
+                 budget: float | None = None) -> TestRun:
+    """#4463/#7950 : une série qui ne part plus, l'échéance totale passée (§3).
+
+    Elle est dite **non lancée**, avec la durée de la borne quand elle est
+    connue : un None ne se lit plus comme un module joué (« code de retour
+    None ») mais comme une série qui n'a jamais démarré (#7950).
+    """
+    spent = " (%d s de budget)" % int(budget) if budget else ""
+    reason = "délai global de la série atteint" + spent
     return TestRun(label=label, modules=list(modules), returncode=None,
                    output="borne totale des tests par unité atteinte : série "
-                          "non jouée (#4463)", seconds=0.0, timed_out=True,
-                   direct=list(modules))
+                          "non jouée (#4463)" + spent, seconds=0.0,
+                   timed_out=True, direct=list(modules), not_started=reason)
 
 
 def _consign_flaky(red: list[tuple[TestRun, list[dict]]],
