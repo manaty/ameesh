@@ -56,6 +56,14 @@ DEFAULT_NAMESPACE = "ameesh"
 DEADLINE_GRACE_S = 300
 MAX_DEADLINE_S = 7 * 86400
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+#: valeur de label Kubernetes (63 caractères, pas de `:`, `/`, `@`…).
+LABEL_VALUE = re.compile(r"^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$")
+#: Secret du mot de passe base, seul Secret statique du template.
+DB_CREDENTIAL_SECRET = "ameesh-db"
+#: Commandes figées : la VAP refuse tout pod dont les commandes diffèrent.
+SUPERVISOR_COMMAND = ["sh", "-ec", "umask 077; exec ameesh run --poll 5"]
+CHILD_COMMAND = ["sh", "-ec",
+                 "mkdir -p '{{CWD}}' && umask 077 && exec ameesh run --poll 5"]
 
 #: placeholders que le template peut porter ; tout autre est refusé.
 ALLOWED_PLACEHOLDERS = frozenset({
@@ -282,12 +290,20 @@ class PodTemplate:
                 raise ProvisionerError(
                     "template-invalid",
                     "a child pod never mounts a hostPath or a parent PVC")
-            allowed = {"name", "emptyDir", "configMap", "secret"}
+            allowed = {"name", "emptyDir", "configMap"}
             if set(volume) - allowed:
                 raise ProvisionerError(
                     "template-invalid",
                     "volume %r has a forbidden source: %s"
                     % (volume.get("name"), ", ".join(sorted(set(volume) - allowed))))
+        # B3 (#7697) : un initContainer ou un conteneur éphémère échappe aux
+        # contrôles des conteneurs et peut monter/voler un Secret. Le template
+        # n'en porte aucun et n'en acceptera jamais.
+        for extra in ("initContainers", "ephemeralContainers"):
+            if spec.get(extra):
+                raise ProvisionerError(
+                    "template-invalid",
+                    "spec.%s is forbidden on a child pod" % extra)
         containers = spec.get("containers") or []
         if not isinstance(containers, list) or not containers:
             raise ProvisionerError("template-invalid", "spec.containers is empty")
@@ -305,6 +321,50 @@ class PodTemplate:
                 raise ProvisionerError(
                     "template-invalid",
                     "container %s must use the frozen {{IMAGE}}" % container.get("name"))
+            if "args" in container:
+                raise ProvisionerError(
+                    "template-invalid",
+                    "container %s must not carry args" % container.get("name"))
+            expected_command = (SUPERVISOR_COMMAND if container.get("name") == "supervisor"
+                                else CHILD_COMMAND)
+            if container.get("command") != expected_command:
+                raise ProvisionerError(
+                    "template-invalid",
+                    "container %s must use the frozen command" % container.get("name"))
+            if "lifecycle" in container:
+                raise ProvisionerError(
+                    "template-invalid",
+                    "container %s must not carry a lifecycle hook"
+                    % container.get("name"))
+            if "envFrom" in container:
+                raise ProvisionerError(
+                    "template-invalid",
+                    "container %s must not import envFrom" % container.get("name"))
+            for entry in container.get("env") or []:
+                if not isinstance(entry, dict):
+                    raise ProvisionerError("template-invalid", "an env entry is not a mapping")
+                source = entry.get("valueFrom")
+                if source is None:
+                    continue
+                if not isinstance(source, dict) or len(source) != 1:
+                    raise ProvisionerError(
+                        "template-invalid",
+                        "env %s has an unsupported valueFrom" % entry.get("name"))
+                if "fieldRef" in source:
+                    if (source["fieldRef"] or {}).get("fieldPath") != "metadata.uid":
+                        raise ProvisionerError(
+                            "template-invalid",
+                            "only metadata.uid may be projected into a child env")
+                    continue
+                ref = (source.get("secretKeyRef") or {})
+                name, key = ref.get("name"), ref.get("key")
+                if (name == DB_CREDENTIAL_SECRET and key == "password") or (
+                        name == "{{CREDENTIAL_SECRET}}" and key == "api-key"):
+                    continue
+                raise ProvisionerError(
+                    "template-invalid",
+                    "env %s reads a Secret that is not the child credential or the "
+                    "database password" % entry.get("name"))
             security = container.get("securityContext") or {}
             if security.get("runAsNonRoot") is not True:
                 raise ProvisionerError("template-invalid",
@@ -399,7 +459,6 @@ class PodTemplate:
             "ameesh.dev/host": request["host"],
             "ameesh.dev/parent": request["parent"],
             "ameesh.dev/child": request["child"],
-            "ameesh.dev/tenant": request["tenant"],
             "ameesh.dev/template": request["template"],
         })
         annotations = pod["metadata"].setdefault("annotations", {})
@@ -407,6 +466,11 @@ class PodTemplate:
             "ameesh.dev/request-id": str(request["id"]),
             "ameesh.dev/fingerprint": request["fingerprint"],
             "ameesh.dev/expires-at": mapping["EXPIRES_AT"],
+            # `human:<id>` porte un `:` interdit dans une valeur de label ;
+            # l'annotation garde l'identité lisible sans casser le pod.
+            "ameesh.dev/tenant": request["tenant"],
+            "ameesh.dev/credential-secret": request["credential_secret"],
+            "ameesh.dev/configmap": configmap,
         })
         pod["spec"]["activeDeadlineSeconds"] = deadline
         config_body = {
@@ -441,6 +505,12 @@ class PodTemplate:
             raise ProvisionerError("template-invalid", "rendered pod has no manager label")
         if labels.get("ameesh.dev/host") != request["host"]:
             raise ProvisionerError("template-invalid", "rendered pod has the wrong host label")
+        for key, value in labels.items():
+            if (not isinstance(value, str) or len(value) > 63
+                    or not LABEL_VALUE.fullmatch(value)):
+                raise ProvisionerError(
+                    "template-invalid",
+                    "rendered label %r has an invalid Kubernetes value" % (key,))
         if (pod.get("metadata") or {}).get("name") != mapping["POD_NAME"]:
             raise ProvisionerError("template-invalid", "rendered pod has the wrong name")
         volumes = (pod.get("spec") or {}).get("volumes") or []
@@ -583,11 +653,12 @@ class Provisioner:
         if request is None:
             return None
         rendered = None
+        pod = None
         try:
             rendered = self.template.render(
                 request, image=self.image, namespace=self.client.namespace,
                 dsn=self.dsn, now=now)
-            self._ensure_configmap(rendered)
+            self._ensure_configmap(rendered, request)
             pod = self._ensure_pod(rendered, request)
             uid = ((pod.get("metadata") or {}).get("uid") or "").strip()
             if not uid:
@@ -597,8 +668,8 @@ class Provisioner:
                 request["id"], pod_uid=uid, pod_name=rendered.pod_name,
                 actor=self.actor)
             if started is None:
-                self._delete_pod(rendered.pod_name)
-                self._delete_configmap(rendered.configmap_name)
+                self._delete_pod(rendered.pod_name, request, pod_uid=uid)
+                self._delete_configmap(rendered.configmap_name, request)
                 requests.fail(request["id"],
                               "the child row disappeared or the request was no "
                               "longer claimable before the pod started")
@@ -606,22 +677,50 @@ class Provisioner:
             return started
         except Exception as exc:  # noqa: BLE001 - une demande ne bloque pas la boucle
             if rendered is not None:
-                self._delete_pod(rendered.pod_name)
-                self._delete_configmap(rendered.configmap_name)
+                # B2 (#7697) : ne supprimer que les objets prouvés à CETTE
+                # demande (labels, annotation `request-id` et, pour un pod né
+                # dans cet appel, son `metadata.uid`). Un conflit de nom sur le
+                # pod d'un autre parent, une ConfigMap étrangère ou un échec
+                # avant `create_pod` ne doivent jamais emporter l'objet d'un
+                # tiers.
+                owned_uid = ((pod or {}).get("metadata") or {}).get("uid")
+                self._delete_pod(rendered.pod_name, request, pod_uid=owned_uid)
+                self._delete_configmap(rendered.configmap_name, request)
             requests.fail(request["id"], _short_error(exc))
             return None
 
-    def _ensure_configmap(self, rendered: Rendered) -> None:
+    def _ensure_configmap(self, rendered: Rendered, request: dict) -> None:
         try:
             self.client.create_configmap(rendered.configmap)
             return
         except KubeConflict:
             existing = self.client.get_configmap(rendered.configmap_name)
-            if existing is not None:
-                if (existing.get("data") or {}) == ((rendered.configmap.get("data")) or {}):
-                    return
-                self.client.delete_configmap(rendered.configmap_name)
+            if existing is None:
+                raise
+            labels = (existing.get("metadata") or {}).get("labels") or {}
+            if labels.get("ameesh.dev/request-id") != str(request["id"]):
+                raise ProvisionerError(
+                    "configmap-name-conflict",
+                    "a ConfigMap of another request already uses %s"
+                    % rendered.configmap_name)
+            if (existing.get("data") or {}) == ((rendered.configmap.get("data")) or {}):
+                return
+            self.client.delete_configmap(rendered.configmap_name)
         self.client.create_configmap(rendered.configmap)
+
+    @staticmethod
+    def _pod_request_id(pod: dict) -> str:
+        metadata = pod.get("metadata") or {}
+        annotations = metadata.get("annotations") or {}
+        labels = metadata.get("labels") or {}
+        return str(annotations.get("ameesh.dev/request-id")
+                   or labels.get("ameesh.dev/request-id") or "")
+
+    def _pod_belongs(self, pod: dict, request: dict) -> bool:
+        labels = ((pod.get("metadata") or {}).get("labels") or {})
+        return (labels.get("ameesh.dev/host") == request["host"]
+                and labels.get("ameesh.dev/parent") == request["parent"]
+                and self._pod_request_id(pod) == str(request["id"]))
 
     def _ensure_pod(self, rendered: Rendered, request: dict) -> dict:
         try:
@@ -630,23 +729,44 @@ class Provisioner:
             existing = self.client.get_pod(rendered.pod_name)
             if existing is None:
                 raise
-            labels = (existing.get("metadata") or {}).get("labels") or {}
-            if (labels.get("ameesh.dev/host") != request["host"]
-                    or labels.get("ameesh.dev/parent") != request["parent"]
-                    or labels.get("ameesh.dev/request-id") != str(request["id"])):
+            # B4 (#7697) : `request-id` vit dans les annotations du template ;
+            # le relire en label rendait faux tout conflit de reprise.
+            if not self._pod_belongs(existing, request):
                 raise ProvisionerError(
                     "pod-name-conflict",
                     "a pod of another parent already uses %s" % rendered.pod_name)
             return existing
         return pod or {}
 
-    def _delete_pod(self, name: str) -> None:
+    def _delete_pod(self, name: str, request: dict | None = None,
+                    *, pod_uid: str | None = None) -> None:
+        if request is not None:
+            try:
+                pod = self.client.get_pod(name)
+            except KubeError:
+                return
+            if pod is None or not self._pod_belongs(pod, request):
+                return
+            if pod_uid is not None:
+                current = ((pod.get("metadata") or {}).get("uid") or "").strip()
+                if current != str(pod_uid):
+                    return
         try:
             self.client.delete_pod(name)
         except KubeError:
             pass
 
-    def _delete_configmap(self, name: str) -> None:
+    def _delete_configmap(self, name: str, request: dict | None = None) -> None:
+        if request is not None:
+            try:
+                existing = self.client.get_configmap(name)
+            except KubeError:
+                return
+            if existing is None:
+                return
+            labels = (existing.get("metadata") or {}).get("labels") or {}
+            if labels.get("ameesh.dev/request-id") != str(request["id"]):
+                return
         try:
             self.client.delete_configmap(name)
         except KubeError:

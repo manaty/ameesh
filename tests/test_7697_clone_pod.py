@@ -177,6 +177,15 @@ class PodTemplateTest(unittest.TestCase):
         self.assertNotIn("hostPath", json.dumps(pod["spec"]["volumes"]))
         self.assertEqual(pod["spec"]["serviceAccountName"], "ameesh-child")
         self.assertFalse(pod["spec"]["automountServiceAccountToken"])
+        # B1 (#7697) : `human:alice` n'est pas une valeur de label Kubernetes ;
+        # le tenant vit en annotation, tous les labels rendus sont valides.
+        self.assertNotIn("ameesh.dev/tenant", pod["metadata"]["labels"])
+        self.assertEqual(pod["metadata"]["annotations"]["ameesh.dev/tenant"], ALICE)
+        self.assertEqual(pod["metadata"]["annotations"]["ameesh.dev/credential-secret"],
+                         self.request["credential_secret"])
+        for value in pod["metadata"]["labels"].values():
+            self.assertLessEqual(len(value), 63)
+            self.assertRegex(value, r"^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$")
         config = rendered.configmap["data"]
         self.assertIn(str(self.request["uid"]), config["passwd"])
         self.assertIn(self.request["unix_user"], config["passwd"])
@@ -233,6 +242,36 @@ class PodTemplateTest(unittest.TestCase):
         with self.assertRaises(pod_provisioner.ProvisionerError):
             self._tampered(mutate)
 
+    def test_un_init_container_privilegie_est_refuse(self):
+        def mutate(raw):
+            raw["spec"]["initContainers"] = [{
+                "name": "init", "image": "busybox",
+                "securityContext": {"privileged": True}}]
+        with self.assertRaises(pod_provisioner.ProvisionerError):
+            self._tampered(mutate)
+
+    def test_un_secret_volume_est_refuse(self):
+        def mutate(raw):
+            raw["spec"]["volumes"].append(
+                {"name": "autre", "secret": {"secretName": "ameesh-child-autre"}})
+        with self.assertRaises(pod_provisioner.ProvisionerError):
+            self._tampered(mutate)
+
+    def test_une_source_de_secret_inconnue_est_refusee(self):
+        def mutate(raw):
+            raw["spec"]["containers"][1]["env"].append({
+                "name": "AUTRE",
+                "valueFrom": {"secretKeyRef": {
+                    "name": "ameesh-child-autre", "key": "api-key"}}})
+        with self.assertRaises(pod_provisioner.ProvisionerError):
+            self._tampered(mutate)
+
+    def test_une_commande_modifiee_est_refusee(self):
+        def mutate(raw):
+            raw["spec"]["containers"][1]["command"] = ["sh", "-ec", "cat /run/secrets/x"]
+        with self.assertRaises(pod_provisioner.ProvisionerError):
+            self._tampered(mutate)
+
 
 class PodManifestsTest(unittest.TestCase):
     def load(self, name):
@@ -259,6 +298,19 @@ class PodManifestsTest(unittest.TestCase):
         self.assertIn("ameesh-pod-provisioner", json.dumps(policy["spec"]["matchConditions"]))
         binding = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicyBinding")
         self.assertEqual(binding["spec"]["validationActions"], ["Deny"])
+
+    def test_vap_ferme_init_ephemeres_commandes_et_secrets(self):
+        """B3 (#7697) : un SA compromis ne peut ni ajouter de processus ni
+        référencer un Secret arbitraire ; la forme est celle du template."""
+        docs = self.load("validatingadmissionpolicy.yaml")
+        policy = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicy")
+        expressions = " ".join(v["expression"] for v in policy["spec"]["validations"])
+        for fragment in ("initContainers", "ephemeralContainers", "imagePullSecrets",
+                         "!has(v.secret)", "credential-secret", "secretKeyRef",
+                         "ameesh-db", "lifecycle", "envFrom", "command"):
+            self.assertIn(fragment, expressions)
+        self.assertIn("object.spec.containers[0].name == 'supervisor'", expressions)
+        self.assertIn("object.spec.containers[1].name == 'child'", expressions)
 
     def test_quota_borne_les_pods_et_les_configmaps(self):
         quota = self.load("resourcequota.yaml")[0]
@@ -390,6 +442,56 @@ class PodRequestDbTest(_CanonDbCase):
         self.assertEqual(storage.of(self.db).pod_hosts.get(row["host"])["state"],
                          "deleted")
         self.assertEqual(self.request()["state"], "deleted")
+
+    def _rendered(self, request=None):
+        return self.template.render(
+            request or self.request(), image="ameesh-runner", namespace="ameesh",
+            dsn="postgresql://ameesh@db/ameesh", now=time.time())
+
+    def test_reprise_adopte_le_pod_de_la_meme_demande(self):
+        """B4 (#7697) : une reprise lit `request-id` dans les annotations et
+        reprend le pod de la même demande sans le supprimer."""
+        self.spawn(pod_wait_s=0)
+        request = self.request()
+        rendered = self._rendered(request)
+        self.client.create_pod(rendered.pod)
+        started = self.provisioner().start_once()
+        self.assertIsNotNone(started)
+        self.assertEqual(started["state"], "running")
+        self.assertIn(rendered.pod_name, self.client.pods)
+        self.assertNotIn(rendered.pod_name, self.client.deleted_pods)
+
+    def test_un_pod_d_un_autre_parent_n_est_pas_supprime(self):
+        """B2 (#7697) : un conflit de nom sur le pod d'un tiers ne le supprime
+        pas et ne laisse pas la demande en vie."""
+        self.spawn(pod_wait_s=0)
+        request = self.request()
+        name = pod_provisioner.pod_name_for(request["id"])
+        self.client.create_pod({
+            "metadata": {
+                "name": name, "namespace": "ameesh",
+                "labels": {"ameesh.dev/host": "autre", "ameesh.dev/parent": "autre"},
+                "annotations": {"ameesh.dev/request-id": "autre"},
+            },
+            "spec": {"containers": []},
+        })
+        self.assertIsNone(self.provisioner().start_once())
+        self.assertIn(name, self.client.pods)
+        self.assertNotIn(name, self.client.deleted_pods)
+        self.assertEqual(self.request()["state"], "failed")
+
+    def test_une_configmap_d_un_autre_n_est_pas_supprimee(self):
+        """B2 (#7697) : une ConfigMap sans notre `request-id` n'est jamais
+        écrasée ni supprimée par le nettoyage d'échec."""
+        self.spawn(pod_wait_s=0)
+        rendered = self._rendered()
+        other = copy.deepcopy(rendered.configmap)
+        other["data"]["passwd"] = "autre"
+        other["metadata"]["labels"]["ameesh.dev/request-id"] = "autre"
+        self.client.configmaps[rendered.configmap_name] = other
+        self.assertIsNone(self.provisioner().start_once())
+        self.assertIn(rendered.configmap_name, self.client.configmaps)
+        self.assertNotIn(rendered.configmap_name, self.client.deleted_configmaps)
 
     def test_refus_sans_pourvoyeur_vivant(self):
         self.db.execute("UPDATE pod_templates SET last_seen_at = now() - interval '10 minutes'")

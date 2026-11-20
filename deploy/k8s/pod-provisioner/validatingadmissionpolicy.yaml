@@ -7,6 +7,13 @@
 # un conteneur privilégié ou qui escalade, un pod sans limites, un pod sans
 # les labels qui permettent au nettoyage de vérifier le parent, une deadline
 # hors bornes. Le template est la source ; la VAP est le filet.
+#
+# B3 (#7697) : la forme est fermée aux deux conteneurs du template — aucun
+# initContainer ni conteneur éphémère, commandes figées, aucun `envFrom`, et
+# les seules sources de Secret admises sont le mot de passe base (`ameesh-db`)
+# et le Secret de CET enfant (annotation `ameesh.dev/credential-secret`, nom
+# `ameesh-child-*`). Un SA compromis ne peut donc pas ajouter un processus
+# d'exfiltration ni référencer un Secret arbitraire dans les conteneurs.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -35,8 +42,12 @@ spec:
     - expression: >-
         object.metadata.?labels['ameesh.dev/host'].orValue('') != '' &&
         object.metadata.?labels['ameesh.dev/parent'].orValue('') != '' &&
-        object.metadata.?labels['ameesh.dev/child'].orValue('') != ''
-      message: "an ameesh child pod must label its host, parent and child"
+        object.metadata.?labels['ameesh.dev/child'].orValue('') != '' &&
+        object.metadata.?annotations['ameesh.dev/tenant'].orValue('') != ''
+      message: "an ameesh child pod must label its host, parent and child, and annotate its tenant"
+    - expression: >-
+        object.metadata.?annotations['ameesh.dev/credential-secret'].orValue('').matches('^ameesh-child-[a-z0-9]([-a-z0-9]*[a-z0-9])?-[0-9a-f]{8}$')
+      message: "an ameesh child pod must annotate its own ameesh-child-* credential Secret"
     - expression: "object.spec.restartPolicy == 'Never'"
       message: "an ameesh child pod must use restartPolicy Never"
     - expression: "object.spec.serviceAccountName == 'ameesh-child'"
@@ -49,13 +60,39 @@ spec:
         (!has(object.spec.hostIPC) || object.spec.hostIPC == false)
       message: "an ameesh child pod must not share a host namespace"
     - expression: >-
-        object.spec.volumes.all(v, !has(v.hostPath) && !has(v.persistentVolumeClaim))
-      message: "an ameesh child pod never mounts a hostPath or a parent PVC"
-    - expression: "object.spec.containers.size() == 2"
+        (!has(object.spec.initContainers) || object.spec.initContainers.size() == 0) &&
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.size() == 0)
+      message: "an ameesh child pod may not add init or ephemeral containers"
+    - expression: >-
+        !has(object.spec.imagePullSecrets) || object.spec.imagePullSecrets.size() == 0
+      message: "an ameesh child pod may not add imagePullSecrets"
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v,
+          !has(v.hostPath) && !has(v.persistentVolumeClaim) && !has(v.secret) &&
+          (has(v.emptyDir) || has(v.configMap)))
+      message: "an ameesh child pod only mounts emptyDir and its own ConfigMap"
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v,
+          !has(v.configMap) ||
+          v.configMap.name == object.metadata.?annotations['ameesh.dev/configmap'].orValue(''))
+      message: "an ameesh child pod only mounts its own ConfigMap"
+    - expression: >-
+        object.spec.containers.size() == 2 &&
+        object.spec.containers[0].name == 'supervisor' &&
+        object.spec.containers[1].name == 'child'
       message: "an ameesh child pod has exactly the supervisor and the child containers"
+    - expression: >-
+        object.spec.containers[0].command == ['sh', '-ec', 'umask 077; exec ameesh run --poll 5'] &&
+        object.spec.containers[1].workingDir.startsWith('/home/') &&
+        !object.spec.containers[1].workingDir.contains("'") &&
+        object.spec.containers[1].command == ['sh', '-ec', "mkdir -p '" + object.spec.containers[1].workingDir + "' && umask 077 && exec ameesh run --poll 5"]
+      message: "the supervisor and child commands are the frozen template's"
     - expression: >-
         object.spec.containers.all(c,
           c.image.startsWith('ameesh-runner') &&
+          !has(c.args) && !has(c.lifecycle) && !has(c.envFrom) &&
           has(c.securityContext) &&
           c.securityContext.runAsNonRoot == true &&
           c.securityContext.allowPrivilegeEscalation == false &&
@@ -66,6 +103,19 @@ spec:
           has(c.resources) && has(c.resources.limits) &&
           has(c.resources.limits.cpu) && has(c.resources.limits.memory))
       message: "every ameesh child container must be non-root, non-privileged, read-only, drop ALL, and set cpu/memory limits"
+    - expression: >-
+        object.spec.containers.all(c,
+          (!has(c.env) || c.env.all(e,
+            !has(e.valueFrom) ||
+            (has(e.valueFrom.secretKeyRef) &&
+              ((e.valueFrom.secretKeyRef.name == 'ameesh-db' &&
+                e.valueFrom.secretKeyRef.key == 'password') ||
+               (e.valueFrom.secretKeyRef.name ==
+                  object.metadata.?annotations['ameesh.dev/credential-secret'].orValue('') &&
+                e.valueFrom.secretKeyRef.key == 'api-key'))) ||
+            (has(e.valueFrom.fieldRef) &&
+             e.valueFrom.fieldRef.fieldPath == 'metadata.uid'))))
+      message: "an ameesh child pod may only read the database password and its own credential Secret"
     - expression: "object.spec.securityContext.runAsNonRoot == true"
       message: "an ameesh child pod must run as non-root"
     - expression: >-

@@ -6,9 +6,11 @@
 # Placeholders connus : voir ALLOWED_PLACEHOLDERS dans src/ameesh/pod_provisioner.py.
 #
 # Aucun PVC, aucun hostPath, aucun volume du parent : le home et le worktree
-# sont des emptyDir propres à ce pod (design 7633 §8.4). Le seul secret monté
-# est celui de la clé d'API d'organisation de CET enfant, référencé par son
-# nom (`{{CREDENTIAL_SECRET}}`) ; le pourvoyeur ne le lit jamais.
+# sont des emptyDir propres à ce pod (design 7633 §8.4). Les seuls Secrets
+# référencés sont le mot de passe base (`ameesh-db`) et celui de la clé d'API
+# d'organisation de CET enfant, par son nom (`{{CREDENTIAL_SECRET}}`) ; le
+# pourvoyeur ne les lit jamais. Aucun `initContainer`/`ephemeralContainer`,
+# aucune source de Secret arbitraire : le template et la VAP ferment la forme.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -21,11 +23,15 @@ metadata:
     ameesh.dev/host: "{{HOST}}"
     ameesh.dev/parent: "{{PARENT}}"
     ameesh.dev/child: "{{CHILD}}"
-    ameesh.dev/tenant: "{{TENANT}}"
     ameesh.dev/template: "{{TEMPLATE}}"
   annotations:
+    # `human:<id>` contient `:`, interdit dans une valeur de label : le tenant
+    # reste lisible en annotation, jamais en label.
+    ameesh.dev/tenant: "{{TENANT}}"
     ameesh.dev/request-id: "{{REQUEST_ID}}"
     ameesh.dev/expires-at: "{{EXPIRES_AT}}"
+    ameesh.dev/credential-secret: "{{CREDENTIAL_SECRET}}"
+    ameesh.dev/configmap: "{{CONFIGMAP}}"
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false

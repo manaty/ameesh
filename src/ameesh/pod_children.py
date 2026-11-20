@@ -53,15 +53,16 @@ def ready(db):
 
 
 def fingerprint(request: dict) -> str:
-    """Empreinte de la demande : ce que le pourvoyeur peut re-vérifier."""
+    """Empreinte de la demande : ce que le pourvoyeur peut re-vérifier.
+
+    Le TTL (`expires_ts`) est volontairement exclu : `timestamptz` arrondit à
+    la microseconde et l'aller-retour base rendait l'empreinte instable au
+    voisinage d'une demi-microseconde. Le TTL est lu dans la ligne, jamais
+    déduit de l'empreinte."""
     payload = {key: request.get(key) for key in (
         "child", "parent", "tenant", "host", "template", "namespace", "harness",
         "credential_secret", "uid", "unix_user", "runner_id", "profile",
-        "requested_by", "expires_ts")}
-    # `timestamptz` garde la microseconde : l'aller-retour base arrondit le
-    # `time.time()` d'origine, l'empreinte doit être stable des deux côtés.
-    if payload.get("expires_ts") is not None:
-        payload["expires_ts"] = round(float(payload["expires_ts"]), 6)
+        "requested_by")}
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"),
                    default=str).encode("utf-8")).hexdigest()

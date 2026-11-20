@@ -36,7 +36,7 @@ enfant** ; le relais de modèle viendra dans une tranche suivante.
 | `ConfigMap/ameesh-pod-provisioner-template` | le template figé, généré par kustomize |
 | `ServiceAccount/ameesh-pod-provisioner` + `Role`/`RoleBinding` | pods et ConfigMap seulement, dans le namespace |
 | `ServiceAccount/ameesh-child` | aucun droit, aucun jeton monté |
-| `ValidatingAdmissionPolicy` + binding | refuse un pod hors template même si le SA est compromis |
+| `ValidatingAdmissionPolicy` + binding | refuse un pod hors template même si le SA est compromis : deux conteneurs nommés, commandes figées, aucun init/éphémère, aucun Secret hors `ameesh-db` et du Secret `ameesh-child-*` de l'enfant |
 | `ResourceQuota/ameesh-pod-children` | borne le nombre et les ressources des enfants |
 | `template.yaml` | 2 conteneurs (`supervisor`, `child`), `emptyDir`, UID enfant 30000+, aucun PVC/hostPath |
 
