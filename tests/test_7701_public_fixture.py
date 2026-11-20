@@ -10,8 +10,10 @@ the standard library, and it runs the installed executables as subprocesses.
 
 These tests freeze the boundary before the database test: the name derivation,
 the refusals, the path and view allowlists, the witness imports.  The database
-test requires ``AMEESH_TEST_DSN`` (never ``AMEESH_DSN``: that variable may name
-the live mesh database) and proves that the witness ran on a fresh
+test uses ``AMEESH_TEST_DSN`` when it is set, else the suite bench
+(``tests.support.TEST_DSN``, never the ambient ``AMEESH_DSN``: that variable
+may name the live mesh database); both name a server whose role may
+``CREATE DATABASE``.  It proves that the witness ran on a fresh
 ``ameesh_fixture_*`` database and that the database is gone afterwards.  The
 deliberate-break test mutates a copy of the surface and requires the frozen
 comparator of :mod:`tests.test_7665_module_contract` to name the break.
@@ -39,8 +41,10 @@ from ameesh.public import fixture as fixture_mod
 ROOT = Path(__file__).resolve().parents[1]
 WITNESS = ROOT / "examples" / "fixtures" / "public-fixture-witness"
 WITNESS_FILE = WITNESS / "fixture_witness.py"
-#: Explicitly the bench variable, never AMEESH_DSN (#7701 safety decision).
-ADMIN = os.environ.get("AMEESH_TEST_DSN", "")
+#: The explicit test DSN when the run carries one, else the suite bench
+#: (#7952: the composer's local series have no explicit DSN).  Never the ambient
+#: AMEESH_DSN, which may name the live mesh database (#7701 safety decision).
+ADMIN = os.environ.get("AMEESH_TEST_DSN") or support.TEST_DSN
 DATABASE_NAME = re.compile(r"^ameesh_fixture_[a-z0-9_]{4,64}$")
 #: core tables: the fixture hands back one opaque connection, never SQL access.
 CORE_TABLES = ("work_items", "agent_mailbox", "agent_registry", "spend_pending",
@@ -281,7 +285,7 @@ class WitnessBoundaryTest(unittest.TestCase):
         self.assertNotIn(ROOT / "tests", WITNESS.parents)
 
 
-@unittest.skipUnless(ADMIN, "AMEESH_TEST_DSN is required: a DSN allowed to CREATE DATABASE")
+@unittest.skipUnless(support.REQUIRE_DB, "banc Postgres requis (AMEESH_REQUIRE_DB=0)")
 class FixtureDatabaseTest(unittest.TestCase):
     """The external witness qualifies through the published fixture only."""
 
