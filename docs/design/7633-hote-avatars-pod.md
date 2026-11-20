@@ -1066,10 +1066,11 @@ agents différents ; P5 dépend des deux.
   pourvoyeur avec `ameesh_pod_provisioner` (UPDATE borné aux colonnes
   d'exploitation de `pod_requests`) : `deploy/sql/role-pod-provisioner.sql`
   et son contrat font de la source d'autorisation une ACL PostgreSQL, pas un
-  drapeau applicatif. Une RLS restrictive borne en plus ses écritures de
+  drapeau applicatif. Des triggers bornent en plus ses écritures de
   liaison (`pod_hosts`, `host_tenancy`, `host_tenants`) aux hôtes de ses
-  propres demandes : la politique des hôtes VM partagés reste hors de sa
-  portée. Le reste du mesh garde le rôle partagé `ameesh` (limite L155).
+  propres demandes et aux valeurs de la demande : la politique des hôtes VM
+  partagés, la durée et les identités restent hors de sa portée. Le reste du
+  mesh garde le rôle partagé `ameesh` (limite L155).
 - **Estimation** : 3 j pour #7633 est sous-évalué ; le pilote doit
   réestimer ou réduire le périmètre.
 

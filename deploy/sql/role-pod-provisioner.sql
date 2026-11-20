@@ -14,8 +14,9 @@
 -- larges est donc ramené au contrat, jamais laissé tel quel.
 --
 -- Le pourvoyeur ne peut PAS modifier les champs d'autorisation d'une demande
--- et ses écritures de liaison sont bornées par RLS aux hôtes de ses propres
--- demandes (`pod_scope_provisioner`), jamais à un hôte VM partagé.
+-- et ses écritures de liaison sont bornées par des triggers aux hôtes de ses
+-- propres demandes et aux valeurs de la demande (`ameesh_pod_write_guard`),
+-- jamais à un hôte VM partagé, une durée prolongée ou un autre tenant.
 -- (`tenant`, `enfant`, `Secret`, `expires_at`, etc.) : son UPDATE est borné
 -- aux colonnes d'exploitation. Le webhook, lui, n'a que SELECT sur
 -- `pod_requests` : sa source d'autorisation est en lecture seule au niveau
@@ -99,24 +100,87 @@ BEGIN
     -- disparu ; deux colonnes suffisent.
     EXECUTE format('GRANT SELECT (name, host) ON %I.agent_registry TO %I', s, r);
 
-    -- #44568/#44569 : les tables de liaison portent la politique de TOUS les
-    -- hôtes, pods et VM. Le pourvoyeur n'écrit que pour les hôtes de ses
-    -- propres demandes. RLS : policy permissive pour tous (comportement
-    -- inchangé ; le propriétaire la contourne) + policy restrictive pour le
-    -- seul rôle du pourvoyeur, bornée par `pod_requests.host` (unique et
-    -- non modifiable par ce rôle).
+    -- #44568/#44569/#44574 : les tables de liaison portent la politique de
+    -- TOUS les hôtes, pods et VM. Le pourvoyeur n'écrit que pour les hôtes de
+    -- ses propres demandes, et seulement avec les valeurs de la demande.
+    -- Des triggers (et non une RLS : l'audit de sauvegarde #5162 refuse toute
+    -- table sous RLS) bornent l'hôte et vérifient chaque champ autorisé.
+    EXECUTE format($ddl$
+        CREATE OR REPLACE FUNCTION %I.ameesh_pod_write_guard()
+        RETURNS trigger LANGUAGE plpgsql
+        SET search_path = %I, pg_catalog, pg_temp
+        AS $body$
+        DECLARE
+            req record;
+        BEGIN
+            -- Les autres rôles (propriétaire, sauvegarde, exécuteurs) gardent
+            -- leurs écritures ; seul le rôle du pourvoyeur est borné.
+            IF current_user <> %L THEN
+                IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+                RETURN NEW;
+            END IF;
+            IF TG_OP = 'DELETE' THEN
+                IF NOT EXISTS (SELECT 1 FROM pod_requests WHERE host = OLD.host) THEN
+                    RAISE EXCEPTION 'pod provisioner write outside its pod request'
+                        USING ERRCODE = '42501';
+                END IF;
+                RETURN OLD;
+            END IF;
+            IF TG_OP = 'UPDATE' AND NEW.host IS DISTINCT FROM OLD.host THEN
+                RAISE EXCEPTION 'pod provisioner may not move a host row'
+                    USING ERRCODE = '42501';
+            END IF;
+            SELECT * INTO req FROM pod_requests WHERE host = NEW.host;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'pod provisioner write outside its pod request'
+                    USING ERRCODE = '42501';
+            END IF;
+            IF TG_TABLE_NAME = 'pod_hosts' THEN
+                IF NEW.namespace IS DISTINCT FROM req.namespace
+                   OR NEW.template IS DISTINCT FROM req.template
+                   OR NEW.parent IS DISTINCT FROM req.parent
+                   OR NEW.tenant IS DISTINCT FROM req.tenant
+                   OR NEW.uid IS DISTINCT FROM req.uid
+                   OR NEW.runner_id IS DISTINCT FROM req.runner_id
+                   OR NEW.expires_at IS DISTINCT FROM req.expires_at THEN
+                    RAISE EXCEPTION 'pod host fields differ from the pod request'
+                        USING ERRCODE = '42501';
+                END IF;
+            ELSIF TG_TABLE_NAME = 'host_tenancy' THEN
+                IF NEW.canon IS DISTINCT FROM 'pod:' || req.template
+                   OR NEW.shared IS DISTINCT FROM true
+                   OR NEW.tenants IS DISTINCT FROM ARRAY[req.tenant]
+                   OR NEW.canon_ref IS DISTINCT FROM 'pod-request:' || req.id::text THEN
+                    RAISE EXCEPTION 'host tenancy differs from the pod request'
+                        USING ERRCODE = '42501';
+                END IF;
+            ELSIF TG_TABLE_NAME = 'host_tenants' THEN
+                IF NEW.tenant IS DISTINCT FROM req.tenant
+                   OR NEW.uid IS DISTINCT FROM req.uid
+                   OR NEW.unix_user IS DISTINCT FROM req.unix_user
+                   OR NEW.runner_id IS DISTINCT FROM req.runner_id THEN
+                    RAISE EXCEPTION 'host tenant differs from the pod request'
+                        USING ERRCODE = '42501';
+                END IF;
+            END IF;
+            RETURN NEW;
+        END
+        $body$;
+    $ddl$, s, s, r);
     FOR item IN
         SELECT unnest(ARRAY['pod_hosts', 'host_tenancy', 'host_tenants']) AS rel
     LOOP
-        EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', s, item.rel);
+        EXECUTE format('DROP TRIGGER IF EXISTS pod_scope_guard ON %I.%I',
+                       s, item.rel);
+        EXECUTE format('CREATE TRIGGER pod_scope_guard BEFORE INSERT OR UPDATE '
+                       'OR DELETE ON %I.%I FOR EACH ROW EXECUTE FUNCTION '
+                       '%I.ameesh_pod_write_guard()', s, item.rel, s);
+        -- Une RLS laissée par une version antérieure du script est retirée :
+        -- l'audit #5162 refuse une relation sous RLS.
         EXECUTE format('DROP POLICY IF EXISTS pod_scope_open ON %I.%I', s, item.rel);
-        EXECUTE format('CREATE POLICY pod_scope_open ON %I.%I FOR ALL TO PUBLIC '
-                       'USING (true) WITH CHECK (true)', s, item.rel);
-        EXECUTE format('DROP POLICY IF EXISTS pod_scope_provisioner ON %I.%I', s, item.rel);
-        EXECUTE format('CREATE POLICY pod_scope_provisioner ON %I.%I AS RESTRICTIVE '
-                       'FOR ALL TO %I USING (host IN (SELECT host FROM %I.pod_requests)) '
-                       'WITH CHECK (host IN (SELECT host FROM %I.pod_requests))',
-                       s, item.rel, r, s, s);
+        EXECUTE format('DROP POLICY IF EXISTS pod_scope_provisioner ON %I.%I',
+                       s, item.rel);
+        EXECUTE format('ALTER TABLE %I.%I DISABLE ROW LEVEL SECURITY', s, item.rel);
     END LOOP;
 
     -- Ce que le pourvoyeur n'a jamais : créer ou supprimer une demande,

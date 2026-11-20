@@ -175,34 +175,34 @@ BEGIN
         END LOOP;
     END LOOP;
 
-    -- #44568/#44569 : RLS active sur les trois tables de liaison, policy
-    -- permissive pour tous, policy restrictive pour le seul pourvoyeur,
-    -- bornée par les hôtes de `pod_requests`.
+    -- #44568/#44569/#44574 : triggers de borne (hôte + valeurs de la
+    -- demande), et aucune RLS : l'audit de sauvegarde #5162 refuse une table
+    -- sous RLS.
     FOR item IN
         SELECT unnest(ARRAY['pod_hosts', 'host_tenancy', 'host_tenants']) AS rel
     LOOP
-        IF NOT EXISTS (SELECT FROM pg_class c
-                        WHERE c.relnamespace = n AND c.relname = item.rel
-                          AND c.relkind IN ('r', 'p') AND c.relrowsecurity) THEN
-            errors := errors || format('RLS missing %s', item.rel);
+        IF NOT EXISTS (
+            SELECT FROM pg_trigger t
+              JOIN pg_class c ON c.oid = t.tgrelid
+              JOIN pg_namespace ns ON ns.oid = c.relnamespace
+             WHERE ns.nspname = s AND c.relname = item.rel
+               AND t.tgname = 'pod_scope_guard'
+               AND NOT t.tgisinternal AND t.tgenabled IN ('O', 'A', 'R')) THEN
+            errors := errors || format('guard trigger missing %s', item.rel);
         END IF;
-        IF NOT EXISTS (SELECT FROM pg_policies p
-                        WHERE p.schemaname = s AND p.tablename = item.rel
-                          AND p.policyname = 'pod_scope_provisioner'
-                          AND p.permissive = 'RESTRICTIVE'
-                          AND r = ANY (p.roles)
-                          AND p.qual LIKE '%pod_requests%'
-                          AND p.with_check LIKE '%pod_requests%') THEN
-            errors := errors || format('restrictive policy missing %s', item.rel);
-        END IF;
-        IF NOT EXISTS (SELECT FROM pg_policies p
-                        WHERE p.schemaname = s AND p.tablename = item.rel
-                          AND p.policyname = 'pod_scope_open'
-                          AND p.permissive = 'PERMISSIVE'
-                          AND 'public' = ANY (p.roles)) THEN
-            errors := errors || format('permissive policy missing %s', item.rel);
+        IF EXISTS (SELECT FROM pg_class c
+                    WHERE c.relnamespace = n AND c.relname = item.rel
+                      AND c.relrowsecurity) THEN
+            errors := errors || format('RLS unexpected %s', item.rel);
         END IF;
     END LOOP;
+    IF NOT EXISTS (
+        SELECT FROM pg_proc p JOIN pg_namespace ns ON ns.oid = p.pronamespace
+         WHERE ns.nspname = s AND p.proname = 'ameesh_pod_write_guard'
+           AND NOT p.prosecdef
+           AND pg_get_functiondef(p.oid) LIKE '%pod_requests%') THEN
+        errors := errors || 'pod write guard function missing';
+    END IF;
 
     IF array_length(errors, 1) > 0 THEN
         RAISE EXCEPTION 'contract refused: %', array_to_string(errors, '; ');

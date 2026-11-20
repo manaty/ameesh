@@ -1049,9 +1049,25 @@ class PodRoleSqlTest(PgTestCase):
             " 'ameesh-child-enfant1', 30001, 'enfant1', 'runner1', %s,"
             " 'avatar', clock_timestamp() + interval '1 hour')", ("b" * 64,))
         self.db.execute(
+            "INSERT INTO pod_requests (child, parent, tenant, host, template,"
+            " namespace, harness, credential_secret, uid, unix_user, runner_id,"
+            " fingerprint, requested_by, expires_at) VALUES ('enfant2',"
+            " 'avatar', 'human:alice', 'hote2', 'child-pod', 'ameesh', 'claude',"
+            " 'ameesh-child-enfant2', 30002, 'enfant2', 'runner2', %s,"
+            " 'avatar', clock_timestamp() + interval '1 hour')", ("d" * 64,))
+        self.db.execute(
+            "INSERT INTO pod_hosts (host, namespace, template, parent, tenant,"
+            " uid, runner_id, pod_uid, state, requested_at, started_at,"
+            " expires_at) SELECT host, namespace, template, parent, tenant, uid,"
+            " runner_id, 'uid-hote1', 'running', requested_at, requested_at,"
+            " expires_at FROM pod_requests WHERE host='hote1'")
+        self.db.execute(
             "INSERT INTO host_tenancy (host, canon, shared, tenants, canon_ref)"
-            " VALUES ('hote1', 'pod:child-pod', true, ARRAY['human:alice'],"
-            " 'pod-request:test'), ('vm-partage', 'canon:atelier', true,"
+            " SELECT host, 'pod:' || template, true, ARRAY[tenant],"
+            " 'pod-request:' || id::text FROM pod_requests WHERE host='hote1'")
+        self.db.execute(
+            "INSERT INTO host_tenancy (host, canon, shared, tenants, canon_ref)"
+            " VALUES ('vm-partage', 'canon:atelier', true,"
             " ARRAY['human:alice'], 'vm')")
         self.db.execute(
             "INSERT INTO host_tenants (host, tenant, unix_user, uid, runner_id,"
@@ -1107,8 +1123,8 @@ class PodRoleSqlTest(PgTestCase):
         self.assertIn("permission denied", write.stderr)
 
     def test_hosts_vm_hors_de_portee(self):
-        """#44568/#44569 : la RLS du rôle ne voit que les hôtes des demandes
-        pod. Un hôte VM partagé n'est ni modifiable ni supprimable."""
+        """#44568/#44569 : le trigger du rôle refuse tout hôte qui n'est pas
+        dans `pod_requests`. Un hôte VM partagé reste intact."""
         for sql in (
                 "DELETE FROM host_tenants WHERE host='vm-partage';",
                 "UPDATE host_tenants SET uid=49999 WHERE host='vm-partage';",
@@ -1116,7 +1132,8 @@ class PodRoleSqlTest(PgTestCase):
                 "UPDATE host_tenancy SET shared=false WHERE host='vm-partage';"):
             with self.subTest(sql=sql):
                 result = self.role_sql(sql)
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("outside its pod request", result.stderr)
         rows = self.db.query(
             "SELECT uid FROM host_tenants WHERE host='vm-partage'")
         self.assertEqual(rows[0]["uid"], 40001)
@@ -1124,35 +1141,61 @@ class PodRoleSqlTest(PgTestCase):
             "SELECT shared FROM host_tenancy WHERE host='vm-partage'")
         self.assertTrue(rows[0]["shared"])
 
-    def test_rls_refuse_une_liaison_hors_demande(self):
+    def test_trigger_refuse_une_liaison_hors_demande(self):
         move = self.role_sql(
             "UPDATE host_tenants SET host='vm-autre' WHERE host='hote1';")
         self.assertNotEqual(move.returncode, 0)
-        self.assertIn("row-level security", move.stderr)
+        self.assertIn("may not move a host row", move.stderr)
         insert = self.role_sql(
             "INSERT INTO pod_hosts (host, namespace, template, parent, tenant,"
             " uid, runner_id, pod_uid, state, expires_at) VALUES ('vm-partage',"
             " 'ameesh', 'child-pod', 'avatar', 'human:alice', 40001, 'runner-vm',"
             " 'uid-vm', 'requested', clock_timestamp() + interval '1 hour');")
         self.assertNotEqual(insert.returncode, 0)
-        self.assertIn("row-level security", insert.stderr)
+        self.assertIn("outside its pod request", insert.stderr)
+
+    def test_valeurs_bornees_par_la_demande(self):
+        """#44574 : la durée, le tenant, l'UID et le runner d'un hôte pod ne
+        peuvent pas diverger des champs autorisés de sa demande."""
+        cases = (
+            ("pod_hosts",
+             "UPDATE pod_hosts SET expires_at = expires_at + interval '1 hour'"
+             " WHERE host='hote1';", "pod host fields differ"),
+            ("host_tenants",
+             "UPDATE host_tenants SET uid=39999 WHERE host='hote1';",
+             "host tenant differs"),
+            ("host_tenancy",
+             "UPDATE host_tenancy SET tenants=ARRAY['human:mallory']"
+             " WHERE host='hote1';", "host tenancy differs"),
+        )
+        for table, sql, message in cases:
+            with self.subTest(table=table):
+                result = self.role_sql(sql)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(message, result.stderr)
 
     def test_hosts_pod_modifiables(self):
         update = self.role_sql(
-            "UPDATE host_tenants SET runner_id='runner1b' WHERE host='hote1';")
+            "UPDATE host_tenants SET registered_at=clock_timestamp()"
+            " WHERE host='hote1';")
         self.assertEqual(update.returncode, 0, update.stderr)
-        rows = self.db.query(
-            "SELECT runner_id FROM host_tenants WHERE host='hote1'")
-        self.assertEqual(rows[0]["runner_id"], "runner1b")
+        update = self.role_sql(
+            "UPDATE host_tenancy SET synced_at=clock_timestamp()"
+            " WHERE host='hote1';")
+        self.assertEqual(update.returncode, 0, update.stderr)
+        state = self.role_sql(
+            "UPDATE pod_hosts SET state='running', pod_uid='uid-hote1b'"
+            " WHERE host='hote1';")
+        self.assertEqual(state.returncode, 0, state.stderr)
         insert = self.role_sql(
             "INSERT INTO pod_hosts (host, namespace, template, parent, tenant,"
-            " uid, runner_id, pod_uid, state, expires_at) VALUES ('hote1',"
-            " 'ameesh', 'child-pod', 'avatar', 'human:alice', 30001, 'runner1',"
-            " 'uid-pod', 'requested', clock_timestamp() + interval '1 hour');")
+            " uid, runner_id, pod_uid, state, requested_at, started_at,"
+            " expires_at) SELECT host, namespace, template, parent, tenant, uid,"
+            " runner_id, 'uid-hote2', 'requested', requested_at, requested_at,"
+            " expires_at FROM pod_requests WHERE host='hote2';")
         self.assertEqual(insert.returncode, 0, insert.stderr)
         rows = self.db.query("SELECT count(*) AS n FROM pod_hosts")
-        self.assertEqual(rows[0]["n"], 1)
-
+        self.assertEqual(rows[0]["n"], 2)
     def test_contrat(self):
         result = self.script("_contrat-pod-provisioner.sql")
         self.assertEqual(result.returncode, 0, result.stderr)
