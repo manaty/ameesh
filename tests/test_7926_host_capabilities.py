@@ -20,7 +20,8 @@ from unittest import mock
 from ameesh import agent_observation, canon, host_capabilities, placement
 
 from .support import REPO
-from .test_canon import _TmpMixin, codes, fiche, write
+from .test_canon import (_TmpMixin, codes, commit_all, fiche, git, publish,
+                         write)
 
 HOSTE = """---
 type: Host
@@ -36,8 +37,8 @@ def group(name: str, gid: int) -> types.SimpleNamespace:
     return types.SimpleNamespace(gr_name=name, gr_gid=gid)
 
 
-def passwd(name: str, gid: int = 1000) -> types.SimpleNamespace:
-    return types.SimpleNamespace(pw_name=name, pw_gid=gid)
+def passwd(name: str, gid: int = 1000, uid: int = 1000) -> types.SimpleNamespace:
+    return types.SimpleNamespace(pw_name=name, pw_gid=gid, pw_uid=uid)
 
 
 # ==========================================================================
@@ -114,11 +115,14 @@ class FakeHost:
     """Un hôte simulé : comptes, groupes et /dev/kvm injectés."""
 
     def __init__(self, *, user: str = "ameesh", groups=("kvm",),
-                 memberships=("kvm",), device=True, mode=0o660, gid=993):
+                 memberships=("kvm",), device=True, mode=0o660, gid=993,
+                 uid=4242, process_groups=("kvm",)):
         self.user = user
+        self.uid = uid
         self.groups = {name: group(name, 900 + index)
                        for index, name in enumerate(groups)}
         self.memberships = list(memberships)
+        self.process_groups = set(process_groups)
         self.device = device
         self.mode = mode
         self.gid = gid
@@ -126,7 +130,7 @@ class FakeHost:
     def pwnam(self, name: str):
         if name != self.user:
             raise KeyError(name)
-        return passwd(name)
+        return passwd(name, uid=self.uid)
 
     def grnam(self, name: str):
         if name not in self.groups:
@@ -153,6 +157,8 @@ class FakeHost:
             st_gid=self.gid)
 
     def probe(self, capabilities, **kwargs):
+        kwargs.setdefault("euid", self.uid)
+        kwargs.setdefault("process_groups", self.process_groups)
         return host_capabilities.probe(
             capabilities, pwnam=self.pwnam, grnam=self.grnam,
             grgid=self.grgid, grouplist=self.grouplist, stat=self.stat, **kwargs)
@@ -203,6 +209,29 @@ class ProbeTest(unittest.TestCase):
         self.assertIn("granted to ameesh but no capability is declared",
                       " ".join(result["warnings"]))
 
+    def test_the_account_group_not_yet_in_the_process_needs_a_restart(self):
+        # usermod a accordé kvm, mais l'exécuteur a été lancé avant : le
+        # docteur ne doit pas se dire vert sans le dire (N2 de #7926).
+        result = FakeHost(process_groups=()).probe(["android-emulator"],
+                                                   user="ameesh")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["process_missing"], ["kvm"])
+        self.assertIn("restart it (ameesh-runner-agent@", " ".join(result["warnings"]))
+
+    def test_a_restarted_process_carries_no_restart_warning(self):
+        result = FakeHost(process_groups=("kvm",)).probe(["android-emulator"],
+                                                         user="ameesh")
+        self.assertEqual(result["process_missing"], [])
+        self.assertNotIn("restart", " ".join(result["warnings"]))
+
+    def test_another_process_uid_does_not_speak_for_the_executors(self):
+        # root (ou un autre compte) ne peut pas conclure sur les groupes des
+        # exécuteurs : pas d'avertissement de redémarrage depuis son processus.
+        result = FakeHost(process_groups=()).probe(["android-emulator"],
+                                                   user="ameesh", euid=0)
+        self.assertEqual(result["process_missing"], [])
+        self.assertNotIn("restart", " ".join(result["warnings"]))
+
     def test_a_world_writable_device_is_a_warning_not_a_ko(self):
         result = FakeHost(mode=0o666).probe(["android-emulator"], user="ameesh")
         self.assertTrue(result["ok"], result)
@@ -252,6 +281,16 @@ class DoctorTest(unittest.TestCase):
             "groups": []})
         self.assertFalse(ko)
         self.assertIn("warning", lines[0])
+
+    def test_the_line_says_when_the_executors_need_a_restart(self):
+        ko, lines = self.doctor([self.card("android-emulator")], {
+            "problems": [], "groups": ["kvm"],
+            "warnings": ["group kvm is granted to ameesh but not yet in the "
+                         "executor process: restart it "
+                         "(ameesh-runner-agent@<agent>.service) to use /dev/kvm"]})
+        self.assertFalse(ko)
+        self.assertIn("warning", lines[0])
+        self.assertIn("restart it", lines[0])
 
     def test_no_card_or_no_host_says_nothing(self):
         self.assertEqual(self.doctor([], {"problems": [], "warnings": [],
@@ -328,24 +367,91 @@ class CardTest(_TmpMixin, unittest.TestCase):
         return types.SimpleNamespace(canon=root or self.root, canon_ref="",
                                      canon_untrusted=True)
 
+    def repo(self):
+        """Un canon git avec sa branche relue `origin/main`."""
+        _bare, clone = publish(self.root, "canon")
+        return clone
+
     def test_card_reads_the_declaration(self):
         write(self.root, "hotes/ag3.md",
               HOSTE % ("ameesh-agents-3", "capabilities: [android-emulator]\n"))
-        data, path = host_capabilities.card(self.root, "ameesh-agents-3")
+        data, path = host_capabilities.card(self.root, "ameesh-agents-3",
+                                            untrusted=True)
         self.assertIsNotNone(data)
         self.assertTrue(path.endswith("hotes/ag3.md"))
         self.assertEqual(host_capabilities.from_card(data),
                          (["android-emulator"], [], []))
 
+    def test_card_reads_the_reviewed_head_not_the_working_tree(self):
+        # N3 de #7926 : ameesh peut réécrire son arbre de travail ; root ne
+        # doit lire la déclaration que dans le commit poussé (`origin/main`).
+        clone = self.repo()
+        write(clone, "hotes/ag3.md",
+              HOSTE % ("ameesh-agents-3", "capabilities: [android-emulator]\n"))
+        commit_all(clone)
+        # l'arbre de travail dit le contraire, sans commit : il est ignoré
+        write(clone, "hotes/ag3.md", HOSTE % ("ameesh-agents-3", ""))
+        data, path = host_capabilities.card(clone, "ameesh-agents-3")
+        self.assertEqual(path, "hotes/ag3.md")
+        self.assertEqual(host_capabilities.from_card(data),
+                         (["android-emulator"], [], []))
+
+    def test_card_ignores_a_local_commit_that_was_never_pushed(self):
+        clone = self.repo()
+        write(clone, "hotes/ag3.md", HOSTE % ("ameesh-agents-3", ""))
+        commit_all(clone)
+        write(clone, "hotes/ag3.md",
+              HOSTE % ("ameesh-agents-3", "capabilities: [android-emulator]\n"))
+        git(clone, "add", "-A")
+        git(clone, "commit", "-q", "-m", "local, jamais poussé")
+        data, _path = host_capabilities.card(clone, "ameesh-agents-3")
+        self.assertEqual(host_capabilities.from_card(data), ([], [], []))
+
+    def test_a_canon_without_hotes_reads_no_card(self):
+        # N4 de #7926 : sans `hotes/`, le parcours ne va pas plus loin (un
+        # worktree imbriqué portait sinon une fiche homonyme).
+        write(self.root, "w7248/hotes/ag3.md",
+              HOSTE % ("ameesh-agents-3", "capabilities: [android-emulator]\n"))
+        self.assertEqual(host_capabilities.card(self.root, "ameesh-agents-3",
+                                                untrusted=True), (None, None))
+        clone = self.repo()
+        write(clone, "w7248/hotes/ag3.md",
+              HOSTE % ("ameesh-agents-3", "capabilities: [android-emulator]\n"))
+        commit_all(clone)
+        self.assertEqual(host_capabilities.card(clone, "ameesh-agents-3"),
+                         (None, None))
+
     def test_card_ignores_other_types_and_other_titles(self):
         write(self.root, "membres/ag3.md", fiche(type="Member", title="ameesh-agents-3"))
         write(self.root, "hotes/autre.md", fiche(type="Host", title="autre"))
-        self.assertIsNone(host_capabilities.card(self.root, "ameesh-agents-3")[0])
+        self.assertIsNone(host_capabilities.card(self.root, "ameesh-agents-3",
+                                                 untrusted=True)[0])
 
     def test_card_for_reads_the_configured_canon(self):
         write(self.root, "hotes/ag3.md", HOSTE % ("ameesh-agents-3", ""))
         data, _path = host_capabilities.card_for(self.cfg(), "ameesh-agents-3")
         self.assertEqual(data["title"], "ameesh-agents-3")
+
+    def test_card_for_reads_a_git_canon_at_its_reviewed_head(self):
+        bare, clone = publish(self.root, "canon")
+        write(clone, "hotes/ag3.md",
+              HOSTE % ("ameesh-agents-3", "capabilities: [android-emulator]\n"))
+        commit_all(clone)
+        write(clone, "hotes/ag3.md", HOSTE % ("ameesh-agents-3", ""))
+        cfg = types.SimpleNamespace(canon=clone, canon_ref="",
+                                    canon_untrusted=False)
+        data, _path = host_capabilities.card_for(cfg, "ameesh-agents-3")
+        self.assertEqual(host_capabilities.from_card(data),
+                         (["android-emulator"], [], []))
+        self.assertTrue(os.path.isdir(bare))
+
+    def test_card_for_marks_an_unreadable_reviewed_head(self):
+        # Une tête relue illisible n'est pas « absent du canon » : l'appelant
+        # doit pouvoir le dire (agent observe -> canon_unreadable).
+        cfg = types.SimpleNamespace(canon=self.root, canon_ref="",
+                                    canon_untrusted=False)
+        with self.assertRaises(canon.CanonError):
+            host_capabilities.card_for(cfg, "ameesh-agents-3")
 
     def test_hosts_with_filters_the_canon(self):
         item = types.SimpleNamespace(hosts=[
@@ -362,15 +468,17 @@ class InstallScriptTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="7926-install-")
         self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
-        write(self.tmp, "hotes/ag3.md",
+        _bare, self.canon = publish(self.tmp, "canon")
+        write(self.canon, "hotes/ag3.md",
               HOSTE % ("ag3-test", "capabilities: [android-emulator]\n"))
-        write(self.tmp, "hotes/ag2.md", HOSTE % ("ag2-test", ""))
+        write(self.canon, "hotes/ag2.md", HOSTE % ("ag2-test", ""))
+        commit_all(self.canon)
 
     def install(self, host: str, *extra: str):
         return subprocess.run(
             ["bash", INSTALL, "--dry-run", "--user", "ameesh-guest-dry-run",
              "--key", "ssh-ed25519 AAAAC3Nza test@poste",
-             "--from", "203.0.113.7", "--host", host, "--canon", self.tmp,
+             "--from", "203.0.113.7", "--host", host, "--canon", self.canon,
              *extra], capture_output=True, text=True)
 
     def test_a_declared_capability_prints_the_usermod(self):
@@ -383,6 +491,28 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertNotIn("usermod -aG kvm", res.stdout)
 
+    def test_the_installer_reads_the_reviewed_head_not_the_working_tree(self):
+        # N3 de #7926 : la fiche non commitée ne doit pas accorder kvm à root.
+        write(self.canon, "hotes/ag2.md",
+              HOSTE % ("ag2-test", "capabilities: [android-emulator]\n"))
+        res = self.install("ag2-test")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("usermod -aG kvm", res.stdout)
+
+    def test_an_unreadable_reviewed_head_applies_nothing_and_says_so(self):
+        plain = os.path.join(self.tmp, "not-a-repo")
+        os.makedirs(os.path.join(plain, "hotes"))
+        write(plain, "hotes/ag3.md",
+              HOSTE % ("ag3-test", "capabilities: [android-emulator]\n"))
+        res = subprocess.run(
+            ["bash", INSTALL, "--dry-run", "--user", "ameesh-guest-dry-run",
+             "--key", "ssh-ed25519 AAAAC3Nza test@poste",
+             "--from", "203.0.113.7", "--host", "ag3-test",
+             "--canon", plain], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("usermod -aG kvm", res.stdout)
+        self.assertIn("no readable reviewed ref", res.stdout)
+
     def test_no_capabilities_option_applies_nothing(self):
         res = self.install("ag3-test", "--no-capabilities")
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -390,7 +520,7 @@ class InstallScriptTest(unittest.TestCase):
 
     def test_an_absent_canon_or_card_applies_nothing(self):
         for args in (("--canon", os.path.join(self.tmp, "nope")),
-                     ("--canon", self.tmp, "--host", "nobody")):
+                     ("--canon", self.canon, "--host", "nobody")):
             with self.subTest(args=args):
                 res = subprocess.run(
                     ["bash", INSTALL, "--dry-run", "--user", "ameesh-guest-dry-run",
