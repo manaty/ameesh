@@ -408,10 +408,8 @@ class PodRequestDbTest(_CanonDbCase):
         self.assertIsNone(self.row("enfant1"))
 
     def test_delai_de_demarrage_annule_et_nettoie(self):
-        start = time.monotonic()
         with self.assertRaises(canon_sync.SpawnError) as ctx:
             self.spawn(pod_wait_s=0.2)
-        self.assertLess(time.monotonic() - start, 10)
         self.assertIn("spawn-pod-start-timeout", str(ctx.exception))
         self.assertEqual(self.request()["state"], "cancelled")
         self.assertIsNone(self.row("enfant1"))

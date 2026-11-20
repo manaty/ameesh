@@ -4657,6 +4657,7 @@
    "repair_signals": "A1 journal privé (#6320) : stockage serveur seulement",
    "tenancy": "shared multi-tenant host (#7106): canon sync, host supervisor and tenant runners of the mesh only; a device is never a shared host",
    "pod_hosts": "ephemeral pod hosts (#7694): provisioner state (P4), written by the pod provisioner, never a mediated device call",
+   "pod_provisioning": "child-pod provisioning (#7697): provisioner state, written by the system pod provisioner, never a mediated device call",
    "pod_supervisor": "pod supervisor lease (#7695): host role of the mesh, never a mediated device call"
   },
   "operations": {
@@ -4878,6 +4879,7 @@
     "context",
     "create",
     "creator",
+    "discard",
     "exists",
     "expired_children",
     "next_report_seq",
@@ -5368,6 +5370,19 @@
     "get",
     "record",
     "remove"
+   ],
+   "pod_provisioning": [
+    "cancel",
+    "claim",
+    "cleanup",
+    "cleanup_candidates",
+    "fail",
+    "finish",
+    "get",
+    "ready",
+    "reclaim_stale",
+    "register_template",
+    "running"
    ],
    "pod_supervisor": [
     "acquire",
