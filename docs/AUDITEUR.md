@@ -1020,8 +1020,8 @@ n'est pas le sien ; un geste root sur un hôte (règle du 2026-10-11) ;
 Tous ses rapports vont à `mesh-design`, l'orchestrateur du projet ameesh, dans
 le fil du projet que lit le propriétaire.
 
-* **Chaque passage court** : un rapport court, en langage courant :
-  `agent-mail send mesh-design "Audit 14:00 : …" --kind event`. Trois parties
+* **Chaque passage court** : préparer un rapport court, en langage courant.
+  L'envoyer avec `ameesh auditor report` selon le filtre ci-dessous. Trois parties
   au plus : ce qui va mal, ce qu'il a fait (avec l'inverse), ce qu'il propose.
   Il **commence par le tableau de débit** (`ameesh debit`) et, pour chaque
   attente de plus de 2 h, par le geste fait (niveau 1) ou le pilote nommé.
@@ -1029,8 +1029,50 @@ le fil du projet que lit le propriétaire.
   compte (section `capacity`), et le quota perdu sur la dernière heure (écart
   avec son passage précédent).
   « Rien à signaler » avec une attente de plus de 2 h, ou avec 20 % ou plus
-  d'agents réveillables au repos (#3256), est un défaut ; sinon, une ligne
-  (« Audit 14:00 : rien à signaler »).
+  d'agents réveillables au repos (#3256), est un défaut.
+
+  **Filtre du rapport vers mesh-design (#7894)** — règle de l'auditeur,
+  acceptée par auditeur le 20/11/2026, courrier #228530 (analyse #228274,
+  proposition e) ; `expire: 2026-12-20`. Ce filtre concerne le compte
+  rendu sortant ; le réveil horaire reste régi par #6643.
+  Comparer au **dernier rapport envoyé**, sans limite horaire : code de sortie
+  du débit ; attentes de plus de 2 h avec leur identifiant, pilote et geste ;
+  identifiants d'alertes ; tranche des agents réveillables au repos (seuil du
+  canon, #3256). Ne pas inclure les âges, horodatages ni la formulation du
+  rapport. Chaque attente nouvelle, changement de pilote ou de geste, alerte
+  nouvelle, ou franchissement du seuil de repos dans un sens ou l'autre fait
+  donc partir le rapport. Une disparition de ces éléments est aussi une
+  information nouvelle.
+
+  Fournir ces observations dans un fichier JSON sous `$TMPDIR`, par exemple :
+  `{"debit_check":0,"waits":[],"alerts":[],"idle_over_threshold":false}`.
+  Chaque attente est un objet avec trois chaînes non vides : `id`, `pilot`,
+  `gesture` ; les alertes sont leurs identifiants stables. Inclure toutes les
+  attentes et alertes courantes, pas seulement les nouvelles. Un débit
+  illisible ne peut pas être déclaré égal à 0 : signaler l'échec de lecture
+  par le courrier d'incident habituel, sans passer par ce filtre.
+
+  Écrire le corps dans un second fichier, puis appeler :
+
+  ```sh
+  ameesh auditor report --recipient mesh-design \
+    --state-file "$TMPDIR/audit-state.json" \
+    --body-file "$TMPDIR/audit-body.txt" --status 'audit : passage terminé'
+  ```
+
+  Ajouter `--activity` pour un geste de niveau 1 effectué ou une proposition
+  faite pendant ce passage : ils imposent un rapport même si les observations
+  restent identiques. Ajouter `--needs-action` quand mesh-design doit agir :
+  le rapport part alors normalement et le réveille. Sinon, il part en `info`,
+  sans réveil. Ajouter `--summary daily` au premier passage après 08:00 et
+  `--summary weekly` pour le résumé du lundi : ils partent toujours, servent
+  de signe de vie et établissent une nouvelle référence de comparaison.
+  Si le débit vaut 0, que les observations sont identiques et qu'aucune de
+  ces exceptions ne s'applique, **aucun courrier**, même « rien à signaler ».
+  La commande met à jour le texte de statut (`agent-mail status`) dans les
+  deux cas. Le journal porte `auditor.report` à l'envoi, avec l'empreinte
+  comparée et l'identifiant du courrier, ou `auditor.report_skipped` au saut ;
+  un saut ne remplace pas la référence du dernier envoi.
 * **Un corps qui cite une commande** (backticks, `$(…)`) ne part jamais entre
   guillemets doubles : le shell de l'auditeur l'exécuterait avant l'envoi.
   Envoyer le corps sur l'entrée standard, avec un délimiteur entre apostrophes
