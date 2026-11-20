@@ -32,6 +32,12 @@
   \set writer vm_probe_writer
 \endif
 BEGIN;
+-- #7951 : les DDL de rôles prennent des verrous de grappe. La borne est posée
+-- côté serveur : un dépassement échoue explicitement (« lock timeout », code 3
+-- de psql) au lieu d'être tué par le délai du sous-processus, qui ne dit pas où
+-- l'installation attendait. La marge de transport du test reste plus large.
+SET LOCAL lock_timeout = '30s';
+SET LOCAL statement_timeout = '90s';
 SELECT set_config('ameesh.vm_probe_role', :'role', true),
        set_config('ameesh.vm_probe_writer', :'writer', true) \g /dev/null
 DO $install$

@@ -47,6 +47,7 @@ test_5655_action_download  # action-download failures and CI retry classificatio
 test_6011_contrat_ecrivains_isoles  # #6011: it.item reads the lot with the module-writers' exact GRANTs
 test_6085_avatar_connectors  # #6085/#7859: read-only MCP tools and account connectors, env-only credentials
 test_6090_work_add_unique_ref  # #6090: migration 0555 (colonne `unique_ref`, index unique partiel) et écriture N-1 sous contrat
+test_6298_vm_probe  # #7951: DDL de rôles (CREATE/DROP ROLE, grappe) sous verrous bornés côté serveur, ménage idempotent
 test_7630_avatar_tools  # #7630: avatar tool restrictions and durable proof across resident and attach launches
 test_7665_module_contract  # #7665: public external-module contract v1 (CLI, OpenAPI, Module, views); any file can break it
 test_7701_public_fixture  # #7701: public fixture kit (consumer-owned disposable database, external witness); any file can break it

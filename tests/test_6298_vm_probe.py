@@ -5,11 +5,13 @@ import os
 import dataclasses
 import json
 import secrets
+import subprocess
+import sys
+import time
 import urllib.parse
+import uuid
 from ameesh import db as db_mod
 from ameesh import bench as bench_mod
-import subprocess
-import uuid
 
 from tests.support import PgTestCase, TEST_DSN
 from tests.test_6276_vm_remote import remote, config, NONCE
@@ -18,13 +20,71 @@ from tests.role_acl import serialize_role_acl
 ROOT = Path(__file__).resolve().parents[1]
 SQL = ROOT / 'deploy/sql'
 
+#: #7951 : les DDL de rôles prennent des verrous de grappe. Toute attente est
+#: bornée *côté serveur* : le dépassement échoue explicitement (psql rc 3,
+#: « canceling statement due to lock timeout ») au lieu de faire tuer le
+#: sous-processus psql par son délai muet. Le délai de transport ci-dessous est
+#: volontairement plus large que la borne SQL.
+SQL_LOCK_TIMEOUT = '30s'
+SQL_STATEMENT_TIMEOUT = '90s'
+PSQL_TIMEOUT = 120
+#: #7951 : `bench.ROLE_LOCK` (#7763) est tenu par la purge des rôles morts, dont
+#: chaque `DROP ROLE` scanne `pg_shdepend` : sous charge, 5 s ne suffisent pas.
+#: `create_test_roles` échouait alors en setUpClass → « Ran 0 tests », code 5.
+#: On réessaie sous cette borne (61 s de pauses, plus 5 s par tentative), puis on
+#: échoue avec le motif explicite au lieu de laisser le sous-processus muet.
+ROLE_LOCK_RETRY_DELAYS = (1, 2, 4, 8, 16, 30)
+
+
+def _pgoptions(schema, *, lock_timeout=SQL_LOCK_TIMEOUT,
+               statement_timeout=SQL_STATEMENT_TIMEOUT):
+    """Options de session psql : search_path et bornes SQL du lot #7951."""
+    return ('-c search_path=%s -c lock_timeout=%s -c statement_timeout=%s'
+            % (schema, lock_timeout, statement_timeout))
+
 
 def create_roles(cls, role, writer):
-    db = db_mod.connect(dataclasses.replace(cls.cfg, dsn=TEST_DSN))
-    try:
-        bench_mod.create_test_roles(db, role, writer)
-    finally:
-        db.close()
+    """Crée les deux rôles du test sous le verrou de grappe du banc (#7951).
+
+    Le verrou est transitoire (purge #7763) : on réessaie, sans masquer une
+    erreur de droit ou de forme qui, elle, doit échouer tout de suite.
+    """
+    last = None
+    for delay in (0,) + ROLE_LOCK_RETRY_DELAYS:
+        if delay:
+            time.sleep(delay)
+        db = db_mod.connect(dataclasses.replace(cls.cfg, dsn=TEST_DSN))
+        try:
+            bench_mod.create_test_roles(db, role, writer)
+            return
+        except db_mod.DbError as exc:
+            if 'lock timeout' not in str(exc):
+                raise
+            last = exc
+        finally:
+            db.close()
+    raise AssertionError('rôles de test : verrou de grappe indisponible après '
+                         '%d s (%s)' % (sum(ROLE_LOCK_RETRY_DELAYS), last))
+
+
+def cleanup_roles(db, roles):
+    """Supprime des rôles sans échouer sur un rôle déjà parti (#7951).
+
+    Un rôle absent n'est pas une erreur : une classe tuée, ou le ménage du banc
+    (#7763) qui purge les rôles marqués, a pu le retirer avant ce nettoyage. Un
+    échec réel est dit sur la sortie d'erreur sans masquer l'erreur d'origine ;
+    le rôle reste marqué et sera purgé plus tard.
+    """
+    for role in roles:
+        try:
+            with db.transaction() as tx:
+                if not tx.query('SELECT FROM pg_roles WHERE rolname=%s', (role,)):
+                    continue
+                tx.execute('DROP OWNED BY %s CASCADE' % db_mod.quote_ident(role))
+                tx.execute('DROP ROLE IF EXISTS %s' % db_mod.quote_ident(role))
+        except Exception as exc:  # noqa: BLE001 — un ménage ne juge pas la classe
+            print('banc : rôle %s non supprimé (%s) ; le ménage du banc le '
+                  'purgera' % (role, exc), file=sys.stderr)
 
 
 def install_for_native_test(cls):
@@ -34,18 +94,19 @@ def install_for_native_test(cls):
     writer = role + '_writer'
     create_roles(cls, role, writer)
     def cleanup():
-        query = ''.join('DROP OWNED BY "' + r + '" CASCADE; DROP ROLE "' + r + '";'
-                        for r in (role, writer))
-        subprocess.run(['psql', '-X', '-w', TEST_DSN, '-q', '-c', query],
-                       capture_output=True, text=True, timeout=30, check=True)
+        # Connexion neuve : les cleanups de classe passent après la fermeture de
+        # la connexion PgTestCase et le DROP de son schéma.
+        db = db_mod.connect(dataclasses.replace(cls.cfg, dsn=TEST_DSN))
+        try:
+            cleanup_roles(db, (role, writer))
+        finally:
+            db.close()
     cls.addClassCleanup(cleanup)
     result = subprocess.run(['psql', '-X', '-w', TEST_DSN, '-q',
         '-v', 'ON_ERROR_STOP=1', '-v', 'role=' + role,
         '-v', 'writer=' + writer, '-f', str(SQL / 'role-vm-probe.sql')],
-        env=dict(os.environ, PGOPTIONS='-c search_path=' + cls.schema),
-        capture_output=True, text=True, timeout=60)
-    # Use a fresh administrative connection: class cleanups happen after the
-    # PgTestCase connection has closed and its schema has been dropped.
+        env=dict(os.environ, PGOPTIONS=_pgoptions(cls.schema)),
+        capture_output=True, text=True, timeout=PSQL_TIMEOUT)
     if result.returncode:
         raise AssertionError(result.stderr)
 
@@ -80,25 +141,23 @@ class VmProbeRoleTest(PgTestCase):
     def drop_roles(cls):
         if cls.__dict__.get("_schema_dropped", False):
             return
-        for role in (cls.role, cls.writer):
-            if not cls.db.query("SELECT FROM pg_roles WHERE rolname=%s", (role,)):
-                continue
-            cls.db.execute('DROP OWNED BY "' + role + '" CASCADE')
-            cls.db.execute('DROP ROLE "' + role + '"')
+        cleanup_roles(cls.db, (cls.role, cls.writer))
 
     @classmethod
     def script(cls, name):
         return subprocess.run(['psql', '-X', '-w', TEST_DSN, '-q',
             '-v', 'ON_ERROR_STOP=1', '-v', 'role=' + cls.role,
             '-v', 'writer=' + cls.writer, '-f', str(SQL / name)],
-            env=dict(os.environ, PGOPTIONS='-c search_path=' + cls.schema),
-            capture_output=True, text=True, timeout=60)
+            env=dict(os.environ, PGOPTIONS=_pgoptions(cls.schema)),
+            capture_output=True, text=True, timeout=PSQL_TIMEOUT)
 
     def role_sql(self, sql):
         return subprocess.run(['psql', '-X', '-w', TEST_DSN, '-Atq',
             '-v', 'ON_ERROR_STOP=1'], input='SET ROLE "' + self.role + '";\n'
             + 'SET search_path="' + self.schema + '";\n' + sql,
-            capture_output=True, text=True, timeout=20)
+            env=dict(os.environ, PGOPTIONS=_pgoptions(
+                self.schema, lock_timeout='10s', statement_timeout='30s')),
+            capture_output=True, text=True, timeout=60)
 
     def audit(self):
         result = self.script('_contrat-vm-probe.sql')
