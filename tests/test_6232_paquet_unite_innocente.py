@@ -94,11 +94,11 @@ class StackCase(unittest.TestCase):
 class EarlierRedTest(StackCase):
     """`earlier_red` sur l'empilement A (fautive), B (rouge hérité)."""
 
-    def removals(self):
-        return [paquet_auto.Removal(lot=1, tests=[TEST_A]),
-                paquet_auto.Removal(lot=2, tests=[TEST_B])]
+    def removals(self, proof=""):
+        return [paquet_auto.Removal(lot=1, tests=[TEST_A], proof=proof),
+                paquet_auto.Removal(lot=2, tests=[TEST_B], proof=proof)]
 
-    def earlier(self, replay):
+    def earlier(self, replay, proof=""):
         calls = []
 
         def recorded(path, label, modules, *, timeout):
@@ -107,7 +107,7 @@ class EarlierRedTest(StackCase):
             return replay(label, modules)
 
         found = paquet_auto.earlier_red(
-            self.repo, self.composition, self.removals(), timeout=5,
+            self.repo, self.composition, self.removals(proof), timeout=5,
             replay=recorded, log=lambda _line: None)
         return found, calls
 
@@ -118,28 +118,43 @@ class EarlierRedTest(StackCase):
         self.assertEqual(calls, [("préfixe de #1 (rouge de #2)", [TEST_B],
                                   self.unit_a)])
 
+    def test_la_preuve_prefixes_ne_dispense_pas_du_rejeu_anterieur(self) -> None:
+        for proof in ("prefixes", "3801"):
+            with self.subTest(proof=proof):
+                found, calls = self.earlier(
+                    lambda label, modules: _red(label, modules), proof=proof)
+                self.assertEqual(found, {2: 1})
+                self.assertEqual(calls, [("préfixe de #1 (rouge de #2)",
+                                          [TEST_B], self.unit_a)])
+
     def test_vert_sur_le_prefixe_garde_le_retrait(self) -> None:
-        found, _calls = self.earlier(
-            lambda label, modules: _green(label, modules))
-        self.assertEqual(found, {})
+        for proof in ("", "prefixes"):
+            with self.subTest(proof=proof):
+                found, _calls = self.earlier(
+                    lambda label, modules: _green(label, modules), proof=proof)
+                self.assertEqual(found, {})
 
     def test_non_concluant_garde_le_retrait(self) -> None:
         def timed_out(label, modules):
             return paquet_auto.TestRun(label, list(modules), None, "", 5.0,
                                        timed_out=True)
 
-        found, _calls = self.earlier(timed_out)
-        self.assertEqual(found, {})
+        for proof in ("", "prefixes"):
+            with self.subTest(proof=proof):
+                found, _calls = self.earlier(timed_out, proof=proof)
+                self.assertEqual(found, {})
 
     def test_rouge_en_partie_garde_le_retrait(self) -> None:
         other = "tests.test_own_b.T.test_other"
-        removals = [paquet_auto.Removal(lot=1, tests=[TEST_A]),
-                    paquet_auto.Removal(lot=2, tests=[TEST_B, other])]
-        found = paquet_auto.earlier_red(
-            self.repo, self.composition, removals, timeout=5,
-            replay=lambda _p, label, modules, *, timeout: _red(label, modules),
-            log=lambda _line: None)
-        self.assertEqual(found, {})
+        for proof in ("", "prefixes"):
+            with self.subTest(proof=proof):
+                removals = [paquet_auto.Removal(lot=1, tests=[TEST_A], proof=proof),
+                            paquet_auto.Removal(lot=2, tests=[TEST_B, other], proof=proof)]
+                found = paquet_auto.earlier_red(
+                    self.repo, self.composition, removals, timeout=5,
+                    replay=lambda _p, label, modules, *, timeout: _red(label, modules),
+                    log=lambda _line: None)
+                self.assertEqual(found, {})
 
     def test_un_seul_retrait_ne_rejoue_rien(self) -> None:
         def never(*_args, **_kwargs):
@@ -187,6 +202,32 @@ class CheckLocalTestsTest(StackCase):
     def test_sans_preuve_les_deux_sont_retirees(self) -> None:
         (_runs, faulty, _removals), _seen = self.check({})
         self.assertEqual(faulty, [1, 2])
+
+    def test_rouge_herite_prefixes_ne_retire_pas_la_seconde_unite(self) -> None:
+        # #7902 : les deux séries sont rouges au même test, mais son rouge
+        # est déjà présent dans le préfixe de la première unité retirée.
+        replayed = []
+
+        def run_tests(path, label, modules, **_kwargs):
+            if label.startswith("préfixe de"):
+                replayed.append(self.git("-C", str(path), "rev-parse", "HEAD"))
+            return _red(label, modules, tests=(TEST_A,))
+
+        removals = [paquet_auto.Removal(lot=lot, tests=[TEST_A],
+                                       attributed=True, proof="prefixes")
+                    for lot in (1, 2)]
+        with mock.patch.object(paquet_auto, "run_tests", side_effect=run_tests), \
+                mock.patch.object(paquet_auto, "contract_modules", return_value=[]), \
+                mock.patch.object(paquet_auto, "designated_removals",
+                                  return_value=(removals, "")):
+            _runs, faulty, kept = paquet_auto.check_local_tests(
+                self.repo, self.composition, timeout=30, base_sha=self.base,
+                attribute=lambda *_a: {}, select=lambda *_a: ({}, ""),
+                parallel=1, log=lambda _line: None)
+        self.assertEqual(replayed, [self.unit_a])
+        self.assertEqual(faulty, [1])
+        self.assertEqual([removal.lot for removal in kept], [1])
+        self.assertEqual(kept[0].proof, "prefixes")
 
 
 if __name__ == "__main__":

@@ -4049,7 +4049,7 @@ def earlier_red(worktree: Path, composition: Composition,
                 deadline: float | None = None) -> dict[int, int]:
     """#6232 : les retraits dont le rouge vient d'une unité antérieure retirée.
 
-    Pour chaque retrait hors préfixes (repli, preuve #3801), dans l'ordre de
+    Pour chaque retrait, quelle que soit sa preuve, dans l'ordre de
     l'empilement, les tests rouges de l'unité sont rejoués sur le préfixe qui
     s'arrête à la dernière unité antérieure retirée. S'ils y sont **tous**
     rouges, le rouge précède l'unité : elle est innocente, ni retirée ni
@@ -4071,7 +4071,7 @@ def earlier_red(worktree: Path, composition: Composition,
         for removal in ordered:
             earlier = kept[-1] if kept else None
             names = [name for name in removal.tests if name]
-            if earlier is None or removal.proof == "prefixes" or not names \
+            if earlier is None or not names \
                     or len(names) != len(removal.tests):
                 kept.append(removal)
                 continue
