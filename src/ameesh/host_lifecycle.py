@@ -27,7 +27,7 @@ def staleness_s(interval_s) -> float:
 def closed_hosts(db, *, readings=None, holds=None) -> dict:
     """{host: reason} des hôtes qui ne peuvent pas ouvrir de tour maintenant.
 
-    Même lecture que l'élection (`election._gate_reason`, celle qu'affiche
+    Même lecture que l'élection (`election.host_gate_reason`, celle qu'affiche
     `ameesh role status` : « host gate closed (draining) ») :
 
     * le mode durable de L232e (`draining`, `lost`) ;

@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7698 (P5 de #7633, design §9.3) — GABARIT, remplacé par le script.
+#
+# Le pod DÉDIÉ de la personne A : un seul conteneur de tenant, monté sur le
+# MÊME PVC que le pod partagé (`pvc-temoin-a`), sous le MÊME UID. C'est le
+# déplacement « pod partagé -> pod dédié » : le volume est ré-attaché, jamais
+# copié ; le UID Kubernetes du pod change, l'UID de la personne non.
+#
+# Le script supprime d'abord `temoin-deux` (ReadWriteOnce), applique ce pod,
+# rejoue le contrôle d'identité (témoin 1) et vérifie que le témoin de A a
+# survécu et que le volume de B n'est pas visible. Aucun secret n'y figure.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: temoin-dedie
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-witness
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  securityContext:
+    runAsNonRoot: true
+    fsGroup: __FS_GROUP__
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: a
+      image: __IMAGE__
+      imagePullPolicy: IfNotPresent
+      args:
+        - sh
+        - -ec
+        - |
+          set -eu
+          test "$(id -u)" = "__UID_A__"
+          test "$(cat "$HOME/.config/ameesh/accounts/.temoin-a")" = temoin-a
+          # le volume d'un autre tenant n'est pas monté dans ce pod
+          test ! -e /home/ameesh-b
+          test ! -e /home/ameesh
+          sleep 3600
+      env:
+        - name: HOME
+          value: /home/ameesh-a
+        - name: USER
+          value: ameesh-a
+        - name: LOGNAME
+          value: ameesh-a
+        - name: TMPDIR
+          value: /tmp
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      securityContext:
+        runAsUser: __UID_A__
+        runAsGroup: __FS_GROUP__
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: home-a
+          mountPath: /home/ameesh-a
+        - name: passwd
+          mountPath: /etc/passwd
+          subPath: passwd
+          readOnly: true
+        - name: group
+          mountPath: /etc/group
+          subPath: group
+          readOnly: true
+        - name: tmp-a
+          mountPath: /tmp
+  volumes:
+    - name: home-a
+      persistentVolumeClaim:
+        claimName: pvc-temoin-a
+    - name: passwd
+      configMap:
+        name: temoin-passwd
+        items:
+          - key: passwd
+            path: passwd
+    - name: group
+      configMap:
+        name: temoin-passwd
+        items:
+          - key: group
+            path: group
+    - name: tmp-a
+      emptyDir:
+        sizeLimit: 64Mi
