@@ -5302,6 +5302,38 @@ class PodHosts(Domain):
         """Marque la ligne supprimée (`deleted`/`failed`) ; faux sans ligne."""
 
 
+class PodSupervisor(Domain):
+    """#7695 (design 7633 §3.3) : bail d'UN superviseur par hôte pod.
+
+    Le superviseur d'un hôte pod est le seul écrivain de `host_resources`
+    (donc de la porte), de `host_lifecycle` et du canon de l'hôte. Le bail
+    est pris à la première passe de ressources, renouvelé à chaque passe et
+    remis à l'arrêt propre ; une époque incrémentée à chaque prise empêche
+    un ancien détenteur de renouveler ou de remettre le bail du suivant.
+    Les hôtes non pod n'ont aucune ligne : leur comportement est inchangé.
+    """
+
+    @abc.abstractmethod
+    def acquire(self, host: str, runner_id: str, ttl_s: float) -> int | None:
+        """Prend le bail ; rend l'époque, ou None tant qu'un autre le tient."""
+
+    @abc.abstractmethod
+    def renew(self, host: str, runner_id: str, epoch: int, ttl_s: float) -> bool:
+        """Renouvelle le bail du détenteur courant ; faux sinon."""
+
+    @abc.abstractmethod
+    def release(self, host: str, runner_id: str, epoch: int) -> bool:
+        """Remet le bail à l'arrêt propre ; faux si l'époque a changé."""
+
+    @abc.abstractmethod
+    def holder(self, host: str) -> str | None:
+        """`runner_id` du détenteur vivant, ou None (bail libre/expiré/remis)."""
+
+    @abc.abstractmethod
+    def lease(self, host: str) -> dict | None:
+        """Ligne de bail (diagnostic/tests), ou None sans ligne."""
+
+
 # --------------------------------------------------------------------------
 # ressources des hôtes (lot L31, décision 0028, migration 0029)
 # --------------------------------------------------------------------------
@@ -6846,6 +6878,7 @@ class Storage(abc.ABC):
     host_lifecycle: HostLifecycle
     tenancy: Tenancy
     pod_hosts: PodHosts
+    pod_supervisor: PodSupervisor
     turn_resources: TurnResources
     turn_observation: TurnObservation
     visibility: Visibility

@@ -468,6 +468,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('runner_presence', ARRAY[
         'host', 'tenant', 'runner_id', 'uid', 'version', 'seen_at'
     ]),
+    -- #7695 (0599) : bail d'un seul superviseur par hôte pod — détenteur,
+    -- époque de garde et dates ; aucun contenu de compte, aucun secret.
+    ('pod_supervisor_leases', ARRAY[
+        'host', 'runner_id', 'epoch', 'acquired_at', 'renewed_at',
+        'expires_at', 'released_at'
+    ]),
     -- #4148 : one journal line per acknowledged adapter transition; `detail`
     -- (command output) is a content.
     ('host_lifecycle_transitions', ARRAY[

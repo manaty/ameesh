@@ -12083,6 +12083,11 @@ class Runner:
         #: rendre visible l'étage qui retarde le grant d'un tour réveillé.
         self._db_wait_seen: dict[str, float] = {}
         self._db_wait_lock = threading.Lock()
+        #: #7695 : le bail du superviseur pod est lu/écrit par plusieurs fils
+        #: (passe ressources, canon, prise) ; `_pod_lease_guard` le protège.
+        self._pod_lease_mutex = threading.Lock()
+        self._pod_lease = None
+        self._pod_lease_waiting = False
         admission_lock.set_wait_observer(self._db_wait_notice)
         self.host = cfg.host
         self.runner_id = cfg.runner
@@ -14458,9 +14463,128 @@ class Runner:
             # puis le bail train-service est rendu avant la sortie immédiate
             # de `_sortie_sure` ; les effets suivants sont déjà refusés.
             train_service.finish()
+        # #7695 : le superviseur d'un hôte pod remet son bail, une fois ses
+        # fils arrêtés : le successeur n'attend pas le TTL. Aucun geste pour
+        # un hôte non pod (pas de bail).
+        self._pod_lease_release()
         # par la file : aucune écriture synchrone sur le chemin d'arrêt avant
         # le repli de `_sortie_sure` (relecture codex2 de 669a6fe, B1)
         log_async("shutdown: %d lease(s) returned, %d turn(s)" % (len(workers), self.turns))
+
+    # -- bail de superviseur d'hôte pod (#7695, design 7633 §3.3) ----------
+    def _pod_supervisor(self) -> bool:
+        """Cet exécuteur est le SUPERVISEUR d'un hôte pod (sans tenant).
+
+        `AMEESH_POD=1` (le chart) le dit dès le démarrage ; après le premier
+        `canon sync`, la fiche Host (`policy.runtime.kind: pod|pod-template`)
+        le confirme. Un runner de tenant n'est jamais superviseur."""
+        cfg = getattr(self, "cfg", None)
+        pod = cfg is not None and bool(getattr(cfg, "pod", False))
+        if not pod:
+            runtime = getattr(self, "_host_runtime", None)
+            pod = (runtime is not None
+                   and getattr(runtime, "kind", "") in ("pod", "pod-template"))
+        if not pod:
+            return False
+        return not _tenant_runner(self)
+
+    def _pod_lease_ttl(self) -> float:
+        """TTL du bail : plusieurs passes de ressources, au moins 3 minutes.
+
+        Un superviseur vivant renouvelle à chaque passe ; un pod tué sans
+        SIGTERM laisse expirer le bail en quelques minutes, pas en quelques
+        secondes (le successeur attend ce délai avant de prendre la main)."""
+        try:
+            interval = float(getattr(self.cfg, "resource_interval", 60.0) or 60.0)
+        except (TypeError, ValueError):
+            interval = 60.0
+        return max(180.0, 3.0 * interval)
+
+    def _pod_lease_guard(self):
+        """Verrou du bail superviseur, partagé par tous les fils du runner.
+
+        `_pod_lease_tick` est appelé par plusieurs fils (passe ressources,
+        canon, prise) : sans verrou, deux passes pouvaient lire la même
+        époque et en renouveler une périmée. Créé à la demande pour les
+        doublures de test qui ne passent pas par `__init__`."""
+        lock = getattr(self, "_pod_lease_mutex", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._pod_lease_mutex = lock
+        return lock
+
+    def _pod_lease_tick(self) -> bool:
+        """Acquiert ou renouvelle le bail du superviseur pod ; vrai si détenteur.
+
+        Ne lève jamais : une base illisible laisse le superviseur en attente
+        (aucun relevé, aucun canon, aucun cycle de vie) plutôt que de le faire
+        tomber. Un détenteur qui a perdu son époque (bail expiré, pod
+        dupliqué) retente une acquisition : la fonction SQL ne la donne que
+        si le bail est libre, donc un second superviseur vivant garde la main."""
+        if not self._pod_supervisor():
+            return True
+        with self._pod_lease_guard():
+            return self._pod_lease_tick_locked()
+
+    def _pod_lease_tick_locked(self) -> bool:
+        db = getattr(self, "db", None)
+        if db is None:
+            return False
+        ttl = self._pod_lease_ttl()
+        lease = getattr(self, "_pod_lease", None)
+        try:
+            api = storage.of(db).pod_supervisor
+            if lease and lease.get("runner_id") == self.runner_id:
+                if api.renew(self.host, self.runner_id, int(lease["epoch"]), ttl):
+                    lease["ttl"] = ttl
+                    return True
+                self._pod_lease = None
+                log_async("pod supervisor: lease of %s lost (epoch %s); standby"
+                          % (self.host, lease.get("epoch")))
+            epoch = api.acquire(self.host, self.runner_id, ttl)
+            if epoch is None:
+                if not getattr(self, "_pod_lease_waiting", False):
+                    holder = api.holder(self.host) or "unknown"
+                    log_async("pod supervisor: lease of %s held by %s; this "
+                              "supervisor is standby (no reading, no canon sync)"
+                              % (self.host, holder))
+                    self._pod_lease_waiting = True
+                return False
+            self._pod_lease = {"epoch": int(epoch), "runner_id": self.runner_id,
+                               "ttl": ttl}
+            self._pod_lease_waiting = False
+            log_async("pod supervisor: lease of %s acquired (epoch %d)"
+                      % (self.host, int(epoch)))
+            return True
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            log_async("pod supervisor: lease pass failed (%s)"
+                      % type(exc).__name__)
+            return False
+
+    def _pod_lease_release(self) -> None:
+        """Remet le bail à l'arrêt propre ; un successeur n'attend pas le TTL.
+
+        Ne lève jamais : un arrêt ne doit pas être retenu par la base."""
+        if not self._pod_supervisor():
+            return
+        with self._pod_lease_guard():
+            self._pod_lease_release_locked()
+
+    def _pod_lease_release_locked(self) -> None:
+        lease = getattr(self, "_pod_lease", None)
+        db = getattr(self, "db", None)
+        if not lease or db is None:
+            return
+        try:
+            storage.of(db).pod_supervisor.release(
+                self.host, self.runner_id, int(lease["epoch"]))
+            log_async("pod supervisor: lease of %s released (epoch %s)"
+                      % (self.host, lease.get("epoch")))
+        except Exception as exc:  # jamais fatal sur le chemin d'arrêt
+            log_async("pod supervisor: lease release failed (%s)"
+                      % type(exc).__name__)
+        finally:
+            self._pod_lease = None
 
     # -- canon sync (spec §4.4) --------------------------------------------
     @migrations.writer_tick(on_admission_error=_background_admission_error)
@@ -14482,6 +14606,15 @@ class Runner:
         # (`canon_sync_interval: 0` dans son chart, et cette garde explicite).
         from . import tenancy
         if tenancy.runner_tenant(self.cfg):
+            return True
+        # #7695 (design 7633 §3.3) : sur un hôte pod, seul le détenteur du
+        # bail de superviseur synchronise le canon (il écrit `host_tenancy` et
+        # `canon_state`). Un second superviseur reste en attente : la base est
+        # l'arbitre, pas l'ordre de démarrage. Une doublure de test
+        # (`SimpleNamespace`) n'a pas la méthode : elle n'est pas un pod et
+        # poursuit, comme un exécuteur dont `cfg.pod` est faux.
+        supervisor = getattr(self, "_pod_supervisor", None)
+        if supervisor is not None and supervisor() and not self._pod_lease_tick():
             return True
         self._designation_retry_ready = False
         entries = canon_mod.configured(self.cfg)
@@ -14857,6 +14990,11 @@ class Runner:
             except Exception as exc:  # jamais fatal pour l'exécuteur
                 log_async("ressources : relevé impossible (%s)" % type(exc).__name__)
                 return None
+        # #7695 (design 7633 §3.3) : un hôte pod n'a qu'un écrivain de
+        # `host_resources`. Le superviseur qui n'a pas (ou plus) le bail ne
+        # publie rien et ne touche pas au cycle de vie : il attend la main.
+        if self._pod_supervisor() and not self._pod_lease_tick():
+            return None
         db = None
         try:
             from .scoped_db import ScopedDb
@@ -14933,6 +15071,11 @@ class Runner:
         calling host. `complete=True` then closes the returns whose claims the
         pass just reopened, since no later resource pass may come.
         """
+        # #7695 : le scanner de libération est un geste d'hôte ; sur un hôte
+        # pod, seul le superviseur détenteur du bail le fait (un second
+        # superviseur reste en attente, sans écrire de transition).
+        if self._pod_supervisor() and not self._pod_lease_tick():
+            return
         from . import host_release
         db = None
         try:
@@ -16944,6 +17087,12 @@ class Runner:
             "batch %ds (L125); config %s" % (self.host, self.runner_id, self.db.name,
                                              self.cfg.schema, int(self.mail_batch),
                                              self.cfg.config_source))
+        # #7695 : sur un hôte pod, prendre le bail AVANT le premier canon sync
+        # et la première passe de ressources. Sans bail (un autre superviseur
+        # vit encore), le processus reste en attente : il ne publie rien et ne
+        # synchronise pas le canon, mais il retente à chaque passe.
+        if self._pod_supervisor():
+            self._pod_lease_tick()
         self.start_canon_sync()
         self.start_account_claims()
         # L159f : suivi de la porte et acquittements — en `--once` aussi (r3) :

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# #7694 (design 7633 §5.3, témoins 1 et 2) — GABARIT, remplacé par le script.
+# #7694/#7695 (design 7633 §5.3, contrôles 1, 2 et 4) — GABARIT, remplacé
+# par le script.
 #
-# Deux conteneurs, deux UID, deux PVC : chacun ne monte QUE son volume.
+# Deux conteneurs de tenant (deux UID, deux PVC, chacun ne monte QUE son
+# volume) et le superviseur du pod partagé, sans aucun volume de tenant.
 # `fsGroup` est le GID neutre unique du pod (10000), jamais un fsGroup par
 # tenant. Le script `preuve-isolation-comptes.sh` remplace __UID_A__,
 # __UID_B__, __FS_GROUP__ et __IMAGE__, applique ce pod, exécute les contrôles
@@ -15,6 +17,7 @@ data:
     root:x:0:0:root:/root:/bin/sh
     ameesh-a:x:__UID_A__:__FS_GROUP__:temoin a:/home/ameesh-a:/bin/sh
     ameesh-b:x:__UID_B__:__FS_GROUP__:temoin b:/home/ameesh-b:/bin/sh
+    ameesh:x:__SUPERVISOR_UID__:__FS_GROUP__:superviseur:/home/ameesh:/bin/sh
     nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
   group: |
     root:x:0:
@@ -152,6 +155,58 @@ spec:
           readOnly: true
         - name: tmp-b
           mountPath: /tmp
+    # #7695 : le superviseur du pod partagé n'a AUCUN volume de tenant — il ne
+    # voit ni home ni PVC d'un tenant, seulement son home et son /tmp à lui.
+    # C'est la frontière que le chart `pod-shared` matérialise.
+    - name: superviseur
+      image: __IMAGE__
+      imagePullPolicy: IfNotPresent
+      args:
+        - sh
+        - -ec
+        - |
+          set -eu
+          test "$(id -u)" = "__SUPERVISOR_UID__"
+          umask 077
+          printf 'temoin-superviseur\n' > /tmp/.temoin-superviseur
+          chmod 600 /tmp/.temoin-superviseur
+          sleep 3600
+      env:
+        - name: HOME
+          value: /home/ameesh
+        - name: TMPDIR
+          value: /tmp
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      securityContext:
+        runAsUser: __SUPERVISOR_UID__
+        runAsGroup: __FS_GROUP__
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: supervisor-home
+          mountPath: /home/ameesh
+        - name: passwd
+          mountPath: /etc/passwd
+          subPath: passwd
+          readOnly: true
+        - name: group
+          mountPath: /etc/group
+          subPath: group
+          readOnly: true
+        - name: supervisor-tmp
+          mountPath: /tmp
   volumes:
     - name: home-a
       persistentVolumeClaim:
@@ -175,5 +230,11 @@ spec:
       emptyDir:
         sizeLimit: 64Mi
     - name: tmp-b
+      emptyDir:
+        sizeLimit: 64Mi
+    - name: supervisor-home
+      emptyDir:
+        sizeLimit: 64Mi
+    - name: supervisor-tmp
       emptyDir:
         sizeLimit: 64Mi
