@@ -77,7 +77,7 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        (no table: written by `auditor_pass`, #6643)
   auditor.report       a sent short-pass report: observation fingerprint,
                        reason and mail id; last sent comparison baseline (#7894)
-  auditor.report.skipped unchanged observations, no mail; does not replace
+  auditor.report_skipped unchanged observations, no mail; does not replace
                        the last sent comparison baseline (#7894)
 
 `data` holds identifiers and states, never free text: the client rereads the
@@ -135,7 +135,7 @@ TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
          "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request", "git.lock_removed",
          "mail.export", "packet.pause", "auditor.pass", "auditor.report",
-         "auditor.report.skipped", "packet.client_types")
+         "auditor.report_skipped", "packet.client_types")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365
 #: the table refuses to delete an event younger than this (migration 0396)

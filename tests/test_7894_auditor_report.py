@@ -50,6 +50,19 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(self.status.call_count, 4)
         self.assertEqual(self.send.call_args.kwargs["payload"], {"info": True})
 
+    def test_quiet_pass_uses_real_journal_validation_and_updates_status(self):
+        # Exercise publish through the actual journal grammar, including the
+        # quiet path; mocking record itself hid the invalid type in #7894.
+        self.record.stop()
+        self.store.events.record.side_effect = (
+            lambda event, key, project, data:
+            self.record_event(self.db, event, key, **data))
+        self.assertEqual(self.publish()["decision"], "sent")
+        self.assertEqual(self.publish()["decision"], "skipped")
+        self.assertEqual(self.journal[-1]["type"], "auditor.report_skipped")
+        self.send.assert_called_once()
+        self.assertEqual(self.status.call_count, 2)
+
     def test_each_stable_change_is_reported_and_then_suppressed(self):
         self.publish()
         state = copy.deepcopy(QUIET)

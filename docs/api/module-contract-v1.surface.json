@@ -1384,7 +1384,7 @@
                     "approval.recorded",
                     "auditor.pass",
                     "auditor.report",
-                    "auditor.report.skipped",
+                    "auditor.report_skipped",
                     "cost.recorded",
                     "decision.closed",
                     "decision.created",

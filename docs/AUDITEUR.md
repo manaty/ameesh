@@ -1071,7 +1071,7 @@ le fil du projet que lit le propriétaire.
   ces exceptions ne s'applique, **aucun courrier**, même « rien à signaler ».
   La commande met à jour le texte de statut (`agent-mail status`) dans les
   deux cas. Le journal porte `auditor.report` à l'envoi, avec l'empreinte
-  comparée et l'identifiant du courrier, ou `auditor.report.skipped` au saut ;
+  comparée et l'identifiant du courrier, ou `auditor.report_skipped` au saut ;
   un saut ne remplace pas la référence du dernier envoi.
 * **Un corps qui cite une commande** (backticks, `$(…)`) ne part jamais entre
   guillemets doubles : le shell de l'auditeur l'exécuterait avant l'envoi.

@@ -2026,7 +2026,7 @@
               "packet.pause",
               "auditor.pass",
               "auditor.report",
-              "auditor.report.skipped",
+              "auditor.report_skipped",
               "packet.client_types"
             ]
           }

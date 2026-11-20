@@ -15,7 +15,7 @@ from pathlib import Path
 from . import config, db as db_mod, events, identity, mail, registry, storage
 
 EVENT = "auditor.report"
-SKIPPED = "auditor.report.skipped"
+SKIPPED = "auditor.report_skipped"
 
 
 def fingerprint(state: dict) -> str:
