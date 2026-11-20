@@ -1537,7 +1537,10 @@ class DevWork(DevDomain):
             "             ORDER BY b.id) AS open_conflicts,"
             "       (pd.lot IS NOT NULL) AS pending_decision,"
             # Match the intake footprint guard used by dispatch (#4173).
-            "       (w.state = 'intake' AND " + footprint_overlap_sql("w", items="plan_open_items", start_on=True) + ")"
+            # #7940 : une attente humaine de plus de 24 h ne marque plus le
+            # lot comme retenu par l'empreinte (même garde que la prise).
+            "       (w.state = 'intake' AND " + footprint_overlap_sql(
+                "w", items="plan_open_items", start_on=True, blocking_only=True) + ")"
             "         AS footprint_overlap,"
             # #4818 : plafond de lots en vol du dépôt, et ce qu'il faut au plan
             # pour choisir un ensemble aux empreintes disjointes deux à deux
@@ -1790,15 +1793,20 @@ class DevWork(DevDomain):
             " WHERE work_item_id = %s", (int(item_id),))
         return rows[0] if rows else None
     def _footprint_overlaps(self, item_id, *, free_only=False,
-                            start_on=False) -> list[dict]:
+                            start_on=False, blocking_only=True) -> list[dict]:
         """#4173, sous le verrou du graphe : les chevauchements de l'empreinte
         du lot avec celle d'un lot occupant de son dépôt (requête POSTÉRIEURE
         au verrou, comme le contrôle des dépendances). `free_only` : vide si
-        le lot occupe déjà son empreinte (réattribution d'un lot démarré)."""
+        le lot occupe déjà son empreinte (réattribution d'un lot démarré).
+        `blocking_only=False` (: #7940) rend aussi les occupants dont un hold
+        d'attente humaine ne retient plus le démarrage, avec leur hold lisible :
+        l'appelant journalise alors l'avertissement sur les deux lots."""
         guard = (" AND NOT " + footprint_occupying_sql("c")) if free_only else ""
         return self.db.query(
             "SELECT DISTINCT x.* FROM work_items c, LATERAL ("
-            + footprint_overlap_rows_sql("c", start_on=start_on) + ") x WHERE c.id = %s" + guard +
+            + footprint_overlap_rows_sql("c", start_on=start_on,
+                                         blocking_only=blocking_only)
+            + ") x WHERE c.id = %s" + guard +
             " ORDER BY x.id, x.path", (int(item_id),))
     def _footprint_cap(self, item_id, *, free_only=False) -> dict | None:
         """#4818, sous le verrou du graphe : `{cap, in_flight}` si le dépôt du
