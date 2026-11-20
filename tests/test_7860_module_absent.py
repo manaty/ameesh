@@ -13,11 +13,12 @@ refuse the canon.
 from __future__ import annotations
 
 import os
+from unittest import mock
 import types as types_mod
 import unittest
 
 from tests import support  # noqa: F401  isolate host config before product imports
-from ameesh import agent_observation, canon, canon_sync, modules, placement, registry
+from ameesh import agent_observation, canon, canon_cli, canon_sync, modules, placement, registry
 from ameesh.modules.storage import ModuleStore
 
 from . import test_canon
@@ -124,6 +125,51 @@ class ObservationTest(unittest.TestCase):
                                       "harness codex not allowed"),
                          ["module_missing", "placement_refused"])
         self.assertEqual(self.reasons("harness codex not allowed"), ["placement_refused"])
+
+
+class CheckHostTest(unittest.TestCase):
+    """#7868 (manaty/ameesh#6101): module availability is a local fact."""
+
+    def check(self, local_host, requested_host):
+        c = types_mod.SimpleNamespace(
+            readable=True, root="/canon", untrusted=False, id="", is_default=True,
+            sources=[], agent=lambda name: agent("acme"))
+        verdicts = [placement.Verdict("avatar", host, True)
+                    for host in ("local", "remote")]
+        absent = [{"code": modules.MISSING, "name": "extra", "projects": ["acme"]}]
+        sink = []
+        with mock.patch.object(canon_cli, "_recorded", return_value=None), \
+                mock.patch.object(canon_cli, "_process_block_json", return_value=None), \
+                mock.patch.object(canon, "validate", return_value=[]), \
+                mock.patch.object(placement, "verdicts", return_value=verdicts), \
+                mock.patch.object(modules, "missing", return_value=absent), \
+                mock.patch("ameesh.persona_memory.canon_findings", return_value=[]), \
+                mock.patch("ameesh.canon_review_coverage.findings", return_value=[]), \
+                mock.patch.object(canon_sync, "assess", return_value=("ok", "")):
+            code = canon_cli._check_one(
+                types_mod.SimpleNamespace(host=local_host),
+                types_mod.SimpleNamespace(host=requested_host, json=True), c, sink=sink)
+        self.assertEqual(code, 0)
+        return {v["host"]: v for v in sink[0]["placements"]}
+
+    def test_local_default_and_explicit_host_refuse_only_local_placement(self):
+        for requested in (None, "local"):
+            with self.subTest(host=requested):
+                rows = self.check("local", requested)
+                self.assertFalse(rows["local"]["placement_ok"])
+                self.assertIn("module missing on this host", rows["local"]["placement_diagnostic"])
+                self.assertTrue(rows["remote"]["placement_ok"])
+
+    def test_remote_host_does_not_inherit_local_missing_modules(self):
+        rows = self.check("local", "remote")
+        self.assertTrue(rows["local"]["placement_ok"])
+        self.assertTrue(rows["remote"]["placement_ok"])
+        self.assertEqual(rows["remote"]["placement_diagnostic"], "")
+
+    def test_without_configured_host_explicit_host_is_the_only_known_host(self):
+        rows = self.check("", "remote")
+        self.assertTrue(rows["local"]["placement_ok"])
+        self.assertFalse(rows["remote"]["placement_ok"])
 
 
 class SyncTest(test_canon._CanonDbCase):

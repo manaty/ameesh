@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 
-from . import land, merge_queue, radar, train_diagnosis
+from . import land, merge_queue, radar, train_diagnosis, work_lifecycle
 from .train import SCHEMA, TrainError, digest, identity, ordered
 
 
@@ -210,6 +210,27 @@ class Runtime:
     def published(self, plan):
         """#6978 : la tête que nomme la référence distante du plan ("" : absente)."""
         return self.repository.published(plan)
+
+    def delivered(self, plan):
+        """#7885 : chaque membre a-t-il déjà une livraison terminale hors train ?
+
+        `delivered`, `merged`, `promoted` et `closed` sont des faits de cycle
+        de vie du lot. Un membre absent de la file est donc distingué d'un
+        membre simplement retiré ou refigé : seul le premier rend le plan
+        définitivement sans effet. Lecture seule, sous la réservation déjà
+        tenue par l'appelant."""
+        self._belongs(plan)
+        members = plan.get("members")
+        if not isinstance(members, list) or not members:
+            return False
+        complete = set(work_lifecycle.COMPLETED)
+        for row in members:
+            if not isinstance(row, dict):
+                return False
+            item = self.ledger.ops.get(row.get("work_item_id"))
+            if not isinstance(item, dict) or item.get("state") not in complete:
+                return False
+        return True
 
     def start_ci(self, plan):
         self.ci_adapter.start(plan)

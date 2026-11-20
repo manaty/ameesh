@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7694 (B1 de #44265) : le canon du pod est cloné par l'init du superviseur
+# (UID 10001) puis lu par le tenant sous SON UID (ici __UID_A__). Git refuse
+# « detected dubious ownership » sans `safe.directory` ; la paire GIT_CONFIG_*
+# du plan (`ameesh host tenant add --pod`) borne la confiance à CE dépôt.
+#
+# Le pod prouve les deux sens :
+#   - sans la paire du plan, la lecture échoue (contrôle négatif, motif
+#     « dubious ownership ») ;
+#   - avec la paire du plan, la lecture réussit sous un UID différent de
+#     celui du clone (contrôle positif).
+#
+# Aucun secret, aucun accès réseau : le dépôt est créé localement.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: temoin-canon
+  labels:
+    app: ameesh-pod-witness
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    fsGroup: __FS_GROUP__
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    # Le clone : même UID que l'init `canon` du chart (superviseur 10001).
+    - name: clone
+      image: __GIT_IMAGE__
+      command: ["sh", "-ec"]
+      args:
+        - |
+          set -eu
+          : > /tmp/gitconfig-init
+          git init -q /canon/repo
+          git -C /canon/repo config user.email witness@ameesh.invalid
+          git -C /canon/repo config user.name witness
+          printf 'carte: temoin canon\n' > /canon/repo/carte.md
+          git -C /canon/repo add carte.md
+          git -C /canon/repo commit -q -m temoin
+          printf 'clone_uid=%s repo=%s\n' "$(id -u)" "$(git -C /canon/repo rev-parse HEAD)"
+      env:
+        - name: HOME
+          value: /tmp
+        - name: GIT_CONFIG_GLOBAL
+          value: /tmp/gitconfig-init
+        - name: GIT_CONFIG_NOSYSTEM
+          value: "1"
+      securityContext:
+        runAsUser: __SUPERVISOR_UID__
+        runAsGroup: __FS_GROUP__
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: canon
+          mountPath: /canon
+        - name: tmp
+          mountPath: /tmp
+  containers:
+    # La lecture : l'UID du tenant, la paire GIT_CONFIG_* du plan seulement.
+    - name: lecture
+      image: __GIT_IMAGE__
+      command: ["sh", "-ec"]
+      args:
+        - |
+          set -eu
+          : > /tmp/gitconfig-tenant
+          if git -C /canon/repo rev-parse --git-dir >/dev/null; then
+            echo "PASS canon-lecture: uid=$(id -u) clone_uid=__SUPERVISOR_UID__"
+          else
+            echo "FAIL canon-lecture: le depot clone par __SUPERVISOR_UID__ est illisible"
+            exit 1
+          fi
+          # Contrôle négatif : SANS la paire du plan, Git doit refuser.
+          if env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+               git -C /canon/repo rev-parse --git-dir 2>/tmp/refus.err; then
+            echo "FAIL canon-refus: lecture acceptee sans safe.directory"
+            exit 1
+          fi
+          if grep -qi 'dubious ownership' /tmp/refus.err; then
+            echo "PASS canon-refus: sans safe.directory, Git refuse (dubious ownership)"
+          else
+            echo "FAIL canon-refus: refus sans motif d'appropriation"
+            cat /tmp/refus.err
+            exit 1
+          fi
+      env:
+        - name: HOME
+          value: /tmp
+        - name: GIT_CONFIG_GLOBAL
+          value: /tmp/gitconfig-tenant
+        - name: GIT_CONFIG_NOSYSTEM
+          value: "1"
+        # Exactement la paire du plan de tenant (#7694) : une seule entrée,
+        # le dépôt du canon, jamais `*`.
+        - name: GIT_CONFIG_COUNT
+          value: "1"
+        - name: GIT_CONFIG_KEY_0
+          value: safe.directory
+        - name: GIT_CONFIG_VALUE_0
+          value: /canon/repo
+      securityContext:
+        runAsUser: __UID_A__
+        runAsGroup: __FS_GROUP__
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: canon
+          mountPath: /canon
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: canon
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}

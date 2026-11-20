@@ -487,6 +487,14 @@ HORS_CONTRAT = {
     "integration_train_requalifications": {
         "id", "project", "pin", "gate", "reviews", "lot", "requester",
         "requested_at", "state", "resolved_at", "resolved_by", "error"},
+    # #7694 (0597) : identité d'un hôte enfant porté par un pod (nom logique,
+    # pod Kubernetes, template, parent, tenant, UID, TTL). État de
+    # provisionnement écrit par le pourvoyeur (P4), jamais un contenu de
+    # compte ; aucune colonne n'est accordée à un rôle superviseur.
+    "pod_hosts": {
+        "host", "namespace", "template", "parent", "tenant", "uid",
+        "runner_id", "pod_uid", "state", "requested_at", "started_at",
+        "expires_at", "deleted_at"},
 }
 EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
            | FERMEES.get(rel, set()) | HORS_CONTRAT.get(rel, set())

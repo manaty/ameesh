@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7694 — les deux PVC du témoin kind (design 7633 §5.3). Volume par tenant :
+# aucun des deux n'est monté dans le conteneur de l'autre.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-temoin-a
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-witness
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 128Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-temoin-b
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-witness
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 128Mi

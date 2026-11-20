@@ -693,10 +693,18 @@ def _passage(cfg, spec: ProjectConfig, mode, report):
     # gate reads on this host; never followed automatically (#1467).
     # #3366: the rules closure follows the passage's live pin, not the commit
     # frozen at assembly: a requalified pin must also requalify the rules.
+    def carrier(db, reading, project=spec.name):
+        # #7880: the alert cites the requalification lot; the callback opens
+        # or updates it only when the guard changed the compiled rules.
+        from . import train_requalify
+        return train_requalify.ensure_requalification_lot_for_reading(
+            cfg, db, project, reading)
+
     canon = train_canon.Watch(spec.name, commit,
                               partial(train_canon.gate_commit, cfg=cfg,
                                       project=spec.name),
-                              pilot=train_canon.pilot_of(cfg, spec.name))
+                              pilot=train_canon.pilot_of(cfg, spec.name),
+                              carrier=carrier)
     if mode == "shadow":
         passage = train_shadow.Passage(
             cfg, project, policy_path=spec.canon, policy_commit=commit,

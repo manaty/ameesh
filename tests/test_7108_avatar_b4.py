@@ -108,7 +108,11 @@ class _AvatarCase(test_canon._CanonDbCase):
             self.cfg, host=host, tenant=ALICE, runner_id="%s/alice" % host,
             accounts={"codex": [{"name": "org", "type": "config_dir",
                                  "path": self.tmp + "/codex-org"}]})
-        self.assertTrue(tenancy.beat(cfg, self.db, version="1.52.0"))
+        # #7694 : le battement vérifie l'UID du processus contre la liaison
+        # (`host_tenants.uid`) ; la fixture lie ALICE à 2001, donc le processus
+        # simulé bat sous cet UID.
+        with mock.patch.object(tenancy.os, "getuid", return_value=2001):
+            self.assertTrue(tenancy.beat(cfg, self.db, version="1.52.0"))
         if profiles is not None:
             self.db.execute(
                 "UPDATE runner_presence SET profiles = %s WHERE host = %s"

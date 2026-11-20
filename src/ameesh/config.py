@@ -78,6 +78,17 @@ def _as_float(value, default: float) -> float:
         return default
 
 
+def _positive_float(value) -> float | None:
+    """Réel fini > 0, ou None (une capacité illisible n'est pas une valeur)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
 def _as_harness_tokens(value) -> dict:
     """#6677 : `{harnais: jetons}` du plafond de contexte par harnais.
 
@@ -279,6 +290,14 @@ class Config:
     #: bat `runner_presence` au lieu de publier les relevés de l'hôte. Vide :
     #: exécuteur d'hôte (superviseur sur un hôte partagé).
     tenant: str = ""
+    #: #7694 (design 7633 §3.2) : cet exécuteur est le superviseur d'un hôte
+    #: pod (`AMEESH_POD=1`, posé par le chart). Il publie la capacité déclarée
+    #: du pod au lieu des mesures du nœud (`load1` n'est jamais mesuré).
+    pod: bool = False
+    #: capacité déclarée du pod par le chart, en octets et en cœurs ; None =
+    #: non déclarée (le relevé ne l'invente pas).
+    pod_memory_bytes: int | None = None
+    pod_cpu_cores: float | None = None
     #: délai de connexion à la base (libpq `connect_timeout`, secondes). 10 s
     #: et non 3 : une base distante (VPN, plusieurs centaines de ms d'aller-
     #: retour) dépassait 3 s au moindre à-coup du lien (L72).
@@ -1192,6 +1211,13 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
         host=pick("AMEESH_HOST", "AGENT_MESH_HOST", default=cfg.host),
         runner_id=pick("AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID", default=cfg.runner_id),
         tenant=str(pick("AMEESH_TENANT", default=cfg.tenant) or "").strip(),
+        # #7694 : le chart d'un hôte pod déclare le runtime et la capacité du
+        # pod ; une valeur illisible laisse la capacité inconnue, jamais 0.
+        pod=bool(_as_bool(pick("AMEESH_POD"), cfg.pod, "AMEESH_POD")),
+        pod_memory_bytes=(_as_count(
+            pick("AMEESH_POD_MEMORY_BYTES", default=cfg.pod_memory_bytes), 0) or None),
+        pod_cpu_cores=_positive_float(
+            pick("AMEESH_POD_CPU_CORES", default=cfg.pod_cpu_cores)),
         connect_timeout=_as_float(pick("AMEESH_CONNECT_TIMEOUT", "AGENT_MESH_CONNECT_TIMEOUT"),
                                   cfg.connect_timeout),
         db_retry_max=_as_float(pick("AMEESH_DB_RETRY_MAX"), cfg.db_retry_max),

@@ -1489,6 +1489,57 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     return out
 
 
+def sample_pod(host: str, *, now: float | None = None,
+              turns_in_progress: int | None = None,
+              memory_bytes: int | None = None,
+              cpu_cores: float | None = None,
+              cgroup: dict | None = None) -> dict:
+    """#7694 : relevé du **superviseur** d'un hôte pod (design 7633 §3.2).
+
+    Le pod ne voit ni la mémoire, ni la charge, ni les disques du nœud : un
+    relevé d'hôte classique (``sample``) mesurerait la machine et fausserait
+    l'admission. On publie donc la capacité **déclarée par le chart**
+    (``memory_bytes``, ``cpu_cores``) et, si elle est lisible, la consommation
+    du cgroup de ce processus. ``load1`` reste ``None`` : la charge 1 min est
+    celle du nœud, jamais celle du pod. Les disques des tenants viendront de
+    leurs rapports (tranche P2) : sans rapport, ``disk_free_bytes`` est
+    ``None``, une mesure absente et non une valeur inventée.
+
+    ``cgroup`` (dict) permet un relevé de test ; sinon le cgroup de ce
+    processus est lu, comme dans ``sample``.
+    """
+    cgroup = _CGROUP_METER.read() if cgroup is None else dict(cgroup)
+    memory_bytes = parse_bytes(memory_bytes)
+    current = parse_bytes(cgroup.get("mem_current_bytes"))
+    available = None
+    if memory_bytes is not None:
+        # Ce qui est mesuré ici est la consommation du superviseur ; la part
+        # des tenants n'est retirée que lorsqu'ils la rapportent (P2). La
+        # limite déclarée reste la capacité du pod, jamais le nœud.
+        available = max(0, int(memory_bytes) - int(current or 0))
+    cores = finite_float(cpu_cores)
+    out: dict = {
+        "host": host,
+        "sampled_ts": time.time() if now is None else float(now),
+        "mem_total_bytes": memory_bytes,
+        "mem_available_bytes": available,
+        "swap_used_bytes": None,
+        # Jamais la charge du nœud : elle ne dit rien du pod.
+        "load1": None,
+        "cpu_count": max(1, int(math.ceil(cores))) if cores else None,
+        "turns_in_progress": turns_in_progress,
+        "volumes": [],
+        "disk_free_bytes": None,
+        "disk_path": None,
+        "guest_mem_bytes": None,
+        "guest_jobs": None,
+        "cgroup": cgroup,
+        "pod_runtime": True,
+    }
+    out.update(tmp_usage(["/tmp"]))
+    return out
+
+
 #: L64: the measures a reading carries, and their names for a human. One
 #: missing from a reading (None) is a measure this OS, or this host, cannot
 #: give (PSI before Linux 4.20 or outside Linux, load on Windows, an
@@ -1561,7 +1612,7 @@ def guard_restart(path: str | None = None, *, now: float | None = None) -> dict 
 
 
 def collect(cfg, db: Db, *, now: float | None = None, policy=None,
-            gate: dict | None = None) -> dict:
+            gate: dict | None = None, runtime=None) -> dict:
     """Relève l'hôte de cet exécuteur et publie le relevé ; rend le relevé.
 
     Le nombre de tours en cours vient de la base (agents de l'hôte au bail
@@ -1569,15 +1620,25 @@ def collect(cfg, db: Db, *, now: float | None = None, policy=None,
     politique de ménage de l'hôte, pour la racine du cache des dépendances
     (#253). L159f : `gate` est l'état de la porte d'hôte que l'exécuteur suit
     (`gate_state`, `gate_seq`, `gate_reason`), None sans porte ; le
-    déplacement le lit.
+    déplacement le lit. `runtime` (#7694) : le bloc `policy.runtime` de la
+    fiche Host ; `kind: pod` publie la capacité déclarée du pod au lieu des
+    mesures du nœud (`load1` non mesuré).
     """
     host = cfg.host or ""
     try:
         turns = storage.of(db).hosts.turns_in_progress(host)
     except Exception:  # un relevé ne doit jamais faire tomber la boucle
         turns = None
-    reading = sample(host, paths=disk_paths(cfg, policy), now=now, turns_in_progress=turns,
-                     tmp=tmp_paths(cfg, policy))
+    pod = bool(getattr(cfg, "pod", False))
+    if runtime is not None and getattr(runtime, "kind", "") in ("pod", "pod-template"):
+        pod = True
+    if pod:
+        reading = sample_pod(host, now=now, turns_in_progress=turns,
+                             memory_bytes=getattr(cfg, "pod_memory_bytes", None),
+                             cpu_cores=getattr(cfg, "pod_cpu_cores", None))
+    else:
+        reading = sample(host, paths=disk_paths(cfg, policy), now=now,
+                         turns_in_progress=turns, tmp=tmp_paths(cfg, policy))
     # L159d: lendable capacity, on the 7 days of readings of the host
     try:
         basis = storage.of(db).hosts.lend_basis(host, LEND_WINDOW_S, LEND_SLOT_S,
@@ -1855,9 +1916,17 @@ def host_limits(canons, host: str, *, reading: dict | None = None,
     best: dict = {}
     scopes: list[tuple[str, str]] = []
     for label, fiche in fiches:
-        for key, value in declared(getattr(fiche, "policy", None)).items():
+        policy = getattr(fiche, "policy", None)
+        runtime = getattr(policy, "runtime", None)
+        pod = runtime is not None and getattr(runtime, "kind", "") in (
+            "pod", "pod-template")
+        for key, value in declared(policy).items():
             if key == PRESSURE_SCOPE_KEY:
                 scopes.append((value, label))
+                continue
+            # #7694 : `max_load` est accepté au canon mais jamais évalué en
+            # mode pod — `load1` est la charge du nœud, pas celle du pod.
+            if key == "max_load" and pod:
                 continue
             current = best.get(key)
             if current is None or (value > current[0] if key in FLOOR_KEYS

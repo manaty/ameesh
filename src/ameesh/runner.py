@@ -12282,6 +12282,10 @@ class Runner:
         #: ménage (L73) : politique de la fiche Host (dernier `canon sync`),
         #: valeurs par défaut tant qu'aucun canon n'est lu
         self._housekeeping = workspaces.default_policy()
+        #: #7694 : `policy.runtime` de la fiche Host (dernier `canon sync`),
+        #: None tant qu'aucun canon n'est lu (le chart peut déclarer
+        #: `AMEESH_POD=1` en attendant) ; le relevé d'hôte s'y adapte.
+        self._host_runtime = None
         #: L162 : jamais deux passages de ménage à la fois (le périodique, et
         #: celui qu'une pression du tmpfs déclenche tout de suite)
         self._housekeeping_lock = threading.Lock()
@@ -14473,6 +14477,12 @@ class Runner:
         """
         if getattr(self, "mediated", False):
             return True  # L109 : le canon est synchronisé par le serveur
+        # #7694 (design 7633 §3.1) : le runner d'un tenant lit le canon monté
+        # en lecture seule par le superviseur ; il ne le synchronise jamais
+        # (`canon_sync_interval: 0` dans son chart, et cette garde explicite).
+        from . import tenancy
+        if tenancy.runner_tenant(self.cfg):
+            return True
         self._designation_retry_ready = False
         entries = canon_mod.configured(self.cfg)
         self._canon_sync_counts = (0, len(entries))
@@ -14852,8 +14862,10 @@ class Runner:
             from .scoped_db import ScopedDb
             db = ScopedDb(self.cfg, family="runner.scoped.resource")
             gate = self.host_gate
-            reading = resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
-                                            gate=gate.snapshot() if gate is not None else None)
+            reading = resources_mod.collect(
+                self.cfg, db, policy=self.housekeeping_policy(),
+                gate=gate.snapshot() if gate is not None else None,
+                runtime=getattr(self, "_host_runtime", None))
             Runner.host_lifecycle_once(self, db)
             return reading
         except Exception as exc:  # jamais fatal pour l'exécuteur
@@ -15742,6 +15754,19 @@ class Runner:
                   if c is not None and hasattr(c, "host") and hasattr(c, "hosts")]
         if not canons:
             return  # objet factice des tests de `canon_sync_once`
+        # #7694 : le runtime de CET hôte (pod) décide du relevé publié et
+        # écarte `max_load` ; la première fiche qui en déclare un fait foi.
+        runtime = None
+        for one in canons:
+            # Un faux canon de test peut porter `host=None` : l'attribut
+            # existe sans être appelable (L159f), comme dans lease_ttl_rule.
+            lookup = getattr(one, "host", None)
+            fiche = lookup(self.host) if callable(lookup) else None
+            candidate = getattr(getattr(fiche, "policy", None), "runtime", None)
+            if candidate is not None:
+                runtime = candidate
+                break
+        self._host_runtime = runtime
         # #2825 N4 : le défaut de CET hôte vient de sa propre détection (ou de
         # sa fiche) ; les autres hôtes gardent le défaut `host`, jamais celui
         # du processus qui lit leurs limites.

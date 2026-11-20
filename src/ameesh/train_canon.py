@@ -22,9 +22,12 @@ over every configured canon, and the compiled model families.
   already in flight runs to its terminal outcome.
 
 The host service follows the audited gate when the versioned train-rule
-guard is unchanged (#3483); other changes require reviewed qualification. The service re-reads the configured pin at
-each passage (#3366), so a requalified pin needs no runner restart. The
-gate's commit is read, never written.
+guard is unchanged (#3483), or when the diff touching it leaves what the train
+compiles for every project of the train strictly identical at the pin and at
+the gate (#7880). Other changes require reviewed qualification, and their
+refusal opens (or updates) one carrier lot cited by the alert. The service
+re-reads the configured pin at each passage (#3366), so a requalified pin needs
+no runner restart. The gate's commit is read, never written.
 """
 from __future__ import annotations
 
@@ -199,7 +202,8 @@ class Watch:
     ``notify`` journals every non-aligned reading.
     """
 
-    def __init__(self, project, pin, reader, *, rules=None, pilot=None, mailer=None):
+    def __init__(self, project, pin, reader, *, rules=None, pilot=None, mailer=None,
+                 carrier=None):
         if not callable(reader):
             raise TypeError("explicit gate canon reader required")
         self.project, self.pin, self.reader = project, pin, reader
@@ -208,6 +212,9 @@ class Watch:
         self.rules = rules
         self.pilot = pilot
         self.mailer = mailer
+        #: #7880 ``carrier(db, reading)`` -> the requalification lot id (or
+        #: None when the move needs no carrier), cited by the alert
+        self.carrier = carrier
         self.alerted = set()
 
     def read(self, db):
@@ -252,6 +259,16 @@ class Watch:
         effect = ("le train refuse de composer un nouveau paquet"
                   if mode == "active" else
                   "le plan d'ombre porte l'écart ; aucun effet")
+        carrier = ""
+        if self.carrier is not None:
+            try:
+                lot = self.carrier(db, reading)
+            except Exception:  # noqa: BLE001 - the alert stands without its lot
+                lot = None
+            if lot:
+                carrier = ("- Porteur : lot #%s — requalification relue (diff, "
+                           "commande de dry-run et avis dus y sont consignés)."
+                           % int(lot))
         if reading.state == DRIFT and reading.gate == reading.pin:
             # #3349: same commit, other rule readings. Nothing to requalify
             # here; the gate's sources are what must be reconciled.
@@ -261,13 +278,16 @@ class Watch:
                       "ces sources sur le canon épinglé, ou, si l'épingle doit "
                       "changer, qualifier un nouveau canon (#1467).")
         else:
-            follow = ("- Le suivi automatique (#3483) exige une avance descendante "
-                      "sans changement des fichiers de règles versionnés ; sinon "
+            follow = ("- Le suivi automatique (#3483) compare les règles compilées "
+                      "du train au pin et à la porte : inchangées, l'avance est "
+                      "mécanique même si `federation.yaml` change ; sinon "
                       "requalification relue requise.\n"
                       "- Requalification mécanique si le diff pin..porte ne touche ni "
                       "`processus/mecanique.yaml` ni `federation.yaml` : "
                       "python -m ameesh.train_cli --project %s requalify --lot <lot>."
                       % self.project)
+            if carrier:
+                follow += "\n" + carrier
         body = "\n".join([
             "Train %s (%s) : %s." % (self.project, mode, reading.describe()),
             "",
@@ -293,3 +313,20 @@ def pilot_of(cfg, project):
         return review_designation_activation._notify(cfg, db, project,
                                                      registry.overview(db))
     return read
+
+
+def canon_pilot_of(cfg):
+    """A reader of the canon's pilot: the orchestrator of the canon's project.
+
+    The canon belongs to the project the host applies it for (``cfg.project``).
+    The train may serve another project: ``pilot_of(cfg, project)`` names that
+    project's orchestrator, the one the drift alert mails, while the
+    requalification carrier opened for a canon move belongs to the canon
+    project's pilot. The role is the canon's declared ``orchestrateur``, never
+    a name in code; without a configured project the reader returns ``""`` and
+    the carrier stays in the team queue.
+    """
+    project = str(getattr(cfg, "project", "") or "").strip()
+    if not project:
+        return lambda db: ""
+    return pilot_of(cfg, project)

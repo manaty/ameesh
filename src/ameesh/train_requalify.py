@@ -3,12 +3,20 @@
 
 The train reads its rules at the commit pinned in the host configuration
 (``train.projects.<p>.canon_commit``). The automatic host service follows the
-audited gate only through this guard (#3483). When the canon has moved and its diff does not touch the two
-files that carry the train's rules — ``processus/mecanique.yaml`` and
-``federation.yaml`` — the move is mechanical: the command below writes the
-gate's audited commit where the pin is declared, and traces the gesture on the
-lot the pilot names. A rules diff requires the explicit reviewed path (#4037):
-exact recorded opinions, including a pilot's, are checked before the move.
+audited gate through this guard (#3483, #7880). When the canon has moved and
+its diff does not touch the two files that carry the train's rules —
+``processus/mecanique.yaml`` and ``federation.yaml`` — the move is mechanical:
+the command below writes the gate's audited commit where the pin is declared,
+and traces the gesture on the lot the pilot names.
+
+A guard-touching diff is followed only when what the train *compiles* for every
+project of the train is identical at the pin and at the gate, and the gate's
+other readings (``train_canon.gate_rules_gap``) agree with the new pin. That is
+the semantic follow-up (#7880): adding a path for another project to
+``federation.yaml`` no longer blocks a train whose own rules did not change.
+Other rule changes require the explicit reviewed path (#4037): exact recorded
+opinions, including a pilot's, are checked before the move, and the train opens
+one carrier lot per project/pin so the refusal always has an owner.
 
 It writes **every** configuration file that explicitly carries the pin (the
 host ``config.json`` and the profiles that override it), so the recursive
@@ -23,6 +31,7 @@ import fcntl
 from datetime import datetime, timezone
 import json
 import os
+import re
 import tempfile
 
 from . import config, train_assembly, train_canon, work
@@ -31,6 +40,29 @@ from .train import TrainError
 
 class RequalifyError(TrainError):
     """The requalification is refused; nothing was written."""
+
+
+class RequalifyReviewRequired(RequalifyError):
+    """The guard changed the train's compiled rules: a reviewed move is due.
+
+    The refusal carries everything needed to open its carrier lot: the two
+    commits, the diff, the guard files and the compiled gap. ``automatic``
+    opens (or updates) that lot, and the gate alert cites it (#7880).
+    """
+
+    def __init__(self, message, *, project, pin, gate, changed=(), guard=(), gap=""):
+        super().__init__(message)
+        self.project = project
+        self.pin = pin
+        self.gate = gate
+        self.changed = tuple(changed or ())
+        self.guard = tuple(guard or ())
+        self.gap = gap
+
+
+#: stable prefix of the carrier lot's source, per project and pin. A newer gate
+#: for the same pin updates that open lot instead of stacking another one.
+CARRIER_SOURCE = "train-requalification"
 
 
 def _read(path):
@@ -123,6 +155,257 @@ def _validate(spec, path, raw, project, gate):
         raise RequalifyError(str(exc)) from exc
 
 
+def _compiled(canon, commit, project):
+    """One project's compiled train rules, with the commit identity removed.
+
+    ``mechanics.load`` binds its object to the exact commit and source path;
+    two readings of equal rules at different commits differ only there (the
+    repair policy carries the commit too). Every other field counts: the
+    comparison is strict, never a subset of fields.
+    """
+    from . import mechanics
+    rules = mechanics.load(canon, commit, project)
+    repair = rules.repair_policy
+    if repair is not None:
+        repair = dataclasses.replace(repair, commit="")
+    return dataclasses.replace(rules, commit="", source="", repair_policy=repair)
+
+
+def _compiled_fields(before, after):
+    """Top-level fields of two compiled objects that differ."""
+    return [field.name for field in dataclasses.fields(before)
+            if getattr(before, field.name) != getattr(after, field.name)]
+
+
+def compiled_rules_gap(cfg, db, *, pin, gate):
+    """What the train compiles differently between ``pin`` and ``gate``, or "".
+
+    Every project of the train is compared in its own canon (#7880): the
+    compiled object (``mechanics.load``) must be strictly equal at the two
+    commits, and the gate's other readings at the gate (``gate_rules_gap``)
+    must leave no gap against the new pin. Paths present in the project
+    repository are never a filter: only the compiled rules matter. An
+    unreadable side is a difference, never a reassuring "unchanged".
+    """
+    pin = str(pin or "").strip().lower()
+    gate = str(gate or "").strip().lower()
+    try:
+        settings = train_assembly.Settings.parse(getattr(cfg, "train", None) or {})
+    except Exception as exc:  # noqa: BLE001 - unreadable train block: never unchanged
+        return "train configuration illisible: %s: %s" % (
+            type(exc).__name__, str(exc)[:160])
+    gaps = []
+    for project in settings.projects:
+        name = project.name
+        try:
+            before = _compiled(project.canon, pin, name)
+            after = _compiled(project.canon, gate, name)
+        except Exception as exc:  # noqa: BLE001 - unreadable rules: a difference
+            gaps.append("%s : règles compilées illisibles (%s: %s)"
+                        % (name, type(exc).__name__, str(exc)[:160]))
+            continue
+        fields = _compiled_fields(before, after)
+        if fields:
+            gaps.append("%s : %s" % (name, ", ".join(fields)))
+            continue
+        try:
+            gap = train_canon.gate_rules_gap(db, cfg, name, project.canon, gate)
+        except Exception as exc:  # noqa: BLE001 - unreadable gate: a difference
+            gaps.append("%s : lectures de la porte illisibles (%s: %s)"
+                        % (name, type(exc).__name__, str(exc)[:160]))
+            continue
+        if gap:
+            gaps.append("%s : %s" % (name, gap))
+    return "; ".join(gaps)
+
+
+def _carrier_source(project, pin):
+    return "%s:%s:%s" % (CARRIER_SOURCE, project, str(pin or "").strip().lower())
+
+
+def _carrier_ref(project, pin, gate):
+    return "%s:%s" % (_carrier_source(project, pin),
+                      str(gate or "").strip().lower())
+
+
+def _carrier_title(project, pin, gate):
+    return "Train %s : requalification relue du pin canon %s → %s" % (
+        project, pin[:12], gate[:12])
+
+
+_GATE_LINE = "- Porte : "
+
+
+def _body_gate(body):
+    """The full gate commit recorded by :func:`_carrier_body`, or ""."""
+    for line in str(body or "").splitlines():
+        if line.startswith(_GATE_LINE):
+            value = line[len(_GATE_LINE):].strip().lower()
+            if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+                return value
+    return ""
+
+
+def _gate_is_newer(canon, current, gate):
+    """True when ``gate`` is ``current`` or descends from it (never a regression).
+
+    A standby host can read an older audited gate than the one already carried
+    by the open lot. Its passage must not rewrite the lot to that older target;
+    the lot keeps the newer reading until the pilot moves the pin.
+    """
+    if not current or current == gate:
+        return True
+    if not canon or not os.path.isdir(canon):
+        return False
+    from . import resolutions
+    try:
+        proc = resolutions._run(canon, "merge-base", "--is-ancestor", current, gate)
+    except Exception:  # noqa: BLE001 - unreadable ancestry: keep the current lot
+        return False
+    return proc.returncode == 0
+
+
+def _carrier_body(project, *, pin, gate, canon, changed, guard, gap, pilot):
+    diff = ", ".join(changed) if changed else "illisible"
+    files = ", ".join(guard) if guard else "aucun"
+    command = (
+        "python -m ameesh.train_cli --project %s requalify --lot <ce lot> "
+        "--reviewed --review milestone:<id> --review milestone:<id> --dry-run"
+        % project)
+    lines = [
+        "Train %s : requalification relue du pin canon %s → %s."
+        % (project, pin[:12], gate[:12]),
+        "",
+        "- Pin : %s" % pin,
+        "- Porte : %s" % gate,
+        "- Diff : %s" % diff,
+        "- Fichiers de règles touchés : %s" % files,
+        "- Écart des règles compilées : %s" % (gap or "?"),
+        "- Effet : le train %s refuse de composer un nouveau paquet ; un paquet "
+        "en vol va au bout." % project,
+        "",
+        "Requalification relue requise (voie relue #4037, avis du canon) :",
+        "1. Relire le diff : `git -C %s diff %s %s`."
+        % (canon or "?", pin, gate),
+        "2. Poser les avis requis par le canon sur la porte %s."
+        % gate[:12],
+        "3. Dry-run : `%s`." % command,
+        "4. Appliquer sur l'hôte du train (détenteur du service), ou enregistrer "
+        "la demande depuis un autre hôte (`--request`, #7751).",
+    ]
+    if pilot:
+        lines.append("- Pilote du canon : %s." % pilot)
+    return "\n".join(lines)
+
+
+def ensure_requalification_lot(cfg, db, project, *, pin, gate, canon="",
+                               changed=None, guard=None, gap=None):
+    """Open or update the single carrier lot of a refused requalification.
+
+    Idempotent by ``unique_ref`` project+pin+gate. A newer gate on the same pin
+    updates the open lot (source project+pin) instead of stacking another one.
+    The lot is assigned to the canon's declared pilot role (the orchestrator of
+    the canon's project, ``train_canon.canon_pilot_of``) when that agent is
+    wakeable; otherwise it stays in the team queue and the body names the role,
+    never dropped. The train project's own orchestrator is a different role
+    (the drift alert's recipient). Returns the lot id, or None when there is
+    nothing to carry (same commit, no guard file, or compiled rules unchanged).
+    """
+    pin = str(pin or "").strip().lower()
+    gate = str(gate or "").strip().lower()
+    if not pin or not gate or pin == gate:
+        return None
+    try:
+        spec = train_assembly.project_of(cfg, project)
+    except Exception:  # noqa: BLE001 - the alert may run on a partial configuration
+        spec = None
+    canon = canon or (spec.canon if spec is not None else "")
+    if changed is None:
+        try:
+            changed = train_assembly.canon_diff(canon, pin, gate) if canon else []
+        except Exception:  # noqa: BLE001 - unreadable diff: no guard proof
+            changed = []
+    changed = tuple(changed or ())
+    if guard is None:
+        guard = tuple(name for name in changed
+                      if name in train_assembly.REQUALIFY_GUARD)
+    guard = tuple(guard or ())
+    if not guard:
+        return None
+    if gap is None:
+        gap = compiled_rules_gap(cfg, db, pin=pin, gate=gate)
+    if not gap:
+        return None
+    try:
+        pilot = train_canon.canon_pilot_of(cfg)(db)
+    except Exception:  # noqa: BLE001 - no readable role: unassigned carrier
+        pilot = ""
+    source = _carrier_source(project, pin)
+    title = _carrier_title(project, pin, gate)
+    body = _carrier_body(project, pin=pin, gate=gate, canon=canon,
+                         changed=changed, guard=guard, gap=gap, pilot=pilot)
+    with db.transaction() as tx:
+        # One writer per project+pin: two hosts (or two passages) never stack
+        # carriers for the same refusal, and a newer gate updates this one.
+        tx.query("SELECT pg_advisory_xact_lock(hashtextextended(lower(%s), 0))",
+                 (source,))
+        existing = work.open_with_source(tx, source)
+        if existing is not None:
+            unchanged = (existing.get("title") == title
+                         and existing.get("body") == body)
+            if unchanged or not _gate_is_newer(
+                    canon, _body_gate(existing.get("body")), gate):
+                return int(existing["id"])
+            row = work.update_generated(
+                tx, int(existing["id"]), title=title, body=body, priority=1,
+                note="avance de la porte %s → %s" % (pin[:12], gate[:12]),
+                actor=train_canon.SENDER)
+            if row is not None:
+                return int(existing["id"])
+        fields = dict(
+            title=title, type="evolution", source=source, app=project, body=body,
+            priority=1, actor=train_canon.SENDER, footprint=[],
+            unique_ref=_carrier_ref(project, pin, gate))
+        created = None
+        if pilot:
+            try:
+                created = work.add(tx, assignee=pilot, **fields)
+            except Exception:  # noqa: BLE001 - assignment is best effort, the lot is due
+                created = None
+        if created is None:
+            created = work.add(tx, **fields)
+        return int(created["id"])
+
+
+def ensure_requalification_lot_for_reading(cfg, db, project, reading):
+    """The carrier lot for a gate reading, or None when the move is mechanical.
+
+    Used by the alert path: a reading that does not touch the guard, or whose
+    compiled rules are unchanged, needs no carrier and returns None.
+    """
+    pin = str(getattr(reading, "pin", "") or "").strip().lower()
+    gate = str(getattr(reading, "gate", "") or "").strip().lower()
+    if not pin or not gate or pin == gate:
+        return None
+    try:
+        spec = train_assembly.project_of(cfg, project)
+    except Exception:  # noqa: BLE001 - no exact canon: nothing is invented
+        return None
+    try:
+        changed = train_assembly.canon_diff(spec.canon, pin, gate)
+    except Exception:  # noqa: BLE001 - unreadable diff: the alert keeps its text
+        return None
+    guard = [name for name in changed if name in train_assembly.REQUALIFY_GUARD]
+    if not guard:
+        return None
+    gap = compiled_rules_gap(cfg, db, pin=pin, gate=gate)
+    if not gap:
+        return None
+    return ensure_requalification_lot(
+        cfg, db, project, pin=pin, gate=gate, canon=spec.canon,
+        changed=changed, guard=guard, gap=gap)
+
+
 def _plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=(),
           expected_pin=None, expected_gate=None):
     try:
@@ -193,13 +476,27 @@ def _plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=(),
                              "reviewed requalification required")
     changed = train_assembly.canon_diff(canon, pin, gate)
     guard = [name for name in changed if name in train_assembly.REQUALIFY_GUARD]
+    motif = ""
     if guard and not reviewed:
-        raise RequalifyError(
-            "refused: the canon diff %s..%s touches %s — a rules change is not "
-            "a mechanical requalification; reviewed requalification required"
-            % (pin[:12], gate[:12], ", ".join(guard)))
+        # #7880: a guard file can move without changing what this train
+        # compiles (another project's policy, a comment, a path the train does
+        # not read). Compare the compiled rules of every train project at both
+        # commits; only unchanged rules make the move mechanical.
+        gap = compiled_rules_gap(cfg, db, pin=pin, gate=gate)
+        if gap:
+            raise RequalifyReviewRequired(
+                "refused: the canon diff %s..%s touches %s — a rules change is "
+                "not a mechanical requalification; reviewed requalification "
+                "required (%s)"
+                % (pin[:12], gate[:12], ", ".join(guard), gap),
+                project=project, pin=pin, gate=gate, changed=changed,
+                guard=guard, gap=gap)
+        motif = "règles compilées inchangées"
     result = {"state": "requalified", "project": project, "pin": pin, "gate": gate,
               "changed": changed, "files": [path for path, _raw in files]}
+    if motif:
+        result["motif"] = motif
+        result["guard"] = guard
     if reviewed:
         from . import train_requalify_review
         result["reviews"] = train_requalify_review.qualify(
@@ -384,9 +681,23 @@ def automatic(cfg, db, project, *, gate_reader=None):
 
     All local profiles follow. The durable host journal is required: a write
     failure rolls the pin writes back. A host lock serializes executor profiles.
+
+    #7880: when the guard changes the compiled rules, the refusal opens (or
+    updates) its carrier lot before being raised. The pin is not written; the
+    caller keeps it and reports the refusal. A failure to open the lot never
+    turns the refusal into a move.
     """
     def record(result):
         with journal(cfg, result, actor="train"):
             pass
-    return apply(cfg, db, project, lot=None, actor="train",
-                 gate_reader=gate_reader, record=record)
+    try:
+        return apply(cfg, db, project, lot=None, actor="train",
+                     gate_reader=gate_reader, record=record)
+    except RequalifyReviewRequired as exc:
+        try:
+            ensure_requalification_lot(
+                cfg, db, project, pin=exc.pin, gate=exc.gate,
+                changed=exc.changed, guard=exc.guard, gap=exc.gap)
+        except Exception:  # noqa: BLE001 - the refusal stands without the carrier
+            pass
+        raise
