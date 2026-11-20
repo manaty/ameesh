@@ -137,14 +137,6 @@
   ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
         tenants of a shared host: plan, binding, presence (#7106, bureau or
         human only; --register runs on the target host);
-  ameesh pod-provisioner [--once] [--cleanup-only] [--template FILE]
-        child-pod provisioner: heartbeat the frozen template, start one
-        requested child, delete expired pods and hosts (#7697, system actor;
-        requires the Kubernetes ServiceAccount of deploy/k8s/pod-provisioner);
-  ameesh pod-admission [--set-ca] [--template FILE] [--cert FILE] [--key FILE]
-        child-pod admission webhook: checks each pod against its
-        `pod_requests` row and the frozen template (independent authority,
-        #7697; requires the ameesh-pod-admission ServiceAccount);
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh hosts HOST --hold --until 2h --reason R | --release
                                         the owner holds a host on purpose: its
@@ -199,6 +191,14 @@
         roadmap: dated commitments, proposals drawn from decisions,
         text Gantt (schema ameesh-roadmap/1, L96); planned dates of a
         task or a card: `ameesh work plan <id> --start DATE --end DATE --delivery DATE`;
+  ameesh pod-admission [--set-ca] [--template FILE] [--cert FILE] [--key FILE]
+        child-pod admission webhook: checks each pod against its
+        `pod_requests` row and the frozen template (independent authority,
+        #7697; requires the ameesh-pod-admission ServiceAccount);
+  ameesh pod-provisioner [--once] [--cleanup-only] [--template FILE]
+        child-pod provisioner: heartbeat the frozen template, start one
+        requested child, delete expired pods and hosts (#7697, system actor;
+        requires the Kubernetes ServiceAccount of deploy/k8s/pod-provisioner);
   ameesh process check <page.md> [--ref REF] [--version N] [--json]
         compile the workflow block of a canon Process card (#2225);
   ameesh process-approvals refresh|check|show
