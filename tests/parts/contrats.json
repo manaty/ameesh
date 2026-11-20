@@ -32,6 +32,7 @@
         "test_6011_contrat_ecrivains_isoles",
         "test_6085_avatar_connectors",
         "test_6090_work_add_unique_ref",
+        "test_6298_vm_probe",
         "test_7630_avatar_tools",
         "test_7651_dev_schema_cutover",
         "test_7665_module_contract",
