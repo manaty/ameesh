@@ -146,12 +146,14 @@ class RecoveryTest(_AvatarCase):
         verdict = election.preference_return(self.db, self.row(), self.CLOUD)
         self.assertEqual((verdict["state"], verdict["recovery"]), ("plan", True))
         self.assertEqual(verdict["holder"], self.POSTE)
+        self.assertEqual(verdict.get("reason"), "failover")
 
         runner = self.runner()
         self.assertEqual(runner.preference_return_pass(), ["pilote"])
         move = storage.of(self.db).conversation_moves.open_for("pilote") or {}
         self.assertEqual((move.get("target_host"), move.get("state")),
                          (self.CLOUD, "planned"))
+        self.assertEqual(move.get("reason"), "failover")
         step = M.advance(self.db, self.CLOUD, probes=ready,
                          cwd_for=lambda m: "/work/cloud")
         self.assertEqual([value for _ident, value in step],
@@ -172,6 +174,52 @@ class RecoveryTest(_AvatarCase):
         row = self.row()
         self.assertEqual((row["status"], row["stop_reason"]), ("idle", None))
         self.assertEqual(row["lease_owner"], "runner-cloud")
+
+    def test_after_a_failover_the_poste_presence_does_not_plan_a_return(self):
+        """#7833 B (relecture 13) : pas de ping-pong poste ↔ cloud.
+
+        Une fois la conversation basculée par `failover`, le poste peut
+        republier un standing frais : le retour automatique de présence (B2)
+        ne doit pas reprendre l'avatar tant qu'un humain ne l'a pas déplacé.
+        """
+        self.stale_poste()
+        self.stop(age_s=avatar_failover.GRACE_S + 1.0)
+        self.assertEqual(self.runner().preference_return_pass(), ["pilote"])
+        M.advance(self.db, self.CLOUD, probes=ready, cwd_for=lambda m: "/work/cloud")
+        lease = registry.claim(self.db, "pilote", "runner-cloud", 120,
+                               host=self.CLOUD)
+        self.assertIsNotNone(lease)
+        # la tentative de bascule n'est plus ouverte (le premier tour cloud a
+        # eu lieu) ; `switched_at` garde la trace de l'arrivée.
+        self.db.execute(
+            "UPDATE conversation_moves SET state = 'failed',"
+            " failed_at = clock_timestamp(), error = 'test: turn served'"
+            " WHERE agent = 'pilote'")
+        # le poste redevient présent et frais, rang 0
+        self.standing("pilote", self.POSTE, 10.0)
+        verdict = election.preference_return(
+            self.db, self.row(), self.POSTE,
+            seen_since=time.monotonic() - 200.0)
+        self.assertEqual(verdict["state"], "plan")
+        self.assertFalse(verdict["recovery"])
+        # le retour par préférence est refusé par la retenue de bascule
+        self.assertIsNone(M.plan(
+            self.db, "pilote", self.POSTE, requested_by="test",
+            reason="preference"))
+        self.assertIsNone(storage.of(self.db).conversation_moves.open_for("pilote"))
+
+    def test_a_manual_move_revives_a_stopped_preference_avatar(self):
+        """N (relecture 13) : le réveil dépend de la relève, pas de la raison."""
+        self.stale_poste()
+        self.stop(age_s=0.0, reason="erreur")
+        move = M.plan(self.db, "pilote", self.CLOUD,
+                      requested_by="test", reason="manual")
+        self.assertIsNotNone(move)
+        M.advance(self.db, self.CLOUD, probes=ready,
+                  cwd_for=lambda m: "/work/cloud")
+        row = self.row()
+        self.assertEqual((row["host"], row["status"], row["stop_reason"]),
+                         (self.CLOUD, "idle", None))
 
     def test_a_manual_stop_is_not_revived_by_the_switch(self):
         self.stale_poste()

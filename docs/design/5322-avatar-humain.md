@@ -587,23 +587,33 @@ hôtes dès l'arrêt (le poste arrêté ne publie jamais), pour que la cible soi
 fraîche à l'échéance ; avant la grâce, `candidacy` affiche « failover in Ns »
 et ne débloque rien. Un avis `avatar_failover` est émis une fois par épisode
 (clé = agent + hôte + `status_since`), avec la cause, la cible et le geste de
-réparation ; sans autre hôte déclaré, il nomme l'absence de repli. Le retour
-au poste reste celui du dwell B2 ci-dessus (poste de nouveau présent 120 s) :
-la bascule ne le modifie pas, et un `ameesh resume` sur le poste avant
-l'échéance annule simplement la bascule.
+réparation ; sans autre hôte déclaré, il nomme l'absence de repli.
 
-*Retour au poste : décision owner non encore outillée.* Le commentaire du
+**Pas de retour automatique après une bascule (#7833).** Une reprise
+`failover` ne se défait pas par présence : la tentative porte
+`reason = 'failover'`, et `conversation_moves.plan` refuse tout retour
+automatique (`reason = 'preference'`) tant que l'arrivée courante vient
+d'une reprise de ce type, même si la tentative a ensuite échoué (`switched_at`
+garde la trace). Un poste encore fautif ne peut donc plus reprendre l'avatar
+après 120 s de présence, re-échouer et repartir au cloud : le cycle arrêt →
+bascule → retour → arrêt est fermé. La retenue tombe quand un humain déplace
+l'avatar (`ameesh agent move <avatar> --to <poste>`, raison `manual`) — ou
+par l'`attach` quand il atteindra un agent tenu par un autre hôte. Une
+nouvelle bascule reste permise si l'hôte cloud s'arrête à son tour, et un
+`ameesh resume` sur le poste avant l'échéance annule simplement la bascule.
+
+*Retour au poste : décision owner et geste disponible.* Le commentaire du
 ticket #6055 (compte owner `smichea`, 19/11/2026) tranche : un `attach` sur
 le poste déclenche le retour à la fin du tour cloud, même session ; sans
-`attach`, l'avatar reste dans le cloud. Le lot livre le retour par présence
-(le dwell de 120 s ci-dessus) parce que l'`attach` demandé n'existe pas
-encore : `ameesh attach` est local et refuse un agent dont la ligne est sur
-un autre hôte (`runner.attach_main`), et l'`attach` distant (#5325 / #7035)
-doit d'abord atteindre une session tenue par un autre hôte. Tant que ce
-préalable n'est pas qualifié sur pc-smichea, exiger l'`attach` laisserait
-l'avatar dans le cloud sans moyen d'en revenir. Le déclencheur est donc à
-reprendre dans #7035/design avant d'être opposable ; le présent lot ne fait
-pas de l'`attach` une condition.
+`attach`, l'avatar reste dans le cloud. Le lot applique cette seconde partie
+(la retenue ci-dessus) ; il ne peut pas outiller l'`attach` demandé :
+`ameesh attach` est local et refuse un agent dont la ligne est sur un autre
+hôte (`runner.attach_main`), et l'`attach` distant (#5325 / #7035) doit
+d'abord atteindre une session tenue par un autre hôte. Le geste humain
+disponible aujourd'hui est donc le déplacement explicite
+(`ameesh agent move <avatar> --to <poste>`), que l'avis `avatar_failover`
+nomme ; le déclencheur `attach` est à reprendre dans #7035/design avant
+d'être opposable.
 
 ### 3.3 Ce qui n'est pas `election`
 

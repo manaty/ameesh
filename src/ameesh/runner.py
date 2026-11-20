@@ -12737,7 +12737,7 @@ class Runner:
                 # autre hôte est rendu tel quel et on n'insiste pas.
                 move = conversation_move.plan(
                     self.db, name, self.host, requested_by=self.runner_id,
-                    reason="preference")
+                    reason=verdict.get("reason") or "preference")
                 if move is None or move.get("target_host") != self.host:
                     # un autre déplacement est déjà ouvert : ne pas insister
                     self._preference_plan_next[name] = now + check_s

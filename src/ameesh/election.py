@@ -1090,8 +1090,10 @@ def preference_return(db, role: Mapping, host: str, *, seen_since: float | None 
     if (role.get("mode") or "execute") != "execute":
         return None
     from . import avatar_failover
-    if role.get("status") == "stopped" \
-            and not avatar_failover.due(role, pg.now_ts(db)):
+    now_ts = pg.now_ts(db)
+    stopped = role.get("status") == "stopped"
+    failover_due = bool(stopped and avatar_failover.due(role, now_ts))
+    if stopped and not failover_due:
         return None
     name = str(role.get("name") or "")
     holder = str(role.get("host") or "")
@@ -1124,9 +1126,15 @@ def preference_return(db, role: Mapping, host: str, *, seen_since: float | None 
         return {"state": "plan", "recovery": False, "holder": holder,
                 "dwell_s": elapsed, "delay_s": delay}
     # the holder is absent (no fresh presence) or its lease expired: the
-    # conversation is recovered at once, the short TTL bounding the wait
-    return {"state": "plan", "recovery": True, "holder": holder,
-            "dwell_s": 0.0, "delay_s": delay}
+    # conversation is recovered at once, the short TTL bounding the wait.
+    # #7833: a holder stopped by its runner (`erreur`) is a failover, not a
+    # preference return: the move carries `reason = 'failover'`, so B2 will
+    # not undo it by presence until a human action on the poste.
+    verdict = {"state": "plan", "recovery": True, "holder": holder,
+               "dwell_s": 0.0, "delay_s": delay}
+    if failover_due:
+        verdict["reason"] = "failover"
+    return verdict
 
 
 def _lease_live(db, role: Mapping) -> bool:
