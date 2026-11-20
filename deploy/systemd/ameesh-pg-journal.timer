@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7962 — passe de plafonnement du journal json d'`ameesh-pg` toutes les
+# 10 minutes après la passe précédente, et 5 minutes après le démarrage.
+# Une passe ordinaire ne coûte qu'un `stat` : le script ne copie et ne tronque
+# que si le fichier dépasse le seuil (128 Mio par défaut). À 137 Mo/jour
+# mesurés sur AG2, le plafond est atteint en ~1 jour ; entre deux passes le
+# fichier peut grossir d'au plus ~1 Mo (10 min), le plafond effectif reste
+# donc ~129 Mio.
+#
+# `OnUnitInactiveSec` attend la fin de la passe précédente : deux passes ne se
+# chevauchent pas, et le verrou du script couvre le cas d'un lancement manuel.
+[Unit]
+Description=ameesh — plafond du journal json d'ameesh-pg toutes les 10 minutes (#7962)
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=10min
+AccuracySec=30s
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

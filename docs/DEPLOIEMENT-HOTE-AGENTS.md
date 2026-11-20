@@ -231,6 +231,11 @@ Sur un hôte d’agents, le banc Pg local (`scripts/test.sh`, conteneur
 tests Pg ciblés échouent en `fe_sendauth` (#4065). Le mot de passe n’est
 jamais affiché ni versionné.
 
+Le journal `json-file` de ce banc n’a pas de plafond quand le conteneur a été
+créé sans `log-opts` : sa taille, son plafonnement sans arrêt par la minuterie
+`ameesh-pg-journal`, et les opts de la prochaine recréation sont décrits dans
+[AMEESH-PG.md](AMEESH-PG.md) (#7962).
+
 `installer` et `retour` refusent d’abord si l’identité effective du compte
 runner — `AMEESH_HOST` de son `EnvironmentFile`, lue dans l’environnement de
 l’unité — n’est pas `HOTE_AGENTS` : un `BASCULE_ENV` qui vise une autre VM
