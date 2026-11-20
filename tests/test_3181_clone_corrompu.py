@@ -57,12 +57,27 @@ class CorruptionReadingTest(unittest.TestCase):
         for message in (
                 "error: object file .git/objects/61/99d0e78 is empty",
                 "fatal: bad object refs/remotes/origin/integration/paquet-h-20261023-1700",
+                "fatal: git show-ref: bad ref refs/ameesh/resolutions/3885/main-x",
+                "fatal: missing object b59e7ec0c6e85495209d692788bb615d83c75a5a "
+                "for refs/ameesh/resolutions/3885/main-x",
                 "error: refs/remotes/origin/x: badRefContent",
                 "fatal: loose object 6199d0e78 (stored in .git/objects/61/99) is corrupt",
                 "error: origin did not send all necessary objects"):
             self.assertTrue(resolutions.local_corruption(message), message)
             self.assertTrue(resolutions.fetch_failure(message).startswith(
                 "local clone corrupted (unclean shutdown?): "), message)
+
+    def test_broken_refs_are_named_in_every_git_shape(self):
+        """#7969 : fetch, show-ref et for-each-ref nomment la ref à quarantaine."""
+        expected = ["refs/ameesh/resolutions/3885/main-fb029a526"]
+        for message in (
+                "fatal: bad object refs/ameesh/resolutions/3885/main-fb029a526",
+                "fatal: git show-ref: bad ref refs/ameesh/resolutions/3885/"
+                "main-fb029a526 (b59e7ec0c6e85495209d692788bb615d83c75a5a)",
+                "fatal: missing object b59e7ec0c6e85495209d692788bb615d83c75a5a "
+                "for refs/ameesh/resolutions/3885/main-fb029a526"):
+            self.assertEqual(resolutions.broken_refs(message), expected, message)
+        self.assertEqual(resolutions.broken_refs("fatal: bad object HEAD"), [])
 
     def test_a_network_error_is_not_local_corruption(self):
         for message in ("ssh: Could not resolve hostname github.com",
@@ -160,6 +175,44 @@ class CorruptedCloneTest(unittest.TestCase):
                         clone_q)
         # chaque déplacement est journalisé dans la quarantaine
         self.assertTrue(any(p.endswith("moved.log") for p in agents_q + clone_q))
+
+    def test_refs_left_on_a_pruned_alternate_object_are_quarantined(self):
+        """#7969 : le gc du checkout (alternate du clone) élague l'objet de
+        refs du clone ; le fetch les met en quarantaine au lieu d'échouer."""
+        tip = self.publish("lot/elague")
+        refs = ("refs/ameesh/candidates/remise/3885/main-fb029a526",
+                "refs/ameesh/resolutions/3885/main-fb029a526")
+        for ref in refs:
+            _git(self.clone.path, "update-ref", ref, tip)
+        # le clone lit l'objet du checkout par alternates : rien de local
+        self.assertFalse(os.path.exists(os.path.join(
+            self.clone.path, ".git", "objects", tip[:2], tip[2:])))
+        # l'élagage du checkout (gc après un fetch) ne voit pas les refs du clone
+        _git(self.agents, "branch", "-D", "lot/elague")
+        _git(self.agents, "update-ref", "-d", "refs/remotes/origin/lot/elague")
+        _git(self.agents, "reflog", "expire", "--expire=now", "--all")
+        _git(self.agents, "gc", "--prune=now", "--quiet")
+        self.assertNotEqual(subprocess.run(
+            ["git", "-C", self.agents, "cat-file", "-e", tip],
+            capture_output=True).returncode, 0)
+        # sans réparation, le fetch du clone échoue sur une ref cassée
+        proc = subprocess.run(["git", "-C", self.clone.path, "fetch", "--quiet", self.origin,
+                               "+refs/heads/main:refs/banc/main"],
+                              capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(resolutions.local_corruption(proc.stderr), proc.stderr)
+        # la passe suivante met les refs en quarantaine, puis refait le fetch
+        proc = resolutions._run(self.clone.path, "fetch", "--quiet", self.origin,
+                                "+refs/heads/main:refs/banc/main")
+        self.assertEqual(proc.returncode, 0, resolutions._err(proc))
+        clone_q = self.quarantined(os.path.join(self.clone.path, ".git"))
+        for ref in refs:
+            self.assertFalse(os.path.exists(os.path.join(
+                self.clone.path, ".git", *ref.split("/"))))
+            self.assertTrue(any(p.endswith(os.path.join(*ref.split("/"))) for p in clone_q),
+                            (ref, clone_q))
+        self.assertTrue(any(p.endswith("moved.log") for p in clone_q), clone_q)
+        _git(self.clone.path, "rev-parse", "refs/banc/main")
 
     def test_a_non_empty_corrupt_object_is_refused_not_moved(self):
         tip = self.publish("lot/b")
