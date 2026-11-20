@@ -1,0 +1,283 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""P2: populated isolated P1 copy -> dev/0001 -> operator rollback -> P2.
+
+No shared mesh database is migrated. Every table's rows, OID, foreign keys,
+ACL and owned sequence state are compared, beyond mere row counts.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from dataclasses import replace
+import unittest
+import uuid
+from unittest import mock
+
+from ameesh import db as db_mod, migrations, work
+from ameesh.modules import registry, dev
+from ameesh.modules.dev.tables import TABLES
+from . import support, gabarit
+from .role_acl import serialize_role_acl
+
+FOLDER = Path(support.REPO) / 'src/ameesh/modules/dev/migrations'
+ROLLBACK = (FOLDER / 'rollback/0001_module_schema_cutover.sql').read_text()
+
+
+def cutover_modules():
+    """Activation ONLY for isolated-copy proofs; runtime remains code-only."""
+    with mock.patch.object(dev, 'MIGRATIONS', 'migrations'):
+        return registry.discover()
+
+
+class CutoverDeclarationTest(unittest.TestCase):
+    def test_non_additive_and_packaged_separately_from_rollback(self):
+        found = cutover_modules().get('dev')
+        self.assertEqual([m.label for m in found.migrations],
+                         ['dev/0001_module_schema_cutover'])
+        self.assertTrue(migrations.non_additive(found.migrations[0]))
+        self.assertEqual(migrations.module_sql_problems(found.migrations[0]), [])
+        self.assertEqual(len(TABLES), 37)
+        for table in TABLES:
+            self.assertIn("'%s'" % table, found.migrations[0].sql)
+            self.assertIn("'%s'" % table, ROLLBACK)
+        self.assertNotRegex(ROLLBACK, r'(?i)DROP\s+(?:SCHEMA|VIEW)\s+[^;]+\s+CASCADE')
+
+
+@support.needs_builtin_modules
+class DevCutoverTest(support.PgTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        serialize_role_acl(cls)
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute('TRUNCATE ' + ','.join(TABLES) + ' RESTART IDENTITY CASCADE')
+        self.physical = migrations.schema_name(self.schema, 'dev')
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        if self.db.query("SELECT EXISTS (SELECT FROM module_schemas WHERE module='dev') AS ok")[0]['ok']:
+            self.db.script(ROLLBACK)
+
+    def upgrade(self):
+        result = migrations.migrate(self.db, modules=cutover_modules())
+        self.assertEqual([m.label for m in result], ['dev/0001_module_schema_cutover'])
+        return result
+
+    def populate(self):
+        self.lot = work.add(self.db, title='fixture cutover', actor='human:alice', cfg=self.cfg)['id']
+        self.db.execute("INSERT INTO ci_runs (repo, run_id, head_sha, branch, work_item_id)"
+                        " VALUES ('acme/demo', 11, %s, 'main', %s)", ('a' * 40, self.lot))
+        self.db.execute("INSERT INTO provenance_receipts (subject, sha, actor, session, turn, harness, work_item_id)"
+                        " VALUES (%s, %s, 'alice', 'session', 'turn', 'codex', %s)",
+                        ('commit:' + 'a' * 40, 'a' * 40, self.lot))
+        self.db.execute("INSERT INTO ci_disk_state (repo,host,volume) VALUES ('acme/demo','fixture-host','data')")
+        self.db.execute("UPDATE work_items SET migration=9122, migration_repo='acme/demo',"
+                        " branch_target='main' WHERE id=%s", (self.lot,))
+        self.db.execute("SELECT nextval('merge_queue_generation_seq')")
+
+    def snapshot(self, schema):
+        tables = {}
+        for name in TABLES:
+            qualified = '%s.%s' % (db_mod.quote_ident(schema), db_mod.quote_ident(name))
+            rows = self.db.query('SELECT to_jsonb(t)::text AS value FROM %s t ORDER BY 1' % qualified)
+            catalog = self.db.query(
+                'SELECT c.oid::bigint AS oid, c.relowner::bigint AS owner, c.relacl::text AS acl,'
+                ' (SELECT jsonb_agg(jsonb_build_array(oid,contype,conrelid,confrelid,conkey,confkey) ORDER BY oid)::text FROM pg_constraint'
+                ' WHERE conrelid=c.oid) AS constraints'
+                ' FROM pg_class c WHERE c.oid=to_regclass(%s)', (qualified,))[0]
+            tables[name] = (rows, catalog)
+        return tables
+
+    def owned_sequence(self, schema):
+        name = self.db.query('SELECT pg_get_serial_sequence(%s, %s) AS name',
+                             (schema + '.work_migration_reservations', 'id'))[0]['name']
+        oid = self.db.query('SELECT to_regclass(%s)::oid::bigint AS oid', (name,))[0]['oid']
+        return oid, self.db.query('SELECT last_value, is_called FROM ' + name)
+
+    def test_round_trip_preserves_data_oids_acls_and_sequences(self):
+        self.populate()
+        before = self.snapshot(self.schema)
+        owned = self.owned_sequence(self.schema)
+        guard = self.db.query("SELECT pg_get_functiondef('ameesh_limited_login_guard()'::regprocedure) AS s")[0]['s']
+        seq = self.db.query("SELECT last_value, is_called FROM merge_queue_generation_seq")
+        self.upgrade()
+        self.assertEqual(self.snapshot(self.physical), before)
+        self.assertEqual(self.owned_sequence(self.physical), owned)
+        for name, (rows, _) in before.items():
+            self.assertEqual(self.db.query('SELECT to_jsonb(t)::text AS value FROM %s t ORDER BY 1' % name), rows)
+        for name in TABLES:
+            self.assertEqual(self.db.query('SELECT relkind FROM pg_class WHERE oid=to_regclass(%s)',
+                                           (self.schema + '.' + name,))[0]['relkind'], 'v')
+        self.assertEqual(self.db.query("SELECT last_value, is_called FROM merge_queue_generation_seq"), seq)
+        self.assertEqual(migrations.migrate(self.db, modules=cutover_modules()), [])
+        # The same old unqualified writer works after cutover, including upsert.
+        self.db.execute("INSERT INTO ci_runs (repo, run_id, head_sha, branch)"
+                        " VALUES ('acme/demo',11,%s,'main') ON CONFLICT (repo,run_id)"
+                        " DO UPDATE SET head_sha=excluded.head_sha", ('b' * 40,))
+        self.db.execute("UPDATE ci_runs SET head_sha=%s WHERE run_id=11", ('a' * 40,))
+        self.db.script(ROLLBACK)
+        self.assertEqual(self.snapshot(self.schema), before)
+        self.assertEqual(self.owned_sequence(self.schema), owned)
+        self.assertEqual(self.db.query("SELECT last_value, is_called FROM merge_queue_generation_seq"), seq)
+        self.assertEqual(self.db.query("SELECT pg_get_functiondef('ameesh_limited_login_guard()'::regprocedure) AS s")[0]['s'], guard)
+        self.assertEqual(self.db.query("SELECT * FROM module_schema_migrations WHERE module='dev'"), [])
+        self.assertEqual(self.db.query("SELECT * FROM module_schema_non_additive_migrations WHERE module='dev'"), [])
+        self.upgrade()
+        self.assertEqual(self.snapshot(self.physical), before)
+        self.assertEqual(self.owned_sequence(self.physical), owned)
+
+    def test_backup_restored_copy_upgrades_and_rolls_back_with_data(self):
+        self.populate()
+        dump = gabarit._dump(self.db, self.schema)
+        if dump is None:
+            self.skipTest('pg_dump matching the test server is unavailable')
+        backup = Path(self.tmp) / 'p1-backup.sql'
+        backup.touch(mode=0o600)
+        backup.write_text(dump)
+        clone_schema = self.schema + '_copy'
+        clone = db_mod.connect(replace(self.cfg, schema=clone_schema))
+        try:
+            gabarit.cloner(clone, clone_schema, self.schema, backup.read_text())
+            self.assertEqual(clone.query('SELECT count(*) AS n FROM ci_runs')[0]['n'], 1)
+            self.assertEqual(clone.query('SELECT count(*) AS n FROM provenance_receipts')[0]['n'], 1)
+            physical = migrations.schema_name(clone_schema, 'dev')
+            def content(schema):
+                return {name: clone.query('SELECT to_jsonb(t)::text AS value FROM %s.%s t ORDER BY 1'
+                                          % (schema, name)) for name in TABLES}
+            before = content(clone_schema)
+            migrations.migrate(clone, modules=cutover_modules())
+            self.assertEqual(content(physical), before)
+            clone.script(ROLLBACK)
+            self.assertEqual(content(clone_schema), before)
+            self.assertEqual(clone.query("SELECT * FROM module_schemas WHERE module='dev'"), [])
+        finally:
+            clone.execute('DROP SCHEMA IF EXISTS %s CASCADE' % migrations.schema_name(clone_schema, 'dev'))
+            clone.execute('DROP SCHEMA IF EXISTS %s CASCADE' % clone_schema)
+            clone.close()
+
+    def test_core_migration_slot_trigger_and_module_storage_after_cutover(self):
+        self.populate()
+        self.upgrade()
+        self.db.execute("UPDATE work_items SET migration=9123, migration_repo='acme/demo',"
+                        " branch_target='main' WHERE id=%s", (self.lot,))
+        rows = self.db.query('SELECT number FROM work_migration_reservations WHERE work_item_id=%s', (self.lot,))
+        self.assertEqual(rows[0]['number'], 9123)
+        # New connection, as required when executors restart after the move.
+        fresh = db_mod.connect(self.cfg)
+        try:
+            from ameesh import storage
+            port = storage.of(fresh).work
+            request = port.train_requalify_request('demo', 'a'*40, 'b'*40, ['review:fixture'], self.lot, 'alice')
+            self.assertIsNotNone(request)
+            self.assertEqual(len(port.train_requalify_requests('demo')), 1)
+            self.assertEqual(port.train_requalify_resolve(request['id'], 'applied', actor='host')['state'], 'applied')
+        finally:
+            fresh.close()
+
+    def test_rollback_refuses_later_migration_without_moving_any_table(self):
+        self.upgrade()
+        self.db.execute("INSERT INTO module_schema_migrations (module,version,name,checksum)"
+                        " VALUES ('dev',2,'fixture','fixture')")
+        try:
+            with self.assertRaisesRegex(db_mod.DbError, 'later migrations'):
+                self.db.script(ROLLBACK)
+            self.assertEqual(self.db.query('SELECT relkind FROM pg_class WHERE oid=to_regclass(%s)',
+                                           (self.physical + '.ci_runs',))[0]['relkind'], 'r')
+        finally:
+            self.db.execute("DELETE FROM module_schema_migrations WHERE module='dev' AND version=2")
+
+    def test_code_only_release_keeps_staging_preflight_open(self):
+        self.assertEqual(registry.discover().get('dev').migrations, ())
+        self.assertEqual(migrations.migrate(self.db, additive_only=True, modules=registry.discover()), [])
+        self.assertEqual(self.db.query("SELECT * FROM module_schemas WHERE module='dev'"), [])
+
+    def test_additive_only_does_not_even_create_the_module_schema(self):
+        with self.assertRaises(migrations.NonAdditiveMigration):
+            migrations.migrate(self.db, additive_only=True, modules=cutover_modules())
+        self.assertEqual(self.db.query("SELECT * FROM module_schemas WHERE module='dev'"), [])
+        self.assertFalse(self.db.query('SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname=%s) AS ok',
+                                      (self.physical,))[0]['ok'])
+
+    def test_rls_preflight_is_atomic(self):
+        self.db.execute('ALTER TABLE ci_runs ENABLE ROW LEVEL SECURITY')
+        self.addCleanup(self.db.execute, 'ALTER TABLE ci_runs DISABLE ROW LEVEL SECURITY')
+        with self.assertRaisesRegex(db_mod.DbError, 'unexpected RLS'):
+            self.upgrade()
+        self.assertEqual(self.db.query("SELECT * FROM module_schemas WHERE module='dev'"), [])
+        self.assertEqual(self.db.query("SELECT relkind FROM pg_class WHERE oid='ci_runs'::regclass")[0]['relkind'], 'r')
+
+    def test_compatibility_view_dml_and_core_foreign_key(self):
+        self.populate()
+        self.upgrade()
+        with self.db.transaction() as tx:
+            self.assertEqual(len(tx.query('SELECT * FROM ci_runs WHERE run_id=11 FOR UPDATE')), 1)
+            rows = tx.query("INSERT INTO ci_runs (repo,run_id,head_sha,branch)"
+                            " VALUES ('acme/demo',12,%s,'main') RETURNING run_id", ('c' * 40,))
+            self.assertEqual(rows[0]['run_id'], 12)
+            tx.execute("UPDATE ci_runs c SET branch='feature' FROM work_items w WHERE c.work_item_id=w.id")
+            tx.execute('DELETE FROM ci_runs c USING work_items w WHERE c.work_item_id=w.id')
+        with self.assertRaises(db_mod.DbError):
+            self.db.execute("INSERT INTO provenance_receipts (subject,sha,actor,session,turn,harness,work_item_id)"
+                            " VALUES (%s,%s,'alice','s','t','codex',-1)", ('commit:' + 'b'*40, 'b'*40))
+
+    def test_relation_grant_without_core_usage_does_not_open_module_schema(self):
+        role = 't_cutover_' + uuid.uuid4().hex[:10]
+        self.db.execute('CREATE ROLE %s NOLOGIN' % role)
+        try:
+            self.db.execute('GRANT SELECT ON ci_runs TO %s' % role)
+            self.assertFalse(self.db.query("SELECT has_schema_privilege(%s,%s,'USAGE') AS ok",
+                                           (role, self.schema))[0]['ok'])
+            self.upgrade()
+            self.assertFalse(self.db.query("SELECT has_schema_privilege(%s,%s,'USAGE') AS ok",
+                                           (role, self.physical))[0]['ok'])
+        finally:
+            self.restore()
+            self.db.execute('DROP OWNED BY %s' % role)
+            self.db.execute('DROP ROLE %s' % role)
+
+    def test_column_acl_and_limited_login_receipt_through_view(self):
+        role = 't_cutover_' + uuid.uuid4().hex[:10]
+        self.db.execute('CREATE ROLE %s NOLOGIN' % role)
+        def drop_role():
+            self.restore()
+            self.db.execute('DROP OWNED BY %s' % role)
+            self.db.execute('DROP ROLE %s' % role)
+        self.addCleanup(drop_role)
+        marker_exists = self.db.query("SELECT to_regrole('ameesh_login_limite') IS NOT NULL AS ok")[0]['ok']
+        if not marker_exists:
+            self.db.execute('CREATE ROLE ameesh_login_limite NOLOGIN')
+            self.addCleanup(self.db.execute, 'DROP ROLE ameesh_login_limite')
+        self.db.execute('GRANT ameesh_login_limite TO %s' % role)
+        self.db.execute('GRANT USAGE ON SCHEMA %s TO %s' % (self.schema, role))
+        self.db.execute('GRANT SELECT ON limited_logins TO %s' % role)
+        self.db.execute('GRANT INSERT (subject,sha,actor,session,turn,harness), SELECT (subject)'
+                        ' ON provenance_receipts TO %s' % role)
+        self.db.execute('GRANT SELECT (subject) ON provenance_receipts TO %s WITH GRANT OPTION' % role)
+        # These defaults apply to the NEW view, not to the existing table.
+        # Copying ACLs must remove this accidental whole-table SELECT grant.
+        self.db.execute('ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT ON TABLES TO %s'
+                        % (self.schema, role))
+        self.db.execute("INSERT INTO limited_logins (rolname,agent,host) VALUES (%s,'alice','host')", (role,))
+        self.upgrade()
+        with self.db.transaction() as tx:
+            tx.execute('SET LOCAL SESSION AUTHORIZATION %s' % role)
+            tx.execute("INSERT INTO provenance_receipts (subject,sha,actor,session,turn,harness)"
+                       " VALUES (%s,%s,'alice','s','t','codex')", ('commit:' + 'd'*40, 'd'*40))
+            self.assertEqual(len(tx.query('SELECT subject FROM provenance_receipts')), 1)
+        for statement in [
+                "INSERT INTO provenance_receipts (subject,sha,actor,session,turn,harness)"
+                " VALUES ('commit:%s','%s','bob','s','t','codex')" % ('e'*40, 'e'*40),
+                'SELECT sha FROM provenance_receipts']:
+            with self.assertRaises(db_mod.DbError):
+                with self.db.transaction() as tx:
+                    tx.execute('SET LOCAL SESSION AUTHORIZATION %s' % role)
+                    tx.execute(statement)
+        self.db.script(ROLLBACK)
+        with self.db.transaction() as tx:
+            tx.execute('SET LOCAL SESSION AUTHORIZATION %s' % role)
+            self.assertEqual(len(tx.query('SELECT subject FROM provenance_receipts')), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()
