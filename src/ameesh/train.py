@@ -22,6 +22,10 @@ from . import merge_queue
 
 SCHEMA = "ameesh-train/1"
 TERMINAL = ("landed", "empty", "paused", "invalidated")
+#: #7967: phases a dead packet reservation may terminalize without promotion.
+#: `publishing` and `promoting` are excluded: a push or a merge may have left
+#: the process, so only the pilot may conclude those (fail closed).
+EXPIRABLE = ("ci-intent", "ci", "ready", "draining")
 
 
 class TrainError(RuntimeError):
@@ -308,6 +312,18 @@ class Engine:
                     return abandoned
             if state is not None and state["phase"] == "paused":
                 return {"result": "paused"}
+            if state is not None and state.get("phase") in EXPIRABLE:
+                # #7967 : l'échéance absolue de la réservation est passée. Le
+                # verrou de la cible est déjà rendu par l'expiration ; le plan
+                # ne peut plus être promu sous ce bail (et ne l'aurait pas été
+                # en `draining`). Le garder non terminal condamnait le train :
+                # `ReservedLedger.acquire` ne pouvait plus prendre d'époque sur
+                # une réservation morte, donc aucun passage ne composait plus.
+                # `publishing`/`promoting` restent au pilote (effet incertain).
+                deadline = self._expired_reservation(state, now)
+                if deadline is not None:
+                    return self._drained_terminal(
+                        state, self._expired_reason(state, deadline))
             if state is not None and state["phase"] in (
                     "publishing", "ci-intent", "ci", "ready", "draining") \
                     and self._members_delivered(state):
@@ -596,6 +612,30 @@ class Engine:
         if not callable(check) or not isinstance(plan, dict):
             return False
         return bool(check(plan))
+
+    def _expired_reservation(self, state, now):
+        """#7967 : échéance absolue du ticket de réservation, ou None.
+
+        Fail-closed : un document sans `reservation` lisible, une échéance
+        absente, non finie, booléenne ou encore future ne prouvent pas une
+        expiration. Lecture seule : aucun effet, aucune promotion."""
+        saved = state.get("reservation")
+        if not isinstance(saved, dict):
+            return None
+        deadline = saved.get("deadline")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
+                or not math.isfinite(deadline) or deadline > now:
+            return None
+        return deadline
+
+    def _expired_reason(self, state, deadline):
+        """#7967 : la raison nommée de l'invalidation, pour le diagnostic."""
+        from datetime import datetime, timezone
+        at = datetime.fromtimestamp(deadline, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        error = state.get("error") or "none"
+        return ("packet reservation expired at %s before any terminal outcome: "
+                "phase %s, last error: %s; plan invalidated without promotion "
+                "(#7967)" % (at, state.get("phase"), error))
 
     def _drained_terminal(self, state, why):
         """#7885 : termine un plan en attente qui n'aura jamais de résultat.

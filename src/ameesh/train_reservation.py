@@ -10,7 +10,7 @@ import copy
 import math
 import time
 
-from .train import TERMINAL, TrainError, digest
+from .train import EXPIRABLE, TERMINAL, TrainError, digest
 from .train_store import Ledger
 
 
@@ -62,8 +62,26 @@ class ReservedLedger(Ledger):
                 ticket = self._ticket(state, epoch)
                 return self._renew(ticket, self.reservation.clock()).epoch
             except TrainError:
+                # #7967 : une réservation expirée ne condamne pas le train.
+                # Pour les phases sans effet incertain, le moteur doit encore
+                # lire l'état, l'invalider et rendre la cible : l'ancien échec
+                # est dépassé, l'époque neuve fence l'ancienne. `publishing` et
+                # `promoting` restent fermés (un push ou un merge a pu partir).
+                if self._expired(state) and state.get("phase") in EXPIRABLE:
+                    return super().acquire(None)
                 return self._adopt(state) if epoch is None else None
         return super().acquire(epoch)
+
+    def _expired(self, state):
+        """#7967 : l'échéance absolue du ticket est-elle passée ? Fail-closed.
+
+        Un ticket illisible n'est pas une expiration : rien ne serait prouvé
+        et l'époque ordinaire ne doit pas être reprise sur un doute."""
+        try:
+            saved = self.provider.Ticket.from_json(state.get("reservation"))
+        except self.provider.ReservationError:
+            return False
+        return self.reservation.clock() >= saved.deadline
 
     def _adopt(self, state):
         """#3142: the plan of another runner's train, left in flight when its

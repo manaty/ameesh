@@ -558,11 +558,15 @@ class Service:
         db = ScopedDb(self.cfg, family="runner.scoped.train.pass")
         try:
             result, deadline = self.passages[index].scheduled_step(db, now)
-            if isinstance(result, dict) and result.get("result") == "landed":
+            if isinstance(result, dict) and result.get("result") in (
+                    "landed", "invalidated"):
                 # #2965: the target just freed. A cutoff the landed packet
                 # overran is composed at once, with the candidates admissible
                 # at that cutoff, instead of waiting for the next calendar
                 # hour (the "créneau manqué, traité dans la foulée" rule).
+                # #7967: an expiry-invalidated plan also frees the target; the
+                # pass that invalidated it must compose the due cutoff itself,
+                # not wait for the next hourly event.
                 with self.condition:
                     self.pending.add(index)
             return deadline
