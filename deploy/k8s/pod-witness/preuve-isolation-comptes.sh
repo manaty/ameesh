@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# #7694/#7695 (design 7633 §5.3) — témoin kind d'un hôte pod : identité (UID
-# du chart = UID du processus = entrée passwd), montage (le PVC de B n'est pas
-# dans le conteneur de A), permissions (le dossier de comptes 0700 de B refuse
-# l'UID de A, même monté en lecture seule), superviseur (uid 10001, aucun
-# volume de tenant, /tmp propre), base (réclamation par tenant, attach,
-# isolation UID et bail superviseur sur un PostgreSQL migré — 0599 comprise).
-# En plus des cinq contrôles de #7695, le canon (#7694, B1 de #44265) est
-# rejoué : clone sous 10001, lecture sous l'UID du tenant avec la paire
-# `safe.directory` du plan.
+# #7694/#7695/#7698 (design 7633 §5.3, §9.3) — témoin kind d'un hôte pod :
+# identité (UID du chart = UID du processus = entrée passwd), montage (le PVC
+# de B n'est pas dans le conteneur de A), permissions (le dossier de comptes
+# 0700 de B refuse l'UID de A, même monté en lecture seule), superviseur (uid
+# 10001, aucun volume de tenant, /tmp propre), base (réclamation par tenant,
+# attach, isolation UID, bail superviseur et préflight de déplacement pod sur
+# un PostgreSQL migré — 0601 comprise). En plus des cinq contrôles de #7695, le
+# canon (#7694, B1 de #44265) est rejoué : clone sous 10001, lecture sous l'UID
+# du tenant avec la paire `safe.directory` du plan. #7698 ajoute le déplacement
+# `pod partagé -> pod dédié` : le MÊME PVC est ré-attaché à un pod recréé
+# (UID Kubernetes neuf, UID de personne inchangé, témoin intact), puis le
+# retour au pod partagé. Un UID différent ne lit pas le dossier de comptes
+# (témoin 3) : c'est le repli « compte re-login » quand le PVC ne peut pas
+# être ré-attaché, jamais une copie.
 #
 # Ce script est un geste de BUREAU/OPÉRATEUR, pas de l'agent intéressé : il
 # crée un cluster kind jetable, applique les gabarits du dossier, exécute les
@@ -88,12 +93,14 @@ render() {
 }
 
 if [ "$RENDER_ONLY" -eq 1 ]; then
-    echo "# #7694 témoin kind — UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE git_image=$GIT_IMAGE"
+    echo "# #7694/#7695/#7698 témoin kind — UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE git_image=$GIT_IMAGE"
     echo "# kubectl create namespace $NS && kubectl -n $NS apply -f -"
     echo "---"
     render temoin-pvc.yaml
     echo "---"
     render temoin-deux.yaml
+    echo "---"
+    render temoin-dedie.yaml
     echo "---"
     render temoin-lecture.yaml
     echo "---"
@@ -107,12 +114,19 @@ for outil in kind kubectl docker; do
 done
 
 k() { kubectl -n "$NS" "$@"; }
-kexec() { local conteneur=$1; shift; k exec temoin-deux -c "$conteneur" -- "$@"; }
+#: pod courant des contrôles d'identité (#7698 : partagé puis dédié).
+POD=temoin-deux
+kexec() { local conteneur=$1; shift; k exec "$POD" -c "$conteneur" -- "$@"; }
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 pod_uid() {
     k get pod "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null || true
+}
+
+#: volume réellement lié au PVC : preuve que le volume est ré-attaché, pas recréé.
+pvc_volume() {
+    k get pvc "$1" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true
 }
 
 diagnostic() {
@@ -123,6 +137,7 @@ diagnostic() {
     for conteneur in a b superviseur; do
         k logs temoin-deux -c "$conteneur" >&2 || true
     done
+    k logs temoin-dedie >&2 || true
     k logs temoin-lecture >&2 || true
     k logs temoin-canon >&2 || true
 }
@@ -147,7 +162,7 @@ apply_manifest() {
 }
 
 wait_ready() {
-    k wait --for=condition=Ready pod/temoin-deux --timeout=180s >/dev/null
+    k wait --for=condition=Ready "pod/${1:-temoin-deux}" --timeout=180s >/dev/null
 }
 
 # kind lie ses PVC par local-path, un volume hostPath : le kubelet n'applique
@@ -189,8 +204,8 @@ trace() {
     echo "trace: git_image=$GIT_IMAGE"
     echo "trace: image_id=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo '?')"
     echo "trace: uid_a=$UID_A uid_b=$UID_B fs_group=$FS_GROUP"
-    echo "trace: pod_uid=$(pod_uid temoin-deux)"
-    echo "trace: image_ids=$(k get pod temoin-deux -o jsonpath='{.status.containerStatuses[*].imageID}' 2>/dev/null || echo '?')"
+    echo "trace: pod=$POD pod_uid=$(pod_uid "$POD")"
+    echo "trace: image_ids=$(k get pod "$POD" -o jsonpath='{.status.containerStatuses[*].imageID}' 2>/dev/null || echo '?')"
 }
 
 # --- contrôle 1 : identité et modes -----------------------------------------
@@ -363,9 +378,10 @@ check_base() {
         || fail "base: python3 absent alors qu'AMEESH_TEST_DSN est posé"
     echo "== base : $AMEESH_TEST_DSN =="
     ( cd "$REPO_ROOT" && PYTHONPATH=src python3 -m unittest -v \
-        tests.test_7695_pod_partage.WitnessBaseTest ) \
-        || fail "base: le contrôle 5 a échoué (voir la sortie unittest)"
-    pass "base: réclamation par tenant, attach par utilisateur système, isolation UID, bail superviseur"
+        tests.test_7695_pod_partage.WitnessBaseTest \
+        tests.test_7698_deplacement_pod.WitnessMoveBaseTest ) \
+        || fail "base: le contrôle base a échoué (voir la sortie unittest)"
+    pass "base: réclamation par tenant, attach par utilisateur système, isolation UID, bail superviseur, présence pod et préflight de déplacement (#7698)"
 }
 
 
@@ -414,15 +430,45 @@ check_identity b "$UID_B"
 check_mount
 check_supervisor
 
-# --- témoin 1 rejoué après un déplacement du PVC ---------------------------
+# --- #7698 : pod partagé -> pod dédié, même PVC, même UID de personne ------
+# Le pod partagé est supprimé (PVC ReadWriteOnce) : le pod dédié de A monte le
+# MÊME PVC `pvc-temoin-a`, sous le MÊME UID 2519. Seul le UID Kubernetes du
+# pod change : le volume n'est pas copié, le témoin de A doit survivre et le
+# volume de B ne doit pas apparaître.
 premier_uid=$(pod_uid temoin-deux)
+premier_volume=$(pvc_volume pvc-temoin-a)
 kubectl -n "$NS" delete pod temoin-deux --wait=true --timeout=120s >/dev/null
+apply_manifest temoin-dedie.yaml
+wait_ready temoin-dedie
+dedie_uid=$(pod_uid temoin-dedie)
+dedie_volume=$(pvc_volume pvc-temoin-a)
+[ -n "$premier_uid" ] && [ -n "$dedie_uid" ] || fail "deplacement: UID de pod illisible"
+[ "$premier_uid" != "$dedie_uid" ] \
+    || fail "deplacement: le pod dedie porte le même UID ($premier_uid)"
+[ -n "$premier_volume" ] && [ "$premier_volume" = "$dedie_volume" ] \
+    || fail "deplacement: le PVC a changé de volume ($premier_volume -> $dedie_volume)"
+POD=temoin-dedie
+trace
+check_identity a "$UID_A"
+kexec a sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-a")" = temoin-a' \
+    || fail "deplacement: le temoin de A n'a pas survecu au re-attachement du PVC"
+if kexec a sh -ec 'test -e /home/ameesh-b' 2>/dev/null; then
+    fail "deplacement: le volume de B est visible dans le pod dedie"
+fi
+POD=temoin-deux
+pass "deplacement pod partage -> dedie : volume $premier_volume re-attache (pod $premier_uid -> $dedie_uid), UID $UID_A et temoin intacts, volume de B absent"
+
+# --- retour au pod partagé : témoin 1 rejoué -------------------------------
+kubectl -n "$NS" delete pod temoin-dedie --wait=true --timeout=120s >/dev/null
 apply_manifest temoin-deux.yaml
 wait_ready
 second_uid=$(pod_uid temoin-deux)
-[ -n "$premier_uid" ] && [ -n "$second_uid" ] || fail "rejeu: UID de pod illisible"
-[ "$premier_uid" != "$second_uid" ] \
-    || fail "rejeu: le pod recréé porte le même UID ($premier_uid)"
+second_volume=$(pvc_volume pvc-temoin-a)
+[ -n "$second_uid" ] || fail "rejeu: UID de pod illisible"
+[ "$dedie_uid" != "$second_uid" ] \
+    || fail "rejeu: le pod recréé porte le même UID ($dedie_uid)"
+[ "$dedie_volume" = "$second_volume" ] \
+    || fail "rejeu: le PVC a changé de volume ($dedie_volume -> $second_volume)"
 trace
 check_identity a "$UID_A"
 check_identity b "$UID_B"
@@ -430,7 +476,7 @@ kexec a sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-a")" = temoin
     || fail "rejeu: le temoin de A n'a pas survécu au déplacement du PVC"
 kexec b sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-b")" = temoin-b' \
     || fail "rejeu: le temoin de B n'a pas survécu au déplacement du PVC"
-pass "rejeu: pod $premier_uid -> $second_uid, identité et modes conservés, temoins persistants"
+pass "rejeu: pod $dedie_uid -> $second_uid, volume $second_volume, identité et modes conservés, temoins persistants"
 
 # Le pod à deux conteneurs est supprimé avant le témoin 3 pour ne pas
 # partager un PVC ReadWriteOnce entre deux pods.
@@ -463,4 +509,4 @@ if [ "$base_code" -eq 77 ]; then
 fi
 [ "$base_code" -eq 0 ] || exit "$base_code"
 
-echo "TOUS LES TEMOINS PASSENT (#7695 : identité, montage, permissions, superviseur, base ; canon #7694)"
+echo "TOUS LES TEMOINS PASSENT (#7695 : identité, montage, permissions, superviseur, base, canon #7694 ; #7698 : déplacement pod partagé -> dédié, PVC ré-attaché, présence pod)"

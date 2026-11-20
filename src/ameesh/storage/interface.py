@@ -5357,7 +5357,10 @@ class Tenancy(Domain):
     @abc.abstractmethod
     def presence(self, host: str, tenant: str) -> dict | None:
         """Dernier battement du tenant sur l'hôte (`seen_ts`, `now_ts`,
-        `runner_id`, `profiles`, `pod_uid`), ou None."""
+        `runner_id`, `profiles`, `pod_uid`, `uid` observé et `binding_uid` de
+        `host_tenants`), ou None. #7698 : le lecteur compare l'UID observé à
+        celui de la liaison ; sur un hôte enfant, `pod_uid` doit encore être
+        celui de `pod_hosts`."""
 
 
 class PodProvisioning(Domain):
