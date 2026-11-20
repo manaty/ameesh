@@ -11,6 +11,13 @@
 # Aucun mot de passe n'est codé ici : AMEESH_PG_PASSWORD le fixe à la création
 # du conteneur ; ensuite les clients le lisent dans PGPASSWORD ou ~/.pgpass.
 # scripts/test.sh dérive de ce profil l'entrée de ses bases jetables (#2170).
+#
+# #7962 : le journal json-file du banc est borné à la création
+# (`--log-driver json-file --log-opt max-size=64m --log-opt max-file=3`).
+# Un conteneur créé avant ce garde garde sa configuration (`LogConfig` vide) :
+# la minuterie utilisateur `ameesh-pg-journal` (deploy/systemd/) tronque son
+# journal sans l'arrêter, et la prochaine recréation prend les log-opts.
+# Voir docs/AMEESH-PG.md.
 set -euo pipefail
 
 # AMEESH_PG_* est le nom courant ; AGENT_MESH_PG_* reste accepté (alias).
@@ -248,7 +255,13 @@ else
   # docker-init en PID 1, qui recueille l'orphelin ; `exec` retire le shell du
   # healthcheck (plus d'enfant à laisser). Un conteneur créé avant ce garde
   # n'en bénéficie qu'après recréation (voir l'avertissement ci-dessous).
+  #
+  # #7962 : sans log-opts, le pilote json-file écrit sans plafond (1,24 Go en
+  # 7 jours sur AG2). Le banc naît donc borné ; les conteneurs antérieurs sont
+  # plafonnés par la minuterie utilisateur `ameesh-pg-journal`, jamais par un
+  # arrêt ou une recréation de Postgres.
   env -u AMEESH_CONTAINER_LABELS docker run -d --init --name "$NAME" \
+    --log-driver json-file --log-opt max-size=64m --log-opt max-file=3 \
     -e POSTGRES_USER="$USER" -e POSTGRES_PASSWORD="$PASSWORD" -e POSTGRES_DB="$DB" \
     -p "127.0.0.1:$PORT:5432" \
     -v "$VOLUME":/var/lib/postgresql/data \

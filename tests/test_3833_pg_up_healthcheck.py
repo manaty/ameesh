@@ -125,6 +125,10 @@ class PgUpHealthcheckTest(unittest.TestCase):
         run = [c for c in calls if c[0] == "run"]
         self.assertEqual(len(run), 1)
         self.assertIn("--init", run[0])
+        self.assertEqual(run[0][run[0].index("--log-driver") + 1], "json-file")
+        log_opts = [run[0][i + 1] for i, a in enumerate(run[0])
+                    if a == "--log-opt"]
+        self.assertEqual(sorted(log_opts), ["max-file=3", "max-size=64m"])
         health = run[0][run[0].index("--health-cmd") + 1]
         self.assertEqual(health, "exec pg_isready -U agent_mesh -d agent_mesh")
         self.assertTrue(health.startswith("exec "))
