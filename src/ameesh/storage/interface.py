@@ -5505,7 +5505,8 @@ class HostLifecycle(Domain):
         release state to busy, `idle-drained` stamps the release. #7913: a
         `busy` that resyncs a `draining` acknowledged by an earlier generation
         (a withdrawal still `draining`, no return requested) keeps the release
-        state: the withdrawal goes on with `draining`. Claims stay
+        state: the withdrawal goes on with `draining`; it advances
+        `release_epoch`, so a later return can still call `busy`. Claims stay
         closed until `open_claims` (a `busy` acknowledgement only means the
         adapter is ready, not that ameesh may already take a lease). Failure
         keeps the acknowledged state and the closed claims, and stores the

@@ -812,6 +812,38 @@ class HostReleaseTest(PgTestCase):
         self.assertEqual((control["release_state"], control["hook_state"]),
                          ("idle-drained", "idle-drained"))
 
+    def _return_after_resync(self, *, released):
+        self._ag3_state()
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
+        self.reading()
+        self.once(now=time.time())
+        self.once(now=time.time())
+        expected = ["busy", "draining"]
+        if released:
+            self.once(now=time.time())
+            expected.append("idle-drained")
+        self.assertEqual(self.states(), expected)
+        self.assertEqual(self.control()["hook_state"], expected[-1])
+        # #7913 (avis mty-amh-qa-01): the resync `busy` must not refuse the
+        # `busy` of a return later in the same withdrawal.
+        control = host_release.request_return(self.cfg, self.db, "vm",
+                                              actor="human:op")
+        self.assertEqual(self.states(), expected + ["busy"])
+        self.assertEqual(control["hook_state"], "busy")
+        self.assertFalse(control["claims_open"])
+        self.reading()
+        self.once(now=time.time())
+        control = self.control()
+        self.assertEqual((control["mode"], control["claims_open"]),
+                         ("returning", True))
+        self.assertEqual(self.states(), expected + ["busy"])
+
+    def test_return_after_the_resync_while_draining(self):
+        self._return_after_resync(released=False)
+
+    def test_return_after_the_resync_once_released(self):
+        self._return_after_resync(released=True)
+
     def test_stale_draining_ack_with_a_return_request_still_returns(self):
         self._ag3_state()
         self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
