@@ -4672,10 +4672,15 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             # elle est bornée par `--tests-timeout`, et par le temps restant
             # de la borne totale en temps mural. Une série non partie ou
             # coupée reste non concluante, nommée.
+            # #7888 : ce temps mural s'arrête avant la réserve #4887. Sans
+            # elle, les séries couraient jusqu'à la borne, le rejeu #3801 d'un
+            # contrat rouge (h-20261119-12 : test_cluster, #7865) n'avait plus
+            # une seconde, restait non concluant (#7692) et le rouge connu
+            # partait en CI.
             limit = timeout
             walled = {}
             if deadline is not None:
-                remaining = max(0, int(deadline - time.monotonic()))
+                remaining = max(0, int(deadline - time.monotonic()) - reserve)
                 if remaining <= 0:
                     log("tests %s : borne totale atteinte, série non jouée "
                         "(non concluant)" % label)

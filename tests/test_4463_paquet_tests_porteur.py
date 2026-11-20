@@ -198,10 +198,11 @@ class BorneTotaleTest(unittest.TestCase):
         with mock.patch.object(paquet_auto.time, "monotonic", side_effect=lambda: clock[0]):
             runs, faulty, _ = local.run(deadline=1000.0 + 600)
         # #7740 : chaque série directe part avec `--tests-timeout` (900 s) et
-        # n'est coupée que par le temps mural restant (600 s puis 200 s). La
-        # troisième et les contrats ne partent plus à l'échéance.
+        # n'est coupée que par le temps mural restant, réserve #4887 déduite
+        # (#7888 : 600 - 120 = 480 s, puis 200 - 120 = 80 s). La troisième et
+        # les contrats ne partent plus à l'échéance.
         self.assertEqual(local.calls, [("unité #1", 900), ("unité #2", 900)])
-        self.assertEqual(local.walls, [600, 200])
+        self.assertEqual(local.walls, [480, 80])
         self.assertEqual(faulty, [])
         self.assertEqual([run.inconclusive for run in runs],
                          [False, False, True, True])
@@ -220,7 +221,8 @@ class BorneTotaleTest(unittest.TestCase):
         self.assertEqual([timeouts["unité #%d" % lot] for lot in (1, 2, 3)],
                          [900, 900, 900])
         self.assertEqual(timeouts["contrats"], 480)
-        self.assertTrue(all(595 <= walls["unité #%d" % lot] <= 600
+        # #7888 : le mur de la série directe laisse la réserve #4887 (120 s).
+        self.assertTrue(all(475 <= walls["unité #%d" % lot] <= 480
                             for lot in (1, 2, 3)), walls)
         # avec créneau, le temps mural des contrats reste l'échéance totale.
         self.assertTrue(595 <= walls["contrats"] <= 600, walls)
@@ -237,7 +239,8 @@ class BorneTotaleTest(unittest.TestCase):
         self.assertEqual([timeouts["unité #%d" % lot] for lot in (1, 2, 3)],
                          [900, 900, 900])
         self.assertEqual(timeouts["contrats"], 480)
-        self.assertTrue(all(595 <= walls["unité #%d" % lot] <= 600
+        # #7888 : le mur de la série directe laisse la réserve #4887 (120 s).
+        self.assertTrue(all(475 <= walls["unité #%d" % lot] <= 480
                             for lot in (1, 2, 3)), walls)
         self.assertEqual(walls["contrats"], 480)
 
