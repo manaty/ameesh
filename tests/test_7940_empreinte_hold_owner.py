@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import dataclasses
 import unittest
+from unittest import mock
 
-from ameesh import debit, storage, work
+from ameesh import debit, planned_waits, storage, work
 from ameesh import work_footprints as fp
 
 from .test_4173_empreinte import _Empreintes
@@ -214,6 +215,45 @@ class AttenteHumaineTest(_AttenteHumaine):
         self.assertNotIn(second["id"], self.taken())
         with self.assertRaises(work.WorkError):
             work.assign(self.db, second["id"], "human:autre", actor="test")
+
+    def test_une_retenue_ordinaire_d_un_autre_auteur_garde_le_blocage(self):
+        """#7943 N1 : le pilote attend l'owner depuis plus de 24 h, mais un
+        autre auteur retient aussi le lot (« hold: attente CI »). L'attente
+        humaine ne suffit pas : le lot peut repartir bientôt, le voisin ne
+        démarre pas sur son empreinte."""
+        premier, second = self.couple()
+        self.hold(premier, "hold: attente owner : signer le go")
+        work.note(self.db, premier["id"],
+                  "hold: attente CI : réparer la panne", actor="agent-x")
+
+        self.assertFalse(self.overlapping(second)[0]["human_wait"])
+        self.assertNotIn(second["id"], self.taken())
+        with self.assertRaises(work.WorkError) as ctx:
+            work.assign(self.db, second["id"], "human:autre", actor="test")
+        self.assertIn("footprint overlaps", str(ctx.exception))
+        self.assertFalse(any("not blocking" in note for note in self.notes(second)))
+
+    def test_les_routes_humaines_ne_sont_lues_qu_une_fois_par_passe(self):
+        """#7943 N2 : une passe qui enchaîne plans et sélections ne recharge
+        ni les canons ni les routes humaines à chaque appel ; la fenêtre
+        refermée, la lecture suivante relit comme avant."""
+        premier, second = self.couple()
+        self.hold(premier)
+        reads = []
+        real = debit.human_route_names
+
+        def counted(*args, **kwargs):
+            reads.append(1)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(debit, "human_route_names", side_effect=counted):
+            with planned_waits.human_routes_cache():
+                self.assertTrue(self.overlapping(second)[0]["human_wait"])
+                self.assertIn(second["id"], self.taken())
+                self.assertTrue(self.overlapping(second)[0]["human_wait"])
+            # La fenêtre ne survit pas à la passe : la lecture suivante relit.
+            self.assertTrue(self.overlapping(second)[0]["human_wait"])
+        self.assertEqual(len(reads), 2)
 
     def test_une_levee_sans_autorite_ne_leve_pas_le_hold_du_pilote(self):
         """B1 de cx2 : un `unhold:` d'un agent qui ne détient pas la retenue ne
