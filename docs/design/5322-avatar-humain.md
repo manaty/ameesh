@@ -602,18 +602,23 @@ par l'`attach` quand il atteindra un agent tenu par un autre hôte. Une
 nouvelle bascule reste permise si l'hôte cloud s'arrête à son tour, et un
 `ameesh resume` sur le poste avant l'échéance annule simplement la bascule.
 
-*Retour au poste : décision owner et geste disponible.* Le commentaire du
-ticket #6055 (compte owner `smichea`, 19/11/2026) tranche : un `attach` sur
-le poste déclenche le retour à la fin du tour cloud, même session ; sans
-`attach`, l'avatar reste dans le cloud. Le lot applique cette seconde partie
-(la retenue ci-dessus) ; il ne peut pas outiller l'`attach` demandé :
-`ameesh attach` est local et refuse un agent dont la ligne est sur un autre
-hôte (`runner.attach_main`), et l'`attach` distant (#5325 / #7035) doit
-d'abord atteindre une session tenue par un autre hôte. Le geste humain
-disponible aujourd'hui est donc le déplacement explicite
-(`ameesh agent move <avatar> --to <poste>`), que l'avis `avatar_failover`
-nomme ; le déclencheur `attach` est à reprendre dans #7035/design avant
-d'être opposable.
+*Retour au poste sur attach (#7897).* Le commentaire owner du 19/11/2026
+sur #6055 tranche : un `ameesh attach <avatar>` lancé depuis le poste
+préféré déclenche le retour à la fin du tour cloud ; sans cet attach, le
+poste redevenu présent ne défait pas la bascule. La CLI locale, quand elle
+a accès à la base, vérifie le rang déclaré 0, la présence B2 du runner,
+l'absence de pause et de handoff, ainsi que les gardes de tenant/compte.
+Ces gardes sont relues sous le verrou du registre avant de planifier une
+tentative `manual` (geste explicite), qui lève la retenue de `failover`.
+Le runner du poste prépare la cible ; la bascule attend la fin du tour
+source et ne révoque jamais un tour en cours.
+
+L'attach attend ensuite le premier tour local vérifié avant d'ouvrir le
+harnais interactif : la conversation reste la même, restaurée depuis le
+journal ; l'identifiant natif source ne traverse pas les hôtes (§2.3).
+L'attente est bornée par `--max`. Un poste malsain ne demande aucun retour
+et conserve le chemin d'attach distant (#7035 / #7121) si celui-ci est
+configuré ; une station relais sans accès base conserve aussi ce chemin.
 
 ### 3.3 Ce qui n'est pas `election`
 

@@ -38,13 +38,17 @@ class RecheckRefused(RuntimeError):
 class ConversationMoves(abc.ABC):
     @abc.abstractmethod
     def plan(self, *, move_id: str, agent: str, target_host: str, reason: str,
-             requested_by: str) -> dict | None:
+             requested_by: str,
+             recheck: Callable[[Mapping], str | None] | None = None) -> dict | None:
         """Open an attempt for the agent's current lease epoch, or reread it.
 
         The source (host, cwd, lease owner, session) is copied from the locked
         registry row. Returns the row with `created` (false on replay or when
         another attempt is already open); None if the agent is unknown, not
         `execute`, or already on `target_host`.
+
+        `recheck(locked_row)` runs before any write under the registry lock;
+        a nonempty refusal raises `RecheckRefused`.
 
         #7833: a `preference` plan is refused while the current placement
         came from a `failover` (runner stopped): B2 must not undo the failover

@@ -79,7 +79,7 @@ class ConversationMoves(Contract):
             " WHERE move_id = %s::uuid RETURNING " + _COLUMNS,
             tuple(params) + (move_id,)))
 
-    def plan(self, *, move_id, agent, target_host, reason, requested_by):
+    def plan(self, *, move_id, agent, target_host, reason, requested_by, recheck=None):
         with self.db.transaction() as tx:
             # #7093 (relecture dev3) : un alias se résout comme à l'écriture
             # (déclencheur ameesh_agent_spelling) ; sans cela, un plan nommé
@@ -90,11 +90,15 @@ class ConversationMoves(Contract):
                 (agent, agent))
             agent = resolved[0]["name"] if resolved else agent
             rows = tx.query(
-                """SELECT name, host, cwd, mode, lease_owner, lease_epoch, session_id
+                """SELECT *
                      FROM agent_registry WHERE name = %s FOR UPDATE""", (agent,))
             if not rows or rows[0]["mode"] != "execute" or rows[0]["host"] == target_host:
                 return None
             r = rows[0]
+            if recheck is not None:
+                refusal = recheck(r)
+                if refusal:
+                    raise RecheckRefused(refusal)
             # B (relecture 3) : une tentative d'avant la bascule plus vieille
             # que PLAN_TTL_S ne retient plus rien — échouée ici, une nouvelle
             # peut s'ouvrir, même sur le même epoch (clé partielle, 0572)
