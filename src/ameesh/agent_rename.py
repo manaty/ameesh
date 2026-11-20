@@ -115,6 +115,16 @@ KEPT = (
     # requalification request (`cfg.host`, never an agent spelling); dated
     # resolution evidence, like `host_tenants.registered_by`.
     "integration_train_requalifications.resolved_by",
+    # #7697 (0601): the pod request's actor columns are operational
+    # attribution, never an identity link. `requested_by` is hashed into the
+    # request fingerprint (`pod_children.fingerprint`) together with its
+    # `parent` pair, which a rename does not rewrite; `claimed_by` is the
+    # provisioner actor (`system:ameesh-pod-provisioner`), not an agent
+    # spelling. The template's `name` is a Kubernetes identifier and
+    # `registered_by` is the provisioner heartbeat actor. Old spellings
+    # resolve through the registry alias.
+    "pod_requests.claimed_by", "pod_requests.requested_by",
+    "pod_templates.name", "pod_templates.registered_by",
     "action_attempts.approver", "action_attempts.launched_by", "action_attempts.settled_by",
     "action_events.actor", "actions.auth_by", "actions.proposed_by", "actions.replaced_by",
     "agent_name_resolutions.primary_name", "agent_name_resolutions.supplied_name",
