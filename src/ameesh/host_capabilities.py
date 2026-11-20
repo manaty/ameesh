@@ -17,12 +17,18 @@ Trois lecteurs, sans autorité propre :
   `--dry-run`, `--check`) ;
 * `ameesh doctor` compare la déclaration à l'état réel, dans les deux sens :
   une capacité déclarée non appliquée est un KO, un groupe accordé sans
-  déclaration est une dérive signalée sans bloquer l'hôte ;
+  déclaration est une dérive signalée sans bloquer l'hôte ; quand le compte
+  a le groupe mais que le processus courant (l'exécuteur) ne l'a pas encore,
+  le docteur le dit : les exécuteurs lancés avant l'application n'ont
+  `/dev/kvm` qu'après redémarrage ;
 * le placement et `ameesh agent observe` lisent la déclaration sans rien
   décider (`hosts_with`, `card_for`).
 
-Le module ne lit que le frontmatter des fiches, jamais un état d'exécution :
-une déclaration dit ce que l'hôte promet, pas ce qui tourne.
+La fiche est lue à la **tête relue** du canon (objets git de `origin/main`,
+ou de `AMEESH_CANON_REF`), jamais dans un arbre de travail que le compte
+`ameesh` peut réécrire, et le parcours est borné à `hotes/` : un worktree
+imbriqué (`w7248/`) ne déclare rien. Seul un canon explicitement
+`untrusted` (essai, prototype) est lu dans ses fichiers.
 """
 from __future__ import annotations
 
@@ -56,6 +62,15 @@ DEFAULT_USER = "ameesh"
 
 #: variable qui nomme le compte des exécuteurs quand la fiche ne le fait pas
 USER_ENV = "AMEESH_HOST_USER"
+
+#: dossier des fiches Host dans un canon OKF
+HOTES = "hotes"
+
+#: branche canonique lue quand rien ne nomme la révision relue
+DEFAULT_CANON_REF = "origin/main"
+
+#: variable qui nomme la révision relue (`origin/main`, un SHA, `HEAD`…)
+CANON_REF_ENV = "AMEESH_CANON_REF"
 
 #: toutes les variables de groupe connues, pour la dérive inverse
 ALL_GROUPS = tuple(sorted({group for groups in CAPABILITY_GROUPS.values()
@@ -140,8 +155,9 @@ def _memberships(pw, grnam, grgid, grouplist) -> set[str]:
 
     Une appartenance ajoutée par `usermod` ne figure pas dans les groupes du
     processus déjà lancé ; c'est pourtant l'état durable de l'hôte que le
-    doctor doit dire. On relit donc `/etc/group` (via `os.getgrouplist`), et
-    `sg kvm`/`newgrp` restent les seuls moyens d'en profiter sans relancer.
+    doctor doit dire. On relit donc `/etc/group` (via `os.getgrouplist`) ;
+    `probe` compare ensuite cette appartenance aux groupes du processus
+    courant pour dire qu'un redémarrage des exécuteurs reste nécessaire.
     """
     try:
         gids = set(grouplist(pw.pw_name, pw.pw_gid))
@@ -156,15 +172,38 @@ def _memberships(pw, grnam, grgid, grouplist) -> set[str]:
     return names
 
 
+def _process_group_names(grgid, gids=None) -> set[str]:
+    """Groupes effectifs du processus courant, pas ceux de la base des comptes.
+
+    `os.getgroups()` ne rend que les groupes supplémentaires : le GID effectif
+    est ajouté. Une appartenance accordée par `usermod` n'y apparaît qu'après
+    le redémarrage du processus qui la porte (l'exécuteur, puis ses enfants).
+    """
+    if gids is None:
+        try:
+            gids = set(os.getgroups()) | {os.getgid()}
+        except OSError:
+            gids = set()
+    names: set[str] = set()
+    for gid in gids:
+        try:
+            names.add(grgid(gid).gr_name)
+        except KeyError:
+            continue
+    return names
+
+
 def probe(capabilities, *, user: str = DEFAULT_USER, device: str = KVM_DEVICE,
           pwnam=pwd.getpwnam, grnam=grp.getgrnam, grgid=grp.getgrgid,
-          grouplist=os.getgrouplist, stat=os.stat) -> dict:
+          grouplist=os.getgrouplist, stat=os.stat,
+          euid=None, process_groups=None) -> dict:
     """État réel d'un hôte pour ces capacités, sans écrire ni élargir.
 
     Rend `{declared, user, groups, missing_groups, user_missing,
-    group_missing, device, problems, warnings, ok}`. `problems` bloque la
-    capacité (déclarée mais inutilisable) ; `warnings` signale une dérive sans
-    bloquer l'hôte (groupe accordé sans déclaration, /dev/kvm 0666, etc.).
+    group_missing, process_missing, device, problems, warnings, ok}`.
+    `problems` bloque la capacité (déclarée mais inutilisable) ; `warnings`
+    signale une dérive sans bloquer l'hôte (groupe accordé sans déclaration,
+    /dev/kvm 0666, groupe dans le compte mais pas encore dans le processus).
     """
     declared = list(dict.fromkeys(str(c).strip() for c in (capabilities or ())
                                   if str(c).strip()))
@@ -176,6 +215,7 @@ def probe(capabilities, *, user: str = DEFAULT_USER, device: str = KVM_DEVICE,
         "missing_groups": [],
         "user_missing": False,
         "group_missing": [],
+        "process_missing": [],
         "device": None,
         "problems": [],
         "warnings": [],
@@ -198,6 +238,23 @@ def probe(capabilities, *, user: str = DEFAULT_USER, device: str = KVM_DEVICE,
         if pw is not None and group not in memberships:
             out["missing_groups"].append(group)
             out["problems"].append("user %s is not in group %s" % (user, group))
+    # Le compte a le groupe, mais le processus courant ne l'a pas encore :
+    # il a été lancé avant l'application (ou en descend). Les exécuteurs ne
+    # peuvent utiliser /dev/kvm qu'après un redémarrage ; on le dit dans la
+    # ligne du doctor, sans rendre l'hôte rouge (l'état durable est correct).
+    current_uid = os.geteuid() if euid is None else euid
+    if (pw is not None and current_uid == pw.pw_uid
+            and declared and memberships):
+        current = (_process_group_names(grgid) if process_groups is None
+                   else set(process_groups))
+        out["process_missing"] = [group for group in groups
+                                  if group in memberships
+                                  and group not in current]
+        if out["process_missing"]:
+            out["warnings"].append(
+                "group %s is granted to %s but not yet in this executor "
+                "process: restart it (ameesh-runner-agent@<agent>.service) "
+                "to use /dev/kvm" % (", ".join(out["process_missing"]), user))
     if not declared:
         # Dérive inverse : un groupe de capacité accordé sans déclaration.
         # Aucun KO : tant que la fiche n'a pas la capacité (#7927), AG3 doit
@@ -324,47 +381,173 @@ def hosts_with(item, capability: str) -> list[str]:
             if capability in (host.capabilities or ())]
 
 
+def _git(root: str, *args: str) -> subprocess.CompletedProcess | None:
+    """git en lecture seule dans `root`, sans crochet ni état local.
+
+    Le canon appartient au compte `ameesh`, l'installation tourne en root :
+    `safe.directory` est déclaré pour ce chemin exact (jamais `*`), donné par
+    l'appelant. Seul du plumbing en lecture est lancé, et `GIT_*` hérité est
+    écarté pour qu'un environnement de tour ne change pas le dépôt lu.
+    """
+    root = os.path.abspath(root)
+    command = [
+        "git", "--no-pager", "--no-replace-objects",
+        "-c", "core.hooksPath=%s" % os.devnull,
+        "-c", "safe.directory=%s" % os.path.realpath(root),
+        "-C", root,
+    ]
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("GIT_")}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    try:
+        # Octets : la sortie d'un blob ne doit pas dépendre de la locale du
+        # python3 système ; l'appelant décode en UTF-8 (les fiches le sont).
+        return subprocess.run(command + list(args), capture_output=True,
+                              env=env, check=False)
+    except OSError:
+        return None
+
+
+def _stdout(proc: subprocess.CompletedProcess | None) -> str:
+    """Sortie d'une commande git, décodée en UTF-8, ou "" si absente."""
+    if proc is None or not proc.stdout:
+        return ""
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def reviewed_head(root: str, ref: str = "") -> tuple[str | None, str]:
+    """`(commit, explication)` de la tête relue du canon.
+
+    `ref` explicite (ou `AMEESH_CANON_REF`) est résolu tel quel ; sans lui,
+    `origin/main` puis `origin/HEAD`. Jamais `HEAD` par défaut : un commit
+    local non poussé, comme un arbre de travail modifié, ne doit pas accorder
+    un droit d'hôte.
+    """
+    wanted = (ref or os.environ.get(CANON_REF_ENV) or "").strip()
+    names = [wanted] if wanted else [DEFAULT_CANON_REF, "origin/HEAD"]
+    for name in names:
+        proc = _git(root, "rev-parse", "--verify", "--quiet", name + "^{commit}")
+        commit = _stdout(proc).strip()
+        if proc is not None and proc.returncode == 0 and commit:
+            return commit, name
+    return None, ("no readable reviewed ref (%s) in %s"
+                  % (", ".join(names), root))
+
+
 def _candidate_files(root: str):
-    """Fiches sous `hotes/` si le dossier existe, sinon tout le canon."""
-    hotes = os.path.join(root, "hotes")
-    base = hotes if os.path.isdir(hotes) else root
-    for directory, dirnames, filenames in os.walk(base):
+    """Fiches `.md` sous `hotes/`, et rien ailleurs.
+
+    Sans `hotes/`, aucun parcours : un canon peut contenir des worktrees
+    entiers (`w7248/`) et une fiche homonyme n'y vaut pas déclaration.
+    """
+    hotes = os.path.join(root, HOTES)
+    if not os.path.isdir(hotes):
+        return
+    for directory, dirnames, filenames in os.walk(hotes):
         dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
         for name in sorted(filenames):
             if name.endswith(".md"):
                 yield os.path.join(directory, name)
 
 
-def card(root: str, host: str) -> tuple[dict | None, str | None]:
-    """Frontmatter de la fiche `Host` de `host` sous `root`, sans git.
+def _candidate_git_files(root: str, commit: str) -> list[str]:
+    """Chemins `.md` de `hotes/` à `commit`, jamais ceux de l'arbre de travail."""
+    proc = _git(root, "ls-tree", "-r", "-z", "--name-only", commit, "--", HOTES)
+    if proc is None or proc.returncode != 0:
+        return []
+    return sorted(path for path in _stdout(proc).split("\0")
+                  if path.endswith(".md"))
 
-    L'installation tourne en root sur l'hôte et ne peut pas toujours lire le
-    dépôt du canon par git (propriétaire, `safe.directory`) ; le frontmatter
-    suffit, et le type/titre sont vérifiés avant de rendre la fiche.
+
+def _card_data(text: str, host: str) -> dict | None:
+    """Frontmatter d'une fiche `Host` de ce titre, ou None."""
+    try:
+        block = canon.split_frontmatter(text)
+        if block is None:
+            return None
+        data = canon.load_yaml(block)
+    except canon.YamlError:
+        return None
+    if (isinstance(data, dict)
+            and str(data.get("type", "")).strip().lower() == "host"
+            and str(data.get("title", "")).strip() == host):
+        return data
+    return None
+
+
+def card(root: str, host: str, *, ref: str = "",
+         untrusted: bool = False) -> tuple[dict | None, str | None]:
+    """Frontmatter de la fiche `Host` de `host` dans `root`.
+
+    Deux lectures, jamais l'arbre de travail par défaut :
+
+    * `untrusted=False` (défaut) : les objets git de la tête relue
+      (`reviewed_head`) ; un arbre modifié ou un commit local non poussé de
+      `/home/ameesh/canon` ne peut donc pas s'accorder un groupe à la
+      prochaine installation en root ;
+    * `untrusted=True` : les fichiers de `root/hotes/`, pour un canon d'essai
+      (même règle que `canon.load`).
+
+    Dans les deux cas le parcours est borné à `hotes/` : un canon imbriqué ou
+    un worktree (`w7248/`) n'est jamais lu.
     """
-    for path in _candidate_files(root):
-        try:
-            with open(path, encoding="utf-8", errors="replace") as handle:
-                text = handle.read()
-            block = canon.split_frontmatter(text)
-            if block is None:
+    if not host:
+        return None, None
+    if untrusted:
+        for path in _candidate_files(root):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+            except OSError:
                 continue
-            data = canon.load_yaml(block)
-        except (OSError, canon.YamlError):
+            data = _card_data(text, host)
+            if data is not None:
+                return data, path
+        return None, None
+    commit, _why = reviewed_head(root, ref)
+    if commit is None:
+        return None, None
+    return _card_git(root, host, commit)
+
+
+def _card_git(root: str, host: str, commit: str) -> tuple[dict | None, str | None]:
+    """Fiche `host` lue dans les objets de `commit`, sous `hotes/` seulement."""
+    for path in _candidate_git_files(root, commit):
+        proc = _git(root, "cat-file", "blob", "%s:%s" % (commit, path))
+        if proc is None or proc.returncode != 0:
             continue
-        if (isinstance(data, dict)
-                and str(data.get("type", "")).strip().lower() == "host"
-                and str(data.get("title", "")).strip() == host):
+        data = _card_data(_stdout(proc), host)
+        if data is not None:
             return data, path
     return None, None
 
 
 def card_for(cfg, host: str) -> tuple[dict | None, str | None]:
-    """Fiche Host de `host` dans les canons configurés (lecture fichier)."""
+    """Fiche Host de `host` dans les canons configurés, à leur tête relue.
+
+    Une tête relue illisible n'est pas « l'hôte n'est pas dans le canon » :
+    elle lève `canon.CanonError`, que l'observation rend en fait nommé
+    (`canon_unreadable`) plutôt qu'en absence de fiche.
+    """
+    unreadable: list[str] = []
     for entry in canon.configured(cfg):
-        data, path = card(entry.path, host)
+        root = getattr(entry, "path", "")
+        ref = getattr(entry, "ref", "") or ""
+        untrusted = bool(getattr(entry, "untrusted", False))
+        if untrusted:
+            data, path = card(root, host, untrusted=True)
+        else:
+            commit, _why = reviewed_head(root, ref)
+            if commit is None:
+                unreadable.append(root)
+                continue
+            data, path = _card_git(root, host, commit)
         if data is not None:
             return data, path
+    if unreadable:
+        raise canon.CanonError("no readable reviewed head: %s"
+                               % ", ".join(unreadable))
     return None, None
 
 
@@ -385,7 +568,14 @@ def main(argv: list[str] | None = None) -> int:
                     "their Unix groups (never chmod, ACL or udev)")
     parser.add_argument("--host", required=True, help="host title in the canon")
     parser.add_argument("--canon", default=os.environ.get("AMEESH_CANON")
-                        or "/home/ameesh/canon", help="canon working tree")
+                        or "/home/ameesh/canon",
+                        help="canon checkout holding the Host card")
+    parser.add_argument("--ref", default=os.environ.get(CANON_REF_ENV) or "",
+                        help="reviewed revision to read (default: "
+                             "AMEESH_CANON_REF, else origin/main)")
+    parser.add_argument("--untrusted", action="store_true",
+                        help="read the working files under hotes/ (test canons "
+                             "only; never trusted by the installer)")
     parser.add_argument("--user", default=DEFAULT_USER,
                         help="account holding the groups (default ameesh)")
     mode = parser.add_mutually_exclusive_group()
@@ -396,7 +586,16 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--check", action="store_true",
                       help="compare the declaration with the host state")
     args = parser.parse_args(argv)
-    data, path = card(args.canon, args.host)
+    if not args.untrusted:
+        commit, why = reviewed_head(args.canon, args.ref)
+        if commit is None:
+            # Ni l'arbre de travail ni un commit local ne remplacent la tête
+            # relue : sans elle, l'installation n'accorde rien.
+            print("capabilities: warning — %s; no Host card read, nothing "
+                  "applied" % why)
+            return 0
+    data, path = card(args.canon, args.host, ref=args.ref,
+                      untrusted=args.untrusted)
     if data is None:
         # En `--check`, l'absence de fiche n'est pas un fait à corriger : un
         # invité sans capacité n'a rien à vérifier et le check reste « ok ».
