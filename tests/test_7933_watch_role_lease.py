@@ -366,6 +366,44 @@ class WatchRoleLeaseTest(PgTestCase):
         # and the holder still emits from that unit, without `watch enable`
         self.assertEqual(self.send(self.banc), "instruction sent to %s" % NAME)
 
+    def test_an_unreadable_watch_storage_does_not_block_the_role_timers(self):
+        # #5947: the watch reconciliation is a complement of the deployment
+        # gesture. A database that cannot serve the watch rows (N-1 schema
+        # during an upgrade, missing grant, simulated base) names the failure
+        # but does not fail the pose of the role timers.
+        directory = Path(self.env[watch.UNIT_DIR_ENV])
+        report = {"schema": "ameesh-role-timers/1", "host": "banc",
+                  "role": NAME, "releve": "election", "candidate": True,
+                  "observation": False, "auditor": False,
+                  "timers": [{"name": "coherence", "only": "coherence",
+                              "interval_s": 21600, "description": "cohérence"}],
+                  "missing_projects": []}
+        lines = []
+        with mock.patch.object(watch, "reconcile_host",
+                               side_effect=RuntimeError("base simulée, watches non servi")):
+            result = role_timers.install(
+                report, directory=directory, bin_path="/opt/ameesh/bin/ameesh",
+                apply=False, db=object(), out=lines.append)
+        self.assertTrue((directory / "ameesh-role-coherence.timer").is_file())
+        self.assertIn("ameesh-role-coherence.timer", result["installed"])
+        self.assertIn("RuntimeError", result["watch_error"])
+        self.assertTrue(any("not reconciled" in line for line in lines), lines)
+
+    def test_an_unreadable_watch_storage_is_a_named_gap_in_the_check(self):
+        # #5947: the control cannot prove the watch without the rows; it stays
+        # red, with a named gap instead of a traceback.
+        directory = Path(self.env[watch.UNIT_DIR_ENV])
+        report = {"schema": "ameesh-role-timers/1", "host": "banc",
+                  "role": NAME, "candidate": True, "observation": False,
+                  "auditor": False, "timers": [], "missing_projects": []}
+        with mock.patch.object(watch, "check_host",
+                               side_effect=RuntimeError("base simulée, watches non servi")):
+            problems = role_timers.check(
+                report, directory=directory, apply=False,
+                bin_path="/opt/ameesh/bin/ameesh", db=object())
+        self.assertTrue(any("unreadable watch storage" in problem
+                            for problem in problems), problems)
+
     # -- unité et affichage ----------------------------------------------
     def test_enable_of_an_elected_role_wraps_the_unit_and_names_the_holder(self):
         self.hold("banc")

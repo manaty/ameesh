@@ -1356,6 +1356,10 @@ def install(report: dict, *, directory: Path, bin_path: str = DEFAULT_BIN,
     candidate (``watch.reconcile_host``). A host that joins the candidates
     therefore gets the watch timer from its ordinary deployment gesture, with
     no second ``watch enable``; the watch row still comes from `enable` once.
+    The reconciliation is best effort: a database that cannot serve the watch
+    rows (N-1 schema during an upgrade, missing grant) never fails the
+    deployment gesture; the failure is named in ``watch_error`` and
+    ``check`` stays strict, since it could not prove the watch.
     """
     out = out or (lambda _line: None)
     if not report.get("candidate"):
@@ -1392,14 +1396,26 @@ def install(report: dict, *, directory: Path, bin_path: str = DEFAULT_BIN,
     # the notifier drop-in belongs to the role timers only: a watch timer does
     # not carry the github-watch/issues/ci passes and must not silence them.
     role_timers = list(timers)
+    watch_error = ""
     if db is not None:
         # #7933 : la pose des minuteries de rôle est le geste de déploiement
         # de chaque candidat ; elle réconcilie aussi les veilles des rôles
         # élus, sinon un hôte qui rejoint les candidats resterait sans
         # émetteur jusqu'à un `ameesh watch enable` manuel.
         from . import watch as watch_mod
-        watched = watch_mod.reconcile_host(report["host"], db, directory=str(directory),
-                                           bin_path=bin_path)
+        try:
+            watched = watch_mod.reconcile_host(report["host"], db,
+                                               directory=str(directory),
+                                               bin_path=bin_path)
+        except Exception as exc:  # noqa: BLE001 - see the comment below
+            # #5947: la réconciliation est un complément de la pose. Une base
+            # qui ne sert pas les lignes de veille (schéma N-1 pendant une
+            # montée, droit manquant) ne doit pas faire échouer le déploiement
+            # de l'hôte : la ligne nomme l'échec, et `--check` reste rouge
+            # puisqu'il ne peut alors pas prouver la veille.
+            watch_error = ("%s: %s" % (type(exc).__name__, exc)).strip()[:300]
+            watched = {"installed": [], "timers": []}
+            out("warning: elected-role watch units not reconciled: %s" % watch_error)
         for name in watched["installed"]:
             installed.append(name)
             out("wrote %s" % name)
@@ -1425,7 +1441,10 @@ def install(report: dict, *, directory: Path, bin_path: str = DEFAULT_BIN,
             active = _systemctl("is-active", "--quiet", "ameesh-notify.service")
             if active.returncode == 0:
                 _systemctl("try-restart", "ameesh-notify.service")
-    return dict(report, installed=installed, removed=removed, applied=applied)
+    result = dict(report, installed=installed, removed=removed, applied=applied)
+    if watch_error:
+        result["watch_error"] = watch_error
+    return result
 
 
 def check(report: dict, *, directory: Path, apply: bool = True,
@@ -1483,8 +1502,17 @@ def check(report: dict, *, directory: Path, apply: bool = True,
                     problems.append("%s: %s" % (spec.name, reason))
     if db is not None:
         from . import watch as watch_mod
-        watched = watch_mod.check_host(report["host"], db, directory=str(directory),
-                                       bin_path=bin_path)
+        try:
+            watched = watch_mod.check_host(report["host"], db,
+                                           directory=str(directory),
+                                           bin_path=bin_path)
+        except Exception as exc:  # noqa: BLE001 - a control that cannot read
+            # #5947: les lignes de veille illisibles ne peuvent pas prouver la
+            # pose : c'est un écart nommé, pas un plantage du contrôle entier.
+            detail = ("%s: %s" % (type(exc).__name__, exc)).strip()[:300]
+            watched = {"problems": ["watch of the elected roles: unreadable watch "
+                                    "storage: %s" % detail],
+                       "timers": []}
         problems.extend(watched["problems"])
         if apply:
             for agent, timer in watched["timers"]:
