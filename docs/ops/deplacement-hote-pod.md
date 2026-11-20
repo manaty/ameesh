@@ -24,11 +24,12 @@ ajoute, **avant tout effet** :
 | `move-pod-passwd` | le `unix_user` lié ne suit pas le plan (`ameesh-<id>`) |
 | `move-pod-uid` | UID hors plage pod, ou battement sous un UID différent de la liaison |
 | `move-tenant-uid` | la présence du runner contredit l'UID de `host_tenants` (via `candidate_state`) |
-| `move-presence`, `move-account-missing` | superviseur frais + battement frais, et profil de compte publié pour le harnais (gardes #7108) |
+| `move-presence`, `move-account-missing` | superviseur vivant, relevé frais, porte ouverte (`host_lifecycle`, `gate_state`), `canon_state` ok, battement frais ; profil de compte publié pour le harnais (gardes #7108) |
 
 Ces deux dernières gardes valent pour **toute** cible pod, y compris un agent
 `releve: hote` qui n'a pas de tentative de conversation : le chemin hôte les
-rejoue sous le verrou avant l'écriture (B #44740).
+rejoue sous le verrou avant l'écriture (B #44740, complété par B #44767 pour
+la porte et le canon).
 
 Le préflight est revalidé **sous le verrou** de l'écriture : un changement de
 liaison, d'UID ou de mode PVC entre la lecture et l'écriture donne

@@ -225,14 +225,16 @@ def _preference_account_refusal(db, row: dict, target: str) -> str:
 
 
 def _pod_availability_refusal(db, row: dict, target: str) -> str:
-    """#7698 (B #44740) : présence d'une cible pod pour un `releve: hote`.
+    """#7698 (B #44740/#44767) : disponibilité d'une cible pod pour un
+    `releve: hote`.
 
     `candidate_state` exige un verdict de placement, que seuls les agents
     `election`/`preference` portent (`agent_candidates`) : il ne peut pas
     servir ici. On vérifie donc directement le couple superviseur vivant +
-    relevé frais, puis le battement du tenant (UID compris). Un agent `hote`
-    n'est pas replacé par le sync d'arrivée : sans cette garde, une simple
-    liaison pod suffirait à le déplacer vers un hôte endormi."""
+    relevé frais, la porte et le canon de l'hôte, puis le battement du tenant
+    (UID compris). Un agent `hote` n'est pas replacé par le sync d'arrivée :
+    sans cette garde, une simple liaison pod suffirait à le déplacer vers un
+    hôte endormi, en cours de retrait ou au canon invalide."""
     from . import election, tenancy
 
     store = storage.of(db)
@@ -251,6 +253,12 @@ def _pod_availability_refusal(db, row: dict, target: str) -> str:
     if age > limit:
         return ("move-presence: %s: stale resource reading (%ds old, limit %ds)"
                 % (target, int(age), int(limit)))
+    gate = election.host_gate_reason(db, target, reading)
+    if gate:
+        return "move-presence: %s: %s" % (target, gate)
+    canon = election.canon_state_reason(db, row, target)
+    if canon:
+        return "move-presence: %s: %s" % (target, canon)
     reason = tenancy.presence_reason(db, row, target, now=now, limit_s=limit)
     if reason:
         if "uid" in reason.lower():

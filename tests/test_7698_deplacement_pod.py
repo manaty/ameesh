@@ -8,9 +8,9 @@ Design `docs/design/7633-hote-avatars-pod.md` §9 :
   et, pour un hôte enfant, le UID Kubernetes de `pod_hosts` ;
 * `agent move` vers un pod refuse un hôte enfant (`pod_hosts`), un template,
   une carte/solation inconnue, un passwd ou un UID hors du plan, et attend la
-  présence et le profil de compte (gardes de #7108), y compris pour un agent
-  `releve: hote` (sans conversation) : ces gardes sont rejouées sous le verrou
-  (B #44740) ;
+  présence, la porte ouverte, le canon et le profil de compte (gardes de
+  #7108), y compris pour un agent `releve: hote` (sans conversation) : ces
+  gardes sont rejouées sous le verrou (B #44740/#44767) ;
 * pod partagé ↔ pod dédié : même UID de personne = PVC ré-attachable
   (`pvc: reattach`) ; UID différent = re-login sur un PVC neuf (`pvc:
   relogin`) ; poste → pod : aucun volume de pod à déplacer (`pvc: none`) ;
@@ -581,6 +581,51 @@ class MoveHoteToPodTest(_PodMoveCase):
     def test_hote_vers_pod_profil_absent_refuse(self):
         self.ready_pod(name=HOTE, profiles=[])
         self.refused("move-account-missing")
+
+    def test_hote_vers_pod_porte_fermee_refuse(self):
+        # retrait durable (L232e) : la porte de l'hôte est fermée.
+        self.ready_pod(name=HOTE)
+        self.db.execute(
+            "INSERT INTO host_lifecycle (host, mode, actor)"
+            " VALUES (%s, 'draining', 'test')", (POD_PARTAGE,))
+        self.refused("move-presence")
+
+    def test_hote_vers_pod_gate_state_arrete_refuse(self):
+        # porte fermée publiée par le superviseur (`gate_state: stopped`).
+        self.ready_pod(name=HOTE)
+        self.db.execute(
+            "UPDATE host_resources SET gate_state = 'stopped' WHERE host = %s",
+            (POD_PARTAGE,))
+        self.refused("move-presence")
+
+    def test_hote_vers_pod_canon_invalide_refuse(self):
+        # le canon de la cible n'est plus lisible/valide : le superviseur ne
+        # peut pas garantir le placement, aucun déplacement.
+        self.ready_pod(name=HOTE)
+        self.db.execute(
+            "UPDATE canon_state SET status = 'invalid', diagnostic = 'test'"
+            " WHERE host = %s", (POD_PARTAGE,))
+        self.refused("move-presence")
+
+    def test_hote_porte_fermee_sous_le_verrou_refuse(self):
+        # La porte est relue sous le verrou : fermer l'hôte entre le
+        # préflight et l'écriture refuse le déplacement, rien n'est écrit.
+        self.ready_pod(name=HOTE)
+        original = election.host_gate_reason
+        calls = []
+
+        def watch(db, host, reading=None):
+            calls.append(host)
+            if len(calls) == 1:
+                # la porte se ferme APRÈS le préflight, avant le verrou
+                db.execute(
+                    "UPDATE host_resources SET gate_state = 'stopped'"
+                    " WHERE host = %s", (POD_PARTAGE,))
+            return original(db, host, reading)
+
+        with mock.patch.object(election, "host_gate_reason", side_effect=watch):
+            self.refused("move-presence")
+        self.assertEqual(len(calls), 2)
 
     def test_hote_profil_retire_sous_le_verrou_refuse(self):
         # La garde est rejouée dans la transaction, sur la ligne d'agent
