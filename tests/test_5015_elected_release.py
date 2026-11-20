@@ -202,6 +202,25 @@ if expected:
                 opened.assert_not_called()
                 stage.assert_not_called()
 
+    def test_staging_apply_queued_handoff_exits_zero(self):
+        """#7904: a requested staging is not reported as a failed command."""
+        for result, expected in (("queued", 0), ("staged", 0),
+                                 ("below-threshold", 0), ("failed", 1)):
+            with self.subTest(result=result):
+                args = self.args()
+                args.release_command, args.apply, args.actor = (
+                    'staging-needed', True, 'pilot')
+                with mock.patch.dict(os.environ, {}, clear=True), \
+                        mock.patch.object(release, '_elected_tick', return_value=None), \
+                        mock.patch.object(release_cutoff, 'projects',
+                                          return_value={'example': object()}), \
+                        mock.patch('ameesh.db.open_db') as opened, \
+                        mock.patch('ameesh.staging_pending.apply',
+                                   return_value={'result': result}), \
+                        mock.patch('builtins.print'):
+                    self.assertEqual(release.run(self.cfg(), args), expected)
+                opened.return_value.close.assert_called_once()
+
     def test_elected_staging_uses_independent_executor_configuration(self):
         cfg = self.cfg()
         cfg.release['projects'] = {'example': {'repo': '/fixture/repo',

@@ -1115,7 +1115,8 @@ def run(cfg, args) -> int:
                 if args.apply:
                     report = staging_pending.apply(cfg, db, declared[name], now=time.time(),
                                                    actor=args.actor)
-                    if report["result"] not in ("staged", "below-threshold"):
+                    if report["result"] not in ("staged", "queued",
+                                                "below-threshold"):
                         status = 1
                 else:
                     report = staging_pending.inspect(cfg, db, declared[name], now=time.time())
