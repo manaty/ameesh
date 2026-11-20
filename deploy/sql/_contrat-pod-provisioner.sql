@@ -175,6 +175,35 @@ BEGIN
         END LOOP;
     END LOOP;
 
+    -- #44568/#44569 : RLS active sur les trois tables de liaison, policy
+    -- permissive pour tous, policy restrictive pour le seul pourvoyeur,
+    -- bornée par les hôtes de `pod_requests`.
+    FOR item IN
+        SELECT unnest(ARRAY['pod_hosts', 'host_tenancy', 'host_tenants']) AS rel
+    LOOP
+        IF NOT EXISTS (SELECT FROM pg_class c
+                        WHERE c.relnamespace = n AND c.relname = item.rel
+                          AND c.relkind IN ('r', 'p') AND c.relrowsecurity) THEN
+            errors := errors || format('RLS missing %s', item.rel);
+        END IF;
+        IF NOT EXISTS (SELECT FROM pg_policies p
+                        WHERE p.schemaname = s AND p.tablename = item.rel
+                          AND p.policyname = 'pod_scope_provisioner'
+                          AND p.permissive = 'RESTRICTIVE'
+                          AND r = ANY (p.roles)
+                          AND p.qual LIKE '%pod_requests%'
+                          AND p.with_check LIKE '%pod_requests%') THEN
+            errors := errors || format('restrictive policy missing %s', item.rel);
+        END IF;
+        IF NOT EXISTS (SELECT FROM pg_policies p
+                        WHERE p.schemaname = s AND p.tablename = item.rel
+                          AND p.policyname = 'pod_scope_open'
+                          AND p.permissive = 'PERMISSIVE'
+                          AND 'public' = ANY (p.roles)) THEN
+            errors := errors || format('permissive policy missing %s', item.rel);
+        END IF;
+    END LOOP;
+
     IF array_length(errors, 1) > 0 THEN
         RAISE EXCEPTION 'contract refused: %', array_to_string(errors, '; ');
     END IF;

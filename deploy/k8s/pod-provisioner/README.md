@@ -70,7 +70,10 @@ cette frontière :
   `ameesh_pod_admission`, qui n'a que `SELECT` : la lecture seule est une ACL
   PostgreSQL, pas seulement le drapeau `writer=False` ; le pourvoyeur, lui,
   n'a qu'un UPDATE borné aux colonnes d'exploitation
-  (`role-pod-provisioner.sql`), jamais aux champs d'autorisation ;
+  (`role-pod-provisioner.sql`), jamais aux champs d'autorisation ; ses
+  écritures sur `pod_hosts`/`host_tenancy`/`host_tenants` sont bornées par
+  une RLS restrictive aux hôtes de ses propres demandes (`pod_requests.host`) :
+  un hôte VM partagé reste hors de sa portée (#44568/#44569) ;
 - il rend le pod attendu avec le template **copié dans son image**
   (`/etc/ameesh/pod-provisioner/template.yaml`), pas depuis une ConfigMap que
   le pourvoyeur pourrait remplacer ;

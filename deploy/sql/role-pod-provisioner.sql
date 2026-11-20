@@ -14,6 +14,8 @@
 -- larges est donc ramené au contrat, jamais laissé tel quel.
 --
 -- Le pourvoyeur ne peut PAS modifier les champs d'autorisation d'une demande
+-- et ses écritures de liaison sont bornées par RLS aux hôtes de ses propres
+-- demandes (`pod_scope_provisioner`), jamais à un hôte VM partagé.
 -- (`tenant`, `enfant`, `Secret`, `expires_at`, etc.) : son UPDATE est borné
 -- aux colonnes d'exploitation. Le webhook, lui, n'a que SELECT sur
 -- `pod_requests` : sa source d'autorisation est en lecture seule au niveau
@@ -93,7 +95,29 @@ BEGIN
     EXECUTE format('GRANT SELECT, INSERT, UPDATE ON %I.pod_hosts TO %I', s, r);
     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I.host_tenancy TO %I', s, r);
     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I.host_tenants TO %I', s, r);
+    -- `running` lit le host de l'enfant pour refuser un pod dont l'enfant a
+    -- disparu ; deux colonnes suffisent.
     EXECUTE format('GRANT SELECT (name, host) ON %I.agent_registry TO %I', s, r);
+
+    -- #44568/#44569 : les tables de liaison portent la politique de TOUS les
+    -- hôtes, pods et VM. Le pourvoyeur n'écrit que pour les hôtes de ses
+    -- propres demandes. RLS : policy permissive pour tous (comportement
+    -- inchangé ; le propriétaire la contourne) + policy restrictive pour le
+    -- seul rôle du pourvoyeur, bornée par `pod_requests.host` (unique et
+    -- non modifiable par ce rôle).
+    FOR item IN
+        SELECT unnest(ARRAY['pod_hosts', 'host_tenancy', 'host_tenants']) AS rel
+    LOOP
+        EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', s, item.rel);
+        EXECUTE format('DROP POLICY IF EXISTS pod_scope_open ON %I.%I', s, item.rel);
+        EXECUTE format('CREATE POLICY pod_scope_open ON %I.%I FOR ALL TO PUBLIC '
+                       'USING (true) WITH CHECK (true)', s, item.rel);
+        EXECUTE format('DROP POLICY IF EXISTS pod_scope_provisioner ON %I.%I', s, item.rel);
+        EXECUTE format('CREATE POLICY pod_scope_provisioner ON %I.%I AS RESTRICTIVE '
+                       'FOR ALL TO %I USING (host IN (SELECT host FROM %I.pod_requests)) '
+                       'WITH CHECK (host IN (SELECT host FROM %I.pod_requests))',
+                       s, item.rel, r, s, s);
+    END LOOP;
 
     -- Ce que le pourvoyeur n'a jamais : créer ou supprimer une demande,
     -- changer un champ d'autorisation, écrire dans le registre.
