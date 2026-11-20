@@ -77,6 +77,10 @@ GRACE_S = 24 * 3600.0
 #: an unreferenced entry is deleted after this long without a new link
 #: (#3746: 24 h, was 3 days; a full agents disk needs the room sooner)
 DEFAULT_DEPS_IDLE_S = GRACE_S
+#: #7944: under pressure (cache over its quota, or the disk under its free
+#: target) an entry nobody links to goes after this long instead: one
+#: mobile lockfile per build iteration filled 2.3 GiB/h kept a whole day
+PRESSURE_GRACE_S = 3600.0
 #: touched by the GC each time it sees a live link to the entry
 ALIVE = ".last-alive"
 #: the one install mode of a fill (part of the key): a full development tree,
@@ -1284,7 +1288,8 @@ def _mtime(path: str) -> float:
 
 
 def _gc_reason(entry: str, *, now: float, idle: float, worktrees, holders,
-               write: bool, kept: list | None = None) -> str | None:
+               write: bool, kept: list | None = None,
+               grace: float = GRACE_S) -> str | None:
     """Why `entry` can go, or None to keep it. Read again under the lock
     before any deletion: never trusts an earlier listing."""
     marker = read_marker(entry)
@@ -1306,10 +1311,12 @@ def _gc_reason(entry: str, *, now: float, idle: float, worktrees, holders,
             last_link = 0.0
         since = max(float(marker.get("created") or 0), last_link,
                     _mtime(os.path.join(entry, ALIVE)))
-        if now - since < max(idle, GRACE_S):
+        if now - since < max(idle, grace):
             return None
         why = "no worktree links to it since %s" % time.strftime(
             "%Y-%m-%d %H:%M", time.localtime(since))
+        if grace < GRACE_S:
+            why += " (pressure: %d min grace)" % (grace // 60)
     else:
         if now - _mtime(entry) < PARTIAL_MIN_AGE_S:
             return None
@@ -1423,7 +1430,8 @@ def entries(cache_root: str) -> list[dict]:
 def gc_node_modules(cache_root: str, *, now: float | None = None,
                     idle: float = DEFAULT_DEPS_IDLE_S, dry_run: bool = False,
                     worktrees=None, holders=None, budget=None,
-                    reserve: float = 0.0, allow=()) -> list[dict]:
+                    reserve: float = 0.0, allow=(), quota: int | None = None,
+                    pressure: bool = False) -> list[dict]:
     """Delete the entries no worktree links to any more and partial ones left
     by a dead fill. A complete entry goes only after `idle` (at least GRACE_S)
     since its creation, its last link and the last time a link to it was seen
@@ -1445,7 +1453,11 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
     tail). If the budget runs out DURING the worktree inventory, the list is
     INCOMPLETE: no entry is deleted (a link nobody recorded may live in an
     omitted worktree), and the kept line says it. The check is made again
-    under the lock, right before the deletion (#3802 B/P1, cx1)."""
+    under the lock, right before the deletion (#3802 B/P1, cx1).
+
+    #7944: under `pressure` (the disk under its free target) or when the
+    complete entries weigh more than `quota` bytes, an entry nobody links to
+    goes after PRESSURE_GRACE_S instead of `idle`; the other guards stand."""
     now = time.time() if now is None else float(now)
     # #5046: the same explicit host policy as tmp/worktrees. An actual
     # observed holder still blocks; only an allowed unreadable daemon is excused.
@@ -1469,7 +1481,13 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
         return inventory_failed or (budget is not None and (
             budget.expired() or budget.remaining() <= max(0.0, reserve)))
 
-    for item in entries(cache_root):
+    items = entries(cache_root)
+    held = sum(int((item["marker"] or {}).get("bytes") or 0)
+               for item in items if item["complete"])
+    pressed = pressure or (quota is not None and held > quota)
+    idle = min(idle, PRESSURE_GRACE_S) if pressed else idle
+    grace = PRESSURE_GRACE_S if pressed else GRACE_S
+    for item in items:
         if exhausted():
             break                      # #3802: a bounded host pass
         entry = item["path"]
@@ -1479,7 +1497,8 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
         # cheap filter first (no worktree scan unless needed); it refreshes
         # `.last-alive` of the entries it sees linked
         if not dry_run and _gc_reason(entry, now=now, idle=idle, worktrees=(),
-                                      holders=lambda _p: [], write=True) is None:
+                                      holders=lambda _p: [], write=True,
+                                      grace=grace) is None:
             continue
         # links found by the scan are recorded (kept entries only; no dry run)
         found = tops()
@@ -1494,7 +1513,7 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
                             else "pass budget reached")})
             break
         why = _gc_reason(entry, now=now, idle=idle, worktrees=found, holders=holders,
-                         write=not dry_run, kept=out)
+                         write=not dry_run, kept=out, grace=grace)
         if why is None:
             continue
         size = int(item["marker"].get("bytes") or 0)
@@ -1508,7 +1527,7 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
             continue                       # being filled or linked right now
         try:
             why = _gc_reason(entry, now=now, idle=idle, worktrees=tops(), holders=holders,
-                             write=True, kept=out)
+                             write=True, kept=out, grace=grace)
             if why is None:
                 continue
             if exhausted():
