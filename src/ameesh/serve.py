@@ -875,12 +875,19 @@ _AGENT_OBS_NATIVE = _obj(
         work_item_id=_STR_NULL, created_ts=_NUM_NULL,
         ledger_ambiguous={"type": "boolean"}),
     sandbox=dict(_SANDBOX, type=["object", "null"]))
+_AGENT_OBS_HOST = _nullable_obj(
+    ["name", "capabilities", "available", "reason"],
+    name=_STR, capabilities={"type": "array", "items": _STR},
+    available={"type": "boolean"},
+    reason={"type": ["string", "null"],
+            "enum": list(agent_observation.HOST_REASONS) + [None]})
 _AGENT_OBSERVATION = _obj(
     "ameesh-agent-observation/1",
-    ["observed_ts", "agent", "profile", "admission", "canon", "placement",
-     "lease", "limits", "budget", "native", "missing"],
+    ["observed_ts", "agent", "profile", "admission", "canon", "host",
+     "placement", "lease", "limits", "budget", "native", "missing"],
     observed_ts=_NUM, agent=_AGENT_OBS_AGENT, profile=_AGENT_OBS_PROFILE,
     admission=_AGENT_OBS_ADMISSION, canon=_AGENT_OBS_CANON,
+    host=_AGENT_OBS_HOST,
     placement=_AGENT_OBS_PLACEMENT, lease=_AGENT_OBS_LEASE,
     limits=_AGENT_OBS_LIMITS, budget=_AGENT_OBS_BUDGET,
     native=_AGENT_OBS_NATIVE,

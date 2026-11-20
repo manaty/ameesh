@@ -1401,6 +1401,10 @@ class Host:
     #: (`device_gates`) ; passé ce jour, la déclaration cesse d'elle-même.
     unavailable_until: str | None = None
     unavailable_reason: str | None = None
+    #: #7926 : capacités déclarées de l'hôte (`android-emulator`), lues par
+    #: `ameesh.host_capabilities` pour le provisioning, le doctor et le
+    #: placement. None = aucune : le défaut sûr n'accorde rien.
+    capabilities: list[str] | None = None
     #: #7662 : place dans la séquence staging (canon §14), absent = l'hôte
     #: n'est pas un hôte de staging (un profil nu n'en a aucun).
     staging: HostStaging | None = None
@@ -1834,6 +1838,7 @@ class Canon:
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
                            admins=h.admins, occupants=h.occupants,
+                           capabilities=h.capabilities,
                            unavailable_until=h.unavailable_until,
                            unavailable_reason=h.unavailable_reason,
                            staging=h.staging.to_dict() if h.staging is not None else None,
@@ -5044,12 +5049,27 @@ class _Loader:
         occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
         until, reason = self._host_unavailability(fiche, where, subject)
         staging = self._host_staging(fiche, where, subject)
+        # #7926 : capacités de l'hôte (`android-emulator` -> groupe kvm).
+        # Le schéma ne connaît que ces noms ; un inconnu est signalé et
+        # n'accorde rien (une faute de frappe ne doit pas élargir un droit).
+        capabilities = self._list(fiche, "capabilities", where,
+                                  "host-capabilities-invalid", **subject)
+        if capabilities is not None:
+            from . import host_capabilities
+            capabilities, problems, unknown = host_capabilities.parse(capabilities)
+            for problem in problems:
+                self.add("host-capabilities-invalid", ERROR, problem,
+                         **where, **subject)
+            for name in unknown:
+                self.add("host-capability-unknown", WARNING,
+                         "`capabilities`: unknown capability %r (ignored)" % name,
+                         **where, **subject)
         self.canon.hosts.append(Host(title=fiche.title,
                                      responsible=_text(fiche.data.get("responsible")),
                                      policy=policy, tags=tags, admins=admins,
                                      occupants=occupants, fiche=fiche,
                                      unavailable_until=until, unavailable_reason=reason,
-                                     staging=staging))
+                                     capabilities=capabilities, staging=staging))
 
     def _host_staging(self, fiche: Fiche, where: dict,
                       subject: dict) -> HostStaging | None:

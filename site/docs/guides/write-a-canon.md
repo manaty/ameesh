@@ -106,7 +106,13 @@ policy:
 ```
 
 The host name is what the runner of that machine uses (`AMEESH_HOST`, else the
-machine's host name).
+machine's host name). A host may also declare its `capabilities`, next to
+`tags`; `android-emulator` is the only one known today and names the `kvm`
+group, which the provisioning applies only for a host that declares it:
+
+```yaml
+capabilities: [android-emulator]   # kvm group and /dev/kvm, checked by ameesh doctor
+```
 
 The host also says **where agents work**: `policy.workspaces.roots` gives a
 working directory per team (here every `acme-web` agent on `banc` works in

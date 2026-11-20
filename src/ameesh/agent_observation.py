@@ -35,7 +35,8 @@ The public surface is `ameesh agent observe` (CLI) and
 """
 from __future__ import annotations
 
-from . import accounts, modules, placement, registry, sandbox_observation, storage
+from . import (accounts, host_capabilities, modules, placement, registry,
+               sandbox_observation, storage)
 
 SCHEMA = "ameesh-agent-observation/1"
 
@@ -312,6 +313,32 @@ def _placement_block(row: dict) -> dict:
     }
 
 
+#: why the declared capabilities of the agent's host are not readable here
+HOST_REASONS = ("canon_unreadable", "host_not_in_canon")
+
+
+def _host_block(cfg, row: dict) -> dict | None:
+    """#7926: capacités déclarées de l'hôte de l'agent (lecture de la fiche).
+
+    Une lecture de fichier, pas une décision : la fiche du canon dit ce que
+    l'hôte promet, et l'absence de fiche est un fait nommé, jamais un zéro.
+    """
+    name = row.get("host") or None
+    if not name:
+        return None
+    try:
+        data, _path = host_capabilities.card_for(cfg, name)
+    except Exception:  # a canon read never turns the observation into an outage
+        return {"name": name, "capabilities": [], "available": False,
+                "reason": "canon_unreadable"}
+    if data is None:
+        return {"name": name, "capabilities": [], "available": False,
+                "reason": "host_not_in_canon"}
+    declared, _problems, _unknown = host_capabilities.from_card(data)
+    return {"name": name, "capabilities": declared, "available": True,
+            "reason": None}
+
+
 def _session_block(row: dict) -> dict | None:
     if not (row.get("session_id") or row.get("session_harness")
             or row.get("session_account")):
@@ -548,6 +575,7 @@ def _build(tx, name: str, *, cfg, account_profile: str | None,
         },
         "admission": admission,
         "canon": canon,
+        "host": _host_block(cfg, row),
         "placement": _placement_block(row),
         "lease": {
             "owner": row.get("lease_owner") or None,

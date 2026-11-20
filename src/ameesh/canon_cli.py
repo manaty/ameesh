@@ -20,7 +20,7 @@
                                          #3955 : sans --allow-rewind, le commit audité
                                          (last_good_commit) ne recule jamais ; le
                                          retour arrière déclaré est journalisé au fil
-  ameesh placement check [--agent A] [--json]
+  ameesh placement check [--agent A] [--capability C] [--json]
                                          admissions actuelles (hôtes admis, verdicts
                                          de placement) et hôtes admissibles (hôtes,
                                          modes d'identifiants) ; lecture seule, code 1
@@ -449,6 +449,9 @@ def _show_one(canon: canon_mod.Canon, args: argparse.Namespace) -> int:
             "all" if p.credential_modes is None else _join(p.credential_modes),
             "—" if p.max_agents is None else p.max_agents,
             "; tags %s" % _join(h.tags) if h.tags else ""))
+        if h.capabilities:
+            # #7926 : ce que l'hôte promet (provisioning et placement)
+            print("  %-14s capabilities %s" % ("", _join(h.capabilities)))
         if h.unavailable_until:
             # #3070 : l'indisponibilité déclarée (canon §12), échue ou non
             print("  %-14s unavailable until %s%s%s" % (
@@ -711,7 +714,8 @@ def _placement_one(args: argparse.Namespace, canon: canon_mod.Canon,
         print("canon UNREADABLE (%s): no placement can be evaluated" % canon.root)
         _print_findings(findings)
         return 1
-    entries = placement_mod.report(canon, args.agent, findings)
+    entries = placement_mod.report(canon, args.agent, findings,
+                                  capability=getattr(args, "capability", None))
     unknown = [e["agent"] for e in entries if not e["known"]]
     refused = [(e["agent"], p) for e in entries for p in e["placements"]
                if not p["placement_ok"]]
@@ -750,10 +754,12 @@ def _placement_one(args: argparse.Namespace, canon: canon_mod.Canon,
         admissible = entry["admissible"]
         print("  admissible:%s" % ("" if admissible else " no canon host"))
         for choice in admissible:
-            print("    %-14s mode %s (admitted: %s)%s" % (
+            print("    %-14s mode %s (admitted: %s)%s%s" % (
                 choice["host"], choice["credential_mode"] or "to be set",
                 _modes(choice["credential_modes"]),
-                " — current placement" if choice["current"] else ""))
+                " — current placement" if choice["current"] else "",
+                " — capabilities: %s" % _join(choice["capabilities"])
+                if choice.get("capabilities") else ""))
         if entry["refused"]:
             print("  refused:")
         for choice in entry["refused"]:
@@ -1379,6 +1385,9 @@ def add_parsers(sub) -> None:
         "check", help="admitted or refused placements, and admissible placements (read-only)")
     _canon_options(p_pcheck)
     p_pcheck.add_argument("--agent", default=None, help="a single agent (otherwise all)")
+    p_pcheck.add_argument(
+        "--capability", default=None,
+        help="only hosts declaring this host capability (e.g. android-emulator)")
     p_pcheck.set_defaults(func=cmd_placement_check)
 
     _add_agent_parsers(sub, move=True, observe=True)

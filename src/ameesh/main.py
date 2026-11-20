@@ -183,7 +183,8 @@
         | status [<job>] | cancel <job>
         heavy suites run on a lending VM over SSH (L159b, AMEESH_OFFLOAD_HOST);
         same output and exit code, local fallback;
-  ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
+  ameesh placement check [--agent A] [--capability C]
+        allowed or refused placements, and eligible hosts (C: declared host capability);
   ameesh plan <accept|add|cancel|done|export|get|import|list|propose|show|update|validate>
         add "what" --due DATE [--proposed] [--key K]; update eN;
         import FILE [--apply] [--update]; export [--project P]; validate [FILE];
