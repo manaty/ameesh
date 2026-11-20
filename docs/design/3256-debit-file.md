@@ -153,6 +153,15 @@ la fenêtre (date inconnue : aucune heure imputée). Cette borne ne prétend pas
 reconstituer les changements historiques de démarrabilité du lot.
 (Source : diagnostic mesh-design du 13/11/2026, lot #7249, manaty/ameesh#5469.)
 
+Quand aucune borne datée n'existe, la mesure n'est pas « 0 h » : elle est
+**exclue**. La ligne du projet porte `idle_agent_hours_excluded` avec la raison
+(`feuille de route épuisée`, ou `date de création du lot démarrable
+inconnue` pour un lot ponctuel non daté), et le texte affiche `exclu (raison)`
+au lieu d'un 0,0 qui se lirait comme une mesure. Le mesh compte ces agents à
+part (`idle_agents_excluded`), avec les raisons
+(`idle_hours_excluded_reasons`) ; son `idle_agent_hours` ne somme que les
+heures imputées. (Source : revue #7804 du 19/11/2026, lot #7849.)
+
 `ameesh debit` gagne une section `capacity`, par projet et pour le mesh :
 
 - `idle_agent_hours` sur la fenêtre du débit, et la part au repos des agents

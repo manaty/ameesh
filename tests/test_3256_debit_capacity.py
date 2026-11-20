@@ -159,21 +159,73 @@ class TriggerTest(unittest.TestCase):
         self.assertEqual(cap["projects"][0]["startable_lots"], [12])
         self.assertIn("ameesh work assign", cap["alerts"][0]["gesture"])
 
-    def test_an_exhausted_roadmap_is_quiet_and_counts_no_hours(self):
+    def test_an_exhausted_roadmap_is_quiet_and_marks_the_hours_excluded(self):
         notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh (feuille "
                   "docs/roadmap.md, décision owner)", "at_ts": T - H}]
         cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[split_lot()])
         self.assertEqual(cap["alerts"], [])
-        self.assertEqual(cap["projects"][0]["idle_agent_hours"], 0.0)
-        self.assertEqual(cap["projects"][0]["roadmap_exhausted"]["lot"], 90)
+        project = cap["projects"][0]
+        self.assertEqual(project["idle_agent_hours"], 0.0)
+        self.assertEqual(project["idle_agent_hours_excluded"],
+                         "feuille de route épuisée")
+        self.assertEqual(project["roadmap_exhausted"]["lot"], 90)
+        # #7849 : le 0,0 d'exclusion n'est pas affiché comme une mesure, et le
+        # mesh nomme les agents hors mesure.
+        self.assertEqual(cap["mesh"]["idle_agents_excluded"], 2)
+        self.assertEqual(cap["mesh"]["idle_hours_excluded_reasons"],
+                         ["feuille de route épuisée"])
+        text = "\n".join(debit._capacity_text(cap))
+        self.assertIn("exclu (feuille de route épuisée)", text)
+        self.assertIn("heures-agent exclues (2 agent(s) : feuille de route épuisée)", text)
+        self.assertNotIn("0.0 heure(s)-agent", text)
+
+    def test_a_dated_startable_lot_counts_the_hours_and_lifts_the_exclusion(self):
+        # #7849/#7249 : un lot ponctuel daté borne la reprise ; les heures
+        # depuis sa création sont mesurées, la ligne n'est plus « exclue ».
+        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh",
+                  "at_ts": T - H}]
+        cap = measure(team(1, 1), roadmap_notes=notes, open_lots=[split_lot()],
+                      startable=[{"id": 12, "app": "ameesh", "created_ts": T - H / 2}])
+        project = cap["projects"][0]
+        self.assertEqual(project["idle_agent_hours"], 0.5)
+        self.assertNotIn("idle_agent_hours_excluded", project)
+        self.assertEqual(cap["mesh"]["idle_agents_excluded"], 0)
+        text = "\n".join(debit._capacity_text(cap))
+        self.assertIn("0.5 h-agent", text)
+        self.assertIn("feuille de route épuisée", text)
+        self.assertNotIn("exclu (", text)
 
     def test_a_startable_lot_keeps_the_exhaustion_note(self):
         notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh", "at_ts": T - H}]
         cap = measure(team(2, 8), roadmap_notes=notes, open_lots=[split_lot()],
                       startable=[{"id": 12, "app": "ameesh"}])
-        self.assertEqual(cap["projects"][0]["roadmap_exhausted"]["lot"], 90)
-        self.assertEqual(cap["projects"][0]["idle_agent_hours"], 0.0)
+        project = cap["projects"][0]
+        self.assertEqual(project["roadmap_exhausted"]["lot"], 90)
+        self.assertEqual(project["idle_agent_hours"], 0.0)
+        # #7849 : sans date de création, aucune heure n'est inventée, mais la
+        # mesure est dite exclue au lieu de passer pour un 0,0 mesuré.
+        self.assertEqual(project["idle_agent_hours_excluded"],
+                         "date de création du lot démarrable inconnue")
         self.assertEqual(len(cap["alerts"]), 1)
+        text = "\n".join(debit._capacity_text(cap))
+        self.assertIn("exclu (date de création du lot démarrable inconnue)", text)
+        self.assertIn("feuille de route épuisée", text)
+
+    def test_the_mesh_counts_measured_hours_and_sets_the_excluded_apart(self):
+        # #7849 : un projet épuisé exclu ne masque pas les heures mesurées
+        # d'un autre projet ; le mesh les distingue.
+        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh",
+                  "at_ts": T - H}]
+        cap = measure(team(2, 8, "ameesh") + team(1, 1, "nexlink"),
+                      roadmap_notes=notes, open_lots=[split_lot()])
+        nexlink = [row for row in cap["projects"]
+                   if row["project"] == "nexlink"][0]
+        self.assertNotIn("idle_agent_hours_excluded", nexlink)
+        self.assertEqual(cap["mesh"]["idle_agent_hours"], 6.0)
+        self.assertEqual(cap["mesh"]["idle_agents_excluded"], 2)
+        text = "\n".join(debit._capacity_text(cap))
+        self.assertIn("6.0 heure(s)-agent mesurées "
+                      "(2 agent(s) exclus : feuille de route épuisée)", text)
 
     def test_a_reopening_note_after_the_exhaustion_reopens(self):
         # #5149 : la dernière note fait foi, comme pour le sommeil et
