@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# GÉNÉRÉ par deploy/k8s/pod-shared/render.py — ne pas editer a la main.
+# Source : deploy/k8s/pod-shared/host.exemple.yaml ; `render.py --check` verifie la fraicheur.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ameesh-pod-alice-quota
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
+    app.kubernetes.io/component: pod-host
+    app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
+spec:
+  hard:
+    pods: '1'
+    persistentvolumeclaims: '2'
+    requests.storage: 40Gi
+    requests.cpu: 660m
+    requests.memory: 1376Mi
+    limits.cpu: 4850m
+    limits.memory: 4992Mi
+    services: '0'
+    ingresses.networking.k8s.io: '0'
+    count/statefulsets.apps: '1'

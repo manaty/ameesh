@@ -1,10 +1,12 @@
-# Témoin d'isolation d'un hôte pod (#7694, #7695)
+# Témoin d'isolation et de référence d'un hôte pod (#7694, #7695, #7699)
 
 Preuve `kind` des cinq contrôles de la tranche P2 du design
 [`7633-hote-avatars-pod.md`](../../../docs/design/7633-hote-avatars-pod.md)
 §5.3 : **identité**, **montage**, **permissions**, **superviseur**, **base**.
 Le canon (#7694, B1 de #44265) est rejoué en plus, comme contrôle
-complémentaire. Le témoin est un geste de bureau/opérateur, pas de l'agent
+complémentaire ; #7698 ajoute le déplacement partagé ↔ dédié, #7699 le
+**contrôle du chart de référence** (NetworkPolicy, quota, PDB, digest,
+`preStop`, labels). Le témoin est un geste de bureau/opérateur, pas de l'agent
 intéressé : il crée un cluster jetable, applique les gabarits, lit les
 résultats depuis les conteneurs, imprime une trace, puis supprime le cluster.
 Aucun secret n'est lu ni affiché.
@@ -32,9 +34,9 @@ AMEESH_TEST_DSN=postgresql://ameesh@127.0.0.1:5432/ameesh \
 ```
 
 Codes de sortie : `0` = tous les témoins passent ; `1` = un contrôle échoue
-(le script imprime le diagnostic) ; `77` = `kind`, `kubectl` ou `docker`
-absent, **ou** `AMEESH_TEST_DSN` absent (contrôle base non exécuté) — le
-témoin est alors **non exécuté / non-concluant**, jamais « vert ».
+(le script imprime le diagnostic) ; `77` = `kind`, `kubectl`, `docker` ou
+PyYAML absent, **ou** `AMEESH_TEST_DSN` absent (contrôle base non exécuté) —
+le témoin est alors **non exécuté / non-concluant**, jamais « vert ».
 
 Le script crée **le consommateur avant d'attendre le binding** : kind installe
 une StorageClass `WaitForFirstConsumer`, donc un PVC seul reste `Pending`
@@ -79,6 +81,17 @@ tenant, montage en lecture seule, avec la **paire du plan**
 un UID différent du clone ; le contrôle négatif, sans la paire, exige le
 refus de Git (`dubious ownership`). La confiance reste bornée au dépôt :
 jamais `*`.
+
+**Chart de référence (#7699, en plus)** : dans un namespace jetable, le
+script rend les objets P6 de `../pod-shared/` (`render.py --check`, puis
+`--stdout --kind NetworkPolicy --kind ResourceQuota --kind
+PodDisruptionBudget`) et vérifie que l'API les accepte. Il prouve que la
+`ResourceQuota` **mord** (un second pod est refusé avec `exceeded quota`),
+que le `PodDisruptionBudget` compte **1 pod et 0 interruption**, et que le
+rendu porte `image@sha256:…`, `preStop`, `terminationGracePeriodSeconds:
+120` et le label de version. Le `kubectl kustomize` complet est aussi
+construit. L'**application** de la NetworkPolicy par le CNI n'est pas
+prouvée par kind (kindnet) : le runbook de qualification la porte à Q-TPK.
 
 Le pod témoin (trois conteneurs : A, B et le superviseur) a **un seul
 `fsGroup` neutre** (`10000`) pour les deux PVC : jamais un `fsGroup` par

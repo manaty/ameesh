@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# #7695 (P2 de #7633) — témoin kind complet du pod partagé à N tenants.
+# #7695 (P2 de #7633), #7699 (P6) — témoin kind complet du pod partagé.
 #
 # Ce workflow ne se déclenche QUE manuellement (`workflow_dispatch`) : un lot
 # ne pousse pas de CI sur sa branche, la CI tourne sur la tête gelée avant la
@@ -7,11 +7,12 @@
 # branche d'intégration avant le paquet.
 #
 # Il exécute `deploy/k8s/pod-witness/preuve-isolation-comptes.sh` en entier :
-# identité, montage, superviseur, permissions, canon (kind), puis le contrôle
-# base contre un PostgreSQL 17 réel migré par `tests/support.py` (0599
-# comprise). Le scénario `--render-only` est déjà couvert par les tests sans
-# cluster (`tests/test_7695_pod_partage.py`), qui tournent dans la suite
-# normale.
+# identité, montage, superviseur, permissions, canon (kind), contrôle du chart
+# de référence (#7699 : NetworkPolicy, quota, PDB, digest, preStop), puis le
+# contrôle base contre un PostgreSQL 17 réel migré par `tests/support.py` (0599
+# comprise). Le scénario `--render-only` et le rendu P6 sont déjà couverts par
+# les tests sans cluster (`tests/test_7695_pod_partage.py`,
+# `tests/test_7699_chart_reference.py`), qui tournent dans la suite normale.
 name: pod-kind
 
 on:
@@ -35,7 +36,7 @@ env:
 
 jobs:
   temoin:
-    name: témoin kind (#7695)
+    name: témoin kind (#7695/#7699)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -79,7 +80,7 @@ jobs:
           sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
           kind version
           kubectl version --client=true
-      - name: témoin complet (#7695)
+      - name: témoin complet (#7695/#7699)
         run: |
           set -euo pipefail
           echo "trace: sha=$(git rev-parse HEAD)"
