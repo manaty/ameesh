@@ -14610,8 +14610,11 @@ class Runner:
         # #7695 (design 7633 §3.3) : sur un hôte pod, seul le détenteur du
         # bail de superviseur synchronise le canon (il écrit `host_tenancy` et
         # `canon_state`). Un second superviseur reste en attente : la base est
-        # l'arbitre, pas l'ordre de démarrage.
-        if self._pod_supervisor() and not self._pod_lease_tick():
+        # l'arbitre, pas l'ordre de démarrage. Une doublure de test
+        # (`SimpleNamespace`) n'a pas la méthode : elle n'est pas un pod et
+        # poursuit, comme un exécuteur dont `cfg.pod` est faux.
+        supervisor = getattr(self, "_pod_supervisor", None)
+        if supervisor is not None and supervisor() and not self._pod_lease_tick():
             return True
         self._designation_retry_ready = False
         entries = canon_mod.configured(self.cfg)
