@@ -227,6 +227,45 @@ class TriggerTest(unittest.TestCase):
         self.assertIn("6.0 heure(s)-agent mesurées "
                       "(2 agent(s) exclus : feuille de route épuisée)", text)
 
+    def test_footprint_lots_on_exhausted_roadmaps_count_on_their_own_field(self):
+        # #7890 : témoin du 19/11 — routes épuisées, 0 démarrable, des lots
+        # retenus par la garde d'empreinte ; le débit rendait 0,0 h. Les heures
+        # se lisent sur `idle_agent_hours_footprint`, sans rouvrir
+        # `idle_agent_hours` (#7249).
+        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh",
+                  "at_ts": T - 3 * H},
+                 {"work_item_id": 91, "source": "file-decoupage:nexlink",
+                  "note": "roadmap: épuisée nexlink", "at_ts": T - 3 * H}]
+        blocker = {"id": 50, "state": "build", "assignee": "x"}
+        held = [{"id": 61, "app": "ameesh", "state": "intake", "created_ts": T - 2 * H},
+                {"id": 62, "app": "ameesh", "state": "intake", "created_ts": T - H},
+                {"id": 63, "app": "nexlink", "state": "intake", "created_ts": T - H}]
+        cap = measure(team(2, 0, "ameesh") + team(1, 0, "nexlink"), roadmap_notes=notes,
+                      open_lots=[split_lot(), split_lot(91, "nexlink")] + held,
+                      footprint={61: [blocker], 62: [blocker], 63: [blocker]})
+        rows = {row["project"]: row for row in cap["projects"]}
+        self.assertEqual(rows["ameesh"]["idle_agent_hours"], 0.0)
+        self.assertEqual(rows["ameesh"]["idle_agent_hours_excluded"],
+                         "feuille de route épuisée")
+        self.assertEqual(rows["ameesh"]["idle_agent_hours_footprint"], 4.0)
+        self.assertEqual(rows["nexlink"]["idle_agent_hours_footprint"], 1.0)
+        self.assertEqual(cap["mesh"]["startable_lots"], 0)
+        self.assertEqual(cap["mesh"]["footprint_lots"], 3)
+        self.assertEqual(cap["mesh"]["idle_agent_hours"], 0.0)
+        self.assertEqual(cap["mesh"]["idle_agent_hours_footprint"], 5.0)
+        text = "\n".join(debit._capacity_text(cap))
+        self.assertIn("5.0 heure(s)-agent au repos retenues par empreinte", text)
+        self.assertIn("4.0 h-agent retenues par empreinte", text)
+
+    def test_an_undated_footprint_lot_invents_no_hours(self):
+        notes = [{"work_item_id": 90, "source": SPLIT, "note": "roadmap: épuisée ameesh",
+                  "at_ts": T - H}]
+        cap = measure(team(2, 0), roadmap_notes=notes,
+                      open_lots=[split_lot(), {"id": 61, "app": "ameesh", "state": "intake"}],
+                      footprint={61: [{"id": 50, "state": "build"}]})
+        self.assertEqual(cap["projects"][0]["idle_agent_hours_footprint"], 0.0)
+        self.assertNotIn("retenues par empreinte", "\n".join(debit._capacity_text(cap)))
+
     def test_a_reopening_note_after_the_exhaustion_reopens(self):
         # #5149 : la dernière note fait foi, comme pour le sommeil et
         # `ameesh alerts` (#4623)
