@@ -1375,6 +1375,13 @@ class AdapterTest(PgTestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
+        # A checkout created under umask 0002 (some hosts and CI runners) holds
+        # group-writable companions, which `_trusted_source` refuses by design.
+        # Normalise the sources the factory reads so the witness depends on the
+        # check, not on the caller's umask — the check itself is unchanged.
+        for name in (factory_module.BRIDGE_NAME, factory_module.COMPANION_NAME):
+            source = Path(factory_module.__file__).resolve().parent / name
+            source.chmod(source.stat().st_mode & ~0o022)
         self.host = 'ameesh-agents-2'
         for name, value in self._documents().items():
             path = self.root / (name + '.json')
