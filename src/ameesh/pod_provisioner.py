@@ -674,6 +674,17 @@ class HttpKubeClient:
         body = self._request("GET", path) or {}
         return list(body.get("items") or [])
 
+    def get_validating_webhook_config(self, name: str) -> dict | None:
+        return self._request(
+            "GET", "/apis/admissionregistration.k8s.io/v1/"
+            "validatingwebhookconfigurations/" + urllib.parse.quote(name, safe=""))
+
+    def update_validating_webhook_config(self, name: str, body: dict) -> dict:
+        return self._request(
+            "PUT", "/apis/admissionregistration.k8s.io/v1/"
+            "validatingwebhookconfigurations/" + urllib.parse.quote(name, safe=""),
+            body) or {}
+
 
 def _read_text(path: str) -> str:
     try:

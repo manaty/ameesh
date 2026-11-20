@@ -14,6 +14,7 @@ resources:
   - resourcequota.yaml
   - validatingadmissionpolicy.yaml
   - deployment.yaml
+  - admission.yaml
 configMapGenerator:
   - name: ameesh-pod-provisioner-template
     files:

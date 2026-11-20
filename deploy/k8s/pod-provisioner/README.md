@@ -37,7 +37,8 @@ enfant** ; le relais de modèle viendra dans une tranche suivante.
 | `Namespace/ameesh` | porte l'annotation `ameesh.dev/pod-child-image`, paramètre cluster-scoped de la VAP (hors de portée du Role namespaced du pourvoyeur) |
 | `ServiceAccount/ameesh-pod-provisioner` + `Role`/`RoleBinding` | pods et ConfigMap seulement, dans le namespace |
 | `ServiceAccount/ameesh-child` | aucun droit, aucun jeton monté |
-| `ValidatingAdmissionPolicy` + binding | refuse un pod hors template même si le SA est compromis : deux conteneurs nommés, image **exactement** celle du paramètre, commandes figées, aucun init/éphémère, aucun Secret hors `ameesh-db` et du Secret `ameesh-child-<label>` de l'enfant, monté dans le seul conteneur `child` |
+| `Deployment/ameesh-pod-admission` + `Service` + `ValidatingWebhookConfiguration` | l'autorité d'admission, sous une identité **distincte** : lit `pod_requests`, rend le pod attendu avec le template de son image et refuse tout écart (request-id, tenant, enfant, nom, Secret exact, env, volumes, ConfigMap) ; `failurePolicy: Fail` |
+| `ValidatingAdmissionPolicy` + binding | seconde barrière statique : deux conteneurs nommés, image **exactement** celle du paramètre, commandes figées, aucun init/éphémère, aucun Secret hors `ameesh-db` et du Secret `ameesh-child-<label>` de l'enfant, monté dans le seul conteneur `child` |
 | `ResourceQuota/ameesh-pod-children` | borne le nombre et les ressources des enfants |
 | `template.yaml` | 2 conteneurs (`supervisor`, `child`), `emptyDir`, UID enfant 30000+, aucun PVC/hostPath |
 
@@ -52,6 +53,30 @@ l'égalité). Le paramètre vit dans le Namespace, cluster-scoped : le Role du
 pourvoyeur ne peut ni le modifier ni le supprimer, contrairement à une
 ConfigMap du namespace. Pour changer d'image, modifier `namespace.yaml` et
 `deployment.yaml` dans le même geste.
+
+### Pourquoi un webhook, et pas seulement la VAP
+
+La VAP statique ne peut pas lire `pod_requests` : elle vérifie que le Secret
+est `ameesh-child-<label>`, mais ce label est choisi par le même
+ServiceAccount que celui qui crée le pod. Un SA compromis pourrait donc
+prendre le label d'un autre enfant. Le webhook `ameesh-pod-admission` ferme
+cette frontière :
+
+- il tourne sous un **ServiceAccount distinct** (`ameesh-pod-admission`) et
+  un Deployment séparé ; le Role du pourvoyeur ne peut ni le modifier, ni le
+  supprimer, ni toucher son `caBundle` (ClusterRole limité au nom
+  `ameesh-child-pods`, porté par le seul SA d'admission) ;
+- il lit `pod_requests` en **lecture seule** (`get_by_id`) et rend le pod
+  attendu avec le template **copié dans son image** (`/etc/ameesh/pod-provisioner/template.yaml`),
+  pas depuis une ConfigMap que le pourvoyeur pourrait remplacer ;
+- il vérifie request-id, tenant, enfant, nom du pod et Secret exact, puis
+  compare la forme complète (image, commandes, env, volumes, montages,
+  contexte de sécurité, labels/annotations) et la ConfigMap passwd/group/
+  config au plan `tenancy.child_plan` ;
+- `failurePolicy: Fail` : webhook indisponible = aucun pod enfant admis.
+
+La VAP reste en place comme seconde barrière (défense en profondeur), mais
+ce n'est pas elle qui porte la frontière inter-tenant.
 
 ## Déployer
 
@@ -75,7 +100,14 @@ ConfigMap du namespace. Pour changer d'image, modifier `namespace.yaml` et
    kubectl create namespace ameesh --dry-run=client -o yaml | kubectl apply -f -
    kubectl apply -k deploy/k8s/pod-provisioner
    kubectl -n ameesh rollout status deployment/ameesh-pod-provisioner
+   kubectl -n ameesh rollout status deployment/ameesh-pod-admission
    ```
+
+   Le conteneur d'init `tls-init` génère un certificat auto-signé dans un
+   `emptyDir` et pose le `caBundle` du `ValidatingWebhookConfiguration`
+   `ameesh-child-pods`. Le Deployment est en `Recreate` : une seule réplique
+   écrit le CA (deux répliques se remplaceraient l'une l'autre ; un Secret
+   TLS partagé est une tranche suivante).
 
 4. **Vérifier le heartbeat** (le template est enregistré par le pourvoyeur à
    chaque passe ; sans heartbeat frais, `children: pod` refuse
@@ -98,7 +130,17 @@ ConfigMap du namespace. Pour changer d'image, modifier `namespace.yaml` et
    de script kind ; les contrôles sont ceux du bureau — appliquer
    `kubectl apply -k deploy/k8s/pod-provisioner`, vérifier
    `kubectl auth can-i --list` du SA enfant (aucun droit), puis soumettre un
-   pod hors template (refus VAP) et un pod conforme (admis, quota respecté).
+   pod hors template (refus VAP/webhook) et un pod conforme (admis, quota
+   respecté). Preuve de refus fail-closed : `kubectl -n ameesh scale
+   deployment/ameesh-pod-admission --replicas=0`, puis un `spawn` d'enfant
+   doit échouer sans pod admis (le webhook est `failurePolicy: Fail`) ;
+   remettre `--replicas=1` ensuite.
+
+7. **Preuve inter-tenant négative** (geste de bureau) : avec un SA
+   pourvoyeur compromis simulé, un pod portant le `request-id`/nom de
+   l'enfant A mais le label/Secret de l'enfant B doit être refusé par le
+   webhook (`child pod shape`) ; la ConfigMap de B référencée par A doit être
+   refusée aussi (`child ConfigMap data differs from the child plan`).
 
 ## Cycle de vie
 

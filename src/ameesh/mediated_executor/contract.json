@@ -5379,6 +5379,7 @@
     "fail",
     "finish",
     "get",
+    "get_by_id",
     "ready",
     "reclaim_stale",
     "register_template",

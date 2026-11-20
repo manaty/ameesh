@@ -16,8 +16,15 @@
 # n'est pas un préfixe : les deux conteneurs doivent porter exactement
 # l'image portée par l'annotation `ameesh.dev/pod-child-image` du Namespace
 # (paramètre cluster-scoped que le Role namespaced du pourvoyeur ne peut pas
-# modifier). Un SA compromis ne peut donc ni changer l'image exécutée ni
-# choisir librement un Secret par une annotation.
+# modifier).
+#
+# La VAP est la SECONDE barrière. Le label `ameesh.dev/child` reste choisi
+# par le SA du pourvoyeur : seul le webhook `ameesh-pod-admission`
+# (`admission.yaml`), sous une identité distincte, recoupe la demande
+# `pod_requests`, le nom du pod, le tenant et le Secret exact. Un SA
+# pourvoyeur compromis ne peut donc ni changer l'image exécutée, ni monter le
+# Secret d'un autre enfant, ni glisser un env/volume supplémentaire.
+
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -145,4 +152,47 @@ spec:
   paramRef:
     name: ameesh
     parameterNotFoundAction: Deny
+  validationActions: ["Deny"]
+---
+# #7697 (B du gel #44541) : le webhook d'admission est une identité
+# distincte ; le pourvoyeur ne doit pas pouvoir le supprimer pour faire
+# tomber la garde (le retrait resterait fail-closed, mais un déni de service
+# répété n'est pas un fonctionnement acceptable). Cette politique ne vise que
+# les DELETE de pods par le SA du pourvoyeur : les pods enfants gardent leur
+# nettoyage normal.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ameesh-protect-admission
+  labels:
+    app.kubernetes.io/part-of: ameesh
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ameesh
+  matchConditions:
+    - name: provisioner-service-account
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:ameesh:ameesh-pod-provisioner'
+  validations:
+    - expression: >-
+        oldObject.metadata.?labels['app.kubernetes.io/name'].orValue('') !=
+        'ameesh-pod-admission'
+      message: "the pod provisioner may not delete the admission webhook"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ameesh-protect-admission
+  labels:
+    app.kubernetes.io/part-of: ameesh
+spec:
+  policyName: ameesh-protect-admission
   validationActions: ["Deny"]

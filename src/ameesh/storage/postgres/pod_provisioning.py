@@ -83,6 +83,12 @@ class PodProvisioning(interface.PodProvisioning):
             "SELECT " + _COLUMNS + " FROM pod_requests WHERE child = %s", (child,))
         return dict(rows[0]) if rows else None
 
+    def get_by_id(self, request_id):
+        rows = self.db.query(
+            "SELECT " + _COLUMNS + " FROM pod_requests WHERE id = %s::uuid",
+            (str(request_id),))
+        return dict(rows[0]) if rows else None
+
     def claim(self, worker):
         rows = self.db.query(
             """

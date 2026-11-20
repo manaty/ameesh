@@ -5293,6 +5293,14 @@ class PodProvisioning(Domain):
         """Demande d'un enfant, ou None."""
 
     @abc.abstractmethod
+    def get_by_id(self, request_id: str) -> dict | None:
+        """Demande par son UUID, ou None.
+
+        Lecteur de l'autorité d'admission (#7697, B du gel #44541) : le
+        webhook ne fait pas confiance au label `ameesh.dev/child` du pod, il
+        recoupe la demande écrite par le `spawn`."""
+
+    @abc.abstractmethod
     def claim(self, worker: str) -> dict | None:
         """Réclame atomiquement la plus ancienne demande `requested` ; None
         s'il n'y en a pas (deux pourvoyeurs ne prennent pas la même)."""

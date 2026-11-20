@@ -35,8 +35,8 @@ try:
 except ImportError:  # pragma: no cover - dépend de l'environnement
     yaml = None
 
-from ameesh import (avatar_children, canon_sync, pod_children, pod_provisioner,
-                    registry, storage, tenancy)
+from ameesh import (avatar_children, canon_sync, pod_admission, pod_children,
+                    pod_provisioner, registry, storage, tenancy)
 
 from .support import REPO
 from .test_7107_avatar_enfants import avatar_card
@@ -477,6 +477,18 @@ class PodRequestDbTest(_CanonDbCase):
     def request(self, child="enfant1"):
         return storage.of(self.db).pod_provisioning.get(child)
 
+    def test_lecture_de_la_demande_par_uuid(self):
+        """Le webhook lit la demande par son UUID, pas par le label du pod."""
+        self.spawn(pod_wait_s=0)
+        request = self.request()
+        row = storage.of(self.db).pod_provisioning.get_by_id(request["id"])
+        self.assertIsNotNone(row)
+        self.assertEqual(row["child"], "enfant1")
+        self.assertEqual(row["credential_secret"],
+                         tenancy.child_credential_secret("enfant1"))
+        self.assertIsNone(storage.of(self.db).pod_provisioning.get_by_id(
+            "00000000-0000-4000-8000-000000000000"))
+
     def test_demande_et_enfant_dans_la_meme_transaction(self):
         row = self.spawn(pod_wait_s=0)
         self.assertEqual(row["host"], "pod-avatar-enfant1-deadbeef")
@@ -713,3 +725,209 @@ class PodRequestDbTest(_CanonDbCase):
         self.assertEqual(self.request()["state"], "failed")
         self.assertEqual(storage.of(self.db).pod_hosts.get(row["host"])["state"],
                          "running")
+
+
+class _AdmissionRows:
+    def __init__(self, row):
+        self.row = row
+
+    def get_by_id(self, request_id):
+        if self.row and str(request_id) == str(self.row["id"]):
+            return dict(self.row)
+        return None
+
+
+class _AdmissionConfigmaps:
+    def __init__(self, configmap):
+        self.configmap = configmap
+
+    def get_configmap(self, name):
+        if self.configmap and name == self.configmap["metadata"]["name"]:
+            return copy.deepcopy(self.configmap)
+        return None
+
+
+@unittest.skipIf(yaml is None, "PyYAML absent : template non vérifié")
+class PodAdmissionTest(unittest.TestCase):
+    """B du gel #44541 (#228610/#228620) : le webhook ne croit pas le label
+    du pourvoyeur ; il recoupe la demande et refuse tout écart inter-tenant."""
+
+    NOW = 1_000.0
+
+    def setUp(self):
+        self.template = pod_provisioner.PodTemplate.load(TEMPLATE)
+        host = tenancy.child_host("avatar", "enfant1", "deadbeef")
+        self.row = {
+            "id": "abcdef01-2345-6789-abcd-ef0123456789",
+            "child": "enfant1",
+            "parent": "avatar",
+            "tenant": ALICE,
+            "host": host,
+            "template": tenancy.POD_CHILD_TEMPLATE,
+            "namespace": "ameesh",
+            "pod_name": None,
+            "harness": "claude",
+            "credential_secret": tenancy.child_credential_secret("enfant1"),
+            "uid": tenancy.child_uid(ALICE, "enfant1"),
+            "unix_user": tenancy.child_unix_user(ALICE, "enfant1"),
+            "runner_id": tenancy.child_runner_id(host, "enfant1"),
+            "profile": {},
+            "fingerprint": "a" * 64,
+            "state": "claimed",
+            "requested_by": "avatar",
+            "claimed_by": pod_admission.ACTOR,
+            "requested_ts": 900.0,
+            "claimed_ts": 990.0,
+            "started_ts": None,
+            "expires_ts": 2_000.0,
+            "finished_ts": None,
+            "error": None,
+        }
+        self.rendered = self.template.render(
+            self.row, image="ameesh-runner", namespace="ameesh",
+            dsn="postgresql://ameesh@db/ameesh", now=self.NOW)
+        self.admission = pod_admission.PodAdmission(
+            None, self.template, requests=_AdmissionRows(self.row),
+            image="ameesh-runner", namespace="ameesh",
+            dsn="postgresql://ameesh@db/ameesh", now=self.NOW,
+            client=_AdmissionConfigmaps(self.rendered.configmap))
+
+    def review(self, pod, *, user=pod_admission.ACTOR):
+        return {"request": {
+            "uid": "review-1", "operation": "CREATE",
+            "resource": {"group": "", "version": "v1", "resource": "pods"},
+            "namespace": "ameesh",
+            "userInfo": {"username": user},
+            "object": copy.deepcopy(pod),
+        }}
+
+    def test_pod_conforme_admis(self):
+        decision = self.admission.check(self.review(self.rendered.pod))
+        self.assertTrue(decision["allowed"], decision.get("message"))
+
+    def test_les_champs_systeme_de_l_api_server_sont_admis(self):
+        """UID, date de création et resourceVersion sont posés avant
+        l'admission : ils ne doivent pas faire refuser un pod légitime."""
+        pod = copy.deepcopy(self.rendered.pod)
+        pod["metadata"].update({
+            "uid": "0f0e0d0c-0b0a-4908-8706-050403020100",
+            "creationTimestamp": "2026-11-20T10:00:00Z",
+            "resourceVersion": "12",
+            "generation": 0,
+            "managedFields": [],
+        })
+        decision = self.admission.check(self.review(pod))
+        self.assertTrue(decision["allowed"], decision.get("message"))
+
+    def test_secret_d_un_autre_enfant_refuse(self):
+        """Le label et le Secret d'un autre enfant sont rejetés, même si le
+        nom du pod et le request-id sont ceux de la demande légitime."""
+        pod = copy.deepcopy(self.rendered.pod)
+        pod["metadata"]["labels"]["ameesh.dev/child"] = tenancy.child_slug("enfant2")
+        pod["metadata"]["annotations"]["ameesh.dev/credential-secret"] = (
+            tenancy.child_credential_secret("enfant2"))
+        for entry in pod["spec"]["containers"][1]["env"]:
+            ref = (entry.get("valueFrom") or {}).get("secretKeyRef")
+            if ref and ref.get("key") == "api-key":
+                ref["name"] = tenancy.child_credential_secret("enfant2")
+        decision = self.admission.check(self.review(pod))
+        self.assertFalse(decision["allowed"])
+        self.assertIn("shape", decision["message"])
+
+    def test_env_supplementaire_est_refuse(self):
+        pod = copy.deepcopy(self.rendered.pod)
+        pod["spec"]["containers"][1]["env"].append(
+            {"name": "HTTPS_PROXY", "value": "http://attacker.invalid:8080"})
+        decision = self.admission.check(self.review(pod))
+        self.assertFalse(decision["allowed"])
+        self.assertIn("shape", decision["message"])
+
+    def test_volume_secret_est_refuse(self):
+        pod = copy.deepcopy(self.rendered.pod)
+        pod["spec"]["volumes"].append(
+            {"name": "autre", "secret": {"secretName": "ameesh-child-autre"}})
+        decision = self.admission.check(self.review(pod))
+        self.assertFalse(decision["allowed"])
+
+    def test_configmap_alteree_refusee(self):
+        bad = copy.deepcopy(self.rendered.configmap)
+        bad["data"]["config.json"] = '{"host":"attacker.invalid"}'
+        admission = pod_admission.PodAdmission(
+            None, self.template, requests=_AdmissionRows(self.row),
+            image="ameesh-runner", namespace="ameesh",
+            dsn="postgresql://ameesh@db/ameesh", now=self.NOW,
+            client=_AdmissionConfigmaps(bad))
+        decision = admission.check(self.review(self.rendered.pod))
+        self.assertFalse(decision["allowed"])
+        self.assertIn("ConfigMap", decision["message"])
+
+    def test_configmap_create_alteree_refusee(self):
+        """Le webhook intercepte aussi la ConfigMap : un pourvoyeur compromis
+        ne peut pas créer une ConfigMap hors plan, même avant le pod."""
+        bad = copy.deepcopy(self.rendered.configmap)
+        bad["data"]["config.json"] = '{"host":"attacker.invalid"}'
+        review = {"request": {
+            "uid": "review-cm", "operation": "CREATE",
+            "resource": {"group": "", "version": "v1", "resource": "configmaps"},
+            "namespace": "ameesh",
+            "userInfo": {"username": pod_admission.ACTOR},
+            "object": bad,
+        }}
+        decision = self.admission.check(review)
+        self.assertFalse(decision["allowed"])
+        self.assertIn("ConfigMap", decision["message"])
+
+    def test_demande_inconnue_ou_perimee_refusee(self):
+        unknown = pod_admission.PodAdmission(
+            None, self.template, requests=_AdmissionRows(None),
+            image="ameesh-runner", namespace="ameesh",
+            dsn="postgresql://ameesh@db/ameesh", now=self.NOW)
+        self.assertFalse(unknown.check(self.review(self.rendered.pod))["allowed"])
+        expired = pod_admission.PodAdmission(
+            None, self.template, requests=_AdmissionRows(self.row),
+            image="ameesh-runner", namespace="ameesh",
+            dsn="postgresql://ameesh@db/ameesh", now=2_001.0)
+        self.assertFalse(expired.check(self.review(self.rendered.pod))["allowed"])
+
+    def test_un_autre_service_account_n_est_pas_filtre(self):
+        decision = self.admission.check(self.review(
+            {"metadata": {"name": "x", "namespace": "ameesh"}}, user="system:serviceaccount:ameesh:autre"))
+        self.assertTrue(decision["allowed"])
+
+    def test_manifests_du_webhook(self):
+        """Identité distincte, fail-closed, et hors de portée du Role du
+        pourvoyeur : le SA compromis ne peut ni retirer ni modifier le
+        webhook, ni son Service, ni son Deployment."""
+        admission = self.load("admission.yaml")
+        kinds = {(doc.get("kind"), (doc.get("metadata") or {}).get("name"))
+                 for doc in admission}
+        self.assertIn(("ServiceAccount", "ameesh-pod-admission"), kinds)
+        self.assertIn(("Deployment", "ameesh-pod-admission"), kinds)
+        self.assertIn(("Service", "ameesh-pod-admission"), kinds)
+        self.assertIn(("ValidatingWebhookConfiguration", "ameesh-child-pods"), kinds)
+        webhook = next(doc for doc in admission
+                       if doc.get("kind") == "ValidatingWebhookConfiguration")
+        for hook in webhook["webhooks"]:
+            self.assertEqual(hook["failurePolicy"], "Fail")
+            self.assertLessEqual(hook["timeoutSeconds"], 10)
+            self.assertIn("pods", hook["rules"][0]["resources"])
+            self.assertIn("configmaps", hook["rules"][0]["resources"])
+        role = self.load("rbac.yaml")[0]
+        resources = {item for rule in role["rules"] for item in rule["resources"]}
+        self.assertNotIn("validatingwebhookconfigurations", resources)
+        self.assertNotIn("deployments", resources)
+        self.assertNotIn("secrets", resources)
+        protections = [doc for doc in self.load("validatingadmissionpolicy.yaml")
+                       if doc.get("kind") == "ValidatingAdmissionPolicy"
+                       and (doc.get("metadata") or {}).get("name")
+                       == "ameesh-protect-admission"]
+        self.assertEqual(len(protections), 1)
+        rule = protections[0]["spec"]["matchConstraints"]["resourceRules"][0]
+        self.assertEqual(rule["operations"], ["DELETE"])
+        self.assertIn("ameesh-pod-admission",
+                      protections[0]["spec"]["validations"][0]["expression"])
+
+    @staticmethod
+    def load(name):
+        with open(os.path.join(PROVISIONER_DIR, name), encoding="utf-8") as stream:
+            return [doc for doc in yaml.safe_load_all(stream) if doc]

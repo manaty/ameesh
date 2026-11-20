@@ -137,6 +137,10 @@
         child-pod provisioner: heartbeat the frozen template, start one
         requested child, delete expired pods and hosts (#7697, system actor;
         requires the Kubernetes ServiceAccount of deploy/k8s/pod-provisioner);
+  ameesh pod-admission [--set-ca] [--template FILE] [--cert FILE] [--key FILE]
+        child-pod admission webhook: checks each pod against its
+        `pod_requests` row and the frozen template (independent authority,
+        #7697; requires the ameesh-pod-admission ServiceAccount);
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh hosts HOST --hold --until 2h --reason R | --release
                                         the owner holds a host on purpose: its
@@ -561,6 +565,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # #7697 (P4 de #7633) : le pourvoyeur d'enfants pod (SA Kubernetes)
         from . import pod_provisioner
         return pod_provisioner.main(rest)
+    if command in ("pod-admission", "pod_admission"):
+        # #7697 (P4 de #7633) : l'autorité d'admission des pods enfants
+        from . import pod_admission
+        return pod_admission.main(rest)
     if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "reattach", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
