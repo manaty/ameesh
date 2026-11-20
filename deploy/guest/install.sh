@@ -28,6 +28,10 @@
 #   --allow-net CIDR     internal network the guest may reach (repeatable)
 #   --gate file          obey /run/ameesh-gate/state/state.json (L159e)
 #   --no-firewall        skip the nftables rules
+#   --host NAME          Host card title (default AMEESH_HOST, else hostname)
+#   --canon DIR          canon checkout holding the Host card
+#                        (default AMEESH_CANON, else /home/ameesh/canon)
+#   --host-user NAME     account whose groups follow the Host card (ameesh)
 #
 # What it does (all of it undone by --uninstall):
 #   * user NAME, no password, no sudo, no docker group, home = --root (0710),
@@ -47,7 +51,9 @@
 #   * nftables rules by uid: no application port on the loopback, no internal
 #     network, no metadata service; HTTPS out stays open;
 #   * /etc/ameesh-guest/offload.json and profiles (root-owned: the guest
-#     cannot raise its slots, its caps, nor write a profile hook).
+#     cannot raise its slots, its caps, nor write a profile hook);
+#   * the groups of the host's declared capabilities (`android-emulator`
+#     -> kvm), and only them: no chmod, ACL or udev rule on /dev/kvm.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -85,6 +91,14 @@ ALLOW_ROOTFS=0
 MODE=install
 PURGE=0
 CHECK_PATHS=()
+# #7926 : capacités déclarées de l'hôte (fiche Host du canon). Le compte
+# `ameesh` ne reçoit le groupe d'une capacité (kvm pour android-emulator) que
+# si la fiche le déclare ; sans canon ou sans fiche, rien n'est appliqué.
+REPO_ROOT=$(cd "$HERE/../.." && pwd)
+HOST_NAME=${AMEESH_HOST:-$(hostname -s 2>/dev/null || hostname)}
+CANON_DIR=${AMEESH_CANON:-/home/ameesh/canon}
+HOST_USER=ameesh
+CAPABILITIES=1
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -107,12 +121,16 @@ while [ $# -gt 0 ]; do
     --allow-net) ALLOW_NETS+=("$2"); shift 2 ;;
     --gate) GATE=$2; shift 2 ;;
     --no-firewall) FIREWALL=0; shift ;;
+    --host) HOST_NAME=$2; shift 2 ;;
+    --canon) CANON_DIR=$2; shift 2 ;;
+    --host-user) HOST_USER=$2; shift 2 ;;
+    --no-capabilities) CAPABILITIES=0; shift ;;
     --allow-rootfs) ALLOW_ROOTFS=1; shift ;;
     --dry-run) DRY=1; shift ;;
     --check) MODE=check; shift; CHECK_PATHS=("$@"); break ;;
     --uninstall) MODE=uninstall; shift ;;
     --purge) PURGE=1; shift ;;
-    -h|--help) sed -n '3,47p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,56p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
@@ -122,6 +140,21 @@ case "$JOB_USER" in ''|*[!a-z0-9_-]*) die "invalid --job-user $JOB_USER" ;; esac
 [ "$JOB_USER" != "$GUEST" ] || die "--job-user must differ from --user"
 case "$SLOTS" in ''|*[!0-9]*) die "invalid --slots $SLOTS" ;; esac
 case "$GATE" in none|file) ;; *) die "--gate none|file" ;; esac
+case "$HOST_NAME" in ''|*[!a-zA-Z0-9_.-]*) die "invalid --host $HOST_NAME" ;; esac
+case "$HOST_USER" in ''|*[!a-z0-9_-]*) die "invalid --host-user $HOST_USER" ;; esac
+
+# host_capabilities --dry-run|--apply|--check: les groupes qu'une fiche Host
+# déclare, lus dans le canon et appliqués au seul compte des exécuteurs.
+# Rien n'est fait sans canon lisible, sans fiche, ou avec --no-capabilities :
+# une reconstruction d'hôte ne devine aucun droit.
+host_capabilities() {
+  [ "$CAPABILITIES" = 1 ] || return 0
+  [ -n "$HOST_NAME" ] || return 0
+  [ -d "$CANON_DIR" ] || return 0
+  [ "$1" = --check ] || say "host capabilities of $HOST_NAME (canon $CANON_DIR)"
+  PYTHONPATH="$REPO_ROOT/src" python3 -m ameesh.host_capabilities \
+      --host "$HOST_NAME" --canon "$CANON_DIR" --user "$HOST_USER" "$1"
+}
 
 # run CMD…: executes, or prints it under --dry-run
 run() {
@@ -272,6 +305,7 @@ if [ "$MODE" = check ]; then
       echo "ok   $path"
     fi
   done
+  if ! host_capabilities --check; then status=1; fi
   exit $status
 fi
 
@@ -645,6 +679,15 @@ if [ "$DRY" = 0 ]; then
   if [ "$JOB_MODE" = 1 ]; then
     check_podman "$JOB_USER" "$juid" "$ROOT/home"
   fi
+fi
+
+# #7926 : après le compte et le guest, les groupes de la fiche Host. Le
+# --dry-run imprime la commande sans lire /etc/group ; l'installation réelle
+# est idempotente et ne touche ni chmod, ni ACL, ni règle udev.
+if [ "$DRY" = 1 ]; then
+  host_capabilities --dry-run
+else
+  host_capabilities --apply
 fi
 
 say "done"

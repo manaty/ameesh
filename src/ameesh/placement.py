@@ -245,14 +245,16 @@ def verdicts(canon: Canon, host: str | None = None) -> list[Verdict]:
 
 
 def proposals(canon: Canon, agent: str,
-              findings: list[Finding] | None = None) -> list[dict]:
+              findings: list[Finding] | None = None,
+              capability: str | None = None) -> list[dict]:
     """Chaque hôte du canon : `agent` y serait-il admis, et avec quel mode ?
 
     Admissible : l'admission de l'agent admet cet hôte (hôtes nommés ou
     étiquettes), la politique de l'hôte admet le harnais, le fournisseur et le
     modèle de l'agent, au moins un mode d'identifiants, il reste de la place
-    (`max_agents`, sans compter l'agent lui-même), et la fiche Host n'a pas
-    d'erreur bloquante. `admitted` dit si l'admission couvre l'hôte ;
+    (`max_agents`, sans compter l'agent lui-même), la fiche Host n'a pas
+    d'erreur bloquante et, si `capability` est demandée (#7926, e2e émulateur
+    Android), l'hôte la déclare. `admitted` dit si l'admission couvre l'hôte ;
     `credential_modes` : les modes admis (None = tous). Rien n'est écrit :
     c'est une proposition au responsable du projet.
     """
@@ -270,6 +272,8 @@ def proposals(canon: Canon, agent: str,
         hosts = [h for h in canon.hosts if h.title == title]
         reasons: list[str] = []
         modes: list[str] | None = None
+        capabilities = sorted({cap for host in hosts
+                               for cap in (host.capabilities or ())})
         if admission is None:
             reasons.append("no admission for %s, or several (ambiguous)" % agent)
         elif title not in admis:
@@ -293,6 +297,11 @@ def proposals(canon: Canon, agent: str,
             full = capacity_reason(canon, agent, title, baseline)
             if full:
                 reasons.append(full)
+        # #7926 : une capacité demandée (ex. `android-emulator`) n'est pas un
+        # critère de la politique d'admission : c'est un fait matériel de
+        # l'hôte, qui retire l'hôte du choix sans changer le verdict du canon.
+        if capability and capability not in capabilities:
+            reasons.append("host %s does not declare capability %s" % (title, capability))
         for finding in block.by_host.get(title, []):
             reasons.append("Host card in error: %s (%s)" % (finding.code, finding.where()))
         if modes is None:
@@ -304,6 +313,7 @@ def proposals(canon: Canon, agent: str,
         current = title in admis
         out.append({
             "host": title, "admissible": not reasons, "admitted": title in admis,
+            "capabilities": capabilities,
             "credential_modes": modes,
             "credential_mode": mode, "current": current,
             "current_credential_mode": (admission.credential_mode or fiche.credential_mode)
@@ -313,8 +323,15 @@ def proposals(canon: Canon, agent: str,
     return out
 
 
+def capable_hosts(canon: Canon, capability: str) -> list[str]:
+    """Hôtes qui déclarent `capability` (#7926), dans l'ordre du canon."""
+    return [host.title for host in canon.hosts
+            if capability in (host.capabilities or ())]
+
+
 def report(canon: Canon, agent: str | None = None,
-           findings: list[Finding] | None = None) -> list[dict]:
+           findings: list[Finding] | None = None,
+           capability: str | None = None) -> list[dict]:
     """`ameesh placement check` : admissions actuelles et hôtes admissibles, par agent."""
     if findings is None:
         findings = canon_mod.validate(canon)
@@ -324,13 +341,14 @@ def report(canon: Canon, agent: str | None = None,
         fiche = canon.agent(name)
         admission = admission_of(canon, name)
         hosts = admitted_hosts(canon, admission)
-        choices = proposals(canon, name, findings)
+        choices = proposals(canon, name, findings, capability=capability)
         out.append({
             "agent": name, "known": fiche is not None,
             "harness": fiche.harness if fiche else None,
             "provider": fiche.provider if fiche else None,
             "model": fiche.model if fiche else None,
             "credential_mode": fiche.credential_mode if fiche else None,
+            "capability": capability,
             "admitted": hosts,
             "placements": [evaluate(canon, name, h).to_dict() for h in hosts],
             "admissible": [c for c in choices if c["admissible"]],

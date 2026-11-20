@@ -1025,6 +1025,7 @@ class MapTest(unittest.TestCase):
             'test_6085_avatar_connectors',
             'test_6090_work_add_unique_ref',
             'test_7630_avatar_tools',
+            'test_7651_dev_schema_cutover',
             'test_7665_module_contract',
             'test_7701_public_fixture',
             'test_7726_prod_go',

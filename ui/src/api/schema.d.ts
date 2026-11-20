@@ -726,6 +726,13 @@ export interface components {
                 /** @enum {string|null} */
                 state: "ok" | "invalid" | "unreadable" | null;
             } | null;
+            host: {
+                available: boolean;
+                capabilities: string[];
+                name: string;
+                /** @enum {string|null} */
+                reason: "canon_unreadable" | "host_not_in_canon" | null;
+            } | null;
             lease: {
                 epoch: number | null;
                 expires_ts: number | null;
