@@ -465,6 +465,29 @@ class DynamicGitHubTest(unittest.TestCase):
         with self.assertRaisesRegex(train.SuiteRefused, "skipped"):
             self.ci().read(self.plan)
 
+    def test_a_refusal_waits_for_an_older_run_of_a_due_workflow(self):
+        """#7971 : le run le plus récent d'un workflow dû peut être terminé
+        alors qu'un run plus ancien (dispatch manuel de secours) court encore.
+        `_unfinished` ne lit que le max : le refus conclurait et libérerait la
+        cible pendant cette CI (canon §11 bis). On attend tous les runs."""
+        other = train_ci.DueWorkflow(".github/workflows/desktop-suite.yml",
+                                     "lot/desktop-suite")
+        self.contract = FakeContract((self.due, other), self.sources)
+        self.runs += [
+            dict(id=10, run_attempt=1, status="in_progress", conclusion=None,
+                 head_sha=self.head, head_branch=self.plan["branch"],
+                 path=other.path, event="workflow_dispatch"),
+            dict(id=11, run_attempt=1, status="completed", conclusion="success",
+                 head_sha=self.head, head_branch=self.plan["branch"],
+                 path=other.path, event="workflow_dispatch"),
+        ]
+        self.jobs[0]["conclusion"] = "skipped"
+        result = self.ci().read(self.plan)
+        self.assertEqual((result["status"], result["complete"]), ("pending", False))
+        self.runs[1].update(status="completed", conclusion="success")
+        with self.assertRaisesRegex(train.SuiteRefused, "skipped"):
+            self.ci().read(self.plan)
+
     def test_start_dispatches_only_the_due_suite(self):
         self.ci().start(self.plan)
         self.assertEqual([call[2] for call in self.dispatch], [self.due.path])

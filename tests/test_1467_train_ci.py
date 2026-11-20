@@ -111,6 +111,27 @@ class TrainCiTest(unittest.TestCase):
         self.runs = [self.run, dict(self.run, run_attempt=2, conclusion=None, status="in_progress")]
         self.assertEqual(self.ci().read(self.plan)["status"], "pending")
 
+    def test_an_older_run_of_the_same_workflow_keeps_the_evidence_pending(self):
+        # #7971: un dispatch manuel de secours peut créer un second run du
+        # même workflow. Le plus récent, déjà terminé, ne doit ni conclure ni
+        # libérer la cible pendant que l'ancien court encore (§11 bis).
+        self.runs = [dict(self.run, id=9, status="in_progress", conclusion=None),
+                     dict(self.run, id=10, status="completed", conclusion="success")]
+        self.assertEqual(self.ci().read(self.plan)["status"], "pending")
+        self.runs[0].update(status="completed", conclusion="success")
+        self.assertEqual(self.ci().read(self.plan)["status"], "green")
+
+    def test_a_completed_refusal_waits_for_the_older_run_of_the_same_workflow(self):
+        # #7971: le refus du run le plus récent ne libère pas la cible tant
+        # qu'un run plus ancien du même workflow n'est pas terminal.
+        self.jobs = [dict(self.job, conclusion="skipped")]
+        self.runs = [dict(self.run, id=9, status="in_progress", conclusion=None),
+                     dict(self.run, id=10, status="completed", conclusion="success")]
+        self.assertEqual(self.ci().read(self.plan)["status"], "pending")
+        self.runs[0].update(status="completed", conclusion="success")
+        with self.assertRaisesRegex(train.SuiteRefused, "skipped"):
+            self.ci().read(self.plan)
+
     def test_cancelled_ci_does_not_blame_a_lot(self):
         self.runs = [dict(self.run, conclusion="cancelled")]
         with self.assertRaisesRegex(train.TrainError, "no culpable lot"):
@@ -225,13 +246,13 @@ class TrainCiTest(unittest.TestCase):
         missing = dict(self.run, path=contract.path, event=contract.event,
                        head_branch=self.plan["branch"], head_sha=self.plan["head"])
         ci = self.caller(contract, every, run=missing)
-        with self.assertRaisesRegex(train.TrainError, "audited reusable workflow"):
+        with self.assertRaisesRegex(train.SuiteRefused, "audited reusable workflow"):
             ci.read(self.plan)
         wrong = dict(missing, referenced_workflows=[dict(
             path="o/r/" + contract.called + "@" + "c" * 40,
             sha="c" * 40, ref="refs/heads/" + self.plan["branch"])])
         ci = self.caller(contract, every, run=wrong)
-        with self.assertRaisesRegex(train.TrainError, "exact head"):
+        with self.assertRaisesRegex(train.SuiteRefused, "exact head"):
             ci.read(self.plan)
 
     def test_recorded_real_reusable_caller_shape_is_read(self):
