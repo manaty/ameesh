@@ -187,8 +187,11 @@ exemple à la main), et son `--etat` sert de diagnostic.
 
 - Le plafond est propre au pilote `json-file` ; un autre pilote est ignoré.
 - La copie de la fin est une photo : les quelques écritures arrivées entre la
-  lecture et la troncature ne sont pas dans l'archive. Sur ce banc, quelques
-  lignes au plus, sans effet sur Postgres.
+  lecture et la troncature sont **perdues**, ni archivées ni conservées dans le
+  journal (la troncature les efface). Sur ce banc, quelques lignes au plus,
+  sans effet sur Postgres ; une écriture plus longue que la fenêtre de copie
+  serait de même perdue. C'est le prix du seul plafonnement à chaud sans
+  redémarrage.
 - Le plafond ne réduit pas le volume produit par les tests négatifs ; il
   l'empêche seulement de remplir le disque. Réduire ce volume demanderait de
   revoir les tests ou leur niveau de log, pas cette minuterie.

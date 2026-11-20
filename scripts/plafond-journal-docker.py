@@ -38,6 +38,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -163,7 +164,10 @@ def preparer_etat(chemin: str) -> str:
         raise Refus(f"répertoire d'état : {exc}") from exc
     if not stat.S_ISDIR(st.st_mode):
         raise Refus(f"répertoire d'état non répertoire : {chemin}")
-    if st.st_mode & 0o077:
+    # Le mode exact, pas seulement l'absence de droits de groupe/autres : un
+    # parent setgid donne 02700 à la création, et un répertoire existant peut
+    # manquer de droits propriétaire. On normalise donc toujours à 0700.
+    if stat.S_IMODE(st.st_mode) != 0o700:
         os.chmod(chemin, 0o700)
     return chemin
 
@@ -256,10 +260,14 @@ def tronquer(chemin: str, attendu: os.stat_result) -> None:
 def lister_archives(etat: str, conteneur: str) -> list[tuple[float, str, int]]:
     if not os.path.isdir(etat):
         return []
-    prefixe = conteneur + "-"
+    # Un nom d'archive est `<conteneur>-<AAAAMMJJTHHMMSSZ>[-<n>].log.gz` :
+    # le motif évite qu'un conteneur `ameesh-pg-x` partage les archives de
+    # `ameesh-pg` dans le même répertoire d'état (#7962, revue N2).
+    motif = re.compile(r"%s-\d{8}T\d{6}Z(?:-\d+)?\.log\.gz$"
+                       % re.escape(conteneur))
     out = []
     for nom in os.listdir(etat):
-        if not (nom.startswith(prefixe) and nom.endswith(".log.gz")):
+        if not motif.fullmatch(nom):
             continue
         chemin = os.path.join(etat, nom)
         try:

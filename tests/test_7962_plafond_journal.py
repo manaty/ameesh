@@ -122,6 +122,28 @@ class PlafondJournalTest(unittest.TestCase):
         self.assertEqual(self.archives(), [])
         self.assertEqual(stat.S_IMODE(os.stat(self.etat).st_mode), 0o700)
 
+    def test_etat_existant_est_normalise_a_0700(self):
+        """Un parent setgid donne 02700 ; le mode doit être ramené à 0700."""
+        os.makedirs(self.etat)
+        os.chmod(self.etat, 0o2700)
+        self.assertEqual(stat.S_IMODE(os.stat(self.etat).st_mode), 0o2700)
+        self.ecrire_inspect()
+        proc = self.run_script()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat(self.etat).st_mode), 0o700)
+
+    def test_archives_d_un_autre_conteneur_ignorees(self):
+        """N2 : `banc-7962-x` ne partage pas les archives de `banc-7962`."""
+        module = charger_module()
+        os.makedirs(self.etat, mode=0o700)
+        garde = "banc-7962-20200101T000000Z.log.gz"
+        autre = "banc-7962-x-20200101T000000Z.log.gz"
+        for nom in (garde, autre):
+            with open(os.path.join(self.etat, nom), "wb") as f:
+                f.write(b"x")
+        noms = [nom for _, nom, _ in module.lister_archives(self.etat, "banc-7962")]
+        self.assertEqual(noms, [garde])
+
     def test_au_dessus_archive_la_fin_et_tronque(self):
         donnees = b"".join(b'{"log":"ligne %d\\n"}\n' % i for i in range(30))
         avant = self.ecrire_journal(donnees)
