@@ -74,10 +74,15 @@ the CLI for an unbound human entry) or, failing it, by a host declared in
 distant attach (`attach:<tenant>:<device>`, #7869) is attributed by the device
 credential, never by a host: the lease device is the bounded `credential_id`
 of the `device-es256` authenticator the host verified at grant time, and
-`authenticators.approver` says which human it belongs to (a live credential
-identifier belongs to exactly one approver). A device of another human, a
-revoked device or an unknown lease shape is not an attachment — the signal is
-missing, not guessed. A decision answer typed by the bureau under the §10
+`authenticators.approver` says which human it belongs to **in the lease
+agent's canon** (the grant is verified with that canon). Active credential
+identifiers are unique per `(canon, facade, credential_id)`, not globally
+(0035): the resolver therefore filters `authenticators.canon` by the
+`agent_registry.canon` of the lease's agent (NULL meaning the default canon,
+`''` in `authenticators`). A device of another human, a device revoked in the
+lease's canon, a credential that only lives in another canon or an unknown
+lease shape is not an attachment — the signal is missing, not guessed. A
+decision answer typed by the bureau under the §10
 delegation — its signed text carries "saisi par le bureau, délégation §10" or
 "réponse de l'owner relayée par le bureau" — is never the owner's own
 activity, whatever host recorded it. Mail delivery, a decision's reply mail

@@ -224,7 +224,8 @@ class LiveSignals:
         accounts = self._accounts(member)
         try:
             rows = self.db.query(
-                "select lease_owner from agent_registry"
+                "select lease_owner, coalesce(canon, '') as canon"
+                "  from agent_registry"
                 " where lease_owner is not null"
                 "   and lease_expires_at > clock_timestamp()"
                 "   and lease_owner like 'attach:%'")
@@ -241,35 +242,49 @@ class LiveSignals:
         # appareil d'un autre humain, un appareil révoqué ou un bail d'une
         # autre forme ne rend personne disponible : le signal manque, il ne
         # ment pas.
-        remote: dict[str, str] = {}
-        for owner in owners:
+        #
+        # Le canon du bail compte : l'unicité active d'un credential est
+        # `(canon, facade, credential_id)` (0035), pas globale. Le grant a été
+        # vérifié avec le canon de l'agent ; rattacher le bail à un appareil
+        # d'un AUTRE canon attribuerait l'attach d'un humain à un homonyme
+        # (B de cx2, #7869). `agent_registry.canon` est NULL pour le canon par
+        # défaut, `authenticators.canon` y vaut '' : on normalise des deux
+        # côtés.
+        remote: dict[str, tuple[str, str]] = {}
+        for row in rows:
+            owner = str(row.get("lease_owner") or "")
             if not owner.startswith("attach:"):
                 continue
             tenant, sep, device = owner[len("attach:"):].partition(":")
             if sep and device:
-                remote[owner] = tenant
+                remote[owner] = (tenant, str(row.get("canon") or ""))
         if not remote:
             return None
-        try:
-            rows = self.db.query(
-                "select credential_id from authenticators"
-                " where approver = %s and facade = 'device-es256'"
-                "   and revoked_at is null",
-                ("human:%s" % getattr(member, "title", ""),))
-        except Exception:
-            return None
-        for row in rows:
-            credential = str(row.get("credential_id") or "")
-            if not credential:
-                continue
-            for owner, tenant in remote.items():
-                try:
-                    expected = attach_session.remote_owner(
-                        "" if tenant == "-" else tenant, credential)
-                except ValueError:
+        human = "human:%s" % getattr(member, "title", "")
+        by_canon: dict[str, dict[str, str]] = {}
+        for owner, (tenant, canon) in remote.items():
+            by_canon.setdefault(canon, {})[owner] = tenant
+        for canon, leases in by_canon.items():
+            try:
+                rows = self.db.query(
+                    "select credential_id from authenticators"
+                    " where approver = %s and facade = 'device-es256'"
+                    "   and revoked_at is null and canon = %s",
+                    (human, canon))
+            except Exception:
+                return None
+            for row in rows:
+                credential = str(row.get("credential_id") or "")
+                if not credential:
                     continue
-                if expected == owner:
-                    return True
+                for owner, tenant in leases.items():
+                    try:
+                        expected = attach_session.remote_owner(
+                            "" if tenant == "-" else tenant, credential)
+                    except ValueError:
+                        continue
+                    if expected == owner:
+                        return True
         return None
 
     # -- last interaction ----------------------------------------------------
