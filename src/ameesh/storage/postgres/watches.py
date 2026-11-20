@@ -36,15 +36,40 @@ class Watches(interface.Watches):
         return self.db.query(
             "select " + _COLUMNS + " from agent_watches where agent = %s", (agent,))
 
-    def deliver(self, agent, host, send, *, reading=None) -> dict | None:
+    def deliver(self, agent, host, send, *, reading=None, takeover=False,
+                epoch=None) -> dict | None:
         with self.db.transaction() as tx:
             rows = tx.query("select " + _COLUMNS + " from agent_watches where agent = %s"
                             " for update", (agent,))
             if not rows:
                 return None
             row = dict(rows[0], sent=False)
+            # #7933 : une veille de rôle élu n'appartient pas à l'hôte inscrit
+            # au moment de l'activation, mais au détenteur du bail. L'époque
+            # est relue DANS la transaction du message : un bail déplacé entre
+            # la lecture de la veille et cet envoi refuse l'envoi (jeton de
+            # garde), et deux hôtes ne peuvent pas déposer deux fois.
+            if epoch is not None:
+                fenced = tx.query(
+                    "select 1 from agent_registry"
+                    " where name = %s and host = %s and lease_epoch = %s"
+                    " and releve = 'election' and status <> 'stopped'"
+                    " and lease_owner is not null"
+                    " and lease_expires_at > clock_timestamp()",
+                    (agent, host, int(epoch)))
+                if not fenced:
+                    row["refused"] = "stale-lease"
+                    return row
             if row["host"] != host:
-                return row
+                if not takeover:
+                    row["refused"] = "other-host"
+                    return row
+                if epoch is None:
+                    row["refused"] = "stale-lease"
+                    return row
+                tx.execute("update agent_watches set host = %s where agent = %s",
+                           (host, agent))
+                row["host"] = host
             if send is not None:
                 send(tx)
                 tx.execute("update agent_watches set last_sent_at = now() where agent = %s",

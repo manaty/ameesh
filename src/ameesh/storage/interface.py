@@ -1147,7 +1147,8 @@ class Watches(Domain):
 
     @abc.abstractmethod
     def deliver(self, agent: str, host: str, send: Callable[[Any], None] | None,
-                *, reading: str | None = None) -> dict | None:
+                *, reading: str | None = None, takeover: bool = False,
+                epoch: int | None = None) -> dict | None:
         """One firing, in one transaction: the watch row of `agent` is locked;
         if it is on `host`, `send(tx)` drops the message in that transaction
         and `last_sent_ts` is set. A move or
@@ -1159,7 +1160,14 @@ class Watches(Domain):
         watch's last reading fingerprint (a caller that must record a reading
         without depositing a message). `reading` is stored in the same
         transaction as the message, so a failed firing leaves neither the
-        message nor the fingerprint."""
+        message nor the fingerprint.
+
+        #7933 : `epoch` fences the firing on the agent's elected-role lease,
+        read in the same transaction (holder `host`, this `epoch`, not
+        stopped): a lease that moved refuses the send. `takeover` lets the
+        host that holds the lease take the watch row over from the host
+        recorded at enable time; only the fenced holder may. A refused firing
+        carries ``refused`` on the row (``stale-lease``, ``other-host``)."""
 
 
 # --------------------------------------------------------------------------
