@@ -30,6 +30,10 @@ _OPEN_SQL = "(%s)" % ", ".join("'%s'" % s for s in OPEN)
 _BEFORE_SQL = "(%s)" % ", ".join("'%s'" % s for s in BEFORE_SWITCH)
 _AFTER_SQL = "(%s)" % ", ".join("'%s'" % s for s in AFTER_SWITCH)
 
+ATTACH_RESTORE = ("Restore the conversation on this workstation from its "
+                  "conversation segment. The human has requested an attach; "
+                  "finish this restoration turn so the local attach can open.")
+
 #: notice left to the source when the target's first turn had been launched
 FAILED_AFTER_LAUNCH = (
     "Conversation move to host %s failed after its first turn was launched there "
@@ -99,7 +103,7 @@ class ConversationMoves(Contract):
             " WHERE move_id = %s::uuid RETURNING " + _COLUMNS,
             tuple(params) + (move_id,)))
 
-    def plan(self, *, move_id, agent, target_host, reason, requested_by):
+    def plan(self, *, move_id, agent, target_host, reason, requested_by, recheck=None):
         with self.db.transaction() as tx:
             # #7093 (relecture dev3) : un alias se résout comme à l'écriture
             # (déclencheur ameesh_agent_spelling) ; sans cela, un plan nommé
@@ -110,14 +114,21 @@ class ConversationMoves(Contract):
                 (agent, agent))
             agent = resolved[0]["name"] if resolved else agent
             rows = tx.query(
-                """SELECT name, host, cwd, mode, lease_owner, lease_epoch, session_id,
+                """SELECT *,
                           extract(epoch FROM lease_expires_at)::float8
                               AS lease_expires_ts,
                           extract(epoch FROM clock_timestamp())::float8 AS now_ts
                      FROM agent_registry WHERE name = %s FOR UPDATE""", (agent,))
-            if not rows or rows[0]["mode"] != "execute" or rows[0]["host"] == target_host:
+            if not rows or rows[0]["mode"] != "execute":
                 return None
             r = rows[0]
+            attach = reason == "manual" and requested_by == "attach:" + target_host
+            if r["host"] == target_host and not attach:
+                return None
+            if recheck is not None:
+                refusal = recheck(tx, r)
+                if refusal:
+                    raise RecheckRefused(refusal)
             # B (relecture 3) : une tentative d'avant la bascule plus vieille
             # que PLAN_TTL_S ne retient plus rien — échouée ici, une nouvelle
             # peut s'ouvrir, même sur le même epoch (clé partielle, 0572)
@@ -165,6 +176,30 @@ class ConversationMoves(Contract):
                         LIMIT 1""", (agent, r["host"]))
                 if origin and origin[0].get("reason") == "failover" \
                         and _holder_alive(tx, r):
+                    return None
+            # Join a B2 attempt while holding the switch's registry lock.
+            if attach:
+                existing = _row(tx.query(
+                    "SELECT " + _COLUMNS + " FROM conversation_moves WHERE agent = %s"
+                    " AND state IN " + _OPEN_SQL + " FOR UPDATE", (agent,)))
+                if existing:
+                    if (existing["target_host"] != target_host
+                            or existing["reason"] not in ("preference", "manual")
+                            or (existing["reason"] == "manual"
+                                and existing["requested_by"] != requested_by)):
+                        return None
+                    existing = self._set(tx, existing["move_id"],
+                                         "requested_by = %s", (requested_by,))
+                    if existing["state"] in ("switched", "recovered"):
+                        tx.execute(
+                            "UPDATE agent_registry SET pending_prompt = %s,"
+                            " pending_prompt_id = gen_random_uuid(), status = 'queued',"
+                            " updated_at = now() WHERE name = %s AND host = %s"
+                            " AND pending_prompt IS NULL AND current_prompt IS NULL",
+                            (ATTACH_RESTORE, agent, target_host))
+                    existing["created"] = False
+                    return existing
+                if r["host"] == target_host:
                     return None
             # ON CONFLICT without a target: the (agent, epoch_source) key AND the
             # one-open-attempt index both reread instead of raising
@@ -426,11 +461,18 @@ class ConversationMoves(Contract):
             # (`pending_prompt_id`), la mention ouvre le texte rejoué.
             notice = (INTERRUPTED_TURN % move["source_host"]
                       if state == "recovered" and r.get("current_prompt") else None)
+            # #7897: an idle avatar has no input to start its first target
+            # turn. Queue the attach's restoration request at the switch,
+            # atomically; never wake the cloud or replace a waiting input.
+            resume = (ATTACH_RESTORE
+                      if (state == "switched" or not r.get("current_prompt"))
+                      and str(move["requested_by"]).startswith("attach:") else None)
             moved = tx.query(
                 """UPDATE agent_registry
                       SET lease_owner = NULL, lease_expires_at = NULL,
                           lease_epoch = lease_epoch + 1,
                           host = %s, cwd = coalesce(%s, cwd),
+                          pending_prompt = coalesce(pending_prompt, %s::text),
                           current_prompt = CASE WHEN %s::text IS NULL
                                                 THEN current_prompt
                                                 ELSE %s::text || E'\\n\\n'
@@ -450,7 +492,7 @@ class ConversationMoves(Contract):
                           updated_at = now()
                     WHERE name = %s AND host = %s AND lease_epoch = %s
                 RETURNING lease_epoch""",
-                (move["target_host"], move["target_cwd"], notice, notice,
+                (move["target_host"], move["target_cwd"], resume, notice, notice,
                  move["agent"], move["source_host"], r["lease_epoch"]))
             if not moved:
                 return None

@@ -88,6 +88,7 @@ class Nexlink:
             "plumbing": list(train_ci.DUE_PLUMBING),
             "tolerated": {path: list(names) for path, names
                           in sorted(train_ci.DUE_SUITE_TOLERATED.items())},
+            "dispatch_tolerated": list(train_ci.DUE_DISPATCH_TOLERATED),
         })
 
     def _project(self):

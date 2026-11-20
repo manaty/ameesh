@@ -3115,7 +3115,9 @@ class WatcherTest(PgTestCase):
 
     def test_garde_file_ne_prend_pas_un_runner_d_un_autre_label(self):
         """#7015 : un runner libre ne compte que s'il porte **tous** les labels
-        du job ; un runner linux libre ne prend pas une part macOS en file."""
+        du job ; un runner linux libre ne prend pas une part macOS en file.
+        #7935 : ce job porte `self-hosted`, donc GitHub ne le prendra jamais ;
+        sans runner macOS correspondant il compte comme saturation du dépôt."""
         horloge = FauxHorloge()
         self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
         linux = ["self-hosted", "linux", "ameesh-ci"]
@@ -3136,6 +3138,80 @@ class WatcherTest(PgTestCase):
         (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
                      if a["type"] == "ci_queue_saturated"]
         self.assertEqual(int(alerte["value"]), 1)
+
+    def test_garde_file_ne_compte_pas_la_capacite_github(self):
+        """#7935 : les 11 jobs `macos-26-intel` de la suite macOS attendent la
+        capacité hébergée par GitHub, qu'aucun runner auto-hébergé du dépôt ne
+        peut prendre. Ce n'est pas notre saturation : la file reste vide et
+        `ci_queue_saturated` se tait (alerte du 20/11, 12:15Z)."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        labels = ["self-hosted", "linux", "ameesh-ci"]
+        self.api.runners = [
+            runner_view(21 + i, "ameesh-ci-%d" % (i + 1), busy=False, labels=labels)
+            for i in range(3)]
+        run = run_view(920, "e1" * 20, "main", workflow="macos.yml")
+        run.update({"status": "queued", "created_at": iso(horloge.t - 3600)})
+        self.api.queued = [run]
+        self.api.jobs[920] = [
+            job_view("suite macOS %d/12" % (i + 1), status="queued", job_id=9200 + i,
+                     created_at=iso(horloge.t - 3600 + i), labels=["macos-26-intel"])
+            for i in range(11)]
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(int(row["queued"]), 0)
+        self.assertIsNone(row["oldest_ts"])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_queue_saturated"], [])
+        self.assertEqual(self.scan_state(), (True, None, len(ci.LIVE_STATUSES) + 2))
+
+    def test_garde_file_ne_compte_que_la_capacite_du_depot(self):
+        """#7935 : dans la même file, un job `ubuntu-latest` d'une PR de fork
+        est une attente de la capacité GitHub et ne compte pas ; un job
+        auto-hébergé dont le runner correspondant est occupé reste compté."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        labels = ["self-hosted", "linux", "ameesh-ci"]
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=True, labels=labels)]
+        run = run_view(921, "e2" * 20, "main")
+        run.update({"status": "queued", "created_at": iso(horloge.t - 2000)})
+        self.api.queued = [run]
+        self.api.jobs[921] = [
+            job_view("fork unit", status="queued", job_id=9210,
+                     created_at=iso(horloge.t - 1900), labels=["ubuntu-latest"]),
+            job_view("psql 1/1", status="queued", job_id=9211,
+                     created_at=iso(horloge.t - 1200), labels=labels)]
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9211))
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(int(alerte["value"]), 1)
+        self.assertIn("20 min", alerte["detail"])
+
+    def test_garde_file_compte_un_groupe_auto_heberge_hors_ligne(self):
+        """#7935 (garde) : les runners correspondants sont enregistrés mais
+        tous hors ligne ; le job `self-hosted` compte toujours — c'est une
+        vraie saturation (ou une panne) du dépôt, pas une attente de GitHub."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        labels = ["self-hosted", "linux", "ameesh-ci"]
+        self.api.runners = [
+            runner_view(21 + i, "ameesh-ci-%d" % (i + 1), busy=False,
+                        status="offline", labels=labels)
+            for i in range(3)]
+        run = run_view(922, "e3" * 20, "main")
+        run.update({"status": "queued", "created_at": iso(horloge.t - 2000)})
+        self.api.queued = [run]
+        self.api.jobs[922] = [job_view("psql 1/1", status="queued", job_id=9221,
+                                       created_at=iso(horloge.t - 1500), labels=labels)]
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9221))
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(int(alerte["value"]), 1)
+        self.assertIn("25 min", alerte["detail"])
 
     def test_garde_file_compte_une_execution_dont_aucun_job_ne_tourne(self):
         """#7015 : un runner libre ne disculpe pas une exécution dont aucun job

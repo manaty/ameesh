@@ -123,6 +123,3 @@ def stopped_sql(alias: str = "r", *, host_expr: str | None = None) -> str:
             " AND %(a)s.stop_reason = '%(reason)s'"
             " AND %(a)s.host IS DISTINCT FROM %(other)s)"
             % {"a": a, "reason": STOP_REASON, "other": other})
-
-
-

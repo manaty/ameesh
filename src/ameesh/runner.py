@@ -18443,6 +18443,21 @@ def attach_main(argv: list[str] | None = None) -> int:
         except db_mod.SchemaMissing as exc:
             print("ameesh attach: %s" % exc, file=sys.stderr)
             return 1
+        # #7897: an attach from the healthy preferred workstation is the
+        # explicit return gesture, including when relay options are present.
+        # The runner changes hosts only after the current cloud turn ends.
+        from . import avatar_attach
+        returning = avatar_attach.plan_return(db, parsed.agent, cfg.host)
+        if returning is not None:
+            started = time.monotonic()
+            if not avatar_attach.wait_return(db, returning, max_seconds=parsed.max):
+                return 1
+            remaining = max(0.0, parsed.max - (time.monotonic() - started))
+            if remaining <= 0:
+                return 1
+            code = run_attach(cfg, db, parsed.agent, wait=True, ttl=parsed.ttl,
+                              max_seconds=remaining)
+            return code
         if explicit_remote:
             code = _attach_distant_main(cfg, parsed)
             return code

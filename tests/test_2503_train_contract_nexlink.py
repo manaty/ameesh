@@ -499,6 +499,43 @@ class DynamicGitHubTest(unittest.TestCase):
         with self.assertRaisesRegex(train.TrainError, "skipped"):
             self.ci().read(self.plan)
 
+    def test_a_qualified_tree_skipped_on_a_packet_dispatch_is_tolerated(self):
+        """#7936 : le job réutilisable ne tourne que sur un push develop."""
+        self.jobs.append(dict(id=20, name="qualified-tree", status="completed",
+                              conclusion="skipped"))
+        result = self.ci().read(self.plan)
+        self.assertEqual((result["status"], result["complete"]), ("green", True))
+
+    def test_a_qualified_tree_failure_is_refused(self):
+        """#7936 : la tolérance ne couvre que le saut par conception."""
+        self.runs[0]["conclusion"] = "failure"
+        self.jobs.append(dict(id=20, name="qualified-tree", status="completed",
+                              conclusion="failure"))
+        result = self.ci().read(self.plan)
+        self.assertEqual((result["status"], result["complete"]), ("red", True))
+
+    def test_a_cancelled_qualified_tree_is_refused(self):
+        """#7936 : un run annulé ne prouve rien, même si le job est toléré."""
+        self.runs[0]["conclusion"] = "cancelled"
+        self.jobs.append(dict(id=20, name="qualified-tree", status="completed",
+                              conclusion="cancelled"))
+        with self.assertRaisesRegex(train.TrainError, "interrupted or cancelled"):
+            self.ci().read(self.plan)
+
+    def test_a_job_named_after_qualified_tree_is_not_tolerated(self):
+        """#7936 : nom exact, jamais un préfixe."""
+        self.jobs.append(dict(id=20, name="qualified-tree-regression",
+                              status="completed", conclusion="skipped"))
+        with self.assertRaisesRegex(train.TrainError, "skipped or interrupted"):
+            self.ci().read(self.plan)
+
+    def test_qualified_tree_is_not_tolerated_on_a_push(self):
+        """#7936 : sur un push develop il doit s'exécuter et prouver l'arbre."""
+        self.assertFalse(train_ci._tolerated_job(
+            "qualified-tree", self.due.path, self.due.context, "push"))
+        self.assertTrue(train_ci._tolerated_job(
+            "qualified-tree", self.due.path, self.due.context, "workflow_dispatch"))
+
     def test_tolerated_skipped_job_does_not_break_the_suite(self):
         """B2 de la relecture #2503 : l'exception est celle de la suite."""
         self.jobs.append(dict(id=20, name="changed-paths", status="completed",
