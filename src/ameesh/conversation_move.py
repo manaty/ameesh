@@ -69,7 +69,8 @@ def _moves(db):
 
 
 def plan(db, agent: str, target_host: str, *, requested_by: str,
-         reason: str = "manual", move_id: str | None = None) -> dict | None:
+         reason: str = "manual", move_id: str | None = None,
+         recheck: Callable[[object, Mapping], str | None] | None = None) -> dict | None:
     """Open (or reread) the attempt for the agent's current lease epoch.
 
     `move_id` is written before any effect: a replay with the same id, or a
@@ -77,9 +78,10 @@ def plan(db, agent: str, target_host: str, *, requested_by: str,
     """
     if reason not in REASONS:
         raise ValueError("unknown conversation move reason: %r" % reason)
+    guards = {"recheck": recheck} if recheck is not None else {}
     return _moves(db).plan(move_id=move_id or str(uuid.uuid4()), agent=agent,
                            target_host=target_host, reason=reason,
-                           requested_by=requested_by)
+                           requested_by=requested_by, **guards)
 
 
 def manual(db, agent: str, target_host: str, target_cwd: str, *,
