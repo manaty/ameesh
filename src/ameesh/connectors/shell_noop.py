@@ -36,6 +36,9 @@ OPERATIONS = {
     "merge": "irreversible",
     "refund": "costly",
     "label": "costly",
+    # #7865 (B2) : l'arrêt d'une ressource récurrente est réversible et non
+    # gardé — le balayage doit pouvoir l'exécuter sans geste humain.
+    "stop": "reversible",
 }
 
 

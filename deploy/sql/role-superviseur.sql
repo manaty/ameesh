@@ -144,7 +144,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'external_ref', 'last_error', 'last_actor', 'created_at',
         'updated_at', 'approved_at', 'launched_at', 'finished_at',
         -- L44 (0035) : canon de l'action (identifiant de fédération, pas de contenu)
-        'canon'
+        'canon',
+        -- #7865 : dimension dépense déclarée dans les args signés
+        'recurrence', 'spend_provider', 'spend_purpose'
     ]),
     ('agent_mailbox', ARRAY[
         'id', 'sender', 'recipient', 'kind', 'work_item_id', 'status',
@@ -375,7 +377,28 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #7629 (0585) : portée du grant, non secrète et nécessaire à la
         -- supervision (bénéficiaire, cibles, ligne et version de charte)
         'beneficiary_kind', 'beneficiary', 'beneficiary_clones', 'targets',
-        'charter_line', 'charter_version'
+        'charter_line', 'charter_version',
+        -- #7865 : dimension dépense du grant (plafonds, périmètre, horizon),
+        -- non secrète et nécessaire à la supervision de l'argent délégué
+        'max_per_month', 'max_per_day', 'spend_providers', 'spend_purposes',
+        'review_horizon_hours'
+    ]),
+    -- #7865 : le grand livre des dépenses — état opérationnel (montants,
+    -- fournisseur, objet, décideur, arrêt), pas de secret
+    ('spend_ledger', ARRAY[
+        'id', 'action_id', 'grant_id', 'reservation_id', 'approver',
+        'decided_by', 'provider', 'purpose', 'amount', 'currency',
+        'recurrence', 'state', 'started_at', 'started_on', 'stopped_at',
+        'stopped_on', 'stopped_by', 'stop_reason', 'stop_action_id',
+        'stop_requested_at', 'stop_requested_on', 'stop_requested_by',
+        'confirmed_at', 'confirmed_by', 'confirmed_decision_id',
+        'created_at', 'updated_at'
+    ]),
+    -- #7865 (B4) : l'historique durable des décisions signées qui ont
+    -- confirmé une revue (identifiants et heures, aucun matériel de
+    -- signature) — l'usage unique d'une décision est un fait de supervision
+    ('spend_review_confirmations', ARRAY[
+        'decision_id', 'ledger_id', 'signed_at', 'confirmed_at', 'confirmed_by'
     ]),
     ('standing_reservations', ARRAY[
         'id', 'grant_id', 'action_id', 'amount', 'connector', 'operation',

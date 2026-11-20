@@ -4904,7 +4904,15 @@
     "register",
     "release",
     "reserve",
-    "revoke"
+    "revoke",
+    "spend_confirm",
+    "spend_confirmation",
+    "spend_for_action",
+    "spend_get",
+    "spend_ongoing",
+    "spend_request_stop",
+    "spend_state",
+    "spend_totals_at"
    ],
    "hosts": [
     "disk_history",

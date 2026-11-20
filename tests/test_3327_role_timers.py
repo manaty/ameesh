@@ -48,7 +48,7 @@ class PlanTest(unittest.TestCase):
         # #3383: the alert delivery joined the three observation passes
         self.assertEqual([item["name"] for item in report["timers"]],
                          ["github-watch", "issues", "ci", "alerts", "coherence",
-                          "carte", "psql-nocturne"])
+                          "spend-sweep", "carte", "psql-nocturne"])
         by_name = {item["name"]: item for item in report["timers"]}
         self.assertEqual(by_name["ci"]["interval_s"], 60)
         self.assertEqual(by_name["issues"]["interval_s"], 90)
@@ -152,13 +152,16 @@ class InstallTest(unittest.TestCase):
 
     def test_install_writes_the_units_and_limits_the_full_notifier(self):
         result = role_timers.install(self.report, directory=self.dir, apply=False)
-        self.assertEqual(len(result["installed"]), 15)  # 7 services + 7 timers + drop-in
+        self.assertEqual(len(result["installed"]), 17)  # 8 services + 8 timers + drop-in
         for name in ("github-watch", "issues", "ci", "alerts", "coherence"):
             self.assertTrue((self.dir / ("ameesh-role-%s.service" % name)).is_file())
             self.assertTrue((self.dir / ("ameesh-role-%s.timer" % name)).is_file())
         # #6777 : la carte garde le nom de la copie manuelle de #6157
         self.assertTrue((self.dir / "ameesh-carte.service").is_file())
         self.assertTrue((self.dir / "ameesh-carte.timer").is_file())
+        # #7865 : le balayage des dépenses a son unité, avant la bascule UTC
+        self.assertTrue((self.dir / "ameesh-spend-sweep.service").is_file())
+        self.assertTrue((self.dir / "ameesh-spend-sweep.timer").is_file())
         dropin = self.dir / "ameesh-notify.service.d" / "10-role-timers.conf"
         self.assertIn("--skip issues,github-watch,ci,alerts",
                       dropin.read_text(encoding="utf-8"))
@@ -206,7 +209,7 @@ class InstallTest(unittest.TestCase):
     def test_remove_deletes_the_units_and_the_dropin(self):
         role_timers.install(self.report, directory=self.dir, apply=False)
         result = role_timers.remove(self.report, directory=self.dir, apply=False)
-        self.assertEqual(len(result["removed"]), 15)
+        self.assertEqual(len(result["removed"]), 17)
         self.assertFalse((self.dir / "ameesh-role-ci.timer").exists())
         self.assertFalse((self.dir / "ameesh-notify.service.d" / "10-role-timers.conf").exists())
 
