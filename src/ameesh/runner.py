@@ -445,14 +445,17 @@ def local_take(db, cfg, agents, settings, *, dry_run: bool = False, alerts=None,
     `kw` surcharge les autres réglages d'`auto_take` (tests, diagnostic). Rend
     les prises faites ; l'appelant isole la panne éventuelle.
     """
-    from . import backlog
+    from . import backlog, planned_waits
     names = {str(name) for name in (agents or ()) if name}
     if not names:
         return []
     options = dict(settings)
     options.update(kw)
-    return backlog.auto_take(cfg, db, agents=names, dry_run=dry_run, alerts=alerts,
-                             **options)
+    # #7940 N2 : les routes humaines se lisent une fois par passe, pas à
+    # chaque plan ni à chaque sélection de la même prise automatique.
+    with planned_waits.human_routes_cache():
+        return backlog.auto_take(cfg, db, agents=names, dry_run=dry_run,
+                                 alerts=alerts, **options)
 
 
 def local_balance_alerts(db, thresholds, now: float) -> list:

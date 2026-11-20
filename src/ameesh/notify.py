@@ -3028,10 +3028,12 @@ class Notifier:
 
     # -- prise automatique (L119, décision 0037) ------------------------------
     def _auto_take(self, db, current: list, now: float) -> None:
-        from . import backlog
+        from . import backlog, planned_waits
         try:
-            taken = backlog.auto_take(self.cfg, db, now=now, alerts=current,
-                                      dry_run=self.dry_run, **self.take)
+            # #7940 N2 : une seule lecture des routes humaines pour la passe.
+            with planned_waits.human_routes_cache():
+                taken = backlog.auto_take(self.cfg, db, now=now, alerts=current,
+                                          dry_run=self.dry_run, **self.take)
         except db_mod.DbError:
             raise
         except Exception as exc:     # la prise ne fait jamais tomber les alertes
