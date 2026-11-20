@@ -67,6 +67,13 @@ _COLUMNS_TEMPLATE = """
 #: (`work.waive_review`) ; un nom d'agent ne commence jamais par `-`.
 REVIEWER_NONE = "-none"
 
+#: #7940 : l'instant lisible d'un hold qui ne retient plus le démarrage.
+def _hold_iso(ts) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(ts)))
+    except (TypeError, ValueError, OverflowError):
+        return "?"
+
 #: #5016 : les seuls champs de la ligne du lot dont la porte des avis dépend
 #: (dépôt, cible, auteurs, véhicule de paquet) et la dispense de re-verdict
 #: (`reviewer`/`reviewers`, lue par `_waiver`). Une note concurrente ne déplace
@@ -837,11 +844,17 @@ class WorkItems(interface.WorkItems):
             if footprint:
                 WorkItems(tx)._intake_footprint(item["id"], footprint, actor)
                 if assignee:
-                    WorkItems(tx)._footprint_guard(item["id"])
+                    exempted = WorkItems(tx)._footprint_guard(item["id"])
+                    if exempted:
+                        WorkItems(tx)._warn_human_wait_overlap(
+                            item["id"], "intake", exempted, actor)
             elif assignee:
                 # #4818 : sans empreinte, le plafond de lots en vol du dépôt
                 # garde encore la création attribuée
-                WorkItems(tx)._footprint_guard(item["id"])
+                exempted = WorkItems(tx)._footprint_guard(item["id"])
+                if exempted:
+                    WorkItems(tx)._warn_human_wait_overlap(
+                        item["id"], "intake", exempted, actor)
             if behind is not None:
                 item["forced_behind" if forced_note else "queued_behind"] = behind
             if parent_lot is not None:
@@ -1440,19 +1453,30 @@ class WorkItems(interface.WorkItems):
             if self._dev.start_blocked(item_id):
                 return None
             ready_state = item["state"]
-            if ready_state == lifecycle.REQUESTED and (
-                    self._footprint_overlaps(item_id, start_on=True)
-                    or self._footprint_cap(item_id)):
-                return None
+            exempted = []
+            if ready_state == lifecycle.REQUESTED:
+                # #7940 : les occupants dont un hold d'attente humaine tient
+                # depuis plus de 24 h ne retiennent plus le démarrage ; leur
+                # chevauchement est journalisé sur les deux lots. Le plafond
+                # de lots en vol reste appliqué tel quel (#4818).
+                overlaps = self._footprint_overlaps(item_id, start_on=True,
+                                                    blocking_only=False)
+                if any(not row.get("human_wait") for row in overlaps):
+                    return None
+                exempted = [row for row in overlaps if row.get("human_wait")]
+                if self._footprint_cap(item_id):
+                    return None
         else:
             ready_state = None
+            exempted = []
             if assignee is not None and current is None:
                 # #4173 : l'attribution d'un lot libre (`work assign`) prend
                 # le même verrou que la prise, AVANT toute ligne : deux
                 # attributions concurrentes de lots chevauchants décident
                 # l'une après l'autre.
                 self.db.execute(_DEPENDENCIES_LOCK)
-                self._footprint_guard(item_id, free_only=True, start_on=True)
+                exempted = self._footprint_guard(item_id, free_only=True,
+                                                 start_on=True)
         behind = None
         if (queued_note is not None or take) and assignee:
             lot = self.db.query("SELECT started_at IS NULL AS fresh FROM work_items"
@@ -1465,18 +1489,24 @@ class WorkItems(interface.WorkItems):
             assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
                               else (None, queued_note.format(lot=behind)))
         row = self._reassign(item_id, assignee, current, ready_state, note, actor)
+        if row is not None and exempted and row.get("assignee"):
+            self._warn_human_wait_overlap(item_id, row.get("state") or ready_state,
+                                          exempted, actor)
         if row is not None and behind is not None:
             row["forced_behind" if forced_note else "queued_behind"] = behind
         return row
 
     def _footprint_overlaps(self, item_id, *, free_only=False,
-                            start_on=False) -> list[dict]:
+                            start_on=False, blocking_only=True) -> list[dict]:
         """#4173, sous le verrou du graphe : les chevauchements de l'empreinte
         du lot avec celle d'un lot occupant de son dépôt (requête POSTÉRIEURE
         au verrou, comme le contrôle des dépendances). `free_only` : vide si
-        le lot occupe déjà son empreinte (réattribution d'un lot démarré)."""
+        le lot occupe déjà son empreinte (réattribution d'un lot démarré).
+        `blocking_only=False` (: #7940) rend aussi les occupants qu'une
+        attente humaine de plus de 24 h ne fait plus retenir."""
         return self._dev._footprint_overlaps(item_id, free_only=free_only,
-                                             start_on=start_on)
+                                             start_on=start_on,
+                                             blocking_only=blocking_only)
 
     def _footprint_cap(self, item_id, *, free_only=False):
         """#4818, sous le verrou du graphe : `{cap, in_flight}` si le dépôt du
@@ -1485,17 +1515,63 @@ class WorkItems(interface.WorkItems):
         return self._dev._footprint_cap(item_id, free_only=free_only)
 
     def _footprint_guard(self, item_id, *, free_only=False,
-                         start_on=False) -> None:
+                         start_on=False) -> list[dict]:
         """La garde d'attribution d'un lot libre : `FootprintOverlap` s'il
         chevauche un lot occupant, `RepositoryCapReached` si son dépôt est au
-        plafond (#4818). Rien n'est écrit ; l'appelant tient le verrou."""
+        plafond (#4818). Rien n'est écrit ; l'appelant tient le verrou.
+
+        #7940 : rend les chevauchements écartés parce que l'occupant porte une
+        attente humaine de plus de 24 h — l'appelant journalise l'avertissement
+        sur les deux lots. Le chevauchement n'est plus une attente de fusion,
+        mais le lot en attente garde son empreinte pour l'information."""
         overlaps = self._footprint_overlaps(item_id, free_only=free_only,
-                                            start_on=start_on)
-        if overlaps:
-            raise interface.FootprintOverlap(overlaps)
+                                            start_on=start_on,
+                                            blocking_only=False)
+        blocked = [row for row in overlaps if not row.get("human_wait")]
+        if blocked:
+            raise interface.FootprintOverlap(blocked)
         cap = self._footprint_cap(item_id, free_only=free_only)
         if cap:
             raise interface.RepositoryCapReached(cap["cap"], cap["in_flight"])
+        return [row for row in overlaps if row.get("human_wait")]
+
+    def _warn_human_wait_overlap(self, item_id, state, rows, actor) -> None:
+        """#7940 : journalise le chevauchement qu'une attente humaine de plus
+        de 24 h ne fait plus retenir.
+
+        Une note sur le lot démarré nomme l'occupant et le chemin partagé ;
+        une note sur l'occupant nomme le lot démarré, le chemin partagé et le
+        geste de son go — se rebaser sur la cible et relire le delta
+        (canon §2). Le lot en attente garde son empreinte : aucune ligne
+        `work_item_footprints` n'est touchée.
+        """
+        by_lot: dict[int, list[dict]] = {}
+        for row in rows:
+            by_lot.setdefault(int(row["id"]), []).append(row)
+        pairs = []
+        pending = []
+        for lot, lot_rows in sorted(by_lot.items()):
+            first = lot_rows[0]
+            shared = "; ".join(sorted({
+                "%s ~ %s" % (row.get("path"), row.get("other_path"))
+                for row in lot_rows}))
+            hold = " ".join(str(first.get("human_hold_note") or "").split())[:160]
+            since = _hold_iso(first.get("human_hold_ts"))
+            pending.append((lot, first.get("state"), (
+                "#%d started on the footprint of this lot (%s) although the human "
+                "wait \"%s\" has been open since %s (> 24 h): it no longer blocks "
+                "the start (#7940). At your go, rebase on the target and review "
+                "the delta (canon §2)." % (int(item_id), shared,
+                                           hold or "hold: attente owner", since))))
+            pairs.append("#%d on %s (hold since %s)" % (lot, shared, since))
+        candidate = (
+            "footprint overlap with %s: not blocking the start — the overlapping "
+            "lot holds a human wait older than 24 h and keeps its footprint for "
+            "information (#7940). It rebases on the target and its review covers "
+            "the delta at its go (canon §2)." % "; ".join(pairs))
+        for lot, lot_state, note in pending:
+            self._event(lot, lot_state or state, note, actor)
+        self._event(int(item_id), state, candidate, actor)
 
     def _pending(self, assignee, item_id) -> int | None:
         """#540, dans la transaction ouverte et sous le verrou de l'agent : son

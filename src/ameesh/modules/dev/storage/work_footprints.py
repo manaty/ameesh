@@ -10,6 +10,9 @@ from .schema import DevDomain
 #: Le préfixe de `source` d'un panier (`backlog.BASKET_PREFIX`).
 BASKET_PREFIX = "backlog-basket:"
 
+#: Les états terminaux d'un porteur (`lifecycle.COMPLETED`), en SQL.
+_COMPLETED_SQL = ("('" + "', '".join(lifecycle.COMPLETED) + "')")
+
 #: Deux chemins se chevauchent : égaux, ou l'un est un dossier parent de
 #: l'autre ; le marqueur `.` (empreinte inconnue, dépôt entier, #4818)
 #: chevauche tout. Même règle que `ameesh.work_footprints.overlaps`.
@@ -102,17 +105,66 @@ def start_blocking(dependent: str, blocker: str = "b") -> str:
             + start_on_sql(dependent, blocker) + ")")
 
 
+def human_wait_expr(alias: str, ids=()) -> str:
+    """#7940 : le lot `alias` porte une attente humaine qui ne bloque plus.
+
+    `ids` sont les lots rendus par `planned_waits.human_waits` — la lecture
+    canonique (`active_holds`, routes humaines du runtime #7634) — jamais une
+    liste écrite ici. Vrai pour un de ces lots qui n'est pas gelé dans un
+    paquet ouvert : la cible d'un paquet en CI est réservée (§12), et sa tête
+    gelée ne doit pas recevoir un voisin. Le lot en attente garde son
+    empreinte : ce prédicat ne retire aucune ligne, il écarte seulement le
+    chevauchement de la garde.
+    """
+    wanted = sorted({int(i) for i in ids or ()})
+    if not wanted:
+        return "false"
+    return ("(" + alias + ".id IN (" + ", ".join(str(i) for i in wanted) + ")"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM work_packet_members pm"
+            "     JOIN work_items pk ON pk.id = pm.package_id"
+            "    WHERE pm.work_item_id = " + alias + ".id"
+            "      AND pk.state NOT IN " + _COMPLETED_SQL + "))")
+
+
+def open_packet_members(db, ids) -> set[int]:
+    """#7940 : les lots `ids` gelés dans un paquet ouvert (cible réservée, §12).
+
+    Même condition que `human_wait_expr` ; l'appelant qui attache le hold
+    lisible après coup (lecture canonique de `planned_waits.human_waits`) doit
+    écarter ces lots : un membre d'un paquet en CI garde sa retenue."""
+    wanted = sorted({int(i) for i in ids or ()})
+    if not wanted:
+        return set()
+    rows = db.query(
+        "SELECT DISTINCT pm.work_item_id FROM work_packet_members pm"
+        "  JOIN work_items pk ON pk.id = pm.package_id"
+        " WHERE pm.work_item_id = ANY(%s) AND pk.state NOT IN " + _COMPLETED_SQL,
+        (wanted,))
+    return {int(row["work_item_id"]) for row in rows}
+
+
 # `items` is a trusted SQL relation name, like `alias`, never user input.
 # A snapshot may supply a CTE containing all non-terminal lots; the canonical
 # predicates below still decide which of those lots occupy an individual app.
 def overlap_rows_sql(alias: str, *, items: str = "work_items",
-                     start_on: bool = False) -> str:
+                     start_on: bool = False,
+                     blocking_only: bool = False,
+                     human_wait_ids=()) -> str:
     """Les paires (chemin du lot `alias`, chemin d'un lot occupant du même
     dépôt) qui se chevauchent — corps de `overlapping` et de la garde.
 
     `start_on=True` (: #7760) écarte les paires « démarrage sur » (#7760) :
     reste ce qui retient vraiment le démarrage. Sans lui, chaque paire porte
     `start_on` et `other_frozen_sha` pour l'affichage.
+
+    `human_wait_ids` sont les lots rendus par `planned_waits.human_waits`
+    (#7940, lecture canonique). `blocking_only=True` écarte ces occupants : le
+    chevauchement ne retient plus, il devient un avertissement journalisé
+    (`human_wait`). Sans lui, la paire reste visible et porte `human_wait` :
+    le lot en attente garde son empreinte pour l'information. Le texte du hold
+    et sa date sont attachés par l'appelant (`human_hold_note`,
+    `human_hold_ts`), depuis la même lecture.
 
     #7758 : un occupant exempté (`exempt_sql` : véhicule de paquet, décision,
     découpage) n'occupe rien ; un véhicule n'a pas de delta propre, ses
@@ -121,7 +173,8 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
             "       " + start_on_sql(alias, "o") + " AS start_on,"
             "       (SELECT m.sha FROM work_item_milestones m"
             "         WHERE m.work_item_id = o.id AND m.kind = 'frozen'"
-            "         ORDER BY m.at DESC, m.id DESC LIMIT 1) AS other_frozen_sha"
+            "         ORDER BY m.at DESC, m.id DESC LIMIT 1) AS other_frozen_sha,"
+            "       " + human_wait_expr("o", human_wait_ids) + " AS human_wait"
             "  FROM work_item_footprints mine"
             "  JOIN work_item_footprints theirs"
             "    ON theirs.work_item_id <> mine.work_item_id"
@@ -136,17 +189,28 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
             "   AND NOT " + _SHARED.format(app=alias + ".app", p="theirs"))
     if start_on:
         rows += "   AND NOT " + start_on_sql(alias, "o")
+    if blocking_only:
+        # #7940 : la garde ne retient plus sur une attente humaine de plus de
+        # 24 h ; l'affichage (`overlapping`) garde la ligne et son hold.
+        rows += "   AND NOT " + human_wait_expr("o", human_wait_ids)
     return rows
 
 
 def overlap_exists_sql(alias: str, *, items: str = "work_items",
-                       start_on: bool = False) -> str:
+                       start_on: bool = False,
+                       blocking_only: bool = False,
+                       human_wait_ids=()) -> str:
     """Vrai si le lot `alias` chevauche un lot occupant de son dépôt.
 
     `unassigned_lots` (sélection) et `_assign_locked` (sous le verrou du
     graphe) appliquent ce même prédicat : une seule règle. `start_on=True`
-    ignore les occupants validés dont le lot déclare la dépendance (#7760)."""
-    return "EXISTS (" + overlap_rows_sql(alias, items=items, start_on=start_on) + ")"
+    ignore les occupants validés dont le lot déclare la dépendance (#7760).
+    `blocking_only=True` (: #7940) applique la garde de démarrage : une
+    attente humaine de plus de 24 h (`human_wait_ids`, lue par
+    `planned_waits.human_waits`) ne retient plus."""
+    return "EXISTS (" + overlap_rows_sql(
+        alias, items=items, start_on=start_on, blocking_only=blocking_only,
+        human_wait_ids=human_wait_ids) + ")"
 
 
 #: #4667 : un véhicule de paquet (`integration/**`) n'a pas de delta propre ;
@@ -198,13 +262,19 @@ def cap_reached_sql(alias: str, *, items: str = "work_items") -> str:
     return "EXISTS (" + cap_rows_sql(alias, items=items) + ")"
 
 
-def held_sql(alias: str, *, start_on: bool = False) -> str:
+def held_sql(alias: str, *, start_on: bool = False,
+             human_wait_ids=()) -> str:
     """Vrai si la garde retient le lot `alias` : son empreinte chevauche celle
     d'un lot occupant de son dépôt, ou le dépôt a atteint son plafond de lots
     en vol (#4818). Le prédicat commun de la prise, de l'attribution et du
     plan de dispatch. `start_on=True` : garde de DÉMARRAGE, qui laisse passer
-    un lot sur les lots validés dont il déclare la dépendance (#7760)."""
-    return ("(" + overlap_exists_sql(alias, start_on=start_on) + " OR "
+    un lot sur les lots validés dont il déclare la dépendance (#7760).
+    #7940 : un occupant en attente humaine depuis plus de 24 h
+    (`human_wait_ids`, lu par `planned_waits.human_waits`) ne retient plus
+    (le chevauchement devient un avertissement journalisé)."""
+    return ("(" + overlap_exists_sql(alias, start_on=start_on,
+                                     blocking_only=True,
+                                     human_wait_ids=human_wait_ids) + " OR "
             + cap_reached_sql(alias) + ")")
 
 
@@ -309,10 +379,22 @@ class WorkFootprints(DevDomain, Contract):
             " ORDER BY work_item_id, path, source", tuple(ids))
 
     def overlapping(self, item_id):
-        return self.db.query(
+        from .... import planned_waits
+        rows = self.db.query(
             "SELECT DISTINCT x.* FROM work_items c, LATERAL ("
             + overlap_rows_sql("c") + ") x WHERE c.id = %s ORDER BY x.id, x.path",
             (int(item_id),))
+        waits = planned_waits.human_waits(
+            self.db, [int(row["id"]) for row in rows])
+        packets = open_packet_members(self.db, waits)
+        for row in rows:
+            ident = int(row["id"])
+            hold = waits.get(ident) if ident not in packets else None
+            row["human_wait"] = hold is not None
+            if hold is not None:
+                row["human_hold_note"] = hold["note"]
+                row["human_hold_ts"] = hold["since"]
+        return rows
 
     def cap_reached(self, item_id):
         rows = self.db.query(

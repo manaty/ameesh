@@ -695,6 +695,88 @@ def pilot_holds(db, events, *, cfg=None,
     return out
 
 
+#: #7940 : au-delà de ce seuil, une attente humaine explicite ne retient plus
+#: le démarrage d'un lot voisin qui chevauche son empreinte. L'âge court
+#: depuis la note de hold elle-même, jamais depuis le dernier événement du lot.
+HUMAN_WAIT_BLOCK_HOURS = 24
+
+
+def human_waits(db, item_ids=None, *, cfg=None, now=None,
+                human_routes=None) -> dict[int, dict]:
+    """#7940 : les attentes humaines actives de plus de 24 h, par lot.
+
+    Une attente humaine est un **hold de pilote** (#1664) dont la note déclare
+    une attente externe (#3498) vers une route humaine : `owner`, `avatar`,
+    `propriétaire`, ou un nom que le runtime résout comme route humaine
+    (#7634, `debit.human_route_names`). Un hold d'agent ordinaire n'en est pas
+    une, et un nom non configuré (`bureau` sans route au canon ou au registre)
+    n'en devient pas une : la lecture est celle du débit, jamais une liste de
+    noms écrite dans le cœur.
+
+    La retenue est lue par `active_holds` : dernière retenue **par auteur**,
+    levée par son auteur ou par un pilote, transitions automatiques de
+    l'outillage sans effet (#5758). L'âge est celui de la note de hold, pas du
+    dernier événement du lot : les notes automatiques du runner ne remettent
+    pas l'horloge à zéro (pilote, #7940).
+
+    Rend `{lot: {note, since, by, executor, gesture}}`, l'attente humaine
+    active la plus récente par lot. Une route humaine illisible ne devine rien
+    (`human_routes` vide : seules les routes du cœur restent reconnues)."""
+    from . import canon as canon_mod
+    st = storage.of(db)
+    cfg = getattr(db, "cfg", None) if cfg is None else cfg
+    if item_ids is None:
+        # Préfiltre bon marché : seuls les lots qui portent une note `hold:`
+        # d'au moins 24 h peuvent être en attente humaine. La décision reste
+        # celle d'`active_holds` ci-dessous ; le préfiltre ne fait que borner
+        # la lecture du journal sur la voie d'attribution.
+        rows = db.query(
+            "SELECT DISTINCT e.work_item_id FROM work_item_events e"
+            "  JOIN work_items w ON w.id = e.work_item_id"
+            " WHERE w.state <> ALL(%s::text[])"
+            "   AND e.note ~* '^[[:space:]]*hold:'"
+            "   AND e.created_at <= now() - make_interval(hours => %s)",
+            (list(lifecycle.COMPLETED), HUMAN_WAIT_BLOCK_HOURS))
+        item_ids = [int(row["work_item_id"]) for row in rows]
+    ids = sorted({int(i) for i in item_ids})
+    if not ids:
+        return {}
+    events = list(st.progress.lot_hold_events(ids, HOLD_NOTE_PATTERNS))
+    if not events:
+        return {}
+    if human_routes is None:
+        human_routes = set()
+        try:
+            from . import debit
+            canons = canon_mod.load_configured(cfg) if cfg is not None else []
+            human_routes = debit.human_route_names(
+                cfg, st.progress.agents(None), canons)
+        except Exception:  # route illisible : aucun nom deviné (#7634)
+            human_routes = set()
+    cutoff = (time.time() if now is None else float(now)) \
+        - HUMAN_WAIT_BLOCK_HOURS * 3600
+    out: dict[int, dict] = {}
+    with canon_mod.configured_cache():
+        holds = active_holds(db, events, cfg=cfg)
+    for ident, by_actor in holds.items():
+        for who, hold in by_actor.items():
+            if not hold.get("pilot"):
+                continue
+            note = str(hold.get("note") or "")
+            declared = external_hold(note, executors=human_routes)
+            if declared is None:
+                continue
+            since = float(hold.get("since") or 0.0)
+            if since > cutoff:
+                continue
+            if ident in out and since <= out[ident]["since"]:
+                continue
+            out[ident] = {"note": note, "since": since, "by": who or None,
+                          "executor": declared["executor"],
+                          "gesture": declared["gesture"]}
+    return out
+
+
 def pilot_hold_releases(db, events, *, cfg=None) -> dict[int, list]:
     """#2916 : les instants où un hold de pilote a été levé, par lot.
 
