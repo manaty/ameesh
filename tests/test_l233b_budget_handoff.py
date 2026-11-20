@@ -303,6 +303,29 @@ class HandoffTest(_Handoff):
                          [("codex1", build["id"])])
         self.assertEqual(self.assignee(build), "codex1")
 
+    def test_preneur_codex_critique_jamais_choisi(self):
+        # #1136 (N1 de la R2 #757) : les preneurs sont filtrés sur `is_critical`
+        # comme les sources — un Codex critique n'est jamais choisi, un Codex
+        # non critique l'est (non-régression des preneurs normaux).
+        self.agent("claude1", team="nexlink")
+        self.pause("claude1")
+        self.agent("codex1", "codex", team="nexlink")
+        build = self.lot("import", state="build", branch="lot/import")
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            # critique par la configuration
+            cfg = dataclasses.replace(self.cfg, critical_agents=("codex1",))
+            self.assertEqual(handoff.budget_handoff(
+                cfg, self.db, now=self.now, canons=[], declared=(),
+                orchestras=[self.orch], budget_check=lambda a: ""), [])
+            # critique comme orchestrateur déclaré
+            self.assertEqual(self.hand(declared=("codex1",)), [])
+        self.assertEqual(self.assignee(build), "claude1")
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            out = self.hand()
+        self.assertEqual([(m["agent"], m["item"]["id"]) for m in out],
+                         [("codex1", build["id"])])
+        self.assertEqual(self.assignee(build), "codex1")
+
     def test_agent_critique_ou_pas_en_pause(self):
         self.team()
         intake = self.lot("export")

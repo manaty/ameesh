@@ -431,6 +431,12 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                 if agent is None:
                     continue
                 agent = dict(row, **agent)
+                # #1136 (N1 de la R2 #757) : les preneurs sont filtrés sur
+                # `is_critical` comme les sources — un agent critique (conception,
+                # auditeur, orchestrateur déclaré) ne prend pas un lot rendu.
+                if auditor_mod.is_critical(cfg, db, row["name"], canons,
+                                           declared=declared, agent=agent):
+                    continue
                 if not auditor_mod.may_take(agent, canons):
                     continue
                 auditors = auditor_mod.cards([agent], canons)
