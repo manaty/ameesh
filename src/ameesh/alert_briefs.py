@@ -68,6 +68,9 @@ BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
                  # #6014 : un train en pause depuis plus d'un jour ne
                  # redémarre pas seul ; le pilote du projet doit trancher
                  "train_paused",
+                 # #7889 : un train figé hors phase terminale depuis plus
+                 # d'un jour tient la réservation ; le pilote du projet
+                 "train_stuck",
                  # #7759 : des candidats prêts laissés dehors par un créneau ;
                  # un seul composeur/pilote du projet
                  "packet_ready_waiting",
@@ -1745,7 +1748,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "fingerprints_source_failing":
             text = alert["detail"]
             teams = {alert["project"]} if alert.get("project") else set()
-        elif kind == "train_paused":
+        elif kind in ("train_paused", "train_stuck"):
             text = alert["detail"]
             teams = {alert["project"]} if alert.get("project") else set()
         elif kind == "release_project_undeclared":
