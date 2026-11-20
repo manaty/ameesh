@@ -7,6 +7,25 @@ ne l'applique pas et son préflight additif reste ouvert. L'activer dès cette
 release ferait refuser tout staging, même sans application de la migration.
 Les tests activent le dossier explicitement sur leurs copies isolées.
 
+Le témoin `test_cutoff_and_staging_needed_keep_p2_dormant_on_copy` parcourt
+le préflight du tic (`paquet-horaire.align_schema`), une vraie coupure sur un
+dépôt Git local, puis `staging_pending.apply` (commande `release
+staging-needed --apply`). Le transport vers les hôtes est remplacé par une
+copie P1 isolée : porte `staging_migrations_preflight`, CLI `migrate
+--dry-run --additive-only`, `migrate --additive-only`, `migrate` sans filtre,
+`doctor --probe`, puis nouvel exécuteur avec `--migrate`. Les données et
+catalogues des 37 tables restent identiques ; aucun registre ni schéma `dev`
+n'est créé. Le choix de la tête verte et l'intention hors coupure sont
+fournis par la fixture ; le témoin ne déploie aucun hôte réel.
+
+Le témoin `test_additive_only_does_not_even_create_the_module_schema`
+active au contraire le dossier sur la copie : les deux commandes CLI
+additives rendent le code 3, nomment `dev/0001_module_schema_cutover` comme
+non additive et ne créent aucun schéma. Dans la version livrée, P2 est
+absente de la découverte, plutôt qu'en attente dans une file de migrations
+qui retiendrait le redémarrage. `doctor` ne possède pas d'option `--fix` ;
+ses contrôles de migration sont en lecture seule.
+
 L'application à chaque base demande une nouvelle autorisation owner et un
 déroulé validé par le bureau (étude #7616, §5.7). La déclaration du dossier
 `MIGRATIONS = "migrations"` appartient à ce geste ultérieur et doit figurer

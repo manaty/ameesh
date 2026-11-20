@@ -8,6 +8,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from dataclasses import replace
+from contextlib import redirect_stdout, redirect_stderr
+import io
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
 import unittest
 import uuid
 from unittest import mock
@@ -194,18 +200,106 @@ class DevCutoverTest(support.PgTestCase):
 
     def test_code_only_cli_and_restarted_runner_keep_p1_schema(self):
         """Exercise the staging migration commands and a fresh executor on a copy."""
+        self.assert_code_only_cli_and_restarted_runner()
+
+    def assert_code_only_cli_and_restarted_runner(self):
         for args in (("migrate", "--dry-run", "--additive-only"),
-                     ("migrate", "--additive-only")):
+                     ("migrate", "--additive-only"), ("migrate",),
+                     ("doctor", "--probe")):
             result = self.mesh(*args, timeout=180)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        runner = self.runner("--once", "--agents", "nobody-7651", timeout=180)
+        runner = self.runner("--once", "--migrate", "--agents", "nobody-7651", timeout=180)
         self.assertIn(runner.returncode, (0, 3), runner.stdout + runner.stderr)
         self.assertIn("no work available", runner.stdout + runner.stderr)
         self.assertEqual(self.db.query("SELECT * FROM module_schemas WHERE module='dev'"), [])
         self.assertEqual(self.db.query(
             "SELECT relkind FROM pg_class WHERE oid='work_items'::regclass")[0]['relkind'], 'r')
 
+    def test_cutoff_and_staging_needed_keep_p2_dormant_on_copy(self):
+        """Real release routing and migration gates; remote hosts are replaced by a copy.
+
+        The release fixture supplies a local Git origin, canon and green CI.
+        Only the host deployment boundary is replaced: it runs the real
+        preflight/CLI and starts a fresh executor against this isolated P1 DB.
+        """
+        from ameesh import mechanics, release_cutoff as rc, staging_pending
+        from tests.test_2448_release_cutoff import ReleaseFixture, _paris
+        from tests.test_3845_paquet_horaire import ph
+
+        fixture = ReleaseFixture()
+        self.addCleanup(fixture.doCleanups)
+        # The Git fixture changes HOME; keep the test DB's ordinary libpq
+        # credential path, without copying or reading its contents.
+        pgpass = mock.patch.dict(os.environ, {
+            'PGPASSFILE': os.environ.get('PGPASSFILE', str(Path.home() / '.pgpass'))})
+        pgpass.start()
+        self.addCleanup(pgpass.stop)
+        fixture.setUp()
+        repo = str(support.REPO)
+        sha = subprocess.check_output(['git', '-C', repo, 'rev-parse', 'HEAD'],
+                                      text=True).strip()
+        before = self.snapshot(self.schema)
+        calls = []
+
+        def stage_copy(project, release_sha, included, state_dir, db=None):
+            gate = subprocess.run(
+                [sys.executable, '-m', 'ameesh.staging_migrations_preflight',
+                 '--repo', repo, '--sha', sha, '--project', 'ameesh'],
+                env=self.env(), cwd=self.tmp, capture_output=True, text=True,
+                timeout=support.scaled(180))
+            self.assertEqual(gate.returncode, 0, gate.stdout + gate.stderr)
+            self.assert_code_only_cli_and_restarted_runner()
+            self.assertEqual(self.snapshot(self.schema), before)
+            calls.append(release_sha)
+            return {'exit': 0}
+
+        # The hourly packet tick has its own CLI dry-run before the cutoff.
+        class Shell:
+            def run(shell, argv, **kwargs):
+                result = subprocess.run(argv, env=self.env(), cwd=self.tmp,
+                                        capture_output=True, text=True, timeout=180)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                return ph.Result(result.returncode, result.stdout, result.stderr)
+
+        ph.align_schema(SimpleNamespace(repo=Path(repo), python=sys.executable,
+                                        shell=Shell(), dry_run=False))
+        with mock.patch.object(rc, 'run_staging', side_effect=stage_copy) as stage:
+            report = fixture.execute()
+            self.assertEqual(report['result'], 'released', report)
+            stage.assert_called_once()
+
+        # Same real _staging_step/maybe_staging path, outside a cutoff.
+        needed = {'result': 'needed', 'candidate': fixture.head,
+                  'candidate_ready': True, 'regressions': {},
+                  'candidate_unblocks': [1, 2, 3],
+                  'waiting': [{'lot': n, 'blocker': 7651} for n in (1, 2, 3)]}
+        rules = SimpleNamespace(staging=mechanics.Staging(3, 1200, 600),
+                                next_cutoff=lambda now: _paris(23),
+                                next_packet=lambda now: _paris(23))
+        port = SimpleNamespace(work=SimpleNamespace(
+            land_lock=mock.Mock(return_value=7), land_unlock=mock.Mock()))
+        with mock.patch.object(staging_pending.storage, 'of', return_value=port), \
+             mock.patch('ameesh.work.corrector', return_value='pilot'), \
+             mock.patch.object(staging_pending, 'inspect', return_value=needed), \
+             mock.patch.object(staging_pending, 'regressions', return_value={}), \
+             mock.patch.object(rc, 'compiled_rules', return_value=(rules, None)), \
+             mock.patch.object(rc, 'run_staging', side_effect=stage_copy) as stage:
+            report = staging_pending.apply(fixture.cfg, None, fixture.project,
+                                           now=_paris(22, 30))
+            self.assertEqual(report['result'], 'staged', report)
+            stage.assert_called_once()
+        self.assertEqual(len(calls), 2)
+
     def test_additive_only_does_not_even_create_the_module_schema(self):
+        from ameesh import cli
+        output = io.StringIO()
+        with mock.patch.object(migrations, 'installed_modules',
+                               return_value=cutover_modules().modules), \
+             redirect_stdout(output), redirect_stderr(output):
+            self.assertEqual(cli.cmd_migrate(self.cfg, dry_run=True, additive_only=True), 3)
+            self.assertEqual(cli.cmd_migrate(self.cfg, additive_only=True), 3)
+        self.assertIn('dev/0001_module_schema_cutover: NOT additive', output.getvalue())
+        self.assertIn('nothing applied', output.getvalue())
         with self.assertRaises(migrations.NonAdditiveMigration):
             migrations.migrate(self.db, additive_only=True, modules=cutover_modules())
         self.assertEqual(self.db.query("SELECT * FROM module_schemas WHERE module='dev'"), [])
