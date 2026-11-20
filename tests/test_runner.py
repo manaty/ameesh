@@ -710,7 +710,12 @@ class RunnerTest(PgTestCase):
         """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
         cwd = self._cwd("perdu")
         self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
-        env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3")
+        env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3",
+                       AMEESH_HOST_GATE="file",
+                       AMEESH_HOST_GATE_PATH=os.environ.get("REPRO_GATE_PATH", ""),
+                       AMEESH_HOST_GATE_ACK=os.path.join(self.tmp, "gate-ack.json"),
+                       AMEESH_HOST_GATE_FALLBACK="draining",
+                       AMEESH_HOST_GATE_DRAIN="5")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
         try:
             self.wait_for(lambda: len(self.turns()) == 1, timeout=20)
@@ -722,6 +727,11 @@ class RunnerTest(PgTestCase):
         finally:
             proc.terminate()
             sortie, _ = proc.communicate(timeout=10)
+            print("---- runner log ----\n%s\n----" % sortie)
+            try:
+                print("row after: %r" % (registry.get(self.db, "perdu"),))
+            except Exception as exc:  # sonde jetable
+                print("row read failed: %s" % exc)
         # pas de mort par signal à l'arrêt (SIGABRT du fil `journal`, 2026-10-05)
         self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, sortie))
         self.assertNotIn("exiting immediately", sortie)
