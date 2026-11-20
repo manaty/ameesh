@@ -21,7 +21,9 @@ owner (UTC+8) sleeps, the French team is at work.
    remains valid; a malformed block is refused by `canon check` with a named
    defect. A broken Application card blocks no agent, like a Pipeline card.
 2. **Who is available is a transient read, never stored.** Signals, strongest
-   first: a live `attach:<account>` lease, a fresh interaction (ameesh journal
+   first: a live attach lease (local `attach:<account>`, or distant
+   `attach:<tenant>:<device>` recognised through the device credential's
+   human, #7869), a fresh interaction (ameesh journal
    first, Memoria second), Slack presence, then timezone and usual hours. Each
    signal has a freshness window; an absent or stale signal passes to the
    next, and a failing provider degrades to absence. A member without a
