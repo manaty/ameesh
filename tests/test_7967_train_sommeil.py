@@ -116,6 +116,36 @@ class ExpiredReservationTest(unittest.TestCase):
                 self.assertEqual(self.ports.document["phase"], "draining")
                 self.assertTrue(self.ports.held)
 
+    def test_a_terminal_suite_refusal_invalidates_at_once(self):
+        # mesh-design (20/11 20:39) : « un refus sur des runs terminés est une
+        # issue terminale ; l'échéance est le filet ». Le run est completed et
+        # sa suite requise ne prouve rien : aucun autre résultat n'arrivera.
+        self.make()
+        self.draining()
+        self.expire(9999.0)          # la réservation n'est pas la cause
+        self.ports.ci = mock.Mock(side_effect=train.SuiteRefused(
+            "required suite job missing, skipped or interrupted"))
+        result = self.engine.step(3601)
+        self.assertEqual(result["result"], "invalidated", result)
+        stored = self.ports.document
+        self.assertEqual(stored["phase"], "invalidated")
+        self.assertFalse(self.ports.held)
+        self.assertEqual(stored["diagnosis"]["stage"], "ci")
+        self.assertIn("required suite job", stored["error"])
+        self.assertNotIn("promote", [effect[0] for effect in self.ports.effects])
+
+    def test_a_ci_read_failure_is_not_a_terminal_refusal(self):
+        # Lecture impossible (API, réseau) : rien n'est prouvé, on attend.
+        self.make()
+        self.draining()
+        self.expire(9999.0)
+        self.ports.ci = mock.Mock(side_effect=train.TrainError(
+            "cannot read exact train CI evidence: api down"))
+        result = self.engine.step(3601)
+        self.assertEqual(result["result"], "refused", result)
+        self.assertEqual(self.ports.document["phase"], "draining")
+        self.assertTrue(self.ports.held)
+
     def test_publishing_and_promoting_are_left_to_the_pilot(self):
         # Un push ou un merge a pu partir : l'expiration ne conclut pas.
         self.assertNotIn("publishing", train.EXPIRABLE)

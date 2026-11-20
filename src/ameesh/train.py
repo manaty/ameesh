@@ -32,6 +32,16 @@ class TrainError(RuntimeError):
     """A missing proof or an uncertain effect: do not merge."""
 
 
+class SuiteRefused(TrainError):
+    """#7967 : la CI d'une tête a rendu un refus terminal.
+
+    Le run est `completed` (le lecteur ne lève jamais ceci sur un run encore
+    en cours ni sur une lecture impossible) mais sa suite requise manque, a
+    été annulée ou ne prouve pas son résultat. Attendre un autre résultat
+    retiendrait la cible pour rien : le plan est terminé sans promotion, et
+    la coupure due recompose."""
+
+
 class PrevalidationRed(TrainError):
     """La prévalidation de la composition a exécuté la sélection et un test a
     échoué : un résultat, pas une réponse perdue.
@@ -528,6 +538,13 @@ class Engine:
             raise TrainError("unknown persisted phase %s" % state["phase"])
         except TrainError as exc:
             if state is not None:
+                if isinstance(exc, SuiteRefused) and state.get("phase") in EXPIRABLE:
+                    # #7967 : un run terminé qui ne prouve pas sa suite requise
+                    # est un refus du contrat CI, pas une CI encore en cours.
+                    # Aucun résultat différent ne peut plus arriver pour cette
+                    # tête : terminer sans promotion (la coupure due repart)
+                    # au lieu d'attendre l'échéance de la réservation.
+                    return self._drained_terminal(state, str(exc), stage="ci")
                 # Keeping a failed promotion's intent makes uncertainty
                 # durable even if notifying the pilot fails.
                 if state.get("phase") != "promoting":
@@ -637,14 +654,15 @@ class Engine:
                 "phase %s, last error: %s; plan invalidated without promotion "
                 "(#7967)" % (at, state.get("phase"), error))
 
-    def _drained_terminal(self, state, why):
+    def _drained_terminal(self, state, why, *, stage="draining"):
         """#7885 : termine un plan en attente qui n'aura jamais de résultat.
 
         `invalidated` est terminal : le `finally` de `step` rend l'époque et
         la réservation. Le diagnostic persiste la raison et la notification
-        suit, comme pour un refus de publication. Aucune promotion."""
+        suit, comme pour un refus de publication. Aucune promotion.
+        `stage` nomme l'origine (#7967 : `ci` pour un refus de suite terminé)."""
         state["error"] = why
-        state["diagnosis"] = {"stage": "draining", "why": why}
+        state["diagnosis"] = {"stage": stage, "why": why}
         state["phase"] = "invalidated"
         state = self._save(state)
         self.ports.notify(why, state)
