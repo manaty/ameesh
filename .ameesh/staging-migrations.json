@@ -12,7 +12,7 @@
       "lot": 7566
     },
     "src/ameesh/migrations/0596_depenses_plafonds.sql": {
-      "checksum": "f16fb2a52387ab01734208d23beadbae18505c16425b8d8fdf99771d33f1298e",
+      "checksum": "52c8822f49657aeb07a945a92e9b40d20266d668ac76d08096deb94e5cafb9e3",
       "lot": 7865,
       "restore": "src/ameesh/migrations/rollback/0596_restore.sql",
       "rejects_previous_writes": false,

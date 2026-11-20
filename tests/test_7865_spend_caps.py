@@ -21,8 +21,9 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
-from ameesh import (actions, authority, db as db_mod, decisions, receipts,
-                    registry, role_timers, signing, spend, standing_policy, work)
+from ameesh import (actions, agent_rename, authority, db as db_mod, decisions,
+                    receipts, registry, role_timers, signing, spend,
+                    standing_policy, work)
 
 from .test_actions import ActionsBase, ALICE, POLICY
 from .test_receipts import standing
@@ -439,6 +440,42 @@ class SpendLedgerTest(ActionsBase):
         self.assertEqual(actions.recap(
             self.db, avatar=AGENT, since=now - 3600,
             until=now + 3600)["spending"]["total_daily"], 0)
+
+    def test_renommage_suit_le_decideur_du_ledger(self):
+        """#4299/#7865 : `agent:<nom>` suit le renommage (ligne existante et
+        écriture tardive), `human:` reste intact, et le relevé retrouve la
+        ressource sous le nouveau nom."""
+        registry.upsert(self.db, "alice-impl", harness="deepseek", host=self.cfg.host)
+        self.register(month=50, day=50, max_amount=50, horizon=24)
+        action = self.spend_action(amount=10, recurrence="daily")
+        self.bound(action)
+        self.launch(action)
+        self.assertEqual(self.db.query(
+            "SELECT decided_by FROM spend_ledger")[0]["decided_by"],
+            "agent:alice-impl")
+        renamed = agent_rename.rename(
+            self.cfg, self.db, "alice-impl", "alice-new",
+            reason="test #7865", actor=ALICE)
+        self.assertEqual(renamed["rewritten"].get("spend_ledger.decided_by"), 1)
+        self.assertEqual(self.db.query(
+            "SELECT decided_by FROM spend_ledger")[0]["decided_by"],
+            "agent:alice-new")
+        now = time.time()
+        spending = actions.recap(
+            self.db, avatar="alice-new", since=now - 3600,
+            until=now + 3600)["spending"]
+        self.assertEqual((len(spending["resources"]), spending["total_daily"]),
+                         (1, 10))
+        # écriture tardive sous l'ancien alias : le trigger la résout
+        self.db.execute("UPDATE spend_ledger SET decided_by = 'agent:alice-impl'")
+        self.assertEqual(self.db.query(
+            "SELECT decided_by FROM spend_ledger")[0]["decided_by"],
+            "agent:alice-new")
+        # `human:` n'est jamais réécrit
+        self.db.execute("UPDATE spend_ledger SET decided_by = 'human:alice'")
+        self.assertEqual(self.db.query(
+            "SELECT decided_by FROM spend_ledger")[0]["decided_by"],
+            "human:alice")
 
     # -- B1 : l'arrêt est une action du connecteur -------------------------
     def test_arret_est_une_action_liee_et_confirmee(self):

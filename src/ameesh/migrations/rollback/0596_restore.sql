@@ -8,6 +8,10 @@
 set local lock_timeout = '5s';
 
 drop trigger if exists spend_ledger_settle on action_attempts;
+drop trigger if exists ameesh_agent_spelling on spend_ledger;
+drop function if exists ameesh_rename_spend_agent_column(text, text, text, text);
+drop function if exists ameesh_spend_decided_spelling();
+drop function if exists ameesh_spend_agent_primary(text);
 drop function if exists ameesh_spend_settle_ledger();
 drop function if exists ameesh_spend_confirm(bigint, text, bigint, timestamptz);
 drop function if exists ameesh_spend_request_stop(bigint, text, text, date, text);

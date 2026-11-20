@@ -255,13 +255,53 @@ create index if not exists spend_ledger_grant_idx
     on spend_ledger (grant_id, state, started_on);
 create index if not exists spend_ledger_decided_idx
     on spend_ledger (decided_by, created_at desc);
--- #7865 (#4299) : `decided_by` désigne l'agent qui a décidé la dépense ; le
--- relevé (`spend.recap`) le lit sous le nouveau nom après un renommage. Les
--- autres acteurs du ledger restent des preuves datées (`agent_rename.KEPT`).
+-- #7865 (#4299) : `decided_by` porte la forme `agent:<nom>` (ou
+-- `human:<nom>`), comme `actions.proposed_by` ; le renommage ne réécrit que
+-- la première et résout l'ancien alias à l'écriture. Les autres acteurs du
+-- ledger restent des preuves datées (`agent_rename.KEPT`).
+create or replace function ameesh_spend_agent_primary(spelling text)
+returns text language plpgsql security invoker set search_path from current as $$
+declare
+    primary_name text;
+begin
+    if spelling is null or left(spelling, 6) <> 'agent:' then
+        return spelling;
+    end if;
+    primary_name := ameesh_agent_primary_locked(substr(spelling, 7));
+    if primary_name is null then
+        return spelling;
+    end if;
+    return 'agent:' || primary_name;
+end $$;
+
+create or replace function ameesh_spend_decided_spelling() returns trigger
+language plpgsql set search_path from current as $$
+begin
+    -- une valeur inchangée n'est pas une nouvelle écriture ; `human:` reste
+    -- intact (seul `agent:` est résolu).
+    if tg_op = 'UPDATE' and new.decided_by is not distinct from old.decided_by then
+        return new;
+    end if;
+    new.decided_by := ameesh_spend_agent_primary(new.decided_by);
+    return new;
+end $$;
+
+create or replace function ameesh_rename_spend_agent_column(tbl text, col text,
+                                                            old_name text, new_name text)
+returns bigint language plpgsql as $$
+declare moved bigint;
+begin
+    execute format('update %I set %I = %L || $2 where %I = %L || $1',
+                   tbl, col, 'agent:', col, 'agent:')
+        using old_name, new_name;
+    get diagnostics moved = row_count;
+    return moved;
+end $$;
+
 drop trigger if exists ameesh_agent_spelling on spend_ledger;
 create trigger ameesh_agent_spelling before insert or update of decided_by
 on spend_ledger for each row
-execute function ameesh_agent_spelling('decided_by');
+execute function ameesh_spend_decided_spelling('decided_by');
 -- #7865 (B3) : une action d'arrêt ne peut être liée qu'à UNE ressource ; une
 -- même action ne doit donc jamais arrêter comptablement plusieurs lignes.
 create unique index if not exists spend_ledger_stop_action_once

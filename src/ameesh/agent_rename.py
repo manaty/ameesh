@@ -151,6 +151,10 @@ KEPT = (
     "work_module_milestones.actor",
 ) + dev_tables.KEPT
 
+#: Colonnes dont la valeur est préfixée par le type d'acteur ; seul `agent:`
+#: suit le renommage, `human:` reste une preuve intacte (#7865).
+PREFIXED = {"spend_ledger.decided_by": "agent:"}
+
 
 class RenameError(ValueError):
     """Renaming refused; the text says why."""
@@ -168,8 +172,9 @@ def _uses(tx, column: str, name: str) -> int:
         # P1b #7650 : le nom physique d'une table `dev` est lu au registre.
         return storage.of(tx).agent_columns.uses(table, col, is_array, name)
     predicate = "%s = ANY(%s)" if is_array else "%s = %s"
+    value = PREFIXED.get(column, "") + name
     rows = tx.query("SELECT count(*) AS n FROM %s WHERE %s" % (
-        table, predicate % ("%s", col)), (name,))
+        table, predicate % ("%s", col)), (value,))
     return int(rows[0]["n"])
 
 
@@ -178,6 +183,11 @@ def _rewrite(tx, column: str, old: str, new: str) -> int:
     if table in dev_tables.TABLES:
         # P1b #7650 : la table n'est pas dans le schéma noyau après P2.
         return storage.of(tx).agent_columns.rewrite(table, col, is_array, old, new)
+    if column in PREFIXED:
+        rows = tx.query(
+            "SELECT ameesh_rename_spend_agent_column(%s, %s, %s, %s) AS n",
+            (table, col, old, new))
+        return int(rows[0]["n"])
     # Counted in SQL (0516): the psql driver's execute() reports no row count.
     rows = tx.query("SELECT ameesh_rename_agent_column(%s, %s, %s, %s, %s) AS n",
                     (table, col, is_array, old, new))
