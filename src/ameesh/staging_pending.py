@@ -439,7 +439,15 @@ def apply(cfg, db, project, *, now: float, actor=None) -> dict:
                            if r["lot"] in report["candidate_unblocks"]})
         report["staging"] = rc._staging_step(project, report["candidate"],
                                              included, cfg.state_dir, db=db)
-        report["result"] = "staged" if report["staging"].get("exit") == 0 else "failed"
+        # #7904: the elected executor hands a normal request to its queue
+        # (exit 75, then None in `_staging_step`). That is not a failure: the
+        # report names the request and the next tick reconciles its
+        # attestation. A real non-zero staging exit stays "failed".
+        if report["staging"].get("queued"):
+            report["result"] = "queued"
+        else:
+            report["result"] = ("staged"
+                                if report["staging"].get("exit") == 0 else "failed")
         return report
     finally:
         storage.of(db).work.land_unlock(key, owner, epoch)

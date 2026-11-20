@@ -1417,6 +1417,8 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
     ]
     remaining = _correction_room(required, eligible_families, correction)
     read = ["- read the diff **of this exact head** and check the edge cases;",
+            "- Read the lot's current freeze before reviewing: a re-freeze keeps your "
+            "pending seat without another mail; use its current head and delta.",
             "- do not announce an ok verdict by mail: record it through the milestone; "
             "send mail only for a blocked verdict, with its reason;"]
     if sql_migration:

@@ -654,15 +654,24 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
     never availability. A present workstation (rank 0) claims at once; the
     cloud waits one rank delay, and claims at once when the workstation is
     absent.
+
+    #7833: a `preference` avatar stopped by its runner's fast failures is not
+    a dead role for ever. After `avatar_failover.GRACE_S` the stopped host is
+    absent and the other declared hosts rank normally; before it, the
+    diagnostic says how long is left. A `manuel` stop (or any non-`erreur`
+    stop) stays stopped: no automatic failover.
     """
     now = pg.now_ts(db) if now is None else float(now)
-    from . import registry
+    from . import avatar_failover, registry
     role = registry.get(db, name)
     if role is None:
         raise ValueError("unknown agent: %s" % name)
     declared = list(role.get("candidats") or [])
     latest = pg.latest(db, name)
     placed = {row["host"]: row for row in pg.candidate_rows(db, name)}
+    stopped = role.get("status") == "stopped"
+    failover = avatar_failover.due(role, now)
+    grace_left = avatar_failover.left_s(role, now)
     out = []
     for host in sorted(set(declared) | set(latest)):
         row = latest.get(host) or {}
@@ -670,12 +679,18 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
         state = candidate_state(db, role, host, now=now, standing=row)
         admitted = candidate.get("placement_ok") is True
         declared_here = host in declared
-        stopped = role.get("status") == "stopped"
-        ready = bool(state["ready"] and admitted and declared_here and not stopped)
+        # Un arrêt automatique d'avatar ne ferme que l'hôte arrêté ; les
+        # autres candidats restent classables, à l'échéance de la grâce.
+        holds_here = stopped and (not failover or host == role.get("host"))
+        ready = bool(state["ready"] and admitted and declared_here and not holds_here)
         diagnostic = state["diagnostic"]
-        if stopped:
-            diagnostic = "; ".join(part for part in (diagnostic, "role stopped")
-                                   if part)
+        if holds_here:
+            if avatar_failover.stopped_by_runner(role) and avatar_failover.is_preference(role):
+                note = ("role stopped: failover in %ds" % (int(grace_left) + 1)
+                        if grace_left > 0 else "role stopped")
+            else:
+                note = "role stopped"
+            diagnostic = "; ".join(part for part in (diagnostic, note) if part)
         out.append({
             "host": host,
             "declared": declared_here,
@@ -1063,10 +1078,22 @@ def preference_return(db, role: Mapping, host: str, *, seen_since: float | None 
 
     The lease itself is never touched here: the move's `switch` releases it at
     the source's turn boundary, and the claim CAS stays the only arbiter.
+
+    #7833: a `preference` avatar stopped by its runner's fast failures is a
+    holder that will never renew again. Once `avatar_failover.GRACE_S` has
+    passed, the next present candidate (rank 0 among the ready hosts) plans
+    the recovery — the stopped host is not ready, so the cloud becomes rank 0.
+    Before the grace, `None`: the human can still fix the poste and resume.
     """
     if (role.get("releve") or "") != "preference":
         return None
-    if (role.get("mode") or "execute") != "execute" or role.get("status") == "stopped":
+    if (role.get("mode") or "execute") != "execute":
+        return None
+    from . import avatar_failover
+    now_ts = pg.now_ts(db)
+    stopped = role.get("status") == "stopped"
+    failover_due = bool(stopped and avatar_failover.due(role, now_ts))
+    if stopped and not failover_due:
         return None
     name = str(role.get("name") or "")
     holder = str(role.get("host") or "")
@@ -1099,9 +1126,15 @@ def preference_return(db, role: Mapping, host: str, *, seen_since: float | None 
         return {"state": "plan", "recovery": False, "holder": holder,
                 "dwell_s": elapsed, "delay_s": delay}
     # the holder is absent (no fresh presence) or its lease expired: the
-    # conversation is recovered at once, the short TTL bounding the wait
-    return {"state": "plan", "recovery": True, "holder": holder,
-            "dwell_s": 0.0, "delay_s": delay}
+    # conversation is recovered at once, the short TTL bounding the wait.
+    # #7833: a holder stopped by its runner (`erreur`) is a failover, not a
+    # preference return: the move carries `reason = 'failover'`, so B2 will
+    # not undo it by presence until a human action on the poste.
+    verdict = {"state": "plan", "recovery": True, "holder": holder,
+               "dwell_s": 0.0, "delay_s": delay}
+    if failover_due:
+        verdict["reason"] = "failover"
+    return verdict
 
 
 def _lease_live(db, role: Mapping) -> bool:

@@ -76,20 +76,28 @@ def elected_roles(db, host: str, *,
     `("election",)` — see `election_roles`.
     A stopped role is not elected: it is left out here, so no new standing is
     published until a human revives it (the lease, if any, still wears out).
+    #7833: the one exception is a `preference` avatar stopped by its runner's
+    fast failures — its *other* candidate hosts publish so that the failover
+    can be judged ready when the grace expires. The stopped host itself never
+    publishes (the SQL excludes it).
     """
+    from . import avatar_failover
     return db.query(
         """
         SELECT name, aliases, chantier, harness, host, cwd, status, status_text,
+               stop_reason, extract(epoch FROM status_since)::float8 AS status_since_ts,
                model, responsible, team, canon, canon_ref, releve, candidats,
                session_account, operator_paused, operator_pause_reason,
                budget_usd, spent_usd
           FROM agent_registry
          WHERE releve = ANY(%s)
            AND %s = ANY(candidats)
-           AND status <> 'stopped'
+           AND (status <> 'stopped'
+                OR """ + avatar_failover.stopped_sql("agent_registry",
+                                                     host_expr="%s") + """)
            AND mode = 'execute'
          ORDER BY name
-        """, (list(releves), host))
+        """, (list(releves), host, host))
 
 
 def election_roles(db, host: str) -> list[dict]:
