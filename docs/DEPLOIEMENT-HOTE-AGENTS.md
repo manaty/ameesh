@@ -353,8 +353,9 @@ n’est jamais compté non plus. Côté exécuteur, un courrier actif non remis
 depuis plus de `MAIL_OVERDUE_S` (300 s, sous la borne de 900 s de la sonde)
 ouvre son tour dès la fin du tour en cours : sans fenêtre de regroupement, et
 avant la suite après plafond, la consigne en attente et le réveil programmé
-(#7976). Une cadence `reveil` déclarée plus longue (#7632) fait le seuil, et un
-message en cours de remise (`deja_consigne`) n’ouvre pas ce tour. Ce tour écoule tout l’arriéré en retard dans le budget de la
+(#7976). Un agent à cadence `reveil` déclarée (#7632) garde sa règle (fenêtre
+depuis l’arrivée et depuis la fin du tour), et un message en cours de remise
+(`deja_consigne`) n’ouvre pas ce tour. Ce tour écoule tout l’arriéré en retard dans le budget de la
 consigne : un message en retard qui ne tient pas en entier est remis en
 aperçu (400 octets, texte intégral par `agent-mail show <id>`), plutôt que de
 coûter un tour par message lourd. Un agent en tours enchaînés ne laisse donc

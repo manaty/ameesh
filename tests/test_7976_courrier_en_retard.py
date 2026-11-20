@@ -117,18 +117,20 @@ class CourrierEnRetardTest(_Base):
 
 
 class CadenceReveilTest(_BaseReveil):
-    """Une cadence `reveil` déclarée (#7632) n'est jamais raccourcie : le
-    seuil de retard est sa fenêtre quand elle est plus longue."""
+    """Une cadence `reveil` déclarée (#7632) garde sa règle entière : le
+    retard ne la raccourcit pas (fenêtre comptée aussi depuis la fin du
+    tour)."""
 
-    def test_la_fenetre_declaree_fait_le_seuil(self):
+    def test_un_long_tour_ne_raccourcit_pas_la_fenetre(self):
         _runner, worker = self._worker("avatar-r", policy=AVATAR)
         mail.send(self.db, "dev1", "avatar-r", "le lot 12 est prêt")
-        self._vieillir("avatar-r", 600)
-        self.assertIsNone(worker.pick())  # fenêtre de 1800 s en cours
+        self._vieillir("avatar-r", AVATAR["fenetre_s"] + 1)  # né au début du tour
+        worker._turn_end_mono = time.monotonic()  # tour de 1800 s qui vient de finir
+        self.assertIsNone(worker.pick())
         worker.suite = "turn ceiling"
         self.assertEqual(worker.pick()["kind"], "suite")
-        self._vieillir("avatar-r", AVATAR["fenetre_s"] + 60)
-        worker.suite = "turn ceiling"
+        # fenêtre écoulée depuis la fin du tour : la règle #7632 l'ouvre
+        worker._turn_end_mono = time.monotonic() - AVATAR["fenetre_s"] - 1
         self.assertEqual(worker.pick()["kind"], "mail")
 
 

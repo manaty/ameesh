@@ -7794,29 +7794,24 @@ class AgentWorker(threading.Thread):
     #: actif non remis est en retard : il ouvre un tour tout de suite, sans
     #: fenêtre de regroupement (L125, C9, #3451, #7632), et passe avant la
     #: suite, la consigne en attente et le réveil programmé. Sous la borne de
-    #: la sonde staging (`sante-courrier.py --souffrance`, 900 s), jamais
-    #: élargie : un tour qui s'achève ne laisse plus en attente le courrier
-    #: arrivé pendant lui.
+    #: la sonde staging (`sante-courrier.py --souffrance`, 900 s ; cette
+    #: borne n'est pas élargie) : un tour qui s'achève ne laisse plus en
+    #: attente le courrier arrivé pendant lui. Hors cadence `reveil` déclarée
+    #: (#7632), qui garde sa propre règle.
     MAIL_OVERDUE_S = 300.0
 
-    def _overdue_seuil(self) -> float:
-        """#7976 : le seuil de retard de cet agent. Une cadence `reveil`
-        déclarée (#7632) n'est jamais raccourcie : sa fenêtre, si plus
-        longue, fait le seuil."""
-        seuil = float(self.MAIL_OVERDUE_S)
-        policy = reveil_mod.of(self.agent)
-        if seuil > 0 and policy is not None:
-            seuil = max(seuil, float(policy["fenetre_s"]))
-        return seuil
-
     def _mail_overdue(self, rows: list[dict]) -> bool:
-        """#7976 : un message actif de `rows` attend-il depuis au moins le
-        seuil (`_overdue_seuil`) ? Le courrier passif n'ouvre jamais de tour ;
-        un message en cours de remise (`deja_consigne` : réservation active ou
-        à expirer) non plus, comme pour la sonde : le réserver échouerait et
-        le tour, vide, retarderait la suite ou la consigne."""
-        seuil = self._overdue_seuil()
-        if seuil <= 0:
+        """#7976 : un message actif de `rows` attend-il depuis au moins
+        `MAIL_OVERDUE_S` ? Le courrier passif n'ouvre jamais de tour ; un
+        message en cours de remise (`deja_consigne` : réservation active ou à
+        expirer) non plus, comme pour la sonde : le réserver échouerait et le
+        tour, vide, retarderait la suite ou la consigne.
+
+        Une cadence `reveil` déclarée (#7632) garde sa règle entière (fenêtre
+        depuis l'arrivée ET depuis la fin du tour) : le retard ne la
+        raccourcit pas, il ne s'applique pas à elle."""
+        seuil = float(self.MAIL_OVERDUE_S)
+        if seuil <= 0 or reveil_mod.of(self.agent) is not None:
             return False
         now = time.time()
         return any(not mail.passive_reason(m) and not mail.maybe_redelivered(m)
@@ -7825,8 +7820,9 @@ class AgentWorker(threading.Thread):
 
     def _retard_avant(self) -> float | None:
         """#7976 : l'instant (epoch) avant lequel un message est en retard,
-        pour l'aperçu de `mail.prompt_for` ; None si le seuil est nul."""
-        seuil = self._overdue_seuil()
+        pour l'aperçu de `mail.prompt_for` dans un tour déjà ouvert ; None si
+        le seuil est nul."""
+        seuil = float(self.MAIL_OVERDUE_S)
         return time.time() - seuil if seuil > 0 else None
 
     def _reveil_due(self, policy: dict, rows: list[dict]) -> bool:
