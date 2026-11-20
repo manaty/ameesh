@@ -1954,13 +1954,19 @@ class Mailbox(Domain):
         """
 
     @abc.abstractmethod
-    def review_requests(self, recipient: str, lot: str) -> list[dict]:
+    def review_requests(self, recipient: str, lot: str, *,
+                        for_update: bool = False) -> list[dict]:
         """#2504 : les demandes de relecture (`kind = 'request'`) du
         destinataire liées à ce lot, du plus récent au plus ancien.
 
         Le filtre (destinataire, nature, lot) est fait DANS la requête : un
         `history` borne avant de filtrer, donc une demande ancienne du même lot
-        sortait de la fenêtre et une re-désignation renvoyait un doublon."""
+        sortait de la fenêtre et une re-désignation renvoyait un doublon.
+
+        `for_update` (#7891) exige une transaction ouverte et verrouille le
+        destinataire puis ses messages, comme leur réservation/remise. Le
+        regel peut décider atomiquement de remplacer une demande non lue ;
+        les messages sont alors verrouillés et rendus par id croissant."""
 
     @abc.abstractmethod
     def delivered_for_lot(self, recipient: str, lot: str, limit: int) -> list[dict]:

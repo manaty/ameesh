@@ -240,7 +240,9 @@ def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers
     if previous_freeze:
         # #7891: the current designation advances even without another mail.
         payload["previous_freeze"] = dict(previous_freeze)
-        payload["delta"] = {"base": str(previous_freeze.get("sha") or ""), "head": sha}
+        payload["changes_since_freeze"] = {
+            "base": str(previous_freeze.get("sha") or ""), "head": sha}
+        payload["review_range"] = {"base": base, "head": sha}
         payload["continued"] = list(continued)
     if base:
         # #6365 : le début du delta désigné ; la porte relit la même plage.
@@ -751,16 +753,33 @@ class PgPort:
                          for row in reviewers or ()}
         current_names.update(row.get("to") for row in messages if row.get("manual"))
         continued = sorted((previous_names & current_names) - reviewed_names - {""})
-        messages = [row for row in messages
-                    if not (row.get("kind") == REQUEST_KIND
-                            and row.get("to") in continued)]
         threads = self.after_commit if self.after_commit is not None else []
         deposited = []
         for row in messages:
             recipient = str(row.get("to") or "").strip()
+            if str(row.get("kind") or "") == REQUEST_KIND:
+                if recipient in continued:
+                    # B/P2 #228297: an unseen request must advance to this
+                    # head via #6641's in-place replacement. Hold the same
+                    # recipient/message locks as delivery until mail.send
+                    # replaces it, so a concurrent reservation cannot turn
+                    # that replacement into a second request.
+                    requests = storage.of(db).mailbox.review_requests(
+                        recipient, str(lot), for_update=True)
+                    replaceable = any(
+                        not request.get("delivered_ts")
+                        and not request.get("deja_consigne")
+                        and not request.get("signature")
+                        and ((request.get("sender") == self.sender
+                              and "review_designation" in (request.get("payload") or {}))
+                             or "review_request" in (request.get("payload") or {}))
+                        for request in requests)
+                    if not replaceable:
+                        continue
+                else:
+                    requests = mail.review_requests(db, recipient, lot)
             if (str(row.get("kind") or "") == REQUEST_KIND
-                    and covering_request(mail.review_requests(db, recipient, lot),
-                                         lot=lot, reviewer=recipient, sha=sha)):
+                    and covering_request(requests, lot=lot, reviewer=recipient, sha=sha)):
                 # #2495/#2504 : this reviewer already holds a request for this
                 # head (or an unread one naming none): the designation is
                 # written, no second mail. The requests are selected per lot in

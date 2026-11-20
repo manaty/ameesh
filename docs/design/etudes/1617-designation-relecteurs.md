@@ -58,7 +58,11 @@ read and returns a decision:
   while they remain available and independent (#7442). At re-freeze (#7891),
   the current designation advances to the new freeze, SHA and delta without
   another mail to a seat whose opinion is still pending, even if its request
-  was already displayed. A verdict not carried needs one delta request; a
+  was already displayed. An unread, unreserved request is updated in place
+  to name the current head, keeping its identity and queue age (#6641).
+  Displayed or reserved requests stay intact. The recipient and mailbox rows
+  are locked through replacement to serialize with delivery/reservation.
+  A verdict not carried needs one delta request; a
   changed seat gets its first request. Reviewers read the lot's current freeze
   before reviewing. An unknown author family still designates nobody.
 - **mails**: each reviewer receives the lot, the `frozen` milestone and the

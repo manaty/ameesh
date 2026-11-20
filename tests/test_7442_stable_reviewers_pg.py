@@ -2,6 +2,8 @@
 """#7442: previous seats and review context from the real milestone journal."""
 from __future__ import annotations
 
+from unittest import mock
+
 from ameesh import mail, registry, storage, work
 from ameesh import review_designation as rd
 from ameesh import review_designation_activation as activation
@@ -83,7 +85,7 @@ class StableJournalTest(PgTestCase):
         self.assertEqual([r['recipient'] for r in rows], ['old'])
         mark = pg.PgPort(self.db).recorded(self.lot, current['id'])
         self.assertEqual(mark['freeze']['sha'], B)
-        self.assertEqual(mark['delta'], {'base': A, 'head': B})
+        self.assertEqual(mark['changes_since_freeze'], {'base': A, 'head': B})
         self.assertEqual(mark['continued'], ['old'])
 
     def messages(self):
@@ -103,16 +105,57 @@ class StableJournalTest(PgTestCase):
             self.assertEqual(mark['reviewers'], [{'name': 'old', 'family': 'claude'}])
             self.assertEqual(mark['continued'], ['old'])
             self.assertEqual(mark['sent'], [])
-            self.assertEqual(mark['delta']['head'], sha)
+            self.assertEqual(mark['changes_since_freeze']['head'], sha)
 
     def test_unread_request_does_not_trigger_another_mail(self):
         self.first_review()
         message = self.messages()[0]
         self.db.execute("UPDATE agent_mailbox SET delivered_at = NULL, status = 'pending'"
                         " WHERE id = %s", (message['id'],))
-        self.freeze(B)
+        age = storage.of(self.db).mailbox.get(message['id'])['created_ts']
+        current = self.freeze(B)
         self.apply(B, [rd.Candidate('old', 'claude')])
-        self.assertEqual(self.messages(), [message])
+        rows = self.messages()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['id'], message['id'])
+        self.assertIn('--sha ' + B, rows[0]['body'])
+        self.assertIn('git diff %s..%s' % ('c' * 12, B[:12]), rows[0]['body'])
+        stored = storage.of(self.db).mailbox.get(message['id'])
+        self.assertEqual(stored['payload']['review_designation']['sha'], B)
+        self.assertEqual(stored['created_ts'], age)
+        mark = pg.PgPort(self.db).recorded(self.lot, current['id'])
+        self.assertEqual(mark['review_range'], {'base': 'c' * 40, 'head': B})
+
+    def test_delivery_cannot_race_between_unread_check_and_replacement(self):
+        self.first_review()
+        message = self.messages()[0]
+        self.db.execute("UPDATE agent_mailbox SET delivered_at = NULL, status = 'pending'"
+                        " WHERE id = %s", (message['id'],))
+        self.freeze(B)
+        other = self.connect()
+        self.addCleanup(other.close)
+        send = mail.send
+        checked = []
+
+        def competing_reservation(*args, **kwargs):
+            # Called after the continuation check but before #6641 replaces
+            # the row: a second connection must not display head A here.
+            with self.assertRaisesRegex(Exception, 'lock timeout'):
+                with other.transaction() as tx:
+                    tx.execute("SET LOCAL lock_timeout = '1s'")
+                    storage.of(tx).mailbox.reserve('old', None, None, 'token',
+                        ids=[message['id']], porteur='test', ttl_seconds=60)
+            checked.append(True)
+            return send(*args, **kwargs)
+
+        with mock.patch.object(mail, 'send', side_effect=competing_reservation):
+            self.apply(B, [rd.Candidate('old', 'claude')])
+        self.assertEqual(checked, [True])
+        shown = storage.of(other).mailbox.reserve('old', None, None, 'token',
+            ids=[message['id']], porteur='test', ttl_seconds=60)
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(shown[0]['payload']['review_designation']['sha'], B)
+        self.assertEqual(len(self.messages()), 1)
 
     def test_reserved_request_does_not_trigger_another_mail(self):
         self.first_review()
