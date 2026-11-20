@@ -7083,6 +7083,16 @@ class AgentWorker(threading.Thread):
             # système vérifié) passe avant la suite et la consigne en attente.
             self.nudged = False
             return self._courrier_spec("urgent", autorises)
+        if messages and self._mail_overdue(messages):
+            # #7976 : un courrier actif en retard passe avant la suite après
+            # plafond, la consigne en attente et le réveil programmé. Sans ce
+            # rang, un agent en tours enchaînés (dsh : rien d'ordinaire au
+            # hook en cours de tour, L514) le laissait 1 h 40 derrière eux.
+            spec = self._mail_spec(messages)
+            if spec is not None:
+                self.nudged = False
+                self._reprise_attach = False
+                return spec
         if self.suite:
             lot = self.turn_lot({"kind": "suite", "prompt": "", "ids": []})
             if not self._lot_workdir_blocked(lot):
@@ -7734,6 +7744,9 @@ class AgentWorker(threading.Thread):
         * passifs (accusé, copie, diffusion à tous : `mail.passive_reason`) :
           jamais dus ; lus au tour suivant, ou par le hook pendant un tour.
 
+        #7976 : un message actif en retard (`_mail_overdue`) est dû tout de
+        suite, quelle que soit la fenêtre.
+
         #7632 : une fiche qui déclare `reveil` remplace les deux premières
         règles par la sienne (`_reveil_due`) : ses natures immédiates ouvrent
         un tour tout de suite, le reste (événements compris) attend la fin de
@@ -7769,13 +7782,33 @@ class AgentWorker(threading.Thread):
             # L81 (étude §6.3) : tant qu'un message humain attend, l'entretien
             # d'une session résidente lui laisse la place (fenêtre de calme).
             self._dernier_humain = time.monotonic()
-        if not mail_due and not events_due:
+        if not mail_due and not events_due and not self._mail_overdue(active):
             return None  # regroupement en cours, ou rien que du courrier passif
         if events:
             registry.mark_event_wake(self.db, self.name)
         rows = active + passive
         return self._courrier_spec(
             "event" if all(mail.is_event(m) for m in rows) else "mail", rows)
+
+    #: #7976 : âge (création, horloge de la base) au-delà duquel un courrier
+    #: actif non remis est en retard : il ouvre un tour tout de suite, sans
+    #: fenêtre de regroupement (L125, C9, #3451, #7632), et passe avant la
+    #: suite, la consigne en attente et le réveil programmé. Sous la borne de
+    #: la sonde staging (`sante-courrier.py --souffrance`, 900 s), jamais
+    #: élargie : un tour qui s'achève ne laisse plus en attente le courrier
+    #: arrivé pendant lui.
+    MAIL_OVERDUE_S = 300.0
+
+    def _mail_overdue(self, rows: list[dict]) -> bool:
+        """#7976 : un message actif de `rows` attend-il depuis au moins
+        `MAIL_OVERDUE_S` ? Le courrier passif n'ouvre jamais de tour."""
+        seuil = float(self.MAIL_OVERDUE_S)
+        if seuil <= 0:
+            return False
+        now = time.time()
+        return any(not mail.passive_reason(m)
+                   and now - float(m.get("created_ts") or now) >= seuil
+                   for m in rows)
 
     def _reveil_due(self, policy: dict, rows: list[dict]) -> bool:
         """#7632 : le courrier actif en attente ouvre-t-il un tour sous la

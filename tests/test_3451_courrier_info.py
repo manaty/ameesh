@@ -43,7 +43,8 @@ class FenetreDepuisLaFinDuTourTest(_Base):
     def test_un_message_ancien_attend_la_fenetre_apres_le_tour(self):
         _runner, worker = self._worker("orch-f")
         mail.send(self.db, "dev1", "orch-f", "le lot 12 est prêt")
-        self._vieillir("orch-f", 3600)  # arrivé pendant un long tour
+        # arrivé pendant le tour, sous le seuil de retard (#7976)
+        self._vieillir("orch-f", 200)
         worker._turn_end_mono = time.monotonic() - 5  # tour fini il y a 5 s
         self.assertIsNone(worker.pick())
         worker._turn_end_mono = time.monotonic() - 61

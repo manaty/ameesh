@@ -348,6 +348,13 @@ nomme les personas occupées ou en pause ; le délai de 300 s ne s’applique qu
 une remise partie vers une persona libre, et exige toujours la réponse outil et
 la fin propre du tour (#2190). Le courrier actif en attente chez une persona
 en pause n’est pas compté comme bloqué : son tour est refusé par construction.
+Un message en cours de remise (réservé pour un tour ouvert, `deja_consigne`)
+n’est jamais compté non plus. Côté exécuteur, un courrier actif non remis
+depuis plus de `MAIL_OVERDUE_S` (300 s, sous la borne de 900 s de la sonde)
+ouvre son tour dès la fin du tour en cours : sans fenêtre de regroupement, et
+avant la suite après plafond, la consigne en attente et le réveil programmé
+(#7976). Un agent en tours enchaînés ne laisse donc plus son courrier en
+souffrance ; la borne de la sonde n’est pas élargie.
 Le courrier actif d’une persona **opérationnelle sans bail vivant** n’est pas
 une souffrance de la chaîne : aucun exécuteur ne peut ouvrir son tour. Il est
 néanmoins un KO, dans `sans_executeur`, parce qu’un courrier opérationnel doit
