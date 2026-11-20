@@ -70,10 +70,11 @@ class _AvatarCase(_RoleCase):
             " - interval '1 hour' WHERE name = 'pilote' AND host = %s",
             (self.POSTE,))
 
-    def runner(self) -> SimpleNamespace:
+    def runner(self, host: str | None = None) -> SimpleNamespace:
         from ameesh.runner import Runner
         runner = SimpleNamespace(
-            db=self.db, host=self.CLOUD, runner_id="runner-cloud",
+            db=self.db, host=host or self.CLOUD,
+            runner_id="runner-%s" % (host or "cloud"),
             dry_run=False, mediated=False, agents_filter=None,
             clock=SimpleNamespace(monotonic=time.monotonic),
             _preference_next=0.0, _preference_seen_since={},
@@ -89,6 +90,43 @@ class _AvatarCase(_RoleCase):
     def poste_item(self) -> dict:
         return next(item for item in election.candidacy(self.db, "pilote")
                     if item["host"] == self.POSTE)
+
+    def failover_to_cloud(self) -> None:
+        """Le chemin #7833 : le poste s'arrête, la grâce passe, le cloud prend."""
+        self.stale_poste()
+        self.stop(age_s=avatar_failover.GRACE_S + 1.0)
+        self.assertEqual(self.runner().preference_return_pass(), ["pilote"])
+        steps = M.advance(self.db, self.CLOUD, probes=ready,
+                          cwd_for=lambda _move: "/work/cloud")
+        self.assertEqual([step for _ident, step in steps],
+                         ["prepared", "switched"])
+        lease = registry.claim(self.db, "pilote", "runner-cloud", 120,
+                               host=self.CLOUD)
+        self.assertIsNotNone(lease)
+        # le premier tour cloud a eu lieu : la tentative de bascule n'est plus
+        # ouverte, `switched_at` garde la trace de l'arrivée.
+        self.db.execute(
+            "UPDATE conversation_moves SET state = 'failed',"
+            " failed_at = clock_timestamp(), error = 'test: turn served'"
+            " WHERE agent = 'pilote'")
+
+    def cloud_dies(self, *, lease: bool = True, standing: bool = True) -> None:
+        """L'hôte cloud meurt : bail expiré (ou plus de bail), ligne non stopped."""
+        if lease:
+            self.db.execute(
+                "UPDATE agent_registry SET status = 'running',"
+                " lease_owner = 'runner-cloud', lease_expires_at ="
+                " clock_timestamp() - interval '5 seconds'"
+                " WHERE name = 'pilote'")
+        else:
+            self.db.execute(
+                "UPDATE agent_registry SET status = 'idle', lease_owner = NULL,"
+                " lease_expires_at = NULL WHERE name = 'pilote'")
+        if standing:
+            self.db.execute(
+                "UPDATE role_standings SET evaluated_at = clock_timestamp()"
+                " - interval '1 hour' WHERE name = 'pilote' AND host = %s",
+                (self.CLOUD,))
 
 
 class GraceTest(_AvatarCase):
@@ -232,6 +270,116 @@ class RecoveryTest(_AvatarCase):
         row = self.row()
         self.assertEqual((row["host"], row["status"], row["stop_reason"]),
                          (self.CLOUD, "stopped", "manuel"))
+
+
+class DeadHostTest(_AvatarCase):
+    """#7900 : la retenue de bascule ne vaut que sur un hôte cloud vivant."""
+
+    THIRD = "troisieme"
+
+    def test_an_expired_cloud_lease_releases_the_avatar_to_the_poste(self):
+        # Le bail expire (signature `dead_runner`, ligne non `stopped`) alors
+        # que le standing du cloud est encore frais : le bail expiré suffit à
+        # déclarer l'hôte mort et à libérer l'avatar.
+        self.failover_to_cloud()
+        self.cloud_dies(standing=False)
+        self.standing("pilote", self.POSTE, 10.0)
+        verdict = election.preference_return(
+            self.db, self.row(), self.POSTE,
+            seen_since=time.monotonic() - election.PREFERENCE_DWELL_S - 1.0)
+        self.assertEqual((verdict["state"], verdict["recovery"]), ("plan", True))
+        move = M.plan(self.db, "pilote", self.POSTE, requested_by="test",
+                      reason="preference")
+        self.assertIsNotNone(move)
+        self.assertEqual(move["reason"], "preference")
+        steps = M.advance(self.db, self.POSTE, probes=ready,
+                          cwd_for=lambda _move: "/work/poste")
+        self.assertEqual([step for _ident, step in steps],
+                         ["prepared", "recovered"])
+        row = self.row()
+        self.assertEqual((row["host"], row["status"], row["lease_owner"]),
+                         (self.POSTE, "idle", None))
+        self.assertIsNotNone(registry.claim(
+            self.db, "pilote", "runner-poste", 120, host=self.POSTE))
+
+    def test_a_silent_cloud_host_releases_the_avatar(self):
+        # Entre deux tours, sans bail : seul le standing prouve la vie. Muet,
+        # l'hôte est mort et ne retient plus l'avatar.
+        self.failover_to_cloud()
+        self.cloud_dies(lease=False)
+        self.standing("pilote", self.POSTE, 10.0)
+        verdict = election.preference_return(self.db, self.row(), self.POSTE)
+        self.assertEqual((verdict["state"], verdict["recovery"]), ("plan", True))
+        move = M.plan(self.db, "pilote", self.POSTE, requested_by="test",
+                      reason="preference")
+        self.assertIsNotNone(move)
+        steps = M.advance(self.db, self.POSTE, probes=ready,
+                          cwd_for=lambda _move: "/work/poste")
+        self.assertEqual([step for _ident, step in steps],
+                         ["prepared", "switched"])
+        self.assertEqual(self.row()["host"], self.POSTE)
+        self.assertIsNotNone(registry.claim(
+            self.db, "pilote", "runner-poste", 120, host=self.POSTE))
+
+    def test_the_poste_runner_plans_the_return_from_a_dead_cloud(self):
+        # Le chemin réel : la passe B2 du poste planifie elle-même la reprise
+        # quand le cloud est mort (bail expiré), sans attendre un agent move.
+        self.failover_to_cloud()
+        self.cloud_dies(standing=False)
+        self.standing("pilote", self.POSTE, 10.0)
+        self.assertEqual(self.runner(self.POSTE).preference_return_pass(),
+                         ["pilote"])
+        move = storage.of(self.db).conversation_moves.open_for("pilote") or {}
+        self.assertEqual((move.get("state"), move.get("target_host"),
+                          move.get("reason")),
+                         ("planned", self.POSTE, "preference"))
+
+    def test_a_living_cloud_keeps_the_avatar(self):
+        # Cloud vivant et au repos (pas de bail, standing frais) : la retenue
+        # #7833 tient, pas de ping-pong poste ↔ cloud.
+        self.failover_to_cloud()
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'idle', lease_owner = NULL,"
+            " lease_expires_at = NULL WHERE name = 'pilote'")
+        self.standing("pilote", self.CLOUD, 10.0)
+        self.standing("pilote", self.POSTE, 10.0)
+        verdict = election.preference_return(
+            self.db, self.row(), self.POSTE,
+            seen_since=time.monotonic() - election.PREFERENCE_DWELL_S - 1.0)
+        self.assertEqual((verdict["state"], verdict["recovery"]), ("plan", True))
+        self.assertIsNone(M.plan(
+            self.db, "pilote", self.POSTE, requested_by="test",
+            reason="preference"))
+
+    def test_another_eligible_host_takes_the_avatar(self):
+        # Le cloud meurt, le poste est muet aussi : le troisième hôte éligible
+        # est rang 0 et prend l'avatar ; la retenue ne le bloque plus.
+        hosts = (self.POSTE, self.CLOUD, self.THIRD)
+        self.db.execute(
+            "UPDATE agent_registry SET candidats = %s::text[],"
+            " admitted_hosts = %s::text[] WHERE name = 'pilote'",
+            ("{%s}" % ",".join(hosts), "{%s}" % ",".join(hosts)))
+        self.ready_host("pilote", self.THIRD)
+        self.standing("pilote", self.THIRD, 10.0)
+        self.db.execute(
+            "UPDATE agent_candidates SET preference_rank = 2"
+            " WHERE name = 'pilote' AND host = %s", (self.THIRD,))
+        self.failover_to_cloud()
+        self.cloud_dies()
+        self.db.execute(
+            "UPDATE role_standings SET evaluated_at = clock_timestamp()"
+            " - interval '1 hour' WHERE name = 'pilote' AND host = %s",
+            (self.POSTE,))
+        verdict = election.preference_return(self.db, self.row(), self.THIRD)
+        self.assertEqual((verdict["state"], verdict["recovery"]), ("plan", True))
+        move = M.plan(self.db, "pilote", self.THIRD, requested_by="test",
+                      reason="preference")
+        self.assertIsNotNone(move)
+        steps = M.advance(self.db, self.THIRD, probes=ready,
+                          cwd_for=lambda _move: "/work/troisieme")
+        self.assertEqual([step for _ident, step in steps],
+                         ["prepared", "recovered"])
+        self.assertEqual(self.row()["host"], self.THIRD)
 
 
 class AlertTest(_AvatarCase):

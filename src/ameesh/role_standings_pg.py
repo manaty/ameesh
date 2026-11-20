@@ -242,6 +242,51 @@ def sample_interval_s(db, host: str, *, now: float | None = None,
     return None if median is None else float(median)
 
 
+def freshness_s(db, host: str, *, now: float | None = None,
+                fallback_interval_s: float | None = None) -> float:
+    """The staleness threshold of `host`: `max(180 s, 3 × its cadence)`.
+
+    The cadence is measured from the host's own readings (`sample_interval_s`),
+    so a host that samples every ten minutes is not declared stale after one
+    missed minute. `fallback_interval_s` is the configured interval of a local
+    publisher, used before its first history exists. Same threshold as L232e
+    (`host_lifecycle.staleness_s`), never a fixed 300 s.
+
+    #7900: moved here from `election` so a storage reader (the failover
+    retention of `conversation_moves.plan`) judges freshness with the same
+    rule, on its own transaction.
+    """
+    from . import host_lifecycle
+    now = now_ts(db) if now is None else float(now)
+    interval = sample_interval_s(db, host, now=now)
+    if interval is None:
+        interval = fallback_interval_s
+    return host_lifecycle.staleness_s(interval)
+
+
+def fresh_standing(db, name: str, host: str, *,
+                   now: float | None = None) -> bool:
+    """#7900: does `host` still publish a fresh standing for `name`?
+
+    A live host publishes its standing on every runner pass; a dead host
+    stops, and its last row ages past the host's own freshness threshold. An
+    absent or future-dated standing is not proof of life (fail closed). The
+    row and the clock are read in one statement, so a standing published
+    meanwhile cannot look future-dated.
+    """
+    rows = db.query(
+        """SELECT extract(epoch FROM max(evaluated_at))::float8 AS evaluated_ts,
+                  extract(epoch FROM clock_timestamp())::float8 AS now_ts
+             FROM role_standings WHERE name = %s AND host = %s""",
+        (name, host))
+    row = rows[0] if rows else {}
+    if row.get("evaluated_ts") is None:
+        return False
+    now = float(row.get("now_ts") or 0.0) if now is None else float(now)
+    age = now - float(row["evaluated_ts"])
+    return 0.0 <= age <= freshness_s(db, host, now=now)
+
+
 def record(db, name: str, host: str, *, availability: float, capacity: float,
            score: float, ready: bool, diagnostic: str,
            notify_ok: bool = False, notify_diagnostic: str = "") -> None:
