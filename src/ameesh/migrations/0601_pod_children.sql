@@ -83,6 +83,7 @@ create table if not exists pod_requests (
     error             text,
     unique (child),
     unique (host),
+    unique (credential_secret),
     constraint pod_requests_state_valid
         check (state in ('requested', 'claimed', 'running', 'cancelled',
                          'failed', 'expired', 'deleted')),
@@ -135,11 +136,12 @@ comment on column runner_presence.pod_uid is
     '#7697: Kubernetes metadata.uid observed by a child-pod runner; the claim guard requires it to equal pod_hosts.pod_uid.';
 
 -- La garde de réclamation d'un hôte pod enfant : en plus de la garde
--- multi-tenant de 0575, il faut une ligne `pod_hosts` vivante et le UID du
--- pod observé par le runner (`runner_presence.pod_uid`). Un pod disparu, une
--- ligne expirée, un pod recréé (UID neuf) ou un runner qui ne bat pas
--- ferment la réclamation. Un hôte sans ligne `pod_hosts` garde exactement le
--- comportement de 0575.
+-- multi-tenant de 0575, il faut une ligne `pod_hosts` vivante, le UID du pod
+-- observé par le runner (`runner_presence.pod_uid`) et un battement frais
+-- (N(c) du verdict auditeur : 120 s, soit deux battements au rythme par
+-- défaut de 60 s). Un pod disparu, une ligne expirée, un pod recréé (UID
+-- neuf), un runner muet ou un runner qui ne bat pas ferment la réclamation.
+-- Un hôte sans ligne `pod_hosts` garde exactement le comportement de 0575.
 create or replace function ameesh_tenant_claim_ok(h text, claimer text, responsible text)
 returns boolean language sql stable as $$
     select (not ameesh_host_shared(h)
@@ -166,8 +168,9 @@ returns boolean language sql stable as $$
                    and p.state = 'running'
                    and p.expires_at > now()
                    and p.tenant = responsible
-                   and p.runner_id = claimer))
+                   and p.runner_id = claimer
+                   and rp.seen_at > now() - interval '120 seconds'))
 $$;
 
 comment on function ameesh_tenant_claim_ok(text, text, text) is
-    '#7106/#7697: shared-host claim guard, plus a live pod_hosts row whose pod_uid matches the runner heartbeat for child pods.';
+    '#7106/#7697: shared-host claim guard, plus a live pod_hosts row whose pod_uid matches a fresh (120 s) runner heartbeat for child pods.';

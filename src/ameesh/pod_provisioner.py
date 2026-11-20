@@ -415,10 +415,24 @@ class PodTemplate:
         now = time.time() if now is None else float(now)
         plan = tenancy.child_plan(
             request["host"], request["child"], request["tenant"],
-            parent=request["parent"], harness=request["harness"],
-            uid=request["uid"], image=image)
+            parent=request["parent"], harness=request["harness"], image=image)
         pod_name = pod_name_for(request["id"])
         configmap = configmap_name_for(request["id"])
+        # N(a) du verdict Codex : la demande ne fait pas foi sur le nom du
+        # Secret ni sur l'identité enfant ; ils sont recalculés et comparés.
+        if request.get("credential_secret") != tenancy.child_credential_secret(
+                request["child"]):
+            raise ProvisionerError(
+                "request-mismatch",
+                "pod request for %s names a credential Secret that is not its own"
+                % request["child"])
+        if int(request["uid"]) != plan["uid"] or request.get(
+                "unix_user") != plan["unix_user"] or request.get(
+                "runner_id") != plan["runner_id"]:
+            raise ProvisionerError(
+                "request-mismatch",
+                "pod request for %s has a UID/user/runner that does not match its "
+                "child plan" % request["child"])
         left = max(0.0, float(request["expires_ts"]) - now)
         deadline = min(MAX_DEADLINE_S, max(60, int(math.ceil(left)) + DEADLINE_GRACE_S))
         mapping = {
@@ -426,7 +440,10 @@ class PodTemplate:
             "NAMESPACE": namespace,
             "HOST": request["host"],
             "PARENT": request["parent"],
-            "CHILD": request["child"],
+            # Le label `ameesh.dev/child` est la forme DNS dérivée du nom brut :
+            # une valeur libre (`Enfant.1`) n'est pas un label Kubernetes, et
+            # c'est ce label que la VAP recoupe avec le nom du Secret.
+            "CHILD": tenancy.child_slug(request["child"]),
             "TENANT": request["tenant"],
             "TEMPLATE": request["template"],
             "REQUEST_ID": str(request["id"]),
@@ -458,7 +475,7 @@ class PodTemplate:
             "ameesh.dev/managed-by": "ameesh-pod-provisioner",
             "ameesh.dev/host": request["host"],
             "ameesh.dev/parent": request["parent"],
-            "ameesh.dev/child": request["child"],
+            "ameesh.dev/child": mapping["CHILD"],
             "ameesh.dev/template": request["template"],
         })
         annotations = pod["metadata"].setdefault("annotations", {})
@@ -469,6 +486,9 @@ class PodTemplate:
             # `human:<id>` porte un `:` interdit dans une valeur de label ;
             # l'annotation garde l'identité lisible sans casser le pod.
             "ameesh.dev/tenant": request["tenant"],
+            # Nom brut de l'enfant, pour l'opérateur ; le label et le Secret
+            # sont, eux, dérivés de la même forme DNS.
+            "ameesh.dev/child-name": request["child"],
             "ameesh.dev/credential-secret": request["credential_secret"],
             "ameesh.dev/configmap": configmap,
         })
@@ -513,9 +533,44 @@ class PodTemplate:
                     "rendered label %r has an invalid Kubernetes value" % (key,))
         if (pod.get("metadata") or {}).get("name") != mapping["POD_NAME"]:
             raise ProvisionerError("template-invalid", "rendered pod has the wrong name")
+        # B3 (#7697) : la VAP lie l'image au paramètre figé et le Secret au
+        # label enfant. Le pourvoyeur vérifie la même forme sur ce qu'il rend,
+        # pour qu'un template modifié échoue ici avant d'atteindre l'API.
+        child_label = labels.get("ameesh.dev/child")
+        if child_label != tenancy.child_slug(request["child"]):
+            raise ProvisionerError(
+                "template-invalid",
+                "rendered pod child label is not the child's DNS form")
+        expected_secret = "ameesh-child-" + str(child_label)
+        annotations = (pod.get("metadata") or {}).get("annotations") or {}
+        if annotations.get("ameesh.dev/credential-secret") != expected_secret:
+            raise ProvisionerError(
+                "template-invalid",
+                "rendered pod credential annotation is not derived from its child label")
+        for container in (pod.get("spec") or {}).get("containers") or []:
+            if container.get("image") != mapping["IMAGE"]:
+                raise ProvisionerError(
+                    "template-invalid",
+                    "container %s does not use the provisioner's frozen image"
+                    % container.get("name"))
+            for entry in container.get("env") or []:
+                ref = ((entry.get("valueFrom") or {}).get("secretKeyRef") or {})
+                if not ref:
+                    continue
+                name, key = ref.get("name"), ref.get("key")
+                if name == DB_CREDENTIAL_SECRET and key == "password":
+                    continue
+                if (container.get("name") == "child"
+                        and name == expected_secret and key == "api-key"):
+                    continue
+                raise ProvisionerError(
+                    "template-invalid",
+                    "container %s reads a Secret that is not the database "
+                    "password or its own child credential" % container.get("name"))
         volumes = (pod.get("spec") or {}).get("volumes") or []
         for volume in volumes:
-            if "hostPath" in volume or "persistentVolumeClaim" in volume:
+            if ("hostPath" in volume or "persistentVolumeClaim" in volume
+                    or "secret" in volume):
                 raise ProvisionerError("template-invalid",
                                        "rendered pod mounts a forbidden volume")
 
@@ -787,7 +842,10 @@ class Provisioner:
                         "pod-owner-mismatch: refusing to delete a pod of another parent")
                     continue
                 self.client.delete_pod(pod_name)
-            self.client.delete_configmap(configmap_name_for(request["id"]))
+            # N(b) du verdict auditeur : la ConfigMap n'est supprimée que si
+            # elle porte le `request-id` de CETTE demande (même garde que le
+            # chemin d'échec), jamais sur le seul nom dérivé de l'UUID.
+            self._delete_configmap(configmap_name_for(request["id"]), request)
             expired = (request.get("state") == "expired"
                        or float(request.get("expires_ts") or 0) <= time.time())
             requests.cleanup(request["host"])

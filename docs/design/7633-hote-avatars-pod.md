@@ -1049,6 +1049,13 @@ agents différents ; P5 dépend des deux.
   trois décisions distinctes, aucune ne se déduit du lot.
 - **Pourvoyeur** : un RBAC trop large (secrets, exec) recréerait la
   compromission du cluster ; le template et l'admission sont la garde.
+- **Secret d'API par enfant** : le nom est dérivé du label
+  `ameesh.dev/child` (`ameesh-child-<label>`) et ne dépend pas du tenant.
+  Un SA pourvoyeur entièrement compromis peut choisir ce label et donc le
+  Secret d'un autre enfant ; la VAP statique ne peut pas recouper
+  `pod_requests`. Fermeture complète : webhook d'admission (tranche
+  suivante). Avec le DSN partagé (limite L155), une écriture en base reste
+  hors du périmètre de cette garde.
 - **Estimation** : 3 j pour #7633 est sous-évalué ; le pilote doit
   réestimer ou réduire le périmètre.
 

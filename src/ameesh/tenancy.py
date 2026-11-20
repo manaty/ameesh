@@ -377,15 +377,28 @@ def child_runner_id(host: str, child: str) -> str:
     return "%s/%s" % (host, _dns_slug(child, 40))
 
 
+def child_slug(child: str) -> str:
+    """Forme DNS de l'enfant, celle du label `ameesh.dev/child` et du Secret.
+
+    Le nom du Secret est **dérivé du label**, sans annotation libre : la VAP
+    vérifie en CEL que le Secret monté est exactement
+    `ameesh-child-<label>`. Le suffixe hexadécimal distingue deux noms bruts
+    qui tombent sur la même forme DNS (`Enfant.1` et `enfant-1`), sans quoi
+    deux enfants partageraient le même Secret (la contrainte `unique` sur
+    `pod_requests.credential_secret` refuserait le second)."""
+    text = str(child or "")
+    digest = hashlib.sha256(
+        ("ameesh-pod-child-slug:" + text).encode("utf-8")).hexdigest()[:8]
+    return "%s-%s" % (_dns_slug(text, 20), digest)
+
+
 def child_credential_secret(child: str) -> str:
     """Nom du Secret d'API d'organisation par enfant (le secret n'est pas ici).
 
     Le pourvoyeur ne lit jamais ce Secret : il le monte dans le conteneur de
     l'enfant, qui est le seul à pouvoir le lire. Le nom est déterministe pour
     que l'opérateur puisse le créer avant le premier `spawn`."""
-    digest = hashlib.sha256(
-        ("ameesh-pod-child-secret:" + str(child)).encode("utf-8")).hexdigest()[:8]
-    return (POD_CHILD_SECRET_PREFIX + _dns_slug(child, 30) + "-" + digest)
+    return POD_CHILD_SECRET_PREFIX + child_slug(child)
 
 
 def child_host(parent: str, child: str, token: str) -> str:

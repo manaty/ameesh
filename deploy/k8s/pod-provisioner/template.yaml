@@ -8,9 +8,10 @@
 # Aucun PVC, aucun hostPath, aucun volume du parent : le home et le worktree
 # sont des emptyDir propres à ce pod (design 7633 §8.4). Les seuls Secrets
 # référencés sont le mot de passe base (`ameesh-db`) et celui de la clé d'API
-# d'organisation de CET enfant, par son nom (`{{CREDENTIAL_SECRET}}`) ; le
-# pourvoyeur ne les lit jamais. Aucun `initContainer`/`ephemeralContainer`,
-# aucune source de Secret arbitraire : le template et la VAP ferment la forme.
+# d'organisation de CET enfant, par son nom (`{{CREDENTIAL_SECRET}}`, dérivé
+# du label `ameesh.dev/child`) ; le pourvoyeur ne les lit jamais. Aucun
+# `initContainer`/`ephemeralContainer`, aucune source de Secret arbitraire :
+# le template et la VAP ferment la forme.
 apiVersion: v1
 kind: Pod
 metadata:

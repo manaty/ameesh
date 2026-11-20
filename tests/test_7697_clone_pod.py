@@ -115,6 +115,17 @@ class PodChildPlanTest(unittest.TestCase):
         secret = tenancy.child_credential_secret("enfant1")
         self.assertTrue(secret.startswith(tenancy.POD_CHILD_SECRET_PREFIX))
         self.assertLessEqual(len(secret), 63)
+        # Le nom du Secret est dérivé du label `ameesh.dev/child` : même
+        # forme DNS, et deux noms bruts qui tombent sur la même forme gardent
+        # des Secrets distincts (sinon la contrainte `unique` refuserait le
+        # second enfant).
+        self.assertEqual(secret,
+                         tenancy.POD_CHILD_SECRET_PREFIX
+                         + tenancy.child_slug("enfant1"))
+        self.assertNotEqual(tenancy.child_slug("Enfant.1"),
+                            tenancy.child_slug("enfant-1"))
+        self.assertNotEqual(tenancy.child_credential_secret("Enfant.1"),
+                            tenancy.child_credential_secret("enfant-1"))
 
     def test_plan_sans_pvc_ni_volume_du_parent(self):
         plan = tenancy.child_plan(
@@ -183,6 +194,24 @@ class PodTemplateTest(unittest.TestCase):
         self.assertEqual(pod["metadata"]["annotations"]["ameesh.dev/tenant"], ALICE)
         self.assertEqual(pod["metadata"]["annotations"]["ameesh.dev/credential-secret"],
                          self.request["credential_secret"])
+        # B3 (#7697) : le label est la forme DNS de l'enfant, et le Secret est
+        # exactement `ameesh-child-<label>` — ce que la VAP sait recouper.
+        child_label = tenancy.child_slug("enfant1")
+        self.assertEqual(pod["metadata"]["labels"]["ameesh.dev/child"], child_label)
+        self.assertEqual(pod["metadata"]["annotations"]["ameesh.dev/credential-secret"],
+                         "ameesh-child-" + child_label)
+        self.assertEqual(
+            pod["metadata"]["annotations"]["ameesh.dev/child-name"], "enfant1")
+        for container in pod["spec"]["containers"]:
+            self.assertEqual(container["image"], "ameesh-runner")
+        child_env = {entry["name"]: entry for entry in child["env"]}
+        secret_ref = next(
+            entry["valueFrom"]["secretKeyRef"]
+            for entry in child_env.values()
+            if (entry.get("valueFrom") or {}).get("secretKeyRef", {}).get("key")
+            == "api-key")
+        self.assertEqual(secret_ref["name"], "ameesh-child-" + child_label)
+        self.assertEqual(secret_ref["key"], "api-key")
         for value in pod["metadata"]["labels"].values():
             self.assertLessEqual(len(value), 63)
             self.assertRegex(value, r"^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$")
@@ -241,6 +270,58 @@ class PodTemplateTest(unittest.TestCase):
             raw["spec"]["containers"][1]["image"] = "busybox"
         with self.assertRaises(pod_provisioner.ProvisionerError):
             self._tampered(mutate)
+
+    # -- B3/N(a) (#7697) : la demande ne fait pas foi sur le Secret ni sur
+    # l'identité enfant, et le rendu vérifie la même forme que la VAP.
+    def test_rendu_refuse_un_secret_qui_n_est_pas_celui_de_l_enfant(self):
+        request = copy.deepcopy(self.request)
+        request["credential_secret"] = tenancy.child_credential_secret("enfant2")
+        with self.assertRaises(pod_provisioner.ProvisionerError) as ctx:
+            self.template.render(request, dsn="postgresql://ameesh@db/ameesh")
+        self.assertEqual(ctx.exception.code, "request-mismatch")
+
+    def test_rendu_refuse_un_uid_qui_n_est_pas_celui_du_plan(self):
+        request = copy.deepcopy(self.request)
+        request["uid"] = int(request["uid"]) + 1
+        with self.assertRaises(pod_provisioner.ProvisionerError) as ctx:
+            self.template.render(request, dsn="postgresql://ameesh@db/ameesh")
+        self.assertEqual(ctx.exception.code, "request-mismatch")
+
+    def _validated_rendered(self):
+        rendered = self.template.render(
+            self.request, image="ameesh-runner",
+            dsn="postgresql://ameesh@db/ameesh")
+        return rendered, {"POD_NAME": rendered.pod_name, "IMAGE": "ameesh-runner"}
+
+    def test_validate_rendered_refuse_une_image_hors_parametre(self):
+        rendered, mapping = self._validated_rendered()
+        for container in rendered.pod["spec"]["containers"]:
+            container["image"] = "ameesh-runner.attacker.example/x:latest"
+        with self.assertRaises(pod_provisioner.ProvisionerError):
+            self.template._validate_rendered(rendered.pod, mapping, self.request)
+
+    def test_validate_rendered_refuse_le_secret_d_un_autre_enfant(self):
+        rendered, mapping = self._validated_rendered()
+        child = next(c for c in rendered.pod["spec"]["containers"]
+                     if c["name"] == "child")
+        ref = next(entry["valueFrom"]["secretKeyRef"] for entry in child["env"]
+                   if (entry.get("valueFrom") or {}).get("secretKeyRef", {}).get(
+                       "key") == "api-key")
+        ref["name"] = tenancy.child_credential_secret("enfant2")
+        with self.assertRaises(pod_provisioner.ProvisionerError):
+            self.template._validate_rendered(rendered.pod, mapping, self.request)
+
+    def test_validate_rendered_refuse_le_secret_enfant_dans_le_superviseur(self):
+        rendered, mapping = self._validated_rendered()
+        supervisor = next(c for c in rendered.pod["spec"]["containers"]
+                          if c["name"] == "supervisor")
+        supervisor.setdefault("env", []).append({
+            "name": "AUTRE_CLE",
+            "valueFrom": {"secretKeyRef": {
+                "name": tenancy.child_credential_secret("enfant1"),
+                "key": "api-key"}}})
+        with self.assertRaises(pod_provisioner.ProvisionerError):
+            self.template._validate_rendered(rendered.pod, mapping, self.request)
 
     def test_un_init_container_privilegie_est_refuse(self):
         def mutate(raw):
@@ -311,6 +392,47 @@ class PodManifestsTest(unittest.TestCase):
             self.assertIn(fragment, expressions)
         self.assertIn("object.spec.containers[0].name == 'supervisor'", expressions)
         self.assertIn("object.spec.containers[1].name == 'child'", expressions)
+
+    def test_vap_epingle_image_et_lie_le_secret_a_l_enfant(self):
+        """B3 (#7697) : image exacte par paramètre (pas un préfixe), Secret
+        dérivé du label enfant et monté dans le seul conteneur enfant."""
+        docs = self.load("validatingadmissionpolicy.yaml")
+        policy = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicy")
+        binding = next(d for d in docs
+                       if d["kind"] == "ValidatingAdmissionPolicyBinding")
+        expressions = " ".join(v["expression"] for v in policy["spec"]["validations"])
+        # L'image n'est plus un préfixe : seule l'égalité au paramètre compte.
+        self.assertNotIn("startsWith('ameesh-runner')", expressions)
+        self.assertIn(
+            "params.metadata.?annotations['ameesh.dev/pod-child-image']"
+            ".orValue('')", expressions)
+        self.assertEqual(policy["spec"]["paramKind"],
+                         {"apiVersion": "v1", "kind": "Namespace"})
+        self.assertEqual(binding["spec"]["paramRef"]["name"], "ameesh")
+        self.assertNotIn("namespace", binding["spec"]["paramRef"])
+        self.assertEqual(binding["spec"]["paramRef"]["parameterNotFoundAction"],
+                         "Deny")
+        # Le Secret vient du label, pas d'une annotation libre.
+        self.assertIn(
+            "'ameesh-child-' + object.metadata.?labels['ameesh.dev/child']"
+            ".orValue('')", expressions)
+        self.assertIn("c.name == 'child'", expressions)
+
+    def test_le_parametre_de_la_vap_est_l_image_du_deploiement(self):
+        deployment = self.load("deployment.yaml")[0]
+        namespace = self.load("namespace.yaml")[0]
+        image = deployment["spec"]["template"]["spec"]["containers"][0]["image"]
+        self.assertEqual(namespace["metadata"]["name"], "ameesh")
+        self.assertEqual(
+            namespace["metadata"]["annotations"]["ameesh.dev/pod-child-image"],
+            image)
+        self.assertEqual(pod_provisioner.DEFAULT_IMAGE, image)
+        kustomization = self.load("kustomization.yaml")[0]
+        self.assertIn("namespace.yaml", kustomization["resources"])
+        # Le paramètre doit rester hors de portée du Role namespaced : aucun
+        # ConfigMap de paramètres que le SA pourrait supprimer et recréer.
+        self.assertNotIn("ameesh-pod-child-params", json.dumps(
+            kustomization.get("configMapGenerator") or []))
 
     def test_quota_borne_les_pods_et_les_configmaps(self):
         quota = self.load("resourcequota.yaml")[0]
@@ -390,6 +512,21 @@ class PodRequestDbTest(_CanonDbCase):
         pod = self.client.get_pod(pod_provisioner.pod_name_for(self.request()["id"]))
         self.assertEqual(pod["metadata"]["labels"]["ameesh.dev/parent"], "avatar")
 
+    def test_pourvoyeur_refuse_une_demande_au_secret_etranger(self):
+        """N(a) (#7697) : le pourvoyeur ne fait pas foi sur
+        `pod_requests.credential_secret` ; il le recompare à l'enfant."""
+        self.spawn(pod_wait_s=0)
+        request = self.request()
+        self.db.execute(
+            "UPDATE pod_requests SET credential_secret = %s WHERE id = %s",
+            (tenancy.child_credential_secret("enfant2"), request["id"]))
+        self.assertIsNone(self.provisioner().start_once())
+        failed = self.request()
+        self.assertEqual(failed["state"], "failed")
+        self.assertIn("request-mismatch", failed["error"])
+        self.assertEqual(self.client.pods, {})
+        self.assertEqual(self.client.configmaps, {})
+
     def test_garde_pod_uid_et_expiration(self):
         row = self.spawn(pod_wait_s=0)
         self.provisioner().start_once()
@@ -412,6 +549,26 @@ class PodRequestDbTest(_CanonDbCase):
         self.db.execute(
             "UPDATE pod_hosts SET state = 'deleted' WHERE host = %s", (host,))
         self.assertFalse(self._claim_ok(host, binding["runner_id"]))
+
+    def test_garde_exige_un_battement_frais(self):
+        """N(c) (#7697) : un pod vivant mais un runner muet ne réclame plus."""
+        row = self.spawn(pod_wait_s=0)
+        self.provisioner().start_once()
+        request = self.request()
+        host, tenant = row["host"], ALICE
+        binding = storage.of(self.db).tenancy.bindings(host)[0]
+        storage.of(self.db).tenancy.beat(
+            host, tenant, binding["runner_id"], uid=binding["uid"], version="t",
+            pod_uid="uid-" + pod_provisioner.pod_name_for(request["id"]))
+        self.assertTrue(self._claim_ok(host, binding["runner_id"]))
+        self.db.execute(
+            "UPDATE runner_presence SET seen_at = now() - interval '10 minutes'"
+            " WHERE host = %s AND tenant = %s", (host, tenant))
+        self.assertFalse(self._claim_ok(host, binding["runner_id"]))
+        storage.of(self.db).tenancy.beat(
+            host, tenant, binding["runner_id"], uid=binding["uid"], version="t",
+            pod_uid="uid-" + pod_provisioner.pod_name_for(request["id"]))
+        self.assertTrue(self._claim_ok(host, binding["runner_id"]))
 
     def _claim_ok(self, host, runner):
         rows = self.db.query(
@@ -441,6 +598,29 @@ class PodRequestDbTest(_CanonDbCase):
         self.assertEqual(storage.of(self.db).tenancy.bindings(row["host"]), [])
         self.assertEqual(storage.of(self.db).pod_hosts.get(row["host"])["state"],
                          "deleted")
+        self.assertEqual(self.request()["state"], "deleted")
+
+    def test_cleanup_ne_supprime_pas_une_configmap_d_un_autre_request(self):
+        """N(b) (#7697) : le nettoyage vérifie `request-id` avant de
+        supprimer la ConfigMap, comme le chemin d'échec."""
+        row = self.spawn(pod_wait_s=0)
+        self.provisioner().start_once()
+        request = self.request()
+        name = pod_provisioner.configmap_name_for(request["id"])
+        other = copy.deepcopy(self.client.configmaps[name])
+        other["metadata"]["labels"]["ameesh.dev/request-id"] = "autre"
+        self.client.configmaps[name] = other
+        self.db.execute(
+            "UPDATE pod_requests SET requested_at = now() - interval '2 hours',"
+            " expires_at = now() - interval '1 second' WHERE id = %s",
+            (request["id"],))
+        self.db.execute(
+            "UPDATE pod_hosts SET requested_at = now() - interval '2 hours',"
+            " expires_at = now() - interval '1 second' WHERE host = %s",
+            (row["host"],))
+        self.provisioner().cleanup_once()
+        self.assertIn(name, self.client.configmaps)
+        self.assertNotIn(name, self.client.deleted_configmaps)
         self.assertEqual(self.request()["state"], "deleted")
 
     def _rendered(self, request=None):

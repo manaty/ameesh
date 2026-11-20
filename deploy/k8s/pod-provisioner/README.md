@@ -34,16 +34,24 @@ enfant** ; le relais de modèle viendra dans une tranche suivante.
 |---|---|
 | `Deployment/ameesh-pod-provisioner` | le processus `ameesh pod-provisioner` (1 réplique) |
 | `ConfigMap/ameesh-pod-provisioner-template` | le template figé, généré par kustomize |
+| `Namespace/ameesh` | porte l'annotation `ameesh.dev/pod-child-image`, paramètre cluster-scoped de la VAP (hors de portée du Role namespaced du pourvoyeur) |
 | `ServiceAccount/ameesh-pod-provisioner` + `Role`/`RoleBinding` | pods et ConfigMap seulement, dans le namespace |
 | `ServiceAccount/ameesh-child` | aucun droit, aucun jeton monté |
-| `ValidatingAdmissionPolicy` + binding | refuse un pod hors template même si le SA est compromis : deux conteneurs nommés, commandes figées, aucun init/éphémère, aucun Secret hors `ameesh-db` et du Secret `ameesh-child-*` de l'enfant |
+| `ValidatingAdmissionPolicy` + binding | refuse un pod hors template même si le SA est compromis : deux conteneurs nommés, image **exactement** celle du paramètre, commandes figées, aucun init/éphémère, aucun Secret hors `ameesh-db` et du Secret `ameesh-child-<label>` de l'enfant, monté dans le seul conteneur `child` |
 | `ResourceQuota/ameesh-pod-children` | borne le nombre et les ressources des enfants |
 | `template.yaml` | 2 conteneurs (`supervisor`, `child`), `emptyDir`, UID enfant 30000+, aucun PVC/hostPath |
 
 Le template est **la** source du pod ; le pourvoyeur refuse tout placeholder
 inconnu, tout `hostPath`/PVC, tout conteneur privilégié ou qui escalade, toute
 image autre que `{{IMAGE}}`, et exige `AMEESH_POD_UID` depuis
-`metadata.uid` (garde `pod-host-unknown`).
+`metadata.uid` (garde `pod-host-unknown`). Le nom du Secret d'API est dérivé
+du label `ameesh.dev/child` (`ameesh-child-<label>`) ; l'image admise est
+l'exacte valeur de l'annotation `ameesh.dev/pod-child-image` du Namespace
+(`namespace.yaml`), que le Deployment doit suivre (le test du lot vérifie
+l'égalité). Le paramètre vit dans le Namespace, cluster-scoped : le Role du
+pourvoyeur ne peut ni le modifier ni le supprimer, contrairement à une
+ConfigMap du namespace. Pour changer d'image, modifier `namespace.yaml` et
+`deployment.yaml` dans le même geste.
 
 ## Déployer
 
@@ -112,10 +120,11 @@ image autre que `{{IMAGE}}`, et exige `AMEESH_POD_UID` depuis
 
 Le runner de l'enfant publie `runner_presence.pod_uid`
 (`AMEESH_POD_UID`, Downward API). `ameesh_tenant_claim_ok` exige, pour un hôte
-présent dans `pod_hosts`, une ligne `running` non expirée **et** un battement
-dont le `pod_uid` est celui du pod provisionné. Un pod recréé a un UID neuf :
-l'ancien ne réclame plus (`pod-host-unknown`, fail closed). Les hôtes non pod
-n'ont aucune ligne `pod_hosts` et gardent la garde #7106 inchangée.
+présent dans `pod_hosts`, une ligne `running` non expirée, un battement frais
+(120 s, deux battements au rythme par défaut de 60 s) et un `pod_uid` égal à
+celui du pod provisionné. Un pod recréé a un UID neuf : l'ancien ne réclame
+plus (`pod-host-unknown`, fail closed) ; un runner muet non plus. Les hôtes
+non pod n'ont aucune ligne `pod_hosts` et gardent la garde #7106 inchangée.
 
 ## Limites connues (tranches suivantes)
 
@@ -131,3 +140,13 @@ n'ont aucune ligne `pod_hosts` et gardent la garde #7106 inchangée.
 - **Kind** : la preuve RBAC/template/quota/cycle de vie est un geste de
   bureau (pas de script livré dans ce lot) ; le témoin complet des identités
   et du canon reste [`../pod-witness/`](../pod-witness/).
+- **SA pourvoyeur entièrement compromis** : la VAP lie le Secret au label
+  `ameesh.dev/child`, mais ce label est posé par le même compte de service.
+  Un SA compromis peut donc se déclarer un autre enfant et monter le Secret
+  correspondant ; la VAP statique ne peut pas interroger `pod_requests`. Une
+  fermeture complète demanderait un webhook d'admission qui recoupe la
+  demande en base, hors de cette tranche. Le nom du Secret ne dépend pas du
+  tenant (limite L155 : la base reste dans le périmètre de confiance).
+- **Battement frais** : la garde de réclamation exige un battement de moins
+  de 120 s ; un runner dont l'intervalle de ressources dépasse cette valeur
+  doit l'abaisser (`AMEESH_RESOURCE_INTERVAL`).
