@@ -13,10 +13,12 @@ the refusals, the path and view allowlists, the witness imports.  The database
 test uses ``AMEESH_TEST_DSN`` when it is set, else the suite bench
 (``tests.support.TEST_DSN``, never the ambient ``AMEESH_DSN``: that variable
 may name the live mesh database); both name a server whose role may
-``CREATE DATABASE``.  It proves that the witness ran on a fresh
-``ameesh_fixture_*`` database and that the database is gone afterwards.  The
-deliberate-break test mutates a copy of the surface and requires the frozen
-comparator of :mod:`tests.test_7665_module_contract` to name the break.
+``CREATE DATABASE``.  A bench whose role lacks ``CREATEDB`` is skipped while
+naming the missing right (#7943).  The database test proves that the witness
+ran on a fresh ``ameesh_fixture_*`` database and that the database is gone
+afterwards.  The deliberate-break test mutates a copy of the surface and
+requires the frozen comparator of :mod:`tests.test_7665_module_contract` to
+name the break.
 """
 from __future__ import annotations
 
@@ -62,6 +64,17 @@ def psql(statement: str) -> str:
     if done.returncode != 0:
         raise AssertionError("psql failed: %s" % (done.stderr or "").strip()[-800:])
     return done.stdout.strip()
+
+
+def bench_can_create_database() -> bool:
+    """#7943 N1 : le rôle du banc a-t-il CREATEDB (CREATE DATABASE) ?
+
+    Le témoin public crée puis jette une base ; sans ce droit, le test ne peut
+    pas le qualifier. On nomme le droit manquant avant de lancer le témoin
+    plutôt que de laisser remonter une erreur psql brute."""
+    return psql(
+        "SELECT bool_or(rolcreatedb OR rolsuper) FROM pg_roles"
+        " WHERE pg_has_role(current_user, oid, 'USAGE')") == "t"
 
 
 class DatabaseNameTest(unittest.TestCase):
@@ -318,6 +331,10 @@ class FixtureDatabaseTest(unittest.TestCase):
         return env
 
     def test_the_external_witness_qualifies_through_the_public_fixture(self):
+        if not bench_can_create_database():
+            self.skipTest(
+                "bench role has no CREATEDB: ameesh.public.fixture needs a role "
+                "allowed to CREATE DATABASE")
         admin_database = psql("SELECT current_database()")
         done = subprocess.run([sys.executable, str(WITNESS_FILE)], env=self.witness_env(),
                               cwd=str(WITNESS), capture_output=True, text=True,
