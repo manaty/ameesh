@@ -53,6 +53,26 @@ def _row(rows):
     return row
 
 
+def _holder_alive(tx, row) -> bool:
+    """#7900: the failover retention only holds while the current host lives.
+
+    A live lease is proof that a runner still serves the agent. An expired
+    lease is the `dead_runner` signature (the row is not `stopped`): the host
+    died with its turn. Between turns (no lease), only a fresh standing proves
+    that the host still publishes; a silent host is dead. Without this rule a
+    `failover` arrival stayed on a dead host until a human move, because the
+    B2 return was refused as if the cloud were still there.
+    """
+    owner = str(row.get("lease_owner") or "")
+    expires = row.get("lease_expires_ts")
+    now = float(row.get("now_ts") or 0.0)
+    if owner and expires is not None:
+        return float(expires) > now
+    from ... import role_standings_pg as standings
+    return standings.fresh_standing(tx, str(row.get("name") or ""),
+                                    str(row.get("host") or ""))
+
+
 class ConversationMoves(Contract):
     def __init__(self, db):
         self.db = db
@@ -90,7 +110,10 @@ class ConversationMoves(Contract):
                 (agent, agent))
             agent = resolved[0]["name"] if resolved else agent
             rows = tx.query(
-                """SELECT name, host, cwd, mode, lease_owner, lease_epoch, session_id
+                """SELECT name, host, cwd, mode, lease_owner, lease_epoch, session_id,
+                          extract(epoch FROM lease_expires_at)::float8
+                              AS lease_expires_ts,
+                          extract(epoch FROM clock_timestamp())::float8 AS now_ts
                      FROM agent_registry WHERE name = %s FOR UPDATE""", (agent,))
             if not rows or rows[0]["mode"] != "execute" or rows[0]["host"] == target_host:
                 return None
@@ -128,6 +151,10 @@ class ConversationMoves(Contract):
             # (l'hôte courant a flanché à son tour) reste permise. La
             # tentative échue vient d'être refermée ci-dessus : `switched_at`
             # garde la trace de l'arrivée même si elle a échoué.
+            # #7900 : la retenue ne vaut que sur un hôte ENCORE VIVANT — un
+            # hôte cloud mort (bail expiré, ligne non `stopped`, ou standing
+            # périmé) ne garde pas l'avatar ; le retour de préférence le
+            # libère vers le poste sain ou un autre hôte éligible.
             if reason == "preference":
                 origin = tx.query(
                     """SELECT m.reason
@@ -136,7 +163,8 @@ class ConversationMoves(Contract):
                           AND m.switched_at IS NOT NULL
                         ORDER BY m.created_at DESC, m.move_id DESC
                         LIMIT 1""", (agent, r["host"]))
-                if origin and origin[0].get("reason") == "failover":
+                if origin and origin[0].get("reason") == "failover" \
+                        and _holder_alive(tx, r):
                     return None
             # ON CONFLICT without a target: the (agent, epoch_source) key AND the
             # one-open-attempt index both reread instead of raising

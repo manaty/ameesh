@@ -196,11 +196,16 @@ _ATTACH_FIELDS = _COMMON_FIELDS | {"attach_id", "agent", "host", "tenant", "devi
 _STANDING_FIELDS = _COMMON_FIELDS | {"standing"}
 #: #7629 : le bénéficiaire, les cibles et la charte sont OPTIONNELS dans le
 #: reçu ; c'est la politique du canon qui décide si leur absence est permise.
+#: #7865 : `spend` (facultatif) porte la dimension dépense signée —
+#: {max_per_month, max_per_day, providers, purposes} ; sans lui, le grant ne
+#: couvre aucune dépense.
 _STANDING_REQUIRED = frozenset({"connector", "operations", "class", "max_amount",
                                 "currency", "until"})
 _STANDING_OPTIONAL = frozenset({"beneficiary", "targets", "charter_line",
-                                "charter_version"})
+                                "charter_version", "spend"})
 _STANDING_KEYS = _STANDING_REQUIRED | _STANDING_OPTIONAL
+_SPEND_KEYS = frozenset({"max_per_month", "max_per_day", "providers", "purposes"})
+_SPEND_MAX = 64
 #: #7631 : `standing.charter` (facultatif, signé) : le cadre de la charte de
 #: l'avatar qu'un grant inscrit, {frame, version}
 #: #7631 : référence d'accord — l'entrée du journal de conversation (L78) où
@@ -238,6 +243,32 @@ class DeadlineError(ReceiptError):
 #: CONTEXTE si le serveur parle français)
 _DEADLINE_RE = re.compile(
     r"ameesh_echeance \[(expired|iat_future)\] : (.*?)(?:\s+CONTEXTE?\s*:.*)?$", re.S)
+#: `ameesh_spend [code] : raison` (0596) — refus de plafond de dépense, stable
+_SPEND_RE = re.compile(
+    r"ameesh_spend \[(spend_[a-z_]+)\] : (.*?)(?:\s+CONTEXTE?\s*:.*)?$", re.S)
+
+
+class SpendRefusal(ReceiptError):
+    """Un plafond de dépense refuse la réservation, avec un code stable.
+
+    Levée par `ameesh_standing_reserve` (0596) SOUS le verrou du grant : rien
+    n'est réservé ni écrit. `code` vaut `spend_daily_cap`,
+    `spend_monthly_cap`, `spend_total_cap`, `spend_provider`,
+    `spend_purpose`, `spend_currency`, `spend_recurrence`, `spend_amount` ou
+    `spend_scope`.
+    """
+
+    def __init__(self, code: str, reason: str):
+        super().__init__(reason)
+        self.code = code
+
+
+def _spend_error(exc: DbError) -> SpendRefusal | None:
+    """Le refus de plafond de dépense porté par une erreur SQL, ou None."""
+    match = _SPEND_RE.search(str(exc))
+    if not match:
+        return None
+    return SpendRefusal(match.group(1), " ".join(match.group(2).split()))
 
 
 def _deadline_error(exc: DbError) -> DeadlineError | None:
@@ -447,6 +478,39 @@ class Receipt:
 # forme
 # --------------------------------------------------------------------------
 
+def _check_spend(spend, max_amount: int, currency: str | None) -> None:
+    """#7865 : la dimension dépense signée — bornes, périmètre, devise.
+
+    La politique du canon décide si elle est PERMISE (règle de dépense) ;
+    cette fonction ne juge que sa FORME, comme le reste du reçu. Une dépense
+    a besoin d'une devise et d'un plafond total non nul : elle est de
+    l'argent, pas un compteur abstrait.
+    """
+    if not isinstance(spend, dict) or set(spend) != _SPEND_KEYS:
+        raise ReceiptError("standing.spend: {max_per_month, max_per_day, providers, "
+                           "purposes} expected")
+    month = _int(spend["max_per_month"], "standing.spend.max_per_month")
+    day = _int(spend["max_per_day"], "standing.spend.max_per_day")
+    if month <= 0:
+        raise ReceiptError("standing.spend.max_per_month: integer > 0 expected")
+    if day > month:
+        raise ReceiptError("standing.spend.max_per_day: at most max_per_month expected")
+    if max_amount <= 0:
+        raise ReceiptError("standing.spend: a non-zero max_amount (total cap) is required")
+    if currency is None:
+        raise ReceiptError("standing.spend: a currency is required")
+    if month > max_amount:
+        raise ReceiptError("standing.spend.max_per_month: above max_amount (%d)" % max_amount)
+    for name in ("providers", "purposes"):
+        values = spend[name]
+        if (not isinstance(values, list) or not values or len(values) > _SPEND_MAX
+                or any(not isinstance(item, str) or not _IDENT_RE.fullmatch(item)
+                       for item in values)
+                or len(set(values)) != len(values)):
+            raise ReceiptError("standing.spend.%s: non-empty list of at most %d distinct "
+                               "identifiers expected" % (name, _SPEND_MAX))
+
+
 def _check_standing(standing, iat: int) -> None:
     if not isinstance(standing, dict):
         raise ReceiptError("standing: object expected")
@@ -511,6 +575,9 @@ def _check_standing(standing, iat: int) -> None:
         if not isinstance(charter_version, str) or len(charter_version) > _CHARTER_VERSION_MAX:
             raise ReceiptError("standing.charter_version: text of at most %d characters expected"
                                % _CHARTER_VERSION_MAX)
+    # #7865 : dimension dépense (facultative, signée avec le reste du grant)
+    if standing.get("spend") is not None:
+        _check_spend(standing["spend"], standing["max_amount"], currency)
 
 
 def check_request(request) -> str:
@@ -1498,6 +1565,14 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
     if scope is None:
         return dataclasses.replace(verdict, ok=False, code=POLICY,
                                    reason=reason), None
+    # #7865 : un grant de dépense porte l'horizon de la prochaine revue
+    # humaine ; il vient du canon, jamais d'une constante cachée.
+    spend = standing.get("spend") or {}
+    if spend and int(limits.review_horizon_hours or 0) <= 0:
+        return dataclasses.replace(
+            verdict, ok=False, code=POLICY,
+            reason="standing.spend: the canon must compile review_horizon_hours "
+                   "(the next human review) with a spend rule"), None
     if verdict.accord is not None and not claim_accord(
             db, verdict.accord, kind="standing", ref=verdict.challenge):
         return dataclasses.replace(
@@ -1518,7 +1593,12 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
             beneficiary_clones=scope["beneficiary_clones"],
             targets_json=jcs.dumps(standing.get("targets") or []),
             charter_line=standing.get("charter_line") or "",
-            charter_version=standing.get("charter_version") or "")
+            charter_version=standing.get("charter_version") or "",
+            max_per_month=int(spend.get("max_per_month") or 0),
+            max_per_day=int(spend.get("max_per_day") or 0),
+            spend_providers_json=jcs.dumps(spend.get("providers") or []),
+            spend_purposes_json=jcs.dumps(spend.get("purposes") or []),
+            review_horizon_hours=(int(limits.review_horizon_hours) if spend else 24))
     except DbError as exc:
         deadline = _deadline_error(exc)
         if deadline is None:
@@ -1574,6 +1654,11 @@ def standing_reserve(db: Db, grant_id: int, action_id: str, amount, *, connector
     except DbError as exc:
         if _deadline_error(exc) is not None:
             return None             # grant échu à l'heure réelle : rien n'est réservé
+        # #7865 : un plafond de dépense refuse NOMMÉMENT, rien n'est écrit ;
+        # l'appelant (actions.execute) en fait un refus `spend_*` + escalade.
+        spend = _spend_error(exc)
+        if spend is not None:
+            raise spend from exc
         if "ameesh_standing_reserve" in str(exc):
             raise ReceiptError(str(exc)) from exc
         raise
@@ -1613,6 +1698,11 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None,
     en priorité — si elle décrit la même action, sinon ReceiptError
     (`standing_reserve`). None = aucune couverture.
 
+    #7865 : un refus de plafond de dépense sur un candidat n'arrête pas la
+    recherche — un autre grant peut encore couvrir l'action. Si AUCUN ne la
+    couvre et qu'un plafond a refusé, la dernière `SpendRefusal` est levée
+    (refus nommé), au lieu d'un `None` muet.
+
     `only_grant` (#7684) : ne réserve QUE ce grant, et rend None s'il ne
     couvre pas. Un appelant qui cite un accord ne peut ainsi pas être couvert
     par un autre grant ; aucune autre réservation vivante de l'action ne doit
@@ -1637,21 +1727,27 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None,
             reserved_by=reserved_by)
     candidates = [int(row["grant_id"]) for row in live]
     # simple PRÉ-FILTRE, sans verrou : la décision (révocation, échéance à
-    # l'heure réelle après le dernier verrou, couverture, cumul) est refaite
-    # par ameesh_standing_reserve pour chaque candidat
-    rows = storage.of(db).grants.candidates(action["connector"], action["operation"],
-                                            action_class, value, currency,
-                                            canon=action.get("canon") or "",
-                                            proposed_by=action.get("proposed_by") or "",
-                                            target=action.get("target") or "")
+    # l'heure réelle après le dernier verrou, couverture, cumul, plafonds)
+    # est refaite par ameesh_standing_reserve pour chaque candidat
+    rows = storage.of(db).grants.candidates(
+        action["connector"], action["operation"], action_class, value, currency,
+        canon=action.get("canon") or "", proposed_by=action.get("proposed_by") or "",
+        target=action.get("target") or "", action_id=action_id)
     candidates += [int(row["id"]) for row in rows if int(row["id"]) not in candidates]
+    refused: SpendRefusal | None = None
     for grant_id in candidates:
-        reserved = standing_reserve(
-            db, grant_id, action_id, value, connector=action["connector"],
-            operation=action["operation"], action_class=action_class, currency=currency,
-            reserved_by=reserved_by)
+        try:
+            reserved = standing_reserve(
+                db, grant_id, action_id, value, connector=action["connector"],
+                operation=action["operation"], action_class=action_class, currency=currency,
+                reserved_by=reserved_by)
+        except SpendRefusal as exc:
+            refused = exc
+            continue
         if reserved:
             return reserved
+    if refused is not None:
+        raise refused
     return None
 
 
@@ -1665,6 +1761,7 @@ def list_standing(db: Db, *, include_inactive: bool = False) -> list[dict]:
         except (ReceiptError, TypeError, ValueError):
             request = {}
         row["charter"] = (request.get("standing") or {}).get("charter")
+        row["spend"] = (request.get("standing") or {}).get("spend")
         row["accord"] = request.get("accord")
         row["facade"] = row.get("facade") or ""
     return rows

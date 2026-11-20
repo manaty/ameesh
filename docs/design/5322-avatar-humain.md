@@ -602,6 +602,16 @@ par l'`attach` quand il atteindra un agent tenu par un autre hôte. Une
 nouvelle bascule reste permise si l'hôte cloud s'arrête à son tour, et un
 `ameesh resume` sur le poste avant l'échéance annule simplement la bascule.
 
+**La retenue ne tient que sur un hôte vivant (#7900).** Un hôte cloud mort
+(bail expiré, ligne pourtant non `stopped`) ne garde pas l'avatar : la
+retenue de #7833 suppose un porteur qui publie encore. `conversation_moves.plan`
+vérifie la vie de l'hôte courant — bail vivant, ou, entre deux tours, un
+standing frais au seuil de l'hôte (même fraîcheur que `candidate_state`) ; un
+bail expiré est la signature du `dead_runner`, un standing périmé celle d'un
+exécuteur muet. Le retour de préférence reprend alors l'avatar vers le poste
+sain, ou vers l'autre hôte éligible rang 0. Un cloud vivant et au repos
+(standing frais, pas de bail) garde la retenue : pas de ping-pong.
+
 *Retour au poste : décision owner et geste disponible.* Le commentaire du
 ticket #6055 (compte owner `smichea`, 19/11/2026) tranche : un `attach` sur
 le poste déclenche le retour à la fin du tour cloud, même session ; sans

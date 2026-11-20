@@ -29,6 +29,14 @@
   ameesh action replace <id> --receipt F [--by NAME]   (decision that assumes the duplicate)
   ameesh action cancel <id> [--note TEXT] [--by NAME]
   ameesh action recover [--grace S]         interrupted launches → unknown outcome
+  ameesh action spend list [--decided-by AGENT] [--json]
+  ameesh action spend state <grant> [--json]
+  ameesh action spend stop <ledger> --by agent:ID|human:ID [--reason TEXT]
+  ameesh action spend confirm <ledger> --decision N   (signed owner review)
+  ameesh action spend sweep [--today YYYY-MM-DD] [--dry-run] [--by agent:ID]
+        #7865: a recurring resource stops by a connector `stop` action (ledger
+        `stopped` only once that action is confirmed); the sweep emits the stop
+        before the day that would cross the monthly/total cap
   ameesh decisions [--for human:ID] [--all] [--json]
         decision requests from agents (L124, `ameesh decide`), actions to
         approve, unknown outcomes, work items waiting for a human
@@ -59,7 +67,7 @@ import time
 
 from . import actions, activity, approve_client, canon as canon_mod
 from . import config as config_mod, connectors, db as db_mod
-from . import jcs, receipts
+from . import jcs, receipts, spend as spend_mod
 from .config import Config
 from .db import Db
 
@@ -145,6 +153,20 @@ def cmd_propose(cfg: Config, args: argparse.Namespace) -> int:
     if not proposer:
         print("error: specify --by agent:<id> (or human:<id>)", file=sys.stderr)
         return 2
+    # #7865 : à la proposition, la dimension dépense est confrontée à la
+    # politique du canon (fournisseurs, objets, plafond du jour). Sans canon
+    # lisible, une dépense est refusée : le plafond ne vient jamais d'un
+    # défaut caché. Une action sans dépense n'a pas besoin du canon.
+    limits = None
+    if values.get("spend") is not None or any(
+            value is not None for value in (args.recurrence, args.provider, args.purpose)):
+        canon = _canon(cfg, args.canon)
+        if canon is None:
+            print("refused [%s]: no readable canon%s for a spend action" % (
+                receipts.CANON, " %s" % args.canon if args.canon else ""),
+                file=sys.stderr)
+            return 1
+        limits = canon.standing_policy()
     connector = _connector(cfg, args.connector, args)
     db = _open(cfg)
     try:
@@ -154,7 +176,9 @@ def cmd_propose(cfg: Config, args: argparse.Namespace) -> int:
             amount=args.amount, currency=args.currency, work_item=args.work_item,
             approvers=args.approver or (), policy_version=args.policy_version,
             receipt_classes=(set(args.receipt_class) if args.receipt_class
-                             else actions.DEFAULT_RECEIPT_CLASSES))
+                             else actions.DEFAULT_RECEIPT_CLASSES),
+            recurrence=args.recurrence, provider=args.provider, purpose=args.purpose,
+            limits=limits)
     finally:
         db.close()
     if args.json:
@@ -181,6 +205,9 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         # bénéficiaire et quelle ligne de charte.
         action["grant"] = (receipts.get_standing(db, int(action["auth_grant_id"]))
                            if action.get("auth_grant_id") else None)
+        # #7865 : la ligne du ledger de la dépense, lue sur la même connexion.
+        action["spend_ledger"] = (actions.spend_of(db, args.id)
+                                  if action.get("spend_provider") else None)
     finally:
         db.close()
     if args.json:
@@ -196,6 +223,11 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         action["class"], "required" if action["requires_receipt"] else "no", action["dedupe"]))
     if action.get("amount") is not None:
         print("amount    : %s %s" % (action["amount"], action.get("currency")))
+    if action.get("spend_ledger"):
+        ledger = action["spend_ledger"]
+        print("spend     : %s %s / %s, %s %s (ledger #%s %s)" % (
+            action["recurrence"], action["spend_provider"], action["spend_purpose"],
+            ledger["amount"], ledger["currency"], ledger["id"], ledger["state"]))
     print("digest    : %s" % action["digest"])
     if action.get("approvers"):
         print("approvers : %s" % ", ".join(action["approvers"]))
@@ -347,7 +379,176 @@ def cmd_recap(cfg: Config, args: argparse.Namespace) -> int:
             print("  %s  %-10s %-12s %-10s %s%s" % (
                 row["action_id"], row["state"], row["connector"][:12],
                 row["operation"][:10], (row.get("target") or "—")[:40], money))
+    # #7865 : la section « dépenses » du relevé — ressources récurrentes en
+    # cours, total quotidien engagé et commande d'arrêt d'une ligne.
+    spending = view.get("spending") or {}
+    resources = spending.get("resources") or []
+    print("spending (%d resource%s, %s %s/day):" % (
+        len(resources), "s" if len(resources) != 1 else "",
+        spending.get("total_daily") or 0,
+        resources[0].get("currency") if resources else ""))
+    for row in resources:
+        print("  ledger #%s  %s %s/day  spent today %s/%s  month %s/%s%s" % (
+            row["id"], row["provider"], row["daily_amount"],
+            row.get("day_spent") or 0, row.get("max_per_day") or 0,
+            row.get("month_spent") or 0, row.get("max_per_month") or 0,
+            "  ARRÊT REQUIS" if row.get("stop_required") else ""))
+        if row.get("stop_required"):
+            print("    stop: %s" % row.get("stop_command"))
+    if spending.get("stop_required"):
+        print("  %d resource(s) require a stop before any new spend" % (
+            spending["stop_required"],))
     return 0
+
+
+def cmd_spend_list(cfg: Config, args: argparse.Namespace) -> int:
+    """#7865 : les ressources récurrentes en cours, avec leur projection."""
+    db = _open(cfg)
+    try:
+        rows = actions.spend_list(db, decided_by=args.decided_by)
+    finally:
+        db.close()
+    if args.json:
+        _dump(rows)
+        return 0
+    print("resources (%d):" % len(rows))
+    for row in rows:
+        print("  ledger #%s  %s %s  %s %s/day  since %s  by %s%s" % (
+            row["id"], row["provider"], row.get("purpose") or "—",
+            row["daily_amount"], row.get("currency") or "",
+            row.get("started_on") or "—", row.get("decided_by") or "—",
+            "  ARRÊT REQUIS" if row.get("stop_required") else ""))
+        print("    today %s/%s  month %s/%s  projected %s  stop: %s" % (
+            row.get("day_spent") or 0, row.get("max_per_day") or 0,
+            row.get("month_spent") or 0, row.get("max_per_month") or 0,
+            row.get("projected") or 0, row.get("stop_command")))
+    return 0
+
+
+def cmd_spend_state(cfg: Config, args: argparse.Namespace) -> int:
+    """#7865 : la projection d'un grant, telle que le gate la calcule."""
+    db = _open(cfg)
+    try:
+        state = actions.spend_state(db, args.grant)
+    finally:
+        db.close()
+    if state is None:
+        print("error: grant %s not found" % args.grant, file=sys.stderr)
+        return 1
+    if args.json:
+        _dump(state)
+        return 0
+    print("grant #%s: %s %s" % (args.grant, state.get("currency") or "",
+                                "day %s/%s, month %s/%s, total %s/%s" % (
+                                    state.get("day_spent") or 0,
+                                    state.get("max_per_day") or 0,
+                                    state.get("month_spent") or 0,
+                                    state.get("max_per_month") or 0,
+                                    state.get("total_accrued") or 0,
+                                    state.get("max_amount") or 0)))
+    print("projection: %s by %s (daily ongoing %s)" % (
+        state.get("projected") or 0, state.get("horizon") or "—",
+        state.get("ongoing_daily") or 0))
+    return 0
+
+
+def cmd_spend_stop(cfg: Config, args: argparse.Namespace) -> int:
+    """#7865 (B1) : arrête une ressource par une ACTION `operation = 'stop'`.
+
+    La ligne ne passe `stopped` qu'à la confirmation du connecteur. Si le
+    connecteur garde `stop`, l'action reste `proposed` et le reçu est à
+    obtenir (`ameesh action approve`) ; rien n'est déclaré arrêté.
+    """
+    by = _actor(args)
+    if not by.startswith(("agent:", "human:")):
+        print("error: --by agent:<id> or human:<id> expected (authenticated actor), "
+              "not %r" % by, file=sys.stderr)
+        return 2
+    db = _open(cfg)
+    try:
+        connector = None
+        if args.noop_dir:
+            connector = connectors.get("shell-noop", directory=args.noop_dir)
+        outcome = actions.spend_request_stop(db, args.id, by=by, reason=args.reason,
+                                             connector=connector)
+    finally:
+        db.close()
+    if outcome is None:
+        print("error: ledger #%s is not an ongoing daily resource (or a stop is "
+              "already requested)" % args.id, file=sys.stderr)
+        return 1
+    if args.json:
+        _dump(outcome)
+    else:
+        action = outcome.get("action") or {}
+        ledger = outcome.get("ledger") or {}
+        print("stop action %s: %s; ledger #%s: %s" % (
+            action.get("action_id") or "—", action.get("state") or "—",
+            args.id, ledger.get("state") or "—"))
+        if outcome.get("receipt_required"):
+            print("a receipt is required for this connector: ameesh action approve %s "
+                  "--receipt FILE" % (action.get("action_id") or "?"))
+    result = outcome.get("result") or {}
+    if outcome.get("receipt_required"):
+        return 1
+    return {"confirmed": 0, "failed": 3, "unknown": 4}.get(result.get("state"), 0)
+
+
+def cmd_spend_confirm(cfg: Config, args: argparse.Namespace) -> int:
+    """#7865 (B2/B4) : confirmation de la revue par décision signée de l'owner."""
+    db = _open(cfg)
+    try:
+        try:
+            row = actions.spend_confirm(db, args.id, decision=args.decision)
+        except spend_mod.SpendError as exc:
+            print("refused [%s]: %s" % (exc.code, exc), file=sys.stderr)
+            return 1
+    finally:
+        db.close()
+    if row is None:
+        print("error: ledger #%s is not an ongoing daily resource (or a stop is "
+              "already requested)" % args.id, file=sys.stderr)
+        return 1
+    if args.json:
+        _dump(row)
+        return 0
+    print("ledger #%s review confirmed by %s (decision #%s) until %s" % (
+        row["id"], row.get("confirmed_by") or "—",
+        row.get("confirmed_decision_id") or "—", (row.get("confirmed_at") or "—")))
+    return 0
+
+
+def cmd_spend_sweep(cfg: Config, args: argparse.Namespace) -> int:
+    """#7865 (B2) : arrête les ressources avant le jour qui franchit un plafond."""
+    by = args.by or spend_mod.SWEEP_ACTOR
+    if not by.startswith("agent:"):
+        print("error: --by agent:<id> expected for the sweep", file=sys.stderr)
+        return 2
+    db = _open(cfg)
+    try:
+        connector = None
+        if args.noop_dir:
+            connector = connectors.get("shell-noop", directory=args.noop_dir)
+        outcome = actions.spend_sweep(db, today=args.today, by=by,
+                                      connector=connector, dry_run=args.dry_run)
+    finally:
+        db.close()
+    if args.json:
+        _dump(outcome)
+    else:
+        print("spend sweep %s: %d stopped, %d planned, %d error(s)" % (
+            outcome["today"], len(outcome["stopped"]), len(outcome["planned"]),
+            len(outcome["errors"])))
+        for item in outcome["planned"]:
+            print("  would stop ledger #%s: %s" % (item["ledger_id"], item["reason"]))
+        for item in outcome["stopped"]:
+            print("  ledger #%s → %s (%s)" % (
+                item["ledger_id"], item.get("ledger_state") or "?",
+                item.get("stop_action_id") or "?"))
+        for item in outcome["errors"]:
+            print("  ledger #%s: %s" % (item["ledger_id"], item.get("error") or "?"),
+                  file=sys.stderr)
+    return 1 if outcome["errors"] else 0
 
 
 def _canon(cfg: Config, wanted: str | None):
@@ -922,6 +1123,12 @@ def build_parser() -> argparse.ArgumentParser:
                    default=None, help="may raise the connector's class, never lower it")
     p.add_argument("--amount", type=int, default=None, help="minor units")
     p.add_argument("--currency", default=None)
+    p.add_argument("--recurrence", choices=["once", "daily"], default=None,
+                   help="spend recurrence: once or daily (no monthly/annual commitment)")
+    p.add_argument("--provider", default=None, help="spend provider (closed list)")
+    p.add_argument("--purpose", default=None, help="spend purpose (closed list)")
+    p.add_argument("--canon", default=None, metavar="ID",
+                   help="canon whose spend policy is checked (default: the default canon)")
     p.add_argument("--work-item", type=int, default=None)
     p.add_argument("--approver", action="append", default=[])
     p.add_argument("--policy-version", default="1")
@@ -959,6 +1166,43 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project", default=None)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_recap)
+
+    p_spend = act.add_parser("spend", help="pre-delegated spending ledger (#7865)")
+    spend_sub = p_spend.add_subparsers(dest="spend_command")
+    p = spend_sub.add_parser("list", help="ongoing recurring resources and projection")
+    p.add_argument("--decided-by", default=None, metavar="AGENT")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_spend_list)
+
+    p = spend_sub.add_parser("state", help="a grant's spend projection")
+    p.add_argument("grant", type=int)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_spend_state)
+
+    p = spend_sub.add_parser("stop", help="stop an ongoing recurring resource")
+    p.add_argument("id", type=int, help="ledger line (see `ameesh action spend list`)")
+    p.add_argument("--reason", default=None)
+    p.add_argument("--by", default=None)
+    p.add_argument("--noop-dir", default=None)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_spend_stop)
+
+    p = spend_sub.add_parser("confirm", help="a signed owner decision confirms a review")
+    p.add_argument("id", type=int, help="ledger line (see `ameesh action spend list`)")
+    p.add_argument("--decision", type=int, required=True, metavar="N",
+                   help="answered decision #N; its signed option must be "
+                        "confirm-spend-<ledger> (ask it with --needs-signature)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_spend_confirm)
+
+    p = spend_sub.add_parser("sweep", help="stop resources before they cross a cap")
+    p.add_argument("--today", default=None, type=spend_mod.date.fromisoformat,
+                   metavar="YYYY-MM-DD", help="simulated UTC day (tests only)")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--by", default=None)
+    p.add_argument("--noop-dir", default=None)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_spend_sweep)
 
     p_standing = act.add_parser("standing", help="bounded standing approvals (#7629)")
     standing_sub = p_standing.add_subparsers(dest="standing_command")
