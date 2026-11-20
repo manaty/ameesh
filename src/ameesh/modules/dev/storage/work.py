@@ -27,6 +27,7 @@ from .work_footprints import (cap_reached_sql as footprint_cap_sql,
                               held_sql as footprint_held_sql,
                               in_flight_sql as footprint_in_flight_sql,
                               occupying_sql as footprint_occupying_sql,
+                              open_packet_members as footprint_open_packet_members,
                               overlap_exists_sql as footprint_overlap_sql,
                               overlap_rows_sql as footprint_overlap_rows_sql,
                               start_blocking as footprint_start_blocking,
@@ -1509,6 +1510,10 @@ class DevWork(DevDomain):
         # #6347: scan historical lots once, then reuse the open set for the
         # correlated footprint/capacity guards. Keep every app and improvement:
         # they can occupy a footprint even when absent from the output snapshot.
+        # #7940 : la garde du plan lit la même attente humaine canonique que la
+        # prise (`planned_waits.human_waits`), pas un motif SQL parallèle.
+        from .... import planned_waits
+        human_wait_ids = tuple(planned_waits.human_waits(self.db))
         return self.db.query(
             "WITH plan_open_items AS MATERIALIZED ("
             " SELECT * FROM work_items WHERE state NOT IN " + self._core()._CLOSED + "),"
@@ -1540,7 +1545,8 @@ class DevWork(DevDomain):
             # #7940 : une attente humaine de plus de 24 h ne marque plus le
             # lot comme retenu par l'empreinte (même garde que la prise).
             "       (w.state = 'intake' AND " + footprint_overlap_sql(
-                "w", items="plan_open_items", start_on=True, blocking_only=True) + ")"
+                "w", items="plan_open_items", start_on=True, blocking_only=True,
+                human_wait_ids=human_wait_ids) + ")"
             "         AS footprint_overlap,"
             # #4818 : plafond de lots en vol du dépôt, et ce qu'il faut au plan
             # pour choisir un ensemble aux empreintes disjointes deux à deux
@@ -1798,16 +1804,37 @@ class DevWork(DevDomain):
         du lot avec celle d'un lot occupant de son dépôt (requête POSTÉRIEURE
         au verrou, comme le contrôle des dépendances). `free_only` : vide si
         le lot occupe déjà son empreinte (réattribution d'un lot démarré).
-        `blocking_only=False` (: #7940) rend aussi les occupants dont un hold
-        d'attente humaine ne retient plus le démarrage, avec leur hold lisible :
-        l'appelant journalise alors l'avertissement sur les deux lots."""
+
+        #7940 : l'attente humaine est lue par `planned_waits.human_waits` sur
+        les occupants rendus (lecture canonique : `active_holds`, routes
+        humaines du runtime), jamais par un motif SQL parallèle.
+        `blocking_only=True` écarte les occupants qu'elle ne retient plus ;
+        `blocking_only=False` les rend avec leur hold lisible
+        (`human_hold_note`, `human_hold_ts`), pour l'avertissement des deux
+        lots."""
+        from .... import planned_waits
         guard = (" AND NOT " + footprint_occupying_sql("c")) if free_only else ""
-        return self.db.query(
+        rows = self.db.query(
             "SELECT DISTINCT x.* FROM work_items c, LATERAL ("
-            + footprint_overlap_rows_sql("c", start_on=start_on,
-                                         blocking_only=blocking_only)
+            + footprint_overlap_rows_sql("c", start_on=start_on)
             + ") x WHERE c.id = %s" + guard +
             " ORDER BY x.id, x.path", (int(item_id),))
+        waits = planned_waits.human_waits(
+            self.db, [int(row["id"]) for row in rows])
+        packets = footprint_open_packet_members(self.db, waits)
+        out = []
+        for row in rows:
+            ident = int(row["id"])
+            hold = waits.get(ident) if ident not in packets else None
+            row = dict(row)
+            row["human_wait"] = hold is not None
+            if hold is not None:
+                row["human_hold_note"] = hold["note"]
+                row["human_hold_ts"] = hold["since"]
+            if blocking_only and hold is not None:
+                continue
+            out.append(row)
+        return out
     def _footprint_cap(self, item_id, *, free_only=False) -> dict | None:
         """#4818, sous le verrou du graphe : `{cap, in_flight}` si le dépôt du
         lot a atteint son plafond de lots en vol, sinon None ; `free_only` :
@@ -1869,6 +1896,9 @@ class DevWork(DevDomain):
         # (`merged`/`promoted`/`closed`) sont prenables. La règle est celle de
         # `work show` (`depends … blocking`) et de « planned: waiting on lots » :
         # une dépendance en `qa`, même jugée, n'offre pas de base stable.
+        # #7940 : même attente humaine canonique que la prise, lue une fois.
+        from .... import planned_waits
+        human_wait_ids = tuple(planned_waits.human_waits(self.db))
         sql = ("SELECT w.*,"
                f"       (w.state = '{lifecycle.IN_PROGRESS}' AND " + self._core().requeued_sql("w") + ") AS returned_to_queue,"
                "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
@@ -1902,7 +1932,8 @@ class DevWork(DevDomain):
                # garde de `_assign_locked`, avant le LIMIT.
                # #4818 : et le plafond de lots en vol de son dépôt (`held_sql`).
                f"           AND (state <> '{lifecycle.REQUESTED}' OR NOT "
-               + footprint_held_sql("work_items", start_on=True) + ")) w"
+               + footprint_held_sql("work_items", start_on=True,
+                                    human_wait_ids=human_wait_ids) + ")) w"
                "  LEFT JOIN work_packages k ON k.id = w.package_id"
                "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
                f" ORDER BY coalesce(w.priority, 2), (w.state = '{lifecycle.IN_PROGRESS}') DESC,"

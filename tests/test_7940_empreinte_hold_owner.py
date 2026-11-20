@@ -7,21 +7,23 @@ owner » depuis le 17/11, gardait son empreinte « en cours » sans limite et
 bloquait l'assignation de #7927, une ligne déclarative de
 `hotes/ameesh-agents-3.md`, dans une autre partie de la fiche.
 
-La règle : un lot dont le dernier hold est une formule d'attente humaine
-(#3498 : owner, propriétaire, avatar, bureau) qui tient depuis plus de 24 h
-ne retient plus le démarrage d'un lot qui chevauche son empreinte. Le
-chevauchement devient un avertissement journalisé sur les deux lots ; le lot
-en attente garde son empreinte pour l'information. L'âge se compte depuis la
-note de hold elle-même, jamais depuis le dernier événement du lot (les notes
-automatiques du runner ne remettent pas l'horloge à zéro). La règle ne
-touche ni la réservation des numéros de migration, ni un lot gelé dans un
-paquet ouvert (cible réservée, canon §12).
+La règle : un lot dont le dernier hold est une attente humaine (#3498 :
+owner, propriétaire, avatar, ou un nom que le runtime résout comme route
+humaine, #7634) qui tient depuis plus de 24 h ne retient plus le démarrage
+d'un lot qui chevauche son empreinte. Le chevauchement devient un
+avertissement journalisé sur les deux lots ; le lot en attente garde son
+empreinte pour l'information. L'âge se compte depuis la note de hold
+elle-même, jamais depuis le dernier événement du lot (les notes automatiques
+du runner ne remettent pas l'horloge à zéro). La règle ne touche ni la
+réservation des numéros de migration, ni un lot gelé dans un paquet ouvert
+(cible réservée, canon §12).
 """
 from __future__ import annotations
 
+import dataclasses
 import unittest
 
-from ameesh import storage, work
+from ameesh import debit, storage, work
 from ameesh import work_footprints as fp
 
 from .test_4173_empreinte import _Empreintes
@@ -42,6 +44,31 @@ class _AttenteHumaine(_Empreintes):
             "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
             " WHERE id = %s", (float(age_s), int(event["id"])))
         return int(event["id"])
+
+    def no_routes(self):
+        """Aucun avatar au canon ni `report` configuré : routes du cœur seules."""
+        cfg = dataclasses.replace(self.cfg, canon="", release={"projects": {}})
+        self.db.cfg = cfg
+        self.addCleanup(setattr, self.db, "cfg", self.cfg)
+        return cfg
+
+    def route_humaine(self, name="bureau", human="human:smichea"):
+        """Une route humaine résolue au runtime (#7634), pas un nom du cœur."""
+        self.agent(name, responsible=human)
+        cfg = dataclasses.replace(
+            self.cfg, canon="",
+            release={"projects": {"nexlink": {"report": name}}})
+        self.db.cfg = cfg
+        self.addCleanup(setattr, self.db, "cfg", self.cfg)
+        self.assertIn(name, debit.human_route_names(
+            cfg, storage.of(self.db).progress.agents(None),
+            []))
+        return cfg
+
+    def close_lots(self, *items):
+        """Ferme les lots d'une sous-itération : ils n'occupent plus rien."""
+        for item in items:
+            work.close(self.db, int(item["id"]), abandoned=True, actor="test")
 
     def notes(self, item):
         return [row["note"] for row in self.db.query(
@@ -126,17 +153,81 @@ class AttenteHumaineTest(_AttenteHumaine):
                 with self.assertRaises(work.WorkError):
                     work.assign(self.db, second["id"], "human:autre", actor="test")
 
-    def test_les_formules_humaines_de_3498_sont_reconnues(self):
+    def test_les_formules_humaines_du_coeur_sont_reconnues(self):
+        self.no_routes()
         for formula in ("hold: attente owner : signer le go",
                         "hold: attente du propriétaire : signer le go",
-                        "hold: attente de l'avatar : poser le backup",
-                        "hold: attente du bureau : signer le go",
-                        "hold: attente externe (bureau) : signer le go"):
+                        "hold: attente de l'avatar : poser le backup"):
             with self.subTest(formula=formula):
                 premier, second = self.couple()
                 self.hold(premier, formula)
                 rows = self.overlapping(second)
                 self.assertTrue(rows and rows[0]["human_wait"], rows)
+                self.close_lots(premier, second)
+
+    def test_bureau_n_est_une_route_que_si_le_runtime_la_resout(self):
+        """#7634 : `bureau` n'est pas un nom du cœur ; une route configurée
+        sous ce nom en fait une attente humaine, sans configuration non."""
+        self.no_routes()
+        for formula in ("hold: attente du bureau : signer le go",
+                        "hold: attente externe (bureau) : signer le go"):
+            with self.subTest(formula=formula, route=False):
+                premier, second = self.couple()
+                self.hold(premier, formula)
+                self.assertFalse(self.overlapping(second)[0]["human_wait"])
+                self.assertNotIn(second["id"], self.taken())
+                with self.assertRaises(work.WorkError):
+                    work.assign(self.db, second["id"], "human:autre", actor="test")
+                self.close_lots(premier, second)
+
+        self.route_humaine("bureau")
+        for formula in ("hold: attente du bureau : signer le go",
+                        "hold: attente externe (bureau) : signer le go"):
+            with self.subTest(formula=formula, route=True):
+                premier, second = self.couple()
+                self.hold(premier, formula)
+                self.assertTrue(self.overlapping(second)[0]["human_wait"])
+                self.assertIn(second["id"], self.taken())
+                self.close_lots(premier, second)
+
+    def test_un_hold_d_agent_non_pilote_ne_declare_pas_une_attente_humaine(self):
+        """B2 de cx2 : `attente owner` posée par un agent ordinaire reste une
+        attente d'agent (#3498 : la déclaration externe est un geste de
+        pilote) ; elle ne lève donc pas la garde."""
+        premier, second = self.couple()
+        self.hold(premier, "hold: attente owner : signer le go",
+                  actor="agent-ordinaire")
+        self.assertFalse(self.overlapping(second)[0]["human_wait"])
+        self.assertNotIn(second["id"], self.taken())
+        with self.assertRaises(work.WorkError):
+            work.assign(self.db, second["id"], "human:autre", actor="test")
+
+    def test_un_hold_ordinaire_posterieur_du_meme_auteur_remplace_l_attente(self):
+        """B1 de cx2 : même auteur, même état, T−25 h `attente owner` puis
+        maintenant `attente CI` : la dernière retenue de cet auteur est
+        l'ordinaire, la garde refuse comme avant."""
+        premier, second = self.couple()
+        self.hold(premier, "hold: attente owner : signer le go")
+        work.note(self.db, premier["id"],
+                  "hold: attente CI : réparer la panne", actor="human:proprio")
+        self.assertFalse(self.overlapping(second)[0]["human_wait"])
+        self.assertNotIn(second["id"], self.taken())
+        with self.assertRaises(work.WorkError):
+            work.assign(self.db, second["id"], "human:autre", actor="test")
+
+    def test_une_levee_sans_autorite_ne_leve_pas_le_hold_du_pilote(self):
+        """B1 de cx2 : un `unhold:` d'un agent qui ne détient pas la retenue ne
+        lève que la sienne (aucune) ; le hold du pilote reste actif."""
+        premier, second = self.couple()
+        self.hold(premier, "hold: attente owner : signer le go")
+        self.db.execute(
+            "INSERT INTO work_item_events(work_item_id, state, note, actor)"
+            " VALUES (%s, 'intake', 'unhold: je passais par là', 'agent-x')",
+            (premier["id"],))
+        self.assertTrue(self.overlapping(second)[0]["human_wait"])
+        self.assertIn(second["id"], self.taken())
+        work.assign(self.db, second["id"], "human:autre", actor="test")
+        self.assertEqual(work.get(self.db, second["id"])["assignee"], "human:autre")
 
     def test_une_levee_ou_une_transition_d_agent_rebloque(self):
         # Une levée explicite après le hold : l'attente n'est plus ouverte.

@@ -10,34 +10,6 @@ from .schema import DevDomain
 #: Le préfixe de `source` d'un panier (`backlog.BASKET_PREFIX`).
 BASKET_PREFIX = "backlog-basket:"
 
-#: #7940 : au-delà de ce seuil, une attente humaine explicite (formules #3498)
-#: ne retient plus le démarrage d'un lot voisin qui chevauche son empreinte.
-#: Le lot en attente garde son empreinte pour l'information (aucune ligne
-#: n'est retirée) ; la règle ne touche ni la réservation des numéros de
-#: migration, ni un lot gelé dans un paquet ouvert (cible réservée, §12).
-HUMAN_WAIT_BLOCK_HOURS = 24
-
-#: #7940 : une formule d'attente humaine explicite à la tête d'un hold
-#: (#3498) : `hold: attente owner : …`, `hold: attente du bureau, …`,
-#: `hold: attente de l'avatar — …`. `owner`, `propriétaire` et `avatar` sont
-#: les routes humaines du cœur ; `bureau` est le nom historique du bureau
-#: Manaty, que la règle de #7940 nomme (l'attente externe du débit le résout
-#: au runtime, #7634). Le geste qui suit n'est pas lu ici : le hold suffit.
-_HUMAN_WAIT = (
-    r"^[[:space:]]*hold:[[:space:]]*attente[[:space:]]+"
-    r"(?:externe[[:space:]]*[\(\[]?[[:space:]]*)?"
-    r"(?:du[[:space:]]+|de[[:space:]]+la[[:space:]]+|"
-    r"de[[:space:]]+l[''’][[:space:]]*|des[[:space:]]+|le[[:space:]]+|"
-    r"la[[:space:]]+|l[''’][[:space:]]*|au[[:space:]]+|aux[[:space:]]+)?"
-    r"(?:owner|propri[ée]taire|bureau|avatar)(?:[[:space:]]*[\)\]]?)"
-    r"(?:[[:space:]]|:|,|$)"
-)
-
-#: #5758 : les transitions et notes de l'outillage ne sont pas des gestes.
-#: Même vocabulaire que `planned_waits._AUTOMATIC_ACTOR`.
-_AUTOMATIC_ACTOR_SQL = (
-    r"!~* '^(ameesh(:|$)|device-gates([[:space:]]|$)|git:|composition:)'")
-
 #: Les états terminaux d'un porteur (`lifecycle.COMPLETED`), en SQL.
 _COMPLETED_SQL = ("('" + "', '".join(lifecycle.COMPLETED) + "')")
 
@@ -133,60 +105,21 @@ def start_blocking(dependent: str, blocker: str = "b") -> str:
             + start_on_sql(dependent, blocker) + ")")
 
 
-def _not_automatic(alias: str) -> str:
-    """L'acteur de `alias` n'est pas une écriture de l'outillage (#5758)."""
-    return alias + ".actor " + _AUTOMATIC_ACTOR_SQL
+def human_wait_expr(alias: str, ids=()) -> str:
+    """#7940 : le lot `alias` porte une attente humaine qui ne bloque plus.
 
-
-def human_wait_lateral(alias: str, hold: str = "hw") -> str:
-    """#7940 : le dernier hold d'attente humaine du lot `alias`, et sa validité.
-
-    `hold.note` et `hold.created_at` portent la déclaration ; `hold.active`
-    dit qu'elle tient encore — aucune levée ni transition d'agent après elle
-    (une transition automatique de l'outillage ne lève pas un hold de pilote,
-    #5758). Le préfixe exact est celui de `planned_waits._HOLD` ; une note
-    d'outillage n'est jamais une déclaration. L'âge (24 h) est comparé par
-    `human_wait_expr`, sur la note elle-même et non sur le dernier événement
-    du lot : les notes automatiques du runner ne remettent pas l'horloge à
-    zéro (pilote, #7940).
+    `ids` sont les lots rendus par `planned_waits.human_waits` — la lecture
+    canonique (`active_holds`, routes humaines du runtime #7634) — jamais une
+    liste écrite ici. Vrai pour un de ces lots qui n'est pas gelé dans un
+    paquet ouvert : la cible d'un paquet en CI est réservée (§12), et sa tête
+    gelée ne doit pas recevoir un voisin. Le lot en attente garde son
+    empreinte : ce prédicat ne retire aucune ligne, il écarte seulement le
+    chevauchement de la garde.
     """
-    return (" LEFT JOIN LATERAL ("
-            " SELECT h.id, h.note, h.created_at,"
-            "        (NOT EXISTS ("
-            "           SELECT 1 FROM work_item_events l"
-            "            WHERE l.work_item_id = h.work_item_id"
-            "              AND l.id > h.id"
-            "              AND l.note ~* '^[[:space:]]*(unhold|hold[[:space:]]+"
-            "(lifted|released|cleared))[[:space:]]*:')"
-            "         AND NOT EXISTS ("
-            "           SELECT 1 FROM ("
-            "             SELECT e.id, e.state, e.actor, e.created_at,"
-            "                    lag(e.state) OVER (PARTITION BY e.work_item_id"
-            "                                       ORDER BY e.id) AS prev"
-            "               FROM work_item_events e"
-            "              WHERE e.work_item_id = h.work_item_id) t"
-            "            WHERE t.id > h.id"
-            "              AND t.prev IS DISTINCT FROM t.state"
-            "              AND " + _not_automatic("t") + ")) AS active"
-            "   FROM work_item_events h"
-            "  WHERE h.work_item_id = " + alias + ".id"
-            "    AND h.note ~* '" + _HUMAN_WAIT + "'"
-            "    AND " + _not_automatic("h") +
-            "  ORDER BY h.id DESC LIMIT 1) " + hold + " ON true")
-
-
-def human_wait_expr(alias: str, hold: str = "hw") -> str:
-    """#7940 : l'attente humaine de `alias` ne bloque plus le démarrage.
-
-    Vrai quand un hold d'attente humaine tient depuis plus de 24 h et que le
-    lot n'est pas gelé dans un paquet ouvert : la cible d'un paquet en CI est
-    réservée (§12), et sa tête gelée ne doit pas recevoir un voisin. Le lot en
-    attente garde son empreinte : ce prédicat ne retire aucune ligne, il
-    écarte seulement le chevauchement de la garde.
-    """
-    return ("(" + hold + ".id IS NOT NULL AND " + hold + ".active"
-            " AND " + hold + ".created_at <= now() - interval '"
-            + str(HUMAN_WAIT_BLOCK_HOURS) + " hours'"
+    wanted = sorted({int(i) for i in ids or ()})
+    if not wanted:
+        return "false"
+    return ("(" + alias + ".id IN (" + ", ".join(str(i) for i in wanted) + ")"
             " AND NOT EXISTS ("
             "   SELECT 1 FROM work_packet_members pm"
             "     JOIN work_items pk ON pk.id = pm.package_id"
@@ -194,12 +127,30 @@ def human_wait_expr(alias: str, hold: str = "hw") -> str:
             "      AND pk.state NOT IN " + _COMPLETED_SQL + "))")
 
 
+def open_packet_members(db, ids) -> set[int]:
+    """#7940 : les lots `ids` gelés dans un paquet ouvert (cible réservée, §12).
+
+    Même condition que `human_wait_expr` ; l'appelant qui attache le hold
+    lisible après coup (lecture canonique de `planned_waits.human_waits`) doit
+    écarter ces lots : un membre d'un paquet en CI garde sa retenue."""
+    wanted = sorted({int(i) for i in ids or ()})
+    if not wanted:
+        return set()
+    rows = db.query(
+        "SELECT DISTINCT pm.work_item_id FROM work_packet_members pm"
+        "  JOIN work_items pk ON pk.id = pm.package_id"
+        " WHERE pm.work_item_id = ANY(%s) AND pk.state NOT IN " + _COMPLETED_SQL,
+        (wanted,))
+    return {int(row["work_item_id"]) for row in rows}
+
+
 # `items` is a trusted SQL relation name, like `alias`, never user input.
 # A snapshot may supply a CTE containing all non-terminal lots; the canonical
 # predicates below still decide which of those lots occupy an individual app.
 def overlap_rows_sql(alias: str, *, items: str = "work_items",
                      start_on: bool = False,
-                     blocking_only: bool = False) -> str:
+                     blocking_only: bool = False,
+                     human_wait_ids=()) -> str:
     """Les paires (chemin du lot `alias`, chemin d'un lot occupant du même
     dépôt) qui se chevauchent — corps de `overlapping` et de la garde.
 
@@ -207,12 +158,13 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
     reste ce qui retient vraiment le démarrage. Sans lui, chaque paire porte
     `start_on` et `other_frozen_sha` pour l'affichage.
 
-    `blocking_only=True` (: #7940) écarte les occupants dont un hold d'attente
-    humaine tient depuis plus de 24 h : le chevauchement ne retient plus, il
-    devient un avertissement journalisé (`human_wait`). Sans lui, la paire
-    reste visible et porte le hold lisible (`human_hold_note`,
-    `human_hold_ts`) : le lot en attente garde son empreinte pour
-    l'information.
+    `human_wait_ids` sont les lots rendus par `planned_waits.human_waits`
+    (#7940, lecture canonique). `blocking_only=True` écarte ces occupants : le
+    chevauchement ne retient plus, il devient un avertissement journalisé
+    (`human_wait`). Sans lui, la paire reste visible et porte `human_wait` :
+    le lot en attente garde son empreinte pour l'information. Le texte du hold
+    et sa date sont attachés par l'appelant (`human_hold_note`,
+    `human_hold_ts`), depuis la même lecture.
 
     #7758 : un occupant exempté (`exempt_sql` : véhicule de paquet, décision,
     découpage) n'occupe rien ; un véhicule n'a pas de delta propre, ses
@@ -222,15 +174,12 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
             "       (SELECT m.sha FROM work_item_milestones m"
             "         WHERE m.work_item_id = o.id AND m.kind = 'frozen'"
             "         ORDER BY m.at DESC, m.id DESC LIMIT 1) AS other_frozen_sha,"
-            "       " + human_wait_expr("o") + " AS human_wait,"
-            "       hw.note AS human_hold_note,"
-            "       extract(epoch FROM hw.created_at)::float8 AS human_hold_ts"
+            "       " + human_wait_expr("o", human_wait_ids) + " AS human_wait"
             "  FROM work_item_footprints mine"
             "  JOIN work_item_footprints theirs"
             "    ON theirs.work_item_id <> mine.work_item_id"
             "   AND " + _PATHS_OVERLAP.format(a="theirs", b="mine") +
             "  JOIN " + items + " o ON o.id = theirs.work_item_id"
-            + human_wait_lateral("o") +
             " WHERE mine.work_item_id = " + alias + ".id"
             "   AND coalesce(btrim(" + alias + ".app), '') <> ''"
             "   AND btrim(o.app) = btrim(" + alias + ".app)"
@@ -243,22 +192,25 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
     if blocking_only:
         # #7940 : la garde ne retient plus sur une attente humaine de plus de
         # 24 h ; l'affichage (`overlapping`) garde la ligne et son hold.
-        rows += "   AND NOT " + human_wait_expr("o")
+        rows += "   AND NOT " + human_wait_expr("o", human_wait_ids)
     return rows
 
 
 def overlap_exists_sql(alias: str, *, items: str = "work_items",
                        start_on: bool = False,
-                       blocking_only: bool = False) -> str:
+                       blocking_only: bool = False,
+                       human_wait_ids=()) -> str:
     """Vrai si le lot `alias` chevauche un lot occupant de son dépôt.
 
     `unassigned_lots` (sélection) et `_assign_locked` (sous le verrou du
     graphe) appliquent ce même prédicat : une seule règle. `start_on=True`
     ignore les occupants validés dont le lot déclare la dépendance (#7760).
     `blocking_only=True` (: #7940) applique la garde de démarrage : une
-    attente humaine de plus de 24 h ne retient plus."""
-    return "EXISTS (" + overlap_rows_sql(alias, items=items, start_on=start_on,
-                                         blocking_only=blocking_only) + ")"
+    attente humaine de plus de 24 h (`human_wait_ids`, lue par
+    `planned_waits.human_waits`) ne retient plus."""
+    return "EXISTS (" + overlap_rows_sql(
+        alias, items=items, start_on=start_on, blocking_only=blocking_only,
+        human_wait_ids=human_wait_ids) + ")"
 
 
 #: #4667 : un véhicule de paquet (`integration/**`) n'a pas de delta propre ;
@@ -310,16 +262,19 @@ def cap_reached_sql(alias: str, *, items: str = "work_items") -> str:
     return "EXISTS (" + cap_rows_sql(alias, items=items) + ")"
 
 
-def held_sql(alias: str, *, start_on: bool = False) -> str:
+def held_sql(alias: str, *, start_on: bool = False,
+             human_wait_ids=()) -> str:
     """Vrai si la garde retient le lot `alias` : son empreinte chevauche celle
     d'un lot occupant de son dépôt, ou le dépôt a atteint son plafond de lots
     en vol (#4818). Le prédicat commun de la prise, de l'attribution et du
     plan de dispatch. `start_on=True` : garde de DÉMARRAGE, qui laisse passer
     un lot sur les lots validés dont il déclare la dépendance (#7760).
-    #7940 : un occupant en attente humaine depuis plus de 24 h ne retient
-    plus (le chevauchement devient un avertissement journalisé)."""
+    #7940 : un occupant en attente humaine depuis plus de 24 h
+    (`human_wait_ids`, lu par `planned_waits.human_waits`) ne retient plus
+    (le chevauchement devient un avertissement journalisé)."""
     return ("(" + overlap_exists_sql(alias, start_on=start_on,
-                                     blocking_only=True) + " OR "
+                                     blocking_only=True,
+                                     human_wait_ids=human_wait_ids) + " OR "
             + cap_reached_sql(alias) + ")")
 
 
@@ -424,10 +379,22 @@ class WorkFootprints(DevDomain, Contract):
             " ORDER BY work_item_id, path, source", tuple(ids))
 
     def overlapping(self, item_id):
-        return self.db.query(
+        from .... import planned_waits
+        rows = self.db.query(
             "SELECT DISTINCT x.* FROM work_items c, LATERAL ("
             + overlap_rows_sql("c") + ") x WHERE c.id = %s ORDER BY x.id, x.path",
             (int(item_id),))
+        waits = planned_waits.human_waits(
+            self.db, [int(row["id"]) for row in rows])
+        packets = open_packet_members(self.db, waits)
+        for row in rows:
+            ident = int(row["id"])
+            hold = waits.get(ident) if ident not in packets else None
+            row["human_wait"] = hold is not None
+            if hold is not None:
+                row["human_hold_note"] = hold["note"]
+                row["human_hold_ts"] = hold["since"]
+        return rows
 
     def cap_reached(self, item_id):
         rows = self.db.query(

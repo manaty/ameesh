@@ -26,8 +26,9 @@ coûte une attente, jamais un conflit ; un lot sans empreinte connue n'est
 pas retenu (rien ne dit qu'il chevauche).
 
 #7940 : une attente humaine explicite et durable ne gèle plus les fichiers
-qu'elle touche. Un lot dont le dernier hold est une formule d'attente owner,
-propriétaire, avatar ou bureau (#3498) qui tient depuis plus de 24 h ne
+qu'elle touche. Un lot dont le dernier hold de pilote déclare une attente
+externe (#3498 : owner, propriétaire, avatar, ou un nom que le runtime
+résout comme route humaine, #7634) qui tient depuis plus de 24 h ne
 retient plus le démarrage d'un lot qui chevauche son empreinte : le
 chevauchement devient un avertissement journalisé sur les deux lots. Le lot
 en attente garde son empreinte pour l'information ; à son go, il se rebase
