@@ -73,6 +73,10 @@ cette frontière :
   compare la forme complète (image, commandes, env, volumes, montages,
   contexte de sécurité, labels/annotations) et la ConfigMap passwd/group/
   config au plan `tenancy.child_plan` ;
+- il n'admet que les objets présentés par l'identité réelle du pourvoyeur,
+  `system:serviceaccount:<namespace>:ameesh-pod-provisioner` (nom dérivé du
+  namespace, surchargeable par `--provisioner-user`) : un autre auteur est
+  refusé, jamais admis par défaut ;
 - `failurePolicy: Fail` : webhook indisponible = aucun pod enfant admis.
 
 La VAP reste en place comme seconde barrière (défense en profondeur), mais
@@ -182,13 +186,15 @@ non pod n'ont aucune ligne `pod_hosts` et gardent la garde #7106 inchangée.
 - **Kind** : la preuve RBAC/template/quota/cycle de vie est un geste de
   bureau (pas de script livré dans ce lot) ; le témoin complet des identités
   et du canon reste [`../pod-witness/`](../pod-witness/).
-- **SA pourvoyeur entièrement compromis** : la VAP lie le Secret au label
-  `ameesh.dev/child`, mais ce label est posé par le même compte de service.
-  Un SA compromis peut donc se déclarer un autre enfant et monter le Secret
-  correspondant ; la VAP statique ne peut pas interroger `pod_requests`. Une
-  fermeture complète demanderait un webhook d'admission qui recoupe la
-  demande en base, hors de cette tranche. Le nom du Secret ne dépend pas du
-  tenant (limite L155 : la base reste dans le périmètre de confiance).
+- **SA pourvoyeur entièrement compromis** : le webhook
+  `ameesh-pod-admission` recoupe chaque pod et ConfigMap étiqueté à sa
+  demande `pod_requests` (lecture seule) et refuse tout écart ; le label d'un
+  autre enfant ne suffit donc plus. Résidus : le DSN partagé (limite L155)
+  laisse une écriture en base hors de la portée de la garde ; le SA du
+  webhook peut mettre à jour son propre `caBundle` (`resourceNames` borné au
+  nom `ameesh-child-pods`), une compromission du webhook peut donc le
+  désarmer ; une ConfigMap sans label `managed-by` échappe à
+  l'`objectSelector`, mais elle est recoupée quand le pod la monte.
 - **Battement frais** : la garde de réclamation exige un battement de moins
   de 120 s ; un runner dont l'intervalle de ressources dépasse cette valeur
   doit l'abaisser (`AMEESH_RESOURCE_INTERVAL`).

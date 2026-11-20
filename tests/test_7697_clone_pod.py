@@ -792,18 +792,53 @@ class PodAdmissionTest(unittest.TestCase):
             dsn="postgresql://ameesh@db/ameesh", now=self.NOW,
             client=_AdmissionConfigmaps(self.rendered.configmap))
 
-    def review(self, pod, *, user=pod_admission.ACTOR):
+    def review(self, pod, *, user=None):
         return {"request": {
             "uid": "review-1", "operation": "CREATE",
             "resource": {"group": "", "version": "v1", "resource": "pods"},
             "namespace": "ameesh",
-            "userInfo": {"username": user},
+            "userInfo": {"username": user or self.admission.provisioner_user},
             "object": copy.deepcopy(pod),
         }}
 
     def test_pod_conforme_admis(self):
         decision = self.admission.check(self.review(self.rendered.pod))
         self.assertTrue(decision["allowed"], decision.get("message"))
+
+    def test_l_identite_reelle_du_service_account_est_admise(self):
+        """L'API server présente `system:serviceaccount:<ns>:<sa>` ; le
+        webhook doit admettre ce nom, pas l'acteur de base de données
+        `system:ameesh-pod-provisioner` (no-op du gel #44550)."""
+        self.assertEqual(
+            self.admission.provisioner_user,
+            "system:serviceaccount:ameesh:ameesh-pod-provisioner")
+        decision = self.admission.check(self.review(
+            self.rendered.pod,
+            user="system:serviceaccount:ameesh:ameesh-pod-provisioner"))
+        self.assertTrue(decision["allowed"], decision.get("message"))
+
+    def test_un_utilisateur_inattendu_est_refuse(self):
+        """Un objet étiqueté présenté par un autre compte est refusé : le
+        webhook ne se désarme plus pour un auteur inconnu."""
+        decision = self.admission.check(self.review(
+            self.rendered.pod,
+            user="system:serviceaccount:ameesh:ameesh-pod-admission"))
+        self.assertFalse(decision["allowed"])
+        self.assertIn("not created by the pod provisioner",
+                      decision["message"])
+
+    def test_le_nom_du_service_account_est_configurable(self):
+        autre = "system:serviceaccount:ameesh:autre-pourvoyeur"
+        admission = pod_admission.PodAdmission(
+            None, self.template, requests=_AdmissionRows(self.row),
+            image="ameesh-runner", namespace="ameesh",
+            dsn="postgresql://ameesh@db/ameesh", now=self.NOW,
+            client=_AdmissionConfigmaps(self.rendered.configmap),
+            provisioner_user=autre)
+        decision = admission.check(self.review(self.rendered.pod, user=autre))
+        self.assertTrue(decision["allowed"], decision.get("message"))
+        decision = admission.check(self.review(self.rendered.pod))
+        self.assertFalse(decision["allowed"])
 
     def test_les_champs_systeme_de_l_api_server_sont_admis(self):
         """UID, date de création et resourceVersion sont posés avant
@@ -870,7 +905,7 @@ class PodAdmissionTest(unittest.TestCase):
             "uid": "review-cm", "operation": "CREATE",
             "resource": {"group": "", "version": "v1", "resource": "configmaps"},
             "namespace": "ameesh",
-            "userInfo": {"username": pod_admission.ACTOR},
+            "userInfo": {"username": self.admission.provisioner_user},
             "object": bad,
         }}
         decision = self.admission.check(review)
@@ -889,10 +924,16 @@ class PodAdmissionTest(unittest.TestCase):
             dsn="postgresql://ameesh@db/ameesh", now=2_001.0)
         self.assertFalse(expired.check(self.review(self.rendered.pod))["allowed"])
 
-    def test_un_autre_service_account_n_est_pas_filtre(self):
+    def test_un_autre_service_account_est_refuse(self):
+        """L'ancien comportement admettait un auteur quelconque : c'était le
+        no-op du gel #44550. Un objet étiqueté hors du SA pourvoyeur est
+        refusé, même avant l'examen de sa forme."""
         decision = self.admission.check(self.review(
-            {"metadata": {"name": "x", "namespace": "ameesh"}}, user="system:serviceaccount:ameesh:autre"))
-        self.assertTrue(decision["allowed"])
+            {"metadata": {"name": "x", "namespace": "ameesh"}},
+            user="system:serviceaccount:ameesh:autre"))
+        self.assertFalse(decision["allowed"])
+        self.assertIn("not created by the pod provisioner",
+                      decision["message"])
 
     def test_manifests_du_webhook(self):
         """Identité distincte, fail-closed, et hors de portée du Role du

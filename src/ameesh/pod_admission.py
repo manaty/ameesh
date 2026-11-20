@@ -42,6 +42,7 @@ from . import pod_provisioner, storage, tenancy
 
 ACTOR = pod_provisioner.ACTOR
 PROVISIONER_LABEL = "ameesh-pod-provisioner"
+PROVISIONER_SA = "ameesh-pod-provisioner"
 MANAGED_BY = "ameesh.dev/managed-by"
 REQUEST_ID = "ameesh.dev/request-id"
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -61,6 +62,16 @@ def _allow(message: str = "") -> dict:
 
 def _deny(message: str) -> dict:
     return {"allowed": False, "message": message}
+
+
+def provisioner_username(namespace: str) -> str:
+    """Identité que l'API server donne au ServiceAccount du pourvoyeur.
+
+    `userInfo.username` vaut `system:serviceaccount:<namespace>:<nom>` ; le
+    nom du SA n'est pas l'acteur de base de données `ACTOR`, qui reste
+    `system:ameesh-pod-provisioner` dans `pod_requests.claimed_by`.
+    """
+    return "system:serviceaccount:%s:%s" % (namespace, PROVISIONER_SA)
 
 
 def _join(path: str, key: str) -> str:
@@ -216,7 +227,8 @@ class PodAdmission:
     def __init__(self, db, template: pod_provisioner.PodTemplate, *,
                  client=None, image: str = pod_provisioner.DEFAULT_IMAGE,
                  namespace: str = pod_provisioner.DEFAULT_NAMESPACE,
-                 dsn: str = "", now: float | None = None, requests=None):
+                 dsn: str = "", now: float | None = None, requests=None,
+                 provisioner_user: str | None = None):
         self.db = db
         self.template = template
         self.client = client
@@ -225,6 +237,8 @@ class PodAdmission:
         self.dsn = dsn
         self._requests = requests
         self._now_value = now
+        self.provisioner_user = (
+            provisioner_user or provisioner_username(namespace))
 
     def _now_ts(self) -> float:
         return time.time() if self._now_value is None else float(self._now_value)
@@ -276,11 +290,14 @@ class PodAdmission:
         request = review.get("request") or {}
         if request.get("operation") not in ("CREATE", "UPDATE"):
             return _allow("not an admission of a child object")
-        user = (request.get("userInfo") or {}).get("username", "")
-        if user != ACTOR:
-            # Le webhook ne vise que le pourvoyeur ; les autres objets du
-            # namespace gardent leurs propres gardes.
-            return _allow("not the pod provisioner")
+        user = (request.get("userInfo") or {}).get("username") or ""
+        if user != self.provisioner_user:
+            # Refus par défaut : un objet étiqueté `managed-by` n'est admis
+            # que pour le ServiceAccount du pourvoyeur. Le webhook ne vise
+            # que ces objets (objectSelector), mais un autre auteur ne doit
+            # pas pouvoir se glisser dans le périmètre. Le nom est dérivé du
+            # namespace et configurable si le SA est renommé.
+            return _deny("child object is not created by the pod provisioner")
         resource = (request.get("resource") or {}).get("resource", "")
         if resource == "configmaps":
             return self._check_configmap(request)
@@ -437,6 +454,10 @@ def main(argv: list[str] | None = None) -> int:
         "AMEESH_POD_IMAGE", pod_provisioner.DEFAULT_IMAGE))
     parser.add_argument("--namespace", default=os.environ.get(
         "AMEESH_POD_NAMESPACE", pod_provisioner.DEFAULT_NAMESPACE))
+    parser.add_argument("--provisioner-user", default=os.environ.get(
+        "AMEESH_POD_PROVISIONER_USER") or None,
+        help="userInfo.username du SA pourvoyeur (défaut : "
+             "system:serviceaccount:<namespace>:ameesh-pod-provisioner)")
     parser.add_argument("--dsn", default="")
     parser.add_argument("--cert", default="/tls/tls.crt")
     parser.add_argument("--key", default="/tls/tls.key")
@@ -467,7 +488,8 @@ def main(argv: list[str] | None = None) -> int:
         client.namespace = args.namespace
         admission = PodAdmission(
             db, template, client=client, image=args.image,
-            namespace=args.namespace, dsn=clean_dsn)
+            namespace=args.namespace, dsn=clean_dsn,
+            provisioner_user=args.provisioner_user)
         server = AdmissionServer(admission, cert=args.cert, key=args.key,
                                  host=args.listen, port=args.port)
         print("ameesh pod-admission: listening on %s:%d" % (args.listen, args.port),

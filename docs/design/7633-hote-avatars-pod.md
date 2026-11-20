@@ -1059,7 +1059,9 @@ agents différents ; P5 dépend des deux.
   (`ameesh-pod-admission`), avec son template dans son image et un accès en
   lecture seule à `pod_requests` : il vérifie request-id, tenant, enfant,
   nom du pod et Secret exact, et refuse absence, discordance ou demande
-  périmée ; `failurePolicy: Fail`. La VAP reste la seconde barrière. Avec le
+  périmée ; il n'admet que l'identité réelle du ServiceAccount pourvoyeur
+  (`system:serviceaccount:<namespace>:ameesh-pod-provisioner`) et refuse tout
+  autre auteur ; `failurePolicy: Fail`. La VAP reste la seconde barrière. Avec le
   DSN partagé (limite L155), une écriture en base reste hors du périmètre de
   cette garde.
 - **Estimation** : 3 j pour #7633 est sous-évalué ; le pilote doit
