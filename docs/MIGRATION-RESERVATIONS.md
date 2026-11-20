@@ -11,7 +11,9 @@ ameesh work migration 711 --repo /path/to/clone
 The legacy next-free allocation keeps its repository-wide scan (worktree and
 all branches, #1603). An exact number (`--number N`) reads only the lot's
 target branch (#2620: `branch_target`, else the project target, else the
-repository default, published `origin/` first): a number carried by an
+repository's declared target — `git config ameesh.target`; never the clone's
+default branch `origin/HEAD`, and without a declared target the command
+refuses, #2660; published `origin/` first): a number carried by an
 unmerged branch no longer refuses it, since a package renumbers that branch's
 migration when it lands (#2400).
 

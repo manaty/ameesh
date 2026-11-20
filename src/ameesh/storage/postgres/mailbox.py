@@ -400,13 +400,17 @@ class Mailbox(interface.Mailbox):
     def delivered_for_lot(self, recipient, lot, limit) -> list[dict]:
         """#2539 : les derniers messages déjà remis de CE lot, filtrés dans la
         requête (destinataire + lot), sans fenêtre de temps — un verdict ancien
-        reste lisible dans le brief de son lot."""
+        reste lisible dans le brief de son lot.
+
+        #2752 : comme #2563, le lot est comparé à `work_item_id` sans
+        fonction, pour rester sur l'index partiel 0413. Tous les écrivains
+        posent `str(int(lot))` : l'égalité simple est exacte."""
         return self.db.query(
             """
             SELECT %s
             FROM agent_mailbox
             WHERE recipient = %%s
-              AND btrim(coalesce(work_item_id, '')) = %%s
+              AND work_item_id = %%s
               AND delivered_at IS NOT NULL
             ORDER BY id DESC
             LIMIT %%s

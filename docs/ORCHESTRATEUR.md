@@ -827,8 +827,10 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    être le dépôt du lot sur l'hôte github.com exactement), et
    des numéros déjà réservés pour ce dépôt. `--number N` réserve un numéro
    précis : il est refusé s'il existe déjà **sur la branche cible du lot**
-   (#2620 : sa `branch_target`, sinon la cible du projet, sinon celle du
-   dépôt, `origin/` publiée d'abord ; l'arbre de travail, le paquet installé
+   (#2620 : sa `branch_target`, sinon la cible du projet, sinon la cible
+   déclarée du clone — `git config ameesh.target` —, jamais sa branche par
+   défaut `origin/HEAD` : sans cible déclarée, la commande refuse (#2660) ;
+   `origin/` publiée d'abord ; l'arbre de travail, le paquet installé
    et les branches non fusionnées ne comptent pas — un paquet renumérote une
    migration à sa fusion, #2400) ou s'il est réservé par un autre lot. Chaque
    dépôt a sa suite : la
@@ -842,8 +844,10 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
    idempotente ; `--number N` réserve un numéro précis, refusé s'il existe
    déjà sur la branche cible du lot (`branch_target`, sinon la cible du
-   projet, sinon celle du dépôt, `origin/` publiée d'abord ; les branches non
-   fusionnées ne comptent pas, #2620) ou s'il est réservé ailleurs. Un lot qui
+   projet, sinon la cible déclarée `ameesh.target`, `origin/` publiée
+   d'abord ; sans cible déclarée, refus — jamais `origin/HEAD`, #2660 ; les
+   branches non fusionnées ne comptent pas, #2620) ou s'il est réservé
+   ailleurs. Un lot qui
    ajoute plusieurs migrations en réserve plusieurs (#2481) : chaque
    `--number` s'ajoute à sa liste `migrations`, le premier numéro restant la
    réservation principale lue par les clients d'avant #2481 ; `--release

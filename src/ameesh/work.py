@@ -624,12 +624,14 @@ def lot_repository(item: dict, cfg=None) -> str:
 
 def _migration_target(item: dict, checkout: str, cfg=None) -> str:
     """La cible du lot pour l'invariant des numéros de migration (#2620) :
-    `branch_target`, sinon la cible de son projet, sinon celle du dépôt —
-    exactement celle que lisent la file de fusion et la classe de revue.
-    Chaîne vide quand aucune n'est connue."""
+    `branch_target`, sinon la cible de son projet, sinon celle que le clone
+    déclare (`git config ameesh.target`) — jamais sa branche par défaut
+    (`origin/HEAD`), qui nomme main sur un clone nexlink alors que le projet
+    intègre sur develop (#2660). Chaîne vide quand aucune n'est déclarée :
+    l'appelant refuse alors explicitement."""
     from . import lot_class
 
-    return str(lot_class.default_base(cfg, item, checkout) or "").strip()
+    return str(lot_class.default_base(cfg, item, checkout, declared_only=True) or "").strip()
 
 
 def _short_repo(repo) -> str:
@@ -685,10 +687,13 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     dépôt du lot. Sans `number` : le prochain libre, au-delà des numéros du
     dépôt (arbre, toutes ses branches) et de ceux déjà réservés pour ce dépôt.
     `number` est refusé s'il existe déjà **sur la branche cible du lot** —
-    `branch_target`, sinon la cible de son projet, sinon celle du dépôt,
-    `origin/` publiée d'abord (#2620 : l'arbre de travail, le paquet installé
+    `branch_target`, sinon la cible de son projet, sinon celle que le clone
+    déclare (`git config ameesh.target`), `origin/` publiée d'abord ; sans
+    cible déclarée, refus — jamais la branche par défaut `origin/HEAD`, qui
+    peut nommer main alors que le projet intègre sur develop (#2660) ;
+    l'arbre de travail, le paquet installé
     et les autres branches ne comptent pas ; une branche non fusionnée sera
-    renumérotée à sa fusion, #2400) — ou s'il est réservé par un autre lot
+    renumérotée à sa fusion, #2400 — ou s'il est réservé par un autre lot
     (index uniques (dépôt, numéro) : la base tranche, même entre deux
     réservations simultanées). Un lot qui a déjà une réservation garde les
     précédentes : un second numéro s'ajoute (liste `migrations`), il ne
@@ -701,7 +706,8 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     contre la réservation. `skip_worktree` (#2400) : ignorer l'arbre de travail
     du clone de lecture — le train y compose justement la migration à réserver.
     `target` (#2620) : la cible à lire pour un numéro exact quand l'appelant la
-    connaît déjà (le train compose une cible explicite), sinon celle du lot.
+    connaît déjà (le train compose une cible explicite), sinon la cible
+    déclarée du lot (#2660).
     Rend le lot, avec `migration_file` et la liste `migrations`. Une correction
     concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
     `issue reference changed meanwhile, retry`), jamais écrite en silence."""
@@ -776,14 +782,20 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         target = (target or "").strip() or _migration_target(item, checkout, cfg)
         present = migrations.target_numbers(checkout, layout, target)
         if present is None:
+            if target:
+                detail = "target branch %r of lot #%s is unknown in %s" % (
+                    target, item_id, checkout)
+                hint = "fetch it (`git fetch origin`) or name the target"
+            else:
+                detail = "no target branch is declared for lot #%s (checkout %s)" % (
+                    item_id, checkout)
+                hint = ("the clone's default branch (`origin/HEAD`) is never read for an "
+                        "exact number (#2660); name the target")
             raise WorkError(
-                "migration %s: %s of lot #%s is unknown in %s — an exact number is checked "
-                "against the target branch only (#2620); fetch it (`git fetch origin`) or "
-                "name the target (`ameesh work branch %s <branch> --target <target>`, or "
+                "migration %s: %s — an exact number is checked against the target branch "
+                "only (#2620); %s (`ameesh work branch %s <branch> --target <target>`, or "
                 "`git config ameesh.target <target>`)"
-                % (layout.label(number),
-                   ("target branch %r" % target) if target else "no target branch",
-                   item_id, checkout, item_id))
+                % (layout.label(number), detail, hint, item_id))
         if number in present:
             raise WorkError("migration %s already in %s (%s): choose another number" % (
                 layout.label(number), slug, ", ".join(sorted(present[number])[:3])))

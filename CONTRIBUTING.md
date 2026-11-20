@@ -101,7 +101,10 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   contribution sans lot prend le numéro suivant le plus haut de `main` et de
   toutes les PR ouvertes. Un numéro exact (`--number N`) ne lit que la
   branche cible : une branche non fusionnée qui porte déjà N ne bloque pas
-  (elle sera renumérotée à sa fusion, #2400). Deux migrations de même numéro
+  (elle sera renumérotée à sa fusion, #2400). La cible est celle du lot, sinon
+  celle de son projet, sinon `git config ameesh.target` ; sans cible déclarée
+  la commande refuse, elle ne lit jamais `origin/HEAD` (#2660). Deux
+  migrations de même numéro
   font échouer la suite unitaire (`tests/test_l122_numeros_de_migration.py`) :
   la dernière venue se renumérote. Une migration ne fait qu'ajouter, sauf
   version majeure (voir ci-dessous).

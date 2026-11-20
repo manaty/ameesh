@@ -561,10 +561,10 @@ class ReadyTest(unittest.TestCase):
     def test_gate_participants_are_critical_scope(self):
         # #1515 N2 : radar et work peuvent calculer la classe ou le correcteur
         # de la porte ; un lot qui ne les touche que là demande deux avis.
-        for path in ("src/ameesh/radar.py", "src/ameesh/work.py"):
-            klass = {"class": "sensitive",
-                     "files": [{"path": path, "class": "sensitive"}]}
-            self.assertEqual(merge_queue.required_verdicts(klass), 2, path)
+        for path in ("src/ameesh/radar.py", "src/ameesh/work.py",
+                     "src/ameesh/merge_queue.py", "src/ameesh/review_lot.py"):
+            self.assertTrue(any(rx.search(path) for rx in merge_queue.CRITICAL_SCOPE),
+                            path)
 
     def test_sql_needs_two_families_before_any_pr(self):
         klass = {"class": "sensitive", "files": [
@@ -1413,6 +1413,43 @@ class CompleteAuthorsTest(unittest.TestCase):
                 with self.assertRaises(merge_queue._ProvenanceError):
                     merge_queue._complete_authors(
                         object(), {"id": 7, "assignee": "author"}, frozen, tmp, "main")
+
+    def test_a_small_reviewer_correction_is_not_an_author(self):
+        # #2638/#2739 : l'auteur d'un petit correctif de relecteur n'est pas un
+        # auteur de la tête ; sa famille reste éligible, la porte écartant son
+        # nom de son propre correctif.
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            base, frozen = self._repo(tmp, git, "rev1")
+            item = {"id": 7, "assignee": "author", "branch_target": "main"}
+            with mock.patch.object(merge_queue.work, "events", return_value=[]), \
+                    mock.patch.object(merge_queue, "actor_family",
+                                      side_effect=_family), \
+                    mock.patch.object(review_lot, "compiled_families", return_value=()), \
+                    mock.patch.object(merge_queue, "_corrections_on_freeze",
+                                      return_value={"rev1"}):
+                authors, _families = merge_queue._complete_authors(
+                    object(), item, frozen, tmp, "main",
+                    klass={"class": "sensitive", "base_sha": base}, marks=[])
+        self.assertEqual([entry["name"] for entry in authors], ["author"])
+
+    def test_an_unreadable_correction_range_refuses(self):
+        # #2739 : une plage illisible ne laisse pas supposer l'absence de
+        # correcteur ; la porte refuse.
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            base, frozen = self._repo(tmp, git, "rev1")
+            item = {"id": 7, "assignee": "author", "branch_target": "main"}
+            with mock.patch.object(merge_queue.work, "events", return_value=[]), \
+                    mock.patch.object(merge_queue, "actor_family",
+                                      side_effect=_family), \
+                    mock.patch.object(review_lot, "compiled_families", return_value=()), \
+                    mock.patch.object(merge_queue, "_corrections_on_freeze",
+                                      side_effect=RuntimeError("range down")):
+                with self.assertRaises(merge_queue._ProvenanceError):
+                    merge_queue._complete_authors(
+                        object(), item, frozen, tmp, "main",
+                        klass={"class": "sensitive", "base_sha": base}, marks=[])
 
 
 if __name__ == "__main__":

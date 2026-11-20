@@ -487,7 +487,8 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     names = [target_branch]
     names += [str(row.get("branch") or "") for row in rows if row.get("branch")]
     try:
-        tips, where = merge_queue.fetch_fresh(repo, names, clone)
+        tips, where = merge_queue.fetch_fresh(repo, names, clone,
+                                              base=target_branch)
     except merge_queue.QueueError as exc:
         raise CandidateError(str(exc)) from exc
     fetched_target = tips.get(target_branch)

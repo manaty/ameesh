@@ -56,6 +56,7 @@ from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail
 from . import rate_limit as rate_limit_mod
 from . import persona_memory as memory_mod
 from . import train_events
+from . import venv_guard
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, NAME_RE, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
 from .config import fresh_radar, load as load_config
@@ -5783,6 +5784,10 @@ class AgentWorker(threading.Thread):
 
         env = os.environ.copy()
         env.update(adapter.env())
+        # #2763 : ni VIRTUAL_ENV ni bin/ du venv de production dans le tour
+        # (incident du 19/10 : `uv pip install -e` d'un worktree dans le venv
+        # vivant) ; `ameesh` et `agent-mail` restent joignables par shims.
+        venv_guard.scrub(env, venv_guard.shim_dir(self.cfg))
         # Decision 0029 disables native account memory for managed sessions.
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         # L31 (0028) : identifiant du tour et étiquettes à poser sur les
@@ -10371,6 +10376,7 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
                 harness: str = "") -> dict:
     """L'identité que le harnais interactif transmet à ses hooks."""
     env = os.environ.copy()
+    venv_guard.scrub(env, venv_guard.shim_dir(cfg))  # #2763 : comme un tour
     env.update({
         "AGENT_MAIL_NAME": name,
         "AGENT_MAIL_STATE": cfg.v0_state,

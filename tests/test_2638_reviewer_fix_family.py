@@ -43,8 +43,11 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
     """The reference author is the assignee; a small reviewer fix keeps its family."""
 
     # -- helpers ----------------------------------------------------------
-    def commit(self, actor, harness, text, path="src/ameesh/work.py"):
-        """A new frozen head whose exact receipt names `actor` / `harness`."""
+    def commit(self, actor, harness, text, path="src/ameesh/mail.py"):
+        """A new frozen head whose exact receipt names `actor` / `harness`.
+
+        `mail.py` reste sensible hors du périmètre critique : #1515 y a fait
+        entrer `work.py`, qui servait de chemin neutre à ces témoins."""
         self.repo.write(path, text)
         sha = self.repo.commit("%s: %s" % (actor, path))
         self.receipts(actor=actor, harness=harness, commits=[sha])
@@ -74,6 +77,13 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
         registry.upsert(self.db, name, harness="claude", host=self.cfg.host,
                         cwd=self.repo.root, status=status)
 
+    def agent(self, name, harness, status="idle"):
+        """Another agent of a family, eligible when the corrector is not."""
+        registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
+                        cwd=self.repo.root, status=status)
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        (name,))
+
     # -- witnesses --------------------------------------------------------
     def test_2602_chain_keeps_a_reviewer_retired_by_a_later_freeze(self):
         # The exact #2602 sequence with one review: dev1 (Claude) reviews,
@@ -90,9 +100,12 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
         self.assertEqual([r["name"] for r in second["reviewers"]], ["r2"])
         self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
         self.status("r1", "idle")              # dev1 is back for the third freeze
+        # #2739: r1 and r2 are both correctors now. Their families stay
+        # eligible, but another Claude agent takes the seat, not r1 itself.
+        self.agent("r1b", "claude")
         _, third = self.freeze()
         self.assertEqual(third["state"], rd.DESIGNATED, third)
-        self.assertEqual([r["name"] for r in third["reviewers"]], ["r1"])
+        self.assertEqual([r["name"] for r in third["reviewers"]], ["r1b"])
         self.assertEqual(self.authors(), {"author": "deepseek"})
 
     def test_2602_three_families_with_small_reviewer_fixes_still_designate(self):
@@ -101,12 +114,17 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
         self.first_freeze()
         self.commit("r1", "claude", "lot\nr1 small fix\n")
         self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
+        # #2739: the exact correctors are no longer designated (they would
+        # review their own fix); their families remain eligible, so one
+        # substitute per family covers the two required opinions.
+        self.agent("r1b", "claude")
+        self.agent("r2b", "codex")
         _, out = self.freeze()
         self.assertEqual(out["state"], rd.DESIGNATED, out)
-        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1b", "r2b"])
         # the three families are in the range, but only the lot author is one
         self.assertEqual(self.authors(), {"author": "deepseek"})
-        # the same reviewer-correctors are designated again on the new head
+        # the families of the reviewer-correctors are still designated
         self.assertEqual([r["family"] for r in out["reviewers"]],
                          ["claude", "codex"])
 

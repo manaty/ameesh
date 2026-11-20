@@ -342,6 +342,39 @@ class ReservationTest(PgTestCase):
         self.assertIn("#2620", str(ctx.exception))
         self.assertIsNone(work.get(self.db, lot["id"])["migration"])
 
+    def test_numero_exact_ne_lit_pas_origin_head(self):
+        """#2660 : sans cible déclarée, un numéro exact ne lit plus
+        `origin/HEAD` — main sur un clone nexlink dont le projet intègre sur
+        develop — et refuse. La cible du projet et `ameesh.target` restent
+        lues : ce sont des cibles déclarées."""
+        _git(self.nexlink, "config", "--unset", "ameesh.target")
+        # `origin/HEAD` dit main, et main porte 377 : le repli silencieux
+        # vérifierait un lot qui vise develop contre main.
+        _git(self.nexlink, "checkout", "-qb", "main")
+        _commit(self.nexlink, NEXLINK.directory, "377_main.sql")
+        _git(self.nexlink, "checkout", "-q", "develop")
+        _git(self.nexlink, "update-ref", "refs/remotes/origin/main", "refs/heads/main")
+        _git(self.nexlink, "symbolic-ref", "refs/remotes/origin/HEAD",
+             "refs/remotes/origin/main")
+        lot = work.add(self.db, title="nx", app="nexlink",
+                       issue_ref="manaty/nexlink#7", actor="mesh-design")
+        with self.assertRaises(work.WorkError) as ctx:
+            self._nx(lot, 377)
+        self.assertIn("no target branch", str(ctx.exception))
+        self.assertIn("#2620", str(ctx.exception))
+        self.assertIn("#2660", str(ctx.exception))
+        self.assertNotIn("already in", str(ctx.exception))
+        self.assertIsNone(work.get(self.db, lot["id"])["migration"])
+        # la cible du projet, déclarée à l'hôte, suffit et fait foi
+        cfg = types.SimpleNamespace(github=None, radar={"projects": {"nexlink": {
+            "repo": self.nexlink, "github": "manaty/nexlink",
+            "migrations": NEXLINK.directory, "target": "develop"}}})
+        self.assertEqual(self._nx(lot, 377, cfg=cfg)["migration"], 377)
+        # `ameesh.target` du clone reste une cible déclarée
+        work.reserve_migration(self.db, lot["id"], release=True)
+        _git(self.nexlink, "config", "ameesh.target", "develop")
+        self.assertEqual(self._nx(lot, 377)["migration"], 377)
+
     def test_clone_d_un_autre_depot_ou_lot_sans_depot_refuse(self):
         nx = self._lot("nx", "manaty/nexlink")
         with self.assertRaises(work.WorkError) as ctx:
