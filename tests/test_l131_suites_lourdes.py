@@ -154,6 +154,10 @@ class RunChildTest(unittest.TestCase):
 
     def test_killed_wrapper_keeps_the_slot_while_the_command_runs(self):
         proc, pid = self._wrapper()
+        # The command can print its PID before the wrapper records it.
+        deadline = time.monotonic() + 10
+        while heavy.status(self.one)[0].get("child") != pid and time.monotonic() < deadline:
+            time.sleep(0.05)
         self.assertEqual(heavy.status(self.one)[0].get("child"), pid)
         proc.kill()
         proc.wait(timeout=10)
@@ -162,7 +166,9 @@ class RunChildTest(unittest.TestCase):
         self.assertIsNone(heavy.acquire(self.one, max_wait_s=0))
         self._kill(pid)
         self.assertTrue(self._gone(pid))
-        got = heavy.acquire(self.one, max_wait_s=0)
+        # Process exit and release of every inherited descriptor can be observed
+        # separately; wait for the actual slot rather than assuming it is free.
+        got = heavy.acquire(self.one, max_wait_s=10, sleep=lambda _: time.sleep(0.05))
         self.assertIsNotNone(got)
         heavy.release(got[1])
 
