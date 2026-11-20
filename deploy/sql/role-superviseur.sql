@@ -391,7 +391,14 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'recurrence', 'state', 'started_at', 'started_on', 'stopped_at',
         'stopped_on', 'stopped_by', 'stop_reason', 'stop_action_id',
         'stop_requested_at', 'stop_requested_on', 'stop_requested_by',
-        'confirmed_at', 'confirmed_by', 'created_at', 'updated_at'
+        'confirmed_at', 'confirmed_by', 'confirmed_decision_id',
+        'created_at', 'updated_at'
+    ]),
+    -- #7865 (B4) : l'historique durable des décisions signées qui ont
+    -- confirmé une revue (identifiants et heures, aucun matériel de
+    -- signature) — l'usage unique d'une décision est un fait de supervision
+    ('spend_review_confirmations', ARRAY[
+        'decision_id', 'ledger_id', 'signed_at', 'confirmed_at', 'confirmed_by'
     ]),
     ('standing_reservations', ARRAY[
         'id', 'grant_id', 'action_id', 'amount', 'connector', 'operation',
