@@ -35,11 +35,10 @@ from .journal import JournalConnector
 
 NAME = "dev"
 
-#: P1a #7649 (étude #7616 §4.2) : nom logique du schéma des tables de
-#: développement. Le nom physique est dérivé du schéma noyau par le runner
-#: (`<schéma_noyau>__dev`, Q8) puis inscrit dans `module_schemas` ; aucune
-#: table n'est déplacée par P1a. Les migrations du module arrivent avec P2
-#: (#7651) : tant que `MIGRATIONS` est None, le runner ne crée aucun schéma.
+#: P2 (#7651) est livrée pour revue et preuves seulement (go signé #228379 b).
+#: Garder MIGRATIONS=None jusqu'au go d'application par base : déclarer la
+#: migration non additive ici bloquerait tout préflight de staging (§11 bis).
+#: Les tests activent explicitement le dossier sur leurs copies isolées.
 SCHEMA = "dev"
 MIGRATIONS = None
 REQUIRES = ()
