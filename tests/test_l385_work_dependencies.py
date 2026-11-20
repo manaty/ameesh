@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import datetime
+import faulthandler
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -14,6 +16,7 @@ from unittest import mock
 from ameesh import db as D, mail, plan, planned_waits, progress, stagnation, storage, work
 from ameesh import work_dependencies as dependencies
 from ameesh.storage.postgres.work_dependencies import WorkDependencies as PgLandingStore
+from tests import support
 from tests.support import PgTestCase, registry_absent
 
 
@@ -408,7 +411,7 @@ class ReleasedWakeTest(PgTestCase):
             def merge(blocker):
                 db = D.connect(self.cfg)
                 try:
-                    start.wait(timeout=5)
+                    start.wait(timeout=support.scaled(5))
                     results.append(work.close_merged(db, blocker, sha="e" * 40,
                                                actor="git:main")["result"])
                 except Exception as exc:  # noqa: BLE001 - remonté par le test
@@ -420,15 +423,47 @@ class ReleasedWakeTest(PgTestCase):
                        for blocker in blockers]
             for thread in threads:
                 thread.start()
+            deadline = time.monotonic() + support.scaled(10)
             for thread in threads:
-                thread.join(timeout=10)
-                self.assertFalse(thread.is_alive())
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if any(thread.is_alive() for thread in threads):
+                self.fail(self._blocking_report(threads))
             self.assertEqual(errors, [])
             self.assertEqual(results, ["merged", "merged"])
             [row] = self.inbox()
             self.assertEqual(mail.message_payload(row)["dependency"]["dependent"], waiting)
             self.assertEqual(len(self.inbox()), 1)
             self.db.execute("DELETE FROM agent_mailbox")
+
+    def _blocking_report(self, threads) -> str:
+        """#7924 : une fermeture parallèle n'a pas rendu la main dans la borne.
+
+        Le rouge doit dire « lent » ou « bloqué » : les verrous et l'attente
+        de chaque connexion de la base (`pg_locks`, `pg_stat_activity` :
+        `wait_event`, requête), puis la pile de tous les fils."""
+        locks = self.db.query(
+            "SELECT l.pid, l.locktype, l.mode, l.granted, l.classid, l.objid,"
+            "       l.objsubid, l.relation::regclass::text AS relation"
+            "  FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid"
+            " WHERE a.datname = current_database() AND l.pid <> pg_backend_pid()"
+            " ORDER BY l.pid, l.granted")
+        activity = self.db.query(
+            "SELECT pid, state, wait_event_type, wait_event,"
+            "       pg_blocking_pids(pid) AS blocked_by,"
+            "       now() - xact_start AS in_xact, left(query, 300) AS query"
+            "  FROM pg_stat_activity"
+            " WHERE datname = current_database() AND pid <> pg_backend_pid()"
+            " ORDER BY pid")
+        with tempfile.TemporaryFile("w+") as out:
+            faulthandler.dump_traceback(file=out, all_threads=True)
+            out.seek(0)
+            stacks = out.read()
+        alive = [thread.name for thread in threads if thread.is_alive()]
+        return ("fermeture(s) parallèle(s) encore vivante(s) après %.0f s : %s\n"
+                "pg_stat_activity :\n%s\npg_locks :\n%s\nfils :\n%s"
+                % (support.scaled(10), alive,
+                   "\n".join(map(repr, activity)) or "(aucune)",
+                   "\n".join(map(repr, locks)) or "(aucun)", stacks))
 
     def test_a_closure_holds_the_graph_lock_while_it_decides(self):
         """Adversaire déterministe du réveil perdu : la première fermeture
