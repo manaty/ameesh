@@ -117,9 +117,14 @@ class CanonReviewRefreshTest(base._ActivationFixture, PgTestCase):
         self.freeze()
         before = len(self.mailbox())
         with mock.patch.object(refresh, "_refs", side_effect=act.NoCanon("unreadable")):
-            for _ in range(2):
+            # #7941 : un échec transitoire reste muet jusqu'à la borne, puis
+            # alerte une fois ; il reste réessayé à chaque passe.
+            for _ in range(refresh.TRANSIENT_NOTICE_AFTER - 1):
                 result = refresh.after_sync(self.cfg, self.db)
                 self.assertTrue(result["errors"], result)
+            self.assertEqual(self.mailbox()[before:], [])
+            result = refresh.after_sync(self.cfg, self.db)
+            self.assertTrue(result["errors"], result)
         self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["pilot"])
         self.raise_policy()
         result = refresh.after_sync(self.cfg, self.db)

@@ -181,6 +181,10 @@ class Unavailable:
     why: str
     #: no canon configured at all: a bench/host without a canon is silent
     silent: bool = False
+    #: #7941 : la forge a prouvé que la cible a disparu (ls-remote sans la ref).
+    #: Un échec transitoire (réseau, forge muette) reste à False et se réessaie
+    #: sans alerter ; un échec terminal se note une fois par gel.
+    terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -1913,7 +1917,7 @@ def prepare_target(cfg, db, item: Mapping, head: str, *,
     try:
         sha = review_target.resolve(repo, base, fetch=fetch)
     except (review_target.TargetError, canon_mod.GitError) as exc:
-        return Unavailable(str(exc))
+        return Unavailable(str(exc), terminal=bool(getattr(exc, "terminal", False)))
     return Target(repo, base, sha, head)
 
 
@@ -4453,6 +4457,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 # `--apply` ultérieur réessaiera.
                 return {"state": "unavailable", "reviewers": [],
                         "freeze": freeze,
+                        "terminal": bool(inputs.terminal),
                         "why": "review floor completion: %s" % inputs.why}
             if waiting and effective is not None:
                 # #6984 : une attente enregistrée est une désignation valide.
@@ -4508,6 +4513,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     _sync_reviewers(tx, item, freeze, [])
                 _drain(db, threads)
             return {"state": "unavailable", "reviewers": [], "freeze": freeze,
+                    "terminal": bool(inputs.terminal),
                     "why": inputs.why}
         # #3554 : même journal hors du hook (reprise), une fois par tête.
         _note_canon_lowering(db, item, freeze, inputs)

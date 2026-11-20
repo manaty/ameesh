@@ -4,6 +4,9 @@
 Runs after canon sync, before the ordinary unavailable/capacity recovery.
 The journal keys each successful check to its exact freeze and policy sources;
 another host or a restarted runner does not resend acquired review requests.
+#7941 : un constat (attente, échec terminal, échec transitoire après la borne)
+est clé par gel, jamais par signature du canon — une nouvelle époque ne
+renvoie pas le même avis au pilote.
 """
 from __future__ import annotations
 
@@ -14,6 +17,12 @@ from . import storage, work_lifecycle as lifecycle
 
 CURSOR = "review-canon-refresh.cursor"
 PREFIX = "review-canon-refresh:"
+#: #7941 : un échec transitoire de complétion ne fait alerter qu'après ce
+#: nombre de passes ; les passes antérieures ne laissent qu'une ligne d'essai.
+TRANSIENT_NOTICE_AFTER = 3
+#: une issue finale du gel : le contrôle de politique est clos pour cette
+#: signature du canon (`checked:`), aucun courrier au pilote.
+RESOLVED_STATES = frozenset(("designated", "manual", "none", "carried"))
 
 
 def _refs(cfg, db, project):
@@ -26,10 +35,17 @@ def _refs(cfg, db, project):
 
 
 def _record(cfg, db, item, freeze, prefix, result):
-    """A successful check or one pilot notice; never alter the freeze.
+    """A successful check per canon signature, an alert at most once per freeze.
 
     #7662 : a `stale` result means the designation moved under the read, not
     that the policy failed: nothing is written, so the next pass re-reads it.
+
+    #7941 : le constat ne se répète plus à chaque époque du canon. Un succès
+    reste clé par signature (`checked:`) : la politique doit être relue quand
+    elle bouge. Une attente, un échec terminal (cible disparue à la forge) et
+    un échec transitoire après la borne sont clés **par gel**, sans signature :
+    le pilote reçoit un seul courrier par gel, quel que soit le nombre de
+    signatures publiées ensuite.
     """
     lot = int(item["id"])
     state = str(result.get("state") or "")
@@ -39,18 +55,44 @@ def _record(cfg, db, item, freeze, prefix, result):
         # un échec de la politique. Aucune note, aucun courrier au pilote et
         # pas de clé `checked:` — la passe suivante relit ce lot.
         return
+    freeze_prefix = "%s%d:%d:" % (PREFIX, lot, freeze["id"])
+    checked = prefix + "checked:"
+    why = result.get("why") or "review seats complete"
+    terminal = bool(result.get("terminal"))
     threads = []
-    unavailable = state not in {"designated", "manual", "none"}
-    key = prefix + ("notice:" if unavailable else "checked:")
     with db.transaction() as tx:
         if not act._lock_current_freeze(tx, lot, freeze):
             return
-        if storage.of(tx).work.events_noted(key, 0.0, ids=[lot]):
+        journal = storage.of(tx).work
+        if state in RESOLVED_STATES:
+            if journal.events_noted(checked, 0.0, ids=[lot]):
+                return
+            journal.note(lot, item["state"],
+                         "%s canon policy rechecked: %s; %s"
+                         % (checked, state, why), act.SENDER)
             return
-        text = "%s canon policy rechecked: %s; %s" % (
-            key, result.get("state"), result.get("why") or "review seats complete")
-        storage.of(tx).work.note(lot, item["state"], text, act.SENDER)
-        if unavailable:
+        if state == act.rd.WAITING:
+            # Une attente de capacité est une désignation valide : elle est
+            # réessayée à chaque passe (la capacité peut revenir) mais
+            # n'alerte qu'une fois pour ce gel, pas à chaque époque du canon.
+            key = freeze_prefix + "waiting:"
+        elif terminal:
+            key = freeze_prefix + "terminal:"
+        else:
+            attempts_key = freeze_prefix + "attempt:"
+            attempts = len(journal.events_noted(attempts_key, 0.0, ids=[lot]) or ())
+            key = freeze_prefix + "transient:"
+            if attempts + 1 < TRANSIENT_NOTICE_AFTER:
+                # Silencieux jusqu'à la borne : une forge ou un fetch qui
+                # échoue une fois ne doit pas alarmer le pilote.
+                journal.note(lot, item["state"],
+                             "%s attempt %d/%d: %s"
+                             % (attempts_key, attempts + 1,
+                                TRANSIENT_NOTICE_AFTER, why), act.SENDER)
+                return
+        if not journal.events_noted(key, 0.0, ids=[lot]):
+            text = "%s canon policy rechecked: %s; %s" % (key, state, why)
+            journal.note(lot, item["state"], text, act.SENDER)
             notify = act._notify(cfg, tx, str(item.get("app") or ""),
                                  registry.overview(tx))
             if notify:
@@ -59,6 +101,13 @@ def _record(cfg, db, item, freeze, prefix, result):
                           "attention on freeze #%s (%s). %s" % (
                               lot, freeze["id"], freeze["sha"], text),
                           work_item_id=str(lot), after_commit=threads)
+        if terminal and not journal.events_noted(checked, 0.0, ids=[lot]):
+            # Un échec terminal ne redevient pas lisible en relisant la même
+            # époque : la signature est marquée close, une nouvelle époque du
+            # canon rejouera la lecture (sans nouveau courrier).
+            journal.note(lot, item["state"],
+                         "%s canon policy rechecked: unavailable; %s"
+                         % (checked, why), act.SENDER)
     act._drain(db, threads)
 
 
