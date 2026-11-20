@@ -280,7 +280,8 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
     # L243 : les projets inconnus ne se vérifient qu'avec la base (lots)
     findings = canon_mod.validate(canon, (recorded or {}).get("projects"))
     placements = placement_mod.verdicts(canon) if canon.readable else []
-    if placements:
+    if placements and (not cfg.host or host == cfg.host):
+        # #7868 : --host distant ne connaît pas les modules installés là-bas.
         # #7860 : un module absent de CET hôte refuse ici les agents de ses
         # projets (fait local : les verdicts des autres hôtes n'en savent rien)
         from . import modules as project_modules
