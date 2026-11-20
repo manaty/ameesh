@@ -167,6 +167,10 @@ end $$;
 comment on function ameesh_pod_reading_supervisor_guard() is
     '#7695: refuse a host_resources reading for a pod host whose author is not the live supervisor lease holder.';
 
+-- ameesh: trigger compatible with previous code — la garde ne s'active
+-- qu'après la première prise de bail : à la migration, la table des baux est
+-- vide, donc le code d'avant écrit `host_resources` comme avant. Un hôte non
+-- pod n'a jamais de bail et n'est jamais concerné.
 drop trigger if exists host_resources_pod_supervisor_guard on host_resources;
 create trigger host_resources_pod_supervisor_guard
 before insert on host_resources
