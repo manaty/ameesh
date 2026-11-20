@@ -67,29 +67,99 @@ class ExpiredReservationTest(unittest.TestCase):
         state["reservation"] = {"deadline": deadline}
         return state
 
-    def test_expiry_invalidates_without_reading_ci_or_promoting(self):
+    def test_expiry_with_pending_ci_keeps_the_plan_and_the_target(self):
+        # B #44821/#44822/#44824 : l'échéance seule ne prouve pas la fin des
+        # runs. Libérer la cible pendant que la CI du paquet tourne lancerait
+        # la suivante par-dessus (§11 bis). On attend l'issue terminale.
         self.make()
         state = self.draining()
         head = state["plan"]["head"]
         self.expire(1500.0)
-        self.ports.ci = mock.Mock(side_effect=AssertionError("CI must not be read"))
         result = self.engine.step(1500.0)
+        self.assertEqual(result["result"], "draining", result)
+        self.assertEqual(self.ports.document["phase"], "draining")
+        self.assertTrue(self.ports.held)
+        self.assertEqual([effect[0] for effect in self.ports.effects], [])
+        # Issue terminale établie : le plan est invalidé, sans promotion.
+        self.ports.ci_by_head[head] = "green"
+        result = self.engine.step(1501.0)
         self.assertEqual(result["result"], "invalidated", result)
-        self.assertEqual(result["plan"]["head"], head)
         stored = self.ports.document
         self.assertEqual(stored["phase"], "invalidated")
         self.assertFalse(self.ports.held)
         self.assertIn("expired at 1970-01-01T00:25:00Z", stored["error"])
         self.assertIn("phase draining", stored["error"])
+        self.assertIn("terminal CI green", stored["error"])
         self.assertIn("admission evidence changed", stored["error"])
         self.assertEqual(stored["diagnosis"],
                          {"stage": "draining", "why": stored["error"]})
         self.assertEqual(self.ports.notices[-1], stored["error"])
         self.assertNotIn("promote", [effect[0] for effect in self.ports.effects])
-        self.ports.ci.assert_not_called()
-        # La passe suivante rend bien l'époque et ne rejoue pas le plan.
-        self.assertEqual(self.engine.step(1500.1)["result"], "idle")
-        self.assertEqual([effect[0] for effect in self.ports.effects], [])
+        # La passe suivante ne rejoue pas le plan.
+        self.assertEqual(self.engine.step(1502.0)["result"], "idle")
+
+    def test_expiry_with_unreadable_ci_keeps_draining(self):
+        # Une lecture impossible ne prouve aucune fin de run.
+        self.make()
+        self.draining()
+        self.expire(1500.0)
+        self.ports.ci = mock.Mock(side_effect=train.TrainError(
+            "cannot read exact train CI evidence: api down"))
+        result = self.engine.step(1500.0)
+        self.assertEqual(result["result"], "draining", result)
+        self.assertEqual(self.ports.document["phase"], "draining")
+        self.assertTrue(self.ports.held)
+        self.assertIn("CI unreadable", result["error"])
+
+    def test_expiry_with_terminal_ci_invalidates_without_promotion(self):
+        self.make()
+        state = self.draining()
+        self.expire(1500.0)
+        self.ports.ci_by_head[state["plan"]["head"]] = "red"
+        result = self.engine.step(1500.0)
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(self.ports.document["phase"], "invalidated")
+        self.assertFalse(self.ports.held)
+        self.assertIn("terminal CI red", self.ports.document["error"])
+        self.assertNotIn("promote", [effect[0] for effect in self.ports.effects])
+
+    def test_expiry_with_absent_unpublished_ci_invalidates(self):
+        # Aucun run ne peut être dû : ni feu, ni publication, ni CI.
+        self.make()
+        state = self.draining()
+        self.ports.published = lambda plan: ""
+        self.ports.ci_by_head[state["plan"]["head"]] = "absent"
+        self.expire(1500.0)
+        result = self.engine.step(1500.0)
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertIn("no publication and no CI run", self.ports.document["error"])
+        self.assertFalse(self.ports.held)
+
+    def test_expiry_in_build_beta_does_not_compose_over_a_running_ci(self):
+        # Le témoin demandé en build/beta : la coupure due (7300 > dernier
+        # départ 3600) ne part pas tant que la CI du paquet n'a pas d'issue
+        # terminale ; elle repart seulement après l'invalidation.
+        self.make()
+        state = self.draining()
+        previous = self.engine.epoch
+        schedule = types.SimpleNamespace(last_packet=lambda now: 7200.0)
+        self.engine = train.Engine(self.ports, source="github.com/o/r",
+                                   target="main",
+                                   policy=train.Policy(enabled=True, build_beta=True,
+                                                       schedule=schedule))
+        self.engine.epoch = previous      # même bail, autre politique
+        self.expire(1500.0)
+        probes = len(self.ports.probes)
+        result = self.engine.step(7300.0)
+        self.assertEqual(result["result"], "draining", result)
+        self.assertEqual(len(self.ports.probes), probes)
+        self.assertEqual(self.ports.document["phase"], "draining")
+        self.ports.ci_by_head[state["plan"]["head"]] = "green"
+        self.assertEqual(self.engine.step(7301.0)["result"], "invalidated")
+        self.assertEqual(len(self.ports.probes), probes)
+        # La cible est libérée : la passe suivante compose la coupure due.
+        self.assertEqual(self.engine.step(7302.0)["result"], "ci")
+        self.assertEqual(len(self.ports.probes), probes + 1)
 
     def test_before_the_deadline_the_same_error_stays_draining(self):
         self.make()
@@ -202,6 +272,23 @@ class ExpiredReservationLedgerTest(unittest.TestCase):
                 ledger.ops.land_lock.assert_called_once_with(
                     ledger.key, ledger.owner, land.LOCK_TTL_S, epoch=None)
 
+    def test_a_held_epoch_is_renewed_on_the_expired_ticket(self):
+        # Le moteur garde la cible sous le verrou ordinaire pendant qu'il
+        # attend l'issue des runs : pas de nouvelle époque à chaque passe.
+        ledger = self.ledger()
+        ledger.ops.land_lock.return_value = 7
+        self.assertEqual(ledger.acquire(7), 7)
+        ledger.ops.land_lock.assert_called_once_with(
+            ledger.key, ledger.owner, land.LOCK_TTL_S, epoch=7)
+        ledger._renew.assert_not_called()
+
+    def test_an_expired_ticket_is_not_maintained(self):
+        # Replanifier une échéance passée ferait boucler la maintenance.
+        ledger = self.ledger()
+        self.assertIsNone(ledger.next_maintenance())
+        self.assertIsNone(ledger.maintain(2000.0))
+        ledger._renew.assert_not_called()
+
     def test_publishing_and_promoting_never_retake_the_epoch(self):
         for phase in ("publishing", "promoting"):
             with self.subTest(phase=phase):
@@ -287,6 +374,23 @@ class TrainStuckHourTest(unittest.TestCase):
     def test_59_minutes_is_not_yet_a_missed_passage(self):
         db = self.Db([self.row()])
         self.assertEqual(exploitation._train_stuck(db, 1000.0 + 59 * 60), [])
+
+    def test_the_threshold_follows_the_project_cadence(self):
+        # §7 : pas de constante propre à un client. Cadence ameesh 11:00/23:00
+        # (12 h) : le passage suivant n'est dû qu'à 23:00, pas à 12:00.
+        rules = types.SimpleNamespace(next_packet=lambda at: (
+            23 * 3600.0 if at < 23 * 3600.0 else 35 * 3600.0))
+        started = 11 * 3600.0
+        db = self.Db([self.row(started_ts=started)])
+        with mock.patch.object(exploitation, "_packet_calendar",
+                               return_value=rules):
+            self.assertEqual(exploitation._train_stuck(
+                db, started + 11 * 3600.0, cfg=object()), [])
+            alerts = exploitation._train_stuck(
+                db, started + 13 * 3600.0, cfg=object())
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["threshold"], 12)
+        self.assertEqual(alerts[0]["value"], 13)
 
     def test_61_minutes_raises_one_named_alert(self):
         db = self.Db([self.row(error="required suite job missing, skipped or interrupted")])

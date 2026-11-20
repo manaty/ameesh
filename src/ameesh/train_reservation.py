@@ -56,19 +56,21 @@ class ReservedLedger(Ledger):
     def acquire(self, epoch):
         state = super().load()
         if state and state.get("phase") not in TERMINAL and state.get("plan"):
+            if self._expired(state) and state.get("phase") in EXPIRABLE:
+                # #7967 : le ticket est mort. Le moteur doit encore lire
+                # l'état et établir l'issue des runs avant de terminer ; on
+                # garde donc l'exclusion de la cible sous le verrou ordinaire,
+                # sans ressusciter la réservation (l'échéance reste absolue).
+                # Les phases `publishing`/`promoting` restent fermées : un
+                # push ou un merge a pu partir, le pilote tranche.
+                held = super().acquire(epoch)
+                return held if held is not None else super().acquire(None)
             # A restart adopts the persisted epoch. It must never recreate an
             # expired lease by passing epoch=None to ordinary land_lock.
             try:
                 ticket = self._ticket(state, epoch)
                 return self._renew(ticket, self.reservation.clock()).epoch
             except TrainError:
-                # #7967 : une réservation expirée ne condamne pas le train.
-                # Pour les phases sans effet incertain, le moteur doit encore
-                # lire l'état, l'invalider et rendre la cible : l'ancien échec
-                # est dépassé, l'époque neuve fence l'ancienne. `publishing` et
-                # `promoting` restent fermés (un push ou un merge a pu partir).
-                if self._expired(state) and state.get("phase") in EXPIRABLE:
-                    return super().acquire(None)
                 return self._adopt(state) if epoch is None else None
         return super().acquire(epoch)
 
@@ -147,12 +149,20 @@ class ReservedLedger(Ledger):
         state = self.load()
         if not state or state.get("phase") in TERMINAL or not state.get("reservation"):
             return None
+        if state.get("phase") in EXPIRABLE and self._expired(state):
+            # #7967 : ticket mort, rien à renouveler. Le moteur reprend le
+            # verrou ordinaire à chaque passage ; replanifier l'échéance
+            # passée ferait boucler la maintenance sur la même erreur.
+            return None
         return self.provider.next_renew(self._ticket(state))
 
     def maintain(self, now):
         """SQL only: no runtime construction, Git, mechanics or CI access."""
         state = self.load()
         if not state or state.get("phase") in TERMINAL or not state.get("reservation"):
+            return None
+        if state.get("phase") in EXPIRABLE and self._expired(state):
+            # #7967 : voir next_maintenance ; aucun renouvellement possible.
             return None
         ticket = self._renew(self._ticket(state), now)
         state["reservation"] = ticket.to_json()
