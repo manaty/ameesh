@@ -944,6 +944,11 @@ def milestone(
     if on_frozen is not None and kind != "frozen":
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
     inferred_branch = None
+    #: #7892 : porteurs ouverts déjà poussés dont ce gel retire le lot ; la
+    #: note le dit (avertissement de l'auteur) et le pilote est prévenu après
+    #: le COMMIT, dans le même geste. Aucun refus : un regel est souvent le
+    #: correctif d'un rouge.
+    packet_matches: list[dict] = []
     replaced: list[int] = []
     if supersedes is not None:
         if kind != "frozen":
@@ -1041,6 +1046,21 @@ def milestone(
             db, item, sha, repo or str(freeze_info.get("repo") or ""))
         if rules_note:
             note = (note + "\n" if note else "") + rules_note
+        # #7892 : un gel ou un regel d'une unité d'un porteur ouvert déjà
+        # poussé la sort du paquet à la recomposition (#4581). L'auteur lit
+        # l'avertissement dans la sortie du gel (la ligne machine de la note)
+        # et le pilote reçoit le courrier après le COMMIT. Une lecture
+        # impossible ne change jamais le gel : l'incertitude ne fabrique pas
+        # d'avis.
+        try:
+            from . import freeze_packet
+            packet_matches = freeze_packet.pushed_carriers(
+                db, item_id, sha, repo=repo or str(freeze_info.get("repo") or ""))
+            if packet_matches:
+                note = (note + "\n" if note else "") + "\n".join(
+                    freeze_packet.note_lines(item_id, sha, packet_matches))
+        except Exception:  # noqa: BLE001 - le gel est la preuve ; l'avis est au mieux
+            packet_matches = []
         # (5) : la marque des branches où le gel était absent, pour que le
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par
@@ -1295,6 +1315,16 @@ def milestone(
         for record in drain:
             record(db.cfg, db)
     if kind == "frozen":
+        # #7892 : le pilote apprend, dans le geste de gel, que la recomposition
+        # va sortir ce membre du paquet (#4581). Au mieux : un courrier refusé
+        # ne défait pas le gel, la note machine en garde la trace pour lui.
+        if packet_matches:
+            try:
+                from . import freeze_packet
+                freeze_packet.notify_pilots(db, item, sha.strip(), packet_matches,
+                                            actor=actor or "")
+            except Exception:  # noqa: BLE001 - le gel est écrit ; l'avis se répare
+                pass
         # #3641 : un regel de véhicule ne reporte pas silencieusement les
         # déclarations d'atterrissage de ses unités (SLO `verdict_merge`
         # fantôme). On prévient le déclarant, sous verrou, et la déclaration
