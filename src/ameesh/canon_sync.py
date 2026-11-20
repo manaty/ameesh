@@ -153,6 +153,7 @@ from . import fil
 from . import harnesses
 from . import mechanics
 from . import placement as placement_mod
+from . import pod_children
 from . import receipts, registry, storage
 from . import spawn as spawn_policy
 from . import visibility as visibility_mod
@@ -2879,7 +2880,8 @@ def parse_ttl(text: str | None) -> float:
 def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
           cwd: str | None = None, canon: "Canon | list[Canon] | None" = None,
           tools: list[str] | None = None, mcp: list[str] | None = None,
-          context: tuple[str, str] | None = None) -> dict:
+          context: tuple[str, str] | None = None,
+          pod_wait_s: float | None = None) -> dict:
     """Crée un agent éphémère : responsable copié du créateur, capacités ⊆ {read, propose}.
 
     L'insertion est atomique (INSERT … SELECT sur la ligne du créateur) : le
@@ -2895,9 +2897,16 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
     #7107 (avatar B5, docs/design/5322-avatar-humain.md §3.6) : un avatar
     (`avatar.children`, défaut `own-host`) place son enfant sur un hôte propre,
     jamais sur l'hôte, l'UID ou le runner de sa lignée ; voir
-    `avatar_children.place_child`. `none` refuse (`spawn-forbidden`), `pod`
-    est hors lot (B5b, `spawn-pod-unsupported`), et sans placement propre
-    `spawn` refuse (`spawn-no-placement`) au lieu de replier sur le parent.
+    `avatar_children.place_child`. `none` refuse (`spawn-forbidden`), sans
+    placement propre `spawn` refuse (`spawn-no-placement`) au lieu de replier
+    sur le parent.
+
+    #7697 (P4 de #7633, design 7633 §8) : `pod` écrit une demande au
+    pourvoyeur (`pod_requests`) dans la transaction de l'enfant, puis attend
+    le premier battement ou un état d'échec (`pod_wait_s`, 120 s par défaut ;
+    0 rend la main sans attendre, pour les témoins). Le nom d'hôte, l'UID
+    enfant, le Secret d'API et le profil sont dans `placement.describe()` ;
+    sans pourvoyeur/template vivant, le refus reste `spawn-pod-unsupported`.
 
     #7034 : `tools`/`mcp` sont un sous-ensemble de la liste du parent, et
     `context` est `(texte, digest)` (déjà lu et borné par l'appelant). La
@@ -3031,6 +3040,15 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
             except avatar_children.PlacementError as exc:
                 raise SpawnError(str(exc)) from exc
     extra = {"profile": profile, "context": context_row}
+    pod_request = None
+    if placement is not None and placement.runtime == "pod":
+        try:
+            pod_request = pod_children.request_fields(
+                placement, ttl_seconds=ttl_seconds, tools=tools, mcp=mcp,
+                context=context_row)
+        except pod_children.PodError as exc:
+            raise SpawnError(str(exc)) from exc
+        extra["pod_request"] = pod_request
     if placement is None:
         created = storage.of(db).ephemerals.create(
             name, creator, cwd=os.path.abspath(os.path.expanduser(cwd)) if cwd else None,
@@ -3050,6 +3068,19 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
         if storage.of(db).ephemerals.exists(name):
             raise SpawnError("an agent %s already exists" % name)
         raise SpawnError("creator %s changed during creation: retry" % creator)
+    if pod_request is not None:
+        try:
+            started = pod_children.wait_started(db, name, timeout_s=pod_wait_s)
+        except pod_children.PodError as exc:
+            raise SpawnError(str(exc)) from exc
+        created["pod"] = {
+            "host": placement.host,
+            "template": placement.template,
+            "credential_secret": placement.credential_secret,
+            "state": (started or {}).get("state") or "requested",
+        }
+        if started is not None:
+            created["pod"]["pod_uid"] = started.get("pod_uid")
     created["tools"] = tools
     created["mcp"] = mcp
     if placement is not None:

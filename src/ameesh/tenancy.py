@@ -34,6 +34,7 @@ import os
 import pwd
 import re
 import shlex
+import time
 from typing import Any, Mapping
 
 from . import canon as canon_mod
@@ -59,6 +60,14 @@ POD_UID_SPAN = 1000
 #: dépôt cloné par l'init du superviseur, lu par le tenant sous SON UID.
 POD_CANON = "/var/lib/ameesh/canon"
 POD_CANON_REPO = POD_CANON + "/repo"
+#: #7697 : plage d'UID des enfants portés par un pod (jamais l'UID du parent) ;
+#: un enfant a un UID neuf, stable pour la vie de son pod.
+POD_CHILD_UID_BASE = 30000
+POD_CHILD_UID_SPAN = 20000
+#: préfixe du nom du Secret d'une clé d'API d'organisation par enfant (D6).
+POD_CHILD_SECRET_PREFIX = "ameesh-child-"
+#: nom du template de pod enfant enregistré par le pourvoyeur.
+POD_CHILD_TEMPLATE = "ameesh-child"
 
 
 class TenancyError(ValueError):
@@ -317,6 +326,225 @@ def pod_plan_text(plan: dict) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# #7697 : identité d'un enfant porté par un pod (design 7633 §8.3–§8.4)
+# --------------------------------------------------------------------------
+def _dns_slug(value: str, limit: int = 40) -> str:
+    """Nom DNS-1123 dérivé d'un identifiant libre (agent, enfant)."""
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(value or "").lower()).strip("-")
+    return (slug[:limit].strip("-") or "x")
+
+
+def child_uid(tenant: str, child: str) -> int:
+    """UID d'un enfant porté par un pod : plage 30000+, stable pour ce couple.
+
+    L'UID ne dépend jamais du parent : un enfant ne peut pas hériter de son
+    UID, et deux enfants du même parent ont des UID distincts. Une collision
+    entre deux enfants est possible (20 000 valeurs) ; le template porte
+    ensuite l'UID comme source de vérité et `host_tenants` le vérifie.
+    """
+    tenant = check_tenant(tenant)
+    digest = hashlib.sha256(
+        ("ameesh-pod-child-uid:" + tenant + ":" + str(child)).encode("utf-8")).digest()
+    return POD_CHILD_UID_BASE + int.from_bytes(digest[:8], "big") % POD_CHILD_UID_SPAN
+
+
+def check_child_uid(uid: int) -> int:
+    """UID acceptable pour un enfant pod : 30000..60000, jamais un UID réservé."""
+    try:
+        value = int(uid)
+    except (TypeError, ValueError):
+        raise TenancyError("child-uid-invalid", "UID %r refused" % (uid,)) from None
+    if not (POD_CHILD_UID_BASE <= value <= 60000) or value in (
+            POD_FS_GROUP, POD_SUPERVISOR_UID):
+        raise TenancyError(
+            "child-uid-invalid",
+            "UID %d refused: a pod child needs an unprivileged UID in "
+            "%d..60000, never the parent's UID" % (value, POD_CHILD_UID_BASE))
+    return value
+
+
+def child_unix_user(tenant: str, child: str) -> str:
+    """Entrée `passwd` propre à l'enfant (jamais le nom du parent)."""
+    tenant = check_tenant(tenant)
+    digest = hashlib.sha256(
+        ("ameesh-pod-child-user:" + tenant + ":" + str(child)).encode("utf-8"))
+    return "child-" + digest.hexdigest()[:10]
+
+
+def child_runner_id(host: str, child: str) -> str:
+    """Identifiant d'exécuteur de l'enfant sur son hôte (stable, sans secret)."""
+    return "%s/%s" % (host, _dns_slug(child, 40))
+
+
+def child_credential_secret(child: str) -> str:
+    """Nom du Secret d'API d'organisation par enfant (le secret n'est pas ici).
+
+    Le pourvoyeur ne lit jamais ce Secret : il le monte dans le conteneur de
+    l'enfant, qui est le seul à pouvoir le lire. Le nom est déterministe pour
+    que l'opérateur puisse le créer avant le premier `spawn`."""
+    digest = hashlib.sha256(
+        ("ameesh-pod-child-secret:" + str(child)).encode("utf-8")).hexdigest()[:8]
+    return (POD_CHILD_SECRET_PREFIX + _dns_slug(child, 30) + "-" + digest)
+
+
+def child_host(parent: str, child: str, token: str) -> str:
+    """Nom logique stable de l'hôte enfant, jamais le nom du pod.
+
+    `pod-<parent>-<enfant>-<8 hex>` : le jeton distingue deux incarnations du
+    même enfant et tient dans les 63 caractères d'un label DNS."""
+    token = re.sub(r"[^a-z0-9]", "", str(token or "").lower())
+    if len(token) < 4:
+        raise TenancyError("child-host-invalid", "a host token of 4+ chars is required")
+    host = "pod-%s-%s-%s" % (_dns_slug(parent, 18), _dns_slug(child, 18), token[:12])
+    host = host[:63].rstrip("-")
+    if not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", host):
+        raise TenancyError("child-host-invalid", "invalid child host %r" % (host,))
+    return host
+
+
+def child_plan(host: str, child: str, tenant: str, *, parent: str,
+               harness: str, uid: int | None = None, provider: str | None = None,
+               model: str | None = None, image: str = "ameesh-runner") -> dict:
+    """Plan de données de l'enfant : UID, passwd/group, ConfigMap, `emptyDir`.
+
+    Aucun PVC ni volume du parent : le home et le dossier de travail sont des
+    `emptyDir` propres à ce pod (design 7633 §8.4). Le plan ne crée rien ;
+    le template du pourvoyeur le rend et `host_tenants` enregistre l'UID que
+    le battement vérifiera. L'enfant est en `api-key` : pas de copie du
+    dossier d'abonnement du parent, un Secret d'organisation par enfant."""
+    from . import accounts as accounts_mod
+
+    tenant = check_tenant(tenant)
+    host = (host or "").strip()
+    if not host:
+        raise TenancyError("child-host-invalid", "a child pod host is required")
+    chosen = check_child_uid(child_uid(tenant, child) if uid is None else uid)
+    user = child_unix_user(tenant, child)
+    home = "/home/" + user
+    cwd = home + "/work"
+    runner = child_runner_id(host, child)
+    key_env = accounts_mod.default_key_env_of(harness)
+    if not key_env:
+        raise TenancyError(
+            "child-harness-key-env",
+            "harness %r has no api-key environment: a pod child cannot use a "
+            "subscription credential (design 7633 §8.4)" % (harness,))
+    secret = child_credential_secret(child)
+    passwd = "\n".join([
+        "root:x:0:0:root:/root:/bin/sh",
+        "ameesh:x:%d:%d:ameesh pod supervisor:/home/ameesh:/bin/sh"
+        % (POD_SUPERVISOR_UID, POD_FS_GROUP),
+        "%s:x:%d:%d:child %s:%s:/bin/sh"
+        % (user, chosen, POD_FS_GROUP, _dns_slug(child, 20), home),
+        "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin",
+    ])
+    group = "\n".join([
+        "root:x:0:",
+        "ameesh:x:%d:" % POD_SUPERVISOR_UID,
+        "ameesh-pod:x:%d:" % POD_FS_GROUP,
+        "nogroup:x:65534:",
+    ])
+    config = {
+        "host": host,
+        "tenant": tenant,
+        "runner_id": runner,
+        "accounts": {
+            harness: [{"name": "enfant", "type": "api_key_env",
+                       "key_env": key_env}],
+        },
+    }
+    env = [
+        {"name": "HOME", "value": home},
+        {"name": "USER", "value": user},
+        {"name": "LOGNAME", "value": user},
+        {"name": "TMPDIR", "value": "/tmp"},
+        {"name": "AMEESH_HOST", "value": host},
+        {"name": "AMEESH_TENANT", "value": tenant},
+        {"name": "AMEESH_RUNNER_ID", "value": runner},
+        {"name": "AMEESH_CONFIG", "value": "/etc/ameesh/child/config.json"},
+        {"name": "AMEESH_CANON_SYNC_INTERVAL", "value": "0"},
+        {"name": "AMEESH_POD", "value": "1"},
+        {"name": "AMEESH_POD_UID", "valueFrom": {
+            "fieldRef": {"fieldPath": "metadata.uid"}}},
+        {"name": key_env, "valueFrom": {
+            "secretKeyRef": {"name": secret, "key": "api-key"}}},
+    ]
+    volumes = {
+        "home": {"name": "child-home", "emptyDir": {"sizeLimit": "2Gi"}},
+        "tmp": {"name": "child-tmp", "emptyDir": {"sizeLimit": "512Mi"}},
+        "config": {"name": "child-config",
+                   "configMap": {"name": "child-config-" + _dns_slug(child, 30)}},
+    }
+    return {
+        "host": host,
+        "child": child,
+        "parent": parent,
+        "tenant": tenant,
+        "harness": harness,
+        "provider": provider,
+        "model": model,
+        "image": image,
+        "uid": chosen,
+        "fs_group": POD_FS_GROUP,
+        "unix_user": user,
+        "home": home,
+        "cwd": cwd,
+        "runner_id": runner,
+        "credential_secret": secret,
+        "credential_env": key_env,
+        "passwd": passwd,
+        "group": group,
+        "config": config,
+        "env": env,
+        "volumes": volumes,
+        "container": {
+            "name": "child",
+            "image": image,
+            "env": env,
+            "volumeMounts": [
+                {"name": "child-home", "mountPath": home},
+                {"name": "child-config", "mountPath": "/etc/ameesh/child",
+                 "readOnly": True},
+                {"name": "child-tmp", "mountPath": "/tmp"},
+            ],
+            "securityContext": {
+                "runAsUser": chosen,
+                "runAsGroup": POD_FS_GROUP,
+                "runAsNonRoot": True,
+                "allowPrivilegeEscalation": False,
+                "privileged": False,
+                "readOnlyRootFilesystem": True,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+        },
+    }
+
+
+def pod_host_problem(db, host: str, pod_uid: str | None, *, now: float | None = None) -> str:
+    """Pourquoi `host` n'est pas un hôte enfant vivant et connu (`""` sinon).
+
+    Fail closed : une ligne absente pour un hôte qui n'est pas un pod n'est
+    pas un problème (les hôtes ordinaires n'ont pas de ligne), mais un hôte
+    qui en a une doit être `running`, non expiré et porter le `pod_uid`
+    observé. Le code stable est `pod-host-unknown`."""
+    row = storage.of(db).pod_hosts.get(host)
+    if row is None:
+        return ""
+    now = time.time() if now is None else float(now)
+    if row.get("state") != "running":
+        return ("pod-host-unknown: pod host %s is %s, not running"
+                % (host, row.get("state") or "unknown"))
+    if float(row.get("expires_ts") or 0) <= now:
+        return ("pod-host-unknown: pod host %s expired at %s"
+                % (host, row.get("expires_ts")))
+    if not pod_uid or str(row.get("pod_uid") or "") != str(pod_uid):
+        return ("pod-host-unknown: pod UID observed by the runner (%s) is not "
+                "the provisioned pod UID (%s)" % (pod_uid or "none", row.get("pod_uid")))
+    return ""
+
+
 def pod_runtime(cfg, host: str):
     """`policy.runtime` de `host` dans le canon configuré, ou None.
 
@@ -423,16 +651,27 @@ def beat(cfg, db, *, version: str | None = None) -> bool:
     """Battement du runner d'un tenant (`runner_presence`) ; faux sans tenant
     configuré ou sans liaison qui nomme ce runner (le superviseur n'a pas
     encore enregistré le tenant, ou l'identifiant diffère). Le battement
-    publie les profils de compte (#7108) avec la présence."""
+    publie les profils de compte (#7108) avec la présence.
+
+    #7697 : sur un hôte enfant, le battement publie aussi le UID Kubernetes
+    observé et refuse (`pod-host-unknown`, fail closed) si la ligne
+    `pod_hosts` manque, est expirée ou ne porte pas ce UID. Un hôte ordinaire
+    n'a pas de ligne et garde le comportement de #7108."""
     tenant = runner_tenant(cfg)
     if not tenant:
         return False
+    pod_uid = str(getattr(cfg, "pod_uid", "") or "").strip() or None
+    if storage.of(db).pod_hosts.get(cfg.host) is not None:
+        problem = pod_host_problem(db, cfg.host, pod_uid)
+        if problem:
+            return False
     if version is None:
         from . import version as package_version
         version = package_version()
     return storage.of(db).tenancy.beat(
         cfg.host, tenant, cfg.runner, uid=os.getuid(),
-        version=str(version or "") or None, profiles=published_profiles(cfg))
+        version=str(version or "") or None, profiles=published_profiles(cfg),
+        pod_uid=pod_uid)
 
 
 def presence_reason(db, role: Mapping, host: str, *, now: float,

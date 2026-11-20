@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7697 (P4 de #7633) : template FIGÉ d'un pod enfant.
+#
+# Le pourvoyeur le valide (apiVersion/kind, sécurité, volumes, placeholders)
+# puis le rend par demande ; aucun champ du pod n'est choisi par le parent.
+# Placeholders connus : voir ALLOWED_PLACEHOLDERS dans src/ameesh/pod_provisioner.py.
+#
+# Aucun PVC, aucun hostPath, aucun volume du parent : le home et le worktree
+# sont des emptyDir propres à ce pod (design 7633 §8.4). Le seul secret monté
+# est celui de la clé d'API d'organisation de CET enfant, référencé par son
+# nom (`{{CREDENTIAL_SECRET}}`) ; le pourvoyeur ne le lit jamais.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{POD_NAME}}"
+  namespace: "{{NAMESPACE}}"
+  labels:
+    app.kubernetes.io/name: ameesh-child
+    app.kubernetes.io/managed-by: ameesh-pod-provisioner
+    ameesh.dev/managed-by: ameesh-pod-provisioner
+    ameesh.dev/host: "{{HOST}}"
+    ameesh.dev/parent: "{{PARENT}}"
+    ameesh.dev/child: "{{CHILD}}"
+    ameesh.dev/tenant: "{{TENANT}}"
+    ameesh.dev/template: "{{TEMPLATE}}"
+  annotations:
+    ameesh.dev/request-id: "{{REQUEST_ID}}"
+    ameesh.dev/expires-at: "{{EXPIRES_AT}}"
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  serviceAccountName: ameesh-child
+  activeDeadlineSeconds: "{{ACTIVE_DEADLINE}}"
+  terminationGracePeriodSeconds: 30
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10000
+    fsGroup: 10000
+    fsGroupChangePolicy: OnRootMismatch
+    supplementalGroups: [10000]
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: supervisor
+      image: "{{IMAGE}}"
+      imagePullPolicy: IfNotPresent
+      workingDir: /home/ameesh
+      command: ["sh", "-ec", "umask 077; exec ameesh run --poll 5"]
+      env:
+        - name: HOME
+          value: /home/ameesh
+        - name: TMPDIR
+          value: /tmp
+        - name: AMEESH_HOST
+          value: "{{HOST}}"
+        - name: AMEESH_POD
+          value: "1"
+        - name: AMEESH_POD_MEMORY_BYTES
+          value: "{{MEMORY_BYTES}}"
+        - name: AMEESH_POD_CPU_CORES
+          value: "{{CPU_CORES}}"
+        - name: AMEESH_CANON_SYNC_INTERVAL
+          value: "0"
+        - name: AMEESH_DSN
+          value: "{{DSN}}"
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ameesh-db
+              key: password
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10000
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: supervisor-home
+          mountPath: /home/ameesh
+        - name: supervisor-tmp
+          mountPath: /tmp
+        - name: child-config
+          mountPath: /etc/passwd
+          subPath: passwd
+          readOnly: true
+        - name: child-config
+          mountPath: /etc/group
+          subPath: group
+          readOnly: true
+    - name: child
+      image: "{{IMAGE}}"
+      imagePullPolicy: IfNotPresent
+      workingDir: "{{CWD}}"
+      command:
+        - sh
+        - -ec
+        - "mkdir -p '{{CWD}}' && umask 077 && exec ameesh run --poll 5"
+      env:
+        - name: HOME
+          value: "{{HOME}}"
+        - name: USER
+          value: "{{UNIX_USER}}"
+        - name: LOGNAME
+          value: "{{UNIX_USER}}"
+        - name: TMPDIR
+          value: /tmp
+        - name: AMEESH_HOST
+          value: "{{HOST}}"
+        - name: AMEESH_TENANT
+          value: "{{TENANT}}"
+        - name: AMEESH_RUNNER_ID
+          value: "{{RUNNER_ID}}"
+        - name: AMEESH_CONFIG
+          value: /etc/ameesh/child/config.json
+        - name: AMEESH_CANON_SYNC_INTERVAL
+          value: "0"
+        - name: AMEESH_POD
+          value: "1"
+        - name: AMEESH_POD_MEMORY_BYTES
+          value: "{{MEMORY_BYTES}}"
+        - name: AMEESH_POD_CPU_CORES
+          value: "{{CPU_CORES}}"
+        - name: AMEESH_DSN
+          value: "{{DSN}}"
+        - name: AMEESH_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: "{{CREDENTIAL_ENV}}"
+          valueFrom:
+            secretKeyRef:
+              name: "{{CREDENTIAL_SECRET}}"
+              key: api-key
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ameesh-db
+              key: password
+      resources:
+        requests:
+          cpu: "{{CPU_REQUEST}}"
+          memory: "{{MEMORY_REQUEST}}"
+        limits:
+          cpu: "{{CPU_LIMIT}}"
+          memory: "{{MEMORY_LIMIT}}"
+      securityContext:
+        runAsUser: "{{UID}}"
+        runAsGroup: 10000
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: child-home
+          mountPath: "{{HOME}}"
+        - name: child-config
+          mountPath: /etc/ameesh/child
+          readOnly: true
+        - name: child-config
+          mountPath: /etc/passwd
+          subPath: passwd
+          readOnly: true
+        - name: child-config
+          mountPath: /etc/group
+          subPath: group
+          readOnly: true
+        - name: child-tmp
+          mountPath: /tmp
+  volumes:
+    - name: supervisor-home
+      emptyDir:
+        sizeLimit: 256Mi
+    - name: supervisor-tmp
+      emptyDir:
+        sizeLimit: 256Mi
+    - name: child-home
+      emptyDir:
+        sizeLimit: 2Gi
+    - name: child-tmp
+      emptyDir:
+        sizeLimit: 512Mi
+    - name: child-config
+      configMap:
+        name: "{{CONFIGMAP}}"

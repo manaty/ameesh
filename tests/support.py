@@ -1338,7 +1338,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
             "work_items, work_item_events, work_item_milestones, work_packages, "
             "thread_index, notify_liveness, notify_briefs, estimate_references, "
             "harness_adoptions, harness_versions, repository_footprint_policies, "
-            "external_executors "
+            "external_executors, pod_requests, pod_templates, pod_hosts "
             "RESTART IDENTITY CASCADE")
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.makedirs(self.tmp, exist_ok=True)

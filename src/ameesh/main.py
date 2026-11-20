@@ -133,6 +133,10 @@
   ameesh host tenant add human:<id> [--host H] [--register] | list | remove human:<id>
         tenants of a shared host: plan, binding, presence (#7106, bureau or
         human only; --register runs on the target host);
+  ameesh pod-provisioner [--once] [--cleanup-only] [--template FILE]
+        child-pod provisioner: heartbeat the frozen template, start one
+        requested child, delete expired pods and hosts (#7697, system actor;
+        requires the Kubernetes ServiceAccount of deploy/k8s/pod-provisioner);
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh hosts HOST --hold --until 2h --reason R | --release
                                         the owner holds a host on purpose: its
@@ -553,6 +557,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # #7106 (avatar B3) : tenants d'un hôte partagé, geste d'infrastructure
         from . import tenancy
         return tenancy.main(rest[1:])
+    if command in ("pod-provisioner", "pod_provisioner"):
+        # #7697 (P4 de #7633) : le pourvoyeur d'enfants pod (SA Kubernetes)
+        from . import pod_provisioner
+        return pod_provisioner.main(rest)
     if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "reattach", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)

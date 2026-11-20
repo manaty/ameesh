@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7697 (P4 de #7633) : la garde d'admission des pods enfants.
+#
+# Le RBAC limite les verbes ; la VAP limite la FORME. Elle s'applique à tout
+# Pod créé par le ServiceAccount du pourvoyeur (même sans label), et refuse :
+# un mauvais restartPolicy, un jeton de ServiceAccount, un hostPath ou un PVC,
+# un conteneur privilégié ou qui escalade, un pod sans limites, un pod sans
+# les labels qui permettent au nettoyage de vérifier le parent, une deadline
+# hors bornes. Le template est la source ; la VAP est le filet.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ameesh-child-pods
+  labels:
+    app.kubernetes.io/part-of: ameesh
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ameesh
+  matchConditions:
+    - name: provisioner-service-account
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:ameesh:ameesh-pod-provisioner'
+  validations:
+    - expression: >-
+        object.metadata.?labels['ameesh.dev/managed-by'].orValue('') == 'ameesh-pod-provisioner'
+      message: "an ameesh child pod must carry ameesh.dev/managed-by=ameesh-pod-provisioner"
+    - expression: >-
+        object.metadata.?labels['ameesh.dev/host'].orValue('') != '' &&
+        object.metadata.?labels['ameesh.dev/parent'].orValue('') != '' &&
+        object.metadata.?labels['ameesh.dev/child'].orValue('') != ''
+      message: "an ameesh child pod must label its host, parent and child"
+    - expression: "object.spec.restartPolicy == 'Never'"
+      message: "an ameesh child pod must use restartPolicy Never"
+    - expression: "object.spec.serviceAccountName == 'ameesh-child'"
+      message: "an ameesh child pod must use the token-less ameesh-child service account"
+    - expression: "object.spec.automountServiceAccountToken == false"
+      message: "an ameesh child pod must not mount a ServiceAccount token"
+    - expression: >-
+        (!has(object.spec.hostNetwork) || object.spec.hostNetwork == false) &&
+        (!has(object.spec.hostPID) || object.spec.hostPID == false) &&
+        (!has(object.spec.hostIPC) || object.spec.hostIPC == false)
+      message: "an ameesh child pod must not share a host namespace"
+    - expression: >-
+        object.spec.volumes.all(v, !has(v.hostPath) && !has(v.persistentVolumeClaim))
+      message: "an ameesh child pod never mounts a hostPath or a parent PVC"
+    - expression: "object.spec.containers.size() == 2"
+      message: "an ameesh child pod has exactly the supervisor and the child containers"
+    - expression: >-
+        object.spec.containers.all(c,
+          c.image.startsWith('ameesh-runner') &&
+          has(c.securityContext) &&
+          c.securityContext.runAsNonRoot == true &&
+          c.securityContext.allowPrivilegeEscalation == false &&
+          (!has(c.securityContext.privileged) || c.securityContext.privileged == false) &&
+          c.securityContext.readOnlyRootFilesystem == true &&
+          has(c.securityContext.capabilities) &&
+          c.securityContext.capabilities.drop.exists(x, x == 'ALL') &&
+          has(c.resources) && has(c.resources.limits) &&
+          has(c.resources.limits.cpu) && has(c.resources.limits.memory))
+      message: "every ameesh child container must be non-root, non-privileged, read-only, drop ALL, and set cpu/memory limits"
+    - expression: "object.spec.securityContext.runAsNonRoot == true"
+      message: "an ameesh child pod must run as non-root"
+    - expression: >-
+        has(object.spec.activeDeadlineSeconds) &&
+        object.spec.activeDeadlineSeconds >= 60 &&
+        object.spec.activeDeadlineSeconds <= 604800
+      message: "an ameesh child pod needs an activeDeadlineSeconds between 60 and 604800"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ameesh-child-pods
+  labels:
+    app.kubernetes.io/part-of: ameesh
+spec:
+  policyName: ameesh-child-pods
+  validationActions: ["Deny"]

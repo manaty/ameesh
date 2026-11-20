@@ -8,8 +8,8 @@ Témoins d'acceptation :
 * un avatar `children: own-host` place son enfant sur un autre hôte que ceux
   de sa lignée, avec le runner et l'UID du tenant de cet hôte — jamais ceux du
   parent ; la base refuse le bail au runner du parent ;
-* `children: none` refuse (`spawn-forbidden`), `pod` est hors lot
-  (`spawn-pod-unsupported`) ;
+* `children: none` refuse (`spawn-forbidden`) ; `pod` sans pourvoyeur vivant
+  refuse (`spawn-pod-unsupported`, #7697) ;
 * sans placement propre, `spawn` refuse (`spawn-no-placement`) en nommant
   l'hôte/le tenant à provisionner, sans replier sur l'hôte du parent ;
 * un petit-enfant ne revient pas sur l'hôte d'un ancêtre.
@@ -320,12 +320,11 @@ class ChildrenPlacementTest(test_canon._CanonDbCase):
         self.assertIn("spawn-forbidden", str(ctx.exception))
         self.assertIsNone(self.row("enfant2"))
 
-    def test_children_pod_hors_lot_refuse(self):
+    def test_children_pod_sans_pourvoyeur_refuse(self):
         write(self.root, "agents/avatar.md", avatar_card("pod"))
         with self.assertRaises(canon_sync.SpawnError) as ctx:
             self.spawn("enfant2")
         self.assertIn("spawn-pod-unsupported", str(ctx.exception))
-        self.assertIn("B5b", str(ctx.exception))
         self.assertIsNone(self.row("enfant2"))
 
     def test_children_illisible_refuse(self):

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7697 (P4 de #7633) : objets du pourvoyeur d'enfants pod.
+#
+# Le Secret `ameesh-db` et les Secrets d'API par enfant ne sont PAS ici :
+# `secrets.exemple.yaml` n'en donne que la forme. `kubectl apply -k .` est un
+# geste d'opérateur, jamais un geste d'agent.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ameesh
+resources:
+  - serviceaccount.yaml
+  - rbac.yaml
+  - resourcequota.yaml
+  - validatingadmissionpolicy.yaml
+  - deployment.yaml
+configMapGenerator:
+  - name: ameesh-pod-provisioner-template
+    files:
+      - template.yaml

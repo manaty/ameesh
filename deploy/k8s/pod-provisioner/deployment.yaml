@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7697 (P4 de #7633) : le pourvoyeur d'enfants pod.
+#
+# Une seule réplique : le claim des demandes est atomique (`SKIP LOCKED`), mais
+# le heartbeat et le nettoyage sont plus simples avec un seul écrivain. Le
+# template est monté depuis la ConfigMap générée par kustomization.yaml ; le
+# mot de passe de la base vient du Secret `ameesh-db` (jamais dans un manifeste).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ameesh-pod-provisioner
+  namespace: ameesh
+  labels:
+    app.kubernetes.io/name: ameesh-pod-provisioner
+    app.kubernetes.io/part-of: ameesh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh-pod-provisioner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ameesh-pod-provisioner
+        app.kubernetes.io/part-of: ameesh
+    spec:
+      serviceAccountName: ameesh-pod-provisioner
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: provisioner
+          image: ameesh-runner
+          imagePullPolicy: IfNotPresent
+          command: ["ameesh", "pod-provisioner"]
+          args:
+            - "--template"
+            - "/etc/ameesh/pod-provisioner/template.yaml"
+            - "--poll"
+            - "5"
+          env:
+            # DSN sans mot de passe : le mot de passe vient du Secret ci-dessous.
+            # Adapter l'hôte/la base au cluster ; ne jamais y mettre de secret.
+            - name: AMEESH_DSN
+              value: "postgresql://ameesh@ameesh-postgres:5432/ameesh?sslmode=require"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ameesh-db
+                  key: password
+          volumeMounts:
+            - name: template
+              mountPath: /etc/ameesh/pod-provisioner
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: template
+          configMap:
+            name: ameesh-pod-provisioner-template

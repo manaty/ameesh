@@ -799,7 +799,8 @@ class Ephemerals(interface.Ephemerals):
         rows = self.db.query(
             """
             SELECT name, responsible, ephemeral, status, capabilities, harness, cwd,
-                   canon_ref, (NOT ephemeral OR ephemeral_expires_at > now()) AS alive
+                   provider, model, credential_mode, budget_usd, canon_ref,
+                   (NOT ephemeral OR ephemeral_expires_at > now()) AS alive
               FROM agent_registry WHERE name = %s
             """,
             (name,),
@@ -810,7 +811,7 @@ class Ephemerals(interface.Ephemerals):
                admitted_hosts=None, credential_mode=None,
                placement=None, evaluated_profile=None,
                evaluated_identity=None, profile=None,
-               context=None) -> dict | None:
+               context=None, pod_request=None) -> dict | None:
         """Insertion atomique (INSERT … SELECT sur la ligne du créateur).
 
         Sans `host` : comportement R14, le responsable, l'hôte, le dossier et
@@ -845,6 +846,11 @@ class Ephemerals(interface.Ephemerals):
             raise ValueError("Ephemerals.create: evaluated_profile is required with host")
         if placed and not evaluated_identity:
             raise ValueError("Ephemerals.create: evaluated_identity is required with host")
+        if pod_request is not None:
+            if not placed:
+                raise ValueError("Ephemerals.create: pod_request requires host")
+            if pod_request.get("child") != name:
+                raise ValueError("Ephemerals.create: pod_request child mismatch")
         # Ordre des paramètres = ordre des `%s` dans le SQL : verrou, nom,
         # hôte/dossier/mode, les deux durées (leur CASE précède created_by),
         # puis la partie placée (admission, verdict, profil), le créateur,
@@ -974,6 +980,30 @@ class Ephemerals(interface.Ephemerals):
                     """,
                     (name, context["parent"], context["digest"],
                      int(context["bytes"]), context["text"]))
+            if pod_request is not None:
+                request = tx.query(
+                    """
+                    INSERT INTO pod_requests
+                        (child, parent, tenant, host, template, namespace, harness,
+                         credential_secret, uid, unix_user, runner_id, profile,
+                         fingerprint, state, requested_by, requested_at, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s::jsonb, %s, 'requested', %s, clock_timestamp(),
+                            to_timestamp(%s))
+                    ON CONFLICT (child) DO NOTHING
+                    RETURNING id
+                    """,
+                    (name, pod_request["parent"], pod_request["tenant"],
+                     pod_request["host"], pod_request["template"],
+                     pod_request["namespace"], pod_request["harness"],
+                     pod_request["credential_secret"], int(pod_request["uid"]),
+                     pod_request["unix_user"], pod_request["runner_id"],
+                     json.dumps(pod_request.get("profile") or {}, sort_keys=True),
+                     pod_request["fingerprint"], pod_request["requested_by"],
+                     float(pod_request["expires_ts"])))
+                if not request:
+                    raise ValueError("Ephemerals.create: pod request for %s "
+                                     "was not inserted" % name)
             return created[0]
 
     def profile(self, child) -> dict | None:
@@ -1061,6 +1091,34 @@ class Ephemerals(interface.Ephemerals):
 
     def purge_context(self, child) -> None:
         self.db.execute("DELETE FROM spawn_contexts WHERE child = %s", (child,))
+
+    def discard(self, name) -> str:
+        """Nettoie un enfant dont le démarrage pod a échoué (#7697).
+
+        Sans bail vivant, la ligne part (les profils, contextes et rapports
+        suivent en cascade). Un bail vivant est arrêté et expiré : on ne
+        supprime jamais une ligne qu'un exécuteur est en train de tenir."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                DELETE FROM agent_registry
+                 WHERE name = %s AND ephemeral AND lease_owner IS NULL
+                RETURNING name
+                """,
+                (name,))
+            if rows:
+                return "deleted"
+            rows = tx.query(
+                """
+                UPDATE agent_registry
+                   SET status = 'stopped',
+                       ephemeral_expires_at = now(),
+                       updated_at = now()
+                 WHERE name = %s AND ephemeral
+                RETURNING name
+                """,
+                (name,))
+        return "stopped" if rows else "missing"
 
     def exists(self, name) -> bool:
         return bool(self.db.query("SELECT 1 AS x FROM agent_registry WHERE name = %s", (name,)))

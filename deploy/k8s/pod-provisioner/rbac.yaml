@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7697 (P4 de #7633) : RBAC du pourvoyeur d'enfants pod.
+#
+# Le rôle est volontairement minuscule : créer/lire/supprimer des Pods et des
+# ConfigMap dans le namespace du mesh. Aucun Secret (le pourvoyeur ne lit
+# jamais la clé de l'enfant, il la monte par son nom), aucun `pods/exec`,
+# aucun `pods/log`, aucun PVC, aucun Deployment. Une compromission du
+# pourvoyeur ne donne pas les identifiants des tenants.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ameesh-pod-provisioner
+  namespace: ameesh
+  labels:
+    app.kubernetes.io/part-of: ameesh
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ameesh-pod-provisioner
+  namespace: ameesh
+  labels:
+    app.kubernetes.io/part-of: ameesh
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ameesh-pod-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: ameesh-pod-provisioner
+    namespace: ameesh
