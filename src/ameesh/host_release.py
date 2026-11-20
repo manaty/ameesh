@@ -636,7 +636,12 @@ def _auto_drain(cfg, api, db, host, *, owner, listing, canons, holds, controls,
         return None
     controls[host] = row
     # Emit the draining acknowledgement now; a failure keeps claims closed.
-    _run_transition(cfg, api, canons, row, "draining", actor=actor,
+    # #7913: a `draining` inherited from an earlier generation is resynced
+    # with `busy` first; the scanner then sends `draining`, claims closed.
+    first = "draining"
+    if row.get("hook_state") == "draining" and not _draining_acknowledged(api, row):
+        first = "busy"
+    _run_transition(cfg, api, canons, row, first, actor=actor,
                     runner=runner, clock=clock)
     return row
 

@@ -795,6 +795,23 @@ class HostReleaseTest(PgTestCase):
         self.assertEqual((control["release_state"], control["hook_state"]),
                          ("idle-drained", "idle-drained"))
 
+    def test_stale_draining_ack_resyncs_busy_before_an_automatic_drain(self):
+        old = self._ag3_state()
+        self.quiet_history()
+        for _ in range(5):
+            self.once(local_host="vm", now=time.time())
+            self.reading()
+            control = self.control()
+            self.assertEqual(control["mode"], "draining")
+            self.assertFalse(control["claims_open"])
+            self.assertIsNone(registry.claim(self.db, "worker", "other",
+                                             ttl_seconds=60))
+        self.assertTrue(control["automatic"])
+        self.assertEqual(control["generation"], old["generation"] + 1)
+        self.assertEqual(self.states(), ["busy", "draining", "idle-drained"])
+        self.assertEqual((control["release_state"], control["hook_state"]),
+                         ("idle-drained", "idle-drained"))
+
     def test_stale_draining_ack_with_a_return_request_still_returns(self):
         self._ag3_state()
         self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
