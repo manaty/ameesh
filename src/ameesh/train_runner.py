@@ -261,7 +261,10 @@ class Passage:
 
     def maintain(self, db, now):
         with (self.guard() if self.guard is not None else contextlib.nullcontext()):
-            self.maintenance_at = self.reservation_ledger(db).maintain(now)
+            # #7967 : l'époque ordinaire tenue par ce moteur, pour renouveler
+            # l'exclusion d'une cible dont la réservation a expiré.
+            self.maintenance_at = self.reservation_ledger(db).maintain(
+                now, epoch=self.epoch)
         return self.maintenance_at
 
     def repository_path(self):

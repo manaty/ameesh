@@ -10,6 +10,7 @@ import copy
 import math
 import time
 
+from . import land
 from .train import EXPIRABLE, TERMINAL, TrainError, digest
 from .train_store import Ledger
 
@@ -150,20 +151,27 @@ class ReservedLedger(Ledger):
         if not state or state.get("phase") in TERMINAL or not state.get("reservation"):
             return None
         if state.get("phase") in EXPIRABLE and self._expired(state):
-            # #7967 : ticket mort, rien à renouveler. Le moteur reprend le
-            # verrou ordinaire à chaque passage ; replanifier l'échéance
-            # passée ferait boucler la maintenance sur la même erreur.
-            return None
+            # #7967 (B #44835) : le ticket est mort, mais la cible doit rester
+            # tenue pendant l'attente de l'issue des runs. Le verrou ordinaire
+            # a un TTL plus court que la cadence des passages (1 h, 12 h) :
+            # on programme son renouvellement au tiers de ce TTL.
+            return self.reservation.clock() + land.LOCK_TTL_S / 3.0
         return self.provider.next_renew(self._ticket(state))
 
-    def maintain(self, now):
-        """SQL only: no runtime construction, Git, mechanics or CI access."""
+    def maintain(self, now, epoch=None):
+        """SQL only: no runtime construction, Git, mechanics or CI access.
+
+        #7967 (B #44835) : sur ticket expiré et phase EXPIRABLE, renouvelle le
+        verrou ordinaire à l'époque du moteur (ou en prend une neuve), sans
+        toucher au ticket mort ni à l'échéance absolue."""
         state = self.load()
         if not state or state.get("phase") in TERMINAL or not state.get("reservation"):
             return None
         if state.get("phase") in EXPIRABLE and self._expired(state):
-            # #7967 : voir next_maintenance ; aucun renouvellement possible.
-            return None
+            held = super().acquire(epoch) if epoch is not None else None
+            if held is None:
+                held = super().acquire(None)
+            return now + land.LOCK_TTL_S / 3.0
         ticket = self._renew(self._ticket(state), now)
         state["reservation"] = ticket.to_json()
         super().save(state, state["revision"], ticket.epoch)

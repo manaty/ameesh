@@ -282,12 +282,44 @@ class ExpiredReservationLedgerTest(unittest.TestCase):
             ledger.key, ledger.owner, land.LOCK_TTL_S, epoch=7)
         ledger._renew.assert_not_called()
 
-    def test_an_expired_ticket_is_not_maintained(self):
-        # Replanifier une échéance passée ferait boucler la maintenance.
+    def test_an_expired_ticket_renews_the_ordinary_lock(self):
+        # B #44835 : le verrou ordinaire (1800 s) est plus court que la
+        # cadence ; il doit être renouvelé jusqu'à l'invalidation, sinon un
+        # composeur manuel peut lancer sa CI pendant que l'ancienne court.
         ledger = self.ledger()
-        self.assertIsNone(ledger.next_maintenance())
-        self.assertIsNone(ledger.maintain(2000.0))
+        self.assertEqual(ledger.next_maintenance(),
+                         2000.0 + land.LOCK_TTL_S / 3.0)
+        ledger.ops.land_lock.return_value = 7
+        self.assertEqual(ledger.maintain(2600.0, epoch=7),
+                         2600.0 + land.LOCK_TTL_S / 3.0)
+        ledger.ops.land_lock.assert_called_once_with(
+            ledger.key, ledger.owner, land.LOCK_TTL_S, epoch=7)
         ledger._renew.assert_not_called()
+        # Aucune écriture du ticket mort : l'échéance reste absolue.
+        ledger.ops.train_save.assert_not_called()
+
+    def test_the_ordinary_lock_survives_a_gap_longer_than_its_ttl(self):
+        # Cadence nexlink 1 h > TTL 1800 s : six renouvellements au tiers du
+        # TTL gardent la cible tenue bien au-delà d'un TTL, sans composition.
+        ledger = self.ledger()
+        ledger.ops.land_lock.return_value = 7
+        t = ledger.next_maintenance()
+        for _ in range(6):
+            t = ledger.maintain(t, epoch=7)
+        self.assertGreater(t, 2000.0 + land.LOCK_TTL_S)
+        self.assertEqual(ledger.ops.land_lock.call_count, 6)
+        self.assertTrue(all(call.kwargs["epoch"] == 7
+                            for call in ledger.ops.land_lock.call_args_list))
+        ledger.ops.train_save.assert_not_called()
+
+    def test_a_lost_ordinary_lock_is_retaken_on_maintenance(self):
+        ledger = self.ledger()
+        ledger.ops.land_lock.side_effect = [None, 9]
+        self.assertEqual(ledger.maintain(2600.0, epoch=7),
+                         2600.0 + land.LOCK_TTL_S / 3.0)
+        self.assertEqual(ledger.ops.land_lock.call_args_list, [
+            mock.call(ledger.key, ledger.owner, land.LOCK_TTL_S, epoch=7),
+            mock.call(ledger.key, ledger.owner, land.LOCK_TTL_S, epoch=None)])
 
     def test_publishing_and_promoting_never_retake_the_epoch(self):
         for phase in ("publishing", "promoting"):
