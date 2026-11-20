@@ -174,7 +174,10 @@ class ReferenceChartTest(unittest.TestCase):
         self.assertEqual(quota["requests.memory"], "1376Mi")
         self.assertEqual(quota["limits.memory"], "4992Mi")
         self.assertEqual(quota["services"], "0")
-        self.assertEqual(quota["ingresses.networking.k8s.io"], "0")
+        # Les ressources hors du groupe core se comptent en `count/…` : une
+        # clé nue est refusée par l'API (`ValidateResourceQuotaResourceName`).
+        self.assertEqual(quota["count/ingresses.networking.k8s.io"], "0")
+        self.assertNotIn("ingresses.networking.k8s.io", quota)
         self.assertEqual(quota["count/statefulsets.apps"], "1")
 
     def test_quota_ajoute_les_cles_explicites(self):

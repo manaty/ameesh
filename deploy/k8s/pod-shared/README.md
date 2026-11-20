@@ -128,7 +128,7 @@ Le chart suppose **un namespace par pod partagé** (les ConfigMap
 `ameesh-pod-*` y ont des noms fixes). La `ResourceQuota` calcule depuis le
 chart : `pods: 1`, `persistentvolumeclaims: N`, `requests.storage` (somme des
 PVC), `requests.cpu/memory` et `limits.cpu/memory` (superviseur, init,
-sidecar, tenants), `services: 0`, `ingresses.networking.k8s.io: 0`,
+sidecar, tenants), `services: 0`, `count/ingresses.networking.k8s.io: 0`,
 `count/statefulsets.apps: 1`. `quota.hard` ajoute des clés explicites (par
 exemple `secrets: "20"`). Un pod de débogage oublié est refusé : c'est voulu.
 

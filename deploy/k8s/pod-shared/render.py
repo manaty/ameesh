@@ -1045,7 +1045,9 @@ def _resourcequota(config) -> dict:
         # Le pod n'expose aucun Service et aucun Ingress (design §6.4) : la
         # quota le rend impossible, pas seulement déconseillé.
         "services": "0",
-        "ingresses.networking.k8s.io": "0",
+        # Une ressource hors du groupe core se compte avec le préfixe
+        # `count/` ; sans lui, l'API refuse le nom de clé de quota.
+        "count/ingresses.networking.k8s.io": "0",
         "count/statefulsets.apps": "1",
     }
     hard.update(quota["extra"])
