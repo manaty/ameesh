@@ -4127,7 +4127,8 @@ class Ephemerals(Domain):
                evaluated_profile: dict | None = None,
                evaluated_identity: dict | None = None,
                profile: dict | None = None,
-               context: dict | None = None) -> dict | None:
+               context: dict | None = None,
+               pod_request: dict | None = None) -> dict | None:
         """Crée l'éphémère atomiquement (INSERT … SELECT sur la ligne du
         créateur) ; None si le nom est pris ou si le créateur a changé.
 
@@ -4149,10 +4150,21 @@ class Ephemerals(Domain):
         changé, un `created_by` modifié ou un ancêtre revenu sur l'hôte
         d'arrivée.
 
+        `pod_request` (#7697) : la demande enfant pod (`pod_requests`) est
+        écrite dans la MÊME transaction que l'enfant. Un enfant porté par un
+        pod n'existe jamais sans sa demande, et une demande ne survit pas à
+        un refus d'insertion.
+
         #7034 : `profile` (outils/MCP, écrit dans `spawn_profiles`) et
         `context` (extrait borné, écrit dans `spawn_contexts`) sont posés dans
         la MÊME transaction que l'enfant : un enfant restreint n'existe jamais
         sans sa liste, et un contexte ne survit pas à un refus."""
+
+    @abc.abstractmethod
+    def discard(self, name: str) -> str:
+        """Nettoie un enfant dont le démarrage pod a échoué : supprime la
+        ligne si aucun bail n'est vivant, sinon l'arrête et l'expire.
+        Rend `deleted`, `stopped` ou `missing`."""
 
     @abc.abstractmethod
     def exists(self, name: str) -> bool:
@@ -5332,16 +5344,93 @@ class Tenancy(Domain):
 
     @abc.abstractmethod
     def beat(self, host: str, tenant: str, runner_id: str, *, uid: int | None,
-             version: str | None, profiles: Sequence[str] = ()) -> bool:
+             version: str | None, profiles: Sequence[str] = (),
+             pod_uid: str | None = None) -> bool:
         """Battement du runner d'un tenant ; faux sans liaison qui le nomme.
 
         #7108 : `profiles` publie les profils de compte `harnais/compte` que
-        ce runner peut offrir (noms seulement, jamais un chemin ni un secret)."""
+        ce runner peut offrir (noms seulement, jamais un chemin ni un secret).
+        #7697 : `pod_uid` est le UID Kubernetes observé par un runner d'enfant
+        porté par un pod ; la garde de réclamation l'exige égal à
+        `pod_hosts.pod_uid` (les hôtes non pod l'ignorent)."""
 
     @abc.abstractmethod
     def presence(self, host: str, tenant: str) -> dict | None:
         """Dernier battement du tenant sur l'hôte (`seen_ts`, `now_ts`,
-        `runner_id`, `profiles`), ou None."""
+        `runner_id`, `profiles`, `pod_uid`), ou None."""
+
+
+class PodProvisioning(Domain):
+    """#7697 (design 7633 §8.2, §8.4) : demandes et templates d'enfants pod.
+
+    Le parent écrit une ligne `pod_requests` (dans la transaction de
+    `Ephemerals.create`) ; le pourvoyeur `system:ameesh-pod-provisioner`
+    enregistre son template, réclame une demande, crée le pod, puis écrit
+    `pod_hosts`/`host_tenancy`/`host_tenants` dans une transaction. À
+    l'échéance, il supprime le pod et les lignes. Aucun secret ici : le nom
+    du Secret enfant et des noms/digests d'outils seulement.
+    """
+
+    @abc.abstractmethod
+    def register_template(self, name: str, *, namespace: str, image: str,
+                          fingerprint: str, spec: dict, actor: str,
+                          active: bool = True) -> dict:
+        """Enregistre (ou met à jour) le template figé et son battement."""
+
+    @abc.abstractmethod
+    def ready(self, *, max_age_s: float = 120.0) -> dict | None:
+        """Template actif vu récemment, ou None : sans lui, `children: pod`
+        refuse (`spawn-pod-unsupported`)."""
+
+    @abc.abstractmethod
+    def get(self, child: str) -> dict | None:
+        """Demande d'un enfant, ou None."""
+
+    @abc.abstractmethod
+    def get_by_id(self, request_id: str) -> dict | None:
+        """Demande par son UUID, ou None.
+
+        Lecteur de l'autorité d'admission (#7697, B du gel #44541) : le
+        webhook ne fait pas confiance au label `ameesh.dev/child` du pod, il
+        recoupe la demande écrite par le `spawn`."""
+
+    @abc.abstractmethod
+    def claim(self, worker: str) -> dict | None:
+        """Réclame atomiquement la plus ancienne demande `requested` ; None
+        s'il n'y en a pas (deux pourvoyeurs ne prennent pas la même)."""
+
+    @abc.abstractmethod
+    def running(self, request_id: str, *, pod_uid: str, pod_name: str,
+                actor: str) -> dict | None:
+        """Après création du pod : écrit dans UNE transaction `pod_hosts`,
+        `host_tenancy`, `host_tenants`, et passe la demande à `running`.
+        None si la demande n'est plus réclamable ou si l'enfant a disparu
+        (le pourvoyeur supprime alors le pod)."""
+
+    @abc.abstractmethod
+    def fail(self, request_id: str, error: str) -> bool:
+        """Marque la demande `failed` (message borné)."""
+
+    @abc.abstractmethod
+    def cancel(self, child: str, reason: str) -> bool:
+        """Annule une demande encore vivante (délai de démarrage dépassé)."""
+
+    @abc.abstractmethod
+    def reclaim_stale(self, *, older_than_s: float = 300.0) -> int:
+        """Remet en file les demandes `claimed` dont le pourvoyeur est mort."""
+
+    @abc.abstractmethod
+    def cleanup_candidates(self, *, limit: int = 32) -> list[dict]:
+        """Demandes à supprimer (annulées, échues, expirées), avec l'hôte."""
+
+    @abc.abstractmethod
+    def cleanup(self, host: str) -> bool:
+        """Supprime les liaisons d'un hôte enfant et marque la demande
+        `deleted` ; le pod est supprimé par l'appelant avant cet appel."""
+
+    @abc.abstractmethod
+    def finish(self, request_id: str, state: str) -> bool:
+        """Pose l'état terminal d'une demande (`deleted`/`expired`)."""
 
 
 class PodHosts(Domain):
@@ -6955,6 +7044,7 @@ class Storage(abc.ABC):
     host_lifecycle: HostLifecycle
     tenancy: Tenancy
     pod_hosts: PodHosts
+    pod_provisioning: PodProvisioning
     pod_supervisor: PodSupervisor
     turn_resources: TurnResources
     turn_observation: TurnObservation

@@ -97,37 +97,43 @@ class Tenancy(interface.Tenancy):
             (host, host))
         return [dict(row) for row in rows]
 
-    def beat(self, host, tenant, runner_id, *, uid, version, profiles=()):
+    def beat(self, host, tenant, runner_id, *, uid, version, profiles=(),
+             pod_uid=None):
         # La présence n'existe que sous une liaison qui nomme CE runner : un
         # runner mal configuré ne se déclare pas présent pour un autre tenant.
         # #7694 (design 7633 §3.1) : l'UID du processus doit aussi être celui
         # de la liaison. Sur un pod, l'UID vient du chart et n'est pas lu dans
         # un passwd local : c'est le battement qui le vérifie, et un processus
         # sous un autre UID ne publie aucune présence.
+        # #7697 : pour un enfant porté par un pod, le UID Kubernetes observé
+        # est publié ; la garde de réclamation exige qu'il soit celui de
+        # `pod_hosts` (un pod recréé a un UID neuf, l'ancien ne réclame plus).
         published = [str(p) for p in profiles or () if p]
+        pod_uid = str(pod_uid or "").strip() or None
         rows = self.db.query(
             """
             INSERT INTO runner_presence
-                (host, tenant, runner_id, uid, version, profiles, seen_at)
+                (host, tenant, runner_id, uid, version, profiles, pod_uid, seen_at)
             SELECT t.host, t.tenant, t.runner_id, %s, %s,
                    ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)),
-                   clock_timestamp()
+                   %s, clock_timestamp()
               FROM host_tenants t
              WHERE t.host = %s AND t.tenant = %s AND t.runner_id = %s
                AND t.uid = %s
             ON CONFLICT (host, tenant) DO UPDATE
                SET runner_id = excluded.runner_id, uid = excluded.uid,
                    version = excluded.version, profiles = excluded.profiles,
-                   seen_at = excluded.seen_at
+                   pod_uid = excluded.pod_uid, seen_at = excluded.seen_at
             RETURNING tenant
             """,
-            (uid, version, json.dumps(published), host, tenant, runner_id, uid))
+            (uid, version, json.dumps(published), pod_uid, host, tenant,
+             runner_id, uid))
         return bool(rows)
 
     def presence(self, host, tenant):
         rows = self.db.query(
             """
-            SELECT p.runner_id, p.version, p.profiles,
+            SELECT p.runner_id, p.version, p.profiles, p.pod_uid,
                    extract(epoch from p.seen_at)::float8 AS seen_ts,
                    extract(epoch from clock_timestamp())::float8 AS now_ts
               FROM runner_presence p

@@ -452,7 +452,9 @@ FERMEES = {
     # du déplacement manuel d'avatar ; données de compte, pas un état de
     # supervision : colonne fermée aux deux rôles superviseur, aucun GRANT
     # modifié.
-    "runner_presence": {"profiles"},
+    # #7697 (0601) : UID Kubernetes observé par un runner d'enfant pod ;
+    # identité interne de la garde `pod-host-unknown`, fermée aux superviseurs.
+    "runner_presence": {"profiles", "pod_uid"},
     # #7034 (0571) : état privé d'un enfant restreint (politique d'outils et
     # de MCP, contexte borné, état des rapports) ; rien à superviser ici, le
     # rôle de base n'en lit aucune colonne, aucun GRANT ajouté.
@@ -495,6 +497,18 @@ HORS_CONTRAT = {
         "host", "namespace", "template", "parent", "tenant", "uid",
         "runner_id", "pod_uid", "state", "requested_at", "started_at",
         "expires_at", "deleted_at"},
+    # #7697 (0601) : demande d'enfant pod et template figé du pourvoyeur.
+    # État de provisionnement (noms, UID, TTL, empreinte), jamais un contenu
+    # de compte ni un secret ; aucune colonne accordée à un superviseur.
+    "pod_requests": {
+        "id", "child", "parent", "tenant", "host", "template", "namespace",
+        "pod_name", "harness", "credential_secret", "uid", "unix_user",
+        "runner_id", "profile", "fingerprint", "state", "requested_by",
+        "claimed_by", "requested_at", "claimed_at", "started_at", "expires_at",
+        "finished_at", "error"},
+    "pod_templates": {
+        "name", "namespace", "image", "fingerprint", "spec", "registered_by",
+        "registered_at", "last_seen_at", "active"},
 }
 EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
            | FERMEES.get(rel, set()) | HORS_CONTRAT.get(rel, set())

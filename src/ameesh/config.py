@@ -294,6 +294,11 @@ class Config:
     #: pod (`AMEESH_POD=1`, posé par le chart). Il publie la capacité déclarée
     #: du pod au lieu des mesures du nœud (`load1` n'est jamais mesuré).
     pod: bool = False
+    #: #7697 (design 7633 §8.3) : UID Kubernetes de CE pod (`metadata.uid`,
+    #: posé par la Downward API). Le runner d'un enfant le publie au battement ;
+    #: la réclamation exige qu'il soit celui de `pod_hosts` (un pod recréé a
+    #: un UID neuf, l'ancien ne réclame plus). Vide hors pod enfant.
+    pod_uid: str = ""
     #: capacité déclarée du pod par le chart, en octets et en cœurs ; None =
     #: non déclarée (le relevé ne l'invente pas).
     pod_memory_bytes: int | None = None
@@ -1214,6 +1219,7 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
         # #7694 : le chart d'un hôte pod déclare le runtime et la capacité du
         # pod ; une valeur illisible laisse la capacité inconnue, jamais 0.
         pod=bool(_as_bool(pick("AMEESH_POD"), cfg.pod, "AMEESH_POD")),
+        pod_uid=str(pick("AMEESH_POD_UID", default=cfg.pod_uid) or "").strip(),
         pod_memory_bytes=(_as_count(
             pick("AMEESH_POD_MEMORY_BYTES", default=cfg.pod_memory_bytes), 0) or None),
         pod_cpu_cores=_positive_float(

@@ -191,6 +191,14 @@
         roadmap: dated commitments, proposals drawn from decisions,
         text Gantt (schema ameesh-roadmap/1, L96); planned dates of a
         task or a card: `ameesh work plan <id> --start DATE --end DATE --delivery DATE`;
+  ameesh pod-admission [--set-ca] [--template FILE] [--cert FILE] [--key FILE]
+        child-pod admission webhook: checks each pod against its
+        `pod_requests` row and the frozen template (independent authority,
+        #7697; requires the ameesh-pod-admission ServiceAccount);
+  ameesh pod-provisioner [--once] [--cleanup-only] [--template FILE]
+        child-pod provisioner: heartbeat the frozen template, start one
+        requested child, delete expired pods and hosts (#7697, system actor;
+        requires the Kubernetes ServiceAccount of deploy/k8s/pod-provisioner);
   ameesh process check <page.md> [--ref REF] [--version N] [--json]
         compile the workflow block of a canon Process card (#2225);
   ameesh process-approvals refresh|check|show
@@ -561,6 +569,14 @@ def _dispatch(argv: list[str] | None) -> int:
         # #7106 (avatar B3) : tenants d'un hôte partagé, geste d'infrastructure
         from . import tenancy
         return tenancy.main(rest[1:])
+    if command in ("pod-provisioner", "pod_provisioner"):
+        # #7697 (P4 de #7633) : le pourvoyeur d'enfants pod (SA Kubernetes)
+        from . import pod_provisioner
+        return pod_provisioner.main(rest)
+    if command in ("pod-admission", "pod_admission"):
+        # #7697 (P4 de #7633) : l'autorité d'admission des pods enfants
+        from . import pod_admission
+        return pod_admission.main(rest)
     if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "reattach", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)

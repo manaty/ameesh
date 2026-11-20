@@ -624,10 +624,12 @@ un agent. Il a :
 - un `Role` limité au namespace : `create`/`delete`/`get`/`list` des pods et
   `get` des logs, **pas** `get secrets`, **pas** `pods/exec`, **pas** de
   namespaces autres ;
-- une `ValidatingAdmissionPolicy` (ou un webhook) qui n'accepte que le
-  template : image au digest autorisé, `runAsNonRoot`, `drop: ALL`, pas de
-  `hostPath`/`privileged`, labels obligatoires, `activeDeadlineSeconds` borné,
-  pas de jeton monté dans les conteneurs de tenant ;
+- une `ValidatingAdmissionPolicy` **et** un webhook d'admission sous une
+  identité distincte (`ameesh-pod-admission`) qui recoupe la demande
+  `pod_requests` (lecture seule) et n'accepte que le template : image exacte,
+  `runAsNonRoot`, `drop: ALL`, pas de `hostPath`/`privileged`, labels
+  obligatoires, `activeDeadlineSeconds` borné, pas de jeton monté dans les
+  conteneurs de tenant, Secret exact de l'enfant ; `failurePolicy: Fail` ;
 - `ResourceQuota` et `LimitRange` pour borner le nombre et la taille des pods
   d'enfants ;
 - un journal des créations/suppressions (table `pod_requests`/`pod_hosts`),
@@ -1049,6 +1051,26 @@ agents différents ; P5 dépend des deux.
   trois décisions distinctes, aucune ne se déduit du lot.
 - **Pourvoyeur** : un RBAC trop large (secrets, exec) recréerait la
   compromission du cluster ; le template et l'admission sont la garde.
+- **Secret d'API par enfant** : le nom est dérivé du label
+  `ameesh.dev/child` (`ameesh-child-<label>`) et ne dépend pas du tenant.
+  Un SA pourvoyeur compromis peut choisir ce label ; la VAP statique ne peut
+  pas recouper `pod_requests`. La frontière est donc un webhook d'admission
+  (P4, #7697) exécuté sous une identité distincte
+  (`ameesh-pod-admission`), avec son template dans son image et un accès en
+  lecture seule à `pod_requests` : il vérifie request-id, tenant, enfant,
+  nom du pod et Secret exact, et refuse absence, discordance ou demande
+  périmée ; il n'admet que l'identité réelle du ServiceAccount pourvoyeur
+  (`system:serviceaccount:<namespace>:ameesh-pod-provisioner`) et refuse tout
+  autre auteur ; `failurePolicy: Fail`. La VAP reste la seconde barrière. Le
+  webhook se connecte avec `ameesh_pod_admission` (SELECT seul) et le
+  pourvoyeur avec `ameesh_pod_provisioner` (UPDATE borné aux colonnes
+  d'exploitation de `pod_requests`) : `deploy/sql/role-pod-provisioner.sql`
+  et son contrat font de la source d'autorisation une ACL PostgreSQL, pas un
+  drapeau applicatif. Des triggers bornent en plus ses écritures de
+  liaison (`pod_hosts`, `host_tenancy`, `host_tenants`) aux hôtes de ses
+  propres demandes et aux valeurs de la demande : la politique des hôtes VM
+  partagés, la durée et les identités restent hors de sa portée. Le reste du
+  mesh garde le rôle partagé `ameesh` (limite L155).
 - **Estimation** : 3 j pour #7633 est sous-évalué ; le pilote doit
   réestimer ou réduire le périmètre.
 

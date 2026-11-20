@@ -1,0 +1,198 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7697 (P4 de #7633) : la garde d'admission des pods enfants.
+#
+# Le RBAC limite les verbes ; la VAP limite la FORME. Elle s'applique à tout
+# Pod créé par le ServiceAccount du pourvoyeur (même sans label), et refuse :
+# un mauvais restartPolicy, un jeton de ServiceAccount, un hostPath ou un PVC,
+# un conteneur privilégié ou qui escalade, un pod sans limites, un pod sans
+# les labels qui permettent au nettoyage de vérifier le parent, une deadline
+# hors bornes. Le template est la source ; la VAP est le filet.
+#
+# B3 (#7697) : la forme est fermée aux deux conteneurs du template — aucun
+# initContainer ni conteneur éphémère, commandes figées, aucun `envFrom`, et
+# les seules sources de Secret admises sont le mot de passe base (`ameesh-db`)
+# et le Secret de CET enfant, dérivé du label `ameesh.dev/child`
+# (`ameesh-child-<label>`) et monté dans le seul conteneur `child`. L'image
+# n'est pas un préfixe : les deux conteneurs doivent porter exactement
+# l'image portée par l'annotation `ameesh.dev/pod-child-image` du Namespace
+# (paramètre cluster-scoped que le Role namespaced du pourvoyeur ne peut pas
+# modifier).
+#
+# La VAP est la SECONDE barrière. Le label `ameesh.dev/child` reste choisi
+# par le SA du pourvoyeur : seul le webhook `ameesh-pod-admission`
+# (`admission.yaml`), sous une identité distincte, recoupe la demande
+# `pod_requests`, le nom du pod, le tenant et le Secret exact. Un SA
+# pourvoyeur compromis ne peut donc ni changer l'image exécutée, ni monter le
+# Secret d'un autre enfant, ni glisser un env/volume supplémentaire.
+
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ameesh-child-pods
+  labels:
+    app.kubernetes.io/part-of: ameesh
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: Namespace
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ameesh
+  matchConditions:
+    - name: provisioner-service-account
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:ameesh:ameesh-pod-provisioner'
+  validations:
+    - expression: >-
+        object.metadata.?labels['ameesh.dev/managed-by'].orValue('') == 'ameesh-pod-provisioner'
+      message: "an ameesh child pod must carry ameesh.dev/managed-by=ameesh-pod-provisioner"
+    - expression: >-
+        object.metadata.?labels['ameesh.dev/host'].orValue('') != '' &&
+        object.metadata.?labels['ameesh.dev/parent'].orValue('') != '' &&
+        object.metadata.?labels['ameesh.dev/child'].orValue('') != '' &&
+        object.metadata.?annotations['ameesh.dev/tenant'].orValue('') != ''
+      message: "an ameesh child pod must label its host, parent and child, and annotate its tenant"
+    - expression: >-
+        object.metadata.?annotations['ameesh.dev/credential-secret'].orValue('') ==
+        ('ameesh-child-' + object.metadata.?labels['ameesh.dev/child'].orValue(''))
+      message: "an ameesh child pod must derive its credential Secret from ameesh.dev/child"
+    - expression: "object.spec.restartPolicy == 'Never'"
+      message: "an ameesh child pod must use restartPolicy Never"
+    - expression: "object.spec.serviceAccountName == 'ameesh-child'"
+      message: "an ameesh child pod must use the token-less ameesh-child service account"
+    - expression: "object.spec.automountServiceAccountToken == false"
+      message: "an ameesh child pod must not mount a ServiceAccount token"
+    - expression: >-
+        (!has(object.spec.hostNetwork) || object.spec.hostNetwork == false) &&
+        (!has(object.spec.hostPID) || object.spec.hostPID == false) &&
+        (!has(object.spec.hostIPC) || object.spec.hostIPC == false)
+      message: "an ameesh child pod must not share a host namespace"
+    - expression: >-
+        (!has(object.spec.initContainers) || object.spec.initContainers.size() == 0) &&
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.size() == 0)
+      message: "an ameesh child pod may not add init or ephemeral containers"
+    - expression: >-
+        !has(object.spec.imagePullSecrets) || object.spec.imagePullSecrets.size() == 0
+      message: "an ameesh child pod may not add imagePullSecrets"
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v,
+          !has(v.hostPath) && !has(v.persistentVolumeClaim) && !has(v.secret) &&
+          (has(v.emptyDir) || has(v.configMap)))
+      message: "an ameesh child pod only mounts emptyDir and its own ConfigMap"
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v,
+          !has(v.configMap) ||
+          v.configMap.name == object.metadata.?annotations['ameesh.dev/configmap'].orValue(''))
+      message: "an ameesh child pod only mounts its own ConfigMap"
+    - expression: >-
+        object.spec.containers.size() == 2 &&
+        object.spec.containers[0].name == 'supervisor' &&
+        object.spec.containers[1].name == 'child'
+      message: "an ameesh child pod has exactly the supervisor and the child containers"
+    - expression: >-
+        object.spec.containers[0].command == ['sh', '-ec', 'umask 077; exec ameesh run --poll 5'] &&
+        object.spec.containers[1].workingDir.startsWith('/home/') &&
+        !object.spec.containers[1].workingDir.contains("'") &&
+        object.spec.containers[1].command == ['sh', '-ec', "mkdir -p '" + object.spec.containers[1].workingDir + "' && umask 077 && exec ameesh run --poll 5"]
+      message: "the supervisor and child commands are the frozen template's"
+    - expression: >-
+        object.spec.containers.all(c,
+          c.image ==
+            params.metadata.?annotations['ameesh.dev/pod-child-image'].orValue('') &&
+          !has(c.args) && !has(c.lifecycle) && !has(c.envFrom) &&
+          has(c.securityContext) &&
+          c.securityContext.runAsNonRoot == true &&
+          c.securityContext.allowPrivilegeEscalation == false &&
+          (!has(c.securityContext.privileged) || c.securityContext.privileged == false) &&
+          c.securityContext.readOnlyRootFilesystem == true &&
+          has(c.securityContext.capabilities) &&
+          c.securityContext.capabilities.drop.exists(x, x == 'ALL') &&
+          has(c.resources) && has(c.resources.limits) &&
+          has(c.resources.limits.cpu) && has(c.resources.limits.memory))
+      message: "every ameesh child container must use the exact frozen image, be non-root, non-privileged, read-only, drop ALL, and set cpu/memory limits"
+    - expression: >-
+        object.spec.containers.all(c,
+          (!has(c.env) || c.env.all(e,
+            !has(e.valueFrom) ||
+            (has(e.valueFrom.secretKeyRef) &&
+              ((e.valueFrom.secretKeyRef.name == 'ameesh-db' &&
+                e.valueFrom.secretKeyRef.key == 'password') ||
+               (c.name == 'child' &&
+                e.valueFrom.secretKeyRef.name ==
+                  ('ameesh-child-' + object.metadata.?labels['ameesh.dev/child'].orValue('')) &&
+                e.valueFrom.secretKeyRef.key == 'api-key'))) ||
+            (has(e.valueFrom.fieldRef) &&
+             e.valueFrom.fieldRef.fieldPath == 'metadata.uid'))))
+      message: "an ameesh child pod may only read the database password and, in the child container, the Secret derived from its child label"
+    - expression: "object.spec.securityContext.runAsNonRoot == true"
+      message: "an ameesh child pod must run as non-root"
+    - expression: >-
+        has(object.spec.activeDeadlineSeconds) &&
+        object.spec.activeDeadlineSeconds >= 60 &&
+        object.spec.activeDeadlineSeconds <= 604800
+      message: "an ameesh child pod needs an activeDeadlineSeconds between 60 and 604800"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ameesh-child-pods
+  labels:
+    app.kubernetes.io/part-of: ameesh
+spec:
+  policyName: ameesh-child-pods
+  paramRef:
+    name: ameesh
+    parameterNotFoundAction: Deny
+  validationActions: ["Deny"]
+---
+# #7697 (B du gel #44541) : le webhook d'admission est une identité
+# distincte ; le pourvoyeur ne doit pas pouvoir le supprimer pour faire
+# tomber la garde (le retrait resterait fail-closed, mais un déni de service
+# répété n'est pas un fonctionnement acceptable). Cette politique ne vise que
+# les DELETE de pods par le SA du pourvoyeur : les pods enfants gardent leur
+# nettoyage normal.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ameesh-protect-admission
+  labels:
+    app.kubernetes.io/part-of: ameesh
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ameesh
+  matchConditions:
+    - name: provisioner-service-account
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:ameesh:ameesh-pod-provisioner'
+  validations:
+    - expression: >-
+        oldObject.metadata.?labels['app.kubernetes.io/name'].orValue('') !=
+        'ameesh-pod-admission'
+      message: "the pod provisioner may not delete the admission webhook"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ameesh-protect-admission
+  labels:
+    app.kubernetes.io/part-of: ameesh
+spec:
+  policyName: ameesh-protect-admission
+  validationActions: ["Deny"]
