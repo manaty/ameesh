@@ -1001,7 +1001,7 @@ touchent les comptes/ secrets : **deux familles** de relecture ; les tranches
 | **P3 — carte Host pod + siège** | 5 | exception Q2 bis et validation `subscription` + `isolation_ref` ; `claude`/`codex` en `subscription` dans la carte ; procédure de connexion du siège par pod dédié d'un conteneur (`resourceNames`, jamais `pods/exec` sur le pod partagé) + état `login` du tenant ; témoin A↛B sur le compte et contrôle 6 ; vérification des conditions du fournisseur (décision owner) | P2 | 0,5–1 j | sensible (comptes, secrets) — 2 familles |
 | **P4 — clone en pod** | 3 | pourvoyeur `system:ameesh-pod-provisioner` + `ServiceAccount`/RBAC/`ValidatingAdmissionPolicy`/quotas ; `pod_requests`, `pod_hosts`, `host_tenancy`/`host_tenants` enfant ; `children: pod` dans `avatar_children` ; template d'image/harnais ; relais ou clé d'API enfant (pas de siège) ; `spawn_profiles`/rapport ; TTL/nettoyage ; tests `kind` | P1, P2 | 1 j | sensible (droits, comptes, infra) — 2 familles |
 | **P5 — déplacement** | 4 | présence pod dans `candidate_state` ; préflight `agent move` pod ; shared ↔ dedicated (PVC ré-attaché ou re-login) ; poste ↔ pod ; runbook ; tests base + `kind` | P2, P4 | 0,75–1 j | sensible (concurrence, comptes) — 2 familles |
-| **P6 — chart de référence** | 6 | chart complet : NetworkPolicy, quotas, PDB, sauvegardes/snapshots, upgrade/rollback, `preStop`/grâce, labels, digest d'image, runbook de qualification ; témoin et documentation ; passation TPK/IMA | P2–P5 | 1 j | sensible (infra) — 1 famille + revue infra |
+| **P6 — chart de référence** | 6 | chart complet : NetworkPolicy, quotas, PDB, sauvegardes/snapshots, upgrade/rollback, `preStop`/grâce, labels, digest d'image, runbook de qualification ; témoin et documentation ; passation TPK/IMA — **livrée #7699** | P2–P5 | 1 j | sensible (infra) — 1 famille + revue infra |
 | **Q-TPK — qualification** | — | déploiement sur `tpk-stg`, RBAC, stockage, PSA, conditions des fournisseurs, témoin réel, connexion des sièges ; **hors série** (TPK/IMA) | P6 | ~1 j | TPK |
 
 **Total série** : 5,25 à 6 j (P1–P6), plus ~1 j de qualification TPK. L'écart
@@ -1014,6 +1014,30 @@ tenir 3 j en gardant tout.
 **Ordre recommandé** : P1 → P2 → P3 (peut être bloquée par la décision
 d'abonnement) → P4 → P5 → P6 → Q-TPK. P3 et P4 peuvent se chevaucher sur des
 agents différents ; P5 dépend des deux.
+
+**Livraison de P6 (#7699)** : le chart de référence est
+[`deploy/k8s/pod-shared/`](../../deploy/k8s/pod-shared/README.md). Il rend le
+`StatefulSet` (digest d'image, labels de version hors sélecteur immuable,
+`preStop` borné par la grâce, `revisionHistoryLimit` pour `rollout undo`), les
+`NetworkPolicy` (entrée refusée, sortie déclarée, métadonnées d'instance
+exclues), la `ResourceQuota` (un pod, N PVC, somme des ressources, aucun
+Service/Ingress) et le `PodDisruptionBudget` (`minAvailable: 1`). Les
+sauvegardes passent par [`snapshot.py`](../../deploy/k8s/pod-shared/snapshot.py)
+et une `VolumeSnapshotClass` du CSI (hors kustomization). Le runbook de
+qualification, les sections mise à jour/retour arrière, sauvegarde et la
+passation TPK/IMA sont dans
+[`docs/ops/qualification-hote-pod.md`](../ops/qualification-hote-pod.md) ; le
+témoin `kind` gagne le contrôle de référence (quota qui mord, PDB, digest,
+`preStop`). Q-TPK reste **hors série** : le chart ne déploie rien sur
+`tpk-stg`.
+
+**Décisions à la livraison de P6** : D3 (namespace réseau/IPC partagé) et D5
+(visibilité mémoire par tenant) sont tranchées ; D1 (Q2 bis), D2 (conditions
+du fournisseur) et D4 (PVC monté par l'admin) restent à l'owner et la partie
+abonnement est scindée dans #7911 — la carte Host reste en
+`credential_modes: [api-key]`, `canon check` refuse `subscription` sur un pod.
+D6 garde le repli clé d'API (P4), D7 le repli re-login et D8 l'UID par hôte
+(P5). Le chart ne suppose aucune décision au-delà de son repli.
 
 ## 11. Risques, limites et décisions à prendre
 

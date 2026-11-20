@@ -7,8 +7,12 @@ metadata:
   name: ameesh-pod-passwd
   labels:
     app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
     app.kubernetes.io/component: pod-host
     app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
 data:
   passwd: |
     root:x:0:0:root:/root:/bin/sh
@@ -28,8 +32,12 @@ metadata:
   name: ameesh-pod-supervisor
   labels:
     app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
     app.kubernetes.io/component: pod-host
     app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
 data:
   config.json: |
     {
@@ -55,8 +63,12 @@ metadata:
   name: ameesh-pod-canon
   labels:
     app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
     app.kubernetes.io/component: pod-host
     app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
 data:
   url: git@git.example.invalid:exemple/canon.git
   branch: main
@@ -68,8 +80,12 @@ metadata:
   name: ameesh-pod-tenant-alice
   labels:
     app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
     app.kubernetes.io/component: pod-host
     app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
 data:
   config.json: |
     {
@@ -108,8 +124,12 @@ metadata:
   name: ameesh-pod-tenant-bruno
   labels:
     app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
     app.kubernetes.io/component: pod-host
     app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
 data:
   config.json: |
     {

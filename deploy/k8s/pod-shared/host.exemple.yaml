@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# #7695 (P2 de #7633) : exemple de chart d'un hôte pod PARTAGÉ à N tenants.
+# #7695 (P2 de #7633), complété par #7699 (P6) : exemple de chart d'un hôte
+# pod PARTAGÉ à N tenants, chart de référence.
 #
 # Ce fichier est la source du chart rendu dans `rendered/` par `render.py`.
 # `ameesh host tenant add human:<id> --host <hôte> --pod` donne le plan d'un
@@ -14,8 +15,67 @@
 host: pod-alice-exemple
 namespace: ameesh
 statefulset: ameesh-pod-alice
-image: ameesh-runner
+
+# Image du chart, épinglée par digest (P6). Le digest d'exemple ci-dessous est
+# un gabarit : le remplacer par le digest publié de l'image construite depuis
+# le Dockerfile. `render.py` refuse un tag seul (`require_digest` vrai par
+# défaut) ; `require_digest: false` n'est admis que sur un banc local.
+image: registry.example.invalid/ameesh-runner
+image_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 image_pull_policy: IfNotPresent
+version: "1.1.0"          # label app.kubernetes.io/version (défaut : digest court)
+
+# Arrêt : la grâce couvre le preStop ET le drainage du runner. L'attente
+# preStop reste 10 s sous la grâce ; `AMEESH_DRAIN_SECONDS` est plus court.
+grace_period: 120
+prestop_wait: 90
+
+# Réseau (design §6.4) : entrée refusée, sortie refusée par défaut puis
+# autorisée par les règles ci-dessous. DNS vers kube-system. Aucune
+# hypothèse sur le cluster : les CIDR d'exemple (TEST-NET) sont à remplacer
+# par ceux de TPK/IMA. Un CIDR 0.0.0.0/0 exclut automatiquement les
+# métadonnées d'instance (169.254.0.0/16) ; une NetworkPolicy standard ne
+# filtre pas les domaines ni l'intra-pod.
+network:
+  dns:
+    namespace: kube-system
+    pod_labels:
+      k8s-app: kube-dns
+  egress:
+    - name: base
+      to:
+        - ipBlock:
+            cidr: 192.0.2.0/24          # TEST-NET-1 : CIDR réel de la base
+      ports:
+        - protocol: TCP
+          port: 5432
+    - name: canon
+      to:
+        - ipBlock:
+            cidr: 198.51.100.0/24       # TEST-NET-2 : CIDR réel du canon
+      ports:
+        - protocol: TCP
+          port: 22
+    - name: fournisseurs
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0             # 443 seulement, métadonnées exclues
+      ports:
+        - protocol: TCP
+          port: 443
+
+# Quota du namespace (un namespace par pod partagé). `hard` ajoute des clés
+# au besoin (ex. `secrets: "20"`) ; les valeurs du chart sont toujours posées.
+quota:
+  pods: 1
+  hard: {}
+
+# Une seule réplique : `min_available: 1` bloque une éviction volontaire
+# (drain de nœud) tant que l'opérateur n'a pas drainé les agents et supprimé
+# le pod explicitement. Voir le runbook pour le drain.
+pdb:
+  min_available: 1
+
 schema: public
 project: exemple
 dsn: postgresql://ameesh@ameesh-postgres:5432/ameesh?sslmode=require

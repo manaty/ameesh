@@ -438,6 +438,33 @@ class DynamicGitHubTest(unittest.TestCase):
     def ci(self):
         return train_ci.GitHub("o/r", self.contract, gh=self.gh, repo="/tmp/clone")
 
+    def test_a_refusal_waits_for_the_other_due_run_to_finish(self):
+        """#7967 : un refus terminal n'ouvre pas la CI suivante par-dessus
+        celle qui court encore (canon §11 bis, une CI de paquet à la fois)."""
+        other = train_ci.DueWorkflow(".github/workflows/desktop-suite.yml",
+                                     "lot/desktop-suite")
+        self.contract = FakeContract((self.due, other), self.sources)
+        self.runs.append(dict(
+            id=10, run_attempt=1, status="in_progress", conclusion=None,
+            head_sha=self.head, head_branch=self.plan["branch"],
+            path=other.path, event="workflow_dispatch"))
+        self.jobs[0]["conclusion"] = "skipped"
+        result = self.ci().read(self.plan)
+        self.assertEqual((result["status"], result["complete"]), ("pending", False))
+
+    def test_a_refusal_is_terminal_once_every_due_run_is_completed(self):
+        """#7967 : tous les runs sont terminés, le refus ne changera plus."""
+        other = train_ci.DueWorkflow(".github/workflows/desktop-suite.yml",
+                                     "lot/desktop-suite")
+        self.contract = FakeContract((self.due, other), self.sources)
+        self.runs.append(dict(
+            id=10, run_attempt=1, status="completed", conclusion="success",
+            head_sha=self.head, head_branch=self.plan["branch"],
+            path=other.path, event="workflow_dispatch"))
+        self.jobs[0]["conclusion"] = "skipped"
+        with self.assertRaisesRegex(train.SuiteRefused, "skipped"):
+            self.ci().read(self.plan)
+
     def test_start_dispatches_only_the_due_suite(self):
         self.ci().start(self.plan)
         self.assertEqual([call[2] for call in self.dispatch], [self.due.path])
@@ -495,8 +522,9 @@ class DynamicGitHubTest(unittest.TestCase):
         self.assertEqual((result["status"], result["complete"]), ("red", True))
 
     def test_skipped_required_job_is_not_full_ci(self):
+        """#7967 : le refus porte sur un run terminé, donc il est terminal."""
         self.jobs[0]["conclusion"] = "skipped"
-        with self.assertRaisesRegex(train.TrainError, "skipped"):
+        with self.assertRaisesRegex(train.SuiteRefused, "skipped"):
             self.ci().read(self.plan)
 
     def test_a_qualified_tree_skipped_on_a_packet_dispatch_is_tolerated(self):
@@ -519,7 +547,7 @@ class DynamicGitHubTest(unittest.TestCase):
         self.runs[0]["conclusion"] = "cancelled"
         self.jobs.append(dict(id=20, name="qualified-tree", status="completed",
                               conclusion="cancelled"))
-        with self.assertRaisesRegex(train.TrainError, "interrupted or cancelled"):
+        with self.assertRaisesRegex(train.SuiteRefused, "interrupted or cancelled"):
             self.ci().read(self.plan)
 
     def test_a_job_named_after_qualified_tree_is_not_tolerated(self):

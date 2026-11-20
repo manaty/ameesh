@@ -14,7 +14,7 @@ import re
 from urllib.parse import quote
 
 from . import land, resolutions
-from .train import PublicationRefused, TrainError, digest
+from .train import PublicationRefused, SuiteRefused, TrainError, digest
 
 
 def _slurp_unsupported(proc) -> bool:
@@ -202,6 +202,14 @@ def audited_sources(workflows):
                 raise TrainError("conflicting audited CI source contracts")
             sources[path] = blob
     return sources
+
+
+class _SuiteStillRunning(Exception):
+    """#7967: un run terminé refuse sa suite, mais un autre run dû court encore.
+
+    Interne au lecteur : le drain attend la fin de tous les runs dus avant de
+    conclure, pour ne pas lancer la CI du paquet suivant par-dessus celle-ci.
+    """
 
 
 class _NotStatic(Exception):
@@ -684,82 +692,125 @@ class GitHub:
             if proc.returncode:
                 raise TrainError("train dispatch failed or uncertain: %s" % workflow.path)
 
+    def _runs(self, plan, workflow):
+        """Les runs exacts de ce workflow pour la tête et l'événement du plan."""
+        name = quote(workflow.path.rsplit("/", 1)[-1], safe="")
+        path = ("actions/workflows/%s/runs?head_sha=%s&event=%s&per_page=100"
+                % (name, plan["head"], workflow.event))
+        return [r for page in self._api(path) for r in page.get("workflow_runs", ())
+                if r.get("head_sha") == plan["head"]
+                and _same_branch(r, workflow, plan)
+                and r.get("path") == workflow.path and r.get("event") == workflow.event]
+
+    def _unfinished(self, plan, workflows):
+        """#7967: un workflow dû n'a-t-il pas encore de run terminal ?
+
+        Un run absent compte comme non terminé : le train l'attend déjà et la
+        prochaine lecture le verra. Seul un ensemble entièrement terminal
+        autorise un refus définitif."""
+        for workflow in workflows:
+            runs = self._runs(plan, workflow)
+            if not runs:
+                return True
+            run = max(runs, key=lambda r: (int(r["id"]), int(r.get("run_attempt", 1))))
+            if run.get("status") != "completed":
+                return True
+        return False
+
+    def _refuse(self, plan, remaining, waiting, message):
+        """#7967: refuse une suite sur un run terminé, sans chevaucher une CI.
+
+        Un job requis sauté sur un run `completed` prouve que cette tête ne
+        sera jamais verte : c'est terminal. Mais si un autre run dû court
+        encore, invalider maintenant lancerait la CI du paquet suivant
+        par-dessus celle-ci (canon §11 bis) : on attend sa fin, et la lecture
+        suivante conclura."""
+        if not waiting and not self._unfinished(plan, remaining):
+            raise SuiteRefused(message)
+        raise _SuiteStillRunning()
+
     def read(self, plan):
         self.verify(plan)
         evidence, pending, red, absent = [], False, False, False
-        for workflow in self._due(plan):
-            name = quote(workflow.path.rsplit("/", 1)[-1], safe="")
-            path = ("actions/workflows/%s/runs?head_sha=%s&event=%s&per_page=100"
-                    % (name, plan["head"], workflow.event))
-            runs = [r for page in self._api(path) for r in page.get("workflow_runs", ())
-                    if r.get("head_sha") == plan["head"]
-                    and _same_branch(r, workflow, plan)
-                    and r.get("path") == workflow.path and r.get("event") == workflow.event]
-            if not runs:
-                absent = True
-                continue
-            # A newer attempt invalidates the old run's evidence. A cancelled
-            # run supplies no outcome and never asks for an automatic rerun.
-            run = max(runs, key=lambda r: (int(r["id"]), int(r.get("run_attempt", 1))))
-            attempt = int(run.get("run_attempt", 1))
-            if run.get("status") != "completed":
-                pending = True
-                continue
-            if run.get("conclusion") not in ("success", "failure"):
-                raise TrainError("complete CI interrupted or cancelled: no culpable lot proved")
-            if getattr(workflow, "called", ""):
-                # #2446: the reusable workflow has no `workflow_call` run of
-                # its own; the caller push must reference it at this exact
-                # head, and its called jobs are read below.
-                called_workflow(run, workflow, plan)
-            jobs = [j for page in self._api("actions/runs/%s/attempts/%s/jobs?per_page=100"
-                                            % (run["id"], attempt)) for j in page.get("jobs", ())]
-            if isinstance(workflow, DueWorkflow):
-                # #2503: the suite is not frozen; every job it actually ran
-                # that is not an identified plumbing job, or a skip-by-design
-                # job of this suite, must be green. A job the API does not
-                # name cannot be proved, and a name alone never exempts it.
-                for job in jobs:
-                    if not isinstance(job.get("name"), str):
-                        raise TrainError("due suite job without a name: %s"
-                                         % workflow.path)
-                required = [job for job in jobs
-                            if not _tolerated_job(job["name"], workflow.path,
-                                                  workflow.context, workflow.event)]
-                if not required:
-                    raise TrainError("due suite has no executable job: %s" % workflow.path)
-                for job in required:
-                    if job.get("status") != "completed" \
-                            or job.get("conclusion") not in ("success", "failure"):
-                        raise TrainError("required suite job missing, skipped or interrupted")
-                # A tolerated job is tolerated when *skipped by design*; if it
-                # actually ran and failed, the run is red and this suite is the
-                # faulty one (N2): a generic conclusion mismatch would hide it.
-                # A failed plumbing job (status publisher, plan guard) is no
-                # test outcome: it names no lot and is left to the mismatch
-                # check below (#2550).
-                failed = any(job.get("conclusion") == "failure" for job in jobs
-                             if not _plumbing_job(job["name"], workflow.context))
-            else:
-                failed = False
-                for required in self._required_jobs(plan).get(workflow.path, workflow.jobs):
-                    found = required_job(required, jobs)
-                    if len(found) != 1 or found[0].get("status") != "completed" \
-                            or found[0].get("conclusion") not in ("success", "failure"):
-                        # Success of the workflow with a skipped or ambiguous
-                        # required job cannot prove that this suite actually ran.
-                        raise TrainError("required full-suite job missing, skipped or interrupted")
-                    failed = failed or found[0]["conclusion"] == "failure"
-            if failed != (run["conclusion"] == "failure"):
-                # A red run with no proved failing job (an ancillary failure
-                # for a static suite) names no culpable lot; nor is a failed
-                # required job hidden behind a successful workflow.
-                raise TrainError("workflow conclusion does not prove full-suite job outcome")
-            red = red or failed
-            evidence.append(dict(workflow=workflow.path, run=run["id"], attempt=attempt,
-                                 conclusion=run["conclusion"],
-                                 jobs=[dict(id=j["id"], name=j.get("name"),
-                                            conclusion=j.get("conclusion")) for j in jobs]))
+        due = self._due(plan)
+        try:
+            for position, workflow in enumerate(due):
+                remaining = due[position + 1:]
+                runs = self._runs(plan, workflow)
+                if not runs:
+                    absent = True
+                    continue
+                # A newer attempt invalidates the old run's evidence. A cancelled
+                # run supplies no outcome and never asks for an automatic rerun.
+                run = max(runs, key=lambda r: (int(r["id"]), int(r.get("run_attempt", 1))))
+                attempt = int(run.get("run_attempt", 1))
+                if run.get("status") != "completed":
+                    pending = True
+                    continue
+                if run.get("conclusion") not in ("success", "failure"):
+                    self._refuse(plan, remaining, pending or absent,
+                                 "complete CI interrupted or cancelled: no culpable lot proved")
+                if getattr(workflow, "called", ""):
+                    # #2446: the reusable workflow has no `workflow_call` run of
+                    # its own; the caller push must reference it at this exact
+                    # head, and its called jobs are read below.
+                    called_workflow(run, workflow, plan)
+                jobs = [j for page in self._api("actions/runs/%s/attempts/%s/jobs?per_page=100"
+                                                % (run["id"], attempt)) for j in page.get("jobs", ())]
+                if isinstance(workflow, DueWorkflow):
+                    # #2503: the suite is not frozen; every job it actually ran
+                    # that is not an identified plumbing job, or a skip-by-design
+                    # job of this suite, must be green. A job the API does not
+                    # name cannot be proved, and a name alone never exempts it.
+                    for job in jobs:
+                        if not isinstance(job.get("name"), str):
+                            self._refuse(plan, remaining, pending or absent,
+                                         "due suite job without a name: %s" % workflow.path)
+                    required = [job for job in jobs
+                                if not _tolerated_job(job["name"], workflow.path,
+                                                      workflow.context, workflow.event)]
+                    if not required:
+                        self._refuse(plan, remaining, pending or absent,
+                                     "due suite has no executable job: %s" % workflow.path)
+                    for job in required:
+                        if job.get("status") != "completed" \
+                                or job.get("conclusion") not in ("success", "failure"):
+                            self._refuse(plan, remaining, pending or absent,
+                                         "required suite job missing, skipped or interrupted")
+                    # A tolerated job is tolerated when *skipped by design*; if it
+                    # actually ran and failed, the run is red and this suite is the
+                    # faulty one (N2): a generic conclusion mismatch would hide it.
+                    # A failed plumbing job (status publisher, plan guard) is no
+                    # test outcome: it names no lot and is left to the mismatch
+                    # check below (#2550).
+                    failed = any(job.get("conclusion") == "failure" for job in jobs
+                                 if not _plumbing_job(job["name"], workflow.context))
+                else:
+                    failed = False
+                    for required in self._required_jobs(plan).get(workflow.path, workflow.jobs):
+                        found = required_job(required, jobs)
+                        if len(found) != 1 or found[0].get("status") != "completed" \
+                                or found[0].get("conclusion") not in ("success", "failure"):
+                            # Success of the workflow with a skipped or ambiguous
+                            # required job cannot prove that this suite actually ran.
+                            self._refuse(plan, remaining, pending or absent,
+                                         "required full-suite job missing, skipped or interrupted")
+                        failed = failed or found[0]["conclusion"] == "failure"
+                if failed != (run["conclusion"] == "failure"):
+                    # A red run with no proved failing job (an ancillary failure
+                    # for a static suite) names no culpable lot; nor is a failed
+                    # required job hidden behind a successful workflow.
+                    self._refuse(plan, remaining, pending or absent,
+                                 "workflow conclusion does not prove full-suite job outcome")
+                red = red or failed
+                evidence.append(dict(workflow=workflow.path, run=run["id"], attempt=attempt,
+                                     conclusion=run["conclusion"],
+                                     jobs=[dict(id=j["id"], name=j.get("name"),
+                                                conclusion=j.get("conclusion")) for j in jobs]))
+        except _SuiteStillRunning:
+            # Un refus terminal est prouvé mais un run dû court encore : la
+            # passe suivante relira et conclura (jamais deux CI de paquet).
+            pending = True
         status = "absent" if absent else "pending" if pending else "red" if red else "green"
         return dict(head=plan["head"], tree=plan["tree"], complete=not absent and not pending,
                     status=status, workflows=evidence)

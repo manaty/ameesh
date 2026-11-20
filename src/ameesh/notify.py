@@ -384,6 +384,8 @@ TYPE_LABELS = {
     "orphan_lot": "orphan {work}",
     "dead_runner": "dead runner",
     "idle_with_mail": "agent idle with mail",
+    # #7933 : la minuterie de veille d'un agent n'a plus rien déposé
+    "watch_silent": "watch silent",
     "delegation_expired": "delegation expired",
     "engagement_overdue": "commitment or due date passed",
     "long_turn": "long turn",

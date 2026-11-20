@@ -22,10 +22,24 @@ from . import merge_queue
 
 SCHEMA = "ameesh-train/1"
 TERMINAL = ("landed", "empty", "paused", "invalidated")
+#: #7967: phases a dead packet reservation may terminalize without promotion.
+#: `publishing` and `promoting` are excluded: a push or a merge may have left
+#: the process, so only the pilot may conclude those (fail closed).
+EXPIRABLE = ("ci-intent", "ci", "ready", "draining")
 
 
 class TrainError(RuntimeError):
     """A missing proof or an uncertain effect: do not merge."""
+
+
+class SuiteRefused(TrainError):
+    """#7967 : la CI d'une tête a rendu un refus terminal.
+
+    Le run est `completed` (le lecteur ne lève jamais ceci sur un run encore
+    en cours ni sur une lecture impossible) mais sa suite requise manque, a
+    été annulée ou ne prouve pas son résultat. Attendre un autre résultat
+    retiendrait la cible pour rien : le plan est terminé sans promotion, et
+    la coupure due recompose."""
 
 
 class PrevalidationRed(TrainError):
@@ -308,6 +322,19 @@ class Engine:
                     return abandoned
             if state is not None and state["phase"] == "paused":
                 return {"result": "paused"}
+            if state is not None and state.get("phase") in EXPIRABLE:
+                # #7967 : l'échéance absolue de la réservation est passée. Le
+                # verrou de la cible est déjà rendu par l'expiration ; le plan
+                # ne peut plus être promu sous ce bail. Mais l'échéance seule
+                # ne prouve pas la fin des runs : libérer la cible pendant
+                # qu'une CI de paquet tourne lancerait la suivante par-dessus
+                # (§11 bis). Seule une issue terminale établie termine le
+                # plan ; sinon il reste en `draining`, cible tenue, et
+                # l'alerte `train_stuck` (cadence du projet) nomme l'attente.
+                # `publishing`/`promoting` restent au pilote (effet incertain).
+                deadline = self._expired_reservation(state, now)
+                if deadline is not None:
+                    return self._expired_step(state, deadline)
             if state is not None and state["phase"] in (
                     "publishing", "ci-intent", "ci", "ready", "draining") \
                     and self._members_delivered(state):
@@ -512,6 +539,13 @@ class Engine:
             raise TrainError("unknown persisted phase %s" % state["phase"])
         except TrainError as exc:
             if state is not None:
+                if isinstance(exc, SuiteRefused) and state.get("phase") in EXPIRABLE:
+                    # #7967 : un run terminé qui ne prouve pas sa suite requise
+                    # est un refus du contrat CI, pas une CI encore en cours.
+                    # Aucun résultat différent ne peut plus arriver pour cette
+                    # tête : terminer sans promotion (la coupure due repart)
+                    # au lieu d'attendre l'échéance de la réservation.
+                    return self._drained_terminal(state, str(exc), stage="ci")
                 # Keeping a failed promotion's intent makes uncertainty
                 # durable even if notifying the pilot fails.
                 if state.get("phase") != "promoting":
@@ -597,14 +631,72 @@ class Engine:
             return False
         return bool(check(plan))
 
-    def _drained_terminal(self, state, why):
+    def _expired_step(self, state, deadline):
+        """#7967 : termine un plan expiré seulement sur une issue établie.
+
+        La réservation morte interdit toute promotion, et son échéance ne
+        prouve pas que les runs dûs sont finis. Trois cas :
+        - refus terminal d'une suite (runs terminés) : plan invalidé, sans
+          promotion ;
+        - CI `pending` (ou `absent` mais publiée, donc peut-être dispatchée),
+          ou lecture impossible : le plan reste en `draining`, la cible
+          reste tenue, et la passe suivante relira — jamais deux CI de
+          paquet en parallèle (§11 bis) ;
+        - CI terminale (`green`/`red`) ou `absent` sans publication ni feu :
+          plan invalidé sans promotion, la coupure due recompose.
+        """
+        try:
+            ci = self._ci(state)
+        except SuiteRefused as exc:
+            return self._drained_terminal(state, str(exc), stage="ci")
+        except TrainError as exc:
+            # Lecture impossible : rien ne prouve la fin des runs.
+            return {"result": "draining", "plan": state["plan"],
+                    "error": "reservation expired, CI unreadable: %s" % exc}
+        if ci["status"] == "absent" and not state.get("fire") \
+                and self._unpublished(state):
+            return self._drained_terminal(
+                state, self._expired_reason(state, deadline)
+                + "; no publication and no CI run: no run can still be owed")
+        if ci["status"] in ("pending", "absent"):
+            return {"result": "draining", "plan": state["plan"]}
+        return self._drained_terminal(
+            state, self._expired_reason(state, deadline)
+            + "; terminal CI %s proven before invalidation" % ci["status"])
+
+    def _expired_reservation(self, state, now):
+        """#7967 : échéance absolue du ticket de réservation, ou None.
+
+        Fail-closed : un document sans `reservation` lisible, une échéance
+        absente, non finie, booléenne ou encore future ne prouvent pas une
+        expiration. Lecture seule : aucun effet, aucune promotion."""
+        saved = state.get("reservation")
+        if not isinstance(saved, dict):
+            return None
+        deadline = saved.get("deadline")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
+                or not math.isfinite(deadline) or deadline > now:
+            return None
+        return deadline
+
+    def _expired_reason(self, state, deadline):
+        """#7967 : la raison nommée de l'invalidation, pour le diagnostic."""
+        from datetime import datetime, timezone
+        at = datetime.fromtimestamp(deadline, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        error = state.get("error") or "none"
+        return ("packet reservation expired at %s: phase %s, last error: %s; "
+                "plan invalidated without promotion (#7967)"
+                % (at, state.get("phase"), error))
+
+    def _drained_terminal(self, state, why, *, stage="draining"):
         """#7885 : termine un plan en attente qui n'aura jamais de résultat.
 
         `invalidated` est terminal : le `finally` de `step` rend l'époque et
         la réservation. Le diagnostic persiste la raison et la notification
-        suit, comme pour un refus de publication. Aucune promotion."""
+        suit, comme pour un refus de publication. Aucune promotion.
+        `stage` nomme l'origine (#7967 : `ci` pour un refus de suite terminé)."""
         state["error"] = why
-        state["diagnosis"] = {"stage": "draining", "why": why}
+        state["diagnosis"] = {"stage": stage, "why": why}
         state["phase"] = "invalidated"
         state = self._save(state)
         self.ports.notify(why, state)

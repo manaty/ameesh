@@ -59,8 +59,9 @@ spec:
       # `shareProcessNamespace` reste au défaut false : chaque conteneur a son
       # namespace PID, donc pas de /proc/<pid> d'un autre tenant.
       # Le runner rend son bail sur SIGTERM ; 120 s couvrent un tour en vol et
-      # son arrêt (design 7633 §6.1). Un `preStop` de drain explicite arrive
-      # avec la tranche P5 (déplacement).
+      # son arrêt (design 7633 §6.1). Le `preStop` de drain explicite est porté
+      # par le chart de référence `pod-shared` (#7699) ; ce squelette P1 reste
+      # volontairement minimal.
       terminationGracePeriodSeconds: 120
       securityContext:
         runAsNonRoot: true

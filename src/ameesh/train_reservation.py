@@ -10,7 +10,8 @@ import copy
 import math
 import time
 
-from .train import TERMINAL, TrainError, digest
+from . import land
+from .train import EXPIRABLE, TERMINAL, TrainError, digest
 from .train_store import Ledger
 
 
@@ -56,6 +57,15 @@ class ReservedLedger(Ledger):
     def acquire(self, epoch):
         state = super().load()
         if state and state.get("phase") not in TERMINAL and state.get("plan"):
+            if self._expired(state) and state.get("phase") in EXPIRABLE:
+                # #7967 : le ticket est mort. Le moteur doit encore lire
+                # l'état et établir l'issue des runs avant de terminer ; on
+                # garde donc l'exclusion de la cible sous le verrou ordinaire,
+                # sans ressusciter la réservation (l'échéance reste absolue).
+                # Les phases `publishing`/`promoting` restent fermées : un
+                # push ou un merge a pu partir, le pilote tranche.
+                held = super().acquire(epoch)
+                return held if held is not None else super().acquire(None)
             # A restart adopts the persisted epoch. It must never recreate an
             # expired lease by passing epoch=None to ordinary land_lock.
             try:
@@ -64,6 +74,17 @@ class ReservedLedger(Ledger):
             except TrainError:
                 return self._adopt(state) if epoch is None else None
         return super().acquire(epoch)
+
+    def _expired(self, state):
+        """#7967 : l'échéance absolue du ticket est-elle passée ? Fail-closed.
+
+        Un ticket illisible n'est pas une expiration : rien ne serait prouvé
+        et l'époque ordinaire ne doit pas être reprise sur un doute."""
+        try:
+            saved = self.provider.Ticket.from_json(state.get("reservation"))
+        except self.provider.ReservationError:
+            return False
+        return self.reservation.clock() >= saved.deadline
 
     def _adopt(self, state):
         """#3142: the plan of another runner's train, left in flight when its
@@ -129,13 +150,28 @@ class ReservedLedger(Ledger):
         state = self.load()
         if not state or state.get("phase") in TERMINAL or not state.get("reservation"):
             return None
+        if state.get("phase") in EXPIRABLE and self._expired(state):
+            # #7967 (B #44835) : le ticket est mort, mais la cible doit rester
+            # tenue pendant l'attente de l'issue des runs. Le verrou ordinaire
+            # a un TTL plus court que la cadence des passages (1 h, 12 h) :
+            # on programme son renouvellement au tiers de ce TTL.
+            return self.reservation.clock() + land.LOCK_TTL_S / 3.0
         return self.provider.next_renew(self._ticket(state))
 
-    def maintain(self, now):
-        """SQL only: no runtime construction, Git, mechanics or CI access."""
+    def maintain(self, now, epoch=None):
+        """SQL only: no runtime construction, Git, mechanics or CI access.
+
+        #7967 (B #44835) : sur ticket expiré et phase EXPIRABLE, renouvelle le
+        verrou ordinaire à l'époque du moteur (ou en prend une neuve), sans
+        toucher au ticket mort ni à l'échéance absolue."""
         state = self.load()
         if not state or state.get("phase") in TERMINAL or not state.get("reservation"):
             return None
+        if state.get("phase") in EXPIRABLE and self._expired(state):
+            held = super().acquire(epoch) if epoch is not None else None
+            if held is None:
+                held = super().acquire(None)
+            return now + land.LOCK_TTL_S / 3.0
         ticket = self._renew(self._ticket(state), now)
         state["reservation"] = ticket.to_json()
         super().save(state, state["revision"], ticket.epoch)

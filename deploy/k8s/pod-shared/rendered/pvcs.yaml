@@ -7,8 +7,12 @@ metadata:
   name: pvc-alice
   labels:
     app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
     app.kubernetes.io/component: pod-host
     app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
     ameesh.kubernetes.io/tenant: alice
 spec:
   accessModes:
@@ -23,8 +27,12 @@ metadata:
   name: pvc-bruno
   labels:
     app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
     app.kubernetes.io/component: pod-host
     app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
     ameesh.kubernetes.io/tenant: bruno
 spec:
   accessModes:

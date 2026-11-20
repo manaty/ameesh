@@ -7,25 +7,36 @@ metadata:
   name: ameesh-pod-alice
   labels:
     app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
     app.kubernetes.io/component: pod-host
     app.kubernetes.io/part-of: ameesh
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: 1.1.0
+    ameesh.dev/host: pod-alice-exemple
 spec:
   replicas: 1
   serviceName: ameesh-pod
   podManagementPolicy: OrderedReady
+  revisionHistoryLimit: 5
+  minReadySeconds: 10
   updateStrategy:
     type: RollingUpdate
+    rollingUpdate:
+      partition: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: ameesh
-      app.kubernetes.io/component: pod-host
-      app.kubernetes.io/part-of: ameesh
+      app.kubernetes.io/instance: ameesh-pod-alice
   template:
     metadata:
       labels:
         app.kubernetes.io/name: ameesh
+        app.kubernetes.io/instance: ameesh-pod-alice
         app.kubernetes.io/component: pod-host
         app.kubernetes.io/part-of: ameesh
+        app.kubernetes.io/managed-by: kustomize
+        app.kubernetes.io/version: 1.1.0
+        ameesh.dev/host: pod-alice-exemple
     spec:
       serviceAccountName: ameesh-pod
       automountServiceAccountToken: false
@@ -45,7 +56,7 @@ spec:
           type: RuntimeDefault
       initContainers:
       - name: canon
-        image: ameesh-runner
+        image: registry.example.invalid/ameesh-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
         imagePullPolicy: IfNotPresent
         args:
         - sh
@@ -113,7 +124,7 @@ spec:
           mountPath: /tmp
       containers:
       - name: supervisor
-        image: ameesh-runner
+        image: registry.example.invalid/ameesh-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
         imagePullPolicy: IfNotPresent
         args:
         - sh
@@ -129,6 +140,8 @@ spec:
           value: pod-alice-exemple
         - name: AMEESH_CONFIG
           value: /etc/ameesh/supervisor/config.json
+        - name: AMEESH_DRAIN_SECONDS
+          value: '80'
         - name: AMEESH_POD
           value: '1'
         - name: AMEESH_POD_MEMORY_BYTES
@@ -180,8 +193,20 @@ spec:
           readOnly: true
         - name: supervisor-tmp
           mountPath: /tmp
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -ec
+              - |
+                kill -TERM 1 2>/dev/null || true
+                i=0
+                while kill -0 1 2>/dev/null && [ "$i" -lt 90 ]; do
+                  i=$((i+1)); sleep 1
+                done
       - name: tenant-alice
-        image: ameesh-runner
+        image: registry.example.invalid/ameesh-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
         env:
         - name: HOME
           value: /home/ameesh-alice
@@ -216,6 +241,8 @@ spec:
             secretKeyRef:
               name: ameesh-db
               key: password
+        - name: AMEESH_DRAIN_SECONDS
+          value: '80'
         volumeMounts:
         - name: home-alice
           mountPath: /home/ameesh-alice
@@ -276,8 +303,20 @@ spec:
         - secretRef:
             name: ameesh-harness-alice
             optional: true
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -ec
+              - |
+                kill -TERM 1 2>/dev/null || true
+                i=0
+                while kill -0 1 2>/dev/null && [ "$i" -lt 90 ]; do
+                  i=$((i+1)); sleep 1
+                done
       - name: tenant-bruno
-        image: ameesh-runner
+        image: registry.example.invalid/ameesh-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
         env:
         - name: HOME
           value: /home/ameesh-bruno
@@ -312,6 +351,8 @@ spec:
             secretKeyRef:
               name: ameesh-db
               key: password
+        - name: AMEESH_DRAIN_SECONDS
+          value: '80'
         volumeMounts:
         - name: home-bruno
           mountPath: /home/ameesh-bruno
@@ -372,8 +413,20 @@ spec:
         - secretRef:
             name: ameesh-harness-bruno
             optional: true
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -ec
+              - |
+                kill -TERM 1 2>/dev/null || true
+                i=0
+                while kill -0 1 2>/dev/null && [ "$i" -lt 90 ]; do
+                  i=$((i+1)); sleep 1
+                done
       - name: canon-fetch
-        image: ameesh-runner
+        image: registry.example.invalid/ameesh-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
         imagePullPolicy: IfNotPresent
         args:
         - sh

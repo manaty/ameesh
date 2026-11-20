@@ -133,7 +133,8 @@ class Tenancy(interface.Tenancy):
     def presence(self, host, tenant):
         rows = self.db.query(
             """
-            SELECT p.runner_id, p.version, p.profiles, p.pod_uid,
+            SELECT p.runner_id, p.version, p.profiles, p.pod_uid, p.uid,
+                   t.uid AS binding_uid,
                    extract(epoch from p.seen_at)::float8 AS seen_ts,
                    extract(epoch from clock_timestamp())::float8 AS now_ts
               FROM runner_presence p

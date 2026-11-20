@@ -113,9 +113,13 @@ class ProfileTest(unittest.TestCase):
 class TenantLoginTest(unittest.TestCase):
     def test_tenant_login_stays_in_its_private_home(self):
         with tempfile.TemporaryDirectory() as root:
+            # #7970 : un parent setgid (job déporté) propage 02700 aux dossiers
+            # créés ; on le reproduit ici pour ne pas dépendre de l'hôte.
+            os.chmod(root, 0o2700)
             own_home = os.path.join(root, "alice")
             other_home = os.path.join(root, "bruno")
             os.mkdir(own_home, 0o700)
+            os.chmod(own_home, 0o700)
             os.mkdir(other_home, 0o700)
             os.mkdir(os.path.join(own_home, ".claude"), 0o700)
             os.mkdir(os.path.join(other_home, ".claude"), 0o700)
@@ -205,7 +209,10 @@ class CommandCleanupTest(unittest.TestCase):
                 sup.begin = mock.Mock(return_value=request)
                 sup.wait = mock.Mock(side_effect=KeyboardInterrupt if event == "publish_interrupt" else None)
                 error = login.LoginError("failed", "synthetic failure")
+                # #7970 : ce témoin porte sur le nettoyage, pas sur la tenancy ;
+                # un job déporté (`ameesh-job`) a un nom d'utilisateur de tenant.
                 with mock.patch.object(login_cli, "resolve_profile", return_value=mock.Mock(name="default")), \
+                        mock.patch.object(login_cli, "tenant_login_problems", return_value=[]), \
                         mock.patch.object(login_cli, "home_problems", return_value=[]), \
                         mock.patch.object(login_cli, "pinned_version", return_value={"version": "0.159.3"}), \
                         mock.patch.object(login_cli, "credential_fingerprint", return_value=None), \

@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7699 (P6 de #7633) : forme d'une VolumeSnapshotClass de référence.
+#
+# Ce fichier n'est PAS dans kustomization.yaml : un VolumeSnapshotClass est
+# cluster-scoped, fourni par le CSI du cluster (TPK/IMA), et son `driver`
+# dépend du stockage réel. Le créer est un geste d'opérateur, pas un objet du
+# pod. `deletionPolicy: Retain` garde le snapshot après suppression de l'objet
+# (une sauvegarde ne disparaît pas avec son manifeste).
+#
+#   kubectl apply -f snapshotclass.exemple.yaml   # après avoir remplacé driver
+#   ./snapshot.py --class ameesh-pod-snapshots --stamp ... > snapshots.yaml
+#
+# Sans cette classe, le script omet `volumeSnapshotClassName` et le cluster
+# applique sa classe par défaut ; le runbook de qualification vérifie que le
+# pilote expose bien `snapshot.storage.k8s.io/v1` et que la restauration
+# produit un PVC lisible par le même UID (témoin 1 rejoué).
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: ameesh-pod-snapshots
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-snapshot
+    app.kubernetes.io/part-of: ameesh
+driver: csi.example.invalid          # à remplacer par le pilote CSI du cluster
+deletionPolicy: Retain

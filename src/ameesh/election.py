@@ -334,7 +334,7 @@ def local_readiness(cfg, db, role: Mapping, host: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _gate_reason(db, host: str, reading: Mapping | None = None) -> str:
+def host_gate_reason(db, host: str, reading: Mapping | None = None) -> str:
     """Host gate: durable withdrawal/return (L232e), owner hold (#254), and
     the gate state published by the host's own resource reading."""
     try:
@@ -363,7 +363,7 @@ def _gate_reason(db, host: str, reading: Mapping | None = None) -> str:
     return ""
 
 
-def _canon_reason(db, role: Mapping, host: str) -> str:
+def canon_state_reason(db, role: Mapping, host: str) -> str:
     """The role's canon must have a valid, current state on this host."""
     canon = role.get("canon") or ""
     try:
@@ -544,10 +544,10 @@ def candidate_state(db, role: Mapping, host: str, *, now: float | None = None,
     reading_reason, reading = _reading_reason(db, host, now=now)
     if reading_reason:
         reasons.append(reading_reason)
-    gate = _gate_reason(db, host, reading)
+    gate = host_gate_reason(db, host, reading)
     if gate:
         reasons.append(gate)
-    canon = _canon_reason(db, role, host)
+    canon = canon_state_reason(db, role, host)
     if canon:
         reasons.append(canon)
     # #7106 (§3.2 point 5) : sur un hôte partagé, le relevé est celui du

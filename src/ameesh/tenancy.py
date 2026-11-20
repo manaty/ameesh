@@ -691,7 +691,13 @@ def presence_reason(db, role: Mapping, host: str, *, now: float,
                     limit_s: float) -> str:
     """§3.2 point 5 : sur un hôte partagé, un runner du tenant de l'agent est
     vivant (battement frais au seuil de l'hôte). "" si présent ou si l'hôte
-    n'est pas partagé ; sinon la raison."""
+    n'est pas partagé ; sinon la raison.
+
+    #7698 : le battement publie l'UID observé (`runner_presence.uid`) et, sur
+    un hôte enfant, le UID Kubernetes du pod. Une ligne de présence dont l'UID
+    ne correspond plus à `host_tenants.uid` (re-liaison, chart changé) ne rend
+    pas l'hôte présent, et un pod recréé (UID neuf) non plus : c'est le même
+    fail closed que la garde de réclamation `ameesh_tenant_claim_ok`."""
     policy = host_policy(db, host)
     if not policy.get("shared"):
         return ""
@@ -707,6 +713,17 @@ def presence_reason(db, role: Mapping, host: str, *, now: float,
     if age > limit_s:
         return "runner of tenant %s silent for %ds (limit %ds)" % (
             tenant, int(age), int(limit_s))
+    observed, bound = row.get("uid"), row.get("binding_uid")
+    if observed is None or bound is None or int(observed) != int(bound):
+        return ("runner of tenant %s on shared host %s beats under UID %s, "
+                "binding UID %s: tenant UID not verified"
+                % (tenant, host, observed if observed is not None else "none",
+                   bound if bound is not None else "none"))
+    child = storage.of(db).pod_hosts.get(host)
+    if child is not None:
+        problem = pod_host_problem(db, host, row.get("pod_uid"), now=now)
+        if problem:
+            return problem
     return ""
 
 

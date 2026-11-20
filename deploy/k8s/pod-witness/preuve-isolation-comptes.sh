@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# #7694/#7695 (design 7633 §5.3) — témoin kind d'un hôte pod : identité (UID
-# du chart = UID du processus = entrée passwd), montage (le PVC de B n'est pas
-# dans le conteneur de A), permissions (le dossier de comptes 0700 de B refuse
-# l'UID de A, même monté en lecture seule), superviseur (uid 10001, aucun
-# volume de tenant, /tmp propre), base (réclamation par tenant, attach,
-# isolation UID et bail superviseur sur un PostgreSQL migré — 0599 comprise).
-# En plus des cinq contrôles de #7695, le canon (#7694, B1 de #44265) est
-# rejoué : clone sous 10001, lecture sous l'UID du tenant avec la paire
-# `safe.directory` du plan.
+# #7694/#7695/#7698/#7699 (design 7633 §5.3, §6, §9.3) — témoin kind d'un
+# hôte pod : identité (UID du chart = UID du processus = entrée passwd),
+# montage (le PVC de B n'est pas dans le conteneur de A), permissions (le
+# dossier de comptes 0700 de B refuse l'UID de A, même monté en lecture
+# seule), superviseur (uid 10001, aucun volume de tenant, /tmp propre), base
+# (réclamation par tenant, attach, isolation UID, bail superviseur et préflight
+# de déplacement pod sur un PostgreSQL migré — 0601 comprise). En plus des cinq
+# contrôles de #7695, le canon (#7694, B1 de #44265) est rejoué : clone sous
+# 10001, lecture sous l'UID du tenant avec la paire `safe.directory` du plan.
+# #7698 ajoute le déplacement `pod partagé -> pod dédié` : le MÊME PVC est
+# ré-attaché à un pod recréé (UID Kubernetes neuf, UID de personne inchangé,
+# témoin intact), puis le retour au pod partagé. Un UID différent ne lit pas le
+# dossier de comptes (témoin 3) : c'est le repli « compte re-login » quand le
+# PVC ne peut pas être ré-attaché, jamais une copie. #7699 ajoute le contrôle
+# du chart de référence : objets P6 acceptés par l'API, quota qui mord, PDB
+# 1 pod / 0 interruption, image par digest, preStop et labels.
 #
 # Ce script est un geste de BUREAU/OPÉRATEUR, pas de l'agent intéressé : il
 # crée un cluster kind jetable, applique les gabarits du dossier, exécute les
@@ -30,6 +37,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$HERE/../../.." && pwd)
 CLUSTER=${CLUSTER:-ameesh-pod-witness}
 NS=${NS:-ameesh-pod-witness}
+#: Namespace jetable du contrôle du chart de référence (#7699).
+NS_REF=${NS_REF:-${NS}-reference}
 UID_A=${UID_A:-2519}
 UID_B=${UID_B:-2520}
 FS_GROUP=${FS_GROUP:-10000}
@@ -88,12 +97,14 @@ render() {
 }
 
 if [ "$RENDER_ONLY" -eq 1 ]; then
-    echo "# #7694 témoin kind — UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE git_image=$GIT_IMAGE"
+    echo "# #7694/#7695/#7698 témoin kind — UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE git_image=$GIT_IMAGE"
     echo "# kubectl create namespace $NS && kubectl -n $NS apply -f -"
     echo "---"
     render temoin-pvc.yaml
     echo "---"
     render temoin-deux.yaml
+    echo "---"
+    render temoin-dedie.yaml
     echo "---"
     render temoin-lecture.yaml
     echo "---"
@@ -107,12 +118,19 @@ for outil in kind kubectl docker; do
 done
 
 k() { kubectl -n "$NS" "$@"; }
-kexec() { local conteneur=$1; shift; k exec temoin-deux -c "$conteneur" -- "$@"; }
+#: pod courant des contrôles d'identité (#7698 : partagé puis dédié).
+POD=temoin-deux
+kexec() { local conteneur=$1; shift; k exec "$POD" -c "$conteneur" -- "$@"; }
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 pod_uid() {
     k get pod "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null || true
+}
+
+#: volume réellement lié au PVC : preuve que le volume est ré-attaché, pas recréé.
+pvc_volume() {
+    k get pvc "$1" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true
 }
 
 diagnostic() {
@@ -123,6 +141,7 @@ diagnostic() {
     for conteneur in a b superviseur; do
         k logs temoin-deux -c "$conteneur" >&2 || true
     done
+    k logs temoin-dedie >&2 || true
     k logs temoin-lecture >&2 || true
     k logs temoin-canon >&2 || true
 }
@@ -147,7 +166,7 @@ apply_manifest() {
 }
 
 wait_ready() {
-    k wait --for=condition=Ready pod/temoin-deux --timeout=180s >/dev/null
+    k wait --for=condition=Ready "pod/${1:-temoin-deux}" --timeout=180s >/dev/null
 }
 
 # kind lie ses PVC par local-path, un volume hostPath : le kubelet n'applique
@@ -189,8 +208,8 @@ trace() {
     echo "trace: git_image=$GIT_IMAGE"
     echo "trace: image_id=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo '?')"
     echo "trace: uid_a=$UID_A uid_b=$UID_B fs_group=$FS_GROUP"
-    echo "trace: pod_uid=$(pod_uid temoin-deux)"
-    echo "trace: image_ids=$(k get pod temoin-deux -o jsonpath='{.status.containerStatuses[*].imageID}' 2>/dev/null || echo '?')"
+    echo "trace: pod=$POD pod_uid=$(pod_uid "$POD")"
+    echo "trace: image_ids=$(k get pod "$POD" -o jsonpath='{.status.containerStatuses[*].imageID}' 2>/dev/null || echo '?')"
 }
 
 # --- contrôle 1 : identité et modes -----------------------------------------
@@ -348,6 +367,126 @@ check_canon() {
     pass "canon: dépôt clone sous $SUPERVISOR_UID lu sous $UID_A, confiance bornée au dépôt"
 }
 
+# --- contrôle 6 (#7699) : chart de référence, objets acceptés et bornés -----
+# Ce contrôle ne rejoue pas les conteneurs : il prouve que le chart de
+# référence APPLIQUÉ est accepté par l'API et que ses gardes mordent (quota,
+# PDB), que l'image est épinglée, que le préStop et les labels sont présents.
+# L'application de la NetworkPolicy dépend du CNI : kind ne la prouve pas, la
+# qualification réelle est Q-TPK (runbook docs/ops/qualification-hote-pod.md).
+reference_pod() {
+    # Un pod conforme à PSA restricted, dans la quota du chart (1 pod).
+    cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $1
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/instance: ameesh-pod-alice
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 2519
+    runAsGroup: 10000
+    fsGroup: 10000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: temoin
+      image: $IMAGE
+      command: ["sleep", "300"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        readOnlyRootFilesystem: true
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 50m
+          memory: 64Mi
+EOF
+}
+
+check_reference() {
+    local render="python3 $REPO_ROOT/deploy/k8s/pod-shared/render.py"
+    local sts types out expected allowed manifest
+    python3 -c 'import yaml' 2>/dev/null \
+        || { echo "SKIP reference: PyYAML absent — contrôle non exécuté (non-concluant)" >&2; return 77; }
+    $render --check >/dev/null \
+        || fail "reference: le rendu du chart est périmé (./render.py --write)"
+    sts=$($render --stdout --kind StatefulSet) \
+        || fail "reference: rendu du StatefulSet impossible"
+    grep -Eq '@sha256:[0-9a-f]{64}' <<<"$sts" \
+        || fail "reference: image non épinglée par digest"
+    grep -q 'preStop' <<<"$sts" \
+        || fail "reference: preStop de drain absent"
+    grep -q 'terminationGracePeriodSeconds: 120' <<<"$sts" \
+        || fail "reference: grâce absente ou inférieure à 120 s"
+    grep -q 'app.kubernetes.io/version' <<<"$sts" \
+        || fail "reference: label de version absent"
+    manifest=$($render --stdout --kind NetworkPolicy --kind ResourceQuota \
+        --kind PodDisruptionBudget) \
+        || fail "reference: rendu des objets P6 impossible"
+    grep -q 'kind: NetworkPolicy' <<<"$manifest" \
+        || fail "reference: NetworkPolicy absente"
+    grep -q 'kind: ResourceQuota' <<<"$manifest" \
+        || fail "reference: ResourceQuota absente"
+    grep -q 'kind: PodDisruptionBudget' <<<"$manifest" \
+        || fail "reference: PodDisruptionBudget absente"
+    kubectl kustomize "$REPO_ROOT/deploy/k8s/pod-shared" >/dev/null \
+        || fail "reference: kubectl kustomize en échec"
+
+    kubectl create namespace "$NS_REF" --dry-run=client -o yaml \
+        | kubectl apply -f - >/dev/null
+    kubectl label namespace "$NS_REF" \
+        pod-security.kubernetes.io/enforce=restricted \
+        pod-security.kubernetes.io/enforce-version=latest --overwrite >/dev/null
+    printf '%s\n' "$manifest" \
+        | kubectl -n "$NS_REF" apply -f - >/dev/null \
+        || fail "reference: les objets P6 sont refusés par l'API"
+    types=$(kubectl -n "$NS_REF" get networkpolicy \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+        | grep -- '-default-deny$' | head -1)
+    [ -n "$types" ] || fail "reference: aucune NetworkPolicy default-deny"
+    types=$(kubectl -n "$NS_REF" get networkpolicy "$types" \
+        -o jsonpath='{.spec.policyTypes[*]}')
+    [ "$types" = "Ingress Egress" ] \
+        || fail "reference: default-deny ne couvre pas Ingress et Egress ($types)"
+    [ "$(kubectl -n "$NS_REF" get networkpolicy -o name | wc -l)" -ge 5 ] \
+        || fail "reference: règles de sortie manquantes"
+
+    reference_pod temoin-reference | kubectl -n "$NS_REF" apply -f - >/dev/null
+    kubectl -n "$NS_REF" wait --for=condition=Ready pod/temoin-reference \
+        --timeout=120s >/dev/null || fail "reference: pod témoin non prêt"
+    expected=0
+    for _ in $(seq 1 30); do
+        expected=$(kubectl -n "$NS_REF" get pdb \
+            -o jsonpath='{.items[0].status.expectedPods}' 2>/dev/null || true)
+        [ "$expected" = "1" ] && break
+        sleep 1
+    done
+    [ "$expected" = "1" ] \
+        || fail "reference: PDB expectedPods=$expected, attendu 1"
+    allowed=$(kubectl -n "$NS_REF" get pdb \
+        -o jsonpath='{.items[0].status.disruptionsAllowed}')
+    [ "$allowed" = "0" ] \
+        || fail "reference: PDB disruptionsAllowed=$allowed, attendu 0"
+    out=$(mktemp "${TMPDIR:-/tmp}/ameesh-reference-XXXXXX")
+    if reference_pod temoin-reference-2 | kubectl -n "$NS_REF" apply -f - >"$out" 2>&1; then
+        rm -f "$out"
+        fail "reference: un second pod n'est pas refusé par la quota"
+    fi
+    grep -q 'exceeded quota' "$out" \
+        || { cat "$out" >&2; rm -f "$out"; fail "reference: refus de quota inattendu"; }
+    rm -f "$out"
+    pass "reference: 5 NetworkPolicy (default-deny + DNS + sorties), quota mord (2e pod refusé), PDB 1 pod / 0 interruption, image@digest, preStop, label de version"
+    echo "trace: reference: NetworkPolicy acceptée ; son application par le CNI kind n'est pas prouvée, Q-TPK la qualifie"
+}
+
 # --- contrôle 5 : base réelle — réclamation et isolation d'un hôte pod ------
 # #7695 : les contrôles 1–4 prouvent les conteneurs ; celui-ci prouve la base
 # qui les gouverne, avec un vrai PostgreSQL migré (0599 comprise) :
@@ -363,9 +502,10 @@ check_base() {
         || fail "base: python3 absent alors qu'AMEESH_TEST_DSN est posé"
     echo "== base : $AMEESH_TEST_DSN =="
     ( cd "$REPO_ROOT" && PYTHONPATH=src python3 -m unittest -v \
-        tests.test_7695_pod_partage.WitnessBaseTest ) \
-        || fail "base: le contrôle 5 a échoué (voir la sortie unittest)"
-    pass "base: réclamation par tenant, attach par utilisateur système, isolation UID, bail superviseur"
+        tests.test_7695_pod_partage.WitnessBaseTest \
+        tests.test_7698_deplacement_pod.WitnessMoveBaseTest ) \
+        || fail "base: le contrôle base a échoué (voir la sortie unittest)"
+    pass "base: réclamation par tenant, attach par utilisateur système, isolation UID, bail superviseur, présence pod et préflight de déplacement (#7698)"
 }
 
 
@@ -414,15 +554,45 @@ check_identity b "$UID_B"
 check_mount
 check_supervisor
 
-# --- témoin 1 rejoué après un déplacement du PVC ---------------------------
+# --- #7698 : pod partagé -> pod dédié, même PVC, même UID de personne ------
+# Le pod partagé est supprimé (PVC ReadWriteOnce) : le pod dédié de A monte le
+# MÊME PVC `pvc-temoin-a`, sous le MÊME UID 2519. Seul le UID Kubernetes du
+# pod change : le volume n'est pas copié, le témoin de A doit survivre et le
+# volume de B ne doit pas apparaître.
 premier_uid=$(pod_uid temoin-deux)
+premier_volume=$(pvc_volume pvc-temoin-a)
 kubectl -n "$NS" delete pod temoin-deux --wait=true --timeout=120s >/dev/null
+apply_manifest temoin-dedie.yaml
+wait_ready temoin-dedie
+dedie_uid=$(pod_uid temoin-dedie)
+dedie_volume=$(pvc_volume pvc-temoin-a)
+[ -n "$premier_uid" ] && [ -n "$dedie_uid" ] || fail "deplacement: UID de pod illisible"
+[ "$premier_uid" != "$dedie_uid" ] \
+    || fail "deplacement: le pod dedie porte le même UID ($premier_uid)"
+[ -n "$premier_volume" ] && [ "$premier_volume" = "$dedie_volume" ] \
+    || fail "deplacement: le PVC a changé de volume ($premier_volume -> $dedie_volume)"
+POD=temoin-dedie
+trace
+check_identity a "$UID_A"
+kexec a sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-a")" = temoin-a' \
+    || fail "deplacement: le temoin de A n'a pas survecu au re-attachement du PVC"
+if kexec a sh -ec 'test -e /home/ameesh-b' 2>/dev/null; then
+    fail "deplacement: le volume de B est visible dans le pod dedie"
+fi
+POD=temoin-deux
+pass "deplacement pod partage -> dedie : volume $premier_volume re-attache (pod $premier_uid -> $dedie_uid), UID $UID_A et temoin intacts, volume de B absent"
+
+# --- retour au pod partagé : témoin 1 rejoué -------------------------------
+kubectl -n "$NS" delete pod temoin-dedie --wait=true --timeout=120s >/dev/null
 apply_manifest temoin-deux.yaml
 wait_ready
 second_uid=$(pod_uid temoin-deux)
-[ -n "$premier_uid" ] && [ -n "$second_uid" ] || fail "rejeu: UID de pod illisible"
-[ "$premier_uid" != "$second_uid" ] \
-    || fail "rejeu: le pod recréé porte le même UID ($premier_uid)"
+second_volume=$(pvc_volume pvc-temoin-a)
+[ -n "$second_uid" ] || fail "rejeu: UID de pod illisible"
+[ "$dedie_uid" != "$second_uid" ] \
+    || fail "rejeu: le pod recréé porte le même UID ($dedie_uid)"
+[ "$dedie_volume" = "$second_volume" ] \
+    || fail "rejeu: le PVC a changé de volume ($dedie_volume -> $second_volume)"
 trace
 check_identity a "$UID_A"
 check_identity b "$UID_B"
@@ -430,7 +600,7 @@ kexec a sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-a")" = temoin
     || fail "rejeu: le temoin de A n'a pas survécu au déplacement du PVC"
 kexec b sh -ec 'test "$(cat "$HOME/.config/ameesh/accounts/.temoin-b")" = temoin-b' \
     || fail "rejeu: le temoin de B n'a pas survécu au déplacement du PVC"
-pass "rejeu: pod $premier_uid -> $second_uid, identité et modes conservés, temoins persistants"
+pass "rejeu: pod $dedie_uid -> $second_uid, volume $second_volume, identité et modes conservés, temoins persistants"
 
 # Le pod à deux conteneurs est supprimé avant le témoin 3 pour ne pas
 # partager un PVC ReadWriteOnce entre deux pods.
@@ -454,13 +624,18 @@ pass "rejeu final: identite et modes intacts apres un montage sans fsGroup"
 
 check_canon
 
+# Le contrôle de référence rend 77 si PyYAML manque : non-concluant.
+ref_code=0
+check_reference || ref_code=$?
+[ "$ref_code" -eq 0 ] || [ "$ref_code" -eq 77 ] || exit "$ref_code"
+
 # Le contrôle base rend 77 quand le DSN manque : non-concluant, jamais vert.
 base_code=0
 check_base || base_code=$?
-if [ "$base_code" -eq 77 ]; then
-    echo "TEMOINS CONTENEURS PASSENT ; base NON EXÉCUTÉE (non-concluant)" >&2
+if [ "$ref_code" -eq 77 ] || [ "$base_code" -eq 77 ]; then
+    echo "TEMOINS CONTENEURS PASSENT ; référence/base NON EXÉCUTÉE(S) (non-concluant)" >&2
     exit 77
 fi
 [ "$base_code" -eq 0 ] || exit "$base_code"
 
-echo "TOUS LES TEMOINS PASSENT (#7695 : identité, montage, permissions, superviseur, base ; canon #7694)"
+echo "TOUS LES TEMOINS PASSENT (#7695 : identité, montage, permissions, superviseur, base, canon #7694 ; #7698 : déplacement pod partagé -> dédié, PVC ré-attaché, présence pod ; #7699 : chart de référence, quota, PDB, digest, preStop)"

@@ -1044,9 +1044,12 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    consigne de veille prépare le staging sans lui appliquer cette attente.
    Les gestes en production d'un projet, les dépenses et les
    secrets restent des décisions du propriétaire.
-   The watch of an orchestrator is set with `ameesh watch enable --agent
-   <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
-   carries these rules and the working rules of the canon — integration by
+   The watch of an orchestrator is created once with `ameesh watch enable
+   --agent <orchestrator> --every 30m` (L121); on an elected role the unit is
+   then reconciled on every candidate by `ameesh role timers --install` (the
+   lease holder emits, the others tick and stand by). Its text,
+   `src/ameesh/consignes/veille.md`, carries these rules and the working
+   rules of the canon — integration by
    hourly packages, review before CI and no CI per lot between packages, sober
    proofs (canon « Processus de lot » §§3, 6, 11 bis, 12) — and changes only
    through a reviewed commit.

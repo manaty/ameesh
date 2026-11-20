@@ -762,7 +762,8 @@ class WitnessTest(unittest.TestCase):
 
     def test_rendu_placeholders_remplaces(self):
         self.assertEqual(len(self.of_kind("PersistentVolumeClaim")), 2)
-        self.assertEqual(len(self.of_kind("Pod")), 3)
+        # #7698 : le pod dédié du déplacement pod partagé -> pod dédié.
+        self.assertEqual(len(self.of_kind("Pod")), 4)
         rendered = self.rendu.stdout
         for placeholder in ("__UID_A__", "__UID_B__", "__FS_GROUP__", "__IMAGE__",
                             "__GIT_IMAGE__", "__SUPERVISOR_UID__"):
@@ -771,6 +772,23 @@ class WitnessTest(unittest.TestCase):
         self.assertIn("2520", rendered)
         self.assertIn("10000", rendered)
         self.assertIn("alpine/git", rendered)
+
+    def test_temoin_dedie_meme_pvc_et_un_seul_tenant(self):
+        # #7698 : pod dédié de A, même PVC et même UID que dans le pod partagé,
+        # sans le volume ni le home de B.
+        pod = next(d for d in self.of_kind("Pod")
+                   if d["metadata"]["name"] == "temoin-dedie")
+        self.assertEqual(pod["spec"]["securityContext"]["fsGroup"], 10000)
+        containers = pod["spec"]["containers"]
+        self.assertEqual(len(containers), 1)
+        self.assertEqual(containers[0]["name"], "a")
+        self.assertEqual(containers[0]["securityContext"]["runAsUser"], 2519)
+        volumes = {v["name"]: v for v in pod["spec"]["volumes"]}
+        self.assertEqual(volumes["home-a"]["persistentVolumeClaim"]["claimName"],
+                         "pvc-temoin-a")
+        mount_paths = [m["mountPath"] for m in containers[0]["volumeMounts"]]
+        self.assertIn("/home/ameesh-a", mount_paths)
+        self.assertNotIn("/home/ameesh-b", mount_paths)
 
     def test_temoin_deux_un_seul_fsgroup(self):
         pod = next(d for d in self.of_kind("Pod") if d["metadata"]["name"] == "temoin-deux")
