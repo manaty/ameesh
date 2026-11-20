@@ -2129,13 +2129,24 @@ def shared_violations(agent: Any, host: Any, mode: Any) -> list[str]:
         out.append("responsible %s is not a tenant of shared host %s (tenants: %s)" % (
             responsible or "undeclared", host_name, ", ".join(sorted(tenants)) or "none"))
     text = None if mode is None or mode == "" else str(mode)
-    subscription_ok = (_get(policy, "allow_subscription") is True
+    # #7696 : la carte Host d'un pod reste en `api-key` (décision owner
+    # #228416 b, P3 sans abonnement). L'opt-in général des hôtes partagés
+    # (#5901/#7705) ne l'ouvre pas, même quand la fiche le déclare : la
+    # défense en profondeur s'applique aussi à un appelant qui n'a pas lancé
+    # `canon check`. Le lot #7911 rouvrira Q2 bis avec D2 et D4.
+    runtime = _get(policy, "runtime")
+    pod = runtime is not None and _get(runtime, "kind") in ("pod", "pod-template")
+    subscription_ok = (not pod and _get(policy, "allow_subscription") is True
                        and _get(policy, "require_isolation") is True)
     allowed_modes = SHARED_CREDENTIAL_MODES + (("subscription",) if subscription_ok else ())
     if text not in allowed_modes:
-        out.append("credential mode %s not allowed on shared host %s: "
-                   "subscription requires explicit tenant isolation (decision %s)"
-                   % (text or "undeclared", host_name, SHARED_DECISION))
+        reason = ("a pod host admits `api-key` only (decision #228416 b; "
+                  "#7911 reopens subscription)"
+                  if pod else
+                  "subscription requires explicit tenant isolation (decision %s)"
+                  % SHARED_DECISION)
+        out.append("credential mode %s not allowed on shared host %s: %s"
+                   % (text or "undeclared", host_name, reason))
     return out
 
 
@@ -2201,6 +2212,9 @@ def _validate_pod_runtime(canon: "Canon", host: Any, add) -> None:
     Un hôte pod reste un hôte partagé : `shared: true`, `tenants` non vide,
     un volume par tenant. Le gabarit d'enfant (`pod-template`) est figé — un
     seul agent, volatil, sans siège — et n'est jamais un hôte plaçable.
+    #7696 : un hôte `kind: pod` reste en `api-key` tant que Q2 bis (D1), les
+    conditions du fournisseur (D2) et le PVC vu par l'admin du cluster (D4)
+    ne sont pas tranchés (décision owner #228416 b, #7911).
     """
     policy = host.policy
     runtime = policy.runtime
@@ -2217,6 +2231,20 @@ def _validate_pod_runtime(canon: "Canon", host: Any, add) -> None:
             "host %s: `policy.runtime` requires a non-empty `policy.tenants`"
             % host.title, host.fiche, host=host.title)
     modes = policy.credential_modes or []
+    if runtime.kind == "pod":
+        # #7696 : P3 de #7633 sans abonnement (décision owner #228416 b,
+        # signée le 20/11 10:42Z). Q2 bis (D1), les conditions du fournisseur
+        # (D2) et le PVC d'un abonnement monté par l'admin du cluster (D4) ne
+        # sont pas tranchés : la carte reste en `api-key`, et l'opt-in général
+        # des hôtes partagés (#5901/#7705) ne l'ouvre pas sur un pod. Le lot
+        # #7911 rouvrira la partie abonnement, avec D2 et D4.
+        if "subscription" in modes or policy.allow_subscription:
+            add("host-pod-subscription-unproven", ERROR,
+                "host %s: a pod host admits `api-key` only: `subscription` "
+                "requires Q2 bis (D1), the supplier terms (D2) and the "
+                "cluster-admin PVC decision (D4), none answered — decision "
+                "#228416 b keeps P3 without subscription; #7911 reopens it"
+                % host.title, host.fiche, host=host.title)
     if runtime.kind == "pod-template":
         if policy.max_agents != 1:
             add("host-pod-template-max-agents", ERROR,
