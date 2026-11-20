@@ -568,16 +568,25 @@ class HostLifecycle(interface.HostLifecycle):
                     (host, generation, release_epoch, state, actor,
                      json.dumps(detail, sort_keys=True)))
                 tx.execute(
-                    "UPDATE host_lifecycle SET hook_state=%s,hook_attempt_at=NULL,"
+                    "UPDATE host_lifecycle c SET hook_state=%s,hook_attempt_at=NULL,"
                     "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
                     "hook_attempt_epoch=NULL,"
                     "hook_wait_at=NULL,hook_wait_state=NULL,"
                     "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                     "release_error=NULL,release_error_state=NULL,release_error_at=NULL,"
                     "release_error_since=NULL,"
-                    "release_state=CASE WHEN %s='busy' THEN 'busy' "
+                    # #7913: a `busy` that resyncs a `draining` acknowledged by
+                    # an earlier generation is not a return: the withdrawal
+                    # goes on (`draining` next), so the release state stays.
+                    "release_state=CASE WHEN %s='busy' AND NOT ("
+                    "                       c.mode='draining' AND c.release_state='draining'"
+                    "                       AND c.hook_state='draining'"
+                    "                       AND c.return_requested_at IS NULL"
+                    "                       AND NOT EXISTS (SELECT 1 FROM host_lifecycle_transitions t"
+                    "                        WHERE t.host=c.host AND t.generation=c.generation"
+                    "                          AND t.state='draining')) THEN 'busy' "
                     "                  WHEN %s='idle-drained' THEN 'idle-drained' "
-                    "                  ELSE release_state END,"
+                    "                  ELSE c.release_state END,"
                     "released_at=CASE WHEN %s='idle-drained' THEN clock_timestamp() "
                     "                  ELSE released_at END,"
                     "updated_at=clock_timestamp() WHERE host=%s AND generation=%s",
@@ -660,6 +669,10 @@ class HostLifecycle(interface.HostLifecycle):
                                                     "attempt_stale_after")
         rows = self.db.query(
             "UPDATE host_lifecycle SET claims_open=true,"
+            # #7913: the release state follows the opened gate (as `undrain`
+            # and `reopen_return`); a return without any adapter answer used
+            # to leave an `available` host saying `draining`.
+            "release_state='busy',"
             "return_requested_at=NULL,return_requested_by=NULL,"
             # #5932: reopening ends any adapter wait of the closed gate.
             "hook_wait_at=NULL,hook_wait_state=NULL,"

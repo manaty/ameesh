@@ -471,6 +471,13 @@ def _busy_sample_ok(cfg, api, db, row, *, now):
     return _fresh_reading(cfg, db, row["host"], now=now, after=after)
 
 
+def _draining_acknowledged(api, row):
+    """#7913: was `draining` acknowledged for this withdrawal (generation)?"""
+    return any(item.get("state") == "draining"
+               and item.get("generation") == row.get("generation")
+               for item in api.transition_journal(row["host"]))
+
+
 def _advance(cfg, api, db, row, *, controls, listing, canons, canon_unknown,
              holds, known, actor, runner, now, clock):
     """One transition decision for a controlled host. Returns a short reason."""
@@ -532,6 +539,15 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, canon_unknown,
         return "idle-drained"
     if row.get("hook_state") == "draining":
         if need_return:
+            _run_transition(cfg, api, canons, row, "busy", actor=actor,
+                            runner=runner, clock=clock)
+            return "busy"
+        if not _draining_acknowledged(api, row):
+            # #7913: this `draining` was acknowledged by an earlier generation
+            # (a return reopened without any `busy` answer, e.g. no adapter
+            # then). It says nothing of this withdrawal: resync with `busy`
+            # first, then `draining`, before any `idle-drained`. The resync
+            # keeps the release state, so it never reads as a return.
             _run_transition(cfg, api, canons, row, "busy", actor=actor,
                             runner=runner, clock=clock)
             return "busy"
@@ -641,7 +657,10 @@ def enter_draining(cfg, db, host, *, actor, runner=None, clock=time.time):
         return row
     if not hook:
         return row
-    if row.get("hook_state") == "idle-drained":
+    if row.get("hook_state") == "idle-drained" or (
+            row.get("hook_state") == "draining" and row.get("mode") == "draining"
+            and not _draining_acknowledged(api, row)):
+        # #7913: a `draining` of an earlier generation is resynced too.
         _run_transition(cfg, api, canons, row, "busy", actor=actor,
                         runner=runner, clock=clock)
     elif row.get("hook_state") in (None, "busy"):

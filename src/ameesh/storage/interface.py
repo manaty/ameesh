@@ -5502,7 +5502,10 @@ class HostLifecycle(Domain):
 
         Success journals `(host, generation, state)` (idempotent), clears the
         attempt and the error, and advances `hook_state`; `busy` also sets the
-        release state to busy, `idle-drained` stamps the release. Claims stay
+        release state to busy, `idle-drained` stamps the release. #7913: a
+        `busy` that resyncs a `draining` acknowledged by an earlier generation
+        (a withdrawal still `draining`, no return requested) keeps the release
+        state: the withdrawal goes on with `draining`. Claims stay
         closed until `open_claims` (a `busy` acknowledgement only means the
         adapter is ready, not that ameesh may already take a lease). Failure
         keeps the acknowledged state and the closed claims, and stores the
@@ -5532,6 +5535,7 @@ class HostLifecycle(Domain):
                     attempt_stale_after: float | None = None) -> bool:
         """Reopen claims after a `busy` acknowledgement and a fresh reading.
 
+        The release state becomes `busy` with the open gate (#7913).
         Only a host whose acknowledged hook state is `busy` can reopen; a
         replay, a stale generation or a moved `release_epoch` opens nothing.
         `require_busy=False` is the explicit operator path of a host whose
