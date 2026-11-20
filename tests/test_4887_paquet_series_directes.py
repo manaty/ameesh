@@ -118,7 +118,7 @@ class PartageDeBorneTest(unittest.TestCase):
         def run(label, modules, *, timeout):
             # La première série consomme presque toute la borne totale : avec
             # la part #4887, les suivantes ne partaient plus.
-            clock[0] += 800 if label == "unité #1" else 10
+            clock[0] += 700 if label == "unité #1" else 10
             return _green(label, modules)
 
         with mock.patch.object(paquet_auto.time, "monotonic",
@@ -132,12 +132,37 @@ class PartageDeBorneTest(unittest.TestCase):
         # la borne totale ; le temps restant ne la coupe qu'en temps mural.
         self.assertEqual([limit for _label, limit, _wall in units],
                          [900, 900, 900])
+        # #7888 : le temps mural s'arrête avant la réserve #4887 (900 // 5 =
+        # 180 s) : les séries partent toutes, le rejeu garde sa part.
         self.assertEqual([wall for _label, _limit, wall in units],
-                         [900, 100, 90])
+                         [720, 20, 10])
         self.assertEqual(faulty, [])
         unit_runs = [run for run in runs if run.label.startswith("unité #")]
         self.assertEqual([run.direct for run in unit_runs],
                          [["tests.test_u1"], ["tests.test_u2"], ["tests.test_u3"]])
+
+    def test_la_serie_directe_laisse_la_reserve_au_rejeu(self) -> None:
+        """#7888 (h-20261119-12) : les séries directes couraient jusqu'à la
+        borne ; le rejeu #3801 du contrat rouge de #7865 n'avait plus de temps
+        et le rouge connu était poussé. Le mur de chaque série s'arrête avant
+        la réserve, une série qui n'a plus que la réserve ne part pas."""
+        clock = [1000.0]
+
+        def run(label, modules, *, timeout):
+            clock[0] += 500 if label == "unité #1" else 1
+            return _green(label, modules)
+
+        with mock.patch.object(paquet_auto.time, "monotonic",
+                               side_effect=lambda: clock[0]):
+            runs, _faulty, _ = self.local((1, 2), run, deadline=1000.0 + 600)
+        units = [call for call in self.calls if call[0].startswith("unité")]
+        # réserve 600 // 5 = 120 s : mur 480 s ; après 500 s, il reste 100 s,
+        # toutes dans la réserve : la série #2 ne part pas (non concluant).
+        self.assertEqual([(label, wall) for label, _limit, wall in units],
+                         [("unité #1", 480)])
+        second = [run for run in runs if run.label == "unité #2"][0]
+        self.assertTrue(second.inconclusive)
+        self.assertGreaterEqual(1000.0 + 600 - clock[0], 100)
 
     def test_rouge_direct_du_dernier_lot_trouve_avant_la_ci(self) -> None:
         clock = [1000.0]

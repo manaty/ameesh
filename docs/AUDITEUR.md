@@ -1076,9 +1076,33 @@ l'auditeur ([0023](design/decisions/0023-critere-d-adoption-des-reglages.md)).
 Un constat qui revient trois passages de suite devient une proposition de
 règle. Une règle acceptée par le propriétaire devient une décision écrite dans
 `docs/design/decisions/` (rapportée par mesh-design), et cette consigne est mise
-à jour par mesh-design, jamais par l'auditeur. C'est la boucle
-d'auto-réparation de [0022](design/decisions/0022-auto-reparation.md),
-appliquée à l'exploitation et au code d'ameesh.
+à jour par mesh-design. Une règle propre de l'auditeur, qui ne règle que son
+propre travail, est persistée par lui (canon §7) : par PR sur cette section,
+datée, sourcée, avec `expire:` quand elle naît d'un incident (30 j par défaut),
+revue à l'échéance. C'est la boucle d'auto-réparation de
+[0022](design/decisions/0022-auto-reparation.md), appliquée à l'exploitation et
+au code d'ameesh.
+
+### Règles propres de l'auditeur
+
+- **Relecture sensible : suivre chaque valeur nouvelle** (20/11/2026, #7899 ;
+  expire: 2026-12-20). Avant un ok sur un lot sensible, chaque valeur que le
+  lot introduit (colonne, champ, format, nom d'acteur, état) est suivie jusqu'à
+  son producteur et à chacun de ses lecteurs. Source : en 24 h, cx2 a renversé
+  quatre ok de l'auditeur (#7694@3b210678, #7870@6a3bb4ef, #7880@83b742a8,
+  #7865@27ec2d15), dont #7865 (format `agent:<nom>` de `decided_by`, non
+  suivi jusqu'à ses lecteurs) et #7880 (porteur assigné au mauvais pilote).
+- **Schéma nouveau : lire le classement des colonnes** (20/11/2026, #7899 ;
+  expire: 2026-12-20). Pour un lot qui ajoute une table ou une colonne,
+  l'auditeur compare, sur la tête gelée, chaque colonne créée par la migration
+  au contrat des rôles (`deploy/sql/role-superviseur*.sql`) et à `EXCLUES`
+  (`tests/test_cluster.py`) ; une colonne ni accordée ni exclue est un B. Il ne
+  rejoue pas la suite (canon §3, §6) : il lit la preuve auteur de
+  `SuperviseurRoleTest` si elle existe ; absente ou non concluante, elle est
+  consignée sans retenir le lot. Correction de relecture : B de cx2 sur le gel
+  #44439 (commit 72c521fe retiré, réécrit ici). Source : B #44402 sur
+  #7865@e69b26cb, où les colonnes de 0596 n'étaient pas classées ; l'ok manqué
+  avait laissé partir le paquet h-20261119-12 sur un rouge connu.
 
 ## Mise en service
 
