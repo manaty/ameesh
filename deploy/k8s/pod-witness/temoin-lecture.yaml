@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #7694 (design 7633 §5.3, témoin 3) — GABARIT, remplacé par le script.
+#
+# Deuxième couche : un pod sous l'UID de A monte les dossiers de comptes des
+# deux PVC en lecture seule, par `subPath`, SANS `fsGroup` (exigence N de
+# #7659 : le test de permissions doit voir les modes posés par le tenant, pas
+# un chown de kubelet). Le dossier de comptes de B est 0700 B ; A doit être
+# refusé (EACCES), et son propre témoin doit rester lisible (contrôle positif).
+# Ce pod est un artefact de test, supprimé par le script ; il ne fait pas
+# partie du pod partagé.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: temoin-lecture
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: pod-witness
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  # AUCUN fsGroup ici : c'est le point du témoin 3.
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: lecteur
+      image: __IMAGE__
+      imagePullPolicy: IfNotPresent
+      args:
+        - sh
+        - -ec
+        - |
+          set -eu
+          fail=0
+          test "$(id -u)" = "__UID_A__" \
+            || { echo "FAIL identite: $(id -u) != __UID_A__"; fail=1; }
+          if cat /mnt/a/.temoin-a >/dev/null 2>&1; then
+            echo "PASS lecture-a: A lit son propre temoin"
+          else
+            echo "FAIL lecture-a: controle positif echoue"
+            fail=1
+          fi
+          if cat /mnt/b/.temoin-b >/dev/null 2>&1; then
+            echo "FAIL lecture-b: B lisible par l'UID de A"
+            fail=1
+          else
+            echo "PASS lecture-b: le dossier 0700 de B refuse A"
+          fi
+          if ls /mnt/b >/dev/null 2>&1; then
+            echo "FAIL listage-b: le dossier de comptes de B est listable par A"
+            fail=1
+          else
+            echo "PASS listage-b refuse"
+          fi
+          test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token \
+            || { echo "FAIL jeton: jeton de compte de service monte"; fail=1; }
+          exit "$fail"
+      env:
+        - name: HOME
+          value: /tmp
+        - name: TMPDIR
+          value: /tmp
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      securityContext:
+        runAsUser: __UID_A__
+        runAsGroup: __FS_GROUP__
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        # subPath = le dossier de comptes lui-même : on teste son mode 0700,
+        # pas seulement le mode de la racine du PVC.
+        - name: home-a
+          mountPath: /mnt/a
+          subPath: .config/ameesh/accounts
+          readOnly: true
+        - name: home-b
+          mountPath: /mnt/b
+          subPath: .config/ameesh/accounts
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: home-a
+      persistentVolumeClaim:
+        claimName: pvc-temoin-a
+        readOnly: true
+    - name: home-b
+      persistentVolumeClaim:
+        claimName: pvc-temoin-b
+        readOnly: true
+    - name: tmp
+      emptyDir:
+        sizeLimit: 64Mi

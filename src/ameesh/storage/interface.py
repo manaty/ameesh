@@ -5250,6 +5250,36 @@ class Tenancy(Domain):
         `runner_id`, `profiles`), ou None."""
 
 
+class PodHosts(Domain):
+    """#7694 (design 7633 §8.3) : identité d'un hôte enfant porté par un pod.
+
+    Le pourvoyeur d'enfants (P4) écrit la ligne dans la même transaction que
+    `host_tenancy` et `host_tenants` ; la réclamation d'un enfant est fermée
+    (`pod-host-unknown`) quand la ligne manque, a expiré ou ne porte pas le
+    `pod_uid` observé. Cette tranche ne livre que la table et cet accès
+    minimal : aucun enfant n'est créé ici.
+    """
+
+    @abc.abstractmethod
+    def record(self, host: str, *, namespace: str, template: str, parent: str,
+               tenant: str, uid: int, runner_id: str, pod_uid: str,
+               expires_ts: float, state: str = "running") -> dict:
+        """Écrit (ou remplace) l'identité de l'hôte enfant `host`."""
+
+    @abc.abstractmethod
+    def get(self, host: str) -> dict | None:
+        """Ligne de l'hôte enfant, ou None (fail closed côté appelant)."""
+
+    @abc.abstractmethod
+    def active(self, host: str, pod_uid: str) -> bool:
+        """Vrai seulement si `host` est `running`, non expiré, et que le
+        `pod_uid` est celui de la ligne."""
+
+    @abc.abstractmethod
+    def remove(self, host: str, *, state: str = "deleted") -> bool:
+        """Marque la ligne supprimée (`deleted`/`failed`) ; faux sans ligne."""
+
+
 # --------------------------------------------------------------------------
 # ressources des hôtes (lot L31, décision 0028, migration 0029)
 # --------------------------------------------------------------------------
@@ -6793,6 +6823,7 @@ class Storage(abc.ABC):
     hosts: HostResources
     host_lifecycle: HostLifecycle
     tenancy: Tenancy
+    pod_hosts: PodHosts
     turn_resources: TurnResources
     turn_observation: TurnObservation
     visibility: Visibility

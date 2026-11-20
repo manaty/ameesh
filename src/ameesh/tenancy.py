@@ -28,6 +28,8 @@ configuration ; l'isolation SQL par rôle est un travail distinct (0033/L155).
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import pwd
 import re
@@ -44,6 +46,21 @@ TENANT_RE = re.compile(r"^human:[A-Za-z0-9][A-Za-z0-9._@-]*$")
 TENANT_UNIT = "ameesh-runner-tenant@%s.service"
 #: préfixe de l'utilisateur système d'un tenant
 USER_PREFIX = "ameesh-"
+#: #7694 (design 7633 §6.2, N de #7659) : un seul GID neutre par volume et
+#: pour tous les pods qui le montent — jamais un `fsGroup` par tenant, dont
+#: le passage récursif de kubelet élargirait les modes 0700/0600 au groupe.
+POD_FS_GROUP = 10000
+#: UID du conteneur superviseur (profil cluster existant) ; jamais un tenant.
+POD_SUPERVISOR_UID = 10001
+#: plage d'allocation automatique des UID de tenant (stable par personne).
+POD_UID_BASE = 2000
+POD_UID_SPAN = 1000
+#: #7694 (B1 de #44265) : montage du canon dans le pod (lecture seule) et
+#: dépôt cloné par l'init du superviseur, lu par le tenant sous SON UID.
+POD_CANON = "/var/lib/ameesh/canon"
+POD_CANON_REPO = POD_CANON + "/repo"
+
+
 class TenancyError(ValueError):
     """Refus d'un geste de tenant (code stable, message lisible)."""
 
@@ -78,6 +95,247 @@ def tenant_home(tenant: str) -> str:
 def runner_id(host: str, tenant: str) -> str:
     """Identifiant d'exécuteur du runner d'un tenant (stable, sans secret)."""
     return "%s/%s" % (host, check_tenant(tenant)[len("human:"):])
+
+
+# --------------------------------------------------------------------------
+# #7694 : hôte pod — plan de tenant (source only, aucun geste root)
+# --------------------------------------------------------------------------
+def pod_uid(tenant: str) -> int:
+    """UID par défaut d'un tenant de pod : stable pour une personne (D8).
+
+    Dérivé du seul identifiant `human:<id>`, donc le même sur tous les hôtes
+    pod et indépendant de l'ordre des tenants. Une collision entre deux
+    personnes est possible (1000 valeurs) : le bureau la tranche avec
+    `--uid`, que le chart porte ensuite comme source de vérité.
+    """
+    digest = hashlib.sha256(("ameesh-pod-uid:" + check_tenant(tenant)).encode("utf-8"))
+    return POD_UID_BASE + int.from_bytes(digest.digest()[:8], "big") % POD_UID_SPAN
+
+
+def check_pod_uid(uid: int) -> int:
+    """UID de tenant acceptable pour un pod : non privilégié et non réservé."""
+    try:
+        value = int(uid)
+    except (TypeError, ValueError):
+        raise TenancyError("tenant-uid-invalid", "UID %r refused" % (uid,)) from None
+    if value < 1000 or value > 60000 or value in (POD_FS_GROUP, POD_SUPERVISOR_UID):
+        raise TenancyError(
+            "tenant-uid-invalid",
+            "UID %d refused: a tenant of a pod needs an unprivileged UID in "
+            "1000..60000, distinct from the neutral fsGroup %d and the "
+            "supervisor %d" % (value, POD_FS_GROUP, POD_SUPERVISOR_UID))
+    return value
+
+
+def _pod_slug(tenant: str) -> str:
+    """Nom DNS-1123 dérivé du tenant (conteneur et PVC)."""
+    ident = check_tenant(tenant)[len("human:"):].lower()
+    slug = re.sub(r"[^a-z0-9-]+", "-", ident).strip("-")[:40].strip("-")
+    return slug or "tenant"
+
+
+def pod_plan(host: str, tenant: str, *, uid: int | None = None,
+             image: str = "ameesh-runner",
+             storage_size: str = "20Gi") -> dict:
+    """#7694 (design 7633 §3.1, §6.2) : fragment de chart d'un tenant de pod.
+
+    Rend un plan de **données** — conteneur, volume, ConfigMap `passwd`/`group`,
+    UID, variables — et n'exécute rien. Le bureau applique le plan dans le
+    chart puis enregistre la liaison avec `--register --uid` ; aucun `useradd`,
+    `linger` ni geste root n'est imprimé.
+
+    Le GID est **le même pour tous les tenants** (`POD_FS_GROUP`, mode A) : un
+    `fsGroup` par tenant est refusé par construction (N de #7659), et le plan
+    ne monte jamais le volume d'un autre tenant.
+    """
+    tenant = check_tenant(tenant)
+    host = (host or "").strip()
+    if not host:
+        raise TenancyError("tenant-host-missing", "a pod host name is required")
+    chosen = check_pod_uid(pod_uid(tenant) if uid is None else uid)
+    user = unix_user(tenant)
+    home = tenant_home(tenant)
+    slug = _pod_slug(tenant)
+    container = "tenant-" + slug
+    claim = "pvc-" + slug
+    mount_home = "home-" + slug
+    runner = runner_id(host, tenant)
+    #: Fichier `passwd` complet du pod : root, superviseur, CE tenant, nobody.
+    #: Le chart le projette tel quel ; toute divergence avec `host_tenants.uid`
+    #: est refusée par le battement (design 7633 §3.1, §6.3).
+    passwd = "\n".join([
+        "root:x:0:0:root:/root:/bin/sh",
+        "ameesh:x:%d:%d:ameesh pod supervisor:/home/ameesh:/bin/sh"
+        % (POD_SUPERVISOR_UID, POD_FS_GROUP),
+        "%s:x:%d:%d:tenant %s:%s:/bin/sh"
+        % (user, chosen, POD_FS_GROUP, slug, home),
+        "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin",
+    ])
+    group = "\n".join([
+        "root:x:0:",
+        "ameesh:x:%d:" % POD_SUPERVISOR_UID,
+        "ameesh-pod:x:%d:" % POD_FS_GROUP,
+        "nogroup:x:65534:",
+    ])
+    passwd_map = "ameesh-pod-passwd"
+    config_map = "ameesh-pod-tenant-" + slug
+    #: le fichier de configuration du tenant est une ConfigMap **non secrète**
+    #: (hôte, tenant, runner, comptes sans clé) montée en lecture seule ; le
+    #: mot de passe de la base reste un Secret (design 7633 §3, tableau).
+    config_path = "/etc/ameesh/tenant/config.json"
+    env = [
+        {"name": "HOME", "value": home},
+        {"name": "USER", "value": user},
+        {"name": "LOGNAME", "value": user},
+        {"name": "TMPDIR", "value": "/tmp"},
+        {"name": "AMEESH_HOST", "value": host},
+        {"name": "AMEESH_TENANT", "value": tenant},
+        {"name": "AMEESH_RUNNER_ID", "value": runner},
+        {"name": "AMEESH_CONFIG", "value": config_path},
+        {"name": "AMEESH_CANON", "value": POD_CANON_REPO},
+        # Le canon est monté en lecture seule par le superviseur : le runner
+        # du tenant ne le synchronise jamais (design 7633 §3.1).
+        {"name": "AMEESH_CANON_SYNC_INTERVAL", "value": "0"},
+        # B1 de #44265 : le dépôt est cloné par l'init du superviseur (10001)
+        # puis lu par ce tenant (UID du plan). Git refuse « dubious ownership »
+        # sans `safe.directory` ; la confiance est déclarée par la configuration
+        # d'environnement de Git, bornée à CE dépôt (jamais `*`) et sans
+        # fichier global. Le chart porte les mêmes variables ; le témoin kind
+        # (`deploy/k8s/pod-witness/temoin-canon.yaml`) prouve la lecture sous
+        # un UID différent de celui du clone.
+        {"name": "GIT_CONFIG_COUNT", "value": "1"},
+        {"name": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+        {"name": "GIT_CONFIG_VALUE_0", "value": POD_CANON_REPO},
+    ]
+    return {
+        "host": host,
+        "tenant": tenant,
+        "unix_user": user,
+        "uid": chosen,
+        "fs_group": POD_FS_GROUP,
+        "home": home,
+        "runner_id": runner,
+        "passwd": passwd,
+        "group": group,
+        "container": {
+            "name": container,
+            "image": image,
+            "env": env,
+            "volumeMounts": [
+                {"name": mount_home, "mountPath": home},
+                {"name": "passwd", "mountPath": "/etc/passwd",
+                 "subPath": "passwd", "readOnly": True},
+                {"name": "group", "mountPath": "/etc/group",
+                 "subPath": "group", "readOnly": True},
+                {"name": "tenant-config", "mountPath": "/etc/ameesh/tenant",
+                 "readOnly": True},
+                # Canon alimenté par l'init/`canon-fetch` du superviseur ; le
+                # runner du tenant le lit, ne l'écrit jamais.
+                {"name": "canon", "mountPath": POD_CANON,
+                 "readOnly": True},
+                {"name": "tenant-tmp", "mountPath": "/tmp"},
+            ],
+            "securityContext": {
+                "runAsUser": chosen,
+                "runAsGroup": POD_FS_GROUP,
+                "runAsNonRoot": True,
+                "allowPrivilegeEscalation": False,
+                "privileged": False,
+                "readOnlyRootFilesystem": True,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "resources": {
+                "requests": {"cpu": "250m", "memory": "512Mi"},
+                "limits": {"cpu": "2", "memory": "2Gi"},
+            },
+        },
+        "volumes": {
+            "home": {
+                "name": mount_home,
+                "persistentVolumeClaim": {"claimName": claim},
+                "accessModes": ["ReadWriteOnce"],
+                "size": storage_size,
+                "mountPath": home,
+            },
+            "tmp": {"name": "tenant-tmp", "emptyDir": {"sizeLimit": "1Gi"}},
+            "passwd": {
+                "name": "passwd",
+                "configMap": {"name": passwd_map,
+                              "items": [{"key": "passwd", "path": "passwd"}]},
+            },
+            "group": {
+                "name": "group",
+                "configMap": {"name": passwd_map,
+                              "items": [{"key": "group", "path": "group"}]},
+            },
+            "tenant_config": {
+                "name": "tenant-config",
+                "configMap": {"name": config_map,
+                              "items": [{"key": "config.json",
+                                         "path": "config.json"}]},
+            },
+            "canon": {"name": "canon", "emptyDir": {}},
+        },
+        "pod_security_context": {
+            "runAsNonRoot": True,
+            # Le superviseur et les init tournent sous 10001 ; le conteneur du
+            # tenant remplace `runAsUser` par l'UID du plan (ci-dessus).
+            "runAsUser": POD_SUPERVISOR_UID,
+            "runAsGroup": POD_FS_GROUP,
+            "fsGroup": POD_FS_GROUP,
+            "fsGroupChangePolicy": "OnRootMismatch",
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+        "config_maps": {
+            "passwd_group": {"name": passwd_map,
+                             "passwd": passwd, "group": group},
+            "tenant": {"name": config_map, "key": "config.json",
+                       "mountPath": "/etc/ameesh/tenant"},
+        },
+        # Valeurs de liaison : ce que le bureau passe au `--register` après
+        # avoir appliqué le chart (l'UID du chart est la source de vérité).
+        "register_argv": ["ameesh", "host", "tenant", "add", tenant,
+                          "--host", host, "--pod", "--register",
+                          "--uid", str(chosen)],
+    }
+
+
+def pod_plan_text(plan: dict) -> str:
+    """Le fragment lisible de `host tenant add --pod` (JSON = YAML valide)."""
+    lines = [
+        "# #7694: tenant %s on pod host %s — apply this fragment in the chart"
+        % (plan["tenant"], plan["host"]),
+        "# one neutral fsGroup %d for every pod that mounts this PVC; never a "
+        "per-tenant fsGroup (N of #7659)" % plan["fs_group"],
+        "# no useradd, no linger, no root gesture: the UID comes from the chart",
+        json.dumps({k: v for k, v in plan.items() if k != "register_argv"},
+                   ensure_ascii=False, indent=2, sort_keys=True),
+        "# then, on the host supervisor: %s"
+        % " ".join(shlex.quote(part) for part in plan["register_argv"]),
+    ]
+    return "\n".join(lines)
+
+
+def pod_runtime(cfg, host: str):
+    """`policy.runtime` de `host` dans le canon configuré, ou None.
+
+    Sert au geste `host tenant add --pod` : le plan pod n'a de sens que pour
+    une fiche Host qui déclare `runtime.kind: pod`. Une erreur de lecture ne
+    rend jamais un hôte pod par défaut (fail closed)."""
+    try:
+        for canon in canon_mod.load_configured(cfg):
+            # Même garde que runner.refresh_host_limits : un faux canon peut
+            # porter `host=None`, attribut présent mais non appelable.
+            lookup = getattr(canon, "host", None)
+            fiche = lookup(host) if callable(lookup) else None
+            runtime = getattr(getattr(fiche, "policy", None), "runtime", None)
+            if runtime is not None:
+                return runtime
+    except Exception as exc:  # noqa: BLE001 - autorité illisible : refus
+        raise TenancyError("tenant-runtime-unreadable",
+                           "cannot read the runtime of %s: %s" % (host, exc)) from exc
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -241,7 +499,8 @@ def add_plan(host: str, tenant: str) -> list[list[str]]:
 
 
 def register(db, host: str, tenant: str, *, actor: str, local_host: str,
-             uid: int | None = None, user: str | None = None) -> dict:
+             uid: int | None = None, user: str | None = None,
+             pod: bool = False) -> dict:
     """Liaison tenant → utilisateur système, UID et runner (`host_tenants`).
 
     Refusée si le canon ne déclare pas l'hôte partagé avec ce tenant
@@ -251,7 +510,12 @@ def register(db, host: str, tenant: str, *, actor: str, local_host: str,
     l'appelant (`cfg.host`) : quand il diffère de `host`, le passwd local
     n'est pas celui de la cible, donc l'UID ne peut pas être lu et la
     liaison est refusée (`tenant-uid-unverified`) sauf `uid` fourni, lu sur
-    la cible par l'appelant."""
+    la cible par l'appelant.
+
+    #7694 : sur un hôte **pod** (`pod=True`), il n'y a pas de `useradd` ni de
+    passwd local dans le superviseur ; l'UID vient du **chart** et est exigé
+    (`tenant-uid-required`). C'est le battement qui prouve ensuite que le
+    processus tourne sous cet UID (design 7633 §3.1)."""
     tenant = check_tenant(tenant)
     policy = host_policy(db, host)
     if not policy.get("shared") or tenant not in policy.get("tenants", []):
@@ -260,7 +524,15 @@ def register(db, host: str, tenant: str, *, actor: str, local_host: str,
                            "(policy.shared/tenants; run \"ameesh canon sync\" first)"
                            % (host, tenant))
     user = user or unix_user(tenant)
-    if uid is None:
+    if pod:
+        if uid is None:
+            raise TenancyError("tenant-uid-required",
+                               "host %s is a pod: the tenant UID comes from the "
+                               "chart and must be passed with `--uid` (see `host "
+                               "tenant add --pod`), never read from a local passwd"
+                               % host)
+        uid = check_pod_uid(uid)
+    elif uid is None:
         if host != local_host:
             raise TenancyError("tenant-uid-unverified",
                                "host %s is not this host (%s): the tenant UID is "
@@ -385,7 +657,11 @@ def main(argv=None) -> int:
     linger, dossier de comptes, unité) et n'exécute rien ; `--register`
     écrit la liaison en base, une fois l'utilisateur créé, et se lance sur
     l'hôte cible (l'UID est lu dans son passwd, pas celui de l'appelant).
-    `remove` est refusé tant qu'un agent du tenant reste sur l'hôte."""
+    #7694 : `add --pod` imprime le fragment de chart d'un tenant de pod
+    (conteneur, PVC, ConfigMap passwd/group, UID, `fsGroup` neutre), sans
+    aucun geste root ; `--register --pod --uid` écrit la liaison avec l'UID
+    du chart. `remove` est refusé tant qu'un agent du tenant reste sur
+    l'hôte."""
     import argparse
     import json
 
@@ -400,6 +676,10 @@ def main(argv=None) -> int:
     add.add_argument("--host", help="shared host (default: this host)")
     add.add_argument("--register", action="store_true",
                      help="write the binding (system user, UID, runner) in the database")
+    add.add_argument("--pod", action="store_true",
+                     help="hôte pod : plan de chart/ConfigMap, aucun geste root")
+    add.add_argument("--uid", type=int,
+                     help="UID du tenant sur un hôte pod (source : le chart)")
     add.add_argument("--actor",
                      help="who registers (human:<id> or avatar) from an unbound terminal")
     listing = commands.add_parser("list", help="tenants and runner presence")
@@ -413,13 +693,36 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     cfg = config.load()
     host = args.host or cfg.host
-    if args.command == "add" and not args.register:
-        try:
-            print(shell_plan(host, args.tenant))
-        except TenancyError as exc:
-            print("tenant refused (%s): %s" % (exc.code, exc))
+    if args.command == "add":
+        if args.uid is not None and not args.pod:
+            print("tenant refused (tenant-pod-flag-required): --uid is the UID "
+                  "of a pod chart; pass --pod")
             return 1
-        return 0
+        if args.pod:
+            try:
+                runtime = pod_runtime(cfg, host)
+            except TenancyError as exc:
+                print("tenant refused (%s): %s" % (exc.code, exc))
+                return 1
+            if runtime is None or getattr(runtime, "kind", "") != "pod":
+                print("tenant refused (tenant-not-pod): host %s does not declare "
+                      "`policy.runtime.kind: pod` in the canon (design 7633 §7.1)"
+                      % host)
+                return 1
+            if not args.register:
+                try:
+                    print(pod_plan_text(pod_plan(host, args.tenant, uid=args.uid)))
+                except TenancyError as exc:
+                    print("tenant refused (%s): %s" % (exc.code, exc))
+                    return 1
+                return 0
+        elif not args.register:
+            try:
+                print(shell_plan(host, args.tenant))
+            except TenancyError as exc:
+                print("tenant refused (%s): %s" % (exc.code, exc))
+                return 1
+            return 0
     db = db_mod.connect(cfg)
     try:
         if args.command == "list":
@@ -436,7 +739,13 @@ def main(argv=None) -> int:
                                % runner_tenant(cfg))
         actor = operator(cfg, db, args.actor)
         if args.command == "add":
-            result = register(db, host, args.tenant, actor=actor, local_host=cfg.host)
+            if args.pod:
+                # Le plan a déjà vérifié la fiche Host ; l'UID vient du chart
+                # et le battement prouvera ensuite l'UID du processus.
+                pod_runtime(cfg, host)
+            result = register(db, host, args.tenant, actor=actor,
+                              local_host=cfg.host, pod=bool(args.pod),
+                              uid=args.uid)
         else:
             result = remove(db, host, args.tenant)
         print(json.dumps(result, ensure_ascii=False))

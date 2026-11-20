@@ -100,6 +100,10 @@ class Tenancy(interface.Tenancy):
     def beat(self, host, tenant, runner_id, *, uid, version, profiles=()):
         # La présence n'existe que sous une liaison qui nomme CE runner : un
         # runner mal configuré ne se déclare pas présent pour un autre tenant.
+        # #7694 (design 7633 §3.1) : l'UID du processus doit aussi être celui
+        # de la liaison. Sur un pod, l'UID vient du chart et n'est pas lu dans
+        # un passwd local : c'est le battement qui le vérifie, et un processus
+        # sous un autre UID ne publie aucune présence.
         published = [str(p) for p in profiles or () if p]
         rows = self.db.query(
             """
@@ -110,13 +114,14 @@ class Tenancy(interface.Tenancy):
                    clock_timestamp()
               FROM host_tenants t
              WHERE t.host = %s AND t.tenant = %s AND t.runner_id = %s
+               AND t.uid = %s
             ON CONFLICT (host, tenant) DO UPDATE
                SET runner_id = excluded.runner_id, uid = excluded.uid,
                    version = excluded.version, profiles = excluded.profiles,
                    seen_at = excluded.seen_at
             RETURNING tenant
             """,
-            (uid, version, json.dumps(published), host, tenant, runner_id))
+            (uid, version, json.dumps(published), host, tenant, runner_id, uid))
         return bool(rows)
 
     def presence(self, host, tenant):

@@ -308,10 +308,17 @@ class SharedClaimTest(test_canon._CanonDbCase):
     # -- présence --------------------------------------------------------------
     def test_battement_sous_liaison_seulement(self):
         cfg = dataclasses.replace(self.cfg, host="banc", tenant=ALICE, runner_id="banc/alice")
-        self.assertTrue(tenancy.beat(cfg, self.db, version="1.51.0"))
+        # #7694 : le battement vérifie l'UID du processus contre `host_tenants`.
+        with mock.patch.object(tenancy.os, "getuid", return_value=2001):
+            self.assertTrue(tenancy.beat(cfg, self.db, version="1.51.0"))
         intrus = dataclasses.replace(cfg, runner_id="banc/bruno")
-        self.assertFalse(tenancy.beat(intrus, self.db, version="x"))
-        self.assertFalse(tenancy.beat(dataclasses.replace(cfg, tenant=""), self.db))
+        with mock.patch.object(tenancy.os, "getuid", return_value=2001):
+            self.assertFalse(tenancy.beat(intrus, self.db, version="x"))
+        # mauvais UID : aucune présence (même sous la bonne liaison)
+        with mock.patch.object(tenancy.os, "getuid", return_value=9999):
+            self.assertFalse(tenancy.beat(cfg, self.db, version="x"))
+        with mock.patch.object(tenancy.os, "getuid", return_value=2001):
+            self.assertFalse(tenancy.beat(dataclasses.replace(cfg, tenant=""), self.db))
         row = storage.of(self.db).tenancy.presence("banc", ALICE)
         self.assertEqual((row["runner_id"], row["version"]), ("banc/alice", "1.51.0"))
 
@@ -321,7 +328,8 @@ class SharedClaimTest(test_canon._CanonDbCase):
         self.assertIn("no runner of tenant human:alice",
                       tenancy.presence_reason(self.db, role, "banc", now=now, limit_s=180))
         cfg = dataclasses.replace(self.cfg, host="banc", tenant=ALICE, runner_id="banc/alice")
-        tenancy.beat(cfg, self.db, version="v")
+        with mock.patch.object(tenancy.os, "getuid", return_value=2001):
+            tenancy.beat(cfg, self.db, version="v")
         self.assertEqual(tenancy.presence_reason(self.db, role, "banc", now=now,
                                                  limit_s=180), "")
         self.assertIn("silent", tenancy.presence_reason(self.db, role, "banc",
