@@ -364,7 +364,15 @@ def _tenant_container(entry, config) -> dict:
     container = copy.deepcopy(plan["container"])
     container["args"] = _args(poll)
     container["workingDir"] = plan["home"]
+    container["imagePullPolicy"] = str(
+        config.get("image_pull_policy") or "IfNotPresent")
     container["env"] = _pod_plan_env(plan["container"]["env"])
+    # Le DSN du ConfigMap ne porte aucun mot de passe (design §6.3) : sans
+    # cette variable, le runner du tenant ne peut pas ouvrir la base (pas de
+    # battement, donc pas de réclamation). Même secret que le superviseur ;
+    # `envFrom` reste réservé aux clés d'API du tenant.
+    container["env"].append({"name": "PGPASSWORD", "valueFrom": {"secretKeyRef": {
+        "name": "ameesh-db", "key": "password"}}})
     container["readinessProbe"] = _readiness()
     container["envFrom"] = [{"secretRef": {
         "name": str(entry.get("secret") or "ameesh-harness-" + slug),

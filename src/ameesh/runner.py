@@ -12083,6 +12083,11 @@ class Runner:
         #: rendre visible l'étage qui retarde le grant d'un tour réveillé.
         self._db_wait_seen: dict[str, float] = {}
         self._db_wait_lock = threading.Lock()
+        #: #7695 : le bail du superviseur pod est lu/écrit par plusieurs fils
+        #: (passe ressources, canon, prise) ; `_pod_lease_guard` le protège.
+        self._pod_lease_mutex = threading.Lock()
+        self._pod_lease = None
+        self._pod_lease_waiting = False
         admission_lock.set_wait_observer(self._db_wait_notice)
         self.host = cfg.host
         self.runner_id = cfg.runner
@@ -14495,6 +14500,19 @@ class Runner:
             interval = 60.0
         return max(180.0, 3.0 * interval)
 
+    def _pod_lease_guard(self):
+        """Verrou du bail superviseur, partagé par tous les fils du runner.
+
+        `_pod_lease_tick` est appelé par plusieurs fils (passe ressources,
+        canon, prise) : sans verrou, deux passes pouvaient lire la même
+        époque et en renouveler une périmée. Créé à la demande pour les
+        doublures de test qui ne passent pas par `__init__`."""
+        lock = getattr(self, "_pod_lease_mutex", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._pod_lease_mutex = lock
+        return lock
+
     def _pod_lease_tick(self) -> bool:
         """Acquiert ou renouvelle le bail du superviseur pod ; vrai si détenteur.
 
@@ -14505,6 +14523,10 @@ class Runner:
         si le bail est libre, donc un second superviseur vivant garde la main."""
         if not self._pod_supervisor():
             return True
+        with self._pod_lease_guard():
+            return self._pod_lease_tick_locked()
+
+    def _pod_lease_tick_locked(self) -> bool:
         db = getattr(self, "db", None)
         if db is None:
             return False
@@ -14545,6 +14567,10 @@ class Runner:
         Ne lève jamais : un arrêt ne doit pas être retenu par la base."""
         if not self._pod_supervisor():
             return
+        with self._pod_lease_guard():
+            self._pod_lease_release_locked()
+
+    def _pod_lease_release_locked(self) -> None:
         lease = getattr(self, "_pod_lease", None)
         db = getattr(self, "db", None)
         if not lease or db is None:

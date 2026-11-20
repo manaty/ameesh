@@ -211,6 +211,11 @@ spec:
           value: /var/lib/ameesh/canon/repo
         - name: AMEESH_POD
           value: '1'
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ameesh-db
+              key: password
         volumeMounts:
         - name: home-alice
           mountPath: /home/ameesh-alice
@@ -256,6 +261,7 @@ spec:
           umask 077
           exec ameesh run --poll 5
         workingDir: /home/ameesh-alice
+        imagePullPolicy: IfNotPresent
         readinessProbe:
           exec:
             command:
@@ -301,6 +307,11 @@ spec:
           value: /var/lib/ameesh/canon/repo
         - name: AMEESH_POD
           value: '1'
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ameesh-db
+              key: password
         volumeMounts:
         - name: home-bruno
           mountPath: /home/ameesh-bruno
@@ -346,6 +357,7 @@ spec:
           umask 077
           exec ameesh run --poll 5
         workingDir: /home/ameesh-bruno
+        imagePullPolicy: IfNotPresent
         readinessProbe:
           exec:
             command:

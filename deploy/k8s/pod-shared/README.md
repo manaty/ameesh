@@ -145,9 +145,10 @@ régénération est refusée. Ne pas éditer `rendered/` à la main.
   pod (tous les tenants) en même temps. À planifier comme une fenêtre de
   maintenance : `ameesh host drain <hôte> --for <durée>` d'abord, puis
   appliquer, puis `undrain`.
-- Le bail superviseur a une échéance (`lease_ttl`, 120 s par défaut) : un
-  pod recréé reprend la main à l'expiration, avec une **époque neuve**. Un
-  ancien détenteur ne peut plus renouveler ni publier.
+- Le bail superviseur a une échéance de trois passes de ressources au moins
+  (plancher 180 s ; `max(180, 3 × resource_interval)`) : un pod recréé
+  reprend la main à l'expiration, avec une **époque neuve**. Un ancien
+  détenteur ne peut plus renouveler ni publier.
 - `kubectl rollout status statefulset/…` et les événements du namespace sont
   la première lecture ; `ameesh host tenant list` montre la présence et les
   profils. Les journaux par conteneur :

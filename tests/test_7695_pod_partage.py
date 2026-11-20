@@ -162,6 +162,7 @@ class PodSharedChartTest(unittest.TestCase):
             self.assertTrue(tenant["securityContext"]["runAsNonRoot"])
             self.assertFalse(tenant["securityContext"]["privileged"])
             self.assertTrue(tenant["securityContext"]["readOnlyRootFilesystem"])
+            self.assertEqual(tenant["imagePullPolicy"], "IfNotPresent")
             env = {e["name"]: e.get("value") for e in tenant["env"]}
             self.assertEqual((env["HOME"], env["AMEESH_TENANT"],
                               env["AMEESH_RUNNER_ID"]),
@@ -170,6 +171,13 @@ class PodSharedChartTest(unittest.TestCase):
             self.assertEqual(env["AMEESH_POD"], "1")
             self.assertEqual(env["GIT_CONFIG_VALUE_0"], tenancy.POD_CANON_REPO)
             self.assertNotEqual(env["GIT_CONFIG_VALUE_0"], "*")
+            # Le DSN du ConfigMap n'a pas de mot de passe : chaque tenant doit
+            # recevoir PGPASSWORD par référence au secret de la base (B1).
+            pg = [e for e in tenant["env"] if e["name"] == "PGPASSWORD"]
+            self.assertEqual(len(pg), 1)
+            self.assertEqual(pg[0]["valueFrom"]["secretKeyRef"],
+                             {"name": "ameesh-db", "key": "password"})
+            self.assertNotIn("value", pg[0])
             # Le PVC de CE tenant, et lui seul, dans les volumes du pod.
             claim = next(v for v in self.pod["volumes"]
                          if v["name"] == "home-" + slug)
@@ -294,6 +302,9 @@ class PodRunnerLeaseUnitTest(unittest.TestCase):
         # doublure, sans construire un exécuteur complet.
         runner._pod_supervisor = lambda: runner_mod.Runner._pod_supervisor(runner)
         runner._pod_lease_ttl = lambda: runner_mod.Runner._pod_lease_ttl(runner)
+        runner._pod_lease_guard = lambda: runner_mod.Runner._pod_lease_guard(runner)
+        runner._pod_lease_tick_locked = (
+            lambda: runner_mod.Runner._pod_lease_tick_locked(runner))
         return runner
 
     def test_superviseur_seulement_sans_tenant(self):
@@ -311,6 +322,41 @@ class PodRunnerLeaseUnitTest(unittest.TestCase):
         self.assertEqual(runner_mod.Runner._pod_lease_ttl(runner), 180.0)
         runner.cfg.resource_interval = 300
         self.assertEqual(runner_mod.Runner._pod_lease_ttl(runner), 900.0)
+
+    def test_un_seul_fil_a_la_fois_sur_le_bail(self):
+        dedans, maxi = [], []
+        premier = threading.Event()
+        liberation = threading.Event()
+
+        class Bail:
+            def acquire(self, host, runner_id, ttl):
+                dedans.append(1)
+                maxi.append(len(dedans))
+                if len(dedans) == 1:
+                    premier.set()
+                    liberation.wait(5)
+                dedans.pop()
+                return None
+
+            def holder(self, host):
+                return "pod-banc/autre"
+
+        runner = self.runner()
+        with mock.patch.object(runner_mod.storage, "of",
+                               return_value=types.SimpleNamespace(
+                                   pod_supervisor=Bail())):
+            fils = [threading.Thread(target=runner_mod.Runner._pod_lease_tick,
+                                     args=(runner,)) for _ in range(2)]
+            fils[0].start()
+            self.assertTrue(premier.wait(5))
+            fils[1].start()
+            # Laisse au second fil le temps d'entrer s'il n'est pas retenu.
+            threading.Event().wait(0.2)
+            liberation.set()
+            for fil in fils:
+                fil.join(5)
+                self.assertFalse(fil.is_alive())
+        self.assertEqual(max(maxi), 1)
 
     def test_standby_n_ecrit_pas_et_detenteur_renouvelle(self):
         appels = []

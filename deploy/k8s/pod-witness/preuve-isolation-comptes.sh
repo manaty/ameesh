@@ -150,10 +150,41 @@ wait_ready() {
     k wait --for=condition=Ready pod/temoin-deux --timeout=180s >/dev/null
 }
 
+# kind lie ses PVC par local-path, un volume hostPath : le kubelet n'applique
+# pas fsGroup aux hostPath, alors qu'un pilote CSI le fait. Le plan repose sur
+# UN fsGroup neutre (10000, jamais un par tenant) : on applique donc à la
+# racine du PVC le pas que ferait le kubelet (chgrp + setgid 2770), avec
+# trace. Sans lui, la racine resterait root:root 0777 en kind et le contrôle 1
+# jugerait le pilote, pas le chart.
+apply_fsgroup() {
+    local conteneur=$1 pvc=$2 home gid pv chemin noeud
+    home="/home/ameesh-$conteneur"
+    gid=$(kexec "$conteneur" stat -c '%g' "$home")
+    if [ "$gid" = "$FS_GROUP" ]; then
+        echo "trace: fsgroup=$conteneur deja applique par le pilote"
+        return 0
+    fi
+    pv=$(k get pvc "$pvc" -o jsonpath='{.spec.volumeName}')
+    [ -n "$pv" ] || fail "fsgroup $conteneur: PVC $pvc non lie"
+    chemin=$(kubectl get pv "$pv" -o jsonpath='{.spec.hostPath.path}')
+    [ -n "$chemin" ] \
+        || fail "fsgroup $conteneur: PV $pv sans hostPath (pilote inattendu)"
+    noeud=$(k get pod temoin-deux -o jsonpath='{.spec.nodeName}')
+    [ -n "$noeud" ] || fail "fsgroup $conteneur: noeud du pod illisible"
+    docker exec "$noeud" chgrp "$FS_GROUP" "$chemin" \
+        || fail "fsgroup $conteneur: chgrp impossible sur $chemin"
+    docker exec "$noeud" chmod 2770 "$chemin" \
+        || fail "fsgroup $conteneur: chmod impossible sur $chemin"
+    gid=$(kexec "$conteneur" stat -c '%g' "$home")
+    [ "$gid" = "$FS_GROUP" ] \
+        || fail "fsgroup $conteneur: groupe $gid apres application, attendu $FS_GROUP"
+    echo "trace: fsgroup=$conteneur applique a la racine du PVC (kind local-path, comme un pilote CSI)"
+}
+
 # --- trace : ce que la preuve attachée au lot doit citer ---------------------
 trace() {
     echo "trace: date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "trace: kubernetes=$(kubectl version -o jsonpath='{.serverVersion.gitVersion}' 2>/dev/null || echo '?')"
+    echo "trace: kubernetes=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null || echo '?')"
     echo "trace: image=$IMAGE"
     echo "trace: git_image=$GIT_IMAGE"
     echo "trace: image_id=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo '?')"
@@ -341,8 +372,23 @@ check_base() {
 docker pull --quiet "$IMAGE" >/dev/null
 docker pull --quiet "$GIT_IMAGE" >/dev/null
 kind create cluster --name "$CLUSTER" --wait 120s >/dev/null
-kind load docker-image "$IMAGE" --name "$CLUSTER" >/dev/null
-kind load docker-image "$GIT_IMAGE" --name "$CLUSTER" >/dev/null
+# kind v0.27 importe `docker save` avec `ctr images import --all-platforms` ;
+# avec le magasin d'images containerd de Docker récent, l'archive d'une image
+# multi-arch ne porte qu'une plateforme et l'import échoue sur un digest
+# absent. `docker save --platform linux/amd64` + `kind load image-archive`
+# borne l'archive à la plateforme du nœud ; le repli `docker save` classique
+# couvre les Docker qui ne connaissent pas `--platform`.
+load_image() {
+    local image=$1 archive
+    archive=$(mktemp "${TMPDIR:-/tmp}/ameesh-kind-image-XXXXXX.tar")
+    if ! docker save --platform linux/amd64 -o "$archive" "$image" 2>/dev/null; then
+        docker save -o "$archive" "$image"
+    fi
+    kind load image-archive "$archive" --name "$CLUSTER" >/dev/null
+    rm -f "$archive"
+}
+load_image "$IMAGE"
+load_image "$GIT_IMAGE"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 # PSA restricted : si le cluster l'applique, le gabarit doit y être admis.
 kubectl label namespace "$NS" \
@@ -359,6 +405,8 @@ k wait --for=jsonpath='{.status.phase}'=Bound \
 pass "PVC: pvc-temoin-a et pvc-temoin-b liés (consommateur temoin-deux créé d'abord)"
 wait_ready
 pass "pod: temoin-deux prêt (A et B)"
+apply_fsgroup a pvc-temoin-a
+apply_fsgroup b pvc-temoin-b
 trace
 
 check_identity a "$UID_A"
