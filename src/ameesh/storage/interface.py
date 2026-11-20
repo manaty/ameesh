@@ -91,7 +91,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    revoke get
    placements      recorded
    progress        lots lot_events lot_transitions lot_event_last lot_hold_events
-                   packet_exits
+                   lot_delivery_notes packet_exits
                    lot_milestones lot_actions actions agents costs packages
                    package_items lot_messages
    projects        board
@@ -4524,6 +4524,22 @@ class Progress(Domain):
         sortie connue — l'horloge part alors du GO, le sens qui n'éteint
         aucune alerte."""
         return []
+
+    def lot_delivery_notes(self, item_ids: Sequence[int]) -> list[dict]:
+        """#7893 : notes écrites dans l'étape de livraison de ces lots — état
+        du journal `merged`, `promoted` ou `delivered` — c'est-à-dire la note
+        de livraison que lit `staging_pending` pour un lot livré mais non
+        clos. Une attente de déploiement s'y lit avec les mêmes règles de
+        phrase que les holds (#3297) ; le texte des notes des étapes
+        antérieures n'en fait pas partie et n'est pas rendu. Rendu dans
+        l'ordre d'écriture (`id`), comme `lot_events`.
+
+        Lecture DÉRIVÉE (pas une opération du contrat médié) : le pilote
+        PostgreSQL ne transfère que ces lignes ; le repli ci-dessous lit
+        `lot_events` une fois."""
+        return [ev for ev in self.lot_events(item_ids)
+                if str(ev.get("state") or "") in lifecycle.DELIVERED
+                and str(ev.get("note") or "").strip()]
 
     def lot_hold_events(self, item_ids: Sequence[int],
                         patterns: Sequence[str]) -> list[dict]:

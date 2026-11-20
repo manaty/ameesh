@@ -111,7 +111,11 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
         self.st = types.SimpleNamespace(
             work=types.SimpleNamespace(items=lambda **kw: self.rows,
                                        milestones=lambda ident, **kw: self.milestones.get(ident, [])),
-            progress=types.SimpleNamespace(lot_hold_events=lambda *a: self.events))
+            progress=types.SimpleNamespace(
+                lot_hold_events=lambda *a: self.events,
+                # #7893 : aucun lot livré dans ce fixture ; les cas de la note
+                # de livraison sont dans test_7893_delivered_staging_pending.
+                lot_delivery_notes=lambda ids: []))
         patch = mock.patch.object(staging_pending.storage, "of", return_value=self.st)
         patch.start()
         self.addCleanup(patch.stop)
