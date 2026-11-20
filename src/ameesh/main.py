@@ -44,6 +44,10 @@
         the hourly short-pass gate: mails the auditor only when something moved
         (mail, debit --check 2, deadline in the hour, head/gate change), journals
         the skip without a mail (#6643);
+  ameesh auditor report --recipient NAME --state-file JSON --body-file TEXT
+        --status TEXT [--activity] [--needs-action] [--summary daily|weekly]
+        skip unchanged outgoing short-pass reports; new information is passive
+        unless an action is due (#7894);
   ameesh authenticator list   registered authenticators (spec §8);
   ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]
         | unset [--per-hour] [--per-day] [--agent A]
@@ -486,6 +490,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "progress":
         from . import progress
         return progress.main(rest)
+    if command == "auditor" and rest[:1] == ["report"]:
+        from . import auditor_report
+        return auditor_report.main(rest[1:])
     if command == "auditor" and rest[:1] == ["tick"]:
         # #6643 : la minuterie horaire de l'auditeur décide s'il y a une passe
         # à jouer ; le saut est journalisé, sans courrier.

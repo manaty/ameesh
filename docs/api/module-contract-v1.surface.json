@@ -1383,6 +1383,8 @@
                     "alert.resolved",
                     "approval.recorded",
                     "auditor.pass",
+                    "auditor.report",
+                    "auditor.report.skipped",
                     "cost.recorded",
                     "decision.closed",
                     "decision.created",

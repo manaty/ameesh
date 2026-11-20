@@ -2025,6 +2025,8 @@
               "mail.export",
               "packet.pause",
               "auditor.pass",
+              "auditor.report",
+              "auditor.report.skipped",
               "packet.client_types"
             ]
           }
