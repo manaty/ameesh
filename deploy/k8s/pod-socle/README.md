@@ -139,8 +139,9 @@ jamais un hôte plaçable.
 
 ## Ce qui n'est pas encore livré
 
-- **P2** : N conteneurs de tenant, N PVC, publication des profils, garde
-  « un seul superviseur », témoin complet ;
+- **P2** : livrée par [`../pod-shared/`](../pod-shared/README.md) (N conteneurs
+  de tenant, N PVC, publication des profils, bail « un seul superviseur »,
+  témoin complet) ; ce squelette P1 reste la référence pas à pas ;
 - **P3** : carte `subscription`, connexion du siège par pod dédié (jamais
   `pods/exec` sur ce pod partagé), contrôle 6 du témoin ;
 - **P4** : pourvoyeur d'enfants (`pod_hosts`, RBAC, admission, TTL) ;
@@ -149,4 +150,5 @@ jamais un hôte plaçable.
   runbook de qualification TPK.
 
 Le témoin `kind` de la tranche P1 (identité, montage, permissions) est dans
-[`deploy/k8s/pod-witness/`](../pod-witness/).
+[`deploy/k8s/pod-witness/`](../pod-witness/) ; il porte aussi, depuis #7695,
+le superviseur, le canon et le contrôle base pour le chart `pod-shared`.

@@ -80,7 +80,6 @@ import time
 from typing import Mapping, Sequence
 
 from . import db as db_mod
-from . import host_lifecycle
 from . import role_handover_pg as handover_pg
 from . import role_standings_pg as pg
 from . import storage
@@ -146,12 +145,12 @@ def freshness_s(db, host: str, *, now: float | None = None,
     stale after one missed minute. `fallback_interval_s` is the configured
     interval of a local publisher, used before its first history exists. Same
     threshold as L232e (`host_lifecycle.staleness_s`), never a fixed 300 s.
+
+    #7900: the rule lives in `role_standings_pg` so the failover retention of
+    `conversation_moves.plan` reads the same freshness on its transaction.
     """
-    now = pg.now_ts(db) if now is None else float(now)
-    interval = pg.sample_interval_s(db, host, now=now)
-    if interval is None:
-        interval = fallback_interval_s
-    return host_lifecycle.staleness_s(interval)
+    return pg.freshness_s(db, host, now=now,
+                          fallback_interval_s=fallback_interval_s)
 
 
 def availability(db, host: str, *, now: float | None = None,

@@ -8,6 +8,15 @@
     },
     "docs/api/openapi-v1.json": {
       "check": ["python3", "-c", "from pathlib import Path; from ameesh.serve import dump_openapi; import sys; sys.exit(0 if Path('docs/api/openapi-v1.json').read_text(encoding='utf-8') == dump_openapi() else 1)"]
+    },
+    "deploy/k8s/pod-shared/rendered/configmaps.yaml": {
+      "check": ["python3", "deploy/k8s/pod-shared/render.py", "--check"]
+    },
+    "deploy/k8s/pod-shared/rendered/pvcs.yaml": {
+      "check": ["python3", "deploy/k8s/pod-shared/render.py", "--check"]
+    },
+    "deploy/k8s/pod-shared/rendered/statefulset.yaml": {
+      "check": ["python3", "deploy/k8s/pod-shared/render.py", "--check"]
     }
   }
 }

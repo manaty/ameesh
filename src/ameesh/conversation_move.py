@@ -55,7 +55,8 @@ CHECKS = ("harness", "binary", "account", "folder", "interactive", "resident")
 BEGIN_REFUSAL = "conversation_move"
 #: `preference` = B2 return; `manual` = B4 operator move; `failover` = #7833
 #: recovery after the runner of the preferred host stopped. A `failover`
-#: placement is not undone by the automatic B2 return until a human move.
+#: placement is not undone by the automatic B2 return until a human move, or
+#: until the holder host itself dies (#7900).
 REASONS = ("preference", "manual", "failover")
 
 
@@ -114,7 +115,7 @@ def handover(db, agent: str, *, holdoff_s: float = 0.0) -> dict | None:
     `switched_at`, so it survives a runner restart without in-memory state.
     A `failover` attempt (#7833) is deliberately not returned: the source is
     stopped, it must not reclaim the avatar by presence; the hold is cleared
-    by a human move, not by the source.
+    by a human move, or when the holder host dies (#7900), not by the source.
     """
     row = _moves(db).open_handover(agent)
     if row is None:

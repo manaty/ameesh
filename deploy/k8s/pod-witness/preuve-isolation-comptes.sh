@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# #7694 (design 7633 §5.3) — témoin kind de l'isolation des comptes d'un hôte
-# pod : identité (UID du chart = UID du processus = entrée passwd), montage
-# (le PVC de B n'est pas dans le conteneur de A), permissions (le dossier de
-# comptes 0700 de B refuse l'UID de A, même monté en lecture seule), canon
-# (dépôt cloné sous 10001 et lu sous l'UID du tenant avec la paire
-# `safe.directory` du plan — B1 de #44265).
+# #7694/#7695 (design 7633 §5.3) — témoin kind d'un hôte pod : identité (UID
+# du chart = UID du processus = entrée passwd), montage (le PVC de B n'est pas
+# dans le conteneur de A), permissions (le dossier de comptes 0700 de B refuse
+# l'UID de A, même monté en lecture seule), superviseur (uid 10001, aucun
+# volume de tenant, /tmp propre), base (réclamation par tenant, attach,
+# isolation UID et bail superviseur sur un PostgreSQL migré — 0599 comprise).
+# En plus des cinq contrôles de #7695, le canon (#7694, B1 de #44265) est
+# rejoué : clone sous 10001, lecture sous l'UID du tenant avec la paire
+# `safe.directory` du plan.
 #
 # Ce script est un geste de BUREAU/OPÉRATEUR, pas de l'agent intéressé : il
 # crée un cluster kind jetable, applique les gabarits du dossier, exécute les
@@ -17,12 +20,14 @@
 #   ./preuve-isolation-comptes.sh --render-only   # rendu des manifestes, sans cluster
 #   ./preuve-isolation-comptes.sh --keep          # garde le cluster pour inspection
 #
-# Sortie 77 si kind/kubectl/docker manque : le témoin est alors « non exécuté »
-# (non-concluant), jamais « vert ». Variables/options : --uid-a, --uid-b,
-# --fs-group, --image, --git-image, --cluster, --namespace.
+# Contrôle 5 (base) : AMEESH_TEST_DSN=postgresql://… (schéma migré). Sans DSN,
+# il est sauté et le script sort 77 (non-concluant). Sortie 77 aussi si
+# kind/kubectl/docker manque : jamais « vert ». Variables/options : --uid-a,
+# --uid-b, --fs-group, --image, --git-image, --cluster, --namespace.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$HERE/../../.." && pwd)
 CLUSTER=${CLUSTER:-ameesh-pod-witness}
 NS=${NS:-ameesh-pod-witness}
 UID_A=${UID_A:-2519}
@@ -37,7 +42,7 @@ KEEP=0
 RENDER_ONLY=0
 
 usage() {
-    sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -115,7 +120,7 @@ diagnostic() {
     k get pods -o wide >&2 || true
     k get pvc >&2 || true
     k get events --sort-by=.lastTimestamp >&2 | tail -20 || true
-    for conteneur in a b; do
+    for conteneur in a b superviseur; do
         k logs temoin-deux -c "$conteneur" >&2 || true
     done
     k logs temoin-lecture >&2 || true
@@ -145,10 +150,41 @@ wait_ready() {
     k wait --for=condition=Ready pod/temoin-deux --timeout=180s >/dev/null
 }
 
+# kind lie ses PVC par local-path, un volume hostPath : le kubelet n'applique
+# pas fsGroup aux hostPath, alors qu'un pilote CSI le fait. Le plan repose sur
+# UN fsGroup neutre (10000, jamais un par tenant) : on applique donc à la
+# racine du PVC le pas que ferait le kubelet (chgrp + setgid 2770), avec
+# trace. Sans lui, la racine resterait root:root 0777 en kind et le contrôle 1
+# jugerait le pilote, pas le chart.
+apply_fsgroup() {
+    local conteneur=$1 pvc=$2 home gid pv chemin noeud
+    home="/home/ameesh-$conteneur"
+    gid=$(kexec "$conteneur" stat -c '%g' "$home")
+    if [ "$gid" = "$FS_GROUP" ]; then
+        echo "trace: fsgroup=$conteneur deja applique par le pilote"
+        return 0
+    fi
+    pv=$(k get pvc "$pvc" -o jsonpath='{.spec.volumeName}')
+    [ -n "$pv" ] || fail "fsgroup $conteneur: PVC $pvc non lie"
+    chemin=$(kubectl get pv "$pv" -o jsonpath='{.spec.hostPath.path}')
+    [ -n "$chemin" ] \
+        || fail "fsgroup $conteneur: PV $pv sans hostPath (pilote inattendu)"
+    noeud=$(k get pod temoin-deux -o jsonpath='{.spec.nodeName}')
+    [ -n "$noeud" ] || fail "fsgroup $conteneur: noeud du pod illisible"
+    docker exec "$noeud" chgrp "$FS_GROUP" "$chemin" \
+        || fail "fsgroup $conteneur: chgrp impossible sur $chemin"
+    docker exec "$noeud" chmod 2770 "$chemin" \
+        || fail "fsgroup $conteneur: chmod impossible sur $chemin"
+    gid=$(kexec "$conteneur" stat -c '%g' "$home")
+    [ "$gid" = "$FS_GROUP" ] \
+        || fail "fsgroup $conteneur: groupe $gid apres application, attendu $FS_GROUP"
+    echo "trace: fsgroup=$conteneur applique a la racine du PVC (kind local-path, comme un pilote CSI)"
+}
+
 # --- trace : ce que la preuve attachée au lot doit citer ---------------------
 trace() {
     echo "trace: date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "trace: kubernetes=$(kubectl version -o jsonpath='{.serverVersion.gitVersion}' 2>/dev/null || echo '?')"
+    echo "trace: kubernetes=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null || echo '?')"
     echo "trace: image=$IMAGE"
     echo "trace: git_image=$GIT_IMAGE"
     echo "trace: image_id=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo '?')"
@@ -227,6 +263,42 @@ check_mount() {
     pass "montage: A ne voit ni /home/ameesh-b, ni le PVC de B, ni un jeton ; il lit son temoin"
 }
 
+# --- contrôle 4 : le superviseur n'a aucun volume de tenant -----------------
+# #7695 : dans le chart pod-shared, le superviseur est un conteneur à part,
+# sous SON UID, avec son home et son /tmp à lui ; il ne monte ni le home ni le
+# PVC d'un tenant et ne reçoit pas de jeton de compte de service. Le contrôle
+# positif (écrire et relire son /tmp) prouve que l'absence de volume tenant
+# n'est pas un conteneur mort.
+check_supervisor() {
+    local uid passwd stat
+    uid=$(kexec superviseur id -u | tr -d '\r')
+    [ "$uid" = "$SUPERVISOR_UID" ] \
+        || fail "superviseur: id -u=$uid, attendu $SUPERVISOR_UID"
+    passwd=$(kexec superviseur sh -ec "grep '^ameesh:' /etc/passwd | cut -d: -f3,4")
+    [ "$passwd" = "$SUPERVISOR_UID:$FS_GROUP" ] \
+        || fail "superviseur: passwd uid:gid=$passwd, attendu $SUPERVISOR_UID:$FS_GROUP"
+    kexec superviseur sh -ec 'test -w /tmp && echo ok > /tmp/.temoin-superviseur \
+        && test "$(cat /tmp/.temoin-superviseur)" = ok' \
+        || fail "superviseur: son /tmp n'est pas inscriptible (contrôle positif)"
+    stat=$(kexec superviseur stat -c '%u:%g %a' /tmp/.temoin-superviseur)
+    [ "$stat" = "$SUPERVISOR_UID:$FS_GROUP 600" ] \
+        || fail "superviseur: temoin /tmp = [$stat], attendu $SUPERVISOR_UID:$FS_GROUP 600"
+    for chemin in /home/ameesh-a /home/ameesh-b; do
+        if kexec superviseur sh -ec "test -e '$chemin'" 2>/dev/null; then
+            fail "superviseur: $chemin est visible dans son conteneur"
+        fi
+    done
+    if kexec superviseur sh -ec 'grep -Fq " /home/ameesh-a " /proc/self/mountinfo \
+        || grep -Fq " /home/ameesh-b " /proc/self/mountinfo' 2>/dev/null; then
+        fail "superviseur: un home de tenant figure dans /proc/self/mountinfo"
+    fi
+    if kexec superviseur sh -ec 'test -e /var/run/secrets/kubernetes.io/serviceaccount/token' 2>/dev/null; then
+        fail "superviseur: jeton de compte de service monte"
+    fi
+    pass "superviseur: uid=$uid, /tmp prive inscriptible, aucun home/PVC de tenant, aucun jeton"
+}
+
+
 # --- contrôle 3 : permissions (pod séparé, sans fsGroup) --------------------
 check_lecture() {
     apply_manifest temoin-lecture.yaml
@@ -251,7 +323,7 @@ check_lecture() {
     pass "lecture: A lit son compte, B (0700, monté sans fsGroup) le refuse"
 }
 
-# --- contrôle 4 : canon lu sous un UID différent du clone (B1 de #44265) ----
+# --- contrôle canon (#7694) : clone et lecture sous des UID différents ------
 # Le dépôt est créé par l'init sous SUPERVISOR_UID ; la lecture par l'UID du
 # tenant passe seulement grâce à la paire `safe.directory` du plan, bornée à
 # ce dépôt. Sans elle, Git refuse « dubious ownership » (contrôle négatif).
@@ -276,12 +348,47 @@ check_canon() {
     pass "canon: dépôt clone sous $SUPERVISOR_UID lu sous $UID_A, confiance bornée au dépôt"
 }
 
-echo "== témoin kind #7694 : UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE git_image=$GIT_IMAGE =="
+# --- contrôle 5 : base réelle — réclamation et isolation d'un hôte pod ------
+# #7695 : les contrôles 1–4 prouvent les conteneurs ; celui-ci prouve la base
+# qui les gouverne, avec un vrai PostgreSQL migré (0599 comprise) :
+# `ameesh_tenant_claim_ok` refuse le runner d'un autre tenant, une session
+# `attach` ne s'ouvre qu'à l'utilisateur système du tenant, l'isolation par UID
+# refuse un pair du même tenant, et un seul superviseur prend le bail.
+check_base() {
+    if [ -z "${AMEESH_TEST_DSN:-}" ]; then
+        echo "SKIP base: AMEESH_TEST_DSN absent — contrôle base non exécuté (non-concluant)" >&2
+        return 77
+    fi
+    command -v python3 >/dev/null 2>&1 \
+        || fail "base: python3 absent alors qu'AMEESH_TEST_DSN est posé"
+    echo "== base : $AMEESH_TEST_DSN =="
+    ( cd "$REPO_ROOT" && PYTHONPATH=src python3 -m unittest -v \
+        tests.test_7695_pod_partage.WitnessBaseTest ) \
+        || fail "base: le contrôle 5 a échoué (voir la sortie unittest)"
+    pass "base: réclamation par tenant, attach par utilisateur système, isolation UID, bail superviseur"
+}
+
+
 docker pull --quiet "$IMAGE" >/dev/null
 docker pull --quiet "$GIT_IMAGE" >/dev/null
 kind create cluster --name "$CLUSTER" --wait 120s >/dev/null
-kind load docker-image "$IMAGE" --name "$CLUSTER" >/dev/null
-kind load docker-image "$GIT_IMAGE" --name "$CLUSTER" >/dev/null
+# kind v0.27 importe `docker save` avec `ctr images import --all-platforms` ;
+# avec le magasin d'images containerd de Docker récent, l'archive d'une image
+# multi-arch ne porte qu'une plateforme et l'import échoue sur un digest
+# absent. `docker save --platform linux/amd64` + `kind load image-archive`
+# borne l'archive à la plateforme du nœud ; le repli `docker save` classique
+# couvre les Docker qui ne connaissent pas `--platform`.
+load_image() {
+    local image=$1 archive
+    archive=$(mktemp "${TMPDIR:-/tmp}/ameesh-kind-image-XXXXXX.tar")
+    if ! docker save --platform linux/amd64 -o "$archive" "$image" 2>/dev/null; then
+        docker save -o "$archive" "$image"
+    fi
+    kind load image-archive "$archive" --name "$CLUSTER" >/dev/null
+    rm -f "$archive"
+}
+load_image "$IMAGE"
+load_image "$GIT_IMAGE"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 # PSA restricted : si le cluster l'applique, le gabarit doit y être admis.
 kubectl label namespace "$NS" \
@@ -298,11 +405,14 @@ k wait --for=jsonpath='{.status.phase}'=Bound \
 pass "PVC: pvc-temoin-a et pvc-temoin-b liés (consommateur temoin-deux créé d'abord)"
 wait_ready
 pass "pod: temoin-deux prêt (A et B)"
+apply_fsgroup a pvc-temoin-a
+apply_fsgroup b pvc-temoin-b
 trace
 
 check_identity a "$UID_A"
 check_identity b "$UID_B"
 check_mount
+check_supervisor
 
 # --- témoin 1 rejoué après un déplacement du PVC ---------------------------
 premier_uid=$(pod_uid temoin-deux)
@@ -344,4 +454,13 @@ pass "rejeu final: identite et modes intacts apres un montage sans fsGroup"
 
 check_canon
 
-echo "TOUS LES TEMOINS PASSENT (#7694 : identité, montage, permissions, canon)"
+# Le contrôle base rend 77 quand le DSN manque : non-concluant, jamais vert.
+base_code=0
+check_base || base_code=$?
+if [ "$base_code" -eq 77 ]; then
+    echo "TEMOINS CONTENEURS PASSENT ; base NON EXÉCUTÉE (non-concluant)" >&2
+    exit 77
+fi
+[ "$base_code" -eq 0 ] || exit "$base_code"
+
+echo "TOUS LES TEMOINS PASSENT (#7695 : identité, montage, permissions, superviseur, base ; canon #7694)"

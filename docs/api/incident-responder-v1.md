@@ -62,7 +62,7 @@ is not an absence**: the next one is used.
 
 | Signal | Read from | Window / bound |
 | --- | --- | --- |
-| `attach` | a live lease `attach:<local account>` in `agent_registry` | the lease expiry |
+| `attach` | a live lease in `agent_registry`: local `attach:<local account>`, or distant `attach:<tenant>:<device>` whose device credential is an active `device-es256` authenticator of the member | the lease expiry |
 | `interaction` | ameesh journal: mail sent from one of the member's own devices, or a decision answered from their own device; then Memoria's public interface | 30 min |
 | `presence` | Slack `users.getPresence`: `active` = available, `away` = not available | live, cached 5 min |
 | `timezone` | `Member.timezone` and usual local hours (08:00–20:00) | last resort |
@@ -71,14 +71,26 @@ Only the human's **own activity** is an interaction. A journal row is
 attributed by the exact `user@host` proof (`payload.human_account`, written by
 the CLI for an unbound human entry) or, failing it, by a host declared in
 `Member.local_accounts` (`["smichea@pc-smichea"]` declares `pc-smichea`). A
-decision answer typed by the bureau under the §10 delegation — its signed text
-carries "saisi par le bureau, délégation §10" or "réponse de l'owner relayée
-par le bureau" — is never the owner's own activity, whatever host recorded it.
-Mail delivery, a decision's reply mail and an `action_events` row are not
-device proofs and are not used: the decision close itself writes the delivery
-timestamp when anyone answers (the bureau included), a reply mail is only the
-answer's byproduct, and an action event names an actor but no device. Fewer
-signals, never a false one; a missing signal passes to the next one.
+distant attach (`attach:<tenant>:<device>`, #7869) is attributed by the device
+credential, never by a host: the lease device is the bounded `credential_id`
+of the `device-es256` authenticator the host verified at grant time, and
+`authenticators.approver` says which human it belongs to **in the lease
+agent's canon** (the grant is verified with that canon). Active credential
+identifiers are unique per `(canon, facade, credential_id)`, not globally
+(0035): the resolver therefore filters `authenticators.canon` by the
+`agent_registry.canon` of the lease's agent (NULL meaning the default canon,
+`''` in `authenticators`). A device of another human, a device revoked in the
+lease's canon, a credential that only lives in another canon or an unknown
+lease shape is not an attachment — the signal is missing, not guessed. A
+decision answer typed by the bureau under the §10
+delegation — its signed text carries "saisi par le bureau, délégation §10" or
+"réponse de l'owner relayée par le bureau" — is never the owner's own
+activity, whatever host recorded it. Mail delivery, a decision's reply mail
+and an `action_events` row are not device proofs and are not used: the
+decision close itself writes the delivery timestamp when anyone answers (the
+bureau included), a reply mail is only the answer's byproduct, and an action
+event names an actor but no device. Fewer signals, never a false one; a
+missing signal passes to the next one.
 
 A present `away` presence and the local-hours fallback can rule a human out;
 a missing timezone never makes someone reachable by default. A signal
