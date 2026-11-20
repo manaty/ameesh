@@ -27,6 +27,8 @@ composition enregistrée après cette tête n'est pas poussée : aucun avis.
 """
 from __future__ import annotations
 
+import hashlib
+
 from ameesh import work_lifecycle as lifecycle
 
 #: marque machine de la note d'un gel : ligne écrite par le gate, jamais par
@@ -229,13 +231,20 @@ def notify_pilots(db, item: dict, head: str, matches, *, actor: str = "") -> lis
                 or recipient.startswith(work.HUMAN_PREFIX) \
                 or recipient == work.SYSTEM_SENDER:
             continue
-        # Un seul avis par situation : un regel de la même tête avec la même
-        # tête poussée est le même geste, et le pilote n'a pas à relire deux
-        # fois le même fait. Une tête poussée qui avance est un fait nouveau.
+        # La tête gelée fait partie de la clé (relecture cx2, #7892) : deux
+        # gels H1 puis H2 du même membre, porteur poussé inchangé, sont deux
+        # avis distincts — le corps les nomme, la clé doit les distinguer. Le
+        # reste de la situation est condensé pour rester sous la limite de
+        # 200 caractères de la clé. Un rejeu de la même tête retrouve le même
+        # corps et ne redépose rien.
+        situation = "\n".join([
+            "actor:%s" % _text(actor),
+            *["%d:%s" % (int(m["package_id"]), _text(m.get("pushed")))
+              for m in sorted(matches, key=lambda m: int(m["package_id"]))],
+        ])
         key = "freeze-packet-pushed:%d:%s:%s" % (
-            lot,
-            ",".join(sorted(str(int(m["package_id"])) for m in matches)),
-            ",".join(sorted(_text(m.get("pushed")) for m in matches)))
+            lot, head,
+            hashlib.sha256(situation.encode("utf-8")).hexdigest()[:24])
         try:
             mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="event",
                       work_item_id=str(lot),

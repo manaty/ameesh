@@ -142,6 +142,23 @@ class PushedMemberTest(_Base):
         self.assertEqual(len(self.freezes()), 2)
         self.assertEqual(len(self.pilot_mails()), 1)
 
+    def test_deux_gels_de_tetes_differentes_avertissent_deux_fois(self):
+        # Relecture cx2 (#7892) : la clé d'idempotence portait (lot, porteurs,
+        # têtes poussées) mais pas la tête gelée. H1 puis H2 avec un porteur
+        # inchangé réutilisaient la clé avec un corps différent : le second
+        # avis était refusé par le courrier puis masqué.
+        composed = self.compose()
+        self.record(composed)
+        first = self.new_head()
+        self.refreeze(first)
+        second = self.new_head()
+        self.refreeze(second)
+        self.refreeze(second)  # rejeu de H2 : même corps, rien de plus
+        mails = self.pilot_mails()
+        self.assertEqual(len(mails), 2)
+        self.assertIn(first[:12], mails[0]["body"])
+        self.assertIn(second[:12], mails[1]["body"])
+
     def test_une_ref_de_suivi_distante_prouve_la_poussee(self):
         # La composition est poussée mais ni le gel du porteur ni le balayage
         # ne l'ont encore vue : la ref de suivi distante est la preuve.
