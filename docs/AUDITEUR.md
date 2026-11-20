@@ -1090,10 +1090,15 @@ au code d'ameesh.
   quatre ok de l'auditeur (#7694@3b210678, #7870@6a3bb4ef, #7880@83b742a8,
   #7865@27ec2d15), dont #7865 (format `agent:<nom>` de `decided_by`, non
   suivi jusqu'à ses lecteurs) et #7880 (porteur assigné au mauvais pilote).
-- **Schéma nouveau : rejouer le contrat des rôles** (20/11/2026, #7899 ;
-  expire: 2026-12-20). Un lot qui ajoute une table ou une colonne n'a pas d'ok
-  avant que l'auditeur ait rejoué `tests.test_cluster.SuperviseurRoleTest` sur
-  la tête gelée : chaque colonne est accordée ou exclue. Source : B #44402 sur
+- **Schéma nouveau : lire le classement des colonnes** (20/11/2026, #7899 ;
+  expire: 2026-12-20). Pour un lot qui ajoute une table ou une colonne,
+  l'auditeur compare, sur la tête gelée, chaque colonne créée par la migration
+  au contrat des rôles (`deploy/sql/role-superviseur*.sql`) et à `EXCLUES`
+  (`tests/test_cluster.py`) ; une colonne ni accordée ni exclue est un B. Il ne
+  rejoue pas la suite (canon §3, §6) : il lit la preuve auteur de
+  `SuperviseurRoleTest` si elle existe ; absente ou non concluante, elle est
+  consignée sans retenir le lot. Correction de relecture : B de cx2 sur le gel
+  #44439 (commit 72c521fe retiré, réécrit ici). Source : B #44402 sur
   #7865@e69b26cb, où les colonnes de 0596 n'étaient pas classées ; l'ok manqué
   avait laissé partir le paquet h-20261119-12 sur un rouge connu.
 
