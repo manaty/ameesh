@@ -49,7 +49,11 @@ class ConversationMoves(abc.ABC):
         #7833: a `preference` plan is refused while the current placement
         came from a `failover` (runner stopped): B2 must not undo the failover
         by presence. A human `manual` move writes a newer attempt and clears
-        the hold; a later `failover` (the current host stopped too) is allowed."""
+        the hold; a later `failover` (the current host stopped too) is allowed.
+        #7900: the hold only lasts while that host is alive — a live lease or a
+        fresh standing. A dead host (expired lease, row not `stopped`, or
+        silent) releases the avatar to the healthy preferred host or another
+        eligible candidate."""
 
     @abc.abstractmethod
     def get(self, move_id: str) -> dict | None:
