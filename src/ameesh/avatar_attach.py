@@ -15,9 +15,10 @@ from . import conversation_move, election, registry, storage
 from .agent_names import resolve
 
 
-def _refusal(db, row, host):
+def _refusal(db, row, host, *, allow_local=False):
     if (row.get("releve") != "preference" or row.get("mode") != "execute"
-            or row.get("status") == "stopped" or row.get("host") == host):
+            or row.get("status") == "stopped"
+            or (row.get("host") == host and not allow_local)):
         return "not a remote running avatar"
     # Declared rank zero is the workstation; availability rank zero could be
     # a fallback cloud host and must never turn its attach into a return.
@@ -47,14 +48,14 @@ def plan_return(db, name: str, host: str) -> dict | None:
     """
     name = resolve(name, db=db, operation="lease.attach")
     row = registry.get(db, name)
-    if row is None or _refusal(db, row, host):
+    if row is None or _refusal(db, row, host, allow_local=True):
         return None
     source = row["host"]
 
     def recheck(tx, locked):
-        if locked["host"] != source:
+        if locked["host"] not in (source, host):
             return "source changed during attach"
-        return _refusal(tx, locked, host)
+        return _refusal(tx, locked, host, allow_local=True)
 
     try:
         attempt = conversation_move.plan(

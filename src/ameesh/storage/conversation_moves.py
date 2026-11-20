@@ -50,6 +50,10 @@ class ConversationMoves(abc.ABC):
         `recheck(tx, locked_row)` runs before any write under the registry lock;
         a nonempty refusal raises `RecheckRefused`.
 
+        #7897: an attach to the target may join a preference attempt under
+        this lock, including after its switch. The target is queued for its
+        first turn if it has no work; existing input is never replaced.
+
         #7833: a `preference` plan is refused while the current placement
         came from a `failover` (runner stopped): B2 must not undo the failover
         by presence. A human `manual` move writes a newer attempt and clears

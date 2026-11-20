@@ -34,6 +34,46 @@ class ReturnTest(Base):
     def moves(self):
         return storage.of(self.db).conversation_moves
 
+    def test_attach_joins_preference_during_cloud_turn(self):
+        self.db.execute("UPDATE agent_registry SET status = 'running',"
+                        " current_prompt = 'cloud turn' WHERE name = 'pilote'")
+        move = M.plan(self.db, "pilote", self.POSTE,
+                      requested_by="runner", reason="preference")
+        joined = A.plan_return(self.db, "pilote", self.POSTE)
+        self.assertEqual(joined["move_id"], move["move_id"])
+        self.db.execute("UPDATE agent_registry SET status = 'idle', current_prompt = NULL"
+                        " WHERE name = 'pilote'")
+        M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: self.tmp)
+        self.assertEqual(self.row()["host"], self.POSTE)
+        self.assertIn("Restore the conversation", self.row()["pending_prompt"])
+
+    def test_attach_joins_preference_after_switch(self):
+        move = M.plan(self.db, "pilote", self.POSTE,
+                      requested_by="runner", reason="preference")
+        M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: self.tmp)
+        self.assertIsNone(self.row()["pending_prompt"])
+        joined = A.plan_return(self.db, "pilote", self.POSTE)
+        self.assertEqual(joined["move_id"], move["move_id"])
+        self.assertIn("Restore the conversation", self.row()["pending_prompt"])
+
+    def test_attach_after_switch_preserves_waiting_input(self):
+        M.plan(self.db, "pilote", self.POSTE, requested_by="runner", reason="preference")
+        M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: self.tmp)
+        registry.set_pending_prompt(self.db, "pilote", "human input")
+        self.assertIsNotNone(A.plan_return(self.db, "pilote", self.POSTE))
+        self.assertEqual(self.row()["pending_prompt"], "human input")
+
+    def test_attach_joins_if_switch_wins_the_registry_lock(self):
+        M.plan(self.db, "pilote", self.POSTE, requested_by="runner", reason="preference")
+        real_plan = M.plan
+        def switch_first(*args, **kwargs):
+            M.advance(self.db, self.POSTE, probes=ready, cwd_for=lambda m: self.tmp)
+            return real_plan(*args, **kwargs)
+        with mock.patch.object(M, "plan", side_effect=switch_first):
+            joined = A.plan_return(self.db, "pilote", self.POSTE)
+        self.assertIsNotNone(joined)
+        self.assertIn("Restore the conversation", self.row()["pending_prompt"])
+
     def test_unhealthy_workstation_does_not_return(self):
         self.standing("pilote", self.POSTE, 10, ready=False)
         self.assertIsNone(A.plan_return(self.db, "pilote", self.POSTE))
@@ -123,9 +163,9 @@ class ReturnTest(Base):
         reads = []
         original = A._refusal
 
-        def check(conn, row, host):
+        def check(conn, row, host, **kwargs):
             reads.append(db_mod.in_transaction(conn))
-            return original(conn, row, host)
+            return original(conn, row, host, **kwargs)
 
         with mock.patch.object(A, "_refusal", side_effect=check):
             self.assertIsNotNone(A.plan_return(self.db, "pilote", self.POSTE))
@@ -139,7 +179,10 @@ class ReturnTest(Base):
                         " AND host = %s", (self.tmp, self.POSTE))
         adapter = adapters.HarnessAdapter(harnesses.get("claude"),
                                           os.path.join(FAKEBIN, "claude"))
+        preference = M.plan(self.db, "pilote", self.POSTE,
+                            requested_by="runner", reason="preference")
         move = A.plan_return(self.db, "pilote", self.POSTE)
+        self.assertEqual(move["move_id"], preference["move_id"])
         self.assertIsNone(self.row()["pending_prompt"])
         self.assertIsNone(self.row()["current_prompt"])
         self.assertEqual(storage.of(self.db).mailbox.unread("pilote", limit=10), [])

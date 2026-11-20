@@ -30,6 +30,10 @@ _OPEN_SQL = "(%s)" % ", ".join("'%s'" % s for s in OPEN)
 _BEFORE_SQL = "(%s)" % ", ".join("'%s'" % s for s in BEFORE_SWITCH)
 _AFTER_SQL = "(%s)" % ", ".join("'%s'" % s for s in AFTER_SWITCH)
 
+ATTACH_RESTORE = ("Restore the conversation on this workstation from its "
+                  "conversation segment. The human has requested an attach; "
+                  "finish this restoration turn so the local attach can open.")
+
 #: notice left to the source when the target's first turn had been launched
 FAILED_AFTER_LAUNCH = (
     "Conversation move to host %s failed after its first turn was launched there "
@@ -92,9 +96,12 @@ class ConversationMoves(Contract):
             rows = tx.query(
                 """SELECT *
                      FROM agent_registry WHERE name = %s FOR UPDATE""", (agent,))
-            if not rows or rows[0]["mode"] != "execute" or rows[0]["host"] == target_host:
+            if not rows or rows[0]["mode"] != "execute":
                 return None
             r = rows[0]
+            attach = reason == "manual" and requested_by == "attach:" + target_host
+            if r["host"] == target_host and not attach:
+                return None
             if recheck is not None:
                 refusal = recheck(tx, r)
                 if refusal:
@@ -141,6 +148,30 @@ class ConversationMoves(Contract):
                         ORDER BY m.created_at DESC, m.move_id DESC
                         LIMIT 1""", (agent, r["host"]))
                 if origin and origin[0].get("reason") == "failover":
+                    return None
+            # Join a B2 attempt while holding the switch's registry lock.
+            if attach:
+                existing = _row(tx.query(
+                    "SELECT " + _COLUMNS + " FROM conversation_moves WHERE agent = %s"
+                    " AND state IN " + _OPEN_SQL + " FOR UPDATE", (agent,)))
+                if existing:
+                    if (existing["target_host"] != target_host
+                            or existing["reason"] not in ("preference", "manual")
+                            or (existing["reason"] == "manual"
+                                and existing["requested_by"] != requested_by)):
+                        return None
+                    existing = self._set(tx, existing["move_id"],
+                                         "requested_by = %s", (requested_by,))
+                    if existing["state"] in ("switched", "recovered"):
+                        tx.execute(
+                            "UPDATE agent_registry SET pending_prompt = %s,"
+                            " pending_prompt_id = gen_random_uuid(), status = 'queued',"
+                            " updated_at = now() WHERE name = %s AND host = %s"
+                            " AND pending_prompt IS NULL AND current_prompt IS NULL",
+                            (ATTACH_RESTORE, agent, target_host))
+                    existing["created"] = False
+                    return existing
+                if r["host"] == target_host:
                     return None
             # ON CONFLICT without a target: the (agent, epoch_source) key AND the
             # one-open-attempt index both reread instead of raising
@@ -405,11 +436,8 @@ class ConversationMoves(Contract):
             # #7897: an idle avatar has no input to start its first target
             # turn. Queue the attach's restoration request at the switch,
             # atomically; never wake the cloud or replace a waiting input.
-            resume = ("Restore the conversation on this workstation from its "
-                      "conversation segment. The human has requested an attach; "
-                      "finish this restoration turn so the local attach can open."
+            resume = (ATTACH_RESTORE
                       if (state == "switched" or not r.get("current_prompt"))
-                      and move["reason"] == "manual"
                       and str(move["requested_by"]).startswith("attach:") else None)
             moved = tx.query(
                 """UPDATE agent_registry
