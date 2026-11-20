@@ -1401,6 +1401,10 @@ class Host:
     #: (`device_gates`) ; passé ce jour, la déclaration cesse d'elle-même.
     unavailable_until: str | None = None
     unavailable_reason: str | None = None
+    #: #7926 : capacités déclarées de l'hôte (`android-emulator`), lues par
+    #: `ameesh.host_capabilities` pour le provisioning, le doctor et le
+    #: placement. None = aucune : le défaut sûr n'accorde rien.
+    capabilities: list[str] | None = None
     #: #7662 : place dans la séquence staging (canon §14), absent = l'hôte
     #: n'est pas un hôte de staging (un profil nu n'en a aucun).
     staging: HostStaging | None = None
@@ -1834,6 +1838,7 @@ class Canon:
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
                            admins=h.admins, occupants=h.occupants,
+                           capabilities=h.capabilities,
                            unavailable_until=h.unavailable_until,
                            unavailable_reason=h.unavailable_reason,
                            staging=h.staging.to_dict() if h.staging is not None else None,
@@ -2129,13 +2134,24 @@ def shared_violations(agent: Any, host: Any, mode: Any) -> list[str]:
         out.append("responsible %s is not a tenant of shared host %s (tenants: %s)" % (
             responsible or "undeclared", host_name, ", ".join(sorted(tenants)) or "none"))
     text = None if mode is None or mode == "" else str(mode)
-    subscription_ok = (_get(policy, "allow_subscription") is True
+    # #7696 : la carte Host d'un pod reste en `api-key` (décision owner
+    # #228416 b, P3 sans abonnement). L'opt-in général des hôtes partagés
+    # (#5901/#7705) ne l'ouvre pas, même quand la fiche le déclare : la
+    # défense en profondeur s'applique aussi à un appelant qui n'a pas lancé
+    # `canon check`. Le lot #7911 rouvrira Q2 bis avec D2 et D4.
+    runtime = _get(policy, "runtime")
+    pod = runtime is not None and _get(runtime, "kind") in ("pod", "pod-template")
+    subscription_ok = (not pod and _get(policy, "allow_subscription") is True
                        and _get(policy, "require_isolation") is True)
     allowed_modes = SHARED_CREDENTIAL_MODES + (("subscription",) if subscription_ok else ())
     if text not in allowed_modes:
-        out.append("credential mode %s not allowed on shared host %s: "
-                   "subscription requires explicit tenant isolation (decision %s)"
-                   % (text or "undeclared", host_name, SHARED_DECISION))
+        reason = ("a pod host admits `api-key` only (decision #228416 b; "
+                  "#7911 reopens subscription)"
+                  if pod else
+                  "subscription requires explicit tenant isolation (decision %s)"
+                  % SHARED_DECISION)
+        out.append("credential mode %s not allowed on shared host %s: %s"
+                   % (text or "undeclared", host_name, reason))
     return out
 
 
@@ -2201,6 +2217,9 @@ def _validate_pod_runtime(canon: "Canon", host: Any, add) -> None:
     Un hôte pod reste un hôte partagé : `shared: true`, `tenants` non vide,
     un volume par tenant. Le gabarit d'enfant (`pod-template`) est figé — un
     seul agent, volatil, sans siège — et n'est jamais un hôte plaçable.
+    #7696 : un hôte `kind: pod` reste en `api-key` tant que Q2 bis (D1), les
+    conditions du fournisseur (D2) et le PVC vu par l'admin du cluster (D4)
+    ne sont pas tranchés (décision owner #228416 b, #7911).
     """
     policy = host.policy
     runtime = policy.runtime
@@ -2217,6 +2236,20 @@ def _validate_pod_runtime(canon: "Canon", host: Any, add) -> None:
             "host %s: `policy.runtime` requires a non-empty `policy.tenants`"
             % host.title, host.fiche, host=host.title)
     modes = policy.credential_modes or []
+    if runtime.kind == "pod":
+        # #7696 : P3 de #7633 sans abonnement (décision owner #228416 b,
+        # signée le 20/11 10:42Z). Q2 bis (D1), les conditions du fournisseur
+        # (D2) et le PVC d'un abonnement monté par l'admin du cluster (D4) ne
+        # sont pas tranchés : la carte reste en `api-key`, et l'opt-in général
+        # des hôtes partagés (#5901/#7705) ne l'ouvre pas sur un pod. Le lot
+        # #7911 rouvrira la partie abonnement, avec D2 et D4.
+        if "subscription" in modes or policy.allow_subscription:
+            add("host-pod-subscription-unproven", ERROR,
+                "host %s: a pod host admits `api-key` only: `subscription` "
+                "requires Q2 bis (D1), the supplier terms (D2) and the "
+                "cluster-admin PVC decision (D4), none answered — decision "
+                "#228416 b keeps P3 without subscription; #7911 reopens it"
+                % host.title, host.fiche, host=host.title)
     if runtime.kind == "pod-template":
         if policy.max_agents != 1:
             add("host-pod-template-max-agents", ERROR,
@@ -5016,12 +5049,27 @@ class _Loader:
         occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
         until, reason = self._host_unavailability(fiche, where, subject)
         staging = self._host_staging(fiche, where, subject)
+        # #7926 : capacités de l'hôte (`android-emulator` -> groupe kvm).
+        # Le schéma ne connaît que ces noms ; un inconnu est signalé et
+        # n'accorde rien (une faute de frappe ne doit pas élargir un droit).
+        capabilities = self._list(fiche, "capabilities", where,
+                                  "host-capabilities-invalid", **subject)
+        if capabilities is not None:
+            from . import host_capabilities
+            capabilities, problems, unknown = host_capabilities.parse(capabilities)
+            for problem in problems:
+                self.add("host-capabilities-invalid", ERROR, problem,
+                         **where, **subject)
+            for name in unknown:
+                self.add("host-capability-unknown", WARNING,
+                         "`capabilities`: unknown capability %r (ignored)" % name,
+                         **where, **subject)
         self.canon.hosts.append(Host(title=fiche.title,
                                      responsible=_text(fiche.data.get("responsible")),
                                      policy=policy, tags=tags, admins=admins,
                                      occupants=occupants, fiche=fiche,
                                      unavailable_until=until, unavailable_reason=reason,
-                                     staging=staging))
+                                     capabilities=capabilities, staging=staging))
 
     def _host_staging(self, fiche: Fiche, where: dict,
                       subject: dict) -> HostStaging | None:

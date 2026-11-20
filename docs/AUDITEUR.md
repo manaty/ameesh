@@ -171,7 +171,9 @@ découpage) retire le projet de l'alerte et de ses heures au repos. Une mesure
 exclue s'affiche `exclu (raison)` et porte `idle_agent_hours_excluded` : un
 0,0 ne représente jamais une mesure absente. Le mesh donne les heures
 imputées et, à part, les agents hors mesure (`idle_agents_excluded`) avec
-leurs raisons. Sans bloc `file` au canon (`processus/mecanique.yaml`), la
+leurs raisons. Les heures de repos d'une route épuisée où des lots attendent
+leur empreinte se lisent à part (`idle_agent_hours_footprint`, « retenues par
+empreinte ») : c'est ce chiffre que le rapport court cite alors. Sans bloc `file` au canon (`processus/mecanique.yaml`), la
 mesure est rendue sans seuil et `capacity.rule_error` le dit : l'auditeur juge
 alors la part au repos lui-même contre 20 % et le signale au pilote.
 
@@ -1018,8 +1020,8 @@ n'est pas le sien ; un geste root sur un hôte (règle du 2026-10-11) ;
 Tous ses rapports vont à `mesh-design`, l'orchestrateur du projet ameesh, dans
 le fil du projet que lit le propriétaire.
 
-* **Chaque passage court** : un rapport court, en langage courant :
-  `agent-mail send mesh-design "Audit 14:00 : …" --kind event`. Trois parties
+* **Chaque passage court** : préparer un rapport court, en langage courant.
+  L'envoyer avec `ameesh auditor report` selon le filtre ci-dessous. Trois parties
   au plus : ce qui va mal, ce qu'il a fait (avec l'inverse), ce qu'il propose.
   Il **commence par le tableau de débit** (`ameesh debit`) et, pour chaque
   attente de plus de 2 h, par le geste fait (niveau 1) ou le pilote nommé.
@@ -1027,8 +1029,50 @@ le fil du projet que lit le propriétaire.
   compte (section `capacity`), et le quota perdu sur la dernière heure (écart
   avec son passage précédent).
   « Rien à signaler » avec une attente de plus de 2 h, ou avec 20 % ou plus
-  d'agents réveillables au repos (#3256), est un défaut ; sinon, une ligne
-  (« Audit 14:00 : rien à signaler »).
+  d'agents réveillables au repos (#3256), est un défaut.
+
+  **Filtre du rapport vers mesh-design (#7894)** — règle de l'auditeur,
+  acceptée par auditeur le 20/11/2026, courrier #228530 (analyse #228274,
+  proposition e) ; `expire: 2026-12-20`. Ce filtre concerne le compte
+  rendu sortant ; le réveil horaire reste régi par #6643.
+  Comparer au **dernier rapport envoyé**, sans limite horaire : code de sortie
+  du débit ; attentes de plus de 2 h avec leur identifiant, pilote et geste ;
+  identifiants d'alertes ; tranche des agents réveillables au repos (seuil du
+  canon, #3256). Ne pas inclure les âges, horodatages ni la formulation du
+  rapport. Chaque attente nouvelle, changement de pilote ou de geste, alerte
+  nouvelle, ou franchissement du seuil de repos dans un sens ou l'autre fait
+  donc partir le rapport. Une disparition de ces éléments est aussi une
+  information nouvelle.
+
+  Fournir ces observations dans un fichier JSON sous `$TMPDIR`, par exemple :
+  `{"debit_check":0,"waits":[],"alerts":[],"idle_over_threshold":false}`.
+  Chaque attente est un objet avec trois chaînes non vides : `id`, `pilot`,
+  `gesture` ; les alertes sont leurs identifiants stables. Inclure toutes les
+  attentes et alertes courantes, pas seulement les nouvelles. Un débit
+  illisible ne peut pas être déclaré égal à 0 : signaler l'échec de lecture
+  par le courrier d'incident habituel, sans passer par ce filtre.
+
+  Écrire le corps dans un second fichier, puis appeler :
+
+  ```sh
+  ameesh auditor report --recipient mesh-design \
+    --state-file "$TMPDIR/audit-state.json" \
+    --body-file "$TMPDIR/audit-body.txt" --status 'audit : passage terminé'
+  ```
+
+  Ajouter `--activity` pour un geste de niveau 1 effectué ou une proposition
+  faite pendant ce passage : ils imposent un rapport même si les observations
+  restent identiques. Ajouter `--needs-action` quand mesh-design doit agir :
+  le rapport part alors normalement et le réveille. Sinon, il part en `info`,
+  sans réveil. Ajouter `--summary daily` au premier passage après 08:00 et
+  `--summary weekly` pour le résumé du lundi : ils partent toujours, servent
+  de signe de vie et établissent une nouvelle référence de comparaison.
+  Si le débit vaut 0, que les observations sont identiques et qu'aucune de
+  ces exceptions ne s'applique, **aucun courrier**, même « rien à signaler ».
+  La commande met à jour le texte de statut (`agent-mail status`) dans les
+  deux cas. Le journal porte `auditor.report` à l'envoi, avec l'empreinte
+  comparée et l'identifiant du courrier, ou `auditor.report_skipped` au saut ;
+  un saut ne remplace pas la référence du dernier envoi.
 * **Un corps qui cite une commande** (backticks, `$(…)`) ne part jamais entre
   guillemets doubles : le shell de l'auditeur l'exécuterait avant l'envoi.
   Envoyer le corps sur l'entrée standard, avec un délimiteur entre apostrophes
@@ -1074,9 +1118,33 @@ l'auditeur ([0023](design/decisions/0023-critere-d-adoption-des-reglages.md)).
 Un constat qui revient trois passages de suite devient une proposition de
 règle. Une règle acceptée par le propriétaire devient une décision écrite dans
 `docs/design/decisions/` (rapportée par mesh-design), et cette consigne est mise
-à jour par mesh-design, jamais par l'auditeur. C'est la boucle
-d'auto-réparation de [0022](design/decisions/0022-auto-reparation.md),
-appliquée à l'exploitation et au code d'ameesh.
+à jour par mesh-design. Une règle propre de l'auditeur, qui ne règle que son
+propre travail, est persistée par lui (canon §7) : par PR sur cette section,
+datée, sourcée, avec `expire:` quand elle naît d'un incident (30 j par défaut),
+revue à l'échéance. C'est la boucle d'auto-réparation de
+[0022](design/decisions/0022-auto-reparation.md), appliquée à l'exploitation et
+au code d'ameesh.
+
+### Règles propres de l'auditeur
+
+- **Relecture sensible : suivre chaque valeur nouvelle** (20/11/2026, #7899 ;
+  expire: 2026-12-20). Avant un ok sur un lot sensible, chaque valeur que le
+  lot introduit (colonne, champ, format, nom d'acteur, état) est suivie jusqu'à
+  son producteur et à chacun de ses lecteurs. Source : en 24 h, cx2 a renversé
+  quatre ok de l'auditeur (#7694@3b210678, #7870@6a3bb4ef, #7880@83b742a8,
+  #7865@27ec2d15), dont #7865 (format `agent:<nom>` de `decided_by`, non
+  suivi jusqu'à ses lecteurs) et #7880 (porteur assigné au mauvais pilote).
+- **Schéma nouveau : lire le classement des colonnes** (20/11/2026, #7899 ;
+  expire: 2026-12-20). Pour un lot qui ajoute une table ou une colonne,
+  l'auditeur compare, sur la tête gelée, chaque colonne créée par la migration
+  au contrat des rôles (`deploy/sql/role-superviseur*.sql`) et à `EXCLUES`
+  (`tests/test_cluster.py`) ; une colonne ni accordée ni exclue est un B. Il ne
+  rejoue pas la suite (canon §3, §6) : il lit la preuve auteur de
+  `SuperviseurRoleTest` si elle existe ; absente ou non concluante, elle est
+  consignée sans retenir le lot. Correction de relecture : B de cx2 sur le gel
+  #44439 (commit 72c521fe retiré, réécrit ici). Source : B #44402 sur
+  #7865@e69b26cb, où les colonnes de 0596 n'étaient pas classées ; l'ok manqué
+  avait laissé partir le paquet h-20261119-12 sur un rouge connu.
 
 ## Mise en service
 

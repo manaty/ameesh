@@ -111,7 +111,11 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
         self.st = types.SimpleNamespace(
             work=types.SimpleNamespace(items=lambda **kw: self.rows,
                                        milestones=lambda ident, **kw: self.milestones.get(ident, [])),
-            progress=types.SimpleNamespace(lot_hold_events=lambda *a: self.events))
+            progress=types.SimpleNamespace(
+                lot_hold_events=lambda *a: self.events,
+                # #7893 : aucun lot livré dans ce fixture ; les cas de la note
+                # de livraison sont dans test_7893_delivered_staging_pending.
+                lot_delivery_notes=lambda ids: []))
         patch = mock.patch.object(staging_pending.storage, "of", return_value=self.st)
         patch.start()
         self.addCleanup(patch.stop)
@@ -309,6 +313,35 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
             with self.assertRaises(release_cutoff.ReleaseBusy):
                 staging_pending.apply(self.cfg, None, self.project, now=_paris(22, 30))
             stage.assert_not_called()
+
+    def test_apply_calls_a_queued_handoff_queued_and_a_real_exit_failed(self):
+        """#7904: remettre une demande à l'exécutant n'est pas un échec."""
+        self.st.work.land_lock = mock.Mock(return_value=7)
+        self.st.work.land_unlock = mock.Mock()
+        report = {"result": "needed", "candidate": self.head, "candidate_ready": True,
+                  "regressions": {}, "candidate_unblocks": [1, 2, 3],
+                  "waiting": [{"lot": n, "blocker": 3111} for n in (1, 2, 3)]}
+        rules = types.SimpleNamespace(staging=mechanics.Staging(3, 1200, 600),
+                                      next_cutoff=lambda now: _paris(23),
+                                      next_packet=lambda now: _paris(23))
+        queued = {"exit": None, "queued": True, "request": "fef69a9e",
+                  "request_state": "pending", "request_host": "ameesh-agents-2"}
+        with mock.patch("ameesh.work.corrector", return_value="pilot"), \
+             mock.patch.object(staging_pending, "inspect", return_value=report), \
+             mock.patch.object(release_cutoff, "compiled_rules", return_value=(rules, None)), \
+             mock.patch.object(release_cutoff, "_staging_step", return_value=queued):
+            result = staging_pending.apply(self.cfg, None, self.project, now=_paris(22, 30))
+            self.assertEqual(result["result"], "queued")
+            self.assertEqual(result["staging"]["request"], "fef69a9e")
+            self.st.work.land_unlock.assert_called_once()
+        report["result"] = "needed"
+        with mock.patch("ameesh.work.corrector", return_value="pilot"), \
+             mock.patch.object(staging_pending, "inspect", return_value=report), \
+             mock.patch.object(release_cutoff, "compiled_rules", return_value=(rules, None)), \
+             mock.patch.object(release_cutoff, "_staging_step",
+                               return_value={"exit": 1}):
+            result = staging_pending.apply(self.cfg, None, self.project, now=_paris(22, 30))
+            self.assertEqual(result["result"], "failed")
 
     def test_occupied_lease_or_near_packet_never_stages(self):
         self.st.work.land_lock = mock.Mock(return_value=None)

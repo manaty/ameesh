@@ -155,7 +155,8 @@ SKIPPABLE_PASSES = ("issues", "github-watch", "ci", "alerts")
 #: levé, c'est tout).
 #: L94 : la sous-utilisation (forfait perdu, agents au repos, orchestrateur
 #: tenu, hôte à vide) est poussée comme la surcharge.
-DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
+DEFAULT_TYPES = ("stopped_with_mail", "avatar_failover", "orphan_lot",
+                 "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
                  # #4164 : un compte fournisseur sans crédit — aucun tour accordé
@@ -377,6 +378,9 @@ TYPE_LABELS = {
     "pgbouncer_pool_at_ceiling": "local PgBouncer pool at server-session ceiling",
     "pgbouncer_console_unreadable": "local PgBouncer console unreadable",
     "stopped_with_mail": "agent stopped with mail",
+    # #7833 : le runner de l'avatar s'est arrêté ; la bascule cloud est en
+    # route et le poste attend une réparation
+    "avatar_failover": "avatar failed over after its runner stopped",
     "orphan_lot": "orphan {work}",
     "dead_runner": "dead runner",
     "idle_with_mail": "agent idle with mail",
@@ -519,7 +523,8 @@ def type_label(kind: str, vocabulary=None) -> str:
 
 
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
-URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
+URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "avatar_failover",
+                "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
                 # #4164 : plus aucun tour sur le compte tant qu'il n'est pas rechargé
                 "provider_credits_exhausted",

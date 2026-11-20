@@ -16,8 +16,10 @@ reste un rouge ; le gel affiche une prévalidation non concluante.
 from __future__ import annotations
 
 import json
+import subprocess
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 from ameesh import prevalidation as pv
 from ameesh import prevalidation_calls as calls
@@ -79,6 +81,22 @@ class BoundedFallbackTest(unittest.TestCase):
         self.assertEqual(got["importers"], ["test_autre", "test_cible"])
         self.assertEqual(got["importers_dropped"], 1)
         self.assertNotIn("test_sans_lien", pv.planned_modules(plan))
+
+    def test_importer_patterns_are_posix_ere(self):
+        # #7930 : sous macOS, `git grep -E` suit la regex BSD, qui ignore les
+        # extensions GNU `\s`, `\b`, `\w` : aucun importateur n'était trouvé
+        with mock.patch.object(calls.subprocess, "run", wraps=subprocess.run) as run:
+            got, _ = self.fallback()
+        greps = [c.args[0] for c in run.call_args_list
+                 if c.args and isinstance(c.args[0], list) and "grep" in c.args[0]]
+        self.assertTrue(greps)
+        for argv in greps:
+            patterns = [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
+            self.assertTrue(patterns, argv)
+            for pattern in patterns:
+                for gnu in ("\\s", "\\b", "\\w", "\\<", "\\>"):
+                    self.assertNotIn(gnu, pattern)
+        self.assertEqual(got["importers"], ["test_autre", "test_cible"])
 
     def test_the_lot_part_runs_before_the_contracts(self):
         _, plan = self.fallback()

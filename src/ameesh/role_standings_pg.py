@@ -76,20 +76,28 @@ def elected_roles(db, host: str, *,
     `("election",)` — see `election_roles`.
     A stopped role is not elected: it is left out here, so no new standing is
     published until a human revives it (the lease, if any, still wears out).
+    #7833: the one exception is a `preference` avatar stopped by its runner's
+    fast failures — its *other* candidate hosts publish so that the failover
+    can be judged ready when the grace expires. The stopped host itself never
+    publishes (the SQL excludes it).
     """
+    from . import avatar_failover
     return db.query(
         """
         SELECT name, aliases, chantier, harness, host, cwd, status, status_text,
+               stop_reason, extract(epoch FROM status_since)::float8 AS status_since_ts,
                model, responsible, team, canon, canon_ref, releve, candidats,
                session_account, operator_paused, operator_pause_reason,
                budget_usd, spent_usd
           FROM agent_registry
          WHERE releve = ANY(%s)
            AND %s = ANY(candidats)
-           AND status <> 'stopped'
+           AND (status <> 'stopped'
+                OR """ + avatar_failover.stopped_sql("agent_registry",
+                                                     host_expr="%s") + """)
            AND mode = 'execute'
          ORDER BY name
-        """, (list(releves), host))
+        """, (list(releves), host, host))
 
 
 def election_roles(db, host: str) -> list[dict]:
@@ -232,6 +240,51 @@ def sample_interval_s(db, host: str, *, now: float | None = None,
         """, (host, now - float(window_s)))
     median = rows[0].get("median") if rows else None
     return None if median is None else float(median)
+
+
+def freshness_s(db, host: str, *, now: float | None = None,
+                fallback_interval_s: float | None = None) -> float:
+    """The staleness threshold of `host`: `max(180 s, 3 × its cadence)`.
+
+    The cadence is measured from the host's own readings (`sample_interval_s`),
+    so a host that samples every ten minutes is not declared stale after one
+    missed minute. `fallback_interval_s` is the configured interval of a local
+    publisher, used before its first history exists. Same threshold as L232e
+    (`host_lifecycle.staleness_s`), never a fixed 300 s.
+
+    #7900: moved here from `election` so a storage reader (the failover
+    retention of `conversation_moves.plan`) judges freshness with the same
+    rule, on its own transaction.
+    """
+    from . import host_lifecycle
+    now = now_ts(db) if now is None else float(now)
+    interval = sample_interval_s(db, host, now=now)
+    if interval is None:
+        interval = fallback_interval_s
+    return host_lifecycle.staleness_s(interval)
+
+
+def fresh_standing(db, name: str, host: str, *,
+                   now: float | None = None) -> bool:
+    """#7900: does `host` still publish a fresh standing for `name`?
+
+    A live host publishes its standing on every runner pass; a dead host
+    stops, and its last row ages past the host's own freshness threshold. An
+    absent or future-dated standing is not proof of life (fail closed). The
+    row and the clock are read in one statement, so a standing published
+    meanwhile cannot look future-dated.
+    """
+    rows = db.query(
+        """SELECT extract(epoch FROM max(evaluated_at))::float8 AS evaluated_ts,
+                  extract(epoch FROM clock_timestamp())::float8 AS now_ts
+             FROM role_standings WHERE name = %s AND host = %s""",
+        (name, host))
+    row = rows[0] if rows else {}
+    if row.get("evaluated_ts") is None:
+        return False
+    now = float(row.get("now_ts") or 0.0) if now is None else float(now)
+    age = now - float(row["evaluated_ts"])
+    return 0.0 <= age <= freshness_s(db, host, now=now)
 
 
 def record(db, name: str, host: str, *, availability: float, capacity: float,

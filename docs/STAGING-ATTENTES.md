@@ -13,7 +13,12 @@ détermine le staging d'ameesh.
 
 La lecture n'utilise que les notes `hold:` encore actives : une dépendance
 explicite est satisfaite par la fusion et ne dit pas que le correctif doit être
-actif sur les hôtes. Dans une note, seules les références `#lot` ou
+actif sur les hôtes. Un lot livré mais non clos ne porte plus de hold actif :
+sa **note de livraison** — les notes écrites dans l'étape de livraison du
+journal (`merged`, `promoted`, `delivered`) — est lue avec les mêmes règles de
+phrase, et une attente de déploiement qui y est nommée le compte comme les
+autres lots (#7893). Un lot livré sans une telle note ne compte pas. Dans une
+note, seules les références `#lot` ou
 `migration N` d'une phrase qui nomme une attente de déploiement comptent
 (« attendre #3111 », « #3111 non actif », « la release doit porter #2994 ») ;
 un numéro de PR, de ticket, de paquet, de gel, ou une référence citée dans un

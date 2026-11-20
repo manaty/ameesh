@@ -54,8 +54,17 @@ read and returns a decision:
   `missing` = the remaining seats, and the capacity notification names the seats
   already provided. A retry of the same freeze keeps those automatic seats (a
   manual name never counts them twice, and they are not mailed again) and
-  provides only the missing ones; a new freeze retires them as before. An
-  unknown author family still designates nobody.
+  provides only the missing ones. A new freeze keeps the previous seats
+  while they remain available and independent (#7442). At re-freeze (#7891),
+  the current designation advances to the new freeze, SHA and delta without
+  another mail to a seat whose opinion is still pending, even if its request
+  was already displayed. An unread, unreserved request is updated in place
+  to name the current head, keeping its identity and queue age (#6641).
+  Displayed or reserved requests stay intact. The recipient and mailbox rows
+  are locked through replacement to serialize with delivery/reservation.
+  A verdict not carried needs one delta request; a
+  changed seat gets its first request. Reviewers read the lot's current freeze
+  before reviewing. An unknown author family still designates nobody.
 - **mails**: each reviewer receives the lot, the `frozen` milestone and the
   **exact** SHA to review, the verdict command on that SHA, and the rule of §2
   (fixing a blocker oneself makes one an author: their review no longer counts,

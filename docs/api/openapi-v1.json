@@ -624,6 +624,43 @@
               "null"
             ]
           },
+          "host": {
+            "properties": {
+              "available": {
+                "type": "boolean"
+              },
+              "capabilities": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "name": {
+                "type": "string"
+              },
+              "reason": {
+                "enum": [
+                  "canon_unreadable",
+                  "host_not_in_canon",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "capabilities",
+              "available",
+              "reason"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "lease": {
             "properties": {
               "epoch": {
@@ -1305,6 +1342,7 @@
           "profile",
           "admission",
           "canon",
+          "host",
           "placement",
           "lease",
           "limits",
@@ -2025,6 +2063,8 @@
               "mail.export",
               "packet.pause",
               "auditor.pass",
+              "auditor.report",
+              "auditor.report_skipped",
               "packet.client_types"
             ]
           }

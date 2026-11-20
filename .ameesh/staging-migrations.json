@@ -11,6 +11,13 @@
       "restore": "src/ameesh/migrations/rollback/0584_restore.sql",
       "lot": 7566
     },
+    "src/ameesh/migrations/0596_depenses_plafonds.sql": {
+      "checksum": "52c8822f49657aeb07a945a92e9b40d20266d668ac76d08096deb94e5cafb9e3",
+      "lot": 7865,
+      "restore": "src/ameesh/migrations/rollback/0596_restore.sql",
+      "rejects_previous_writes": false,
+      "previous_writes_justification": "#7865: the trigger only copies an already-recorded attempt state into the spend ledger; it never rejects a write"
+    },
     "src/ameesh/migrations/0598_bureau_clear_only.sql": {
       "checksum": "25417ce2c34be1d93859f373f99de9df8bc233d9d201a5f8818b1cc23933f475",
       "lot": 7870,

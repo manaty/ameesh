@@ -3212,6 +3212,20 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     for line in module_lines:
         print(line)
     print(host_measures_line(cfg))
+    # #7926 : capacités déclarées de l'hôte (`android-emulator` -> groupe
+    # kvm). Une capacité promise et inutilisable est un KO ; un groupe accordé
+    # sans déclaration est une dérive signalée, pour qu'une fiche en retard
+    # (#7927) ne rende pas l'hôte rouge.
+    from . import host_capabilities
+    try:
+        capabilities_ko, capability_lines = host_capabilities.doctor_lines(
+            cfg, canons=canons or None)
+    except Exception as exc:  # a reading never breaks the doctor
+        capabilities_ko = False
+        capability_lines = ["capabilities: not checked (%s)"
+                            % (" ".join(str(exc).split())[:120],)]
+    for line in capability_lines:
+        print(line)
     # #6832 : un hôte candidat d'un rôle élu doit pouvoir prouver les checks
     # requis de chaque projet qu'il fusionne sans dépendre de la config d'un
     # autre hôte : une déclaration versionnée couvre un 403 de plan, son
@@ -3300,6 +3314,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     verdict = 1 if channel_ko else 0
     # L98 T2a: an active module that is not installed (or is refused) is a KO.
     if not modules_ok:
+        verdict = 1
+    # #7926 : une capacité déclarée non appliquée (groupe manquant, /dev/kvm
+    # absent) rend l'hôte KO : la promesse de la fiche n'est pas tenue.
+    if capabilities_ko:
         verdict = 1
     # P1a #7649 : un schéma de module inscrit qui manque, une identité qui ne
     # correspond plus ou une empreinte modifiée est un KO du doctor.

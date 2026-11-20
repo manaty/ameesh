@@ -12,6 +12,7 @@ import getpass
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DIR = ROOT / "deploy/serveur/pgbackrest"
 SCRIPT = DIR / "pgbackrest-ameesh.sh"
+
+# #7930 : les exercices passent par `realpath -m` (GNU coreutils, absent de
+# macOS) et comparent des chemins résolus (/var → /private/var sous macOS) ;
+# le script ne tourne que sur les serveurs Linux.
+SERVEUR_LINUX = unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "server script: GNU realpath -m and resolved paths (Linux servers only)")
 
 # Les outils de Postgres refusent un autre compte que celui de Postgres, comme
 # initdb et pg_ctl refusent root ; `runuser` faux passe le compte par RUNAS.
@@ -190,6 +198,7 @@ class PgBackRestAmeesh(unittest.TestCase):
         self.assertEqual(self.calls(), ["pgbackrest --stanza=ameesh --type=diff backup"])
 
     # --- exercices ---------------------------------------------------------------
+    @SERVEUR_LINUX
     def test_restaurer_refuse_la_base_vive(self):
         for dossier in (self.pgdata, self.pgdata / "sous", self.tmp):
             r = self.run_script("restaurer", "--cible", "2026-11-11 08:00:00+00",
@@ -198,6 +207,7 @@ class PgBackRestAmeesh(unittest.TestCase):
             self.assertIn("base vive", r.stderr)
         self.assertEqual(self.calls(), [])
 
+    @SERVEUR_LINUX
     def test_restaurer_refuse_dossier_non_vide_et_port_vif(self):
         d = self.tmp / "plein"
         d.mkdir()
@@ -209,6 +219,7 @@ class PgBackRestAmeesh(unittest.TestCase):
         self.assertIn("jamais 5432", r.stderr)
         self.assertEqual(self.calls(), [])
 
+    @SERVEUR_LINUX
     def test_restaurer_a_un_instant(self):
         d = self.tmp / "exercice"
         r = self.run_script("restaurer", "--cible", "2026-11-11 08:00:00+00",
@@ -224,6 +235,7 @@ class PgBackRestAmeesh(unittest.TestCase):
         self.assertIn("RTO mesuré", r.stderr)
         self.assertFalse(d.exists())  # instance jetable effacée sans --garder
 
+    @SERVEUR_LINUX
     def test_exercice_dump_garder(self):
         dump = self.tmp / "ameesh.dump"
         dump.write_bytes(b"PGDMP")
@@ -239,6 +251,7 @@ class PgBackRestAmeesh(unittest.TestCase):
         self.assertIn("listen_addresses = ''", conf)
         self.assertIn("archive_mode = off", conf)
 
+    @SERVEUR_LINUX
     def test_exercices_sous_le_compte_de_postgres(self):
         # lancés par un autre compte (root en vrai), les outils de Postgres
         # passent par runuser ; appelés directement, les faux refusent

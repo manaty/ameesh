@@ -7,7 +7,8 @@ attempt is a row of `conversation_moves`; this module drives it:
     planned → prepared → switched | recovered → rehydrating → verified
                                    any open state → failed
 
-- **plan** (`plan`, the preference ranking or a manual move): the source
+- **plan** (`plan`, the preference ranking, a manual move or the #7833
+  failover from a stopped runner): the source
   finishes its turn in progress and opens no new one (`begin_turn` answers
   `conversation_move`); queued input stays queued;
 - **prepare** (`advance`, on the target host): harness, account, folder,
@@ -52,7 +53,11 @@ SEGMENT_FILENAME = "conversation-segment.md"
 CHECKS = ("harness", "binary", "account", "folder", "interactive", "resident")
 #: `begin_turn` refusal while a move holds the source back
 BEGIN_REFUSAL = "conversation_move"
-REASONS = ("preference", "manual")
+#: `preference` = B2 return; `manual` = B4 operator move; `failover` = #7833
+#: recovery after the runner of the preferred host stopped. A `failover`
+#: placement is not undone by the automatic B2 return until a human move, or
+#: until the holder host itself dies (#7900).
+REASONS = ("preference", "manual", "failover")
 
 
 class MoveError(RuntimeError):
@@ -106,6 +111,9 @@ def handover(db, agent: str, *, holdoff_s: float = 0.0) -> dict | None:
     with `left_s` = seconds of holdoff remaining on the database clock
     (negative once the margin is over), or None. The holdoff is computed from
     `switched_at`, so it survives a runner restart without in-memory state.
+    A `failover` attempt (#7833) is deliberately not returned: the source is
+    stopped, it must not reclaim the avatar by presence; the hold is cleared
+    by a human move, or when the holder host dies (#7900), not by the source.
     """
     row = _moves(db).open_handover(agent)
     if row is None:

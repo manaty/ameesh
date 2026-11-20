@@ -569,6 +569,62 @@ tour : sous une pression d'hôte qui retient ses tours, la réclamation est
 différée et la tentative reste ouverte à sa cible (la source la referme à la
 fin de la pression).
 
+**Bascule quand le runner du poste s'arrête (#7833).** La présence de §3.2
+était celle d'un hôte : un runner qui s'arrête après des échecs rapides
+(`stop_after_failures`, L48) publie `status = 'stopped'` et
+`stop_reason = 'erreur'`, mais plus aucun hôte ne publie son standing et
+aucun candidat ne classe la ligne arrêtée : l'avatar restait muet alors que
+le poste était allumé et joignable. Pour un `releve: preference` seulement,
+un arrêt **automatique** (`stop_reason = 'erreur'`) est désormais distingué
+d'un arrêt humain (`manuel`, retrait de canon) : après `GRACE_S` (10 min,
+ticket #6055), le poste n'est plus présent et le premier autre hôte déclaré
+du Placement devient rang 0. Il planifie alors un `conversation_moves`
+`recovered` — la conversation suit, la session native ne traverse pas — et
+le `switch` réveille l'arrêt automatique (`stopped`/`erreur` → `idle`) pour
+que la cible puisse réclamer ; un arrêt `manuel` reste `stopped` et n'est
+jamais repris par la bascule. `elected_roles` publie le standing des autres
+hôtes dès l'arrêt (le poste arrêté ne publie jamais), pour que la cible soit
+fraîche à l'échéance ; avant la grâce, `candidacy` affiche « failover in Ns »
+et ne débloque rien. Un avis `avatar_failover` est émis une fois par épisode
+(clé = agent + hôte + `status_since`), avec la cause, la cible et le geste de
+réparation ; sans autre hôte déclaré, il nomme l'absence de repli.
+
+**Pas de retour automatique après une bascule (#7833).** Une reprise
+`failover` ne se défait pas par présence : la tentative porte
+`reason = 'failover'`, et `conversation_moves.plan` refuse tout retour
+automatique (`reason = 'preference'`) tant que l'arrivée courante vient
+d'une reprise de ce type, même si la tentative a ensuite échoué (`switched_at`
+garde la trace). Un poste encore fautif ne peut donc plus reprendre l'avatar
+après 120 s de présence, re-échouer et repartir au cloud : le cycle arrêt →
+bascule → retour → arrêt est fermé. La retenue tombe quand un humain déplace
+l'avatar (`ameesh agent move <avatar> --to <poste>`, raison `manual`) — ou
+par l'`attach` quand il atteindra un agent tenu par un autre hôte. Une
+nouvelle bascule reste permise si l'hôte cloud s'arrête à son tour, et un
+`ameesh resume` sur le poste avant l'échéance annule simplement la bascule.
+
+**La retenue ne tient que sur un hôte vivant (#7900).** Un hôte cloud mort
+(bail expiré, ligne pourtant non `stopped`) ne garde pas l'avatar : la
+retenue de #7833 suppose un porteur qui publie encore. `conversation_moves.plan`
+vérifie la vie de l'hôte courant — bail vivant, ou, entre deux tours, un
+standing frais au seuil de l'hôte (même fraîcheur que `candidate_state`) ; un
+bail expiré est la signature du `dead_runner`, un standing périmé celle d'un
+exécuteur muet. Le retour de préférence reprend alors l'avatar vers le poste
+sain, ou vers l'autre hôte éligible rang 0. Un cloud vivant et au repos
+(standing frais, pas de bail) garde la retenue : pas de ping-pong.
+
+*Retour au poste : décision owner et geste disponible.* Le commentaire du
+ticket #6055 (compte owner `smichea`, 19/11/2026) tranche : un `attach` sur
+le poste déclenche le retour à la fin du tour cloud, même session ; sans
+`attach`, l'avatar reste dans le cloud. Le lot applique cette seconde partie
+(la retenue ci-dessus) ; il ne peut pas outiller l'`attach` demandé :
+`ameesh attach` est local et refuse un agent dont la ligne est sur un autre
+hôte (`runner.attach_main`), et l'`attach` distant (#5325 / #7035) doit
+d'abord atteindre une session tenue par un autre hôte. Le geste humain
+disponible aujourd'hui est donc le déplacement explicite
+(`ameesh agent move <avatar> --to <poste>`), que l'avis `avatar_failover`
+nomme ; le déclencheur `attach` est à reprendre dans #7035/design avant
+d'être opposable.
+
 ### 3.3 Ce qui n'est pas `election`
 
 `releve: election` reste pour les rôles de gouvernance : disponibilité sur

@@ -262,6 +262,71 @@ class TrainPausedAlertTest(unittest.TestCase):
         self.assertEqual(exploitation._train_paused(db, 1000.0), [])
 
 
+class TrainStuckAlertTest(unittest.TestCase):
+    """#7889 : un train figé hors phase terminale (draining, ci...) alerte."""
+    Db = TrainPausedAlertTest.Db
+
+    def row(self, phase, **document):
+        return {"target_key": "nexlink:develop", "revision": 140,
+                "document": dict({"phase": phase, "started_ts": 1000.0,
+                                  "failures": 0, "plan": {"id": "plan-1"}},
+                                 **document)}
+
+    def test_draining_for_more_than_a_day_raises_train_stuck(self):
+        db = self.Db([self.row("draining", error="ci unreadable")])
+        alerts = exploitation._train_stuck(db, 1000.0 + 25 * 3600)
+        self.assertEqual(len(alerts), 1)
+        alert = alerts[0]
+        self.assertEqual(alert["type"], "train_stuck")
+        self.assertEqual(alert["project"], "nexlink")
+        self.assertEqual(alert["phase"], "draining")
+        self.assertEqual(alert["plan"], "plan-1")
+        self.assertIn("phase draining", alert["detail"])
+        self.assertIn("ci unreadable", alert["detail"])
+        self.assertIn("train_stuck", exploitation.ALERT_TYPES)
+        self.assertIn("train_stuck", alert_briefs.BRIEFED_TYPES)
+        self.assertEqual(exploitation._train_paused(db, 1000.0 + 25 * 3600), [])
+
+    def test_every_non_terminal_phase_is_watched(self):
+        for phase in ("draining", "ci", "ci-intent", "publishing", "ready",
+                      "composing", "promoting"):
+            with self.subTest(phase=phase):
+                db = self.Db([self.row(phase)])
+                self.assertEqual(len(exploitation._train_stuck(db, 1000.0 + 25 * 3600)), 1)
+
+    def test_terminal_phases_and_young_trains_are_not_stuck(self):
+        for phase in ("landed", "empty", "paused", "invalidated"):
+            with self.subTest(phase=phase):
+                db = self.Db([self.row(phase)])
+                self.assertEqual(exploitation._train_stuck(db, 1000.0 + 48 * 3600), [])
+        db = self.Db([self.row("draining")])
+        self.assertEqual(exploitation._train_stuck(db, 1000.0 + 23 * 3600), [])
+
+    def test_unreadable_state_is_not_stuck(self):
+        db = types.SimpleNamespace(query=mock.Mock(side_effect=RuntimeError("db down")))
+        self.assertEqual(exploitation._train_stuck(db, 1000.0), [])
+
+    def test_one_mail_per_train_and_phase(self):
+        db = self.Db([self.row("draining")])
+        first = exploitation._train_stuck(db, 1000.0 + 25 * 3600)[0]
+        later = exploitation._train_stuck(db, 1000.0 + 50 * 3600)[0]
+        self.assertEqual(exploitation.alert_key(first), exploitation.alert_key(later))
+        other = exploitation._train_stuck(self.Db([self.row("ci")]), 1000.0 + 25 * 3600)[0]
+        self.assertNotEqual(exploitation.alert_key(first), exploitation.alert_key(other))
+
+    def test_the_project_orchestrator_is_briefed(self):
+        alert = exploitation._train_stuck(self.Db([self.row("draining")]),
+                                          1000.0 + 25 * 3600)[0]
+        listing = [{"name": "nx-orch", "team": "nexlink"},
+                   {"name": "amh-orch", "team": "ameesh"}]
+        # `alerts` pose les orchestrateurs déclarés (#7889, comme #7759)
+        alert["orchestrators"] = ["nx-orch", "amh-orch"]
+        briefs = alert_briefs.briefs(alert, listing)
+        self.assertIn("nx-orch", briefs)
+        self.assertNotIn("amh-orch", briefs)
+        self.assertIn("phase draining", briefs["nx-orch"])
+
+
 class TransientReportTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))

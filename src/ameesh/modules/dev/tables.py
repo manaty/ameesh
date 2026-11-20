@@ -13,7 +13,7 @@ les trouve dans ``<schéma_noyau>__dev`` sans second changement.
 """
 from __future__ import annotations
 
-#: Les 36 tables de l'inventaire #7616 (§3.2), par famille.
+#: Les 36 tables de #7616, plus la demande de requalification (0592).
 TABLES = (
     # CI
     "ci_runs", "ci_test_failures", "ci_runner_state", "ci_queue_state",
@@ -22,6 +22,7 @@ TABLES = (
     # Fusion, trains, paquets
     "merge_queue", "merge_locks", "integration_trains",
     "integration_train_fires", "integration_train_queue_receipts",
+    "integration_train_requalifications",
     "work_packet_members", "work_packet_snapshots", "work_landings",
     "work_resolutions",
     # Réservation de migration
@@ -75,6 +76,7 @@ KEPT = (
     "provenance_receipts.actor",
     "provenance_revocations.actor",
     "review_finding_resolutions.withdrawn_by",
+    "integration_train_requalifications.resolved_by",
 )
 
 #: Séquence explicite de `merge_queue` : elle reste dans le schéma noyau

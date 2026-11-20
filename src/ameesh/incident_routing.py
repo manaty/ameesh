@@ -23,8 +23,10 @@ those defects so the canon does not have to duplicate the schema.
 
 Availability, strongest first, each with its freshness window:
 
-* `attach` — a live lease `attach:<unix user>@<host>` held by one of the
-  member's `local_accounts` (the lease itself is the freshness bound);
+* `attach` — a live lease held for the member: locally
+  `attach:<user>@<host>` matching one of their `local_accounts`, or distantly
+  `attach:<tenant>:<device>` whose `device-es256` credential is theirs in the
+  attached agent's canon (the lease itself is the freshness bound);
 * `interaction` — a human interaction in ameesh's journal that is proven to
   come from one of the member's own devices (`user@host` proof or a declared
   `local_accounts` host; mail sent, decision answered, never a delivery or a

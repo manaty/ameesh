@@ -31,6 +31,17 @@ Le plafond est contrôlé à l'ENREGISTREMENT du grant (`receipts.
 register_standing`) : le grant est ensuite immuable, seule sa révocation ou
 la consommation de son plafond l'écrivent. La couverture d'une action (à la
 liaison et à chaque réservation) est décidée en SQL, sur le grant enregistré.
+
+Dimension « dépense » (#7865). Une règle peut porter un plafond de dépense
+d'organisation, par mois et par jour (`max_per_month`, `max_per_day`, en
+unités mineures de `currency`), et le périmètre fermé des fournisseurs et des
+objets autorisés (`providers`, `purposes`). Une règle de dépense doit nommer
+au moins un fournisseur et un objet : un grant signé ne peut pas dépenser
+hors de listes que l'organisation n'a pas écrites. Le bloc porte aussi
+`review_horizon_hours` : l'horizon de la prochaine revue humaine (le prochain
+relevé quotidien), compilé dans le canon, recopié dans le grant et utilisé
+par la projection mensuelle des ressources récurrentes. Il est obligatoire
+dès qu'une règle porte un plafond de dépense — jamais une constante cachée.
 """
 from __future__ import annotations
 
@@ -41,19 +52,26 @@ SCHEMA = "ameesh-standing-approvals/1"
 
 #: une durée maximale de 10 ans : au-delà, c'est une erreur de saisie
 MAX_DURATION_HOURS = 10 * 365 * 24
+#: horizon de revue : une semaine au plus (le relevé est quotidien)
+MAX_REVIEW_HORIZON_HOURS = 168
+#: périmètre de dépense : 64 fournisseurs / objets, comme les cibles
+MAX_SPEND_SCOPE = 64
 
 _NAME = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 _IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _APPROVER_RE = re.compile(r"^human:%s$" % _NAME)
 _OPERATION_RE = _IDENT_RE
+_SPEND_RE = _IDENT_RE
 _CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
 _RULE_KEYS = frozenset({"connector", "operations", "approvers", "max_duration_hours",
                         "max_amount", "currency", "allow_missing_beneficiary",
-                        "require_charter", "require_targets"})
+                        "require_charter", "require_targets",
+                        "max_per_month", "max_per_day", "providers", "purposes"})
 _REQUIRED = frozenset({"connector", "operations", "approvers", "max_duration_hours",
                        "max_amount"})
-_TOP_KEYS = frozenset({"schema", "rules"})
+_TOP_KEYS = frozenset({"schema", "rules", "review_horizon_hours"})
+_SPEND_KEYS = frozenset({"max_per_month", "max_per_day", "providers", "purposes"})
 
 
 class StandingPolicyError(ValueError):
@@ -73,6 +91,15 @@ class Rule:
     allow_missing_beneficiary: bool = False
     require_charter: bool = True
     require_targets: bool = False
+    # #7865 : plafonds de dépense d'organisation (0 = pas de dimension dépense)
+    max_per_month: int = 0
+    max_per_day: int = 0
+    providers: tuple[str, ...] = ()
+    purposes: tuple[str, ...] = ()
+
+    @property
+    def spend(self) -> bool:
+        return self.max_per_month > 0 or self.max_per_day > 0
 
     def matches(self, approver: str, connector: str, operation: str) -> bool:
         return (self.connector == connector and operation in self.operations
@@ -85,6 +112,9 @@ class Policy:
 
     rules: tuple[Rule, ...] = field(default_factory=tuple)
     schema: str = SCHEMA
+    #: #7865 : horizon de la prochaine revue humaine, en heures, compilé dans
+    #: le canon ; 0 = aucune règle de dépense (aucun horizon requis)
+    review_horizon_hours: int = 0
 
     def __bool__(self) -> bool:
         return bool(self.rules)
@@ -110,6 +140,12 @@ class Policy:
         le reçu doit tenir sous CHACUNE des règles qui la permettent : la plus
         stricte gagne. Le bénéficiaire absent n'est accepté que si toutes les
         règles applicables l'autorisent explicitement.
+
+        #7865 : si une règle applicable porte un plafond de dépense, le grant
+        DOIT porter `spend` et tenir sous le plafond d'organisation, avec des
+        fournisseurs et des objets inclus dans ceux de la règle. Une règle
+        sans dimension dépense interdit `spend` : le canon n'a pas autorisé
+        l'argent pour ce connecteur et cette opération.
         """
         connector = standing.get("connector")
         operations = standing.get("operations") or []
@@ -129,6 +165,7 @@ class Policy:
         targets = standing.get("targets") or []
         charter_line = standing.get("charter_line") or ""
         charter_version = standing.get("charter_version") or ""
+        spend = standing.get("spend")
         applicable: list[Rule] = []
         for operation in operations:
             rules = self.matches(approver, connector, operation)
@@ -164,6 +201,64 @@ class Policy:
                     and currency != rule.currency:
                 return ("standing approval currency %r: %s expected for %s %s"
                         % (currency, rule.currency, connector, ",".join(rule.operations)))
+            if rule.spend:
+                reason = self._check_spend(rule, standing, spend, amount=amount)
+                if reason:
+                    return reason
+            elif spend is not None:
+                return ("the canon allows no spend for %s %s: the rule of the canon "
+                        "carries no monthly or daily spend cap"
+                        % (connector, ",".join(rule.operations)))
+        return None
+
+    @staticmethod
+    def _check_spend(rule: Rule, standing: dict, spend, *, amount: int) -> str | None:
+        where = "%s %s" % (rule.connector, ",".join(rule.operations))
+        if spend is None:
+            return ("a standing approval for %s must carry its spend dimension "
+                    "(max_per_month, max_per_day, providers, purposes)" % where)
+        if not isinstance(spend, dict) or set(spend) != _SPEND_KEYS:
+            return ("standing approval spend: {max_per_month, max_per_day, "
+                    "providers, purposes} expected")
+        month = spend.get("max_per_month")
+        day = spend.get("max_per_day")
+        if not isinstance(month, int) or isinstance(month, bool) or month <= 0:
+            return "standing approval spend.max_per_month: integer > 0 expected"
+        if not isinstance(day, int) or isinstance(day, bool) or day < 0:
+            return "standing approval spend.max_per_day: integer >= 0 expected"
+        if day > month:
+            return ("standing approval spend: max_per_day %s > max_per_month %s"
+                    % (day, month))
+        if amount <= 0:
+            return ("a standing approval with a spend dimension needs a non-zero "
+                    "max_amount (the total cap)")
+        if month > amount:
+            return ("standing approval spend: max_per_month %s > max_amount %s"
+                    % (month, amount))
+        if month > rule.max_per_month:
+            return ("standing approval spend above the canon cap for %s: "
+                    "%s/month > %s/month" % (where, month, rule.max_per_month))
+        if rule.max_per_day and day > rule.max_per_day:
+            return ("standing approval spend above the canon cap for %s: "
+                    "%s/day > %s/day" % (where, day, rule.max_per_day))
+        providers = spend.get("providers")
+        purposes = spend.get("purposes")
+        for name, value in (("providers", providers), ("purposes", purposes)):
+            if (not isinstance(value, list) or not value
+                    or any(not isinstance(item, str) or not _SPEND_RE.fullmatch(item)
+                           for item in value)
+                    or len(set(value)) != len(value)
+                    or len(value) > MAX_SPEND_SCOPE):
+                return ("standing approval spend.%s: non-empty list of at most %d "
+                        "distinct identifiers expected" % (name, MAX_SPEND_SCOPE))
+        if rule.providers and not set(providers) <= set(rule.providers):
+            return ("standing approval spend.providers: %s outside the canon list %s"
+                    % (sorted(set(providers) - set(rule.providers)),
+                       list(rule.providers)))
+        if rule.purposes and not set(purposes) <= set(rule.purposes):
+            return ("standing approval spend.purposes: %s outside the canon list %s"
+                    % (sorted(set(purposes) - set(rule.purposes)),
+                       list(rule.purposes)))
         return None
 
     def describe(self) -> list[dict]:
@@ -174,7 +269,11 @@ class Policy:
                  "max_amount": rule.max_amount, "currency": rule.currency,
                  "allow_missing_beneficiary": rule.allow_missing_beneficiary,
                  "require_charter": rule.require_charter,
-                 "require_targets": rule.require_targets} for rule in self.rules]
+                 "require_targets": rule.require_targets,
+                 "max_per_month": rule.max_per_month,
+                 "max_per_day": rule.max_per_day,
+                 "providers": list(rule.providers),
+                 "purposes": list(rule.purposes)} for rule in self.rules]
 
 
 def _int(value, where: str, *, minimum: int = 0, maximum: int | None = None) -> int:
@@ -193,6 +292,25 @@ def _bool(value, where: str, default: bool) -> bool:
     return value
 
 
+def _spend_list(value, where: str) -> tuple[str, ...]:
+    """Liste fermée de fournisseurs ou d'objets (identifiants, sans doublon)."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value:
+        raise StandingPolicyError("%s: non-empty list expected" % where)
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _SPEND_RE.fullmatch(item):
+            raise StandingPolicyError("%s: identifiers expected, not %r" % (where, item))
+        if item in cleaned:
+            raise StandingPolicyError("%s: duplicate %r" % (where, item))
+        cleaned.append(item)
+    if len(cleaned) > MAX_SPEND_SCOPE:
+        raise StandingPolicyError("%s: at most %d entries expected"
+                                  % (where, MAX_SPEND_SCOPE))
+    return tuple(cleaned)
+
+
 def parse(data, *, where: str = "standing_approvals") -> Policy:
     """Lit et valide le bloc `standing_approvals` d'un canon (strict)."""
     if data is None:
@@ -208,6 +326,7 @@ def parse(data, *, where: str = "standing_approvals") -> Policy:
     if not isinstance(rules, list) or not rules:
         raise StandingPolicyError("%s.rules: non-empty list expected" % where)
     parsed: list[Rule] = []
+    spend_rules = 0
     for index, raw in enumerate(rules):
         at = "%s.rules[%d]" % (where, index)
         if not isinstance(raw, dict):
@@ -250,6 +369,32 @@ def parse(data, *, where: str = "standing_approvals") -> Policy:
                 raise StandingPolicyError("%s.currency: no currency without an amount" % at)
         elif amount > 0:
             raise StandingPolicyError("%s.currency: required with a non-zero amount" % at)
+        # #7865 : dimension dépense — plafonds d'organisation et périmètre fermé
+        month = _int(raw.get("max_per_month", 0), "%s.max_per_month" % at)
+        day = _int(raw.get("max_per_day", 0), "%s.max_per_day" % at)
+        providers = _spend_list(raw.get("providers"), "%s.providers" % at)
+        purposes = _spend_list(raw.get("purposes"), "%s.purposes" % at)
+        spend = month > 0 or day > 0
+        if spend:
+            spend_rules += 1
+            if day > month:
+                raise StandingPolicyError("%s.max_per_day: at most max_per_month (%d) "
+                                          "expected" % (at, month))
+            if amount == 0:
+                raise StandingPolicyError("%s.max_per_month: a spend rule needs a "
+                                          "non-zero max_amount (total cap)" % at)
+            if currency is None:
+                raise StandingPolicyError("%s.max_per_month: a spend rule needs a "
+                                          "currency" % at)
+            if not providers:
+                raise StandingPolicyError("%s.providers: a spend rule names its "
+                                          "authorized providers" % at)
+            if not purposes:
+                raise StandingPolicyError("%s.purposes: a spend rule names its "
+                                          "authorized purposes" % at)
+        elif providers or purposes:
+            raise StandingPolicyError("%s.providers/purposes: a scope without a "
+                                      "spend cap is refused" % at)
         parsed.append(Rule(
             connector=connector, operations=tuple(cleaned), approvers=tuple(approvers),
             max_duration=duration * 3600, max_amount=amount, currency=currency,
@@ -258,8 +403,21 @@ def parse(data, *, where: str = "standing_approvals") -> Policy:
             require_charter=_bool(raw.get("require_charter"),
                                   "%s.require_charter" % at, True),
             require_targets=_bool(raw.get("require_targets"),
-                                  "%s.require_targets" % at, False)))
-    return Policy(rules=tuple(parsed))
+                                  "%s.require_targets" % at, False),
+            max_per_month=month, max_per_day=day, providers=providers,
+            purposes=purposes))
+    horizon = data.get("review_horizon_hours")
+    if spend_rules:
+        if horizon is None:
+            raise StandingPolicyError(
+                "%s.review_horizon_hours: required with a spend rule (the horizon of "
+                "the next human review is compiled in the canon, not a hidden constant)"
+                % where)
+    elif horizon is not None:
+        raise StandingPolicyError("%s.review_horizon_hours: no spend rule uses it" % where)
+    horizon = _int(horizon, "%s.review_horizon_hours" % where, minimum=1,
+                   maximum=MAX_REVIEW_HORIZON_HOURS) if horizon is not None else 0
+    return Policy(rules=tuple(parsed), review_horizon_hours=horizon)
 
 
 def from_federation(federation) -> Policy:

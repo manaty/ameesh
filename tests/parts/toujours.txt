@@ -67,3 +67,5 @@ test_migrations  # migrations: application, idempotence, immuabilité (contrat, 
 test_migrations_additives  # #6147: contrat additif du staging (§11 bis) : une migration non additive est refusée
 
 test_7726_prod_go  # #7726: signed production authority and supersession locks
+
+test_7651_dev_schema_cutover  # P2 : tables/vues/ACL, garde login limité et rollback avec données (#7651)

@@ -4049,7 +4049,7 @@ def earlier_red(worktree: Path, composition: Composition,
                 deadline: float | None = None) -> dict[int, int]:
     """#6232 : les retraits dont le rouge vient d'une unité antérieure retirée.
 
-    Pour chaque retrait hors préfixes (repli, preuve #3801), dans l'ordre de
+    Pour chaque retrait, quelle que soit sa preuve, dans l'ordre de
     l'empilement, les tests rouges de l'unité sont rejoués sur le préfixe qui
     s'arrête à la dernière unité antérieure retirée. S'ils y sont **tous**
     rouges, le rouge précède l'unité : elle est innocente, ni retirée ni
@@ -4071,7 +4071,7 @@ def earlier_red(worktree: Path, composition: Composition,
         for removal in ordered:
             earlier = kept[-1] if kept else None
             names = [name for name in removal.tests if name]
-            if earlier is None or removal.proof == "prefixes" or not names \
+            if earlier is None or not names \
                     or len(names) != len(removal.tests):
                 kept.append(removal)
                 continue
@@ -4672,10 +4672,15 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             # elle est bornée par `--tests-timeout`, et par le temps restant
             # de la borne totale en temps mural. Une série non partie ou
             # coupée reste non concluante, nommée.
+            # #7888 : ce temps mural s'arrête avant la réserve #4887. Sans
+            # elle, les séries couraient jusqu'à la borne, le rejeu #3801 d'un
+            # contrat rouge (h-20261119-12 : test_cluster, #7865) n'avait plus
+            # une seconde, restait non concluant (#7692) et le rouge connu
+            # partait en CI.
             limit = timeout
             walled = {}
             if deadline is not None:
-                remaining = max(0, int(deadline - time.monotonic()))
+                remaining = max(0, int(deadline - time.monotonic()) - reserve)
                 if remaining <= 0:
                     log("tests %s : borne totale atteinte, série non jouée "
                         "(non concluant)" % label)

@@ -856,7 +856,7 @@ class Mailbox(interface.Mailbox):
         )
         return int(rows[0]["id"]) if rows else None
 
-    def review_requests(self, recipient, lot) -> list[dict]:
+    def review_requests(self, recipient, lot, *, for_update=False) -> list[dict]:
         """#2504 : les `request` du lot, filtrés avant toute borne.
 
         `history` lit les N derniers messages PUIS l'appelant filtre : sous un
@@ -868,6 +868,9 @@ class Mailbox(interface.Mailbox):
         #2563 : le lot est comparé à `work_item_id` sans fonction, pour rester
         sur l'index partiel 0413. Tous les écrivains de `request` posent
         `str(int(lot))` : l'égalité simple est exacte."""
+        if for_update:
+            # #7891: same lock order as reserve/deliver and mail.send.
+            self.lock_recipient(recipient)
         return self.db.query(
             """
             SELECT %s
@@ -875,8 +878,9 @@ class Mailbox(interface.Mailbox):
             WHERE recipient = %%s
               AND kind = 'request'
               AND work_item_id = %%s
-            ORDER BY id DESC
-            """ % MAIL_COLUMNS,
+            ORDER BY id %s%s
+            """ % (MAIL_COLUMNS, "ASC" if for_update else "DESC",
+                   " FOR UPDATE" if for_update else ""),
             (recipient, str(lot)),
         )
 

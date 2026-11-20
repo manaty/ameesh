@@ -5,8 +5,11 @@ Only active holds count (#3297). An explicit dependency is satisfied by the
 merge and says nothing about staging, so it is not a deployment wait. A hold
 is prose: a `#N` or `migration N` is read only in a clause that names a
 deployment wait — a conflict, a PR, a package, a freeze or a review is not
-one. Evidence is dated: the last attestation of each host, not a tag, a
-package version number or the lot's branch head.
+one. #7893: a delivered but not closed lot carries no active hold; its
+delivery note — the notes written in the delivery stage of the journal — is
+read with the same clause rules, so a verification that waits for a merged
+fix still counts before staging. Evidence is dated: the last attestation of
+each host, not a tag, a package version number or the lot's branch head.
 """
 from __future__ import annotations
 
@@ -23,6 +26,9 @@ from . import planned_waits, storage
 
 SCHEMA = "ameesh-staging-pending/1"
 _SHA = re.compile(r"^[0-9a-f]{7,40}$")
+#: #7893: only a full commit id is compared with the local object set; a short
+#: id is resolved by git, which knows prefixes and ambiguity.
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _LOT = re.compile(r"(?<![\w/])#([1-9][0-9]*)\b")
 _MIGRATION = re.compile(r"\bmigration\s+0*([1-9][0-9]*)\b", re.I)
 
@@ -192,6 +198,46 @@ def _merged(milestones):
                default=None)
 
 
+def _local_commits(repo) -> set[str] | None:
+    """#7893: full SHAs of the commit objects present in the release clone.
+
+    A merged head absent from the clone is unknown evidence (#3297), but
+    asking git for one on the partial clone of the release makes it attempt a
+    lazy fetch for that head, about ten seconds apiece on the real
+    repository. The delivery notes multiply the heads (#7893), so one
+    enumeration of the local objects answers every presence check. `None`
+    when the enumeration itself is unreadable: the caller then keeps the
+    per-reference resolution of `commit_of`.
+    """
+    from . import release_cutoff as rc
+    try:
+        proc = rc._git(repo, "cat-file", "--batch-all-objects",
+                       "--batch-check=%(objectname) %(objecttype)")
+    except rc.ReleaseError:
+        return None
+    if proc.returncode:
+        return None
+    out = set()
+    for line in (proc.stdout or "").splitlines():
+        name, _, kind = line.partition(" ")
+        if kind.strip() == "commit":
+            out.add(name)
+    return out
+
+
+def _ancestors(repo, sha) -> set[str]:
+    """#7893: commits reachable from `sha`, in one git process.
+
+    `merge-base --is-ancestor` spawns one process per (merged head, host) and
+    the delivery notes multiply the heads; one `rev-list` per host commit
+    gives the same answer for every pair."""
+    from . import release_cutoff as rc
+    proc = rc._git(repo, "rev-list", sha)
+    if proc.returncode:
+        raise rc.TransientReleaseError("unreadable staging ancestry")
+    return set((proc.stdout or "").split())
+
+
 def waiting(db, project, *, active=None) -> dict:
     """Read-only, shared by the staging alert and the auditor's throughput view."""
     from . import release_cutoff as rc, work
@@ -206,6 +252,9 @@ def waiting(db, project, *, active=None) -> dict:
                       lifecycle.VALIDATED,
                       lifecycle.BLOCKED,
                   )]
+    # #7893: a delivered but not closed lot is not held any more; its
+    # delivery note can still name the deployment wait of its verification.
+    delivered = [r for r in all_rows if r.get("state") in lifecycle.DELIVERED]
     ids = [int(r["id"]) for r in candidates]
     holds = planned_waits.active_holds(
         db, st.progress.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS))
@@ -229,6 +278,16 @@ def waiting(db, project, *, active=None) -> dict:
             refs.setdefault(ident, set()).update(lots)
             for number in numbers:
                 refs[ident].update(migrations.get(number, ()))
+    # #7893: the delivery note is read with the same #3297 clause filter, so a
+    # PR, a conflict, a package or a review reference still names no wait.
+    for event in st.progress.lot_delivery_notes([int(r["id"]) for r in delivered]):
+        lots, numbers = _deployment_refs(event.get("note"))
+        if not lots and not numbers:
+            continue
+        ident = int(event["work_item_id"])
+        refs.setdefault(ident, set()).update(lots)
+        for number in numbers:
+            refs[ident].update(migrations.get(number, ()))
     active = active_hosts(db) if active is None else active
     # #3848 : un poste reporte absent ne retient ni staging ni lots. Seuls les
     # hotes reellement actifs sont compares.
@@ -237,18 +296,33 @@ def waiting(db, project, *, active=None) -> dict:
     needed, unknown = [], []
     milestones: dict[int, dict | None] = {}
     commits: dict[str, str | None] = {}
+    # #7893: the delivery notes multiply the merged heads; one local-object
+    # enumeration avoids a lazy fetch per absent head, and one `rev-list` per
+    # host commit avoids a `merge-base` process per pair.
+    local = _local_commits(project.repo)
+    ancestors: dict[str, set[str]] = {}
 
     def commit(ref):
         # #3297: a merged head absent from this clone (squashed or unfetched
         # branch) is unknown evidence, not an unreadable report on every tick.
         if ref not in commits:
-            try:
-                commits[ref] = rc.commit_of(project.repo, ref)
-            except rc.TransientReleaseError:
-                raise
-            except rc.ReleaseError:
+            text = str(ref or "").strip()
+            if (local is not None and _FULL_SHA.fullmatch(text.lower())
+                    and text.lower() not in local):
                 commits[ref] = None
+            else:
+                try:
+                    commits[ref] = rc.commit_of(project.repo, ref)
+                except rc.TransientReleaseError:
+                    raise
+                except rc.ReleaseError:
+                    commits[ref] = None
         return commits[ref]
+
+    def is_ancestor(ancestor, current):
+        if current not in ancestors:
+            ancestors[current] = _ancestors(project.repo, current)
+        return ancestor in ancestors[current]
 
     for ident, blockers in sorted(refs.items()):
         for blocker in sorted(blockers):
@@ -273,10 +347,7 @@ def waiting(db, project, *, active=None) -> dict:
                                     "host": host, "active": evidence["sha"],
                                     "reason": "active commit absent from the release clone"})
                     continue
-                check = rc._git(project.repo, "merge-base", "--is-ancestor", sha, current)
-                if check.returncode not in (0, 1):
-                    raise rc.TransientReleaseError("unreadable staging ancestry")
-                if check.returncode:
+                if not is_ancestor(sha, current):
                     missing_hosts.append(host)
             if not actifs_reels:
                 unknown.append({"lot": ident, "blocker": blocker, "sha": sha,
@@ -368,7 +439,15 @@ def apply(cfg, db, project, *, now: float, actor=None) -> dict:
                            if r["lot"] in report["candidate_unblocks"]})
         report["staging"] = rc._staging_step(project, report["candidate"],
                                              included, cfg.state_dir, db=db)
-        report["result"] = "staged" if report["staging"].get("exit") == 0 else "failed"
+        # #7904: the elected executor hands a normal request to its queue
+        # (exit 75, then None in `_staging_step`). That is not a failure: the
+        # report names the request and the next tick reconciles its
+        # attestation. A real non-zero staging exit stays "failed".
+        if report["staging"].get("queued"):
+            report["result"] = "queued"
+        else:
+            report["result"] = ("staged"
+                                if report["staging"].get("exit") == 0 else "failed")
         return report
     finally:
         storage.of(db).work.land_unlock(key, owner, epoch)

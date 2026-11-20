@@ -119,6 +119,24 @@ class Progress(interface.Progress):
             " ORDER BY id",
             (float(since_ts), PACKET_COMPOSITION_NOTE + "%" + VEHICLE_EXIT_MARK + "%"))
 
+    def lot_delivery_notes(self, item_ids) -> list[dict]:
+        # #7893 : seules les notes de l'étape de livraison sortent (état du
+        # journal `merged`, `promoted` ou `delivered`) ; le texte des notes
+        # ordinaires des étapes antérieures n'est ni lu ni transféré.
+        states = ", ".join("'%s'" % state for state in lifecycle.DELIVERED)
+        rows: list[dict] = []
+        for page in _id_pages(item_ids):
+            rows += self.db.query(
+                "SELECT id, work_item_id, state, note, actor,"
+                "       extract(epoch from created_at)::float8 AS created_ts"
+                "  FROM work_item_events"
+                " WHERE work_item_id = ANY(%%s::bigint[])"
+                "   AND state IN (%s)"
+                "   AND note IS NOT NULL AND btrim(note, %%s) <> ''"
+                " ORDER BY id" % states,
+                (page, interface.HOLD_NOTE_WHITESPACE))
+        return sorted(rows, key=lambda row: int(row["id"]))
+
     def lot_hold_events(self, item_ids, patterns) -> list[dict]:
         wanted = [str(pattern) for pattern in patterns]
         if any(not pattern for pattern in wanted):

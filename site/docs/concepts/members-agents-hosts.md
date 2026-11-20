@@ -111,6 +111,23 @@ policy:
     dirs: {ouvrier: /srv/example-org/ouvrier}            # per agent, wins over the above (v1.3.1)
 ```
 
+A host may also declare the **capabilities** it promises to the agents that run
+there, next to `tags`:
+
+```yaml
+capabilities: [android-emulator]   # optional: needs the kvm group and /dev/kvm
+```
+
+The only capability known today is `android-emulator`, which names the `kvm`
+Unix group. The host provisioning (`deploy/guest/install.sh`) grants that group
+only when the card declares it, idempotently and without widening `/dev/kvm`
+(no `chmod`, ACL or udev rule); without the card, nothing is applied.
+`ameesh doctor` compares the declaration with the host: a declared capability
+that is not applied is a KO, while a group granted without a declaration is a
+warning. `ameesh placement check --capability android-emulator` keeps only the
+hosts that declare it, and `ameesh agent observe` exposes the declaration in its
+`host` block.
+
 The host's responsible human sets the rules of their machine, for example "only
 DeepSeek and Codex agents, billed by API key". The host also decides **where**
 agents work: the working directory is `policy.workspaces.dirs[<agent>]`, else

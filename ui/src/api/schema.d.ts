@@ -726,6 +726,13 @@ export interface components {
                 /** @enum {string|null} */
                 state: "ok" | "invalid" | "unreadable" | null;
             } | null;
+            host: {
+                available: boolean;
+                capabilities: string[];
+                name: string;
+                /** @enum {string|null} */
+                reason: "canon_unreadable" | "host_not_in_canon" | null;
+            } | null;
             lease: {
                 epoch: number | null;
                 expires_ts: number | null;
@@ -1017,7 +1024,7 @@ export interface components {
             project: string | null;
             ts: number;
             /** @enum {unknown} */
-            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "agent.attach" | "agent.tools" | "agent.read" | "host.memory_unavailable" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "git.lock_removed" | "mail.export" | "packet.pause" | "auditor.pass" | "packet.client_types";
+            type: "lot.updated" | "turn.started" | "turn.ended" | "turn.stages" | "turn.context" | "agent.updated" | "agent.moved" | "agent.attach" | "agent.tools" | "agent.read" | "host.memory_unavailable" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested" | "staging.sequence" | "staging.request" | "git.lock_removed" | "mail.export" | "packet.pause" | "auditor.pass" | "auditor.report" | "auditor.report_skipped" | "packet.client_types";
         };
         "ameesh-host-1": {
             history: Record<string, never>[];

@@ -66,7 +66,8 @@ REWRITTEN = (
     "sandbox_turns.agent", "session_bindings.agent",
     "tranche_reservations.agent", "tranche_reservations.closed_by", "tranche_events.actor",
     "tranche_limits.admitted_by",
-    "session_bindings.created_by", "spend_pending.agent", "spend_marker_events.agent",
+    "session_bindings.created_by", "spend_ledger.decided_by", "spend_marker_events.agent",
+    "spend_pending.agent",
     "standing_reservations.reserved_by",
     "turn_costs.agent", "turn_resources.agent", "visibility_checks.persona",
     "work_item_delegations.delegate", "work_item_delegations.delegated_by",
@@ -111,10 +112,6 @@ KEPT = (
     # #7106 (0575): who registered a tenant of a shared host, dated evidence
     # like `executors.enrolled_by`; a rename does not rewrite it.
     "host_tenants.registered_by",
-    # #7751 (0592): the holder host that applied or refused a persisted
-    # requalification request (`cfg.host`, never an agent spelling); dated
-    # resolution evidence, like `host_tenants.registered_by`.
-    "integration_train_requalifications.resolved_by",
     # #7697 (0601): the pod request's actor columns are operational
     # attribution, never an identity link. `requested_by` is hashed into the
     # request fingerprint (`pod_children.fingerprint`) together with its
@@ -146,12 +143,23 @@ KEPT = (
     # preuve historique ; sa colonne vit avec le module `dev` (P1b #7650).
     "schema_migrations.name",
     "schema_non_additive_migrations.name",
+    # #7865 (0596) : le ledger de dépense garde les acteurs d'approbation, de
+    # confirmation et d'arrêt comme preuves datées, comme les actions et
+    # `standing_approvals` ; seul `decided_by`, lu par le relevé de l'agent
+    # (`spend.recap`), suit le renommage.
+    "spend_ledger.approver", "spend_ledger.confirmed_by",
+    "spend_ledger.stop_requested_by", "spend_ledger.stopped_by",
+    "spend_review_confirmations.confirmed_by",
     "spend_marker_events.actor",  # Human resolution / runner audit evidence.
     "sandbox_turns.owner",  # Runner lease owner, never an agent identity.
     "standing_approvals.approver", "standing_approvals.registered_by",
     "standing_approvals.revoked_by", "turn_cost_corrections.actor",
     "work_module_milestones.actor",
 ) + dev_tables.KEPT
+
+#: Colonnes dont la valeur est préfixée par le type d'acteur ; seul `agent:`
+#: suit le renommage, `human:` reste une preuve intacte (#7865).
+PREFIXED = {"spend_ledger.decided_by": "agent:"}
 
 
 class RenameError(ValueError):
@@ -170,8 +178,9 @@ def _uses(tx, column: str, name: str) -> int:
         # P1b #7650 : le nom physique d'une table `dev` est lu au registre.
         return storage.of(tx).agent_columns.uses(table, col, is_array, name)
     predicate = "%s = ANY(%s)" if is_array else "%s = %s"
+    value = PREFIXED.get(column, "") + name
     rows = tx.query("SELECT count(*) AS n FROM %s WHERE %s" % (
-        table, predicate % ("%s", col)), (name,))
+        table, predicate % ("%s", col)), (value,))
     return int(rows[0]["n"])
 
 
@@ -180,6 +189,11 @@ def _rewrite(tx, column: str, old: str, new: str) -> int:
     if table in dev_tables.TABLES:
         # P1b #7650 : la table n'est pas dans le schéma noyau après P2.
         return storage.of(tx).agent_columns.rewrite(table, col, is_array, old, new)
+    if column in PREFIXED:
+        rows = tx.query(
+            "SELECT ameesh_rename_spend_agent_column(%s, %s, %s, %s) AS n",
+            (table, col, old, new))
+        return int(rows[0]["n"])
     # Counted in SQL (0516): the psql driver's execute() reports no row count.
     rows = tx.query("SELECT ameesh_rename_agent_column(%s, %s, %s, %s, %s) AS n",
                     (table, col, is_array, old, new))

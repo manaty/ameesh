@@ -2653,7 +2653,11 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       tant qu'aucun lot démarrable daté ne borne la reprise (#7249). La ligne
       du projet porte alors `idle_agent_hours_excluded` avec la raison, et le
       mesh `idle_agents_excluded` : une mesure absente n'est jamais rendue
-      comme un 0,0 mesuré (le texte affiche « exclu »).
+      comme un 0,0 mesuré (le texte affiche « exclu »). Sur une telle route,
+      des lots retenus par la garde d'empreinte sont du travail qui attend :
+      les heures de repos depuis la création du plus ancien (dans la
+      fenêtre) se lisent à part, `idle_agent_hours_footprint`, par projet et
+      au mesh (#7890).
     * `startable` : les lots démarrables (`split_startable`) ; `footprint` :
       `{lot: [bloqueurs]}` des lots d'intake retenus par la garde d'empreinte
       (#3185, #4561) — ils ne sont jamais démarrables, ils attendent la fusion
@@ -2786,6 +2790,22 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         since = max(start, float(at))
         available_since[project] = min(available_since.get(project, now), since)
 
+    # #7890 : une route épuisée sans lot démarrable rend ses heures exclues,
+    # mais un lot retenu par la garde d'empreinte est du travail réel qui
+    # attend : les heures de repos depuis sa création (dans la fenêtre) se
+    # lisent sur un champ à part, `idle_agent_hours_footprint`, sans rouvrir
+    # `idle_agent_hours`. Sans date connue, aucune heure n'est inventée.
+    footprint_since: dict[str, float] = {}
+    for project, held_lots in footprint_by.items():
+        if project not in exhausted or project in available_since:
+            continue
+        for held_lot in held_lots:
+            at = _epoch((lots_by_id.get(held_lot["lot"]) or {}).get("created_ts"))
+            if at is None:
+                continue
+            since = max(start, float(at))
+            footprint_since[project] = min(footprint_since.get(project, now), since)
+
     def hours_exclusion(project: str | None) -> str | None:
         """Pourquoi les heures de ce projet ne sont pas imputées (#7849).
 
@@ -2822,10 +2842,14 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
             available_since.get(primary.get(name), now)
             if primary.get(name) in exhausted else start, now, min_gap)
             for name in idle)
+        held_seconds = sum(_idle_gaps(
+            spans.get(name, []), footprint_since[primary.get(name)], now, min_gap)
+            for name in idle if primary.get(name) in footprint_since)
         share = (len(idle) / len(names)) if names else 0.0
         row = {"wakeable": len(names), "idle": len(idle), "idle_agents": idle,
                "idle_share": round(share, 4),
                "idle_agent_hours": round(seconds / 3600.0, 2),
+               "idle_agent_hours_footprint": round(held_seconds / 3600.0, 2),
                "roadmap_exhausted": exhausted.get(project) if project else None}
         excluded = hours_exclusion(project)
         if excluded:
@@ -3704,6 +3728,10 @@ def _capacity_text(cap: Mapping[str, Any] | None) -> list[str]:
     else:
         hours_text = "%.1f heure(s)-agent au repos" % float(
             mesh.get("idle_agent_hours") or 0)
+    held_hours = float(mesh.get("idle_agent_hours_footprint") or 0)
+    if held_hours:
+        # #7890 : route épuisée, mais des lots attendent leur empreinte.
+        hours_text += ", %.1f heure(s)-agent au repos retenues par empreinte" % held_hours
     lines = ["", "Capacité (%s) — %d/%d agent(s) réveillable(s) au repos (%s), "
              "%s, %d lot(s) démarrable(s), "
              "%d en attente d'empreinte"
@@ -3726,6 +3754,9 @@ def _capacity_text(cap: Mapping[str, Any] | None) -> list[str]:
                     len(row.get("startable_lots") or ()))]
         if row.get("footprint_lots"):
             parts.append("%d en attente d'empreinte" % len(row["footprint_lots"]))
+        if row.get("idle_agent_hours_footprint"):
+            parts.append("%.1f h-agent retenues par empreinte"
+                         % float(row["idle_agent_hours_footprint"]))
         if decoupage:
             text = "découpage #%d (%s" % (decoupage["lot"],
                                           _duration(decoupage.get("age_s")))

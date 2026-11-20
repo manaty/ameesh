@@ -901,9 +901,13 @@ def _importers(prepared: Prepared, head: str, changes, tree_modules: set[str],
     for dotted in targets[:FALLBACK_IMPORTED_FILES]:
         parent, _, leaf = dotted.rpartition(".")
         here = re.escape(dotted)
-        patterns = [r"^\s*(import|from)\s+%s(\s|\.|,|$)" % here]
+        # ERE POSIX seule : `\s` et `\b` sont des extensions GNU que la regex
+        # BSD de `git grep -E` sous macOS ne voit pas (#7930)
+        patterns = [r"^[[:space:]]*(import|from)[[:space:]]+%s([[:space:]]|\.|,|$)"
+                    % here]
         if parent:
-            patterns.append(r"^\s*from\s+%s\s+import\s.*\b%s\b"
+            patterns.append(r"^[[:space:]]*from[[:space:]]+%s[[:space:]]+import"
+                            r"[[:space:]](.*[^[:alnum:]_])?%s([^[:alnum:]_]|$)"
                             % (re.escape(parent), re.escape(leaf)))
         argv = ["git", "-C", prepared.repo, *prevalidation.NO_REPLACE,
                 "grep", "-l", "-E"]

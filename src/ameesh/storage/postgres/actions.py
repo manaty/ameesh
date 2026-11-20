@@ -26,7 +26,8 @@ from .. import interface
 ACTION_COLUMNS = """
     action_id, project, work_item, proposed_by, connector, operation, target, args,
     class, amount, currency, policy_version, digest, dedupe, requires_receipt, approvers,
-    canon, state, replaces, replaced_by, replace_approver, attempts, auth_kind, auth_approver,
+    canon, recurrence, spend_provider, spend_purpose,
+    state, replaces, replaced_by, replace_approver, attempts, auth_kind, auth_approver,
     auth_nonce, auth_challenge, auth_authenticator_id, auth_grant_id, auth_by,
     external_ref, last_error, last_actor, last_note,
     extract(epoch from auth_expires_at)::float8 AS auth_expires_ts,
@@ -120,7 +121,12 @@ class Actions(interface.Actions):
         fait au lancement, atomiquement, et y recontrôle tout sous verrou.
         L44 (0031) : seuls les grants dont l'authentificateur est déclaré par
         `canon` (celui de l'action) la couvrent. #7629 : le bénéficiaire
-        (`proposed_by`) et la cible sont filtrés ici aussi."""
+        (`proposed_by`) et la cible sont filtrés ici aussi. #7865 : un grant
+        de dépense exige une action de dépense dont le fournisseur et l'objet
+        sont dans son périmètre (le plafond est recontrôlé à la réservation) ;
+        réciproquement, un grant sans dimension dépense n'est jamais proposé
+        pour une action de dépense (la réservation la refuserait `no_cover`,
+        et un grant legacy vivant ne doit pas masquer le grant de dépense)."""
         return self.db.query(
             """
             SELECT s.id, s.approver,
@@ -135,13 +141,26 @@ class Actions(interface.Actions):
                AND ameesh_standing_beneficiary_ok(s.beneficiary_kind, s.beneficiary,
                                                   %s::text)
                AND ameesh_standing_target_ok(s.targets, %s::text)
+               AND (CASE WHEN s.max_per_month = 0 AND s.max_per_day = 0
+                         THEN NOT EXISTS (SELECT 1 FROM actions a
+                                           WHERE a.action_id = %s
+                                             AND (a.spend_provider <> ''
+                                                  OR a.spend_purpose <> ''
+                                                  OR a.recurrence = 'daily'))
+                         ELSE EXISTS (SELECT 1 FROM actions a
+                                       WHERE a.action_id = %s
+                                         AND a.recurrence IN ('once', 'daily')
+                                         AND a.spend_provider <> '' AND a.spend_purpose <> ''
+                                         AND s.spend_providers @> jsonb_build_array(a.spend_provider)
+                                         AND s.spend_purposes @> jsonb_build_array(a.spend_purpose))
+                    END)
                AND EXISTS (SELECT 1 FROM authenticators a
                             WHERE a.id = s.authenticator_id AND a.revoked_at IS NULL
                               AND a.canon = %s)
              ORDER BY s.valid_until, s.id
             """,
             (action_id, amount, connector, operation, action_class, amount, currency,
-             proposed_by, target, canon),
+             proposed_by, target, action_id, action_id, canon),
         )
 
     def recap(self, proposed_by, since_ts, until_ts, project=None) -> list[dict]:
@@ -149,6 +168,7 @@ class Actions(interface.Actions):
         sql = """
             SELECT a.action_id, a.state, a.auth_kind, a.auth_grant_id, a.policy_version,
                    a.connector, a.operation, a.target, a.amount, a.currency,
+                   a.recurrence, a.spend_provider, a.spend_purpose,
                    a.requires_receipt,
                    extract(epoch from a.created_at)::float8  AS created_ts,
                    extract(epoch from a.finished_at)::float8 AS finished_ts,
@@ -182,19 +202,27 @@ class Actions(interface.Actions):
     def propose(self, *, action_id, project, work_item, proposed_by, connector, operation,
                 target, args_json, action_class, amount, currency, policy_version, digest,
                 dedupe, requires_receipt, approvers_json, note) -> None:
+        # #7865 : les colonnes de dépense sont des copies de `args.spend`, le
+        # JSON signé déjà canonisé ; le SQL les dérive lui-même, sans second
+        # paramètre que l'appelant pourrait désaccorder de l'empreinte.
         self.db.query(
             """
             INSERT INTO actions
                 (action_id, project, work_item, proposed_by, connector, operation, target, args,
                  class, amount, currency, policy_version, digest, dedupe, requires_receipt,
-                 approvers, last_actor, last_note)
+                 approvers, recurrence, spend_provider, spend_purpose, last_actor, last_note)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s,
-                    %s::jsonb, %s, %s)
+                    %s::jsonb,
+                    coalesce(%s::jsonb #>> '{spend,recurrence}', 'once'),
+                    coalesce(%s::jsonb #>> '{spend,provider}', ''),
+                    coalesce(%s::jsonb #>> '{spend,purpose}', ''),
+                    %s, %s)
             RETURNING action_id
             """,
             (action_id, project, work_item, proposed_by, connector, operation, target,
              args_json, action_class, amount, currency, policy_version, digest,
-             dedupe, requires_receipt, approvers_json, proposed_by, note),
+             dedupe, requires_receipt, approvers_json, args_json, args_json, args_json,
+             proposed_by, note),
         )
 
     def bind(self, action_id, *, from_states, digest, auth, by, policy_version=None,

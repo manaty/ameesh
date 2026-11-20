@@ -44,7 +44,16 @@ class ConversationMoves(abc.ABC):
         The source (host, cwd, lease owner, session) is copied from the locked
         registry row. Returns the row with `created` (false on replay or when
         another attempt is already open); None if the agent is unknown, not
-        `execute`, or already on `target_host`."""
+        `execute`, or already on `target_host`.
+
+        #7833: a `preference` plan is refused while the current placement
+        came from a `failover` (runner stopped): B2 must not undo the failover
+        by presence. A human `manual` move writes a newer attempt and clears
+        the hold; a later `failover` (the current host stopped too) is allowed.
+        #7900: the hold only lasts while that host is alive — a live lease or a
+        fresh standing. A dead host (expired lease, row not `stopped`, or
+        silent) releases the avatar to the healthy preferred host or another
+        eligible candidate."""
 
     @abc.abstractmethod
     def get(self, move_id: str) -> dict | None:
@@ -77,12 +86,14 @@ class ConversationMoves(abc.ABC):
         whose target has not claimed yet (no live lease).
 
         States `switched`, `recovered` and `rehydrating`; reasons `preference`
-        (B2 return) and `manual` (B4 operator move). Carries `source_host`,
-        `target_host` and `reason` (#7680: the failure label names a manual
-        move as such), plus `switched_ts` and `now_ts` on the database clock,
-        so the caller computes the holdoff. This is how a candidate tells "the
-        conversation was handed to that host, let it claim" from "the row is
-        simply free"."""
+        (B2 return) and `manual` (B4 operator move). A `failover` attempt
+        (#7833) is excluded: its source is stopped and must not reclaim the
+        avatar by presence; only a human `manual` move clears the hold.
+        Carries `source_host`, `target_host` and `reason` (#7680: the failure
+        label names a manual move as such), plus `switched_ts` and `now_ts` on
+        the database clock, so the caller computes the holdoff. This is how a
+        candidate tells "the conversation was handed to that host, let it
+        claim" from "the row is simply free"."""
 
     @abc.abstractmethod
     def manual(self, move_id: str, agent: str, target_host: str,
