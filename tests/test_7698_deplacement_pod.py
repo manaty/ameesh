@@ -8,7 +8,9 @@ Design `docs/design/7633-hote-avatars-pod.md` §9 :
   et, pour un hôte enfant, le UID Kubernetes de `pod_hosts` ;
 * `agent move` vers un pod refuse un hôte enfant (`pod_hosts`), un template,
   une carte/solation inconnue, un passwd ou un UID hors du plan, et attend la
-  présence et le profil de compte (gardes de #7108) ;
+  présence et le profil de compte (gardes de #7108), y compris pour un agent
+  `releve: hote` (sans conversation) : ces gardes sont rejouées sous le verrou
+  (B #44740) ;
 * pod partagé ↔ pod dédié : même UID de personne = PVC ré-attachable
   (`pvc: reattach`) ; UID différent = re-login sur un PVC neuf (`pvc:
   relogin`) ; poste → pod : aucun volume de pod à déplacer (`pvc: none`) ;
@@ -39,6 +41,7 @@ from .test_7694_pod_socle import pod_card
 
 ALICE, BRUNO = "human:alice", "human:bruno"
 AVATAR = "alice-avatar"
+HOTE = "alice-hote"
 POSTE = "poste"
 POD_PARTAGE = "pod-partage"
 POD_DEDIE = "pod-dedie"
@@ -98,12 +101,12 @@ class _PodMoveCase(test_canon._CanonDbCase):
             " status = 'idle', status_text = '' WHERE name = %s", (AVATAR,))
         return self.row(AVATAR)
 
-    def _standing(self, host: str) -> None:
+    def _standing(self, host: str, name: str = AVATAR) -> None:
         self.db.execute(
             "INSERT INTO role_standings (name, host, evaluated_at, availability,"
             " capacity, score, ready, diagnostic)"
             " VALUES (%s, %s, clock_timestamp(), 99.0, 0.5, 99.5, true, '')",
-            (AVATAR, host))
+            (name, host))
 
     def _reading(self, host: str, *, pod: bool) -> None:
         runner = ("pod-supervisor/%s" % host) if pod else None
@@ -116,13 +119,13 @@ class _PodMoveCase(test_canon._CanonDbCase):
             " VALUES (%s, clock_timestamp(), %s, 4, %s, 0, %s)",
             (host, None if pod else 0.1, 8 * 1024 ** 3, runner))
 
-    def ready_station(self, host: str = POSTE) -> None:
+    def ready_station(self, host: str = POSTE, *, name: str = AVATAR) -> None:
         """Un poste présent : relevé, verdict local, canevas synchrone."""
         self.db.execute("DELETE FROM host_resources WHERE host = %s", (host,))
         self.db.execute("DELETE FROM role_standings WHERE name = %s AND host = %s",
-                        (AVATAR, host))
+                        (name, host))
         self._reading(host, pod=False)
-        self._standing(host)
+        self._standing(host, name)
         self.db.execute("DELETE FROM host_lifecycle WHERE host = %s", (host,))
         self.db.execute("DELETE FROM host_holds WHERE host = %s", (host,))
 
@@ -152,14 +155,15 @@ class _PodMoveCase(test_canon._CanonDbCase):
                 " AND tenant = %s", (profiles, host, tenant))
 
     def ready_pod(self, host: str = POD_PARTAGE, *, uid: int | None = None,
-                  profiles: list[str] | None = None) -> int:
+                  profiles: list[str] | None = None,
+                  name: str = AVATAR) -> int:
         """Un hôte pod présent : bail + relevé du superviseur, battement."""
         self.db.execute("DELETE FROM host_resources WHERE host = %s", (host,))
         self.db.execute("DELETE FROM role_standings WHERE name = %s AND host = %s",
-                        (AVATAR, host))
+                        (name, host))
         self.db.execute("DELETE FROM pod_supervisor_leases WHERE host = %s", (host,))
         self._reading(host, pod=True)
-        self._standing(host)
+        self._standing(host, name)
         self.db.execute("DELETE FROM host_lifecycle WHERE host = %s", (host,))
         self.db.execute("DELETE FROM host_holds WHERE host = %s", (host,))
         bound = self.bind_tenant(host, ALICE, uid=uid)
@@ -174,10 +178,10 @@ class _PodMoveCase(test_canon._CanonDbCase):
             " WHERE move_id = %s",
             (self.row(AVATAR)["lease_epoch"], "a" * 64, result["conversation_move"]))
 
-    def moved_events(self) -> list[dict]:
+    def moved_events(self, name: str = AVATAR) -> list[dict]:
         rows = self.db.query(
             "SELECT data FROM ameesh_events WHERE type = 'agent.moved'"
-            " AND object = %s ORDER BY id", ("agent:" + AVATAR,))
+            " AND object = %s ORDER BY id", ("agent:" + name,))
         return [row["data"] for row in rows]
 
     def refused(self, pattern: str, target: str) -> None:
@@ -520,6 +524,84 @@ class MoveToPodTest(_PodMoveCase):
         self.assertIsNone(
             storage.of(self.db).conversation_moves.get(
                 result["conversation_move"])["target_session"])
+
+
+class MoveHoteToPodTest(_PodMoveCase):
+    """B #44740 : un agent `releve: hote` vers un pod reçoit les mêmes gardes
+    de présence et de compte que le chemin préférence (`releve: preference`).
+
+    Le chemin hôte n'appelle pas `_preference_refusal` : sans ces gardes, une
+    liaison pod valide suffisait alors qu'aucun runner ne bat, que le
+    superviseur est silencieux ou que le profil du harnais manque."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        write(self.root, "agents/alice-hote.md", fiche(
+            type="Agent", title=HOTE, responsible=ALICE, team="acme-web",
+            capabilities=["read"], harness="codex", provider="openai",
+            credential_mode="api-key", releve="hote"))
+        write(self.root, "placements/alice-hote.md", fiche(
+            type="Placement", title=HOTE, agent=HOTE,
+            hosts=[POSTE, POD_PARTAGE], credential_mode="api-key"))
+        self.sync(POSTE)
+        # le verdict de placement est écrit par la synchro de l'hôte d'arrivée
+        self.sync(POD_PARTAGE)
+        self.assertEqual(self.row(HOTE)["host"], POSTE)
+
+    def moved(self, target: str = POD_PARTAGE) -> dict:
+        return relocation.move_manual(self.cfg, self.db, HOTE, target, actor=ALICE)
+
+    def refused(self, pattern: str, target: str = POD_PARTAGE) -> None:
+        before = self.row(HOTE)
+        with self.assertRaisesRegex(relocation.MoveError, pattern):
+            self.moved(target)
+        self.assertEqual(self.row(HOTE), before)
+
+    def test_hote_vers_pod_present_passe(self):
+        self.ready_pod()
+        result = self.moved()
+        self.assertEqual(self.row(HOTE)["host"], POD_PARTAGE)
+        self.assertEqual(result["pod"]["pvc"], "none")
+        self.assertEqual(result["pod"]["source_kind"], "host")
+        self.assertEqual(self.moved_events(HOTE)[-1]["pod"], result["pod"])
+
+    def test_hote_vers_pod_sans_presence_refuse(self):
+        # liaison provisionnée, mais aucun runner du tenant ne bat.
+        self.ready_station(name=HOTE)
+        self.bind_tenant(POD_PARTAGE, ALICE)
+        self.refused("move-presence")
+
+    def test_hote_vers_pod_superviseur_silencieux_refuse(self):
+        self.ready_pod(name=HOTE)
+        self.db.execute(
+            "UPDATE host_resources SET sampled_at = clock_timestamp()"
+            " - interval '1 hour' WHERE host = %s", (POD_PARTAGE,))
+        self.refused("move-presence")
+
+    def test_hote_vers_pod_profil_absent_refuse(self):
+        self.ready_pod(name=HOTE, profiles=[])
+        self.refused("move-account-missing")
+
+    def test_hote_profil_retire_sous_le_verrou_refuse(self):
+        # La garde est rejouée dans la transaction, sur la ligne d'agent
+        # verrouillée : un profil qui disparaît entre le préflight et
+        # l'écriture refuse le déplacement, rien n'est écrit.
+        self.ready_pod(name=HOTE)
+        original = relocation._preference_account_refusal
+        calls = []
+
+        def watch(db, row, target):
+            calls.append(target)
+            if len(calls) == 2:
+                db.execute(
+                    "UPDATE runner_presence SET profiles = '{}' WHERE host = %s"
+                    " AND tenant = %s", (POD_PARTAGE, ALICE))
+            return original(db, row, target)
+
+        with mock.patch.object(relocation, "_preference_account_refusal",
+                               side_effect=watch):
+            self.refused("move-account-missing")
+        self.assertEqual(len(calls), 2)
 
 
 class WitnessMoveBaseTest(_PodMoveCase):

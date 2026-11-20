@@ -224,6 +224,41 @@ def _preference_account_refusal(db, row: dict, target: str) -> str:
     return ""
 
 
+def _pod_availability_refusal(db, row: dict, target: str) -> str:
+    """#7698 (B #44740) : présence d'une cible pod pour un `releve: hote`.
+
+    `candidate_state` exige un verdict de placement, que seuls les agents
+    `election`/`preference` portent (`agent_candidates`) : il ne peut pas
+    servir ici. On vérifie donc directement le couple superviseur vivant +
+    relevé frais, puis le battement du tenant (UID compris). Un agent `hote`
+    n'est pas replacé par le sync d'arrivée : sans cette garde, une simple
+    liaison pod suffirait à le déplacer vers un hôte endormi."""
+    from . import election, tenancy
+
+    store = storage.of(db)
+    if not store.pod_supervisor.holder(target):
+        return ("move-presence: %s: no live pod supervisor (lease expired or "
+                "released)" % target)
+    reading = store.hosts.latest(target)
+    if not reading or reading.get("sampled_ts") is None:
+        return "move-presence: %s: no resource reading for this host" % target
+    # `hosts.latest` ne rend pas l'heure de lecture : une seule horloge de
+    # base pour le relevé et le battement, jamais l'horloge du processus.
+    now = float(db.query(
+        "SELECT extract(epoch from clock_timestamp())::float8 AS now")[0]["now"])
+    limit = election.freshness_s(db, target, now=now)
+    age = now - float(reading["sampled_ts"])
+    if age > limit:
+        return ("move-presence: %s: stale resource reading (%ds old, limit %ds)"
+                % (target, int(age), int(limit)))
+    reason = tenancy.presence_reason(db, row, target, now=now, limit_s=limit)
+    if reason:
+        if "uid" in reason.lower():
+            return "move-tenant-uid: %s: %s" % (target, reason)
+        return "move-presence: %s: %s" % (target, reason)
+    return ""
+
+
 def _preference_target_cwd(db, name: str, target: str) -> str:
     """Le dossier de travail de la cible, écrit par son `canon sync`."""
     rows = db.query(
@@ -464,22 +499,43 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
         pod_plan = pod_move.preflight(cfg, db, row, target)
     except pod_move.PodMoveError as exc:
         raise MoveError(str(exc)) from exc
+    # B #44740 : ce chemin (`releve: hote`) n'appelle pas `_preference_refusal`,
+    # mais une cible pod exige les mêmes gardes de disponibilité et de compte
+    # que le chemin préférence (#7108) : liaison pod valide ne vaut pas
+    # présence ni profil publié. Sans cible pod, rien ne change.
+    pod_guards = (_pod_availability_refusal, _preference_account_refusal)
+    if pod_plan:
+        for guard in pod_guards:
+            reason = guard(db, row, target)
+            if reason:
+                raise MoveError(reason)
     stopped = unit_stopped(cfg, name, source)
     summary = "" if keep_session else FALLBACK_SUMMARY % (source, target)
     diagnostic = ("moved from %s by hand%s: placement to re-evaluate on %s"
                   % (source, " (%s)" % actor if actor else "", target))
     with db.transaction() as tx:
-        # #7698 : l'identité pod (liaison, UID, PVC) est revalidée sous le
-        # verrou avant tout effet ; un changement entre le préflight et
-        # l'écriture refuse, il n'est jamais contourné.
+        # #7698 : l'identité pod (liaison, UID, PVC), la présence et le profil
+        # de compte sont revalidés sous le verrou de la ligne d'agent, avant
+        # tout effet ; un changement entre le préflight et l'écriture refuse,
+        # il n'est jamais contourné.
+        locked_row = row
+        if pod_plan:
+            tx.query("SELECT name FROM agent_registry WHERE name = %s FOR UPDATE",
+                     (name,))
+            locked_row = registry.get(tx, name) or row
         try:
-            fresh = pod_move.preflight(cfg, tx, row, target)
+            fresh = pod_move.preflight(cfg, tx, locked_row, target)
         except pod_move.PodMoveError as exc:
             raise MoveError(str(exc)) from exc
         if fresh != pod_plan:
             raise MoveError(
                 "move-pod-changed: the target pod identity changed during the "
                 "preflight (UID, binding, isolation or PVC mode); retry")
+        if pod_plan:
+            for guard in pod_guards:
+                reason = guard(tx, locked_row, target)
+                if reason:
+                    raise MoveError(reason)
         moved = storage.of(tx).canon.relocate_operator(
             name, source, target=target, canon_ref=row.get("canon_ref") or "",
             diagnostic=diagnostic, ref=row.get("placement_ref"),
