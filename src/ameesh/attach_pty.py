@@ -18,7 +18,6 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
-import pty
 import signal
 import struct
 import subprocess
@@ -47,6 +46,40 @@ def _winsize(rows: int, cols: int, xpix: int = 0, ypix: int = 0) -> bytes:
     return struct.pack("HHHH", rows, cols, min(xpix, 65535), min(ypix, 65535))
 
 
+def _login_tty(slave: int) -> None:
+    """Session neuve dont `slave` est le terminal de contrôle et les flux 0-2.
+
+    Appelé dans l'enfant après le fork : uniquement des appels système.
+    `os.login_tty` (3.11+) fait setsid, TIOCSCTTY et les trois dup2 ; le
+    chemin de repli fait la même chose pour les Python plus anciens.
+    """
+    login_tty = getattr(os, "login_tty", None)
+    if login_tty is not None:
+        login_tty(slave)
+        return
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    for target in (0, 1, 2):
+        os.dup2(slave, target)
+    if slave > 2:
+        os.close(slave)
+
+
+def _wait_gate(fd: int) -> None:
+    """Crochet de test (#7922) : attend un octet avant l'exec de l'enfant.
+
+    Réservé aux tests de course : aucun chemin de production ne passe ce
+    descripteur. Un EOF rend aussi la main, pour qu'un tube fermé ne bloque
+    jamais l'enfant.
+    """
+    while True:
+        try:
+            os.read(fd, 1)
+            return
+        except InterruptedError:
+            continue
+
+
 class PtyProcess:
     """Une commande interactive dans un PTY, du côté de l'hôte.
 
@@ -56,7 +89,9 @@ class PtyProcess:
     """
 
     def __init__(self, argv, *, env=None, cwd=None, rows: int = 24, cols: int = 80,
-                 close_timeout: float = DEFAULT_CLOSE_TIMEOUT):
+                 close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
+                 # crochet de test (#7922), voir `_wait_gate`
+                 _child_gate: int | None = None):
         if not argv or not all(isinstance(part, str) and part for part in argv):
             raise PtyError("an argv of non-empty strings is required")
         self.argv = list(argv)
@@ -68,14 +103,32 @@ class PtyProcess:
         self._pending = bytearray()
         size = _winsize(self.rows, self.cols)
         try:
-            pid, master = pty.fork()
+            master, slave = os.openpty()
         except OSError as exc:
             raise PtyError("cannot open a pseudo-terminal (%s)" % exc.strerror) from exc
+        try:
+            # #7922 : la taille initiale est posée AVANT le fork. Posée par
+            # l'enfant après coup, elle écrasait un resize du parent arrivé
+            # entre-temps (l'enfant sous charge tourne tard) ; l'enfant n'a
+            # donc plus aucun TIOCSWINSZ à faire.
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, size)
+            pid = os.fork()
+        except OSError as exc:
+            for fd in (master, slave):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise PtyError("cannot start the command on the pseudo-terminal "
+                           "(%s)" % exc.strerror) from exc
         if pid == 0:  # enfant : uniquement des appels système avant l'exec
             try:
+                os.close(master)
+                if _child_gate is not None:
+                    _wait_gate(_child_gate)
+                _login_tty(slave)
                 if cwd:
                     os.chdir(cwd)
-                fcntl.ioctl(0, termios.TIOCSWINSZ, size)
                 os.execvpe(self.argv[0], self.argv,
                            dict(os.environ if env is None else env))
             except BaseException:
@@ -83,6 +136,7 @@ class PtyProcess:
             os._exit(127)
         self.pid = pid
         self.master = master
+        os.close(slave)
         os.set_blocking(master, False)
         self.start_ts = time.monotonic()
 

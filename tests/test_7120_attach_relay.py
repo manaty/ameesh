@@ -417,6 +417,14 @@ class ChannelTest(unittest.TestCase):
 @unittest.skipUnless(sys.platform.startswith("linux"),
                      "process-group proof reads /proc (Linux)")
 class PtyTest(unittest.TestCase):
+    @staticmethod
+    def _terminal_size(fd):
+        import fcntl
+        import termios
+        rows, cols, _x, _y = struct.unpack(
+            "HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8))
+        return rows, cols
+
     def test_code_de_sortie_et_sortie(self):
         code, out = attach_pty.run(["/bin/sh", "-c", "printf ready; exit 3"], timeout=3)
         self.assertEqual(code, 3)
@@ -426,11 +434,7 @@ class PtyTest(unittest.TestCase):
         proc = attach_pty.PtyProcess(["/bin/sh", "-c", "read x; printf 'got:%s' \"$x\""])
         self.addCleanup(proc.close)
         proc.resize(40, 120)
-        import fcntl
-        import termios
-        rows, cols, _x, _y = struct.unpack(
-            "HHHH", fcntl.ioctl(proc.master, termios.TIOCGWINSZ, b"\x00" * 8))
-        self.assertEqual((rows, cols), (40, 120))
+        self.assertEqual(self._terminal_size(proc.master), (40, 120))
         proc.write(b"hello\n")
         out = bytearray()
         deadline = time.monotonic() + PROCESS_TIMEOUT
@@ -441,6 +445,41 @@ class PtyTest(unittest.TestCase):
             else:
                 time.sleep(0.01)
         self.assertIn(b"got:hello", out)
+
+    def test_resize_precoce_ne_se_perd_pas_avec_un_enfant_retarde(self):
+        """#7922 : la taille initiale est posée avant le fork, pas par l'enfant.
+
+        L'enfant est retenu sur un tube avant son exec : le resize du parent
+        passe donc à coup sûr avant tout ce que l'enfant pourrait poser. Sans
+        le correctif, l'enfant écrit ensuite sa taille 24x80 et écrase 40x120.
+        Aucun sleep ne « laisse passer » la course : le tube est la barrière.
+        """
+        gate_r, gate_w = os.pipe()
+        self.addCleanup(os.close, gate_w)
+        try:
+            proc = attach_pty.PtyProcess(
+                ["/bin/sh", "-c", "read x; printf 'got:%s' \"$x\""],
+                _child_gate=gate_r)
+        finally:
+            os.close(gate_r)
+        self.addCleanup(proc.close)
+        # la taille initiale est déjà celle du pty, avant que l'enfant n'ait
+        # exécuté quoi que ce soit
+        self.assertEqual(self._terminal_size(proc.master), (24, 80))
+        proc.resize(40, 120)
+        self.assertEqual(self._terminal_size(proc.master), (40, 120))
+        os.write(gate_w, b"g")  # l'enfant poursuit : il ne doit plus la poser
+        proc.write(b"hello\n")
+        out = bytearray()
+        deadline = time.monotonic() + PROCESS_TIMEOUT
+        while time.monotonic() < deadline and b"got:hello" not in out:
+            chunk = proc.read(4096)
+            if chunk:
+                out.extend(chunk)
+            else:
+                time.sleep(0.01)
+        self.assertIn(b"got:hello", out)
+        self.assertEqual(self._terminal_size(proc.master), (40, 120))
 
     def test_fermeture_tue_le_groupe(self):
         proc = attach_pty.PtyProcess(["/bin/sh", "-c", "sleep 30"])
