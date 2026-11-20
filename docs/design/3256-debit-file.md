@@ -162,6 +162,14 @@ part (`idle_agents_excluded`), avec les raisons
 (`idle_hours_excluded_reasons`) ; son `idle_agent_hours` ne somme que les
 heures imputées. (Source : revue #7804 du 19/11/2026, lot #7849.)
 
+Sur une route épuisée sans lot démarrable, des lots retenus par la garde
+d'empreinte attendent pourtant : les heures de repos de ses agents depuis la
+création du plus ancien de ces lots (bornée à la fenêtre, date inconnue :
+aucune heure) se lisent sur un champ distinct, `idle_agent_hours_footprint`,
+par projet et au mesh, sans rouvrir `idle_agent_hours`. (Source : constat de
+l'auditeur du 19/11/2026, 28/29 agents au repos et 0,0 h affiché, lot #7890,
+manaty/ameesh#6123.)
+
 `ameesh debit` gagne une section `capacity`, par projet et pour le mesh :
 
 - `idle_agent_hours` sur la fenêtre du débit, et la part au repos des agents
