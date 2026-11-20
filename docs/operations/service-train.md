@@ -405,8 +405,11 @@ doivent être verts. Seuls des jobs de plomberie **nommés exactement**
 (`lot-plan`, `lot-plan-retry`, `lot-pending`, `lot-status` et leurs jobs
 appelés) et les exceptions **de la suite concernée** sont écartés :
 `changed-paths` dans backend-suite, `github-bridge` dans compute, la matrice
-`Desktop suite (...)` dans desktop-suite. Un job de test nommé `lot-*` ou
-`Desktop suite (...)` hors de sa suite reste donc requis, comme tout job
+`Desktop suite (...)` dans desktop-suite. #7936 : `qualified-tree`, le job
+réutilisable appelé par les suites Nexlink, est écarté **sur un dispatch
+seulement** — il ne s'exécute que sur un push `develop` ; sur un push il reste
+requis, et un échec ou une annulation le refuse. Un job de test nommé `lot-*`
+ou `Desktop suite (...)` hors de sa suite reste donc requis, comme tout job
 nouveau — sans nouvelle relecture du contrat. Une liste due vide refuse : un
 paquet documentation seule n'est pas une preuve de train. Le contrat est livré
 pour le mode ombre seulement : aucune configuration d'hôte ni bascule n'est

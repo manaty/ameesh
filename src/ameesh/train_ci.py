@@ -139,6 +139,15 @@ DUE_SUITE_TOLERATED = {
                                            "Desktop suite (macos-latest)"),
 }
 
+#: #7936: the reusable `qualified-tree` workflow (#5456) that every Nexlink
+#: lot suite calls only runs on a push to `develop`: a packet dispatch sees
+#: the caller job skipped by design. The exact caller name is tolerated on a
+#: dispatch only — a push, where the job must run to prove the tree, keeps it
+#: required, and no other name starting with it is exempt. A failure is never
+#: tolerated: the job stays in the outcome check below, so a red one names its
+#: suite, and a cancelled run is refused before this point.
+DUE_DISPATCH_TOLERATED = ("qualified-tree",)
+
 
 def _plumbing_job(name, context):
     """An identified plumbing job of the suite publishing `context`."""
@@ -147,9 +156,16 @@ def _plumbing_job(name, context):
         "lot-status / Lot status (%s)" % context)
 
 
-def _tolerated_job(name, path, context):
+def _dispatch_tolerated_job(name, event):
+    """#7936: a job the suite skips by design on a packet dispatch."""
+    return event == "workflow_dispatch" and name in DUE_DISPATCH_TOLERATED
+
+
+def _tolerated_job(name, path, context, event):
     """An identified plumbing job, or a skip-by-design job of *this* suite."""
-    return _plumbing_job(name, context) or name in DUE_SUITE_TOLERATED.get(path, ())
+    return (_dispatch_tolerated_job(name, event)
+            or _plumbing_job(name, context)
+            or name in DUE_SUITE_TOLERATED.get(path, ()))
 
 
 @dataclass(frozen=True)
@@ -709,7 +725,7 @@ class GitHub:
                                          % workflow.path)
                 required = [job for job in jobs
                             if not _tolerated_job(job["name"], workflow.path,
-                                                  workflow.context)]
+                                                  workflow.context, workflow.event)]
                 if not required:
                     raise TrainError("due suite has no executable job: %s" % workflow.path)
                 for job in required:
