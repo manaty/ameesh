@@ -774,7 +774,8 @@ class PgPort:
                               and "review_designation" in (request.get("payload") or {}))
                              or "review_request" in (request.get("payload") or {}))
                         for request in requests)
-                    if not replaceable:
+                    # A purged request needs a fresh deposit for this head.
+                    if requests and not replaceable:
                         continue
                 else:
                     requests = mail.review_requests(db, recipient, lot)

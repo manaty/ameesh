@@ -126,6 +126,22 @@ class StableJournalTest(PgTestCase):
         mark = pg.PgPort(self.db).recorded(self.lot, current['id'])
         self.assertEqual(mark['review_range'], {'base': 'c' * 40, 'head': B})
 
+    def test_missing_request_is_deposited_for_continued_seat(self):
+        self.first_review()
+        self.db.execute('DELETE FROM agent_mailbox WHERE work_item_id = %s',
+                        (str(self.lot),))
+        current = self.freeze(B)
+        self.apply(B, [rd.Candidate('old', 'claude')])
+        rows = self.messages()
+        self.assertEqual(len(rows), 1)
+        self.assertIn('--sha ' + B, rows[0]['body'])
+        stored = storage.of(self.db).mailbox.get(rows[0]['id'])
+        self.assertEqual(stored['payload']['review_designation']['sha'], B)
+        mark = pg.PgPort(self.db).recorded(self.lot, current['id'])
+        self.assertEqual(mark['continued'], ['old'])
+        self.apply(B, [rd.Candidate('old', 'claude')])
+        self.assertEqual(self.messages(), rows)
+
     def test_delivery_cannot_race_between_unread_check_and_replacement(self):
         self.first_review()
         message = self.messages()[0]
