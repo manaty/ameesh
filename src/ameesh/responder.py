@@ -9,11 +9,12 @@ reason and the *kinds* of signals used.
     ameesh responder <application> --severity P1 [--json] [--now ISO]
 
 Signals, strongest first, each with its freshness window (see
-`incident_routing`): attached avatar (a live `attach:<account>` lease), last
-interaction (ameesh's journal, then Memoria's public interface), Slack
-presence (`active` / `away`), then the timezone and usual hours fallback.  An
-absent or stale signal passes to the next one; a present `away` presence and
-the local-hours fallback can rule a human out.
+`incident_routing`): an attached human (a live local `attach:<account>` lease,
+or a distant `attach:<tenant>:<device>` lease whose device credential is
+theirs), last interaction (ameesh's journal, then Memoria's public interface),
+Slack presence (`active` / `away`), then the timezone and usual hours
+fallback.  An absent or stale signal passes to the next one; a present `away`
+presence and the local-hours fallback can rule a human out.
 
 Only the human's **own activity** counts. A journal row proves it with the
 `user@host` proof (`payload.human_account`) or, failing that, a host declared
@@ -47,6 +48,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
+from . import attach_session
 from . import canon as canon_mod
 from . import db as db_mod
 from . import decisions as decisions_mod
@@ -217,9 +219,9 @@ class LiveSignals:
 
     # -- attach --------------------------------------------------------------
     def attach(self, member: Any) -> bool | None:
-        accounts = self._accounts(member)
-        if self.db is None or not accounts:
+        if self.db is None:
             return None
+        accounts = self._accounts(member)
         try:
             rows = self.db.query(
                 "select lease_owner from agent_registry"
@@ -231,6 +233,43 @@ class LiveSignals:
         owners = {str(row.get("lease_owner") or "") for row in rows}
         if any("attach:%s" % account in owners for account in accounts):
             return True
+        # #7869 : un attach distant porte `attach:<tenant>:<appareil>`, où
+        # l'appareil est l'identifiant borné d'un authentificateur
+        # `device-es256` ; le tenant seul ne dit pas l'humain. On relit donc
+        # les appareils actifs du membre et on reconstruit le bail qu'ils
+        # auraient écrit (`remote_owner`, la forme même de l'hôte). Un
+        # appareil d'un autre humain, un appareil révoqué ou un bail d'une
+        # autre forme ne rend personne disponible : le signal manque, il ne
+        # ment pas.
+        remote: dict[str, str] = {}
+        for owner in owners:
+            if not owner.startswith("attach:"):
+                continue
+            tenant, sep, device = owner[len("attach:"):].partition(":")
+            if sep and device:
+                remote[owner] = tenant
+        if not remote:
+            return None
+        try:
+            rows = self.db.query(
+                "select credential_id from authenticators"
+                " where approver = %s and facade = 'device-es256'"
+                "   and revoked_at is null",
+                ("human:%s" % getattr(member, "title", ""),))
+        except Exception:
+            return None
+        for row in rows:
+            credential = str(row.get("credential_id") or "")
+            if not credential:
+                continue
+            for owner, tenant in remote.items():
+                try:
+                    expected = attach_session.remote_owner(
+                        "" if tenant == "-" else tenant, credential)
+                except ValueError:
+                    continue
+                if expected == owner:
+                    return True
         return None
 
     # -- last interaction ----------------------------------------------------
