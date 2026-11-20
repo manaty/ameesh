@@ -38,6 +38,14 @@ _ROW = ("host, mode, generation, actor, "
         "hook_wait_state, hook_wait_generation, hook_wait_epoch, "
         "extract(epoch from updated_at)::float8 AS updated_ts")
 
+# #7913: a `busy` finishing on row `c` resyncs a `draining` acknowledged by an
+# earlier generation: the withdrawal goes on, no return was requested.
+_RESYNC = (
+    "(c.mode='draining' AND c.release_state='draining' "
+    "AND c.hook_state='draining' AND c.return_requested_at IS NULL "
+    "AND NOT EXISTS (SELECT 1 FROM host_lifecycle_transitions t "
+    "WHERE t.host=c.host AND t.generation=c.generation AND t.state='draining'))")
+
 #: #4148: states an adapter can acknowledge, in the strict order of the spec.
 RELEASE_STATES = ("busy", "draining", "idle-drained")
 
@@ -568,20 +576,28 @@ class HostLifecycle(interface.HostLifecycle):
                     (host, generation, release_epoch, state, actor,
                      json.dumps(detail, sort_keys=True)))
                 tx.execute(
-                    "UPDATE host_lifecycle SET hook_state=%s,hook_attempt_at=NULL,"
+                    "UPDATE host_lifecycle c SET hook_state=%s,hook_attempt_at=NULL,"
                     "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
                     "hook_attempt_epoch=NULL,"
                     "hook_wait_at=NULL,hook_wait_state=NULL,"
                     "hook_wait_generation=NULL,hook_wait_epoch=NULL,"
                     "release_error=NULL,release_error_state=NULL,release_error_at=NULL,"
                     "release_error_since=NULL,"
-                    "release_state=CASE WHEN %s='busy' THEN 'busy' "
+                    # #7913: a `busy` that resyncs a `draining` acknowledged by
+                    # an earlier generation is not a return: the withdrawal
+                    # goes on (`draining` next), so the release state stays.
+                    "release_state=CASE WHEN %s='busy' AND NOT " + _RESYNC + " THEN 'busy' "
                     "                  WHEN %s='idle-drained' THEN 'idle-drained' "
-                    "                  ELSE release_state END,"
+                    "                  ELSE c.release_state END,"
+                    # The resync opens a new wave: its `busy` journal must not
+                    # refuse the `busy` of a later return (draining or
+                    # released) within the same withdrawal.
+                    "release_epoch=CASE WHEN %s='busy' AND " + _RESYNC + " "
+                    "                   THEN c.release_epoch+1 ELSE c.release_epoch END,"
                     "released_at=CASE WHEN %s='idle-drained' THEN clock_timestamp() "
                     "                  ELSE released_at END,"
                     "updated_at=clock_timestamp() WHERE host=%s AND generation=%s",
-                    (state, state, state, state, host, generation))
+                    (state, state, state, state, state, host, generation))
             return HostLifecycle(tx).get(host)
 
     def wait_transition(self, host, generation, state, *, release_epoch, actor,
@@ -660,6 +676,10 @@ class HostLifecycle(interface.HostLifecycle):
                                                     "attempt_stale_after")
         rows = self.db.query(
             "UPDATE host_lifecycle SET claims_open=true,"
+            # #7913: the release state follows the opened gate (as `undrain`
+            # and `reopen_return`); a return without any adapter answer used
+            # to leave an `available` host saying `draining`.
+            "release_state='busy',"
             "return_requested_at=NULL,return_requested_by=NULL,"
             # #5932: reopening ends any adapter wait of the closed gate.
             "hook_wait_at=NULL,hook_wait_state=NULL,"
