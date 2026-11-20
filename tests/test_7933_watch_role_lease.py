@@ -257,6 +257,34 @@ class WatchRoleLeaseTest(PgTestCase):
             " WHERE agent = %s", (old - 60, old, old, NAME))
         self.assertEqual(len(self.watch_silent()), 1)
 
+    # -- compatibilité N-1 (ameesh-cx2) ----------------------------------
+    def test_an_n1_writer_row_is_read_and_a_recent_send_is_not_mute(self):
+        added = ("last_fired_at", "last_fired_reason", "last_attempt_at")
+        # the N-1 `put` did not know the three columns
+        self.previous_insert(
+            "agent_watches",
+            {"agent": NAME, "every_s": EVERY, "host": "atelier",
+             "enabled_by": "human:owner"}, added=added)
+        # the N-1 `deliver` wrote only last_sent_at
+        self.previous_write(
+            "update agent_watches set last_sent_at = now() where agent = %s",
+            (NAME,), added=added)
+        row = self.watched()
+        self.assertIsNone(row["last_fired_ts"])
+        self.assertIsNone(row["last_fired_reason"])
+        self.assertIsNone(row["last_attempt_ts"])
+        # a recent N-1 deposit still keeps the alert quiet, even without a beat
+        self.assertEqual(self.watch_silent(), [])
+        # the new code accepts the N-1 row and populates the new columns when
+        # the lease holder emits (no re-registration, no backfill)
+        self.hold("banc")
+        self.assertEqual(self.send(self.banc), "instruction sent to %s" % NAME)
+        row = self.watched()
+        self.assertEqual(row["host"], "banc")
+        self.assertEqual(row["last_fired_reason"], "sent")
+        self.assertIsNotNone(row["last_fired_ts"])
+        self.assertIsNotNone(row["last_attempt_ts"])
+
     # -- concurrence bail / dépôt (ameesh-cx2) ---------------------------
     def test_a_handover_waits_for_the_deposit(self):
         self.put("atelier")

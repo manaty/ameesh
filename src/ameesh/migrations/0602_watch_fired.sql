@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0601_watch_fired — #7933 : le battement d'un tir de veille, même sans envoi.
+-- 0602_watch_fired — #7933 : le battement d'un tir de veille, même sans envoi.
 --
 -- `watch send` ne dépose rien dans plusieurs cas sains : lecture inchangée et
 -- tour récent, changement gardé en attente, note passive encore non lue,
