@@ -175,13 +175,19 @@ def _run(cwd: str, *args: str, timeout: float = GIT_TIMEOUT,
          stdin: bytes | None = None,
          env_extra: dict | None = None) -> subprocess.CompletedProcess:
     """git dans `cwd`. #3181 : un fetch que fait échouer une corruption locale
-    (`local_corruption`) est refait une fois, après la mise en quarantaine des
-    fichiers vides du clone (`quarantine_empty`) ; si rien n'a été déplacé ou
-    si l'erreur persiste, l'échec est rendu tel quel, à lire par
+    (`local_corruption`) est refait après la mise en quarantaine des fichiers
+    vides du clone (`quarantine_empty`) ; #7969 : une ref dont l'objet a été
+    élagué dans l'alternate est mise en quarantaine de même, et le fetch est
+    refait (une ref cassée par échec, plusieurs : une par essai). Si rien n'a
+    été déplacé ou si l'erreur persiste, l'échec est rendu tel quel, à lire par
     `fetch_failure`."""
     proc = _git(cwd, *args, stdin=stdin, timeout=timeout, env_extra=env_extra)
-    if (proc.returncode and _subcommand(args) == "fetch"
-            and local_corruption(_err(proc)) and quarantine_empty(cwd)):
+    for _attempt in range(3):
+        if not (proc.returncode and _subcommand(args) == "fetch"
+                and local_corruption(_err(proc))):
+            break
+        if not quarantine_empty(cwd, error=_err(proc)):
+            break
         proc = _git(cwd, *args, stdin=stdin, timeout=timeout, env_extra=env_extra)
     return proc
 
@@ -189,9 +195,20 @@ def _run(cwd: str, *args: str, timeout: float = GIT_TIMEOUT,
 #: #3181 : ce que Git écrit quand le clone ou ses alternates portent un objet
 #: ou une ref abîmés (coupure de courant pendant une écriture) ; jamais une
 #: forge injoignable, et une attente ne le résorbe pas.
+#: #7969 : `missing object <sha> for <ref>` (for-each-ref) et `bad ref <ref>`
+#: (show-ref) désignent la même ref dont l'objet a disparu de l'alternate.
 _LOCAL_CORRUPTION = re.compile(
-    r"object file \S+ is empty|bad object (?:refs/|HEAD)|badRefContent"
+    r"object file \S+ is empty|bad object (?:refs/|HEAD)|bad ref refs/"
+    r"|missing object [0-9a-f]{40,64} for refs/|badRefContent"
     r"|loose object \S+ .*is corrupt|did not send all necessary objects")
+#: #7969 : les refs que Git nomme dans l'échec d'une lecture (objet absent).
+_BROKEN_REF = (
+    re.compile(r"bad object (refs/[^\s:]+)"),
+    re.compile(r"bad ref (refs/\S+)"),
+    re.compile(r"missing object [0-9a-f]{40,64} for (refs/[^\s:]+)"),
+)
+#: le contenu d'une ref directe (SHA-1 ou SHA-256), jamais une ref symbolique
+_REF_CONTENT = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
 #: un objet libre (`objects/xx/<reste du SHA-1 ou SHA-256>`) ; les fichiers
 #: temporaires de Git (`tmp_obj_*`) ne le sont pas
 _LOOSE_OBJECT = re.compile(r"[0-9a-f]{38}|[0-9a-f]{62}")
@@ -275,6 +292,39 @@ def _empty_files(objects: str, git_dir: str | None) -> list[str]:
     return sorted(found)
 
 
+def broken_refs(message: str) -> list[str]:
+    """#7969 : les refs que Git nomme dans l'échec d'une lecture (objet absent).
+
+    Trois formes vues : `bad object refs/…` (fetch, rev-list), `bad ref
+    refs/…` (show-ref), `missing object <sha> for refs/…` (for-each-ref). Un
+    `bad object HEAD` n'est pas une ref nommable : il est ignoré."""
+    found: list[str] = []
+    for pattern in _BROKEN_REF:
+        for match in pattern.finditer(message or ""):
+            name = match.group(1)
+            if name not in found:
+                found.append(name)
+    return found
+
+
+def _dangling_ref_files(git_dir: str, message: str) -> list[str]:
+    """Les fichiers de ref libres (sous `refs/`) que `message` nomme comme
+    cassés. Jamais une ref symbolique, un lien ni un chemin hors de `refs/`."""
+    refs = os.path.realpath(os.path.join(git_dir, "refs"))
+    found: list[str] = []
+    for name in broken_refs(message):
+        parts = name.split("/")
+        if len(parts) < 2 or parts[0] != "refs" \
+                or any(part in ("", ".", "..") for part in parts):
+            continue
+        path = os.path.join(git_dir, *parts)
+        if not os.path.realpath(path).startswith(refs + os.sep):
+            continue
+        if os.path.isfile(path) and not os.path.islink(path):
+            found.append(path)
+    return found
+
+
 def _move_ref(source: str, target: str) -> str:
     """Déplace la ref libre `source` vers `target` sous le verrou de Git
     (`<ref>.lock` créé en O_EXCL, comme `update-ref`) : aucun écrivain ne
@@ -288,6 +338,39 @@ def _move_ref(source: str, target: str) -> str:
     try:
         if os.lstat(source).st_size != 0:
             return "no longer empty"
+        os.rename(source, target)
+        return ""
+    finally:
+        os.close(fd)
+        os.unlink(lock)
+
+
+def _move_dangling_ref(git_dir: str, source: str, target: str) -> str:
+    """#7969 : déplace la ref `source`, dont l'objet a disparu (élagué dans
+    l'alternate par le gc du checkout), sous le verrou de Git.
+
+    La ref est relue sous le verrou et son objet revérifié : une ref réparée
+    entre le scan et le déplacement reste en place. `git cat-file -e` lit aussi
+    les alternates : un objet encore emprunté n'est pas déplacé. Rend pourquoi
+    la ref reste, vide si elle est déplacée."""
+    lock = source + ".lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return "a git writer holds %s" % lock
+    try:
+        try:
+            with open(source, "rb") as handle:
+                value = handle.read().strip()
+        except OSError as exc:
+            return "unreadable: %s" % exc
+        if not _REF_CONTENT.fullmatch(value):
+            return "not a plain ref"
+        probe = subprocess.run(
+            ["git", "--git-dir", git_dir, "cat-file", "-e", value.decode()],
+            capture_output=True, env={**_git_env(), **NO_LAZY_FETCH})
+        if probe.returncode == 0:
+            return "object present again"
         os.rename(source, target)
         return ""
     finally:
@@ -391,7 +474,7 @@ def _replacing_writer(git_dir: str) -> bool:
     return False
 
 
-def quarantine_empty(path: str) -> list[str]:
+def quarantine_empty(path: str, error: str = "") -> list[str]:
     """#3181 : déplace les objets libres de 0 octet du clone `path` et de ses
     alternates, et ses refs libres de 0 octet, vers
     `<.git>/ameesh-quarantine/<date UTC>-<unique>/` du dépôt qui les portait.
@@ -403,6 +486,12 @@ def quarantine_empty(path: str) -> list[str]:
     verrou de quarantaine (`_store_lock`, du scan au dernier déplacement), une
     ref est relue sous son verrou Git (`_move_ref`), un objet n'est déplacé
     que si Git ne peut pas le remplacer (`_replacing_writer`, `_move_object`).
+
+    #7969 : `error` est l'échec de Git qui a déclenché la passe ; les refs
+    qu'il nomme comme cassées (`broken_refs`) sont déplacées de même, après
+    revérification de leur objet (`_move_dangling_ref`) : le gc d'un checkout
+    lu par alternates peut élaguer l'objet d'une ref que le clone gardait.
+
     Chaque appel a son propre dossier de quarantaine :
     deux passes de la même seconde n'écrasent aucune preuve. Chaque
     déplacement (ou refus) est journalisé (`moved.log` de la quarantaine, et
@@ -421,16 +510,20 @@ def quarantine_empty(path: str) -> list[str]:
                   % git_dir, file=sys.stderr)
             continue
         try:
-            moved += _quarantine_store(objects, git_dir, common, stamp)
+            moved += _quarantine_store(objects, git_dir, common, stamp,
+                                       error if git_dir == common else "")
         finally:
             os.close(lock)  # rend le flock
     return moved
 
 
-def _quarantine_store(objects: str, git_dir: str, common: str, stamp: str) -> list[str]:
+def _quarantine_store(objects: str, git_dir: str, common: str, stamp: str,
+                      error: str = "") -> list[str]:
     """Le corps de `quarantine_empty` pour un dépôt, sous son verrou."""
     moved: list[str] = []
     found = _empty_files(objects, common if git_dir == common else None)
+    dangling = set(_dangling_ref_files(common, error) if git_dir == common else ())
+    found = list(dict.fromkeys([*found, *dangling]))
     if not found:
         return moved
     try:
@@ -448,7 +541,10 @@ def _quarantine_store(objects: str, git_dir: str, common: str, stamp: str) -> li
         if not is_ref and replacing is None:
             replacing = _replacing_writer(git_dir)
         try:
-            if not is_ref and replacing:
+            if source in dangling:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                kept = _move_dangling_ref(git_dir, source, target)
+            elif not is_ref and replacing:
                 kept = ("core.createObject=rename (or unreadable): a git writer may "
                         "replace it while it moves, repair by hand")
             else:
@@ -463,7 +559,8 @@ def _quarantine_store(objects: str, git_dir: str, common: str, stamp: str) -> li
                 log.write(line + "\n")
         except OSError:
             pass
-        print("ameesh: #3181 %s%s" % ("" if kept else "quarantined empty ", line),
+        what = "dangling ref" if source in dangling else "empty"
+        print("ameesh: #3181 %s%s" % ("" if kept else "quarantined %s " % what, line),
               file=sys.stderr)
         if not kept:
             moved.append(source)
