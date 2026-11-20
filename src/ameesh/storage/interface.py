@@ -1780,10 +1780,17 @@ class Mailbox(Domain):
         (`work_item_id`, #794 : le brief d'un lot ne montre que son fil)."""
 
     @abc.abstractmethod
-    def unread_active(self, recipient: str, limit: int) -> list[dict]:
+    def unread_active(self, recipient: str, limit: int, *,
+                      after_id: int | None = None,
+                      since: float | None = None) -> list[dict]:
         """L125 : messages non remis qui ouvriront un tour — ni accusé, ni
         copie, ni diffusion non urgents (`mail.passive_reason`) —, du plus
-        ancien au plus récent."""
+        ancien au plus récent.
+
+        #7861 : `after_id` est le curseur de la page précédente (`id`) et
+        `since` une borne de création (epoch) ; les deux sont appliquées
+        AVANT la limite, pour qu'un préfixe de plus de `limit` non-lus ne
+        masque pas les messages suivants. None = pas de borne."""
 
     @abc.abstractmethod
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:

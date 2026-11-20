@@ -315,17 +315,33 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
-    def unread_active(self, recipient, limit) -> list[dict]:
+    def unread_active(self, recipient, limit, *, after_id=None,
+                      since=None) -> list[dict]:
+        # #7861 : les bornes sont dans la requête, avant LIMIT : un préfixe
+        # de plus de `limit` non-lus ne cache ni les suivants (curseur), ni
+        # ceux créés depuis `since`.
+        params = [recipient]
+        apres = ""
+        if after_id is not None:
+            apres = " AND id > %s"
+            params.append(int(after_id))
+        depuis = ""
+        if since is not None:
+            depuis = " AND created_at >= to_timestamp(%s)"
+            params.append(float(since))
+        params.append(int(limit))
         return self.db.query(
             """
             SELECT %s
             FROM agent_mailbox
             WHERE recipient = %%s AND delivered_at IS NULL
               AND NOT %s
+              %s%s
             ORDER BY id
             LIMIT %%s
-            """ % (MAIL_COLUMNS, PASSIVE_SQL.format(t="agent_mailbox")),
-            (recipient, int(limit)),
+            """ % (MAIL_COLUMNS, PASSIVE_SQL.format(t="agent_mailbox"),
+                   apres, depuis),
+            tuple(params),
         )
 
     def unread_urgent(self, recipient, limit) -> list[dict]:

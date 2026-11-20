@@ -7741,13 +7741,27 @@ class AgentWorker(threading.Thread):
         self._marque_vu(active)
         events = [m for m in active if mail.is_event(m)]
         others = [m for m in active if not mail.is_event(m)]
+        # #7861 : le courrier restant au détachement d'un attach est dû tout
+        # de suite (pas de fenêtre L125). Le marqueur ne porte que les ids
+        # vus à cet instant ; dès qu'aucun n'est plus non lu — le hook a pu
+        # livrer entre-temps — il est retiré, sans double remise.
+        from . import attach_mail
+        marker = attach_mail.due_marker(self.cfg, self.name)
+        if marker is not None and not any(
+                m.get("id") is not None and int(m["id"]) <= marker for m in messages):
+            attach_mail.clear(self.cfg, self.name)
+            marker = None
         policy = reveil_mod.of(self.agent)
         if policy is not None:
-            mail_due = bool(active) and self._reveil_due(policy, active)
+            mail_due = bool(active) and (
+                self._attach_mail_due(active, marker)
+                or self._reveil_due(policy, active))
             events_due = False
         else:
-            mail_due = bool(others) and self._mail_due(others)
-            events_due = bool(events) and self._events_due(events)
+            mail_due = bool(others) and (
+                self._attach_mail_due(others, marker) or self._mail_due(others))
+            events_due = bool(events) and (
+                self._attach_mail_due(events, marker) or self._events_due(events))
         if others and any(self._from_human(m) for m in others):
             # L81 (étude §6.3) : tant qu'un message humain attend, l'entretien
             # d'une session résidente lui laisse la place (fenêtre de calme).
@@ -7810,6 +7824,26 @@ class AgentWorker(threading.Thread):
         `human:<id>`, ou nom déclaré humain sur cet hôte (`AMEESH_HUMANS`)."""
         return (mail.is_human(row)
                 or (row.get("sender") or "") in getattr(self.cfg, "human_names", ()))
+
+    @staticmethod
+    def _attach_mail_due(rows: list[dict], marker: int | None) -> bool:
+        """#7861 : ce courrier était non lu au détachement d'un attach.
+
+        `marker` est l'id maximal écrit par `attach_mail.mark_due` juste
+        avant que le bail d'attach ne soit rendu. Ces messages sont dus tout
+        de suite : on ne leur applique ni la fenêtre L125, ni la fenêtre des
+        événements (C9). Aucun autre message n'est concerné (les ids sont
+        croissants), et le marqueur ne marque rien lu.
+        """
+        if marker is None:
+            return False
+        for row in rows:
+            try:
+                if int(row.get("id")) <= marker:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def _mail_due(self, rows: list[dict]) -> bool:
         """L125 : le courrier ordinaire en attente ouvre-t-il un tour ?
@@ -17882,6 +17916,7 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     vérifié, et la dernière page du journal est imprimée avant le harnais.
     """
     from . import attach as attach_mod
+    from . import attach_mail
     from . import attach_session as attach_session_mod
     from . import attach_wake
     from .platform import session_lock
@@ -18124,9 +18159,15 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     #: #7789 : l'attente signalée pendant la session, rendue à l'humain après
     #: le harnais (le terminal du harnais, lui, ne reçoit plus rien)
     attente = {"since": None}
+    #: #7861 : le courrier plus ancien que l'attach est déjà à la charge du
+    #: hook ou du tour de détachement ; seuls les nouveaux messages sont
+    #: signalés à l'humain pendant la session.
+    session_started = time.time()
+
     def check_inputs() -> None:
         prompt_since = time.time() if agent.get("pending_prompt") else None
         alerted_since = None
+        notified: set[int] = set()
         while not stop.is_set():
             try:
                 queued = registry.get(db, name) or {}
@@ -18145,6 +18186,22 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                     attente["since"] = since
             except db_mod.DbError as exc:
                 log_async("[%s] attach: cannot check waiting inputs (%s)" % (name, exc))
+            # #7861 : un courrier non passif arrivé pendant la session est
+            # signalé à l'humain attaché par le canal notify de l'hôte
+            # (bureau), une fois par message, sans rien marquer lu. La TUI du
+            # harnais n'est jamais touchée (#7789). Un échec de cette veille
+            # ne doit jamais arrêter la vérification des inputs.
+            try:
+                failures = attach_mail.new_mail(
+                    db, name, since=session_started, notified=notified)
+                for message_id, reason in failures:
+                    log_async("[%s] attach: new mail #%d not notified (%s)"
+                              % (name, message_id, reason))
+            except db_mod.DbError as exc:
+                log_async("[%s] attach: cannot check mail (%s)" % (name, exc))
+            except Exception as exc:  # noqa: BLE001 — la session continue
+                log_async("[%s] attach: mail check failed (%s: %s)"
+                          % (name, type(exc).__name__, exc))
             stop.wait(attach_mod.INPUT_CHECK)
 
     inputs = threading.Thread(target=check_inputs, daemon=True, name="%s-attach-inputs" % name)
@@ -18317,10 +18374,23 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         for worker in (thread, veille, inputs):
             if worker.ident is not None:    # started (L223)
                 worker.join(timeout=5)
+        # #7861 : lire les non-lus AVANT de rendre le bail — le marqueur doit
+        # exister quand l'exécuteur, réveillé par le déclencheur de bail,
+        # reprend l'agent : il lance alors le tour de courrier restant sans
+        # la fenêtre de regroupement L125. Rien n'est marqué lu, et une
+        # écriture impossible ne retient pas le bail (le tour ordinaire
+        # reste le filet).
+        due = None
+        try:
+            due = attach_mail.mark_due(cfg, db, name)
+        except (OSError, db_mod.DbError) as exc:
+            log_async("[%s] unread mail not marked due (%s)" % (name, exc))
         try:
             registry.release(db, name, lease_owner, epoch)
         except db_mod.DbError:
             pass
+        if due is not None:
+            attach_mail.wake(db, name, due)
         # #7789 : le bail est rendu avant toute sortie ; le garde vide alors
         # le journal de la session dans le fichier, puis rend le terminal.
         if terminal is not None:
