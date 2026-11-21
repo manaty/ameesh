@@ -192,8 +192,11 @@ class RejeuRolesTest(PgTestCase):
         # tests/test_l56_role_executor.py sérialise sa création et sa
         # destruction entre les workers du banc.
         cls.lock_db = db_mod.connect(cls.cfg)
-        cls.lock_tx = cls.lock_db.transaction()
-        cls.lock_tx.__enter__()
+        # `transaction()` est un gestionnaire de contexte dans les deux
+        # pilotes (psycopg et psql) : le verrou doit tenir de BEGIN à COMMIT
+        # pendant toute la classe, donc on entre et sort explicitement.
+        cls.lock_cm = cls.lock_db.transaction()
+        cls.lock_tx = cls.lock_cm.__enter__()
         cls.lock_tx.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended('ameesh-role-module-writers', 0))")
         cls.addClassCleanup(cls._release_lock)
@@ -269,7 +272,7 @@ class RejeuRolesTest(PgTestCase):
     @classmethod
     def _release_lock(cls) -> None:
         try:
-            cls.lock_tx.__exit__(None, None, None)
+            cls.lock_cm.__exit__(None, None, None)
         except Exception:  # noqa: BLE001 — nettoyage
             pass
         try:
