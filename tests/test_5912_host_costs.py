@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest import mock
 
-from ameesh import host_capacity_alerts, host_idle, notify
+from ameesh import host_capacity_alerts, host_idle, host_lifecycle, notify
 
 GP1_S = {'calcul_eur_h': 0.19074, 'disque_eur_h': 0.00735, 'ip_eur_h': 0.005,
          'source': 'Scaleway catalog fr-par-1, 05/11/2026'}
@@ -16,6 +16,20 @@ def canon(**cards):
 
 
 class CostStatesTest(unittest.TestCase):
+    def test_service_host_is_neither_idle_candidate_nor_drainable(self):
+        cards = [canon(hub={'capacity': 'services', 'policy': {'max_agents': 0}})]
+        caps, _ = host_idle.capacities(cards, ['hub'], baseline_hosts=0)
+        self.assertEqual(caps['hub'], 'services')
+        fp = {'state': 'idle', 'capacity': caps['hub'], 'idle_since': 1, 'unknown': []}
+        self.assertEqual(host_capacity_alerts.project({'hub': fp}, [], now=4000), [])
+        with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
+             mock.patch.object(host_lifecycle.work, 'configured_canons', return_value=cards), \
+             mock.patch('ameesh.canon.configured', return_value=['canon']), \
+             mock.patch.object(host_lifecycle.storage, 'of') as store:
+            with self.assertRaisesRegex(ValueError, 'protected services'):
+                host_lifecycle.drain(None, None, 'hub', actor='human:test')
+            store.assert_not_called()
+
     def test_parts_give_on_and_off(self):
         cost = host_idle.cost_states([{'tarif': GP1_S}])
         self.assertAlmostEqual(cost['on'], 0.20309)

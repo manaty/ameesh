@@ -93,6 +93,10 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
     except Exception:  # an unreadable canon must not reopen the gate
         canons = []
         configured = True
+    from . import host_idle
+    if any(h.title == host and h.fiche.data.get('capacity') == host_idle.CAPACITY_SERVICES
+           for canon in canons for h in canon.hosts):
+        raise ValueError('drain refused: host carries protected services')
     try:
         hook = host_release.hook_for(cfg, canons, host)
     except ValueError:

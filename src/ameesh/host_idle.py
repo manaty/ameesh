@@ -32,6 +32,8 @@ RUNS_LENDING = 'lending'
 #: #7727: a host that admits no agent is outside the reserved-capacity
 #: projection: neither a baseline reserve nor a burst candidate.
 CAPACITY_NONE = 'none'
+# Service hosts are protected independently of agent placement and baseline.
+CAPACITY_SERVICES = 'services'
 #: the capacity classes an idle host can be counted in by the alerts
 CAPACITY_CLASSES = ('baseline', 'burst')
 
@@ -345,7 +347,9 @@ def capacities(canons, names, *, protected=(), baseline_hosts=2):
     for name in names:
         cards = [host.fiche.data for canon in canons for host in canon.hosts
                  if host.title == name]
-        if no_agent_reason(cards):
+        if any(c.get('capacity') == CAPACITY_SERVICES for c in cards):
+            out[name] = CAPACITY_SERVICES
+        elif no_agent_reason(cards):
             out[name] = CAPACITY_NONE
         else:
             out[name] = ('baseline' if any(c.get('capacity') == 'baseline' for c in cards)
