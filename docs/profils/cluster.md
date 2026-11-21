@@ -198,9 +198,15 @@ psql "<admin DSN>" -v ON_ERROR_STOP=1 -f deploy/sql/role-superviseur-contenus.sq
 On the mesh database the staging sequence replays the state contract right
 after each migration (`deploy/sql/rejeu-superviseur.sql`, under the migration
 owner's connection, #7982): a migration that adds a column to the contract no
-longer waits for the owner's station update. The installation above remains
-the administrator's gesture for creating the role and setting its attributes;
-the replay never creates or alters a role.
+longer waits for the owner's station update. The contents contract is replayed
+the same way when its role already exists
+(`deploy/sql/rejeu-superviseur-contenus.sql`, #7986): the replay only holds
+the columns already reviewed in that script, on a role posed by decision; it
+does not create the role, alter it or grant any membership, so a supervisor's
+effective access to contents remains the administrator's
+`GRANT ameesh_superviseur_contenus`. The installation above remains the
+administrator's gesture for creating the role and setting its attributes; the
+replay never creates or alters a role.
 
 Each script opens **its own transaction** and guarantees its result, not
 only its own statements. It creates the role if it is missing, revokes the

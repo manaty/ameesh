@@ -24,6 +24,12 @@
 -- rien n'est créé ni changé. Idempotent : le relancer après chaque mise à
 -- jour d'ameesh ; une colonne du contrat absente (base en retard de
 -- migrations) le fait échouer.
+-- #7986 : le staging rejoue ce contrat après chaque migration
+-- (deploy/sql/rejeu-approve.sql, sous la connexion du propriétaire des tables,
+-- sans CREATEROLE) : il ne tient que les colonnes déjà relues ci-dessous, sur
+-- un rôle existant. Le rejeu ne crée ni n'altère le rôle ; l'installation
+-- ci-dessus reste le geste de l'administrateur pour le CRÉER, et la
+-- connexion du service reste un rôle de connexion membre de celui-ci.
 --
 -- Le rôle est NOLOGIN. Le service se connecte sous un rôle de connexion
 -- dédié, membre de celui-ci, en lecture seule par défaut :

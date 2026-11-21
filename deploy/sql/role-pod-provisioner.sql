@@ -25,6 +25,15 @@
 -- Les rôles sont LOGIN sans mot de passe initial : l'opérateur pose le secret
 -- avec `\password <rôle>` (SCRAM, jamais d'argument contenant le secret).
 -- La connexion se fait avec un passfile dédié 0600, jamais le DSN `ameesh`.
+--
+-- #7986 : en mode rejeu (`ameesh.rejeu_pod` = '1', posé par
+-- rejeu-pod-provisioner.sql sous le propriétaire des tables, sans
+-- CREATEROLE), les CREATE/ALTER ROLE et le remplacement de la fonction de
+-- garde sont sautés : les deux rôles et la fonction doivent déjà exister,
+-- seuls les GRANT/REVOKE et les triggers sont rejoués, et l'audit
+-- _contrat-pod-provisioner.sql est inclus dans la même transaction. Créer les
+-- rôles, poser leurs attributs et remplacer la fonction restent les gestes de
+-- l'administrateur.
 \set ON_ERROR_STOP on
 \if :{?role}
 \else
@@ -43,23 +52,26 @@ DECLARE
     r text := current_setting('ameesh.pod_role');
     a text := current_setting('ameesh.pod_admission');
     s text := current_schema();
+    rejeu boolean := coalesce(current_setting('ameesh.rejeu_pod', true), '') = '1';
     item record;
 BEGIN
     IF r = a OR s IS NULL OR s IN ('pg_catalog', 'information_schema', 'diagnostics') THEN
         RAISE EXCEPTION 'invalid pod role enrollment';
     END IF;
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = r) THEN
+    IF NOT rejeu AND NOT EXISTS (SELECT FROM pg_roles WHERE rolname = r) THEN
         EXECUTE format('CREATE ROLE %I LOGIN NOINHERIT NOSUPERUSER NOCREATEDB '
                        'NOCREATEROLE NOREPLICATION NOBYPASSRLS', r);
     END IF;
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = a) THEN
+    IF NOT rejeu AND NOT EXISTS (SELECT FROM pg_roles WHERE rolname = a) THEN
         EXECUTE format('CREATE ROLE %I LOGIN NOINHERIT NOSUPERUSER NOCREATEDB '
                        'NOCREATEROLE NOREPLICATION NOBYPASSRLS', a);
     END IF;
-    EXECUTE format('ALTER ROLE %I LOGIN NOINHERIT NOSUPERUSER NOCREATEDB '
-                   'NOCREATEROLE NOREPLICATION NOBYPASSRLS', r);
-    EXECUTE format('ALTER ROLE %I LOGIN NOINHERIT NOSUPERUSER NOCREATEDB '
-                   'NOCREATEROLE NOREPLICATION NOBYPASSRLS', a);
+    IF NOT rejeu THEN
+        EXECUTE format('ALTER ROLE %I LOGIN NOINHERIT NOSUPERUSER NOCREATEDB '
+                       'NOCREATEROLE NOREPLICATION NOBYPASSRLS', r);
+        EXECUTE format('ALTER ROLE %I LOGIN NOINHERIT NOSUPERUSER NOCREATEDB '
+                       'NOCREATEROLE NOREPLICATION NOBYPASSRLS', a);
+    END IF;
     -- Aucune appartenance : un rôle membre hériterait des droits du parent
     -- (le rôle `ameesh` propriétaire, notamment).
     IF EXISTS (SELECT FROM pg_auth_members m JOIN pg_roles x ON x.oid = m.member
@@ -105,6 +117,9 @@ BEGIN
     -- ses propres demandes, et seulement avec les valeurs de la demande.
     -- Des triggers (et non une RLS : l'audit de sauvegarde #5162 refuse toute
     -- table sous RLS) bornent l'hôte et vérifient chaque champ autorisé.
+    -- #7986 : le remplacement de la fonction appartient à l'administrateur
+    -- (elle est possédée par un autre rôle) ; en rejeu, elle doit déjà exister.
+    IF NOT rejeu THEN
     EXECUTE format($ddl$
         CREATE OR REPLACE FUNCTION %I.ameesh_pod_write_guard()
         RETURNS trigger LANGUAGE plpgsql
@@ -167,6 +182,7 @@ BEGIN
         END
         $body$;
     $ddl$, s, s, r);
+    END IF;
     FOR item IN
         SELECT unnest(ARRAY['pod_hosts', 'host_tenancy', 'host_tenants']) AS rel
     LOOP
@@ -198,4 +214,7 @@ BEGIN
     END IF;
 END
 $install$;
+-- #7986 : l'audit complet du contrat, dans la même transaction que
+-- l'installation ou que le rejeu (le fichier est aussi utilisable seul).
+\ir _contrat-pod-provisioner.sql
 COMMIT;

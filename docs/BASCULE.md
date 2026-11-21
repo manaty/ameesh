@@ -1178,7 +1178,10 @@ check of `vm.sh redemarrer` changes (0041 to 0047).
    `commitments.note` is content: it is only read with
    `role-superviseur-contenus.sql`, applied separately, by decision. Without
    this step, a supervisor fails on the new columns, without breaking
-   anything else.
+   anything else. #7986 : le staging rejoue ce contrat après chaque migration
+   quand le rôle existe déjà ; le rejeu ne crée pas le rôle et ne tient que
+   les colonnes déjà relues du script, l'appartenance d'une connexion restant
+   la décision d'accès.
 4. **Stop the ghost agent `orchestrator`**, before the restart. This name
    is registered without a runner driving it. After the update,
    `ameesh doctor` would flag it as a driven agent without a unit (L106), and the

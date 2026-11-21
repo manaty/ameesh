@@ -25,6 +25,13 @@
 -- changé. Il ne répare jamais des droits accordés par d'autres ; il refuse.
 -- Idempotent : le relancer après chaque mise à jour d'ameesh. Une colonne du
 -- contrat absente (base en retard de migrations) le fait aussi échouer.
+-- #7986 : le staging rejoue ce contrat après chaque migration
+-- (deploy/sql/rejeu-superviseur-contenus.sql, sous la connexion du
+-- propriétaire des tables, sans CREATEROLE) : il ne tient que les colonnes
+-- déjà relues ci-dessous, sur un rôle déjà posé par décision. Le rejeu ne
+-- crée ni n'altère le rôle et n'accorde aucune appartenance ; l'installation
+-- ci-dessus reste le geste de l'administrateur pour CRÉER le rôle, et le
+-- GRANT d'appartenance à une connexion reste la décision d'accès.
 -- Jamais de matériel de signature, de reçu ni de nonce : le test
 -- tests/test_cluster.py vérifie que ce rôle lit exactement ces colonnes, et
 -- le rôle de base aucune.

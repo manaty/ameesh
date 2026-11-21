@@ -13,6 +13,9 @@
 --    par rejeu-superviseur.sql sous la connexion de `migrate`, propriétaire
 --    des tables, sans CREATEROLE), le rôle doit exister : ni création ni
 --    altération, la base en retard de rôle reste un geste d'administrateur.
+--    #7986 : le même mode sert à rejeu-superviseur-contenus.sql et à
+--    rejeu-approve.sql ; il ne tient que le contrat de colonnes du script
+--    appelant, sans création de rôle ni appartenance.
 -- 2. Ses PROPRES droits sur le schéma sont retirés, puis la lecture des
 --    colonnes du contrat est accordée (droits de colonne : une colonne ajoutée
 --    plus tard par une migration n'est jamais lisible sans décision).

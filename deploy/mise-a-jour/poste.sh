@@ -612,7 +612,7 @@ redemarrer_urgence() {
 # si ce code est déjà installé. Le lien src-current n'accorde aucune autorité de
 # migration. --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
-  local ref cible d garde=(--additive-only) sha incompatible=0 code_dry=0 droits=0 superviseur=0
+  local ref cible d garde=(--additive-only) sha incompatible=0 code_dry=0 droits=0 superviseur=0 roles=0
   if [ "${1:-}" = "--additif-seulement" ]; then
     shift
   fi
@@ -655,6 +655,14 @@ migrer() {
        -m ameesh.droits_superviseur --sql-dir "$cible/deploy/sql"; then
     superviseur=1
   fi
+  # #7986 : contrats rejouables restants (superviseur-contenus, approve,
+  # module-writers, pod-provisioner), même connexion ; un rôle absent est
+  # sauté, un contrat refusé arrête avant l'installation.
+  etape "contrats de rôle rejouables, base du mesh (rejeu puis audit)"
+  if ! AMEESH_CONFIG="$CONFIG" PYTHONPATH="$cible/src" "$VENV/bin/python" \
+       -m ameesh.droits_roles --sql-dir "$cible/deploy/sql"; then
+    roles=1
+  fi
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
     dsn_part d "$CONFIG_RESTE" dsn || return
@@ -665,16 +673,19 @@ migrer() {
     fi
     AMEESH_CONFIG="$CONFIG_RESTE" migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
   fi
-  # #7873/#7982 : un audit refusé arrête la mise à jour avant toute
+  # #7873/#7982/#7986 : un audit refusé arrête la mise à jour avant toute
   # installation, sauf quand l'ancien code ne sert plus le schéma migré
   # (installation immédiate ci-dessous, puis échec).
-  if { [ "$droits" = 1 ] || [ "$superviseur" = 1 ]; } \
+  if { [ "$droits" = 1 ] || [ "$superviseur" = 1 ] || [ "$roles" = 1 ]; } \
      && { [ "$incompatible" = 0 ] || [ "${MIGRER_SANS_REDEMARRAGE:-0}" = 1 ]; }; then
     if [ "$droits" = 1 ]; then
       echo "droits des connexions limitées refusés par l'audit : aucune installation, version précédente conservée" >&2
     fi
     if [ "$superviseur" = 1 ]; then
       echo "contrat du superviseur refusé par l'audit : aucune installation, version précédente conservée" >&2
+    fi
+    if [ "$roles" = 1 ]; then
+      echo "contrats de rôle refusés par l'audit : aucune installation, version précédente conservée" >&2
     fi
     return 1
   fi
@@ -716,6 +727,10 @@ migrer() {
   fi
   if [ "$superviseur" = 1 ]; then
     echo "contrat du superviseur refusé par l'audit : à corriger avant tout autre hôte" >&2
+    return 1
+  fi
+  if [ "$roles" = 1 ]; then
+    echo "contrats de rôle refusés par l'audit : à corriger avant tout autre hôte" >&2
     return 1
   fi
 }
