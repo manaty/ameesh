@@ -3,7 +3,13 @@
 
 Aucune VM n'est contactée : l'offload et la lecture de la tête publiée sont
 testés par leurs entrées/sorties. La commande refuse un canon sans bloc
-(`block-missing`) et n'écrit aucun jalon."""
+(`block-missing`) et n'écrit aucun jalon.
+
+#7999 : la politique de contrats est fixée par les témoins
+(`contract_policy=None`), jamais lue du canon de l'hôte — AG1/AG3 déclarent
+`contract_selection` pour ameesh et un plan historique sans bloc
+`contract_plan` y était refusé.
+"""
 from __future__ import annotations
 
 import json
@@ -16,12 +22,39 @@ from io import StringIO
 from types import SimpleNamespace
 from unittest import mock
 
+from ameesh import contract_plan, mechanics
 from ameesh import db as db_mod
 from ameesh import mesh_cli, prevalidation as pv
 
 A = "a" * 40
 B = "b" * 40
 C = "c" * 40
+
+#: #7999 : le canon de l'hôte (AG1/AG3) déclare `contract_selection`.
+HOST_POLICY = mechanics.ContractSelection("tests/parts/contrats.json")
+
+
+def host_canon_declares_a_policy():
+    """#7999 : contexte d'un hôte qui déclare une politique de contrats."""
+    return mock.patch.object(contract_plan, "configured_policy",
+                             return_value=HOST_POLICY)
+
+
+_policy_patch = None
+
+
+def setUpModule():
+    # Le témoin doit rester vert sous ce contexte, et un appel resté en
+    # `configured` y est rouge : la dépendance à l'hôte ne peut pas revenir
+    # silencieusement (elle était invisible en CI, sans canon).
+    global _policy_patch
+    _policy_patch = host_canon_declares_a_policy()
+    _policy_patch.start()
+
+
+def tearDownModule():
+    if _policy_patch is not None:
+        _policy_patch.stop()
 
 
 def plan_canon(head: str = A) -> dict:
@@ -104,14 +137,14 @@ def snapshot_for(snap: str = C):
 
 class MeetsCanonTest(unittest.TestCase):
     def test_selection_exacte_acceptee(self):
-        ok, why = pv.meets_canon(plan_canon(), params())
+        ok, why = pv.meets_canon(plan_canon(), params(), contract_policy=None)
         self.assertTrue(ok, why)
 
     def test_module_hors_classes_refuse(self):
         plan = plan_canon()
         plan["parts"]["psycopg"][0]["modules"].append("test_autre")
         plan["selection"]["selected"] = 3
-        ok, why = pv.meets_canon(plan, params())
+        ok, why = pv.meets_canon(plan, params(), contract_policy=None)
         self.assertFalse(ok)
         self.assertIn("hors des classes", why)
 
@@ -119,18 +152,18 @@ class MeetsCanonTest(unittest.TestCase):
         plan = plan_canon()
         plan["parts"]["psycopg"][0]["modules"] = ["test_a"]
         plan["selection"]["selected"] = 1
-        ok, why = pv.meets_canon(plan, params())
+        ok, why = pv.meets_canon(plan, params(), contract_policy=None)
         self.assertFalse(ok)
         self.assertIn("absents", why)
 
     def test_plan_sans_classes_refuse(self):
         plan = plan_canon()
         plan.pop("classes")
-        ok, why = pv.meets_canon(plan, params())
+        ok, why = pv.meets_canon(plan, params(), contract_policy=None)
         self.assertFalse(ok)
 
     def test_canon_sans_classes_refuse(self):
-        ok, _ = pv.meets_canon(plan_canon(), params(classes=()))
+        ok, _ = pv.meets_canon(plan_canon(), params(classes=()), contract_policy=None)
         self.assertFalse(ok)
 
 
@@ -152,7 +185,8 @@ class ContractContentTest(unittest.TestCase):
 
     def test_contrat_declare_non_selectionne_refuse(self):
         name = self._file("contrats.txt", "test_mandatory  # garanti par le bloc\n")
-        ok, why = pv.meets_canon(plan_canon(), params(contracts=(name,)), self.tmp.name)
+        ok, why = pv.meets_canon(plan_canon(), params(contracts=(name,)),
+                                 self.tmp.name, contract_policy=None)
         self.assertFalse(ok)
         self.assertIn("test_mandatory", why)
         self.assertIn("absents de la sélection", why)
@@ -160,19 +194,21 @@ class ContractContentTest(unittest.TestCase):
     def test_contrat_invente_par_le_plan_refuse(self):
         """Le plan compte `test_cluster` en contrat : le fichier ne le dit pas."""
         name = self._file("contrats.txt", "test_a  # pas un contrat, juste un module\n")
-        ok, why = pv.meets_canon(plan_canon(), params(contracts=(name,)), self.tmp.name)
+        ok, why = pv.meets_canon(plan_canon(), params(contracts=(name,)),
+                                 self.tmp.name, contract_policy=None)
         self.assertFalse(ok)
         self.assertIn("hors des fichiers déclarés", why)
 
     def test_contrat_declare_selectionne_accepte(self):
         name = self._file("contrats.txt",
                           "test_cluster  # rôles du cluster\n# ligne de commentaire\n")
-        ok, why = pv.meets_canon(plan_canon(), params(contracts=(name,)), self.tmp.name)
+        ok, why = pv.meets_canon(plan_canon(), params(contracts=(name,)),
+                                 self.tmp.name, contract_policy=None)
         self.assertTrue(ok, why)
 
     def test_contrat_illisible_refuse(self):
         ok, why = pv.meets_canon(plan_canon(), params(contracts=("absent.txt",)),
-                                 self.tmp.name)
+                                 self.tmp.name, contract_policy=None)
         self.assertFalse(ok)
         self.assertIn("illisible", why)
 
@@ -207,7 +243,7 @@ class ValidateTest(unittest.TestCase):
                              params=params(), repo=self.tmp.name,
                              runner=runner_for(0, flux()),
                              snapshotter=snapshot_for(),
-                             git_runner=git_runner_for())
+                             git_runner=git_runner_for(), contract_policy=None)
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["causes"], [])
         self.assertEqual(report["host"], "vm1")
@@ -232,7 +268,7 @@ class ValidateTest(unittest.TestCase):
                              params=params(), repo=self.tmp.name, runner=runner,
                              snapshotter=snapshot_for(),
                              git_runner=git_runner_for(),
-                             deadline=pv.Deadline(30.0))
+                             deadline=pv.Deadline(30.0), contract_policy=None)
         self.assertFalse(report["ok"])
         self.assertEqual(report["outcome"], "run-incomplete")
         self.assertIn("run-incomplete", report["causes"])
@@ -260,7 +296,7 @@ class ValidateTest(unittest.TestCase):
                         params=params(), repo=self.tmp.name,
                         runner=runner_for(0, flux()),
                         snapshotter=snapshot_for(), git_runner=git_runner,
-                        deadline=pv.Deadline(0.03, clock=lambda: now[0]))
+                        deadline=pv.Deadline(0.03, clock=lambda: now[0]), contract_policy=None)
         self.assertEqual(caught.exception.cause, "run-incomplete")
         self.assertIn("pendant git", str(caught.exception))
         self.assertEqual(seen, [0.03])
@@ -278,7 +314,7 @@ class ValidateTest(unittest.TestCase):
                              params=params(parts_script="tools/parts.py"),
                              repo=self.tmp.name, runner=capture,
                              snapshotter=snapshot_for(),
-                             git_runner=git_runner_for())
+                             git_runner=git_runner_for(), contract_policy=None)
         self.assertTrue(report["ok"], report)
         command = " ".join(seen[0])
         self.assertIn("tools/parts.py run --plan", command)
@@ -295,7 +331,7 @@ class ValidateTest(unittest.TestCase):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name, runner=capture,
                              snapshotter=snapshot_for(),
-                             git_runner=git_runner_for())
+                             git_runner=git_runner_for(), contract_policy=None)
         self.assertTrue(report["ok"], report)
         self.assertIn(pv.DEFAULT_PARTS_SCRIPT, " ".join(seen[0]))
 
@@ -310,7 +346,7 @@ class ValidateTest(unittest.TestCase):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name, runner=capture,
                              snapshotter=snapshot_for(),
-                             git_runner=git_runner_for())
+                             git_runner=git_runner_for(), contract_policy=None)
         self.assertTrue(report["ok"], report)
         argv, kwargs = seen[0]
         self.assertEqual(kwargs.get("cwd"), os.path.abspath(self.tmp.name))
@@ -329,7 +365,7 @@ class ValidateTest(unittest.TestCase):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              profile="ameesh", params=params(), repo=self.tmp.name,
                              runner=capture, snapshotter=snapshot_for(),
-                             git_runner=git_runner_for())
+                             git_runner=git_runner_for(), contract_policy=None)
         self.assertTrue(report["ok"], report)
         argv = seen[0]
         self.assertEqual(argv[argv.index("--profile") + 1], "ameesh")
@@ -340,7 +376,7 @@ class ValidateTest(unittest.TestCase):
                         params=params(), repo=self.tmp.name,
                         runner=runner_for(0, flux()),
                         snapshotter=snapshot_for(),
-                        git_runner=git_runner_for())
+                        git_runner=git_runner_for(), contract_policy=None)
         self.assertEqual(caught.exception.cause, "no-vm")
 
     def test_contrat_declare_introuvable_refuse(self):
@@ -349,7 +385,7 @@ class ValidateTest(unittest.TestCase):
                         params=params(contracts=("tests/parts/toujours.txt",)),
                         repo=self.tmp.name, runner=runner_for(0, flux()),
                         snapshotter=snapshot_for(),
-                        git_runner=git_runner_for())
+                        git_runner=git_runner_for(), contract_policy=None)
         self.assertEqual(caught.exception.cause, "selection-unsafe")
 
     def test_arbre_a_une_autre_tete_refuse(self):
@@ -359,7 +395,7 @@ class ValidateTest(unittest.TestCase):
                         params=params(), repo=self.tmp.name,
                         runner=runner_for(0, flux()),
                         snapshotter=snapshot_for(),
-                        git_runner=git_runner_for(head=B))
+                        git_runner=git_runner_for(head=B), contract_policy=None)
         self.assertEqual(caught.exception.cause, "head-moved")
         self.assertIn("arbre à", caught.exception.why)
 
@@ -377,7 +413,7 @@ class ValidateTest(unittest.TestCase):
                              params=params(), repo=self.tmp.name,
                              runner=capture,
                              snapshotter=snapshot_for(),
-                             git_runner=git_runner_for())
+                             git_runner=git_runner_for(), contract_policy=None)
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["tree"]["snapshot"], C)
         self.assertIn("--snapshot", " ".join(seen[0]))
@@ -390,7 +426,7 @@ class ValidateTest(unittest.TestCase):
                         params=params(), repo=self.tmp.name,
                         runner=runner_for(0, flux()),
                         snapshotter=snapshot_for(),
-                        git_runner=git_runner_for(ignored=True))
+                        git_runner=git_runner_for(ignored=True), contract_policy=None)
         self.assertEqual(caught.exception.cause, "selection-unsafe")
         self.assertIn("ignoré", caught.exception.why)
 
@@ -405,7 +441,7 @@ class ValidateTest(unittest.TestCase):
                             params=params(), repo=self.tmp.name,
                             runner=runner_for(0, flux()),
                             snapshotter=snapshot_for(),
-                            git_runner=git_runner_for())
+                            git_runner=git_runner_for(), contract_policy=None)
         self.assertEqual(caught.exception.cause, "selection-unsafe")
         self.assertIn("hors de l'arbre", caught.exception.why)
 
@@ -423,7 +459,7 @@ class ValidateTest(unittest.TestCase):
                              params=params(), repo=self.tmp.name,
                              runner=runner_for(0, flux()),
                              snapshotter=snapshot_for(),
-                             git_runner=git)
+                             git_runner=git, contract_policy=None)
         self.assertFalse(report["ok"])
         self.assertIn("head-moved", report["causes"])
 
@@ -432,7 +468,7 @@ class ValidateTest(unittest.TestCase):
                              params=params(), repo=self.tmp.name,
                              runner=runner_for(1, flux("echec")),
                              snapshotter=snapshot_for(),
-                             git_runner=git_runner_for())
+                             git_runner=git_runner_for(), contract_policy=None)
         self.assertFalse(report["ok"])
         self.assertIn("run-red", report["causes"])
 
@@ -445,7 +481,7 @@ class ValidateTest(unittest.TestCase):
                              params=params(), repo=self.tmp.name,
                              runner=runner_for(0, sans_fin + "\n" + pv.SECONDS_MARK + "9\n"),
                              snapshotter=snapshot_for(),
-                             git_runner=git_runner_for())
+                             git_runner=git_runner_for(), contract_policy=None)
         self.assertFalse(report["ok"])
         self.assertIn("run-incomplete", report["causes"])
 
@@ -456,7 +492,7 @@ class ValidateTest(unittest.TestCase):
                              runner=runner_for(0, flux()),
                              snapshotter=snapshot_for(),
                              git_runner=git_runner_for(
-                                 ls_remote="%s\trefs/heads/lot/x\n" % C))
+                                 ls_remote="%s\trefs/heads/lot/x\n" % C), contract_policy=None)
         self.assertFalse(report["ok"])
         self.assertIn("head-moved", report["causes"])
 
@@ -467,7 +503,7 @@ class ValidateTest(unittest.TestCase):
                              runner=runner_for(0, flux()),
                              snapshotter=snapshot_for(),
                              git_runner=git_runner_for(
-                                 ls_remote="%s\trefs/heads/lot/x\n" % A))
+                                 ls_remote="%s\trefs/heads/lot/x\n" % A), contract_policy=None)
         self.assertTrue(report["ok"], report)
 
 
@@ -546,7 +582,7 @@ class CommitContentTest(unittest.TestCase):
         self.transport = mock.Mock(return_value=_Proc(0, flux()))
         return pv.validate(lot=1770, plan_path=path, head=self.head, host="vm1",
                            params=params(contracts=contracts), repo=self.repo,
-                           runner=self.transport)
+                           runner=self.transport, contract_policy=None)
 
     def test_contrat_local_altere_ne_reduit_pas_la_selection(self):
         plan = plan_canon(head=self.head)
