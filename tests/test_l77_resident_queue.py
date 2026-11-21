@@ -998,7 +998,8 @@ class StopAtPublicationTest(unittest.TestCase):
 
 def tearDownModule():
     # L77 : les préemptions journalisent (`log_async`) ; fermer le fil borné
-    # avant la finalisation évite l'abort CPython sur le verrou stdout.
+    # avant la finalisation évite l'abort CPython sur le verrou du flux de
+    # journal (stderr, #8013).
     from ameesh import runner
     runner._journal.close(2.0)
     # Le processus de tests continue : les modules suivants doivent retrouver

@@ -235,7 +235,7 @@ class RunnerTest(PgTestCase):
         self.register("sec", "claude", cwd=cwd, prompt="tour")
         proc = self.runner("--once", "--dry-run", "--agents", "sec")
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("dry-run", proc.stdout)
+        self.assertIn("dry-run", proc.stderr)  # journal d'exploitation (#8013)
         self.assertEqual(self.turns(), [])
         row = registry.get(self.db, "sec")
         self.assertEqual(int(row["turns"]), 0)
@@ -250,7 +250,8 @@ class RunnerTest(PgTestCase):
         self.assertEqual(row["status"], "blocked")
         self.assertIn("not found", row["last_error"])
         self.assertEqual(self.turns(), [])
-        self.assertEqual(proc.stdout.count("not found"), 1)
+        self.assertEqual(proc.stdout.count("not found"), 0)
+        self.assertEqual(proc.stderr.count("not found"), 1)  # journal (#8013)
 
     def test_consigne_restauree_apres_echec_au_demarrage(self):
         """Sonde codex3 (6) : un tour qui ne démarre pas ne perd pas sa consigne."""
@@ -552,15 +553,18 @@ class RunnerTest(PgTestCase):
             os.close(r)
             os.close(w)
 
-    def test_arret_borne_stderr_seul_bloque(self):
+    def test_arret_borne_stdout_seul_bloque(self):
+        """Le stdout seul est plein et jamais lu (le journal est sur stderr,
+        #8013) : le SIGTERM aboutit quand même, dans un délai borné."""
         r, w = os.pipe()
         proc = subprocess.Popen(
             [sys.executable, "-m", "ameesh.runner", "--agents", "personne", "--poll", "1"],
-            stdout=subprocess.PIPE, stderr=w, text=True, env=self.env(), cwd=self.tmp)
+            stdout=w, stderr=subprocess.PIPE, text=True, env=self.env(), cwd=self.tmp)
         lignes: list[str] = []
-        threading.Thread(
-            target=lambda: [lignes.append(line) for line in proc.stdout], daemon=True
-        ).start()
+        lecteur = threading.Thread(
+            target=lambda: [lignes.append(line) for line in proc.stderr], daemon=True
+        )
+        lecteur.start()
         try:
             self.wait_for(lambda: any("LISTEN" in l for l in lignes), timeout=20)
             self._remplir_tube(w)
@@ -575,7 +579,8 @@ class RunnerTest(PgTestCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=10)
-            proc.stdout.close()
+            lecteur.join(timeout=5)
+            proc.stderr.close()
             os.close(r)
             os.close(w)
 
@@ -597,7 +602,10 @@ class RunnerTest(PgTestCase):
         sortie = proc.stdout + proc.stderr
         self.assertEqual(proc.returncode, 1, sortie)
         self.assertIn("RuntimeError: boom", proc.stderr)
-        self.assertIn("m299", proc.stdout)  # journal entièrement vidé avant la sortie
+        # #8013 : le journal d'exploitation va sur stderr, jamais sur le
+        # stdout d'une commande qui rend des données ligne à ligne.
+        self.assertIn("m299", proc.stderr)  # journal entièrement vidé avant la sortie
+        self.assertNotIn("m299", proc.stdout)
         self.assertNotIn("Fatal Python error", sortie)
 
     # -- NOTIFY ------------------------------------------------------------
@@ -1028,8 +1036,8 @@ class RunnerTest(PgTestCase):
         self.register(nom, "claude", cwd=w, prompt="tour avec configuration partagée")
         proc = self.runner("--once", "--agents", nom, env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("shared git identity", proc.stdout)
-        self.assertIn(autre, proc.stdout)
+        self.assertIn("shared git identity", proc.stderr)  # journal (#8013)
+        self.assertIn(autre, proc.stderr)
         # l'identité du tour reste celle du bail, pas celle du dépôt
         env_tour = [t for t in self.turns() if "env" in t][-1]["env"]
         self.assertEqual(env_tour["GIT_AUTHOR_NAME"], nom)
@@ -1041,7 +1049,7 @@ class RunnerTest(PgTestCase):
         self.register(autre, "claude", cwd=chez_lui, prompt="tour de l'agent nommé")
         proc = self.runner("--once", "--agents", autre, env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("shared git identity", proc.stdout)
+        self.assertNotIn("shared git identity", proc.stdout + proc.stderr)
 
     def test_echeance_atteinte_arrete_sans_appeler_la_base(self):
         """Verdict codex3 B5a : plus de budget plancher après l'échéance.
