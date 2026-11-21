@@ -134,6 +134,45 @@ GUEST_EXCLUSIONS: dict[str, dict[str, str]] = {
 }
 
 
+#: #7988 — un même test rouge en prévalidation invitée sur au moins
+#: `RECURRENT_LOTS` lots distincts (celui-ci compris), dans la fenêtre
+#: `RECURRENT_WINDOW_S`, ne dit rien du lot : il dépend de l'hôte invité ou de
+#: la cible. Il est classé « environnement », non concluant (§3), et ouvre un
+#: lot de cause. Seul le nom exact du test compte, jamais un motif ; les
+#: porteurs de paquet ne comptent pas (ils portent le code de leurs unités).
+RECURRENT_LOTS = 2
+#: la fenêtre de lecture des rouges des autres lots (48 h, comme la carte)
+RECURRENT_WINDOW_S = 48 * 3600
+
+
+def recurrent_failures(rows, lot: int, *, carriers=()) -> dict[str, list[int]]:
+    """#7988 : `{test: [lots]}` des tests rouges sur d'autres lots que `lot`.
+
+    `rows` : les rapports non verts récents (`work_item_id`, `report`) ;
+    `carriers` : les lots porteurs de paquet, écartés. Les lots rendus sont
+    distincts et triés ; le lot courant n'y figure jamais."""
+    excluded = {int(lot)} | {int(c) for c in carriers}
+    seen: dict[str, set[int]] = {}
+    for row in rows or ():
+        try:
+            other = int(row.get("work_item_id"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if other <= 0 or other in excluded:
+            continue
+        report = row.get("report")
+        if isinstance(report, str):
+            try:
+                report = json.loads(report)
+            except ValueError:
+                continue
+        if not isinstance(report, dict):
+            continue
+        for name in report.get("failed") or ():
+            seen.setdefault(str(name), set()).add(other)
+    return {name: sorted(lots) for name, lots in seen.items()}
+
+
 class PrevalidationError(Exception):
     """Un refus nommé : la prévalidation s'arrête, elle ne suppose rien.
 
@@ -267,7 +306,8 @@ class Selection:
         return not self.causes
 
     def proof(self, *, lot: int, host: str, run: dict, flow: dict | None = None,
-              head_after: str = "", tree: dict | None = None) -> dict:
+              head_after: str = "", tree: dict | None = None,
+              recurrent: dict | None = None) -> dict:
         """Le rapport de prévalidation, sans effet de verdict.
 
         `run` : `{"outcome", "exit", "seconds"}` ; `flow` : le flux lu
@@ -275,7 +315,10 @@ class Selection:
         après le run (locale et/ou publiée) ; si elle diffère du SHA validé, le
         rapport est invalidé (`head-moved`). `tree` : ce qui a été vérifié et ce
         qui est parti (tête observée, identité du snapshot envoyé, chemin du
-        plan), recopié dans le rapport.
+        plan), recopié dans le rapport. `recurrent` (#7988) : `{test: [lots]}`
+        des tests vus rouges sur d'autres lots (`recurrent_failures`) ; un échec
+        qui y figure atteint `RECURRENT_LOTS` lots distincts et compte comme un
+        échec d'environnement (`environment_recurrent`).
 
         La preuve est **exhaustive** : chaque part attendue doit avoir sa fin
         verte — seul `succes` est vert ; `echec` est rouge, tout autre statut
@@ -370,6 +413,14 @@ class Selection:
         #: expliquée que par ses **propres** échecs nommés d'environnement :
         #: une part sans test nommé (crash, import) reste rouge.
         environment = set(str(t) for t in (flow.get("environment") or ())) & set(failed)
+        #: #7988 : le même test rouge sur d'autres lots distincts est de
+        #: l'environnement, comme une fixture : la part qu'il peint n'est
+        #: expliquée que si tous ses échecs nommés le sont.
+        others = {str(k): sorted({int(x) for x in v if int(x) != int(lot)})
+                  for k, v in (recurrent or {}).items()}
+        repeated = [t for t in failed
+                    if len(others.get(t) or ()) + 1 >= RECURRENT_LOTS]
+        environment |= set(repeated)
         explained = True
         for part in red:
             named = [str(t) for t in
@@ -386,6 +437,8 @@ class Selection:
                                    or (outcome == "green" and red)):
             outcome = "run-incomplete"
             causes.append("run-incomplete")
+            if repeated:
+                detail.append(_repeated_line(repeated, others))
             detail.append("échecs d'environnement seuls (%d) : %s%s"
                           % (len(failed), ", ".join(failed[:4]),
                              " (+%d)" % (len(failed) - 4)
@@ -394,6 +447,8 @@ class Selection:
             if red or failed:
                 outcome = "run-red"
                 causes.append("run-red")
+                if repeated:
+                    detail.append(_repeated_line(repeated, others))
                 if red:
                     detail.append("parts rouges: %s" % ", ".join(red[:4]))
                 if failed:
@@ -458,12 +513,25 @@ class Selection:
             "excluded_failed": excluded_failed,
             "causes": unique, "ok": not unique, "detail": detail,
         }
+        if repeated:
+            report["environment_recurrent"] = [
+                {"test": t, "lots": others.get(t) or []} for t in repeated]
         if self.fallback:
             report["selection"] = "contract"
             report["fallback"] = dict(self.fallback)
         if tree is not None:
             report["tree"] = tree
         return report
+
+
+def _repeated_line(repeated: Sequence[str], others: dict) -> str:
+    """#7988 : la ligne du rapport qui nomme les tests rouges ailleurs."""
+    shown = ["%s (aussi %s)" % (t, ", ".join("#%d" % n for n in others.get(t) or ()))
+             for t in repeated[:4]]
+    return ("environnement : même test rouge sur %d lots distincts ou plus "
+            "(#7988, non concluant) : %s%s"
+            % (RECURRENT_LOTS, ", ".join(shown),
+               " (+%d)" % (len(repeated) - 4) if len(repeated) > 4 else ""))
 
 
 def plan_text(path: str) -> str:
@@ -1297,7 +1365,8 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
              snapshotter=None, executable: str = "ameesh",
              contract_policy="configured", project: str = "ameesh",
              canon_repo: str = "", canon_commit: str = "",
-             deadline: Deadline | None = None) -> dict:
+             deadline: Deadline | None = None,
+             recurrent: dict | None = None) -> dict:
     """Le geste complet : contrôles du canon, exécution distante, rapport.
 
     Refuse avant tout run un hôte hors du canon, un contrat déclaré introuvable
@@ -1311,7 +1380,8 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     Avec `deadline` (#2665/N cx2), le geste ne commence aucune étape après
     l'échéance et `run_offload` borne l'attente locale du client (slot,
     transport, push) ; une échéance épuisée est `run-incomplete`, jamais un
-    vert."""
+    vert. `recurrent` (#7988) : les tests rouges d'autres lots, passés au
+    rapport (`Selection.proof`)."""
     #: lot 0 : une composition de train, sans lot de paquet (rapport non
     #: persisté, cf. #2644) ; un identifiant négatif reste refusé.
     if not isinstance(lot, int) or isinstance(lot, bool) or lot < 0:
@@ -1390,7 +1460,7 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     if published_ref:
         tree["published_ref"] = published_ref
     return chosen.proof(lot=lot, host=name, run=result, flow=result.get("flow"),
-                        head_after=after, tree=tree)
+                        head_after=after, tree=tree, recurrent=recurrent)
 
 
 def attest_report(report: dict, *, tree: str, scope: dict, lots: list,
