@@ -366,6 +366,32 @@ class MesureEtPolitiqueTest(unittest.TestCase):
         self.assertEqual(menage.sweep_prefixes_label(pol),
                          "`ameesh-*` / `autre-*` / `nexlink-*`")
 
+    def test_une_declaration_mal_formee_ne_fait_pas_lever_effective(self):
+        # #8020 (paquet h-12) : un canon de test (Mock) ou une valeur scalaire
+        # ne doit pas faire lever `mesh_sweep_prefixes` ; on ne devine aucun
+        # nom, on garde le seul préfixe d'ameesh.
+        canon = mock.Mock(id="m", host=lambda name: None)
+        self.assertEqual(menage.mesh_sweep_prefixes([canon]),
+                         menage.DEFAULT_SWEEP_PREFIXES)
+        self.assertEqual(menage.effective([canon], "pc").sweep_prefixes,
+                         menage.DEFAULT_SWEEP_PREFIXES)
+
+        class Naming:
+            projects = "pas-un-mapping"
+
+        class Agent:
+            effective_projects = 42
+
+        class MalForme:
+            naming = Naming()
+            agents = [Agent()]
+
+            def host(self, name):
+                return None
+
+        self.assertEqual(menage.mesh_sweep_prefixes([MalForme()]),
+                         menage.DEFAULT_SWEEP_PREFIXES)
+
 
 if __name__ == "__main__":
     unittest.main()

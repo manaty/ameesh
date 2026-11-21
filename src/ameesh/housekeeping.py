@@ -703,23 +703,40 @@ def parse_idle(value) -> float | None:
         return None
 
 
+def _declared_names(value) -> tuple:
+    """#8020 : les noms d'une déclaration de canon, ou rien.
+
+    `naming.projects` est un mapping, `projects:` et `agents` des listes ; un
+    canon mal formé (valeur scalaire, objet de test, Mock) ne doit jamais
+    faire lever `effective` : seule une forme dict/liste/tuple (ou ensemble)
+    rend des noms, tout le reste ne rend rien — on balaie moins, jamais autre
+    chose."""
+    if isinstance(value, dict):
+        return tuple(value)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(value)
+    return ()
+
+
 def mesh_sweep_prefixes(canons) -> tuple:
     """#8020 : les préfixes des dossiers temporaires du mesh, lus au canon.
 
     Le préfixe d'ameesh lui-même, puis un `<projet>-` par projet DÉCLARÉ dans
     les fiches Agent (`projects:`/`team:`) ou `naming.projects` du canon : les
     répertoires sont créés hors du code (`mktemp -d`), le cœur n'a donc aucun
-    nom de client à écrire (#7660). Un canon illisible ne rend que le préfixe
+    nom de client à écrire (#7660). Un canon illisible — ou une déclaration
+    d'une autre forme qu'un mapping ou une liste — ne rend que le préfixe
     d'ameesh : on balaie moins, jamais autre chose."""
     prefixes = set(DEFAULT_SWEEP_PREFIXES)
     for canon in canons or ():
         naming = getattr(canon, "naming", None)
-        for project in getattr(naming, "projects", None) or {}:
+        for project in _declared_names(getattr(naming, "projects", None)):
             name = str(project).strip()
             if name and "/" not in name:
                 prefixes.add(name + "-")
-        for agent in getattr(canon, "agents", ()) or ():
-            for project in getattr(agent, "effective_projects", ()) or ():
+        for agent in _declared_names(getattr(canon, "agents", ())):
+            for project in _declared_names(
+                    getattr(agent, "effective_projects", ())):
                 name = str(project).strip()
                 if name and "/" not in name:
                     prefixes.add(name + "-")
