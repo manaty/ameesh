@@ -1713,11 +1713,12 @@ WAITING_GESTURES = {
     "pilot-hold":
         "le pilote lève le hold (`unhold`) quand il n'est plus dû",
     "migration-collision":
-        "réserver/renuméroter (`ameesh work migration {lot} --number "
-        "{number}`), puis regeler",
+        "choisir un nouveau numéro libre N, renommer la migration et réserver "
+        "(`ameesh work migration {lot} --number N`), puis regeler",
     "migration-gap":
-        "réserver/renuméroter (`ameesh work migration {lot} --number "
-        "{number}`), puis regeler",
+        "choisir un numéro libre N au-dessus de la tête cible en comblant "
+        "le trou, renommer la migration et réserver "
+        "(`ameesh work migration {lot} --number N`), puis regeler",
     "packet-exception":
         "exception de paquet : fusion hors paquet (§11 bis), rien à composer",
     "packet-vehicle":
@@ -1737,19 +1738,39 @@ WAITING_GESTURES = {
 def waiting_gesture(cause: dict, lot: int) -> str:
     """#7989 : le geste attendu d'un lot laissé en attente, vide si inconnu.
 
-    Le gabarit ne reçoit que des valeurs **lues** dans la cause (numéro de
-    migration, prérequis) : jamais un numéro deviné. Un gabarit qui manque une
-    valeur rend le texte tel quel, sans exception."""
+    Un numéro fautif n'est pas un numéro à réserver. Seuls les `numbers` non
+    couverts sont à réserver tels quels ; pour une renumérotation, la cause ne
+    prouve pas la disponibilité d'un nouveau numéro (même `missing` peut être
+    réservé par un autre lot). N reste donc à choisir et vérifier par l'auteur.
+    Un gabarit qui manque une valeur rend le texte tel quel, sans exception."""
     cause = cause if isinstance(cause, dict) else {}
-    template = WAITING_GESTURES.get(str(cause.get("code") or ""))
+    code = str(cause.get("code") or "")
+    if code == "migration-collision" and not cause.get("case"):
+        numbers = cause.get("numbers")
+        if isinstance(numbers, (list, tuple)) and numbers and all(
+                isinstance(n, int) and not isinstance(n, bool) and n > 0
+                for n in numbers):
+            commands = "; ".join(
+                "`ameesh work migration %d --number %d`" % (int(lot), number)
+                for number in sorted(set(numbers)))
+            return "réserver les numéros non couverts (%s), puis regeler" % commands
+    template = WAITING_GESTURES.get(code)
     if not template:
         return ""
-    values = {"lot": int(lot), "number": "N", "blocker": "N"}
-    for key in ("number", "blocker_id"):
-        value = cause.get(key)
-        if isinstance(value, int) and not isinstance(value, bool):
-            values[key] = value
-    values["blocker"] = values.get("blocker_id", values["blocker"])
+    if code == "migration-gap" and cause.get("case") == "behind":
+        template = (
+            "choisir un nouveau numéro libre N au-dessus de la tête cible, "
+            "renommer la migration et réserver "
+            "(`ameesh work migration {lot} --number N`), puis regeler")
+    missing = cause.get("missing")
+    if (code == "migration-gap" and cause.get("case") == "gap"
+            and isinstance(missing, int) and not isinstance(missing, bool)
+            and missing > 0):
+        template += " (premier numéro manquant : %d ; vérifier sa disponibilité)" % missing
+    values = {"lot": int(lot), "blocker": "N"}
+    blocker = cause.get("blocker_id")
+    if isinstance(blocker, int) and not isinstance(blocker, bool):
+        values["blocker"] = blocker
     try:
         return template.format(**values)
     except (KeyError, IndexError, ValueError):
