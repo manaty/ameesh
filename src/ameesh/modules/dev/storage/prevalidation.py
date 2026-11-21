@@ -62,3 +62,14 @@ class PrevalidationReports(DevDomain, interface.PrevalidationReports):
             " ORDER BY recorded_at DESC, head_sha LIMIT 1" % COLUMNS,
             (int(work_item_id),))
         return rows[0] if rows else None
+
+    def failures_since(self, work_item_id: int, seconds: float,
+                       limit: int = 500) -> list[dict]:
+        return list(self.db.query(
+            "SELECT work_item_id, head_sha, report FROM prevalidation_reports"
+            " WHERE work_item_id <> %s AND NOT ok"
+            " AND recorded_at > now() - make_interval(secs => %s)"
+            " AND jsonb_typeof(report->'failed') = 'array'"
+            " AND report->'failed' <> '[]'::jsonb"
+            " ORDER BY recorded_at DESC, work_item_id LIMIT %s",
+            (int(work_item_id), float(seconds), int(limit))) or ())

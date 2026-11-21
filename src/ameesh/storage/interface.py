@@ -6707,6 +6707,14 @@ class PrevalidationReports(Domain):
     def latest(self, work_item_id: int) -> dict | None:
         """Le rapport le plus récent du lot (toute tête), ou None."""
 
+    @abc.abstractmethod
+    def failures_since(self, work_item_id: int, seconds: float,
+                       limit: int = 500) -> list[dict]:
+        """#7988 : les rapports non verts **des autres lots** écrits depuis
+        `seconds` secondes et qui nomment des tests en échec
+        (`work_item_id`, `head_sha`, `report`), du plus récent au plus
+        ancien, au plus `limit`."""
+
 
 # --------------------------------------------------------------------------
 # le stockage d'une connexion
