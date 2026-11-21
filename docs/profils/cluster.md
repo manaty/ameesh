@@ -195,6 +195,13 @@ psql "<admin DSN>" -v ON_ERROR_STOP=1 -f deploy/sql/role-superviseur-contenus.sq
 #   GRANT ameesh_superviseur_contenus TO supervision_outil;
 ```
 
+On the mesh database the staging sequence replays the state contract right
+after each migration (`deploy/sql/rejeu-superviseur.sql`, under the migration
+owner's connection, #7982): a migration that adds a column to the contract no
+longer waits for the owner's station update. The installation above remains
+the administrator's gesture for creating the role and setting its attributes;
+the replay never creates or alters a role.
+
 Each script opens **its own transaction** and guarantees its result, not
 only its own statements. It creates the role if it is missing, revokes the
 rights this role received directly, and grants read access column by column

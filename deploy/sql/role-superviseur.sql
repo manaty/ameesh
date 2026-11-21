@@ -19,6 +19,10 @@
 -- changé. Il ne répare jamais des droits accordés par d'autres ; il refuse.
 -- Idempotent : le relancer après chaque mise à jour d'ameesh. Une colonne du
 -- contrat absente (base en retard de migrations) le fait aussi échouer.
+-- #7982 : le staging rejoue ce contrat après chaque migration
+-- (deploy/sql/rejeu-superviseur.sql, sous la connexion du propriétaire des
+-- tables) ; l'installation ci-dessus reste le geste de l'administrateur pour
+-- CRÉER le rôle et poser ses attributs, jamais un effet du staging.
 --
 -- Le rôle est NOLOGIN : on ne se connecte jamais sous son nom. Chaque
 -- superviseur (humain ou outil) a son propre rôle de connexion, membre de

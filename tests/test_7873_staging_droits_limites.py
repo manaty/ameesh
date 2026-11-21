@@ -54,12 +54,14 @@ class SequenceSimuleeTest(unittest.TestCase):
         python = os.path.join(venv, "python3")
         with open(python, "w", encoding="utf-8") as fh:
             fh.write('#!/bin/sh\nprintf "%s\\n" "$*" >> "$APPELS"\n'
-                     'case "$*" in *ameesh.droits_limites*) exit "${DROITS_RC:-0}" ;; esac\n')
+                     'case "$*" in *ameesh.droits_limites*) exit "${DROITS_RC:-0}" ;; esac\n'
+                     'case "$*" in *ameesh.droits_superviseur*) exit "${SUPERVISEUR_RC:-0}" ;; esac\n')
         os.chmod(python, 0o755)
         self.depot = os.path.join(self.tmp, "depot")
         for sub in ("src/ameesh", "deploy/sql"):
             os.makedirs(os.path.join(self.depot, sub))
-        for name in ("src/ameesh/__init__.py", "deploy/sql/rejeu-droits-limites.sql"):
+        for name in ("src/ameesh/__init__.py", "deploy/sql/rejeu-droits-limites.sql",
+                     "deploy/sql/rejeu-superviseur.sql"):
             with open(os.path.join(self.depot, name), "w", encoding="utf-8") as fh:
                 fh.write("-- fixture\n")
 
@@ -73,11 +75,12 @@ class SequenceSimuleeTest(unittest.TestCase):
         git("remote", "add", "origin", self.depot)
         self.sha = git("rev-parse", "HEAD")
 
-    def run_remote(self, droits_rc: int) -> subprocess.CompletedProcess:
+    def run_remote(self, droits_rc: int, superviseur_rc: int = 0) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["bash", "-s", "--", self.sha, self.depot, os.path.join(self.tmp, "snap")],
             input=_remote_migrations(), capture_output=True, text=True, timeout=60,
-            env=dict(os.environ, HOME=self.home, APPELS=self.log, DROITS_RC=str(droits_rc)))
+            env=dict(os.environ, HOME=self.home, APPELS=self.log, DROITS_RC=str(droits_rc),
+                     SUPERVISEUR_RC=str(superviseur_rc)))
 
     def calls(self) -> list[str]:
         return _read(self.log).splitlines()
@@ -86,16 +89,25 @@ class SequenceSimuleeTest(unittest.TestCase):
         proc = self.run_remote(0)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         calls = self.calls()
-        self.assertEqual(calls[-2], "-m ameesh migrate --additive-only")
+        self.assertEqual(calls[-3], "-m ameesh migrate --additive-only")
         snap = os.path.join(self.tmp, "snap", "snap-" + self.sha[:8])
-        self.assertEqual(calls[-1], "-m ameesh.droits_limites --sql-dir %s/deploy/sql" % snap)
+        self.assertEqual(calls[-2], "-m ameesh.droits_limites --sql-dir %s/deploy/sql" % snap)
+        # #7982 : le contrat du superviseur est rejoué après les migrations, sur
+        # le même instantané et sous la même connexion que le rejeu #7873.
+        self.assertEqual(calls[-1], "-m ameesh.droits_superviseur --sql-dir %s/deploy/sql" % snap)
         # le SQL relu part avec l'instantané du commit déployé
         self.assertTrue(os.path.isfile(os.path.join(snap, "deploy", "sql", "rejeu-droits-limites.sql")))
+        self.assertTrue(os.path.isfile(os.path.join(snap, "deploy", "sql", "rejeu-superviseur.sql")))
 
     def test_refus_du_contrat_code_5(self):
         proc = self.run_remote(1)
         self.assertEqual(proc.returncode, 5)
         self.assertIn("ameesh.droits_limites", self.calls()[-1])
+
+    def test_refus_du_contrat_superviseur_code_6(self):
+        proc = self.run_remote(0, superviseur_rc=1)
+        self.assertEqual(proc.returncode, 6)
+        self.assertIn("ameesh.droits_superviseur", self.calls()[-1])
 
     def test_staging_s_arrete_avant_toute_installation(self):
         text = _read(STAGING)
@@ -112,7 +124,8 @@ class SequenceSimuleeTest(unittest.TestCase):
         self.assertLess(migrer.index('migrer_base "$cible"'), rejeu)
         self.assertIn('AMEESH_CONFIG="$CONFIG"', migrer[migrer.rindex("\n", 0, rejeu - 80):rejeu])
         # staging (MIGRER_SANS_REDEMARRAGE=1) : refus avant le retour anticipé
-        garde = migrer.index('if [ "$droits" = 1 ] && {')
+        # (#7982 : la garde couvre aussi le contrat du superviseur)
+        garde = migrer.index('if { [ "$droits" = 1 ] || [ "$superviseur" = 1 ]; }')
         self.assertLess(garde, migrer.index('if [ "$incompatible" = 1 ]; then'))
 
     def test_aucune_creation_de_role_ni_mot_de_passe(self):
