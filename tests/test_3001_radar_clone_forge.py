@@ -77,10 +77,10 @@ class CloneFollowsForgeTest(unittest.TestCase):
         self.assertEqual(self._tracked("develop"), self.published)
         self.assertEqual(plan_git.default_target(self.clone), "origin/develop")
         self.assertEqual(replayer.target_doubt, "")
-        # les objets restent lus du checkout (`--shared`)
-        with open(os.path.join(self.clone, ".git", "objects", "info", "alternates"),
-                  encoding="utf-8") as fh:
-            self.assertIn(os.path.join(self.repo, ".git", "objects"), fh.read())
+        # #7978 : le clone possède ses objets, il ne lit plus le checkout
+        self.assertFalse(os.path.exists(os.path.join(
+            self.clone, ".git", "objects", "info", "alternates")))
+        self.assertIsNotNone(plan_git._commit(self.clone, self.published))
 
     def test_divergent_checkout_is_not_read(self) -> None:
         _git(self.repo, "checkout", "-q", "-b", "develop", self.base)
@@ -115,6 +115,9 @@ class CloneFollowsForgeTest(unittest.TestCase):
                          resolutions.FORGE_REFSPEC)
         self.assertEqual(self._tracked("develop"), self.published)
         self.assertEqual(plan_git.declared_target(self.clone), "origin/develop")
+        # #7978 : la migration a aussi retiré l'alternate, sans recloner
+        self.assertFalse(os.path.exists(os.path.join(
+            self.clone, ".git", "objects", "info", "alternates")))
 
     def test_unreadable_forge_is_a_doubt_never_the_local_branch(self) -> None:
         _git(self.repo, "branch", "develop", self.base)

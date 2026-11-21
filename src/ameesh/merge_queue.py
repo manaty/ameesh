@@ -2914,6 +2914,9 @@ def fetch_fresh(repo: str, names, clone=None,
             # #2673 : un clone déjà créé sans `ameesh.target` (origin/HEAD figé
             # sur une release) reçoit sa cible ici, sans être réinitialisé.
             clone.declare_target()
+            # #7978 : le premier lecteur migre un clone radar hérité de
+            # `--shared` avant de le fetch ; sans alternates, rien à faire.
+            clone.migrate_borrowed_objects()
         wanted = sorted(set(remote.values()))
         listing = resolutions._run(clone.path, "ls-remote", url,
                                    *("refs/heads/" + b for b in wanted), timeout=FETCH_TIMEOUT)
