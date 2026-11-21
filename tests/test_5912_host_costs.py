@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest import mock
 
-from ameesh import host_capacity_alerts, host_idle, host_lifecycle, notify
+from ameesh import host_budget, host_capacity_alerts, host_idle, host_lifecycle, notify
 
 GP1_S = {'calcul_eur_h': 0.19074, 'disque_eur_h': 0.00735, 'ip_eur_h': 0.005,
          'source': 'Scaleway catalog fr-par-1, 05/11/2026'}
@@ -16,6 +16,31 @@ def canon(**cards):
 
 
 class CostStatesTest(unittest.TestCase):
+    def test_observed_running_idle_baseline_alert_has_no_drain_suggestion(self):
+        fp = {'state': 'idle', 'capacity': 'baseline', 'idle_since': 1,
+              'unknown': [], 'runs': 0, 'leases': 0, 'runs_source': 'none'}
+        self.assertEqual(host_capacity_alerts.project({'vm': fp}, [], now=4000), [])
+        alerts = host_capacity_alerts.project({'vm': fp}, [], now=4000,
+                                               provider_running={'vm'})
+        self.assertEqual(len(alerts), 1)
+        self.assertIn('observed running without activity', alerts[0]['detail'])
+        self.assertNotIn('host drain', alerts[0]['detail'])
+
+    def test_budget_only_prices_proven_running_interval(self):
+        cards = [canon(vm={'tarif_eur_h': 0.2, 'tarif_source': 'owner 2026-11-21'},
+                       missing={'tarif_eur_h': 0.1})]
+        rows = host_budget.project(cards, [dict(host='vm', provider_state='running',
+                                                on_ts=100, seen_ts=7300)])
+        by_host = {row['host']: row for row in rows}
+        self.assertEqual(by_host['vm']['observed_on_hours'], 2)
+        self.assertEqual(by_host['vm']['observed_cost_eur'], 0.4)
+        self.assertEqual(by_host['vm']['rate_source'], 'owner 2026-11-21')
+        self.assertIsNone(by_host['vm']['total_cost_eur'])
+        self.assertIsNone(by_host['missing']['observed_cost_eur'])
+        stopped = host_budget.project(cards, [dict(host='vm', provider_state='stopped',
+                                                   on_ts=100, seen_ts=7300)])
+        self.assertIsNone(next(row for row in stopped if row['host'] == 'vm')['observed_on_hours'])
+
     def test_service_host_is_neither_idle_candidate_nor_drainable(self):
         cards = [canon(hub={'capacity': 'services', 'policy': {'max_agents': 0}})]
         caps, _ = host_idle.capacities(cards, ['hub'], protected=['hub'], baseline_hosts=2)

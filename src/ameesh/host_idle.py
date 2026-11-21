@@ -306,7 +306,9 @@ def cost_states(cards):
     legacy = next((v for v in values if v is not None and v >= 0), None)
     if legacy is None and problem is None:
         return None
-    return {'on': legacy, 'off': None, 'parts': None, 'source': None,
+    source = next((str(c.get('tarif_source')).strip()[:200] for c in cards
+                   if c.get('tarif_source')), None)
+    return {'on': legacy, 'off': None, 'parts': None, 'source': source,
             'problem': problem}
 
 
