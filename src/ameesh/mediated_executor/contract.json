@@ -5290,6 +5290,7 @@
     "reconcile_loss",
     "reopen_return",
     "release_locks",
+    "resync_return",
     "transition_journal",
     "undrain",
     "wait_transition"
