@@ -577,6 +577,13 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      processus) ;
    - aucun contrôle `draining`/`returning` sur AG3 (`ameesh host status
      ameesh-agents-3`), aucune retenue ;
+     Si un ancien retour sans adaptateur a laissé `available`, prises ouvertes
+     et `hook_state=draining` ou `idle-drained`, l'opérateur peut demander
+     `ameesh host resync-ack ameesh-agents-3`. Cette commande ferme les prises,
+     journalise la demande et lance un retour suivi par le scanner et l'adaptateur ;
+     attendre `available`, prises ouvertes et `hook_state=busy` avant le feu.
+     Un adaptateur absent, un état changé ou une transition en cours refuse la
+     demande ; la commande répétée pendant ou après le retour est sans effet.
    - `/home/ameesh/.local/share/ameesh/venv/bin/python` présent et
      exécutable sur chaque hôte au runner vivant ;
    - #297 et #298 gelées et relues ;

@@ -376,6 +376,9 @@ def main(argv=None):
     restore = commands.add_parser("undrain", help="reopen the host and request agents' return")
     restore.add_argument("host")
     restore.add_argument("--actor", help="who reopens (human:<id>) from an unbound terminal")
+    resync = commands.add_parser("resync-ack", help="fence an available host and resynchronize its adapter acknowledgement")
+    resync.add_argument("host")
+    resync.add_argument("--actor", help="authenticated operator")
     recovered = commands.add_parser(
         "reconcile", help="verified reopening of a lost host whose readings returned")
     recovered.add_argument("host")
@@ -408,6 +411,12 @@ def main(argv=None):
                              actor=work.corrector(cfg, db, args.actor))
             if result is None:
                 raise ValueError("host has no drain request")
+        elif args.command == "resync-ack":
+            if not NAME_RE.fullmatch(args.host):
+                raise ValueError("invalid host name")
+            from . import host_release
+            result = host_release.resync_available(
+                cfg, db, args.host, actor=work.corrector(cfg, db, args.actor))
         elif args.command == "reattach":
             for name in (args.host, args.agent, args.target):
                 if not NAME_RE.fullmatch(name):

@@ -494,7 +494,8 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, canon_unknown,
     if not hook:
         # No adapter: keep the historical L232e behaviour. A return opened by
         # an operator still reopens claims; nothing is released.
-        if mode == "returning" and not row.get("claims_open"):
+        if (mode == "returning" and not row.get("claims_open")
+                and row.get("hook_state") not in ("draining", "idle-drained")):
             # No adapter: a first drain (or a migrated row) has hook_state
             # NULL; there is no `busy` answer to wait for.
             api.open_claims(host, row["generation"], require_busy=False,
@@ -674,6 +675,28 @@ def enter_draining(cfg, db, host, *, actor, runner=None, clock=time.time):
     return api.get(host)
 
 
+def resync_available(cfg, db, host, *, actor):
+    """Request a fenced, journalled adapter return for a stale acknowledgement."""
+    api = storage.of(db).host_lifecycle
+    row = api.get(host)
+    if row is None:
+        raise ValueError("host has no lifecycle control")
+    if row.get("mode") == "returning":
+        return row
+    if row.get("mode") != "available":
+        raise ValueError("resync requires an available host")
+    if row.get("hook_state") == "busy" and row.get("release_state") == "busy":
+        return row
+    canons, unknown = _canon_read(cfg)
+    if unknown or not hook_for(cfg, canons, host):
+        raise ValueError("resync requires a readable configured adapter")
+    result = api.resync_return(host, generation=row["generation"],
+                               release_epoch=row["release_epoch"], actor=actor)
+    if result is None:
+        raise ValueError("resync refused: control changed, is not eligible, or has an adapter attempt in flight")
+    return result
+
+
 def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.time):
     """Explicit return request: `busy` first, then claims reopen.
 
@@ -709,6 +732,9 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
         return api.get(host)
     now = clock() if now is None else float(now)
     if not hook:
+        if row.get("hook_state") in ("draining", "idle-drained"):
+            raise ValueError("return refused: the last adapter acknowledgement is %s; "
+                             "restore the adapter before returning" % row["hook_state"])
         if row.get("mode") == "returning" and not row.get("claims_open"):
             api.open_claims(host, row["generation"], require_busy=False,
                             release_epoch=row.get("release_epoch"),

@@ -761,7 +761,9 @@ class HostReleaseTest(PgTestCase):
         self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
                         "WHERE host='vm'")
         self.api.host_lifecycle.expire_returns(open_claims=False)
-        self.once(now=time.time())
+        # Replay the old binary's unguarded no-hook reopening.
+        self.api.host_lifecycle.open_claims("vm", self.control()["generation"],
+                                           require_busy=False)
         self.api.host_lifecycle.complete_return("vm", self.control()["generation"])
         self.cfg = hooked
         # The binary of 19/11 did not move the release state with the gate.
@@ -773,6 +775,59 @@ class HostReleaseTest(PgTestCase):
                          ("available", True, "draining", "draining"))
         self.clear_calls()
         return control
+
+    def test_available_stale_ack_is_fenced_and_repaired_by_a_real_busy(self):
+        old = self._ag3_state()
+        self.db.execute("UPDATE host_lifecycle SET release_state='busy' WHERE host='vm'")
+        row = host_release.resync_available(self.cfg, self.db, "vm", actor="human:op")
+        self.assertEqual((row["mode"], row["claims_open"], row["hook_state"]),
+                         ("returning", False, "draining"))
+        self.assertEqual(row["release_epoch"], old["release_epoch"] + 1)
+        self.assertEqual(host_release.resync_available(self.cfg, self.db, "vm", actor="human:op"), row)
+        events = self.db.query("SELECT data FROM ameesh_events WHERE type='host.resync_requested' "
+                               "AND object='host:vm'")
+        self.assertEqual(len(events), 1)
+        self.reading()
+        self.once(now=time.time())
+        self.assertEqual(self.states(), ["busy"])
+        self.reading()
+        self.once(now=time.time())
+        row = self.control()
+        self.assertEqual((row["hook_state"], row["release_state"], row["claims_open"]),
+                         ("busy", "busy", True))
+        self.api.host_lifecycle.complete_return("vm", row["generation"])
+        self.assertEqual(self.control()["mode"], "available")
+        self.assertEqual(host_release.resync_available(self.cfg, self.db, "vm", actor="human:op")["mode"], "available")
+
+    def test_missing_adapter_does_not_reopen_stale_ack(self):
+        self._ag3_state()
+        self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=False)
+        with self.assertRaisesRegex(ValueError, "restore the adapter"):
+            host_lifecycle.undrain(self.cfg, self.db, "vm", actor="human:op")
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' WHERE host='vm'")
+        self.api.host_lifecycle.expire_returns(open_claims=False)
+        self.once(now=time.time())
+        row = self.control()
+        self.assertEqual((row["mode"], row["claims_open"], row["hook_state"]),
+                         ("returning", False, "draining"))
+
+    def test_resync_guards_snapshot_and_inflight_attempt(self):
+        self._ag3_state()
+        self.db.execute("UPDATE host_lifecycle SET release_state='busy' WHERE host='vm'")
+        row = self.control()
+        self.assertIsNone(self.api.host_lifecycle.resync_return(
+            "vm", generation=row["generation"], release_epoch=row["release_epoch"] + 1,
+            actor="human:op"))
+        self.db.execute("UPDATE host_lifecycle SET hook_attempt_at=now(), "
+                        "hook_attempt_state='draining' WHERE host='vm'")
+        with self.assertRaisesRegex(ValueError, "attempt in flight"):
+            host_release.resync_available(self.cfg, self.db, "vm", actor="human:op")
+        self.assertEqual((self.control()["mode"], self.control()["claims_open"]),
+                         ("available", True))
+        self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        with self.assertRaisesRegex(ValueError, "configured adapter"):
+            host_release.resync_available(self.cfg, self.db, "vm", actor="human:op")
 
     def test_stale_draining_ack_resyncs_busy_before_a_new_drain(self):
         old = self._ag3_state()
