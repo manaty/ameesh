@@ -1220,9 +1220,13 @@ def cleanup_lot_dirs(cfg, policy: Policy, *, agents=None, db=None, host: str = "
     n'est retiré que si son agent n'est pas en tour (verrou exclusif du
     dossier temporaire, ou `running`), qu'aucun processus ne le tient (cwd,
     fichier ouvert, ligne de commande ; illisible = doute, rien n'est retiré),
-    et — `ended_only` — que l'état de son lot est terminal (`LOT_ENDED`) :
+    qu'aucune copie Git n'y porte de travail non sauvé (`tmp_git_work` :
+    gardé et signalé, les worktrees liés prouvés saufs étant détachés), et —
+    `ended_only` — que l'état de son lot est terminal (`LOT_ENDED`) :
     `lot_state(lot)` le dit, sinon la base (`db`). Un lot en cours garde son
-    dossier d'un tour à l'autre. `dry_run` rend le plan sans rien supprimer.
+    dossier d'un tour à l'autre ; `ended_only=False` ne vaut que pour un
+    retrait d'agent décidé, jamais pour un simple redémarrage. `dry_run` rend
+    le plan sans rien supprimer.
 
     Rend `entries` (journal), `plan` (essai), `skipped`, `bytes` libérés et
     `dirs` retirés."""
@@ -1287,12 +1291,44 @@ def cleanup_lot_dirs(cfg, policy: Policy, *, agents=None, db=None, host: str = "
                 if held:
                     skipped.append("lot temp %s kept: %s" % (path, held))
                     continue
+                # #8020 (B1) : ce dossier est le `TMPDIR` du lot ; un agent y
+                # clone et commite. Une copie Git qui porte du travail non
+                # poussé garde le dossier (mêmes gardes que le balayage), sinon
+                # seules les copies prouvées sauves sont détachées avant le rm.
+                copies, git_doubt = _git_copies_report(path)
+                if git_doubt:
+                    plan.append({"kind": "tmp", "path": path, "agent": agent,
+                                 "action": "garde", "bytes": size_of(path),
+                                 "detail": "git copies not fully inspected (%s)"
+                                           % git_doubt})
+                    skipped.append("lot temp %s kept: git copies not fully inspected (%s)"
+                                   % (path, git_doubt))
+                    continue
+                work = tmp_git_work(path, build_artifacts.rules_of(policy.artifacts),
+                                    report=(copies, git_doubt),
+                                    allow=policy.unreadable_ok)
+                if work:
+                    command = tmp_recovery_command(path, report=(copies, git_doubt))
+                    plan.append({"kind": "tmp", "path": path, "agent": agent,
+                                 "action": "garde", "bytes": size_of(path),
+                                 "detail": "git work to keep — %s ; inspect with: %s"
+                                           % (work, command)})
+                    skipped.append("lot temp %s kept: git work — %s ; inspect with: %s"
+                                   % (path, work, command))
+                    continue
                 size = size_of(path)
                 plan.append({"kind": "tmp", "path": path, "agent": agent,
                              "action": "suppression", "bytes": size,
                              "detail": "lot #%s %s" % (ident, reason)})
                 if dry_run:
                     continue
+                if copies:
+                    ok, error, _repos = recover_tmp_git_copies(
+                        path, report=(copies, git_doubt))
+                    if not ok:
+                        skipped.append("lot temp %s kept: git copy removal refused — %s"
+                                       % (path, error))
+                        continue
                 freed = _safe_rmtree(path, troot)
                 total += freed
                 deleted.append({"path": path, "lot": ident, "bytes": freed})

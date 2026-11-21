@@ -14540,15 +14540,17 @@ class Runner:
         # Travail de fond encore en délai de grâce : le nettoyage habituel,
         # tout de suite (rien ne survit à l'exécuteur qui le suit).
         self.background.stop_all("runner shutdown")
-        # #8020 : un agent arrêté ne laisse pas derrière lui le dossier
-        # temporaire de son lot (les tours sont clos ci-dessus). Le verrou et
-        # la lecture des processus sont reposés par `cleanup_lot_dirs` ; un
-        # dossier encore tenu reste, l'agent le reprendra vide au besoin.
+        # #8020 : à l'arrêt du runner, seuls les dossiers des lots TERMINÉS
+        # partent (les tours sont clos ci-dessus). Un lot encore ouvert garde
+        # le sien : un redéploiement n'est pas l'arrêt de l'agent, et le
+        # `TMPDIR` peut porter un clone en cours ; le balayage par âge ou la
+        # clôture du lot s'en chargeront. Le verrou et la lecture des
+        # processus sont reposés par `cleanup_lot_dirs` ; un dossier tenu reste.
         try:
             lot_tmp = workspaces.cleanup_lot_dirs(
                 self.cfg, self.housekeeping_policy(),
                 agents=[worker.name for worker in workers], db=self.db,
-                host=self.host, ended_only=False, reason="agent stopped")
+                host=self.host, ended_only=True, reason="runner stopped")
             if lot_tmp["entries"]:
                 storage.of(self.db).housekeeping.log(
                     self.host, lot_tmp["entries"],

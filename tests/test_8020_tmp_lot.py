@@ -123,12 +123,57 @@ class NettoyageDesLotsTest(_Base):
                          {self.lot_dir(10), self.lot_dir(11)})
         self.assertEqual(out["dirs"], [])
 
-    def test_arret_de_l_agent_retire_aussi_un_lot_actif(self):
+    def test_arret_du_runner_garde_un_lot_actif(self):
         out = menage.cleanup_lot_dirs(self.cfg, self.pol, agents=["a1"],
-                                      lot_state=self.etat, ended_only=False,
-                                      reason="agent stopped")
-        self.assertFalse(os.path.exists(self.lot_dir(11)))
-        self.assertEqual({d["lot"] for d in out["dirs"]}, {"10", "11"})
+                                      lot_state=self.etat, ended_only=True,
+                                      reason="runner stopped")
+        self.assertFalse(os.path.exists(self.lot_dir(10)))
+        self.assertTrue(os.path.exists(self.lot_dir(11)))
+        self.assertEqual([d["lot"] for d in out["dirs"]], ["10"])
+
+    def _copie_git_avec_commit_non_pousse(self, path: str) -> None:
+        origin = os.path.join(self.base, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "clone", "-q", origin, path], check=True,
+                       capture_output=True)
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        _write(os.path.join(path, "pousse"), 10)
+        subprocess.run(["git", "-C", path, "add", "."], check=True, env=env)
+        subprocess.run(["git", "-C", path, "commit", "-q", "-m", "pousse"],
+                       check=True, env=env)
+        subprocess.run(["git", "-C", path, "push", "-q", "origin", "main"],
+                       check=True, env=env)
+        _write(os.path.join(path, "garde"), 10)
+        subprocess.run(["git", "-C", path, "add", "."], check=True, env=env)
+        subprocess.run(["git", "-C", path, "commit", "-q", "-m", "non pousse"],
+                       check=True, env=env)
+
+    def test_un_lot_termine_avec_travail_git_non_pousse_est_garde(self):
+        menage.turn_env(self.cfg, self.pol, "a1", {}, lot=12)
+        copie = os.path.join(self.lot_dir(12), "clone")
+        self._copie_git_avec_commit_non_pousse(copie)
+        out = menage.cleanup_lot_dirs(self.cfg, self.pol, agents=["a1"],
+                                      lot_state=lambda ident: "closed",
+                                      ended_only=True)
+        self.assertTrue(os.path.isdir(copie))
+        self.assertTrue(any("git work" in note for note in out["skipped"]))
+        commits = subprocess.run(["git", "-C", copie, "rev-list", "--count", "HEAD"],
+                                 check=True, capture_output=True, text=True).stdout
+        self.assertEqual(commits.strip(), "2")
+
+    def test_arret_du_runner_garde_un_lot_en_build_avec_commit_non_pousse(self):
+        menage.turn_env(self.cfg, self.pol, "a1", {}, lot=13)
+        copie = os.path.join(self.lot_dir(13), "clone")
+        self._copie_git_avec_commit_non_pousse(copie)
+        menage.cleanup_lot_dirs(self.cfg, self.pol, agents=["a1"],
+                               lot_state=lambda ident: "active",
+                               ended_only=True, reason="runner stopped")
+        self.assertTrue(os.path.isdir(copie))
+        commits = subprocess.run(["git", "-C", copie, "rev-list", "--count", "HEAD"],
+                                 check=True, capture_output=True, text=True).stdout
+        self.assertEqual(commits.strip(), "2")
 
     def test_un_tour_en_cours_garde_le_dossier(self):
         tour = menage.Turn.begin(self.cfg, self.pol, "a1", None,
