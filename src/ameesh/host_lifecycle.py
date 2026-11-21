@@ -94,6 +94,13 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
         canons = []
         configured = True
     from . import host_idle
+    # #8033: `configured_canons` renders [] both when no canon is configured
+    # and when a configured one cannot be read. In the second case the host
+    # cards are unknown and the services guard below cannot recognise a
+    # protected host: refuse the drain instead of failing open (doubt →
+    # sensitive, canon §8).
+    if configured and not canons:
+        raise ValueError('drain refused: configured canon unreadable')
     if any(h.title == host and h.fiche.data.get('capacity') == host_idle.CAPACITY_SERVICES
            for canon in canons for h in canon.hosts):
         raise ValueError('drain refused: host carries protected services')
