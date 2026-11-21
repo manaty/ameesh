@@ -9,6 +9,10 @@
 --     les colonnes que ce rôle doit pouvoir lire, et rien d'autre.
 --
 -- 1. Rôle : créé s'il manque, attributs remis à NOLOGIN et sans privilège.
+--    En mode rejeu (#7982 : réglage `ameesh.rejeu_superviseur` = '1', posé
+--    par rejeu-superviseur.sql sous la connexion de `migrate`, propriétaire
+--    des tables, sans CREATEROLE), le rôle doit exister : ni création ni
+--    altération, la base en retard de rôle reste un geste d'administrateur.
 -- 2. Ses PROPRES droits sur le schéma sont retirés, puis la lecture des
 --    colonnes du contrat est accordée (droits de colonne : une colonne ajoutée
 --    plus tard par une migration n'est jamais lisible sans décision).
@@ -57,8 +61,16 @@ BEGIN
                         r, s, array_to_string(manquantes, ', ');
     END IF;
 
-    -- 1. le rôle
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+    -- 1. le rôle : création et attributs par l'ADMINISTRATEUR seulement.
+    --    Le rejeu du staging (#7982, rejeu-superviseur.sql) tourne sous la
+    --    connexion de `migrate`, propriétaire des tables mais sans CREATEROLE :
+    --    il exige que le rôle existe et ne touche ni à sa création ni à ses
+    --    attributs. L'audit ci-dessous vérifie quand même les attributs.
+    IF coalesce(current_setting('ameesh.rejeu_superviseur', true), '') = '1' THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+            RAISE EXCEPTION 'rejeu du contrat : rôle % absent (création : role-superviseur.sql, administrateur)', r;
+        END IF;
+    ELSIF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
         EXECUTE format('CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE '
                        'NOREPLICATION NOBYPASSRLS', r);
     ELSE
@@ -67,10 +79,19 @@ BEGIN
     END IF;
 
     -- 2. ses propres droits : remis à zéro (les droits de colonne tombent avec
-    --    ceux de table), puis le contrat, colonne par colonne
+    --    ceux de table), puis le contrat, colonne par colonne.
+    --    En mode rejeu, les FONCTIONS ne sont pas révoquées : le porteur est
+    --    le propriétaire des tables, pas celui de toutes les fonctions du
+    --    schéma (des rôles dédiés possèdent les leurs), et un REVOKE global
+    --    échouerait en « permission denied ». Une fonction ordinaire est
+    --    SECURITY INVOKER (aucun droit de plus pour le rôle) et l'audit 3d
+    --    refuse toute fonction SECURITY DEFINER encore exécutable : la garde
+    --    reste fermée.
     EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM %I', s, r);
     EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM %I', s, r);
-    EXECUTE format('REVOKE ALL ON ALL FUNCTIONS IN SCHEMA %I FROM %I', s, r);
+    IF coalesce(current_setting('ameesh.rejeu_superviseur', true), '') <> '1' THEN
+        EXECUTE format('REVOKE ALL ON ALL FUNCTIONS IN SCHEMA %I FROM %I', s, r);
+    END IF;
     EXECUTE format('REVOKE ALL ON SCHEMA %I FROM %I', s, r);
     EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', s, r);
     FOR rel_name, v_cols IN SELECT c.rel, c.cols FROM pg_temp.ameesh_contrat c LOOP
