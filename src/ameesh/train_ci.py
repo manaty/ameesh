@@ -207,7 +207,8 @@ def audited_sources(workflows):
 class _SuiteStillRunning(Exception):
     """#7967: un run terminé refuse sa suite, mais un autre run dû court encore.
 
-    Interne au lecteur : le drain attend la fin de tous les runs dus avant de
+    Interne au lecteur : le drain attend la fin de tous les runs dus (autres
+    workflows et runs plus anciens d'un même workflow, #7971) avant de
     conclure, pour ne pas lancer la CI du paquet suivant par-dessus celle-ci.
     """
 
@@ -703,17 +704,19 @@ class GitHub:
                 and r.get("path") == workflow.path and r.get("event") == workflow.event]
 
     def _unfinished(self, plan, workflows):
-        """#7967: un workflow dû n'a-t-il pas encore de run terminal ?
+        """#7967: un workflow dû a-t-il encore un run non terminal ?
 
         Un run absent compte comme non terminé : le train l'attend déjà et la
-        prochaine lecture le verra. Seul un ensemble entièrement terminal
-        autorise un refus définitif."""
+        prochaine lecture le verra. Un workflow peut porter plusieurs runs
+        (dispatch manuel de secours en plus de celui du train) : aucun n'est
+        ignoré, car conclure sur le seul plus récent libérerait la cible
+        pendant qu'un run plus ancien court encore. Seul un ensemble
+        entièrement terminal autorise un refus définitif."""
         for workflow in workflows:
             runs = self._runs(plan, workflow)
             if not runs:
                 return True
-            run = max(runs, key=lambda r: (int(r["id"]), int(r.get("run_attempt", 1))))
-            if run.get("status") != "completed":
+            if any(run.get("status") != "completed" for run in runs):
                 return True
         return False
 
@@ -742,11 +745,14 @@ class GitHub:
                     continue
                 # A newer attempt invalidates the old run's evidence. A cancelled
                 # run supplies no outcome and never asks for an automatic rerun.
-                run = max(runs, key=lambda r: (int(r["id"]), int(r.get("run_attempt", 1))))
-                attempt = int(run.get("run_attempt", 1))
-                if run.get("status") != "completed":
+                # #7971: several runs of the same due workflow (a manual backup
+                # dispatch) are all owed: the newest carries the verdict, but
+                # the target is not released while any of them still runs.
+                if any(other.get("status") != "completed" for other in runs):
                     pending = True
                     continue
+                run = max(runs, key=lambda r: (int(r["id"]), int(r.get("run_attempt", 1))))
+                attempt = int(run.get("run_attempt", 1))
                 if run.get("conclusion") not in ("success", "failure"):
                     self._refuse(plan, remaining, pending or absent,
                                  "complete CI interrupted or cancelled: no culpable lot proved")
@@ -754,7 +760,16 @@ class GitHub:
                     # #2446: the reusable workflow has no `workflow_call` run of
                     # its own; the caller push must reference it at this exact
                     # head, and its called jobs are read below.
-                    called_workflow(run, workflow, plan)
+                    try:
+                        called_workflow(run, workflow, plan)
+                    except TrainError as exc:
+                        # #7971: sur un run `completed`, les workflows appelés
+                        # sont une preuve figée de l'API (`actions/runs` comme
+                        # la liste des runs la portent pour un run appelant,
+                        # vert ou rouge) : un nom absent ou différent ne
+                        # changera plus. C'est donc un refus terminal de la
+                        # suite, pas une lecture passagère qui draine.
+                        self._refuse(plan, remaining, pending or absent, str(exc))
                 jobs = [j for page in self._api("actions/runs/%s/attempts/%s/jobs?per_page=100"
                                                 % (run["id"], attempt)) for j in page.get("jobs", ())]
                 if isinstance(workflow, DueWorkflow):

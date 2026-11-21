@@ -798,8 +798,11 @@ PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migra
 # #7873 : droits des connexions limitées rejoués sous la même connexion, puis
 # audités (_contrat-bureau.sql) ; un refus (code 5) arrête la séquence avant
 # toute installation : aucun exécuteur n'est relancé, la version reste la
-# précédente (§14).
+# précédente (§14). #7982 : même rejeu du contrat du rôle superviseur, sous la
+# même connexion (propriétaire des tables), refus = code 6 ; une migration qui
+# ajoute une colonne au contrat ne laisse plus le trou jusqu'au retour du poste.
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh.droits_limites --sql-dir "$d/deploy/sql" || exit 5
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh.droits_superviseur --sql-dir "$d/deploy/sql" || exit 6
 REMOTE
 }
 # #5692 : preflight de la base que le chemin sans poste va migrer. Meme
@@ -1609,12 +1612,18 @@ if [ "$POSTE_ABSENT" = 1 ]; then
     trace "$HOTE_MIGRATIONS" droits ko "droits des connexions limitees refuses par _contrat-bureau.sql apres les migrations"
     echo "droits des connexions limitees en echec : aucune installation, version precedente conservee" >&2
     exit 1
+  elif [ "$rc_migrer" = 6 ]; then
+    # #7982 : base migree, mais contrat du role superviseur refuse par l'audit
+    # (la colonne ou le droit est nomme plus haut) : rien n'est installe.
+    trace "$HOTE_MIGRATIONS" droits ko "contrat du role superviseur refuse par _contrat-superviseur.sql apres les migrations"
+    echo "contrat du superviseur en echec : aucune installation, version precedente conservee" >&2
+    exit 1
   elif [ "$rc_migrer" != 0 ]; then
     trace "$HOTE_MIGRATIONS" migrations ko "migrations en echec depuis la VM"
     echo "migrations en echec : aucune installation" >&2
     exit 1
   fi
-  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord), droits limites rejoues et audites"
+  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord), droits limites et contrat superviseur rejoues et audites"
 else
   etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
   debut_etape poste migrations

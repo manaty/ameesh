@@ -37,9 +37,10 @@ class SuiteRefused(TrainError):
 
     Le run est `completed` (le lecteur ne lève jamais ceci sur un run encore
     en cours ni sur une lecture impossible) mais sa suite requise manque, a
-    été annulée ou ne prouve pas son résultat. Attendre un autre résultat
-    retiendrait la cible pour rien : le plan est terminé sans promotion, et
-    la coupure due recompose."""
+    été annulée, ne nomme pas le workflow appelé au head exact (#7971) ou ne
+    prouve pas son résultat. Attendre un autre résultat retiendrait la cible
+    pour rien : le plan est terminé sans promotion, et la coupure due
+    recompose."""
 
 
 class PrevalidationRed(TrainError):
@@ -323,14 +324,16 @@ class Engine:
             if state is not None and state["phase"] == "paused":
                 return {"result": "paused"}
             if state is not None and state.get("phase") in EXPIRABLE:
-                # #7967 : l'échéance absolue de la réservation est passée. Le
-                # verrou de la cible est déjà rendu par l'expiration ; le plan
-                # ne peut plus être promu sous ce bail. Mais l'échéance seule
-                # ne prouve pas la fin des runs : libérer la cible pendant
-                # qu'une CI de paquet tourne lancerait la suivante par-dessus
-                # (§11 bis). Seule une issue terminale établie termine le
-                # plan ; sinon il reste en `draining`, cible tenue, et
-                # l'alerte `train_stuck` (cadence du projet) nomme l'attente.
+                # #7967 : l'échéance absolue du ticket de réservation est
+                # passée : le plan ne peut plus être promu sous ce bail et le
+                # ticket mort n'est plus renouvelé. La cible, elle, reste
+                # tenue par le verrou ordinaire que la maintenance renouvelle
+                # jusqu'à l'issue terminale des runs. L'échéance seule ne
+                # prouve pas cette fin : libérer la cible pendant qu'une CI
+                # de paquet tourne lancerait la suivante par-dessus (§11 bis).
+                # Seule une issue terminale établie termine le plan ; sinon il
+                # reste en `draining`, cible tenue, et l'alerte `train_stuck`
+                # (cadence du projet) nomme l'attente.
                 # `publishing`/`promoting` restent au pilote (effet incertain).
                 deadline = self._expired_reservation(state, now)
                 if deadline is not None:
