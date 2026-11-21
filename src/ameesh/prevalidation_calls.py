@@ -1253,7 +1253,7 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
             "no-vm", "aucun hôte de prévalidation autorisé (%s)"
             % ", ".join(declared))
     tooling(repo, head, params, deadline=deadline)
-    recurrent = seen_elsewhere(db, lot, warn=warn)
+    recurrent = seen_elsewhere(db, lot, cfg=cfg, warn=warn)
     carte, cleanup = map_for(repo_slug, repo, explicit=map_path, deadline=deadline)
     prepared = None
     try:
@@ -1322,45 +1322,48 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
 CAUSE_SOURCE = "prevalidation-environment:%s:%s"
 
 
-def _scope(item: dict | None) -> tuple[str, str] | None:
-    """#7988 (B cx2/dev3) : le projet d'un lot et le dépôt de son ticket.
+def _scope(cfg, item: dict | None) -> tuple[str, str] | None:
+    """#7988 (B cx2/dev3) : le projet d'un lot et son dépôt **effectif**.
 
-    `None` pour un lot illisible, sans projet ou porteur de paquet (il
-    contient ses unités, leur rouge n'est pas indépendant du sien)."""
+    Le dépôt se résout comme `ci.repo_of` : celui du ticket (`issue_ref`),
+    sinon celui configuré pour le projet. `None` pour un lot illisible, sans
+    projet, sans dépôt prouvé, ou porteur de paquet (il contient ses unités,
+    leur rouge n'est pas indépendant du sien)."""
     if not item or packet_guard.is_packet_branch(str(item.get("branch") or "")):
         return None
-    app = str(item.get("app") or "").strip().casefold()
+    app = str(item.get("app") or "").strip()
     if not app:
         return None
-    ref = str(item.get("issue_ref") or "").strip()
-    repo = ref.split("#", 1)[0].strip().casefold() if "#" in ref else ""
-    return app, repo
+    from . import plan_github
+    parts = plan_github._ref_parts(item.get("issue_ref"))
+    repo = parts[0] if parts and parts[0] else None
+    if not repo and cfg is not None:
+        try:
+            repo = plan_github.settings_of(cfg).repo_for(app)
+        except Exception:  # noqa: BLE001 - réglages illisibles : dépôt non prouvé
+            repo = None
+    if not repo:
+        return None
+    return app.casefold(), str(repo).strip().casefold()
 
 
-def _same_scope(mine: tuple[str, str], other: tuple[str, str] | None) -> bool:
-    """Même projet ; et même dépôt quand les deux tickets en nomment un."""
-    if other is None or other[0] != mine[0]:
-        return False
-    return not (mine[1] and other[1] and mine[1] != other[1])
-
-
-def seen_elsewhere(db, lot: int, *, warn=None) -> dict:
+def seen_elsewhere(db, lot: int, *, cfg=None, warn=None) -> dict:
     """#7988 : `{test: [lots]}` des tests rouges en prévalidation sur d'autres
-    lots **du même projet** (et du même dépôt quand leurs tickets en nomment
-    un), hors porteurs de paquet, dans `prevalidation.RECURRENT_WINDOW_S`.
+    lots **du même projet et du même dépôt effectif** (`_scope`), hors
+    porteurs de paquet, dans `prevalidation.RECURRENT_WINDOW_S`.
 
     `prevalidation_reports` est partagée par tous les projets : un test
-    homonyme d'un autre projet ne dit rien de celui-ci. Un lot dont le projet
-    est illisible ne compte pas ; un porteur de paquet ou un lot courant
-    illisible est jugé seul. Une lecture impossible rend `{}` : chaque gel est
-    alors jugé seul, comme avant, et rien n'est supposé vert."""
+    homonyme d'un autre projet ou dépôt ne dit rien de celui-ci. Un lot dont
+    le dépôt n'est pas prouvé ne compte pas ; un porteur de paquet ou un lot
+    courant sans dépôt prouvé est jugé seul. Une lecture impossible rend `{}` :
+    chaque gel est alors jugé seul, comme avant, et rien n'est supposé vert."""
     if db is None or int(lot or 0) <= 0:
         return {}
     from . import storage
 
     def scope(number: int) -> tuple[str, str] | None:
         try:
-            return _scope(work.get(db, number))
+            return _scope(cfg, work.get(db, number))
         except Exception:  # noqa: BLE001 - lot illisible : ne compte pas
             return None
 
@@ -1376,7 +1379,7 @@ def seen_elsewhere(db, lot: int, *, warn=None) -> dict:
         return {}
     ignored = {other for other in {int(r.get("work_item_id") or 0)
                                    for r in rows or ()}
-               if not _same_scope(mine, scope(other))}
+               if scope(other) != mine}
     return prevalidation.recurrent_failures(rows, int(lot), ignored=ignored)
 
 

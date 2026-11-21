@@ -116,57 +116,86 @@ def lot(app="ameesh", branch="lot/x", issue_ref=None) -> dict:
     return {"app": app, "branch": branch, "issue_ref": issue_ref}
 
 
+#: projets configurés : `ameesh` → org/core, `nexlink` → org/nex
+SETTINGS = mock.Mock()
+SETTINGS.repo_for.side_effect = {"ameesh": "org/core", "nexlink": "org/nex"}.get
+
+
 class SeenElsewhereTest(unittest.TestCase):
-    def seen(self, items: dict, rows, current=7988):
+    def seen(self, items: dict, rows, current=7988, settings=SETTINGS):
         store = mock.Mock()
         store.prevalidation.failures_since.return_value = rows
         with mock.patch.object(storage, "of", return_value=store), \
                 mock.patch.object(calls.work, "get",
-                                  side_effect=lambda db, n: items.get(n)):
-            return calls.seen_elsewhere(object(), current), store
+                                  side_effect=lambda db, n: items.get(n)), \
+                mock.patch("ameesh.plan_github.settings_of", return_value=settings):
+            return calls.seen_elsewhere(object(), current, cfg=object()), store
+
+    @staticmethod
+    def red(*lots):
+        return [{"work_item_id": n, "report": {"failed": [REAL]}} for n in lots]
 
     def test_lecture_impossible_juge_le_lot_seul(self):
         warned = []
         with mock.patch.object(storage, "of", side_effect=RuntimeError("base")), \
-                mock.patch.object(calls.work, "get", return_value=lot()):
-            self.assertEqual(calls.seen_elsewhere(object(), 7988, warn=warned.append), {})
+                mock.patch.object(calls.work, "get", return_value=lot()), \
+                mock.patch("ameesh.plan_github.settings_of", return_value=SETTINGS):
+            self.assertEqual(calls.seen_elsewhere(object(), 7988, cfg=object(),
+                                                  warn=warned.append), {})
         self.assertTrue(warned)
 
     def test_sans_base_rien(self):
         self.assertEqual(calls.seen_elsewhere(None, 7988), {})
 
     def test_meme_projet_compte(self):
-        """Témoin positif (B cx2/dev3) : deux lots du même projet."""
-        seen, store = self.seen({7988: lot(), 7970: lot()},
-                                [{"work_item_id": 7970, "report": {"failed": [REAL]}}])
+        """Témoin positif (B cx2/dev3) : deux lots du même projet, sans ticket,
+        tous deux dans le dépôt configuré."""
+        seen, store = self.seen({7988: lot(), 7970: lot()}, self.red(7970))
         self.assertEqual(seen, {REAL: [7970]})
         store.prevalidation.failures_since.assert_called_once_with(
             7988, pv.RECURRENT_WINDOW_S)
-        report = proof(seen)
-        self.assertEqual(calls.report_state(report), "unavailable")
+        self.assertEqual(calls.report_state(proof(seen)), "unavailable")
+
+    def test_ticket_et_depot_configure_identiques_comptent(self):
+        """Positif : un lot sans ticket (dépôt configuré org/core) et un lot
+        au ticket org/core se rapprochent."""
+        seen, _ = self.seen({7988: lot(), 7970: lot(issue_ref="org/core#5")},
+                            self.red(7970))
+        self.assertEqual(seen, {REAL: [7970]})
 
     def test_autre_projet_au_test_homonyme_ne_compte_pas(self):
         """Témoin négatif (B cx2/dev3) : la table est partagée par les projets ;
         le même nom de test rouge dans un autre projet laisse le rouge."""
-        seen, _ = self.seen({7988: lot(), 9001: lot(app="nexlink")},
-                            [{"work_item_id": 9001, "report": {"failed": [REAL]}}])
+        seen, _ = self.seen({7988: lot(), 9001: lot(app="nexlink")}, self.red(9001))
         self.assertEqual(seen, {})
         self.assertEqual(calls.report_state(proof(seen)), "red")
 
-    def test_autre_depot_du_meme_projet_ne_compte_pas(self):
-        seen, _ = self.seen(
-            {7988: lot(issue_ref="manaty/ameesh#6221"),
-             7970: lot(issue_ref="manaty/ameesh#6206"),
-             7971: lot(issue_ref="manaty/ameesh-ui#12"),
-             7972: lot()},
-            [{"work_item_id": n, "report": {"failed": [REAL]}}
-             for n in (7970, 7971, 7972)])
-        self.assertEqual(seen, {REAL: [7970, 7972]})
+    def test_sans_ticket_depot_configure_contre_ticket_autre_depot(self):
+        """Négatif (B cx2 #44939) : le lot sans ticket est dans org/core
+        (dépôt configuré), pas « tout dépôt » ; un ticket org/ui ne compte pas,
+        dans les deux sens."""
+        seen, _ = self.seen({7988: lot(), 7971: lot(issue_ref="org/ui#12")},
+                            self.red(7971))
+        self.assertEqual(seen, {})
+        seen, _ = self.seen({7988: lot(issue_ref="org/ui#12"), 7972: lot()},
+                            self.red(7972))
+        self.assertEqual(seen, {})
+
+    def test_depot_non_prouve_ne_compte_pas(self):
+        """Sans réglage pour le projet, un lot sans ticket n'a pas de dépôt
+        prouvé : il ne compte pas, et un lot courant ainsi est jugé seul."""
+        empty = mock.Mock()
+        empty.repo_for.return_value = None
+        seen, _ = self.seen({7988: lot(issue_ref="org/core#1"), 7970: lot()},
+                            self.red(7970), settings=empty)
+        self.assertEqual(seen, {})
+        seen, store = self.seen({7988: lot(), 7970: lot(issue_ref="org/core#5")},
+                                self.red(7970), settings=empty)
+        self.assertEqual(seen, {})
+        store.prevalidation.failures_since.assert_not_called()
 
     def test_lot_illisible_ou_sans_projet_ne_compte_pas(self):
-        seen, _ = self.seen({7988: lot(), 7970: lot(app="")},
-                            [{"work_item_id": n, "report": {"failed": [REAL]}}
-                             for n in (7970, 7971)])
+        seen, _ = self.seen({7988: lot(), 7970: lot(app="")}, self.red(7970, 7971))
         self.assertEqual(seen, {})
 
     def test_porteur_de_paquet_ecarte(self):
