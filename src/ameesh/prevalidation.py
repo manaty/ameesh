@@ -138,20 +138,22 @@ GUEST_EXCLUSIONS: dict[str, dict[str, str]] = {
 #: `RECURRENT_LOTS` lots distincts (celui-ci compris), dans la fenêtre
 #: `RECURRENT_WINDOW_S`, ne dit rien du lot : il dépend de l'hôte invité ou de
 #: la cible. Il est classé « environnement », non concluant (§3), et ouvre un
-#: lot de cause. Seul le nom exact du test compte, jamais un motif ; les
-#: porteurs de paquet ne comptent pas (ils portent le code de leurs unités).
+#: lot de cause. Seul le nom exact du test compte, jamais un motif, et
+#: seulement entre lots du même projet et dépôt ; les porteurs de paquet ne
+#: comptent pas (ils portent le code de leurs unités).
 RECURRENT_LOTS = 2
 #: la fenêtre de lecture des rouges des autres lots (48 h, comme la carte)
 RECURRENT_WINDOW_S = 48 * 3600
 
 
-def recurrent_failures(rows, lot: int, *, carriers=()) -> dict[str, list[int]]:
+def recurrent_failures(rows, lot: int, *, ignored=()) -> dict[str, list[int]]:
     """#7988 : `{test: [lots]}` des tests rouges sur d'autres lots que `lot`.
 
     `rows` : les rapports non verts récents (`work_item_id`, `report`) ;
-    `carriers` : les lots porteurs de paquet, écartés. Les lots rendus sont
-    distincts et triés ; le lot courant n'y figure jamais."""
-    excluded = {int(lot)} | {int(c) for c in carriers}
+    `ignored` : les lots écartés par l'appelant (autre projet ou dépôt,
+    porteurs de paquet). Les lots rendus sont distincts et triés ; le lot
+    courant n'y figure jamais."""
+    excluded = {int(lot)} | {int(c) for c in ignored}
     seen: dict[str, set[int]] = {}
     for row in rows or ():
         try:

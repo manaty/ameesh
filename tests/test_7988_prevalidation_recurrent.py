@@ -108,42 +108,79 @@ class RecurrentFailuresTest(unittest.TestCase):
                 {"work_item_id": 8000, "report": {"failed": [OTHER]}},
                 {"work_item_id": 0, "report": {"failed": [OTHER]}},
                 {"work_item_id": 9, "report": "illisible"}]
-        seen = pv.recurrent_failures(rows, 7988, carriers=(8000,))
+        seen = pv.recurrent_failures(rows, 7988, ignored=(8000,))
         self.assertEqual(seen, {REAL: [7699, 7970], OTHER: [7699]})
 
 
+def lot(app="ameesh", branch="lot/x", issue_ref=None) -> dict:
+    return {"app": app, "branch": branch, "issue_ref": issue_ref}
+
+
 class SeenElsewhereTest(unittest.TestCase):
+    def seen(self, items: dict, rows, current=7988):
+        store = mock.Mock()
+        store.prevalidation.failures_since.return_value = rows
+        with mock.patch.object(storage, "of", return_value=store), \
+                mock.patch.object(calls.work, "get",
+                                  side_effect=lambda db, n: items.get(n)):
+            return calls.seen_elsewhere(object(), current), store
+
     def test_lecture_impossible_juge_le_lot_seul(self):
         warned = []
-        with mock.patch.object(storage, "of", side_effect=RuntimeError("base")):
+        with mock.patch.object(storage, "of", side_effect=RuntimeError("base")), \
+                mock.patch.object(calls.work, "get", return_value=lot()):
             self.assertEqual(calls.seen_elsewhere(object(), 7988, warn=warned.append), {})
         self.assertTrue(warned)
 
     def test_sans_base_rien(self):
         self.assertEqual(calls.seen_elsewhere(None, 7988), {})
 
-    def test_porteur_de_paquet_ecarte(self):
-        rows = [{"work_item_id": 7970, "report": {"failed": [REAL]}},
-                {"work_item_id": 8000, "report": {"failed": [OTHER]}}]
-        store = mock.Mock()
-        store.prevalidation.failures_since.return_value = rows
-        branches = {7970: "lot/7970-x", 8000: "integration/paquet-h-20261120-13",
-                    7988: "lot/7988-preval"}
-        with mock.patch.object(storage, "of", return_value=store), \
-                mock.patch.object(calls.work, "get",
-                                  side_effect=lambda db, n: {"branch": branches[n]}):
-            seen = calls.seen_elsewhere(object(), 7988)
+    def test_meme_projet_compte(self):
+        """Témoin positif (B cx2/dev3) : deux lots du même projet."""
+        seen, store = self.seen({7988: lot(), 7970: lot()},
+                                [{"work_item_id": 7970, "report": {"failed": [REAL]}}])
         self.assertEqual(seen, {REAL: [7970]})
         store.prevalidation.failures_since.assert_called_once_with(
             7988, pv.RECURRENT_WINDOW_S)
+        report = proof(seen)
+        self.assertEqual(calls.report_state(report), "unavailable")
 
+    def test_autre_projet_au_test_homonyme_ne_compte_pas(self):
+        """Témoin négatif (B cx2/dev3) : la table est partagée par les projets ;
+        le même nom de test rouge dans un autre projet laisse le rouge."""
+        seen, _ = self.seen({7988: lot(), 9001: lot(app="nexlink")},
+                            [{"work_item_id": 9001, "report": {"failed": [REAL]}}])
+        self.assertEqual(seen, {})
+        self.assertEqual(calls.report_state(proof(seen)), "red")
+
+    def test_autre_depot_du_meme_projet_ne_compte_pas(self):
+        seen, _ = self.seen(
+            {7988: lot(issue_ref="manaty/ameesh#6221"),
+             7970: lot(issue_ref="manaty/ameesh#6206"),
+             7971: lot(issue_ref="manaty/ameesh-ui#12"),
+             7972: lot()},
+            [{"work_item_id": n, "report": {"failed": [REAL]}}
+             for n in (7970, 7971, 7972)])
+        self.assertEqual(seen, {REAL: [7970, 7972]})
+
+    def test_lot_illisible_ou_sans_projet_ne_compte_pas(self):
+        seen, _ = self.seen({7988: lot(), 7970: lot(app="")},
+                            [{"work_item_id": n, "report": {"failed": [REAL]}}
+                             for n in (7970, 7971)])
+        self.assertEqual(seen, {})
+
+    def test_porteur_de_paquet_ecarte(self):
+        seen, _ = self.seen(
+            {7988: lot(), 7970: lot(),
+             8000: lot(branch="integration/paquet-h-20261120-13")},
+            [{"work_item_id": 7970, "report": {"failed": [REAL]}},
+             {"work_item_id": 8000, "report": {"failed": [OTHER]}}])
+        self.assertEqual(seen, {REAL: [7970]})
 
     def test_porteur_courant_juge_seul(self):
-        store = mock.Mock()
-        with mock.patch.object(storage, "of", return_value=store), \
-                mock.patch.object(calls.work, "get", return_value={
-                    "branch": "integration/paquet-h-20261120-13"}):
-            self.assertEqual(calls.seen_elsewhere(object(), 8000), {})
+        seen, store = self.seen(
+            {8000: lot(branch="integration/paquet-h-20261120-13")}, [], current=8000)
+        self.assertEqual(seen, {})
         store.prevalidation.failures_since.assert_not_called()
 
 

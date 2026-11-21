@@ -1322,25 +1322,50 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
 CAUSE_SOURCE = "prevalidation-environment:%s:%s"
 
 
+def _scope(item: dict | None) -> tuple[str, str] | None:
+    """#7988 (B cx2/dev3) : le projet d'un lot et le dépôt de son ticket.
+
+    `None` pour un lot illisible, sans projet ou porteur de paquet (il
+    contient ses unités, leur rouge n'est pas indépendant du sien)."""
+    if not item or packet_guard.is_packet_branch(str(item.get("branch") or "")):
+        return None
+    app = str(item.get("app") or "").strip().casefold()
+    if not app:
+        return None
+    ref = str(item.get("issue_ref") or "").strip()
+    repo = ref.split("#", 1)[0].strip().casefold() if "#" in ref else ""
+    return app, repo
+
+
+def _same_scope(mine: tuple[str, str], other: tuple[str, str] | None) -> bool:
+    """Même projet ; et même dépôt quand les deux tickets en nomment un."""
+    if other is None or other[0] != mine[0]:
+        return False
+    return not (mine[1] and other[1] and mine[1] != other[1])
+
+
 def seen_elsewhere(db, lot: int, *, warn=None) -> dict:
     """#7988 : `{test: [lots]}` des tests rouges en prévalidation sur d'autres
-    lots (hors porteurs de paquet) dans `prevalidation.RECURRENT_WINDOW_S`.
+    lots **du même projet** (et du même dépôt quand leurs tickets en nomment
+    un), hors porteurs de paquet, dans `prevalidation.RECURRENT_WINDOW_S`.
 
-    Un porteur de paquet est jugé seul : il contient ses unités, leur rouge
-    n'est pas indépendant du sien. Une lecture impossible rend `{}` : chaque
-    gel est alors jugé seul, comme avant, et rien n'est supposé vert."""
+    `prevalidation_reports` est partagée par tous les projets : un test
+    homonyme d'un autre projet ne dit rien de celui-ci. Un lot dont le projet
+    est illisible ne compte pas ; un porteur de paquet ou un lot courant
+    illisible est jugé seul. Une lecture impossible rend `{}` : chaque gel est
+    alors jugé seul, comme avant, et rien n'est supposé vert."""
     if db is None or int(lot or 0) <= 0:
         return {}
     from . import storage
 
-    def carrier(number: int) -> bool:
+    def scope(number: int) -> tuple[str, str] | None:
         try:
-            item = work.get(db, number) or {}
-        except Exception:  # noqa: BLE001 - lot illisible : compté comme lot
-            item = {}
-        return packet_guard.is_packet_branch(str(item.get("branch") or ""))
+            return _scope(work.get(db, number))
+        except Exception:  # noqa: BLE001 - lot illisible : ne compte pas
+            return None
 
-    if carrier(int(lot)):
+    mine = scope(int(lot))
+    if mine is None:
         return {}
     try:
         rows = storage.of(db).prevalidation.failures_since(
@@ -1349,9 +1374,10 @@ def seen_elsewhere(db, lot: int, *, warn=None) -> dict:
         if warn is not None:
             warn("prévalidation : rouges des autres lots illisibles — %s" % exc)
         return {}
-    carriers = {other for other in {int(r.get("work_item_id") or 0)
-                                    for r in rows or ()} if carrier(other)}
-    return prevalidation.recurrent_failures(rows, int(lot), carriers=carriers)
+    ignored = {other for other in {int(r.get("work_item_id") or 0)
+                                   for r in rows or ()}
+               if not _same_scope(mine, scope(other))}
+    return prevalidation.recurrent_failures(rows, int(lot), ignored=ignored)
 
 
 def cause_lots(cfg, db, report: dict, *, project: str, warn=None) -> list[dict]:
