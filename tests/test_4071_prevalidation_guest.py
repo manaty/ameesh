@@ -7,6 +7,10 @@ systemd, HOME/UID du poste, canaux Unix courts, recette libpq, snapshot sans
 histoire). Ces témoins bornés vérifient la liste déclarative, le filtrage du
 plan envoyé, la preuve qui distingue un échec exclu d'un rouge réel, et le
 fait que la suite complète n'est jamais filtrée.
+
+#7996 : la politique de contrats est fixée par les témoins (`contract_policy=None`),
+jamais lue du canon de l'hôte — AG1/AG3 déclarent `contract_selection` pour
+ameesh et un plan historique sans bloc `contract_plan` y était refusé.
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from ameesh import contract_plan, mechanics
 from ameesh import prevalidation as pv
 
 from . import test_1770_prevalidation_cli as cli
@@ -25,6 +30,18 @@ A, B, C = cli.A, cli.B, cli.C
 FAKE = "test_hote_factice"
 PROFILE = "ameesh-test-4071"
 REASON = "hôte factice : unité systemd et HOME du poste"
+HOST_POLICY = mechanics.ContractSelection("tests/parts/contrats.json")
+
+
+def host_canon_declares_a_policy():
+    """#7996 : le canon de l'hôte (AG1/AG3) déclare `contract_selection`.
+
+    Sous ce contexte, un appel resté en `configured` refuse le plan
+    historique sans bloc `contract_plan` (« active contract policy missing
+    from plan ») ; la politique fixée par le témoin doit l'emporter.
+    """
+    return mock.patch.object(contract_plan, "configured_policy",
+                             return_value=HOST_POLICY)
 
 
 def plan_with_host() -> dict:
@@ -134,10 +151,14 @@ class FilterTest(unittest.TestCase):
             filtered, applied = pv.filter_guest_plan(plan, exclusions())
             self.assertEqual([item["module"] for item in applied], [FAKE])
             self.assertEqual(filtered["contract"], ["test_cluster"])
-            self.assertTrue(pv.meets_canon(filtered, params((path,)),
-                                           excluded=exclusions())[0])
-            # sans la déclaration d'exclusion, le contrat manque : refus
-            ok, why = pv.meets_canon(filtered, params((path,)))
+            # #7996 : la politique est fixée par le témoin, pas lue de l'hôte.
+            with host_canon_declares_a_policy():
+                self.assertTrue(pv.meets_canon(
+                    filtered, params((path,)), excluded=exclusions(),
+                    contract_policy=None)[0])
+                # sans la déclaration d'exclusion, le contrat manque : refus
+                ok, why = pv.meets_canon(filtered, params((path,)),
+                                         contract_policy=None)
             self.assertFalse(ok)
             self.assertIn(FAKE, why)
 
@@ -409,14 +430,15 @@ class ValidateTest(unittest.TestCase):
                 seen["plan"] = plan
                 return C
 
-            with mock.patch.dict(pv.GUEST_EXCLUSIONS,
-                                 {PROFILE: {FAKE: REASON}}):
+            with host_canon_declares_a_policy(), \
+                    mock.patch.dict(pv.GUEST_EXCLUSIONS,
+                                    {PROFILE: {FAKE: REASON}}):
                 report = pv.validate(
                     lot=4071, plan_path=path, head=A, host="vm1",
                     params=params(), repo=directory, profile=PROFILE,
                     runner=cli.runner_for(0, cli.flux()),
                     snapshotter=snapshot,
-                    git_runner=cli.git_runner_for())
+                    git_runner=cli.git_runner_for(), contract_policy=None)
         self.assertTrue(report["ok"], report)
         sent = json.loads(seen["plan"])
         self.assertNotIn(FAKE, pv.planned_modules(sent))
@@ -438,12 +460,14 @@ class ValidateTest(unittest.TestCase):
                 seen["plan"] = plan
                 return C
 
-            report = pv.validate(
-                lot=4071, plan_path=path, head=A, host="vm1",
-                params=params(), repo=directory, profile="default",
-                runner=cli.runner_for(
-                    0, flux_with(successes=("test_a", "test_cluster", FAKE))),
-                snapshotter=snapshot, git_runner=cli.git_runner_for())
+            with host_canon_declares_a_policy():
+                report = pv.validate(
+                    lot=4071, plan_path=path, head=A, host="vm1",
+                    params=params(), repo=directory, profile="default",
+                    runner=cli.runner_for(
+                        0, flux_with(successes=("test_a", "test_cluster", FAKE))),
+                    snapshotter=snapshot, git_runner=cli.git_runner_for(),
+                    contract_policy=None)
         self.assertTrue(report["ok"], report)
         self.assertIn(FAKE, seen["plan"])
         self.assertEqual(report["excluded"], [])
