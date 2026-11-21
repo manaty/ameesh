@@ -582,6 +582,19 @@ class WatchTest(unittest.TestCase):
         for state in ("completed", "partial"):
             self.assertEqual(staging_watch.findings([row(state=state)], now=250), [])
 
+    def test_attestation_before_unattested_terminal_settles_only_its_run(self):
+        running = row(2, run="run-a", state="running", sha="a" * 40)
+        terminal = row(4, run="run-a", state="unattested", sha="a" * 40)
+        proof = dict(id=3, data=dict(sha="a" * 40))
+        self.assertEqual(staging_watch.findings([running, terminal], now=250,
+                                                attested=[proof]), [])
+        for other in (dict(id=1, data=dict(sha="a" * 40)),
+                      dict(id=3, data=dict(sha="b" * 40))):
+            self.assertEqual(len(staging_watch.findings(
+                [running, terminal], now=250, attested=[other])), 1)
+        self.assertEqual(len(staging_watch.findings(
+            [terminal], now=250, attested=[proof])), 1)
+
     def test_local_writer_imports_without_platform_shadowing(self):
         import os
         import subprocess

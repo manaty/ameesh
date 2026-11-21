@@ -930,6 +930,28 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(attestation['emissions']['docs01'], avant)
         self.assertNotIn('docs01', attestation['notifies'])
 
+    def test_timeout_rapporteur_apres_preuve_ne_declenche_pas_alerte_urgente(self):
+        from ameesh import staging_watch
+        self.ecrire(journal_complet())
+        def lecture(nom, cle):
+            if nom == 'auditeur':
+                raise RuntimeError('statement timeout')
+            return self.faux_deja_emis(nom, cle)
+        with mock.patch.object(self.actif, 'deja_emis', side_effect=lecture):
+            code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'auditeur',
+                                          '--rapporteur', 'bureau')
+        self.assertEqual(code, self.actif.CODE_AMBIGU, erreur)
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertIn('bureau', attestation['notifies'])
+        self.assertNotIn('auditeur', attestation['notifies'])
+        preuve = self.enregistre.call_args.args[0]
+        base = dict(run='run-a', sha=SHA, started=100, deadline=200,
+                    notify='pilot', hosts={})
+        rows = [dict(id=1, data=dict(base, state='running')),
+                dict(id=3, data=dict(base, state='unattested'))]
+        self.assertEqual(staging_watch.findings(
+            rows, now=250, attested=[dict(id=2, data=preuve)]), [])
+
     def test_courrier_sorti_des_20000_derniers_est_retrouve(self):
         """B3 / #4180 : 20001 courriers plus recents ne cachent pas un depot durable ;
         la relance reconcilie au lieu de renvoyer (temoin de l'avis R1)."""
@@ -1475,6 +1497,7 @@ class StagingSignalTest(unittest.TestCase):
         self.assertEqual(len(self.actifs()), 1)
         self.assertIn('ambigu', p.stderr)
         self.assertIn('relayer a la main', p.stderr)
+        self.assertIn('actif-%s.json' % self.sha[:12], p.stderr)
 
     def test_listes_normalisees(self):
         self.creer_poste_installe()
