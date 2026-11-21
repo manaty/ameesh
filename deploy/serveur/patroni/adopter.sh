@@ -212,7 +212,7 @@ phase_primaire() {
   fi
   [[ $ROLE == primaire ]] || die "$NOM_LOCAL est $ROLE : la phase primaire se joue sur le primaire EP8.3"
   [[ $NOFAIL_LOCAL == non ]] \
-    || die "$NOM_LOCAL est nofailover : Patroni ne le garderait pas leader ; promouvoir d'abord ameesh-agents-1 par EP8.3 (replication/promouvoir.sh), puis adopter depuis lui"
+    || die "$NOM_LOCAL est nofailover : Patroni ne le garderait pas leader ; le plan #8027 veut le primaire sur le hub, l'adoption Patroni doit être révisée avant #6959 (ne pas promouvoir ameesh-agents-1 pour adopter)"
   etcd_quorum || die "etcd sans quorum : phase etcd d'abord, sur les trois nœuds"
   local leader
   leader=$(cle_dcs leader)

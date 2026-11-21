@@ -12,6 +12,16 @@ santé et ce runbook. **Aucun geste n'est fait sur un hôte réel par ce lot** ;
 l'application est EP8.4. Il ne touche ni `installer-serveur.sh`, ni
 `deploy/serveur/terraform/`, ni `sauvegarder-base.sh`.
 
+> **#8027 (2026-11-22) — le primaire reste sur le hub, plan suspendu.** La
+> veille du mesh fixe le primaire permanent sur `manaty-mesh-1`, seul hôte
+> allumé au repos. La topologie de ce répertoire (primaire préféré
+> `ameesh-agents-1`, promotion préalable du hub vers AG1) est donc **périmée** :
+> `adoption.py topologie` la refuse désormais contre
+> `replication/noeuds.conf` (écart « primaire d'EP8.3 manaty-mesh-1, primaire
+> préféré de Patroni ameesh-agents-1 »), et `adopter.sh` ne doit pas être joué
+> avant une révision de `topologie.json` et une décision owner. #6959 est en
+> attente. Ne pas promouvoir un agent pour contourner cet écart.
+
 ## Topologie
 
 Trois votants, un par VM ; deux voix suffisent pour le quorum etcd. Les
@@ -259,6 +269,11 @@ de `deploy/serveur/replication`) sous Patroni, **sans `pg_basebackup`** : le
 primaire garde son `data_dir`, les standbys aussi (même identifiant système).
 Chaque phase se joue en root sur le nœud nommé. Sans `--geste-reel`, c'est une
 simulation : les contrôles sont réels et les gestes sont seulement affichés.
+
+> **#8027 : ne pas jouer ce plan en l'état.** Il suppose le primaire sur
+> `ameesh-agents-1` ; `adopter.sh verifier` échoue désormais sur l'écart de
+> topologie, et la promotion préalable du hub vers AG1 est interdite par la
+> règle de veille (primaire sur le hub).
 
 ```bash
 cd deploy/serveur/patroni

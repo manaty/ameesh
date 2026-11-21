@@ -6,7 +6,7 @@ Aucun hôte réel, aucun réseau : `psql`, `pg_ctlcluster`, `pg_isready`,
 un répertoire jetable, pilotées par des fichiers d'état. Les témoins portent
 sur les points sensibles du lot (SQL, droits) :
 
-- l'inventaire (hub nosync/nofailover, primaire `ameesh-agents-1`, `ANY 1`
+- l'inventaire (primaire `manaty-mesh-1`, le hub, nosync/nofailover ; `ANY 1`
   limité aux deux VM d'agents) et ses refus ;
 - la configuration idempotente (`conf.d`, bloc marqué de `pg_hba`, rechargement,
   redémarrage seulement sur demande) ;
@@ -23,6 +23,10 @@ sur les points sensibles du lot (SQL, droits) :
 - le retour arrière sans perte de données, grants pg_rewind révoqués avant
   `DROP ROLE` ;
 - `etat.sh` : colonnes réelles de `pg_stat_wal_receiver` (pas de `*_lag`) ;
+- le mode veille (#8027) : primaire sur le hub exigé, sauvegarde logique
+  récente exigée (dérogation consignée), fin des tours attendue, liste
+  synchrone vidée et consignée, réveil après rattrapage, refus si un autre
+  gestionnaire tient la liste ;
 - aucun mot de passe en argument de processus.
 """
 from __future__ import annotations
@@ -35,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -153,7 +158,11 @@ q = " ".join(sql.split())
 
 if q.startswith("SHOW "):
     parametre = q.split()[1]
-    print(lire("params/" + parametre, DEFAUT.get(parametre, "")))
+    if parametre == "synchronous_standby_names" and (base / "sync_gele").exists():
+        # Simule un autre gestionnaire (Patroni) qui tient la valeur.
+        print((base / "sync_gele").read_text(encoding="utf-8").strip())
+    else:
+        print(lire("params/" + parametre, DEFAUT.get(parametre, "")))
 elif "pg_is_in_recovery()" in q:
     print(lire("in_recovery", "f"))
 elif "pg_create_physical_replication_slot" in q:
@@ -181,6 +190,19 @@ elif "SELECT 1 FROM pg_replication_slots" in q:
 elif "SELECT slot_name, active, wal_status FROM pg_replication_slots" in q:
     for ligne in slots():
         print("|".join(ligne))
+elif "replay_lsn >= pg_current_wal_flush_lsn()" in q:
+    # #8027 : répliques en flux ET rattrapées (replay >= flush du primaire).
+    noms = set(re.findall(r"'([^']+)'", q.split(" IN (", 1)[1]))
+    flush = lsn(lire("flush_lsn", "0/0"))
+    chemin = base / "replication"
+    if chemin.exists():
+        for ligne in chemin.read_text(encoding="utf-8").splitlines():
+            champs = ligne.split("|")
+            if (len(champs) >= 5 and champs[0] in noms
+                    and champs[1] == "streaming" and lsn(champs[4]) >= flush):
+                print(champs[0])
+elif "FROM agent_registry" in q and "count(*)" in q:
+    print(lire("tours", "0"))
 elif "SELECT application_name FROM pg_stat_replication" in q:
     # B1 : seuls les candidats nommés et réellement en streaming comptent.
     noms = set(re.findall(r"'([^']+)'", q.split(" IN (", 1)[1]))
@@ -268,6 +290,19 @@ elif action == "restart":
             if "=" in ligne:
                 cle, valeur = ligne.split("=", 1)
                 (params / cle).write_text(valeur, encoding="utf-8")
+elif action == "reload":
+    # Rechargement réel : SHOW lit le fragment conf.d, comme PostgreSQL.
+    pgconf = os.environ.get("AMEESH_REPLICATION_PGCONF")
+    if pgconf:
+        fragment = pathlib.Path(pgconf) / "conf.d" / "60-ameesh-replication.conf"
+        if fragment.exists():
+            for ligne in fragment.read_text(encoding="utf-8").splitlines():
+                if ligne.strip().startswith("synchronous_standby_names"):
+                    valeur = ligne.split("=", 1)[1].strip().strip("'")
+                    params = state / "params"
+                    params.mkdir(exist_ok=True)
+                    (params / "synchronous_standby_names").write_text(
+                        valeur, encoding="utf-8")
 elif action != "reload":
     sys.stderr.write("fake pg_ctlcluster: action inconnue: " + action + "\n")
     sys.exit(2)
@@ -370,8 +405,11 @@ class ReplicationTest(unittest.TestCase):
         self.journal = self.tmp / "journal"
         self.stdin_log = self.tmp / "stdin.log"
         self.pgpass = self.tmp / "pgpass"
+        # #8027 : sauvegardes logiques et marqueur de veille, hors /etc réel.
+        self.sauvegardes = self.tmp / "sauvegardes"
+        self.veille = self.etc / "mode-veille"
         for dossier in (self.bin, self.pgbin, self.etc, self.pgconf / "conf.d",
-                        self.state / "params"):
+                        self.state / "params", self.sauvegardes):
             dossier.mkdir(parents=True)
         self.stub("psql", FAKE_PSQL)
         self.stub("pg_isready", FAKE_PG_ISREADY)
@@ -441,6 +479,11 @@ class ReplicationTest(unittest.TestCase):
             "AMEESH_REPLICATION_PGBIN": str(self.pgbin),
             "AMEESH_REPLICATION_PGPASS": str(self.pgpass),
             "AMEESH_REPLICATION_ATTENTE": "2",
+            "AMEESH_REPLICATION_ATTENTE_TOURS": "2",
+            "AMEESH_REPLICATION_ATTENTE_REVEIL": "2",
+            "AMEESH_REPLICATION_VEILLE": str(self.veille),
+            "AMEESH_SAUVEGARDES_DIR": str(self.sauvegardes),
+            "AMEESH_SAUVEGARDE_MAX_AGE_S": "93600",
             "AMEESH_REPLICATION_RUNUSER": "oui",
             "AMEESH_REPLICATION_NOM": "ameesh-agents-2",
             "FAKE_STATE": str(self.state),
@@ -518,6 +561,41 @@ class ReplicationTest(unittest.TestCase):
     def auto_conf(self):
         return (self.data / "postgresql.auto.conf").read_text(encoding="utf-8")
 
+    # --- mode veille (#8027) -------------------------------------------------
+
+    def etat_veille(self):
+        return self.veille.read_text(encoding="utf-8") if self.veille.exists() else ""
+
+    def etat_veille_champs(self):
+        champs = {}
+        for ligne in self.etat_veille().splitlines():
+            cle, _, valeur = ligne.partition("=")
+            champs[cle] = valeur
+        return champs
+
+    def hub_primaire(self, sauvegarde=True, tours=0):
+        """Primaire effectif sur le hub, comme au repos du mesh (#8027)."""
+        self.serveur(demarre=True, en_recuperation=False)
+        self.parametre("synchronous_standby_names",
+                       'ANY 1 ("ameesh-agents-1", "ameesh-agents-2")')
+        if sauvegarde:
+            self.sauvegarde_logique()
+        self.tours(tours)
+        return {"AMEESH_REPLICATION_NOM": "manaty-mesh-1"}
+
+    def sauvegarde_logique(self, nom="ameesh-manaty-mesh-1-2026-11-22-033500.dump"):
+        chemin = self.sauvegardes / nom
+        chemin.write_text("dump logique de test\n", encoding="utf-8")
+        return chemin
+
+    def tours(self, nombre):
+        (self.state / "tours").write_text(str(nombre), encoding="utf-8")
+
+    def flux(self, lignes, flush="0/5000000"):
+        (self.state / "replication").write_text(
+            "".join("|".join(ligne) + "\n" for ligne in lignes), encoding="utf-8")
+        (self.state / "flush_lsn").write_text(flush, encoding="utf-8")
+
     # --- inventaire ----------------------------------------------------------
     def test_inventaire_cible(self):
         lignes = []
@@ -526,10 +604,12 @@ class ReplicationTest(unittest.TestCase):
             if ligne:
                 lignes.append(ligne.split())
         self.assertEqual([ligne[0] for ligne in lignes],
-                         ["ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1"])
-        self.assertEqual(lignes[0][2:], ["primaire", "oui", "non", "100"])
-        self.assertEqual(lignes[1][2:], ["standby", "oui", "non", "90"])
-        self.assertEqual(lignes[2][2:], ["standby", "non", "oui", "0"])
+                         ["manaty-mesh-1", "ameesh-agents-1", "ameesh-agents-2"])
+        # #8027 : le primaire est le hub, jamais candidat synchrone ; les deux
+        # agents restent les seuls candidats (ANY 1).
+        self.assertEqual(lignes[0][2:], ["primaire", "non", "oui", "0"])
+        self.assertEqual(lignes[1][2:], ["standby", "oui", "non", "100"])
+        self.assertEqual(lignes[2][2:], ["standby", "oui", "non", "90"])
 
     def test_inventaire_reseau_prive(self):
         # EP8.3 (#6860) : les nœuds se joignent sur les adresses privées
@@ -559,6 +639,17 @@ class ReplicationTest(unittest.TestCase):
             hub hub standby oui oui 0
             """), encoding="utf-8")
         resultat = self.run_script("configurer-noeud.sh", "a1", attendu=1,
+                                   env={"AMEESH_REPLICATION_NOEUDS": str(inventaire)})
+        self.assertIn("nofailover et synchrone", resultat.stderr)
+
+        # #8027 : un primaire nofailover (le hub permanent) ne peut pas être
+        # son propre standby : il n'entre jamais dans la liste synchrone.
+        inventaire.write_text(textwrap.dedent("""\
+            hub hub primaire oui oui 0
+            a1 a1 standby oui non 90
+            a2 a2 standby oui non 80
+            """), encoding="utf-8")
+        resultat = self.run_script("configurer-noeud.sh", "hub", attendu=1,
                                    env={"AMEESH_REPLICATION_NOEUDS": str(inventaire)})
         self.assertIn("nofailover et synchrone", resultat.stderr)
 
@@ -690,6 +781,176 @@ class ReplicationTest(unittest.TestCase):
         resultat = self.run_script("configurer-noeud.sh", "ameesh-agents-2")
         self.assertIn("serveur arrêté", resultat.stdout)
         self.assertNotIn("psql ", self.journal_texte())
+
+    # --- mode veille (#8027) -------------------------------------------------
+    def test_mode_veille_entrer_puis_sortir(self):
+        env = self.hub_primaire()
+        self.assertEqual(
+            self.run_script("mode-veille.sh", "etat", env=env).stdout.strip(),
+            "mode=actif")
+        inactif = self.run_script("mode-veille.sh", "sortir", env=env)
+        self.assertIn("mode veille inactif", inactif.stdout)
+
+        entre = self.run_script("mode-veille.sh", "entrer",
+                                "--raison", "veille de test", env=env)
+        self.assertIn("veille : synchronous_standby_names vidé", entre.stdout)
+        self.assertIn("veille : tours en cours : 0", entre.stdout)
+        self.assertIn("pg_ctlcluster 17 main reload", self.journal_texte())
+        fragment = self.fragment().read_text(encoding="utf-8")
+        self.assertIn("# mode veille (#8027)", fragment)
+        self.assertIn("synchronous_standby_names = ''", fragment)
+        self.assertNotIn("ANY 1", fragment)
+        # Le rechargement réel a bien pris la liste vide.
+        self.assertEqual(
+            (self.state / "params" / "synchronous_standby_names")
+            .read_text(encoding="utf-8"), "")
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["mode"], "veille")
+        self.assertEqual(champs["noeud"], "manaty-mesh-1")
+        self.assertEqual(champs["primaire"], "manaty-mesh-1")
+        self.assertEqual(champs["tours"], "0")
+        self.assertEqual(champs["resultat"], "ok")
+        self.assertEqual(champs["raison"], "veille de test")
+        self.assertIn("ANY 1", champs["sync_avant"])
+        self.assertTrue(champs["sauvegarde"].endswith(".dump"))
+        etat = self.run_script("mode-veille.sh", "etat", env=env)
+        self.assertIn("mode=veille\n", etat.stdout)
+        self.assertIn("resultat=ok", etat.stdout)
+
+        # Réveil : une réplique en flux et rattrapée autorise la liste ANY 1.
+        self.flux([["ameesh-agents-1", "streaming", "quorum",
+                    "0/5000000", "0/5000000"]], flush="0/5000000")
+        reveil = self.run_script("mode-veille.sh", "sortir", env=env)
+        self.assertIn("réplique(s) rattrapée(s) : ameesh-agents-1", reveil.stdout)
+        self.assertIn("synchronous_standby_names rétabli", reveil.stdout)
+        fragment = self.fragment().read_text(encoding="utf-8")
+        self.assertNotIn("# mode veille (#8027)", fragment)
+        self.assertIn(
+            "synchronous_standby_names = 'ANY 1 (\"ameesh-agents-1\", \"ameesh-agents-2\")'",
+            fragment)
+        self.assertEqual(
+            (self.state / "params" / "synchronous_standby_names")
+            .read_text(encoding="utf-8"),
+            'ANY 1 ("ameesh-agents-1", "ameesh-agents-2")')
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["mode"], "actif")
+        self.assertEqual(champs["resultat"], "ok")
+        self.assertEqual(
+            self.run_script("mode-veille.sh", "etat", env=env).stdout.strip(),
+            "mode=actif")
+
+    def test_mode_veille_refuse_hors_du_hub(self):
+        self.serveur(demarre=True, en_recuperation=False)
+        self.sauvegarde_logique()
+        self.tours(0)
+        resultat = self.run_script(
+            "mode-veille.sh", "entrer", attendu=1,
+            env={"AMEESH_REPLICATION_NOM": "ameesh-agents-2"})
+        self.assertIn("la veille exige le primaire sur le hub", resultat.stderr)
+        self.assertFalse(self.veille.exists())
+        self.assertFalse(self.fragment().exists())
+        self.assertNotIn("pg_ctlcluster", self.journal_texte())
+
+        # Le hub en standby effectif (bascule de secours) n'est pas un état
+        # de veille : refus avant tout geste.
+        self.serveur(demarre=True, en_recuperation=True)
+        resultat = self.run_script(
+            "mode-veille.sh", "entrer", attendu=1,
+            env={"AMEESH_REPLICATION_NOM": "manaty-mesh-1"})
+        self.assertIn("est standby, pas primaire", resultat.stderr)
+        self.assertFalse(self.veille.exists())
+        self.assertFalse(self.fragment().exists())
+
+        self.serveur(demarre=False)
+        resultat = self.run_script(
+            "mode-veille.sh", "entrer", attendu=1,
+            env={"AMEESH_REPLICATION_NOM": "manaty-mesh-1"})
+        self.assertIn("PostgreSQL ne répond pas", resultat.stderr)
+        self.assertFalse(self.veille.exists())
+
+    def test_mode_veille_exige_une_sauvegarde_logique(self):
+        env = self.hub_primaire(sauvegarde=False)
+        resultat = self.run_script("mode-veille.sh", "entrer", env=env, attendu=1)
+        self.assertIn("aucune sauvegarde logique", resultat.stderr)
+        self.assertFalse(self.veille.exists())
+        self.assertFalse(self.fragment().exists())
+
+        # Un dump de plus de 26 h ne compte pas (RPO de la veille).
+        vieux = self.sauvegarde_logique("ameesh-manaty-mesh-1-vieux.dump")
+        os.utime(vieux, (time.time() - 27 * 3600, time.time() - 27 * 3600))
+        resultat = self.run_script("mode-veille.sh", "entrer", env=env, attendu=1)
+        self.assertIn("aucune sauvegarde logique", resultat.stderr)
+        self.assertFalse(self.veille.exists())
+
+        # Dérogation d'exploitant : la raison est consignée, pas le secret.
+        self.run_script("mode-veille.sh", "entrer",
+                        "--sans-sauvegarde", "minuteur de sauvegarde en panne",
+                        env=env)
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["sauvegarde"],
+                         "sans: minuteur de sauvegarde en panne")
+        self.assertEqual(champs["resultat"], "ok")
+
+    def test_mode_veille_attend_la_fin_des_tours(self):
+        env = self.hub_primaire(tours=3)
+        resultat = self.run_script("mode-veille.sh", "entrer", env=env, attendu=1)
+        self.assertIn("tours encore en cours (3)", resultat.stderr)
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["mode"], "veille")
+        self.assertEqual(champs["tours"], "3")
+        self.assertEqual(champs["resultat"], "tours-restants")
+        # La liste est déjà vide (état sûr), mais la sortie non nulle interdit
+        # au déclencheur d'arrêter les agents.
+        self.assertIn("synchronous_standby_names = ''",
+                      self.fragment().read_text(encoding="utf-8"))
+
+        self.tours(0)
+        self.run_script("mode-veille.sh", "entrer", env=env)
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["tours"], "0")
+        self.assertEqual(champs["resultat"], "ok")
+
+    def test_mode_veille_reveil_attend_le_rattrapage(self):
+        env = self.hub_primaire()
+        self.run_script("mode-veille.sh", "entrer", env=env)
+        # En flux mais en retard sur le flush du primaire : pas de rétablissement.
+        self.flux([["ameesh-agents-1", "streaming", "quorum",
+                    "0/4000000", "0/4000000"]], flush="0/5000000")
+        resultat = self.run_script("mode-veille.sh", "sortir", env=env, attendu=1)
+        self.assertIn("aucune réplique rattrapée", resultat.stderr)
+        self.assertIn("ameesh-agents-1", resultat.stderr)
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["mode"], "veille")
+        self.assertEqual(champs["resultat"], "reveil-incomplet")
+        self.assertIn("synchronous_standby_names = ''",
+                      self.fragment().read_text(encoding="utf-8"))
+        self.assertEqual(
+            (self.state / "params" / "synchronous_standby_names")
+            .read_text(encoding="utf-8"), "")
+
+        self.flux([["ameesh-agents-2", "streaming", "quorum",
+                    "0/5000000", "0/5000000"]], flush="0/5000000")
+        self.run_script("mode-veille.sh", "sortir", env=env)
+        self.assertIn("synchronous_standby_names = 'ANY 1",
+                      self.fragment().read_text(encoding="utf-8"))
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["mode"], "actif")
+        self.assertEqual(champs["resultat"], "ok")
+
+    def test_mode_veille_refuse_un_gestionnaire_externe(self):
+        env = self.hub_primaire()
+        # Patroni (ou un autre gestionnaire) réimpose la liste après le
+        # rechargement : le script refuse et les agents ne doivent pas tomber.
+        (self.state / "sync_gele").write_text('ANY 1 ("ameesh-agents-1")',
+                                               encoding="utf-8")
+        resultat = self.run_script("mode-veille.sh", "entrer", env=env, attendu=1)
+        self.assertIn("autre gestionnaire", resultat.stderr)
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["mode"], "veille")
+        self.assertEqual(champs["resultat"], "echec-gestionnaire")
+        self.assertEqual(champs["sync_apres"], 'ANY 1 ("ameesh-agents-1")')
+        self.assertIn("synchronous_standby_names = ''",
+                      self.fragment().read_text(encoding="utf-8"))
 
     def test_secrets_0600_et_validation(self):
         self.serveur(demarre=False)
@@ -1197,7 +1458,8 @@ os.execv({vrai_stat!r}, ["stat"] + args)
         readme = (REPLICATION / "README.md").read_text(encoding="utf-8")
         for attendu in ("EP8.3", "pg_rewind", "retour arrière", "noeuds.conf",
                         "replication.env", "synchronous_standby_names",
-                        "sans-synchrone", "quorum"):
+                        "sans-synchrone", "quorum", "Mode veille (#8027)",
+                        "mode-veille.sh"):
             self.assertIn(attendu, readme)
         self.assertTrue((REPLICATION / "noeuds.conf").exists())
 
