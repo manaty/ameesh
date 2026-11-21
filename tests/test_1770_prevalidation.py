@@ -303,6 +303,50 @@ class ProofTest(unittest.TestCase):
         self.assertIn("run-incomplete", rapport["causes"])
         self.assertEqual(rapport["missing"], ["test_b"])
 
+    def test_un_contrat_saute_est_non_concluant_pas_vert(self):
+        """#7985 : un contrat dont tous les tests sautent n'est pas prouvé.
+
+        Le banc N-1 saute hors du job requis quand le clone n'a pas les tags ;
+        la preuve doit le consigner non concluant (canon §3), jamais vert.
+        """
+        lignes = []
+        for part, modules in (("psycopg:1", ["test_a"]),
+                              ("psycopg:2", ["test_cluster", "test_b"])):
+            lignes.append(pv.PART_MARK + part)
+            for module in modules:
+                lignes.append(json.dumps({
+                    "v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                    "part": part, "module": module, "test": "test_" + module,
+                    "statut": "saute" if module == "test_cluster" else "succes"}))
+            lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                                      "part": part, "statut": "succes",
+                                      "duree_s": 1.0}))
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                                 flow=pv.parse_flow("\n".join(lignes)))
+        self.assertFalse(rapport["ok"], rapport)
+        self.assertIn("run-incomplete", rapport["causes"])
+        self.assertEqual(rapport["skipped_contracts"], ["test_cluster"])
+        self.assertIn("contrats sautés", " ".join(rapport["detail"]))
+
+    def test_un_test_saute_hors_contrat_ne_rend_pas_la_preuve_incomplete(self):
+        """#7985 : le non-concluant porte sur les contrats, pas sur tout skip."""
+        lignes = []
+        for part, modules in (("psycopg:1", ["test_a"]),
+                              ("psycopg:2", ["test_cluster", "test_b"])):
+            lignes.append(pv.PART_MARK + part)
+            for module in modules:
+                lignes.append(json.dumps({
+                    "v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                    "part": part, "module": module, "test": "test_" + module,
+                    "statut": "saute" if module == "test_b" else "succes"}))
+            lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                                      "part": part, "statut": "succes",
+                                      "duree_s": 1.0}))
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                                 flow=pv.parse_flow("\n".join(lignes)))
+        self.assertTrue(rapport["ok"], rapport)
+        self.assertEqual(rapport["skipped_contracts"], [])
+
     def test_sans_aucun_flux_le_run_est_incomplet(self):
         rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
                                  flow={"fins": (), "modules": ()})

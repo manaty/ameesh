@@ -258,6 +258,10 @@ class Selection:
     #: #3800 : repli contractuel quand la sélection n'a pas pu être prouvée ;
     #: porte la cause d'origine et les modules de contrat réellement joués.
     fallback: dict | None = None
+    #: #7985 : modules du contrat (toujours.txt) de la sélection. Un contrat
+    #: dont tous les tests sont sautés n'est pas prouvé : la preuve le dit
+    #: non concluant (canon §3), jamais vert.
+    contracts: tuple[str, ...] = ()
     #: #4071 : modules retirés du plan parce que le guest ne peut pas les
     #: exécuter, avec leur raison nommée. Ils restent dans la suite complète.
     excluded: tuple[dict, ...] = ()
@@ -324,6 +328,11 @@ class Selection:
                       if fins_par_part.get(p) not in ("succes", "echec")]
         missing_modules = [m for m in self.modules
                            if m not in set(executed) and m not in excluded_names]
+        #: #7985 : un contrat dont tous les tests sont sautés n'est pas joué
+        #: (canon §3) : la preuve le consigne non concluant, jamais vert.
+        skipped_modules = {str(m) for m in (flow.get("skipped_modules") or ())}
+        skipped_contracts = [m for m in self.contracts
+                             if m in skipped_modules and m not in excluded_names]
         detail: list[str] = []
         if self.fallback:
             #: #3800 : la preuve dit toujours que la sélection n'était pas
@@ -418,6 +427,13 @@ class Selection:
                 causes.append("run-incomplete")
                 detail.append("modules planifiés non exécutés: %s"
                               % ", ".join(sorted(missing_modules)[:4]))
+            elif skipped_contracts:
+                outcome = "run-incomplete"
+                causes.append("run-incomplete")
+                detail.append("contrats sautés (non concluants, canon §3) : %s%s"
+                              % (", ".join(skipped_contracts[:4]),
+                                 " (+%d)" % (len(skipped_contracts) - 4)
+                                 if len(skipped_contracts) > 4 else ""))
             else:
                 # un run `run-red` dont tous les échecs sont ceux de modules
                 # exclus du guest n'a plus de rouge réel : il est vert.
@@ -448,6 +464,7 @@ class Selection:
             "modules": list(executed),
             "planned": list(self.modules),
             "missing": sorted(missing_modules),
+            "skipped_contracts": skipped_contracts,
             "parts": list(flow.get("parts") or ()),
             "planned_parts": list(planned_parts),
             "tests": flow.get("tests"),
@@ -708,7 +725,7 @@ def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "",
     return Selection(head=head, base=base, card_commit=card_commit,
                      modules=modules, parts=tuple(parts),
                      causes=tuple(unique), why=" ; ".join(why), plan_path=plan_path,
-                     fallback=fallback,
+                     fallback=fallback, contracts=contract,
                      excluded=tuple(dict(item) for item in excluded
                                     if isinstance(item, dict)))
 
@@ -962,8 +979,12 @@ def parse_flow(text: str) -> dict:
     Rend les modules réellement exécutés (événements `test`), le nombre de
     tests, les tests en échec (nom complet, pour le refus nommé), les statuts
     de fin par part et les parts vues. Un part sans événement `fin` reste
-    visible : c'est un run incomplet, jamais un vert."""
+    visible : c'est un run incomplet, jamais un vert. #7985 : un module dont
+    tous les tests sont sautés est nommé à part (`skipped_modules`) — sauté
+    n'est pas joué (canon §3)."""
     modules: set = set()
+    played: set = set()
+    skipped: set = set()
     failed: list[str] = []
     environment_hits: set = set()
     body_hits: set = set()
@@ -993,8 +1014,13 @@ def parse_flow(text: str) -> dict:
         part = courant or str(event.get("part") or "")
         if kind == "test":
             tests += 1
-            if event.get("module"):
-                modules.add(str(event["module"]))
+            module = str(event.get("module") or "")
+            if module:
+                modules.add(module)
+                if str(event.get("statut") or "") == "saute":
+                    skipped.add(module)
+                else:
+                    played.add(module)
             if str(event.get("statut") or "") in ("echec", "erreur",
                                                   "succes_inattendu") \
                     and event.get("test"):
@@ -1022,6 +1048,7 @@ def parse_flow(text: str) -> dict:
                         if nom in environment_hits and nom not in body_hits)
     return {"modules": tuple(sorted(modules)), "failed": tuple(failed), "tests": tests,
             "environment": environment,
+            "skipped_modules": tuple(sorted(skipped - played)),
             "parts": tuple(parts), "fins": tuple(fins), "fins_par_part": fins_par_part,
             "failed_by_part": {part: tuple(names)
                                for part, names in failed_by_part.items()}}
