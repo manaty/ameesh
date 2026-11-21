@@ -383,8 +383,9 @@ DEFAULT_ORPHAN_IDLE_S = 2 * 3600.0
 #: supprime (`policy.housekeeping.sweep_age`)
 DEFAULT_SWEEP_AGE_S = 6 * 3600.0
 #: #8020 : préfixes des dossiers balayés dans /tmp et /dev/shm (créés par les
-#: agents eux-mêmes, pas par le code d'ameesh)
-SWEEP_PREFIXES = ("ameesh-", "nexlink-")
+#: agents eux-mêmes, pas par le code d'ameesh) ; ceux des projets sont lus aux
+#: fiches du canon (`mesh_sweep_prefixes`), jamais écrits ici (#7660)
+DEFAULT_SWEEP_PREFIXES = ("ameesh-",)
 #: #8020 : sous-dossier temporaire d'un lot, sous le dossier de l'agent
 LOT_TMP_PREFIX = "ameesh-lot-"
 #: #8020 : alerte de remplissage d'un tmpfs autre que le /tmp de l'hôte
@@ -430,10 +431,10 @@ UNREADABLE_OK_HINT = "policy.housekeeping.unreadable_ok if it is a daemon"
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
-#: #8020 : le balayage supprime désormais les dossiers `ameesh-*` /
-#: `nexlink-*` abandonnés (âge + aucun processus), pas les autres entrées.
+#: #8020 : le balayage supprime désormais les dossiers temporaires du mesh
+#: abandonnés (âge + aucun processus), pas les autres entrées.
 TMPFS_ACTION = ("expected action: delete what is no longer needed (one command per entry "
-                "in `ameesh menage`); housekeeping sweeps `ameesh-*` / `nexlink-*` "
+                "in `ameesh menage`); housekeeping sweeps %s "
                 "directories unchanged for %s and held by no process, and otherwise "
                 "deletes on its own only a signaled entry attributed before #222 "
                 "(`tmp_orphan`); an entry appeared since is never deleted by ameesh; "
@@ -535,12 +536,15 @@ class Policy:
     orphan_cleanup: bool = True
     #: L162 : inactivité (secondes) avant cette suppression
     orphan_idle: float = DEFAULT_ORPHAN_IDLE_S
-    #: #8020 : balayer /tmp et /dev/shm (dossiers `ameesh-*` / `nexlink-*`
-    #: plus vieux que `sweep_age`, tenus par aucun processus) ; `false` : rien
-    #: n'est supprimé par le balayage
+    #: #8020 : balayer /tmp et /dev/shm (les dossiers temporaires du mesh plus
+    #: vieux que `sweep_age`, tenus par aucun processus) ; `false` : rien n'est
+    #: supprimé par le balayage
     sweep: bool = True
     #: #8020 : âge (secondes) avant ce balayage
     sweep_age: float = DEFAULT_SWEEP_AGE_S
+    #: #8020 : préfixes des dossiers balayés ; les projets viennent des fiches
+    #: du canon (`mesh_sweep_prefixes`), jamais d'un nom de client écrit ici
+    sweep_prefixes: tuple = DEFAULT_SWEEP_PREFIXES
     #: #248: node_modules shared per lockfile (npm wrapper, links, GC)
     deps: bool = True
     #: #248: idle time (seconds) before an unreferenced entry is deleted
@@ -699,6 +703,34 @@ def parse_idle(value) -> float | None:
         return None
 
 
+def mesh_sweep_prefixes(canons) -> tuple:
+    """#8020 : les préfixes des dossiers temporaires du mesh, lus au canon.
+
+    Le préfixe d'ameesh lui-même, puis un `<projet>-` par projet DÉCLARÉ dans
+    les fiches Agent (`projects:`/`team:`) ou `naming.projects` du canon : les
+    répertoires sont créés hors du code (`mktemp -d`), le cœur n'a donc aucun
+    nom de client à écrire (#7660). Un canon illisible ne rend que le préfixe
+    d'ameesh : on balaie moins, jamais autre chose."""
+    prefixes = set(DEFAULT_SWEEP_PREFIXES)
+    for canon in canons or ():
+        naming = getattr(canon, "naming", None)
+        for project in getattr(naming, "projects", None) or {}:
+            name = str(project).strip()
+            if name and "/" not in name:
+                prefixes.add(name + "-")
+        for agent in getattr(canon, "agents", ()) or ():
+            for project in getattr(agent, "effective_projects", ()) or ():
+                name = str(project).strip()
+                if name and "/" not in name:
+                    prefixes.add(name + "-")
+    return tuple(sorted(prefixes))
+
+
+def sweep_prefixes_label(policy: Policy) -> str:
+    """#8020 : les préfixes balayés, pour une alerte ou un journal."""
+    return " / ".join("`%s*`" % prefix for prefix in policy.sweep_prefixes)
+
+
 def effective(canons, host: str) -> Policy:
     """Politique de ménage de `host` d'après toutes les fiches Host des canons.
 
@@ -711,11 +743,13 @@ def effective(canons, host: str) -> Policy:
     `dirty_worktree_after` et `dirty_archive_retention`
     aussi, les plus longs (garder plus longtemps est le choix prudent). #8020 :
     le balayage est coupé dès qu'une fiche le coupe, son âge est le plus long
-    et son seuil d'alerte /dev/shm le plus bas."""
+    et son seuil d'alerte /dev/shm le plus bas ; ses préfixes sont ceux des
+    projets déclarés au canon, jamais un nom écrit dans le cœur."""
     values: dict = {}
     origin: dict = {}
     roots: set[str] = set()
-    for canon in canons or ():
+    canons = tuple(canons or ())
+    for canon in canons:
         fiche = canon.host(host) if hasattr(canon, "host") else None
         host_policy = getattr(fiche, "policy", None)
         declared = getattr(host_policy, "housekeeping", None) or {}
@@ -755,6 +789,7 @@ def effective(canons, host: str) -> Policy:
                              "docker_images") and value is False
                      and values[key] is not False):
                 values[key], origin[key] = value, label
+    values["sweep_prefixes"] = mesh_sweep_prefixes(canons)
     return Policy(origin=origin, worktree_roots=tuple(sorted(roots)), **values)
 
 
@@ -1171,7 +1206,8 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
     `<dossier de l'agent>/ameesh-lot-<id>`, créé ici et gardé d'un tour à
     l'autre du même lot. Ce sous-dossier reste sous la racine gérée (donc sur
     disque, L162) ; il est supprimé à la fin du lot (`cleanup_lot_dirs`) ou à
-    l'arrêt de l'agent. Un tour sans lot garde le dossier de l'agent, comme
+    l'arrêt de l'agent pour un lot déjà terminé ; un lot ouvert le garde,
+    borné par `tmp_quota`. Un tour sans lot garde le dossier de l'agent, comme
     avant."""
     if not policy.redirect or disabled(base_env):
         return {}
@@ -2976,7 +3012,8 @@ def tmpfs_hint(top, policy: Policy) -> str:
     (si un bilan les a relevées) et l'action attendue."""
     plus_gros = ("largest in /tmp: %s" % describe_top(top)) if top else \
         "largest in /tmp: `ameesh menage` on the host"
-    return "%s — %s" % (plus_gros, TMPFS_ACTION % fmt_idle(policy.sweep_age))
+    return "%s — %s" % (plus_gros, TMPFS_ACTION % (
+        sweep_prefixes_label(policy), fmt_idle(policy.sweep_age)))
 
 
 # --------------------------------------------------------------------------
@@ -3937,7 +3974,7 @@ class Turn:
 
 
 # --------------------------------------------------------------------------
-# #8020 : balayage des dossiers `ameesh-*` / `nexlink-*` de /tmp et /dev/shm
+# #8020 : balayage des dossiers temporaires du mesh dans /tmp et /dev/shm
 # --------------------------------------------------------------------------
 
 def sweep_roots() -> list[str]:
@@ -3949,12 +3986,13 @@ def sweep_roots() -> list[str]:
 def tmp_sweep(policy: Policy, *, dry_run: bool = False, now: float | None = None,
               budget: PassBudget | None = None, roots=None, age: float | None = None,
               procs=None) -> dict:
-    """#8020 : supprime les dossiers `ameesh-*` / `nexlink-*` abandonnés de
-    /tmp et /dev/shm.
+    """#8020 : supprime les dossiers temporaires abandonnés du mesh de /tmp
+    et /dev/shm.
 
     Un candidat est un enfant DIRECT d'une racine, de l'utilisateur, qui est
     un dossier ordinaire (jamais un lien), dont le nom porte un des préfixes
-    du mesh, et dont la dernière activité (mtime ET ctime, contenu compris)
+    du mesh (`policy.sweep_prefixes`, lus aux projets déclarés au canon), et
+    dont la dernière activité (mtime ET ctime, contenu compris)
     remonte à plus de `age` (défaut `policy.sweep_age`, 6 h). Il est GARDÉ si
     un processus de l'utilisateur le tient (cwd, exécutable, fichier ouvert
     ou projeté, `platform.user_paths`), si la table des processus est
@@ -4009,7 +4047,7 @@ def tmp_sweep(policy: Policy, *, dry_run: bool = False, now: float | None = None
             skipped.append("tmp sweep: %s unreadable (%s)" % (root, exc.strerror or exc))
             continue
         for name in names:
-            if not name.startswith(SWEEP_PREFIXES):
+            if not name.startswith(policy.sweep_prefixes):
                 continue
             path = os.path.join(root, name)
             try:

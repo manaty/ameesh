@@ -14543,8 +14543,9 @@ class Runner:
         # #8020 : à l'arrêt du runner, seuls les dossiers des lots TERMINÉS
         # partent (les tours sont clos ci-dessus). Un lot encore ouvert garde
         # le sien : un redéploiement n'est pas l'arrêt de l'agent, et le
-        # `TMPDIR` peut porter un clone en cours ; le balayage par âge ou la
-        # clôture du lot s'en chargeront. Le verrou et la lecture des
+        # `TMPDIR` peut porter un clone en cours ; la clôture du lot (état
+        # terminal) s'en chargera, et `tmp_quota` borne un lot ouvert
+        # indéfiniment. Le verrou et la lecture des
         # processus sont reposés par `cleanup_lot_dirs` ; un dossier tenu reste.
         try:
             lot_tmp = workspaces.cleanup_lot_dirs(

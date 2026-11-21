@@ -205,7 +205,11 @@ class BalayageTest(unittest.TestCase):
         os.makedirs(self.tmp)
         os.makedirs(self.shm)
         self.now = time.time()
-        self.pol = menage.Policy(sweep_age=3600)
+        self.pol = menage.Policy(
+            sweep_age=3600,
+            # deux projets déclarés : le préfixe du projet vient de la fiche,
+            # jamais du cœur (#7660)
+            sweep_prefixes=menage.DEFAULT_SWEEP_PREFIXES + ("nexlink-",))
         patcher = mock.patch.object(menage.platform, "user_paths",
                                     lambda *a, **k: platform.UserPaths())
         patcher.start()
@@ -338,6 +342,29 @@ class MesureEtPolitiqueTest(unittest.TestCase):
                                 Canon({"sweep": False, "sweep_age": 12 * 3600})], "pc")
         self.assertIs(pol.sweep, False)
         self.assertEqual(pol.sweep_age, 12 * 3600)
+
+    def test_les_prefixes_du_balayage_viennent_des_projets_du_canon(self):
+        # #7660 : aucun nom de client dans le cœur ; les préfixes sont lus aux
+        # fiches Agent (`projects:`/`team:`) et à `naming.projects`.
+        class Agent:
+            effective_projects = ["ameesh", "nexlink"]
+
+        class Canon:
+            naming = type("N", (), {"projects": {"autre": "aut"}})()
+            agents = [Agent()]
+
+            def host(self, name):
+                return None
+
+        self.assertEqual(menage.mesh_sweep_prefixes([Canon()]),
+                         ("ameesh-", "autre-", "nexlink-"))
+        self.assertEqual(menage.mesh_sweep_prefixes([]),
+                         menage.DEFAULT_SWEEP_PREFIXES)
+        pol = menage.effective([Canon()], "pc")
+        self.assertEqual(pol.sweep_prefixes,
+                         ("ameesh-", "autre-", "nexlink-"))
+        self.assertEqual(menage.sweep_prefixes_label(pol),
+                         "`ameesh-*` / `autre-*` / `nexlink-*`")
 
 
 if __name__ == "__main__":
