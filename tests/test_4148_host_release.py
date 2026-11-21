@@ -774,6 +774,25 @@ class HostReleaseTest(PgTestCase):
         self.clear_calls()
         return control
 
+    def test_ag3_busy_release_resyncs_before_a_new_drain(self):
+        self._ag3_state()
+        self.db.execute("UPDATE host_lifecycle SET generation=6, release_state='busy' "
+                        "WHERE host='vm'")
+        control = self.control()
+        self.assertEqual((control["mode"], control["generation"],
+                          control["claims_open"], control["hook_state"],
+                          control["release_state"]),
+                         ("available", 6, True, "draining", "busy"))
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
+        for _ in range(2):
+            self.once(now=time.time())
+            control = self.control()
+            self.assertFalse(control["claims_open"])
+            self.assertIsNone(registry.claim(self.db, "worker", "other", ttl_seconds=60))
+        self.assertEqual(self.states(), ["busy", "draining"])
+        self.assertTrue(all(call[2] == str(control["generation"])
+                            for call in self.calls() if call[0] != "runs"))
+
     def test_stale_draining_ack_resyncs_busy_before_a_new_drain(self):
         old = self._ag3_state()
         self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
