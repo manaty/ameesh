@@ -114,13 +114,14 @@ class ManifestTest(unittest.TestCase):
                    if re.fullmatch(r"role-[a-z0-9-]+\.sql", name)}
         self.assertEqual(on_disk, ROLE_SCRIPTS)
         elsewhere = droits_roles.replayed_elsewhere(SQL)
+        exempted = droits_roles.exemptions(SQL)
         replayed = set(REPLAY_SCRIPTS) | set(elsewhere)
-        covered = replayed | set(droits_roles.EXEMPTIONS)
+        covered = replayed | set(exempted)
         self.assertEqual(on_disk, covered)
-        self.assertFalse(set(REPLAY_SCRIPTS) & set(droits_roles.EXEMPTIONS))
+        self.assertFalse(set(REPLAY_SCRIPTS) & set(exempted))
         self.assertFalse(set(REPLAY_SCRIPTS) & set(elsewhere))
-        self.assertFalse(set(droits_roles.EXEMPTIONS) & set(elsewhere))
-        for name, reason in droits_roles.EXEMPTIONS.items():
+        self.assertFalse(set(exempted) & set(elsewhere))
+        for name, reason in exempted.items():
             self.assertGreaterEqual(len(reason), 60, name)
         for name, reason in elsewhere.items():
             self.assertGreaterEqual(len(reason), 20, name)

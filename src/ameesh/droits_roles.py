@@ -18,13 +18,13 @@ replay. Each entry has its own SQL replay script, which:
   same contract audit in the same transaction;
 * refuses (non-zero) on a missing or extra right, naming it, and rolls back.
 
-The scripts that cannot run under the migration owner are declared in
-`EXEMPTIONS`, with the reason. A role script already replayed by another
-migration-path caller declares it in its own header (`-- rejeu-ailleurs:`),
-read by `replayed_elsewhere()`: the declaration lives in the SQL file, not in
-an executed core string (#7634). `tests/test_7986_rejeu_roles.py` requires
-every `deploy/sql/role-*.sql` to be replayed here, declared elsewhere, or
-exempted.
+The scripts that cannot run under the migration owner, or are already replayed
+by another migration-path caller, declare it in their own SQL header
+(`-- rejeu-exempte:` and `-- rejeu-ailleurs:`, read by `exemptions()` and
+`replayed_elsewhere()`): the declaration and its reason live in the SQL file,
+not in an executed core string (#7634, #7660). `tests/test_7986_rejeu_roles.py`
+requires every `deploy/sql/role-*.sql` to be replayed here, declared elsewhere,
+or exempted.
 
 Exit codes: 0 every replay succeeded or was skipped, 1 one contract was refused
 (the violated right is named on stderr), 2 could not run (psql, database or
@@ -84,20 +84,14 @@ REPLAYS: tuple[Replay, ...] = (
     ),
 )
 
-#: Header marker of a role script whose contract is replayed by another
-#: migration-path caller. The reason stays in the SQL file: #7634 forbids an
-#: executed core string from naming the human avatar that owns that login.
+#: Header markers of a role script's declaration, read from the SQL file: an
+#: executable core string must not name a Manaty role (#7634, #7660).
 ELSEWHERE_MARKER = "-- rejeu-ailleurs:"
+EXEMPTION_MARKER = "-- rejeu-exempte:"
 
 
-def replayed_elsewhere(sql_dir: str) -> dict[str, str]:
-    """Role scripts whose header declares another replay caller (#7986).
-
-    A `role-*.sql` script carries `-- rejeu-ailleurs: <reason>` when another
-    migration-path caller already replays its contract. The manifest test
-    requires every role script to be replayed here, declared elsewhere this
-    way, or exempted; an undeclared script fails instead of being ignored.
-    """
+def _role_headers(sql_dir: str, marker: str) -> dict[str, str]:
+    """Role scripts whose header starts with `marker`, with the rest of the line."""
     found: dict[str, str] = {}
     try:
         names = sorted(os.listdir(sql_dir))
@@ -112,37 +106,31 @@ def replayed_elsewhere(sql_dir: str) -> dict[str, str]:
         with open(path, encoding="utf-8") as stream:
             for line in stream:
                 text = line.strip()
-                if text.startswith(ELSEWHERE_MARKER):
-                    found[name] = text[len(ELSEWHERE_MARKER):].strip()
+                if text.startswith(marker):
+                    found[name] = text[len(marker):].strip()
                     break
     return found
 
 
-#: Role scripts that cannot be replayed by the migration owner, with the reason
-#: that keeps the gap a declared administrator gesture rather than a hole.
-EXEMPTIONS: dict[str, str] = {
-    "role-vm-probe.sql":
-        "superuser only: creates/alters the LOGIN vm_probe and the NOLOGIN "
-        "vm_probe_writer, creates the SECURITY DEFINER functions owned by "
-        "vm_probe_writer and audits pg_authid. The migration owner owns the "
-        "tables but neither the functions nor CREATEROLE, so it cannot replay "
-        "the script or run its audit; the administrator applies it with "
-        "_contrat-vm-probe.sql (#6298/#7951).",
-    "role-executor.sql":
-        "future objects are covered by ALTER DEFAULT PRIVILEGES executed by the "
-        "migration owner, so a migration does not leave a missing grant; the "
-        "administrator wrapper role-executor.sh / poste.sh reapply_executor_role "
-        "reapplies the script itself (#L56).",
-    "role-release-controller.sql":
-        "superuser enrollment: creates an isolated NOLOGIN owner and transfers "
-        "SECURITY DEFINER functions to it. The migration owner is not that "
-        "superuser and cannot replay the transfer (#L232b).",
-    "role-auditeur.sql":
-        "a permission gesture, not a column contract: creates/alters the "
-        "auditor's LOGIN role and its memberships in the two supervisor "
-        "contracts. It grants no column itself; the contracts it inherits are "
-        "replayed above (#2340).",
-}
+def replayed_elsewhere(sql_dir: str) -> dict[str, str]:
+    """Role scripts whose header declares another replay caller (#7986).
+
+    A `role-*.sql` script carries `-- rejeu-ailleurs: <reason>` when another
+    migration-path caller already replays its contract. The manifest test
+    requires every role script to be replayed here, declared elsewhere this
+    way, or exempted; an undeclared script fails instead of being ignored.
+    """
+    return _role_headers(sql_dir, ELSEWHERE_MARKER)
+
+
+def exemptions(sql_dir: str) -> dict[str, str]:
+    """Role scripts whose header declares why the migration owner cannot replay it.
+
+    A `role-*.sql` script carries `-- rejeu-exempte: <reason>` when its contract
+    needs an administrator with more rights than the migration owner. The
+    reason lives in the SQL file, not in an executed core string (#7660).
+    """
+    return _role_headers(sql_dir, EXEMPTION_MARKER)
 
 
 def replay(cfg, sql_dir: str, item: Replay) -> tuple[int, str]:

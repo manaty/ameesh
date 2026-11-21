@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- rejeu-exempte: a permission gesture, not a column contract: creates/alters the auditor's LOGIN role and its memberships in the two supervisor contracts. It grants no column itself; the contracts it inherits are replayed above (#2340).
 -- Rôle de CONNEXION en lecture seule de l'auditeur interne (#2340).
 --
 --   PGOPTIONS='-c search_path=<schéma ameesh>' \
