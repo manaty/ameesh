@@ -2,8 +2,9 @@
 """#7789 : pendant une session `attach`, rien ne s'écrit sur le terminal du harnais.
 
 Constat manaty/ameesh#6001 : les lignes de journal du battement, du veilleur
-et de l'attente d'inputs (`log_async` → `_AsyncLog` → stdout) tombaient dans
-la TUI de Claude Code et la brouillaient. Le test attache un faux harnais sur
+et de l'attente d'inputs (`log_async` → `_AsyncLog` → flux du journal,
+stderr depuis #8013) tombaient dans la TUI de Claude Code et la brouillaient.
+Le test attache un faux harnais sur
 un vrai pty : il lit son terminal et y écrit son flux ; le banc vérifie
 qu'aucune ligne de l'attach n'y apparaît. Le journal de fichier et la ligne
 d'attente rendue après la session sont vérifiés de la même manière.
