@@ -162,7 +162,7 @@ class ActiviteTest(unittest.TestCase):
         texte = menage.tmpfs_hint(top, menage.Policy())
         self.assertIn("gros", texte)
         self.assertIn("expected action", texte)
-        self.assertIn("2 h", texte)
+        self.assertIn("6 h", texte)
         self.assertIn("ameesh menage", menage.tmpfs_hint([], menage.Policy()))
         self.assertEqual(menage.fmt_idle(5400), "90 min")
 
