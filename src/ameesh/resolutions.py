@@ -32,9 +32,9 @@ The lot branch never changes: it stays the version WITHOUT the other lot;
 the resolution commit R(lot, other) is the version WITH it.
 
 Validity, at each radar pass: in its private clone of the project
-(`<state_dir>/radar/<project>.clone`, `git clone --shared`: objects read
-from the agents' repository, nothing written to it; its `origin` is the
-forge, never the checkout's local branches, #3001), the radar replays the
+(`<state_dir>/radar/<project>.clone`, which owns its objects: `ensure`
+dissociates it from the agents' checkout, #7978; its `origin` is the forge,
+never the checkout's local branches, #3001), the radar replays the
 merge of the two current tips with an `rr-cache` holding the pair's own
 resolution only (trained once per resolution commit with git's
 `rerere-train.sh`, contrib, or a port of the same loop when the script is
@@ -564,6 +564,96 @@ def _quarantine_store(objects: str, git_dir: str, common: str, stamp: str,
               file=sys.stderr)
         if not kept:
             moved.append(source)
+    return moved
+
+
+def _raw_ref_7978(git_dir: str, name: str) -> str:
+    """#7978 : la valeur brute de la ref `name`, libre ou empaquetée, sans
+    résoudre son objet (il peut manquer) ; vide si ce n'est pas une ref
+    directe. Une ref symbolique n'a pas d'objet à sauver."""
+    path = os.path.join(git_dir, *name.split("/"))
+    try:
+        with open(path, "rb") as handle:
+            value = handle.read().strip()
+        if _REF_CONTENT.fullmatch(value):
+            return value.decode()
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(git_dir, "packed-refs"), encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith(("#", "^")):
+                    continue
+                sha, _, ref = line.partition(" ")
+                if ref == name and _REF_CONTENT.fullmatch(sha.encode()):
+                    return sha
+    except OSError:
+        pass
+    return ""
+
+
+def _quarantine_missing_refs_7978(path: str, message: str) -> list[str]:
+    """#7978 : met en quarantaine les refs que `message` dit cassées (objet
+    absent), en gardant leur valeur sous
+    `<.git>/ameesh-quarantine/<date>-7978-…/refs/…` ; rend leurs noms.
+
+    Une ref n'est déplacée que si son objet manque encore — une réparation
+    concurrente la laisse en place — et si `update-ref -d` réussit ; un échec
+    la laisse intacte. Le clone radar est un cache : une ref dont l'objet
+    n'existe plus ne vaut aucune lecture, et sa valeur reste lisible dans la
+    quarantaine (comme la garde #7969, étendue aux refs empaquetées)."""
+    names = broken_refs(message)
+    if not names:
+        return []
+    common = plan_git._out(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common or not os.path.isdir(common):
+        return []
+    common = os.path.realpath(common)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    try:
+        os.makedirs(os.path.join(common, QUARANTINE_DIR), exist_ok=True)
+        box = tempfile.mkdtemp(prefix=stamp + "-7978-",
+                               dir=os.path.join(common, QUARANTINE_DIR))
+    except OSError as exc:
+        print("ameesh: #7978 cannot open a quarantine in %s: %s" % (common, exc),
+              file=sys.stderr)
+        return []
+    moved: list[str] = []
+    for name in names:
+        parts = name.split("/")
+        if len(parts) < 2 or parts[0] != "refs" \
+                or any(part in ("", ".", "..") for part in parts):
+            continue
+        value = _raw_ref_7978(common, name)
+        if not value:
+            continue
+        # l'objet peut avoir été réécrit entre l'échec et la quarantaine
+        if _run(path, "cat-file", "-e", value, timeout=GIT_TIMEOUT).returncode == 0:
+            continue
+        target = os.path.join(box, *parts)
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(value + "\n")
+        except OSError as exc:
+            kept = "cannot keep a copy: %s" % exc
+        else:
+            # la valeur attendue : une ref réécrite entre-temps n'est pas
+            # supprimée (compare-and-swap, comme le verrou de #7969)
+            proc = _run(path, "update-ref", "-d", name, value, timeout=GIT_TIMEOUT)
+            kept = _err(proc) if proc.returncode else ""
+        line = ("%s -> %s" % (name, target) if not kept
+                else "%s not quarantined: %s" % (name, kept))
+        try:
+            with open(os.path.join(box, "moved.log"), "a", encoding="utf-8") as log:
+                log.write(line + "\n")
+        except OSError:
+            pass
+        print("ameesh: #7978 %s%s" % ("" if kept else "quarantined dangling ref ", line),
+              file=sys.stderr)
+        if not kept:
+            moved.append(name)
     return moved
 
 
@@ -1557,8 +1647,10 @@ def _clone_lock(path: str) -> _CloneLock:
 
 
 class Replayer:
-    """The radar's private clone of a project. Objects come from the agents'
-    repository (`--shared`); merges are replayed in the clone's worktree.
+    """The radar's private clone of a project. A persistent radar clone owns
+    its objects (#7978, `ensure` dissociates it); a scratch clone still reads
+    them from the agents' repository (`--shared`). Merges are replayed in the
+    clone's worktree.
     Each resolution commit gets its own `rr-cache`, trained once and kept
     under `.git/ameesh-rr-v3/<commit>` (branches' attributes) or
     `.git/ameesh-rr-v4/<commit>` (the target's, `attributes_tree`): a replay
@@ -1632,8 +1724,162 @@ class Replayer:
             else:
                 _run(self.path, "reset", "-q", "--hard")
             self.track_forge()
+            if not self.forge_url() and self.follow_forge:
+                # #7978 : sans forge, le checkout est la seule copie ; le clone
+                # dissocié ne le voit plus par les alternates, il le fetch
+                self.follow_repo()
             self.declare_target()
             self.refresh_target()
+            # #7978 : un clone radar ne lit plus les objets du checkout des
+            # agents (un gc de celui-ci élaguait des refs du radar, #7969)
+            if self.path.rstrip(os.sep).endswith(RADAR_CLONE_SUFFIX):
+                self.dissociate()
+
+    def follow_repo(self) -> bool:
+        """#7978 : sans forge, récupère les branches du checkout dans le clone.
+
+        Un clone `--shared` voyait les commits neufs du checkout par les
+        alternates ; une fois dissocié, il ne les voit plus. Le checkout étant
+        la seule copie, ses branches redeviennent `origin/*` (comme au clone
+        initial) ; l'`origin` du clone reste le checkout, aucune forge n'est
+        suivie. Rend True si le fetch a réussi."""
+        if os.path.realpath(self.path) == os.path.realpath(self.repo):
+            return False
+        try:
+            proc = _run(self.path, "fetch", "--quiet", "--prune", "--no-tags",
+                        self.repo, "+refs/heads/*:refs/remotes/origin/*",
+                        "+%s*:%s*" % (REF_PREFIX, REF_PREFIX),
+                        "+refs/heads/%s*:refs/ameesh/resolve/*" % BRANCH_PREFIX,
+                        timeout=FETCH_TIMEOUT)
+        except (GitError, OSError) as exc:
+            print("ameesh: #7978 %s cannot follow %s (%s)" % (self.path, self.repo, exc),
+                  file=sys.stderr)
+            return False
+        return proc.returncode == 0
+
+    def _alternates_file(self) -> str:
+        """#7978 : le fichier d'alternates du clone, vide sans `.git`."""
+        git_dir = os.path.join(self.path, ".git")
+        if os.path.isdir(git_dir):
+            return os.path.join(git_dir, "objects", "info", "alternates")
+        common = plan_git._out(self.path, "rev-parse", "--path-format=absolute",
+                               "--git-common-dir")
+        return (os.path.join(os.path.realpath(common), "objects", "info", "alternates")
+                if common and os.path.isdir(common) else "")
+
+    def borrowed_objects(self) -> bool:
+        """#7978 : le clone lit-il encore des objets d'un autre dépôt
+        (`objects/info/alternates`) ? Un clone radar créé `--shared` oui,
+        jusqu'à sa dissociation."""
+        if os.path.realpath(self.path) == os.path.realpath(self.repo):
+            return False
+        path = self._alternates_file()
+        try:
+            return bool(path) and os.path.getsize(path) > 0
+        except OSError:
+            return False
+
+    def dissociate(self) -> bool:
+        """#7978 : le clone radar cesse d'emprunter les objets du checkout.
+
+        `git clone --shared` laisse `objects/info/alternates` pointer sur le
+        dépôt des agents : un `gc` de celui-ci élague les objets que seules
+        les refs du radar atteignent (`refs/ameesh/candidates/remise/…`,
+        `refs/ameesh/resolutions/…`) et le clone devient illisible (« bad
+        object ») jusqu'à la réparation #7969. `repack -a -d` copie dans le
+        clone tous les objets atteignables par ses refs ; le fichier
+        d'alternates n'est retiré qu'après l'écriture du pack, donc un échec
+        laisse le clone lisible comme avant (il emprunte encore).
+
+        Les reflogs sont expirés d'abord : le clone est un cache, et un
+        reflog peut nommer un objet que la forge n'a jamais publié et que la
+        source a élagué (nexlink, 20/11) ; `repack -a` le lit et échouerait
+        sur un arbre dont aucune ref n'a besoin. Une ref dont l'objet manque
+        déjà est mise en quarantaine (`_quarantine_missing_refs_7978`) et le
+        repack refait, une ref par essai comme la garde #7969. Rend True si
+        le clone ne lit plus d'alternates (ou n'en avait pas)."""
+        if not self.borrowed_objects():
+            return True
+        alternates = self._alternates_file()
+        try:
+            with open(alternates, encoding="utf-8") as handle:
+                borrowed = handle.read()
+        except OSError:
+            return False
+        if not borrowed.strip():
+            return True
+        try:
+            _run(self.path, "reflog", "expire", "--expire=now", "--all",
+                 timeout=GIT_TIMEOUT)
+        except (GitError, OSError) as exc:
+            print("ameesh: #7978 reflogs of %s not expired (%s): repack may fail"
+                  % (self.path, exc), file=sys.stderr)
+        for _attempt in range(3):
+            try:
+                proc = _run(self.path, "repack", "-a", "-d", "-q", timeout=FETCH_TIMEOUT)
+            except (GitError, OSError) as exc:
+                print("ameesh: #7978 repack of %s failed: %s" % (self.path, exc),
+                      file=sys.stderr)
+                return False
+            if proc.returncode == 0:
+                break
+            error = _err(proc)
+            if not _quarantine_missing_refs_7978(self.path, error):
+                print("ameesh: #7978 %s keeps borrowing objects: %s"
+                      % (self.path, error[-300:]), file=sys.stderr)
+                return False
+        else:
+            print("ameesh: #7978 %s: repack still fails after quarantining refs"
+                  % self.path, file=sys.stderr)
+            return False
+        try:
+            os.unlink(alternates)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print("ameesh: #7978 %s: alternates not removed (%s); clone kept as is"
+                  % (self.path, exc), file=sys.stderr)
+            return False
+        # la preuve que le pack couvre bien toutes les refs, sans l'alternate
+        detail = ""
+        try:
+            probe = _run(self.path, "fsck", "--connectivity-only", "--no-dangling",
+                         timeout=FETCH_TIMEOUT)
+            detail = _err(probe) if probe.returncode else ""
+        except (GitError, OSError) as exc:
+            detail = str(exc)
+        if detail:
+            try:
+                with open(alternates, "w", encoding="utf-8") as handle:
+                    handle.write(borrowed)
+            except OSError:
+                pass
+            print("ameesh: #7978 %s: the copied pack does not cover its refs (%s); "
+                  "alternates restored" % (self.path, detail[-300:]), file=sys.stderr)
+            return False
+        print("ameesh: #7978 %s owns its objects now (alternates removed)"
+              % self.path, file=sys.stderr)
+        return True
+
+    def migrate_borrowed_objects(self) -> bool:
+        """#7978 : dissocie le clone radar existant, sous le verrou du clone.
+
+        `fetch_fresh` lit un clone existant sans passer par `ensure` (il ne
+        veut pas le réinitialiser) : ce point d'entrée garantit que le
+        premier lecteur migre un clone hérité de `--shared`, avant son fetch.
+        Sans alternates, un simple test de fichier. Clone occupé : différé,
+        le passage suivant réessaie. Rend True si le clone est autonome."""
+        if not self.path.rstrip(os.sep).endswith(RADAR_CLONE_SUFFIX):
+            return True
+        if not self.borrowed_objects():
+            return True
+        try:
+            with self.locked():
+                return self.dissociate()
+        except CloneBusy as exc:
+            print("ameesh: #7978 migration of %s deferred: %s" % (self.path, exc),
+                  file=sys.stderr)
+            return False
 
     def forge_url(self) -> str:
         """#3001 : la forge du projet, l'URL `origin` du checkout source ; vide

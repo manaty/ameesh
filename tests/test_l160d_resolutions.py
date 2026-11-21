@@ -52,7 +52,11 @@ def _manual_resolution(repo, ours="lot/1-a", theirs="lot/2-b", text=RESOLVED,
     """R(ours, theirs) made by hand in a scratch worktree; returns its sha.
 
     `attributes_tree` makes the merge read `.gitattributes` from that tree,
-    as the target does (`attr.tree`, #2189)."""
+    as the target does (`attr.tree`, #2189). The commit is pointed at by a
+    `refs/ameesh/resolutions/…` ref, like a recorded one (`finish_resolution`
+    creates the local ref before pushing, and keeps it when the push fails):
+    #7978 the radar clone no longer reads objects that no ref reaches, so a
+    resolution the radar must prime is reachable by its ref."""
     wt = os.path.join(os.path.dirname(repo), "wt-%s" % os.urandom(3).hex())
     _git(repo, "worktree", "add", "-q", "--detach", wt, ours)
     attrs = ["-c", "attr.tree=%s" % attributes_tree] if attributes_tree else []
@@ -65,7 +69,9 @@ def _manual_resolution(repo, ours="lot/1-a", theirs="lot/2-b", text=RESOLVED,
         _write(wt, "shared.py", text)
         _git(wt, "add", "shared.py")
         _git(wt, "commit", "-qm", "R")
-        return _git(wt, "rev-parse", "HEAD")
+        sha = _git(wt, "rev-parse", "HEAD")
+        _git(repo, "update-ref", "refs/ameesh/resolutions/manual/" + sha, sha)
+        return sha
     finally:
         _git(repo, "worktree", "remove", "--force", wt)
 
@@ -206,11 +212,13 @@ class ReplayTest(_Base):
         _commit_on(self.repo, "lot/1-a", "shared.py",
                    "UN\ndeux\ntrois\nquatre\ncinq\nsix\nSept\n", "a elsewhere")
         a2 = _git(self.repo, "rev-parse", "lot/1-a")
+        rp.ensure()                 # #7978 : le clone ne lit plus la source
         self.assertEqual(rp.replay(a2, b, sha)["state"], "prepared")
         # a push that changes the hunk makes it stale
         _commit_on(self.repo, "lot/1-a", "shared.py",
                    "UNO\ndeux\ntrois\nquatre\ncinq\nsix\nSept\n", "a changes the hunk")
         a3 = _git(self.repo, "rev-parse", "lot/1-a")
+        rp.ensure()                 # #7978 : idem pour la tête suivante
         got = rp.replay(a3, b, sha)
         self.assertEqual((got["state"], got["remaining"]), ("stale", ["shared.py"]))
         # nothing left behind in the agents' repository
@@ -289,6 +297,7 @@ class ReplayTest(_Base):
         _add_on(self.repo, "main", ".gitattributes",
                 "tests/parts/*.txt merge=union\n", "target unions parts")
         changed = _git(self.repo, "rev-parse", "main")
+        rp.ensure()                 # #7978 : la cible neuve entre dans le clone
         self.assertNotIn(sha, rp.trained(changed))
         self.assertEqual(rp.prime([sha], attributes_tree=changed), [])
         self.assertIn(sha, rp.trained(changed))
@@ -320,6 +329,7 @@ class ReplayTest(_Base):
         _git(self.repo, "mv", ".gitattributes", "scoped/.gitattributes")
         _git(self.repo, "commit", "-qm", "move attributes outside their scope")
         moved = _git(self.repo, "rev-parse", "main")
+        rp.ensure()                 # #7978 : la cible neuve entre dans le clone
         self.assertNotIn(sha, rp.trained(moved))
         self.assertEqual(rp.prime([sha], attributes_tree=moved), [])
         a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))

@@ -5024,6 +5024,7 @@
     "recorded"
    ],
    "prevalidation": [
+    "failures_since",
     "latest",
     "record",
     "report"

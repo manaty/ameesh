@@ -64,7 +64,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from . import canon as canon_mod
-from . import land, lot_class, mechanics, plan_git, prevalidation, registry, work
+from . import land, lot_class, mechanics, packet_guard, plan_git, prevalidation
+from . import registry, work
 from . import transverse_contracts
 from .deadline import Deadline
 
@@ -1252,6 +1253,7 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
             "no-vm", "aucun hôte de prévalidation autorisé (%s)"
             % ", ".join(declared))
     tooling(repo, head, params, deadline=deadline)
+    recurrent = seen_elsewhere(db, lot, cfg=cfg, warn=warn)
     carte, cleanup = map_for(repo_slug, repo, explicit=map_path, deadline=deadline)
     prepared = None
     try:
@@ -1277,7 +1279,7 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
             report = _run_hosts(prepared, params, lot=lot, head=head, base=base,
                                 branch=branch, profile=profile, say=say,
                                 executable=executable, validate=validate,
-                                deadline=deadline)
+                                deadline=deadline, recurrent=recurrent)
             if waited and isinstance(report, dict):
                 #: #7161 : la note du gel dit que la prévalidation a attendu son
                 #: créneau ; la preuve ne le cache pas.
@@ -1306,12 +1308,131 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
         except Exception as exc:  # noqa: BLE001 - 0450 absente ou base en défaut
             if warn is not None:
                 warn("prévalidation : rapport non persisté — %s" % exc)
+    if db is not None and report.get("environment_recurrent"):
+        cause_lots(cfg, db, report, project=project, warn=warn)
     return report
+
+
+# --------------------------------------------------------------------------
+# #7988 : le même test rouge sur plusieurs lots distincts
+# --------------------------------------------------------------------------
+
+#: source du lot de cause, un par (projet, module de test) : `work.add_or_note`
+#: note les occurrences suivantes sur le lot ouvert au lieu d'en ouvrir un autre
+CAUSE_SOURCE = "prevalidation-environment:%s:%s"
+
+
+def _scope(cfg, item: dict | None) -> tuple[str, str] | None:
+    """#7988 (B cx2/dev3) : le projet d'un lot et son dépôt **effectif**.
+
+    Le dépôt se résout comme `ci.repo_of` : celui du ticket (`issue_ref`),
+    sinon celui configuré pour le projet. `None` pour un lot illisible, sans
+    projet, sans dépôt prouvé, ou porteur de paquet (il contient ses unités,
+    leur rouge n'est pas indépendant du sien)."""
+    if not item or packet_guard.is_packet_branch(str(item.get("branch") or "")):
+        return None
+    app = str(item.get("app") or "").strip()
+    if not app:
+        return None
+    from . import plan_github
+    parts = plan_github._ref_parts(item.get("issue_ref"))
+    repo = parts[0] if parts and parts[0] else None
+    if not repo and cfg is not None:
+        try:
+            repo = plan_github.settings_of(cfg).repo_for(app)
+        except Exception:  # noqa: BLE001 - réglages illisibles : dépôt non prouvé
+            repo = None
+    if not repo:
+        return None
+    return app.casefold(), str(repo).strip().casefold()
+
+
+def seen_elsewhere(db, lot: int, *, cfg=None, warn=None) -> dict:
+    """#7988 : `{test: [lots]}` des tests rouges en prévalidation sur d'autres
+    lots **du même projet et du même dépôt effectif** (`_scope`), hors
+    porteurs de paquet, dans `prevalidation.RECURRENT_WINDOW_S`.
+
+    `prevalidation_reports` est partagée par tous les projets : un test
+    homonyme d'un autre projet ou dépôt ne dit rien de celui-ci. Un lot dont
+    le dépôt n'est pas prouvé ne compte pas ; un porteur de paquet ou un lot
+    courant sans dépôt prouvé est jugé seul. Une lecture impossible rend `{}` :
+    chaque gel est alors jugé seul, comme avant, et rien n'est supposé vert."""
+    if db is None or int(lot or 0) <= 0:
+        return {}
+    from . import storage
+
+    def scope(number: int) -> tuple[str, str] | None:
+        try:
+            return _scope(cfg, work.get(db, number))
+        except Exception:  # noqa: BLE001 - lot illisible : ne compte pas
+            return None
+
+    mine = scope(int(lot))
+    if mine is None:
+        return {}
+    try:
+        rows = storage.of(db).prevalidation.failures_since(
+            int(lot), prevalidation.RECURRENT_WINDOW_S)
+    except Exception as exc:  # noqa: BLE001 - lecture impossible : jugé seul
+        if warn is not None:
+            warn("prévalidation : rouges des autres lots illisibles — %s" % exc)
+        return {}
+    ignored = {other for other in {int(r.get("work_item_id") or 0)
+                                   for r in rows or ()}
+               if scope(other) != mine}
+    return prevalidation.recurrent_failures(rows, int(lot), ignored=ignored)
+
+
+def cause_lots(cfg, db, report: dict, *, project: str, warn=None) -> list[dict]:
+    """#7988 : un lot de cause par module de test rouge sur plusieurs lots.
+
+    Le canon §3 dit le test dépendant de l'environnement défaut du test,
+    corrigé à la source : le lot le demande, et un lot déjà ouvert pour ce
+    module reçoit l'occurrence en note. Une création impossible est signalée,
+    jamais transformée en refus du gel."""
+    lot = int(report.get("lot") or 0)
+    head = str(report.get("sha") or "")[:12]
+    by_module: dict[str, list[dict]] = {}
+    for entry in report.get("environment_recurrent") or ():
+        name = str(entry.get("test") or "")
+        module = prevalidation.test_module(name) or name
+        by_module.setdefault(module, []).append(entry)
+    made: list[dict] = []
+    for module, entries in sorted(by_module.items()):
+        lots = sorted({lot} | {int(n) for e in entries for n in e.get("lots") or ()})
+        cited = ", ".join("#%d" % n for n in lots)
+        tests = "\n".join("- %s" % e.get("test") for e in entries)
+        try:
+            made.append(work.add_or_note(
+                db, source=CAUSE_SOURCE % (project, module),
+                occurrence="prévalidation invitée : %s encore rouge sur #%d (tête %s) ; "
+                           "lots vus : %s" % (module, lot, head, cited),
+                actor="ameesh", cfg=cfg, app=project, type="bug", priority=2,
+                title="Prévalidation invitée : %s rouge sur %d lots distincts "
+                      "(%s) — test dépendant de l'environnement"
+                      % (module, len(lots), cited),
+                body="Constat (#7988) : les mêmes tests sont rouges en "
+                     "prévalidation invitée sur %d lots distincts (%s) ; le "
+                     "rouge est classé environnement, non concluant (canon §3), "
+                     "et ne retient plus ces gels.\n%s\n"
+                     "Attendu : reproduire dans l'invité (#4044), nommer la "
+                     "dépendance (HOME, UID, droits, binaire, minuterie…) et "
+                     "corriger le test à la source ; l'exclure de l'invité "
+                     "(`GUEST_EXCLUSIONS`) seulement si la dépendance est "
+                     "légitime, raison écrite. Preuve : une prévalidation "
+                     "invitée verte sur ces tests." % (len(lots), cited, tests),
+                footprint=["tests/%s.py" % module] if module.startswith("test")
+                else []))
+        except Exception as exc:  # noqa: BLE001 - le lot de cause ne bloque rien
+            if warn is not None:
+                warn("prévalidation : lot de cause %s non ouvert — %s" % (module, exc))
+    return made
 
 
 def _run_hosts(prepared: Prepared, params: Parameters, *, lot: int, head: str,
                base: str, branch: str, profile: str, say, executable: str,
-               validate, deadline: Deadline | None = None) -> dict:
+               validate, deadline: Deadline | None = None,
+               recurrent: dict | None = None) -> dict:
     """Les hôtes déclarés, dans l'ordre, sans repli local ni après un rouge.
 
     Avec ``deadline`` (#2665), chaque tentative ne reçoit que le temps qui
@@ -1344,7 +1465,8 @@ def _run_hosts(prepared: Prepared, params: Parameters, *, lot: int, head: str,
                 params=attempt.params, base=base, repo=prepared.tree,
                 published_ref=branch, profile=profile, executable=executable,
                 project=attempt.project, canon_repo=attempt.repo,
-                canon_commit=attempt.commit, deadline=deadline)
+                canon_commit=attempt.commit, deadline=deadline,
+                **({"recurrent": recurrent} if recurrent else {}))
         except prevalidation.PrevalidationError as exc:
             if exc.cause in RETRYABLE and index + 1 < len(hosts):
                 if deadline is not None and deadline.expired():

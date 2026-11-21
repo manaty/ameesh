@@ -65,6 +65,9 @@ MAX_FLIGHT_S = 6 * 3600.0
 #: `integration/paquet-<n>-nexlink` (#2381, #2733); one prefix covers both.
 _PACKET_HEADS = "refs/heads/integration/paquet-"
 _INFLIGHT = "refs/ameesh/shadow-inflight/"
+#: #7978 : the clone owns its objects; a base the caller read outside it is
+#: fetched here, under a private ref, before comparing.
+_BASE_REF = "refs/ameesh/shadow-base/"
 
 
 def _atom(tag):
@@ -650,6 +653,37 @@ class Passage:
         packets.reverse()  # oldest first, like the plans
         return packets
 
+    def _base_commit(self, clone, base, url):
+        """#7978 : the target base, readable in a clone that owns its objects.
+
+        A persistent radar clone no longer borrows the checkout's objects
+        (#7978): a base the caller read there — or the tip of a target that
+        moved since the clone was prepared — is missing from the clone and
+        ``merge-base`` would fail with "Not a valid commit name". The project
+        target is then fetched from `url` (the forge, or the checkout when
+        there is no forge), as :meth:`train_git.Repository.target` already
+        does for its fresh tip. A base still absent is a named error, never an
+        opaque `merge-base` failure."""
+        held = plan_git._commit(clone, base)
+        if held:
+            return held
+        branch = merge_queue._remote_branch(self.project.target or "")
+        if branch and not plan_git._SHA_RE.match(branch):
+            fetched = resolutions._run(
+                clone, "fetch", "--quiet", "--no-tags", url,
+                "+refs/heads/%s:%s%s" % (branch, _BASE_REF, branch),
+                timeout=FETCH_TIMEOUT)
+            if fetched.returncode:
+                raise train.TrainError(
+                    "cannot fetch the target %s to compare the open packets: %s"
+                    % (branch, resolutions._err(fetched)[-300:]))
+        held = plan_git._commit(clone, base)
+        if held is None:
+            raise train.TrainError(
+                "cannot compare an open packet with the target: %s is not in "
+                "the radar clone" % str(base)[:12])
+        return held
+
     def open_packets(self, clone, base, zone=None):
         """The composer's packet branches still open on the target (#2682).
 
@@ -660,6 +694,8 @@ class Passage:
         not on the target are listed here; their manifest is read later, at
         the exact commit that was composed before a plan cutoff. A numbered
         packet carries no hour: its stamp is the head commit date (#2733).
+        The base itself is brought into the clone when it is missing
+        (`_base_commit`, #7978).
         """
         url = land._origin(self.project) or merge_queue.source_of(self.project.repo)
         stale = resolutions._run(clone, "for-each-ref", "--format=%(refname)", _INFLIGHT)
@@ -681,8 +717,14 @@ class Passage:
         listed = resolutions._run(clone, "for-each-ref", "--format=%(refname)", _INFLIGHT)
         if listed.returncode:
             raise train.TrainError("cannot read the shadow in-flight refs")
+        open_refs = resolutions._text(listed).splitlines()
+        if not open_refs:
+            return []
+        # #7978 : la base lue par l'appelant hors du clone (checkout, test) n'y
+        # est pas forcément ; on ne la récupère que s'il y a un paquet à dater.
+        base = self._base_commit(clone, base, url)
         open_packets = []
-        for ref in resolutions._text(listed).splitlines():
+        for ref in open_refs:
             tail = "paquet-" + ref[len(_INFLIGHT):]
             head = plan_git._commit(clone, ref)
             if head is None:

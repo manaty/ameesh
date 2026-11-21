@@ -39,9 +39,17 @@ rougir le retour arrière pour une raison qui ne dit rien du vrai N-1. La
 version du paquet au checkout est celle que la release a taguée : un tag plus
 ancien qu'elle trahit ce clone, et le job CI (clone complet, REQUIS) reste le
 seul juge.
+
+#7985 : ce saut ne doit plus être muet hors CI. Un worktree d'agent ou le
+clone du composeur y rapatrie une fois les tags (`git fetch --tags`, borné)
+avant de juger ; s'ils restent absents ou en retard, le saut est nommé
+« non concluant (canon §3) », jamais compté vert. Et le module entre dans
+tests/parts/toujours.txt : la sélection d'un lot (impactés + contrat, §11 bis)
+le joue au lieu de ne le voir qu'à la CI du paquet (#7933, 8 h 20 d'attente).
 """
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import os
@@ -49,8 +57,10 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ameesh import canon
 
@@ -58,6 +68,10 @@ from tests import test_940_agregat_bash as t940
 from tests.test_1252_vm_agents_install import AMEESH, DB_PYTHON, ROOT, SCRIPT, VmAgentsHarness
 
 REQUIS = os.environ.get('AMEESH_TEST_N1_REQUIS') == '1'
+#: #7985 : la CI clone ce dont chaque job a besoin (le job « préflight N-1 »
+#: prend tous les tags). Hors CI — worktree d'agent, clone du composeur — le
+#: module prépare lui-même ses tags ; s'il n'y arrive pas, le saut est nommé.
+EN_CI = os.environ.get('GITHUB_ACTIONS') == 'true'
 
 
 def release_precedente(root: Path = ROOT) -> str:
@@ -83,11 +97,52 @@ def version_du_paquet(root: Path = ROOT) -> str:
     return 'v' + trouve.group(1) if trouve else ''
 
 
-TAG = release_precedente()
-VERSION = version_du_paquet()
-#: Le tag retenu est celui que la version du paquet a tagué (la release pose
-#: les deux dans le même commit). Sinon les tags du clone sont en retard.
-TAG_FIABLE = not TAG or not VERSION or TAG == VERSION
+def preparer_tags(root: Path = ROOT, *, timeout: float = 30.0) -> bool:
+    """#7985 : rapatrier les tags de release d'un clone qui ne les a pas.
+
+    Un worktree d'agent ou le clone du composeur (`git pull --ff-only`, sans
+    `--tags`) peut n'avoir aucun tag `v*` ou des tags en retard : le banc N-1
+    sautait alors sans bruit, et le rouge d'un lot ne se voyait qu'à la CI du
+    paquet (#7933, 8 h 20). Hors CI, on rapatrie une fois, borné ; un échec
+    (réseau, distant absent, verrou) laisse le saut nommé qui suit.
+
+    #7985 : l'instantané d'offload est un dépôt neuf à commit racine, sans
+    histoire ni distant : aucun tag n'y est atteignable et un `fetch` y
+    attendrait 30 s pour rien à chaque import du guest (revue #44935). On le
+    constate sans réseau.
+    """
+    try:
+        parents = subprocess.run(
+            ['git', '-C', str(root), 'rev-list', '--parents', '-n', '1', 'HEAD'],
+            capture_output=True, text=True, timeout=min(float(timeout), 10.0))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    if parents.returncode != 0 or len(parents.stdout.split()) < 2:
+        return False
+    try:
+        proc = subprocess.run(
+            ['git', '-C', str(root), 'fetch', '--quiet', '--tags',
+             '--no-write-fetch-head', 'origin'],
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def etat_tags(root: Path = ROOT) -> tuple[str, str, bool]:
+    """(tag N-1, version du paquet, tag fiable)."""
+    tag = release_precedente(root)
+    version = version_du_paquet(root)
+    return tag, version, not tag or not version or tag == version
+
+
+TAG, VERSION, TAG_FIABLE = etat_tags()
+if not REQUIS and not EN_CI and (not TAG or not TAG_FIABLE):
+    # #7985 : hors CI, un clone sans tags ou en retard les rapatrie avant de
+    # juger ; le saut qui reste est nommé « non concluant » (canon §3), jamais
+    # un vert muet.
+    if preparer_tags():
+        TAG, VERSION, TAG_FIABLE = etat_tags()
 
 # Amorce du CLI installé : le code d'un arbre `src` (N-1 ou N) sous l'interpréteur
 # du banc, base et ligne de rôle simulées. `-I` : ni PYTHONPATH ni dossier
@@ -166,9 +221,17 @@ l'hôte du banc et fait lire le canon et `github.projects` par `role timers`.
 '''
 
 
-MOTIF_N1 = ('aucun tag de release atteignable (clone sans tags)' if not TAG else
-            'tags du clone en retard : %s alors que le paquet est %s (#5954)'
-            % (TAG, VERSION or 'illisible'))
+def motif_n1(tag: str, version: str) -> str:
+    """Le motif d'un saut : nommé non concluant (canon §3), jamais un vert."""
+    if not tag:
+        cause = 'aucun tag de release atteignable (clone sans tags)'
+    else:
+        cause = ('tags du clone en retard : %s alors que le paquet est %s (#5954)'
+                 % (tag, version or 'illisible'))
+    return 'non concluant (canon §3) : ' + cause
+
+
+MOTIF_N1 = '' if (TAG and TAG_FIABLE) else motif_n1(TAG, VERSION)
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"),
@@ -469,6 +532,110 @@ class BarriereCiTest(unittest.TestCase):
         annule = self.classify(preflight_n1='cancelled')
         self.assertEqual(annule['state'], agregat.GREEN, annule)
         self.assertEqual([c['part'] for c in annule['consigned']], ['préflight N-1'])
+
+
+class ContratToujoursTest(unittest.TestCase):
+    """#7985 : la sélection d'un lot joue le préflight N-1 (contrat)."""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            'test_plan_7985', ROOT / 'scripts' / 'test-plan.py')
+        cls.plan = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.plan)
+        cls.modules = sorted(p.stem for p in (ROOT / 'tests').glob('test*.py'))
+
+    def test_le_preflight_n_1_est_dans_la_liste_toujours(self):
+        toujours = self.plan.read_list(self.plan.ALWAYS_FILE, self.modules,
+                                       required=True)
+        self.assertIn('test_5947_preflight_cli_n_moins_1', toujours)
+
+    def test_la_selection_d_un_lot_joue_le_preflight_n_1(self):
+        toujours = self.plan.read_list(self.plan.ALWAYS_FILE, self.modules,
+                                       required=True)
+        classes = {module: ('P3', '') for module in self.modules}
+        state = {'contract': toujours, 'map': {'used': True}, 'lot_safe': True}
+        selection, why = self.plan.lot_selection(True, state, self.modules, classes)
+        self.assertEqual(why, '')
+        self.assertIn('test_5947_preflight_cli_n_moins_1', selection)
+
+
+class DesignationTest(unittest.TestCase):
+    """#7985 : la prévalidation ne bloque que sur les sauts du banc N-1."""
+
+    def test_les_classes_du_banc_n_1_sont_designees(self):
+        from ameesh import prevalidation as pv
+        designes = pv.DESIGNATED_SKIPS['test_5947_preflight_cli_n_moins_1']
+        for classe in (PreflightCliPrecedentTest, IncidentRejoueTest):
+            prefixe = ('tests.test_5947_preflight_cli_n_moins_1.%s'
+                       % classe.__name__)
+            with self.subTest(classe=classe.__name__):
+                self.assertIn(prefixe, designes)
+
+
+class TagsPrepareTest(unittest.TestCase):
+    """#7985 : sans tags, le module les rapatrie ; le saut reste nommé."""
+
+    def _git(self, repo: Path, *args: str) -> None:
+        subprocess.run(['git', '-C', str(repo), *args], check=True,
+                       capture_output=True, text=True)
+
+    def test_un_clone_sans_tag_rapatrie_les_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            remote, source, clone = (base / 'remote.git', base / 'source',
+                                     base / 'clone')
+            subprocess.run(['git', 'init', '-q', '--bare', '--initial-branch=main',
+                            str(remote)], check=True, capture_output=True)
+            subprocess.run(['git', 'init', '-q', '--initial-branch=main', str(source)],
+                           check=True, capture_output=True)
+            self._git(source, 'config', 'user.email', 't@invalid')
+            self._git(source, 'config', 'user.name', 'test')
+            (source / 'a').write_text('a\n', encoding='utf-8')
+            self._git(source, 'add', 'a')
+            self._git(source, 'commit', '-q', '-m', 'v1')
+            self._git(source, 'tag', 'v1.0.0')
+            (source / 'b').write_text('b\n', encoding='utf-8')
+            self._git(source, 'add', 'b')
+            self._git(source, 'commit', '-q', '-m', 'tete')
+            self._git(source, 'remote', 'add', 'origin', str(remote))
+            self._git(source, 'push', '-q', 'origin', 'main', '--tags')
+            subprocess.run(['git', 'clone', '-q', '--no-tags', str(remote), str(clone)],
+                           check=True, capture_output=True)
+            self.assertEqual(release_precedente(clone), '')
+            self.assertTrue(preparer_tags(clone))
+            self.assertEqual(release_precedente(clone), 'v1.0.0')
+
+    def test_un_instantane_sans_histoire_ne_lance_aucun_fetch(self):
+        """#7985 : le guest reçoit un dépôt à commit racine : pas de réseau."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / 'snapshot'
+            subprocess.run(['git', 'init', '-q', '--initial-branch=main',
+                            str(snapshot)], check=True, capture_output=True)
+            self._git(snapshot, 'config', 'user.email', 't@invalid')
+            self._git(snapshot, 'config', 'user.name', 'test')
+            (snapshot / 'a').write_text('a\n', encoding='utf-8')
+            self._git(snapshot, 'add', 'a')
+            self._git(snapshot, 'commit', '-q', '-m', 'instantané')
+            self._git(snapshot, 'remote', 'add', 'origin',
+                      str(Path(tmp) / 'absent.git'))
+            vrai = subprocess.run
+            appels = []
+
+            def espion(*args, **kwargs):
+                appels.append(args)
+                if args and 'fetch' in args[0]:
+                    raise AssertionError(
+                        'fetch réseau sur un instantané sans histoire')
+                return vrai(*args, **kwargs)
+
+            with mock.patch.object(subprocess, 'run', side_effect=espion):
+                self.assertFalse(preparer_tags(snapshot))
+            self.assertFalse([a for a in appels if 'fetch' in a[0]], appels)
+
+    def test_le_motif_d_un_saut_est_nomme_non_concluant(self):
+        self.assertTrue(motif_n1('', '').startswith('non concluant (canon §3)'))
+        self.assertIn('v1.65.0', motif_n1('v1.65.0', 'v1.66.0'))
 
 
 if __name__ == '__main__':
