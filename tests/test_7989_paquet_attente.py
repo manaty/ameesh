@@ -44,7 +44,7 @@ def payload() -> dict:
                 {"code": "migration-collision",
                  "detail": "migration 0601_veille.sql: number already on main "
                            "(0601_autre.sql): renumber, reserve, freeze again",
-                 "number": 601},
+                 "number": 601, "case": "target"},
                 {"code": "verdicts-missing", "detail": "1 missing"},
             ]},
             {"work_item": 8, "state": "qa", "causes": [
@@ -77,8 +77,49 @@ def write_note(conn, lot, text, *, actor="", once=False) -> None:
 class WaitingGestureTest(unittest.TestCase):
     def test_migration_collision_names_the_reservation_command(self) -> None:
         gesture = packet_candidates.waiting_gesture(
-            {"code": "migration-collision", "number": 601}, 7697)
+            {"code": "migration-collision", "numbers": [601]}, 7697)
         self.assertIn("`ameesh work migration 7697 --number 601`", gesture)
+
+    def test_target_collision_renumbers_instead_of_reserving_taken_number(self) -> None:
+        gesture = packet_candidates.waiting_gesture(
+            {"code": "migration-collision", "case": "target", "number": 601}, 7)
+        self.assertIn("--number N`", gesture)
+        self.assertNotIn("--number 601", gesture)
+        self.assertIn("renommer", gesture)
+
+    def test_behind_renumbers_above_target_head(self) -> None:
+        gesture = packet_candidates.waiting_gesture(
+            {"code": "migration-gap", "case": "behind", "number": 500,
+             "target_head": 600}, 7)
+        self.assertIn("--number N`", gesture)
+        self.assertNotIn("--number 500", gesture)
+        self.assertIn("au-dessus de la tête cible", gesture)
+        self.assertIn("renommer", gesture)
+
+    def test_gap_fills_missing_number_without_reusing_high_number(self) -> None:
+        gesture = packet_candidates.waiting_gesture(
+            {"code": "migration-gap", "case": "gap", "number": 603,
+             "missing": 601, "target_head": 600}, 7)
+        self.assertIn("--number N`", gesture)
+        self.assertNotIn("--number 603", gesture)
+        self.assertIn("comblant le trou", gesture)
+        self.assertIn("premier numéro manquant : 601", gesture)
+        self.assertIn("vérifier sa disponibilité", gesture)
+
+    def test_all_uncovered_numbers_are_reserved(self) -> None:
+        gesture = packet_candidates.waiting_gesture(
+            {"code": "migration-collision", "numbers": [602, 601]}, 7)
+        self.assertIn("`ameesh work migration 7 --number 601`", gesture)
+        self.assertIn("`ameesh work migration 7 --number 602`", gesture)
+        self.assertNotIn("renommer", gesture)
+
+    def test_other_collisions_and_unknown_cases_do_not_reuse_faulty_number(self) -> None:
+        for case in ("lot", "candidates", "", "unknown"):
+            with self.subTest(case=case):
+                gesture = packet_candidates.waiting_gesture(
+                    {"code": "migration-collision", "case": case, "number": 601}, 7)
+                self.assertIn("--number N`", gesture)
+                self.assertNotIn("--number 601", gesture)
 
     def test_migration_gap_without_number_keeps_the_placeholder(self) -> None:
         gesture = packet_candidates.waiting_gesture(
@@ -109,7 +150,7 @@ class JournalWaitingTest(unittest.TestCase):
         collision = next(note["text"] for note in conn.notes
                          if "migration-collision" in note["text"])
         self.assertTrue(collision.startswith("paquet-attente:migration-collision:"))
-        self.assertIn("`ameesh work migration 7 --number 601`", collision)
+        self.assertIn("`ameesh work migration 7 --number N`", collision)
         self.assertIn("constat : migration 0601_veille.sql", collision)
 
     def test_an_existing_marker_blocks_a_second_note(self) -> None:
@@ -136,7 +177,7 @@ class ManifestWaitingTest(unittest.TestCase):
             waiting=2, waiting_entries=packet_candidates.waiting_entries(payload()))
         self.assertIn("## En attente (lots validés, motif calculé)", manifest)
         self.assertIn("| #7 | migration-collision: migration 0601_veille.sql", manifest)
-        self.assertIn("`ameesh work migration 7 --number 601`", manifest)
+        self.assertIn("`ameesh work migration 7 --number N`", manifest)
         self.assertIn("verdicts-missing", manifest)
         # Un lot qa n'est pas nommé : il attend sa relecture.
         self.assertNotIn("| #8 |", manifest)
