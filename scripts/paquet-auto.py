@@ -1883,7 +1883,8 @@ def changed_units(units: list[Unit], current: dict[int, str]) -> list[Discarded]
 
 
 def compute_candidates(worktree: Path, target: str, base_sha: str,
-                       ready_out: Path, *, tolerate_landing: bool = False
+                       ready_out: Path, *, tolerate_landing: bool = False,
+                       note_waiting: bool = False
                        ) -> tuple[list[Candidate], dict]:
     """`paquet-candidats.py` **du worktree**, à la base exacte du paquet.
 
@@ -1896,6 +1897,10 @@ def compute_candidates(worktree: Path, target: str, base_sha: str,
     (`--allow-code-mismatch`) puis relu ici : il ne passe que si le code est
     `base_sha`, propre, et que la référence n'en diffère que par des commits
     d'atterrissage de coupure (§12). Tout autre décalage reste un refus.
+
+    #7989 : `note_waiting` écrit sur chaque lot validé en attente une note
+    idempotente par cause (premier calcul de composition). Jamais sur une
+    relecture de gel (`tolerate_landing`) ni un calcul de contrôle.
     """
     script = worktree / CANDIDATES_SCRIPT
     if not script.is_file():
@@ -1908,6 +1913,8 @@ def compute_candidates(worktree: Path, target: str, base_sha: str,
            "--ready-out", str(ready_out)]
     if tolerate_landing:
         cmd.append("--allow-code-mismatch")
+    if note_waiting:
+        cmd.append("--note-waiting")
     proc = run_command(cmd, cwd=worktree, timeout=DEFAULT_TIMEOUT,
                        env=python_env(worktree))
     stdout = _decode(proc.stdout)
@@ -5248,11 +5255,73 @@ def _cell(value: str) -> str:
     return _one_line(value).replace("|", "/")
 
 
+def _packet_candidates_module():
+    """#7989 : le module de la liste calculée, depuis le `src` de ce dépôt."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh import packet_candidates
+    return packet_candidates
+
+
+def _validated_waiting(payload: dict) -> list[dict]:
+    """#7989 : les lots **validés** laissés en attente par le calcul.
+
+    Un arbre de base antérieur à #7989 n'a pas `waiting_entries` : le
+    manifeste garde alors son ancienne forme, jamais une composition cassée."""
+    try:
+        candidates = _packet_candidates_module()
+        waiting = getattr(candidates, "waiting_entries", None)
+        return waiting(payload) if waiting else []
+    except Exception:  # noqa: BLE001 - un manifeste ne casse pas la composition
+        return []
+
+
+def _waiting_manifest_lines(entries: list[dict] | None) -> list[str]:
+    """#7989 : les lots **validés** laissés en attente, motif et geste nommés.
+
+    Jusqu'ici le manifeste ne donnait que leur nombre : un validé écarté pour
+    `migration-collision` (#7697) ne se voyait qu'au JSON des candidats. La
+    section est distincte des « Écartés » (le contrôle d'inclusion ne lit que
+    ces derniers) : un lot en attente n'est pas prêt, il n'a pas à y figurer.
+    Le geste vient de `packet_candidates.waiting_gesture`, même vocabulaire
+    que la note écrite sur le lot."""
+    if not entries:
+        return []
+    try:
+        packet_candidates = _packet_candidates_module()
+        gesture_of = getattr(packet_candidates, "waiting_gesture", None)
+    except Exception:  # noqa: BLE001 - base antérieure à #7989 : motif seul
+        gesture_of = None
+    rows: list[str] = []
+    for entry in entries:
+        try:
+            lot = int(entry.get("work_item") or 0)
+        except (TypeError, ValueError):
+            continue
+        causes = [cause for cause in entry.get("causes") or ()
+                  if isinstance(cause, dict)]
+        if not lot or not causes:
+            continue
+        motives: list[str] = []
+        gestures: list[str] = []
+        for cause in causes:
+            code = str(cause.get("code") or "cause")
+            detail = str(cause.get("detail") or "").strip()
+            motives.append(code + (": " + detail if detail else ""))
+            gesture = gesture_of(cause, lot) if gesture_of else ""
+            if gesture and gesture not in gestures:
+                gestures.append(gesture)
+        rows.append("| #%d | %s | %s |"
+                    % (lot, _cell("; ".join(motives)),
+                       _cell("; ".join(gestures) or "voir le motif")))
+    return rows
+
+
 def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
                    composition: Composition, table: str,
                    tests: list[TestRun] | None, freeze_seconds: float,
                    ready_count: int = 0, waiting: int = 0,
-                   errors: int = 0, client_types: str = "") -> str:
+                   errors: int = 0, client_types: str = "",
+                   waiting_entries: list[dict] | None = None) -> str:
     """Le manifeste §12, lisible par `paquet-inclusion.py` (#1644/#2409).
 
     #4304/#7740 : `tests=None` — le manifeste est écrit avant les séries
@@ -5263,7 +5332,12 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     La table d'admissions ne porte que le lot et sa source : un id cité dans
     un objet (`#N`) serait relu par le contrôle d'inclusion comme un lot
     attendu. Les objets et les classes restent à la PR et au courrier.
-    """
+
+    #7989 : `waiting_entries` nomme les lots validés laissés en attente avec
+    leur cause calculée et le geste attendu ; le manifeste ne se limite plus
+    au compteur. La section « En attente » est ignorée du contrôle
+    d'inclusion, qui ne lit que « Écartés » : un lot en attente n'est pas un
+    lot prêt à expliquer."""
     try:
         admissions = parse_composition_table(table)
     except InputError:
@@ -5316,6 +5390,17 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
         "(les erreurs sont écartées ci-dessus, jamais composées)."
         % (ready_count, waiting, errors),
         "",
+    ]
+    # #7989 : les validés en attente, nommés avec leur cause et leur geste.
+    waiting_lines = _waiting_manifest_lines(waiting_entries)
+    if waiting_lines:
+        lines += [
+            "## En attente (lots validés, motif calculé)",
+            "",
+            "| lot | motif | geste |",
+            "|---|---|---|",
+        ] + waiting_lines + [""]
+    lines += [
         "## Contrôles locaux",
         "",
         "- `scripts/freeze-checks.py` : vert en %.1f s." % freeze_seconds,
@@ -6707,8 +6792,11 @@ def compose_packet(args: argparse.Namespace) -> int:
         ready_out = Path(tmp.name) / "prets.txt"
         if guard is not None:
             guard()
-        candidates, payload = compute_candidates(worktree, args.target,
-                                                 base_sha, ready_out)
+        candidates, payload = compute_candidates(
+            worktree, args.target, base_sha, ready_out,
+            # #7989 : le calcul de la composition réelle note les validés en
+            # attente ; un calcul de contrôle (`--no-packet-record`) n'écrit rien.
+            note_waiting=not getattr(args, "no_packet_record", False))
         listed = list(candidates)
         errors = error_discards(payload)
         error_lots = {item.lot for item in errors}
@@ -6915,7 +7003,9 @@ def compose_packet(args: argparse.Namespace) -> int:
                 tests=None, freeze_seconds=freeze_seconds,
                 ready_count=ready_count,
                 waiting=len(payload.get("waiting") or []),
-                errors=len(errors), client_types=client_note)
+                errors=len(errors), client_types=client_note,
+                # #7989 : chaque validé en attente nommé, motif et geste.
+                waiting_entries=_validated_waiting(payload))
             # Keep metadata outside the product tree; no metadata commit.
             composition_file = Path(tmp.name) / Path(rel).name
             head = write_composition(worktree, str(composition_file), manifest_text,

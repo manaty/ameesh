@@ -75,9 +75,10 @@ reste écrit et nomme explicitement les lots en erreur :
 au manifeste est un défaut bloquant ; un lot en erreur absent du manifeste est
 consigné comme écarté avec son motif, sans recopie manuelle (#3813).
 
-Lecture seule, sauf le geste explicite `--hold-override` : la base n'est
-modifiée que pour y journaliser la raison de la surcharge sur le lot ; les
-branches sont lues dans le clone privé du radar ou dans un clone jetable,
+Lecture seule, sauf deux gestes explicites : `--hold-override` journalise la
+raison de la surcharge sur le lot, et `--note-waiting` (appelé par le
+composeur, #7989) écrit une note par (lot validé, cause) laissé en attente.
+Les branches sont lues dans le clone privé du radar ou dans un clone jetable,
 jamais dans le dépôt des agents.
 """
 from __future__ import annotations
@@ -308,6 +309,68 @@ def journal_hold_overrides(conn, payload: dict, overrides: dict[int, str], *,
     return [{"lot": lot, "note": text} for lot, text in planned]
 
 
+#: #7989 : préfixe stable d'une note « lot validé laissé en attente ». La clé
+#: d'idempotence est (lot, code de cause), jamais le texte entier : le détail
+#: (tête, numéro, prérequis) peut changer d'une composition à l'autre.
+WAITING_PREFIX = "paquet-attente:"
+
+
+def _waiting_note_text(lot: int, cause: dict) -> str:
+    """Le texte stable d'une note d'attente : le code, le geste, le constat."""
+    code = str(cause.get("code") or "").strip()
+    gesture = packet_candidates.waiting_gesture(cause, lot)
+    detail = " ".join(str(cause.get("detail") or "").split())
+    if len(detail) > 400:
+        detail = detail[:397] + "..."
+    text = "%s%s: %s" % (WAITING_PREFIX, code, gesture or "motif calculé")
+    if detail:
+        text += " ; constat : " + detail
+    return text
+
+
+def journal_waiting_notes(conn, payload: dict, *, actor: str = "ameesh") -> list[dict]:
+    """#7989 : une note par (lot validé, cause) au premier paquet qui l'écarte.
+
+    Un lot validé laissé en attente (#7697) recevait jusqu'ici un simple
+    compteur au manifeste : il reçoit ici le motif calculé et le geste attendu,
+    une seule fois par cause. L'idempotence se lit dans le journal (préfixe
+    `paquet-attente:<code>:`), jamais dans la composition : le détail peut
+    changer d'un tic à l'autre sans redonner une note. Un lot `qa` ou en erreur
+    n'est pas noté (il attend sa relecture, ou il est écarté, #3813). Une
+    écriture impossible est dite sans arrêter la composition : le manifeste
+    nomme déjà le lot et sa cause."""
+    written: list[dict] = []
+    for entry in packet_candidates.waiting_entries(payload):
+        lot = int(entry["work_item"])
+        for cause in entry.get("causes") or ():
+            if not isinstance(cause, dict):
+                continue
+            code = str(cause.get("code") or "").strip()
+            if not code:
+                continue
+            marker = "%s%s:" % (WAITING_PREFIX, code)
+            try:
+                seen = conn.query(
+                    "SELECT 1 FROM work_item_events WHERE work_item_id = %s"
+                    " AND note LIKE %s LIMIT 1",
+                    (lot, marker + "%"))
+            except Exception as exc:  # noqa: BLE001 - une note n'arrête rien
+                print("paquet-candidats: note d'attente #%d non relue : %s"
+                      % (lot, exc), file=sys.stderr)
+                continue
+            if seen:
+                continue
+            text = _waiting_note_text(lot, cause)
+            try:
+                work.note(conn, lot, text, actor=actor or "", once=True)
+            except Exception as exc:  # noqa: BLE001 - une note n'arrête rien
+                print("paquet-candidats: note d'attente #%d non écrite : %s"
+                      % (lot, exc), file=sys.stderr)
+                continue
+            written.append({"lot": lot, "code": code, "note": text})
+    return written
+
+
 def render(payload: dict) -> str:
     lines = [
         "paquet-candidats : projet %s, cible %s (%s), base %s (%s)"
@@ -465,6 +528,10 @@ def main(argv: list[str] | None = None) -> int:
                              "(répétable), la raison étant journalisée sur le lot")
     parser.add_argument("--hold-reason", default=None,
                         help="la raison de --hold-override, écrite au journal du lot")
+    parser.add_argument("--note-waiting", action="store_true",
+                        help="#7989 : écrire une note par (lot validé, cause) "
+                             "laissé en attente, au premier calcul de composition "
+                             "(idempotent, jamais à chaque tic)")
     args = parser.parse_args(argv)
 
     ready_out = Path(args.ready_out) if args.ready_out else None
@@ -541,6 +608,10 @@ def main(argv: list[str] | None = None) -> int:
             print("paquet-candidats: erreur(s) non attribuable(s) à un lot : "
                   "la liste est inutilisable, aucun export", file=sys.stderr)
             return 1
+        if args.note_waiting:
+            # #7989 : après la preuve que la liste est exploitable (une erreur
+            # globale n'écrit rien) et avant l'export lu par le composeur.
+            journal_waiting_notes(conn, payload, actor="ameesh")
         if ready_out is not None:
             write_ready_out(ready_out, payload)
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str)
