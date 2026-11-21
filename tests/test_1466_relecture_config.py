@@ -198,6 +198,8 @@ class RelectureConfigTest(unittest.TestCase):
         self.assertEqual(cfg.config_path, self.host)
         os.remove(self.host)
         with mock.patch.dict(os.environ, {"HOME": self.home}):
+            # #8000 : l'absence de config nommée est demandée explicitement ;
+            # la suite pose sinon une config vide à l'import.
             os.environ.pop("AMEESH_CONFIG", None)
             os.environ.pop("AGENT_MESH_CONFIG", None)
             self.assertFalse(runner.reload_config())
