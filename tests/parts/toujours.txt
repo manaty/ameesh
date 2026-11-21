@@ -53,6 +53,7 @@ test_7630_avatar_tools  # #7630: avatar tool restrictions and durable proof acro
 test_7665_module_contract  # #7665: public external-module contract v1 (CLI, OpenAPI, Module, views); any file can break it
 test_7701_public_fixture  # #7701: public fixture kit (consumer-owned disposable database, external witness); any file can break it
 test_7859_avatar_reads  # #7859: content-free avatar read journal (tool, target, outcome)
+test_7986_rejeu_roles  # #7986: rejeu des contrats de rôle après migration (rôles de grappe, base dédiée)
 test_987_relance_hosted  # workflow retry and runner loss (#6264 h-03-16)
 test_cluster  # roles created on the cluster (supervisor, approve), grants checked against every column
 test_contract_registry_ameesh  # #6180: registre initial, observation additive et régressions du 07/11

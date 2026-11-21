@@ -1032,6 +1032,7 @@ class MapTest(unittest.TestCase):
             'test_7701_public_fixture',
             'test_7726_prod_go',
             'test_7859_avatar_reads',
+            'test_7986_rejeu_roles',
             'test_987_relance_hosted',
             'test_cluster',
             'test_contract_registry_ameesh',

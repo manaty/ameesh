@@ -169,6 +169,12 @@ class MigrationPinningTest(unittest.TestCase):
             '  printf \'%s\\n\' "$*" >> "${SUPERVISEUR_CALLS:-/dev/null}"\n'
             '  exit "${DROITS_SUPERVISEUR_STATUS:-0}"\n'
             'fi\n'
+            # #7986 : rejeu des contrats de rôle rejouables, appel distinct ;
+            # le SQL est couvert par test_7986_rejeu_roles.
+            'if [ "$1" = -m ] && [ "$2" = ameesh.droits_roles ]; then\n'
+            '  printf \'%s\\n\' "$*" >> "${ROLES_CALLS:-/dev/null}"\n'
+            '  exit "${DROITS_ROLES_STATUS:-0}"\n'
+            'fi\n'
             'exec ' + shlex.quote(sys.executable) + ' "$@"\n')
         (venv / "python").chmod(0o755)
         config = Path(self.env["HOME"]) / ".config/ameesh/config.json"
@@ -231,6 +237,20 @@ class MigrationPinningTest(unittest.TestCase):
                                MIGRER_SANS_REDEMARRAGE="1")
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn("contrat du superviseur refusé par l'audit", done.stderr)
+
+    def test_7986_contrats_de_role_rejoues_apres_la_base_du_mesh(self):
+        trace = self.root / "roles.calls"
+        done = self.run_script("migrer", self.a, ROLES_CALLS=str(trace))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        appel = trace.read_text().splitlines()
+        self.assertEqual(len(appel), 1)
+        self.assertRegex(appel[0], r"^-m ameesh\.droits_roles --sql-dir .*/src-[0-9a-f]{7}/deploy/sql$")
+
+    def test_7986_audit_roles_refuse_arrete_avant_installation(self):
+        done = self.run_script("migrer", self.a, DROITS_ROLES_STATUS="1",
+                               MIGRER_SANS_REDEMARRAGE="1")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("contrats de rôle refusés par l'audit", done.stderr)
 
     def test_approved_a_with_head_b_only_runs_a(self):
         done = self.run_script("migrer", self.a)

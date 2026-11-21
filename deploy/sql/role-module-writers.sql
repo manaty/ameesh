@@ -5,17 +5,27 @@
 -- Revoke PUBLIC TEMP on the database separately before applying this script.
 -- The audit rejects TEMP on the groups and their transitive members, including
 -- PUBLIC grants and other parent-role grants (also reachable by SET ROLE).
+--
+-- #7986 : in replay mode (`ameesh.rejeu_module_writers` = '1', set by
+-- rejeu-module-writers.sql under the migration owner, no CREATEROLE), the
+-- CREATE ROLE statements are skipped: the three groups must already exist and
+-- the replay only reapplies their grants before running the same audit in the
+-- same transaction. An absent group makes the caller skip the whole replay;
+-- creating it remains the administrator's gesture.
 \set ON_ERROR_STOP on
 BEGIN;
 SELECT current_schema() AS schema \gset
 SELECT 'CREATE ROLE ameesh_canon_sync NOLOGIN'
- WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_canon_sync') \gexec
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_canon_sync')
+   AND coalesce(current_setting('ameesh.rejeu_module_writers', true), '') <> '1' \gexec
 SELECT 'CREATE ROLE ameesh_it_proof NOLOGIN'
- WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_it_proof') \gexec
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_it_proof')
+   AND coalesce(current_setting('ameesh.rejeu_module_writers', true), '') <> '1' \gexec
 -- L244 (#420): the QA verdict has its own isolated writer, distinct from the
 -- execution proof writer.
 SELECT 'CREATE ROLE ameesh_it_qa NOLOGIN'
- WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_it_qa') \gexec
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_it_qa')
+   AND coalesce(current_setting('ameesh.rejeu_module_writers', true), '') <> '1' \gexec
 SELECT format('GRANT USAGE ON SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 -- Canon sync executes the existing registry/authenticator/package transaction.
 SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
@@ -28,7 +38,22 @@ SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM ameesh_canon_sync', :
   FROM unnest(ARRAY['schema_non_additive_migrations','review_catch_up','host_release_operations','host_release_fences','host_release_fence_receipts']) name
  WHERE to_regclass(format('%I.%I', :'schema', name)) IS NOT NULL \gexec
 SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
-SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
+-- #7986 : le propriétaire des migrations ne peut accorder EXECUTE que sur une
+-- fonction qu'il possède, ou pour laquelle il a le droit d'accord. Comme pour
+-- role-executor.sql (#4806), un `GRANT ... ON ALL FUNCTIONS` échouerait en
+-- bloc sur une fonction possédée par un rôle dédié (release_controller_decision,
+-- vm_probe_send sur le mesh) ; on boucle donc fonction par fonction. Sous le
+-- superutilisateur d'installation, has_function_privilege est vrai partout : le
+-- contrat reste identique, procédures exclues comme pour ALL FUNCTIONS.
+SELECT format('GRANT EXECUTE ON FUNCTION %I.%I(%s) TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa',
+              n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
+  FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = :'schema'
+   AND p.prokind <> 'p'
+   AND (p.proowner = current_user::regrole
+        OR has_function_privilege(current_user, p.oid, 'EXECUTE WITH GRANT OPTION'))
+ ORDER BY p.oid \gexec
 SELECT format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 SELECT format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 SELECT format('GRANT SELECT ON %I.work_items, %I.project_modules, %I.work_module_milestones TO ameesh_it_proof, ameesh_it_qa',

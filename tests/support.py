@@ -180,9 +180,12 @@ atexit.register(_cleanup_temp_dirs)
 #: « Aucune config » se dit par un fichier VIDE mais EXISTANT : un chemin
 #: explicite absent est refusé (#1127), et un chemin absent ne peut donc plus
 #: servir de sentinelle.
-EMPTY_CONFIG = os.path.join(_mkdtemp(prefix="ameesh-test-config-"), "empty.json")
-with open(EMPTY_CONFIG, "w", encoding="utf-8") as _fh:
-    _fh.write("{}\n")
+#: #8000 : ce fichier est posé par `tests/__init__.py`, donc avant tout module
+#: de test — y compris ceux qui n'importent pas ce socle et lisaient sinon le
+#: canon de l'hôte (`scripts/test-plan.py:make_plan`). La boucle ci-dessus
+#: retire les variables AMEESH_* de la session : on repose la config vide du
+#: paquet, et on la réexporte pour les témoins qui nomment son chemin.
+from . import EMPTY_CONFIG  # noqa: E402
 os.environ["AMEESH_CONFIG"] = EMPTY_CONFIG
 os.environ["AGENT_MESH_CONFIG"] = EMPTY_CONFIG
 # la surcharge AMEESH_CODEX_SESSIONS prime sur CODEX_HOME : jamais héritée
@@ -447,6 +450,18 @@ def child_env(**extra: str) -> dict:
     env.pop("AGENT_MESH_HARNESSES_DIR", None)
     env.pop("AMEESH_CODEX_SESSIONS", None)   # isolement par CODEX_HOME (ci-dessus)
     env.update({k: str(v) for k, v in extra.items() if v is not None})
+    return env
+
+
+def env_without_config(**extra: str) -> dict:
+    """L'environnement du banc SANS configuration nommée (#1127, #8000).
+
+    La suite pose une configuration vide à l'import ; les rares témoins qui
+    veulent le repli historique ou l'absence de configuration le demandent par
+    ce nom, jamais en héritant du poste."""
+    env = child_env(**extra)
+    for name in ("AMEESH_CONFIG", "AGENT_MESH_CONFIG"):
+        env.pop(name, None)
     return env
 
 

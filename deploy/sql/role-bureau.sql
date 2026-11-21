@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- rejeu-ailleurs: rejeu-droits-limites.sql après migrate (#7873, ameesh.droits_limites; noms de connexion lus dans limited_logins)
 -- #6881 / manaty/ameesh#5236 : connexion PostgreSQL LIMITÉE du bureau depuis
 -- bureau-goal (décision owner #211859 a), jamais le rôle ameesh ni un DSN
 -- d'agent. Installation par l'ADMINISTRATEUR (CREATEROLE, propriétaire des

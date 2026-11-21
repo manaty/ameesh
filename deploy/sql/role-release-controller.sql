@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- rejeu-exempte: superuser enrollment: creates an isolated NOLOGIN owner and transfers SECURITY DEFINER functions to it. The migration owner is not that superuser and cannot replay the transfer (#L232b).
 -- L232b: independently enrolled controller; NOT a migration/backup/root role.
 -- Apply as the explicit cluster administrator (SUPERUSER) of an approved
 -- enrollment (source_owner_dsn), not merely the schema owner: creates an

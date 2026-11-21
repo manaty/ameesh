@@ -50,11 +50,9 @@ class ConfigExpliciteTest(unittest.TestCase):
 
     def env_without_config(self) -> dict:
         """L'environnement du banc, sans config nommée : c'est lui qui doit
-        déclencher le repli historique."""
-        env = support.child_env()
-        for name in ("AMEESH_CONFIG", "AGENT_MESH_CONFIG"):
-            env.pop(name, None)
-        return env
+        déclencher le repli historique (#8000 : le nom est porté par
+        `support.env_without_config`, la suite posant sinon une config vide)."""
+        return support.env_without_config()
 
     def test_ameesh_config_absent_echoue(self):
         absent = os.path.join(self.tmp, "absent.json")

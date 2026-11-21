@@ -801,8 +801,12 @@ PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migra
 # précédente (§14). #7982 : même rejeu du contrat du rôle superviseur, sous la
 # même connexion (propriétaire des tables), refus = code 6 ; une migration qui
 # ajoute une colonne au contrat ne laisse plus le trou jusqu'au retour du poste.
+# #7986 : les autres contrats rejouables (superviseur-contenus, approve,
+# module-writers, pod-provisioner) passent par droits_roles, même connexion,
+# refus = code 7 ; un rôle absent est sauté, sans création ni altération.
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh.droits_limites --sql-dir "$d/deploy/sql" || exit 5
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh.droits_superviseur --sql-dir "$d/deploy/sql" || exit 6
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh.droits_roles --sql-dir "$d/deploy/sql" || exit 7
 REMOTE
 }
 # #5692 : preflight de la base que le chemin sans poste va migrer. Meme
@@ -1618,12 +1622,18 @@ if [ "$POSTE_ABSENT" = 1 ]; then
     trace "$HOTE_MIGRATIONS" droits ko "contrat du role superviseur refuse par _contrat-superviseur.sql apres les migrations"
     echo "contrat du superviseur en echec : aucune installation, version precedente conservee" >&2
     exit 1
+  elif [ "$rc_migrer" = 7 ]; then
+    # #7986 : base migree, mais un contrat de role rejouable (contenus,
+    # approve, module-writers, pod-provisioner) est refuse par son audit.
+    trace "$HOTE_MIGRATIONS" droits ko "contrat de role refuse par l'audit apres les migrations"
+    echo "contrats de rôle en echec : aucune installation, version precedente conservee" >&2
+    exit 1
   elif [ "$rc_migrer" != 0 ]; then
     trace "$HOTE_MIGRATIONS" migrations ko "migrations en echec depuis la VM"
     echo "migrations en echec : aucune installation" >&2
     exit 1
   fi
-  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord), droits limites et contrat superviseur rejoues et audites"
+  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord), droits limites, contrat superviseur et contrats de role rejoues et audites"
 else
   etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
   debut_etape poste migrations
