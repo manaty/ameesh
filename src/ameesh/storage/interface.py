@@ -5556,11 +5556,6 @@ class HostLifecycle(Domain):
         """Persistent host controls, release/hook states included."""
 
     @abc.abstractmethod
-    def resync_return(self, host: str, *, generation: int, release_epoch: int,
-                      actor: str) -> dict | None:
-        """Fence an available host for an adapter-acknowledged return."""
-
-    @abc.abstractmethod
     def claims_open(self, host: str, agent: str) -> bool:
         """#7799: may this agent open a turn on `host` right now?
 

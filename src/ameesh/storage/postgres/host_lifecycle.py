@@ -85,28 +85,6 @@ def _release_elected(tx, host):
 
 
 class HostLifecycle(interface.HostLifecycle):
-    def resync_return(self, host, *, generation, release_epoch, actor):
-        if not isinstance(actor, str) or not actor.strip() or any(ord(c) < 32 for c in actor):
-            raise ValueError('transition actor required')
-        with self.db.transaction() as tx:
-            Hosts._lock_gate(tx, host)
-            rows = tx.query(
-                "UPDATE host_lifecycle SET mode='returning',claims_open=false, "
-                "release_epoch=release_epoch+1,return_requested_at=clock_timestamp(), "
-                "return_requested_by=%s,updated_at=clock_timestamp() "
-                "WHERE host=%s AND generation=%s AND release_epoch=%s "
-                "AND mode='available' AND claims_open AND release_state='busy' "
-                "AND hook_state IN ('draining','idle-drained') "
-                "AND hook_attempt_at IS NULL AND hook_wait_at IS NULL RETURNING " + _ROW,
-                (actor, host, generation, release_epoch))
-            if not rows:
-                return None
-            tx.execute("INSERT INTO ameesh_events(type,object,project,data) "
-                       "VALUES ('host.resync_requested',%s,NULL,%s::jsonb)",
-                       ('host:' + host, json.dumps({'actor': actor, 'generation': generation,
-                                                   'release_epoch': rows[0]['release_epoch']})))
-            return rows[0]
-
     def detect_losses(self, *, actor, older_than, critical=(), released_grace=900.0):
         if isinstance(older_than, bool) or not isinstance(older_than, int) or older_than < 60:
             raise ValueError("loss threshold must be at least 60 seconds")
@@ -409,10 +387,8 @@ class HostLifecycle(interface.HostLifecycle):
                     # #5932: the scheduled return supersedes any adapter wait.
                     "hook_wait_at=NULL,hook_wait_state=NULL,"
                     "hook_wait_generation=NULL,hook_wait_epoch=NULL, "
-                    "claims_open=CASE WHEN hook_state IN ('draining','idle-drained') THEN false "
-                    "WHEN %s THEN true ELSE claims_open END, "
-                    "release_state=CASE WHEN %s AND hook_state IS DISTINCT FROM 'draining' "
-                    "AND hook_state IS DISTINCT FROM 'idle-drained' THEN 'busy' ELSE release_state END, "
+                    "claims_open=CASE WHEN %s THEN true ELSE claims_open END, "
+                    "release_state=CASE WHEN %s THEN 'busy' ELSE release_state END, "
                     "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
                     "AND mode='draining' AND return_at<=clock_timestamp() RETURNING " + _ROW,
                     (open_claims, open_claims, row["host"], row["generation"]))
