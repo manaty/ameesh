@@ -30,10 +30,11 @@ class _PuitsJournalSature:
 
     Le journal d'`ameesh.runner` est un fil démon global, partagé par tous les
     tests du processus. Le bloquer avec un `sleep` laissait ce fil vivant après
-    le test ; à son réveil il écrivait dans le `redirect_stdout` d'un test
-    suivant (`test_l109_mediated_mode`). Ce puits confine la saturation : le
-    premier message bloque, les suivants s'empilent, et `vider()` prouve leur
-    passage avant que le patch de `log` ne soit retiré.
+    le test ; à son réveil il écrivait dans le flux capturé d'un test suivant
+    (`test_l109_mediated_mode`) — le journal va sur stderr depuis #8013. Ce
+    puits confine la saturation : le premier message bloque, les suivants
+    s'empilent, et `vider()` prouve leur passage avant que le patch de `log`
+    ne soit retiré.
     """
 
     def __init__(self) -> None:
@@ -340,12 +341,13 @@ class AttachTest(_AgentFixture):
                          "le journal a écrit hors du puits après le test")
         self.assertTrue(any("harness stopped" in message for message in puits.messages),
                         "l'arrêt n'est pas passé par le journal asynchrone")
-        # Comme l109 : une capture ouverte après la fin du test ne doit plus
-        # recevoir aucun message d'attach. La sentinelle est FIFO : elle ne
-        # peut passer qu'après tout message déjà en file.
+        # Comme l109 : une capture du flux du journal (stderr, #8013) ouverte
+        # après la fin du test ne doit plus recevoir aucun message d'attach.
+        # La sentinelle est FIFO : elle ne peut passer qu'après tout message
+        # déjà en file.
         apres = io.StringIO()
         marqueur = "%s-apres-%d" % (_FIN_JOURNAL, time.monotonic_ns())
-        with contextlib.redirect_stdout(apres):
+        with contextlib.redirect_stderr(apres):
             runner_mod.log_async(marqueur)
             fin = time.monotonic() + 30.0
             while marqueur not in apres.getvalue() and time.monotonic() < fin:

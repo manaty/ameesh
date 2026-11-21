@@ -86,7 +86,16 @@ from .config import fresh_radar, load as load_config
 
 
 def log(message: str) -> None:
-    print("%s %s" % (time.strftime("%H:%M:%S"), message), flush=True)
+    """Journal d'exploitation de l'exécuteur, sur **stderr**.
+
+    #8013 : le fil `journal` est global au processus et vivait après l'import
+    de `runner` ; écrire sur `sys.stdout` faisait tomber ses lignes (datées)
+    dans un `redirect_stdout` d'un autre test — `alerts --follow --json` rend
+    un objet JSON par ligne et son stdout doit rester propre. Un journal
+    d'exploitation n'est pas une donnée de commande : il va sur stderr.
+    """
+    print("%s %s" % (time.strftime("%H:%M:%S"), message), file=sys.stderr,
+          flush=True)
 
 
 def _duree(secondes: float) -> str:
@@ -204,9 +213,9 @@ class _AsyncLog:
         """Vide la file puis arrête le fil, **dans un délai borné**.
 
         À appeler avant la fin de l'interpréteur : un fil démon encore dans un
-        `print` au moment de la finalisation garde le verrou de `sys.stdout`,
+        `print` au moment de la finalisation garde le verrou de `sys.stderr`,
         et le vidage final de CPython échoue alors en erreur fatale
-        (« could not acquire lock for <stdout> at interpreter shutdown »,
+        (« could not acquire lock for <stderr> at interpreter shutdown »,
         SIGABRT). Rend `True` si le fil s'est arrêté, `False` s'il est resté
         bloqué (puits plein) au-delà du délai : l'appelant ne doit alors pas
         laisser l'interpréteur se finaliser normalement.
@@ -516,7 +525,7 @@ def _sortie_sure(code: int, fils: "list[threading.Thread] | tuple" = ()) -> int:
     Vide puis arrête le fil `journal` (délai borné). Si lui ou l'un des `fils`
     donnés (workers, qui écrivent par `log`) vit encore — bloqué sur un tube
     plein, typiquement —, la finalisation normale de CPython abandonnerait le
-    processus (SIGABRT) en tentant de vider `sys.stdout` dont le verrou est
+    processus (SIGABRT) en tentant de vider `sys.stderr` dont le verrou est
     tenu : on sort alors par `os._exit(code)`, sans vidage (chaque `log` vide
     déjà son flux), après un diagnostic qui n'attend jamais le puits. Aucune
     écriture synchrone sur stdout/stderr ici : un arrêt ne pend jamais.

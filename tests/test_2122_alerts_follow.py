@@ -13,6 +13,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -35,9 +37,9 @@ class FollowTest(unittest.TestCase):
             unreadable.extend(families)
         return [dict(a) for a in alerts]
 
-    def run_follow(self):
+    @contextlib.contextmanager
+    def _isolated(self):
         db = SimpleNamespace(close=lambda: None)
-        out = io.StringIO()
         with mock.patch.object(exploitation.db_mod, "connect", return_value=db), \
                 mock.patch.object(exploitation.db_mod, "require_schema",
                                   lambda *a, **k: None), \
@@ -46,8 +48,12 @@ class FollowTest(unittest.TestCase):
                 mock.patch.object(alert_ack, "annotate",
                                   lambda cfg, db, alerts: alerts), \
                 mock.patch.object(canon, "configured_cache", contextlib.nullcontext):
-            with contextlib.redirect_stdout(out):
-                rc = exploitation.cmd_alerts(self.cfg, self.args)
+            yield
+
+    def run_follow(self):
+        out = io.StringIO()
+        with self._isolated(), contextlib.redirect_stdout(out):
+            rc = exploitation.cmd_alerts(self.cfg, self.args)
         self.assertEqual(rc, 0)
         return [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
 
@@ -120,6 +126,51 @@ class FollowTest(unittest.TestCase):
         self.assertEqual([(e["event"], e["type"]) for e in events][2:],
                          [("resolved", "pgbouncer_console_unreadable"),
                           ("resolved", "pgbouncer_pool_waiting")])
+
+    def test_un_fil_qui_journalise_ne_casse_pas_la_sortie_json(self):
+        """#8013 : le journal de l'exécuteur reste hors du stdout de la commande.
+
+        Le fil `journal` de `runner` est global au processus : ses lignes
+        datées tombaient dans le `redirect_stdout` d'un autre test (CI
+        psycopg 8/12, paquet h-08). Un fil qui journalise pendant
+        `alerts --follow` ne doit pas casser le JSON ligne à ligne.
+        """
+        from ameesh import runner
+
+        self.passes = [([self.gate_alert()], []), ([], []), ([], [])]
+        marqueur = "témoin-journal-8013"
+        fin = "témoin-journal-8013-fin"
+        out, err = io.StringIO(), io.StringIO()
+        arret = threading.Event()
+
+        def journaliste():
+            while not arret.is_set():
+                runner.log_async(marqueur)
+                arret.wait(0.01)
+
+        fil = threading.Thread(target=journaliste, name="témoin-8013", daemon=True)
+        try:
+            with self._isolated(), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                fil.start()
+                rc = exploitation.cmd_alerts(self.cfg, self.args)
+                arret.set()
+                fil.join(timeout=5.0)
+                # le fil `journal` est asynchrone : une sentinelle en fin de
+                # file prouve que les lignes du témoin ont été vidées pendant
+                # la redirection (file FIFO).
+                runner.log_async(fin)
+                limite = time.monotonic() + 5.0
+                while fin not in err.getvalue() and time.monotonic() < limite:
+                    time.sleep(0.01)
+        finally:
+            arret.set()
+            fil.join(timeout=5.0)
+        self.assertEqual(rc, 0)
+        self.assertNotIn(marqueur, out.getvalue())
+        self.assertIn(marqueur, err.getvalue())
+        events = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+        self.assertEqual([e["event"] for e in events], ["raised", "resolved"])
 
 
 class ResolutionUnobservableTest(unittest.TestCase):

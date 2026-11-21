@@ -101,8 +101,14 @@ print(json.dumps(housekeeping.run_pass(cfg, None, housekeeping.Policy(),
 """
 
         def during_first(*args, **kwargs):
+            # #8015 : le lanceur met `src/` dans `sys.path` (tests/__init__.py,
+            # scripts/test-parts.py), pas dans l'environnement ; dans l'invité
+            # `PYTHONPATH` est vide et l'enfant n'importerait pas `ameesh`.
+            # Le sous-processus reçoit donc le même chemin d'import que le
+            # parent, sans dépendre d'une variable posée par le poste.
             child = subprocess.run([sys.executable, "-c", script, self.cfg.state_dir],
-                                   text=True, capture_output=True, check=True, timeout=10)
+                                   text=True, capture_output=True, check=True,
+                                   timeout=10, env=support.child_env())
             self.assertIn("another housekeeping pass", json.loads(child.stdout)["skipped"][0])
             return {}
 
