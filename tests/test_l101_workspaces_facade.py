@@ -97,7 +97,7 @@ class DelegationTest(unittest.TestCase):
                                            new_session=True, base_env=env)
         self.assertIs(rendu, sentinelle)
         begin.assert_called_once_with(cfg, pol, "a1", "/work/a1",
-                                      new_session=True, base_env=env)
+                                      new_session=True, base_env=env, lot=None)
 
     def test_after_turn_conclut_puis_recolte_les_conteneurs_du_tour(self):
         tour = mock.Mock(off=False)

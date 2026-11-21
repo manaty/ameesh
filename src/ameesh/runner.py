@@ -10144,7 +10144,7 @@ class AgentWorker(threading.Thread):
                     new_session=not session and not suite_de_rotation
                     and not (fond and fond.has_jobs(self.name))
                     and self.resident is None,
-                    base_env=env)
+                    base_env=env, lot=lot_du_tour)
                 env.update(menage_tour.env)
             except Exception as exc:
                 log("[%s] cleanup before the turn failed (%s)" % (self.name, exc))
@@ -14540,6 +14540,24 @@ class Runner:
         # Travail de fond encore en délai de grâce : le nettoyage habituel,
         # tout de suite (rien ne survit à l'exécuteur qui le suit).
         self.background.stop_all("runner shutdown")
+        # #8020 : à l'arrêt du runner, seuls les dossiers des lots TERMINÉS
+        # partent (les tours sont clos ci-dessus). Un lot encore ouvert garde
+        # le sien : un redéploiement n'est pas l'arrêt de l'agent, et le
+        # `TMPDIR` peut porter un clone en cours ; la clôture du lot (état
+        # terminal) s'en chargera, et `tmp_quota` borne un lot ouvert
+        # indéfiniment. Le verrou et la lecture des
+        # processus sont reposés par `cleanup_lot_dirs` ; un dossier tenu reste.
+        try:
+            lot_tmp = workspaces.cleanup_lot_dirs(
+                self.cfg, self.housekeeping_policy(),
+                agents=[worker.name for worker in workers], db=self.db,
+                host=self.host, ended_only=True, reason="runner stopped")
+            if lot_tmp["entries"]:
+                storage.of(self.db).housekeeping.log(
+                    self.host, lot_tmp["entries"],
+                    actor="runner:%s" % self.runner_id)
+        except Exception as exc:  # un arrêt ne doit jamais échouer sur le ménage
+            log_async("lot temporary directories at shutdown: %s" % exc)
         gate = getattr(self, "host_gate", None)
         if gate is not None:
             try:

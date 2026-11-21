@@ -378,6 +378,19 @@ def _phase_budget(budget: PassBudget | None, reserve_s: float = 0.0):
 #: L162: idle time (seconds) after which a /tmp entry signaled with an agent
 #: (before #222) is deleted (`policy.housekeeping.orphan_idle`)
 DEFAULT_ORPHAN_IDLE_S = 2 * 3600.0
+#: #8020 : âge minimal (secondes) d'un dossier `ameesh-*` / `nexlink-*` de
+#: /tmp ou /dev/shm, sans processus qui le tient, avant que le balayage ne le
+#: supprime (`policy.housekeeping.sweep_age`)
+DEFAULT_SWEEP_AGE_S = 6 * 3600.0
+#: #8020 : préfixes des dossiers balayés dans /tmp et /dev/shm (créés par les
+#: agents eux-mêmes, pas par le code d'ameesh) ; ceux des projets sont lus aux
+#: fiches du canon (`mesh_sweep_prefixes`), jamais écrits ici (#7660)
+DEFAULT_SWEEP_PREFIXES = ("ameesh-",)
+#: #8020 : sous-dossier temporaire d'un lot, sous le dossier de l'agent
+LOT_TMP_PREFIX = "ameesh-lot-"
+#: #8020 : alerte de remplissage d'un tmpfs autre que le /tmp de l'hôte
+#: (/dev/shm), en part du système de fichiers
+DEFAULT_SHM_ALERT = 0.5
 #: L162 : horizon des signalements relus par le passage (le journal en garde 30 j)
 ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
 #: #222: an unattributed /tmp entry, never deleted, is signaled again by the
@@ -418,13 +431,14 @@ UNREADABLE_OK_HINT = "policy.housekeeping.unreadable_ok if it is a daemon"
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
-#: #234: since #222 the housekeeping deletes by itself only a signal attributed
-#: before #222; a new /tmp entry is never charged to a turn nor deleted
+#: #8020 : le balayage supprime désormais les dossiers temporaires du mesh
+#: abandonnés (âge + aucun processus), pas les autres entrées.
 TMPFS_ACTION = ("expected action: delete what is no longer needed (one command per entry "
-                "in `ameesh menage` or in the `tmp_orphan` alert); housekeeping deletes on "
-                "its own only a signaled entry attributed before #222, unchanged for %s "
-                "and held by no process; an entry appeared since is never deleted by "
-                "ameesh; agents write in $TMPDIR, never directly in /tmp")
+                "in `ameesh menage`); housekeeping sweeps %s "
+                "directories unchanged for %s and held by no process, and otherwise "
+                "deletes on its own only a signaled entry attributed before #222 "
+                "(`tmp_orphan`); an entry appeared since is never deleted by ameesh; "
+                "agents write in $TMPDIR, never directly in /tmp or /dev/shm")
 
 #: dossier géré sous l'état d'ameesh (un nom d'agent ne commence jamais par
 #: un point : pas de collision avec `<état>/<agent>`)
@@ -473,8 +487,9 @@ LOT_MERGED = lifecycle.DELIVERED
 KEPT_MERGED_GRACE_S = 24 * 3600.0
 
 POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_alert",
-               "redirect", "xdg_cache", "worktrees", "orphan_min_size",
-               "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
+               "shm_alert", "redirect", "xdg_cache", "worktrees", "orphan_min_size",
+               "orphan_cleanup", "orphan_idle", "sweep", "sweep_age",
+               "deps", "deps_idle", "artifacts",
                "artifact_idle", "artifact_ended_idle", "unreadable_ok",
                "docker_orphan_volumes_alert",
                "docker_build_cache_alert", "docker_volumes", "docker_images",
@@ -497,6 +512,8 @@ class Policy:
     tmp_quota: int = DEFAULT_TMP_QUOTA
     cache_quota: int = DEFAULT_CACHE_QUOTA
     tmpfs_alert: float = DEFAULT_TMPFS_ALERT
+    #: #8020 : alerte de remplissage de /dev/shm (part du tmpfs)
+    shm_alert: float = DEFAULT_SHM_ALERT
     docker_orphan_volumes_alert: int = 100
     docker_build_cache_alert: int = 20 * 1024 ** 3
     #: #2003 : récolter les volumes Docker DÉCLARÉS JETABLES par le mesh
@@ -519,6 +536,15 @@ class Policy:
     orphan_cleanup: bool = True
     #: L162 : inactivité (secondes) avant cette suppression
     orphan_idle: float = DEFAULT_ORPHAN_IDLE_S
+    #: #8020 : balayer /tmp et /dev/shm (les dossiers temporaires du mesh plus
+    #: vieux que `sweep_age`, tenus par aucun processus) ; `false` : rien n'est
+    #: supprimé par le balayage
+    sweep: bool = True
+    #: #8020 : âge (secondes) avant ce balayage
+    sweep_age: float = DEFAULT_SWEEP_AGE_S
+    #: #8020 : préfixes des dossiers balayés ; les projets viennent des fiches
+    #: du canon (`mesh_sweep_prefixes`), jamais d'un nom de client écrit ici
+    sweep_prefixes: tuple = DEFAULT_SWEEP_PREFIXES
     #: #248: node_modules shared per lockfile (npm wrapper, links, GC)
     deps: bool = True
     #: #248: idle time (seconds) before an unreferenced entry is deleted
@@ -615,8 +641,15 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`tmpfs_alert`: fraction expected (0 < x <= 1, or \"60%\")")
         else:
             parsed["tmpfs_alert"] = part
+    if raw.get("shm_alert") is not None:
+        part = resources_mod.parse_fraction(raw["shm_alert"])
+        if part is None:
+            problems.append("`shm_alert`: fraction expected (0 < x <= 1, or \"50%\")")
+        else:
+            parsed["shm_alert"] = part
     for key in ("orphan_idle", "deps_idle", "artifact_idle", "artifact_ended_idle",
-                "docker_volume_idle", "dirty_worktree_after", "dirty_archive_retention"):
+                "docker_volume_idle", "dirty_worktree_after", "dirty_archive_retention",
+                "sweep_age"):
         if raw.get(key) is None:
             continue
         seconds = parse_idle(raw[key])
@@ -644,7 +677,7 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
                             "(the owner files of `.menage/tmp`)")
         else:
             parsed["former_mesh_keys"] = tuple(sorted(set(keys)))
-    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps",
+    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "sweep", "deps",
                 "docker_volumes", "docker_images"):
         if raw.get(key) is None:
             continue
@@ -670,6 +703,34 @@ def parse_idle(value) -> float | None:
         return None
 
 
+def mesh_sweep_prefixes(canons) -> tuple:
+    """#8020 : les préfixes des dossiers temporaires du mesh, lus au canon.
+
+    Le préfixe d'ameesh lui-même, puis un `<projet>-` par projet DÉCLARÉ dans
+    les fiches Agent (`projects:`/`team:`) ou `naming.projects` du canon : les
+    répertoires sont créés hors du code (`mktemp -d`), le cœur n'a donc aucun
+    nom de client à écrire (#7660). Un canon illisible ne rend que le préfixe
+    d'ameesh : on balaie moins, jamais autre chose."""
+    prefixes = set(DEFAULT_SWEEP_PREFIXES)
+    for canon in canons or ():
+        naming = getattr(canon, "naming", None)
+        for project in getattr(naming, "projects", None) or {}:
+            name = str(project).strip()
+            if name and "/" not in name:
+                prefixes.add(name + "-")
+        for agent in getattr(canon, "agents", ()) or ():
+            for project in getattr(agent, "effective_projects", ()) or ():
+                name = str(project).strip()
+                if name and "/" not in name:
+                    prefixes.add(name + "-")
+    return tuple(sorted(prefixes))
+
+
+def sweep_prefixes_label(policy: Policy) -> str:
+    """#8020 : les préfixes balayés, pour une alerte ou un journal."""
+    return " / ".join("`%s*`" % prefix for prefix in policy.sweep_prefixes)
+
+
 def effective(canons, host: str) -> Policy:
     """Politique de ménage de `host` d'après toutes les fiches Host des canons.
 
@@ -680,11 +741,15 @@ def effective(canons, host: str) -> Policy:
     l'inactivité exigée est la plus longue. L230: `artifact_idle` too, the
     longest, et `artifact_ended_idle` (#3956) de même. #3728 :
     `dirty_worktree_after` et `dirty_archive_retention`
-    aussi, les plus longs (garder plus longtemps est le choix prudent)."""
+    aussi, les plus longs (garder plus longtemps est le choix prudent). #8020 :
+    le balayage est coupé dès qu'une fiche le coupe, son âge est le plus long
+    et son seuil d'alerte /dev/shm le plus bas ; ses préfixes sont ceux des
+    projets déclarés au canon, jamais un nom écrit dans le cœur."""
     values: dict = {}
     origin: dict = {}
     roots: set[str] = set()
-    for canon in canons or ():
+    canons = tuple(canons or ())
+    for canon in canons:
         fiche = canon.host(host) if hasattr(canon, "host") else None
         host_policy = getattr(fiche, "policy", None)
         declared = getattr(host_policy, "housekeeping", None) or {}
@@ -711,18 +776,20 @@ def effective(canons, host: str) -> Policy:
             if key not in values:
                 values[key], origin[key] = value, label
             elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert",
+                         "shm_alert",
                          "docker_orphan_volumes_alert", "docker_build_cache_alert",
                          "events_quota") \
                     and value < values[key]:
                 values[key], origin[key] = value, label
             elif (key in ("orphan_idle", "deps_idle", "artifact_idle",
                           "artifact_ended_idle", "docker_volume_idle",
-                          "dirty_worktree_after",
+                          "dirty_worktree_after", "sweep_age",
                           "dirty_archive_retention") and value > values[key]) or \
-                    (key in ("orphan_cleanup", "deps", "docker_volumes",
+                    (key in ("orphan_cleanup", "sweep", "deps", "docker_volumes",
                              "docker_images") and value is False
                      and values[key] is not False):
                 values[key], origin[key] = value, label
+    values["sweep_prefixes"] = mesh_sweep_prefixes(canons)
     return Policy(origin=origin, worktree_roots=tuple(sorted(roots)), **values)
 
 
@@ -1115,8 +1182,15 @@ def hold_tmp(cfg, policy: Policy, agent: str, *, new_session: bool) -> TmpHold:
     return TmpHold(path=mine, lock=lock, entries=entries)
 
 
+def lot_tmp_name(lot) -> str:
+    """#8020 : nom du sous-dossier temporaire d'un lot (`ameesh-lot-<id>`),
+    vide si `lot` n'est pas un identifiant numérique."""
+    ident = str(lot or "").strip().lstrip("#")
+    return LOT_TMP_PREFIX + ident if ident.isdigit() else ""
+
+
 def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
-             hold: TmpHold | None = None) -> dict:
+             hold: TmpHold | None = None, lot=None) -> dict:
     """Variables à poser dans l'environnement d'un tour (crée les dossiers).
 
     `TMPDIR`/`TMP`/`TEMP` sont toujours redirigés (c'est l'objet du lot) vers
@@ -1126,7 +1200,15 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
     docker/podman (podman y copie ses images). Une variable de cache déjà
     posée dans `base_env` est respectée. L219 : le dossier est celui de
     `hold` (verrouillé pour le tour) ; sans `hold`, il est pris puis relâché
-    aussitôt (préparation, tests)."""
+    aussitôt (préparation, tests).
+
+    #8020 : quand le tour porte UN lot, les trois variables pointent vers
+    `<dossier de l'agent>/ameesh-lot-<id>`, créé ici et gardé d'un tour à
+    l'autre du même lot. Ce sous-dossier reste sous la racine gérée (donc sur
+    disque, L162) ; il est supprimé à la fin du lot (`cleanup_lot_dirs`) ou à
+    l'arrêt de l'agent pour un lot déjà terminé ; un lot ouvert le garde,
+    borné par `tmp_quota`. Un tour sans lot garde le dossier de l'agent, comme
+    avant."""
     if not policy.redirect or disabled(base_env):
         return {}
     if hold is None:
@@ -1135,6 +1217,10 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
     croot = cache_root(cfg, policy)
     _ensure_root(croot)
     mine = hold.path
+    lot_name = lot_tmp_name(lot)
+    if lot_name:
+        mine = os.path.join(mine, lot_name)
+        os.makedirs(mine, mode=0o700, exist_ok=True)
     out = {"TMPDIR": mine, "TMP": mine, "TEMP": mine,
            "AMEESH_TMPDIR": mine, "AMEESH_CACHE_DIR": croot}
     for name, variables in cache_names(policy):
@@ -1158,6 +1244,139 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
             os.path.join(cfg.state_dir, MANAGED_DIR, deps_mod.SHIM_DIR),
             out.get("PATH") or base_env.get("PATH") or os.defpath))
     return out
+
+
+def cleanup_lot_dirs(cfg, policy: Policy, *, agents=None, db=None, host: str = "",
+                     running=(), ended_only: bool = True, lot_state=None,
+                     now: float | None = None, dry_run: bool = False,
+                     reason: str = "closed") -> dict:
+    """#8020 : retire les dossiers temporaires `ameesh-lot-<id>` des agents.
+
+    `agents` (noms) restreint le balayage ; None les prend tous. Un dossier
+    n'est retiré que si son agent n'est pas en tour (verrou exclusif du
+    dossier temporaire, ou `running`), qu'aucun processus ne le tient (cwd,
+    fichier ouvert, ligne de commande ; illisible = doute, rien n'est retiré),
+    qu'aucune copie Git n'y porte de travail non sauvé (`tmp_git_work` :
+    gardé et signalé, les worktrees liés prouvés saufs étant détachés), et —
+    `ended_only` — que l'état de son lot est terminal (`LOT_ENDED`) :
+    `lot_state(lot)` le dit, sinon la base (`db`). Un lot en cours garde son
+    dossier d'un tour à l'autre ; `ended_only=False` ne vaut que pour un
+    retrait d'agent décidé, jamais pour un simple redémarrage. `dry_run` rend
+    le plan sans rien supprimer.
+
+    Rend `entries` (journal), `plan` (essai), `skipped`, `bytes` libérés et
+    `dirs` retirés."""
+    entries: list[dict] = []
+    plan: list[dict] = []
+    skipped: list[str] = []
+    deleted: list[dict] = []
+    total = 0
+    troot = tmp_root(cfg, policy)
+    if not os.path.isdir(troot) or not _managed(troot):
+        return {"entries": entries, "plan": plan, "skipped": skipped,
+                "bytes": 0, "dirs": deleted}
+    key = mesh_key(cfg)
+    wanted = set(agents) if agents is not None else None
+    now = time.time() if now is None else float(now)
+    for name in sorted(os.listdir(troot)):
+        if name == MARKER:
+            continue
+        adir = os.path.join(troot, name)
+        if not os.path.isdir(adir) or os.path.islink(adir):
+            continue
+        if read_owner(troot, name) != key:
+            continue                  # L219 : le dossier d'un autre mesh n'est pas à nous
+        agent = tmp_agent(name, key)
+        if wanted is not None and agent not in wanted:
+            continue
+        try:
+            children = sorted(os.listdir(adir))
+        except OSError:
+            continue
+        lots = []
+        for child in children:
+            ident = child[len(LOT_TMP_PREFIX):] if child.startswith(LOT_TMP_PREFIX) else ""
+            if ident.isdigit():
+                lots.append((ident, os.path.join(adir, child)))
+        if not lots:
+            continue
+        if agent in set(running or ()):
+            skipped.append("lot temp of %s kept: in turn" % agent)
+            continue
+        lock = None if dry_run else tmp_lock(troot, name, exclusive=True)
+        if not dry_run and lock is None:
+            skipped.append("lot temp of %s kept: in turn (lock held)" % agent)
+            continue
+        try:
+            for ident, path in lots:
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                    continue
+                if ended_only:
+                    try:
+                        state = (lot_state(ident) if lot_state is not None
+                                 else _lot_state(db, ident) if db is not None else None)
+                    except Exception:       # état illisible : doute, on garde
+                        state = None
+                    if state not in LOT_ENDED:
+                        continue
+                held = tmp_holder(path, allow=policy.unreadable_ok)
+                if held:
+                    skipped.append("lot temp %s kept: %s" % (path, held))
+                    continue
+                # #8020 (B1) : ce dossier est le `TMPDIR` du lot ; un agent y
+                # clone et commite. Une copie Git qui porte du travail non
+                # poussé garde le dossier (mêmes gardes que le balayage), sinon
+                # seules les copies prouvées sauves sont détachées avant le rm.
+                copies, git_doubt = _git_copies_report(path)
+                if git_doubt:
+                    plan.append({"kind": "tmp", "path": path, "agent": agent,
+                                 "action": "garde", "bytes": size_of(path),
+                                 "detail": "git copies not fully inspected (%s)"
+                                           % git_doubt})
+                    skipped.append("lot temp %s kept: git copies not fully inspected (%s)"
+                                   % (path, git_doubt))
+                    continue
+                work = tmp_git_work(path, build_artifacts.rules_of(policy.artifacts),
+                                    report=(copies, git_doubt),
+                                    allow=policy.unreadable_ok)
+                if work:
+                    command = tmp_recovery_command(path, report=(copies, git_doubt))
+                    plan.append({"kind": "tmp", "path": path, "agent": agent,
+                                 "action": "garde", "bytes": size_of(path),
+                                 "detail": "git work to keep — %s ; inspect with: %s"
+                                           % (work, command)})
+                    skipped.append("lot temp %s kept: git work — %s ; inspect with: %s"
+                                   % (path, work, command))
+                    continue
+                size = size_of(path)
+                plan.append({"kind": "tmp", "path": path, "agent": agent,
+                             "action": "suppression", "bytes": size,
+                             "detail": "lot #%s %s" % (ident, reason)})
+                if dry_run:
+                    continue
+                if copies:
+                    ok, error, _repos = recover_tmp_git_copies(
+                        path, report=(copies, git_doubt))
+                    if not ok:
+                        skipped.append("lot temp %s kept: git copy removal refused — %s"
+                                       % (path, error))
+                        continue
+                freed = _safe_rmtree(path, troot)
+                total += freed
+                deleted.append({"path": path, "lot": ident, "bytes": freed})
+                entries.append({"kind": "tmp", "action": "deleted", "path": path,
+                                "bytes": freed, "agent": agent,
+                                "detail": "lot #%s %s: per-lot temporary directory "
+                                          "removed" % (ident, reason)})
+        finally:
+            if lock is not None:
+                lock.close()
+    return {"entries": entries, "plan": plan, "skipped": skipped,
+            "bytes": total, "dirs": deleted}
 
 
 # --------------------------------------------------------------------------
@@ -2793,7 +3012,8 @@ def tmpfs_hint(top, policy: Policy) -> str:
     (si un bilan les a relevées) et l'action attendue."""
     plus_gros = ("largest in /tmp: %s" % describe_top(top)) if top else \
         "largest in /tmp: `ameesh menage` on the host"
-    return "%s — %s" % (plus_gros, TMPFS_ACTION % fmt_idle(policy.orphan_idle))
+    return "%s — %s" % (plus_gros, TMPFS_ACTION % (
+        sweep_prefixes_label(policy), fmt_idle(policy.sweep_age)))
 
 
 # --------------------------------------------------------------------------
@@ -3566,7 +3786,7 @@ class Turn:
 
     @classmethod
     def begin(cls, cfg, policy: Policy, agent: str, cwd: str | None, *,
-              new_session: bool, base_env: dict) -> "Turn":
+              new_session: bool, base_env: dict, lot=None) -> "Turn":
         turn = cls(cfg=cfg, policy=policy, agent=agent, cwd=cwd, started=time.time())
         if disabled(base_env):
             turn.off = True
@@ -3578,7 +3798,7 @@ class Turn:
             turn.lock, turn.tmp = hold, hold.path
             turn.entries.extend(hold.entries)
             try:
-                turn.env = turn_env(cfg, policy, agent, base_env, hold=hold)
+                turn.env = turn_env(cfg, policy, agent, base_env, hold=hold, lot=lot)
             except Exception:
                 hold.release()
                 raise
@@ -3754,6 +3974,168 @@ class Turn:
 
 
 # --------------------------------------------------------------------------
+# #8020 : balayage des dossiers temporaires du mesh dans /tmp et /dev/shm
+# --------------------------------------------------------------------------
+
+def sweep_roots() -> list[str]:
+    """#8020 : les deux tmpfs partagés que le balayage visite (`/tmp` et
+    `/dev/shm`, surchargés par les mêmes variables que la mesure)."""
+    return [resources_mod.system_tmp(), resources_mod.system_shm()]
+
+
+def tmp_sweep(policy: Policy, *, dry_run: bool = False, now: float | None = None,
+              budget: PassBudget | None = None, roots=None, age: float | None = None,
+              procs=None) -> dict:
+    """#8020 : supprime les dossiers temporaires abandonnés du mesh de /tmp
+    et /dev/shm.
+
+    Un candidat est un enfant DIRECT d'une racine, de l'utilisateur, qui est
+    un dossier ordinaire (jamais un lien), dont le nom porte un des préfixes
+    du mesh (`policy.sweep_prefixes`, lus aux projets déclarés au canon), et
+    dont la dernière activité (mtime ET ctime, contenu compris)
+    remonte à plus de `age` (défaut `policy.sweep_age`, 6 h). Il est GARDÉ si
+    un processus de l'utilisateur le tient (cwd, exécutable, fichier ouvert
+    ou projeté, `platform.user_paths`), si la table des processus est
+    illisible ou douteuse (`unreadable_ok` de l'hôte), si son contenu n'a pas
+    pu être parcouru en entier (entrée illisible, point de montage, budget),
+    ou si une copie Git y porte du travail non poussé (`tmp_git_work`) —
+    dans ce dernier cas, seules les copies prouvées sauves sont retirées
+    (`recover_tmp_git_copies`), puis le dossier. Une entrée est revérifiée
+    (inode, propriétaire, enfant direct) juste avant sa suppression.
+
+    `dry_run` rend le plan (chemins, tailles) sans rien supprimer. Rend
+    `entries` (journal), `plan`, `skipped`, `bytes` libérés, `deleted` et
+    `doubt`."""
+    now = time.time() if now is None else float(now)
+    age = policy.sweep_age if age is None else float(age)
+    roots = sweep_roots() if roots is None else list(roots)
+    entries: list[dict] = []
+    plan: list[dict] = []
+    skipped: list[str] = []
+    deleted: list[dict] = []
+    total = 0
+    out = {"entries": entries, "plan": plan, "skipped": skipped,
+           "bytes": 0, "deleted": deleted, "doubt": ""}
+    if not policy.sweep:
+        skipped.append("tmp sweep disabled by policy (`sweep: false`)")
+        return out
+    if procs is None:
+        try:
+            procs = platform.user_paths(allow=policy.unreadable_ok)
+        except Exception:  # noqa: BLE001 - un balayage ne lève jamais
+            procs = None
+    if procs is None or not getattr(procs, "available", False):
+        out["doubt"] = "process table unreadable on this host"
+        skipped.append("tmp sweep: %s; nothing deleted" % out["doubt"])
+        return out
+    doubt = procs.doubt()
+    if doubt:
+        out["doubt"] = doubt
+        skipped.append("tmp sweep: %s; nothing deleted" % doubt)
+    uid = os.getuid()
+    for root in roots:
+        if not root:
+            continue
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            skipped.append("tmp sweep: pass budget reached, %s left for the next pass"
+                           % root)
+            break
+        try:
+            names = sorted(os.listdir(root))
+        except OSError as exc:
+            skipped.append("tmp sweep: %s unreadable (%s)" % (root, exc.strerror or exc))
+            continue
+        for name in names:
+            if not name.startswith(policy.sweep_prefixes):
+                continue
+            path = os.path.join(root, name)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                continue
+            if st.st_uid != uid:
+                skipped.append("tmp sweep %s kept: belongs to another user" % path)
+                continue
+            if budget is not None and budget.expired():
+                budget.timed_out = True
+                skipped.append("tmp sweep: pass budget reached, %s left for the next pass"
+                               % root)
+                break
+            scan = scan_activity(path, budget=budget, now=now)
+            idle = now - float(scan.get("latest") or 0)
+            if idle < age:
+                continue                    # récent : ni candidat ni bruit
+            item = {"kind": "tmp_sweep", "path": path, "bytes": scan["bytes"],
+                    "agent": None, "lot": None}
+            if not scan.get("complete"):
+                plan.append(dict(item, action="garde",
+                                 detail="%s kept: %s" % (path, scan.get("why") or "unreadable")))
+                skipped.append("tmp sweep %s kept: %s" % (path, scan.get("why") or "unreadable"))
+                continue
+            held = procs.holders(_real(path))
+            if held:
+                plan.append(dict(item, action="garde",
+                                 detail="held by process %s" % held[0]))
+                skipped.append("tmp sweep %s kept: held by process %s"
+                               % (path, held[0]))
+                continue
+            if doubt:
+                plan.append(dict(item, action="garde",
+                                 detail="process table doubtful: %s" % doubt))
+                continue
+            copies, git_doubt = _git_copies_report(path)
+            if git_doubt:
+                plan.append(dict(item, action="garde",
+                                 detail="git copies not fully inspected (%s)" % git_doubt))
+                skipped.append("tmp sweep %s kept: git copies not fully inspected (%s)"
+                               % (path, git_doubt))
+                continue
+            work = tmp_git_work(path, build_artifacts.rules_of(policy.artifacts),
+                                report=(copies, git_doubt),
+                                allow=policy.unreadable_ok)
+            if work:
+                command = tmp_recovery_command(path, report=(copies, git_doubt))
+                plan.append(dict(item, action="garde",
+                                 detail="git work to keep — %s ; inspect with: %s"
+                                        % (work, command)))
+                skipped.append("tmp sweep %s kept: git work — %s ; inspect with: %s"
+                               % (path, work, command))
+                continue
+            # dernière vérification en direct : un processus a pu naître depuis
+            # le relevé ; une lecture impossible est un doute, on garde.
+            holder = tmp_holder(path, allow=policy.unreadable_ok)
+            if holder:
+                plan.append(dict(item, action="garde", detail=holder))
+                skipped.append("tmp sweep %s kept: %s" % (path, holder))
+                continue
+            detail = ("unreferenced %s directory, unchanged for %s (sweep after %s)"
+                      % (os.path.basename(root), fmt_idle(idle), fmt_idle(age)))
+            plan.append(dict(item, action="suppression", detail=detail,
+                             command="rm -rf -- %s" % shlex.quote(path)))
+            if dry_run:
+                continue
+            if copies:
+                ok, error, _repos = recover_tmp_git_copies(path, report=(copies, git_doubt))
+                if not ok:
+                    skipped.append("tmp sweep %s kept: git copy removal refused — %s"
+                                   % (path, error))
+                    continue
+            try:
+                freed = _remove_tmp_entry(path, root, st.st_ino, st.st_dev)
+            except (OSError, RefusedDeletion) as exc:
+                skipped.append("tmp sweep %s kept: deletion refused — %s" % (path, exc))
+                continue
+            total += freed
+            deleted.append({"path": path, "bytes": freed})
+            entries.append(dict(item, action="deleted", bytes=freed, detail=detail))
+    out.update(bytes=total)
+    return out
+
+
+# --------------------------------------------------------------------------
 # un passage (exécuteur périodique, ou `ameesh menage`)
 # --------------------------------------------------------------------------
 
@@ -3794,6 +4176,7 @@ def measure(cfg, policy: Policy, budget: PassBudget | None = None) -> dict:
             cache_partial.append(name)
     system = resources_mod.fs_usage(resources_mod.system_tmp())
     fraction = resources_mod.tmpfs_fraction(system)
+    shm = resources_mod.tmpfs_usage(resources_mod.system_shm())
     seuil = min(policy.tmpfs_alert, resources_mod.DEFAULT_MAX_TMPFS_USED)
     return {
         "tmp_root": troot, "tmp_bytes": sum(agents.values()), "tmp_by_agent": agents,
@@ -3807,9 +4190,13 @@ def measure(cfg, policy: Policy, budget: PassBudget | None = None) -> dict:
                                  else None if cache_partial else False),
         "system_tmp": system,
         "system_tmp_fraction": fraction,
+        # #8020 : la mémoire partagée de l'hôte, mesurée à part de /tmp
+        "system_shm": shm,
+        "system_shm_fraction": shm.get("fraction"),
         "system_tmp_top": (tmp_top(budget=budget)
                            if fraction is not None and fraction >= seuil else []),
         "tmpfs_alert": policy.tmpfs_alert,
+        "shm_alert": policy.shm_alert,
     }
 
 
@@ -5928,6 +6315,20 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     continue
                 entries.append({"kind": "tmp", "action": "gone", "path": path,
                                 "detail": "temporary directory over quota gone"})
+    # 1b. #8020 : dossiers temporaires des lots finis. Un lot en cours garde
+    #     le sien d'un tour à l'autre ; l'agent en tour et tout processus qui
+    #     le tient le gardent aussi (verrou et doute : rien n'est retiré).
+    budget.check("lot_tmp")
+    try:
+        lot_cleanup = cleanup_lot_dirs(
+            cfg, policy, db=db, host=host, running=running, ended_only=True,
+            now=now, dry_run=dry_run, reason="closed")
+    except Exception as exc:  # jamais fatal pour le passage
+        lot_cleanup = {"entries": [], "plan": [], "skipped": [
+            "lot temp dirs: pass failed (%s)" % type(exc).__name__]}
+    entries += lot_cleanup["entries"]
+    plan += lot_cleanup["plan"]
+    skipped += lot_cleanup["skipped"]
     budget.check("caches")
     # 2. caches partagés
     # #3293 : sous pression disque (moins que `free_target` libre sur le
@@ -6198,8 +6599,29 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 "detail": "ExecStart %s -> %s" % (", ".join(fix["before"]),
                                                   ", ".join(fix["after"])),
                 "data": {"before": fix["before"], "after": fix["after"]}})
+    # 6b. #8020 : balayage des dossiers `ameesh-*` / `nexlink-*` de /tmp et
+    #     /dev/shm, plus vieux que `sweep_age` et tenus par aucun processus.
+    #     Le relevé porte ce qui a été fait (ou ce qui serait fait, en essai)
+    #     et l'alerte `tmp_swept` reprend le total libéré.
+    budget.check("sweep")
+    try:
+        # #8020 : le balayage s'arrête avant la réserve du passage, pour que
+        # le bilan (`measure`) et les phases qui le suivent gardent leur temps.
+        swept = tmp_sweep(policy, dry_run=dry_run, now=now,
+                          budget=budget.window(reserve))
+    except Exception as exc:  # jamais fatal pour le passage
+        swept = {"entries": [], "plan": [], "skipped": [
+            "tmp sweep: pass failed (%s)" % type(exc).__name__],
+            "bytes": 0, "deleted": [], "doubt": ""}
+    entries += swept["entries"]
+    plan += swept["plan"]
+    skipped += swept["skipped"]
     budget.check("measure")
     report_measure = measure(cfg, policy, budget=budget)
+    report_measure["tmp_sweep"] = {
+        "age_s": policy.sweep_age, "bytes": swept["bytes"],
+        "deleted": list(swept["deleted"]), "dry_run": dry_run,
+        "doubt": swept["doubt"]}
     # #3802 : la trace des phases reste au journal (relevé `mesure`), pas
     # seulement dans la sortie de cette passe.
     report_measure["host_pass"] = budget.summary()
@@ -6344,6 +6766,19 @@ def print_report(report: dict) -> None:
                 _fmt(sys_tmp.get("tmp_size_bytes")), sys_tmp.get("tmp_fstype") or "?",
                 " — ALERT: above %d %%" % round(m["tmpfs_alert"] * 100)
                 if (m.get("system_tmp_fraction") or 0) >= m["tmpfs_alert"] else ""))
+        # #8020 : /dev/shm a sa propre jauge, et le balayage son total
+        sys_shm = m.get("system_shm") or {}
+        if sys_shm.get("size_bytes"):
+            print("  %-21s %s / %s (%s)%s" % (
+                sys_shm.get("path") or "/dev/shm", _fmt(sys_shm.get("used_bytes")),
+                _fmt(sys_shm.get("size_bytes")), sys_shm.get("fstype") or "?",
+                " — ALERT: above %d %%" % round(m["shm_alert"] * 100)
+                if (sys_shm.get("fraction") or 0) >= m["shm_alert"] else ""))
+        swept = m.get("tmp_sweep") or {}
+        if swept.get("deleted") or swept.get("bytes"):
+            print("  sweep                 %d dir(s) of /tmp and /dev/shm, %s freed%s"
+                  % (len(swept.get("deleted") or ()), _fmt(swept.get("bytes")),
+                     " (dry run, nothing deleted)" if swept.get("dry_run") else ""))
     # en essai, les entrées de /tmp ont leur propre section (avec la commande)
     rows = [p for p in report["plan"] if p.get("kind") != "orphan"
             and p.get("action") != "unowned"] if report["dry_run"] \
