@@ -69,11 +69,30 @@ def _database_admin(cfg):
     return db_mod.connect(dataclasses.replace(cfg, statement_timeout_ms=0))
 
 
+#: Refus d'environnement, pas un défaut du lot : le guest de prévalidation
+#: n'accorde pas CREATE DATABASE (rôle du DSN sans CREATEDB, ou pooler). Le
+#: contrat des groupes d'écriture exige de révoquer TEMP à PUBLIC, donc une
+#: base dédiée ; sans elle le test est non concluant (sauté), il ne bloque pas
+#: (§3), et il tourne sur le banc et en CI où CREATE DATABASE est accordé.
+_CREATE_DATABASE_REFUSED = (
+    "permission denied to create database",
+    "CREATE DATABASE cannot run inside a transaction block",
+    "cannot run inside a transaction block",
+)
+
+
 def _create_database(cfg, database: str) -> None:
     admin = _database_admin(cfg)
     try:
         db_mod.execute_without_statement_timeout(
             admin, "CREATE DATABASE %s TEMPLATE template0" % db_mod.quote_ident(database))
+    except db_mod.DbError as exc:
+        if not any(refus in str(exc) for refus in _CREATE_DATABASE_REFUSED):
+            raise
+        raise unittest.SkipTest(
+            "banc sans CREATE DATABASE (rôle du DSN sans CREATEDB ou pooler) : "
+            "RejeuRolesTest exige une base dédiée pour révoquer TEMP à PUBLIC ; "
+            "détail : %s" % exc) from exc
     finally:
         admin.close()
 

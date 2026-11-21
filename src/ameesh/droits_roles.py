@@ -52,6 +52,13 @@ class Replay:
 
 #: The role scripts replayed by this module. Each one is a grant-only contract:
 #: the migration owner (table owner, no CREATEROLE) can reapply it.
+#:
+#: #7986, limite déclarée (N1 de la relecture auditeur) : le rejeu vise le nom
+#: par défaut du script. Sur une base où ce nom sert à une autre équipe (autre
+#: schéma), l'audit refuse les droits hors du schéma et la séquence s'arrête
+#: (code 7) au lieu de deviner ; l'administrateur rejoue alors le script avec
+#: le nom de son équipe (`psql -v role=<nom> -f deploy/sql/rejeu-approve.sql`)
+#: ou renomme le rôle. Le rejeu ne crée, n'altère ni ne renomme jamais un rôle.
 REPLAYS: tuple[Replay, ...] = (
     Replay(
         "role-superviseur-contenus.sql",
