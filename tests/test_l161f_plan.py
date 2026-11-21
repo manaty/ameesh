@@ -1021,6 +1021,7 @@ class MapTest(unittest.TestCase):
             'test_503_agent_host',
             'test_5588_housekeeping_retention',
             'test_5655_action_download',
+            'test_5947_preflight_cli_n_moins_1',
             'test_6011_contrat_ecrivains_isoles',
             'test_6085_avatar_connectors',
             'test_6090_work_add_unique_ref',
