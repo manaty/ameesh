@@ -74,7 +74,7 @@ class SequenceTest(unittest.TestCase):
                       migrer[migrer.rindex("\n", 0, rejeu - 80):rejeu])
         # un refus arrête avant l'installation (ou, si l'ancien code ne sert
         # plus, après l'installation immédiate puis échec)
-        garde = migrer.index('if { [ "$droits" = 1 ] || [ "$superviseur" = 1 ]; }')
+        garde = migrer.index('if { [ "$droits" = 1 ] || [ "$superviseur" = 1 ] || [ "$roles" = 1 ]; }')
         self.assertLess(garde, migrer.index('if [ "$incompatible" = 1 ]; then'))
 
     def test_le_rejeu_ne_cree_ni_ne_modifie_le_role(self):

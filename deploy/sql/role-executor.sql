@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- rejeu-exempte: future objects are covered by ALTER DEFAULT PRIVILEGES executed by the migration owner, so a migration does not leave a missing grant; the administrator wrapper role-executor.sh / poste.sh reapply_executor_role reapplies the script itself (#L56).
 -- L56: executor data access, without schema or database administration.
 -- Apply as the migration owner, with the mesh schema first in search_path:
 --   PGOPTIONS='-c search_path=<schema>' psql '<owner DSN>' -X \

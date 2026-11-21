@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- rejeu-exempte: superuser only: creates/alters the LOGIN vm_probe and the NOLOGIN vm_probe_writer, creates the SECURITY DEFINER functions owned by vm_probe_writer and audits pg_authid. The migration owner owns the tables but neither the functions nor CREATEROLE, so it cannot replay the script or run its audit; the administrator applies it with _contrat-vm-probe.sql (#6298/#7951).
 -- #6298 / manaty/ameesh#4858 : identité DB du compte VM, jamais le rôle ameesh.
 -- Installation BUREAU uniquement, superutilisateur PostgreSQL (audit pg_authid) :
 --   PGOPTIONS='-c search_path=<schema mesh>' psql <DSN admin> -X \
