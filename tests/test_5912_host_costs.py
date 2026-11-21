@@ -67,6 +67,19 @@ class CostStatesTest(unittest.TestCase):
                 host_lifecycle.drain(None, None, 'hub', actor='human:test')
             store.assert_not_called()
 
+    def test_unreadable_canon_root_refuses_drain(self):
+        # #8033 review witness (B #45128): `canon._load` catches the git/OS
+        # error and returns `Canon(readable=False)`, so `configured_canons`
+        # is non-empty. The services card is still unknown; a drain of the
+        # hub must not go through.
+        cfg = NS(canon='/nonexistent/ameesh-canon-8033', canon_ref='',
+                 canon_untrusted=False)
+        with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
+             mock.patch.object(host_lifecycle.storage, 'of') as store:
+            with self.assertRaisesRegex(ValueError, 'configured canon unreadable'):
+                host_lifecycle.drain(cfg, None, 'hub', actor='human:test')
+            store.assert_not_called()
+
     def test_no_configured_canon_still_allows_drain(self):
         store = mock.Mock()
         store.host_lifecycle.drain.return_value = {'mode': 'draining'}
