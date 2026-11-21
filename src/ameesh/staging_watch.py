@@ -555,13 +555,29 @@ def findings(rows: list[dict], *, now: float, attested=(),
     """
     latest, ids = _latest_runs(rows)
     proofs = _attested_ids(attested)
+    # An attestation is recorded before the launcher's terminal snapshot.  A
+    # notification failure can therefore leave an `unattested` snapshot after
+    # a valid proof. Restrict this recovery to a proof newer than this run's
+    # first snapshot; an old proof for a repeated SHA must not settle it.
+    first_ids = {}
+    for row in rows:
+        data = row.get("data") or {}
+        if isinstance(data, dict) and data.get("run"):
+            run = data["run"]
+            first_ids[run] = min(first_ids.get(run, int(row["id"])), int(row["id"]))
+
+    def attests(run, data):
+        proof = proofs.get(data.get("sha"), 0)
+        return (proof > ids[run] or
+                (data.get("state") == "unattested" and
+                 proof > first_ids[run] and first_ids[run] < ids[run]))
     descends = descends or _git_descends
     # A complete deployment by the same staging authority settles an earlier
     # failure. A partial run settles it only through the hosts it repaired.
     completed = {}
     for run, data in latest.items():
         if (data.get("state") == "completed"
-                or proofs.get(data.get("sha"), 0) > ids[run]):
+                or attests(run, data)):
             scope = data.get("notify", "")
             completed[scope] = max(completed.get(scope, 0), ids[run])
     # #5693: every unsettled run's hosts still to repair, computed once.
@@ -576,7 +592,7 @@ def findings(rows: list[dict], *, now: float, attested=(),
         data = latest[run]
         if (data.get("state") in ("completed", "partial")
                 or completed.get(data.get("notify", ""), 0) > ids[run]
-                or proofs.get(data.get("sha"), 0) > ids[run]):
+                or attests(run, data)):
             return True
         broken, proved = remaining(run)
         return proved and not broken
