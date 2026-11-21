@@ -1609,7 +1609,8 @@ if [ "$POSTE_ABSENT" = 1 ]; then
   etape "migrations de $SHA_TRAVE depuis $HOTE_MIGRATIONS (poste absent, additives seulement)"
   debut_etape "$HOTE_MIGRATIONS" migrations
   rc_migrer=0
-  migrer_depuis_vm "$HOTE_MIGRATIONS" "$SHA" || rc_migrer=$?
+  sortie_migrer=$(migrer_depuis_vm "$HOTE_MIGRATIONS" "$SHA") || rc_migrer=$?
+  [ -z "$sortie_migrer" ] || printf '%s\n' "$sortie_migrer"
   if [ "$rc_migrer" = 5 ]; then
     # #7873 : base migree, mais droits des connexions limitees refuses par
     # l'audit (le droit est nomme plus haut) : rien n'est installe.
@@ -1633,7 +1634,9 @@ if [ "$POSTE_ABSENT" = 1 ]; then
     echo "migrations en echec : aucune installation" >&2
     exit 1
   fi
-  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord), droits limites, contrat superviseur et contrats de role rejoues et audites"
+  detail_rejeux=$(printf '%s\n' "$sortie_migrer" | grep -E 'contrat tenu|contrat bureau conforme|rejeu saute' || true)
+  [ -n "$detail_rejeux" ] || detail_rejeux="detail des rejeux indisponible"
+  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord) ; resultats des contrats : $detail_rejeux"
 else
   etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
   debut_etape poste migrations
