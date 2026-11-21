@@ -12,7 +12,8 @@ Ce module rejoue ces deux contrôles avec, comme CLI installé, le **code réel
 du dernier tag de release** (`git archive`, aucun réseau). Le banc est celui de
 test_1252 (faux ssh, runuser, systemctl, systemd-run) ; dans le venv installé,
 `ameesh` et `python -c` exécutent le code du tag, seules les frontières
-externes sont simulées : la base (aucune requête servie), la ligne de rôle du
+externes sont simulées : la base (seule la lecture de `agent_watches` y est
+servie, vide, #8004 ; toute autre requête échoue, nommée), la ligne de rôle du
 registre (`registry.get`, fixture) et, pour les lectures du registre des
 agents (`list`, `show`, `doctor`, `--version`) et les sondes de base de vm.sh,
 les faux de test_1252. Toute autre commande lancée par vm.sh va au vrai CLI
@@ -158,9 +159,20 @@ assert Path(ameesh.__file__).resolve().is_relative_to(Path(src).resolve()), amee
 from ameesh import db as db_mod, registry
 
 class FakeDb:
-    """Aucune requête servie : un contrôle qui lit la base échoue ici, nommé."""
+    """La base de staging existe et sa table des veilles est vide (#8004).
+
+    Depuis 1.67.0 (#7933), `role timers --check` y lit les veilles des rôles
+    élus : refuser la lecture rendait le préflight N-1 rouge dès que N-1 lisait
+    les veilles (#8004), alors qu'une table vide et lisible est un état sain.
+    Seule cette lecture est servie ; toute autre requête échoue, nommée : le
+    banc ne simule pas une base vivante.
+    """
     def close(self):
         pass
+    def query(self, sql, params=()):
+        if 'from agent_watches' in ' '.join(sql.lower().split()):
+            return []
+        raise RuntimeError('banc #5947 : base simulée, query non servi')
     def __getattr__(self, name):
         raise RuntimeError('banc #5947 : base simulée, %s non servi' % name)
 
