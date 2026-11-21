@@ -15,6 +15,7 @@ droit retiré est nommé puis reposé ; l'audit annule le rejeu quand un droit
 from __future__ import annotations
 
 import os
+import subprocess
 import re
 import subprocess
 import unittest
@@ -43,6 +44,22 @@ def _sans_commentaires(text: str) -> str:
 
 class SequenceTest(unittest.TestCase):
     """La séquence appelle le rejeu au bon endroit et s'arrête sur un refus."""
+
+    def test_trace_distingue_rejeu_et_role_absent(self):
+        text = _read(STAGING)
+        start = text.index('  rc_migrer=0\n', text.index('if [ "$POSTE_ABSENT" = 1 ]; then', text.index('if [ "$SAUVER" = 1 ]; then')))
+        end = text.index('\nelse\n  etape "migrations de', start)
+        bloc = text[start:end]
+        for verdict in ("contrat : rejoue, contrat tenu", "contrat : absent, rejeu saute"):
+            script = ('migrer_depuis_vm() { printf "%s\\n" "$VERDICT"; }\n'
+                      'trace() { printf "TRACE:%s\\n" "$4"; }\n' + bloc)
+            proc = subprocess.run(["bash", "-c", script], text=True, capture_output=True,
+                                  env=dict(os.environ, VERDICT=verdict, HOTE_MIGRATIONS="vm",
+                                           SHA="abc", SHA_TRAVE="abc"))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            trace = proc.stdout.split("TRACE:", 1)[1]
+            self.assertIn(verdict, trace)
+            self.assertNotIn("rejoues et audites", trace)
 
     def test_staging_rejoue_le_contrat_apres_migrate(self):
         text = _read(STAGING)
