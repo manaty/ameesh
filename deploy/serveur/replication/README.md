@@ -258,12 +258,22 @@ est idempotent : le rejouer ne change rien d'utile.
 4. vérifie que `SHOW synchronous_standby_names` est bien vide après le
    rechargement ; si un autre gestionnaire (Patroni) tient la valeur, le script
    refuse et les agents ne doivent pas être arrêtés ;
-5. attend qu'aucun **tour** ne soit en cours (aucun bail vivant dans
-   `agent_registry`, base `ameesh`), borné par
+5. attend qu'aucun **tour** ne soit réellement en cours (statut `running` et
+   bail vivant dans `agent_registry`, base `ameesh`) ; les runners *idle*
+   gardent leur bail et ne comptent pas, sinon la veille ne pourrait jamais
+   être prise avant l'arrêt des agents. L'attente est bornée par
    `AMEESH_REPLICATION_ATTENTE_TOURS` (600 s par défaut) ; un tour restant est
    un refus, pas un arrêt forcé ;
 6. consigne `mode=veille`, l'heure, le nœud, la liste avant, la sauvegarde, le
    compte de tours et le résultat dans `/etc/ameesh/mode-veille`.
+
+Si l'entrée échoue après la pose du marqueur (tours restants, autre
+gestionnaire, rechargement), elle est **annulée** : le marqueur est retiré, la
+liste synchrone rétablie si un candidat est en flux, et l'échec consigné en
+`mode=actif` — les agents ne sont pas arrêtés et la durabilité n'est pas
+laissée dégradée sans échéance. Un rejeu sur une veille **déjà active** ne
+défait jamais l'état existant : en cas d'échec, le marqueur et la liste vide
+restent en place.
 
 `sortir` :
 
@@ -448,8 +458,10 @@ remplace `psql`, `pg_ctlcluster`, `pg_isready`, `pg_basebackup`, `pg_rewind`,
 `runuser` et `hostname` par des doublures sous un répertoire jetable, et
 vérifie aussi que les mots de passe ne passent jamais en argument. Les témoins
 du mode veille (#8027) couvrent le refus hors du hub, la sauvegarde logique,
-la liste vidée et rechargée, l'attente des tours, le rattrapage au réveil et
-la consignation dans le marqueur.
+la liste vidée et rechargée, l'attente des tours réellement en cours (les
+baux des runners idle ne comptent pas), l'annulation d'une entrée échouée
+avec liste rétablie, le rejeu sur une veille active, le rattrapage au réveil
+et la consignation dans le marqueur.
 
 ```bash
 PYTHONPATH=src python -m unittest tests.test_6868_replication -v

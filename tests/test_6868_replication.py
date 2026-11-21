@@ -24,8 +24,10 @@ sur les points sensibles du lot (SQL, droits) :
   `DROP ROLE` ;
 - `etat.sh` : colonnes réelles de `pg_stat_wal_receiver` (pas de `*_lag`) ;
 - le mode veille (#8027) : primaire sur le hub exigé, sauvegarde logique
-  récente exigée (dérogation consignée), fin des tours attendue, liste
-  synchrone vidée et consignée, réveil après rattrapage, refus si un autre
+  récente exigée (dérogation consignée), fin des tours réellement en cours
+  attendue (baux des runners idle ignorés), liste synchrone vidée et
+  consignée, annulation d'une entrée échouée (liste rétablie), rejeu sans
+  défaire une veille active, réveil après rattrapage, refus si un autre
   gestionnaire tient la liste ;
 - aucun mot de passe en argument de processus.
 """
@@ -202,7 +204,12 @@ elif "replay_lsn >= pg_current_wal_flush_lsn()" in q:
                     and champs[1] == "streaming" and lsn(champs[4]) >= flush):
                 print(champs[0])
 elif "FROM agent_registry" in q and "count(*)" in q:
-    print(lire("tours", "0"))
+    # #8027 : un bail vivant d'agent idle ne compte pas ; seul un tour
+    # réellement en cours (status = 'running') bloque la veille.
+    if "status = 'running'" in q:
+        print(lire("tours", "0"))
+    else:
+        print(lire("baux", lire("tours", "0")))
 elif "SELECT application_name FROM pg_stat_replication" in q:
     # B1 : seuls les candidats nommés et réellement en streaming comptent.
     noms = set(re.findall(r"'([^']+)'", q.split(" IN (", 1)[1]))
@@ -591,6 +598,10 @@ class ReplicationTest(unittest.TestCase):
     def tours(self, nombre):
         (self.state / "tours").write_text(str(nombre), encoding="utf-8")
 
+    def baux(self, nombre):
+        """Baux vivants d'agents, y compris idle : ne comptent pas en veille."""
+        (self.state / "baux").write_text(str(nombre), encoding="utf-8")
+
     def flux(self, lignes, flush="0/5000000"):
         (self.state / "replication").write_text(
             "".join("|".join(ligne) + "\n" for ligne in lignes), encoding="utf-8")
@@ -891,24 +902,62 @@ class ReplicationTest(unittest.TestCase):
                          "sans: minuteur de sauvegarde en panne")
         self.assertEqual(champs["resultat"], "ok")
 
-    def test_mode_veille_attend_la_fin_des_tours(self):
-        env = self.hub_primaire(tours=3)
-        resultat = self.run_script("mode-veille.sh", "entrer", env=env, attendu=1)
-        self.assertIn("tours encore en cours (3)", resultat.stderr)
+    def test_mode_veille_ignore_les_baux_des_agents_inactifs(self):
+        # B1 de revue : un runner idle garde son bail ; seul un tour
+        # réellement en cours (status running) doit retenir la veille.
+        env = self.hub_primaire(tours=0)
+        self.baux(41)
+        entre = self.run_script("mode-veille.sh", "entrer", env=env)
+        self.assertIn("veille : tours en cours : 0", entre.stdout)
         champs = self.etat_veille_champs()
         self.assertEqual(champs["mode"], "veille")
+        self.assertEqual(champs["tours"], "0")
+        self.assertEqual(champs["resultat"], "ok")
+
+    def test_mode_veille_attend_la_fin_des_tours(self):
+        env = self.hub_primaire(tours=3)
+        self.baux(41)
+        self.flux([["ameesh-agents-1", "streaming", "quorum",
+                    "0/5000000", "0/5000000"]], flush="0/5000000")
+        resultat = self.run_script("mode-veille.sh", "entrer", env=env, attendu=1)
+        self.assertIn("tours encore en cours (3)", resultat.stderr)
+        # B2 de revue : l'entrée échouée est annulée, la liste synchrone est
+        # rétablie et le marqueur ne force plus la liste vide.
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["mode"], "actif")
         self.assertEqual(champs["tours"], "3")
         self.assertEqual(champs["resultat"], "tours-restants")
-        # La liste est déjà vide (état sûr), mais la sortie non nulle interdit
-        # au déclencheur d'arrêter les agents.
-        self.assertIn("synchronous_standby_names = ''",
-                      self.fragment().read_text(encoding="utf-8"))
+        fragment = self.fragment().read_text(encoding="utf-8")
+        self.assertNotIn("# mode veille", fragment)
+        self.assertIn("synchronous_standby_names = 'ANY 1 (", fragment)
+        self.assertEqual(
+            (self.state / "params" / "synchronous_standby_names")
+            .read_text(encoding="utf-8"),
+            'ANY 1 ("ameesh-agents-1", "ameesh-agents-2")')
 
         self.tours(0)
         self.run_script("mode-veille.sh", "entrer", env=env)
         champs = self.etat_veille_champs()
+        self.assertEqual(champs["mode"], "veille")
         self.assertEqual(champs["tours"], "0")
         self.assertEqual(champs["resultat"], "ok")
+
+    def test_mode_veille_reentree_echouee_ne_defait_pas_la_veille(self):
+        env = self.hub_primaire()
+        self.run_script("mode-veille.sh", "entrer", env=env)
+        # Un rejeu qui échoue (tour apparu, base illisible) ne doit jamais
+        # rétablir la liste ni retirer le marqueur : la veille est déjà en
+        # place et les agents peuvent être arrêtés.
+        self.tours(1)
+        self.flux([["ameesh-agents-1", "streaming", "quorum",
+                    "0/5000000", "0/5000000"]], flush="0/5000000")
+        resultat = self.run_script("mode-veille.sh", "entrer", env=env, attendu=1)
+        self.assertIn("tours encore en cours (1)", resultat.stderr)
+        champs = self.etat_veille_champs()
+        self.assertEqual(champs["mode"], "veille")
+        self.assertEqual(champs["resultat"], "tours-restants")
+        self.assertIn("synchronous_standby_names = ''",
+                      self.fragment().read_text(encoding="utf-8"))
 
     def test_mode_veille_reveil_attend_le_rattrapage(self):
         env = self.hub_primaire()
@@ -946,11 +995,14 @@ class ReplicationTest(unittest.TestCase):
         resultat = self.run_script("mode-veille.sh", "entrer", env=env, attendu=1)
         self.assertIn("autre gestionnaire", resultat.stderr)
         champs = self.etat_veille_champs()
-        self.assertEqual(champs["mode"], "veille")
+        # Entrée annulée : le marqueur ne force plus la liste vide ; c'est le
+        # gestionnaire externe qui tient la liste, pas notre veille.
+        self.assertEqual(champs["mode"], "actif")
         self.assertEqual(champs["resultat"], "echec-gestionnaire")
         self.assertEqual(champs["sync_apres"], 'ANY 1 ("ameesh-agents-1")')
-        self.assertIn("synchronous_standby_names = ''",
-                      self.fragment().read_text(encoding="utf-8"))
+        fragment = self.fragment().read_text(encoding="utf-8")
+        self.assertNotIn("# mode veille", fragment)
+        self.assertIn("synchronous_standby_names = ''", fragment)
 
     def test_secrets_0600_et_validation(self):
         self.serveur(demarre=False)

@@ -327,11 +327,12 @@ retirer_mode_veille() {
   [[ ! -e $VEILLE_ETAT ]] || rm -f -- "$VEILLE_ETAT"
 }
 
-# Nombre de tours encore en cours sur le mesh : un bail vivant dans
-# agent_registry. Le déclencheur de veille draine les tours ; ce compte est
-# la preuve qu'aucun tour ne sera tué par l'arrêt des agents.
+# Nombre de tours encore en cours sur le mesh : les agents réellement en tour
+# (statut « running » et bail vivant), pas tous les baux. Un runner garde son
+# bail quand il est idle : compter les baux empêcherait toute veille tant que
+# les runners d'AG1/AG2 vivent, et ils ne s'arrêtent qu'après « entrer ».
 tours_en_cours() {
-  psql_ameesh -tAc "SELECT count(*) FROM agent_registry WHERE lease_owner IS NOT NULL AND lease_expires_at > clock_timestamp()"
+  psql_ameesh -tAc "SELECT count(*) FROM agent_registry WHERE status = 'running' AND lease_owner IS NOT NULL AND lease_expires_at > clock_timestamp()"
 }
 
 # Nom de slot physique d'un nœud : stable, sans tiret (les tirets sont

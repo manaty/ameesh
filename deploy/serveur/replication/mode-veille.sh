@@ -99,6 +99,10 @@ sync_avant=""
 sync_apres=""
 sauvegarde=""
 raison_etat=$raison
+marqueur_pose=0
+nouvelle_entree=0
+resultat_echec=""
+tours_echec="?"
 
 maintenant() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -136,6 +140,26 @@ consigner() {
     "resultat=${resultat}" \
     "raison=${raison_etat:-}"
 }
+
+# Annule une entrée fraîche qui a échoué avant que le déclencheur n'arrête
+# les agents : sans cela le marqueur resterait posé et la liste synchrone
+# vide, dégradant la durabilité sans échéance. On rétablit donc la liste si
+# un candidat est en flux, on retire le marqueur et on consigne l'échec en
+# mode=actif (aucun forçage de liste vide). Une entrée déjà en veille n'est
+# jamais défaite par ce retour arrière : l'état de veille existant prime.
+annuler_entree() {
+  set +e
+  local resultat=${resultat_echec:-echec-entree}
+  (( marqueur_pose && nouvelle_entree )) || return 0
+  retirer_mode_veille
+  ecrire_fichier "$CONF_FRAGMENT" 0644 "$(fragment_conf)"
+  pg_ctlcluster "$PG_VERSION" main reload
+  sync_apres=$(psql_local -tAc 'SHOW synchronous_standby_names' 2>/dev/null || true)
+  consigner actif "$tours_echec" "$resultat"
+  log "entrée annulée : marqueur retiré, liste synchrone rétablie (${sync_apres:-vide}) ; agents à ne pas arrêter"
+}
+
+trap 'code=$?; if (( code != 0 )); then annuler_entree; fi; exit "$code"' EXIT
 
 # Le primaire doit être le hub : la veille n'a de sens que sur la VM qui reste
 # allumée. Un primaire sur un agent est une bascule de secours, pas un état de
@@ -226,8 +250,12 @@ entrer() {
   fi
 
   # Le marqueur est posé avant la configuration : le fragment le lit et vide
-  # la liste, même si un candidat est encore en flux.
+  # la liste, même si un candidat est encore en flux. Une entrée fraîche est
+  # annulée par le trap EXIT si la suite échoue (les agents ne sont pas
+  # arrêtés) ; une entrée déjà en veille n'est jamais défaite.
+  (( veille )) || nouvelle_entree=1
   consigner veille "?" "en-cours"
+  marqueur_pose=1
   ecrire_fichier "$CONF_FRAGMENT" 0644 "$(fragment_conf)"
   controler_configuration
   pg_ctlcluster "$PG_VERSION" main reload
@@ -241,13 +269,16 @@ entrer() {
   done
   if [[ -n $apres ]]; then
     sync_apres=$apres
+    resultat_echec="echec-gestionnaire"
     consigner veille "?" "echec-gestionnaire"
     die "synchronous_standby_names=$apres après rechargement : un autre gestionnaire (Patroni ?) tient la liste ; veille refusée, agents à ne pas arrêter"
   fi
 
   if ! restants=$(attendre_tours); then
+    tours_echec=$restants
+    resultat_echec="tours-restants"
     consigner veille "$restants" "tours-restants"
-    die "tours encore en cours ($restants) après ${ATTENTE_TOURS}s : ne pas arrêter les agents (la liste synchrone reste vide)"
+    die "tours encore en cours ($restants) après ${ATTENTE_TOURS}s : ne pas arrêter les agents (entrée annulée, liste synchrone rétablie)"
   fi
   consigner veille "0" "ok"
 
