@@ -18,7 +18,7 @@ def canon(**cards):
 class CostStatesTest(unittest.TestCase):
     def test_service_host_is_neither_idle_candidate_nor_drainable(self):
         cards = [canon(hub={'capacity': 'services', 'policy': {'max_agents': 0}})]
-        caps, _ = host_idle.capacities(cards, ['hub'], baseline_hosts=0)
+        caps, _ = host_idle.capacities(cards, ['hub'], protected=['hub'], baseline_hosts=2)
         self.assertEqual(caps['hub'], 'services')
         fp = {'state': 'idle', 'capacity': caps['hub'], 'idle_since': 1, 'unknown': []}
         self.assertEqual(host_capacity_alerts.project({'hub': fp}, [], now=4000), [])

@@ -357,7 +357,7 @@ def capacities(canons, names, *, protected=(), baseline_hosts=2):
         costs[name] = cost_states(cards)
     if sum(v == 'baseline' for v in out.values()) < baseline_hosts:
         for name in protected:
-            if name in out and out[name] != CAPACITY_NONE:
+            if name in out and out[name] in CAPACITY_CLASSES:
                 out[name] = 'baseline'
     return out, costs
 
