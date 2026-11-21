@@ -7,6 +7,7 @@ import hashlib
 import io
 import os
 import shutil
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -338,7 +339,24 @@ class EncryptArgvTest(unittest.TestCase):
         self.assertLess(argv.index("--no-autostart"), argv.index("--encrypt"))
 
 
+def _gpg_agent_can_start() -> bool:
+    """GnuPG 2 crée et utilise ses clés via gpg-agent, qui exige AF_UNIX.
+
+    Le guest d'offload refuse `socket(AF_UNIX)` (seccomp, R1-B3 de #354,
+    #4071) : la génération de clé échoue alors que `gpg` est présent. C'est
+    une limite d'environnement, pas un défaut de la sauvegarde ; les autres
+    tests du module continuent de tourner au guest (#8016).
+    """
+    try:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError:
+        return False
+    probe.close()
+    return True
+
+
 @unittest.skipUnless(shutil.which("gpg"), "gpg missing")
+@unittest.skipUnless(_gpg_agent_can_start(), "gpg-agent needs AF_UNIX sockets")
 class EncryptionTest(_Tmp):
     def setUp(self) -> None:
         super().setUp()
