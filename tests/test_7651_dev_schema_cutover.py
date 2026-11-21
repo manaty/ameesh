@@ -227,7 +227,6 @@ class DevCutoverTest(support.PgTestCase):
         from tests.test_3845_paquet_horaire import ph
 
         fixture = ReleaseFixture()
-        self.addCleanup(fixture.doCleanups)
         # The Git fixture changes HOME; keep the test DB's ordinary libpq
         # credential path, without copying or reading its contents.
         pgpass = mock.patch.dict(os.environ, {
@@ -246,6 +245,8 @@ class DevCutoverTest(support.PgTestCase):
             'GIT_CONFIG_VALUE_%d' % count: repo})
         safe.start()
         self.addCleanup(safe.stop)
+        # Restore the fixture's environment before removing its safe.directory.
+        self.addCleanup(fixture.doCleanups)
         fixture.setUp()
         sha = subprocess.check_output(['git', '-C', repo, 'rev-parse', 'HEAD'],
                                       text=True).strip()
