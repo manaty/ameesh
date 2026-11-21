@@ -170,7 +170,8 @@ class FakeDb:
     def close(self):
         pass
     def query(self, sql, params=()):
-        if 'from agent_watches' in ' '.join(sql.lower().split()):
+        normalized = ' '.join(sql.lower().split())
+        if normalized.startswith('select ') and 'from agent_watches' in normalized:
             return []
         raise RuntimeError('banc #5947 : base simulée, query non servi')
     def __getattr__(self, name):
