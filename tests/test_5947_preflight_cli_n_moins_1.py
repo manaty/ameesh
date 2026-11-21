@@ -60,6 +60,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ameesh import canon
 
@@ -104,7 +105,20 @@ def preparer_tags(root: Path = ROOT, *, timeout: float = 30.0) -> bool:
     sautait alors sans bruit, et le rouge d'un lot ne se voyait qu'à la CI du
     paquet (#7933, 8 h 20). Hors CI, on rapatrie une fois, borné ; un échec
     (réseau, distant absent, verrou) laisse le saut nommé qui suit.
+
+    #7985 : l'instantané d'offload est un dépôt neuf à commit racine, sans
+    histoire ni distant : aucun tag n'y est atteignable et un `fetch` y
+    attendrait 30 s pour rien à chaque import du guest (revue #44935). On le
+    constate sans réseau.
     """
+    try:
+        parents = subprocess.run(
+            ['git', '-C', str(root), 'rev-list', '--parents', '-n', '1', 'HEAD'],
+            capture_output=True, text=True, timeout=min(float(timeout), 10.0))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    if parents.returncode != 0 or len(parents.stdout.split()) < 2:
+        return False
     try:
         proc = subprocess.run(
             ['git', '-C', str(root), 'fetch', '--quiet', '--tags',
@@ -578,6 +592,33 @@ class TagsPrepareTest(unittest.TestCase):
             self.assertEqual(release_precedente(clone), '')
             self.assertTrue(preparer_tags(clone))
             self.assertEqual(release_precedente(clone), 'v1.0.0')
+
+    def test_un_instantane_sans_histoire_ne_lance_aucun_fetch(self):
+        """#7985 : le guest reçoit un dépôt à commit racine : pas de réseau."""
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / 'snapshot'
+            subprocess.run(['git', 'init', '-q', '--initial-branch=main',
+                            str(snapshot)], check=True, capture_output=True)
+            self._git(snapshot, 'config', 'user.email', 't@invalid')
+            self._git(snapshot, 'config', 'user.name', 'test')
+            (snapshot / 'a').write_text('a\n', encoding='utf-8')
+            self._git(snapshot, 'add', 'a')
+            self._git(snapshot, 'commit', '-q', '-m', 'instantané')
+            self._git(snapshot, 'remote', 'add', 'origin',
+                      str(Path(tmp) / 'absent.git'))
+            vrai = subprocess.run
+            appels = []
+
+            def espion(*args, **kwargs):
+                appels.append(args)
+                if args and 'fetch' in args[0]:
+                    raise AssertionError(
+                        'fetch réseau sur un instantané sans histoire')
+                return vrai(*args, **kwargs)
+
+            with mock.patch.object(subprocess, 'run', side_effect=espion):
+                self.assertFalse(preparer_tags(snapshot))
+            self.assertFalse([a for a in appels if 'fetch' in a[0]], appels)
 
     def test_le_motif_d_un_saut_est_nomme_non_concluant(self):
         self.assertTrue(motif_n1('', '').startswith('non concluant (canon §3)'))

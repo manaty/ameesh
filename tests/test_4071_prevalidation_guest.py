@@ -79,6 +79,16 @@ class GuestListTest(unittest.TestCase):
             "test_l161f_plan", "test_1323_actif",
         } <= set(listed))
 
+    def test_le_preflight_n_1_saute_au_guest_est_declare(self):
+        """#7985 : l'instantané d'offload n'a pas d'histoire, donc pas de tags.
+
+        Le banc N-1 y saute toujours ; sans déclaration, chaque prévalidation
+        de lot deviendrait non concluante (revue #44935). Le saut reste nommé.
+        """
+        listed = pv.GUEST_EXCLUSIONS["ameesh"]
+        self.assertIn("test_5947_preflight_cli_n_moins_1", listed)
+        self.assertIn("instantané", listed["test_5947_preflight_cli_n_moins_1"])
+
     def test_unknown_profile_has_no_exclusion(self):
         self.assertEqual(pv.guest_excluded("default"), ())
         self.assertEqual(pv.guest_excluded(""), ())
@@ -148,6 +158,37 @@ class ProofTest(unittest.TestCase):
                          ["tests.%s.C.test_x" % FAKE])
         self.assertIn("exclu", " ".join(report["detail"]))
         self.assertEqual([item["module"] for item in report["excluded"]], [FAKE])
+
+    def test_an_excluded_contract_skipped_is_not_run_incomplete(self):
+        """#7985 : un contrat déclaré exclu du guest peut sauter sans bruit.
+
+        Le préflight N-1 saute sur l'instantané d'offload (pas d'histoire, pas
+        de tags) ; l'exclusion nommée garde la preuve verte au lieu de rendre
+        chaque lot non concluant (revue #44935).
+        """
+        plan = plan_with_host()
+        plan["contract"] = ["test_cluster", FAKE]
+        selection = pv.selection(plan, head=A, excluded=exclusions())
+        flux = "\n".join([
+            pv.PART_MARK + "psycopg:1",
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                        "part": "psycopg:1", "module": "test_a",
+                        "test": "tests.test_a.C.test_x", "statut": "succes"}),
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                        "part": "psycopg:1", "module": "test_cluster",
+                        "test": "tests.test_cluster.C.test_x", "statut": "succes"}),
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                        "part": "psycopg:1", "module": FAKE,
+                        "test": "tests.%s.C.test_x" % FAKE, "statut": "saute"}),
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                        "part": "psycopg:1", "statut": "succes", "duree_s": 1.0}),
+        ])
+        report = selection.proof(
+            lot=4071, host="ameesh-agents-3",
+            run={"outcome": "green", "exit": 0, "seconds": 1.0},
+            flow=pv.parse_flow(flux))
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["skipped_contracts"], [])
 
     def test_a_real_failure_next_to_an_excluded_one_stays_red(self):
         report = self.sel().proof(

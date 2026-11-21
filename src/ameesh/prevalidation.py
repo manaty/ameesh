@@ -130,6 +130,9 @@ GUEST_EXCLUSIONS: dict[str, dict[str, str]] = {
             "guest (#4044) : plan L161f dans le snapshot (1 échec)",
         "test_1323_actif":
             "guest (#4044) : point d'entrée deploy/mise-a-jour (1 échec)",
+        "test_5947_preflight_cli_n_moins_1":
+            "guest : instantané sans histoire (offload), les tags de release "
+            "ne voyagent pas ; le banc N-1 se joue localement et au paquet (#7985)",
     },
 }
 
@@ -328,8 +331,8 @@ class Selection:
                       if fins_par_part.get(p) not in ("succes", "echec")]
         missing_modules = [m for m in self.modules
                            if m not in set(executed) and m not in excluded_names]
-        #: #7985 : un contrat dont tous les tests sont sautés n'est pas joué
-        #: (canon §3) : la preuve le consigne non concluant, jamais vert.
+        #: #7985 : un contrat ayant au moins un test sauté n'est pas entièrement
+        #: joué (canon §3) : la preuve le consigne non concluant, jamais vert.
         skipped_modules = {str(m) for m in (flow.get("skipped_modules") or ())}
         skipped_contracts = [m for m in self.contracts
                              if m in skipped_modules and m not in excluded_names]
@@ -979,11 +982,10 @@ def parse_flow(text: str) -> dict:
     Rend les modules réellement exécutés (événements `test`), le nombre de
     tests, les tests en échec (nom complet, pour le refus nommé), les statuts
     de fin par part et les parts vues. Un part sans événement `fin` reste
-    visible : c'est un run incomplet, jamais un vert. #7985 : un module dont
-    tous les tests sont sautés est nommé à part (`skipped_modules`) — sauté
-    n'est pas joué (canon §3)."""
+    visible : c'est un run incomplet, jamais un vert. #7985 : un module ayant
+    au moins un test sauté est nommé à part (`skipped_modules`) — sauté n'est
+    pas joué (canon §3), même si d'autres tests du module passent."""
     modules: set = set()
-    played: set = set()
     skipped: set = set()
     failed: list[str] = []
     environment_hits: set = set()
@@ -1019,8 +1021,6 @@ def parse_flow(text: str) -> dict:
                 modules.add(module)
                 if str(event.get("statut") or "") == "saute":
                     skipped.add(module)
-                else:
-                    played.add(module)
             if str(event.get("statut") or "") in ("echec", "erreur",
                                                   "succes_inattendu") \
                     and event.get("test"):
@@ -1048,7 +1048,7 @@ def parse_flow(text: str) -> dict:
                         if nom in environment_hits and nom not in body_hits)
     return {"modules": tuple(sorted(modules)), "failed": tuple(failed), "tests": tests,
             "environment": environment,
-            "skipped_modules": tuple(sorted(skipped - played)),
+            "skipped_modules": tuple(sorted(skipped)),
             "parts": tuple(parts), "fins": tuple(fins), "fins_par_part": fins_par_part,
             "failed_by_part": {part: tuple(names)
                                for part, names in failed_by_part.items()}}
