@@ -8,6 +8,9 @@ sous `dir/plan.json` dans l'arbre de travail (qui peut différer du SHA). Le
 `head-moved` alors que la tête n'avait pas bougé. Le geste refuse désormais
 avant toute construction avec `plan-path-conflict` ; `head-moved` reste réservé
 à la tête qui a réellement bougé.
+
+#7999 : le plan du refus fixe `contract_policy=None` : la politique de contrats
+n'est jamais lue du canon de l'hôte (AG1/AG3 en déclarent une).
 """
 from __future__ import annotations
 
@@ -17,11 +20,37 @@ import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
+from ameesh import contract_plan, mechanics
 from ameesh import prevalidation as pv
 
 A = "a" * 40
 B = "b" * 40
+
+#: #7999 : le canon de l'hôte (AG1/AG3) déclare `contract_selection`.
+HOST_POLICY = mechanics.ContractSelection("tests/parts/contrats.json")
+
+
+def host_canon_declares_a_policy():
+    """#7999 : contexte d'un hôte qui déclare une politique de contrats."""
+    return mock.patch.object(contract_plan, "configured_policy",
+                             return_value=HOST_POLICY)
+
+
+_policy_patch = None
+
+
+def setUpModule():
+    # Un appel resté en `configured` rougit sous ce contexte, comme sur AG1.
+    global _policy_patch
+    _policy_patch = host_canon_declares_a_policy()
+    _policy_patch.start()
+
+
+def tearDownModule():
+    if _policy_patch is not None:
+        _policy_patch.stop()
 
 
 def _git(repo: str, *args: str) -> str:
@@ -176,7 +205,7 @@ class ValidateRefusalTest(unittest.TestCase):
                     repo=tmp, runner=no_run,
                     snapshotter=lambda *args: self.fail(
                         "l'arbre ne doit pas être construit après le refus"),
-                    git_runner=_git_runner())
+                    git_runner=_git_runner(), contract_policy=None)
             self.assertEqual(caught.exception.cause, "plan-path-conflict")
             self.assertIn("dir", caught.exception.why)
 
