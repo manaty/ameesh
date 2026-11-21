@@ -227,15 +227,27 @@ class DevCutoverTest(support.PgTestCase):
         from tests.test_3845_paquet_horaire import ph
 
         fixture = ReleaseFixture()
-        self.addCleanup(fixture.doCleanups)
         # The Git fixture changes HOME; keep the test DB's ordinary libpq
         # credential path, without copying or reading its contents.
         pgpass = mock.patch.dict(os.environ, {
             'PGPASSFILE': os.environ.get('PGPASSFILE', str(Path.home() / '.pgpass'))})
         pgpass.start()
         self.addCleanup(pgpass.stop)
-        fixture.setUp()
         repo = str(support.REPO)
+        # #8017 : dans l'invité de prévalidation, l'arbre appartient à un autre
+        # UID que le job et le HOME de la fixture n'a pas de `safe.directory` :
+        # Git refuse le dépôt. Ce dépôt seul (jamais `*`) est déclaré sûr par
+        # `GIT_CONFIG_*`, hérité par les sous-processus.
+        count = int(os.environ.get('GIT_CONFIG_COUNT') or 0)
+        safe = mock.patch.dict(os.environ, {
+            'GIT_CONFIG_COUNT': str(count + 1),
+            'GIT_CONFIG_KEY_%d' % count: 'safe.directory',
+            'GIT_CONFIG_VALUE_%d' % count: repo})
+        safe.start()
+        self.addCleanup(safe.stop)
+        # Restore the fixture's environment before removing its safe.directory.
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         sha = subprocess.check_output(['git', '-C', repo, 'rev-parse', 'HEAD'],
                                       text=True).strip()
         before = self.snapshot(self.schema)
