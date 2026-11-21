@@ -7083,6 +7083,16 @@ class AgentWorker(threading.Thread):
             # système vérifié) passe avant la suite et la consigne en attente.
             self.nudged = False
             return self._courrier_spec("urgent", autorises)
+        if messages and self._mail_overdue(messages):
+            # #7976 : un courrier actif en retard passe avant la suite après
+            # plafond, la consigne en attente et le réveil programmé. Sans ce
+            # rang, un agent en tours enchaînés (dsh : rien d'ordinaire au
+            # hook en cours de tour, L514) le laissait 1 h 40 derrière eux.
+            spec = self._mail_spec(messages)
+            if spec is not None:
+                self.nudged = False
+                self._reprise_attach = False
+                return spec
         if self.suite:
             lot = self.turn_lot({"kind": "suite", "prompt": "", "ids": []})
             if not self._lot_workdir_blocked(lot):
@@ -7734,6 +7744,9 @@ class AgentWorker(threading.Thread):
         * passifs (accusé, copie, diffusion à tous : `mail.passive_reason`) :
           jamais dus ; lus au tour suivant, ou par le hook pendant un tour.
 
+        #7976 : un message actif en retard (`_mail_overdue`) est dû tout de
+        suite, quelle que soit la fenêtre.
+
         #7632 : une fiche qui déclare `reveil` remplace les deux premières
         règles par la sienne (`_reveil_due`) : ses natures immédiates ouvrent
         un tour tout de suite, le reste (événements compris) attend la fin de
@@ -7769,13 +7782,48 @@ class AgentWorker(threading.Thread):
             # L81 (étude §6.3) : tant qu'un message humain attend, l'entretien
             # d'une session résidente lui laisse la place (fenêtre de calme).
             self._dernier_humain = time.monotonic()
-        if not mail_due and not events_due:
+        if not mail_due and not events_due and not self._mail_overdue(active):
             return None  # regroupement en cours, ou rien que du courrier passif
         if events:
             registry.mark_event_wake(self.db, self.name)
         rows = active + passive
         return self._courrier_spec(
             "event" if all(mail.is_event(m) for m in rows) else "mail", rows)
+
+    #: #7976 : âge (création, horloge de la base) au-delà duquel un courrier
+    #: actif non remis est en retard : il ouvre un tour tout de suite, sans
+    #: fenêtre de regroupement (L125, C9, #3451, #7632), et passe avant la
+    #: suite, la consigne en attente et le réveil programmé. Sous la borne de
+    #: la sonde staging (`sante-courrier.py --souffrance`, 900 s ; cette
+    #: borne n'est pas élargie) : un tour qui s'achève ne laisse plus en
+    #: attente le courrier arrivé pendant lui. Hors cadence `reveil` déclarée
+    #: (#7632), qui garde sa propre règle.
+    MAIL_OVERDUE_S = 300.0
+
+    def _mail_overdue(self, rows: list[dict]) -> bool:
+        """#7976 : un message actif de `rows` attend-il depuis au moins
+        `MAIL_OVERDUE_S` ? Le courrier passif n'ouvre jamais de tour ; un
+        message en cours de remise (`deja_consigne` : réservation active ou à
+        expirer) non plus, comme pour la sonde : le réserver échouerait et le
+        tour, vide, retarderait la suite ou la consigne.
+
+        Une cadence `reveil` déclarée (#7632) garde sa règle entière (fenêtre
+        depuis l'arrivée ET depuis la fin du tour) : le retard ne la
+        raccourcit pas, il ne s'applique pas à elle."""
+        seuil = float(self.MAIL_OVERDUE_S)
+        if seuil <= 0 or reveil_mod.of(self.agent) is not None:
+            return False
+        now = time.time()
+        return any(not mail.passive_reason(m) and not mail.maybe_redelivered(m)
+                   and now - float(m.get("created_ts") or now) >= seuil
+                   for m in rows)
+
+    def _retard_avant(self) -> float | None:
+        """#7976 : l'instant (epoch) avant lequel un message est en retard,
+        pour l'aperçu de `mail.prompt_for` dans un tour déjà ouvert ; None si
+        le seuil est nul."""
+        seuil = float(self.MAIL_OVERDUE_S)
+        return time.time() - seuil if seuil > 0 else None
 
     def _reveil_due(self, policy: dict, rows: list[dict]) -> bool:
         """#7632 : le courrier actif en attente ouvre-t-il un tour sous la
@@ -8110,7 +8158,8 @@ class AgentWorker(threading.Thread):
         refait le choix au moment de réserver.
         """
         prompt, retenus, reste = mail.prompt_for(self.db, messages, kind=kind,
-                                                 budget=self._budget_courrier())
+                                                 budget=self._budget_courrier(),
+                                                 en_retard_avant=self._retard_avant())
         ids = [int(m["id"]) for m in retenus if m.get("id") is not None]
         # #6005 : l'attribution d'appelant du tour est celle des messages
         # réellement servis ; plusieurs attributions différentes = ambigu, le
@@ -8602,8 +8651,10 @@ class AgentWorker(threading.Thread):
         kind = spec["kind"]
         budget = self._budget_courrier()
         envelopes = spec.get("envelopes")
+        retard = self._retard_avant()
         _texte, retenus, reste = mail.prompt_for(self.db, candidats, kind=kind,
-                                                 budget=budget, envelopes=envelopes)
+                                                 budget=budget, envelopes=envelopes,
+                                                 en_retard_avant=retard)
         jeton = mail.new_token()
         try:
             reserves = mail.reserve(
@@ -8623,7 +8674,8 @@ class AgentWorker(threading.Thread):
         # La consigne est rendue sur les messages RÉSERVÉS (leur état exact :
         # « re-livré » compris), dans le même budget.
         prompt, inclus, _ = mail.prompt_for(self.db, reserves, kind=kind, budget=budget,
-                                            extra_remaining=reste, envelopes=envelopes)
+                                            extra_remaining=reste, envelopes=envelopes,
+                                            en_retard_avant=retard)
         ids = [int(m["id"]) for m in inclus]
         # #2810 : ce tour sert exactement ces messages (la réservation peut
         # différer de la sélection).
