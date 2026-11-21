@@ -560,6 +560,19 @@ class ContratToujoursTest(unittest.TestCase):
         self.assertIn('test_5947_preflight_cli_n_moins_1', selection)
 
 
+class DesignationTest(unittest.TestCase):
+    """#7985 : la prévalidation ne bloque que sur les sauts du banc N-1."""
+
+    def test_les_classes_du_banc_n_1_sont_designees(self):
+        from ameesh import prevalidation as pv
+        designes = pv.DESIGNATED_SKIPS['test_5947_preflight_cli_n_moins_1']
+        for classe in (PreflightCliPrecedentTest, IncidentRejoueTest):
+            prefixe = ('tests.test_5947_preflight_cli_n_moins_1.%s'
+                       % classe.__name__)
+            with self.subTest(classe=classe.__name__):
+                self.assertIn(prefixe, designes)
+
+
 class TagsPrepareTest(unittest.TestCase):
     """#7985 : sans tags, le module les rapatrie ; le saut reste nommé."""
 

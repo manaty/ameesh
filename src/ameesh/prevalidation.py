@@ -136,6 +136,27 @@ GUEST_EXCLUSIONS: dict[str, dict[str, str]] = {
     },
 }
 
+#: #7985 : les sauts qui disent qu'un contrat n'a pas été joué, désignés par
+#: module et préfixe de test. Un contrat peut sauter pour une raison
+#: d'environnement (psql, PG < 16, root, appareil absent…) : ce saut reste
+#: consigné mais ne rend pas la preuve non concluante (canon §3, revue
+#: #44935). Seul le banc N-1, lui, saute parce que le contrat n'a pas été
+#: joué ; ses classes sont nommées ici.
+DESIGNATED_SKIPS: dict[str, tuple[str, ...]] = {
+    "test_5947_preflight_cli_n_moins_1": (
+        "tests.test_5947_preflight_cli_n_moins_1.PreflightCliPrecedentTest",
+        "tests.test_5947_preflight_cli_n_moins_1.IncidentRejoueTest",
+    ),
+}
+
+
+def _designated_skip(module: str, tests) -> bool:
+    """#7985 : ce module de contrat a-t-il sauté un test désigné ?"""
+    prefixes = DESIGNATED_SKIPS.get(str(module))
+    if not prefixes:
+        return False
+    return any(str(name).startswith(prefixes) for name in (tests or ()))
+
 
 class PrevalidationError(Exception):
     """Un refus nommé : la prévalidation s'arrête, elle ne suppose rien.
@@ -261,9 +282,10 @@ class Selection:
     #: #3800 : repli contractuel quand la sélection n'a pas pu être prouvée ;
     #: porte la cause d'origine et les modules de contrat réellement joués.
     fallback: dict | None = None
-    #: #7985 : modules du contrat (toujours.txt) de la sélection. Un contrat
-    #: dont tous les tests sont sautés n'est pas prouvé : la preuve le dit
-    #: non concluant (canon §3), jamais vert.
+    #: #7985 : modules du contrat (toujours.txt) de la sélection. Un saut
+    #: désigné (banc N-1) n'est pas un test joué : la preuve le dit non
+    #: concluant (canon §3), jamais vert. Les sauts d'environnement d'un
+    #: contrat restent consignés sans bloquer (revue #44935).
     contracts: tuple[str, ...] = ()
     #: #4071 : modules retirés du plan parce que le guest ne peut pas les
     #: exécuter, avec leur raison nommée. Ils restent dans la suite complète.
@@ -331,11 +353,14 @@ class Selection:
                       if fins_par_part.get(p) not in ("succes", "echec")]
         missing_modules = [m for m in self.modules
                            if m not in set(executed) and m not in excluded_names]
-        #: #7985 : un contrat ayant au moins un test sauté n'est pas entièrement
-        #: joué (canon §3) : la preuve le consigne non concluant, jamais vert.
-        skipped_modules = {str(m) for m in (flow.get("skipped_modules") or ())}
-        skipped_contracts = [m for m in self.contracts
-                             if m in skipped_modules and m not in excluded_names]
+        #: #7985 : seuls les sauts désignés (banc N-1) disent que le contrat
+        #: n'a pas été joué ; les sauts d'environnement d'un contrat restent
+        #: consignés sans rendre la preuve non concluante (revue #44935).
+        skipped_tests = flow.get("skipped_tests") or {}
+        skipped_contracts = [
+            m for m in self.contracts
+            if m not in excluded_names
+            and _designated_skip(m, skipped_tests.get(m) or ())]
         detail: list[str] = []
         if self.fallback:
             #: #3800 : la preuve dit toujours que la sélection n'était pas
@@ -433,7 +458,8 @@ class Selection:
             elif skipped_contracts:
                 outcome = "run-incomplete"
                 causes.append("run-incomplete")
-                detail.append("contrats sautés (non concluants, canon §3) : %s%s"
+                detail.append("contrats sautés (sauts désignés, non concluants, "
+                              "canon §3) : %s%s"
                               % (", ".join(skipped_contracts[:4]),
                                  " (+%d)" % (len(skipped_contracts) - 4)
                                  if len(skipped_contracts) > 4 else ""))
@@ -982,11 +1008,12 @@ def parse_flow(text: str) -> dict:
     Rend les modules réellement exécutés (événements `test`), le nombre de
     tests, les tests en échec (nom complet, pour le refus nommé), les statuts
     de fin par part et les parts vues. Un part sans événement `fin` reste
-    visible : c'est un run incomplet, jamais un vert. #7985 : un module ayant
-    au moins un test sauté est nommé à part (`skipped_modules`) — sauté n'est
-    pas joué (canon §3), même si d'autres tests du module passent."""
+    visible : c'est un run incomplet, jamais un vert. #7985 : les tests
+    sautés sont nommés par module (`skipped_tests`) ; la preuve ne retient
+    que les sauts désignés (`DESIGNATED_SKIPS`), un saut d'environnement
+    restant consigné sans bloquer (revues #44933, #44935)."""
     modules: set = set()
-    skipped: set = set()
+    skipped_tests: dict[str, list[str]] = {}
     failed: list[str] = []
     environment_hits: set = set()
     body_hits: set = set()
@@ -1019,8 +1046,10 @@ def parse_flow(text: str) -> dict:
             module = str(event.get("module") or "")
             if module:
                 modules.add(module)
-                if str(event.get("statut") or "") == "saute":
-                    skipped.add(module)
+                if str(event.get("statut") or "") == "saute" \
+                        and event.get("test"):
+                    nom = str(event["test"])
+                    skipped_tests.setdefault(module, []).append(nom)
             if str(event.get("statut") or "") in ("echec", "erreur",
                                                   "succes_inattendu") \
                     and event.get("test"):
@@ -1048,7 +1077,8 @@ def parse_flow(text: str) -> dict:
                         if nom in environment_hits and nom not in body_hits)
     return {"modules": tuple(sorted(modules)), "failed": tuple(failed), "tests": tests,
             "environment": environment,
-            "skipped_modules": tuple(sorted(skipped)),
+            "skipped_tests": {module: tuple(names)
+                              for module, names in skipped_tests.items()},
             "parts": tuple(parts), "fins": tuple(fins), "fins_par_part": fins_par_part,
             "failed_by_part": {part: tuple(names)
                                for part, names in failed_by_part.items()}}
