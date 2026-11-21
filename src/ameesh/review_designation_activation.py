@@ -2758,6 +2758,24 @@ def _carried_mark(db, lot: int, freeze_id: int, *, since_ts: Optional[float] = N
     return carried[-1] if carried else None
 
 
+def _force_superseded(db, lot: int, freeze: Mapping,
+                      expected: Optional[int]) -> bool:
+    """True when the mark a forced replay was decided on is no longer effective.
+
+    #8008 : a recovery (executor pass, deferred designation) decides `force`
+    on the provisional carried mark it read. The carry may land meanwhile, on
+    another host, and write the final mark under the lot lock; forcing then
+    sends the kept seats a delta request they do not owe. `expected` is the id
+    of the mark the caller read; without it (explicit replay) `force` keeps
+    its #2487 meaning.
+    """
+    if expected is None:
+        return False
+    effective = _effective_mark(db, int(lot), int((freeze or {}).get("id") or 0),
+                                since_ts=float((freeze or {}).get("at_ts") or 0.0))
+    return effective is None or int(effective[0]) != int(expected)
+
+
 def _carried_shape(mark: Mapping) -> dict:
     """La forme rendue par le hook et la reprise pour une désignation gardée."""
     reviewers = []
@@ -4325,7 +4343,8 @@ def _stale(freeze: Mapping, why: str = "") -> dict:
 
 
 def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
-              force: bool = False, refresh_policy: bool = False) -> dict:
+              force: bool = False, refresh_policy: bool = False,
+              expected_mark: Optional[int] = None) -> dict:
     """Replays the latest freeze outside the hook (recovery, CLI).
 
     The selection's mark, its mails and the reviewer column are written in ONE
@@ -4342,7 +4361,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     couvrait la tête (le report a refusé après le gel : les sièges manquants
     doivent être désignés). Sans lui, une désignation reportée déjà écrite est
     rendue telle quelle, et un plan de report encore valable garde les
-    relecteurs reportés sans courrier.
+    relecteurs reportés sans courrier. `expected_mark` (#8008) borne `force`
+    à la marque que l'appelant a lue : si une autre marque est devenue
+    effective (report accompli sur un autre hôte), le rejeu redevient simple.
 
     #3557 : quand le plancher d'avis du lot dépasse le compte enregistré pour
     le dernier gel, la désignation de ce gel est **complétée** — les sièges
@@ -4378,6 +4399,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     if _waiver(item):
         return {"state": "manual", "reviewers": [], "freeze": freeze,
                 "why": "manual waiver (-none)"}
+    if force and _force_superseded(db, int(lot), freeze, expected_mark):
+        # #8008 : the carry landed since the caller decided to force; the
+        # selection lock rechecks it for a carry that lands during `prepare`.
+        force = False
     # #3557 : un plancher posé après le gel relève le besoin ; la désignation
     # enregistrée doit être **complétée** pour ce même gel, pas rejouée telle
     # quelle. #3592 : un journal illisible n'est pas un plancher nul — une
@@ -4596,6 +4621,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         with db.transaction() as tx:
             if not _lock_current_freeze(tx, int(lot), freeze):
                 return _stale(freeze)
+            if force and _force_superseded(tx, int(lot), freeze, expected_mark):
+                # #8008 : the carry writes its final mark under this same lot
+                # lock; one that landed during `prepare` keeps its seats.
+                raise _ForceSuperseded()
             # #5129 : une reprise d'attente lève aussi le sommeil de la
             # famille manquante, sinon le pilote doit encore la réveiller à
             # la main. Les sièges retirés de la colonne (#3617/#3661) restent
@@ -4630,6 +4659,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 pass
         _drain(db, threads)
         return out
+    except _ForceSuperseded:
+        del threads[checkpoint:]
+        return designate(cfg, db, int(lot), freeze=freeze,
+                         refresh_policy=refresh_policy)
     except (rd.StaleFreeze, _SeatsMoved) as exc:
         # The port or the column guard refused an old freeze before any
         # write: never clear or re-register the newer head's reviewers.
@@ -4884,7 +4917,9 @@ def designate_deferred(cfg, db, lot: int, freeze: Mapping, *,
             return {"state": "resolved", "reviewers": [],
                     "freeze": dict(freeze or {}),
                     "why": "a final designation outcome is already journaled"}
-        return designate(cfg, db, int(lot), freeze=freeze, force=force)
+        return designate(cfg, db, int(lot), freeze=freeze, force=force,
+                         expected_mark=(int(effective[0]) if force and provisional
+                                        else None))
     finally:
         fire._unlock(handle)
 
@@ -5374,6 +5409,10 @@ GATE_COVERED_WHY = ("unreachable seat(s) dropped: the required reviews are alrea
 
 class _SeatsMoved(Exception):
     """#3367 : the mark the pass read is no longer the freeze's effective mark."""
+
+
+class _ForceSuperseded(Exception):
+    """#8008 : the mark a forced replay was decided on is no longer effective."""
 
 
 class _AlreadyNoted(Exception):

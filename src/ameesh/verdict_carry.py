@@ -2058,7 +2058,7 @@ def describe(result: dict) -> str:
     return "verdicts not carried (%s): %s" % (kind, result.get("detail") or "")
 
 
-def _carried_pending(db, lot: int, freeze: dict) -> bool:
+def _carried_pending(db, lot: int, freeze: dict) -> Optional[int]:
     """Un report planifié au gel n'a pas eu lieu : faut-il désigner ?
 
     La désignation au gel s'est abstenue sur le plan du report (#2487) et a
@@ -2067,7 +2067,10 @@ def _carried_pending(db, lot: int, freeze: dict) -> bool:
     marque est **effective** (la dernière du gel, aucune sélection réelle ne la
     remplace), que ses verdicts ne sont pas déjà sur la tête gelée, et qu'aucun
     échec de désignation n'a déjà été constaté pour ce gel (sinon la passe
-    suivante répéterait la même lecture sans rien changer)."""
+    suivante répéterait la même lecture sans rien changer).
+
+    #8008 : rend l'id de la marque lue (None sinon) ; la désignation forcée
+    ne vaut que tant que cette marque reste effective."""
     from . import review_designation_activation as activation
     lot = int(lot)
     freeze_id = int(freeze.get("id") or 0)
@@ -2075,20 +2078,23 @@ def _carried_pending(db, lot: int, freeze: dict) -> bool:
         effective = activation._effective_mark(
             db, lot, freeze_id, since_ts=float(freeze.get("at_ts") or 0.0))
         if effective is None or effective[1] != "carried":
-            return False
+            return None
+        if not effective[2].get("provisional"):
+            # #8008 : un report accompli n'est pas un report en attente.
+            return None
         carried = effective[2].get("carried") or ()
         if carried:
             on_head = {_key(mark.get("actor")) for mark in work.milestones(db, lot, None)
                        if mark.get("kind") == "verdict"
                        and _same(mark.get("sha"), freeze.get("sha"))}
             if all(_key(entry.get("actor")) in on_head for entry in carried):
-                return False
+                return None
         prefix = "%s%d:%d:" % (activation.UNAVAILABLE_PREFIX, lot, freeze_id)
         if storage.of(db).work.events_noted(prefix, 0.0, ids=[lot]):
-            return False
-        return True
+            return None
+        return int(effective[0])
     except Exception:  # noqa: BLE001 - lecture impossible : rien à réparer
-        return False
+        return None
 
 
 def _gate_print(row: Mapping, lot_marks, freeze: Mapping) -> tuple:
@@ -2185,11 +2191,15 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
             # Personne n'est désigné ; on rejoue la désignation réelle du gel, une
             # fois, sans toucher au reste. Le gel n'est pas re-déclaré.
             freeze = plan_git.latest_freeze(marks.get(lot, []))
-            if not freeze or not _carried_pending(db, lot, freeze):
+            pending_mark = _carried_pending(db, lot, freeze) if freeze else None
+            if not pending_mark:
                 continue
             try:
                 from . import review_designation_activation as activation
-                fixed = activation.designate(cfg, db, lot, force=True)
+                # #8008 : forcer seulement la marque lue ; un report accompli
+                # entre-temps (autre hôte) garde ses sièges, sans courrier.
+                fixed = activation.designate(cfg, db, lot, force=True,
+                                             expected_mark=pending_mark)
                 result["designation"] = str((fixed or {}).get("state") or "")
             except Exception as exc:  # noqa: BLE001 - la passe suivante retente
                 result["designation"] = "error: %s" % (type(exc).__name__,)
