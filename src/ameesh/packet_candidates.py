@@ -1483,6 +1483,9 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
     target = _row_target(row, target_branch)
     entry: dict = {
         "work_item": lot,
+        # #7989 : l'état sert à ne nommer (et noter) que les lots **validés**
+        # laissés en attente ; un lot `qa` attend normalement sa relecture.
+        "state": str(row.get("state") or ""),
         "title": row.get("title") or "",
         "assignee": row.get("assignee") or "",
         "priority": row.get("priority"),
@@ -1675,6 +1678,113 @@ AUTHOR_CAUSES = {
 def author_gesture(code: str) -> str:
     """#4572 : le geste de l'auteur pour un refus, vide si ce n'est pas le sien."""
     return AUTHOR_CAUSES.get(str(code or ""), "")
+
+
+#: #7989 : le geste attendu pour un lot **validé** laissé en attente, par code
+#: de refus. Le manifeste du paquet le nomme et le journal du lot le reçoit une
+#: fois par (lot, cause) : un validé qui manque un paquet ne reste plus un
+#: simple compteur. Les codes sont ceux de `_candidate` ; un code inconnu ne
+#: reçoit aucun geste inventé (le motif calculé reste cité).
+WAITING_GESTURES = {
+    "freeze-not-head":
+        "regeler sur la tête publiée (`ameesh work milestone {lot} frozen "
+        "--sha <tête publiée>`), puis faire relire",
+    "freeze-required":
+        "déclarer le gel de la tête publiée, puis faire relire",
+    "freeze-unresolved":
+        "regeler sur un commit du dépôt, puis faire relire",
+    "missing-branch":
+        "donner une branche au lot, la pousser, puis regeler",
+    "branch-not-published":
+        "pousser la branche sur origin",
+    "conflict":
+        "réduire le conflit avec la cible (rebaser), puis regeler et faire relire",
+    "stacked-undeclared":
+        "déclarer la dépendance (`ameesh work dependencies {lot} --add "
+        "<parent>`) ou rebaser sur la cible, puis regeler",
+    "dependency-blocking":
+        "attendre la fusion du prérequis #{blocker}",
+    "dependency-unready":
+        "attendre que le prérequis #{blocker} soit prêt dans le même paquet",
+    "dependency-base":
+        "rebaser sur la tête gelée du prérequis #{blocker}",
+    "verdicts-missing":
+        "obtenir les avis requis sur la tête gelée (relecteurs désignés)",
+    "pilot-hold":
+        "le pilote lève le hold (`unhold`) quand il n'est plus dû",
+    "migration-collision":
+        "réserver/renuméroter (`ameesh work migration {lot} --number "
+        "{number}`), puis regeler",
+    "migration-gap":
+        "réserver/renuméroter (`ameesh work migration {lot} --number "
+        "{number}`), puis regeler",
+    "packet-exception":
+        "exception de paquet : fusion hors paquet (§11 bis), rien à composer",
+    "packet-vehicle":
+        "le lot est lui-même un paquet : rien à composer",
+    "target-mismatch":
+        "cibler la même branche que le paquet, puis regeler",
+    "release":
+        "classe release : la procédure de release le porte, pas un paquet",
+    "already-in-target":
+        "la tête est déjà dans la cible : `ameesh work sync-merges` doit clore "
+        "le lot",
+    "unit-tests-red":
+        "corriger le test rouge, puis regeler",
+}
+
+
+def waiting_gesture(cause: dict, lot: int) -> str:
+    """#7989 : le geste attendu d'un lot laissé en attente, vide si inconnu.
+
+    Le gabarit ne reçoit que des valeurs **lues** dans la cause (numéro de
+    migration, prérequis) : jamais un numéro deviné. Un gabarit qui manque une
+    valeur rend le texte tel quel, sans exception."""
+    cause = cause if isinstance(cause, dict) else {}
+    template = WAITING_GESTURES.get(str(cause.get("code") or ""))
+    if not template:
+        return ""
+    values = {"lot": int(lot), "number": "N", "blocker": "N"}
+    for key in ("number", "blocker_id"):
+        value = cause.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            values[key] = value
+    values["blocker"] = values.get("blocker_id", values["blocker"])
+    try:
+        return template.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return template
+
+
+def waiting_entries(payload: dict) -> list[dict]:
+    """#7989 : les lots **validés** en attente, avec leurs causes calculées.
+
+    Un lot `qa` n'est pas nommé : il attend normalement sa relecture. Un lot
+    en erreur n'est pas « en attente » (il est écarté, #3813)."""
+    if not isinstance(payload, dict):
+        return []
+    waiting = set()
+    for lot in payload.get("waiting") or ():
+        try:
+            waiting.add(int(lot))
+        except (TypeError, ValueError):
+            continue
+    entries = []
+    for entry in payload.get("candidates") or ():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            lot = int(entry.get("work_item") or 0)
+        except (TypeError, ValueError):
+            continue
+        if lot not in waiting:
+            continue
+        if str(entry.get("state") or "") != "validated":
+            continue
+        if not entry.get("causes"):
+            continue
+        entries.append(entry)
+    return sorted(entries, key=lambda item: int(item["work_item"]))
 
 
 def _author_refusal(code: str, detail: str, **extra) -> dict:
