@@ -1753,13 +1753,13 @@ else
     ARGS_ACTIF+=(--rapporteur "$rapporteur")
   done
   rc=0
-  ATTESTATION_ACTIF="$TRAVAIL/actif-${SHA_TRAVE:0:12}.json"
+  ATTESTATION_ACTIF="$TRAVAIL/actif-${SHA:0:12}.json"
   JOURNAL_ACTIF="$JOURNAL"
   # #3981 : depuis bureau-goal, actif.py tourne sur HOTE_OUTILS avec le venv et
   # la base d'une VM ; le journal local part avec lui. La preuve partagee est
   # un evenement `ameesh_events` que release_cutoff relit sur le poste.
   if [ "$OUTILS_DISTANTS" = 1 ]; then
-    ATTESTATION_ACTIF="$TRAVAIL_OUTILS/actif-${SHA_TRAVE:0:12}.json"
+    ATTESTATION_ACTIF="$TRAVAIL_OUTILS/actif-${SHA:0:12}.json"
     JOURNAL_ACTIF="$TRAVAIL_OUTILS/staging-$(date +%F)-$$.jsonl"
     if copier_journal_outils "$JOURNAL" "$JOURNAL_ACTIF"; then
       py_sequence "$ACTIF_PY" --journal "$JOURNAL_ACTIF" "${ARGS_ACTIF[@]}" || rc=$?
