@@ -113,14 +113,17 @@ class ManifestTest(unittest.TestCase):
         on_disk = {name for name in os.listdir(SQL)
                    if re.fullmatch(r"role-[a-z0-9-]+\.sql", name)}
         self.assertEqual(on_disk, ROLE_SCRIPTS)
-        replayed = set(REPLAY_SCRIPTS) | set(droits_roles.REPLAYED_ELSEWHERE)
+        elsewhere = droits_roles.replayed_elsewhere(SQL)
+        replayed = set(REPLAY_SCRIPTS) | set(elsewhere)
         covered = replayed | set(droits_roles.EXEMPTIONS)
         self.assertEqual(on_disk, covered)
         self.assertFalse(set(REPLAY_SCRIPTS) & set(droits_roles.EXEMPTIONS))
-        self.assertFalse(set(REPLAY_SCRIPTS) & set(droits_roles.REPLAYED_ELSEWHERE))
-        self.assertFalse(set(droits_roles.EXEMPTIONS) & set(droits_roles.REPLAYED_ELSEWHERE))
+        self.assertFalse(set(REPLAY_SCRIPTS) & set(elsewhere))
+        self.assertFalse(set(droits_roles.EXEMPTIONS) & set(elsewhere))
         for name, reason in droits_roles.EXEMPTIONS.items():
             self.assertGreaterEqual(len(reason), 60, name)
+        for name, reason in elsewhere.items():
+            self.assertGreaterEqual(len(reason), 20, name)
 
     def test_les_scripts_de_rejeu_ne_creent_ni_ne_modifient_un_role(self):
         for replay in NEW_SQL:

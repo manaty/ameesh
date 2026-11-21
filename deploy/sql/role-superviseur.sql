@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
+-- rejeu-ailleurs: rejeu-superviseur.sql après migrate (#7982, ameesh.droits_superviseur)
 -- Rôle Postgres en LECTURE SEULE pour un superviseur externe (profil
 -- « cluster », docs/profils/cluster.md) : l'ÉTAT du mesh, pas les contenus.
 --
