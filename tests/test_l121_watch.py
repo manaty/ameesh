@@ -138,16 +138,18 @@ class ReadingTest(unittest.TestCase):
                          {"id": 2, "state": "build", "assignee": "orchestrateur",
                           "app": "ameesh", "total": 2}]}
 
-    def reading(self, board, alerts=None, due=None):
+    def reading(self, board, alerts=None, due=None, sessions=None):
         with mock.patch.object(watch, "_alerts_reading",
                                return_value=alerts or {"active": []}), \
                 mock.patch.object(watch, "_due_reading",
                                   return_value=due or {"actionable": [],
                                                        "due_wakes": []}):
-            return watch.reading(None, "mesh-design", now=0, board=board)
+            return watch.reading(None, "mesh-design", now=0, board=board,
+                                 sessions=sessions)
 
-    def snapshot(self, board, alerts=None, due=None, **kw):
-        return watch.reading_snapshot(self.reading(board, alerts=alerts, due=due), **kw)
+    def snapshot(self, board, alerts=None, due=None, sessions=None, **kw):
+        return watch.reading_snapshot(
+            self.reading(board, alerts=alerts, due=due, sessions=sessions), **kw)
 
     def test_the_fingerprint_ignores_turn_churn(self):
         base = watch.fingerprint(self.reading(self.board()))
@@ -237,6 +239,42 @@ class ReadingTest(unittest.TestCase):
         short = self.board(status="running", status_since_ts=0,
                            turn_started_ts=-watch.LONG_TURN_S + 1)
         self.assertEqual(watch.waking_moved(base, self.snapshot(short)), (False, []))
+
+    def test_a_session_over_the_threshold_wakes(self):
+        # #8097, B de #45484 : la taille de la session vient du grand livre
+        # (#4448) ; le franchissement du seuil réveille, la croissance des
+        # jetons au-dessus du même seuil non (le compte brut change à chaque
+        # tour, le signal reste le même).
+        base = self.snapshot(self.board())
+        big = self.snapshot(self.board(), sessions={"mesh-design": {
+            "tokens": 200000, "threshold": 150000, "turns": 4}})
+        self.assertEqual(watch.waking_moved(base, big), (True, ["agents"]))
+        self.assertEqual(watch.waking_moved(
+            big, self.snapshot(self.board(), sessions={"mesh-design": {
+                "tokens": 250000, "threshold": 150000, "turns": 5}})),
+            (False, []))
+
+    def test_a_resolved_signal_does_not_wake(self):
+        # #8097 : seul un signal NOUVEAU ouvre un tour. Le signal qui
+        # disparaît (agent repris, tour fini, session tournée, alerte
+        # résolue) n'appelle aucun geste : le réveiller serait le bruit que
+        # le lot supprime.
+        base = self.snapshot(self.board())
+        long_turn = self.board(status="running", status_since_ts=0,
+                               turn_started_ts=-watch.LONG_TURN_S)
+        during = self.snapshot(long_turn)
+        self.assertEqual(watch.waking_moved(base, during), (True, ["agents"]))
+        self.assertEqual(watch.waking_moved(during, base), (False, []))
+        stopped = self.snapshot(self.board(status="stopped"))
+        self.assertEqual(watch.waking_moved(base, stopped), (True, ["agents"]))
+        self.assertEqual(watch.waking_moved(stopped, base), (False, []))
+        alert = self.snapshot(self.board(),
+                              alerts={"active": [["k", "ci_disk_low", False]]})
+        self.assertEqual(watch.waking_moved(base, alert), (True, ["alerts"]))
+        self.assertEqual(watch.waking_moved(alert, base), (False, []))
+        big = self.snapshot(self.board(), sessions={"mesh-design": {
+            "tokens": 200000, "threshold": 150000, "turns": 4}})
+        self.assertEqual(watch.waking_moved(big, base), (False, []))
 
     def test_a_new_critical_alert_or_type_wakes_but_key_rotation_does_not(self):
         # #8097, troisième témoin : une nouvelle alerte critique réveille.
@@ -469,6 +507,81 @@ class WatchTest(PgTestCase):
         self.assertIn("lots", meta["changed_parts"])
         self.assertEqual(meta["waking"], [])
         self.assertTrue(meta["passive"])
+
+    def test_a_giant_session_wakes_between_two_short_turns(self):
+        # #8097, B de #45484 : la taille de la session n'est ni dans le board
+        # ni dans les alertes lues ; elle est relue du grand livre, avec la
+        # mesure et le seuil de `session_too_big` (#4448). Une session qui
+        # franchit le seuil entre deux tours courts réveille, et la croissance
+        # des jetons au-dessus du même seuil ne réveille plus.
+        with mock.patch.object(watch.fil, "record"):
+            self.enable()
+            self.assertIn("instruction sent to w121",
+                          watch.send(self.here, self.db, "w121"))
+        [message] = [m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                     if m["sender"] == "veille"]
+        storage.of(self.db).mailbox.mark_delivered([int(message["id"])])
+        costs = storage.of(self.db).turn_costs
+        self.db.execute("UPDATE agent_registry SET session_id = 's-big'"
+                        " WHERE name = 'w121'")
+
+        def a_turn(turn, session, tokens):
+            costs.insert(agent="w121", harness="claude", turn=turn, model="m",
+                         session=session, usd=0, input_tokens=tokens,
+                         cached_input_tokens=0, output_tokens=0, cum_usd=0,
+                         cum_input_tokens=tokens, cum_cached_input_tokens=0,
+                         cum_output_tokens=0)
+
+        for n in range(3):                  # the rotation minimum (#4448)
+            a_turn("t%d" % n, "s-big", 10 ** 9)
+        # the short turn has just ended: the change stays pending, never
+        # consumed (B/P2 cx3)
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now() - interval '5 minutes',"
+            " last_turn_at = now() - interval '5 minutes' WHERE name = 'w121'")
+        self.assertIn("change kept pending", watch.send(self.here, self.db, "w121"))
+        # the next firing, with the turn older, sends the instruction
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now() - interval '1 hour',"
+            " last_turn_at = now() - interval '1 hour' WHERE name = 'w121'")
+        with mock.patch.object(watch.fil, "record") as thread:
+            out = watch.send(self.here, self.db, "w121")
+        self.assertIn("instruction sent to w121", out)
+        self.assertIn("waking: agents", out)
+        self.assertEqual(thread.call_args.kwargs["meta"]["watch"]["waking"],
+                         ["agents"])
+        [sent] = [m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                  if m["sender"] == "veille"]
+        self.assertEqual(sent["body"], watch.consigne("w121"))
+        # the session keeps growing over the same threshold: no new signal,
+        # so no new instruction (only the passive note may go out)
+        storage.of(self.db).mailbox.mark_delivered([int(sent["id"])])
+        a_turn("t3", "s-big", 2 * 10 ** 9)
+        out = watch.send(self.here, self.db, "w121")
+        self.assertNotIn("instruction sent", out)
+        self.assertIn("waking: none", out)
+        self.assertIn("information was deposited", out)
+        # the session rotates while that note is unread: the resolution is
+        # recorded even though nothing is sent (the unread-note firing), so a
+        # later session crossing the threshold is a NEW signal
+        self.db.execute("UPDATE agent_registry SET session_id = 's-new'"
+                        " WHERE name = 'w121'")
+        for n in range(3):
+            a_turn("u%d" % n, "s-new", 1)
+        out = watch.send(self.here, self.db, "w121")
+        self.assertNotIn("instruction sent", out)
+        self.assertIn("waking: none", out)
+        self.assertIn("not read yet", out)
+        for note in storage.of(self.db).mailbox.unread("w121", 200):
+            if note["sender"] == "veille":
+                storage.of(self.db).mailbox.mark_delivered([int(note["id"])])
+        self.db.execute("UPDATE agent_registry SET session_id = 's-big2'"
+                        " WHERE name = 'w121'")
+        for n in range(3):
+            a_turn("v%d" % n, "s-big2", 10 ** 9)
+        out = watch.send(self.here, self.db, "w121")
+        self.assertIn("instruction sent to w121", out)
+        self.assertIn("waking: agents", out)
 
     def test_an_unreadable_reading_never_mutes_the_watch(self):
         # #5698: the reading is a comfort, not a gate; if it cannot be made,
