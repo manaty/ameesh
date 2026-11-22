@@ -347,6 +347,18 @@ SSH tourne en `-F none` et `BatchMode`, avec `StrictHostKeyChecking=yes`,
   `ssh` lui-même) : 75, borné par `health_deadline_s`, y compris pendant les
   contrôles de santé et la lecture du journal précédent. Seule une commande
   distante qui répond non zéro est un échec (1).
+  #8072 : `health` écrit une seule ligne bornée sur sa sortie, que le worker
+  journalise après validation (`health host=… nonce=<8 hex> stage=…`, suivie
+  de `(exit N)`). Elle nomme l'étape atteinte (`control`, `admission`,
+  `launched`, `receipt`, `checks`, `previous-boot`, `done`), la réponse de
+  `probe_receipt` (`answer` : `ok`, `transport`, `failed`), son `verdict` et
+  ses trois booléens (`true`, `false`, `absent` pour un reçu étranger), puis
+  `checks` et le rang (`step`) du premier argv `health` qui n'a pas rendu 0.
+  Elle ne contient que des mots fixes : ni octet distant, ni chemin, ni nonce
+  complet, ni secret. Une sortie qui ne correspond pas exactement est écartée
+  sans être lue (« no valid line »). Les fichiers
+  `/var/lib/ameesh-vm-remote/<nonce>.json` ne portent que le lancement : le
+  reçu est calculé à chaque appel, il ne s'y lit pas.
 - `reconcile` : contrôle fermé en `returning` sur `probe_agent`, puis chaque
   argv distant `reconcile` à 0 ; n'ouvre jamais les prises et ne force jamais
   `lost`.
@@ -644,6 +656,15 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      (`probe_agent`) figure parmi les agents réclamables d'un retour
      `returning` prises fermées. Avant #7874, elle n'était jamais réclamée,
      et le retour bouclait sur `health deadline passed`.
+   - la sonde (`probe_agent` de la cible) n'est pas en pause :
+     `ameesh show <probe_agent>` n'a pas de ligne `paused`.
+     Un agent en pause ne prend aucun tour (L87b), donc pas celui de santé.
+     Depuis #8072, le découpeur de file n'endort plus la sonde d'une fenêtre
+     ouverte (retour `returning` prises fermées, verrou de release) et lève
+     son sommeil automatique. Avant l'admission, il ne la connaît pas : une
+     pause posée avant l'étape 4 se lève ici (`ameesh resume <probe_agent>
+     --operator --reason …`), et se consigne.
+     Une pause humaine n'est jamais levée par le découpeur ;
    - reçu de santé d'AG3 vert (#8069), relevé avant l'étape 4 : sur AG3,
      `/var/lib/ameesh-vm-health/health.json` porte `version_mode` et
      `doctor` à `true`, sans `reason`, daté de moins de trois périodes du
@@ -676,7 +697,14 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
    pas en poser un second.
 5. Suite de v3.4.1 sans changement : préchauffe (hystérésis), halt, preuve,
    archivage, poweron, santé dans les 15 min. Relever T_halt, T_archive,
-   T_restore et T_health.
+   T_restore et T_health. Un retour qui n'aboutit pas se lit dans le journal
+   du worker (#8072), ligne `health` de chaque passe : `stage=launched` puis
+   `verdict=pending` tant que le tour de sonde court ; `verdict=ok` suivi de
+   `checks=failed step=N` désigne un contrôle de santé rouge (au R1 du 22/11,
+   la sonde avait joué ses tours et le refus venait de `health.py`, #8069) ;
+   `verdict=ko`, un tour de sonde fini en échec. Après un refus, le runner de
+   la sonde écrit « host claims closed (draining or returning) » : c'est la
+   conséquence du retour en `draining`, pas sa cause.
 6. Clôture : une fois AG3 revenu (`available`, prises ouvertes, santé
    verte), le pilote fusionne #298, puis fait la synchronisation prouvée.
    Ensuite le bureau arrête le timer (R2) et remet `enabled: false`.

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import os
 import re
 import threading
 import time
@@ -560,7 +561,8 @@ def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
     return out
 
 
-def _pilot_allowed(db, cfg, *, strict: bool = False):
+def _pilot_allowed(db, cfg, *, strict: bool = False, agents=None,
+                   names=None):
     """Le prédicat d'autorisation d'un hold de pilote (#1664, #2916).
 
     Même autorisation que la correction d'état et la désignation du relecteur
@@ -574,18 +576,81 @@ def _pilot_allowed(db, cfg, *, strict: bool = False):
     stagnation ; la porte du paquet lit en strict, car ignorer un hold de
     pilote y ferait composer un lot réservé. En strict, une panne du registre,
     du canon ou de la résolution d'alias lève, au lieu de conclure « non ».
-    """
+
+    `agents` est le listing déjà lu par l'appelant (57 lignes, une requête,
+    #8051). L'autorité de chaque auteur est alors jugée sur cette ligne —
+    résolution d'alias et canon compris — au lieu d'une résolution et d'une
+    fiche complète du registre par auteur (34 requêtes mesurées par
+    `human_waits`, appelé plusieurs fois par seconde par la prise). Sans
+    listing, la lecture d'origine par nom reste le repli."""
     from . import assignments, work            # imports tardifs : pas de cycle
     verdict: dict[str, bool] = {}
+    rows_by_name = None
+    if agents is not None:
+        rows_by_name = {str(row.get("name") or ""): row for row in agents}
+    # #8051 : résoudre en UNE requête les auteurs absents du listing (alias) ;
+    # la résolution par nom reste le repli quand l'appelant n'a pas fourni la
+    # liste des noms.
+    resolved_map: dict[str, str] = {}
+    if rows_by_name is not None:
+        missing = sorted({str(name) for name in (names or ())
+                          if name and str(name) not in rows_by_name
+                          and not str(name).startswith(work.HUMAN_PREFIX)})
+        if missing:
+            try:
+                resolved_map = storage.of(db).agents.resolve_names(
+                    missing, operation="assignments.is_orchestrator")
+            except Exception:
+                if strict:
+                    raise        # autorité indéterminée : le doute refuse
+                resolved_map = {}
+    declared = None
+    declared_env = os.environ.get(assignments.ORCHESTRATORS_ENV) or ""
+    if declared_env:
+        from . import sous_utilisation as su
+        from .agent_names import resolve as resolve_agent_name
+        try:
+            declared = {resolve_agent_name(su._bare(n), db=db,
+                                           operation="authority.orchestrator")
+                        for n in declared_env.split(",") if n.strip()}
+        except Exception:
+            if strict:
+                raise            # autorité indéterminée : le doute refuse
+            declared = set()
+    canons = None
+
+    def canon_list():
+        nonlocal canons
+        if canons is None:
+            from . import canon as canon_mod
+            canons = canon_mod.load_configured(cfg) if cfg is not None else []
+        return canons
 
     def allowed(who: str) -> bool:
         if who not in verdict:
             try:
-                verdict[who] = bool(who) and (
-                    who.startswith(work.HUMAN_PREFIX)
-                    or assignments.is_orchestrator(cfg, db, who,
-                                                   roles=work.CORRECTOR_ROLES,
-                                                   history=False, strict=strict))
+                if not who:
+                    verdict[who] = False
+                elif who.startswith(work.HUMAN_PREFIX):
+                    verdict[who] = True
+                else:
+                    resolved = None
+                    row = None
+                    if rows_by_name is not None:
+                        row = rows_by_name.get(who)
+                        resolved = who
+                        if row is None:
+                            resolved = resolved_map.get(who)
+                            if resolved is None:
+                                resolved = storage.of(db).agents.resolve_name(
+                                    who, operation="assignments.is_orchestrator")
+                            row = rows_by_name.get(resolved)
+                    verdict[who] = bool(assignments.is_orchestrator(
+                        cfg, db, who, roles=work.CORRECTOR_ROLES,
+                        history=False, strict=strict, row=row,
+                        resolved=resolved,
+                        canons=canon_list() if rows_by_name is not None else None,
+                        declared=declared))
             except Exception:
                 if strict:
                     raise                # autorité indéterminée : le doute refuse
@@ -595,7 +660,8 @@ def _pilot_allowed(db, cfg, *, strict: bool = False):
     return allowed
 
 
-def lift_authority(db, cfg=None, *, strict: bool = False):
+def lift_authority(db, cfg=None, *, strict: bool = False, agents=None,
+                   names=None):
     """Le prédicat d'autorisation d'une levée de hold (#3219), partagé.
 
     `active_holds` et la reconstruction des retenues de fermeture du débit
@@ -603,11 +669,13 @@ def lift_authority(db, cfg=None, *, strict: bool = False):
     retenue, un pilote (humain, orchestrateur ou conception) lève celle du lot.
     `cfg` par défaut : celui de `db`."""
     cfg = getattr(db, "cfg", None) if cfg is None else cfg
-    return _pilot_allowed(db, cfg, strict=strict)
+    return _pilot_allowed(db, cfg, strict=strict, agents=agents,
+                          names=names)
 
 
 def active_holds(db, events, *, cfg=None,
-                 strict: bool = False, preserve_on_transition=None) -> dict[int, dict[str, dict]]:
+                 strict: bool = False, preserve_on_transition=None,
+                 agents=None) -> dict[int, dict[str, dict]]:
     """#3219 : les retenues actives de chaque lot, par auteur.
 
     Les holds d'un lot forment un **ensemble**, pas une pile dont on ne lirait
@@ -631,7 +699,12 @@ def active_holds(db, events, *, cfg=None,
     if not ordered or not any(is_hold_note(event.get("note"))
                               for event in events or ()):
         return {}
-    allowed = lift_authority(db, cfg, strict=strict)
+    actors = sorted({str(event.get("actor") or "") for event in events or ()
+                     if event.get("actor")
+                     and (is_hold_note(event.get("note"))
+                          or is_lift_note(event.get("note")))})
+    allowed = lift_authority(db, cfg, strict=strict, agents=agents,
+                             names=actors)
     out: dict[int, dict[str, dict]] = {}
     for ident, lot_events in ordered.items():
         held: dict[str, dict] = {}
@@ -671,7 +744,8 @@ def active_holds(db, events, *, cfg=None,
 
 
 def pilot_holds(db, events, *, cfg=None,
-                strict: bool = False) -> dict[int, dict]:
+                strict: bool = False,
+                agents=None) -> dict[int, dict]:
     """Les holds posés par un pilote (#1664) — les seuls comptés par la
     stagnation.
 
@@ -687,7 +761,9 @@ def pilot_holds(db, events, *, cfg=None,
     if not any(is_hold_note(event.get("note")) for event in events):
         return {}
     out: dict[int, dict] = {}
-    for lot, holds in active_holds(db, events, cfg=cfg, strict=strict).items():
+    holds_by_lot = active_holds(db, events, cfg=cfg, strict=strict,
+                                agents=agents)
+    for lot, holds in holds_by_lot.items():
         pilots = [hold for hold in holds.values() if hold.get("pilot")]
         if not pilots:
             continue
@@ -730,7 +806,22 @@ def human_routes_cache():
         _HUMAN_ROUTES.window = previous
 
 
-def _runtime_human_routes(db, cfg):
+def _human_agent_rows(db):
+    """#8051 : le registre lu une fois par passe pour les routes humaines et
+    pour l'autorité des holds. Dans la fenêtre `human_routes_cache`, la même
+    liste sert à tous les appels de la passe (la lecture coûtait 78 ms et
+    était refaite par chaque `human_waits`) ; hors fenêtre, chaque passe
+    relit, comme avant."""
+    window = getattr(_HUMAN_ROUTES, "window", None)
+    if window is not None and window.get("agents") is not None:
+        return window["agents"]
+    rows = list(storage.of(db).progress.agents(None))
+    if window is not None:
+        window["agents"] = rows
+    return rows
+
+
+def _runtime_human_routes(db, cfg, *, agents=None):
     """#7634 : les routes humaines du runtime, lues une fois par passe."""
     window = getattr(_HUMAN_ROUTES, "window", None)
     if window is not None and window["routes"] is not None:
@@ -741,7 +832,7 @@ def _runtime_human_routes(db, cfg):
         from . import debit
         canons = canon_mod.load_configured(cfg) if cfg is not None else []
         routes = debit.human_route_names(
-            cfg, storage.of(db).progress.agents(None), canons)
+            cfg, agents if agents is not None else _human_agent_rows(db), canons)
     except Exception:  # route illisible : aucun nom deviné (#7634)
         routes = set()
     if window is not None:
@@ -797,33 +888,39 @@ def human_waits(db, item_ids=None, *, cfg=None, now=None,
     events = list(st.progress.lot_hold_events(ids, HOLD_NOTE_PATTERNS))
     if not events:
         return {}
-    if human_routes is None:
-        human_routes = _runtime_human_routes(db, cfg)
-    cutoff = (time.time() if now is None else float(now)) \
-        - HUMAN_WAIT_BLOCK_HOURS * 3600
+    # #8051 : la même liste d'agents sert aux routes et à l'autorité des
+    # auteurs de hold — une lecture au lieu d'une par auteur. La fenêtre de
+    # canons couvre les routes ET l'autorité : `load_configured` était appelé
+    # deux fois par `human_waits` (600 ms de fichiers YAML mesurés).
     out: dict[int, dict] = {}
     with canon_mod.configured_cache():
-        holds = active_holds(db, events, cfg=cfg)
-    for ident, by_actor in holds.items():
-        chosen = None
-        for who, hold in by_actor.items():
-            since = float(hold.get("since") or 0.0)
-            declared = None
-            if hold.get("pilot"):
-                declared = external_hold(str(hold.get("note") or ""),
-                                         executors=human_routes)
-            # #7943 N1 : une retenue ordinaire, récente, ou d'un auteur non
-            # pilote n'est pas une attente humaine : elle garde le blocage.
-            if declared is None or since > cutoff:
-                chosen = None
-                break
-            if chosen is None or since > chosen["since"]:
-                chosen = {"note": str(hold.get("note") or ""), "since": since,
-                          "by": who or None,
-                          "executor": declared["executor"],
-                          "gesture": declared["gesture"]}
-        if chosen is not None:
-            out[ident] = chosen
+        agents = _human_agent_rows(db)
+        if human_routes is None:
+            human_routes = _runtime_human_routes(db, cfg, agents=agents)
+        cutoff = (time.time() if now is None else float(now)) \
+            - HUMAN_WAIT_BLOCK_HOURS * 3600
+        holds = active_holds(db, events, cfg=cfg, agents=agents)
+        for ident, by_actor in holds.items():
+            chosen = None
+            for who, hold in by_actor.items():
+                since = float(hold.get("since") or 0.0)
+                declared = None
+                if hold.get("pilot"):
+                    declared = external_hold(str(hold.get("note") or ""),
+                                             executors=human_routes)
+                # #7943 N1 : une retenue ordinaire, récente, ou d'un auteur
+                # non pilote n'est pas une attente humaine : elle garde le
+                # blocage.
+                if declared is None or since > cutoff:
+                    chosen = None
+                    break
+                if chosen is None or since > chosen["since"]:
+                    chosen = {"note": str(hold.get("note") or ""),
+                              "since": since, "by": who or None,
+                              "executor": declared["executor"],
+                              "gesture": declared["gesture"]}
+            if chosen is not None:
+                out[ident] = chosen
     return out
 
 

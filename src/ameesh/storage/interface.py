@@ -284,6 +284,17 @@ class Agents(Domain):
     def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
         """Resolve a spelling and audit aliases; unknown names stay unchanged."""
 
+    def resolve_names(self, names, *, operation: str = "lookup") -> dict[str, str]:
+        """#8051 : résoudre plusieurs orthographes, `{reçu: primaire}`.
+
+        Le pilote Postgres le fait en UNE requête (même fonction, même audit
+        des alias) : l'autorité d'un hold jugeait 15 auteurs avec 15 requêtes
+        de résolution par appel de `human_waits`. Le repli par nom garde le
+        contrat pour les autres pilotes."""
+        wanted = sorted({str(name) for name in (names or ()) if str(name)})
+        return {name: self.resolve_name(name, operation=operation)
+                for name in wanted}
+
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
                        actor: str, principal: str,
