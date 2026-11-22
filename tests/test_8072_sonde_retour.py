@@ -112,25 +112,30 @@ class RunProbeLineTest(unittest.TestCase):
 
     def run_probe(self, stdout, code=75, pending=True):
         out = io.StringIO()
-        done = SimpleNamespace(returncode=code, stdout=stdout)
-        with mock.patch('ameesh.vm_adapter.subprocess.run', return_value=done) as run, \
-                contextlib.redirect_stdout(out):
+        if pending:
+            patcher = mock.patch('ameesh.vm_adapter._probe_bounded',
+                                 return_value=(code, stdout))
+        else:
+            patcher = mock.patch('ameesh.vm_adapter.subprocess.run',
+                                 return_value=SimpleNamespace(returncode=code))
+        with patcher as called, contextlib.redirect_stdout(out):
             result = vm.run_probe(['/health'], 10, pending=pending)
-        return result, out.getvalue(), run.call_args.kwargs
+        return result, out.getvalue(), called
 
     def test_valid_line_is_journalled_with_the_exit_code(self):
         line = (b'health host=ameesh-agents-3 nonce=abb7d867 stage=checks answer=ok '
                 b'verdict=ok delivered=true acknowledged=true turn_ended=true '
                 b'checks=failed step=3\n')
-        result, out, kwargs = self.run_probe(line, code=1)
+        result, out, called = self.run_probe(line, code=1)
         self.assertIs(result, False)
         self.assertEqual(out, line.decode().strip() + ' (exit 1)\n')
-        self.assertEqual(kwargs['stderr'], vm.subprocess.DEVNULL)
+        self.assertEqual(called.call_args.args, (['/health'], 10))
 
     def test_anything_else_is_dropped_unread(self):
         for hostile in (b'postgresql://user:secret@db/ameesh\n',
                         b'health host=burst stage=/etc/shadow\n',
                         b'health host=burst token=' + b'a' * 40 + b'\n',
+                        b'health host=burst token=abc\n',
                         b'health host=burst\n',
                         b'x' * 5000):
             result, out, _ = self.run_probe(hostile)
@@ -138,10 +143,10 @@ class RunProbeLineTest(unittest.TestCase):
             self.assertEqual(out, 'health probe: no valid line (exit 75)\n')
 
     def test_other_probes_stay_silent_and_discarded(self):
-        result, out, kwargs = self.run_probe(None, code=0, pending=False)
+        result, out, run = self.run_probe(None, code=0, pending=False)
         self.assertIs(result, True)
         self.assertEqual(out, '')
-        self.assertEqual(kwargs['stdout'], vm.subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs['stdout'], vm.subprocess.DEVNULL)
 
 
 class RefusedReturnClosesTheProbeTest(PgTestCase):
