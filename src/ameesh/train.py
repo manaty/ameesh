@@ -684,16 +684,44 @@ class Engine:
             return False
         return bool(check(plan))
 
-    def _paused_members_left(self, state):
-        """#8096 : membres nommés du plan paused qui ne sont plus admissibles.
+    @staticmethod
+    def _paused_named_culprits(state, plan):
+        """#8096 : fautifs NOMMÉS par le diagnostic du plan paused.
 
-        Un plan en pause après un rouge ne sera jamais promu tel quel. Quand
-        un de ses membres quitte `validated` (revenu en build, retiré de la
-        file, regelé ou requeueé), le plan ne peut plus être qualifié : le
-        service l'invalide au lieu d'attendre un abandon manuel. Le retour est
-        la liste des lots concernés, ou None quand la lecture ne prouve rien
-        (port sans `entries`, document incomplet, erreur de lecture) : dans ce
-        cas le train reste en pause, fail-closed.
+        Un rouge multi-lots sans attribution ne prouve aucun coupable : retirer
+        un innocent ne dit rien du lot resté en cause (B cx2 #45452). Seules
+        deux preuves nomment un lot : `diagnosis.attribution.proven_lots` du
+        rapport CI, et un plan de diagnostic dont l'unique suspect est le lot
+        testé. Rend l'ensemble des identifiants nommés (vide sans preuve)."""
+        named = set()
+        diagnosis = (state or {}).get("diagnosis")
+        attribution = diagnosis.get("attribution") if isinstance(diagnosis, dict) else None
+        proven = attribution.get("proven_lots") if isinstance(attribution, dict) else None
+        if isinstance(proven, list):
+            for entry in proven:
+                lot = entry.get("work_item_id") if isinstance(entry, dict) else None
+                if isinstance(lot, int) and not isinstance(lot, bool):
+                    named.add(lot)
+        suspects = plan.get("suspects")
+        if plan.get("diagnostic") and isinstance(suspects, list) and len(suspects) == 1 \
+                and isinstance(suspects[0], dict):
+            lot = suspects[0].get("work_item_id")
+            if isinstance(lot, int) and not isinstance(lot, bool):
+                named.add(lot)
+        return named
+
+    def _paused_members_left(self, state):
+        """#8096 : lots dont le départ prouve que le plan paused est mort.
+
+        Un plan en pause après un rouge ne sera jamais promu tel quel. Le
+        service ne l'invalide que sur une preuve (B cx2 #45452) :
+        - tous ses membres ont quitté `validated` (plus rien à composer) ;
+        - sinon, tous les fautifs NOMMÉS par le diagnostic ont quitté : un
+          retrait partiel, ou le retrait d'un innocent alors qu'un fautif
+          reste, ne prouve rien et garde la pause.
+        Le retour est la liste des lots partis, ou None sans preuve suffisante
+        (ou lecture incomplète : port sans `entries`, document ou erreur),
+        fail-closed.
         """
         plan = (state or {}).get("plan")
         members = plan.get("members") if isinstance(plan, dict) else None
@@ -709,16 +737,29 @@ class Engine:
             return None
         if not all(isinstance(row, dict) for row in members):
             return None
-        left = []
+        left, remaining = [], []
         for row in members:
             try:
                 fresh = current.get(row["work_item_id"])
                 same = fresh is not None and identity(fresh) == identity(row)
+                lot_id = row["work_item_id"]
             except (KeyError, TypeError):
                 return None
-            if not same:
-                left.append(row.get("work_item_id"))
-        return left or None
+            (remaining if same else left).append(lot_id)
+        if not left:
+            return None
+        if not remaining:
+            # Le plan entier a quitté : aucune recomposition ne peut le
+            # qualifier, et il n'y a plus de coupable à attendre.
+            return left
+        try:
+            named = self._paused_named_culprits(state, plan)
+            member_ids = {int(row["work_item_id"]) for row in members}
+        except (KeyError, TypeError, ValueError):
+            return None
+        if named and named <= member_ids and named <= set(left):
+            return left
+        return None
 
     def _paused_invalidated(self, state, left, now):
         """#8096 : invalide un plan paused dont un membre n'est plus admissible.

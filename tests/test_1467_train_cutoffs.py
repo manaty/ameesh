@@ -216,8 +216,8 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual([e[0] for e in self.ports.effects], ["publish", "ci"])
         self.assertTrue(self.ports.notices)
 
-    def test_8096_paused_plan_invalidates_when_a_member_leaves_and_recomposes_at_once(self):
-        """#8096: le retour en build d'un membre sort la pause sans pilote.
+    def test_8096_paused_plan_invalidates_when_a_proven_culprit_leaves(self):
+        """#8096: le retour en build du fautif NOMMÉ sort la pause sans pilote.
 
         Le plan ne peut plus être promu ; le service l'invalide sous son bail
         avec la trace du lot parti, puis la passe suivante recompose sans lui
@@ -228,6 +228,8 @@ class CutoffTest(unittest.TestCase):
         first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
         self.ports.ci_by_head[first["head"]] = "red"
         self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        self.ports.document["diagnosis"] = {"attribution": {
+            "status": "proven", "candidates": [], "proven_lots": [{"work_item_id": 2}]}}
         self.ports.rows = [admitted(1)]
         result = engine.step(stamp("2026-10-15T11:10:00"))
         self.assertEqual(result["result"], "invalidated", result)
@@ -240,6 +242,55 @@ class CutoffTest(unittest.TestCase):
         self.assertNotEqual(result["plan"]["id"], first["id"])
         self.assertNotIn("promote", [e[0] for e in self.ports.effects])
         self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
+
+    def test_8096_removing_an_innocent_or_part_of_the_culprits_keeps_the_pause(self):
+        """B cx2 #45452: sans preuve que TOUS les fautifs sont partis, pause."""
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2), admitted(3)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        # Un rouge multi-lots sans diagnostic ne nomme aucun coupable : le
+        # retrait d'un membre ne prouve rien, même s'il est le vrai fautif.
+        self.ports.rows = [admitted(1), admitted(3)]
+        self.assertEqual(engine.step(stamp("2026-10-15T11:10:00"))["result"], "paused")
+        # Deux fautifs nommés : en retirer un seul ne suffit pas.
+        self.ports.document["diagnosis"] = {"attribution": {
+            "status": "proven", "candidates": [],
+            "proven_lots": [{"work_item_id": 2}, {"work_item_id": 3}]}}
+        self.ports.rows = [admitted(1), admitted(3)]
+        self.assertEqual(engine.step(stamp("2026-10-15T11:11:00"))["result"], "paused")
+        # Tous les fautifs nommés sont partis : la pause tombe, sans le lot 1.
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:12:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(sorted(result["invalidated"]["members"]), [2, 3])
+        result = engine.step(stamp("2026-10-15T11:12:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+
+    def test_8096_a_plan_whose_members_all_left_is_invalidated_without_culprit(self):
+        engine = self.engine([admitted(1), admitted(2)])
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        self.ports.rows = []
+        result = engine.step(stamp("2026-10-15T11:10:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(sorted(result["invalidated"]["members"]), [1, 2])
+
+    def test_8096_an_isolated_singleton_red_names_its_culprit(self):
+        engine = self.engine([admitted(1), admitted(2)])
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        plan = self.ports.document["plan"]
+        plan["diagnostic"] = True
+        plan["suspects"] = [row for row in plan["members"] if row["work_item_id"] == 2]
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:10:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(result["invalidated"]["members"], [2])
 
     def test_8096_recompose_takes_a_new_freeze_admitted_after_the_consumed_slot(self):
         """B cx2 #45448: un nouveau gel après le créneau consommé n'est pas exclu.
