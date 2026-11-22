@@ -37,8 +37,8 @@ class MemoryPorts:
         self.fired, self.admitted = True, True
         self.synced = None
         self.edges = []
-        #: #8096: lots dont le retour en build nomme le plan paused.
-        self.removals = set()
+        #: #8096: fautifs explicitement nommés pour le plan paused.
+        self.faults = set()
 
     def acquire(self, epoch):
         if epoch is not None:
@@ -70,8 +70,8 @@ class MemoryPorts:
     def dependencies(self, rows):
         return copy.deepcopy(self.edges)
 
-    def plan_removals(self, plan):
-        return set(self.removals)
+    def plan_faults(self, plan):
+        return set(self.faults)
 
     def target(self):
         return self.base

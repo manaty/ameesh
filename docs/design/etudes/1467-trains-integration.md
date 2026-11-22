@@ -112,7 +112,13 @@ Les phases persistées précèdent les effets externes : `publishing`,
 `ci-intent`, `ci`, `ready`, `promoting`, puis `landed`. Une réponse de dispatch
 perdue ne provoque pas un deuxième dispatch. Une promotion incertaine conserve
 son intention ; le passage suivant constate la cible exacte ou sollicite le
-pilote. Une pause pour échecs répétés ne repart pas d'elle-même.
+pilote. Une pause pour échecs répétés ne repart pas d'elle-même. #8096 : après un
+rouge, le pilote qui renvoie un lot fautif en build inscrit en tête de la note
+le marqueur `train-fault: <identifiant du plan> <motif>` ; citer seulement
+l'identifiant ne vaut pas attribution. Le service invalide la pause et
+recompose sans eux uniquement quand tous les lots explicitement marqués (et
+ceux nommés par le diagnostic) ont quitté `validated` : le retrait d'un
+innocent, ou d'une partie seulement des fautifs, laisse la pause.
 
 Une admission retirée ou devenue invalide après publication ne termine pas
 la CI déjà lancée : la phase `draining` conserve le manifeste et le bail,
