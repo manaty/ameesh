@@ -256,14 +256,41 @@ class Scaleway:
         self._call(target, action)
 
 
+#: #8072: the one line `health` may print (vm-commande.py `said`): an
+#: enrolled host, 8 hex digits of the nonce and fixed words. Anything else is
+#: dropped unread: the worker journal never carries remote or free text.
+HEALTH_LINE = re.compile(r'health host=[A-Za-z0-9][A-Za-z0-9._-]{0,63}'
+                         r'(?: nonce=[0-9a-f]{8})?(?: [a-z_]{1,16}=[a-z0-9-]{1,16}){1,12}\Z')
+
+
+def health_line(out):
+    """#8072: the validated health line of a probe's stdout, or None."""
+    if not isinstance(out, bytes) or len(out) > 4096:
+        return None
+    lines = out.decode('ascii', 'replace').splitlines()
+    line = lines[-1].strip() if lines else ''
+    return line if HEALTH_LINE.fullmatch(line) else None
+
+
 def run_probe(argv, timeout, *, pending=False):
-    """True on 0; with `pending`, 'pending' on 75 (#6073); False otherwise."""
+    """True on 0; with `pending`, 'pending' on 75 (#6073); False otherwise.
+
+    #8072: for health (`pending`), the command's bounded line (stage reached,
+    receipt verdict and booleans, failing check) is journalled, so a return
+    that does not complete reads from the worker log alone."""
     try:
-        code = subprocess.run(argv, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'},
-                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=timeout).returncode
+        done = subprocess.run(argv, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'},
+                              stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE if pending else subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
+        if pending:
+            print('health probe: not run or not ended within its bound', flush=True)
         return False
+    code = done.returncode
+    if pending:
+        line = health_line(getattr(done, 'stdout', None))
+        print('%s (exit %s)' % (line or 'health probe: no valid line', code), flush=True)
     if pending and code == host_release.ADAPTER_WAIT_CODE:
         return 'pending'
     return code == 0

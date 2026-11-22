@@ -64,6 +64,10 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   `artifact-review-requested: <agent> sha256:<empreinte>` ; tant qu'aucune
   note `artifact-review-done: <agent> sha256:<empreinte>` ne la suit et que
   le lot reste ouvert, c'est un travail engagé de l'agent cité.
+  #8072 : la sonde d'une fenêtre d'hôte ouverte (`return_probe` d'un retour
+  `returning` prises fermées, sonde d'un verrou de release vivant) n'est
+  jamais endormie, et son sommeil automatique est levé : c'est la seule
+  identité qui peut jouer le tour de santé du retour.
 * **#4623, la dernière note fait foi** : une note `roadmap: rouverte <projet>`
   postérieure à la dernière `roadmap: épuisée <projet>` désarme le sommeil et
   lève les dormeurs du projet dans la même passe (le geste est journalisé sur
@@ -1067,6 +1071,33 @@ def _avatar_agents(canons) -> set[str]:
     return out
 
 
+#: #8072 : les sondes d'une fenêtre d'hôte ouverte — la seule identité
+#: admise par `ameesh_agent_claims_open` sur un hôte aux prises fermées.
+WINDOW_PROBES_SQL = (
+    "SELECT return_probe AS name FROM host_lifecycle"
+    " WHERE mode = 'returning' AND NOT claims_open AND return_probe IS NOT NULL"
+    " UNION SELECT probe AS name FROM host_release_fences")
+
+
+def window_probes(db) -> tuple:
+    """#8072 : `({sondes}, erreur)` des fenêtres d'hôte ouvertes.
+
+    Au R1 du 22/11, le découpeur a mis en pause la sonde du retour d'AG3
+    (`probe_agent` de l'adaptateur VM) faute de lot prêt : en pause, elle ne
+    prend aucun tour (L87b) et le retour ne peut prouver sa santé. Le contrôle
+    `returning` ne ferme pas l'hôte pour `host_lifecycle.closed_hosts` (seuls
+    `draining`/`lost` le font) : ses agents restent comptés et endormables.
+    Une lecture en échec rend l'erreur : le doute n'endort personne."""
+    from . import db as db_mod
+    try:
+        rows = db.query(WINDOW_PROBES_SQL)
+    except db_mod.Unavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - le doute épargne
+        return set(), "%s: %s" % (type(exc).__name__, str(exc)[:160])
+    return {str(row["name"]) for row in rows or () if row.get("name")}, None
+
+
 def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
            split_id=None, lots=(), listing=(), cfg=None, canons=None,
            mail_window_s=None, waits=None, since_ts: float = 0.0) -> list:
@@ -1108,7 +1139,19 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
         for name in item.idle:
             out.append({"agent": name, "slept": False, "why": why})
         return out
+    probes, probes_error = window_probes(db)
+    if probes_error:
+        why = "host window probes unreadable: %s" % probes_error
+        _journal_exemption(db, split_id, "*", why, since_ts=since_ts)
+        for name in item.idle:
+            out.append({"agent": name, "slept": False, "why": why})
+        return out
     for name in item.idle:
+        if name in probes:
+            why = "probe of an open host window, never slept (#8072)"
+            out.append({"agent": name, "slept": False, "why": why})
+            _journal_exemption(db, split_id, name, why, since_ts=since_ts)
+            continue
         if name in avatars:
             why = "avatar card, never slept (#7658)"
             out.append({"agent": name, "slept": False, "why": why})
@@ -1365,6 +1408,9 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
     #7658 : la pause automatique d'un avatar est levée à toute passe, même
     s'il a quitté son équipe (`_wake` ne parcourt que les agents du projet) :
     son humain doit pouvoir le joindre par courrier.
+
+    #8072 : de même pour la sonde d'une fenêtre d'hôte ouverte
+    (`window_probes`) ; une lecture en échec ne lève personne sur ce motif.
     """
     #7476 : le siège de veille lève aussi un ancien sommeil automatique.
     from . import agent_pause
@@ -1375,6 +1421,7 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
                 if row.get("operator_paused")
                 and is_sleep_reason(str(row.get("operator_pause_reason") or ""))]
     owed = owed_work(db, sleepers, lots, cfg=cfg, now=now)[0] if sleepers else {}
+    probes = window_probes(db)[0] if sleepers else set()
     for row in listing:
         name = str(row.get("name") or "").strip()
         reason = str(row.get("operator_pause_reason") or "")
@@ -1382,7 +1429,9 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
             continue
         project = project_of_sleep_reason(reason)
         why = None
-        if name in avatars:
+        if name in probes:
+            why = "probe of an open host window, never kept asleep (#8072)"
+        elif name in avatars:
             why = "avatar card, never kept asleep (#7658)"
         elif (name, project) in watchers:
             why = "designated GitHub watcher for %s (#7476)" % project
@@ -1419,7 +1468,7 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
             continue
         if done.get("changed"):
             woken.setdefault(project, []).append(name)
-            if name in avatars or (name, project) in watchers:
+            if name in probes or name in avatars or (name, project) in watchers:
                 try:
                     split = _open_split(db, project)
                     if split is not None:
