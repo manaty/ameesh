@@ -55,6 +55,42 @@ class CostStatesTest(unittest.TestCase):
                 host_lifecycle.drain(None, None, 'hub', actor='human:test')
             store.assert_not_called()
 
+    def test_unreadable_configured_canon_refuses_drain(self):
+        # #8033: with the canon configured but unreadable, `configured_canons`
+        # renders [] and the services guard cannot see the host cards. The
+        # drain must fail closed instead of looking like "no canon".
+        with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
+             mock.patch.object(host_lifecycle.work, 'configured_canons', return_value=[]), \
+             mock.patch('ameesh.canon.configured', return_value=['canon']), \
+             mock.patch.object(host_lifecycle.storage, 'of') as store:
+            with self.assertRaisesRegex(ValueError, 'configured canon unreadable'):
+                host_lifecycle.drain(None, None, 'hub', actor='human:test')
+            store.assert_not_called()
+
+    def test_unreadable_canon_root_refuses_drain(self):
+        # #8033 review witness (B #45128): `canon._load` catches the git/OS
+        # error and returns `Canon(readable=False)`, so `configured_canons`
+        # is non-empty. The services card is still unknown; a drain of the
+        # hub must not go through.
+        cfg = NS(canon='/nonexistent/ameesh-canon-8033', canon_ref='',
+                 canon_untrusted=False)
+        with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
+             mock.patch.object(host_lifecycle.storage, 'of') as store:
+            with self.assertRaisesRegex(ValueError, 'configured canon unreadable'):
+                host_lifecycle.drain(cfg, None, 'hub', actor='human:test')
+            store.assert_not_called()
+
+    def test_no_configured_canon_still_allows_drain(self):
+        store = mock.Mock()
+        store.host_lifecycle.drain.return_value = {'mode': 'draining'}
+        with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
+             mock.patch.object(host_lifecycle.work, 'configured_canons', return_value=[]), \
+             mock.patch('ameesh.canon.configured', return_value=[]), \
+             mock.patch.object(host_lifecycle.storage, 'of', return_value=store):
+            row = host_lifecycle.drain(None, None, 'vm', actor='human:test')
+        self.assertEqual(row['mode'], 'draining')
+        self.assertFalse(store.host_lifecycle.drain.call_args.kwargs['close_claims'])
+
     def test_parts_give_on_and_off(self):
         cost = host_idle.cost_states([{'tarif': GP1_S}])
         self.assertAlmostEqual(cost['on'], 0.20309)
