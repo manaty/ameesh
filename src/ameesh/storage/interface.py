@@ -6464,9 +6464,11 @@ class CiResults(Domain):
     @abc.abstractmethod
     def observe_runners(self, repo: str, runners: Sequence[dict]) -> None:
         """Enregistre l'état des runners du dépôt (relevé `ci.Watcher`) :
-        `[{id, name, busy, job, stuck}]`. `stuck_since` garde le début de
-        l'épisode « busy sans job in_progress » et redevient NULL dès qu'il
-        finit ; `busy_since` suit l'état busy, pour le diagnostic. Les runners
+        `[{id, name, busy, job, stuck, labels}]`. `stuck_since` garde le début
+        de l'épisode « busy sans job in_progress » et redevient NULL dès qu'il
+        finit ; `busy_since` suit l'état busy, pour le diagnostic. #8031 :
+        `labels` porte les étiquettes du runner, en ligne ou hors ligne (NULL :
+        non relevé), pour la correspondance hôte → file servie. Les runners
         absents du relevé (retirés du dépôt) sont supprimés : pas d'alerte
         fantôme. Un relevé partiel n'est jamais écrit (l'appelant le saute)."""
 
@@ -6477,8 +6479,14 @@ class CiResults(Domain):
         (`since_ts` : début de l'épisode)."""
 
     @abc.abstractmethod
+    def all_runners(self) -> list[dict]:
+        """#8031 : tous les runners relevés du dépôt, avec `labels` (liste ou
+        NULL) et `seen_ts` : une VM CI arrêtée reste enregistrée hors ligne,
+        et ses étiquettes nomment la file qu'elle peut servir au réveil."""
+
+    @abc.abstractmethod
     def observe_queue(self, repo: str, *, oldest_id: int | None, oldest_at: str | None,
-                      queued: int) -> None:
+                      queued: int, wait_published: bool = False) -> None:
         """Enregistre la file **de capacité** vue du dépôt : le plus vieux
         **job** `queued` qu'aucun runner libre ne peut prendre (`oldest_id` :
         identifiant GitHub du job ; `oldest_at` : son `created_at`) et le
@@ -6488,21 +6496,62 @@ class CiResults(Domain):
         propre exécution (matrice `max-parallel` au plafond, `needs`) pendant
         qu'un runner libre porte ses labels n'est pas une attente de capacité
         et n'est pas compté (`ci.Watcher`). `queued=0` efface le relevé
-        précédent."""
+        précédent.
+
+        #8031 : `wait_published` estampille `wait_seen_at` dans la même
+        écriture que `seen_at`, preuve que `ci_queue_wait` vient de cette
+        passe. Un veilleur N-1 rafraîchit la file sans publier les groupes :
+        le champ reste NULL ou antérieur, et le lecteur doute."""
 
     @abc.abstractmethod
     def queued_oldest(self) -> list[dict]:
         """Le dernier relevé de file de capacité par dépôt : `{repo,
-        oldest_id, oldest_ts, queued, seen_ts}` (les dépôts sans job en
-        attente de runner ont `oldest_ts` NULL)."""
+        oldest_id, oldest_ts, queued, seen_ts, wait_seen_ts, scan_seen_ts}`
+        (les dépôts sans job en attente de runner ont `oldest_ts` NULL ;
+        #8031 : `wait_seen_ts` date la publication de `queue_wait`, NULL si
+        elle n'a pas eu lieu dans cette passe ; `scan_seen_ts` date le stamp
+        atomique des groupes, NULL s'il n'a jamais été publié)."""
+
+    @abc.abstractmethod
+    def queue_wait(self) -> list[dict]:
+        """#8031 : la file du réveil, groupée par jeu d'étiquettes demandées :
+        `{repo, labels, oldest_id, oldest_ts, queued, seen_ts}`. Un groupe
+        n'existe que pour un job qu'**aucun runner en ligne** ne peut servir
+        (plus étroit que la file de capacité `queued_oldest`, qui compte aussi
+        l'attente d'un créneau) ; `labels` est le jeu trié et replié en
+        minuscules. Les lignes d'un dépôt sont remplacées à chaque relevé
+        complet ; `seen_at` date ce relevé."""
+
+    @abc.abstractmethod
+    def wake_queue(self) -> list[dict]:
+        """#8031 : la preuve de réveil lue en UNE requête (même instantané) :
+        `{repo, oldest_ts, queue_queued, seen_ts, wait_seen_ts, scan_seen_ts,
+        labels, wait_oldest_ts, wait_queued, group_seen_ts}`. La file de
+        capacité, le stamp `ci_queue_wait_scan` et les groupes sont joints :
+        un `observe_queue_wait` concurrent ne peut pas mélanger les timestamps
+        d'une génération avec les groupes d'une autre. Une ligne par groupe ;
+        une file vide rend une ligne au `labels` NULL, avec son stamp. Sans
+        ligne de capacité, le dépôt est absent (le lecteur doute)."""
+
+    @abc.abstractmethod
+    def observe_queue_wait(self, repo: str, groups: Sequence[dict]) -> None:
+        """#8031 : remplace la file du réveil du dépôt par `groups`
+        (`[{labels, oldest_id, oldest_at, queued}]`, `oldest_at` : date ISO du
+        plus vieux job). Le veilleur l'écrit AVANT `observe_queue`, dont
+        `wait_published=True` estampille `wait_seen_at`. Les groupes et leur
+        stamp `ci_queue_wait_scan` sont écrits atomiquement, même quand la
+        liste est vide : une écriture interrompue laisse un stamp antérieur ou
+        NULL (donc « doute »), jamais une file fraîche aux groupes disparus.
+        Les groupes présents sont mis à jour, les disparus retirés ; une liste
+        vide efface le relevé des groupes mais publie le stamp."""
 
     @abc.abstractmethod
     def prune_queue(self, repos: Sequence[str]) -> None:
         """Retire les relevés de file des dépôts hors du périmètre actif
         `repos`. Un dépôt sorti de `github.projects` ne doit pas laisser une
         ligne qui fonderait une alerte de silence perpétuelle sur les autres
-        hôtes (#2957). Un périmètre vide ne purge rien : il ne prouve pas que
-        des dépôts ont été retirés."""
+        hôtes (#2957), ni un réveil de VM (#8031). Un périmètre vide ne purge
+        rien : il ne prouve pas que des dépôts ont été retirés."""
 
     # -- #3344 : âge de la carte de mesure ----------------------------------
     @abc.abstractmethod

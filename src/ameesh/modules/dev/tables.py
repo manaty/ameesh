@@ -17,8 +17,8 @@ from __future__ import annotations
 TABLES = (
     # CI
     "ci_runs", "ci_test_failures", "ci_runner_state", "ci_queue_state",
-    "ci_guard_scan", "ci_guard_run", "ci_map_state", "ci_disk_state",
-    "ci_disk_refusals", "ci_disk_dispatch",
+    "ci_queue_wait", "ci_queue_wait_scan", "ci_guard_scan", "ci_guard_run",
+    "ci_map_state", "ci_disk_state", "ci_disk_refusals", "ci_disk_dispatch",
     # Fusion, trains, paquets
     "merge_queue", "merge_locks", "integration_trains",
     "integration_train_fires", "integration_train_queue_receipts",

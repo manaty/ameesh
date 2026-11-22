@@ -321,7 +321,7 @@ class DevBoundaryTest(unittest.TestCase):
             'INSERT INTO "t_x__dev"."work_packet_members" (package_id) VALUES (%s)')
 
     def test_dev_declares_the_tables_it_owns(self):
-        self.assertEqual(len(TABLES), 37)
+        self.assertEqual(len(TABLES), 39)
         self.assertEqual(len(set(TABLES)), len(TABLES))
         # les déclarations d'agent ne nomment que des tables du module
         from ameesh.modules.dev.tables import KEPT, REWRITTEN
