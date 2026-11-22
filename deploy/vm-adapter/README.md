@@ -603,10 +603,17 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      fixes de l'inscription (`checks.version-mode`, `checks.doctor`), lancés
      sous le compte VM, rendent 0. Un reçu rouge arrête R1 avant tout
      drainage : sa raison (`étape:Classe`, `checks/diagnostics.md`) se
-     traite d'abord. La version lancée sur AG3 contient #8069 : sinon la
-     carte `units` posée à l'installation, périmée dès qu'un agent change,
-     rend le reçu rouge (`inventory:ValueError`, R1 du 22/11), et un retour
-     prises fermées le laisserait rouge faute de bail des autres runners.
+     traite d'abord. #8069 doit être en place, par deux voies distinctes :
+     (1) AG3 tourne un venv ameesh qui contient #8069 (`ameesh version`),
+     pour que `ameesh host status` porte `return_probe` ; (2) le bureau a
+     reposé `checks/health.py` dans `/opt/ameesh-vm-adapter/checks`,
+     root:root 0644, depuis le commit fusionné, au feu pilote, puis relevé
+     un reçu vert. Le déploiement staging du venv ne met pas à jour ce
+     fichier, posé par root à l'étape 2. Sans (2), la carte `units` posée à
+     l'installation, périmée dès qu'un agent change, rend le reçu rouge
+     (`inventory:ValueError`, R1 du 22/11), et un retour prises fermées le
+     laisserait rouge faute de bail des autres runners. Retirer `units` de
+     la carte reste facultatif ; ce geste est au bureau.
 2. Le bureau active l'inscription (`enabled: true`, copie avant) et démarre
    le timer (R1 de D1). Le worker doit être vu (`vm_adapter_observations`)
    **avant** l'étape 3 : un hook sans worker laisse l'hôte fermé.
