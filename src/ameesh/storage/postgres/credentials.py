@@ -67,10 +67,11 @@ class Credentials(interface.Credentials):
 
     def touch(self, host, harness, account, *, expect_failures=None) -> bool:
         # #8062 : la sonde a relu l'identifiant sans changer de verdict
-        # (`kept_failure`) ; `checked_at` est son battement, l'état et le
-        # compteur d'échecs restent intacts.
+        # (`kept_failure`) ; `checked_at` est son battement et `source` dit
+        # qu'il vient de la sonde (un échec de tour, lui, ne prouve pas
+        # qu'elle tourne). L'état et le compteur d'échecs restent intacts.
         rows = self.db.query(
-            "update credential_health set checked_at = now()"
+            "update credential_health set checked_at = now(), source = 'sentinel'"
             " where host = %s and harness = %s and account = %s"
             "   and state = 'failing'"
             "   and (%s::int is null or failures = %s::int) returning account",

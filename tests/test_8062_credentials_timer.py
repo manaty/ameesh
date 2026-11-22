@@ -33,12 +33,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CredentialProbeAlertsTest(unittest.TestCase):
-    def _alerts(self, rows, now=NOW):
+    def _alerts(self, rows, now=NOW, cfg=None, hosts=()):
         creds = mock.Mock()
         creds.listing.return_value = rows
-        with mock.patch.object(exploitation.storage, "of",
-                               return_value=SimpleNamespace(credentials=creds)):
-            return exploitation._credential_probe_alerts(object(), now)
+        store = SimpleNamespace(
+            credentials=creds,
+            hosts=SimpleNamespace(current=mock.Mock(return_value=list(hosts))))
+        with mock.patch.object(exploitation.storage, "of", return_value=store):
+            return exploitation._credential_probe_alerts(object(), now, cfg)
 
     def _row(self, **kw):
         row = {"host": "h1", "harness": "claude", "account": "a", "state": "healthy",
@@ -77,8 +79,27 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         self.assertEqual(self._alerts([self._row(harness="deepseek",
                                                  checked_ts=NOW - 30 * 86400)]), [])
 
-    def test_a_row_without_a_reading_is_ignored(self):
-        self.assertEqual(self._alerts([self._row(checked_ts=None)]), [])
+    def test_a_sentinel_row_without_a_stamp_alerts_as_never_probed(self):
+        # La base interdit checked_at NULL ; une ligne sans date ne prouve
+        # aucune sonde et ne doit pas se taire.
+        [alert] = self._alerts([self._row(checked_ts=None)])
+        self.assertIsNone(alert["since"])
+        self.assertIn("no probe reading", alert["detail"])
+
+    def test_turn_failures_do_not_refresh_the_probe_heartbeat(self):
+        # #8042/#8062 B : `Credentials.report(source='turn')` écrit aussi
+        # checked_at ; des échecs de tour répétés ne doivent pas masquer une
+        # sonde arrêtée.
+        stale = NOW - LIMIT - 5
+        [alert] = self._alerts([self._row(source="sentinel", checked_ts=stale),
+                                self._row(source="turn", checked_ts=NOW - 60)])
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertEqual(alert["since"], stale)
+
+    def test_a_pair_with_only_turn_rows_has_never_been_probed(self):
+        [alert] = self._alerts([self._row(source="turn", checked_ts=NOW - 60)])
+        self.assertIsNone(alert["since"])
+        self.assertIn("no probe reading", alert["detail"])
 
     def test_alert_identity_stays_stable_while_the_silence_grows(self):
         row = self._row(checked_ts=NOW - LIMIT - 5)
@@ -106,6 +127,82 @@ class CredentialProbeAlertsTest(unittest.TestCase):
             with self.assertRaises(db_mod.Unavailable):
                 exploitation._credential_probe_alerts(object(), NOW)
 
+
+def _canon(**policy):
+    card = SimpleNamespace(policy=SimpleNamespace(**policy))
+    return SimpleNamespace(id="c", host=lambda _name: card)
+
+
+class QuietHostsTest(unittest.TestCase):
+    """#5207 × #8062 : un poste éteint (`intermittent`) ou un hôte retiré
+    (`max_agents: 0`) ne fait pas pousser une alerte de sonde muette."""
+
+    HOST = "pc-smichea"
+    OFF = {"host": HOST, "sampled_ts": NOW - 4 * 86400}
+    ON = {"host": HOST, "sampled_ts": NOW - 30}
+
+    def _quiet(self, policy, readings):
+        store = SimpleNamespace(hosts=SimpleNamespace(
+            current=mock.Mock(return_value=list(readings))))
+        with mock.patch("ameesh.canon.load_configured",
+                        return_value=[_canon(**policy)]), \
+                mock.patch.object(exploitation, "host_unsampled_after_s",
+                                  return_value=3600), \
+                mock.patch.object(exploitation.storage, "of", return_value=store):
+            return exploitation._probe_quiet_hosts(
+                SimpleNamespace(), object(), {self.HOST}, NOW)
+
+    def test_an_intermittent_host_off_is_quiet(self):
+        self.assertEqual(self._quiet({"intermittent": True, "max_agents": 27},
+                                     [self.OFF]), {self.HOST})
+
+    def test_a_purged_reading_changes_nothing(self):
+        self.assertEqual(self._quiet({"intermittent": True, "max_agents": 27},
+                                     []), {self.HOST})
+
+    def test_its_probe_alerts_come_back_when_it_is_on(self):
+        self.assertEqual(self._quiet({"intermittent": True, "max_agents": 27},
+                                     [self.ON]), set())
+
+    def test_a_retired_host_is_quiet_even_when_its_row_stays(self):
+        self.assertEqual(self._quiet({"intermittent": False, "max_agents": 0},
+                                     [self.OFF]), {self.HOST})
+
+    def test_an_ordinary_host_still_alerts(self):
+        self.assertEqual(self._quiet({"intermittent": False, "max_agents": 27},
+                                     [self.OFF]), set())
+
+    def test_the_server_publish_reading_is_not_a_retirement(self):
+        # #5559/#5857 : `max_agents: 0` avec un relevé `publish@` = serveur
+        # sans exécuteur, pas hôte retiré : sa sonde doit parler.
+        reading = dict(self.OFF, runner_id="publish@%s" % self.HOST)
+        self.assertEqual(self._quiet({"intermittent": False, "max_agents": 0},
+                                     [reading]), set())
+
+    def _alerts(self, rows, policy, readings):
+        creds = mock.Mock()
+        creds.listing.return_value = rows
+        store = SimpleNamespace(
+            credentials=creds,
+            hosts=SimpleNamespace(current=mock.Mock(return_value=list(readings))))
+        with mock.patch("ameesh.canon.load_configured",
+                        return_value=[_canon(**policy)]), \
+                mock.patch.object(exploitation, "host_unsampled_after_s",
+                                  return_value=3600), \
+                mock.patch.object(exploitation.storage, "of", return_value=store):
+            return exploitation._credential_probe_alerts(
+                SimpleNamespace(), NOW, SimpleNamespace())
+
+    def test_the_alert_itself_is_silent_while_the_poste_is_off(self):
+        row = {"host": self.HOST, "harness": "claude", "account": "a",
+               "state": "healthy", "reason": "", "source": "sentinel",
+               "checked_ts": NOW - LIMIT - 5, "failing_since_ts": None,
+               "expires_ts": None}
+        self.assertEqual(self._alerts([row], {"intermittent": True,
+                                              "max_agents": 27}, [self.OFF]), [])
+        [alert] = self._alerts([row], {"intermittent": True, "max_agents": 27},
+                               [self.ON])
+        self.assertEqual(alert["type"], "credential_probe_stale")
 
 class KeptFailureHeartbeatTest(unittest.TestCase):
     def _check(self, verdict, *, dry_run=False):
@@ -146,7 +243,8 @@ class TouchStorageTest(unittest.TestCase):
         self.assertTrue(Credentials(db).touch("h1", "claude", "a", expect_failures=2))
         sql, params = db.query.call_args[0]
         self.assertEqual(sql.split(" where ", 1)[0],
-                         "update credential_health set checked_at = now()")
+                         "update credential_health set checked_at = now(), "
+                         "source = 'sentinel'")
         self.assertIn("state = 'failing'", sql)
         self.assertIn("failures = %s::int", sql)
         self.assertEqual(params, ("h1", "claude", "a", 2, 2))
