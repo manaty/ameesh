@@ -446,8 +446,9 @@ Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
    avec le bureau, sans ajout automatique de droits ni de sudo.
    Ce contrôle vérifie la cohérence installée, pas une cible de vague.
 
-   Le producteur énumère les unités runners actives via `systemctl --user`
-   et exige la liste exacte de sa carte. Pour chaque MainPID actif il appelle
+   Le producteur énumère les unités runners via `systemctl --user` : celles
+   que `default.target` veut et celles chargées, activées ou non inactives
+   (#8069, aucune liste de carte). Pour chaque MainPID actif il appelle
    le même `venv-processus.py` que staging (dont l'attestation privée 0600
    pour les processus non dumpables), puis lit sa cmdline, jamais son
    environnement. Le mode `execute` ou `dry-run` vient du `run` vivant et de

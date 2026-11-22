@@ -69,7 +69,8 @@ class Producer:
             return json.dumps(dict(version='1.2.3', source={'url': 'file:///src-' + 'a' * 40}))
         if 'list' in argv:
             return json.dumps([dict(name=name, host='vm', lease_owner=owner,
-                                    runner_seen_owner=seen, status='idle',
+                                    runner_seen_owner=seen, runner_seen_host='vm',
+                                    status='idle',
                                     lease_expires_ts=time.time() + 60 if owner else None)
                                for name, owner, seen in self.leases])
         if 'status' in argv:
@@ -222,12 +223,35 @@ class ClosedReturnReadinessTest(unittest.TestCase):
         self.assertFalse([argv for argv in producer.calls if 'status' in argv])
 
     def test_runner_host_must_be_one(self):
-        rows = [dict(host='vm', runner_seen_owner='a'), dict(host='vm2', lease_owner='b')]
+        rows = [dict(host='vm', runner_seen_owner='a', runner_seen_host='vm'),
+                dict(host='vm', runner_seen_owner='b', runner_seen_host='vm2')]
         with self.assertRaises(ValueError):
             health.runner_host(rows, ['a', 'b'])
         with self.assertRaises(ValueError):
             health.runner_host([], ['a'])
+        with self.assertRaises(ValueError):
+            health.runner_host([dict(host='vm', lease_owner='a')], ['a'])
         self.assertEqual(health.runner_host(rows, ['a']), 'vm')
+
+    def test_moved_agent_keeps_the_runner_host(self):
+        # B of mty-amh-impl-05 (freeze e268532875b9): an agent moved off the VM
+        # before step 4 has host = destination, last seen by a runner here.
+        producer = Producer(self.temp.name, units=self.units, control=self.control(),
+                            leases=[('probe', IDS[PROBE], IDS[PROBE]), ('other', None, IDS[OTHER])])
+        command = producer.command
+
+        def moved(argv, end, **kw):
+            out = command(argv, end, **kw)
+            if argv[-2:] == ['list', '--json']:
+                rows = json.loads(out)
+                rows[1]['host'] = 'ameesh-agents-1'
+                out = json.dumps(rows)
+            return out
+        producer.command = moved
+        code, receipt = producer.run()
+        self.assertEqual(code, 0, receipt)
+        status = [argv for argv in producer.calls if 'status' in argv]
+        self.assertEqual(status[0][-3:], ['host', 'status', 'vm'])
 
 
 class HostStatusReturnProbeTest(PgTestCase):

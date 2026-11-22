@@ -169,10 +169,11 @@ def runner_units(end):
 
 
 def runner_host(rows, runner_ids):
-    """The one registry host of the launched runners (lease or last sighting)."""
-    hosts = {row.get('host') for row in rows if isinstance(row, dict)
-             and (row.get('lease_owner') in runner_ids
-                  or row.get('runner_seen_owner') in runner_ids)}
+    """The one host the launched runners report from (`runner_seen_host` of
+    the rows they last saw). Never the agent's `host`: that is its placement,
+    the destination after a move, while the last sighting stays here."""
+    hosts = {row.get('runner_seen_host') for row in rows if isinstance(row, dict)
+             and row.get('runner_seen_owner') in runner_ids}
     if len(hosts) != 1 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', str(*hosts)):
         raise ValueError('runner host not proven')
     return hosts.pop()
