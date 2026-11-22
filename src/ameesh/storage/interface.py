@@ -4592,6 +4592,24 @@ HOLD_NOTE_WHITESPACE = ("\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
                         "\u2028\u2029\u202f\u205f\u3000")
 
 
+class HoldPatterns(tuple):
+    """#8051 : motifs de `Progress.lot_hold_events` et têtes littérales.
+
+    Chaque motif est ancré (`^`) : seul le DÉBUT de la note peut le satisfaire.
+    `heads` donne les débuts du premier mot (minuscules) que ces motifs
+    acceptent ; le stockage ajoute alors `note_head LIKE <tête>%` AVANT le
+    motif exact, servi par l'index `work_item_events_item_note_head_idx`
+    (0606). Un tuple ordinaire reste accepté : sans `heads`, aucun préfiltre
+    n'est posé et la lecture reste exacte. Une tête n'est jamais une seconde
+    règle : le motif exact filtre encore chaque ligne (le préfiltre ne peut
+    que SUR-approximer, jamais décider)."""
+
+    def __new__(cls, values, *, heads=()):
+        obj = super().__new__(cls, values)
+        obj.heads = tuple(str(head).lower() for head in heads)
+        return obj
+
+
 def _transitions(events) -> list[dict]:
     """Lignes où l'état d'un lot change (la première de chaque lot en fait
     partie), texte des notes écarté : la règle de `lot_transitions`, partagée

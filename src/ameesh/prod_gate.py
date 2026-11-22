@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import re
 
+from .storage.interface import HoldPatterns
+
 #: la marque d'un lot de porte de production, et sa levée explicite
 _MARK = re.compile(r"^prod-gate\s*:", re.I)
 _LIFT = re.compile(r"^prod-gate\s+lifted\s*:", re.I)
 #: motifs donnés au stockage (`Progress.lot_hold_events`), syntaxe commune
 #: `re` / ARE PostgreSQL ; le filtre exact reste ici
-NOTE_PATTERNS = (_MARK.pattern, _LIFT.pattern)
+NOTE_PATTERNS = HoldPatterns((_MARK.pattern, _LIFT.pattern), heads=("prod-gate",))
 #: longueur gardée de la garde dans les motifs et le journal
 _GUARD_MAX = 160
 

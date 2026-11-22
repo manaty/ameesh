@@ -20,8 +20,12 @@ import json
 import re
 import time
 
+from .storage.interface import HoldPatterns
+
 PREFIX = 'packet-unit-red: '
 PATTERN = '^' + re.escape(PREFIX)
+#: #8051 : tête littérale pour le préfiltre indexé (`lot_hold_events`).
+NOTE_PATTERNS = HoldPatterns((PATTERN,), heads=("packet-unit-red",))
 #: Le tic paquet-horaire passe toutes les dix minutes, mais un porteur ouvert
 #: retient la composition suivante ; sa ci-full dure environ une heure (jobs
 #: bornés à soixante minutes), puis le tic suivant compose. Deux heures
@@ -126,7 +130,7 @@ def remember(db, lot, source, target, tests, *, actor='', base=None):
             raise work.WorkError('lot %s not found' % lot)
         seen_source = False
         wanted = normalize_target(target)
-        for event in st.progress.lot_hold_events([lot], [PATTERN]):
+        for event in st.progress.lot_hold_events([lot], NOTE_PATTERNS):
             value = read_note(event.get('note'))
             if value and value['source'] == source and value['target'] == wanted:
                 seen_source = True

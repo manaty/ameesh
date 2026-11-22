@@ -42,6 +42,7 @@ import os
 import re
 
 from . import plan_git
+from .storage.interface import HoldPatterns
 
 #: tête d'un paquet : elle seule se fusionne hors paquet
 PACKET_PREFIX = "integration/"
@@ -52,6 +53,9 @@ MARKER = "packet-exception"
 #: #6893 : motif de lecture ciblée des déclarations au journal
 #: (`Progress.lot_hold_events`), sans relire les notes ordinaires
 PATTERN = r"^" + re.escape(MARKER) + r"\s"
+#: #8051 : mêmes motifs pour `lot_hold_events`, avec la tête littérale qui
+#: permet le préfiltre indexé (`HoldPatterns`) ; le motif exact reste filtre.
+NOTE_PATTERNS = HoldPatterns((PATTERN,), heads=("packet-exception",))
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 #: `owner/repo` nu : un dépôt GitHub
 _SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")

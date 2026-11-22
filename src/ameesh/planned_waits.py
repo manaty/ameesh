@@ -37,7 +37,7 @@ import threading
 import time
 
 from . import plan, storage, work_lifecycle as lifecycle
-from .storage.interface import HOLD_NOTE_WHITESPACE, LotSessions
+from .storage.interface import HOLD_NOTE_WHITESPACE, HoldPatterns, LotSessions
 
 _LOT = re.compile(r"^(?:(?:task|lot)\s*#?\s*|#)?([0-9]{1,18})$", re.I)
 _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
@@ -85,7 +85,8 @@ _LIFT = re.compile(
 #: (`Progress.lot_hold_events`) — exactement `_HOLD` et `_LIFT` (syntaxe `re`
 #: côté repli, ARE côté pilote PostgreSQL) : toutes les notes hold/levée,
 #: aucune note ordinaire. Le filtre exact reste ici.
-HOLD_NOTE_PATTERNS = (_HOLD.pattern, _LIFT.pattern)
+HOLD_NOTE_PATTERNS = HoldPatterns((_HOLD.pattern, _LIFT.pattern),
+                                 heads=("hold", "unhold"))
 #: #3373 : le mot « hold » suivi d'un séparateur (`hold :`, `hold (pilote) :`,
 #: `Hold —`) — une retenue apparente qui n'en est pas une : le préfixe exact
 #: est `hold:` sans blanc. Un trait d'union collé (`hold-up:`) reste une note

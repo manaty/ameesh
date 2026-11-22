@@ -1110,7 +1110,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     # entrer dans le paquet un lot destiné à une fusion hors paquet.
     try:
         exception_events = storage.of(db).progress.lot_hold_events(
-            ids, [packet_guard.PATTERN])
+            ids, packet_guard.NOTE_PATTERNS)
     except Exception as exc:  # noqa: BLE001 - liste incomplète : on ne compose pas
         raise CandidateError(
             "cannot read the packet exceptions: %s" % exc) from exc
@@ -1251,7 +1251,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     if ready_ids:
         try:
             red_events = storage.of(db).progress.lot_hold_events(
-                ready_ids, [packet_unit_red.PATTERN])
+                ready_ids, packet_unit_red.NOTE_PATTERNS)
             packet_unit_red.apply(candidates, red_events, base=fetched_target)
         except Exception as exc:
             raise CandidateError('cannot read unit-test exclusions: %s' % exc) from exc

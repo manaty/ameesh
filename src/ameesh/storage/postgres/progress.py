@@ -41,6 +41,38 @@ def _marks(values) -> str:
     return ", ".join(["%s"] * len(values))
 
 
+def _sql_estring(value: str) -> str:
+    """Un littéral `E'…'` dont la VALEUR est `value`, octet pour octet.
+
+    Un escape `\\xNN` n'est valide qu'en ASCII : au-delà, `\\uNNNN` (le
+    serveur est en UTF-8). L'expression de tête de note (`NOTE_HEAD_SQL`) doit
+    être écrite à l'identique dans l'index 0606 : un littéral de paramètre
+    `%s` ne peut pas entrer dans une expression d'index."""
+    out: list[str] = []
+    for ch in value:
+        code = ord(ch)
+        if ch == "'":
+            out.append("''")
+        elif ch == "\\":
+            out.append("\\\\")
+        elif 0x20 <= code < 0x7F:
+            out.append(ch)
+        elif code < 0x80:
+            out.append("\\x%02x" % code)
+        else:
+            out.append("\\u%04x" % code)
+    return "E'" + "".join(out) + "'"
+
+
+#: #8051 : premier mot d'une note, en minuscules, blancs de `btrim` retirés.
+#: L'index `work_item_events_item_note_head_idx` (0606) porte EXACTEMENT cette
+#: expression : le préfiltre `NOTE_HEAD_SQL LIKE 'hold%'` sonde alors le seul
+#: petit ensemble des notes hold/levée, au lieu de lire le texte de tout le
+#: journal des lots demandés (mesuré : 21 638 notes lues → 797).
+NOTE_HEAD_SQL = ("lower(split_part(btrim(note, " + _sql_estring(interface.HOLD_NOTE_WHITESPACE)
+                 + "), ' ', 1))")
+
+
 def _id_pages(item_ids):
     """Ids entiers, sans doublon, par pages de `GROUPED_IDS_MAX` (#5585).
 
@@ -141,6 +173,7 @@ class Progress(interface.Progress):
         wanted = [str(pattern) for pattern in patterns]
         if any(not pattern for pattern in wanted):
             raise ValueError("empty hold pattern")
+        heads = tuple(getattr(patterns, "heads", ()) or ())
         merged: dict[tuple[int, int], dict] = {}
         for ev in self.lot_transitions(item_ids):
             merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
@@ -149,6 +182,17 @@ class Progress(interface.Progress):
             # planned_waits, ARE) : le texte des notes ordinaires (des
             # mégaoctets sur une liste de lots) n'est ni lu ni transféré. La
             # ligne à note l'emporte sur la transition de même id.
+            # #8051 : quand les motifs déclarent leurs têtes (`HoldPatterns`),
+            # un préfiltre `note_head LIKE 'hold%'` passe AVANT le motif :
+            # servi par l'index 0606, il ne lit que les notes candidates au
+            # lieu de détoaster et regexer tout le journal des lots. Le motif
+            # exact reste le seul juge ; une tête inconnue = aucun préfiltre.
+            prefilter = ""
+            pre_params: tuple = ()
+            if heads:
+                prefilter = "   AND (" + " OR ".join(
+                    [NOTE_HEAD_SQL + " LIKE %s"] * len(heads)) + ")"
+                pre_params = tuple(head + "%" for head in heads)
             where = " OR ".join(["btrim(note, %s) ~* %s"] * len(wanted))
             note_params = tuple(value for pattern in wanted
                                 for value in (interface.HOLD_NOTE_WHITESPACE, pattern))
@@ -157,10 +201,11 @@ class Progress(interface.Progress):
                         "SELECT id, work_item_id, state, note, actor,"
                         "       extract(epoch from created_at)::float8 AS created_ts"
                         "  FROM work_item_events"
-                        " WHERE work_item_id = ANY(%%s::bigint[])"
-                        "   AND note IS NOT NULL AND (%s)"
-                        " ORDER BY id" % where,
-                        (page,) + note_params):
+                        " WHERE work_item_id = ANY(%s::bigint[])"
+                        "   AND note IS NOT NULL" + prefilter +
+                        "   AND (__WHERE__)"
+                        " ORDER BY id".replace("__WHERE__", where),
+                        (page,) + pre_params + note_params):
                     merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
         return sorted(merged.values(), key=lambda e: int(e["id"]))
 
