@@ -3230,7 +3230,22 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
          installed: str | None = None, jobs: bool = True,
          api=None) -> dict:
     """Lit la base et rend le rapport (voir `build`). Une lecture illisible
-    n'est jamais une file vide : elle est nommée dans `unreadable`."""
+    n'est jamais une file vide : elle est nommée dans `unreadable`.
+
+    #8041 : une seule fenêtre de cache des canons par lecture. Sans elle,
+    chaque contrôle d'autorité (`assignments.is_orchestrator`,
+    `account_turn._is_critical`) relisait tous les canons : 56 relectures,
+    ~30 s sur 50 s le 22/11. Des canons passés par `--canon` ne sont pas
+    ceux de la configuration : ils ne remplissent pas la fenêtre."""
+    from . import canon as canon_mod
+    with canon_mod.configured_cache():
+        return _read(db, cfg=cfg, now=now, hours=hours, wait_s=wait_s,
+                     ci_hours=ci_hours, ci_slow_s=ci_slow_s, canons=canons,
+                     installed=installed, jobs=jobs, api=api)
+
+
+def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
+          installed, jobs, api) -> dict:
     now = time.time() if now is None else float(now)
     horizon = now - EVENT_DAYS * 86400
     unreadable: list[str] = []
