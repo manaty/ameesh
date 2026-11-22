@@ -3,12 +3,11 @@
 --
 -- `checked_at` is written by every report, including a runner's `turn`
 -- failure (L226b): a repeated turn failure must not mask a stopped probe.
--- `probed_at` only advances when the sentinel reads the credential (a
--- `source = 'sentinel'` report, or the kept-failure touch). Existing
--- sentinel rows are backfilled from their last reading so the rollout does
--- not raise a false "never probed" alert; a turn-only row stays NULL and is
--- named as such.
+-- `probed_at` only advances when the new sentinel reads the credential (a
+-- `source = 'sentinel'` report, or the kept-failure touch). It stays NULL on
+-- an N-1 write, and there is deliberately no backfill: a backfilled date is
+-- not replayed and would be trusted as a fresh probe after a `turn` write.
+-- The reader treats an N-1 `source = 'sentinel'` row through `checked_at`
+-- instead, and only names a pair with no probe date once it has been silent
+-- for a full limit.
 alter table credential_health add column if not exists probed_at timestamptz;
-
-update credential_health set probed_at = checked_at
- where probed_at is null and source = 'sentinel';

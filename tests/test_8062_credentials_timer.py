@@ -89,9 +89,9 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         self.assertEqual(self._alerts([self._row(probed_ts=None,
                                                  checked_ts=NOW - 60)]), [])
 
-    def test_an_n1_sentinel_write_refreshes_even_a_stale_backfill(self):
-        # Le backfill ne se rejoue pas : une écriture N-1 postérieure à la
-        # migration doit compter malgré un probed_at périmé.
+    def test_an_n1_sentinel_write_wins_over_an_older_probe_date(self):
+        # Une lecture N-1 (`checked_at`) plus récente qu'un `probed_at`
+        # antérieur est le vrai battement ; le maximum des deux compte.
         self.assertEqual(self._alerts([self._row(
             probed_ts=NOW - 2 * LIMIT, checked_ts=NOW - 60)]), [])
 
@@ -120,10 +120,30 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         self.assertEqual(self._alerts([self._row(
             source="turn", probed_ts=NOW - 60, checked_ts=NOW - 5)]), [])
 
-    def test_a_pair_with_only_turn_rows_has_never_been_probed(self):
-        [alert] = self._alerts([self._row(source="turn", probed_ts=None,
-                                          checked_ts=NOW - 60)])
-        self.assertIsNone(alert["since"])
+    def test_a_pair_with_only_turn_rows_is_not_named_immediately(self):
+        # #230319 : une sonde N-1 a pu écrire puis être écrasée par un
+        # `turn` ; sans date de sonde, la paire fraîchement écrite n'est pas
+        # « jamais sondée ».
+        self.assertEqual(self._alerts([self._row(
+            source="turn", probed_ts=None, checked_ts=NOW - 60)]), [])
+
+    def test_a_pair_with_only_turn_rows_is_named_once_silent(self):
+        row = self._row(source="turn", probed_ts=None, checked_ts=NOW - 60)
+        [alert] = self._alerts([row], now=NOW + LIMIT)
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertEqual(alert["since"], NOW - 60)
+        self.assertIn("no probe reading", alert["detail"])
+        self.assertIn("silent", alert["detail"])
+
+    def test_an_n1_sentinel_then_a_turn_write_is_not_named_immediately(self):
+        # La séquence du rejeu : sonde N-1 (source=sentinel, checked_at,
+        # probed_at NULL), puis échec turn qui écrase source et checked_at.
+        # La date de sonde est perdue, mais l'alerte attend le silence.
+        row = self._row(source="turn", probed_ts=None, checked_ts=NOW - 5)
+        self.assertEqual(self._alerts([row]), [])
+        [alert] = self._alerts([row], now=NOW + LIMIT)
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertEqual(alert["since"], NOW - 5)
         self.assertIn("no probe reading", alert["detail"])
 
     def test_alert_identity_stays_stable_while_the_silence_grows(self):
@@ -319,11 +339,14 @@ class ReportProbeStampTest(unittest.TestCase):
 
 
 class ProbeDateWiringTest(unittest.TestCase):
-    def test_migration_0604_adds_and_backfills_the_probe_date(self):
+    def test_migration_0604_adds_the_probe_date_without_backfill(self):
+        # #230319 : un backfill ne se rejoue pas à chaque écriture N-1 et
+        # serait pris pour une sonde fraîche après un `turn` ; la
+        # compatibilité se lit dans `checked_at`, pas dans une reprise.
         text = (ROOT / "src/ameesh/migrations/0604_credentials_probe_heartbeat.sql"
                 ).read_text(encoding="utf-8")
         self.assertIn("add column if not exists probed_at", text)
-        self.assertIn("source = 'sentinel'", text)
+        self.assertNotIn("update credential_health set probed_at", text)
 
     def test_the_supervisor_role_reads_the_probe_date(self):
         text = (ROOT / "deploy/sql/role-superviseur.sql").read_text(encoding="utf-8")
