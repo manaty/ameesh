@@ -5,12 +5,12 @@
     vm-commande.py <quiesce|halt|halted|health|reconcile> <cible.json>
 
 Run by the adapter worker (`run_probe`): fixed absolute argv, no shell,
-outputs discarded, a scrubbed environment (`PATH`, `LANG`), at most
-`io_timeout_s`. This program adds nothing to that environment and passes
-nothing of it on: every child gets the same two variables, so no cloud
-secret is ever inherited. Host, user, key and known_hosts come from the
-operator's private target file `cible.json` (one per VM, 0600, no link),
-never from code: no client or host name is written here.
+outputs discarded (except health's one bounded line, #8072), a scrubbed
+environment (`PATH`, `LANG`), at most `io_timeout_s`. This program adds
+nothing to that environment and passes nothing of it on: every child gets
+the same two variables, so no cloud secret is ever inherited. Host, user,
+key and known_hosts come from the operator's private target file
+`cible.json` (one per VM, 0600, no link), never from code: no client or host name is written here.
 
 Exit codes follow the worker (#6073): 0 proven, 75 (EX_TEMPFAIL) health
 turn still in flight, anything else not proven. The worker reads every
@@ -33,7 +33,11 @@ as nothing at all; failure is a wait, never an effect.
   old and never accepted; delivery alone is not completion. Then the remote
   health checks (version/mode, runners, doctor, mail) and, after an adapter
   halt, the end of the previous boot's journal (`journalctl -b -1`,
-  read-only) must pass.
+  read-only) must pass. #8072: health prints ONE bounded line on stdout,
+  built from fixed words and validated fields only (see `Commande.said`):
+  the stage reached and the receipt's verdict and booleans. The worker
+  journals it, so a return that does not complete reads without a remote
+  inspection. Never a remote byte, a path, a full nonce or a secret.
 - reconcile: closed return only (never opens claims, never forces `lost`),
   then the operator's remote reconciliation commands.
 
@@ -77,6 +81,18 @@ SSH_KEYS = {'executable', 'destination', 'user', 'port', 'identity_file',
 ANSWERED = ('Permission denied', 'Host key verification failed',
             'REMOTE HOST IDENTIFICATION HAS CHANGED', 'No ED25519 host key',
             'Too many authentication failures')
+
+
+#: #8072: the only words and values of the health line (`Commande.said`).
+REPORT = {'stage': ('control', 'admission', 'launched', 'receipt', 'checks',
+                    'previous-boot', 'done'),
+          'answer': ('ok', 'transport', 'failed'),
+          'verdict': ('ok', 'ko', 'pending'),
+          'delivered': ('true', 'false', 'absent'),
+          'acknowledged': ('true', 'false', 'absent'),
+          'turn_ended': ('true', 'false', 'absent'),
+          'checks': ('ok', 'transport', 'failed'),
+          'previous_boot': ('ok', 'transport', 'failed')}
 
 
 class Refus(ValueError):
@@ -260,12 +276,34 @@ class Commande:
     def outcome(self, key):
         """'ok', 'transport' (no answer: bound reached, ssh not started, ssh's
         own 255) or 'failed' (a remote command answered non-zero). Stops at
-        the first argv that is not 'ok'."""
-        for argv in self.t['remote'][key]:
+        the first argv that is not 'ok'; `self.step` is its 1-based rank."""
+        for rank, argv in enumerate(self.t['remote'][key], 1):
+            self.step = rank
             verdict = transport(self.ssh(argv)[0])
             if verdict != 'ok':
                 return verdict
         return 'ok'
+
+    # -- #8072: the bounded health line -----------------------------------------
+    def note(self, **fields):
+        for key, value in fields.items():
+            if key == 'step':
+                if type(value) is int and 0 < value < 100:
+                    self.report[key] = str(value)
+            elif value in REPORT.get(key, ()):
+                self.report[key] = value
+
+    def said(self):
+        """The health line: host (enrolled name), the first 8 hex digits of
+        the nonce (enough to match the probe turn's log, useless as an ack)
+        and fixed words. Anything unexpected is left out, never echoed."""
+        fields = ['host=' + self.t['host']]
+        nonce = str((getattr(self, 'launch', None) or {}).get('nonce') or '')
+        if NONCE.fullmatch(nonce):
+            fields.append('nonce=' + nonce[:8])
+        fields += ['%s=%s' % (k, self.report[k]) for k in (*REPORT, 'step')
+                   if k in self.report]
+        return 'health ' + ' '.join(fields)
 
     def preflight(self):
         s = self.t['ssh']
@@ -370,9 +408,18 @@ class Commande:
         return out
 
     def health(self):
+        self.report, self.launch, self.step = {'stage': 'control'}, None, 0
+        try:
+            return self._health()
+        finally:
+            # One line, whatever the exit (refusal, wait, base unavailable).
+            print(self.said(), flush=True)
+
+    def _health(self):
         control = self.control('returning')
         if control.get('return_probe') != self.t['probe_agent']:
             return 1
+        self.note(stage='admission')
         key = self.key(control)
         admitted = self.natif.admitted(self.t['host'], key['generation'], key['release_epoch'])
         if admitted is None:
@@ -386,27 +433,40 @@ class Commande:
             # lost answer or a crash never launches a second probe turn.
             launch = dict(key, nonce=secrets.token_hex(16), launched_at=self.natif.now())
             self.save('probe', launch)
+            self.launch = launch
+            self.note(stage='launched')
             self.ssh(self.substituted(self.t['remote']['probe_start'], launch))
             return WAIT
+        self.launch = launch
+        self.note(stage='receipt')
         code, out, _err = self.ssh(self.substituted(self.t['remote']['probe_receipt'], launch),
                                    capture=True)
+        self.note(answer=transport(code))
         verdict = receipt(out, launch) if code == 0 else 'pending'
+        self.note(verdict=verdict, **(receipt_flags(out, launch) if code == 0 else {}))
         if verdict != 'ok':
             return WAIT if verdict == 'pending' else 1
         # Transport unavailable is a wait (bounded by health_deadline_s), a
         # remote check that answers non-zero is a real health failure.
+        self.note(stage='checks')
         verdict = self.outcome('health')
+        self.note(checks=verdict, **({'step': self.step} if verdict != 'ok' else {}))
         if verdict != 'ok':
             return WAIT if verdict == 'transport' else 1
         if self.load('halt') is not None:
+            self.note(stage='previous-boot')
             code, out, _err = self.ssh(self.t['remote']['previous_boot'], capture=True)
             if transport(code) == 'transport':
+                self.note(previous_boot='transport')
                 return WAIT
             lines = [l for l in out.decode('utf-8', 'replace').splitlines() if l.strip()]
             if (code != 0 or len(out) > OUTPUT or not lines
                     or not re.fullmatch(self.t['previous_boot_end'], lines[-1].strip())):
+                self.note(previous_boot='failed')
                 return 1
+            self.note(previous_boot='ok')
             self.drop('halt')
+        self.note(stage='done')
         return 0
 
     def reconcile(self):
@@ -424,21 +484,38 @@ def transport(code):
     return 'transport' if code in (None, 'unstarted', 255) else 'failed'
 
 
-def receipt(raw, launch):
-    """'ok' only for the complete receipt of this launch; 'ko' for its failure;
-    'pending' otherwise (absent, unreadable, in flight or another launch's)."""
+def _receipt_of(raw, launch):
+    """The receipt JSON of this very launch, or None (absent, unreadable,
+    oversized, old or foreign)."""
     if len(raw) > OUTPUT:
-        return 'pending'
+        return None
     lines = [l for l in raw.decode('utf-8', 'replace').splitlines() if l.strip()]
     try:
         value = json.loads(lines[-1]) if lines else None
     except ValueError:
-        return 'pending'
+        return None
     if not isinstance(value, dict):
-        return 'pending'
+        return None
     if any(value.get(k) != launch[k] or isinstance(value.get(k), bool) for k in (
             'nonce', 'host', 'probe_agent', 'generation', 'release_epoch')):
-        return 'pending'  # an old or foreign receipt is never this probe's proof
+        return None  # an old or foreign receipt is never this probe's proof
+    return value
+
+
+def receipt_flags(raw, launch):
+    """#8072: the three booleans of this launch's receipt, as fixed words
+    ('true', 'false', 'absent'); nothing from another launch."""
+    value = _receipt_of(raw, launch) or {}
+    return {k: ('absent' if k not in value else 'true' if value[k] is True else 'false')
+            for k in ('delivered', 'acknowledged', 'turn_ended')}
+
+
+def receipt(raw, launch):
+    """'ok' only for the complete receipt of this launch; 'ko' for its failure;
+    'pending' otherwise (absent, unreadable, in flight or another launch's)."""
+    value = _receipt_of(raw, launch)
+    if value is None:
+        return 'pending'
     if value.get('verdict') == 'ko':
         return 'ko'
     if (value.get('verdict') == 'ok' and value.get('delivered') is True
