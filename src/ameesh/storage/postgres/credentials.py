@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Postgres driver: credential health per host, harness and account
-(L226a/L226b, migrations 0060 and 0068).
+(L226a/L226b, migrations 0060, 0068 and 0604).
 
 Only account NAMES pass here, never a secret.
 """
@@ -13,6 +13,7 @@ from .. import interface
 _COLUMNS = ("select host, harness, account, state, reason, source,"
             " extract(epoch from checked_at)::float8 as checked_ts,"
             " extract(epoch from probed_at)::float8 as probed_ts,"
+            " extract(epoch from probe_missing_since)::float8 as probe_missing_ts,"
             " extract(epoch from failing_since)::float8 as failing_since_ts,"
             " extract(epoch from expires_at)::float8 as expires_ts,"
             " extract(epoch from last_failure_at)::float8 as last_failure_ts,"

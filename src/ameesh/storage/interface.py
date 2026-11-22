@@ -1737,8 +1737,8 @@ class Credentials(Domain):
     @abc.abstractmethod
     def health(self, host: str, harness: str) -> dict[str, dict]:
         """{account: row} for a harness on a host: state, reason, source,
-        checked_ts, probed_ts, failing_since_ts, expires_ts, last_failure_ts,
-        failing_fingerprint, failures."""
+        checked_ts, probed_ts, probe_missing_ts, failing_since_ts, expires_ts,
+        last_failure_ts, failing_fingerprint, failures."""
 
     @abc.abstractmethod
     def listing(self, host: str | None = None) -> list[dict]:
