@@ -83,18 +83,26 @@ def descriptor(ident: str, *, protocol: str = "cli", interactive=None,
 class AvatarHarnessCanonTest(test_canon._TmpMixin, unittest.TestCase):
     def setUp(self) -> None:
         self.root = self.example_copy()
-        self.host_dir = os.path.join(self.make_tmp(), "harnais")
-        os.makedirs(self.host_dir, mode=0o700)
-        self.env = mock.patch.dict(
-            os.environ, {"AMEESH_HARNESSES_DIR": self.host_dir})
-        self.env.start()
-        self.addCleanup(self.env.stop)
+        # These tests qualify harness modes, not host descriptor discovery.
+        # Inject the descriptors so the host scan does not depend on whether
+        # every ancestor of TMPDIR can be opened by the secure reader.
+        scan = harnesses.scan
+        self.real_scan = scan
+        self.host_descriptors = {}
+
+        def fixture_scan():
+            found, findings = scan(host="")
+            found.update(self.host_descriptors)
+            return found, findings
+
+        patcher = mock.patch.object(harnesses, "scan", side_effect=fixture_scan)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def write_host(self, ident: str, **kwargs) -> None:
-        path = os.path.join(self.host_dir, ident + ".json")
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(descriptor(ident, **kwargs), fh)
-        os.chmod(path, 0o600)
+        document = descriptor(ident, **kwargs)
+        self.assertFalse(harnesses.errors(harnesses.validate(document)))
+        self.host_descriptors[ident] = harnesses._build(document, ident, "hôte")
 
     def load(self):
         return canon.load(self.root, untrusted=True)
@@ -138,6 +146,26 @@ class AvatarHarnessCanonTest(test_canon._TmpMixin, unittest.TestCase):
         found = self.findings("avatar-harness-unsupported")
         self.assertTrue(found, self.errors())
         self.assertIn("resident", found[0].message)
+
+    def test_qualification_does_not_depend_on_readable_tmp_parents(self):
+        # Simulate EACCES while opening a TMPDIR ancestor. The product scan
+        # must reject the real host descriptor, while our injected fixture
+        # still exercises avatar qualification.
+        host = os.path.join(self.make_tmp(), "harnais")
+        os.mkdir(host, 0o700)
+        path = os.path.join(host, "acp-no-interactive.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(descriptor("acp-no-interactive", protocol="acp"), fh)
+        os.chmod(path, 0o600)
+        self.write_host("acp-no-interactive", protocol="acp")
+        write(self.root, "agents/alice-avatar.md",
+              avatar_card("alice-avatar", "acp-no-interactive"))
+        with mock.patch.object(harnesses, "_open_root_dir",
+                               side_effect=PermissionError("inaccessible parent")):
+            found, findings = self.real_scan(host=host)
+            self.assertNotIn("acp-no-interactive", found)
+            self.assertIn("harness-host-insecure", codes(findings))
+            self.assertTrue(self.findings("avatar-harness-unsupported"))
 
     def test_a_declared_list_is_qualified_harness_by_harness(self):
         write(self.root, "agents/alice-avatar.md",
