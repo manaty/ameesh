@@ -1745,6 +1745,14 @@ class Credentials(Domain):
         """Every row (of a host, or of all hosts), without
         `failing_fingerprint`: only columns the supervisor role reads."""
 
+    @abc.abstractmethod
+    def probe_transition(self) -> float | None:
+        """#8062: epoch at which migration 0604 landed, or None when the
+        ledger does not record it. The alert reads it to bound the N-1
+        heartbeat transition: a failing row kept by an old sentinel writes
+        nothing, and its silence is a transition only for a fixed window
+        after this instant."""
+
 
 # --------------------------------------------------------------------------
 # boîte aux lettres (`agent_mailbox`)

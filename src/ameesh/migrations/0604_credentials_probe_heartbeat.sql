@@ -13,11 +13,11 @@
 -- and `annotate` leaves `checked_at` untouched), so its old probe date stays.
 -- An N-1 failing report advances `checked_at` but has no probe date of its
 -- own; the trigger drops the inherited date on such a report. The reader
--- keeps a failing row quiet while it has stopped moving (the kept-failure
--- signature) and names a stale probe date only while another writer is
--- still active on the row. The row is already named by `credential_failing`;
--- a new sentinel stamps its own date on each pass (`touch`), and that date
--- ages normally.
+-- keeps this kept-failure signature quiet only for a bounded window after
+-- this migration: afterwards the silence is named, on a date that no longer
+-- moves, and the alert persists until a probe writes. The row is already
+-- named by `credential_failing` during the window; a new sentinel stamps its
+-- own date on each pass (`touch`), and that date ages normally.
 --
 -- `probe_missing_since` anchors the other case: a non-failing pair with no
 -- probe date at all (the timer never ran, or its last writing predates this

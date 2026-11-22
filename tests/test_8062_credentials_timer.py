@@ -11,9 +11,10 @@ Quatre pièces, sans hôte réel (le trigger 0604 est rejoué sur le banc) :
   alors que la sonde tourne (`Credentials.touch`) ;
 * le trigger 0604 : il date la sonde d'un écrivain N-1 depuis `checked_at`,
   préserve la date à travers les écritures `turn`, et n'invente pas de date
-  pour un report `failing` N-1 (un échec maintenu n'écrit rien) ; une ligne
-  en échec sans battement de sonde est nommée par `credential_failing`, pas
-  par la garde de la minuterie ;
+  pour un report `failing` N-1 (un échec maintenu n'écrit rien) ; pendant la
+  fenêtre bornée qui suit la migration, une ligne en échec sans battement
+  est lue comme la transition N-1 (`credential_failing` la nomme) ; après,
+  le silence est nommé et l'alerte persiste jusqu'à un relevé ;
 * l'installation et le contrôle : la mise à jour d'hôte pose et active
   `ameesh-credentials.timer` (unité utilisateur sur une VM ou le poste, unité
   système sur le serveur), et `ameesh doctor` la vérifie (KO si absente ou
@@ -47,9 +48,11 @@ def _db_time(offset: float = 0.0) -> datetime.datetime:
 
 
 class CredentialProbeAlertsTest(unittest.TestCase):
-    def _alerts(self, rows, now=NOW, cfg=None, hosts=()):
+    def _alerts(self, rows, now=NOW, cfg=None, hosts=(),
+                transition_at=NOW - exploitation.PROBE_N1_TRANSITION_S - 1):
         creds = mock.Mock()
         creds.listing.return_value = rows
+        creds.probe_transition.return_value = transition_at
         store = SimpleNamespace(
             credentials=creds,
             hosts=SimpleNamespace(current=mock.Mock(return_value=list(hosts))))
@@ -123,11 +126,17 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         # checked_at ; des échecs de tour répétés ne doivent pas masquer une
         # sonde arrêtée.
         stale = NOW - LIMIT - 5
-        [alert] = self._alerts([self._row(source="turn", state="failing",
-                                          checked_ts=NOW - 60,
-                                          probed_ts=stale)])
+        row = self._row(source="turn", state="failing",
+                        checked_ts=NOW - 60, probed_ts=stale)
+        [alert] = self._alerts([row])
         self.assertEqual(alert["type"], "credential_probe_stale")
         self.assertEqual(alert["since"], stale)
+        # Pendant la transition N-1, la ligne est lue comme un échec maintenu
+        # (fenêtre bornée) ; l'alerte revient et persiste après la fenêtre.
+        self.assertEqual(self._alerts([row], transition_at=NOW - 60), [])
+        [later] = self._alerts([row], now=NOW + 3600)
+        self.assertEqual(later["type"], "credential_probe_stale")
+        self.assertGreater(later["value"], alert["value"])
 
     def test_a_fresh_probe_survives_a_turn_write_on_the_same_row(self):
         # #230300 : un seul compte, sondé il y a une minute, puis un échec
@@ -137,26 +146,52 @@ class CredentialProbeAlertsTest(unittest.TestCase):
             source="turn", state="failing", probed_ts=NOW - 60,
             checked_ts=NOW - 5)]), [])
 
-    def test_a_failing_row_without_a_probe_date_is_quiet(self):
+    def test_a_failing_row_without_a_probe_date_is_quiet_during_the_transition(self):
         # #45274 : un échec maintenu N-1 ne fait aucun report et `annotate`
         # ne touche pas checked_at ; sans date de sonde, la ligne est déjà
-        # nommée par `credential_failing`, pas par la garde de la minuterie.
+        # nommée par `credential_failing` pendant la transition bornée.
         for source in ("turn", "sentinel"):
             with self.subTest(source=source):
                 row = self._row(source=source, state="failing", probed_ts=None,
                                 probe_missing_ts=NOW - 2 * 3600,
                                 checked_ts=NOW - 60)
-                self.assertEqual(self._alerts([row]), [])
+                self.assertEqual(
+                    self._alerts([row], transition_at=NOW - 60), [])
 
-    def test_a_static_failing_row_is_not_a_stopped_probe(self):
+    def test_a_failing_row_without_a_probe_date_alerts_after_the_transition(self):
+        # La transition est bornée : après elle, une sonde qui ne date plus
+        # l'échec est un vrai silence, et l'alerte persiste.
+        row = self._row(source="turn", state="failing", probed_ts=None,
+                        probe_missing_ts=NOW - 2 * 3600, checked_ts=NOW - 60)
+        [alert] = self._alerts([row])
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertEqual(alert["since"], NOW - 2 * 3600)
+        self.assertIn("no probe reading", alert["detail"])
+        [later] = self._alerts([row], now=NOW + 6 * 3600)
+        self.assertEqual(later["type"], "credential_probe_stale")
+        self.assertGreater(later["value"], alert["value"])
+
+    def test_a_static_failing_row_is_quiet_during_the_transition(self):
         # #45274 : la sonde N-1 active garde l'échec sans écrire ; la ligne a
         # cessé de bouger (dernier écrivain : l'échec, il y a plus de trois
-        # périodes). La date de sonde antérieure n'est pas un battement, et
-        # `credential_failing` nomme déjà la ligne.
+        # périodes). La date de sonde antérieure n'est pas un battement.
         row = self._row(source="turn", state="failing",
                         probed_ts=NOW - 2 * LIMIT,
                         checked_ts=NOW - LIMIT - 5)
-        self.assertEqual(self._alerts([row]), [])
+        self.assertEqual(self._alerts([row], transition_at=NOW - 60), [])
+
+    def test_a_static_failing_row_alerts_after_the_transition(self):
+        # Passé la fenêtre bornée, le même silence est nommé et le reste :
+        # aucune reprise de sonde ne le fait disparaître.
+        row = self._row(source="turn", state="failing",
+                        probed_ts=NOW - 2 * LIMIT,
+                        checked_ts=NOW - LIMIT - 5)
+        [alert] = self._alerts([row])
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertEqual(alert["since"], NOW - 2 * LIMIT)
+        [later] = self._alerts([row], now=NOW + 3600)
+        self.assertEqual(later["type"], "credential_probe_stale")
+        self.assertGreater(later["value"], alert["value"])
 
     def test_a_new_sentinel_heartbeat_on_a_failing_row_ages(self):
         # Une sonde nouvelle (`touch`) écrit les deux dates ; si elle s'arrête,
@@ -310,6 +345,8 @@ class QuietHostsTest(unittest.TestCase):
     def _alerts(self, rows, policy, readings):
         creds = mock.Mock()
         creds.listing.return_value = rows
+        creds.probe_transition.return_value = (
+            NOW - exploitation.PROBE_N1_TRANSITION_S - 1)
         store = SimpleNamespace(
             credentials=creds,
             hosts=SimpleNamespace(current=mock.Mock(return_value=list(readings))))
@@ -467,6 +504,11 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
     def setUp(self):
         super().setUp()
         self.db.execute("delete from credential_health")
+        # La transition N-1 est bornée par la date d'application de 0604 :
+        # le banc la replace à l'instant présent pour les cas de transition,
+        # et le test d'après-transition la vieillit explicitement.
+        self.db.execute("update schema_migrations set applied_at = now()"
+                        " where version = 604")
 
     def _n1_insert(self, source, checked_at, *, state="healthy"):
         self.previous_insert(
@@ -507,6 +549,9 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
         self.assertEqual(row["source"], "turn")
         self.assertAlmostEqual(row["probed_ts"], probe_at.timestamp(), delta=2)
         self.assertIsNone(row["missing_ts"])
+        # Hors de la fenêtre N-1 : la date de sonde préservée fait l'alerte.
+        self.db.execute("update schema_migrations set applied_at = now()"
+                        " - interval '2 days' where version = 604")
         [alert] = self._alerts(turn_at.timestamp() + 1)
         self.assertEqual(alert["type"], "credential_probe_stale")
         self.assertAlmostEqual(alert["since"], probe_at.timestamp(), delta=2)
@@ -552,6 +597,21 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
         row = self._row()
         self.assertIsNone(row["probed_ts"])
         self.assertEqual(self._alerts(time.time()), [])
+
+    def test_a_static_failing_row_alerts_once_the_transition_is_over(self):
+        # #45281 : la fenêtre N-1 est bornée par la date d'application de
+        # 0604. Passée, une ligne en échec qui ne reçoit plus de battement
+        # est un vrai silence ; l'alerte persiste sans reprise de sonde.
+        self.db.execute("update schema_migrations set applied_at = now()"
+                        " - interval '2 days' where version = 604")
+        self._n1_insert("turn", _db_time(-2 * 3600), state="failing")
+        now = time.time()
+        [alert] = self._alerts(now)
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertIn("no probe reading", alert["detail"])
+        [later] = self._alerts(now + 3600)
+        self.assertEqual(later["type"], "credential_probe_stale")
+        self.assertGreater(later["value"], alert["value"])
 
     def test_an_annotate_does_not_drop_the_failing_probe_date(self):
         # `annotate` ne change que la raison : le trigger ne doit pas prendre

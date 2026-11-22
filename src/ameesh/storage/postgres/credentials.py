@@ -101,3 +101,11 @@ class Credentials(interface.Credentials):
         if host is None:
             return self.db.query(_LISTING + " order by host, harness, account")
         return self.db.query(_LISTING + " where host = %s order by harness, account", (host,))
+
+    def probe_transition(self):
+        # #8062 : l'instant où 0604 est passée borne la transition N-1. La
+        # table est dans le contrat du rôle superviseur (#7982).
+        rows = self.db.query(
+            "select extract(epoch from applied_at)::float8 as ts"
+            " from schema_migrations where version = 604")
+        return float(rows[0]["ts"]) if rows else None

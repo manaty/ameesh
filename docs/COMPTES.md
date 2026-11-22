@@ -636,15 +636,18 @@ the child, even if its key file is replaced during the turn.
 failure, so it cannot tell whether the sentinel still runs. Migration 0604
 adds `probed_at`, the probe's own date: the sentinel writes it, and a
 trigger stamps it from `checked_at` for a non-failing N-1 sentinel that does
-not know the column; a `turn` write preserves it. A failing row is read
-through `probed_at`, with one transition rule: an N-1 kept failure writes
-nothing (no report, and `annotate` leaves `checked_at` untouched), so a
-probe date older than a later turn write is not a heartbeat once the row
-stops moving — `credential_failing` already names the row; while the row
-still moves (a non-probe write less than three periods ago), the silence is
-the probe's and is named. A probe date at or after the last write (a
-`touch` or a new-sentinel failing report) ages normally, so a new timer that
-stops on a failure is detected. `probe_missing_since`
+not know the column; a `turn` write preserves it. A failing row uses a
+bounded N-1 transition: an N-1 kept failure writes nothing (no report, and
+`annotate` leaves `checked_at` untouched), so for 24 h after migration 0604
+lands, a failing row whose probe date is absent or precedes a later
+non-probe write is read as that transition — `credential_failing` already
+names the row. The window is anchored on the migration ledger; afterwards
+the guard returns, and the alert, anchored on a date that no longer moves,
+persists until a probe writes again. A probe date written while the row is
+failing (a `touch` or a new-sentinel failing report) ages normally, even
+during the window, so a new timer that stops on a failure is detected at
+once.
+`probe_missing_since`
 anchors a non-failing pair
 that has never been probed (migration time for rows present when 0604 lands,
 the first write's date for a newer row), is never moved by a turn, and is

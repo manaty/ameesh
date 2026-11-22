@@ -4861,6 +4861,7 @@
     "annotate",
     "health",
     "listing",
+    "probe_transition",
     "report",
     "touch"
    ],
