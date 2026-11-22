@@ -67,6 +67,9 @@ PHASES = (STOP_PREPARED, POWEROFF_SENT) + HALTING
 # first refusal and host_release names the host past the stall bound.
 POWERON_REFUSED = 'poweron refused'
 POWERON_SENT = 'poweron sent'
+# Leave time for a candidate to start before also requesting its successor.
+# Election itself remains the authority that chooses the holder.
+ROLE_WAKE_FAILOVER_S = 150
 
 
 def private_json(path):
@@ -298,6 +301,50 @@ def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, tar
     return isinstance(deadline, (float, int)) and deadline <= now + horizon
 
 
+def elected_wake_due(role, lots, *, now, horizon):
+    """A role needs its executor for active mail or a scheduled lot."""
+    if (role.get('releve') not in ('election', 'preference')
+            or role.get('lease_live') or role.get('status') == 'stopped'
+            or role.get('mode') not in (None, 'execute')):
+        return False
+    scheduled = any(lot.get('assignee') == role.get('name')
+                    and lot.get('state') not in host_idle.DONE
+                    and isinstance(lot.get('wake_ts'), (int, float))
+                    and lot['wake_ts'] <= now + horizon for lot in lots)
+    return bool(role.get('unread') or role.get('has_pending_prompt') or scheduled)
+
+
+def elected_wake_target(role, candidates, lots, targets, holds, *, now, horizon,
+                        stalled=()):
+    """Choose one enrolled candidate for pending work on a lease-free role.
+
+    A sleeping candidate has no fresh standing; its declared placement, not
+    election readiness, is the evidence available before the machine starts.
+    """
+    if not elected_wake_due(role, lots, now=now, horizon=horizon):
+        return None
+    admitted = set(role.get('admitted_hosts') or ())
+    eligible = [c for c in candidates if c.get('declared') and c.get('admitted')
+                and c.get('host') in admitted and c.get('host') in targets
+                and c.get('host') not in holds and c.get('host') not in stalled]
+    eligible.sort(key=lambda c: (c.get('preference_rank') is None,
+                                 c.get('preference_rank') or 0, c['host']))
+    return eligible[0]['host'] if eligible else None
+
+
+def stalled_role_wakes(queue, targets, controls, *, now):
+    """A bounded, still-pending return cannot indefinitely bar the reserve."""
+    stalled = set()
+    for candidate in targets:
+        for request in queue.pending_all(candidate):
+            created = request.get('created_ts')
+            if (request.get('state') == 'busy' and current(controls.get(candidate), request)
+                    and isinstance(created, (int, float))
+                    and now - created >= ROLE_WAKE_FAILOVER_S):
+                stalled.add(candidate)
+    return stalled
+
+
 def stop_evidence(cfg, db, host, control, *, now, quiet_s=None):
     """Revalidate native release proof and elected leader/reserve at effect time."""
     canons, unknown = host_release._canon_read(cfg)
@@ -357,6 +404,34 @@ def settle_obsolete(db, host):
         (host,))
 
 
+def prepare_elected_wake(db, policy, host, listing, lots, controls, holds):
+    """Persist a role return before contacting the provider, even if it fails."""
+    if host in holds:
+        return
+    with db.transaction() as tx:
+        q = Queue(tx)
+        if not q.worker_lock(host):
+            return
+        control = q.lock(host)
+        if not control or control['claims_open'] or control['mode'] not in ('draining', 'returning'):
+            return
+        now = q.now()
+        stalled = None
+        for role in listing:
+            if not elected_wake_due(role, lots, now=now, horizon=policy['wake_delay_s']):
+                continue
+            status = election.status(tx, role['name'])
+            if status.get('holder'):
+                continue
+            if stalled is None:
+                stalled = stalled_role_wakes(q, policy['targets'], controls, now=now)
+            if elected_wake_target(role, status['candidates'], lots, policy['targets'], holds,
+                                   now=now, horizon=policy['wake_delay_s'], stalled=stalled) == host:
+                q.return_intent(host)
+                q.request(host, control['generation'], control['release_epoch'], 'busy')
+                return
+
+
 def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop_evidence):
     """One bounded operator tick; never opens native claims itself."""
     target = policy['targets'][host]
@@ -366,6 +441,9 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
     if not control or control['mode'] not in ('draining', 'returning') or control['claims_open']:
         settle_obsolete(db, host)
         return 'inactive'
+    prepare_elected_wake(db, policy, host, store.operations.listing(),
+                         store.operations.open_lots_activity(None), controls,
+                         {h['host']: h for h in store.hosts.holds()})
     # Operator reconciliation may itself need the native gate. Run probes
     # outside our transaction, then revalidate generation, provider and fresh
     # reading under the gate before acknowledging. No probe opens claims.

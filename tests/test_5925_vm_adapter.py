@@ -118,6 +118,38 @@ class DecisionTest(unittest.TestCase):
         self.assertIsNone(vm.host_release.release_blocker(control, [], reading,
             footprint=fp, cfg=cfg, now=5000, adapter_wait=True))
 
+    def test_elected_wake_uses_one_admitted_candidate_for_active_work(self):
+        role = dict(name='role', releve='election', lease_live=False, status='idle',
+                    admitted_hosts=['ag1', 'ag2'], unread=1)
+        candidates = [dict(host='ag2', declared=True, admitted=True, preference_rank=1),
+                      dict(host='ag1', declared=True, admitted=True, preference_rank=0)]
+        choose = lambda r, lots=(), holds={}: vm.elected_wake_target(
+            r, candidates, lots, {'ag1': {}, 'ag2': {}}, holds, now=1000, horizon=60)
+        self.assertEqual(choose(role), 'ag1')
+        self.assertEqual(choose(role, holds={'ag1': {}}), 'ag2')
+        self.assertIsNone(choose(dict(role, lease_live=True)))
+        self.assertIsNone(choose(dict(role, status='stopped')))
+        self.assertIsNone(choose(dict(role, unread=0, passive_unread=2)))
+        scheduled = [dict(assignee='role', state='build', wake_ts=1050)]
+        self.assertEqual(choose(dict(role, unread=0), scheduled), 'ag1')
+        self.assertIsNone(choose(dict(role, unread=0), [dict(scheduled[0], wake_ts=1061)]))
+        self.assertIsNone(choose(dict(role, unread=0), [dict(scheduled[0], state='closed')]))
+        self.assertEqual(vm.elected_wake_target(role, candidates, [],
+                         {'ag1': {}, 'ag2': {}}, {}, now=1000, horizon=60,
+                         stalled={'ag1'}), 'ag2')
+
+    def test_stalled_busy_return_allows_reserve_after_bounded_wait(self):
+        queue = mock.Mock()
+        queue.pending_all.side_effect = lambda host: ([dict(state='busy', created_ts=850,
+                                                             generation=1, release_epoch=1)]
+                                                       if host == 'ag1' else [])
+        controls = {'ag1': dict(mode='returning', claims_open=False,
+                                generation=1, release_epoch=1)}
+        self.assertEqual(vm.stalled_role_wakes(queue, ['ag1', 'ag2'], controls, now=999), set())
+        self.assertEqual(vm.stalled_role_wakes(queue, ['ag1', 'ag2'], controls, now=1000), {'ag1'})
+        controls['ag1']['generation'] = 2
+        self.assertEqual(vm.stalled_role_wakes(queue, ['ag1', 'ag2'], controls, now=1000), set())
+
     def test_wake_before_lot_and_release_but_not_when_work_can_run_elsewhere(self):
         now = datetime(2026, 11, 5, 9, 45, tzinfo=timezone.utc).timestamp()  # Paris 10:45
         control = dict(host='burst', mode='draining')
@@ -173,6 +205,30 @@ class AdapterTest(PgTestCase):
         self.q.observe('burst', state, 90)
         self.db.execute("UPDATE vm_adapter_observations SET on_since=clock_timestamp()-interval '2 hours',"
                         "off_since=clock_timestamp()-interval '2 hours'")
+
+    def test_active_mail_for_lease_free_role_starts_candidate(self):
+        self.operations.listing.return_value = [dict(
+            name='role', releve='election', lease_live=False, status='idle',
+            admitted_hosts=['burst'], unread=1)]
+        self.provider.state.return_value = 'stopped'
+        self.observe_old('stopped')
+        status = dict(holder=None, candidates=[dict(host='burst', declared=True,
+                                                    admitted=True, preference_rank=0)])
+        with mock.patch('ameesh.vm_adapter.election.status', return_value=status):
+            self.assertEqual(self.tick(), 'starting')
+        self.provider.action.assert_called_once_with(TARGET, 'poweron')
+
+    def test_role_return_is_recorded_before_provider_failure(self):
+        self.operations.listing.return_value = [dict(
+            name='role', releve='election', lease_live=False, status='idle',
+            admitted_hosts=['burst'], unread=1)]
+        self.provider.state.side_effect = vm.Refused('provider unavailable')
+        status = dict(holder=None, candidates=[dict(host='burst', declared=True,
+                                                    admitted=True, preference_rank=0)])
+        with mock.patch('ameesh.vm_adapter.election.status', return_value=status):
+            with self.assertRaises(vm.Refused):
+                self.tick()
+        self.assertEqual(self.q.pending('burst')[0]['state'], 'busy')
 
     def test_queue_idempotence_and_generation_fence(self):
         self.assertEqual(self.request(), 'pending')
