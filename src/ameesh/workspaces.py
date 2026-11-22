@@ -328,21 +328,24 @@ def mail_hold(cfg, db, agent: dict, lot, *, canons=None) -> bool:
 
 
 def before_turn(cfg, policy: Policy, agent: str, cwd: str | None, *,
-                new_session: bool, base_env: dict):
+                new_session: bool, base_env: dict, lot=None):
     """Ouvre l'espace de l'agent pour un tour (L73, L219).
 
     Rend le `Turn` de `housekeeping.Turn.begin` : son `env` est posé sur le
     tour, et il doit être conclu par :func:`after_turn`, même si le tour
     échoue. `new_session` est décidé par l'appelant — une suite de rotation,
     un travail de fond encore vivant ou un résident gardent le dossier
-    (#2610, #2619). Au profil nu (pas de module `dev`), le ménage est un
-    no-op : un tour éteint (`off=True`), sans dossier temporaire ni cache
-    touchés ; le tour part avec l'environnement d'origine."""
+    (#2610, #2619). #8020 : `lot`, quand le tour en porte un seul, donne un
+    sous-dossier temporaire par lot (`ameesh-lot-<id>`) sous le dossier de
+    l'agent, gardé entre deux tours du même lot. Au profil nu (pas de module
+    `dev`), le ménage est un no-op : un tour éteint (`off=True`), sans dossier
+    temporaire ni cache touchés ; le tour part avec l'environnement d'origine."""
     if dev_module() is None:
         return housekeeping.Turn(cfg=cfg, policy=policy, agent=agent, cwd=cwd,
                                  off=True)
     return housekeeping.Turn.begin(cfg, policy, agent, cwd,
-                                   new_session=new_session, base_env=base_env)
+                                   new_session=new_session, base_env=base_env,
+                                   lot=lot)
 
 
 def after_turn(turn, *, lot: str | None, turn_id: str, db, host: str,
@@ -362,6 +365,24 @@ def after_turn(turn, *, lot: str | None, turn_id: str, db, host: str,
         entries += housekeeping.reap_containers(
             runtime, db, host, only_turn=turn_id)["entries"]
     return entries
+
+
+def cleanup_lot_dirs(cfg, policy, *, agents=None, db=None, host: str = "",
+                     running=(), ended_only: bool = True, lot_state=None,
+                     now: float | None = None, dry_run: bool = False,
+                     reason: str = "closed") -> dict:
+    """#8020 : retire les dossiers temporaires de lots (`ameesh-lot-<id>`).
+
+    Même contrat que :func:`housekeeping.cleanup_lot_dirs` (verrou du dossier
+    de l'agent, processus qui le tiennent, état terminal du lot) ; la façade
+    n'ajoute que le no-op du profil nu, pour que l'arrêt d'un exécuteur ne
+    dépende pas du module `dev`."""
+    if dev_module() is None:
+        return {"entries": [], "plan": [], "skipped": [], "bytes": 0, "dirs": []}
+    return housekeeping.cleanup_lot_dirs(
+        cfg, policy, agents=agents, db=db, host=host, running=running,
+        ended_only=ended_only, lot_state=lot_state, now=now, dry_run=dry_run,
+        reason=reason)
 
 
 def periodic_pass(cfg, db, policy: Policy, *, host: str, actor: str,

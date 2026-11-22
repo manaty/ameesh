@@ -962,12 +962,14 @@ Règle de l'orchestrateur et de chacun de ses agents, à rappeler dans tout
 travail confié qui produit de gros fichiers (images Docker, clones, caches de
 tests) :
 
-* **n'écris jamais en dur dans `/tmp`, utilise `$TMPDIR`** — le dossier de
-  l'agent, sur disque, posé par ameesh à chaque tour (`$AMEESH_TMPDIR` est le
-  même) ; `docker save -o "$TMPDIR/image.tar"`, `git clone … "$TMPDIR/relecture"`,
+* **n'écris jamais en dur dans `/tmp` ni dans `/dev/shm`, utilise `$TMPDIR`** —
+  le dossier de l'agent, sur disque, posé par ameesh à chaque tour
+  (`$AMEESH_TMPDIR` est le même) et, pour un tour qui porte un lot, un
+  sous-dossier `ameesh-lot-<id>` gardé d'un tour à l'autre du même lot ;
+  `docker save -o "$TMPDIR/image.tar"`, `git clone … "$TMPDIR/relecture"`,
   `jest --cacheDirectory "$TMPDIR/jest"` ;
 * **rien de plus de 500 Mo dans `/tmp`** : sur un poste, `/tmp` est souvent en
-  mémoire (tmpfs) et partagé par tous les agents de l'hôte.
+  mémoire (tmpfs) et partagé par tous les agents de l'hôte ; `/dev/shm` aussi.
 
 Le 2026-10-11 à 03:38, le `/tmp` d'un poste (12 Go en mémoire, douze agents)
 était plein à 83 % : la porte de pression de l'hôte a bloqué tous les nouveaux
@@ -976,7 +978,9 @@ de `/tmp` apparue pendant un tour est signalée (`tmp_orphan`), mais jamais
 supprimée par ameesh : `/tmp` est commun à l'hôte, et rien ne prouve quel tour
 l'a créée. L'alerte la suit, taille à jour, avec la commande qui la supprime
 quand elle ne sert plus ; et l'alerte d'un tmpfs plein dit les plus grosses
-entrées et l'action attendue.
+entrées et l'action attendue. Seule exception (#8020) : un dossier
+`ameesh-*` / `nexlink-*` abandonné depuis `sweep_age` (6 h), tenu par aucun
+processus et sans travail Git à garder, est balayé dans `/tmp` et `/dev/shm`.
 Le texte de chaque tour de courrier rappelle cette règle.
 
 ## Review worktrees get no dependencies (#248)

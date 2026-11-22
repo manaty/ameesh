@@ -31,7 +31,8 @@ import time
 import uuid
 from typing import Sequence
 
-from . import accounts, account_turn, auth_failure, fil, identity, mail, platform, registry, stagnation, storage
+from . import (accounts, account_turn, adapters, auth_failure, fil, identity,
+               mail, platform, registry, stagnation, storage)
 from . import canon as canon_mod
 from . import config as config_mod
 from . import cost as cost_mod
@@ -1389,7 +1390,8 @@ def lot_brief(cfg: Config, db, row: dict | None, lot, *, consigne: str = "",
     else:
         fiche = _lot_sheet(db, item) + _not_yours(item, name, cfg=cfg, db=db)
     diff = _lot_diff(item or {}, row.get("cwd") or "", db=db, cfg=cfg)
-    fin = ["## Instructions", (consigne or "").strip() or DEFAULT_RESUME]
+    fin = ["## Instructions", (consigne or "").strip() or DEFAULT_RESUME,
+           "", adapters.TMP_NOTE]
     text = "\n".join(head + ident + [""] + fiche + [""] + diff + [""]
                      + _lot_thread(db, name, str(lot)) + fin)
     return with_process_rules(cfg, _clip(text.replace("\x00", ""), LOT_BRIEF_MAX_BYTES),
