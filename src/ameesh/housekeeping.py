@@ -4000,6 +4000,33 @@ def sweep_roots() -> list[str]:
     return [resources_mod.system_tmp(), resources_mod.system_shm()]
 
 
+class PassProcs:
+    """#8050 : le relevé `platform.user_paths` d'un passage, lu au plus une
+    fois et seulement à la première demande (sur un runner CI chargé, la
+    lecture de /proc/*/maps coûtait 5 à 6 s à un passage qui n'avait rien à
+    juger). `get()` rend le relevé, ou False quand la lecture a échoué ;
+    `reads` et `seconds` vont au journal du passage. Un relevé partagé peut
+    dater du début du passage : chaque suppression le revérifie en direct
+    (`tmp_holder`), un processus né depuis garde donc toujours l'entrée."""
+
+    def __init__(self, allow=()):
+        self.allow = tuple(allow or ())
+        self.reads = 0
+        self.seconds = 0.0
+        self._value = None
+
+    def get(self):
+        if self._value is None:
+            start = time.monotonic()
+            try:
+                self._value = platform.user_paths(allow=self.allow)
+            except Exception:  # noqa: BLE001 - un passage de ménage ne lève jamais
+                self._value = False
+            self.reads += 1
+            self.seconds += time.monotonic() - start
+        return self._value
+
+
 def tmp_sweep(policy: Policy, *, dry_run: bool = False, now: float | None = None,
               budget: PassBudget | None = None, roots=None, age: float | None = None,
               procs=None) -> dict:
@@ -4020,6 +4047,10 @@ def tmp_sweep(policy: Policy, *, dry_run: bool = False, now: float | None = None
     (`recover_tmp_git_copies`), puis le dossier. Une entrée est revérifiée
     (inode, propriétaire, enfant direct) juste avant sa suppression.
 
+    `procs` : un relevé déjà lu, ou le `PassProcs` du passage ; la table
+    n'est lue qu'au premier candidat à juger (#8050), jamais pour des
+    racines sans dossier abandonné.
+
     `dry_run` rend le plan (chemins, tailles) sans rien supprimer. Rend
     `entries` (journal), `plan`, `skipped`, `bytes` libérés, `deleted` et
     `doubt`."""
@@ -4036,19 +4067,11 @@ def tmp_sweep(policy: Policy, *, dry_run: bool = False, now: float | None = None
     if not policy.sweep:
         skipped.append("tmp sweep disabled by policy (`sweep: false`)")
         return out
-    if procs is None:
-        try:
-            procs = platform.user_paths(allow=policy.unreadable_ok)
-        except Exception:  # noqa: BLE001 - un balayage ne lève jamais
-            procs = None
-    if procs is None or not getattr(procs, "available", False):
-        out["doubt"] = "process table unreadable on this host"
-        skipped.append("tmp sweep: %s; nothing deleted" % out["doubt"])
-        return out
-    doubt = procs.doubt()
-    if doubt:
-        out["doubt"] = doubt
-        skipped.append("tmp sweep: %s; nothing deleted" % doubt)
+    lazy = procs if isinstance(procs, PassProcs) else PassProcs(policy.unreadable_ok)
+    if procs is not None and lazy is not procs:
+        lazy._value = procs                 # relevé déjà lu par l'appelant
+    table = None
+    doubt = ""
     uid = os.getuid()
     for root in roots:
         if not root:
@@ -4092,7 +4115,18 @@ def tmp_sweep(policy: Policy, *, dry_run: bool = False, now: float | None = None
                                  detail="%s kept: %s" % (path, scan.get("why") or "unreadable")))
                 skipped.append("tmp sweep %s kept: %s" % (path, scan.get("why") or "unreadable"))
                 continue
-            held = procs.holders(_real(path))
+            if table is None:
+                # #8050 : premier candidat à juger, la table est lue ici
+                table = lazy.get()
+                if not table or not getattr(table, "available", False):
+                    out["doubt"] = "process table unreadable on this host"
+                    skipped.append("tmp sweep: %s; nothing deleted" % out["doubt"])
+                    return out
+                doubt = table.doubt()
+                if doubt:
+                    out["doubt"] = doubt
+                    skipped.append("tmp sweep: %s; nothing deleted" % doubt)
+            held = table.holders(_real(path))
             if held:
                 plan.append(dict(item, action="garde",
                                  detail="held by process %s" % held[0]))
@@ -6085,17 +6119,13 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     # 1. dossiers temporaires des agents
     key = mesh_key(cfg)
     # #2704 : un seul relevé des processus de l'utilisateur par passage (il
-    # lit /proc/*/maps : ~200 ms) ; False quand la lecture est impossible.
-    procs: object = None
+    # lit /proc/*/maps : ~200 ms, 5–6 s sur un runner CI chargé) ; False quand
+    # la lecture est impossible. #8050 : le même relevé sert au balayage de
+    # /tmp et /dev/shm (6b), lu seulement si l'un des deux en a besoin.
+    procs = PassProcs(policy.unreadable_ok)
 
     def held_by_user(path: str) -> str:
-        nonlocal procs
-        if procs is None:
-            try:
-                procs = platform.user_paths()
-            except Exception:  # noqa: BLE001 - un passage de ménage ne lève jamais
-                procs = False
-        return tmp_user_holder(path, procs)
+        return tmp_user_holder(path, procs.get())
 
     # #2493 : dernier signalement d'un dossier sans propriétaire, pour ne pas
     # le répéter dans `skipped` à chaque passe (un constat persistant suffit).
@@ -6625,7 +6655,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         # #8020 : le balayage s'arrête avant la réserve du passage, pour que
         # le bilan (`measure`) et les phases qui le suivent gardent leur temps.
         swept = tmp_sweep(policy, dry_run=dry_run, now=now,
-                          budget=budget.window(reserve))
+                          budget=budget.window(reserve), procs=procs)
     except Exception as exc:  # jamais fatal pour le passage
         swept = {"entries": [], "plan": [], "skipped": [
             "tmp sweep: pass failed (%s)" % type(exc).__name__],
@@ -6638,7 +6668,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     report_measure["tmp_sweep"] = {
         "age_s": policy.sweep_age, "bytes": swept["bytes"],
         "deleted": list(swept["deleted"]), "dry_run": dry_run,
-        "doubt": swept["doubt"]}
+        "doubt": swept["doubt"],
+        # #8050 : lectures de la table des processus du passage et leur coût
+        "procs_reads": procs.reads, "procs_s": round(procs.seconds, 3)}
     # #3802 : la trace des phases reste au journal (relevé `mesure`), pas
     # seulement dans la sortie de cette passe.
     report_measure["host_pass"] = budget.summary()

@@ -4814,6 +4814,7 @@
     "upsert_models"
    ],
    "ci": [
+    "all_runners",
     "disks",
     "expect_disk",
     "observe_disk_refusal",
@@ -4841,11 +4842,13 @@
     "observe_guard_run",
     "observe_map",
     "observe_queue",
+    "observe_queue_wait",
     "observe_runners",
     "open_run",
     "prune_guard_runs",
     "prune_maps",
     "prune_queue",
+    "queue_wait",
     "queued_oldest",
     "reopen_run",
     "run",
@@ -4855,7 +4858,8 @@
     "set_message",
     "stuck_runners",
     "suite",
-    "supersede"
+    "supersede",
+    "wake_queue"
    ],
    "credentials": [
     "annotate",

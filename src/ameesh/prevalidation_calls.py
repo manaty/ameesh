@@ -60,6 +60,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
@@ -810,8 +811,21 @@ def _tree_modules(prepared: Prepared, head: str, *,
 FALLBACK_IMPORTERS_BUDGET_S = 120.0
 #: durée d'un module absent de la table (même forfait que paquet-attribution)
 FALLBACK_UNKNOWN_S = 60.0
-#: fichiers changés dont on cherche les importateurs (un `git grep` chacun)
+#: fichiers changés dont on cherche les importateurs (une racine de graphe)
 FALLBACK_IMPORTED_FILES = 40
+#: #8046 : profondeur du graphe d'imports lue depuis chaque fichier changé
+#: (directs, puis transitifs). Au-delà, un test est trop loin du diff pour
+#: valoir sa place dans le budget d'un gel.
+FALLBACK_IMPORTER_MAX_DISTANCE = 3
+#: #8046 : modules visités au plus par racine (borne le coût de la lecture)
+FALLBACK_IMPORTER_MAX_NODES = 500
+#: #8046 : modules retenus au plus par fichier changé. Le budget mesuré seul
+#: laissait partir des dizaines de modules à 0 s, dont le démarrage n'est pas
+#: dans la table ; neuf couvre les directs d'un petit module et garde le lot
+#: jouable dans la prévalidation d'un gel.
+FALLBACK_IMPORTERS_PER_ROOT = 9
+#: #8046 : délai de la lecture du graphe d'imports (git + analyse)
+FALLBACK_GRAPH_TIMEOUT = 120
 DURATIONS_PATH = "tests/parts/durees.json"
 
 
@@ -870,89 +884,298 @@ def _durations(prepared: Prepared, head: str, run) -> dict[str, float]:
     return out
 
 
+def _module_name(path: str) -> str:
+    """Le nom importable d'un fichier Python de `src/` ou `tests/`, ou ``""``."""
+    if not path.endswith(".py"):
+        return ""
+    if path.startswith("src/"):
+        stem = path[len("src/"):-3]
+    elif path.startswith("tests/"):
+        stem = path[:-3]
+    else:
+        return ""
+    if stem.endswith("/__init__"):
+        stem = stem[:-len("/__init__")]
+    parts = [part for part in stem.split("/") if part]
+    if not parts or not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part)
+                            for part in parts):
+        return ""
+    return ".".join(parts)
+
+
+def _import_targets(text: str, importer: str, known: set[str]) -> set[str]:
+    """Les modules du SHA qu'une ligne ``import``/``from`` importe (#8046).
+
+    Résout les imports relatifs depuis le paquet de ``importer``. Un nom
+    importé n'est retenu que s'il est un module du SHA : ``from a import b``
+    lie ``a.b`` quand c'est un module, sinon le module ``a`` (import de
+    symbole). Il ne lie jamais ``a`` au seul prétexte que ``b`` est un module :
+    le paquet lui-même n'est pas la dépendance utile, et le lier rendrait tous
+    les tests importateurs d'un nom quelconque de ``a`` des importateurs
+    directs du fichier changé.
+    """
+    line = str(text or "").strip()
+    if line.startswith("from "):
+        match = re.match(r"from\s+(\S+)\s+import\s+(.+)$", line)
+        if not match:
+            return set()
+        base, names = match.group(1), match.group(2)
+        names = (names.split("#", 1)[0].replace("(", "").replace(")", "")
+                 .replace("\\", ""))
+        if base.startswith("."):
+            dots = len(base) - len(base.lstrip("."))
+            rest = base[dots:]
+            package = importer.rpartition(".")[0]
+            for _ in range(dots - 1):
+                package = package.rpartition(".")[0]
+            if not package:
+                return set()
+            base = (package + "." + rest).strip(".") if rest else package
+        targets: set[str] = set()
+        submodule = False
+        for name in names.split(","):
+            name = name.strip().split(" as ")[0].strip()
+            if not name or name == "*" \
+                    or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                continue
+            target = (base + "." + name).strip(".")
+            if target in known:
+                targets.add(target)
+                submodule = True
+        if not submodule and base in known:
+            targets.add(base)
+        return targets
+    if line.startswith("import "):
+        names = line[len("import "):].split("#", 1)[0]
+        targets = set()
+        for name in names.split(","):
+            name = name.strip().split(" as ")[0].strip()
+            if name in known and re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*", name):
+                targets.add(name)
+        return targets
+    return set()
+
+
+def _import_graph(prepared: Prepared, head: str, *,
+                  deadline: Deadline | None = None
+                  ) -> tuple[dict[str, set[str]], set[str]]:
+    """#8046 : le graphe inverse des imports au SHA candidat.
+
+    Une seule lecture de l'arbre (``git ls-tree``) et une seule lecture des
+    lignes d'import (``git grep``) : ``rev[module]`` est l'ensemble des modules
+    qui l'importent, ``known`` l'ensemble des modules du SHA. Un import sur
+    plusieurs lignes, dynamique ou conditionnel n'est pas vu (même limite que
+    la sélection #7823) ; la ci-full du paquet reste la preuve finale. Une
+    lecture impossible rend ``({}, set())`` : le repli garde alors les seuls
+    tests du diff, jamais un élargissement supposé.
+    """
+    if not str(getattr(prepared, "repo", "") or ""):
+        return {}, set()
+    bounded = prevalidation._bounded_runner(subprocess.run, deadline)
+    timeout = FALLBACK_GRAPH_TIMEOUT
+    if deadline is not None:
+        timeout = min(timeout, max(0.0, deadline.remaining()))
+    if timeout <= 0:
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé avant le graphe d'imports")
+    tree = ["git", "-C", prepared.repo, *prevalidation.NO_REPLACE,
+            "ls-tree", "-r", "--name-only", "-z", head]
+    try:
+        proc = bounded(tree, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return {}, set()
+    if getattr(proc, "returncode", 1):
+        return {}, set()
+    modules = {}
+    for path in (getattr(proc, "stdout", "") or "").split("\0"):
+        if not path.endswith(".py"):
+            continue
+        module = _module_name(path)
+        if module:
+            modules[path] = module
+    known = set(modules.values())
+    grep = ["git", "-C", prepared.repo, *prevalidation.NO_REPLACE,
+            "grep", "-n", "-E", r"^[[:space:]]*(import|from)[[:space:]]",
+            head, "--", "*.py"]
+    try:
+        proc = bounded(grep, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return {}, known
+    if getattr(proc, "returncode", 1):
+        return {}, known
+    rev: dict[str, set[str]] = {}
+    for line in (getattr(proc, "stdout", "") or "").splitlines():
+        fields = line.split(":", 3)
+        if len(fields) != 4:
+            continue
+        importer = modules.get(fields[1])
+        if not importer:
+            continue
+        for target in _import_targets(fields[3], importer, known):
+            rev.setdefault(target, set()).add(importer)
+    return rev, known
+
+
+def _test_module(module: str, tree_modules: set[str]) -> str:
+    """`tests.test_2820_events_rotation` → `test_2820_events_rotation`."""
+    if not module.startswith("tests.test_"):
+        return ""
+    name = module[len("tests."):]
+    return name if name in tree_modules else ""
+
+
+def _importer_candidates(rev: dict[str, set[str]], roots,
+                         tree_modules: set[str]) -> dict[str, dict[str, int]]:
+    """#8046 : pour chaque fichier changé, ses tests importateurs et leur
+    distance d'import (1 = direct, 2 et 3 = transitifs). Le parcours est borné
+    en profondeur et en modules visités par racine."""
+    out: dict[str, dict[str, int]] = {}
+    for root in roots:
+        found: dict[str, int] = {}
+        seen = {root: 0}
+        queue = deque([root])
+        while queue and len(seen) <= FALLBACK_IMPORTER_MAX_NODES:
+            node = queue.popleft()
+            distance = seen[node]
+            if distance >= FALLBACK_IMPORTER_MAX_DISTANCE:
+                continue
+            for importer in rev.get(node, ()):
+                if importer in seen:
+                    continue
+                seen[importer] = distance + 1
+                name = _test_module(importer, tree_modules)
+                if name and name not in found:
+                    found[name] = distance + 1
+                queue.append(importer)
+        out[root] = found
+    return out
+
+
+def _budget_importers(queues: dict[str, dict[str, int]],
+                      durations: dict[str, float], taken: set[str],
+                      budget: float,
+                      per_root_max: int = FALLBACK_IMPORTERS_PER_ROOT
+                      ) -> tuple[list[str], list[str]]:
+    """#8046 : un quota par fichier changé, puis la coupe au budget global.
+
+    Chaque racine (fichier changé) retient d'abord ses `per_root_max`
+    importateurs les plus pertinents : par distance d'import (directs, puis
+    transitifs), puis par durée mesurée. Une racine très importée ne peut donc
+    plus consommer seule le budget avant qu'une autre, modérément importée,
+    n'ait joué les siens : c'est ce qui arrivait à `test_2820_events_rotation`
+    (6 s, neuvième de `housekeeping`) face aux importateurs bon marché d'un
+    autre fichier dans la coupe globale de #7823.
+
+    Le budget `budget` (secondes mesurées) reste une borne **globale** : si la
+    somme des modules retenus la dépasse, les moins pertinents sont retirés
+    d'abord — plus grande distance d'import, puis plus longue durée. Un
+    importateur direct coûteux passe donc avant un transitif bon marché, et
+    les directs courts avant les directs longs. Le reliquat n'est pas
+    redistribué : il reste la marge entre la table mesurée et le run réel, qui
+    l'a déjà dépassée (#7823). Rend `(ordre de jeu, noms laissés de côté)`.
+    """
+    live = []
+    for root, found in queues.items():
+        queue = []
+        for name, distance in found.items():
+            if name in taken:
+                continue
+            queue.append((distance, durations.get(name, FALLBACK_UNKNOWN_S),
+                          name))
+        queue.sort()
+        if queue:
+            live.append((root, queue))
+    if not live:
+        return [], []
+    picked: dict[str, list[str]] = {root: [] for root, _ in live}
+    owner: dict[str, str] = {}
+    for root, queue in live:
+        for _distance, _seconds, name in queue:
+            if len(picked[root]) >= per_root_max:
+                break
+            if name in owner:
+                continue
+            owner[name] = root
+            picked[root].append(name)
+    #: la distance la plus courte parmi les racines qui voient le module : un
+    #: test qui importe directement un fichier changé reste direct même si une
+    #: autre racine ne l'atteint que par un intermédiaire.
+    distance = {}
+    for _root, queue in live:
+        for d, _seconds, name in queue:
+            if name in owner and d < distance.get(name, 99):
+                distance[name] = d
+    seconds = {name: durations.get(name, FALLBACK_UNKNOWN_S) for name in owner}
+    spent = sum(seconds.values())
+    if spent > budget + 1e-9:
+        for name in sorted(owner, key=lambda n: (-distance[n], -seconds[n], n)):
+            if spent <= budget + 1e-9:
+                break
+            picked[owner[name]].remove(name)
+            del owner[name]
+            spent -= seconds[name]
+    # Ordre de jeu : un module de chaque racine à tour de rôle, du plus
+    # pertinent au moins pertinent : un rouge du lot est vu tôt, avant que
+    # les contrats ne prennent le reste du budget.
+    order: list[str] = []
+    index = {root: 0 for root, _ in live}
+    while True:
+        moved = False
+        for root, _queue in live:
+            if index[root] < len(picked[root]):
+                order.append(picked[root][index[root]])
+                index[root] += 1
+                moved = True
+        if not moved:
+            break
+    all_names = {name for _root, queue in live for _d, _s, name in queue}
+    return order, sorted(all_names - set(owner))
+
+
 def _importers(prepared: Prepared, head: str, changes, tree_modules: set[str],
                taken, *, deadline: Deadline | None = None
-               ) -> tuple[list[str], int]:
-    """#7823 : le repli statique borné — les tests qui importent les fichiers
-    changés du lot.
+               ) -> tuple[list[str], list[str]]:
+    """#7823/#8046 : le repli statique borné — les tests qui importent les
+    fichiers changés du lot.
 
-    Un `git grep` par fichier changé (`import a.b.c`, `from a.b.c import`,
-    `from a.b import … c`) dans les `tests/test*.py` de la tête ; un import
-    sur plusieurs lignes ou dynamique n'est pas vu (la ci-full du paquet reste
-    la preuve finale). Le budget `FALLBACK_IMPORTERS_BUDGET_S` se partage entre
-    les fichiers changés à tour de rôle, le module le moins cher de chacun
-    d'abord (même règle que #7195) : un fichier très importé
-    (`tests/support.py`) ne consomme pas seul la borne. Rend
-    `(modules retenus, modules au-delà du budget)`."""
+    Le graphe inverse des imports est lu au SHA candidat, puis parcouru depuis
+    chaque fichier **source** changé : directs (distance 1), puis transitifs
+    (2, 3). Un changement de l'infrastructure de test (`tests/support.py`)
+    n'est pas une racine : ses importateurs sont presque toute la suite, que
+    la CI du paquet couvre et que le budget du gel ne peut pas jouer ; les
+    tests du lot restent pris par `_own_tests`. Chaque fichier changé retient
+    au plus `FALLBACK_IMPORTERS_PER_ROOT` modules, par distance puis durée
+    mesurée (`tests/parts/durees.json`) ; la coupe au budget global
+    `FALLBACK_IMPORTERS_BUDGET_S` retire ensuite les plus éloignés, puis les
+    plus longs (`_budget_importers`).
+    Rend `(modules retenus dans l'ordre de jeu, noms laissés de côté)`. Un
+    import sur plusieurs lignes ou dynamique n'est pas vu (la ci-full du paquet
+    reste la preuve finale).
+    """
     if deadline is not None and deadline.expired():
         raise prevalidation.PrevalidationError(
             "run-incomplete",
             "budget de prévalidation épuisé avant les importateurs du lot")
     if not str(getattr(prepared, "repo", "") or ""):
-        return [], 0
-    bounded = prevalidation._bounded_runner(subprocess.run, deadline)
-    targets = []
+        return [], []
+    roots = []
     for status, path in changes:
         dotted = _dotted(path) if status != "D" else ""
-        if dotted and dotted not in targets:
-            targets.append(dotted)
-    queues: list[list[str]] = []
-    candidates: set[str] = set()
-    durations: dict[str, float] | None = None
-    for dotted in targets[:FALLBACK_IMPORTED_FILES]:
-        parent, _, leaf = dotted.rpartition(".")
-        here = re.escape(dotted)
-        # ERE POSIX seule : `\s` et `\b` sont des extensions GNU que la regex
-        # BSD de `git grep -E` sous macOS ne voit pas (#7930)
-        patterns = [r"^[[:space:]]*(import|from)[[:space:]]+%s([[:space:]]|\.|,|$)"
-                    % here]
-        if parent:
-            patterns.append(r"^[[:space:]]*from[[:space:]]+%s[[:space:]]+import"
-                            r"[[:space:]](.*[^[:alnum:]_])?%s([^[:alnum:]_]|$)"
-                            % (re.escape(parent), re.escape(leaf)))
-        argv = ["git", "-C", prepared.repo, *prevalidation.NO_REPLACE,
-                "grep", "-l", "-E"]
-        for pattern in patterns:
-            argv += ["-e", pattern]
-        argv += [head, "--", "tests/test*.py"]
-        try:
-            proc = bounded(argv, capture_output=True, text=True)
-        except (OSError, subprocess.SubprocessError):
+        if not dotted or dotted.startswith("tests.") or dotted in roots:
             continue
-        #: 1 : aucun fichier ne correspond ; plus : lecture impossible, ignorée
-        if getattr(proc, "returncode", 1) not in (0, 1):
-            continue
-        found = []
-        for line in (getattr(proc, "stdout", "") or "").splitlines():
-            path = line.split(":", 1)[-1]
-            name = os.path.basename(path)[:-3] if path.endswith(".py") else ""
-            if name in tree_modules and name not in taken:
-                found.append(name)
-        if not found:
-            continue
-        if durations is None:
-            durations = _durations(prepared, head, bounded)
-        found.sort(key=lambda name: (durations.get(name, FALLBACK_UNKNOWN_S), name))
-        queues.append(found)
-        candidates.update(found)
-    durations = durations or {}
-    chosen: list[str] = []
-    spent = 0.0
-    while queues:
-        still = []
-        for queue in queues:
-            while queue and (queue[0] in chosen or spent
-                             + durations.get(queue[0], FALLBACK_UNKNOWN_S)
-                             > FALLBACK_IMPORTERS_BUDGET_S):
-                queue.pop(0)
-            if not queue:
-                continue
-            name = queue.pop(0)
-            spent += durations.get(name, FALLBACK_UNKNOWN_S)
-            chosen.append(name)
-            still.append(queue)
-        queues = still
-    return sorted(chosen), len(candidates - set(chosen))
+        roots.append(dotted)
+    roots = roots[:FALLBACK_IMPORTED_FILES]
+    if not roots:
+        return [], []
+    bounded = prevalidation._bounded_runner(subprocess.run, deadline)
+    durations = _durations(prepared, head, bounded)
+    graph, _known = _import_graph(prepared, head, deadline=deadline)
+    queues = _importer_candidates(graph, roots, tree_modules)
+    order, dropped = _budget_importers(
+        queues, durations, set(taken), FALLBACK_IMPORTERS_BUDGET_S)
+    return order, dropped
 
 
 def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
@@ -1069,7 +1292,7 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
     #: `tests/test*.py`) ; diff illisible, les P0 restent (élargir, jamais
     #: rétrécir en silence).
     importers: list[str] = []
-    importers_dropped = 0
+    importers_skipped: list[str] = []
     if changes is not None:
         changes = [(str(item[0]), str(item[1]))
                    if isinstance(item, (list, tuple)) and len(item) >= 2
@@ -1081,7 +1304,7 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
                    if name in stems or any(stem.endswith("/" + name)
                                            for stem in stems))
         changed_tests = sorted(own)
-        importers, importers_dropped = _importers(
+        importers, importers_skipped = _importers(
             prepared, head, changes, tree_modules,
             set(changed_tests) | set(required) | set(transverse),
             deadline=deadline)
@@ -1120,7 +1343,8 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
         "transverse": sorted(transverse),
         "changed_tests": sorted(changed_tests),
         "importers": list(importers),
-        "importers_dropped": importers_dropped,
+        "importers_dropped": len(importers_skipped),
+        "importers_skipped": list(importers_skipped),
         "transverse_all": not diff_read,
         "diff": "read" if diff_read else "unreadable",
         "modules": list(modules),

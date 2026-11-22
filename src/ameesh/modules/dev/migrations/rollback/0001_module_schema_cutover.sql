@@ -13,6 +13,8 @@ DECLARE
         'ci_test_failures',
         'ci_runner_state',
         'ci_queue_state',
+        'ci_queue_wait',
+        'ci_queue_wait_scan',
         'ci_guard_scan',
         'ci_guard_run',
         'ci_map_state',
