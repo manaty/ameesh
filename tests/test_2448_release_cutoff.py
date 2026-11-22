@@ -246,6 +246,19 @@ class ReleaseFixtureMixin:
 
 class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
 
+    def test_roadmap_added_in_release_commit_without_private_titles(self):
+        self.write('site/docs/roadmap.md', '## Generated release entries\n\n<!-- generated releases: begin -->\n<!-- generated releases: end -->\n\n## In progress\nmanual\n')
+        self.head = self.commit('roadmap block')
+        self.git(self.seed, 'push', '-q', 'origin', 'main')
+        report = self.execute()
+        self.assertEqual(report['result'], 'released', report)
+        page = self.git(self.clone, 'show', 'origin/main:site/docs/roadmap.md')
+        self.assertIn('- **v1.11.8** (2026-10-18): +3 internal lots.', page)
+        self.assertIn('## In progress\nmanual', page)
+        notes = self.git(self.clone, 'show', 'origin/main:docs/versions/1.11.8.md')
+        self.assertIn('[Roadmap]', notes)
+
+
     def test_release_tags_green_head_generates_notes_and_runs_staging(self):
         report = self.execute()
         self.assertEqual(report["result"], "released", report)
