@@ -583,8 +583,9 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
     """Probes every credential and reports it; the rows, with `previous`.
 
     A credential already `failing` stays so unless the probe proves a fresh
-    login (`kept_failure`): the row then carries `kept` and only its
-    `checked_at` is touched (#8062: the probe's heartbeat). A write other than
+    login (`kept_failure`): the row then carries `kept` and its `probed_at`
+    is stamped (#8062: the probe's own heartbeat, which a `turn` write never
+    refreshes). A write other than
     `failing` is conditional on the failure count read (`expect_failures`): a
     failure recorded meanwhile by a turn wins."""
     from . import storage
@@ -615,7 +616,8 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
                 row["reason"] = reason or row["reason"]
             if not dry_run:
                 # #8062 : la sonde a bien relu l'identifiant (même échec, ou
-                # verdict non concluant) : `checked_at` est son battement, et
+                # verdict non concluant) : `probed_at` est son battement propre,
+                # que les écritures `turn` ne touchent pas, et
                 # `credential_probe_stale` le lit. L'état, le nombre d'échecs et
                 # `failing_since` ne changent pas.
                 storage.of(db).credentials.touch(

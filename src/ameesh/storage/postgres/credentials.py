@@ -12,6 +12,7 @@ from .. import interface
 #: fingerprint — `listing` feeds the alerts, which that role reads
 _COLUMNS = ("select host, harness, account, state, reason, source,"
             " extract(epoch from checked_at)::float8 as checked_ts,"
+            " extract(epoch from probed_at)::float8 as probed_ts,"
             " extract(epoch from failing_since)::float8 as failing_since_ts,"
             " extract(epoch from expires_at)::float8 as expires_ts,"
             " extract(epoch from last_failure_at)::float8 as last_failure_ts,"
@@ -31,15 +32,18 @@ class Credentials(interface.Credentials):
             "with old as (select state from credential_health"
             "             where host = %s and harness = %s and account = %s)"
             " insert into credential_health"
-            " (host, harness, account, state, reason, source, checked_at, failing_since,"
-            "  expires_at, last_failure_at, failing_fingerprint, failures)"
+            " (host, harness, account, state, reason, source, checked_at, probed_at,"
+            "  failing_since, expires_at, last_failure_at, failing_fingerprint, failures)"
             " values (%s, %s, %s, %s, %s, %s, now(),"
+            "         case when %s = 'sentinel' then now() end,"
             "         case when %s = 'failing' then now() end, to_timestamp(%s::float8),"
             "         case when %s = 'failing' then now() end, %s,"
             "         case when %s = 'failing' then 1 else 0 end)"
             " on conflict (host, harness, account) do update set"
             "   state = excluded.state, reason = excluded.reason,"
             "   source = excluded.source, checked_at = now(),"
+            "   probed_at = case when excluded.source = 'sentinel' then now()"
+            "     else credential_health.probed_at end,"
             "   expires_at = excluded.expires_at,"
             "   failing_since = case when excluded.state <> 'failing' then null"
             "     else coalesce(credential_health.failing_since, now()) end,"
@@ -51,10 +55,19 @@ class Credentials(interface.Credentials):
             "    or credential_health.failures = %s::int"
             " returning state, (select state from old) as previous",
             (host, harness, account or "", host, harness, account or "", state,
-             reason or "", source, state,
+             reason or "", source, source, state,
              None if expires_at is None else float(expires_at),
              state, fingerprint if state == "failing" else None, state,
              expect_failures, expect_failures))
+        if not rows and source == "sentinel":
+            # #8062 : un échec de tour a gagné la course, le verdict n'est pas
+            # écrit, mais la sonde a bien relu l'identifiant : sa date avance.
+            self.db.query(
+                "update credential_health set probed_at = now()"
+                " where host = %s and harness = %s and account = %s"
+                " returning account",
+                (host, harness, account or ""))
+            return {"skipped": True}
         return rows[0] if rows else {"skipped": True}
 
     def annotate(self, host, harness, account, reason, *, expect_failures) -> bool:
@@ -67,11 +80,11 @@ class Credentials(interface.Credentials):
 
     def touch(self, host, harness, account, *, expect_failures=None) -> bool:
         # #8062 : la sonde a relu l'identifiant sans changer de verdict
-        # (`kept_failure`) ; `checked_at` est son battement et `source` dit
-        # qu'il vient de la sonde (un échec de tour, lui, ne prouve pas
-        # qu'elle tourne). L'état et le compteur d'échecs restent intacts.
+        # (`kept_failure`) ; `probed_at` est son battement propre, que les
+        # écritures `turn` ne touchent pas. L'état et le compteur d'échecs
+        # restent intacts ; `checked_at` suit la dernière lecture.
         rows = self.db.query(
-            "update credential_health set checked_at = now(), source = 'sentinel'"
+            "update credential_health set checked_at = now(), probed_at = now()"
             " where host = %s and harness = %s and account = %s"
             "   and state = 'failing'"
             "   and (%s::int is null or failures = %s::int) returning account",

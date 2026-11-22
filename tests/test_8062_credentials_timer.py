@@ -45,14 +45,14 @@ class CredentialProbeAlertsTest(unittest.TestCase):
     def _row(self, **kw):
         row = {"host": "h1", "harness": "claude", "account": "a", "state": "healthy",
                "reason": "", "source": "sentinel", "checked_ts": NOW - 60,
-               "failing_since_ts": None, "expires_ts": None}
+               "probed_ts": NOW - 60, "failing_since_ts": None, "expires_ts": None}
         row.update(kw)
         return row
 
     def test_a_stale_pair_alerts_once_per_host_and_harness(self):
         stale = NOW - LIMIT - 5
-        alerts = self._alerts([self._row(account="a", checked_ts=stale),
-                               self._row(account="b", checked_ts=stale - 10)])
+        alerts = self._alerts([self._row(account="a", probed_ts=stale),
+                               self._row(account="b", probed_ts=stale - 10)])
         [alert] = alerts
         self.assertEqual(alert["type"], "credential_probe_stale")
         self.assertEqual((alert["host"], alert["harness"]), ("h1", "claude"))
@@ -64,25 +64,25 @@ class CredentialProbeAlertsTest(unittest.TestCase):
 
     def test_one_fresh_account_proves_the_probe_runs(self):
         self.assertEqual(self._alerts([
-            self._row(account="a", checked_ts=NOW - LIMIT - 5),
-            self._row(account="b", checked_ts=NOW - 60),
+            self._row(account="a", probed_ts=NOW - LIMIT - 5),
+            self._row(account="b", probed_ts=NOW - 60),
         ]), [])
 
     def test_the_limit_is_three_probe_periods(self):
-        [alert] = self._alerts([self._row(checked_ts=NOW - LIMIT)])
+        [alert] = self._alerts([self._row(probed_ts=NOW - LIMIT)])
         self.assertEqual(alert["type"], "credential_probe_stale")
-        self.assertEqual(self._alerts([self._row(checked_ts=NOW - LIMIT + 1)]), [])
+        self.assertEqual(self._alerts([self._row(probed_ts=NOW - LIMIT + 1)]), [])
 
     def test_relay_harnesses_are_not_periodic_readings(self):
         # `deepseek` n'écrit une ligne qu'à la récupération d'une clé : son
         # ancienneté ne prouve pas que la sonde s'est tue.
         self.assertEqual(self._alerts([self._row(harness="deepseek",
-                                                 checked_ts=NOW - 30 * 86400)]), [])
+                                                 probed_ts=NOW - 30 * 86400)]), [])
 
-    def test_a_sentinel_row_without_a_stamp_alerts_as_never_probed(self):
-        # La base interdit checked_at NULL ; une ligne sans date ne prouve
-        # aucune sonde et ne doit pas se taire.
-        [alert] = self._alerts([self._row(checked_ts=None)])
+    def test_a_row_without_a_probe_date_alerts_as_never_probed(self):
+        # Une ligne `turn` n'a pas de date de sonde ; elle ne prouve aucune
+        # sonde et ne doit pas se taire.
+        [alert] = self._alerts([self._row(probed_ts=None)])
         self.assertIsNone(alert["since"])
         self.assertIn("no probe reading", alert["detail"])
 
@@ -91,22 +91,30 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         # checked_at ; des échecs de tour répétés ne doivent pas masquer une
         # sonde arrêtée.
         stale = NOW - LIMIT - 5
-        [alert] = self._alerts([self._row(source="sentinel", checked_ts=stale),
-                                self._row(source="turn", checked_ts=NOW - 60)])
+        [alert] = self._alerts([self._row(source="turn", checked_ts=NOW - 60,
+                                          probed_ts=stale)])
         self.assertEqual(alert["type"], "credential_probe_stale")
         self.assertEqual(alert["since"], stale)
 
+    def test_a_fresh_probe_survives_a_turn_write_on_the_same_row(self):
+        # #230300 : un seul compte, sondé il y a une minute, puis un échec
+        # source=turn sur la même ligne : la date de sonde reste, aucune
+        # alerte avant trois périodes.
+        self.assertEqual(self._alerts([self._row(
+            source="turn", probed_ts=NOW - 60, checked_ts=NOW - 5)]), [])
+
     def test_a_pair_with_only_turn_rows_has_never_been_probed(self):
-        [alert] = self._alerts([self._row(source="turn", checked_ts=NOW - 60)])
+        [alert] = self._alerts([self._row(source="turn", probed_ts=None,
+                                          checked_ts=NOW - 60)])
         self.assertIsNone(alert["since"])
         self.assertIn("no probe reading", alert["detail"])
 
     def test_alert_identity_stays_stable_while_the_silence_grows(self):
-        row = self._row(checked_ts=NOW - LIMIT - 5)
+        row = self._row(probed_ts=NOW - LIMIT - 5)
         first = self._alerts([row])[0]
         later = self._alerts([row], now=NOW + 4 * PERIOD)[0]
         self.assertEqual(exploitation.alert_key(first), exploitation.alert_key(later))
-        other = self._alerts([self._row(harness="codex", checked_ts=row["checked_ts"])])[0]
+        other = self._alerts([self._row(harness="codex", probed_ts=row["probed_ts"])])[0]
         self.assertNotEqual(exploitation.alert_key(first), exploitation.alert_key(other))
 
     def test_the_type_is_declared_pushed_and_labelled(self):
@@ -244,7 +252,7 @@ class TouchStorageTest(unittest.TestCase):
         sql, params = db.query.call_args[0]
         self.assertEqual(sql.split(" where ", 1)[0],
                          "update credential_health set checked_at = now(), "
-                         "source = 'sentinel'")
+                         "probed_at = now()")
         self.assertIn("state = 'failing'", sql)
         self.assertIn("failures = %s::int", sql)
         self.assertEqual(params, ("h1", "claude", "a", 2, 2))
@@ -255,6 +263,52 @@ class TouchStorageTest(unittest.TestCase):
         self.assertTrue(Credentials(db).touch("h1", "claude", "a"))
         self.assertEqual(db.query.call_args[0][1], ("h1", "claude", "a", None, None))
 
+
+class ReportProbeStampTest(unittest.TestCase):
+    """#8062 : `probed_at` est la date de sonde, distincte de `checked_at`."""
+
+    def _report(self, source, rows):
+        db = mock.Mock()
+        db.query.side_effect = rows
+        out = Credentials(db).report("h1", "claude", "a", "healthy",
+                                     source=source, expect_failures=0)
+        return db, out
+
+    def test_a_sentinel_report_stamps_the_probe_date(self):
+        db, _ = self._report("sentinel", [[{"state": "healthy", "previous": None}]])
+        sql, params = db.query.call_args[0]
+        self.assertIn("case when %s = 'sentinel' then now() end", sql)
+        self.assertIn("probed_at = case when excluded.source = 'sentinel'", sql)
+        self.assertEqual(params[8:10], ("sentinel", "sentinel"))
+
+    def test_a_turn_report_does_not_replace_the_probe_date(self):
+        db, _ = self._report("turn", [[{"state": "healthy", "previous": None}]])
+        _sql, params = db.query.call_args[0]
+        self.assertEqual(params[8:10], ("turn", "turn"))
+
+    def test_a_skipped_sentinel_report_still_marks_the_probe(self):
+        db, out = self._report("sentinel", [[], [{"account": "a"}]])
+        self.assertTrue(out["skipped"])
+        sql, params = db.query.call_args[0]
+        self.assertIn("set probed_at = now()", sql)
+        self.assertEqual(params, ("h1", "claude", "a"))
+
+    def test_a_skipped_turn_report_does_not_mark_the_probe(self):
+        db, out = self._report("turn", [[]])
+        self.assertTrue(out["skipped"])
+        self.assertEqual(db.query.call_count, 1)
+
+
+class ProbeDateWiringTest(unittest.TestCase):
+    def test_migration_0604_adds_and_backfills_the_probe_date(self):
+        text = (ROOT / "src/ameesh/migrations/0604_credentials_probe_heartbeat.sql"
+                ).read_text(encoding="utf-8")
+        self.assertIn("add column if not exists probed_at", text)
+        self.assertIn("source = 'sentinel'", text)
+
+    def test_the_supervisor_role_reads_the_probe_date(self):
+        text = (ROOT / "deploy/sql/role-superviseur.sql").read_text(encoding="utf-8")
+        self.assertIn("'probed_at'", text)
 
 def _systemctl(*, user=None, system=None):
     """Faux `systemctl` : None = gestionnaire illisible, dict = unité lue."""

@@ -1729,14 +1729,15 @@ class Credentials(Domain):
     def touch(self, host: str, harness: str, account: str, *,
               expect_failures: int | None = None) -> bool:
         """#8062: the sentinel read the credential again without changing its
-        verdict (`kept_failure`): stamps `checked_at` (the probe's heartbeat),
-        nothing else, and only while the failure count is still
-        `expect_failures` (None: no condition). True if written."""
+        verdict (`kept_failure`): stamps `probed_at` (the probe's own
+        heartbeat) and `checked_at`, nothing else, and only while the failure
+        count is still `expect_failures` (None: no condition). True if
+        written."""
 
     @abc.abstractmethod
     def health(self, host: str, harness: str) -> dict[str, dict]:
         """{account: row} for a harness on a host: state, reason, source,
-        checked_ts, failing_since_ts, expires_ts, last_failure_ts,
+        checked_ts, probed_ts, failing_since_ts, expires_ts, last_failure_ts,
         failing_fingerprint, failures."""
 
     @abc.abstractmethod
