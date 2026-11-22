@@ -35,10 +35,12 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
 import socket
 import stat
 import struct
 import subprocess
+import time
 import urllib.request
 import uuid
 from zoneinfo import ZoneInfo
@@ -256,20 +258,113 @@ class Scaleway:
         self._call(target, action)
 
 
-#: #8072: the one line `health` may print (vm-commande.py `said`): an
-#: enrolled host, 8 hex digits of the nonce and fixed words. Anything else is
-#: dropped unread: the worker journal never carries remote or free text.
-HEALTH_LINE = re.compile(r'health host=[A-Za-z0-9][A-Za-z0-9._-]{0,63}'
-                         r'(?: nonce=[0-9a-f]{8})?(?: [a-z_]{1,16}=[a-z0-9-]{1,16}){1,12}\Z')
+#: #8083: the only fields and values of the health line, the same table as
+#: `REPORT` in deploy/vm-adapter/commandes/vm-commande.py (`Commande.said`);
+#: a test keeps both equal. `step` is the only number: the rank (1-99) of the
+#: first remote health command that did not answer 0.
+HEALTH_REPORT = {
+    'stage': ('control', 'admission', 'launched', 'receipt', 'checks',
+              'previous-boot', 'done'),
+    'answer': ('ok', 'transport', 'failed'),
+    'verdict': ('ok', 'ko', 'pending'),
+    'delivered': ('true', 'false', 'absent'),
+    'acknowledged': ('true', 'false', 'absent'),
+    'turn_ended': ('true', 'false', 'absent'),
+    'checks': ('ok', 'transport', 'failed'),
+    'previous_boot': ('ok', 'transport', 'failed'),
+}
+HEALTH_HOST = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z')
+HEALTH_NONCE = re.compile(r'[0-9a-f]{8}\Z')
+HEALTH_STEP = re.compile(r'[1-9][0-9]?\Z')
+#: #8083: `run_probe` reads at most this many bytes of the health command's
+#: stdout; one byte past the accepted line proves it is over the bound.
+HEALTH_OUTPUT_MAX = 4096
 
 
 def health_line(out):
-    """#8072: the validated health line of a probe's stdout, or None."""
-    if not isinstance(out, bytes) or len(out) > 4096:
+    """#8072/#8083: the validated health line of a probe's stdout, or None.
+
+    Only the fixed fields of `HEALTH_REPORT` are accepted, each at most once,
+    with `stage` required: never a free `key=value` (#8083). Every other
+    output, including one over 4096 bytes, is dropped."""
+    if not isinstance(out, bytes) or len(out) > HEALTH_OUTPUT_MAX:
         return None
     lines = out.decode('ascii', 'replace').splitlines()
     line = lines[-1].strip() if lines else ''
-    return line if HEALTH_LINE.fullmatch(line) else None
+    parts = line.split()
+    if len(parts) < 3 or parts[0] != 'health':
+        return None
+    fields = {}
+    for part in parts[1:]:
+        key, sep, value = part.partition('=')
+        if not sep or not key or key in fields:
+            return None
+        fields[key] = value
+    if not HEALTH_HOST.fullmatch(fields.pop('host', '')):
+        return None
+    nonce = fields.pop('nonce', None)
+    if nonce is not None and not HEALTH_NONCE.fullmatch(nonce):
+        return None
+    if 'stage' not in fields:
+        return None
+    for key, value in fields.items():
+        if key == 'step':
+            if not HEALTH_STEP.fullmatch(value):
+                return None
+        elif value not in HEALTH_REPORT.get(key, ()):
+            return None
+    return line
+
+
+def _read_bounded(stream, limit, deadline):
+    """At most `limit` bytes of `stream`, before `deadline` (monotonic).
+
+    #8083: the bound is on the read itself, not on the accepted line: a
+    failing local command must not inflate the worker's memory. Reaching the
+    bound stops the read; the caller closes the pipe and reaps the child."""
+    chunks, total = [], 0
+    with selectors.DefaultSelector() as selector:
+        selector.register(stream, selectors.EVENT_READ)
+        while total < limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise TimeoutError('probe stdout read timed out')
+            chunk = os.read(stream.fileno(), limit - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    return b''.join(chunks)
+
+
+def _probe_bounded(argv, timeout):
+    """(code, stdout) of one health probe; stdout is read at most 4097 bytes.
+
+    #8083: past that bound the pipe is closed (the writer gets EPIPE) and the
+    child is reaped within the same deadline, killed if it outlives it."""
+    proc = subprocess.Popen(argv, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'},
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + timeout
+    raw = b''
+    try:
+        raw = _read_bounded(proc.stdout, HEALTH_OUTPUT_MAX + 1, deadline)
+        proc.stdout.close()
+        proc.stdout = None
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+            proc.stdout = None
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    return proc.returncode, raw
 
 
 def run_probe(argv, timeout, *, pending=False):
@@ -277,19 +372,24 @@ def run_probe(argv, timeout, *, pending=False):
 
     #8072: for health (`pending`), the command's bounded line (stage reached,
     receipt verdict and booleans, failing check) is journalled, so a return
-    that does not complete reads from the worker log alone."""
+    that does not complete reads from the worker log alone.
+    #8083: that stdout is read at most 4097 bytes; the other verbs keep it on
+    /dev/null."""
+    env = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}
     try:
-        done = subprocess.run(argv, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'},
-                              stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE if pending else subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=timeout)
+        if pending:
+            code, raw = _probe_bounded(argv, timeout)
+        else:
+            done = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  timeout=timeout)
+            code, raw = done.returncode, None
     except (OSError, subprocess.SubprocessError):
         if pending:
             print('health probe: not run or not ended within its bound', flush=True)
         return False
-    code = done.returncode
     if pending:
-        line = health_line(getattr(done, 'stdout', None))
+        line = health_line(raw)
         print('%s (exit %s)' % (line or 'health probe: no valid line', code), flush=True)
     if pending and code == host_release.ADAPTER_WAIT_CODE:
         return 'pending'
