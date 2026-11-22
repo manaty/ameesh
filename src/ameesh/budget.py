@@ -312,11 +312,12 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
         events = storage.of(db).budgets.events(max(0, last))
     except db_mod.DbError:
         events = []
-    from . import account_budget, provider_credits
+    from . import account_budget, provider_credits, host_budget
     return {"schema": "ameesh-budget/1", "limits": limits.as_dict(),
             "rows": list(limits.rows), "spend": spend, "paused": paused, "events": events,
             # #1469 : enveloppes par compte de facturation (jour calendaire)
             "accounts": account_budget.usage(db),
+            "infrastructure": host_budget.status(cfg, db),
             # #4164 : l'état réel des crédits de chaque compte fournisseur, à
             # côté des enveloppes (une enveloppe ne voit pas un compte épuisé)
             "provider_credits": provider_credits.listing(db)}
@@ -384,6 +385,16 @@ def format_status(data: dict) -> str:
                            _fmt_usd(a["reserved"]), _fmt_usd(a["kept"]),
                            _fmt_usd(a["remaining"]), a["period"], a["tz"],
                            account_budget.moment(a.get("reset_ts"), a["tz"])))
+    if data.get("infrastructure"):
+        out.append("infrastructure (observed running interval only; total bill unknown):")
+        for host in data["infrastructure"]:
+            hours = host['observed_on_hours']
+            amount = host['observed_cost_eur']
+            out.append("  %s: %s h, %s EUR; rate %s EUR/h (%s); observed %s" % (
+                host['host'], 'unknown' if hours is None else '%.2f' % hours,
+                'unknown' if amount is None else '%.2f' % amount,
+                'unknown' if host['rate_eur_h'] is None else host['rate_eur_h'],
+                host['rate_source'] or 'source unknown', _moment(host['observed_at'])))
     if "provider_credits" in data:
         from . import provider_credits
         rows = data["provider_credits"] or []

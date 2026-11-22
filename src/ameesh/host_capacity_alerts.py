@@ -6,7 +6,7 @@ TYPES = ('host_idle_reserved', 'baseline_oversized')
 
 
 def project(footprints, listing, *, now, idle_after_s=1800, baseline_hosts=2,
-            held_hosts=(), draining_hosts=(), orchestrators=()):
+            held_hosts=(), draining_hosts=(), orchestrators=(), provider_running=()):
     """Alert projection over A2 evidence; no host lifecycle effects.
 
     A host whose `capacity` is `none` admits no agent (#7727): it is outside
@@ -24,10 +24,15 @@ def project(footprints, listing, *, now, idle_after_s=1800, baseline_hosts=2,
         idle[host] = fp
     out = []
     for host, fp in idle.items():
-        if fp.get('capacity') != 'burst':
+        if fp.get('capacity') != 'burst' and host not in provider_running:
             continue
         agents = sorted(a['name'] for a in listing if a.get('host') == host)
-        detail = ('Host %s idle with reserved capacity: %s. Holders: agents %s; '
+        if fp.get('capacity') != 'burst':
+            detail = ('VM %s observed running without activity: %s. '
+                      'Review whether this reserve is still needed; preserve critical '
+                      'roles and their guards. No automatic action.' % (host, host_idle.line(fp)))
+        else:
+            detail = ('Host %s idle with reserved capacity: %s. Holders: agents %s; '
                   'lot leases %s; declared runs %s (%s). Action: propose drainage '
                   '(ameesh host drain %s), hold (ameesh hosts %s --hold --until 2h '
                   '--reason <reason>), or stop an unnecessary reserve after '
@@ -99,9 +104,19 @@ def alerts(cfg, db, listing, now, *, canons, readings, held_hosts=(), orchestrat
     members = [a for a in listing if a.get('host') in readings]
     footprints = host_idle.snapshot(cfg, db, canons, readings, now=now, listing=members,
                                     controls={row['host']: row for row in controls})
+    try:
+        from .storage.postgres.vm_adapter import Queue
+        observations = Queue(db).observations()
+    except Exception:
+        observations = []
+    running = {row['host'] for row in observations
+               if row.get('provider_state') == 'running'
+               and resources.finite_float(row.get('seen_ts')) is not None
+               and 0 <= now - row['seen_ts'] <= fresh}
     return project(footprints, listing, now=now, idle_after_s=cfg.idle_after_s,
                    baseline_hosts=cfg.baseline_hosts, held_hosts=held_hosts,
-                   draining_hosts=excluded, orchestrators=orchestrators)
+                   draining_hosts=excluded, orchestrators=orchestrators,
+                   provider_running=running)
 
 
 def _episode(alert):

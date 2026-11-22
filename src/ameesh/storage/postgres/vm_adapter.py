@@ -5,6 +5,13 @@ from .host_lifecycle import HostLifecycle
 
 
 class Queue:
+    def observations(self):
+        """Last provider observation and its uninterrupted observed interval."""
+        return self.db.query("SELECT host,provider_state,"
+                             "extract(epoch from on_since)::float8 AS on_ts,"
+                             "extract(epoch from updated_at)::float8 AS seen_ts "
+                             "FROM vm_adapter_observations")
+
     def __init__(self, db):
         self.db = db
 
