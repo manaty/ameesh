@@ -10,12 +10,14 @@
 -- visible.
 --
 -- A failing row is different: an N-1 kept failure writes nothing (no report,
--- and `annotate` leaves `checked_at` untouched), and an N-1 failing report
--- has no probe date of its own. The trigger drops the inherited date on such
--- a report; the reader then reads a failing row through `probed_at` alone,
--- so an active N-1 kept failure is not mistaken for a stopped timer. The
--- row is already named by `credential_failing`; a new sentinel stamps its
--- own date on each pass (`touch`), and that date ages normally.
+-- and `annotate` leaves `checked_at` untouched), so its old probe date stays.
+-- An N-1 failing report advances `checked_at` but has no probe date of its
+-- own; the trigger drops the inherited date on such a report. The reader
+-- keeps a failing row quiet while it has stopped moving (the kept-failure
+-- signature) and names a stale probe date only while another writer is
+-- still active on the row. The row is already named by `credential_failing`;
+-- a new sentinel stamps its own date on each pass (`touch`), and that date
+-- ages normally.
 --
 -- `probe_missing_since` anchors the other case: a non-failing pair with no
 -- probe date at all (the timer never ran, or its last writing predates this
@@ -38,10 +40,12 @@ begin
     if new.source = 'sentinel' then
         if new.state = 'failing' then
             -- An N-1 failing report advances `checked_at` but has no probe
-            -- date of its own, and an N-1 kept failure writes nothing at all.
-            -- Drop the inherited date so neither is read as a stopped probe;
-            -- a new sentinel writes `probed_at` explicitly and keeps it.
+            -- date of its own; an `annotate` changes neither date. Drop the
+            -- inherited date on such a report only, so neither is read as a
+            -- stopped probe; a new sentinel writes `probed_at` explicitly and
+            -- keeps it.
             if tg_op = 'UPDATE'
+                    and new.checked_at is distinct from old.checked_at
                     and new.probed_at is not distinct from old.probed_at then
                 new.probed_at := null;
             end if;

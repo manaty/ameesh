@@ -12,8 +12,8 @@ Quatre pièces, sans hôte réel (le trigger 0604 est rejoué sur le banc) :
 * le trigger 0604 : il date la sonde d'un écrivain N-1 depuis `checked_at`,
   préserve la date à travers les écritures `turn`, et n'invente pas de date
   pour un report `failing` N-1 (un échec maintenu n'écrit rien) ; une ligne
-  en échec sans date de sonde est nommée par `credential_failing`, pas par la
-  garde de la minuterie ;
+  en échec sans battement de sonde est nommée par `credential_failing`, pas
+  par la garde de la minuterie ;
 * l'installation et le contrôle : la mise à jour d'hôte pose et active
   `ameesh-credentials.timer` (unité utilisateur sur une VM ou le poste, unité
   système sur le serveur), et `ameesh doctor` la vérifie (KO si absente ou
@@ -147,6 +147,25 @@ class CredentialProbeAlertsTest(unittest.TestCase):
                                 probe_missing_ts=NOW - 2 * 3600,
                                 checked_ts=NOW - 60)
                 self.assertEqual(self._alerts([row]), [])
+
+    def test_a_static_failing_row_is_not_a_stopped_probe(self):
+        # #45274 : la sonde N-1 active garde l'échec sans écrire ; la ligne a
+        # cessé de bouger (dernier écrivain : l'échec, il y a plus de trois
+        # périodes). La date de sonde antérieure n'est pas un battement, et
+        # `credential_failing` nomme déjà la ligne.
+        row = self._row(source="turn", state="failing",
+                        probed_ts=NOW - 2 * LIMIT,
+                        checked_ts=NOW - LIMIT - 5)
+        self.assertEqual(self._alerts([row]), [])
+
+    def test_a_new_sentinel_heartbeat_on_a_failing_row_ages(self):
+        # Une sonde nouvelle (`touch`) écrit les deux dates ; si elle s'arrête,
+        # la ligne ne bouge plus mais la date est bien un relevé de sonde.
+        stale = NOW - LIMIT - 5
+        [alert] = self._alerts([self._row(state="failing", probed_ts=stale,
+                                          checked_ts=stale)])
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertEqual(alert["since"], stale)
 
     def test_a_failing_row_does_not_hide_a_stale_healthy_sibling(self):
         # La ligne en échec est écartée, pas la paire : un autre compte sain
@@ -424,6 +443,7 @@ class ProbeDateWiringTest(unittest.TestCase):
         self.assertIn("create trigger credential_health_probe_heartbeat", text)
         self.assertIn("new.state = 'failing'", text)
         self.assertIn("is not distinct from old.probed_at", text)
+        self.assertIn("new.checked_at is distinct from old.checked_at", text)
         self.assertIn("new.probe_missing_since := null", text)
         self.assertNotIn("update credential_health set probed_at", text)
         migration = next(m for m in migrations.discover() if m.version == 604)
@@ -515,6 +535,35 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
         row = self._row()
         self.assertIsNone(row["probed_ts"])
         self.assertEqual(self._alerts(time.time()), [])
+
+    def test_an_n1_failing_report_drops_the_healthy_probe_date(self):
+        # #45274 : une sonde N-1 saine a daté la ligne ; son report `failing`
+        # avance checked_at sans date de sonde. Le trigger enlève la date
+        # héritée, sinon la garde la lirait comme un battement après 30 min.
+        self._n1_insert("sentinel", _db_time(-2 * 3600))
+        self.assertIsNotNone(self._row()["probed_ts"])
+        self.previous_update(
+            "credential_health",
+            {"state": "failing", "reason": "auth", "source": "sentinel",
+             "checked_at": _db_time(-60)},
+            where={"host": self.HOST, "harness": self.HARNESS,
+                   "account": self.ACCOUNT},
+            added=self.ADDED)
+        row = self._row()
+        self.assertIsNone(row["probed_ts"])
+        self.assertEqual(self._alerts(time.time()), [])
+
+    def test_an_annotate_does_not_drop_the_failing_probe_date(self):
+        # `annotate` ne change que la raison : le trigger ne doit pas prendre
+        # cette écriture pour un report N-1 et effacer la date de la sonde.
+        self._n1_insert("sentinel", _db_time(-2 * 3600), state="failing")
+        self.assertTrue(Credentials(self.db).touch(
+            self.HOST, self.HARNESS, self.ACCOUNT))
+        before = self._row()["probed_ts"]
+        self.assertTrue(Credentials(self.db).annotate(
+            self.HOST, self.HARNESS, self.ACCOUNT, "still failing",
+            expect_failures=0))
+        self.assertEqual(self._row()["probed_ts"], before)
 
     def test_a_new_sentinel_touch_restores_the_failing_probe_heartbeat(self):
         # Une fois la nouvelle sonde passée (`touch`), sa date propre existe :
