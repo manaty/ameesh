@@ -42,6 +42,7 @@ from __future__ import annotations
 from ameesh import work_lifecycle as lifecycle
 
 import argparse
+import atexit
 from contextlib import closing, contextmanager, nullcontext
 import dataclasses
 import functools
@@ -234,6 +235,10 @@ class _AsyncLog:
 
 
 _journal = _AsyncLog()
+#: #8074 : processus propriétaire du fil `journal`. Un enfant forké hérite de
+#: l'objet (et de sa file) mais pas du fil : il ne doit ni l'attendre ni le
+#: fermer, sinon sa sortie attendrait un fil qui n'existe que chez le parent.
+_JOURNAL_PID = os.getpid()
 
 
 def log_async(message: str) -> None:
@@ -538,6 +543,36 @@ def _sortie_sure(code: int, fils: "list[threading.Thread] | tuple" = ()) -> int:
     _ecrire_sans_attendre(2, ("agent-runner: thread(s) still active at shutdown (%s): "
                               "exiting immediately\n" % noms).encode("utf-8", "replace"))
     os._exit(code)
+
+
+def _arret_journal() -> None:
+    """#8074 : vide et arrête le fil `journal` à la sortie de l'interpréteur.
+
+    `_sortie_sure` ne couvre que le point d'entrée de l'exécuteur. Tout autre
+    processus qui importe `runner` — tests, prévalidation, CLI — laissait le
+    fil démon vivre après le retour du `main` : ses messages encore en file
+    étaient perdus, et s'il écrivait sur `sys.stderr` quand CPython finalisait,
+    le vidage final échouait en erreur fatale (« could not acquire lock for
+    <stderr> at interpreter shutdown », SIGABRT). On le vide donc ici, dans un
+    délai borné, avant la finalisation.
+
+    Si le puits est bloqué et que le fil ne s'arrête pas, le laisser à CPython
+    reproduirait le SIGABRT : on sort par `os._exit(1)`, comme le repli de
+    `_sortie_sure`, sans écriture synchrone. Un arrêt anormal ne se déguise
+    pas en succès.
+    """
+    if os.getpid() != _JOURNAL_PID:
+        # Enfant forké : le fil appartient au parent, il n'existe pas ici.
+        return
+    if _journal.close(JOURNAL_CLOSE_TIMEOUT):
+        return
+    _ecrire_sans_attendre(
+        2, b"agent-runner: journal thread still active at shutdown: "
+           b"exiting immediately\n")
+    os._exit(1)
+
+
+atexit.register(_arret_journal)
 
 
 class _LancementImpossible(Exception):
