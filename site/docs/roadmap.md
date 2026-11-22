@@ -449,7 +449,7 @@ version.
   receipts for VMs (#6298, #6329).
 - **v1.46** (09/11/2026): mailbox read indexes give exact unread counts
   (#6422, #6424). Canon updates are broadcast as a bounded diff (#6425). The
-  review designation gate uses an authenticated base proof (#6365).
+  merge gate counts author families only on the lot's own commits (#6365).
 - **v1.47** (09/11/2026; patch .1): adds `ameesh work packet check/hold`
   (#6562, #6563). `export-v0` now requires an explicit scope (#6534).
   Automatic retries are journaled (#6475, #6487), and stacked branches that
