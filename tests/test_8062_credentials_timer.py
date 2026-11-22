@@ -51,8 +51,10 @@ class CredentialProbeAlertsTest(unittest.TestCase):
 
     def test_a_stale_pair_alerts_once_per_host_and_harness(self):
         stale = NOW - LIMIT - 5
-        alerts = self._alerts([self._row(account="a", probed_ts=stale),
-                               self._row(account="b", probed_ts=stale - 10)])
+        alerts = self._alerts([self._row(account="a", probed_ts=stale,
+                                         checked_ts=stale),
+                               self._row(account="b", probed_ts=stale - 10,
+                                         checked_ts=stale - 10)])
         [alert] = alerts
         self.assertEqual(alert["type"], "credential_probe_stale")
         self.assertEqual((alert["host"], alert["harness"]), ("h1", "claude"))
@@ -69,9 +71,11 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         ]), [])
 
     def test_the_limit_is_three_probe_periods(self):
-        [alert] = self._alerts([self._row(probed_ts=NOW - LIMIT)])
+        [alert] = self._alerts([self._row(probed_ts=NOW - LIMIT,
+                                          checked_ts=NOW - LIMIT)])
         self.assertEqual(alert["type"], "credential_probe_stale")
-        self.assertEqual(self._alerts([self._row(probed_ts=NOW - LIMIT + 1)]), [])
+        self.assertEqual(self._alerts([self._row(probed_ts=NOW - LIMIT + 1,
+                                                 checked_ts=NOW - LIMIT + 1)]), [])
 
     def test_relay_harnesses_are_not_periodic_readings(self):
         # `deepseek` n'écrit une ligne qu'à la récupération d'une clé : son
@@ -79,12 +83,25 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         self.assertEqual(self._alerts([self._row(harness="deepseek",
                                                  probed_ts=NOW - 30 * 86400)]), [])
 
-    def test_a_row_without_a_probe_date_alerts_as_never_probed(self):
-        # Une ligne `turn` n'a pas de date de sonde ; elle ne prouve aucune
-        # sonde et ne doit pas se taire.
-        [alert] = self._alerts([self._row(probed_ts=None)])
-        self.assertIsNone(alert["since"])
-        self.assertIn("no probe reading", alert["detail"])
+    def test_an_n1_sentinel_write_without_probed_at_is_a_heartbeat(self):
+        # 0604 peut être appliquée avant le code qui écrit probed_at : la
+        # sonde N-1 écrit checked_at et source=sentinel, c'est une lecture.
+        self.assertEqual(self._alerts([self._row(probed_ts=None,
+                                                 checked_ts=NOW - 60)]), [])
+
+    def test_an_n1_sentinel_write_refreshes_even_a_stale_backfill(self):
+        # Le backfill ne se rejoue pas : une écriture N-1 postérieure à la
+        # migration doit compter malgré un probed_at périmé.
+        self.assertEqual(self._alerts([self._row(
+            probed_ts=NOW - 2 * LIMIT, checked_ts=NOW - 60)]), [])
+
+    def test_an_n1_sentinel_silence_still_alerts(self):
+        # La compatibilité n'éteint pas la garde : sans écriture récente de
+        # sonde, l'alerte reste.
+        [alert] = self._alerts([self._row(probed_ts=None,
+                                          checked_ts=NOW - LIMIT - 5)])
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertEqual(alert["since"], NOW - LIMIT - 5)
 
     def test_turn_failures_do_not_refresh_the_probe_heartbeat(self):
         # #8042/#8062 B : `Credentials.report(source='turn')` écrit aussi
@@ -110,11 +127,13 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         self.assertIn("no probe reading", alert["detail"])
 
     def test_alert_identity_stays_stable_while_the_silence_grows(self):
-        row = self._row(probed_ts=NOW - LIMIT - 5)
+        row = self._row(probed_ts=NOW - LIMIT - 5, checked_ts=NOW - LIMIT - 5)
         first = self._alerts([row])[0]
         later = self._alerts([row], now=NOW + 4 * PERIOD)[0]
         self.assertEqual(exploitation.alert_key(first), exploitation.alert_key(later))
-        other = self._alerts([self._row(harness="codex", probed_ts=row["probed_ts"])])[0]
+        other = self._alerts([self._row(harness="codex",
+                                        probed_ts=row["probed_ts"],
+                                        checked_ts=row["checked_ts"])])[0]
         self.assertNotEqual(exploitation.alert_key(first), exploitation.alert_key(other))
 
     def test_the_type_is_declared_pushed_and_labelled(self):
