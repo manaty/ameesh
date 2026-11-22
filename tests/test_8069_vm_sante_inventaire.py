@@ -42,7 +42,7 @@ def show(states):
 class Producer:
     """produce() against a fake user manager, registry and host control."""
 
-    def __init__(self, root, *, units, leases, control=None, card_units=None):
+    def __init__(self, root, *, units, leases, control=None, card_units=None, unloaded=()):
         self.receipt = Path(root) / 'health.json'
         self.boot = Path(root) / 'boot'
         self.boot.write_text('boot\n')
@@ -51,12 +51,18 @@ class Producer:
         if card_units is not None:
             self.card['units'] = card_units
         self.units, self.leases, self.control = units, leases, control
+        # Enabled by a default.target.wants link, absent from list-units.
+        self.unloaded = set(unloaded)
         self.calls = []
 
     def command(self, argv, end, **kw):
         self.calls.append(argv)
         if 'list-units' in argv:
-            return json.dumps([dict(unit=u, active=a) for u, (a, _e) in self.units.items()])
+            return json.dumps([dict(unit=u, active=a) for u, (a, _e) in self.units.items()
+                               if u not in self.unloaded])
+        if 'default.target' in argv:
+            return ' '.join(['docker.service'] + [u for u, (_a, e) in self.units.items()
+                                                  if e == 'enabled']) + '\n'
         if 'show' in argv:
             return show({u: self.units[u] for u in argv[argv.index('--') + 1:]})
         if '-c' in argv:
@@ -119,6 +125,16 @@ class InventoryTest(unittest.TestCase):
                     PROBE: ('active', 'enabled'), OTHER: (state, 'enabled')}, leases=self.leases)
                 code, receipt = producer.run()
                 self.assertEqual((code, receipt['reason']), (1, 'runners-before:ValueError'))
+
+    def test_enabled_instance_absent_from_list_units_is_expected_and_red(self):
+        # B of mty-amh-impl-11 (freeze caf3812f9a99): an instance enabled by its
+        # default.target.wants link but not loaded was invisible to list-units.
+        units = {PROBE: ('active', 'enabled'), OTHER: ('inactive', 'enabled')}
+        producer = Producer(self.temp.name, units=units, leases=self.leases, unloaded=[OTHER])
+        with mock.patch.object(health, 'command', side_effect=producer.command):
+            self.assertEqual(health.runner_units(time.monotonic() + 5), sorted(units))
+        code, receipt = producer.run()
+        self.assertEqual((code, receipt['reason']), (1, 'runners-before:ValueError'))
 
     def test_disabled_active_runner_is_still_proven(self):
         units = {PROBE: ('active', 'enabled'), OTHER: ('active', 'disabled')}

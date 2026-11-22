@@ -49,9 +49,11 @@ tenu par un des exécuteurs lancés ; les autres restent prouvés par
 tout autre état, chaque exécuteur doit tenir son bail.
 
 Inventaire (#8069) : les unités attendues sont lues du gestionnaire
-utilisateur, plus d’une carte. Toute unité `ameesh-runner-agent@` chargée
-qui est activée (`enabled`) ou non `inactive` (active, `failed`, en
-redémarrage) est attendue et doit tourner ; une unité désactivée et arrêtée
+utilisateur, plus d’une carte. Toute instance `ameesh-runner-agent@` que
+`default.target` veut (`Wants=`, ses liens `.wants`, lus que l’instance soit
+chargée ou non), et toute unité chargée qui est activée (`enabled`) ou non
+`inactive` (active, `failed`, en redémarrage), est attendue et doit
+tourner ; une unité désactivée et arrêtée
 (agent retiré, essai fini) est ignorée. La clé `units` d’une ancienne carte
 `health-producer.json` est obsolète et ignorée : ajouter ou retirer un agent
 ne demande plus de pose root. Un exécuteur activé mais arrêté ou en échec

@@ -132,28 +132,36 @@ def runner_state(unit, venv, verifier, end, *, proc=Path('/proc'), run=command):
 
 
 def runner_units(end):
-    """#8069: the permanent runners are the loaded units the user manager
-    enables or keeps out of `inactive` (failed, activating, active). A
+    """#8069: the permanent runners, read from the user manager, never a card.
+
+    Expected: every instance default.target wants (its `.wants` links, the
+    enablement, read whether or not the instance is loaded), and every loaded
+    instance enabled or not `inactive` (failed, activating, active). A
     disabled and stopped unit (agent retired, trial over) is not expected; an
-    enabled one that is stopped or crashed is, and runner_state refuses it."""
+    expected one that is stopped, crashed or not loaded is refused by
+    runner_state."""
     rows = json.loads(command([
         '/usr/bin/systemctl', '--user', 'list-units', '--all', '--type=service',
         '--output=json', '--no-pager', 'ameesh-runner-agent@*.service'], end))
-    loaded = sorted({row['unit'] for row in rows})
-    if not loaded or len(loaded) > 64:
+    loaded = {row['unit'] for row in rows}
+    wants = command(['/usr/bin/systemctl', '--user', 'show', '--property=Wants',
+                     '--value', 'default.target'], end).split()
+    wanted = {unit for unit in wants if unit.startswith('ameesh-runner-agent@')}
+    names = sorted(loaded | wanted)
+    if not names or len(names) > 64:
         raise ValueError('runner inventory empty or unbounded')
-    if any(not re.fullmatch(RUNNER_UNIT, unit) for unit in loaded):
+    if any(not re.fullmatch(RUNNER_UNIT, unit) for unit in names):
         raise ValueError('invalid runner unit')
     props = command(['/usr/bin/systemctl', '--user', 'show',
-                     '--property=Id,ActiveState,UnitFileState', '--', *loaded], end)
+                     '--property=Id,ActiveState,UnitFileState', '--', *names], end)
     found = {}
     for block in props.strip().split('\n\n'):
         values = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
         found[values.get('Id')] = values
-    if set(found) != set(loaded):
+    if set(found) != set(names):
         raise ValueError('runner inventory unreadable')
-    units = [unit for unit in loaded
-             if found[unit].get('ActiveState') != 'inactive'
+    units = [unit for unit in names if unit in wanted
+             or found[unit].get('ActiveState') != 'inactive'
              or found[unit].get('UnitFileState', '').startswith('enabled')]
     if not units:
         raise ValueError('no permanent runner')
