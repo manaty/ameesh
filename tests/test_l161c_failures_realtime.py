@@ -33,7 +33,8 @@ from datetime import datetime, timezone
 from unittest import mock
 from urllib.parse import unquote
 
-from ameesh import ci, db as db_mod, exploitation, mail, notify, registry, runner, storage, work
+from ameesh import (ci, db as db_mod, exploitation, mail, notify, plan_github, registry,
+                    runner, storage, work)
 from ameesh.storage.postgres.ci import CiResults
 
 from .support import PgTestCase
@@ -407,6 +408,8 @@ class FauxApi:
         self.branches = {}
         #: annulations demandées (#1161), et l'erreur que l'écriture rend
         self.cancels, self.cancel_error = [], None
+        #: #8073 : exécutions disparues de GitHub (404 sur leur état)
+        self.missing: set[int] = set()
 
     def cancel(self, repo, run_id):
         """L'écriture d'annulation (#1161) : l'exécution quitte les listes
@@ -476,6 +479,10 @@ class FauxApi:
                                                          "run_attempt": attempt})
         if "/actions/runs/" in path:
             run_id = int(path.rsplit("/", 1)[1])
+            if run_id in self.missing:
+                raise plan_github.GithubError(
+                    "gh api repos/%s/actions/runs/%s: HTTP 404" % (DEPOT, run_id),
+                    status=404)
             if run_id in self.done:
                 return self.done[run_id]
             for bucket in (self.live, self.queued, self.pending):
@@ -842,6 +849,26 @@ class WatcherTest(PgTestCase):
         self.watcher.tick(self.db)
         self._termine(224, "cancelled")
         self.assertEqual(self.mails("dev-a"), [])
+
+    def test_8073_run_disparu_dernier_workflow_reveille_le_porteur(self):
+        """#8073 : un 404 sur le dernier workflow d'une tête vaut une annulation
+        ordinaire — les verdicts passifs déjà remis attendent ce réveil."""
+        sha = "e7" * 20
+        self._deux_suites(sha)
+        self._termine(221, "success")
+        (passif,) = self.mails("dev-a")
+        self.assertEqual(mail.passive_reason(passif), "info")
+        # 222 disparaît de GitHub : son état rend 404 au relevé
+        self.api.live = [r for r in self.api.live if r["id"] != 222]
+        self.api.missing.add(222)
+        out = self.watcher.tick(self.db)
+        self.assertIn(("verdict", 222),
+                      [(o["action"], o.get("run_id")) for o in out])
+        mails = self.mails("dev-a")
+        self.assertEqual(len(mails), 2)
+        self.assertEqual(mail.passive_reason(mails[-1]), "")
+        self.assertIn("backend-suite.yml success", mails[-1]["body"])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 222)["status"], "cancelled")
 
     def test_rouge_sans_flux_lit_les_not_ok_tap(self):
         """#3783 : un job `node --test` rouge sans flux JSON donne ses tests.

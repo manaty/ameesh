@@ -1555,12 +1555,26 @@ class Watcher:
                     errors.append("run %s: %s" % (run_id, exc))
             except Exception as exc:  # isolate each tracked run
                 errors.append("run %s: %s" % (run_id, exc))
+
+        def still_running(row: dict) -> list[dict]:
+            """Les autres workflows de la même tête encore en cours : ni ceux
+            que ce passage conclut, ni ceux qui ont disparu (#8073)."""
+            return [r for r in running
+                    if int(r["run_id"]) not in finishing
+                    and int(r["run_id"]) not in disappeared
+                    and int(r["run_id"]) != int(row["run_id"])
+                    and r.get("head_sha") == row.get("head_sha")
+                    and r.get("branch") == row.get("branch")]
+
         for row in running:
             run_id = int(row["run_id"])
             try:
                 if run_id in disappeared:
                     if st.ci.conclude(repo, run_id, "cancelled"):
                         self.log("CI %s: run %s disappeared from GitHub; cancelled" % (repo, run_id))
+                        # #8073 : une annulation du dernier workflow d'une tête
+                        # réveille comme une annulation ordinaire.
+                        out += self._cancelled_last(db, repo, row, still_running(row))
                     continue
                 run = finishing.get(run_id)
                 out += self._failures(db, repo, row, bases,
@@ -1568,12 +1582,7 @@ class Watcher:
                                       run=run or live.get(run_id))
                 if run is None:
                     continue
-                others = [r for r in running if int(r["run_id"]) not in finishing
-                          and int(r["run_id"]) not in disappeared
-                          and int(r["run_id"]) != run_id
-                          and r.get("head_sha") == row.get("head_sha")
-                          and r.get("branch") == row.get("branch")]
-                out += self._conclude(db, repo, row, run=run, pending=others)
+                out += self._conclude(db, repo, row, run=run, pending=still_running(row))
             except plan_github.GithubRateLimited:
                 raise
             except Exception as exc:  # keep processing other tracked runs
