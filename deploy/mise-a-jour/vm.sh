@@ -2288,6 +2288,24 @@ timers_agents() {
   ameesh_agents role timers --role auditeur --install
 }
 
+installer_sentinelle_agents() {
+  # #8062 : la sentinelle des identifiants (`ameesh accounts check`, L226a)
+  # est une unité d'hôte, pas un rôle : la mise à jour la pose et l'active.
+  # Unités réécrites et `enable --now` rejouable = idempotent ; un échec ne
+  # défait pas le code déjà installé, il se rejoue par « installer ».
+  local court=$1
+  etape "minuterie des identifiants (#8062) sur $HOTE_AGENTS"
+  utilisateur_agents bash -c "set -euo pipefail
+    S=/home/ameesh/.local/share/ameesh/src-$court
+    U=/home/ameesh/.config/systemd/user
+    install -d -m 0755 \"\$U\"
+    install -m 0644 \"\$S/deploy/systemd/ameesh-credentials.service\" \\
+                    \"\$S/deploy/systemd/ameesh-credentials.timer\" \"\$U/\"
+    systemctl --user daemon-reload
+    systemctl --user enable --now ameesh-credentials.timer" \
+    || { echo "minuterie des identifiants non posée sur $HOTE_AGENTS" >&2; return 1; }
+}
+
 installer_agents() {
   local ref=${1:-HEAD} sha court avant complet courant journal
   exiger_identite_agents
@@ -2398,6 +2416,12 @@ installer_agents() {
     echo "code ${sha:0:9} installe mais garde de staging non posee ; relancer « $0 agents installer ${sha:0:9} » (idempotente)" >&2
     return 1
   fi
+  # #8062 : sans la sonde, `credential_health` n'est plus relu et une échéance
+  # passe sans alerte ; l'unité est posée par la mise à jour, pas à la main.
+  if ! installer_sentinelle_agents "$court"; then
+    echo "code ${sha:0:9} installé mais minuterie des identifiants non posée ; relancer « $0 agents installer ${sha:0:9} » (idempotente)" >&2
+    return 1
+  fi
   echo "installé depuis src-$court (avant $complet). Les exécuteurs tournent encore l'ancien code : « $0 agents redemarrer », puis « $0 agents controler »."
 }
 
@@ -2500,6 +2524,15 @@ installer() {
     rm -f $BASCULE_VM
     $VENV/bin/python -c 'import psycopg, cryptography, ameesh.budget, ameesh.projects; print(\"psycopg\", psycopg.__version__, \"crypto\", cryptography.__version__, \": modules L70 et L62 présents\")'"
   runtime_invite ssh_vm "$SRC"
+  # #8062 : la sentinelle des identifiants sur le serveur, en unité système
+  # (les personas tournent sous ameesh avec /opt/ameesh/venv). Rejouable :
+  # unités réécrites et `enable --now`. Sans elle, une échéance est muette.
+  etape "minuterie des identifiants (#8062) sur le serveur"
+  ssh_vm "set -e
+    install -m 0644 $SRC/deploy/serveur/ameesh-credentials.service \
+                    $SRC/deploy/systemd/ameesh-credentials.timer /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --now ameesh-credentials.timer"
   # #5559 : le relevé de l'hôte (disque de la base) suit le code installé ;
   # rejouable, sans redémarrage d'exécuteur.
   etape "relevé de l'hôte (ameesh-releve-hote.timer, #5559)"

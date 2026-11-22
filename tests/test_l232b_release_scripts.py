@@ -77,7 +77,7 @@ class MigrationPinningTest(unittest.TestCase):
         (bin_dir / "systemctl").write_text(
             '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$SYSTEMCTL_CALLS"\ncase "$1" in\n'
             '--user) case "$2" in\n'
-            '  list-units) exit 0 ;;\n'
+            '  list-units|daemon-reload|enable) exit 0 ;;\n'
             '  restart|is-active) exit 0 ;;\n'
             '  *) exit 97 ;; esac ;;\n'
             'start) [ "${BACKUP_START_STATUS:-0}" = 0 ] || exit "${BACKUP_START_STATUS}";\n'
@@ -129,6 +129,12 @@ class MigrationPinningTest(unittest.TestCase):
         # bail.sh and call bascule.py; both are stubbed for sequencing.
         shutil.copy(ROOT / "deploy/mise-a-jour/bail.sh", self.script.with_name("bail.sh"))
         self.script.with_name("bascule.py").write_text(FAKE_BASCULE)
+        # #8062 : l'instantané simulé porte les unités que `installer` pose,
+        # comme le vrai `git archive` ; sans elles, « install: cannot stat ».
+        units = self.repo / "deploy/systemd"
+        units.mkdir(parents=True)
+        for name in ("ameesh-credentials.service", "ameesh-credentials.timer"):
+            shutil.copy(ROOT / "deploy/systemd" / name, units / name)
         self.module = self.repo / "src/ameesh"
         self.module.mkdir(parents=True)
         (self.module / "__init__.py").write_text("")
@@ -261,6 +267,18 @@ class MigrationPinningTest(unittest.TestCase):
         self.assertEqual(calls[1]["args"], ["migrate", "--additive-only"])
         self.assertEqual(calls[2]["args"], ["doctor", "--probe"])
 
+    def test_installer_installs_and_enables_the_credentials_sentinel(self):
+        # #8062 : la mise à jour du poste pose la minuterie des identifiants
+        # depuis l'instantané du code cible, puis l'active.
+        done = self.run_script("migrer", self.a, AUTO_TAKE_PROBE_STATUS="1")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        units = Path(self.env["HOME"]) / ".config/systemd/user"
+        for name in ("ameesh-credentials.service", "ameesh-credentials.timer"):
+            self.assertTrue((units / name).is_file(), name)
+        calls = self.systemctl_calls()
+        self.assertIn("--user daemon-reload", calls)
+        self.assertIn("--user enable --now ameesh-credentials.timer", calls)
+
     def test_incompatible_installed_auto_take_installs_and_restarts(self):
         # #2357: the database is already migrated, so stopping here would leave
         # the old code serving it. The target passed doctor --probe: migrer
@@ -304,7 +322,8 @@ class MigrationPinningTest(unittest.TestCase):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("redémarrage refusé depuis une unité ameesh-*", done.stderr)
         self.assertIn("ÉCHEC du redémarrage immédiat", done.stderr)
-        self.assertEqual(self.systemctl_calls(), [])
+        self.assertFalse([c for c in self.systemctl_calls()
+                          if "restart" in c or "stop" in c])
         self.assertEqual(len(self.systemd_run_calls()), 1)
 
     def test_emergency_install_failure_stops_before_activation_and_restart(self):
@@ -321,7 +340,10 @@ class MigrationPinningTest(unittest.TestCase):
 
     def test_emergency_direct_restart_failure_is_reported(self):
         systemctl = self.root / "bin/systemctl"
-        systemctl.write_text('#!/bin/sh\nexit 42\n')
+        # #8062 : l'installation pose d'abord la minuterie (daemon-reload,
+        # enable) ; seul le redémarrage doit échouer ici.
+        systemctl.write_text(
+            '#!/bin/sh\ncase "$1 $2" in "--user restart") exit 42 ;; *) exit 0 ;; esac\n')
         done = self.run_script("migrer", self.a, AUTO_TAKE_PROBE_STATUS="1")
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("ÉCHEC du redémarrage immédiat", done.stderr)

@@ -492,6 +492,12 @@ class VmAgentsHarness(unittest.TestCase):
             cible = self.origin / 'deploy/mise-a-jour' / nom
             cible.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(DEPLOY / nom, cible)
+        # #8062 : la sentinelle des identifiants est posee par `installer` depuis
+        # l'instantane du code cible ; ses unites doivent y etre.
+        cible = self.origin / 'deploy/systemd'
+        cible.mkdir(parents=True, exist_ok=True)
+        for nom in ('ameesh-credentials.service', 'ameesh-credentials.timer'):
+            shutil.copy2(ROOT / 'deploy/systemd' / nom, cible / nom)
         shutil.copy2(ROOT / '.gitignore', self.origin / '.gitignore')
         (self.origin / 'src/ameesh/migrations').mkdir(parents=True)
         (self.origin / 'src/ameesh/__init__.py').write_text('# origine\n')
@@ -627,6 +633,19 @@ class VmAgentsInstallTest(VmAgentsHarness):
                if (self.state / 'systemctl.log').exists() else '')
         self.assertNotIn('restart', log)
         self.assertNotIn('ameesh-runner', log)
+
+    def test_install_installs_and_enables_the_credentials_sentinel(self):
+        # #8062 : la mise à jour d'hôte pose et active la sonde des
+        # identifiants ; sans elle, une échéance passe sans alerte.
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        unites = self.vmhome / '.config/systemd/user'
+        for nom in ('ameesh-credentials.service', 'ameesh-credentials.timer'):
+            self.assertTrue((unites / nom).is_file(), nom)
+        log = (self.state / 'systemctl.log').read_text()
+        self.assertIn('--user enable --now ameesh-credentials.timer', log)
+        self.assertIn('--user daemon-reload', log)
+        self.assertIn('minuterie des identifiants', p.stdout)
 
     def test_a_stopped_persona_active_unit_is_reloaded_into_the_new_code(self):
         # #1131/#1633 : la persona arrêtée par le propriétaire n'est pas

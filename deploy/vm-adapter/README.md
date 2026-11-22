@@ -441,9 +441,12 @@ Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
    root:root 0644 sous les parents root non inscriptibles de l'étape 2.
    Rendre `checks/health-producer.example.json` dans
    `/etc/ameesh-vm-adapter/health-producer.json`, root:root 0644 (aucun secret) :
-   venv stable du compte ameesh, liste **exhaustive** de ses unités runners
-   permanentes, chemin absolu de son EnvironmentFile et du reçu partagé.
-   Ne pas copier cet EnvironmentFile : le producteur le lit sous ameesh.
+   venv stable du compte ameesh, chemin absolu de son EnvironmentFile et du
+   reçu partagé. Ne pas copier cet EnvironmentFile : le producteur le lit
+   sous ameesh. Les unités runners ne sont plus dans la carte (#8069) : le
+   producteur lit celles que le gestionnaire utilisateur active ou fait
+   tourner (`checks/diagnostics.md`) ; la clé `units` d'une ancienne carte
+   est ignorée.
 3. Créer uniquement `/var/lib/ameesh-vm-remote` sous le compte VM, 0700.
    Le compte y écrit ses reçus et son verrou, jamais dans le dépôt ni dans
    les répertoires des agents. Archiver les anciens reçus hors activation
@@ -490,8 +493,9 @@ Préparation par le **bureau**, hors de ce lot et sur feu distinct du pilote :
    avec le bureau, sans ajout automatique de droits ni de sudo.
    Ce contrôle vérifie la cohérence installée, pas une cible de vague.
 
-   Le producteur énumère les unités runners actives via `systemctl --user`
-   et exige la liste exacte de sa carte. Pour chaque MainPID actif il appelle
+   Le producteur énumère les unités runners via `systemctl --user` : celles
+   que `default.target` veut et celles chargées, activées ou non inactives
+   (#8069, aucune liste de carte). Pour chaque MainPID actif il appelle
    le même `venv-processus.py` que staging (dont l'attestation privée 0600
    pour les processus non dumpables), puis lit sa cmdline, jamais son
    environnement. Le mode `execute` ou `dry-run` vient du `run` vivant et de
@@ -640,6 +644,24 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      (`probe_agent`) figure parmi les agents réclamables d'un retour
      `returning` prises fermées. Avant #7874, elle n'était jamais réclamée,
      et le retour bouclait sur `health deadline passed`.
+   - reçu de santé d'AG3 vert (#8069), relevé avant l'étape 4 : sur AG3,
+     `/var/lib/ameesh-vm-health/health.json` porte `version_mode` et
+     `doctor` à `true`, sans `reason`, daté de moins de trois périodes du
+     minuteur (`period_s` de `health-reader.json`) ; les deux contrôles
+     fixes de l'inscription (`checks.version-mode`, `checks.doctor`), lancés
+     sous le compte VM, rendent 0. Un reçu rouge arrête R1 avant tout
+     drainage : sa raison (`étape:Classe`, `checks/diagnostics.md`) se
+     traite d'abord. #8069 doit être en place, par deux voies distinctes :
+     (1) AG3 tourne un venv ameesh qui contient #8069 (`ameesh version`),
+     pour que `ameesh host status` porte `return_probe` ; (2) le bureau a
+     reposé `checks/health.py` dans `/opt/ameesh-vm-adapter/checks`,
+     root:root 0644, depuis le commit fusionné, au feu pilote, puis relevé
+     un reçu vert. Le déploiement staging du venv ne met pas à jour ce
+     fichier, posé par root à l'étape 2. Sans (2), la carte `units` posée à
+     l'installation, périmée dès qu'un agent change, rend le reçu rouge
+     (`inventory:ValueError`, R1 du 22/11), et un retour prises fermées le
+     laisserait rouge faute de bail des autres runners. Retirer `units` de
+     la carte reste facultatif ; ce geste est au bureau.
 2. Le bureau active l'inscription (`enabled: true`, copie avant) et démarre
    le timer (R1 de D1). Le worker doit être vu (`vm_adapter_observations`)
    **avant** l'étape 3 : un hook sans worker laisse l'hôte fermé.

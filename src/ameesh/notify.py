@@ -215,7 +215,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "avatar_failover", "orphan_lot",
                  # L226b : un agent attend un compte authentifié sain
                  "auth_blocked",
                  # L226a : un identifiant est en échec, ou expire bientôt
-                 "credential_failing", "credential_expiring", "module_deviation",
+                 "credential_failing", "credential_expiring",
+                 # #8062 : la sonde des identifiants ne relit plus un hôte
+                 "credential_probe_stale", "module_deviation",
                  # L317c : analyse profonde demandée, sans rapport dans les 30 min
                  "deep_analysis_overdue",
                  # #411: Docker storage needs an explicit owner cleanup decision.
@@ -430,6 +432,7 @@ TYPE_LABELS = {
     "auth_blocked": "authentication failing",
     "credential_failing": "credential failing",
     "credential_expiring": "credential expiring soon",
+    "credential_probe_stale": "credential probe silent",
     "host_power_low": "host battery low",
     "backlog_empty": "improvement backlog empty",
     "roadmap_exhausted": "roadmap exhausted",

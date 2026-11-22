@@ -650,11 +650,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',
         'agent', 'at', 'wave_id', 'wave_epoch'
     ]),
-    -- credential health (L226a/L226b, 0060, 0068): account NAMES and their state
-    -- (short cause and fix command), never a credential
+    -- credential health (L226a/L226b, 0060, 0068, 0604): account NAMES and
+    -- their state (short cause and fix command), never a credential
     ('credential_health', ARRAY[
         'host', 'harness', 'account', 'state', 'reason', 'source', 'checked_at',
-        'failing_since', 'expires_at', 'last_failure_at', 'failures'
+        'probed_at', 'probe_missing_since', 'failing_since', 'expires_at',
+        'last_failure_at', 'failures'
     ]),
     -- provider account credits (#4164, 0500 ; #4166, 0504): account NAMES,
     -- their state, the declared prepaid and the last assessed balance;

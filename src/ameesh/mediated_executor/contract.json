@@ -4865,7 +4865,9 @@
     "annotate",
     "health",
     "listing",
-    "report"
+    "probe_transition",
+    "report",
+    "touch"
    ],
    "decisions": [
     "close",

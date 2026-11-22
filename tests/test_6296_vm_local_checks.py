@@ -220,6 +220,8 @@ class ReceiptTest(unittest.TestCase):
             calls.append(argv)
             if 'list-units' in argv:
                 return json.dumps([dict(unit=unit, active='active')])
+            if 'show' in argv:
+                return 'Id=%s\nActiveState=active\nUnitFileState=enabled\n' % unit
             if '-c' in argv:
                 return json.dumps(dict(version='1.2.3', source={'url': 'file:///store/src-' + 'a' * 40}))
             if 'list' in argv:
@@ -256,6 +258,8 @@ class ReceiptTest(unittest.TestCase):
             def command(argv, end, **kwargs):
                 if 'list-units' in argv:
                     return json.dumps([dict(unit=unit, active='active')])
+                if 'show' in argv:
+                    return 'Id=%s\nActiveState=active\nUnitFileState=enabled\n' % unit
                 if '-c' in argv:
                     return json.dumps(dict(version='1.2.3', source={
                         'url': 'file:///store/src-' + 'a' * 40}))
