@@ -530,6 +530,11 @@ version.
   reference chart for a pod host (#7699). Late mail is delivered first
   (#7976), and the N-1 preflight is part of the contract (#7985, #8004).
 
+## Generated release entries
+
+<!-- generated releases: begin -->
+<!-- generated releases: end -->
+
 ## In progress
 
 These workstreams were open when this page was written. Their state is in the
