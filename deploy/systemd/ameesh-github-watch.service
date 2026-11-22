@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# #8059 — veille GitHub AU REPOS, sans agent ni LLM. Service UTILISATEUR,
+# installé sur l'hôte toujours allumé qui porte aussi le worker de
+# l'adaptateur VM (BG, bureau-goal). Il ne passe PAS par `ameesh role run` :
+# aucune élection, aucun bail. Le passage s'efface de lui-même tant que le
+# rôle élu de la veille (mesh-design, réglable par `github.watch_role`) a un
+# bail vivant : sous activité, c'est la minuterie du rôle qui collecte.
+#
+# Autorisation : `github.host` doit nommer cet hôte dans
+# ~/.config/ameesh/config.json. Les dépôts surveillés viennent des cartes
+# `github_watch` du canon ; le jeton en lecture seule va dans notify.env
+# (0600), jamais dans cette unité. Voir docs/EXPLOITATION.md, « Veille GitHub
+# au repos, sur BG ».
+#
+# Installation (compte opérateur de BG, celui du worker de l'adaptateur) :
+#   install -m 0644 deploy/systemd/ameesh-github-watch.service \
+#                      deploy/systemd/ameesh-github-watch.timer \
+#                      ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ameesh-github-watch.timer
+#   loginctl enable-linger "$USER"   # sans session ouverte, le gestionnaire
+#                                    # utilisateur et sa minuterie s'arrêtent
+#   journalctl --user -u ameesh-github-watch -f
+[Unit]
+Description=ameesh GitHub watch at rest (standby collector, #8059)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# PATH explicite : `gh` et le venv n'héritent pas du PATH de la session.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# AMEESH_DSN, AMEESH_HOST, AMEESH_CANON… (le même fichier que l'exécuteur)
+EnvironmentFile=-%h/.config/ameesh/env
+# Secrets facultatifs : GH_TOKEN=… (lecture seule) si `gh` n'a pas de session.
+EnvironmentFile=-%h/.config/ameesh/notify.env
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh notify --once --only github-watch
+TimeoutStartSec=5min
+Nice=10
+NoNewPrivileges=yes

@@ -242,6 +242,20 @@ premier geste, comme le mode.
    dans l'ordre de la section « Déclarer le hook d'une cible » (#7656).
    Aucune commande de cette étape n'a été exécutée par l'auteur du lot.
 
+### Veille GitHub au repos, à côté du worker (#8059)
+
+BG reste allumé au repos (décision owner #230087) et porte déjà ce worker :
+il porte aussi la veille GitHub déterministe, en minuterie utilisateur, sans
+agent ni bail (`deploy/systemd/ameesh-github-watch.{service,timer}`). Le
+collecteur s'efface tant que le rôle élu de la veille a un bail vivant.
+Préalables sur BG : `github.host` = `bureau-goal` (et, si le canon renomme le
+rôle, `github.watch_role`) dans la configuration du compte qui lance la
+minuterie, cartes `github_watch` synchronisées, jeton en lecture seule dans
+`notify.env` 0600 — secret d'hôte, décision owner, jamais copié par un agent.
+Le compte doit écrire les curseurs de veille : la connexion limitée
+`bureau_goal` ne le peut pas. Procédure et témoin : `docs/EXPLOITATION.md`,
+« Veille GitHub au repos, sur BG ».
+
 ## Commandes par VM (#6252)
 
 `commandes/vm-commande.py <verbe> <cible.json>` porte les cinq commandes ;
