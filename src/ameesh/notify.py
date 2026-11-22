@@ -3208,6 +3208,8 @@ class Notifier:
             return False
         if row is None:
             return False
+        if row.get("retired_ts") is not None:
+            return False
         if row.get("mode") in ("stopped", "off"):
             return False
         if str(row.get("status") or "") in ("stopped", "paused", "error", "dead"):
@@ -3229,6 +3231,8 @@ class Notifier:
         row = by_name.get(str(name))
         if row is None:
             return "not in the registry"
+        if row.get("retired_ts") is not None:
+            return "retired"
         if row.get("mode") in ("stopped", "off"):
             return "executor %s" % row.get("mode")
         if row.get("mode") == "externe":
