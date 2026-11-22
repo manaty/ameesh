@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# #8059 — veille GitHub au repos, sur BG. Un tic toutes les cinq minutes ; la
+# cadence de chaque dépôt reste celle de sa carte `github_watch` (le curseur
+# durable fait sauter les passages trop rapprochés). `Persistent` n'a pas de
+# sens ici : au redémarrage de BG, OnBootSec relance le premier passage.
+[Unit]
+Description=ameesh GitHub watch at rest (standby collector, #8059)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=300s
+AccuracySec=1s
+RandomizedDelaySec=10s
+Unit=ameesh-github-watch.service
+
+[Install]
+WantedBy=timers.target

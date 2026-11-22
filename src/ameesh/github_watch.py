@@ -700,6 +700,29 @@ def deliver(db, sub, events, until, feed, host, *, partial=False,
     return len(delivered)
 
 
+def standby_reason(db, cfg, settings):
+    """#8059: why a plain ``github.host`` collector must stand by this pass.
+
+    The role timer already collects under the elected lease; the rest-by-
+    default collector only takes over when no lease is live (all agent VMs
+    stopped). A role timer itself never stands by. An unknown or unreadable
+    role leaves the collector working: `deliver` takes a cursor lock and
+    compares the committed window, so a duplicate event is impossible even
+    if both paths see the same GitHub page.
+    """
+    if role_run.role_host_authorized(cfg):
+        return None
+    role = getattr(settings, "watch_role", plan_github.DEFAULT_WATCH_ROLE)
+    try:
+        report = role_run.live(db, role)
+    except role_run.RoleError:
+        return None
+    if not report.get("held"):
+        return None
+    return ("role %s holds a live lease on %s (epoch %s)"
+            % (role, report.get("host") or "?", report.get("epoch")))
+
+
 class Watcher:
     def __init__(self, cfg, *, dry_run=False, log=None, api=None, declarations=None,
                  stalled_ticks=STALLED_TICKS):
@@ -711,6 +734,7 @@ class Watcher:
         self.next = {}
         self._warned = set()
         self._stalled = set()
+        self._standby = None
 
     def _warn(self, text):
         """Journal an ignored declaration once, not on every notifier pass."""
@@ -719,9 +743,24 @@ class Watcher:
         self._warned.add(text)
         self.log("GitHub watch declaration: %s" % text)
 
+    def _wait_for_the_role(self, db, settings):
+        """Stand by while the elected role collects; log the reason once."""
+        reason = standby_reason(db, self.cfg, settings)
+        if not reason:
+            self._standby = None
+            return False
+        if reason != self._standby:
+            self._standby = reason
+            self.log("GitHub watch: standby, %s" % reason)
+        return True
+
     def tick(self, db, now):
         settings = plan_github.settings_of(self.cfg)
         if not role_run.host_authorized(self.cfg, settings.host):
+            return []
+        # A dry run reads GitHub without writing: it stays available for the
+        # operator's witness, even while the role timer is collecting.
+        if not self.dry_run and self._wait_for_the_role(db, settings):
             return []
         declared = (self.declarations if self.declarations is not None else
                     subscriptions(canon.load_configured(self.cfg), self._warn))
