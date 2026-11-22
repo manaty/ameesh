@@ -56,7 +56,8 @@ class AssignmentError(RuntimeError):
 
 
 def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True,
-                    strict: bool = False) -> bool:
+                    strict: bool = False, row=None, resolved=None,
+                    canons=None, declared=None) -> bool:
     """`name` est-il un orchestrateur ? Déclaré (`AMEESH_ALERT_ORCHESTRATORS`),
     fiche Agent de son canon propriétaire dont `roles` nomme un orchestrateur
     (`sous_utilisation.orchestrators`), ou — tant que son organisation ne
@@ -73,10 +74,19 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True,
     une résolution d'alias, une lecture de registre ou de canon qui lève, un
     canon configuré non chargé ou lu en partie (`fully_read`) lèvent au lieu de
     conclure « non » : le doute refuse.
-    """
+
+    #8051 : `row`, `resolved`, `canons` et `declared` sont des lectures déjà
+    faites par un appelant qui juge plusieurs noms d'un coup (`_pilot_allowed`
+    sur les auteurs de hold) : même verdict, sans une résolution et une fiche
+    complète du registre par nom (34 requêtes mesurées par appel de
+    `human_waits`). `row` ne doit porter que les champs lus par
+    `sous_utilisation.orchestrators` (nom, canon, mode) ; les contrôles stricts
+    restent exécutés."""
     from .agent_names import resolve as resolve_agent_name
     try:
-        name = resolve_agent_name(name, db=db, operation="assignments.is_orchestrator")
+        name = (resolved if resolved is not None else
+                resolve_agent_name(name, db=db,
+                                   operation="assignments.is_orchestrator"))
     except Exception:
         # Registre indisponible (base hors service, doublure de test #424) :
         # on garde l'orthographe reçue, comme avant la résolution d'alias.
@@ -85,14 +95,19 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True,
         pass
     from . import sous_utilisation as su
 
-    declared = {resolve_agent_name(su._bare(n), db=db, operation="authority.orchestrator")
-                for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
-                if n.strip()}
+    if declared is None:
+        declared = {resolve_agent_name(su._bare(n), db=db,
+                                       operation="authority.orchestrator")
+                    for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
+                    if n.strip()}
+    else:
+        declared = set(declared)
     if name in declared:
         return True
     try:
         from . import canon, registry
-        canons = canon.load_configured(cfg) if cfg is not None else []
+        if canons is None:
+            canons = canon.load_configured(cfg) if cfg is not None else []
         if strict:
             if cfg is None:
                 raise RuntimeError(
@@ -106,7 +121,8 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True,
                        if not su.fully_read(c)]
             if partial:
                 raise RuntimeError("canon partially read: %s" % ", ".join(partial))
-        row = registry.get(db, name) if db is not None else None
+        if row is None:
+            row = registry.get(db, name) if db is not None else None
     except Exception:
         if strict:
             raise

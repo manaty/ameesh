@@ -241,6 +241,10 @@ class Progress(interface.Progress):
                    extract(epoch from r.operator_pause_until)::float8 AS operator_pause_until_ts,
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    r.turns, r.lease_owner, r.mode, r.stop_reason, r.responsible,
+                   -- #8051 : le canon propriétaire, lu par l'autorité de hold
+                   -- (`sous_utilisation.card_role`) sans une seconde requête
+                   -- complète du registre par auteur.
+                   r.canon,
                    (r.lease_owner IS NOT NULL AND r.lease_expires_at > now()) AS lease_live,
                    extract(epoch from r.last_turn_at)::float8 AS last_turn_ts,
                    extract(epoch from r.last_seen)::float8    AS last_seen_ts,

@@ -1899,7 +1899,14 @@ class DevWork(DevDomain):
         # #7940 : même attente humaine canonique que la prise, lue une fois.
         from .... import planned_waits
         human_wait_ids = tuple(planned_waits.human_waits(self.db))
-        sql = ("SELECT w.*,"
+        # #8051 : les occupants sont matérialisés UNE fois pour toute la
+        # sélection. Sans cette CTE, chaque candidat refaisait le parcours des
+        # ~7 500 lots ouverts (plan mesuré : 16 ms par candidat) ; les colonnes
+        # sont celles que lisent `occupying`/`exempt`/le plafond.
+        sql = ("WITH open_items AS MATERIALIZED ("
+               " SELECT id, app, state, assignee, source, branch FROM work_items"
+               "  WHERE state NOT IN " + self._core()._CLOSED + ") "
+               "SELECT w.*,"
                f"       (w.state = '{lifecycle.IN_PROGRESS}' AND " + self._core().requeued_sql("w") + ") AS returned_to_queue,"
                "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
                "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
@@ -1932,7 +1939,8 @@ class DevWork(DevDomain):
                # garde de `_assign_locked`, avant le LIMIT.
                # #4818 : et le plafond de lots en vol de son dépôt (`held_sql`).
                f"           AND (state <> '{lifecycle.REQUESTED}' OR NOT "
-               + footprint_held_sql("work_items", start_on=True,
+               + footprint_held_sql("work_items", items="open_items",
+                                    start_on=True,
                                     human_wait_ids=human_wait_ids) + ")) w"
                "  LEFT JOIN work_packages k ON k.id = w.package_id"
                "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
