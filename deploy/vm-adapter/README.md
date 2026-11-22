@@ -245,16 +245,49 @@ premier geste, comme le mode.
 ### Veille GitHub au repos, à côté du worker (#8059)
 
 BG reste allumé au repos (décision owner #230087) et porte déjà ce worker :
-il porte aussi la veille GitHub déterministe, en minuterie utilisateur, sans
-agent ni bail (`deploy/systemd/ameesh-github-watch.{service,timer}`). Le
+il porte aussi la veille GitHub déterministe, sans agent ni bail
+(`deploy/systemd/ameesh-github-watch.{service,timer}`), **unité système**
+installée comme le worker : `User=` = compte opérateur existant, même
+`EnvironmentFile=/etc/ameesh-vm-adapter/database.env` (connexion mesh de
+l'opérateur, `AMEESH_CONFIG`), même venv `/opt/ameesh-vm-adapter/venv`. Le
 collecteur s'efface tant que le rôle élu de la veille a un bail vivant.
 Préalables sur BG : `github.host` = `bureau-goal` (et, si le canon renomme le
-rôle, `github.watch_role`) dans la configuration du compte qui lance la
-minuterie, cartes `github_watch` synchronisées, jeton en lecture seule dans
-`notify.env` 0600 — secret d'hôte, décision owner, jamais copié par un agent.
-Le compte doit écrire les curseurs de veille : la connexion limitée
-`bureau_goal` ne le peut pas. Procédure et témoin : `docs/EXPLOITATION.md`,
-« Veille GitHub au repos, sur BG ».
+rôle, `github.watch_role`) dans la configuration lue par `database.env`, cartes
+`github_watch` synchronisées, et un jeton GitHub en lecture seule.
+
+Jeton : `GH_TOKEN` (ou `GITHUB_TOKEN`) dans
+`/etc/ameesh-github-watch/notify.env`, root:root 0600. systemd lit ce fichier
+avant de passer au compte du service : le compte opérateur ne peut pas le lire
+sur disque ; il n'est ni dans l'unité, ni dans la configuration, ni dans un
+argument. `notify` lit `GH_TOKEN`/`GITHUB_TOKEN` et ne lit pas
+`$CREDENTIALS_DIRECTORY` : le fichier d'environnement est donc retenu plutôt
+que `LoadCredential`. La pose du jeton est une décision de l'owner ; un agent
+ne le copie jamais. Le compte doit écrire les curseurs de veille : la
+connexion limitée `bureau_goal` ne le peut pas.
+
+Installation, sur BG, en root, comme le worker (aucune commande de cette
+étape n'a été exécutée par l'auteur du lot) :
+
+1. `install -m 0644 deploy/systemd/ameesh-github-watch.service
+   deploy/systemd/ameesh-github-watch.timer /etc/systemd/system/`, puis
+   remplacer `User=` par le compte opérateur existant — le même que
+   `ameesh-vm-adapter.service`, jamais un compte d'agent.
+2. Poser le jeton : `install -d -m 0700 /etc/ameesh-github-watch`, puis
+   `install -m 0600 -o root -g root <fichier 0600 du jeton>
+   /etc/ameesh-github-watch/notify.env` (contenu `GH_TOKEN=…`).
+3. `systemctl daemon-reload`, puis
+   `systemctl enable --now ameesh-github-watch.timer`.
+4. Vérifier : `systemctl status ameesh-github-watch.timer`,
+   `systemctl start ameesh-github-watch.service`, `journalctl -u
+   ameesh-github-watch -n 20 --no-pager`. Sans jeton, le journal porte
+   « no token or gh » et le curseur ne bouge pas.
+5. Retour arrière : `systemctl disable --now ameesh-github-watch.timer`,
+   retirer les deux unités de `/etc/systemd/system/`, `systemctl
+   daemon-reload`. Le curseur en base reste ; le courrier déjà déposé n'est
+   pas retiré.
+
+Procédure et témoin détaillés : `docs/EXPLOITATION.md`, « Veille GitHub au
+repos, sur BG ».
 
 ## Commandes par VM (#6252)
 

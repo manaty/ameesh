@@ -2,9 +2,9 @@
 """#8059 : la veille GitHub tourne au repos sur BG, sans agent ni bail.
 
 Témoin demandé par le lot : toutes les VM d'agents sont arrêtées (aucun bail
-vivant, aucun `role run`), un ticket simulé est lu par la minuterie
-utilisateur de BG, et le courrier actif du veilleur désigné est déposé. Le
-même courrier compte dans `unread` et suffit à `host_release.return_targets` /
+vivant, aucun `role run`), un ticket simulé est lu par la minuterie système de
+BG, et le courrier actif du veilleur désigné est déposé. Le même courrier
+compte dans `unread` et suffit à `host_release.return_targets` /
 `vm_adapter.wake_due` pour demander le retour de l'hôte drainé du veilleur.
 
 Le collecteur de repos s'efface pendant qu'un rôle élu tient le bail : sous
@@ -31,8 +31,15 @@ BG = "bureau-goal"
 OTHER_HOST = "ameesh-agents-2"
 
 
+def section(path, start, end):
+    """One documentation section, so unrelated user units are not read here."""
+    text = (ROOT / path).read_text()
+    begin = text.index(start)
+    return text[begin:text.index(end, begin)]
+
+
 class StandbyUnitTest(unittest.TestCase):
-    """The BG timer is a user unit, installed next to the operator worker."""
+    """The BG timer is a system unit, installed like the VM adapter worker."""
 
     def test_the_unit_runs_the_notify_pass_without_a_role_or_a_lease(self):
         service = (ROOT / "deploy/systemd/ameesh-github-watch.service").read_text()
@@ -41,17 +48,48 @@ class StandbyUnitTest(unittest.TestCase):
                       if line.startswith("ExecStart=")]
         self.assertEqual(len(exec_lines), 1)
         self.assertEqual(exec_lines[0],
-                         "ExecStart=%h/.local/share/ameesh/venv/bin/ameesh "
+                         "ExecStart=/opt/ameesh-vm-adapter/venv/bin/python -m ameesh "
                          "notify --once --only github-watch")
         self.assertNotIn("role run", exec_lines[0])
         self.assertNotIn("AMEESH_ROLE", service)
-        # Secret d'hôte : le jeton vient de notify.env (0600), jamais de l'unité.
-        self.assertIn("EnvironmentFile=-%h/.config/ameesh/notify.env", service)
+        # #230272: same pattern as deploy/vm-adapter (a SYSTEM unit, installed
+        # by the bureau): the worker's operator account and database.env, the
+        # worker's venv. No user unit, no linger, no new account.
+        self.assertIn("User=REPLACE_WITH_EXISTING_OPERATOR_ACCOUNT", service)
+        self.assertIn("EnvironmentFile=/etc/ameesh-vm-adapter/database.env", service)
+        self.assertNotIn("loginctl", service)
+        self.assertNotIn("systemctl --user", service)
+        self.assertNotIn("%h", service)
+        self.assertIn("Unit=ameesh-github-watch.service", timer)
         self.assertIn("OnUnitActiveSec=300s", timer)
-        # A user timer only runs without a session under linger.
-        self.assertIn("loginctl enable-linger", service)
+        self.assertIn("WantedBy=timers.target", timer)
         # A timer failure is visible; the pass keeps its cursor on error.
         self.assertNotIn("Restart=", service)
+
+    def test_the_token_is_read_by_systemd_before_dropping_privileges(self):
+        service = (ROOT / "deploy/systemd/ameesh-github-watch.service").read_text()
+        # notify reads GH_TOKEN/GITHUB_TOKEN, not $CREDENTIALS_DIRECTORY: the
+        # root:root 0600 EnvironmentFile is the chosen form, not LoadCredential.
+        self.assertIn("EnvironmentFile=/etc/ameesh-github-watch/notify.env", service)
+        self.assertNotIn("\nLoadCredential=", service)
+        self.assertNotIn("\nGH_TOKEN=", service)
+        for path, text in (
+                ("deploy/vm-adapter/README.md",
+                 section("deploy/vm-adapter/README.md",
+                         "### Veille GitHub au repos", "## Commandes par VM")),
+                ("docs/EXPLOITATION.md",
+                 section("docs/EXPLOITATION.md",
+                         "### Veille GitHub au repos, sur BG",
+                         "### Coupeur de release"))):
+            self.assertIn("root:root 0600", text, path)
+            self.assertIn("avant de passer au compte du service", text, path)
+            self.assertIn("systemctl enable --now ameesh-github-watch.timer",
+                          text, path)
+            self.assertIn("systemctl disable --now ameesh-github-watch.timer",
+                          text, path)
+            # The installer is a root procedure like the worker's.
+            self.assertNotIn("systemctl --user", text, path)
+            self.assertNotIn("enable-linger", text, path)
 
     def test_bg_is_documented_and_the_hub_installer_is_untouched(self):
         text = (ROOT / "docs/EXPLOITATION.md").read_text()

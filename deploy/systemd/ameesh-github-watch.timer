@@ -12,6 +12,7 @@ OnBootSec=2min
 OnUnitActiveSec=300s
 AccuracySec=1s
 RandomizedDelaySec=10s
+Unit=ameesh-github-watch.service
 
 [Install]
 WantedBy=timers.target
