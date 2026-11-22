@@ -424,7 +424,8 @@ class Engine:
                     # pass writes anything (a stale revision would refuse).
                     state = self.ports.load()
                 rows = self.ports.entries()
-                if self.policy.build_beta:
+                recompose = self._recompose_pending(state)
+                if self.policy.build_beta and not recompose:
                     # A late admission belongs to the next packet, even if
                     # this cutoff was empty or the executor has restarted.
                     # #2965: the instant is the candidate's admissibility,
@@ -435,10 +436,15 @@ class Engine:
                     admitted = getattr(self.ports, "admitted", None)
                     rows = (admitted(rows, slot) if callable(admitted)
                             else [r for r in rows if float(r["queued_ts"]) <= slot])
+                # #8096 (B cx2 #45448) : quand un créneau a été consommé sans
+                # promotion, la recomposition due prend les candidats
+                # admissibles courants, y compris un nouveau gel qualifié
+                # après ce créneau ; sinon le train resterait idle jusqu'au
+                # suivant alors que le marqueur dit la recomposition due.
                 rows = ordered(rows, self.ports.dependencies(rows))
                 if not due(rows, now, self.policy,
                            last_started=float((state or {}).get("started_ts", 0)),
-                           recompose=self._recompose_pending(state)):
+                           recompose=recompose):
                     return {"result": "idle"}
                 from datetime import datetime, timezone
                 state = dict(schema=SCHEMA, source=self.source, target=self.target,

@@ -574,7 +574,7 @@ class Service:
         try:
             result, deadline = self.passages[index].scheduled_step(db, now)
             if isinstance(result, dict) and result.get("result") in (
-                    "landed", "invalidated"):
+                    "landed", "invalidated", "abandoned"):
                 # #2965: the target just freed. A cutoff the landed packet
                 # overran is composed at once, with the candidates admissible
                 # at that cutoff, instead of waiting for the next calendar
@@ -582,6 +582,9 @@ class Service:
                 # #7967: an expiry-invalidated plan also frees the target; the
                 # pass that invalidated it must compose the due cutoff itself,
                 # not wait for the next hourly event.
+                # #8096 (B cx2 #45448): an abandon applied under the service
+                # lease frees the target too; its `recompose` marker must be
+                # consumed at once, not at the next calendar wake.
                 with self.condition:
                     self.pending.add(index)
             return deadline
