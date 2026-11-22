@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#6296: same-user health producer and unprivileged, fail-closed readers.
 
-Paths and unit names come only from root installed cards, never from the
-process environment. The producer service still loads the ameesh
+Paths come only from root installed cards, never from the process
+environment. #8069: the runner units are read from the user manager itself
+(every loaded unit enabled or not inactive), not from a card posed once: a
+root card went stale as soon as an agent was added or retired. The producer service still loads the ameesh
 EnvironmentFile (its doctor and readiness children need it), and the
 venv_processus verifier resolves its state directory from XDG_STATE_HOME.
 The receipt proves health, not resistance to its producer.
@@ -32,6 +34,7 @@ SCHEMA = 'ameesh-vm-health/1'
 # Runner blocks that mean "this host is not ready" (runner.py HOST_STATUS,
 # DB_STATUS, WORKDIR_STATUS); other blocks (account, budget) are not health.
 HOST_BLOCKS = frozenset({'hôte non prêt', 'base injoignable', 'dossier absent'})
+RUNNER_UNIT = r'ameesh-runner-agent@[A-Za-z0-9_.-]+\.service'
 
 
 def document(path, uid, mode):
@@ -104,7 +107,7 @@ def command(argv, end, *, capture=True):
 
 
 def runner_state(unit, venv, verifier, end, *, proc=Path('/proc'), run=command):
-    if not re.fullmatch(r'ameesh-runner-agent@[A-Za-z0-9_.-]+\.service', unit):
+    if not re.fullmatch(RUNNER_UNIT, unit):
         raise ValueError('invalid runner unit')
     props = run(['/usr/bin/systemctl', '--user', 'show', unit,
                  '--property=MainPID,ActiveState,SubState,NeedDaemonReload'], end)
@@ -127,14 +130,86 @@ def runner_state(unit, venv, verifier, end, *, proc=Path('/proc'), run=command):
     return int(pid), mode, ids[0].decode()
 
 
-def readiness(rows, runner_ids, now):
-    """Each launched runner holds a live lease and reports no host block."""
+
+def runner_units(end):
+    """#8069: the permanent runners are the loaded units the user manager
+    enables or keeps out of `inactive` (failed, activating, active). A
+    disabled and stopped unit (agent retired, trial over) is not expected; an
+    enabled one that is stopped or crashed is, and runner_state refuses it."""
+    rows = json.loads(command([
+        '/usr/bin/systemctl', '--user', 'list-units', '--all', '--type=service',
+        '--output=json', '--no-pager', 'ameesh-runner-agent@*.service'], end))
+    loaded = sorted({row['unit'] for row in rows})
+    if not loaded or len(loaded) > 64:
+        raise ValueError('runner inventory empty or unbounded')
+    if any(not re.fullmatch(RUNNER_UNIT, unit) for unit in loaded):
+        raise ValueError('invalid runner unit')
+    props = command(['/usr/bin/systemctl', '--user', 'show',
+                     '--property=Id,ActiveState,UnitFileState', '--', *loaded], end)
+    found = {}
+    for block in props.strip().split('\n\n'):
+        values = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+        found[values.get('Id')] = values
+    if set(found) != set(loaded):
+        raise ValueError('runner inventory unreadable')
+    units = [unit for unit in loaded
+             if found[unit].get('ActiveState') != 'inactive'
+             or found[unit].get('UnitFileState', '').startswith('enabled')]
+    if not units:
+        raise ValueError('no permanent runner')
+    return units
+
+
+def runner_host(rows, runner_ids):
+    """The one registry host of the launched runners (lease or last sighting)."""
+    hosts = {row.get('host') for row in rows if isinstance(row, dict)
+             and (row.get('lease_owner') in runner_ids
+                  or row.get('runner_seen_owner') in runner_ids)}
+    if len(hosts) != 1 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', str(*hosts)):
+        raise ValueError('runner host not proven')
+    return hosts.pop()
+
+
+def closed_return_probe(control, host):
+    """The probe agent of a `returning` host whose claims are still closed,
+    else None. Any unreadable control is a refusal, never an open host."""
+    if (not isinstance(control, list) or len(control) != 1 or not isinstance(control[0], dict)
+            or control[0].get('host') != host):
+        raise ValueError('host control unreadable')
+    row = control[0]
+    if row.get('mode') != 'returning' or row.get('claims_open') is not False:
+        return None
+    if not isinstance(row.get('return_probe'), str) or not row['return_probe']:
+        raise ValueError('closed return without probe')
+    return row['return_probe']
+
+
+def lacking(rows, runner_ids):
+    return [runner_id for runner_id in runner_ids
+            if not any(isinstance(row, dict) and row.get('lease_owner') == runner_id
+                       for row in rows)]
+
+
+def readiness(rows, runner_ids, now, probe=None):
+    """Each launched runner holds a live lease and reports no host block.
+
+    #8069: in a `returning` return whose claims are still closed (`probe`
+    named), only the probe agent can be claimed (#7874); the other runners
+    hold no lease and stay proven by runner_state (active, execute, venv).
+    The probe's own lease is then required, from one of the launched runners."""
     if not isinstance(rows, list):
         raise ValueError('invalid agent overview')
+    required = runner_ids
+    if probe is not None:
+        owners = [row.get('lease_owner') for row in rows
+                  if isinstance(row, dict) and row.get('name') == probe]
+        if len(owners) != 1 or owners[0] not in runner_ids:
+            raise ValueError('probe holds no lease')
+        required = owners
     for runner_id in runner_ids:
         held = [row for row in rows if isinstance(row, dict)
                 and row.get('lease_owner') == runner_id]
-        if not held:
+        if not held and runner_id in required:
             raise ValueError('runner holds no lease')
         for row in held:
             expires = row.get('lease_expires_ts')
@@ -177,14 +252,12 @@ def produce(*, card=CARD, boot=BOOT, reader=document):
         if os.geteuid() == 0:
             raise ValueError('producer must run as ameesh')
         cfg = reader(card, 0, 0o644)
-        if set(cfg) != {'venv', 'verifier', 'units', 'environment_file', 'receipt'}:
+        # #8069: `units` of an older card is obsolete and ignored.
+        if set(cfg) - {'units'} != {'venv', 'verifier', 'environment_file', 'receipt'}:
             raise ValueError('invalid producer card')
         for key in ('venv', 'verifier', 'environment_file', 'receipt'):
             if not isinstance(cfg[key], str) or not Path(cfg[key]).is_absolute():
                 raise ValueError('absolute path required')
-        if (not isinstance(cfg['units'], list) or not cfg['units']
-                or len(cfg['units']) > 64 or len(set(cfg['units'])) != len(cfg['units'])):
-            raise ValueError('explicit runner inventory required')
         stage = 'boot'
         end = time.monotonic() + 45
         result = dict(schema=SCHEMA, boot_id='', timestamp=time.time(),
@@ -198,14 +271,9 @@ def produce(*, card=CARD, boot=BOOT, reader=document):
         spec.loader.exec_module(verifier)
         venv = Path(cfg['venv'])
         stage = 'inventory'
-        inventory = json.loads(command([
-            '/usr/bin/systemctl', '--user', 'list-units', '--all', '--type=service',
-            '--output=json', '--no-pager', 'ameesh-runner-agent@*.service'], end))
-        active = {row['unit'] for row in inventory if row['active'] == 'active'}
-        if active != set(cfg['units']):
-            raise ValueError('active runner inventory differs from card')
+        units = runner_units(end)
         stage = 'runners-before'
-        before = [runner_state(unit, venv, verifier, end) for unit in cfg['units']]
+        before = [runner_state(unit, venv, verifier, end) for unit in units]
         if {state[1] for state in before} != {'execute'}:
             raise ValueError('runner mode is not execute')
         stage = 'venv'
@@ -236,15 +304,22 @@ def produce(*, card=CARD, boot=BOOT, reader=document):
             stage = 'doctor'
             command(transient(30, 'doctor'), end, capture=False)
             stage = 'readiness'
-            # Bounded: one registry read, after doctor, for the runners above.
-            readiness(json.loads(command(transient(8, 'list', '--json'), end)),
-                      [state[2] for state in before], time.time())
+            # Bounded: one registry read, after doctor, for the runners above;
+            # the host control is read only when a runner holds no lease.
+            rows = json.loads(command(transient(8, 'list', '--json'), end))
+            ids = [state[2] for state in before]
+            probe = None
+            if isinstance(rows, list) and lacking(rows, ids):
+                host = runner_host(rows, ids)
+                probe = closed_return_probe(json.loads(command(
+                    transient(8, 'host', 'status', host), end)), host)
+            readiness(rows, ids, time.time(), probe)
             healthy = True
         except Exception as error:
             # doctor red does not hide version_mode, still proven below.
             reason, healthy = failure(stage, error), False
         stage = 'runners-after'
-        after = [runner_state(unit, venv, verifier, end) for unit in cfg['units']]
+        after = [runner_state(unit, venv, verifier, end) for unit in units]
         if before != after or verifier.venv_installe(venv) != live:
             raise ValueError('runner changed during health probe')
         result.update(version_mode=True, doctor=healthy)

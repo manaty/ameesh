@@ -38,6 +38,25 @@ réelle (drop-ins compris), doit tenir un bail vivant, sans blocage d’hôte
 boucle au démarrage sans bail n’est donc plus vert. Aucun secret ni droit
 supplémentaire : le même fichier d’environnement que `doctor`, sans sudo.
 
+Retour prises fermées (#8069) : en `returning` prises fermées, seule la
+sonde (`return_probe`) peut être réclamée (#7874) ; les autres exécuteurs
+ne tiennent aucun bail. Quand un exécuteur lancé n’a pas de bail,
+`readiness` lit alors le contrôle de l’hôte (`ameesh host status <hôte>`,
+même unité transitoire ; l’hôte est celui des lignes du registre de ces
+exécuteurs). En retour prises fermées, seul le bail de la sonde est exigé,
+tenu par un des exécuteurs lancés ; les autres restent prouvés par
+`runners-before` et `runners-after` (actifs, mode `execute`, venv). Dans
+tout autre état, chaque exécuteur doit tenir son bail.
+
+Inventaire (#8069) : les unités attendues sont lues du gestionnaire
+utilisateur, plus d’une carte. Toute unité `ameesh-runner-agent@` chargée
+qui est activée (`enabled`) ou non `inactive` (active, `failed`, en
+redémarrage) est attendue et doit tourner ; une unité désactivée et arrêtée
+(agent retiré, essai fini) est ignorée. La clé `units` d’une ancienne carte
+`health-producer.json` est obsolète et ignorée : ajouter ou retirer un agent
+ne demande plus de pose root. Un exécuteur activé mais arrêté ou en échec
+rend le reçu rouge (`runners-before:ValueError`).
+
 Le lecteur SSH garde ses sorties supprimées. `version-mode` accepte un reçu
 dont seul `doctor` est rouge (raison bornée présente) ; `doctor` refuse tout
 reçu rouge.

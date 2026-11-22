@@ -128,10 +128,13 @@ class DiagnosticsTest(unittest.TestCase):
             raise ValueError(self.secret)
 
         def command(argv, end, **kw):
-            current = ('inventory' if 'list-units' in argv else 'metadata' if '-c' in argv
+            current = ('inventory' if 'list-units' in argv or 'show' in argv
+                       else 'metadata' if '-c' in argv
                        else 'readiness' if 'list' in argv else 'doctor')
             if current in stages:
                 fail()
+            if current == 'inventory' and 'show' in argv:
+                return 'Id=%s\nActiveState=active\nUnitFileState=enabled\n' % self.unit
             if current == 'inventory':
                 return json.dumps([dict(unit=self.unit, active='active')])
             if current == 'readiness':

@@ -437,6 +437,10 @@ def main(argv=None):
                 # #4148: the acknowledged adapter transitions are the evidence
                 # an operator reads; one line per generation and state.
                 row["transitions"] = api.transition_journal(args.host)
+                # #8069: the VM health producer reads the probe of a closed
+                # return here, the only runner then able to hold a lease.
+                from .storage.postgres.vm_adapter import Queue
+                row["return_probe"] = Queue(db).return_probe(args.host)
             result = [row]
         else:
             result = api.listing()
