@@ -632,6 +632,28 @@ records the fingerprint of the credential it was launched with, read from
 the child's environment at launch: an API key is the exact value handed to
 the child, even if its key file is replaced during the turn.
 
+**Probe heartbeat.** `checked_at` moves on every write, including a turn
+failure, so it cannot tell whether the sentinel still runs. Migration 0604
+adds `probed_at`, the probe's own date: the sentinel writes it, and a
+trigger stamps it from `checked_at` for a non-failing N-1 sentinel that does
+not know the column; a `turn` write preserves it. A failing row uses a
+bounded N-1 transition: an N-1 kept failure writes nothing (no report, and
+`annotate` leaves `checked_at` untouched), so for 24 h after migration 0604
+lands, a failing row whose probe date is absent or precedes a later
+non-probe write is read as that transition — `credential_failing` already
+names the row. The window is anchored on the migration ledger; afterwards
+the guard returns, and the alert, anchored on a date that no longer moves,
+persists until a probe writes again. A probe date written while the row is
+failing (a `touch` or a new-sentinel failing report) ages normally, even
+during the window, so a new timer that stops on a failure is detected at
+once.
+`probe_missing_since`
+anchors a non-failing pair
+that has never been probed (migration time for rows present when 0604 lands,
+the first write's date for a newer row), is never moved by a turn, and is
+cleared by the first probe. The `credential_probe_stale` alert reads these
+dates, not the turn-refreshed `checked_at`.
+
 **End of turn.** A failed turn whose error, short answer (600 characters at
 most) or stderr tail (this turn's output only: `stderr.log` is appended to by
 every turn) is an authentication failure
@@ -718,14 +740,27 @@ Alerts, computed by `ameesh notify` from the table (all hosts):
   start of failure), and it resolves when the credential is `healthy` again;
 * `credential_expiring` (pushed by default): a healthy credential's forecast
   expiry is less than `warn_hours` away (default 24 h). This warns before
-  gcloud asks to log in again in the middle of a release.
+  gcloud asks to log in again in the middle of a release;
+* `credential_probe_stale` (pushed by default): no probe reading of a
+  non-failing (host, harness) pair for three probe periods (30 min): the
+  timer is stopped, so an expiry would now be silent. Repeated turn failures
+  do not refresh the probe date, and a pair that has never been probed is
+  named once its `probe_missing_since` anchor is older than the same limit.
+  One alert per pair; it resolves when a fresh reading lands. A `failing`
+  row is read through its probe date alone: an N-1 kept failure writes no
+  heartbeat, so it is named by `credential_failing`, not by this guard; a
+  new sentinel `touch` gives it a probe heartbeat again.
 
-Setup on each host (systemd user units, same environment as the runner):
+Setup: the host update installs and enables the timer, idempotently —
+`deploy/mise-a-jour/vm.sh agents installer` on an agent VM,
+`deploy/mise-a-jour/poste.sh installer` on the poste, and
+`deploy/mise-a-jour/vm.sh installer` (or
+`deploy/serveur/installer-serveur.sh`) on the server, with the system unit
+`deploy/serveur/ameesh-credentials.service`. `ameesh doctor` reports a
+missing, disabled or stopped timer as a KO. Do not copy a unit by hand on a
+mesh host: the next host update is what makes it last.
 
 ```sh
-cp deploy/systemd/ameesh-credentials.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ameesh-credentials.timer
 ameesh accounts check --dry-run      # probe now, write nothing
 ```
 

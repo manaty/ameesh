@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Postgres driver: credential health per host, harness and account
-(L226a/L226b, migrations 0060 and 0068).
+(L226a/L226b, migrations 0060, 0068 and 0604).
 
 Only account NAMES pass here, never a secret.
 """
@@ -12,6 +12,8 @@ from .. import interface
 #: fingerprint — `listing` feeds the alerts, which that role reads
 _COLUMNS = ("select host, harness, account, state, reason, source,"
             " extract(epoch from checked_at)::float8 as checked_ts,"
+            " extract(epoch from probed_at)::float8 as probed_ts,"
+            " extract(epoch from probe_missing_since)::float8 as probe_missing_ts,"
             " extract(epoch from failing_since)::float8 as failing_since_ts,"
             " extract(epoch from expires_at)::float8 as expires_ts,"
             " extract(epoch from last_failure_at)::float8 as last_failure_ts,"
@@ -31,15 +33,18 @@ class Credentials(interface.Credentials):
             "with old as (select state from credential_health"
             "             where host = %s and harness = %s and account = %s)"
             " insert into credential_health"
-            " (host, harness, account, state, reason, source, checked_at, failing_since,"
-            "  expires_at, last_failure_at, failing_fingerprint, failures)"
+            " (host, harness, account, state, reason, source, checked_at, probed_at,"
+            "  failing_since, expires_at, last_failure_at, failing_fingerprint, failures)"
             " values (%s, %s, %s, %s, %s, %s, now(),"
+            "         case when %s = 'sentinel' then now() end,"
             "         case when %s = 'failing' then now() end, to_timestamp(%s::float8),"
             "         case when %s = 'failing' then now() end, %s,"
             "         case when %s = 'failing' then 1 else 0 end)"
             " on conflict (host, harness, account) do update set"
             "   state = excluded.state, reason = excluded.reason,"
             "   source = excluded.source, checked_at = now(),"
+            "   probed_at = case when excluded.source = 'sentinel' then now()"
+            "     else credential_health.probed_at end,"
             "   expires_at = excluded.expires_at,"
             "   failing_since = case when excluded.state <> 'failing' then null"
             "     else coalesce(credential_health.failing_since, now()) end,"
@@ -51,10 +56,19 @@ class Credentials(interface.Credentials):
             "    or credential_health.failures = %s::int"
             " returning state, (select state from old) as previous",
             (host, harness, account or "", host, harness, account or "", state,
-             reason or "", source, state,
+             reason or "", source, source, state,
              None if expires_at is None else float(expires_at),
              state, fingerprint if state == "failing" else None, state,
              expect_failures, expect_failures))
+        if not rows and source == "sentinel":
+            # #8062 : un échec de tour a gagné la course, le verdict n'est pas
+            # écrit, mais la sonde a bien relu l'identifiant : sa date avance.
+            self.db.query(
+                "update credential_health set probed_at = now()"
+                " where host = %s and harness = %s and account = %s"
+                " returning account",
+                (host, harness, account or ""))
+            return {"skipped": True}
         return rows[0] if rows else {"skipped": True}
 
     def annotate(self, host, harness, account, reason, *, expect_failures) -> bool:
@@ -63,6 +77,19 @@ class Credentials(interface.Credentials):
             " where host = %s and harness = %s and account = %s"
             "   and state = 'failing' and failures = %s::int returning account",
             (reason, host, harness, account or "", int(expect_failures)))
+        return bool(rows)
+
+    def touch(self, host, harness, account, *, expect_failures=None) -> bool:
+        # #8062 : la sonde a relu l'identifiant sans changer de verdict
+        # (`kept_failure`) ; `probed_at` est son battement propre, que les
+        # écritures `turn` ne touchent pas. L'état et le compteur d'échecs
+        # restent intacts ; `checked_at` suit la dernière lecture.
+        rows = self.db.query(
+            "update credential_health set checked_at = now(), probed_at = now()"
+            " where host = %s and harness = %s and account = %s"
+            "   and state = 'failing'"
+            "   and (%s::int is null or failures = %s::int) returning account",
+            (host, harness, account or "", expect_failures, expect_failures))
         return bool(rows)
 
     def health(self, host, harness) -> dict:
@@ -74,3 +101,11 @@ class Credentials(interface.Credentials):
         if host is None:
             return self.db.query(_LISTING + " order by host, harness, account")
         return self.db.query(_LISTING + " where host = %s order by harness, account", (host,))
+
+    def probe_transition(self):
+        # #8062 : l'instant où 0604 est passée borne la transition N-1. La
+        # table est dans le contrat du rôle superviseur (#7982).
+        rows = self.db.query(
+            "select extract(epoch from applied_at)::float8 as ts"
+            " from schema_migrations where version = 604")
+        return float(rows[0]["ts"]) if rows else None

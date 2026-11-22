@@ -1726,15 +1726,32 @@ class Credentials(Domain):
         failure count is still `expect_failures`. True if written."""
 
     @abc.abstractmethod
+    def touch(self, host: str, harness: str, account: str, *,
+              expect_failures: int | None = None) -> bool:
+        """#8062: the sentinel read the credential again without changing its
+        verdict (`kept_failure`): stamps `probed_at` (the probe's own
+        heartbeat) and `checked_at`, nothing else, and only while the failure
+        count is still `expect_failures` (None: no condition). True if
+        written."""
+
+    @abc.abstractmethod
     def health(self, host: str, harness: str) -> dict[str, dict]:
         """{account: row} for a harness on a host: state, reason, source,
-        checked_ts, failing_since_ts, expires_ts, last_failure_ts,
-        failing_fingerprint, failures."""
+        checked_ts, probed_ts, probe_missing_ts, failing_since_ts, expires_ts,
+        last_failure_ts, failing_fingerprint, failures."""
 
     @abc.abstractmethod
     def listing(self, host: str | None = None) -> list[dict]:
         """Every row (of a host, or of all hosts), without
         `failing_fingerprint`: only columns the supervisor role reads."""
+
+    @abc.abstractmethod
+    def probe_transition(self) -> float | None:
+        """#8062: epoch at which migration 0604 landed, or None when the
+        ledger does not record it. The alert reads it to bound the N-1
+        heartbeat transition: a failing row kept by an old sentinel writes
+        nothing, and its silence is a transition only for a fixed window
+        after this instant."""
 
 
 # --------------------------------------------------------------------------

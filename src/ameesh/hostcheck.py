@@ -62,6 +62,8 @@ RELEASE_TIMER = "ameesh-release.timer"
 PAQUET_HORAIRE_TIMER = "ameesh-paquet-horaire.timer"
 #: #3264 A / #4291 : la minuterie de la veille quotidienne des versions
 VEILLE_TIMER = "ameesh-veille.timer"
+#: #8062 : la sonde des identifiants de l'hôte (L226a, `accounts check`)
+CREDENTIALS_TIMER = "ameesh-credentials.timer"
 
 
 def _systemctl(*args: str) -> str | None:
@@ -578,6 +580,70 @@ def veille_lines(cfg, run=_systemctl) -> list[str]:
         "warning    : veille.sources is declared for this host but %s is not active "
         "(%s): the daily version watch is stopped" % (VEILLE_TIMER, state),
         "             systemctl --user enable --now %s" % VEILLE_TIMER,
+    ]
+
+
+def _timer_value(out) -> str | None:
+    """Première ligne non vide d'une sortie `systemctl`, None si illisible."""
+    if out is None:
+        return None
+    for line in str(out).splitlines():
+        if line.strip():
+            return line.strip()
+    return None
+
+
+def credentials_timer_lines(run=_systemctl) -> tuple[bool, list[str]]:
+    """#8062 : la sentinelle des identifiants est posée, activée et active.
+
+    La mise à jour d'hôte la pose — unité utilisateur sur une VM d'agents ou
+    le poste, unité système sur le serveur (`deploy/serveur/`) — et sans elle
+    `credential_health` n'est plus relu : une échéance passerait sans alerte,
+    le silence que ce lot ferme. Le verdict est donc KO (et non un
+    avertissement) : l'absence se voit au déploiement, pas à l'expiration.
+
+    Les deux portées sont lues : un serveur interrogé par `runuser -l ameesh`
+    n'a pas de gestionnaire utilisateur, et une unité utilisateur posée à la
+    main ne doit pas faire un faux KO quand l'unité système vit. Une seule
+    unité active et activée suffit. Sans aucune lecture systemd, on ne
+    conclut pas (canon §3)."""
+    found = []
+    unreadable = 0
+    for scope, label in (((), "user"), ((SYSTEM,), "system")):
+        load = _timer_value(run(*scope, "show", CREDENTIALS_TIMER,
+                                "-p", "LoadState", "--value"))
+        if load is None:
+            unreadable += 1
+            continue
+        if load != "loaded":
+            continue
+        state = _timer_value(run(*scope, "show", CREDENTIALS_TIMER,
+                                 "-p", "ActiveState", "--value")) or "unknown"
+        enabled = _timer_value(run(*scope, "is-enabled", CREDENTIALS_TIMER)) or "unknown"
+        found.append((label, state, enabled))
+    for label, state, enabled in found:
+        if state == "active" and enabled in ENABLED_STATES:
+            return False, ["%s active (%s unit)" % (CREDENTIALS_TIMER, label)]
+    if not found and unreadable < 2:
+        return True, [
+            "KO — %s is not installed: the credential sentinel never probes, "
+            "so an expiry is silent" % CREDENTIALS_TIMER,
+            "             re-run the host update (deploy/mise-a-jour/vm.sh installer, "
+            "deploy/mise-a-jour/poste.sh installer) — never copy a unit by hand, "
+            "it would not survive the next update",
+        ]
+    if not found:
+        return False, ["not checked: systemd unavailable — %s not verified"
+                       % CREDENTIALS_TIMER]
+    detail = "; ".join("%s unit %s (%s)" % (label, state, enabled)
+                       for label, state, enabled in found)
+    label = found[0][0]
+    scope = "" if label == "system" else "--user "
+    return True, [
+        "KO — %s is present but not running: %s; the credential sentinel is "
+        "stopped, so an expiry is silent" % (CREDENTIALS_TIMER, detail),
+        "             systemctl %senable --now %s" % (scope, CREDENTIALS_TIMER),
+        "             or re-run the host update (deploy/mise-a-jour)",
     ]
 
 

@@ -3076,6 +3076,17 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         account_lines = ["not checked (%s)" % (" ".join(str(exc).split())[:120],)]
     for line in account_lines:
         print("accounts   : %s" % line)
+    # #8062 : la sonde des identifiants est posée par la mise à jour d'hôte ;
+    # sans elle, `credential_health` cesse d'être relu et une échéance passe
+    # sans alerte. Un KO : le silence ne doit pas être vert.
+    credentials_ko = False
+    try:
+        from . import hostcheck as hostcheck_mod
+        credentials_ko, credentials_lines = hostcheck_mod.credentials_timer_lines()
+    except Exception as exc:  # a reading never breaks the doctor
+        credentials_lines = ["not checked (%s)" % (" ".join(str(exc).split())[:120],)]
+    for line in credentials_lines:
+        print("credentials: %s" % line)
     # #3745 : le pgbouncer local accepte-t-il les réglages `-c` qu'ameesh
     # envoie au démarrage de session ? Lu sur sa console avant la connexion
     # ordinaire, que son refus ferait échouer (`jit` de #3503 sur pc-smichea).
@@ -3340,6 +3351,8 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     if forge_ko:
         verdict = 1
     if accounts_ko:
+        verdict = 1
+    if credentials_ko:
         verdict = 1
     # #2763 : installation éditable, ou ameesh chargé hors du venv déployé
     from . import venv_guard

@@ -583,6 +583,17 @@ installer() {
     ${precedent_court:+--precedent "$precedent_court"}
   ln -sfn "src-$court" "$PARTAGE/src-current"
   "$VENV/bin/python" -c 'import psycopg, cryptography, ameesh.budget, ameesh.projects; print("psycopg", psycopg.__version__, "crypto", cryptography.__version__, ": modules L70 et L62 présents")'
+  # #8062 : la sentinelle des identifiants est une unité d'hôte, pas un rôle ;
+  # la mise à jour la pose et l'active, comme les autres unités du poste.
+  # Unités réécrites et `enable --now` rejouable = idempotent ; sans elle,
+  # `credential_health` n'est plus relu et une échéance passe sans alerte.
+  etape "minuterie des identifiants (#8062)"
+  install -d -m 0755 "$HOME/.config/systemd/user"
+  install -m 0644 "$cible/deploy/systemd/ameesh-credentials.service" \
+                  "$cible/deploy/systemd/ameesh-credentials.timer" \
+                  "$HOME/.config/systemd/user/"
+  systemctl --user daemon-reload
+  systemctl --user enable --now ameesh-credentials.timer
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
