@@ -1,0 +1,14 @@
+{
+  "description": "manaty/nexlink's prevalidation parts (scripts/test-parts.py: node, jest, sql): pinned Node 22 and a docker-to-rootless-podman shim cached once, npm ci of each tested package per job from the shared npm cache, scripts/sql-tests.sh containers in the job slice",
+  "setup": "mkdir -p \"$OFFLOAD_CACHE/bin\" \"$OFFLOAD_CACHE/npm\" \"$OFFLOAD_CACHE/electron\"\nprintf '%s\\n' '#!/bin/sh' '# nexlink scripts/sql-tests.sh calls docker: rootless podman, its run in the job slice, image volumes in tmpfs' '[ \"$1\" = run ] || exec podman \"$@\"' 'shift' 'exec podman run --image-volume=tmpfs ${OFFLOAD_SLICE:+--cgroup-parent \"$OFFLOAD_SLICE\"} \"$@\"' > \"$OFFLOAD_CACHE/bin/docker\"\nchmod 0755 \"$OFFLOAD_CACHE/bin/docker\"\nv=22.22.0; f=node-v$v-linux-x64.tar.xz\ncurl -fsSL -o \"$TMPDIR/$f\" \"https://nodejs.org/dist/v$v/$f\"\necho \"9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37  $TMPDIR/$f\" | sha256sum -c - >&2\nmkdir \"$OFFLOAD_CACHE/node\"\ntar -xJf \"$TMPDIR/$f\" -C \"$OFFLOAD_CACHE/node\" --strip-components=1\nrm -f \"$TMPDIR/$f\"",
+  "env": {
+    "PATH": "${OFFLOAD_CACHE}/node/bin:${OFFLOAD_CACHE}/bin:${PATH}",
+    "npm_config_cache": "${OFFLOAD_CACHE}/npm",
+    "electron_config_cache": "${OFFLOAD_CACHE}/electron",
+    "PG_IMAGE": "docker.io/library/postgres:17",
+    "RUNNER_NAME": "ameesh-job-${OFFLOAD_JOB}",
+    "CI": "true"
+  },
+  "before": "for d in backend website desktop mobile shared/*; do\n  [ -f \"$d/package-lock.json\" ] || continue\n  echo \"nexlink: npm ci $d\" >&2\n  (cd \"$d\" && npm ci --prefer-offline --no-audit --no-fund) >&2\ndone",
+  "after": "podman ps -aq --filter \"label=nexlink.ci.owner=ameesh-job-$OFFLOAD_JOB\" | xargs -r podman rm -f -v -t 2 >/dev/null 2>&1 || true"
+}
