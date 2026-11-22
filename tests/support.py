@@ -300,6 +300,11 @@ os.environ["AMEESH_PRICES"] = EMPTY_PRICES
 #: vrai /tmp de la machine n'est ni mesuré ni balayé par les tests)
 EMPTY_SYSTEM_TMP = _mkdtemp(prefix="ameesh-test-system-tmp-")
 os.environ["AMEESH_SYSTEM_TMP"] = EMPTY_SYSTEM_TMP
+#: #8020 : même isolement pour /dev/shm — le balayage du passage ne doit ni
+#: mesurer ni parcourir le vrai /dev/shm de la machine ; le dossier du banc
+#: suffit (sa part n'est lue que si son support est un tmpfs, comme /tmp)
+EMPTY_SYSTEM_SHM = _mkdtemp(prefix="ameesh-test-system-shm-")
+os.environ["AMEESH_SYSTEM_SHM"] = EMPTY_SYSTEM_SHM
 #: L125 : pas de fenêtre de regroupement du courrier dans le banc — un message
 #: réveille son destinataire tout de suite, comme avant L125 ; les tests du
 #: regroupement (test_l125_courrier_regroupe) posent leur propre fenêtre
@@ -437,6 +442,7 @@ def child_env(**extra: str) -> dict:
     # ni relevé périodique des branches (L118) : les tests le lancent eux-mêmes
     env["AMEESH_BRANCH_SWEEP_INTERVAL"] = "0"
     env["AMEESH_SYSTEM_TMP"] = EMPTY_SYSTEM_TMP
+    env["AMEESH_SYSTEM_SHM"] = EMPTY_SYSTEM_SHM
     # Aucun moteur de conteneurs réel pendant les tests (L31) : les tests de
     # rattachement injectent leur propre façade.
     env["AMEESH_CONTAINER_RUNTIME"] = "none"

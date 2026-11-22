@@ -77,9 +77,9 @@ PRIORITY_FOOTER = ("Handle it first, then resume your work without waiting "
 #: L162 : la règle des fichiers temporaires, dans chaque tour de courrier
 #: (le 2026-10-11, un /tmp en mémoire de 12 Go rempli à la main par des
 #: agents a bloqué tous les tours de l'hôte)
-TMP_NOTE = ("Temporary files: in $TMPDIR (your own directory, on disk), never hard-coded "
-            "in /tmp; nothing over 500 MB in /tmp (in memory, shared by all agents "
-            "on the host).")
+TMP_NOTE = ("Temporary files: in $TMPDIR (your own directory, one per lot, on disk), "
+            "never hard-coded in /tmp or /dev/shm; nothing over 500 MB there (in "
+            "memory, shared by all agents on the host).")
 #: #2763 : jamais d'installation dans le venv partagé de l'hôte (le
 #: 2026-10-19, un `uv pip install -e` lancé d'un worktree de relecture a
 #: remplacé l'ameesh de pc-smichea et mis six agents critiques en pause)

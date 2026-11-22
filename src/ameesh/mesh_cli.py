@@ -1192,6 +1192,11 @@ def _host_menage(hk, host: str, policy, measure_row: dict | None,
         "system_tmp": tmp,
         "tmpfs_alert": bool(tmp and tmp["fraction"] is not None
                             and tmp["fraction"] >= policy.tmpfs_alert),
+        # #8020 : jauge de la mémoire partagée, mesurée avec le ménage (elle
+        # n'est pas dans `host_resources`, qui garde /tmp)
+        "system_shm": data.get("system_shm"),
+        "shm_alert": bool((data.get("system_shm") or {}).get("fraction") is not None
+                          and data["system_shm"]["fraction"] >= policy.shm_alert),
         "measure": data or None,
         "measured_ts": (measure_row or {}).get("at_ts"),
         "host_pass": host_pass,
@@ -1224,6 +1229,15 @@ def _print_host_menage(menage: dict) -> None:
             " (%d %%)" % round(part * 100) if part is not None else " (on disk)",
             " — ALERT: above %d %% (ameesh menage to see what fills it)"
             % round(policy["tmpfs_alert"] * 100) if menage.get("tmpfs_alert") else ""))
+    shm = menage.get("system_shm")
+    if shm and shm.get("size_bytes"):
+        part = shm.get("fraction")
+        print("  /dev/shm   %s %s / %s%s%s" % (
+            shm.get("fstype") or "?", _fmt_bytes(shm.get("used_bytes")),
+            _fmt_bytes(shm.get("size_bytes")),
+            " (%d %%)" % round(part * 100) if part is not None else " (on disk)",
+            " — ALERT: above %d %% (ameesh menage to see what fills it)"
+            % round(policy["shm_alert"] * 100) if menage.get("shm_alert") else ""))
     m = menage.get("measure")
     if menage.get("tmpfs_alert") and (m or {}).get("system_tmp_top"):
         # L162 : les plus grosses entrées relevées par le dernier bilan
@@ -1234,16 +1248,20 @@ def _print_host_menage(menage: dict) -> None:
         # (ce que leur retrait a libéré est dans la ligne 24 h : `worktree
         # archived`)
         arch = m.get("worktree_archives") or {}
+        sweep = m.get("tmp_sweep") or {}
         print("  cleanup    temporary directories %s (quota %s per agent); caches %s / %s"
-              "%s%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
-                        ("at least " if m.get("cache_partial") else "")
-                        + _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
-                        "; %d /tmp entries reported (%s)" % (
-                            m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
-                        if m.get("orphans") else "",
-                        "; %d worktree archive(s) (%s)" % (
-                            arch["count"], _fmt_bytes(arch.get("bytes")))
-                        if arch.get("count") else ""))
+              "%s%s%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
+                          ("at least " if m.get("cache_partial") else "")
+                          + _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                          "; %d /tmp entries reported (%s)" % (
+                              m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
+                          if m.get("orphans") else "",
+                          "; %d worktree archive(s) (%s)" % (
+                              arch["count"], _fmt_bytes(arch.get("bytes")))
+                          if arch.get("count") else "",
+                          "; sweep of /tmp and /dev/shm: %d dir(s), %s freed" % (
+                              len(sweep.get("deleted") or ()), _fmt_bytes(sweep.get("bytes")))
+                          if (sweep.get("deleted") or sweep.get("bytes")) else ""))
     conteneurs = (m or {}).get("containers") or {}
     if conteneurs.get("ameesh") is not None or conteneurs.get("others") is not None:
         ours = conteneurs.get("ameesh") or []

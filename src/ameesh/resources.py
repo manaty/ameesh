@@ -69,6 +69,8 @@ BTRFS_KEYS = ("min_btrfs_unallocated", "min_btrfs_metadata_headroom")
 DEFAULT_MAX_TMPFS_USED = 0.8
 #: dossier temporaire du système mesuré (surchargé par AMEESH_SYSTEM_TMP)
 DEFAULT_SYSTEM_TMP = "/tmp"
+#: #8020 : mémoire partagée mesurée (surchargée par AMEESH_SYSTEM_SHM)
+DEFAULT_SYSTEM_SHM = "/dev/shm"
 
 #: facteurs de gravité : au-delà, la pression est CRITIQUE (pause des agents
 #: les moins prioritaires, jamais au milieu d'un tour).
@@ -674,6 +676,26 @@ def tmp_usage(tmps) -> dict:
 def system_tmp() -> str:
     """Le dossier temporaire du système mesuré (`AMEESH_SYSTEM_TMP`, /tmp)."""
     return os.environ.get("AMEESH_SYSTEM_TMP") or DEFAULT_SYSTEM_TMP
+
+
+def system_shm() -> str:
+    """#8020 : la mémoire partagée mesurée (`AMEESH_SYSTEM_SHM`, /dev/shm)."""
+    return os.environ.get("AMEESH_SYSTEM_SHM") or DEFAULT_SYSTEM_SHM
+
+
+def tmpfs_usage(path: str) -> dict:
+    """#8020 : occupation d'un tmpfs sous une forme nommée.
+
+    `fs_usage` garde ses clés historiques (`tmp_*`) pour `/tmp` ; un second
+    tmpfs (/dev/shm) se lit avec des clés qui ne prétendent pas être /tmp :
+    `path`, `fstype`, `size_bytes`, `used_bytes`, `fraction` (None hors
+    tmpfs). Lecture seule, sans parcours."""
+    reading = fs_usage(path)
+    return {"path": reading.get("tmp_path"),
+            "fstype": reading.get("tmp_fstype"),
+            "size_bytes": reading.get("tmp_size_bytes"),
+            "used_bytes": reading.get("tmp_used_bytes"),
+            "fraction": tmpfs_fraction(reading)}
 
 
 def tmpfs_fraction(reading: dict) -> float | None:
