@@ -733,6 +733,9 @@ def _envelope_for(envelopes: dict[int, str] | None, row: dict) -> str | None:
 #: #7976 : octets du corps cités pour un message en retard qui ne tient pas
 #: en entier ; le texte intégral reste à `agent-mail show` (note de troncature)
 APERCU_RETARD_BYTES = 400
+#: #8040 : octets du corps cités pour un message passif (accusé, copie,
+#: diffusion, `--info`) qui ne tient pas en entier, en retard ou non
+APERCU_PASSIF_BYTES = 160
 
 
 def _en_retard(row: dict, avant: float | None) -> bool:
@@ -740,6 +743,17 @@ def _en_retard(row: dict, avant: float | None) -> bool:
     if avant is None or row.get("created_ts") is None:
         return False
     return float(row["created_ts"]) <= float(avant)
+
+
+def _apercu(row: dict, avant: float | None) -> int | None:
+    """Octets du corps cités en aperçu quand `row` ne tient pas en entier, ou
+    None : le message attend le tour suivant. #8040 : un passif entre
+    toujours en aperçu court ; un actif en retard en aperçu (#7976)."""
+    if passive_reason(row):
+        return APERCU_PASSIF_BYTES
+    if _en_retard(row, avant):
+        return APERCU_RETARD_BYTES
+    return None
 
 
 def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
@@ -760,6 +774,12 @@ def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
     entre en aperçu (`APERCU_RETARD_BYTES`, texte intégral à `agent-mail
     show`) au lieu d'attendre : un arriéré en retard s'écoule en un tour, pas
     un tour par message lourd. Le budget reste la borne.
+
+    #8040 : un passif qui ne tient pas en entier entre en aperçu court
+    (`APERCU_PASSIF_BYTES`), et seuls les actifs en retard réservent la place
+    de leur aperçu : un arriéré de passifs en retard réservait plus que le
+    budget, et chaque tour ne servait plus que son premier actif, tronqué
+    (mesh-design, 893 passifs en attente).
     """
     budget = max(PROMPT_MIN_BYTES, int(budget))
     total = len(rows) + extra_remaining
@@ -768,13 +788,14 @@ def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
     # réservée : un message entier ne la prend pas, sinon trois longs
     # messages remplissent encore le tour et l'arriéré attend.
     # Marge de 100 octets par aperçu : note de signature, séparateurs.
+    # #8040 : un passif ne réserve rien ; il prend la place qui reste.
     reserve = [0] * (len(rows) + 1)
     for index in range(len(rows) - 1, -1, -1):
         row = rows[index]
         reserve[index] = reserve[index + 1] + (
             octets(_block(db, row, APERCU_RETARD_BYTES, note="",
                           envelope=_envelope_for(envelopes, row))) + 100
-            if _en_retard(row, en_retard_avant) else 0)
+            if _en_retard(row, en_retard_avant) and not passive_reason(row) else 0)
     for index, row in enumerate(rows):
         note = _verdict_note(db, row)  # une vérification par message, pas par essai
         env = _envelope_for(envelopes, row)
@@ -783,9 +804,13 @@ def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
                 + reserve[index + 1] <= budget):
             blocks.append(bloc)
             continue
-        if _en_retard(row, en_retard_avant):
-            bloc = _block(db, row, APERCU_RETARD_BYTES, note=note, envelope=env)
-            if octets(_assemble(kind, blocks + [bloc], total - index - 1)) <= budget:
+        apercu = _apercu(row, en_retard_avant)
+        if apercu is not None:
+            bloc = _block(db, row, apercu, note=note, envelope=env)
+            # un passif n'a rien réservé : il laisse la réserve des suivants
+            suivants = reserve[index + 1] if passive_reason(row) else 0
+            if (octets(_assemble(kind, blocks + [bloc], total - index - 1))
+                    + suivants <= budget):
                 blocks.append(bloc)
                 continue
         if blocks:
