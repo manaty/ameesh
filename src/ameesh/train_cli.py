@@ -96,6 +96,11 @@ def _abandon(ledger, plan, *, actor, reason, now):
         state["abandoned"] = dict(actor=actor, at_ts=now, reason=reason,
                                   previous_phase=phase, plan=current["id"],
                                   fire=(fire or {}).get("id"))
+        if phase == "paused":
+            # #8096 : la pause n'a pas consommé de promotion ; la recomposition
+            # est due tout de suite, sans attendre le créneau suivant.
+            state["recompose"] = dict(at_ts=now, previous_phase="paused",
+                                      plan=current["id"], reason=reason)
         state["abandon_request"] = None
         saved = ledger.abandon(state, int(state["revision"]), epoch)
     finally:

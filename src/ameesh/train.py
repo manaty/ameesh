@@ -159,7 +159,8 @@ def ordered(rows: list[dict], dependencies: list[dict]) -> list[dict]:
     return result
 
 
-def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0) -> bool:
+def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0,
+        recompose: bool = False) -> bool:
     if not rows:
         return False
     if policy.build_beta:
@@ -169,7 +170,14 @@ def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0
         # must not re-apply the queue timestamp, or that rescued row would
         # still skip the packet.
         slot = policy.cutoff(now)
+        if recompose:
+            # #8096 : un plan paused invalidé (ou abandonné par le pilote)
+            # est un créneau consommé sans promotion. Le remplacement est dû
+            # tout de suite, sans attendre le créneau suivant (§11 bis).
+            return True
         return last_started < slot and bool(rows)
+    if recompose:
+        return True
     # First train: at most an hour from the oldest admitted lot. Subsequent
     # trains: at most an hour since the preceding train, never an idle burst.
     since = max(last_started, min(float(r["queued_ts"]) for r in rows))
@@ -342,6 +350,15 @@ class Engine:
                     state = abandoned.pop("state")
                     return abandoned
             if state is not None and state["phase"] == "paused":
+                # #8096 : un plan en pause dont un membre nommé a quitté
+                # `validated` (revenu en build, retiré ou regelé) ne peut plus
+                # être promu et n'a plus de raison d'attendre un abandon
+                # manuel du pilote. Le service l'invalide sous son bail, avec
+                # la trace du membre, et la passe suivante recompose sans lui.
+                # Sans lecture complète des membres, on reste en pause.
+                left = self._paused_members_left(state)
+                if left is not None:
+                    return self._paused_invalidated(state, left, now)
                 return {"result": "paused"}
             if state is not None and state.get("phase") in EXPIRABLE:
                 # #7967 : l'échéance absolue du ticket de réservation est
@@ -420,7 +437,8 @@ class Engine:
                             else [r for r in rows if float(r["queued_ts"]) <= slot])
                 rows = ordered(rows, self.ports.dependencies(rows))
                 if not due(rows, now, self.policy,
-                           last_started=float((state or {}).get("started_ts", 0))):
+                           last_started=float((state or {}).get("started_ts", 0)),
+                           recompose=self._recompose_pending(state)):
                     return {"result": "idle"}
                 from datetime import datetime, timezone
                 state = dict(schema=SCHEMA, source=self.source, target=self.target,
@@ -628,6 +646,12 @@ class Engine:
                                      reason=request.get("reason", ""), previous_phase=phase,
                                      plan=plan["id"], fire=request.get("fire"),
                                      applied_ts=now)
+        if phase == "paused":
+            # #8096 : un abandon de plan en pause est un créneau consommé sans
+            # promotion ; la recomposition est due sans attendre le calendrier.
+            terminal["recompose"] = dict(at_ts=now, previous_phase="paused",
+                                         plan=plan["id"],
+                                         reason=request.get("reason", ""))
         terminal["abandon_request"] = None
         try:
             saved = abandon(terminal, int(state.get("revision", 0)), self.epoch)
@@ -653,6 +677,83 @@ class Engine:
         if not callable(check) or not isinstance(plan, dict):
             return False
         return bool(check(plan))
+
+    def _paused_members_left(self, state):
+        """#8096 : membres nommés du plan paused qui ne sont plus admissibles.
+
+        Un plan en pause après un rouge ne sera jamais promu tel quel. Quand
+        un de ses membres quitte `validated` (revenu en build, retiré de la
+        file, regelé ou requeueé), le plan ne peut plus être qualifié : le
+        service l'invalide au lieu d'attendre un abandon manuel. Le retour est
+        la liste des lots concernés, ou None quand la lecture ne prouve rien
+        (port sans `entries`, document incomplet, erreur de lecture) : dans ce
+        cas le train reste en pause, fail-closed.
+        """
+        plan = (state or {}).get("plan")
+        members = plan.get("members") if isinstance(plan, dict) else None
+        if not isinstance(members, list) or not members:
+            return None
+        entries = getattr(self.ports, "entries", None)
+        if not callable(entries):
+            return None
+        try:
+            current = {row["work_item_id"]: row for row in entries()
+                       if isinstance(row, dict)}
+        except (TrainError, KeyError, TypeError):
+            return None
+        if not all(isinstance(row, dict) for row in members):
+            return None
+        left = []
+        for row in members:
+            try:
+                fresh = current.get(row["work_item_id"])
+                same = fresh is not None and identity(fresh) == identity(row)
+            except (KeyError, TypeError):
+                return None
+            if not same:
+                left.append(row.get("work_item_id"))
+        return left or None
+
+    def _paused_invalidated(self, state, left, now):
+        """#8096 : invalide un plan paused dont un membre n'est plus admissible.
+
+        Écrit sous le bail de la passe, avec la trace des lots partis, puis
+        rend l'époque : la passe suivante recompose sur la tête courante, sans
+        eux. Aucune promotion n'est possible depuis une pause. Le marqueur
+        `recompose` rend cette recomposition due sans attendre le créneau
+        suivant (§11 bis) ; un plan en cours de CI n'entre jamais ici.
+        """
+        plan = state.get("plan") or {}
+        why = ("paused plan can no longer be promoted: member(s) %s left validated, "
+               "were removed or requeued; invalidated without promotion (#8096)"
+               % ", ".join("#%s" % lot for lot in left))
+        state["error"] = why
+        state["invalidated"] = dict(at_ts=now, previous_phase="paused", reason=why,
+                                    members=list(left), plan=plan.get("id"))
+        state["recompose"] = dict(at_ts=now, previous_phase="paused", plan=plan.get("id"),
+                                  reason=why)
+        state["phase"] = "invalidated"
+        state = self._save(state)
+        self.ports.notify(why, state)
+        return {"result": "invalidated", "error": why, "plan": state["plan"],
+                "invalidated": state["invalidated"]}
+
+    @staticmethod
+    def _recompose_pending(state):
+        """#8096 : ce plan terminal a-t-il consommé un créneau sans promotion ?
+
+        Un plan paused invalidé par le service porte `recompose`; un abandon
+        de pilote le porte aussi (et les documents antérieurs au déploiement
+        le disent par `abandoned.previous_phase == "paused"`). Dans les deux
+        cas la recomposition est due immédiatement, une seule CI de paquet à
+        la fois restant garantie par la réservation de la cible.
+        """
+        if not isinstance(state, dict):
+            return False
+        if isinstance(state.get("recompose"), dict):
+            return True
+        abandoned = state.get("abandoned")
+        return isinstance(abandoned, dict) and abandoned.get("previous_phase") == "paused"
 
     def _expired_step(self, state, deadline):
         """#7967 : termine un plan expiré seulement sur une issue établie.

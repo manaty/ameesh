@@ -42,6 +42,10 @@ class TrainAdmissionsTest(PgTestCase):
         item = work.add(self.db, title="train member", app=self.project.name, source="fixture",
                         actor="fixture", assignee="author", branch="lot/admission",
                         branch_target=target)
+        # #8096 : seuls les lots prêts (qa/validated) entrent dans un paquet ;
+        # le lot du fixture est donc validé avant sa mise en file.
+        self.db.execute("UPDATE work_items SET state = 'validated' WHERE id = %s",
+                        (item["id"],))
         freeze = self.ops.add_milestone(item["id"], "frozen", sha=HEAD, actor="author",
                                          verdict=None, note="")
         self.db.execute("INSERT INTO turn_costs (agent, harness, session, recorded_at)"
@@ -78,6 +82,17 @@ class TrainAdmissionsTest(PgTestCase):
         self.assertEqual([r["work_item_id"] for r in self.admissions.entries()],
                          [self.entry["work_item_id"]])
         self.assertNotEqual(foreign["work_item_id"], self.entry["work_item_id"])
+
+    def test_8096_a_build_lot_with_a_surviving_queue_row_is_not_a_packet_member(self):
+        """#8096: même si une ligne de file périmée subsistait, un lot en build
+        (ou intake) n'est pas un membre de paquet."""
+        self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s",
+                        (self.entry["work_item_id"],))
+        self.assertEqual(self.admissions.entries(), [])
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s",
+                        (self.entry["work_item_id"],))
+        self.assertEqual([r["work_item_id"] for r in self.admissions.entries()],
+                         [self.entry["work_item_id"]])
 
     def test_same_sha_requeue_invalidates_previous_admission(self):
         self.ops.queue_add(self.entry["work_item_id"], target="main", frozen_sha=HEAD,
@@ -675,6 +690,64 @@ class PacketAllocationTest(PgTestCase):
         self.assertIsNone(self.allocate())
         self.assertIsNone(self.allocate(frozen_id=mark["id"]))
         self.assertEqual(self.ops.queue(None)[0]["state"], "ejected")
+
+    def test_8096_build_transition_takes_the_lot_out_of_the_queue_atomically(self):
+        """#8096: un lot revenu en build ne peut pas rester en file.
+
+        La ligne de file et le reçu `removed` sont écrits dans la transaction
+        du mouvement ; un nouveau gel du lot peut ensuite se réinscrire."""
+        row = self.allocate()
+        moved = self.ops.move(self.item, "build", current="qa", loops=0,
+                              note="reprise après échec", actor="fixture")
+        self.assertEqual(moved["state"], "build")
+        self.assertEqual(self.ops.queue(None), [])
+        self.assertEqual(self.receipts(), [
+            {"generation": row["generation"], "kind": "packet"},
+            {"generation": row["generation"], "kind": "removed"}])
+        self.assertTrue(any("taken out" in (event.get("note") or "")
+                            for event in work.events(self.db, self.item)))
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (self.item,))
+        mark = self.ops.add_milestone(self.item, "frozen", sha=BASE, actor="fixture",
+                                      verdict=None, note="nouveau gel après reprise")
+        again = self.allocate(frozen_sha=BASE, frozen_id=mark["id"])
+        self.assertEqual((again["state"], again["frozen_sha"]), ("queued", BASE))
+        self.assertNotEqual(again["generation"], row["generation"])
+
+    def test_8096_stale_ejected_row_of_another_freeze_is_replaced_by_the_new_freeze(self):
+        """#8096: une éjection du gel précédent ne bloque plus le nouveau gel.
+
+        La branche a avancé depuis l'éjection : la ligne ne vise que l'ancien
+        SHA. Un nouveau gel validé, d'une autre tête, la remplace sous une
+        nouvelle génération et son reçu de paquet, sans geste manuel."""
+        old = self.allocate()
+        self.eject_for_want_of_ci()
+        mark = self.ops.add_milestone(self.item, "frozen", sha=BASE, actor="fixture",
+                                      verdict=None, note="nouvelle tête")
+        again = self.allocate(frozen_sha=BASE, frozen_id=mark["id"])
+        self.assertEqual((again["state"], again["reason"], again["rank"],
+                          again["landing_sha"], again["frozen_sha"], again["frozen_id"]),
+                         ("queued", "", None, None, BASE, mark["id"]))
+        self.assertGreater(again["generation"], old["generation"])
+        self.assertIs(again["packet_allocated"], True)
+        self.assertEqual(self.ops.queue(None), [again])
+        self.assertEqual(self.receipts(), [
+            {"generation": old["generation"], "kind": "packet"},
+            {"generation": again["generation"], "kind": "packet"}])
+        self.assertTrue(any("#8096" in (event.get("note") or "")
+                            for event in work.events(self.db, self.item)))
+        # Rejouer la même allocation est idempotent, pas une seconde écriture.
+        self.assertEqual(self.allocate(frozen_sha=BASE, frozen_id=mark["id"]), again)
+
+    def test_8096_landing_or_landed_rows_are_never_replaced(self):
+        self.allocate()
+        for state in ("landing", "landed"):
+            with self.subTest(state=state):
+                self.ops.queue_update(self.item, state=state)
+                mark = self.ops.add_milestone(self.item, "frozen", sha=BASE, actor="fixture",
+                                              verdict=None, note="nouvelle tête")
+                self.assertIsNone(self.allocate(frozen_sha=BASE, frozen_id=mark["id"]))
+                self.assertEqual(self.ops.queue(None)[0]["state"], state)
+        self.assertEqual([r["kind"] for r in self.receipts()], ["packet"])
 
     def test_3560_withdrawn_allocation_is_not_requeued(self):
         self.allocate()

@@ -148,6 +148,7 @@ class TrainCommandTest(PgTestCase):
         self.assertEqual(state["phase"], "invalidated")
         self.assertEqual(state["revision"], document["revision"] + 1)
         self.assertEqual(state["abandoned"], result["abandoned"])
+        self.assertNotIn("recompose", state)
         self.assertEqual(self.db.query(
             "SELECT owner FROM merge_locks WHERE target = %s", (self.ledger.key,)),
             [{"owner": None}])
@@ -210,6 +211,11 @@ class TrainCommandTest(PgTestCase):
         state = self.ledger.load()
         self.assertEqual((state["phase"], state["revision"]),
                          ("invalidated", document["revision"] + 1))
+        # #8096 : la pause n'a pas consommé de promotion ; la recomposition
+        # est due au prochain pas, sans attendre le créneau.
+        self.assertEqual(state["recompose"], dict(
+            at_ts=state["recompose"]["at_ts"], previous_phase="paused",
+            plan=item["id"], reason="prevalidation red"))
         # la réservation est libre : le créneau suivant peut composer
         epoch = self.ledger.acquire(None)
         self.assertIsNotNone(epoch)

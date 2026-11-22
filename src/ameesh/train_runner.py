@@ -45,6 +45,11 @@ RELOAD_RETRY_S = 60.0
 #: producer owed them. The retry re-enters `pass_once`, so it also applies the
 #: pending requests within this bound; it never polls CI or widens authority.
 PASSAGE_RETRY_S = 60.0
+#: #8096: a paused plan has no packet cutoff left to wake the service (its
+#: phase never composes again on its own). The passage revisits it within this
+#: bound so the "member left the validated set" rule is applied without a
+#: pilot gesture and without an external event; it neither polls CI nor merges.
+PAUSED_RECHECK_S = 600.0
 #: #3134: how long the runner's shutdown waits for a train effect still in
 #: flight (push, promotion, SQL write) before releasing the lease. Far below
 #: the runner units' `TimeoutStopSec`; past it the lease expires with its TTL.
@@ -397,7 +402,14 @@ class Passage:
                 or not math.isfinite(deadline) or deadline <= now:
             raise train.TrainError("compiled canon must provide a future packet cutoff")
         refused = self.canon_refusal(db, runtime)
-        return (refused if refused is not None else self._step(runtime, now)), deadline
+        result = refused if refused is not None else self._step(runtime, now)
+        if isinstance(result, dict) and result.get("result") == "paused":
+            # #8096 : un plan en pause ne repart jamais seul et aucun créneau
+            # ne le réveille. On le revoit dans l'heure pour appliquer la
+            # règle du membre parti (invalidation sans promotion), sans
+            # attendre un geste du pilote.
+            deadline = min(deadline, now + PAUSED_RECHECK_S)
+        return result, deadline
 
     def canon_refusal(self, db, runtime):
         """#2914: refuse by name to compose while the pin differs from the gate.

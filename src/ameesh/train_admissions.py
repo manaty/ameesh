@@ -183,9 +183,12 @@ class Admissions:
     def entries(self):
         # Read all targets: filtering SQL on 'main' would hide 'origin/main'.
         # The runtime verifies their shared canonical target reservation.
+        # #8096 : une ligne de file ne vaut que pour un lot encore en qa ou
+        # validated. Un lot revenu en build (ou en intake) n'est pas un membre
+        # de paquet, même si une ligne de file périmée subsistait.
         return [row for row in self.ops.queue(None)
                 if row["state"] == "queued" and row["source"] == self.source
-                and row["item_state"] not in UNAVAILABLE]
+                and row["item_state"] in work.TO_VALIDATE]
 
     def dependencies(self, rows):
         return storage.of(self.db).work_dependencies.for_items(

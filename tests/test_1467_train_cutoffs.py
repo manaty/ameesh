@@ -216,6 +216,66 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual([e[0] for e in self.ports.effects], ["publish", "ci"])
         self.assertTrue(self.ports.notices)
 
+    def test_8096_paused_plan_invalidates_when_a_member_leaves_and_recomposes_at_once(self):
+        """#8096: le retour en build d'un membre sort la pause sans pilote.
+
+        Le plan ne peut plus être promu ; le service l'invalide sous son bail
+        avec la trace du lot parti, puis la passe suivante recompose sans lui
+        au même créneau, sans seconde CI tant que la première n'est pas finie.
+        """
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:10:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(result["invalidated"]["members"], [2])
+        self.assertEqual(result["invalidated"]["previous_phase"], "paused")
+        self.assertFalse(self.ports.held)
+        result = engine.step(stamp("2026-10-15T11:10:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+        self.assertNotEqual(result["plan"]["id"], first["id"])
+        self.assertNotIn("promote", [e[0] for e in self.ports.effects])
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
+
+    def test_8096_paused_rule_never_recomposes_over_a_running_packet_ci(self):
+        """Un plan qui a déjà sa CI ne se recompose pas : il draine d'abord."""
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:05:00"))
+        self.assertEqual(result["result"], "refused", result)
+        self.assertEqual(self.ports.document["phase"], "draining")
+        self.assertEqual(self.ports.document["plan"]["id"], first["id"])
+        self.assertEqual(len(self.ports.probes), 1)
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 1)
+        self.assertEqual(engine.step(stamp("2026-10-15T11:06:00"))["result"], "draining")
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:07:00"))["result"], "invalidated")
+        self.assertNotIn("promote", [e[0] for e in self.ports.effects])
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 1)
+
+    def test_8096_unreadable_members_keep_the_paused_train_fail_closed(self):
+        """Sans preuve de lecture des membres, la pause n'est pas invalidée."""
+        engine = self.engine([admitted(1), admitted(2)])
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+
+        def unreadable():
+            raise train.TrainError("connection closed")
+
+        self.ports.entries = unreadable
+        self.assertEqual(engine.step(stamp("2026-10-15T11:10:00"))["result"], "paused")
+        self.assertEqual(self.ports.document["phase"], "paused")
+        self.ports.entries = None
+        self.assertEqual(engine.step(stamp("2026-10-15T11:11:00"))["result"], "paused")
+        self.assertEqual(self.ports.document["phase"], "paused")
+
     def test_policy_without_compiled_calendar_refuses_a_cutoff(self):
         # #2451: no local 11:00/23:00 fallback survives in the engine
         self.assertFalse(hasattr(train, "cutoff"))

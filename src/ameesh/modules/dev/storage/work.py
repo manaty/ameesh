@@ -801,6 +801,48 @@ class DevWork(DevDomain):
                 if current is not None:
                     same = (current["generation"], current["target"], current["frozen_id"],
                             current["frozen_sha"], current["source"])
+                    # #8096 : une ligne de file laissée par un AUTRE gel (la
+                    # branche a avancé depuis l'éjection) ne vise que ce gel
+                    # périmé. Un nouveau gel validé, d'une tête différente,
+                    # remplace la ligne sous une nouvelle génération et son
+                    # reçu de paquet, sans geste manuel. La ligne n'est pas
+                    # verrouillée par la lecture : l'UPDATE compare la ligne
+                    # entière lue (génération, cible, source, gel, état,
+                    # motif) et une écriture concurrente le fait échouer.
+                    stale_freeze = (
+                        allocated is None
+                        and current["state"] in ("queued", "ejected")
+                        and current["target"] == target
+                        and current["source"] == source
+                        and current["frozen_sha"] != frozen_sha)
+                    if stale_freeze:
+                        replaced = tx.query(
+                            "UPDATE merge_queue SET frozen_sha = %s, frozen_id = %s,"
+                            "   state = 'queued', rank = NULL, landing_sha = NULL,"
+                            "   reason = '', generation = nextval('merge_queue_generation_seq'),"
+                            "   queued_by = %s, queued_at = clock_timestamp(), updated_at = now()"
+                            " WHERE work_item_id = %s AND generation = %s AND target = %s"
+                            "   AND source = %s AND frozen_sha = %s"
+                            "   AND frozen_id IS NOT DISTINCT FROM %s AND state = %s"
+                            "   AND reason IS NOT DISTINCT FROM %s"
+                            " RETURNING work_item_id",
+                            (frozen_sha, frozen_id, actor or "", int(item_id),
+                             current["generation"], target, source, current["frozen_sha"],
+                             current["frozen_id"], current["state"], current["reason"]))
+                        if replaced:
+                            self._event(
+                                tx, int(item_id), lot[0]["state"],
+                                "%s (#8096: stale queue row of freeze %s replaced by "
+                                "freeze %s, generation %s)"
+                                % (note, current["frozen_sha"][:12], frozen_sha[:12],
+                                   current["generation"]), actor)
+                            row = self._queue_row(tx, item_id)
+                            tx.execute("INSERT INTO integration_train_queue_receipts"
+                                       " (work_item_id, generation, frozen_id, kind)"
+                                       " VALUES (%s, %s, %s, 'packet')",
+                                       (row["work_item_id"], row["generation"],
+                                        row["frozen_id"]))
+                            return dict(row, packet_allocated=True)
                     if same != (allocated, target, frozen_id, frozen_sha, source):
                         return None
                     if current["state"] == "queued":
@@ -929,6 +971,33 @@ class DevWork(DevDomain):
                        (rows[0]["work_item_id"], rows[0]["generation"],
                         rows[0]["frozen_id"], rows[0].get("target")))
             return True
+    def queue_take_out_on_build(self, item_id, *, note, actor) -> bool:
+        """#8096 : un lot qui repasse en build sort de la file, atomiquement.
+
+        Appelé par le mouvement du noyau dans SA transaction : la ligne de
+        file ne peut pas survivre à la transition (un lot en build n'est plus
+        prêt à être fusionné), et le reçu `removed` la borne, cible et gel
+        compris, pour un feu ou une inscription ultérieure. Une base d'avant
+        0058 (ou 0442 pour les reçus) n'a pas la file : rien à retirer.
+        """
+        present = self.db.query(
+            "SELECT to_regclass(%s) IS NOT NULL AND to_regclass(%s) IS NOT NULL AS present",
+            (relation(self.db, "merge_queue"),
+             relation(self.db, "integration_train_queue_receipts")))
+        if not present or not present[0].get("present"):
+            return False
+        rows = self.db.query("DELETE FROM merge_queue WHERE work_item_id = %s"
+                             " RETURNING work_item_id, generation, frozen_id, target",
+                             (int(item_id),))
+        if not rows:
+            return False
+        self._event(self.db, int(item_id), lifecycle.IN_PROGRESS, note, actor)
+        self.db.execute("INSERT INTO integration_train_queue_receipts"
+                        " (work_item_id, generation, frozen_id, target, kind)"
+                        " VALUES (%s, %s, %s, %s, 'removed')",
+                        (rows[0]["work_item_id"], rows[0]["generation"],
+                         rows[0]["frozen_id"], rows[0].get("target")))
+        return True
     def queue_withdrawn_since(self, item_id, since_ts, *, target=None,
                               frozen_id=None) -> float | None:
         # #3550: a take-out is final only for the queue entry it removed — its

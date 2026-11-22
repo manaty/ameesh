@@ -65,6 +65,25 @@ class TrainServiceTest(unittest.TestCase):
                 passage.scheduled_step(db, 100)
         self.assertEqual(passage._step.call_count, 1)
 
+    def test_8096_a_paused_passage_is_revisited_within_the_recheck_bound(self):
+        """#8096 : aucun créneau ne réveille une pause ; le service la revoit."""
+        passage = train_runner.Passage.__new__(train_runner.Passage)
+        passage.policy = train.Policy(enabled=True)
+        runtime = mock.Mock()
+        runtime.policy.schedule.next_packet.return_value = 10_000
+        passage.runtime = mock.Mock(return_value=runtime)
+        passage._step = mock.Mock(return_value={"result": "paused"})
+        db = object()
+        self.assertEqual(passage.scheduled_step(db, 100),
+                         ({"result": "paused"}, 100 + train_runner.PAUSED_RECHECK_S))
+        # Un créneau compilé plus proche reste prioritaire.
+        runtime.policy.schedule.next_packet.return_value = 200
+        self.assertEqual(passage.scheduled_step(db, 100), ({"result": "paused"}, 200))
+        # Les autres issues gardent le créneau compilé.
+        passage._step.return_value = {"result": "ci"}
+        runtime.policy.schedule.next_packet.return_value = 1234
+        self.assertEqual(passage.scheduled_step(db, 100), ({"result": "ci"}, 1234))
+
     def test_standby_host_refreshes_pin_without_executing_a_passage(self):
         for role_held in (False, True):
             with self.subTest(role_held=role_held):
