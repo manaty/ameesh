@@ -389,20 +389,36 @@ def requeued_sql(alias: str) -> str:
 
     Fragment SQL booléen, jamais dans une chaîne passée à `%` (ses `%s` sont
     des paramètres) ; il attend les paramètres `REQUEUED_PARAMS`, dans l'ordre
-    du texte : la note de retour, puis un paramètre par préfixe d'attribution
-    (un `unnest(%s::text[])` recevrait un littéral de tableau dépendant du
-    pilote : chaque préfixe est donc son propre `%s`)."""
+    du texte : (premier mot, texte) de la note de retour, puis les premiers
+    mots des préfixes d'attribution, puis un paramètre par préfixe (un
+    `unnest(%s::text[])` recevrait un littéral de tableau dépendant du pilote :
+    chaque préfixe est donc son propre `%s`). Les premiers mots laissent
+    l'index `work_item_events_item_note_first_idx` sonder les seules notes
+    d'attribution ; le `starts_with` exact reste le juge (#8051)."""
     starts = " OR ".join(["starts_with(d.note, %s)"] * len(interface.ASSIGN_NOTE_PREFIXES))
+    first_words = ", ".join(["%s"] * len(ASSIGN_FIRST_WORDS))
     return ("EXISTS (SELECT 1 FROM work_item_events r"
-            " WHERE r.work_item_id = {a}.id AND starts_with(r.note, %s)"
+            " WHERE r.work_item_id = {a}.id"
+            "   AND split_part(r.note, ' ', 1) = %s AND starts_with(r.note, %s)"
             "   AND r.id > coalesce((SELECT max(d.id) FROM work_item_events d"
             "                        WHERE d.work_item_id = {a}.id"
+            "                          AND split_part(d.note, ' ', 1) IN (" + first_words + ")"
             "                          AND (" + starts + ")), 0))"
             ).format(a=alias)
 
 
+#: #8051 : premier mot des notes d'attribution — l'index
+#: `work_item_events_item_note_first_idx (work_item_id, split_part(note,' ',1))`
+#: sonde alors directement la dernière attribution du lot au lieu de relire
+#: tout son journal (210 événements mesurés sur un lot du central).
+ASSIGN_FIRST_WORDS = tuple(sorted({prefix.split(" ", 1)[0]
+                                   for prefix in interface.ASSIGN_NOTE_PREFIXES}))
+#: premier mot de la note de retour §4
+RETURNED_FIRST_WORD = interface.RETURNED_NOTE.split(" ", 1)[0]
+
 #: les paramètres du fragment `requeued_sql`, dans l'ordre du texte
-REQUEUED_PARAMS = (interface.RETURNED_NOTE,) + tuple(interface.ASSIGN_NOTE_PREFIXES)
+REQUEUED_PARAMS = ((RETURNED_FIRST_WORD, interface.RETURNED_NOTE)
+                   + ASSIGN_FIRST_WORDS + tuple(interface.ASSIGN_NOTE_PREFIXES))
 
 #: #540 : verrou de transaction d'un agent : « a-t-il déjà un lot non démarré ? »
 #: et l'attribution qui suit passent l'une après l'autre
