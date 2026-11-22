@@ -27,10 +27,12 @@ class EnrollmentTest(unittest.TestCase):
                 vm.enrollment(value, local_host='controller')
 
     def test_only_health_reads_75_as_pending(self):
-        with mock.patch('ameesh.vm_adapter.subprocess.run', return_value=SimpleNamespace(returncode=75)):
+        with mock.patch('ameesh.vm_adapter._probe_bounded', return_value=(75, b'')), \
+                mock.patch('ameesh.vm_adapter.subprocess.run',
+                           return_value=SimpleNamespace(returncode=75)):
             self.assertEqual(vm.run_probe(['/health'], 10, pending=True), 'pending')
             self.assertIs(vm.run_probe(['/reconcile'], 10), False)
-        with mock.patch('ameesh.vm_adapter.subprocess.run', return_value=SimpleNamespace(returncode=1)):
+        with mock.patch('ameesh.vm_adapter._probe_bounded', return_value=(1, b'')):
             self.assertIs(vm.run_probe(['/health'], 10, pending=True), False)
 
 

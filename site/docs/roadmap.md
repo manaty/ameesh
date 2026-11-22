@@ -300,9 +300,9 @@ Migrations 0058 to 0069 and 0359, 0361–0364, 0368, 0371–0373, 0380, 0384,
 0388, 0390, 0392, 0395, 0398, 0402, 0410, 0412, 0413, all additive; apply them
 with `ameesh migrate` before installing the new code.
 
-## v1.11 to v1.67: one line per minor version
+## v1.11 to v1.67: one entry per minor version
 
-Since v1.11 the mesh has released at two fixed cuts a day (11:00 and 23:00,
+Since v1.12 the mesh has released at two fixed cuts a day (11:00 and 23:00,
 Europe/Paris), and each cut is tagged and deployed to staging. Every release
 note is in `docs/versions/<version>.md`. The version deployed when this page was
 written is **1.67.1** (21/11/2026). Patch releases are listed with their minor
@@ -346,7 +346,7 @@ version.
   (`cost turns --message`, #288).
 - **v1.19** (23/10/2026): `ameesh chat --veille` watches decisions and mail
   between the owner's messages (#480). The full suite also runs on macOS
-  (#393, #3042).
+  (#393).
 - **v1.20** (23/10/2026): pilot election and handover between candidate hosts
   (#3010). Alerts and escalations are routed by liveness (#3036). Adds
   `work milestone --supersedes` (#2989), and the macOS suite becomes required
@@ -363,7 +363,7 @@ version.
   longer opens a pilot turn (#3451). A release cut accepts a head whose tree
   matches a green packet (#3633).
 - **v1.24** (26/10/2026): adds `ameesh handoff advance/cancel/retry`, run
-  through a pinned privileged dispatcher (#3509), and `AMEESH_FREEZE_GATE`.
+  through a pinned privileged dispatcher (#3767), and `AMEESH_FREEZE_GATE`.
   Adds the `rate_limited_chronic` alert (#3733) and an account pace compiled
   from the canon (#3647).
 - **v1.25** (27/10/2026): the test-bench database is purged of orphan schemas
@@ -451,7 +451,7 @@ version.
   (#6422, #6424). Canon updates are broadcast as a bounded diff (#6425). The
   merge gate counts author families only on the lot's own commits (#6365).
 - **v1.47** (09/11/2026; patch .1): adds `ameesh work packet check/hold`
-  (#6562, #6563). `export-v0` now requires an explicit scope (#6534).
+  for composition lease checks. `export-v0` now requires an explicit scope (#6534).
   Automatic retries are journaled (#6475, #6487), and stacked branches that
   declare no dependency are detected (#6607).
 - **v1.48** (10/11/2026): adds `ameesh model-report` and
