@@ -147,10 +147,27 @@ def open_packet_members(db, ids) -> set[int]:
 # `items` is a trusted SQL relation name, like `alias`, never user input.
 # A snapshot may supply a CTE containing all non-terminal lots; the canonical
 # predicates below still decide which of those lots occupy an individual app.
+def start_on_pair_sql(dependent: str, occupant: str = "o") -> str:
+    """#8051 : le prédicat « démarrage sur » DANS une paire déjà chevauchante.
+
+    `start_on_sql` prouve le chevauchement des empreintes par une seconde
+    jointure `work_item_footprints` : dans `overlap_rows_sql`, la ligne
+    examinée EST une paire (mine, theirs) qui chevauche déjà, hors chemins
+    partagés et dans le même dépôt. La seule preuve restante est l'état
+    `validated` et la dépendance déclarée ; la jointure d'empreintes y était
+    un doublon (mesuré #8051). Même règle que `start_on_sql`, jamais une
+    seconde règle : les deux passent par le même contrat de dépendance."""
+    return ("(" + occupant + ".state = '" + lifecycle.VALIDATED + "' AND EXISTS ("
+            "SELECT 1 FROM work_item_dependencies sd"
+            " WHERE sd.work_item_id = " + dependent + ".id"
+            "   AND sd.blocker_id = " + occupant + ".id))")
+
+
 def overlap_rows_sql(alias: str, *, items: str = "work_items",
                      start_on: bool = False,
                      blocking_only: bool = False,
-                     human_wait_ids=()) -> str:
+                     human_wait_ids=(),
+                     columns: bool = True) -> str:
     """Les paires (chemin du lot `alias`, chemin d'un lot occupant du même
     dépôt) qui se chevauchent — corps de `overlapping` et de la garde.
 
@@ -169,13 +186,50 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
     #7758 : un occupant exempté (`exempt_sql` : véhicule de paquet, décision,
     découpage) n'occupe rien ; un véhicule n'a pas de delta propre, ses
     membres sont comptés chacun."""
-    rows = ("SELECT o.id, o.state, o.assignee, mine.path, theirs.path AS other_path,"
-            "       " + start_on_sql(alias, "o") + " AS start_on,"
-            "       (SELECT m.sha FROM work_item_milestones m"
-            "         WHERE m.work_item_id = o.id AND m.kind = 'frozen'"
-            "         ORDER BY m.at DESC, m.id DESC LIMIT 1) AS other_frozen_sha,"
-            "       " + human_wait_expr("o", human_wait_ids) + " AS human_wait"
-            "  FROM work_item_footprints mine"
+    if columns:
+        # #8051 : une garde (`overlap_exists_sql`) ne lit que l'existence ;
+        # projeter le SHA gelé, `start_on` ou `human_wait` y ajoutait des
+        # sous-requêtes par paire pour des colonnes jetées.
+        rows = ("SELECT o.id, o.state, o.assignee, mine.path, theirs.path AS other_path,"
+                "       " + start_on_pair_sql(alias, "o") + " AS start_on,"
+                "       (SELECT m.sha FROM work_item_milestones m"
+                "         WHERE m.work_item_id = o.id AND m.kind = 'frozen'"
+                "         ORDER BY m.at DESC, m.id DESC LIMIT 1) AS other_frozen_sha,"
+                "       " + human_wait_expr("o", human_wait_ids) + " AS human_wait"
+                "  FROM work_item_footprints mine")
+    else:
+        # #8051 : la garde ne lit qu'une existence. La jointure d'origine
+        # partait des empreintes du lot (`mine`), puis balayait TOUTES les
+        # empreintes (`theirs`, 30 k lignes) avant de joindre le lot occupant :
+        # à chaque appel et par candidat. On matérialise une fois les
+        # empreintes des seuls lots occupants du dépôt (36 au central), que
+        # `theirs` sonde ensuite par `work_item_id` : même règle, même
+        # résultat, sans le balayage. La CTE reste non corrélée à `alias` ;
+        # le planificateur la rejoue par sous-requête, jamais par ligne.
+        rows = ("WITH theirs AS MATERIALIZED ("
+                "SELECT o.id, o.state, o.assignee, btrim(o.app) AS app, f.path"
+                "  FROM " + items + " o"
+                "  JOIN work_item_footprints f ON f.work_item_id = o.id"
+                " WHERE coalesce(btrim(o.app), '') <> ''"
+                "   AND " + occupying_sql("o") +
+                "   AND NOT " + exempt_sql("o") + ") "
+                "SELECT 1"
+                "  FROM work_item_footprints mine"
+                "  JOIN theirs ON theirs.id <> mine.work_item_id"
+                "   AND theirs.app = btrim(" + alias + ".app)"
+                "   AND " + _PATHS_OVERLAP.format(a="theirs", b="mine") +
+                " WHERE mine.work_item_id = " + alias + ".id"
+                "   AND coalesce(btrim(" + alias + ".app), '') <> ''"
+                "   AND NOT " + _SHARED.format(app=alias + ".app", p="mine") +
+                "   AND NOT " + _SHARED.format(app="theirs.app", p="theirs"))
+        if start_on:
+            rows += "   AND NOT " + start_on_pair_sql(alias, "theirs")
+        if blocking_only:
+            # #7940 : la garde ne retient plus sur une attente humaine de plus
+            # de 24 h ; l'affichage (`overlapping`) garde la ligne et son hold.
+            rows += "   AND NOT " + human_wait_expr("theirs", human_wait_ids)
+        return rows
+    rows += (
             "  JOIN work_item_footprints theirs"
             "    ON theirs.work_item_id <> mine.work_item_id"
             "   AND " + _PATHS_OVERLAP.format(a="theirs", b="mine") +
@@ -188,7 +242,7 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
             "   AND NOT " + _SHARED.format(app=alias + ".app", p="mine") +
             "   AND NOT " + _SHARED.format(app=alias + ".app", p="theirs"))
     if start_on:
-        rows += "   AND NOT " + start_on_sql(alias, "o")
+        rows += "   AND NOT " + start_on_pair_sql(alias, "o")
     if blocking_only:
         # #7940 : la garde ne retient plus sur une attente humaine de plus de
         # 24 h ; l'affichage (`overlapping`) garde la ligne et son hold.
@@ -210,7 +264,7 @@ def overlap_exists_sql(alias: str, *, items: str = "work_items",
     `planned_waits.human_waits`) ne retient plus."""
     return "EXISTS (" + overlap_rows_sql(
         alias, items=items, start_on=start_on, blocking_only=blocking_only,
-        human_wait_ids=human_wait_ids) + ")"
+        human_wait_ids=human_wait_ids, columns=False) + ")"
 
 
 #: #4667 : un véhicule de paquet (`integration/**`) n'a pas de delta propre ;
