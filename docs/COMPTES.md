@@ -635,12 +635,17 @@ the child, even if its key file is replaced during the turn.
 **Probe heartbeat.** `checked_at` moves on every write, including a turn
 failure, so it cannot tell whether the sentinel still runs. Migration 0604
 adds `probed_at`, the probe's own date: the sentinel writes it, and a
-trigger stamps it from `checked_at` for an N-1 sentinel that does not know
-the column; a `turn` write preserves it. `probe_missing_since` anchors a
-pair that has never been probed (migration time for rows present when 0604
-lands, the first write's date for a newer row), is never moved by a turn,
-and is cleared by the first probe. The `credential_probe_stale` alert reads
-these two dates, not the turn-refreshed `checked_at`.
+trigger stamps it from `checked_at` for a non-failing N-1 sentinel that does
+not know the column; a `turn` write preserves it. A failing row is read
+through `probed_at` alone: an N-1 kept failure writes nothing (no report,
+and `annotate` leaves `checked_at` untouched), so a failing row without a
+probe date is not named stale — `credential_failing` already names it. A new
+sentinel `touch` writes its own date on each pass, so a stopped timer is
+visible again on that row. `probe_missing_since` anchors a non-failing pair
+that has never been probed (migration time for rows present when 0604 lands,
+the first write's date for a newer row), is never moved by a turn, and is
+cleared by the first probe. The `credential_probe_stale` alert reads these
+dates, not the turn-refreshed `checked_at`.
 
 **End of turn.** A failed turn whose error, short answer (600 characters at
 most) or stderr tail (this turn's output only: `stderr.log` is appended to by
@@ -730,13 +735,14 @@ Alerts, computed by `ameesh notify` from the table (all hosts):
   expiry is less than `warn_hours` away (default 24 h). This warns before
   gcloud asks to log in again in the middle of a release;
 * `credential_probe_stale` (pushed by default): no probe reading of a
-  (host, harness) pair for three probe periods (30 min): the timer is
-  stopped, so an expiry would now be silent. Repeated turn failures do not
-  refresh the probe date, and a pair that has never been probed is named
-  once its `probe_missing_since` anchor is older than the same limit. One
-  alert per pair; it resolves when a fresh reading lands. A `failing` row
-  kept by the probe is touched at each pass, so a maintained failure is a
-  heartbeat, not silence.
+  non-failing (host, harness) pair for three probe periods (30 min): the
+  timer is stopped, so an expiry would now be silent. Repeated turn failures
+  do not refresh the probe date, and a pair that has never been probed is
+  named once its `probe_missing_since` anchor is older than the same limit.
+  One alert per pair; it resolves when a fresh reading lands. A `failing`
+  row is read through its probe date alone: an N-1 kept failure writes no
+  heartbeat, so it is named by `credential_failing`, not by this guard; a
+  new sentinel `touch` gives it a probe heartbeat again.
 
 Setup: the host update installs and enables the timer, idempotently —
 `deploy/mise-a-jour/vm.sh agents installer` on an agent VM,

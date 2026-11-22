@@ -9,9 +9,11 @@ Quatre pièces, sans hôte réel (le trigger 0604 est rejoué sur le banc) :
 * le battement de la sonde : un échec maintenu (`kept_failure`) est relu à
   chaque passage et `checked_at` est touché, sinon la paire paraîtrait muette
   alors que la sonde tourne (`Credentials.touch`) ;
-* le trigger 0604 : il date la sonde d'un écrivain N-1 depuis `checked_at` et
-  préserve la date à travers les écritures `turn`, y compris celles qui
-  ignorent la colonne ;
+* le trigger 0604 : il date la sonde d'un écrivain N-1 depuis `checked_at`,
+  préserve la date à travers les écritures `turn`, et n'invente pas de date
+  pour un report `failing` N-1 (un échec maintenu n'écrit rien) ; une ligne
+  en échec sans date de sonde est nommée par `credential_failing`, pas par la
+  garde de la minuterie ;
 * l'installation et le contrôle : la mise à jour d'hôte pose et active
   `ameesh-credentials.timer` (unité utilisateur sur une VM ou le poste, unité
   système sur le serveur), et `ameesh doctor` la vérifie (KO si absente ou
@@ -121,7 +123,8 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         # checked_at ; des échecs de tour répétés ne doivent pas masquer une
         # sonde arrêtée.
         stale = NOW - LIMIT - 5
-        [alert] = self._alerts([self._row(source="turn", checked_ts=NOW - 60,
+        [alert] = self._alerts([self._row(source="turn", state="failing",
+                                          checked_ts=NOW - 60,
                                           probed_ts=stale)])
         self.assertEqual(alert["type"], "credential_probe_stale")
         self.assertEqual(alert["since"], stale)
@@ -131,28 +134,53 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         # source=turn sur la même ligne : la date de sonde reste, aucune
         # alerte avant trois périodes.
         self.assertEqual(self._alerts([self._row(
-            source="turn", probed_ts=NOW - 60, checked_ts=NOW - 5)]), [])
-
-    def test_a_pair_with_only_turn_rows_is_not_named_immediately(self):
-        # Une paire jamais sondée (ou dont la dernière sonde N-1 a été écrasée
-        # avant 0604) reçoit une ancre à la première écriture ; elle n'est pas
-        # nommée « jamais sondée » dans la foulée.
-        self.assertEqual(self._alerts([self._row(
-            source="turn", probed_ts=None, probe_missing_ts=NOW - 60,
+            source="turn", state="failing", probed_ts=NOW - 60,
             checked_ts=NOW - 5)]), [])
 
-    def test_a_pair_with_only_turn_rows_is_named_once_the_anchor_is_old(self):
-        row = self._row(source="turn", probed_ts=None,
+    def test_a_failing_row_without_a_probe_date_is_quiet(self):
+        # #45274 : un échec maintenu N-1 ne fait aucun report et `annotate`
+        # ne touche pas checked_at ; sans date de sonde, la ligne est déjà
+        # nommée par `credential_failing`, pas par la garde de la minuterie.
+        for source in ("turn", "sentinel"):
+            with self.subTest(source=source):
+                row = self._row(source=source, state="failing", probed_ts=None,
+                                probe_missing_ts=NOW - 2 * 3600,
+                                checked_ts=NOW - 60)
+                self.assertEqual(self._alerts([row]), [])
+
+    def test_a_failing_row_does_not_hide_a_stale_healthy_sibling(self):
+        # La ligne en échec est écartée, pas la paire : un autre compte sain
+        # sans relevé prouve toujours que la minuterie s'est tue.
+        rows = [
+            self._row(account="a", source="turn", state="failing",
+                      probed_ts=None, probe_missing_ts=NOW - 5,
+                      checked_ts=NOW - 5),
+            self._row(account="b", state="healthy", probed_ts=NOW - LIMIT - 5,
+                      checked_ts=NOW - LIMIT - 5),
+        ]
+        [alert] = self._alerts(rows)
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertEqual(alert["since"], NOW - LIMIT - 5)
+
+    def test_a_pair_without_a_probe_is_not_named_immediately(self):
+        # Une paire jamais sondée reçoit une ancre à la première écriture ;
+        # elle n'est pas nommée « jamais sondée » dans la foulée.
+        self.assertEqual(self._alerts([self._row(
+            source="manual", probed_ts=None, probe_missing_ts=NOW - 60,
+            checked_ts=NOW - 5)]), [])
+
+    def test_a_pair_without_a_probe_is_named_once_the_anchor_is_old(self):
+        row = self._row(source="manual", probed_ts=None,
                         probe_missing_ts=NOW - 60, checked_ts=NOW - 5)
         [alert] = self._alerts([row], now=NOW + LIMIT)
         self.assertEqual(alert["type"], "credential_probe_stale")
         self.assertEqual(alert["since"], NOW - 60)
         self.assertIn("no probe reading", alert["detail"])
 
-    def test_repeated_turn_writes_do_not_move_the_missing_probe_anchor(self):
-        # #230332 : une paire jamais sondée dont les turn se répètent ne doit
-        # pas repousser indéfiniment l'alerte ; seule l'ancre compte.
-        row = self._row(source="turn", probed_ts=None,
+    def test_repeated_writes_do_not_move_the_missing_probe_anchor(self):
+        # #230332 : une paire jamais sondée dont les écritures se répètent ne
+        # doit pas repousser indéfiniment l'alerte ; seule l'ancre compte.
+        row = self._row(source="manual", probed_ts=None,
                         probe_missing_ts=NOW - 2 * 3600, checked_ts=NOW - 5)
         [alert] = self._alerts([row])
         self.assertEqual(alert["type"], "credential_probe_stale")
@@ -164,16 +192,17 @@ class CredentialProbeAlertsTest(unittest.TestCase):
         # date depuis checked_at), puis un turn il y a 1 min. La date de sonde
         # reste celle d'il y a 2 h et l'alerte part sans attendre un silence.
         stale = NOW - 2 * 3600
-        [alert] = self._alerts([self._row(source="turn", probed_ts=stale,
+        [alert] = self._alerts([self._row(source="turn", state="failing",
+                                          probed_ts=stale,
                                           checked_ts=NOW - 60)])
         self.assertEqual(alert["type"], "credential_probe_stale")
         self.assertEqual(alert["since"], stale)
         self.assertIn("last reading", alert["detail"])
 
-    def test_a_pre_migration_turn_only_row_gets_a_grace(self):
+    def test_a_pre_migration_row_gets_a_grace(self):
         # Ligne existante sans date de sonde au moment de 0604 : l'ancre est
-        # l'instant de la migration, pas le checked_at ancien du turn.
-        row = self._row(source="turn", probed_ts=None,
+        # l'instant de la migration, pas le checked_at ancien de la ligne.
+        row = self._row(source="manual", probed_ts=None,
                         probe_missing_ts=NOW - 5, checked_ts=NOW - 3 * 3600)
         self.assertEqual(self._alerts([row]), [])
         [alert] = self._alerts([row], now=NOW + LIMIT)
@@ -393,6 +422,8 @@ class ProbeDateWiringTest(unittest.TestCase):
         self.assertIn("add column if not exists probe_missing_since", text)
         self.assertIn("-- ameesh: trigger compatible with previous code", text)
         self.assertIn("create trigger credential_health_probe_heartbeat", text)
+        self.assertIn("new.state = 'failing'", text)
+        self.assertIn("is not distinct from old.probed_at", text)
         self.assertIn("new.probe_missing_since := null", text)
         self.assertNotIn("update credential_health set probed_at", text)
         migration = next(m for m in migrations.discover() if m.version == 604)
@@ -417,11 +448,11 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
         super().setUp()
         self.db.execute("delete from credential_health")
 
-    def _n1_insert(self, source, checked_at):
+    def _n1_insert(self, source, checked_at, *, state="healthy"):
         self.previous_insert(
             "credential_health",
             {"host": self.HOST, "harness": self.HARNESS, "account": self.ACCOUNT,
-             "state": "healthy", "reason": "", "source": source,
+             "state": state, "reason": "", "source": source,
              "checked_at": checked_at},
             added=self.ADDED)
 
@@ -461,17 +492,43 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
         self.assertAlmostEqual(alert["since"], probe_at.timestamp(), delta=2)
         self.assertIn("last reading", alert["detail"])
 
-    def test_repeated_turn_writes_keep_the_anchor_of_a_never_probed_pair(self):
+    def test_an_n1_turn_failure_without_a_probe_date_is_quiet(self):
+        # #45274 : la ligne en échec écrite par un turn n'a pas de date de
+        # sonde ; N-1 la maintient sans écrire, donc la garde ne la nomme pas.
         first = _db_time(-2 * 3600)
-        later = _db_time(-60)
-        self._n1_insert("turn", first)
-        self._n1_turn(later)
+        self._n1_insert("turn", first, state="failing")
         row = self._row()
         self.assertIsNone(row["probed_ts"])
-        self.assertAlmostEqual(row["missing_ts"], first.timestamp(), delta=2)
-        [alert] = self._alerts(later.timestamp() + 1)
-        self.assertIn("no probe reading", alert["detail"])
-        self.assertAlmostEqual(alert["since"], first.timestamp(), delta=2)
+        self.assertEqual(self._alerts(time.time()), [])
+
+    def test_an_n1_sentinel_failing_report_has_no_probe_date(self):
+        # #45274 : un report `failing` N-1 avance checked_at mais ne porte pas
+        # de date de sonde ; le trigger ne l'invente pas depuis checked_at.
+        first = _db_time(-2 * 3600)
+        self._n1_insert("sentinel", first, state="failing")
+        self.previous_update(
+            "credential_health",
+            {"reason": "still failing; fix: login"},
+            where={"host": self.HOST, "harness": self.HARNESS,
+                   "account": self.ACCOUNT},
+            added=self.ADDED)
+        row = self._row()
+        self.assertIsNone(row["probed_ts"])
+        self.assertEqual(self._alerts(time.time()), [])
+
+    def test_a_new_sentinel_touch_restores_the_failing_probe_heartbeat(self):
+        # Une fois la nouvelle sonde passée (`touch`), sa date propre existe :
+        # son arrêt redevient visible, même sur une ligne en échec.
+        first = _db_time(-2 * 3600)
+        self._n1_insert("sentinel", first, state="failing")
+        self.assertTrue(Credentials(self.db).touch(
+            self.HOST, self.HARNESS, self.ACCOUNT))
+        row = self._row()
+        self.assertIsNotNone(row["probed_ts"])
+        self.assertEqual(self._alerts(time.time()), [])
+        [alert] = self._alerts(time.time() + LIMIT + 1)
+        self.assertEqual(alert["type"], "credential_probe_stale")
+        self.assertGreaterEqual(alert["value"], LIMIT)
 
     def test_an_n1_sentinel_update_advances_an_older_probe_date(self):
         first = _db_time(-2 * 3600)
@@ -490,7 +547,7 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
 
     def test_a_fresh_sentinel_report_clears_the_missing_anchor(self):
         first = _db_time(-2 * 3600)
-        self._n1_insert("turn", first)
+        self._n1_insert("turn", first, state="failing")
         Credentials(self.db).report(self.HOST, self.HARNESS, self.ACCOUNT,
                                     "healthy", source="sentinel",
                                     expect_failures=0)
