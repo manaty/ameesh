@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 
 from . import land, merge_queue, radar, train_diagnosis, work_lifecycle
-from .train import SCHEMA, TrainError, digest, identity, ordered
+from .train import SCHEMA, TrainError, digest, evidence, identity, ordered
 
 
 class Runtime:
@@ -187,8 +187,11 @@ class Runtime:
         self.repository.check_members(self.target_branch, plan["members"])
         # JSON persistence changes tuples to arrays; their semantic proof is
         # identical, unlike a changed receipt, verdict or review requirement.
-        if digest(self.qualify(plan["members"], plan["base"], self.policy.ci_mode)) \
-                != digest(plan["proof"]):
+        # The canon commit is provenance: a pin move that leaves the
+        # requirement identical (a `packets.cutoffs`-only change) keeps the
+        # frozen packet (#8067).
+        if digest(evidence(self.qualify(plan["members"], plan["base"], self.policy.ci_mode))) \
+                != digest(evidence(plan["proof"])):
             raise TrainError("admission evidence changed before train effect")
         if plan.get("transports"):
             self.validate_transports(plan)

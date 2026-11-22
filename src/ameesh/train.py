@@ -107,6 +107,26 @@ def digest(value) -> str:
                                      ensure_ascii=True).encode()).hexdigest()
 
 
+def evidence(proof) -> dict:
+    """The admission evidence, without the canon commit it was read at.
+
+    The evidence is the review requirement of each member: class, count,
+    classified paths, named rules and the historical verdicts. The policy
+    commit is provenance, not evidence: a canon pin may move while a packet
+    is in flight, and a move that leaves every requirement identical — for
+    instance a `packets.cutoffs`-only change — must not throw that packet
+    away (#8067). Any change that touches a member's requirement still
+    changes its proof and refuses the plan.
+    """
+    trimmed = copy.deepcopy(proof)
+    members = trimmed.get("members") if isinstance(trimmed, dict) else None
+    for member in members or ():
+        policy = member.get("policy") if isinstance(member, dict) else None
+        if isinstance(policy, dict):
+            policy.pop("policy_commit", None)
+    return trimmed
+
+
 def identity(row: dict) -> tuple:
     """Requeueing the same SHA must still invalidate an old admission."""
     return tuple(row[k] for k in ("work_item_id", "generation", "target", "frozen_id",
@@ -285,7 +305,7 @@ class Engine:
             if other is None or identity(other) != identity(row):
                 raise TrainError("member withdrawn, refrozen or requeued")
         proof = self.ports.qualify(plan["members"], plan["base"], self.policy.ci_mode)
-        if digest(proof) != digest(plan["proof"]):
+        if digest(evidence(proof)) != digest(evidence(plan["proof"])):
             raise TrainError("admission evidence changed: recompose and qualify again")
         if plan.get("transports"):
             validate = getattr(self.ports, "validate_transports", None)
