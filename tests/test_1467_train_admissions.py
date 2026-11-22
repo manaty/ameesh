@@ -94,6 +94,25 @@ class TrainAdmissionsTest(PgTestCase):
         self.assertEqual([r["work_item_id"] for r in self.admissions.entries()],
                          [self.entry["work_item_id"]])
 
+    def test_8096_a_build_note_naming_the_plan_is_the_removal_attribution(self):
+        """#45460 : la note de retour en build qui cite le plan est la preuve.
+
+        Le journal du lot est persistant : le pilote y écrit « pulled from
+        packet <id> ». Un retour en build sans cette citation n'attribue rien.
+        """
+        other = self.enqueue()
+        plan_id = "25d1a5fb" + "a" * 56
+        plan = {"id": plan_id, "members": [self.entry, other]}
+        self.ops.move(self.entry["work_item_id"], "build", current="qa", loops=0,
+                      note="orchestrateur: pulled from packet 1900 (%s, sql-rules red)"
+                      % plan_id[:8], actor="orchestrator")
+        self.ops.move(other["work_item_id"], "build", current="qa", loops=0,
+                      note="reprise ordinaire, pas une attribution", actor="fixture")
+        self.assertEqual(self.admissions.plan_removals(plan),
+                         {self.entry["work_item_id"]})
+        self.assertEqual(self.admissions.plan_removals(dict(plan, id="b" * 64)), set())
+        self.assertEqual(self.admissions.plan_removals({"id": plan_id}), set())
+
     def test_same_sha_requeue_invalidates_previous_admission(self):
         self.ops.queue_add(self.entry["work_item_id"], target="main", frozen_sha=HEAD,
                            note="new generation", actor="fixture", source=self.admissions.source)

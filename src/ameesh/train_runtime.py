@@ -129,6 +129,10 @@ class Runtime:
     def dependencies(self, rows):
         return self.admissions.dependencies(rows)
 
+    def plan_removals(self, plan):
+        """#8096 : retraits en build qui nomment ce plan paused (journal)."""
+        return self.admissions.plan_removals(plan)
+
     def admitted(self, rows, slot):
         """#2965: rows admissible at the cutoff, dated by their admission.
 

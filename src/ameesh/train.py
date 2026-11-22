@@ -714,9 +714,10 @@ class Engine:
         """#8096 : lots dont le départ prouve que le plan paused est mort.
 
         Un plan en pause après un rouge ne sera jamais promu tel quel. Le
-        service ne l'invalide que sur une preuve (B cx2 #45452) :
+        service ne l'invalide que sur une preuve (B cx2 #45452, #45460) :
         - tous ses membres ont quitté `validated` (plus rien à composer) ;
-        - sinon, tous les fautifs NOMMÉS par le diagnostic ont quitté : un
+        - sinon, tous les fautifs NOMMÉS par le diagnostic ou par un retour en
+          build dont la note cite CE plan (`plan_removals`) ont quitté : un
           retrait partiel, ou le retrait d'un innocent alors qu'un fautif
           reste, ne prouve rien et garde la pause.
         Le retour est la liste des lots partis, ou None sans preuve suffisante
@@ -754,8 +755,11 @@ class Engine:
             return left
         try:
             named = self._paused_named_culprits(state, plan)
+            removals = getattr(self.ports, "plan_removals", None)
+            if callable(removals):
+                named |= set(removals(plan))
             member_ids = {int(row["work_item_id"]) for row in members}
-        except (KeyError, TypeError, ValueError):
+        except (TrainError, KeyError, TypeError, ValueError):
             return None
         if named and named <= member_ids and named <= set(left):
             return left
@@ -913,8 +917,9 @@ class Engine:
             # diagnostic halves or silently transferring a green result.
             state["phase"] = "paused"
             state = self._save(state)
-            self.ports.notify("build/beta packet CI red: factual diagnosis unknown; "
-                              "no automatic diagnostic CI", state)
+            self.ports.notify("build/beta packet CI red (plan %s): factual diagnosis "
+                              "unknown; no automatic diagnostic CI"
+                              % state["plan"]["id"][:8], state)
             return {"result": "paused"}
         if state["failures"] >= self.policy.max_failures:
             state["phase"] = "paused"

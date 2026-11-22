@@ -243,6 +243,26 @@ class CutoffTest(unittest.TestCase):
         self.assertNotIn("promote", [e[0] for e in self.ports.effects])
         self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
 
+    def test_8096_a_build_return_naming_the_plan_attributes_the_removal(self):
+        """#45460 : un retour en build qui cite le plan est une preuve durable.
+
+        C'est le chemin réel : le journal du lot porte la note du pilote
+        « pulled from packet <id> », que `plan_removals` relit.
+        """
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        self.ports.removals = {2}
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:10:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(result["invalidated"]["members"], [2])
+        result = engine.step(stamp("2026-10-15T11:10:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+
     def test_8096_removing_an_innocent_or_part_of_the_culprits_keeps_the_pause(self):
         """B cx2 #45452: sans preuve que TOUS les fautifs sont partis, pause."""
         schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)

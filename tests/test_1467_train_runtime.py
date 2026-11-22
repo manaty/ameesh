@@ -72,6 +72,13 @@ class TrainRuntimeTest(PgTestCase):
     def engine_for(self, runtime):
         return train.Engine(runtime, source=self.repository.source, target="main", policy=self.policy)
 
+    def test_8096_plan_removals_reads_the_attribution_through_admissions(self):
+        """#45460 : le runtime expose la preuve persistante au moteur."""
+        plan = {"id": "a" * 64}
+        self.admissions.plan_removals.return_value = {7}
+        self.assertEqual(self.runtime.plan_removals(plan), {7})
+        self.admissions.plan_removals.assert_called_once_with(plan)
+
     def test_queue_alias_is_refused_before_any_remote_effect(self):
         self.admissions.entries.side_effect = lambda: [dict(row(1), target="origin/main")]
         raw_key = lambda project, target: "%s:%s" % (project.name, target)

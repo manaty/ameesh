@@ -37,6 +37,8 @@ class MemoryPorts:
         self.fired, self.admitted = True, True
         self.synced = None
         self.edges = []
+        #: #8096: lots dont le retour en build nomme le plan paused.
+        self.removals = set()
 
     def acquire(self, epoch):
         if epoch is not None:
@@ -67,6 +69,9 @@ class MemoryPorts:
 
     def dependencies(self, rows):
         return copy.deepcopy(self.edges)
+
+    def plan_removals(self, plan):
+        return set(self.removals)
 
     def target(self):
         return self.base

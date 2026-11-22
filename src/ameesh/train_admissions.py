@@ -14,6 +14,7 @@ provider, runner hook or configuration is enabled by importing this module.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
+import re
 
 from . import (land, lot_class, merge_queue, packet_guard, review, review_floor,
                storage, work)
@@ -193,6 +194,44 @@ class Admissions:
     def dependencies(self, rows):
         return storage.of(self.db).work_dependencies.for_items(
             [int(row["work_item_id"]) for row in rows]) if rows else []
+
+    def plan_removals(self, plan) -> set:
+        """#8096 : lots dont le retour en build nomme CE plan paused.
+
+        Le journal du lot est persistant ; une note de retour en build qui cite
+        l'identifiant du plan (au moins ses 8 premiers caractères, la forme
+        qu'écrivent les pilotes : « pulled from packet 1900 (25d1a5fb…) ») est
+        l'attribution vérifiable du retrait. Sans elle, un retrait ne prouve
+        pas que le lot était fautif (B cx2 #45452/#45460).
+        """
+        if not isinstance(plan, dict) or not isinstance(plan.get("id"), str):
+            return set()
+        plan_id = plan["id"].lower()
+        if len(plan_id) < 12:
+            return set()
+        members = plan.get("members")
+        if not isinstance(members, list):
+            return set()
+        prefix = plan_id[:8]
+        exact = re.compile(r"(?<![0-9a-f])%s(?![0-9a-f])" % re.escape(prefix))
+        full = re.compile(r"(?<![0-9a-f])%s(?![0-9a-f])" % re.escape(plan_id))
+        out = set()
+        for row in members:
+            lot = row.get("work_item_id") if isinstance(row, dict) else None
+            if not isinstance(lot, int) or isinstance(lot, bool):
+                continue
+            try:
+                events = self.ops.events(lot, 200)
+            except Exception as exc:  # noqa: BLE001 - unreadable proof = no proof
+                raise TrainError("removal attribution unreadable: %s" % exc) from exc
+            for event in events:
+                if event.get("state") != "build":
+                    continue
+                note = str(event.get("note") or "").lower()
+                if full.search(note) or exact.search(note):
+                    out.add(lot)
+                    break
+        return out
 
     # -- packet-cutoff admission (#2965) -------------------------------------
 
