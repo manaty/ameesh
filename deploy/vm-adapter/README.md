@@ -570,13 +570,15 @@ drainage, même posé par le pilote, n'envoie aucune demande à l'adaptateur.
 La fenêtre R1 du 17/11 a été perdue pour cette raison. Le hook se déclare
 sur la carte Host (`policy.lifecycle_hook`), sans secret :
 
-    /home/ameesh/.local/share/ameesh/venv/bin/python -m ameesh.vm_adapter request
+    @ameesh-python -m ameesh.vm_adapter request
 
 Un hôte contrôlé (`draining`, `returning`) avance depuis le scanner de
-**n'importe quel** runner, pas seulement celui de la cible. Ce chemin
-absolu doit donc exister sur chaque hôte qui fait tourner un runner ou le
-serveur médié. Une absence donne `host_release_failed` à la tentative de cet
-hôte, et les prises restent fermées.
+**n'importe quel** runner, pas seulement celui de la cible. Le jeton
+`@ameesh-python` est remplacé par le Python du processus scanner,
+sans recherche dans `PATH`. La version incluant #8068 doit être déployée sur
+chaque runner et sur le serveur médié avant de déclarer ce hook ; chaque
+runtime doit contenir le module. Une absence donne `host_release_failed`
+à la tentative de cet hôte, et les prises restent fermées.
 
 Il faut aussi que les runs de la cible soient connus. Sans cela, ni le
 drainage automatique, ni `idle-drained`, ni la preuve d'arrêt du worker
@@ -623,8 +625,9 @@ et gelées avant le feu : « fenêtre » (manaty/home#297) et « R2 »
 (manaty/home#298), qui en est l'inverse exact (son revert, sans écart avec
 `main`). Le pilote fusionne #297 au feu et #298 à R2.
 
-**Hôtes au runner vivant** : AG1, AG2, AG3, manaty-mesh-1 et le serveur
-médié. pc-smichea (lost, éteint) est hors champ : il est consigné comme tel,
+**Hôtes au runner vivant** : AG1, AG2, AG3 et le serveur médié.
+manaty-mesh-1 ne porte actuellement que le collecteur hosts, sans runner.
+pc-smichea (lost, éteint) est hors champ : il est consigné comme tel,
 sans vérification. S'il revient pendant la fenêtre, le feu s'arrête (sortie,
 étape 7).
 
@@ -640,8 +643,12 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      processus) ;
    - aucun contrôle `draining`/`returning` sur AG3 (`ameesh host status
      ameesh-agents-3`), aucune retenue ;
-   - `/home/ameesh/.local/share/ameesh/venv/bin/python` présent et
-     exécutable sur chaque hôte au runner vivant ;
+   - sur chaque hôte au runner vivant et sur le serveur médié, relever le
+     Python du processus scanner et vérifier qu’il est exécutable, contient
+     #8068 et importe `ameesh.vm_adapter` avec cet interpréteur. Selon la
+     disposition, le runtime est celui de la VM sous
+     `~/.local/share/ameesh/venv` ou du serveur sous `/opt/ameesh/venv` ;
+     vérifier le processus réellement lancé, pas seulement le chemin prévu ;
    - #297 et #298 gelées et relues ;
    - aucun lot ouvert assigné à un agent placé sur AG3 (#7874) :
      `ameesh host release-check ameesh-agents-3` rend 0. Sinon, chaque lot
@@ -684,8 +691,9 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      laisserait rouge faute de bail des autres runners. Retirer `units` de
      la carte reste facultatif ; ce geste est au bureau.
 2. Le bureau active l'inscription (`enabled: true`, copie avant) et démarre
-   le timer (R1 de D1). Le worker doit être vu (`vm_adapter_observations`)
-   **avant** l'étape 3 : un hook sans worker laisse l'hôte fermé.
+   le timer (R1 de D1). Avant l'étape 3, vérifier ses passes dans le journal :
+   les ticks inactifs ne produisent pas de `vm_adapter_observations`. Après
+   drainage, vérifier les observations ; un hook sans worker laisse l'hôte fermé.
 3. Le pilote fusionne #297, puis fait la synchronisation prouvée. Sur AG3 et
    sur un autre hôte, la projection (`ameesh hosts ameesh-agents-3`) donne
    ce hook et `runs_interface: none (Host card)`.

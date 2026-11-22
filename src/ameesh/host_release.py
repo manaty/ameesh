@@ -44,6 +44,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 import time
 
 from . import host_lifecycle, host_idle, resources, storage
@@ -159,6 +160,9 @@ def _argv(command):
         raise ValueError("lifecycle hook is not a command line: %s" % _bounded(exc)) from None
     if not argv or any("\x00" in part for part in argv):
         raise ValueError("lifecycle hook is not a command line")
+    # Use the scanner runtime, independent of PATH and installation layout.
+    if argv[0] == "@ameesh-python":
+        argv[0] = sys.executable
     return argv
 
 
@@ -1026,9 +1030,9 @@ def _pending_adapter_requests(db, host):
 def _adapter_worker_seen(db, host):
     """#5932: last operator tick of the VM adapter for a host, or None.
 
-    The worker writes `vm_adapter_observations` on every tick; a silent
-    observation is the direct evidence that the worker disappeared, even
-    before a durable poweroff intent exists.
+    The worker records observations while handling a controlled host; inactive
+    ticks do not write one. A missing observation is meaningful after a hook
+    request, not as proof that a worker is absent before the first drain.
     """
     try:
         from .storage.postgres.vm_adapter import Queue
