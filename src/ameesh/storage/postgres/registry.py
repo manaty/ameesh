@@ -750,6 +750,18 @@ class Agents(interface.Agents):
         return self.db.query("SELECT ameesh_resolve_agent_name(%s, %s) AS name",
                              (name, operation))[0]["name"]
 
+    def resolve_names(self, names, *, operation="lookup"):
+        # #8051 : une seule requête, même fonction (donc même audit d'alias)
+        # que `resolve_name`.
+        wanted = sorted({str(name) for name in (names or ()) if str(name)})
+        if not wanted:
+            return {}
+        rows = self.db.query(
+            "SELECT supplied, ameesh_resolve_agent_name(supplied, %s) AS name"
+            "  FROM unnest(%s::text[]) AS supplied",
+            (operation, wanted))
+        return {row["supplied"]: row["name"] for row in rows}
+
     def same_identity(self, first, second) -> bool:
         first, second = str(first or "").strip(), str(second or "").strip()
         if not first or not second:

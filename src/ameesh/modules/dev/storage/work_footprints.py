@@ -175,12 +175,22 @@ def overlap_rows_sql(alias: str, *, items: str = "work_items",
             "         WHERE m.work_item_id = o.id AND m.kind = 'frozen'"
             "         ORDER BY m.at DESC, m.id DESC LIMIT 1) AS other_frozen_sha,"
             "       " + human_wait_expr("o", human_wait_ids) + " AS human_wait"
-            "  FROM work_item_footprints mine"
-            "  JOIN work_item_footprints theirs"
-            "    ON theirs.work_item_id <> mine.work_item_id"
+            # #8051 : partir des lots occupants (`o`), puis de leurs seules
+            # empreintes par la clé primaire `(work_item_id, source, path)`.
+            # L'ancien ordre partait des empreintes (`theirs`) sans borne :
+            # chaque évaluation parcourait les ~33 000 lignes de la table et
+            # les comparait deux à deux (plan mesuré : 193 ms par candidat,
+            # 41 000 tampons), sur une requête appelée plusieurs fois par
+            # seconde par la prise automatique.
+            "  FROM " + items + " o"
+            "  CROSS JOIN LATERAL ("
+            "    SELECT theirs.path FROM work_item_footprints theirs"
+            "     WHERE theirs.work_item_id = o.id OFFSET 0) theirs"
+            "  CROSS JOIN LATERAL ("
+            "    SELECT mine.path FROM work_item_footprints mine"
+            "     WHERE mine.work_item_id = " + alias + ".id OFFSET 0) mine"
+            " WHERE o.id <> " + alias + ".id"
             "   AND " + _PATHS_OVERLAP.format(a="theirs", b="mine") +
-            "  JOIN " + items + " o ON o.id = theirs.work_item_id"
-            " WHERE mine.work_item_id = " + alias + ".id"
             "   AND coalesce(btrim(" + alias + ".app), '') <> ''"
             "   AND btrim(o.app) = btrim(" + alias + ".app)"
             "   AND " + occupying_sql("o") +
@@ -263,7 +273,7 @@ def cap_reached_sql(alias: str, *, items: str = "work_items") -> str:
 
 
 def held_sql(alias: str, *, start_on: bool = False,
-             human_wait_ids=()) -> str:
+             human_wait_ids=(), items: str = "work_items") -> str:
     """Vrai si la garde retient le lot `alias` : son empreinte chevauche celle
     d'un lot occupant de son dépôt, ou le dépôt a atteint son plafond de lots
     en vol (#4818). Le prédicat commun de la prise, de l'attribution et du
@@ -271,11 +281,16 @@ def held_sql(alias: str, *, start_on: bool = False,
     un lot sur les lots validés dont il déclare la dépendance (#7760).
     #7940 : un occupant en attente humaine depuis plus de 24 h
     (`human_wait_ids`, lu par `planned_waits.human_waits`) ne retient plus
-    (le chevauchement devient un avertissement journalisé)."""
-    return ("(" + overlap_exists_sql(alias, start_on=start_on,
+    (le chevauchement devient un avertissement journalisé).
+
+    `items` : la relation des lots candidats à l'occupation. Un appelant qui
+    matérialise déjà les lots ouverts (`open_items`, `plan_open_items`) la
+    passe ici : les occupants sont lus une fois, plus une fois par candidat
+    (#8051, plan mesuré à 193 ms par candidat)."""
+    return ("(" + overlap_exists_sql(alias, items=items, start_on=start_on,
                                      blocking_only=True,
                                      human_wait_ids=human_wait_ids) + " OR "
-            + cap_reached_sql(alias) + ")")
+            + cap_reached_sql(alias, items=items) + ")")
 
 
 def unknown_policy_sql(tx, item_id) -> str:
