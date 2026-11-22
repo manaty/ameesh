@@ -209,7 +209,9 @@ class TokenFileTest(unittest.TestCase):
         err = io.StringIO()
         token = serve.load_token(path, out=err)
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
+        # #8036 : rwx seuls ; un parent setgid (TMPDIR du guest, g+s) transmet
+        # S_ISGID au dossier créé, sans l'ouvrir à personne
+        self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
         self.assertGreaterEqual(len(token), 43)
         self.assertNotIn(token, err.getvalue())
         self.assertEqual(serve.load_token(path), token)
