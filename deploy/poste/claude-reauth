@@ -1,0 +1,273 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["playwright>=1.48"]
+# ///
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# STATUT : EXPLORATION (lot #8038) — outil de poste, non intégré au mesh ; rien
+# ne l'appelle. Note : docs/design/explorations/claude-reauth.md.
+"""claude-reauth — reconnecte un profil Claude Code (OAuth claude.ai via Google).
+
+Deux usages :
+
+  claude-reauth EMAIL --url URL
+      ouvre l'URL d'autorisation affichée par `claude auth login`, se connecte
+      avec EMAIL (e-mail + code reçu, ou --google), clique Authorize et écrit le code
+      sur la sortie standard.
+
+  claude-reauth EMAIL --ssh "ssh -J root@10.77.0.1 root@10.77.0.3" \
+                      --user ameesh --config-dir /home/ameesh/.claude
+      fait tout le tour : lance `claude auth login` dans un tmux sur la machine
+      distante, récupère l'URL, obtient le code, le colle, puis vérifie
+      `claude auth status` (le compte connecté doit être EMAIL).
+
+Le mot de passe Google est demandé dans le terminal (non affiché, jamais écrit
+sur disque ni dans les journaux). La 2FA, si Google la demande, se fait dans
+la fenêtre du navigateur. Le navigateur garde un profil dédié par compte
+(~/.local/share/claude-reauth/profiles/EMAIL) : après la première fois, la
+session Google est en général réutilisée et aucun mot de passe n'est demandé.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CODE_RE = re.compile(r"([A-Za-z0-9_\-]{20,}#[A-Za-z0-9_\-]{20,})")
+URL_RE = re.compile(r"https://claude\.(?:com|ai)/[^\s]*oauth/authorize[^\s]*")
+PROFILES = Path(os.environ.get("CLAUDE_REAUTH_HOME",
+                               Path.home() / ".local/share/claude-reauth")) / "profiles"
+USE_GOOGLE = False  # --google
+TIMEOUT = 600  # s (captcha et 2FA faits à la main)
+
+
+def log(msg: str) -> None:
+    print(f"[claude-reauth] {msg}", file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# navigateur : URL d'autorisation -> code
+# --------------------------------------------------------------------------
+def visible(page, selector: str) -> bool:
+    try:
+        loc = page.locator(selector).first
+        return loc.count() > 0 and loc.is_visible()
+    except Exception:
+        return False
+
+
+def try_click(loc) -> bool:
+    """Clic court : une page qui change ou un bouton occupé ne fait pas planter."""
+    try:
+        loc.click(timeout=3000)
+        return True
+    except Exception:
+        return False
+
+
+def get_code(email: str, url: str, headless: bool = False) -> str:
+    from playwright.sync_api import sync_playwright
+
+    profile = PROFILES / email
+    profile.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as p:
+        kwargs = dict(
+            user_data_dir=str(profile),
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation", "--no-sandbox"],
+            chromium_sandbox=True,
+            viewport={"width": 1100, "height": 850},
+        )
+        try:  # le vrai Chrome passe mieux la détection de Google
+            ctx = p.chromium.launch_persistent_context(channel="chrome", **kwargs)
+        except Exception:
+            ctx = p.chromium.launch_persistent_context(**kwargs)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(url)
+
+        deadline = time.time() + TIMEOUT
+        asked_pwd = switched = told_2fa = clicked_google = used_mail = asked_mail_code = False
+        login_seen = None
+        last_pwd_url = None
+        try:
+            while time.time() < deadline:
+                for pg in list(ctx.pages):
+                    try:
+                        u = pg.url
+                    except Exception:
+                        continue
+
+                    # 1) page finale : le code
+                    if "oauth/code/callback" in u:
+                        try:
+                            m = CODE_RE.search(pg.inner_text("body"))
+                        except Exception:
+                            m = None
+                        if m:
+                            return m.group(1)
+                        continue
+
+                    # 2) page d'autorisation claude.ai
+                    if "oauth/authorize" in u:
+                        try:
+                            body = pg.inner_text("body")
+                        except Exception:
+                            continue
+                        m = re.search(r"Logged in as\s+(\S+@\S+)", body)
+                        if m and m.group(1).lower() != email.lower():
+                            if not switched:
+                                log(f"connecté en {m.group(1)} : changement de compte")
+                                try_click(pg.get_by_text("Switch account").first)
+                                switched = True
+                            continue
+                        btn = pg.get_by_role("button", name="Authorize")
+                        if m and btn.count() and btn.first.is_enabled():
+                            log(f"autorisation pour {email}")
+                            try_click(btn.first)
+                        continue
+
+                    # 3) page de connexion claude.ai : Google d'abord ; si le
+                    #    bouton Google reste occupé 20 s, connexion par e-mail
+                    if re.search(r"claude\.(ai|com)/(login|signin)", u):
+                        if login_seen is None:
+                            login_seen = time.time()
+                        rej = pg.get_by_role("button", name=re.compile("Reject all cookies", re.I))
+                        if rej.count() and rej.first.is_visible():
+                            try_click(rej.first)  # bandeau cookies : refuser le non essentiel
+                        code_in = pg.locator('input[autocomplete="one-time-code"], input[name*="code" i], '
+                                             'input[placeholder*="code" i], input[id*="code" i]')
+                        sent = pg.get_by_text(re.compile("click the link sent to", re.I))
+                        if (code_in.count() and code_in.first.is_visible()) or (sent.count() and sent.first.is_visible()):
+                            if not asked_mail_code:
+                                log(f"un e-mail de connexion a été envoyé à {email}")
+                                mc = input("Colle ici le LIEN du mail (clic droit > copier le lien), "
+                                           "ou le code de vérification s'il en affiche un : ").strip()
+                                asked_mail_code = True
+                                if mc.startswith("http"):
+                                    pg.goto(mc)  # le lien ouvre la session dans CE profil
+                                elif mc and code_in.count():
+                                    code_in.first.fill(mc)
+                                    v = pg.get_by_role("button", name=re.compile("Verify", re.I))
+                                    if not (v.count() and try_click(v.first)):
+                                        pg.keyboard.press("Enter")
+                            continue
+                        if USE_GOOGLE:
+                            g = pg.get_by_role("button", name=re.compile("Google", re.I))
+                            if not clicked_google and g.count() and g.first.is_visible() and g.first.is_enabled():
+                                log("Continue with Google")
+                                clicked_google = try_click(g.first)
+                            continue
+                        # par défaut : e-mail (le bouton Google passe par FedCM,
+                        # que le navigateur piloté ne sait pas ouvrir)
+                        mail = pg.locator('input[type="email"]')
+                        if not used_mail and mail.count() and mail.first.is_visible():
+                            log("connexion par e-mail")
+                            mail.first.fill(email)
+                            if try_click(pg.get_by_role("button", name=re.compile("Continue with email", re.I)).first):
+                                used_mail = True
+                                log("un lien et/ou un code arrive sur la boîte de " + email)
+                        continue
+
+                    # 4) Google
+                    if "accounts.google.com" in u:
+                        chooser = pg.locator(f'[data-identifier="{email}" i]')
+                        if chooser.count() and chooser.first.is_visible():
+                            log("choix du compte Google")
+                            try_click(chooser.first)
+                        elif visible(pg, 'input[type="email"]'):
+                            log("saisie de l'adresse")
+                            pg.fill('input[type="email"]', email)
+                            pg.keyboard.press("Enter")
+                        elif visible(pg, 'input[type="password"]'):
+                            if not asked_pwd or last_pwd_url != u:
+                                if asked_pwd:
+                                    log("mot de passe refusé ? nouvel essai")
+                                pwd = getpass.getpass(f"Mot de passe Google de {email} : ")
+                                pg.fill('input[type="password"]', pwd)
+                                del pwd
+                                pg.keyboard.press("Enter")
+                                asked_pwd, last_pwd_url = True, u
+                        elif not told_2fa and "challenge" in u:
+                            log("vérification Google : termine-la dans la fenêtre du navigateur")
+                            told_2fa = True
+                        continue
+                time.sleep(1)
+            raise SystemExit("délai dépassé sans code (10 min)")
+        finally:
+            ctx.close()
+
+
+# --------------------------------------------------------------------------
+# machine distante : tmux + claude auth login
+# --------------------------------------------------------------------------
+def remote(ssh: str, user: str, script: str) -> str:
+    cmd = shlex.split(ssh) + [f"sudo -u {shlex.quote(user)} -i bash -s"]
+    r = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise SystemExit(f"ssh a échoué ({r.returncode}) : {r.stderr.strip()[-400:]}")
+    return r.stdout
+
+
+def vm_flow(email: str, ssh: str, user: str, config_dir: str, headless: bool) -> None:
+    cd = shlex.quote(config_dir)
+    out = remote(ssh, user, f"""
+tmux kill-session -t claude-reauth 2>/dev/null
+tmux new-session -d -s claude-reauth -x 250 -y 50 -e CLAUDE_CONFIG_DIR={cd} "claude auth login"
+for i in $(seq 1 20); do
+  sleep 1
+  tmux capture-pane -p -J -t claude-reauth -S -60 | grep -o 'https://claude[^ ]*oauth/authorize[^ ]*' | tail -1 | grep . && exit 0
+done
+echo "PAS-D-URL"; tmux capture-pane -p -t claude-reauth | tail -5
+""")
+    m = URL_RE.search(out)
+    if not m:
+        raise SystemExit(f"aucune URL d'autorisation : {out.strip()[-400:]}")
+    code = get_code(email, m.group(0), headless)
+    log("code obtenu, envoi à la machine distante")
+    status = remote(ssh, user, f"""
+tmux send-keys -t claude-reauth -l {shlex.quote(code)}
+tmux send-keys -t claude-reauth Enter
+for i in $(seq 1 15); do sleep 1; tmux has-session -t claude-reauth 2>/dev/null || break; done
+tmux kill-session -t claude-reauth 2>/dev/null
+CLAUDE_CONFIG_DIR={cd} claude auth status
+""")
+    logged = re.search(r'"loggedIn":\s*true', status)
+    who = re.search(r'"email":\s*"([^"]+)"', status)
+    if logged and who and who.group(1).lower() == email.lower():
+        log(f"OK : {config_dir} connecté en {who.group(1)}")
+    else:
+        raise SystemExit(f"échec : {status.strip()[-400:]}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("email", help="compte claude.ai (connexion Google)")
+    ap.add_argument("--url", help="URL d'autorisation de `claude auth login` (mode code seul)")
+    ap.add_argument("--ssh", help='commande ssh vers la machine, ex. "ssh -J root@10.77.0.1 root@10.77.0.3"')
+    ap.add_argument("--user", default="ameesh", help="utilisateur distant (défaut ameesh)")
+    ap.add_argument("--config-dir", help="CLAUDE_CONFIG_DIR du profil distant")
+    ap.add_argument("--headless", action="store_true", help="sans fenêtre (seulement si la session Google est déjà ouverte)")
+    ap.add_argument("--google", action="store_true", help="se connecter par « Continue with Google » au lieu de l'e-mail")
+    a = ap.parse_args()
+    global USE_GOOGLE
+    USE_GOOGLE = a.google
+    if a.ssh:
+        if not a.config_dir:
+            ap.error("--config-dir est requis avec --ssh")
+        vm_flow(a.email, a.ssh, a.user, a.config_dir, a.headless)
+    elif a.url:
+        print(get_code(a.email, a.url, a.headless))
+    else:
+        ap.error("donner --url ou --ssh")
+
+
+if __name__ == "__main__":
+    main()
