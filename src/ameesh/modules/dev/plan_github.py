@@ -1859,7 +1859,8 @@ TITLE_MAX = 256
 BODY_MAX = 30000
 SUMMARY_MAX = 300
 #: clé `github` de la configuration de l'hôte : clés admises, cadence
-SETTINGS_KEYS = ("projects", "host", "interval", "ci_ttl", "exclude_terms", "process")
+SETTINGS_KEYS = ("projects", "host", "interval", "ci_ttl", "exclude_terms",
+                 "process", "watch_role")
 #: #2130/D : clés admises d'un mapping Process (data only, compilé au chargement)
 PROCESS_KEYS = ("ref", "version", "document", "labels")
 #: forme longue d'un projet : `repo`, les workflows suivis par le veilleur de
@@ -1869,6 +1870,12 @@ PROJECT_KEYS = ("repo", "workflows", "base")
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 DEFAULT_INTERVAL = 300.0
 MIN_INTERVAL = 60.0
+#: #8059: elected role whose role timers carry the GitHub watch. A plain
+#: `github.host` collector (no `role run`) stands by while this role holds a
+#: live lease; the role holder collects as before. The canon names another
+#: role with `github.watch_role`, and an unknown role leaves the standby
+#: collector working (the cursor lock already prevents a duplicate event).
+DEFAULT_WATCH_ROLE = "mesh-design"
 #: durée de vie (secondes) des lectures CI dans le cache partagé (#848) :
 #: 60 s = un passage de `ameesh notify` sur deux est servi du cache, les
 #: autres revalident (un 304 ne consomme pas de quota)
@@ -1919,6 +1926,9 @@ class Settings:
     projects: dict = field(default_factory=dict)
     #: hôte qui mène la projection automatique (un seul, pour éviter les doublons)
     host: str | None = None
+    #: #8059: rôle élu dont les minuteries portent déjà la veille ; le
+    #: collecteur au repos s'efface tant que ce rôle a un bail vivant.
+    watch_role: str = DEFAULT_WATCH_ROLE
     #: secondes entre deux tours complets d'un projet
     interval: float = DEFAULT_INTERVAL
     #: secondes de garde d'une lecture CI partagée (#848)
@@ -2117,6 +2127,10 @@ def parse_settings(raw) -> Settings:
     host = raw.get("host")
     if host is not None and not isinstance(host, str):
         raise SettingsError("`github.host`: host name expected")
+    watch_role = raw.get("watch_role", DEFAULT_WATCH_ROLE)
+    if not isinstance(watch_role, str) or not watch_role.strip() \
+            or watch_role.strip() != watch_role:
+        raise SettingsError("`github.watch_role`: role name expected")
     interval = raw.get("interval", DEFAULT_INTERVAL)
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) \
             or interval < MIN_INTERVAL:
@@ -2149,6 +2163,7 @@ def parse_settings(raw) -> Settings:
         process[canonical] = _process_mappings(canonical, value)
     return Settings(projects=projects, host=(host or "").strip() or None,
                     interval=float(interval), ci_ttl=float(ci_ttl),
+                    watch_role=watch_role,
                     exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)),
                     workflows=workflows, bases=bases, process=process)
 
