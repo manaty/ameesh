@@ -108,7 +108,13 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   * `postgres`: a throwaway Postgres on a free loopback port, with
     `PGPASSWORD`, `AMEESH_TEST_DSN` and `DATABASE_URL`;
   * `ameesh`: the same, plus the psycopg venv cached by the hash of
-    `pyproject.toml`, for `scripts/test.sh` (which then skips `pg-up.sh`).
+    `pyproject.toml`, for `scripts/test.sh` (which then skips `pg-up.sh`);
+  * `nexlink` (#8098): manaty/nexlink's prevalidation parts. Its cache holds
+    a pinned Node 22 (SHA-256 checked), the shared npm cache and a `docker`
+    shim to the same rootless Podman (`run` in the job's slice, tmpfs image
+    volumes) for `scripts/sql-tests.sh`; `before` runs `npm ci` for each
+    package with a lock file; `after` removes this job's containers only
+    (label `nexlink.ci.owner=ameesh-job-<job>`).
 
   Postgres image volumes use tmpfs: PGDATA disappears when the container
   stops, including after a killed job, and counts against the job's memory
