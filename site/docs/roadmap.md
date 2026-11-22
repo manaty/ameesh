@@ -533,6 +533,7 @@ version.
 ## Generated release entries
 
 <!-- generated releases: begin -->
+- **v1.69.0** (2026-11-22): Migrations 0604; +11 internal lots.
 <!-- generated releases: end -->
 
 ## In progress
