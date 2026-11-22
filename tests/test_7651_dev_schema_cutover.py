@@ -41,7 +41,7 @@ class CutoverDeclarationTest(unittest.TestCase):
                          ['dev/0001_module_schema_cutover'])
         self.assertTrue(migrations.non_additive(found.migrations[0]))
         self.assertEqual(migrations.module_sql_problems(found.migrations[0]), [])
-        self.assertEqual(len(TABLES), 37)
+        self.assertEqual(len(TABLES), 39)
         for table in TABLES:
             self.assertIn("'%s'" % table, found.migrations[0].sql)
             self.assertIn("'%s'" % table, ROLLBACK)

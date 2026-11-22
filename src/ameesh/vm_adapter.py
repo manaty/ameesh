@@ -266,10 +266,18 @@ def run_probe(argv, timeout, *, pending=False):
     return code == 0
 
 
-def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, target):
-    """Only necessary capacity: immediate work, scheduled wake or enrolled release."""
+def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, target,
+             ci=None):
+    """Only necessary capacity: immediate work, scheduled wake, CI queue or
+    enrolled release."""
     if host in holds:
         return False
+    # #8031: a job the measured CI queue holds on labels this host's runners
+    # serve is work for a stopped CI VM. `ci` is the evidence read by
+    # `host_release.ci_wake_evidence`; `unknown` never wakes (it only forbids a
+    # stop, see `stop_evidence`).
+    if ci and ci.get('state') == 'waiting':
+        return True
     # #7769: `admitted_hosts` is declarative and nullable (0029). A row outside
     # `canon sync` carries NULL, which `get` returns as-is: NULL means no
     # declared admission, as every other reader already treats it.
@@ -317,8 +325,15 @@ def stop_evidence(cfg, db, host, control, *, now, quiet_s=None):
                         if c.get('ready') and c['host'] != role.get('holder')), None)
         if host in (role.get('holder'), reserve):
             raise Refused('elected leader or reserve protected')
+    # #8031: a CI host is stopped only on a readable, fresh queue. An
+    # unreadable reading is doubt: it never wakes, but it forbids the halt
+    # (`release_blocker` names it), because a job could be waiting on labels
+    # this VM's runners serve. A named lease or turn is reported first.
+    ci = host_release.ci_wake_evidence(db, host, now=now,
+                                       released_ts=control.get('released_ts'))
     reason = host_release.release_blocker(control, listing, reading,
-                                          footprint=fp, cfg=cfg, now=now, adapter_wait=True)
+                                          footprint=fp, cfg=cfg, now=now,
+                                          adapter_wait=True, ci=ci)
     if reason:
         # #7799: the R1 entry guard. `release_blocker` names the placed agents
         # whose lease is still live ("a lease is still held: <agents>"), so the
@@ -405,8 +420,12 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
         listing = store.operations.listing()
         lots = store.operations.open_lots_activity(None)
         holds = {h['host']: h for h in store.hosts.holds()}
+        # #8031: the same measured queue the scanner reads decides the wake of
+        # a stopped CI VM; `unknown` is no wake (the halt refuses it later).
+        ci = host_release.ci_wake_evidence(tx, host, now=now,
+                                           released_ts=control.get('released_ts'))
         due = wake_due(host, control, listing, lots, controls, holds, now=now,
-                       horizon=delay, target=target)
+                       horizon=delay, target=target, ci=ci)
         if due or control.get('return_requested_ts') is not None or control['mode'] == 'returning':
             q.return_intent(host)
             q.request(host, control['generation'], control['release_epoch'], 'busy')

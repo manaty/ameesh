@@ -741,11 +741,23 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- aucun contenu)
     ('ci_runner_state', ARRAY[
         'repo', 'runner_id', 'name', 'busy', 'job', 'busy_since', 'stuck_since',
-        'seen_at'
+        'seen_at',
+        -- #8031 (0603) : étiquettes servies par le runner, même nature qu'un nom
+        'labels'
     ]),
     ('ci_queue_state', ARRAY[
-        'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at'
+        'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at',
+        -- #8031 (0603) : instant du relevé qui a publié la file de réveil
+        'wait_seen_at'
     ]),
+    -- #8031 (0603) : jobs qu'aucun runner en ligne ne peut servir — dépôt,
+    -- étiquettes demandées, plus vieux job et comptage, dates. Même nature que
+    -- la file de capacité ci-dessus : aucun contenu, aucun identifiant secret.
+    ('ci_queue_wait', ARRAY[
+        'repo', 'labels', 'oldest_id', 'oldest_at', 'queued', 'seen_at'
+    ]),
+    -- #8031 (0603) : stamp de complétude qui date la publication des groupes.
+    ('ci_queue_wait_scan', ARRAY['repo', 'seen_at']),
     -- #5630 (0539) : mesures physiques CI, sans contenu ni identifiant secret.
     -- #5633 (0540) : première apparition, même nature (horodatage seul).
     ('ci_disk_state', ARRAY[

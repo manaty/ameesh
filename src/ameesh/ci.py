@@ -1145,6 +1145,34 @@ def _github_hosted(job, known) -> bool:
     return not any(labels <= runner_labels for runner_labels in known)
 
 
+def _queue_groups(waiting) -> list[dict]:
+    """#8031 : la file du réveil, groupée par jeu d'étiquettes demandées.
+
+    Le réveil d'une VM CI se décide, dans la même passe que `ci_queue_state`
+    (#845) mais sans nouvel appel à GitHub, par les jobs qu'**aucun runner en
+    ligne** ne peut servir : chaque groupe porte le plus vieux job et son
+    compte, pour que l'hôte qui sert ces étiquettes puisse se reconnaître. Un
+    job sans étiquette connue ne prouve aucun hôte capable de le servir ; il
+    est laissé hors des groupes (rien ne serait réveillé pour lui) tout en
+    restant compté par l'alerte de capacité."""
+    groups: dict[tuple, dict] = {}
+    for job in waiting or ():
+        labels = tuple(sorted(job.get("labels") or ()))
+        if not labels:
+            continue
+        group = groups.get(labels)
+        if group is None:
+            groups[labels] = {"labels": list(labels), "oldest_id": job.get("id"),
+                              "oldest_at": job.get("created_at"), "queued": 1}
+            continue
+        group["queued"] += 1
+        if (str(job.get("created_at") or ""), int(job.get("id") or 0)) < (
+                str(group.get("oldest_at") or ""), int(group.get("oldest_id") or 0)):
+            group["oldest_id"] = job.get("id")
+            group["oldest_at"] = job.get("created_at")
+    return [groups[key] for key in sorted(groups)]
+
+
 class Watcher:
     """Le relevé de la CI, mené par `ameesh notify` à chaque passage, sur
     l'hôte désigné (`github.host`). Une erreur (GitHub, base) d'un dépôt est
@@ -2314,21 +2342,42 @@ class Watcher:
                         # sans runner correspondant, car GitHub ne le prendra
                         # jamais.
                         known = [_label_set(r.get("labels")) for r in runners]
+                        online = [_label_set(r.get("labels")) for r in runners
+                                  if (r.get("status") or "online") == "online"]
                         free = [_label_set(r.get("labels")) for r in runners
                                 if (r.get("status") or "online") == "online"
                                 and not r.get("busy")]
                         waiting = [job for job in queued_jobs
                                    if not _github_hosted(job, known)
                                    and not _held_by_own_run(job, free, now)]
+                        # #8031 : la file du réveil est plus étroite que
+                        # l'alerte de capacité : un job qu'un runner EN LIGNE
+                        # porte déjà (même occupé) n'appelle aucune VM — il
+                        # sera pris au prochain créneau. Seul un job qu'aucun
+                        # runner en ligne ne peut servir prouve qu'une VM
+                        # arrêtée manque à la file.
+                        unserved = [job for job in queued_jobs
+                                    if not _github_hosted(job, known)
+                                    and not any(job["labels"] <= labels
+                                                for labels in online)]
+                        # #8031 : publier la file groupée AVANT la ligne de
+                        # dépôt, puis estampiller `wait_seen_at` DANS cette
+                        # ligne (`wait_published=True`). Un veilleur N-1
+                        # rafraîchit la file sans publier les groupes : le
+                        # stamp reste NULL ou antérieur, donc le réveil doute
+                        # au lieu de lire une file fraîche aux groupes
+                        # disparus.
+                        st.ci.observe_queue_wait(repo, _queue_groups(unserved))
                         if waiting:
                             oldest = min(waiting, key=lambda j: (
                                 str(j.get("created_at") or ""), int(j.get("id") or 0)))
                             st.ci.observe_queue(repo, oldest_id=oldest["id"],
                                                 oldest_at=oldest["created_at"] or None,
-                                                queued=len(waiting))
+                                                queued=len(waiting),
+                                                wait_published=True)
                         else:
                             st.ci.observe_queue(repo, oldest_id=None, oldest_at=None,
-                                                queued=0)
+                                                queued=0, wait_published=True)
                         state = []
                         for r in runners:
                             name = str(r.get("name") or "")
@@ -2336,7 +2385,15 @@ class Watcher:
                             busy = bool(r.get("busy")) and online
                             state.append({"id": r.get("id"), "name": name, "busy": busy,
                                           "job": holding.get(name) if busy else None,
-                                          "stuck": busy and name not in holding})
+                                          "stuck": busy and name not in holding,
+                                          # #8031 : en ligne ou hors ligne, la VM
+                                          # arrêtée garde ses runners enregistrés
+                                          # et leurs étiquettes pour le réveil ;
+                                          # un relevé sans étiquettes reste NULL
+                                          # (illisible), jamais une liste vide.
+                                          "labels": (sorted(_label_set(r.get("labels")))
+                                                     if r.get("labels") is not None
+                                                     else None)})
                         st.ci.observe_runners(repo, state)
                         complete = True
                         try:

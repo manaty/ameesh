@@ -379,13 +379,17 @@ class CiResults(DevDomain, interface.CiResults):
             if r.get("id") is None:
                 continue
             ids.append(int(r["id"]))
+            labels = r.get("labels")
+            # #8031 : les étiquettes du runner, en ligne ou hors ligne, sont la
+            # correspondance hôte → file qu'il peut servir. NULL = non relevé.
             self.db.execute(
                 """
                 INSERT INTO ci_runner_state AS s
-                    (repo, runner_id, name, busy, job, busy_since, stuck_since)
+                    (repo, runner_id, name, busy, job, busy_since, stuck_since, labels)
                 VALUES (%s, %s, %s, %s, %s,
                         CASE WHEN %s THEN now() END,
-                        CASE WHEN %s THEN now() END)
+                        CASE WHEN %s THEN now() END,
+                        %s::jsonb)
                 ON CONFLICT (repo, runner_id) DO UPDATE SET
                     name        = excluded.name,
                     busy        = excluded.busy,
@@ -394,10 +398,12 @@ class CiResults(DevDomain, interface.CiResults):
                                        THEN coalesce(s.busy_since, now()) ELSE NULL END,
                     stuck_since = CASE WHEN excluded.stuck_since IS NOT NULL
                                        THEN coalesce(s.stuck_since, now()) ELSE NULL END,
+                    labels      = excluded.labels,
                     seen_at     = now()
                 """,
                 (repo, int(r["id"]), r.get("name") or "", bool(r.get("busy")),
-                 r.get("job"), bool(r.get("busy")), bool(r.get("stuck"))))
+                 r.get("job"), bool(r.get("busy")), bool(r.get("stuck")),
+                 json.dumps(sorted(labels)) if labels is not None else None))
         # un runner retiré du dépôt ne doit pas laisser une alerte derrière lui
         if ids:
             marks = ", ".join(["%s"] * len(ids))
@@ -419,29 +425,141 @@ class CiResults(DevDomain, interface.CiResults):
              ORDER BY repo, name
             """)
 
-    def observe_queue(self, repo, *, oldest_id, oldest_at, queued) -> None:
+    def all_runners(self) -> list[dict]:
+        """#8031 : tous les runners relevés, avec leurs étiquettes.
+
+        En ligne ou hors ligne : GitHub les rend encore quand la VM est
+        arrêtée, et c'est cette inscription qui nomme les étiquettes que
+        l'hôte peut servir au réveil."""
+        return self.db.query(
+            """
+            SELECT repo, runner_id, name, busy, labels,
+                   extract(epoch from seen_at)::float8 AS seen_ts
+              FROM ci_runner_state
+             ORDER BY repo, name
+            """)
+
+    def observe_queue(self, repo, *, oldest_id, oldest_at, queued,
+                      wait_published=False) -> None:
+        """#8031 : `wait_published` estampille `wait_seen_at` dans la même
+        écriture que `seen_at`, preuve que `ci_queue_wait` vient de cette
+        passe. Sans lui, un veilleur N-1 rafraîchit la file de capacité sans
+        publier les groupes : `wait_seen_at` reste NULL ou antérieur, et le
+        lecteur doute au lieu de lire une file de réveil vide."""
         self.db.execute(
             """
-            INSERT INTO ci_queue_state AS q (repo, oldest_id, oldest_at, queued, seen_at)
-            VALUES (%s, %s, %s::timestamptz, %s, now())
+            INSERT INTO ci_queue_state AS q
+                (repo, oldest_id, oldest_at, queued, seen_at, wait_seen_at)
+            VALUES (%s, %s, %s::timestamptz, %s, now(),
+                    CASE WHEN %s THEN now() END)
             ON CONFLICT (repo) DO UPDATE SET
-                oldest_id = excluded.oldest_id,
-                oldest_at = excluded.oldest_at,
-                queued    = excluded.queued,
-                seen_at   = now()
+                oldest_id    = excluded.oldest_id,
+                oldest_at    = excluded.oldest_at,
+                queued       = excluded.queued,
+                seen_at      = excluded.seen_at,
+                wait_seen_at = CASE WHEN %s THEN excluded.wait_seen_at
+                                    ELSE q.wait_seen_at END
             """,
             (repo, int(oldest_id) if oldest_id is not None else None, oldest_at,
-             int(queued or 0)))
+             int(queued or 0), bool(wait_published), bool(wait_published)))
 
     def queued_oldest(self) -> list[dict]:
         return self.db.query(
             """
-            SELECT repo, oldest_id, queued,
+            SELECT q.repo, q.oldest_id, q.queued,
+                   extract(epoch from q.oldest_at)::float8    AS oldest_ts,
+                   extract(epoch from q.seen_at)::float8      AS seen_ts,
+                   extract(epoch from q.wait_seen_at)::float8 AS wait_seen_ts,
+                   extract(epoch from s.seen_at)::float8      AS scan_seen_ts
+              FROM ci_queue_state AS q
+              LEFT JOIN ci_queue_wait_scan AS s ON s.repo = q.repo
+             ORDER BY q.repo
+            """)
+
+    def queue_wait(self) -> list[dict]:
+        """#8031 : la file du réveil, groupée par jeu d'étiquettes demandées."""
+        return self.db.query(
+            """
+            SELECT repo, labels, oldest_id, queued,
                    extract(epoch from oldest_at)::float8 AS oldest_ts,
                    extract(epoch from seen_at)::float8   AS seen_ts
-              FROM ci_queue_state
-             ORDER BY repo
+              FROM ci_queue_wait
+             ORDER BY repo, labels
             """)
+
+    def wake_queue(self) -> list[dict]:
+        """#8031 : file de capacité, stamp de scan et groupes en UNE lecture.
+
+        Les trois tables sont jointes dans la même requête (même instantané) :
+        un `observe_queue_wait` concurrent ne peut pas fournir des timestamps
+        d'une génération avec les groupes d'une autre. Une ligne par groupe ;
+        une file vide rend une ligne au `labels` NULL, avec le stamp du scan."""
+        return self.db.query(
+            """
+            SELECT q.repo,
+                   extract(epoch from q.oldest_at)::float8     AS oldest_ts,
+                   q.queued                                    AS queue_queued,
+                   extract(epoch from q.seen_at)::float8       AS seen_ts,
+                   extract(epoch from q.wait_seen_at)::float8  AS wait_seen_ts,
+                   extract(epoch from s.seen_at)::float8       AS scan_seen_ts,
+                   w.labels,
+                   extract(epoch from w.oldest_at)::float8     AS wait_oldest_ts,
+                   w.queued                                    AS wait_queued,
+                   extract(epoch from w.seen_at)::float8       AS group_seen_ts
+              FROM ci_queue_state AS q
+              LEFT JOIN ci_queue_wait_scan AS s ON s.repo = q.repo
+              LEFT JOIN ci_queue_wait AS w ON w.repo = q.repo
+             ORDER BY q.repo, w.labels
+            """)
+
+    def observe_queue_wait(self, repo, groups) -> None:
+        """#8031 : remplace la file du réveil du dépôt par `groups`.
+
+        Le veilleur publie ces groupes AVANT `ci_queue_state`, dont
+        `wait_published=True` estampille `wait_seen_at`. Les groupes et
+        `ci_queue_wait_scan` sont écrits dans le MÊME ordre SQL : le stamp
+        existe même quand la file est vide. Une publication interrompue laisse
+        le stamp de la file antérieur (groupes ou scan plus récents) ou NULL
+        (veilleur N-1), donc le lecteur doute au lieu de lire une file
+        fraîche aux groupes disparus. La suppression des groupes disparus et
+        l'UPSERT des groupes présents ne laissent aucun état intermédiaire
+        visible, et un groupe qui demeure est mis à jour sans violer sa clé."""
+        payload = json.dumps([
+            {"labels": sorted({str(label).strip().casefold()
+                               for label in group.get("labels") or ()
+                               if str(label).strip()}),
+             "oldest_id": (int(group["oldest_id"])
+                           if group.get("oldest_id") is not None else None),
+             "oldest_at": group.get("oldest_at") or None,
+             "queued": int(group.get("queued") or 0)}
+            for group in groups])
+        self.db.execute(
+            """
+            WITH fresh AS (
+                SELECT labels, oldest_id, oldest_at, queued
+                  FROM jsonb_to_recordset(%s::jsonb)
+                       AS x(labels jsonb, oldest_id bigint, oldest_at timestamptz,
+                            queued integer)
+            ), gone AS (
+                DELETE FROM ci_queue_wait AS old
+                 WHERE old.repo = %s
+                   AND NOT EXISTS (SELECT 1 FROM fresh
+                                    WHERE fresh.labels = old.labels)
+            ), scan AS (
+                INSERT INTO ci_queue_wait_scan(repo, seen_at)
+                VALUES (%s, now())
+                ON CONFLICT (repo) DO UPDATE SET seen_at = excluded.seen_at
+                RETURNING seen_at
+            )
+            INSERT INTO ci_queue_wait(repo, labels, oldest_id, oldest_at, queued, seen_at)
+            SELECT %s, labels, oldest_id, oldest_at, queued, scan.seen_at
+              FROM fresh, scan
+            ON CONFLICT (repo, labels) DO UPDATE SET
+                oldest_id = excluded.oldest_id,
+                oldest_at = excluded.oldest_at,
+                queued    = excluded.queued,
+                seen_at   = excluded.seen_at
+            """, (payload, repo, repo, repo))
 
     def prune_queue(self, repos) -> None:
         """#2957 : les relevés des dépôts hors du périmètre actif sont retirés.
@@ -449,16 +567,24 @@ class CiResults(DevDomain, interface.CiResults):
         Sans cette purge, un dépôt sorti de `github.projects` garde sa ligne
         `ci_queue_state` : le repli de `github_observation` sur un hôte sans
         configuration continue de le surveiller et alerte à jamais de son
-        silence. Sans périmètre, rien n'est retiré (on ne sait pas si les
-        dépôts ont été retirés ou si la configuration locale est seulement
-        absente)."""
+        silence. #8031 : la file groupée par étiquettes suit la même purge,
+        sinon un réveil nommerait un dépôt sorti du périmètre. Sans périmètre,
+        rien n'est retiré (on ne sait pas si les dépôts ont été retirés ou si
+        la configuration locale est seulement absente)."""
         keys = sorted({str(repo).strip().casefold() for repo in repos
                        if str(repo).strip()})
         if not keys:
             return
+        marks = ", ".join(["%s"] * len(keys))
         self.db.execute(
-            "DELETE FROM ci_queue_state WHERE lower(repo) NOT IN (%s)"
-            % ", ".join(["%s"] * len(keys)), tuple(keys))
+            "DELETE FROM ci_queue_wait WHERE lower(repo) NOT IN (%s)" % marks,
+            tuple(keys))
+        self.db.execute(
+            "DELETE FROM ci_queue_wait_scan WHERE lower(repo) NOT IN (%s)" % marks,
+            tuple(keys))
+        self.db.execute(
+            "DELETE FROM ci_queue_state WHERE lower(repo) NOT IN (%s)" % marks,
+            tuple(keys))
 
     # -- #3344 : âge de la carte de mesure ----------------------------------
     def observe_map(self, repo, *, branch, run_id, head_sha, published_at) -> None:

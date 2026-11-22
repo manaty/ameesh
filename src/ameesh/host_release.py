@@ -66,6 +66,10 @@ ADAPTER_IMMEDIATE = {"halt deadline passed": "halt_deadline",
 # #6080: a return blocked in standby (poweron not allowed) ages against the
 # stall bound from its first refusal.
 ADAPTER_POWERON_REFUSED = "poweron refused"
+#: #8031: beyond this silence the measured CI queue proves nothing. Same bound
+#: as `exploitation.CI_GUARD_FRESH_S` (an interrupted reading no longer founds
+#: an alert): the wake does not act on it, and the stop is refused.
+CI_WAKE_FRESH_S = 1800.0
 #: bounded text kept from a hook
 DETAIL_MAX = 400
 #: a run count is usable only when A published a real source
@@ -279,12 +283,18 @@ def auto_drain_blocker(footprint, control, *, hook, held=None):
     return None
 
 
-def release_blocker(control, listing, reading, *, footprint, cfg, now, adapter_wait=False):
+def release_blocker(control, listing, reading, *, footprint, cfg, now,
+                    adapter_wait=False, ci=None):
     """Why a draining host cannot yet be declared `idle-drained`, or None.
 
     `adapter_wait` (#5925) is only for the operator's already-queued release:
     billing hysteresis may outlast the drain bound. All live safety evidence
     still applies; the native scanner keeps its original timeout.
+
+    `ci` (#8031) is the wake evidence of a CI host (`ci_wake_evidence`). A job
+    waiting on the labels this host serves, or an unreadable/stale queue, keeps
+    the host up: a VM is never stopped on a reading that cannot prove the CI
+    queue empty.
     """
     if listing is None:
         return "agent activity unreadable"
@@ -318,6 +328,14 @@ def release_blocker(control, listing, reading, *, footprint, cfg, now, adapter_w
                   if a.get("host") == control.get("host") and a.get("lease_live"))
     if held:
         return "a lease is still held: %s" % ", ".join(held)
+    # #8031: the CI queue is capacity evidence like a lease: a job that only
+    # this host's runners can serve keeps it up, and an unreadable measurement
+    # forbids the stop (doubt), never the wake.
+    if ci and ci.get("state") == "waiting":
+        return "CI job waiting for %s (%s)" % (
+            ", ".join(ci.get("labels") or ()), ci.get("repo") or "?")
+    if ci and ci.get("state") == "unknown":
+        return "CI queue unreadable: %s" % (ci.get("reason") or "no measurement")
     return None
 
 
@@ -362,6 +380,156 @@ def return_targets(control, listing, controls, *, known_hosts, holds):
             continue
         out.append(row.get("name"))
     return sorted(out)
+
+
+def _runner_labels(row):
+    """The case-folded label set a measured runner carries (None: unreadable)."""
+    labels = row.get("labels")
+    if labels is None:
+        return None
+    return frozenset(str(label).strip().casefold() for label in labels
+                     if str(label).strip())
+
+
+def _host_runner(row, host):
+    """Is this measured runner one of `host`'s? The fleet names them
+    `<host>-<slot>` (`ameesh-ci-1-3`); a runner outside that convention is
+    never evidence for the host, so no arbitrary registration wakes it."""
+    return str(row.get("name") or "").startswith(str(host) + "-")
+
+
+def ci_wake(host, runners, queues, waiting, *, now, released_ts=None,
+            fresh_s=CI_WAKE_FRESH_S):
+    """#8031: should `host` be woken for a CI job the measured queue holds?
+
+    The queue is the **wake queue** measured by `ci.Watcher` in the same pass
+    as `ci_queue_saturated` (#845/#7015/#7935), but narrower: it holds the jobs
+    **no online runner** can serve. A job an online runner can take (free or
+    merely busy) waits for that runner's next slot, not for a stopped VM. A CI
+    VM is recognised by its **registered runners** (online or offline, GitHub
+    keeps them while the VM is stopped): a runner named `<host>-<slot>` carries
+    the labels the host serves. A waiting group whose labels one of those
+    runners carries is a job only this host (or an identical one) can run now.
+
+    Completeness is proven by the queue row itself: its `wait_seen_ts` must
+    equal its `seen_ts` (the current pass stamped that it published the wake
+    queue, even empty), and no group may be newer than that stamp. A row
+    refreshed by an N-1 watcher, or left by an interrupted publication, is
+    `unknown` — never a silent "nothing waits".
+
+    Returns `{"state": "waiting", repo, labels, oldest_ts}` when the host must
+    come back, `{"state": "inert"}` when the host has no measured runner (a
+    non-CI host, or a fleet never enrolled: nothing changes), `{"state":
+    "idle"}` when the measured queue holds nothing it can serve, and
+    `{"state": "unknown", reason}` when the measurement cannot prove either
+    way (stale/missing queue, unreadable labels). `unknown` never wakes: it
+    only forbids a stop (`release_blocker`).
+
+    A group measured at or before `released_ts` (the host's last release) is
+    ignored: waking on the reading that preceded the stop would restart the
+    VM in a loop. The next complete queue reading decides again.
+    """
+    host_runners = [row for row in runners or () if _host_runner(row, host)]
+    if not host_runners:
+        return {"state": "inert"}
+    queues = {row.get("repo"): row for row in queues or ()}
+    by_repo: dict[str, list] = {}
+    for row in host_runners:
+        by_repo.setdefault(row.get("repo"), []).append(row)
+    wait_rows: dict[str, list] = {}
+    for row in waiting or ():
+        wait_rows.setdefault(row.get("repo"), []).append(row)
+    due, unknown = [], []
+    for repo in sorted(by_repo, key=lambda value: str(value)):
+        queue = queues.get(repo)
+        if not queue:
+            unknown.append("%s: queue never measured" % repo)
+            continue
+        queue_seen = resources.finite_float(queue.get("seen_ts"))
+        if queue_seen is None or now - queue_seen > fresh_s:
+            unknown.append("%s: queue reading stale" % repo)
+            continue
+        # #8031 (B de revue) : la ligne de capacité ne vaut que si le relevé
+        # courant a publié la file de réveil dans la même passe. Un veilleur
+        # N-1 rafraîchit `ci_queue_state` sans toucher ce stamp ; une
+        # publication interrompue laisse le stamp des groupes plus récent que
+        # la file (ou absent). Le scan est écrit avec les groupes, même vides.
+        wait_seen = resources.finite_float(queue.get("wait_seen_ts"))
+        if wait_seen is None or abs(wait_seen - queue_seen) > 1e-6:
+            unknown.append("%s: wake queue not published by this scan" % repo)
+            continue
+        scan_seen = resources.finite_float(queue.get("scan_seen_ts"))
+        if scan_seen is None or now - scan_seen > fresh_s:
+            unknown.append("%s: wake queue scan missing or stale" % repo)
+            continue
+        if scan_seen > wait_seen + 1e-6:
+            unknown.append("%s: wake queue published after the queue reading"
+                           % repo)
+            continue
+        served = []
+        for row in by_repo[repo]:
+            labels = _runner_labels(row)
+            if labels is None:
+                unknown.append("%s: labels of %s unreadable"
+                               % (repo, row.get("name") or "?"))
+            elif labels:
+                served.append(labels)
+        for row in wait_rows.get(repo, ()):
+            job = _runner_labels(row)
+            if not job:
+                continue  # no label proves no host able to serve it
+            group_seen = resources.finite_float(row.get("seen_ts"))
+            if group_seen is None or now - group_seen > fresh_s:
+                unknown.append("%s: waiting jobs unreadable" % repo)
+                continue
+            if abs(group_seen - scan_seen) > 1e-6:
+                unknown.append("%s: waiting jobs from another scan" % repo)
+                continue
+            if released_ts is not None and group_seen <= float(released_ts):
+                # Measured before the host's last release: never a wake.
+                continue
+            if any(job <= labels for labels in served):
+                due.append(dict(row, repo=repo))
+    if due:
+        row = min(due, key=lambda item: (
+            resources.finite_float(item.get("oldest_ts")) or 0.0,
+            str(item.get("repo")), str(item.get("labels"))))
+        return {"state": "waiting", "repo": row.get("repo"),
+                "labels": list(row.get("labels") or ()),
+                "oldest_ts": resources.finite_float(row.get("oldest_ts"))}
+    if unknown:
+        return {"state": "unknown", "reason": unknown[0]}
+    return {"state": "idle"}
+
+
+def ci_wake_evidence(db, host, *, now, released_ts=None):
+    """#8031: read the measured CI queue and decide for `host`.
+
+    Read-only and never fatal to the caller: an error is `unknown` (no wake,
+    no stop), not an exception. A storage backend without the CI domain (the
+    mediated executor) is `inert`: the local adapter and scanner always read
+    the real one, and a missing domain must not block every host life-cycle.
+
+    Capacity row, scan stamp and waiting groups come from **one** storage
+    query (`wake_queue`), hence one snapshot: a concurrent `observe_queue_wait`
+    cannot pair one generation's timestamps with another's groups.
+    """
+    try:
+        store = storage.of(db)
+        ci = getattr(store, "ci", None)
+        if ci is None:
+            return {"state": "inert"}
+        rows = ci.wake_queue()
+        waiting = [{"repo": row.get("repo"), "labels": row.get("labels"),
+                    "oldest_ts": row.get("wait_oldest_ts"),
+                    "queued": row.get("wait_queued"),
+                    "seen_ts": row.get("group_seen_ts")}
+                   for row in rows if row.get("labels") is not None]
+        return ci_wake(host, ci.all_runners(), rows, waiting,
+                       now=now, released_ts=released_ts)
+    except Exception as exc:  # noqa: BLE001 - doubt, never a crash
+        return {"state": "unknown", "reason": "CI queue unreadable (%s)"
+                % type(exc).__name__}
 
 
 def release_check(host, listing, lots, *, controls, holds):
@@ -523,9 +691,15 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, canon_unknown,
             return "claims already closed"
         row = api.get(host) or row
     released = row.get("release_state") == "idle-drained"
+    # #8031: the measured CI queue is a wake cause and a stop blocker for the
+    # host whose registered runners serve the waiting labels. Read here, once,
+    # so the return decision and the stop proof see the same evidence.
+    ci = ci_wake_evidence(db, host, now=now,
+                          released_ts=resources.finite_float(row.get("released_ts")))
     need_return = (return_targets(row, listing, controls, known_hosts=known,
                                   holds=holds)
-                   or row.get("return_requested_ts") is not None)
+                   or row.get("return_requested_ts") is not None
+                   or ci.get("state") == "waiting")
     reading = _fresh_reading(cfg, db, host, now=now,
                              after=row.get("requested_ts"))
     footprint = _host_footprint(cfg, db, canons, host, reading, listing,
@@ -552,7 +726,7 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, canon_unknown,
                             runner=runner, clock=clock)
             return "busy"
         blocker = release_blocker(row, listing, reading,
-                                  footprint=footprint, cfg=cfg, now=now)
+                                  footprint=footprint, cfg=cfg, now=now, ci=ci)
         if blocker is not None:
             return blocker
         _run_transition(cfg, api, canons, row, "idle-drained", actor=actor,
