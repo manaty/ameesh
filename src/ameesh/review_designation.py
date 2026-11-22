@@ -1331,6 +1331,15 @@ N1_QUESTION = (
     "Replay their write (or its SQL stub) against the new schema and reader "
     "(`PgTestCase.previous_write`, CONTRIBUTING.md);")
 
+#: #8043: the permanent reading rule, in every reviewer mail whatever the
+#: class or the SQL: the frozen head is read from an immutable snapshot —
+#: never from a shared working tree or a branch name that can move.
+SNAPSHOT_INSTRUCTION = (
+    "- read the diff and the files of the frozen head from an immutable "
+    "snapshot (`git diff <base>...<sha>`, `git show <sha>:<path>`, or a "
+    "detached worktree at `<sha>`), never from a shared working tree or a "
+    "branch name that can move; the verdict cites the SHA read;")
+
 
 def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      reviewer: Mapping, authors: Iterable = (), base: str = "",
@@ -1363,6 +1372,11 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
     `sql_migration` (#5690) adds the N-1 question: the frozen diff carries a
     migration, so a column added for the new code may be left unwritten by
     writers still on the previous version during a wave deployment.
+
+    Every mail, in the correction room or the normal path, also carries the
+    permanent reading rule (`SNAPSHOT_INSTRUCTION`, #8043): the frozen head is
+    read from an immutable snapshot, never from a shared working tree or a
+    branch name that can move; the verdict cites the SHA read.
     """
     sha = str((freeze or {}).get("sha") or "")
     fid = (freeze or {}).get("id")
@@ -1417,6 +1431,7 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
     ]
     remaining = _correction_room(required, eligible_families, correction)
     read = ["- read the diff **of this exact head** and check the edge cases;",
+            SNAPSHOT_INSTRUCTION,
             "- Read the lot's current freeze before reviewing: a re-freeze keeps your "
             "pending seat without another mail; use its current head and delta.",
             "- do not announce an ok verdict by mail: record it through the milestone; "
