@@ -1243,17 +1243,17 @@ def _record_ahead(member, carrier, now: float) -> bool:
 
 
 def _head_outside_source(db, unit, current, source):
-    """True only when local Git proves the observed head is outside the source."""
+    """Preserve the notice unless local Git proves the head is in the source."""
     if db is None:
-        return False
+        return True
     from . import lot_class, plan_git
     try:
         repo, _ = lot_class.repo_for_freeze(db, getattr(db, "cfg", None), unit, source)
         if not repo:
-            return False
-        return plan_git._git(repo, "merge-base", "--is-ancestor", current, source).returncode == 1
-    except Exception:  # unreadable Git is unknown, not evidence of a new head
-        return False
+            return True
+        return plan_git._git(repo, "merge-base", "--is-ancestor", current, source).returncode != 0
+    except Exception:  # unreadable Git must not suppress a potentially new head
+        return True
 
 
 def recorded_packet_attachments(st, open_items, rows, *, now=None, moved=None, db=None):

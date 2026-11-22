@@ -53,9 +53,16 @@ class PacketHeadAncestryTest(unittest.TestCase):
         self.assertEqual(self.attachment(self.later), {
             1: {"vehicle": 90, "frozen": self.source, "head": self.later}})
 
-    def test_unreadable_commit_has_no_notice(self):
-        self.assertEqual(self.attachment("f" * 40), {})
+    def test_unreadable_commit_has_notice(self):
+        self.assertEqual(self.attachment("f" * 40), {
+            1: {"vehicle": 90, "frozen": self.source, "head": "f" * 40}})
 
-    def test_unreadable_repository_has_no_notice(self):
+    def test_unreadable_repository_has_notice(self):
         with mock.patch.object(lot_class, "repo_for_freeze", side_effect=OSError):
-            self.assertEqual(self.attachment(self.later), {})
+            self.assertEqual(self.attachment(self.later), {
+                1: {"vehicle": 90, "frozen": self.source, "head": self.later}})
+
+    def test_missing_repository_has_notice(self):
+        with mock.patch.object(lot_class, "repo_for_freeze", return_value=(None, None)):
+            self.assertEqual(self.attachment(self.later), {
+                1: {"vehicle": 90, "frozen": self.source, "head": self.later}})
