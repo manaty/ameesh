@@ -678,6 +678,13 @@ class AlertsTest(unittest.TestCase):
                 self._row(harness="claude", account="primaire", checked_ts=NOW - 60)]
         self.assertEqual(self._alerts(rows), [])
 
+    def test_stale_healthy_forecast_is_not_reported(self):
+        # #8042 : claude/primaire d'AG1, relevé cinq jours plus tôt ; la sonde
+        # n'avait pas recalculé l'échéance après un rafraîchissement du jeton.
+        row = self._row(harness="claude", account="primaire",
+                        checked_ts=NOW - 5 * 86400, expires_ts=NOW - 60)
+        self.assertEqual(self._alerts([row]), [])
+
     def test_stale_default_failure_is_ignored_once_accounts_are_declared(self):
         rows = [self._row(harness="claude", account="", state="failing",
                           failing_since_ts=NOW - 7 * 86400,
