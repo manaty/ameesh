@@ -113,11 +113,15 @@ Les phases persistées précèdent les effets externes : `publishing`,
 perdue ne provoque pas un deuxième dispatch. Une promotion incertaine conserve
 son intention ; le passage suivant constate la cible exacte ou sollicite le
 pilote. Une pause pour échecs répétés ne repart pas d'elle-même. #8096 : après un
-rouge, le pilote qui renvoie un lot fautif en build inscrit en tête de la note
-le marqueur `train-fault: <identifiant du plan> <motif>` ; citer seulement
-l'identifiant ne vaut pas attribution. Le service invalide la pause et
-recompose sans eux uniquement quand tous les lots explicitement marqués (et
-ceux nommés par le diagnostic) ont quitté `validated` : le retrait d'un
+rouge, le pilote déclare d'un seul geste l'ensemble complet des fautifs par une
+note d'un membre du plan commençant par
+`train-faults: <identifiant du plan> lots=[<id>,<id>...]; <motif>` ; citer
+seulement l'identifiant, ou marquer un lot à la fois, ne prouve pas que
+l'ensemble est complet (une passe entre deux retours verrait un ensemble
+partiel et lèverait la pause alors qu'un fautif reste). La déclaration la plus
+récente pour ce plan fait foi. Le service invalide la pause et recompose sans
+eux uniquement quand tous les fautifs déclarés (et ceux nommés par le
+diagnostic) sont membres du plan et ont quitté `validated` : le retrait d'un
 innocent, ou d'une partie seulement des fautifs, laisse la pause.
 
 Une admission retirée ou devenue invalide après publication ne termine pas

@@ -37,7 +37,7 @@ class MemoryPorts:
         self.fired, self.admitted = True, True
         self.synced = None
         self.edges = []
-        #: #8096: fautifs explicitement nommés pour le plan paused.
+        #: #8096: ensemble complet des fautifs déclaré pour le plan paused.
         self.faults = set()
 
     def acquire(self, epoch):

@@ -72,8 +72,8 @@ class TrainRuntimeTest(PgTestCase):
     def engine_for(self, runtime):
         return train.Engine(runtime, source=self.repository.source, target="main", policy=self.policy)
 
-    def test_8096_plan_faults_reads_the_attribution_through_admissions(self):
-        """#45460 : le runtime expose la preuve persistante au moteur."""
+    def test_8096_plan_faults_reads_the_declaration_through_admissions(self):
+        """#45460/#231037 : le runtime expose la déclaration persistante au moteur."""
         plan = {"id": "a" * 64}
         self.admissions.plan_faults.return_value = {7}
         self.assertEqual(self.runtime.plan_faults(plan), {7})

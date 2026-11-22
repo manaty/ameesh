@@ -716,10 +716,11 @@ class Engine:
         Un plan en pause après un rouge ne sera jamais promu tel quel. Le
         service ne l'invalide que sur une preuve (B cx2 #45452, #45460) :
         - tous ses membres ont quitté `validated` (plus rien à composer) ;
-        - sinon, tous les fautifs NOMMÉS par le diagnostic ou par le marqueur
-          `train-fault: <plan>` du journal (`plan_faults`) ont quitté : un
-          retrait partiel, ou le retrait d'un innocent alors qu'un fautif
-          reste, ne prouve rien et garde la pause.
+        - sinon, tous les fautifs NOMMÉS par le diagnostic ou par la
+          déclaration complète `train-faults: <plan> lots=[<id>,...];` du journal
+          (`plan_faults`) ont quitté : un retrait partiel, un marqueur posé lot
+          par lot, ou le retrait d'un innocent alors qu'un fautif reste, ne
+          prouve rien et garde la pause.
         Le retour est la liste des lots partis, ou None sans preuve suffisante
         (ou lecture incomplète : port sans `entries`, document ou erreur),
         fail-closed.
@@ -918,10 +919,10 @@ class Engine:
             state["phase"] = "paused"
             state = self._save(state)
             self.ports.notify("build/beta packet CI red (plan %s): factual diagnosis "
-                              "unknown; no automatic diagnostic CI. To attribute a "
-                              "culprit, return it to build with a note beginning "
-                              "train-fault: %s <reason>; the pause lifts only when "
-                              "every marked culprit has left."
+                              "unknown; no automatic diagnostic CI. To declare the "
+                              "complete set of culprits, write a note beginning "
+                              "train-faults: %s lots=[<lot>,<lot>]; <reason>; the "
+                              "pause lifts only when every declared culprit has left."
                               % (state["plan"]["id"][:8], state["plan"]["id"][:8]), state)
             return {"result": "paused"}
         if state["failures"] >= self.policy.max_failures:

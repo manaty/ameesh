@@ -94,29 +94,43 @@ class TrainAdmissionsTest(PgTestCase):
         self.assertEqual([r["work_item_id"] for r in self.admissions.entries()],
                          [self.entry["work_item_id"]])
 
-    def test_8096_only_an_explicit_train_fault_marker_attributes_the_lot(self):
-        """#45468 : citer le plan ne prouve pas la faute, le marqueur oui.
+    def test_8096_only_a_complete_declaration_links_the_culprits_to_the_plan(self):
+        """#45468/#231037 : une déclaration atomique, jamais un marqueur partiel.
 
-        Le journal du lot est persistant : le pilote marque explicitement le
-        fautif par `train-fault: <plan-id> <motif>`. Un retrait pour
-        dépendance, une note ordinaire qui cite seulement l'identifiant, ou
-        une note ajoutée plus tard dans build n'attribuent rien.
+        Le journal des membres est persistant : le pilote y déclare d'un seul
+        geste l'ensemble complet des fautifs. Un marqueur par lot, un retrait
+        pour dépendance ou une note qui cite seulement l'identifiant
+        n'attribuent rien. La déclaration la plus récente fait foi.
         """
         other = self.enqueue()
+        entry_id, other_id = self.entry["work_item_id"], other["work_item_id"]
         plan_id = "25d1a5fb" + "a" * 56
         plan = {"id": plan_id, "members": [self.entry, other]}
-        self.ops.move(self.entry["work_item_id"], "build", current="qa", loops=0,
-                      note="train-fault: %s sql-rules red" % plan_id[:8],
-                      actor="orchestrator")
-        self.ops.move(other["work_item_id"], "build", current="qa", loops=0,
+        self.ops.move(entry_id, "build", current="qa", loops=0,
+                      note="train-fault: %s lots=%d sql-rules red"
+                      % (plan_id[:8], entry_id), actor="orchestrator")
+        self.ops.move(other_id, "build", current="qa", loops=0,
                       note="retiré pour dépendance, cite %s sans faute"
                       % plan_id[:8], actor="orchestrator")
-        # Une note ordinaire écrite plus tard DANS build ne vaut pas faute :
-        # seule l'attribution explicite du pilote compte.
-        self.ops.note(other["work_item_id"], "build",
-                      "train-fault manquant, cite %s" % plan_id[:8], "fixture")
-        self.assertEqual(self.admissions.plan_faults(plan),
-                         {self.entry["work_item_id"]})
+        self.ops.note(other_id, "build",
+                      "note citant %s sans déclaration" % plan_id[:8], "fixture")
+        self.assertEqual(self.admissions.plan_faults(plan), set())
+        # Déclaration atomique : les deux fautifs, partis ou non.
+        self.ops.note(other_id, "build",
+                      "train-faults: %s lots=[%d,%d]; sql-rules red"
+                      % (plan_id[:8], entry_id, other_id), "orchestrator")
+        self.assertEqual(self.admissions.plan_faults(plan), {entry_id, other_id})
+        # Une déclaration plus récente mais illisible ne prouve rien et ne
+        # retombe pas sur l'ancienne : la liste close est vérifiable.
+        self.ops.note(other_id, "build",
+                      "train-faults: %s lots=[%d,%d] sans clôture"
+                      % (plan_id[:8], entry_id, other_id), "orchestrator")
+        self.assertEqual(self.admissions.plan_faults(plan), set())
+        # Une déclaration plus récente et valide remplace la précédente.
+        self.ops.note(entry_id, "build",
+                      "train-faults: %s lots=[%d]; correction" % (plan_id[:8], entry_id),
+                      "orchestrator")
+        self.assertEqual(self.admissions.plan_faults(plan), {entry_id})
         self.assertEqual(self.admissions.plan_faults(dict(plan, id="b" * 64)), set())
         self.assertEqual(self.admissions.plan_faults({"id": plan_id}), set())
 

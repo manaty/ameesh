@@ -243,11 +243,11 @@ class CutoffTest(unittest.TestCase):
         self.assertNotIn("promote", [e[0] for e in self.ports.effects])
         self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
 
-    def test_8096_a_marked_build_return_attributes_the_removal(self):
-        """#45460/#45468 : le marqueur explicite du pilote est la preuve durable.
+    def test_8096_a_complete_declaration_attributes_the_removal(self):
+        """#231037 : la déclaration atomique du pilote est la preuve durable.
 
-        C'est le chemin réel : le journal du lot porte la note du pilote
-        `train-fault: <id>`, que `plan_faults` relit.
+        C'est le chemin réel : le journal d'un membre porte la note
+        `train-faults: <id> lots=[<lot>,...]; <motif>`, que `plan_faults` relit.
         """
         schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
         engine = self.engine([admitted(1), admitted(2)], schedule=schedule)
@@ -263,11 +263,40 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(result["result"], "ci", result)
         self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
 
-    def test_8096_innocent_or_partial_marked_removal_keeps_the_pause(self):
-        """B cx2 #45468 : le marqueur lie les fautifs au plan, pas les voisins.
+    def test_8096_a_pass_before_the_complete_declaration_keeps_the_pause(self):
+        """B cx2 #231037 : une passe entre deux retours ne prouve pas l'ensemble.
+
+        A et B sont fautifs sans diagnostic. A revient en build et une passe a
+        lieu avant la déclaration complète : rien ne prouve encore que B n'est
+        pas fautif, donc la pause tient. La déclaration {A, B} arrive ensuite,
+        B encore présent : la pause tient. B part à son tour : tous les fautifs
+        déclarés ont quitté, la recomposition repart sans eux.
+        """
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2), admitted(3)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        # A (2) est revenu en build ; aucune déclaration complète n'existe.
+        self.ports.rows = [admitted(1), admitted(3)]
+        self.assertEqual(engine.step(stamp("2026-10-15T11:10:00"))["result"], "paused")
+        # Déclaration atomique {2, 3} : 3 est encore dans le plan, pause.
+        self.ports.faults = {2, 3}
+        self.assertEqual(engine.step(stamp("2026-10-15T11:11:00"))["result"], "paused")
+        # 3 part : tous les fautifs déclarés ont quitté.
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:12:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(sorted(result["invalidated"]["members"]), [2, 3])
+        result = engine.step(stamp("2026-10-15T11:12:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+
+    def test_8096_innocent_or_partial_declared_removal_keeps_the_pause(self):
+        """B cx2 #45468 : la déclaration lie les fautifs au plan, pas les voisins.
 
         Le retrait d'un lot innocent, puis le départ d'un seul des deux
-        fautifs marqués, ne prouvent pas la fin de la pause ; tous partis,
+        fautifs déclarés, ne prouvent pas la fin de la pause ; tous partis,
         la recomposition repart sans eux.
         """
         schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
@@ -275,15 +304,15 @@ class CutoffTest(unittest.TestCase):
         first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
         self.ports.ci_by_head[first["head"]] = "red"
         self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
-        # Seul le lot 3 est marqué fautif : le retrait du lot 2, innocent,
+        # Seul le lot 3 est déclaré fautif : le retrait du lot 2, innocent,
         # ne dit rien du lot 3 resté dans le plan.
         self.ports.faults = {3}
         self.ports.rows = [admitted(1), admitted(3)]
         self.assertEqual(engine.step(stamp("2026-10-15T11:10:00"))["result"], "paused")
-        # Les deux fautifs sont marqués : le départ d'un seul ne suffit pas.
+        # Les deux fautifs sont déclarés : le départ d'un seul ne suffit pas.
         self.ports.faults = {2, 3}
         self.assertEqual(engine.step(stamp("2026-10-15T11:11:00"))["result"], "paused")
-        # Tous les fautifs marqués ont quitté : la pause tombe sans eux.
+        # Tous les fautifs déclarés ont quitté : la pause tombe sans eux.
         self.ports.rows = [admitted(1)]
         result = engine.step(stamp("2026-10-15T11:12:00"))
         self.assertEqual(result["result"], "invalidated", result)
