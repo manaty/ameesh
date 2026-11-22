@@ -32,10 +32,12 @@ from ameesh.storage.postgres.vm_adapter import Queue
 
 from tests.support import PgTestCase
 from tests import test_4610_sleep_work_mail as sleep_fixtures
-from tests.test_6252_vm_commandes import CloudCycleTest, FRESH, cmd
+from tests import test_6252_vm_commandes as cycle
+
+FRESH, cmd = cycle.FRESH, cycle.cmd
 
 
-class HealthLineTest(CloudCycleTest):
+class HealthLineTest(cycle.CloudCycleTest):
     """(c) The real command, the real worker tick, a simulated guest."""
 
     def said(self):
