@@ -124,8 +124,11 @@ class HousekeepingBlockedTest(PgTestCase):
 
     def test_the_plan_names_the_doubt_and_the_measure_records_it(self):
         path = self._ended_worktree()
+        # #8048 : le `now` du passage est capturé une fois ; une seconde lecture
+        # d'horloge mesurait la durée du passage (rouge en CI chargée).
+        now = time.time() - HOUR
         with mock.patch.object(hk, "worktree_holders", return_value=(True, DOUBT)):
-            report = self._pass(time.time() - HOUR)
+            report = self._pass(now)
         plan = next(row for row in report["plan"] if row["path"] == path)
         self.assertEqual(plan["action"], "attend")
         self.assertIn("lot #", plan["detail"])
@@ -133,7 +136,7 @@ class HousekeepingBlockedTest(PgTestCase):
         blocked = report["measure"]["worktrees_blocked"]
         self.assertEqual(blocked["count"], 1)
         self.assertEqual(blocked["detail"], DOUBT)
-        self.assertAlmostEqual(blocked["since"], time.time() - HOUR, delta=5)
+        self.assertEqual(blocked["since"], now)
         self.assertTrue(os.path.isdir(path))              # fail-closed unchanged
 
     def test_the_episode_keeps_its_start_across_passes(self):
@@ -142,7 +145,7 @@ class HousekeepingBlockedTest(PgTestCase):
         with mock.patch.object(hk, "worktree_holders", return_value=(True, DOUBT)):
             first = self._pass(start)
             second = self._pass(time.time())
-        self.assertAlmostEqual(first["measure"]["worktrees_blocked"]["since"], start, delta=5)
+        self.assertEqual(first["measure"]["worktrees_blocked"]["since"], start)
         self.assertEqual(second["measure"]["worktrees_blocked"]["since"],
                          first["measure"]["worktrees_blocked"]["since"])
 
@@ -175,13 +178,14 @@ class HousekeepingBlockedTest(PgTestCase):
     def test_alert_only_after_six_hours_and_names_process_and_key(self):
         self._measure({"count": 3, "since": time.time() - HOUR, "detail": DOUBT})
         self.assertEqual(self._alerts(), [])
-        self._measure({"count": 3, "since": time.time() - 7 * HOUR, "detail": DOUBT})
+        since = time.time() - 7 * HOUR
+        self._measure({"count": 3, "since": since, "detail": DOUBT})
         alerts = self._alerts()
         self.assertEqual(len(alerts), 1, alerts)
         alert = alerts[0]
         self.assertEqual(alert["host"], "pc")
         self.assertEqual(alert["value"], 3)
-        self.assertAlmostEqual(alert["since"], time.time() - 7 * HOUR, delta=5)
+        self.assertAlmostEqual(alert["since"], since, delta=0.001)  # arrondi à la ms
         self.assertIn("23223 gpg-agent", alert["detail"])
         self.assertIn("policy.housekeeping.unreadable_ok", alert["detail"])
 
