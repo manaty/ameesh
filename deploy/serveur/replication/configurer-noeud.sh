@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 # Prépare un nœud PostgreSQL 17 pour la réplication en flux du mesh
-# (lot #6868, EP8.3a, étude docs/design/etudes/replique-base-mesh.md §2/§3).
+# (lot #6868, EP8.3a, étude docs/design/etudes/replique-base-mesh.md §2/§3 ;
+# mode veille du lot #8027).
 #
 #   configurer-noeud.sh [--redemarrer] [--sans-synchrone] [nom-du-noeud]
 #
@@ -11,6 +12,7 @@
 #     (wal_level, wal_log_hints, hot_standby, slots) ; synchronous_standby_names
 #     n'est posé que si un candidat synchrone est déjà en flux (B1 de revue
 #     #6868 : à l'amorçage, une liste non vide ferait attendre chaque COMMIT) ;
+#     en mode veille (#8027), il reste vide même si un candidat est en flux ;
 #   - remplace le bloc marqué de pg_hba.conf (replicator et rewind, hostssl) ;
 #   - recharge le serveur s'il tourne (pg_hba et paramètres rechargeables) ;
 #   - signale les paramètres qui exigent un redémarrage (wal_log_hints, …) ;
@@ -21,8 +23,9 @@
 # --sans-synchrone dégrade volontairement : liste vide et rechargement, geste
 # d'urgence quand le standby synchrone est perdu et que les COMMIT attendent.
 #
-# Le hub est encore primaire au moment de la préparation : le rôle effectif
-# est lu au serveur, pas seulement dans l'inventaire.
+# Le hub est le primaire permanent (#8027) : le rôle effectif est lu au
+# serveur, pas seulement dans l'inventaire, pour couvrir une bascule de secours
+# et son retour planifié.
 #
 # Aucun secret en argument : les mots de passe viennent de
 # /etc/ameesh/replication.env (0600) et passent par l'entrée standard de psql.
@@ -47,6 +50,8 @@ Le script est idempotent. Il n'ouvre aucun port, ne touche ni au réseau
 (#6859) ni à l'archivage (#6858), et ne démarre pas un serveur arrêté.
 synchronous_standby_names n'est posé que si un candidat synchrone est déjà en
 flux : à l'amorçage, une liste non vide ferait attendre chaque COMMIT.
+En mode veille (#8027, marqueur /etc/ameesh/mode-veille), il reste vide :
+c'est mode-veille.sh sortir qui rétablit la liste après le rattrapage.
 EOF
 }
 
@@ -81,14 +86,20 @@ charger_noeud_local "$nom"
 log "nœud $NOM_LOCAL ($HOTE_LOCAL) — inventaire : $ROLE_INVENTAIRE, synchrone=$SYNC_LOCAL, nofailover=$NOFAIL_LOCAL"
 log "synchrones de l'inventaire : $(liste_sync)"
 
+veille=0
+mode_veille_actif && veille=1
+
 # B1 de revue #6868 : dire noir sur blanc ce que la liste vaudra. À l'amorçage
 # (aucun standby en flux), elle reste vide et les COMMIT ne s'attendent pas ;
-# après l'étape base backup, un nouveau passage active ANY 1.
+# après l'étape base backup, un nouveau passage active ANY 1. En mode veille
+# (#8027), elle reste vide même si un candidat est encore en flux.
 sync_flux=""
-if (( ! FORCER_SANS_SYNCHRONE )); then
+if (( ! veille && ! FORCER_SANS_SYNCHRONE )); then
   sync_flux=$(sync_candidats_en_flux || true)
 fi
-if (( FORCER_SANS_SYNCHRONE )); then
+if (( veille )); then
+  log "mode veille actif (#8027) : synchronous_standby_names reste vide jusqu'à mode-veille.sh sortir"
+elif (( FORCER_SANS_SYNCHRONE )); then
   log "synchrone désactivé (--sans-synchrone) : synchronous_standby_names vide et rechargement"
 elif [[ -n $sync_flux ]]; then
   log "candidat(s) synchrone(s) en flux : $(printf '%s' "$sync_flux" | paste -sd, -) — liste ANY 1 posée"

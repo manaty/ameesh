@@ -63,8 +63,13 @@ charger_noeud_local "$nom"
 
 log "retour arrière de la réplication sur $NOM_LOCAL ($HOTE_LOCAL)"
 
-# 1. Configuration : le fragment du lot et son bloc pg_hba. Le reste de
-#    pg_hba.conf et de conf.d est intact (bloc marqué, fichier dédié).
+# 1. Configuration : le fragment du lot, son marqueur de veille (#8027) et
+#    son bloc pg_hba. Le reste de pg_hba.conf et de conf.d est intact (bloc
+#    marqué, fichier dédié).
+if [[ -e $VEILLE_ETAT ]]; then
+  retirer_mode_veille
+  log "marqueur de veille retiré : $VEILLE_ETAT"
+fi
 if [[ -f $CONF_FRAGMENT ]]; then
   rm -f -- "$CONF_FRAGMENT"
   log "fragment retiré : $CONF_FRAGMENT"

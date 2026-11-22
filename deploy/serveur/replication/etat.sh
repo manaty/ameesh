@@ -1,13 +1,16 @@
 #!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# État de réplication du nœud local (lot #6868, EP8.3a) — lecture seule.
+# État de réplication du nœud local (lot #6868, EP8.3a ; mode veille #8027)
+# — lecture seule.
 #
 #   etat.sh [nom-du-noeud]
 #
 # Sur un primaire : rôles des standbys (pg_stat_replication), synchrones
 # attendus, slots et leur état (actif, wal_status), paramètres de réplication.
 # Sur un standby : flux entrant (pg_stat_wal_receiver), source, slot, retards.
+# Affiche aussi le mode veille (#8027) et, sur un primaire, si le primaire
+# effectif est bien celui de l'inventaire (le hub).
 # Les avertissements sont imprimés mais ne changent pas le code de sortie :
 # 0 si le serveur répond, 1 s'il ne répond pas. Aucun secret n'est lu, aucune
 # connexion distante n'est faite (le pgpass n'est pas nécessaire).
@@ -43,6 +46,16 @@ printf 'nœud              : %s (%s)\n' "$NOM_LOCAL" "$HOTE_LOCAL"
 printf 'inventaire        : rôle %s, synchrone %s, nofailover %s, priorité %s\n' \
   "$ROLE_INVENTAIRE" "$SYNC_LOCAL" "$NOFAIL_LOCAL" "$PRIO_LOCAL"
 printf 'synchrones voulus : %s\n' "$(liste_sync)"
+veille=0
+mode_veille_actif && veille=1
+if (( veille )); then
+  depuis=$(valeur_veille at || true)
+  avant=$(valeur_veille sync_avant || true)
+  printf 'mode veille       : actif (depuis %s ; liste avant : %s)\n' \
+    "${depuis:-?}" "${avant:-?}"
+else
+  printf 'mode veille       : inactif\n'
+fi
 
 if ! pg_isready -q 2>/dev/null; then
   printf 'état              : INJOIGNABLE (pg_isready)\n'
@@ -80,6 +93,13 @@ avertir() {
 [[ $wal_log_hints == on ]] || avertir "wal_log_hints=$wal_log_hints : pg_rewind de ce nœud impossible (activer, redémarrer)"
 [[ $wal_level == replica ]] || avertir "wal_level=$wal_level : la réplication en flux est impossible"
 
+if (( veille )) && [[ $role != primaire ]]; then
+  avertir "marqueur de veille présent sur un standby ($NOM_LOCAL) : le mode veille ne s'écrit que sur le primaire (hub) ; à retirer"
+fi
+if [[ $role == primaire && $NOM_LOCAL != "$PRIMAIRE_NOM" ]]; then
+  avertir "primaire effectif $NOM_LOCAL, primaire d'inventaire $PRIMAIRE_NOM (hub) : bascule de secours ; mode-veille.sh entrer refuse tant que le primaire n'est pas revenu sur le hub"
+fi
+
 # Un nœud nofailover ne doit jamais apparaître dans synchronous_standby_names.
 for ((i = 0; i < ${#NOEUDS_NOMS[@]}; i++)); do
   [[ ${NOEUDS_NOFAIL[$i]} == oui ]] || continue
@@ -96,7 +116,7 @@ if [[ $role == primaire ]]; then
   quorum=0
   if [[ -z $lignes ]]; then
     echo '  (aucun)'
-    avertir "aucun standby connecté : RPO non garanti"
+    (( veille )) || avertir "aucun standby connecté : RPO non garanti"
   else
     while IFS='|' read -r app etat sync_state sent replay; do
       [[ -n $app ]] || continue
@@ -107,8 +127,15 @@ if [[ $role == primaire ]]; then
     done <<< "$lignes"
   fi
   # B1 de revue #6868 : une liste posée sans candidat en flux fait attendre
-  # chaque COMMIT indéfiniment (PostgreSQL seul, sans Patroni).
-  if [[ -z $sync_names ]]; then
+  # chaque COMMIT indéfiniment (PostgreSQL seul, sans Patroni). En veille
+  # (#8027), une liste vide est l'état voulu, pas une dégradation.
+  if (( veille )); then
+    if [[ -n $sync_names ]]; then
+      avertir "mode veille actif mais synchronous_standby_names=$sync_names : la liste devrait être vide (un autre gestionnaire l'a reposée ? Patroni, configurer-noeud.sh) ; rejouer mode-veille.sh entrer"
+    elif [[ -n $lignes ]]; then
+      echo '  (mode veille : liste synchrone vide attendue, répliques laissées en asynchrone)'
+    fi
+  elif [[ -z $sync_names ]]; then
     avertir "synchronous_standby_names vide : synchrone inactif (amorçage ou dégradation), RPO non garanti ; rejouer configurer-noeud.sh après le flux pour activer"
   elif (( sync_en_flux == 0 )); then
     avertir "synchronous_standby_names=$sync_names mais aucun candidat en flux : les COMMIT peuvent attendre indéfiniment ; dégager par configurer-noeud.sh --sans-synchrone, puis rétablir"

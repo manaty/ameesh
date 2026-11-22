@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 # Fonctions communes des scripts de réplication PostgreSQL 17 du mesh
-# (lot #6868, EP8.3a, étude docs/design/etudes/replique-base-mesh.md §2/§3).
+# (lot #6868, EP8.3a, étude docs/design/etudes/replique-base-mesh.md §2/§3 ;
+# mode veille du lot #8027).
 #
 # Ce fichier est sourcé, jamais exécuté. Il ne fait aucun geste : il lit
 # l'inventaire, vérifie les secrets et écrit la configuration.
@@ -18,6 +19,10 @@
 #   AMEESH_REPLICATION_PGPASS   (/var/lib/postgresql/.pgpass)
 #   AMEESH_REPLICATION_NOM      (nom court de l'hôte)
 #   AMEESH_REPLICATION_ATTENTE  (secondes, 60)
+#   AMEESH_REPLICATION_ATTENTE_TOURS (secondes, 600 : fin des tours en veille)
+#   AMEESH_REPLICATION_ATTENTE_REVEIL (secondes, 900 : rattrapage au réveil)
+#   AMEESH_REPLICATION_VEILLE   ($ETC/mode-veille : état du mode veille)
+#   AMEESH_SAUVEGARDES_DIR      (/home/ameesh/sauvegardes : dumps logiques)
 #   AMEESH_REPLICATION_RUNUSER  (auto : oui si root ; « oui » force le témoin)
 #
 # Aucun secret n'est passé en argument : le mot de passe des rôles est écrit
@@ -35,6 +40,11 @@ DATA=${AMEESH_REPLICATION_DATA:-/var/lib/postgresql/$PG_VERSION/main}
 PG_BIN=${AMEESH_REPLICATION_PGBIN:-/usr/lib/postgresql/$PG_VERSION/bin}
 PGPASS=${AMEESH_REPLICATION_PGPASS:-/var/lib/postgresql/.pgpass}
 ATTENTE=${AMEESH_REPLICATION_ATTENTE:-60}
+ATTENTE_TOURS=${AMEESH_REPLICATION_ATTENTE_TOURS:-600}
+ATTENTE_REVEIL=${AMEESH_REPLICATION_ATTENTE_REVEIL:-900}
+VEILLE_ETAT=${AMEESH_REPLICATION_VEILLE:-$AMEESH_REPLICATION_ETC/mode-veille}
+SAUVEGARDES_DIR=${AMEESH_SAUVEGARDES_DIR:-/home/ameesh/sauvegardes}
+SAUVEGARDE_MAX_AGE_S=${AMEESH_SAUVEGARDE_MAX_AGE_S:-93600}  # 26 h
 
 CONF_FRAGMENT="$PGCONF/conf.d/60-ameesh-replication.conf"
 HBA="$PGCONF/pg_hba.conf"
@@ -131,9 +141,10 @@ charger_env() {
 
 # Inventaire : une ligne par nœud, six champs, « # » commente.
 #   nom  hote  role  synchrone  nofailover  priorite
-# Le rôle de l'inventaire est la cible ; à l'exécution, le rôle effectif est
-# celui que le serveur local annonce (pg_is_in_recovery), pour couvrir la
-# bascule du hub (encore primaire au moment de la préparation).
+# Le rôle de l'inventaire est la cible : le hub est primaire (#8027), les
+# agents sont ses standbys. À l'exécution, le rôle effectif est celui que le
+# serveur local annonce (pg_is_in_recovery), pour couvrir une bascule de
+# secours et son retour planifié.
 lire_noeuds() {
   NOEUDS_NOMS=()
   NOEUDS_HOTES=()
@@ -177,10 +188,11 @@ lire_noeuds() {
   (( ${#NOEUDS_NOMS[@]} >= 2 )) || die "inventaire : au moins deux nœuds"
   (( primaires == 1 )) || die "inventaire : un seul primaire attendu, $primaires trouvé(s)"
   (( syncs >= 2 )) || die "inventaire : au moins deux candidats synchrones (la paire d'agents)"
-  for ((i = 0; i < ${#NOEUDS_NOMS[@]}; i++)); do
-    [[ ${NOEUDS_ROLES[$i]} != primaire || ${NOEUDS_SYNC[$i]} == oui ]] \
-      || die "inventaire : le primaire ${NOEUDS_NOMS[$i]} doit être un candidat synchrone"
-  done
+  # Un primaire peut rester candidat synchrone (modèle de bascule EP8.3 :
+  # l'ancien primaire redevient standby) ; il n'est alors jamais connecté à
+  # lui-même, donc inerte dans synchronous_standby_names. Seul un nœud
+  # nofailover est exclu de la liste (règle ci-dessus) : c'est le cas du hub
+  # primaire permanent de #8027, qui n'est pas candidat.
 }
 
 # Indice d'un nœud dans les tableaux, sans toucher aux globales du nœud local.
@@ -219,8 +231,9 @@ charger_noeud_local() {
   fi
 }
 
-# Renseigne PRIMAIRE_IDX/PRIMAIRE_NOM/PRIMAIRE_HOTE (le primaire de
-# l'inventaire, c'est-à-dire la cible, pas nécessairement le primaire actuel).
+# Renseigne PRIMAIRE_IDX/PRIMAIRE_NOM/PRIMAIRE_HOTE (le primaire permanent
+# de l'inventaire : le hub depuis #8027, pas nécessairement le primaire
+# effectif après une bascule de secours).
 trouver_primaire() {
   local i
   for ((i = 0; i < ${#NOEUDS_NOMS[@]}; i++)); do
@@ -267,11 +280,59 @@ sync_candidats_en_flux() {
   printf '%s' "$liste"
 }
 
+# Candidats synchrones de l'inventaire en flux ET à jour (replay_lsn a
+# rejoint le flush courant du primaire). C'est la condition du réveil #8027 :
+# la contrainte n'est rétablie qu'une fois une réplique rattrapée, sinon les
+# COMMIT attendraient son retard. Vide si le serveur n'est pas primaire.
+sync_candidats_rattrapes() {
+  local rec valeurs="" nom i liste
+  pg_isready -q 2>/dev/null || return 0
+  rec=$(psql_local -tAc 'SELECT pg_is_in_recovery()' 2>/dev/null) || return 0
+  [[ $rec == f ]] || return 0
+  for ((i = 0; i < ${#NOEUDS_NOMS[@]}; i++)); do
+    [[ ${NOEUDS_SYNC[$i]} == oui ]] || continue
+    nom=${NOEUDS_NOMS[$i]}
+    valeurs+="${valeurs:+,}$(litteral_sql "$nom")"
+  done
+  [[ -n $valeurs ]] || return 0
+  liste=$(psql_local -tAc "SELECT application_name FROM pg_stat_replication WHERE state = 'streaming' AND replay_lsn IS NOT NULL AND replay_lsn >= pg_current_wal_flush_lsn() AND application_name IN ($valeurs) ORDER BY application_name" 2>/dev/null) || return 0
+  printf '%s' "$liste"
+}
+
 # Vrai si la liste synchrone doit être posée : un candidat est en flux et
 # l'exploitant n'a pas demandé la dégradation (--sans-synchrone).
 sync_actif() {
   (( ${FORCER_SANS_SYNCHRONE:-0} )) && return 1
   [[ -n $(sync_candidats_en_flux) ]]
+}
+
+# --- mode veille (#8027) ------------------------------------------------------
+
+# L'état est un fichier texte clé=valeur, écrit atomiquement par
+# mode-veille.sh. Sa présence avec « mode=veille » force la liste synchrone
+# vide dans le fragment, même si un candidat est encore en flux : c'est la
+# condition qui permet d'arrêter les agents sans bloquer les COMMIT.
+mode_veille_actif() {
+  [[ -f $VEILLE_ETAT ]] || return 1
+  grep -qx 'mode=veille' -- "$VEILLE_ETAT" 2>/dev/null
+}
+
+valeur_veille() {
+  local cle=$1
+  [[ -r $VEILLE_ETAT ]] || return 1
+  sed -n "s/^${cle}=//p" -- "$VEILLE_ETAT" | head -n 1
+}
+
+retirer_mode_veille() {
+  [[ ! -e $VEILLE_ETAT ]] || rm -f -- "$VEILLE_ETAT"
+}
+
+# Nombre de tours encore en cours sur le mesh : les agents réellement en tour
+# (statut « running » et bail vivant), pas tous les baux. Un runner garde son
+# bail quand il est idle : compter les baux empêcherait toute veille tant que
+# les runners d'AG1/AG2 vivent, et ils ne s'arrêtent qu'après « entrer ».
+tours_en_cours() {
+  psql_ameesh -tAc "SELECT count(*) FROM agent_registry WHERE status = 'running' AND lease_owner IS NOT NULL AND lease_expires_at > clock_timestamp()"
 }
 
 # Nom de slot physique d'un nœud : stable, sans tiret (les tirets sont
@@ -298,6 +359,12 @@ comme_postgres() {
 
 psql_local() {
   comme_postgres psql -X -w -v ON_ERROR_STOP=1 -q -d postgres "$@"
+}
+
+# Base du mesh : les baux des tours (agent_registry) et l'état applicatif.
+# Le compte postgres y lit sans secret ; aucun mot de passe n'est passé.
+psql_ameesh() {
+  comme_postgres psql -X -w -v ON_ERROR_STOP=1 -q -d ameesh "$@"
 }
 
 # Connexion normale (pas de réplication) au nom de rewind, pour pg_rewind et
@@ -343,11 +410,16 @@ ecrire_fichier() {
 }
 
 fragment_conf() {
-  local sync=""
+  local sync="" note_veille=""
   # B1 de revue #6868 : la liste n'est posée que si un candidat est déjà en
   # flux. À l'amorçage (aucun standby), elle reste vide pour que les COMMIT
   # (dont les CREATE/ALTER ROLE et les slots) ne s'attendent pas.
-  if sync_actif; then
+  # #8027 : en mode veille, elle est vidée même si un candidat est encore en
+  # flux, pour que l'arrêt des agents ne bloque aucun COMMIT.
+  if mode_veille_actif; then
+    note_veille="# mode veille (#8027) : liste vidée par mode-veille.sh entrer
+"
+  elif sync_actif; then
     sync=$(liste_sync)
   fi
   cat <<CONF
@@ -362,7 +434,7 @@ hot_standby = on
 wal_keep_size = '$WAL_KEEP_SIZE'
 max_slot_wal_keep_size = '$MAX_SLOT_WAL_KEEP_SIZE'
 synchronous_commit = on
-synchronous_standby_names = '$sync'
+${note_veille}synchronous_standby_names = '$sync'
 password_encryption = 'scram-sha-256'
 # END ameesh-replication (lot #6868)
 CONF

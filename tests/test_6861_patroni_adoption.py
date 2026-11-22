@@ -7,7 +7,8 @@ un répertoire jetable, pilotées par un fichier d'état JSON ; l'API /cluster
 de Patroni est lue d'un document enregistré (AMEESH_ADOPTION_LECTURE). Les
 témoins couvrent :
 
-- `adoption.py` : concordance topologie.json / noeuds.conf, règles pg_hba et
+- `adoption.py` : topologie.json / noeuds.conf (l'écart de primaire #8027 est
+  volontaire et unique, le plan Patroni est suspendu), règles pg_hba et
   clients que le pg_hba de Patroni perdrait, slots inconnus de Patroni, état
   cible de la grappe (un leader, hub jamais synchrone) ;
 - `adopter.sh` : simulation sans geste, ordre des gestes réels (sauvegarde,
@@ -156,14 +157,22 @@ class AdoptionPyTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="t6861-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def test_topologie_et_inventaire_ep83_concordent(self):
+    def test_topologie_et_inventaire_ep83_ecart_primaire_volontaire(self):
         noeuds = self.mod.lire_noeuds_conf(REPLICATION / "noeuds.conf")
-        self.assertEqual(self.mod.comparer_topologie(self.topologie, noeuds), [])
+        # #8027 : le primaire permanent est le hub, seul hôte allumé en veille ;
+        # topologie.json (primaire préféré ameesh-agents-1) est périmée et le
+        # plan Patroni suspendu jusqu'à révision (#6959). L'écart est volontaire
+        # et doit rester unique : toute autre divergence échoue ici.
+        self.assertEqual(
+            self.mod.comparer_topologie(self.topologie, noeuds),
+            ["primaire d'EP8.3 manaty-mesh-1, primaire préféré de Patroni ameesh-agents-1"])
 
     def test_topologie_ecarts_detectes(self):
         noeuds = self.mod.lire_noeuds_conf(REPLICATION / "noeuds.conf")
-        noeuds[1]["hote"] = "10.78.0.99"
-        noeuds[2]["synchrone"] = True
+        par_nom = {noeud["nom"]: noeud for noeud in noeuds}
+        par_nom["ameesh-agents-1"]["hote"] = "10.78.0.99"
+        # Contredit nosync=true de la topologie pour le hub.
+        par_nom["manaty-mesh-1"]["synchrone"] = True
         ecarts = self.mod.comparer_topologie(self.topologie, noeuds)
         self.assertTrue(any("10.78.0.99" in e for e in ecarts), ecarts)
         self.assertTrue(any("manaty-mesh-1" in e and "nosync" in e for e in ecarts), ecarts)
@@ -308,6 +317,17 @@ class ScriptsTest(unittest.TestCase):
             AMEESH_DB_ETCD_KEY=/etc/patroni/tls/etcd-client.key
             """ % (REPLICATION_PASSWORD, SUPERUSER_PASSWORD)))
         self.env_patroni.chmod(0o640)
+        # #8027 : l'inventaire réel a désormais le primaire sur le hub et le
+        # plan Patroni est suspendu (écart volontaire de primaire, voir
+        # AdoptionPyTest). Les mécanismes d'adoption restent testés sur la
+        # disposition EP8.3 que topologie.json décrit encore (AG1 primaire,
+        # hub nofailover) ; c'est une grappe de témoin, pas la production.
+        self.noeuds_ep83 = self.tmp / "noeuds.conf"
+        self.noeuds_ep83.write_text(textwrap.dedent("""\
+            ameesh-agents-1  10.78.0.11  primaire  oui  non  100
+            ameesh-agents-2  10.78.0.12  standby   oui  non   90
+            manaty-mesh-1    10.78.0.10  standby   non  oui    0
+            """), encoding="utf-8")
         self.env_ep83 = self.tmp / "replication.env"
         self.env_ep83.write_text("REPLICATION_SUBNET=10.78.0.0/24\nREPLICATOR_PASSWORD=%s\nREWIND_PASSWORD=%s\n"
                                  % (EP83_REPLICATOR, EP83_REWIND))
@@ -357,6 +377,7 @@ class ScriptsTest(unittest.TestCase):
             "AMEESH_REPLICATION_PGBIN": str(self.bin),
             "AMEESH_REPLICATION_PGPASS": str(self.pgpass),
             "AMEESH_REPLICATION_ENV": str(self.env_ep83),
+            "AMEESH_REPLICATION_NOEUDS": str(self.noeuds_ep83),
             "AMEESH_REPLICATION_NOM": nom,
             "AMEESH_REPLICATION_ATTENTE": "2",
             "AMEESH_REPLICATION_RUNUSER": "non",
