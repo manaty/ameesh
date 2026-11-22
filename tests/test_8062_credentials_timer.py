@@ -20,6 +20,7 @@ Quatre pièces, sans hôte réel (le trigger 0604 est rejoué sur le banc) :
 from __future__ import annotations
 
 import datetime
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,12 @@ NOW = 1_800_000_000.0
 PERIOD = sentinel.PERIOD_S
 LIMIT = PERIOD * sentinel.PROBE_SILENCE_PERIODS
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _db_time(offset: float = 0.0) -> datetime.datetime:
+    """Horodatage du banc, relatif à l'instant réel, sans jour calendaire."""
+    return datetime.datetime.fromtimestamp(time.time() + offset,
+                                        datetime.timezone.utc)
 
 
 class CredentialProbeAlertsTest(unittest.TestCase):
@@ -441,8 +448,8 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
             return exploitation._credential_probe_alerts(object(), now, None)
 
     def test_an_n1_probe_date_survives_a_later_turn_write(self):
-        probe_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
-        turn_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)
+        probe_at = _db_time(-2 * 3600)
+        turn_at = _db_time(-60)
         self._n1_insert("sentinel", probe_at)
         self._n1_turn(turn_at)
         row = self._row()
@@ -455,8 +462,8 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
         self.assertIn("last reading", alert["detail"])
 
     def test_repeated_turn_writes_keep_the_anchor_of_a_never_probed_pair(self):
-        first = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
-        later = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)
+        first = _db_time(-2 * 3600)
+        later = _db_time(-60)
         self._n1_insert("turn", first)
         self._n1_turn(later)
         row = self._row()
@@ -467,8 +474,8 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
         self.assertAlmostEqual(alert["since"], first.timestamp(), delta=2)
 
     def test_an_n1_sentinel_update_advances_an_older_probe_date(self):
-        first = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
-        second = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)
+        first = _db_time(-2 * 3600)
+        second = _db_time(-60)
         self._n1_insert("sentinel", first)
         self.previous_update(
             "credential_health",
@@ -482,7 +489,7 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
         self.assertIsNone(row["missing_ts"])
 
     def test_a_fresh_sentinel_report_clears_the_missing_anchor(self):
-        first = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
+        first = _db_time(-2 * 3600)
         self._n1_insert("turn", first)
         Credentials(self.db).report(self.HOST, self.HARNESS, self.ACCOUNT,
                                     "healthy", source="sentinel",
@@ -490,8 +497,7 @@ class ProbeHeartbeatTriggerTest(PgTestCase):
         row = self._row()
         self.assertIsNotNone(row["probed_ts"])
         self.assertIsNone(row["missing_ts"])
-        self.assertEqual(self._alerts(datetime.datetime.now(
-            datetime.timezone.utc).timestamp()), [])
+        self.assertEqual(self._alerts(time.time()), [])
 
 def _systemctl(*, user=None, system=None):
     """Faux `systemctl` : None = gestionnaire illisible, dict = unité lue."""
