@@ -73,7 +73,7 @@ import subprocess
 import tempfile
 from urllib.parse import quote, unquote
 
-from . import fire, land, packet_parallel, storage, work
+from . import fire, land, packet_parallel, roadmap_release, storage, work
 
 #: une tête de porteur de paquet (§12) ; `integration/paquet-h-…`, `…-nexlink`
 CARRIER_PREFIX = "integration/"
@@ -367,6 +367,10 @@ def _cutoff_commit(repo: str, sha: str) -> bool:
                 return False
             if not (_VERSION_LINE.match(removed[0].strip())
                     and _VERSION_LINE.match(added[0].strip())):
+                return False
+        elif name == roadmap_release.ROADMAP:
+            patch = _git(repo, "diff", "-U0", parent, sha, "--", name)
+            if patch is None or not roadmap_release.valid_patch(patch):
                 return False
         elif name.startswith(NOTES_DIR + "/") and name.endswith(".md"):
             continue

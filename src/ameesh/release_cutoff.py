@@ -2165,7 +2165,7 @@ def _commit(path: str, message: str, *, author: str = "ameesh release") -> str:
     return _out(path, "rev-parse", "HEAD")
 
 
-def create_version_commit(project: ProjectRelease, plan: Plan) -> str:
+def create_version_commit(project: ProjectRelease, plan: Plan, *, cfg=None, db=None) -> str:
     """Create (or reconcile) the version commit V on B, without pushing.
 
     V only changes `pyproject.toml` and the generated notes. It is the commit
@@ -2194,7 +2194,52 @@ def create_version_commit(project: ProjectRelease, plan: Plan) -> str:
         if version_tuple(current) != version_tuple(plan.version):
             _write_version(worktree, plan.version)
         _write_notes(worktree, plan.version, plan.notes)
-        _git(worktree, "add", VERSION_FILE, notes_path)
+        files = [VERSION_FILE, notes_path]
+        from . import roadmap_release
+        roadmap_path = os.path.join(worktree, roadmap_release.ROADMAP)
+        if os.path.isfile(roadmap_path):
+            with open(roadmap_path, encoding="utf-8") as stream:
+                page = stream.read()
+            names = None
+            summaries = []
+            try:
+                from . import work_projects
+                names = {name for name in work_projects.known_projects(cfg, db)
+                         if name.casefold() != project.name.casefold()}
+            except Exception:
+                pass  # No private registry: every free-text summary is internal.
+            for lot in sorted(set(plan.included)):
+                try:
+                    from . import storage
+                    marks = storage.of(db).work.milestones(lot, limit=None)
+                    freeze = next(m for m in marks if m.get('kind') == 'frozen')
+                    match = re.search(r'(?m)^public-summary:\s*(.+?)\s*$', freeze.get('note') or '')
+                    summary = roadmap_release.safe_summary(match.group(1), names) if match else None
+                except Exception:
+                    summary = None
+                if summary:
+                    summaries.append(summary)
+            since = plan.previous['commit'] if plan.previous else plan.base
+            commands = []
+            try:
+                before = _out(project.repo, 'show', since + ':src/ameesh/mesh_cli.py')
+                after = _out(project.repo, 'show', plan.base + ':src/ameesh/mesh_cli.py')
+                commands = sorted(roadmap_release.parser_commands(after) - roadmap_release.parser_commands(before))
+            except Exception:
+                pass
+            date = _dt.datetime.fromtimestamp(plan.cutoff_at, plan.rules.zone()).strftime('%Y-%m-%d')
+            new_migrations = _out(project.repo, 'diff', '--diff-filter=A', '--name-only',
+                                  since + '..' + plan.base, '--', 'src/ameesh/migrations')
+            migration_names = [os.path.basename(path) for path in new_migrations.splitlines()
+                               if os.path.dirname(path) == 'src/ameesh/migrations']
+            line = roadmap_release.render(plan.version, date, migration_names, summaries,
+                                          len(set(plan.included)) - len(summaries), commands)
+            with open(roadmap_path, 'w', encoding='utf-8') as stream:
+                stream.write(roadmap_release.insert(page, line))
+            files.append(roadmap_release.ROADMAP)
+            with open(os.path.join(worktree, notes_path), 'a', encoding='utf-8') as stream:
+                stream.write('\n[Roadmap](../../site/docs/roadmap.md#generated-release-entries)\n')
+        _git(worktree, "add", *files)
         message = ("release: %s (coupure de %s du %s ; %d paquets, %d lots) [skip ci]\n\n"
                    "ameesh-release: %s"
                    % (plan.version, plan.cutoff_label,
@@ -3510,7 +3555,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
     elif not plan.green:
         deviations.append("tête %s non verte: release sur le dernier commit vert %s"
                           % (plan.head[:12], plan.base[:12]))
-    version_sha = create_version_commit(project, plan)
+    version_sha = create_version_commit(project, plan, cfg=cfg, db=db)
     push_error = None
     landed = None
     if db is not None:

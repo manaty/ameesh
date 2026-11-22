@@ -528,6 +528,9 @@ jobs:
             for name in $names; do
               case "$name" in
                 docs/versions/*.md) ;;
+                site/docs/roadmap.md)
+                  git diff -U0 "$parent" "$sha" -- "$name" | PYTHONPATH=src python3 -c "import sys; from ameesh.roadmap_release import valid_patch; sys.exit(not valid_patch(sys.stdin.read()))" || return 1
+                  ;;
                 pyproject.toml)
                   git diff -U0 "$parent" "$sha" -- pyproject.toml | awk '
                     /^(\+\+\+|---)/ { next }
@@ -598,6 +601,8 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
+      - name: generated roadmap grammar
+        run: PYTHONPATH=src python3 -c "from pathlib import Path; from ameesh.roadmap_release import valid_page; import sys; sys.exit(not valid_page(Path('site/docs/roadmap.md').read_text(encoding='utf-8')))"
       # #4521 (revue cx2, B/P2 ; B/P1 auditeur) : la garde des alias
       # `sys.modules` tourne aussi en CI, sur l'arbre testé, dans `plan` dont
       # l'échec rougit l'agrégat requis `tests`. Le canon `manaty/home` est
