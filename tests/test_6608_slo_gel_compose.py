@@ -27,6 +27,12 @@ class GelComposeTest(base.RecompositionTest):
     #: S2 : un commit poussé par l'auteur après le gel composé
     MOVED = "f" * 40
 
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(planned_waits, "_head_outside_source", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def move_head(self):
         self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
                         (self.MOVED, int(self.lot["id"])))

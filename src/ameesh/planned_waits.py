@@ -1242,7 +1242,21 @@ def _record_ahead(member, carrier, now: float) -> bool:
     return observed < recorded and now - recorded <= RECORD_AHEAD_GRACE_S
 
 
-def recorded_packet_attachments(st, open_items, rows, *, now=None, moved=None):
+def _head_outside_source(db, unit, current, source):
+    """Preserve the notice unless local Git proves the head is in the source."""
+    if db is None:
+        return True
+    from . import lot_class, plan_git
+    try:
+        repo, _ = lot_class.repo_for_freeze(db, getattr(db, "cfg", None), unit, source)
+        if not repo:
+            return True
+        return plan_git._git(repo, "merge-base", "--is-ancestor", current, source).returncode != 0
+    except Exception:  # unreadable Git must not suppress a potentially new head
+        return True
+
+
+def recorded_packet_attachments(st, open_items, rows, *, now=None, moved=None, db=None):
     """#4082: read current packet membership without a local Git clone.
 
     Membership is replaced by record_packet on recomposition. Bind it to the
@@ -1302,7 +1316,7 @@ def recorded_packet_attachments(st, open_items, rows, *, now=None, moved=None):
         if not plan_git.same_commit(current, source):
             if not frozen:
                 continue
-            if moved is not None:
+            if moved is not None and _head_outside_source(db, unit, current, source):
                 moved[uid] = {"vehicle": cid, "frozen": str(frozen["sha"]),
                               "head": str(current)}
         out.setdefault(cid, set()).add(uid)
@@ -1690,7 +1704,7 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     moved: dict[int, dict] = {}
     if want_packets and not _dry_pass(db):
         for cid, members in recorded_packet_attachments(st, open_items, rows,
-                                                        now=now, moved=moved).items():
+                                                        now=now, moved=moved, db=db).items():
             attached.setdefault(cid, set()).update(members)
     packet = packet_waits(rows, open_items, attachments=attached) if want_packets else {}
     for ident, shift in moved.items():
