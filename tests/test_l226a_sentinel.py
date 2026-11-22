@@ -670,6 +670,37 @@ class AlertsTest(unittest.TestCase):
         keys = {exploitation.alert_key(a) for a in self._alerts(rows)}
         self.assertEqual(len(keys), 2)
 
+    def test_stale_default_is_ignored_once_accounts_are_declared(self):
+        # #8042 : la sonde ne sonde plus le profil par défaut dès qu'un compte
+        # est déclaré ; son échéance passée ne doit plus alerter indéfiniment.
+        rows = [self._row(harness="claude", account="", checked_ts=NOW - 7 * 86400,
+                          expires_ts=NOW - 3600),
+                self._row(harness="claude", account="primaire", checked_ts=NOW - 60)]
+        self.assertEqual(self._alerts(rows), [])
+
+    def test_stale_default_failure_is_ignored_once_accounts_are_declared(self):
+        rows = [self._row(harness="claude", account="", state="failing",
+                          failing_since_ts=NOW - 7 * 86400,
+                          checked_ts=NOW - 7 * 86400),
+                self._row(harness="claude", account="primaire", checked_ts=NOW - 60)]
+        self.assertEqual(self._alerts(rows), [])
+
+    def test_removed_account_is_ignored_after_a_return_to_the_default(self):
+        rows = [self._row(harness="claude", account="", checked_ts=NOW - 60),
+                self._row(harness="claude", account="primaire",
+                          checked_ts=NOW - 7 * 86400, expires_ts=NOW - 3600)]
+        self.assertEqual(self._alerts(rows), [])
+
+    def test_kept_failure_of_a_declared_account_is_not_stale(self):
+        # la sonde maintient un échec sans réécrire la ligne (kept_failure) :
+        # son ancienneté relative aux autres comptes ne la rend pas périmée.
+        rows = [self._row(harness="claude", account="primaire", state="failing",
+                          failing_since_ts=NOW - 3600, checked_ts=NOW - 3600),
+                self._row(harness="claude", account="secondaire", checked_ts=NOW - 60)]
+        [alert] = self._alerts(rows)
+        self.assertEqual(alert["type"], "credential_failing")
+        self.assertEqual(alert["account"], "primaire")
+
     def test_failing_is_pushed_and_urgent_by_default(self):
         self.assertIn("credential_failing", notify.DEFAULT_TYPES)
         self.assertIn("credential_expiring", notify.DEFAULT_TYPES)
