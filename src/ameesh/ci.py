@@ -126,6 +126,8 @@ Le réessai d'un échec (étude : « premier échec confirmé ») n'est pas enco
 """
 from __future__ import annotations
 
+import hashlib
+
 import contextlib
 import json
 import os
@@ -1446,6 +1448,7 @@ class Watcher:
             for repo in repos:
                 try:
                     out += self.watch(db, repo)
+                    storage.of(db).ci.watch_success(repo)
                 except plan_github.GithubRateLimited as exc:
                     # quota épuisé : aucun autre appel ne part avant le reset
                     when = time.strftime("%H:%M:%SZ", time.gmtime(exc.reset)) \
@@ -1454,7 +1457,21 @@ class Watcher:
                              % (repo, when))
                     break
                 except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
-                    self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
+                    detail = " ".join(str(exc).split())[:200]
+                    self.log("CI %s: check failed (%s)" % (repo, detail))
+                    try:
+                        failure = storage.of(db).ci.watch_failure(repo)
+                        if failure["watch_failures"] >= 3:
+                            pilot = self._project_pilot(db, repo)
+                            if pilot:
+                                text = ("CI %s: repository check failed at least three consecutive "
+                                        "passes; investigate the watcher logs." % repo)
+                                _send(db, pilot, text, text, lot=None,
+                                      payload={"ci_watch_failure": {"repo": repo}}, urgent=True,
+                                      idempotency_key="ci-watch-failure:%s:%s" % (
+                                          hashlib.sha256(repo.encode()).hexdigest(), failure["since"]))
+                    except Exception as alert_exc:  # never prevent the other repositories
+                        self.log("CI %s: check failure alert failed (%s)" % (repo, alert_exc))
             # #2957 : le périmètre actif est la configuration de l'hôte
             # désigné. Un dépôt qui en sort ne doit pas laisser sa ligne de
             # file : le repli de `github_observation` sur un hôte sans
@@ -1516,26 +1533,53 @@ class Watcher:
         # les lignes que ce passage conclut sont figées AVANT les envois : le
         # verdict d'un workflow ne cite pas comme « encore en cours » un
         # workflow conclu dans le même passage (#1110)
+        from . import plan_github
         running = st.ci.running(repo)
         finishing: dict[int, dict] = {}
+        disappeared: set[int] = set()
+        errors: list[str] = []
         for row in running:
-            if int(row["run_id"]) in live:
+            run_id = int(row["run_id"])
+            if run_id in live:
                 continue
-            run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
-            if (run.get("status") or "") == "completed":
-                finishing[int(row["run_id"])] = run
+            try:
+                run = self.api("repos/%s/actions/runs/%s" % (repo, run_id)) or {}
+                if (run.get("status") or "") == "completed":
+                    finishing[run_id] = run
+            except plan_github.GithubRateLimited:
+                raise
+            except plan_github.GithubError as exc:
+                if exc.status in (404, 410):
+                    disappeared.add(run_id)
+                else:
+                    errors.append("run %s: %s" % (run_id, exc))
+            except Exception as exc:  # isolate each tracked run
+                errors.append("run %s: %s" % (run_id, exc))
         for row in running:
-            run = finishing.get(int(row["run_id"]))
-            out += self._failures(db, repo, row, bases,
-                                  terminal=conclusion_status(run),
-                                  run=run or live.get(int(row["run_id"])))
-            if run is None:
-                continue
-            others = [r for r in running if int(r["run_id"]) not in finishing
-                      and int(r["run_id"]) != int(row["run_id"])
-                      and r.get("head_sha") == row.get("head_sha")
-                      and r.get("branch") == row.get("branch")]
-            out += self._conclude(db, repo, row, run=run, pending=others)
+            run_id = int(row["run_id"])
+            try:
+                if run_id in disappeared:
+                    if st.ci.conclude(repo, run_id, "cancelled"):
+                        self.log("CI %s: run %s disappeared from GitHub; cancelled" % (repo, run_id))
+                    continue
+                run = finishing.get(run_id)
+                out += self._failures(db, repo, row, bases,
+                                      terminal=conclusion_status(run),
+                                      run=run or live.get(run_id))
+                if run is None:
+                    continue
+                others = [r for r in running if int(r["run_id"]) not in finishing
+                          and int(r["run_id"]) not in disappeared
+                          and int(r["run_id"]) != run_id
+                          and r.get("head_sha") == row.get("head_sha")
+                          and r.get("branch") == row.get("branch")]
+                out += self._conclude(db, repo, row, run=run, pending=others)
+            except plan_github.GithubRateLimited:
+                raise
+            except Exception as exc:  # keep processing other tracked runs
+                errors.append("run %s: %s" % (run_id, exc))
+        if errors:
+            raise CiError("; ".join(errors))
         # #845 : la garde passe après les échecs et les verdicts — un relevé de
         # runners coûte une requête par exécution non conclue (quelques
         # dizaines de secondes en saturation) et ne doit pas les retarder

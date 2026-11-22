@@ -748,7 +748,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('ci_queue_state', ARRAY[
         'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at',
         -- #8031 (0603) : instant du relevé qui a publié la file de réveil
-        'wait_seen_at'
+        'wait_seen_at',
+        -- #8071 : compteur et début de l'échec de veille du dépôt
+        'watch_failures', 'watch_failure_since'
     ]),
     -- #8031 (0603) : jobs qu'aucun runner en ligne ne peut servir — dépôt,
     -- étiquettes demandées, plus vieux job et comptage, dates. Même nature que

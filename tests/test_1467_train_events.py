@@ -354,6 +354,31 @@ class TrainEventTransactionTest(PgTestCase):
         args.update(fields)
         return storage.of(self.db).ci.open_run("o/r", number, **args)
 
+    def test_disappeared_ci_run_wakes_train(self):
+        from ameesh import plan_github
+        self.packet()
+        self.run_row(1)
+        listener = self.listener()
+        def api(path):
+            raise plan_github.GithubError("gone", status=404)
+        watcher = ci.Watcher(self.cfg, api=api)
+        watcher.followed_workflows = lambda repo: []
+        watcher.bases = lambda repo: []
+        watcher._listed = lambda *a: []
+        watcher._unblock = lambda *a: []
+        watcher._catch_up = lambda *a: []
+        watcher._refresh_bases = lambda *a: None
+        watcher._guard = lambda *a: None
+        watcher._undispatched_parts = lambda *a: []
+        watcher._map = watcher._disks = lambda *a: None
+        watcher._watch(self.db, "o/r")
+        signal = json.loads(listener.wait(3)["payload"])
+        self.assertEqual((signal["project"], signal["target"], signal["kind"]),
+                         ("event-test", "develop", "ci-terminal"))
+        self.assertEqual(storage.of(self.db).ci.run("o/r", 1)["status"], "cancelled")
+        watcher._watch(self.db, "o/r")
+        self.assertIsNone(listener.wait(0.1))
+
     def test_ci_producer_routes_all_terminal_statuses_without_recipient_or_default_base(self):
         self.packet()
         listener = self.listener()
