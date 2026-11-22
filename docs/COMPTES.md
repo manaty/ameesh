@@ -718,14 +718,23 @@ Alerts, computed by `ameesh notify` from the table (all hosts):
   start of failure), and it resolves when the credential is `healthy` again;
 * `credential_expiring` (pushed by default): a healthy credential's forecast
   expiry is less than `warn_hours` away (default 24 h). This warns before
-  gcloud asks to log in again in the middle of a release.
+  gcloud asks to log in again in the middle of a release;
+* `credential_probe_stale` (pushed by default): no reading of a
+  (host, harness) pair for three probe periods (30 min): the timer is
+  stopped, so an expiry would now be silent. One alert per pair; it resolves
+  when a fresh reading lands. A `failing` row kept by the probe is touched at
+  each pass, so a maintained failure is a heartbeat, not silence.
 
-Setup on each host (systemd user units, same environment as the runner):
+Setup: the host update installs and enables the timer, idempotently —
+`deploy/mise-a-jour/vm.sh agents installer` on an agent VM,
+`deploy/mise-a-jour/poste.sh installer` on the poste, and
+`deploy/mise-a-jour/vm.sh installer` (or
+`deploy/serveur/installer-serveur.sh`) on the server, with the system unit
+`deploy/serveur/ameesh-credentials.service`. `ameesh doctor` reports a
+missing, disabled or stopped timer as a KO. Do not copy a unit by hand on a
+mesh host: the next host update is what makes it last.
 
 ```sh
-cp deploy/systemd/ameesh-credentials.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ameesh-credentials.timer
 ameesh accounts check --dry-run      # probe now, write nothing
 ```
 

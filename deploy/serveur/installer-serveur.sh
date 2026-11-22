@@ -168,6 +168,16 @@ log "gabarit systemd ameesh-runner@<persona>"
 install -m 0644 "$SRC/deploy/serveur/ameesh-runner@.service" /etc/systemd/system/
 systemctl daemon-reload
 
+# --- sentinelle des identifiants (#8062) ----------------------------------------
+# Même sonde que sur une VM d'agents, en unité SYSTÈME : le serveur mène des
+# personas sous ameesh avec /opt/ameesh/venv et /etc/ameesh/harnais.env.
+# Rejouable : unités réécrites et `enable --now` (l'installation est idempotente).
+log "sentinelle des identifiants (ameesh-credentials.timer, #8062)"
+install -m 0644 "$SRC/deploy/serveur/ameesh-credentials.service" \
+  "$SRC/deploy/systemd/ameesh-credentials.timer" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ameesh-credentials.timer
+
 # --- sauvegardes ---------------------------------------------------------------
 log "sauvegarde quotidienne de la base"
 install -m 0755 "$SRC/deploy/serveur/sauvegarder-base.sh" /usr/local/sbin/ameesh-sauvegarder-base

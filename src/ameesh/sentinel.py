@@ -63,6 +63,10 @@ from dataclasses import dataclass
 from . import accounts as accounts_mod
 
 PERIOD_S = 600
+#: #8062 : nombre de périodes sans relevé au-delà duquel la sonde est muette
+#: (`credential_probe_stale`, 3 × 10 min) ; le jitter de la minuterie (30 s)
+#: est très en deçà.
+PROBE_SILENCE_PERIODS = 3
 #: a forecast expiry closer than this raises `credential_expiring`
 DEFAULT_WARN_HOURS = 24.0
 ACCOUNT_WARN_HOURS = 30 * 24.0
@@ -579,9 +583,10 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
     """Probes every credential and reports it; the rows, with `previous`.
 
     A credential already `failing` stays so unless the probe proves a fresh
-    login (`kept_failure`): the row then carries `kept` and nothing is
-    written. A write other than `failing` is conditional on the failure count
-    read (`expect_failures`): a failure recorded meanwhile by a turn wins."""
+    login (`kept_failure`): the row then carries `kept` and only its
+    `checked_at` is touched (#8062: the probe's heartbeat). A write other than
+    `failing` is conditional on the failure count read (`expect_failures`): a
+    failure recorded meanwhile by a turn wins."""
     from . import storage
     rows = []
     # #210 r5: health is read BEFORE the probes — a failure a turn records
@@ -608,6 +613,14 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
                         expect_failures=int(current.get("failures") or 0))
             else:
                 row["reason"] = reason or row["reason"]
+            if not dry_run:
+                # #8062 : la sonde a bien relu l'identifiant (même échec, ou
+                # verdict non concluant) : `checked_at` est son battement, et
+                # `credential_probe_stale` le lit. L'état, le nombre d'échecs et
+                # `failing_since` ne changent pas.
+                storage.of(db).credentials.touch(
+                    cfg.host, verdict.harness, verdict.account,
+                    expect_failures=int(current.get("failures") or 0))
             rows.append(row)
             continue
         if not dry_run:

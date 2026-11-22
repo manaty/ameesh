@@ -65,6 +65,18 @@ class Credentials(interface.Credentials):
             (reason, host, harness, account or "", int(expect_failures)))
         return bool(rows)
 
+    def touch(self, host, harness, account, *, expect_failures=None) -> bool:
+        # #8062 : la sonde a relu l'identifiant sans changer de verdict
+        # (`kept_failure`) ; `checked_at` est son battement, l'état et le
+        # compteur d'échecs restent intacts.
+        rows = self.db.query(
+            "update credential_health set checked_at = now()"
+            " where host = %s and harness = %s and account = %s"
+            "   and state = 'failing'"
+            "   and (%s::int is null or failures = %s::int) returning account",
+            (host, harness, account or "", expect_failures, expect_failures))
+        return bool(rows)
+
     def health(self, host, harness) -> dict:
         rows = self.db.query(_ROW + " where host = %s and harness = %s order by account",
                              (host, harness))
