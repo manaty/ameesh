@@ -439,6 +439,25 @@ class CiResults(DevDomain, interface.CiResults):
              ORDER BY repo, name
             """)
 
+    def watch_failure(self, repo):
+        """Count a failed repository pass, without fabricating a fresh queue scan."""
+        rows = self.db.query("""
+            INSERT INTO ci_queue_state AS q
+                (repo, seen_at, watch_failures, watch_failure_since)
+            VALUES (%s, 'epoch'::timestamptz, 1, now())
+            ON CONFLICT (repo) DO UPDATE SET
+                watch_failures = q.watch_failures + 1,
+                watch_failure_since = coalesce(q.watch_failure_since, now())
+            RETURNING watch_failures, (extract(epoch from watch_failure_since) * 1000000)::bigint AS since
+        """, (repo,))
+        return rows[0]
+
+    def watch_success(self, repo):
+        self.db.execute("""
+            UPDATE ci_queue_state SET watch_failures = 0, watch_failure_since = NULL
+            WHERE repo = %s
+        """, (repo,))
+
     def observe_queue(self, repo, *, oldest_id, oldest_at, queued,
                       wait_published=False) -> None:
         """#8031 : `wait_published` estampille `wait_seen_at` dans la même
