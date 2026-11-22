@@ -19,6 +19,7 @@ import json
 import subprocess
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import prevalidation as pv
@@ -77,26 +78,31 @@ class BoundedFallbackTest(unittest.TestCase):
 
     def test_static_importers_within_budget(self):
         got, plan = self.fallback()
-        # test_lent dépasse le budget ; test_sans_lien importe `circle`, pas `ci`
-        self.assertEqual(got["importers"], ["test_autre", "test_cible"])
+        # test_lent dépasse le budget ; test_sans_lien importe `circle`, pas `ci`.
+        # L'ordre est la durée mesurée (test_cible 5 s avant test_autre 10 s),
+        # plus l'ordre alphabétique.
+        self.assertEqual(got["importers"], ["test_cible", "test_autre"])
         self.assertEqual(got["importers_dropped"], 1)
+        self.assertEqual(got["importers_skipped"], ["test_lent"])
         self.assertNotIn("test_sans_lien", pv.planned_modules(plan))
 
     def test_importer_patterns_are_posix_ere(self):
         # #7930 : sous macOS, `git grep -E` suit la regex BSD, qui ignore les
-        # extensions GNU `\s`, `\b`, `\w` : aucun importateur n'était trouvé
+        # extensions GNU `\s`, `\b`, `\w`. Le graphe #8046 lit les imports en
+        # une passe : son motif après -E doit rester en ERE POSIX.
         with mock.patch.object(calls.subprocess, "run", wraps=subprocess.run) as run:
             got, _ = self.fallback()
         greps = [c.args[0] for c in run.call_args_list
                  if c.args and isinstance(c.args[0], list) and "grep" in c.args[0]]
         self.assertTrue(greps)
         for argv in greps:
-            patterns = [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
+            patterns = [argv[i + 1] for i, a in enumerate(argv)
+                        if a in ("-e", "-E") and i + 1 < len(argv)]
             self.assertTrue(patterns, argv)
             for pattern in patterns:
                 for gnu in ("\\s", "\\b", "\\w", "\\<", "\\>"):
                     self.assertNotIn(gnu, pattern)
-        self.assertEqual(got["importers"], ["test_autre", "test_cible"])
+        self.assertEqual(got["importers"], ["test_cible", "test_autre"])
 
     def test_the_lot_part_runs_before_the_contracts(self):
         _, plan = self.fallback()
@@ -104,7 +110,7 @@ class BoundedFallbackTest(unittest.TestCase):
         self.assertEqual([p["label"] for p in parts],
                          ["psycopg lot", "psycopg contrats"])
         self.assertEqual(parts[0]["modules"],
-                         ["test_3611_fire", "test_autre", "test_cible"])
+                         ["test_3611_fire", "test_cible", "test_autre"])
         self.assertIn("test_cluster", parts[1]["modules"])
         self.assertEqual([(p["part"], p["of"]) for p in parts], [(1, 2), (2, 2)])
         chosen = pv.selection(plan, head=self.head, base=self.base)
@@ -118,6 +124,94 @@ class BoundedFallbackTest(unittest.TestCase):
         self.assertEqual(calls._dotted("tests/support.py"), "tests.support")
         self.assertEqual(calls._dotted("tests/test_a.py"), "")
         self.assertEqual(calls._dotted("docs/a.md"), "")
+
+
+class ImportGraphTest(unittest.TestCase):
+    """#8046 : le graphe d'imports, sa distance et la coupe par racine."""
+
+    def test_import_targets_relative_and_package(self):
+        known = {"ameesh.ci", "ameesh.runner", "tests.support"}
+        self.assertEqual(calls._import_targets(
+            "from . import ci", "ameesh.runner", known), {"ameesh.ci"})
+        self.assertEqual(calls._import_targets(
+            "from .ci import run", "ameesh.runner", known), {"ameesh.ci"})
+        self.assertEqual(calls._import_targets(
+            "from ameesh import ci", "tests.test_a", known), {"ameesh.ci"})
+        self.assertEqual(calls._import_targets(
+            "from ameesh import ci as c", "tests.test_a", known), {"ameesh.ci"})
+        self.assertEqual(calls._import_targets(
+            "import ameesh.ci as c", "tests.test_a", known), {"ameesh.ci"})
+        self.assertEqual(calls._import_targets(
+            "from .support import PgTestCase", "tests.test_a", known),
+            {"tests.support"})
+        # un nom inconnu n'est pas un module du SHA : pas d'arête inventée
+        self.assertEqual(calls._import_targets(
+            "from ameesh import inconnu", "tests.test_a", known), set())
+
+    def test_a_transitive_importer_comes_after_a_direct_one(self):
+        repo = Repo()
+        self.addCleanup(repo.cleanup)
+        repo.write("src/ameesh/ci.py", "x = 1\n")
+        repo.write("src/ameesh/helper.py", "from . import ci\n")
+        repo.write("tests/test_direct.py", "from ameesh import ci\n")
+        repo.write("tests/test_transitif.py", "from ameesh import helper\n")
+        head = repo.commit("lot")
+        prepared = SimpleNamespace(repo=repo.root, tree=repo.root)
+        tree_modules = calls._tree_modules(prepared, head)
+        chosen, skipped = calls._importers(
+            prepared, head, [("M", "src/ameesh/ci.py")], tree_modules, set())
+        self.assertEqual(chosen, ["test_direct", "test_transitif"])
+        self.assertEqual(skipped, [])
+
+    def test_the_per_root_quota_keeps_a_moderate_test(self):
+        # Une coupe globale « plus court d'abord » prendrait les 48 modules
+        # à 0,1 s puis laisserait test_2820 (6 s) hors d'un budget de 30 s.
+        # Le quota par racine le garde (9e de housekeeping) ; la coupe
+        # globale ne retire ensuite que les plus éloignés ou les plus longs.
+        queues = {
+            "ameesh.housekeeping": dict(
+                [("test_court_%d" % i, 1) for i in range(8)]
+                + [("test_2820_events_rotation", 1)]),
+            "ameesh.runner": {"test_runner_%d" % i: 1 for i in range(20)},
+            "ameesh.work": {"test_work_%d" % i: 1 for i in range(20)},
+        }
+        durations = {name: 60.0 for queue in queues.values()
+                     for name in queue}
+        for i in range(8):
+            durations["test_court_%d" % i] = 0.1
+        durations["test_2820_events_rotation"] = 6.0
+        order, skipped = calls._budget_importers(
+            queues, durations, set(), 30.0)
+        self.assertIn("test_2820_events_rotation", order)
+        self.assertLessEqual(len(order), 3 * calls.FALLBACK_IMPORTERS_PER_ROOT)
+        self.assertTrue(skipped)
+        self.assertEqual(skipped, sorted(set(skipped)))
+
+    def test_the_global_cut_drops_the_farthest_first(self):
+        # À budget serré, un direct coûteux passe avant un transitif bon
+        # marché : la distance d'import prime sur la durée.
+        queues = {
+            "ameesh.ci": {"test_direct": 1},
+            "ameesh.runner": {"test_transitif": 2, "test_profond": 3},
+        }
+        durations = {"test_direct": 6.0, "test_transitif": 0.1,
+                     "test_profond": 0.1}
+        order, skipped = calls._budget_importers(
+            queues, durations, set(), 6.0)
+        self.assertEqual(order, ["test_direct"])
+        self.assertEqual(skipped, ["test_profond", "test_transitif"])
+
+    def test_a_test_support_change_is_not_an_importer_root(self):
+        repo = Repo()
+        self.addCleanup(repo.cleanup)
+        repo.write("tests/support.py", "x = 1\n")
+        repo.write("tests/test_a.py", "from .support import x\n")
+        head = repo.commit("lot")
+        prepared = SimpleNamespace(repo=repo.root, tree=repo.root)
+        tree_modules = calls._tree_modules(prepared, head)
+        chosen, skipped = calls._importers(
+            prepared, head, [("M", "tests/support.py")], tree_modules, set())
+        self.assertEqual((chosen, skipped), ([], []))
 
 
 class RedBeforeDeadlineTest(unittest.TestCase):
