@@ -19,6 +19,8 @@ class _Canon:
 
     def __init__(self, name, cards, federation=None):
         self.name, self.federation = name, federation
+        # #8030/#8033: the drain also reads the canon's Host cards.
+        self.hosts = []
         self.agents = [types.SimpleNamespace(
             title=agent, fiche=types.SimpleNamespace(data={"roles": roles}))
             for agent, roles in cards.items()]

@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest import mock
 
-from ameesh import host_capacity_alerts, host_idle, notify
+from ameesh import host_budget, host_capacity_alerts, host_idle, host_lifecycle, notify
 
 GP1_S = {'calcul_eur_h': 0.19074, 'disque_eur_h': 0.00735, 'ip_eur_h': 0.005,
          'source': 'Scaleway catalog fr-par-1, 05/11/2026'}
@@ -16,6 +16,81 @@ def canon(**cards):
 
 
 class CostStatesTest(unittest.TestCase):
+    def test_observed_running_idle_baseline_alert_has_no_drain_suggestion(self):
+        fp = {'state': 'idle', 'capacity': 'baseline', 'idle_since': 1,
+              'unknown': [], 'runs': 0, 'leases': 0, 'runs_source': 'none'}
+        self.assertEqual(host_capacity_alerts.project({'vm': fp}, [], now=4000), [])
+        alerts = host_capacity_alerts.project({'vm': fp}, [], now=4000,
+                                               provider_running={'vm'})
+        self.assertEqual(len(alerts), 1)
+        self.assertIn('observed running without activity', alerts[0]['detail'])
+        self.assertNotIn('host drain', alerts[0]['detail'])
+
+    def test_budget_only_prices_proven_running_interval(self):
+        cards = [canon(vm={'tarif_eur_h': 0.2, 'tarif_source': 'owner 2026-11-21'},
+                       missing={'tarif_eur_h': 0.1})]
+        rows = host_budget.project(cards, [dict(host='vm', provider_state='running',
+                                                on_ts=100, seen_ts=7300)])
+        by_host = {row['host']: row for row in rows}
+        self.assertEqual(by_host['vm']['observed_on_hours'], 2)
+        self.assertEqual(by_host['vm']['observed_cost_eur'], 0.4)
+        self.assertEqual(by_host['vm']['rate_source'], 'owner 2026-11-21')
+        self.assertIsNone(by_host['vm']['total_cost_eur'])
+        self.assertIsNone(by_host['missing']['observed_cost_eur'])
+        stopped = host_budget.project(cards, [dict(host='vm', provider_state='stopped',
+                                                   on_ts=100, seen_ts=7300)])
+        self.assertIsNone(next(row for row in stopped if row['host'] == 'vm')['observed_on_hours'])
+
+    def test_service_host_is_neither_idle_candidate_nor_drainable(self):
+        cards = [canon(hub={'capacity': 'services', 'policy': {'max_agents': 0}})]
+        caps, _ = host_idle.capacities(cards, ['hub'], protected=['hub'], baseline_hosts=2)
+        self.assertEqual(caps['hub'], 'services')
+        fp = {'state': 'idle', 'capacity': caps['hub'], 'idle_since': 1, 'unknown': []}
+        self.assertEqual(host_capacity_alerts.project({'hub': fp}, [], now=4000), [])
+        with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
+             mock.patch.object(host_lifecycle.work, 'configured_canons', return_value=cards), \
+             mock.patch('ameesh.canon.configured', return_value=['canon']), \
+             mock.patch.object(host_lifecycle.storage, 'of') as store:
+            with self.assertRaisesRegex(ValueError, 'protected services'):
+                host_lifecycle.drain(None, None, 'hub', actor='human:test')
+            store.assert_not_called()
+
+    def test_unreadable_configured_canon_refuses_drain(self):
+        # #8033: with the canon configured but unreadable, `configured_canons`
+        # renders [] and the services guard cannot see the host cards. The
+        # drain must fail closed instead of looking like "no canon".
+        with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
+             mock.patch.object(host_lifecycle.work, 'configured_canons', return_value=[]), \
+             mock.patch('ameesh.canon.configured', return_value=['canon']), \
+             mock.patch.object(host_lifecycle.storage, 'of') as store:
+            with self.assertRaisesRegex(ValueError, 'configured canon unreadable'):
+                host_lifecycle.drain(None, None, 'hub', actor='human:test')
+            store.assert_not_called()
+
+    def test_unreadable_canon_root_refuses_drain(self):
+        # #8033 review witness (B #45128): `canon._load` catches the git/OS
+        # error and returns `Canon(readable=False)`, so `configured_canons`
+        # is non-empty. The services card is still unknown; a drain of the
+        # hub must not go through.
+        cfg = NS(canon='/nonexistent/ameesh-canon-8033', canon_ref='',
+                 canon_untrusted=False)
+        with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
+             mock.patch.object(host_lifecycle.storage, 'of') as store:
+            with self.assertRaisesRegex(ValueError, 'configured canon unreadable'):
+                host_lifecycle.drain(cfg, None, 'hub', actor='human:test')
+            store.assert_not_called()
+
+    def test_no_configured_canon_still_allows_drain(self):
+        store = mock.Mock()
+        store.host_lifecycle.drain.return_value = {'mode': 'draining'}
+        with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
+             mock.patch.object(host_lifecycle.work, 'configured_canons', return_value=[]), \
+             mock.patch('ameesh.canon.configured', return_value=[]), \
+             mock.patch.object(host_lifecycle.storage, 'of', return_value=store):
+            row = host_lifecycle.drain(None, None, 'vm', actor='human:test')
+        self.assertEqual(row['mode'], 'draining')
+        self.assertFalse(store.host_lifecycle.drain.call_args.kwargs['close_claims'])
+
     def test_parts_give_on_and_off(self):
         cost = host_idle.cost_states([{'tarif': GP1_S}])
         self.assertAlmostEqual(cost['on'], 0.20309)

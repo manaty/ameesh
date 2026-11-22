@@ -93,6 +93,20 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
     except Exception:  # an unreadable canon must not reopen the gate
         canons = []
         configured = True
+    from . import host_idle
+    # #8033: an unreadable canon has two shapes here. `configured_canons`
+    # renders [] when the load raises, and `Canon(readable=False)` with no
+    # Host cards when `canon._load` itself caught the git/OS error. Either
+    # way the cards are unknown and the services guard below cannot recognise
+    # a protected host: refuse the drain instead of failing open (doubt →
+    # sensitive, canon §8). Canon objects without the flag count as readable
+    # (test doubles).
+    unreadable = any(not getattr(canon, 'readable', True) for canon in canons)
+    if configured and (not canons or unreadable):
+        raise ValueError('drain refused: configured canon unreadable')
+    if any(h.title == host and h.fiche.data.get('capacity') == host_idle.CAPACITY_SERVICES
+           for canon in canons for h in canon.hosts):
+        raise ValueError('drain refused: host carries protected services')
     try:
         hook = host_release.hook_for(cfg, canons, host)
     except ValueError:

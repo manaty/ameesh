@@ -32,6 +32,8 @@ RUNS_LENDING = 'lending'
 #: #7727: a host that admits no agent is outside the reserved-capacity
 #: projection: neither a baseline reserve nor a burst candidate.
 CAPACITY_NONE = 'none'
+# Service hosts are protected independently of agent placement and baseline.
+CAPACITY_SERVICES = 'services'
 #: the capacity classes an idle host can be counted in by the alerts
 CAPACITY_CLASSES = ('baseline', 'burst')
 
@@ -304,7 +306,9 @@ def cost_states(cards):
     legacy = next((v for v in values if v is not None and v >= 0), None)
     if legacy is None and problem is None:
         return None
-    return {'on': legacy, 'off': None, 'parts': None, 'source': None,
+    source = next((str(c.get('tarif_source')).strip()[:200] for c in cards
+                   if c.get('tarif_source')), None)
+    return {'on': legacy, 'off': None, 'parts': None, 'source': source,
             'problem': problem}
 
 
@@ -345,7 +349,9 @@ def capacities(canons, names, *, protected=(), baseline_hosts=2):
     for name in names:
         cards = [host.fiche.data for canon in canons for host in canon.hosts
                  if host.title == name]
-        if no_agent_reason(cards):
+        if any(c.get('capacity') == CAPACITY_SERVICES for c in cards):
+            out[name] = CAPACITY_SERVICES
+        elif no_agent_reason(cards):
             out[name] = CAPACITY_NONE
         else:
             out[name] = ('baseline' if any(c.get('capacity') == 'baseline' for c in cards)
@@ -353,7 +359,7 @@ def capacities(canons, names, *, protected=(), baseline_hosts=2):
         costs[name] = cost_states(cards)
     if sum(v == 'baseline' for v in out.values()) < baseline_hosts:
         for name in protected:
-            if name in out and out[name] != CAPACITY_NONE:
+            if name in out and out[name] in CAPACITY_CLASSES:
                 out[name] = 'baseline'
     return out, costs
 

@@ -1,4 +1,4 @@
-# Réplication en flux PostgreSQL 17 du mesh (lot #6868, EP8.3a)
+# Réplication en flux PostgreSQL 17 du mesh (lots #6868 EP8.3a et #8027)
 
 Scripts de **préparation** de la réplication en flux à trois nœuds décrite par
 l'étude [replique-base-mesh.md](../../../docs/design/etudes/replique-base-mesh.md)
@@ -9,31 +9,42 @@ EP8.3 (#6860). Le réseau privé est #6859, l'archivage #6858 : ni l'un ni l'aut
 n'est traité ici, et `installer-serveur.sh`, `terraform` et
 `sauvegarder-base.sh` ne sont pas modifiés.
 
+Le lot **#8027** (décision owner de veille du mesh) fixe le primaire sur le
+**hub** : au repos, seul `manaty-mesh-1` reste allumé et doit servir la base.
+La bascule d'EP8.3 vers `ameesh-agents-1` n'est donc plus la cible ; les
+agents sont les standbys synchrones du hub, et une promotion d'agent n'est
+qu'une **bascule de secours**. Le mode veille (`mode-veille.sh`) vide la liste
+synchrone avant l'arrêt des agents et la rétablit au réveil.
+
 ## Cible
 
 Trois nœuds PostgreSQL 17, sans VM nouvelle (étude §2) :
 
-| Nœud | Inventaire | Rôle effectif après EP8.3 | Flux |
+| Nœud | Inventaire | Rôle effectif | Flux |
 |---|---|---|---|
-| `ameesh-agents-1` | `primaire`, synchrone, priorité 100 | primaire | sert les clients |
-| `ameesh-agents-2` | `standby`, synchrone, priorité 90 | standby synchrone | `sync` (un seul) |
-| `manaty-mesh-1` | `standby`, **nosync**, **nofailover**, priorité 0 | standby asynchrone, hub WireGuard | `async` ; promu seulement au retour planifié (`--retour-nofailover`) |
+| `manaty-mesh-1` | `primaire`, **nofailover**, priorité 0 | primaire permanent, hub WireGuard | sert les clients ; seul allumé en veille |
+| `ameesh-agents-1` | `standby`, synchrone, priorité 100 | standby synchrone | `quorum` (l'un des deux) |
+| `ameesh-agents-2` | `standby`, synchrone, priorité 90 | standby synchrone | `quorum` (l'un des deux) |
 
 L'inventaire [`noeuds.conf`](noeuds.conf) porte ces valeurs ; les scripts n'ont
-aucun nom de nœud en dur. La cible d'EP8.3 est le primaire `ameesh-agents-1`,
-mais au moment de la préparation le hub est encore primaire : les scripts
-lisent le **rôle effectif** du serveur (`pg_is_in_recovery()`), pas seulement
-l'inventaire, pour poser les rôles et les slots sur celui qui sert.
+aucun nom de nœud en dur. Le hub est le primaire permanent ; un agent ne
+devient primaire que par une bascule de secours (le hub ne revient qu'au
+retour planifié, `--retour-nofailover`). Les scripts lisent aussi le **rôle
+effectif** du serveur (`pg_is_in_recovery()`), pas seulement l'inventaire,
+pour poser les rôles et les slots sur celui qui sert.
 
 Règles encodées :
 
 - `synchronous_commit = on` et, **seulement quand un candidat est déjà en
   flux**, `synchronous_standby_names = 'ANY 1 (...)'` avec les deux VM
   d'agents : un seul synchrone, `ANY 1` choisit celui des deux qui est
-  connecté ; le hub n'est jamais candidat (`nosync`). À l'amorçage (aucun
-  standby), la liste reste **vide** : sans Patroni, une liste non vide sans
-  standby connecté ferait attendre chaque `COMMIT` indéfiniment (B1 de revue
-  #6868) ;
+  connecté ; le primaire (le hub) n'est jamais candidat — il n'est pas son
+  propre standby. À l'amorçage (aucun standby), la liste reste **vide** : sans
+  Patroni, une liste non vide sans standby connecté ferait attendre chaque
+  `COMMIT` indéfiniment (B1 de revue #6868) ;
+- en **mode veille** (#8027), la liste reste vide même si un candidat est
+  encore en flux : c'est la condition pour arrêter les agents sans bloquer un
+  `COMMIT` ; `mode-veille.sh sortir` la rétablit après le rattrapage ;
 - `wal_log_hints = on` (pg_rewind) et `full_page_writes = on` ;
 - `wal_level = replica`, `max_wal_senders = 10`, `max_replication_slots = 10`,
   `hot_standby = on` ;
@@ -104,8 +115,9 @@ Règles encodées :
 | `promouvoir.sh` | promotion manuelle avec gardes anti-split-brain et borne WAL rejouée ; crée les slots des autres nœuds |
 | `reintegrer.sh` | `pg_rewind` de l'ancien primaire, re-pose de la configuration copiée par le rewind, démarrage en standby, suppression des slots physiques inactifs de l'ancien rôle primaire |
 | `suivre-primaire.sh` | fait suivre un autre standby au nouveau primaire (`primary_conninfo`/slot), recharge et contrôle |
-| `retour-arriere.sh` | retire la configuration du lot, et sur demande les slots et les rôles ; aucune donnée supprimée |
-| `etat.sh` | lecture seule : rôle, synchrones, slots, flux, retards, avertissements |
+| `retour-arriere.sh` | retire la configuration du lot (dont le marqueur de veille), et sur demande les slots et les rôles ; aucune donnée supprimée |
+| `etat.sh` | lecture seule : rôle, mode veille, synchrones, slots, flux, retards, avertissements |
+| `mode-veille.sh` | #8027 : `entrer` (liste synchrone vidée, fin des tours, sauvegarde, consignation), `sortir` (rattrapage puis liste rétablie), `etat` |
 
 Tous les scripts tournent en **root** (comme `installer-serveur.sh`) et
 passent les commandes PostgreSQL par `runuser -u postgres`. Les chemins sont
@@ -117,12 +129,12 @@ voir `lib.sh`) ; ce n'est pas une interface d'exploitation.
 L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
 `replication.env` présent sur les trois nœuds.
 
-1. **Sur le primaire actuel (`manaty-mesh-1`)** : rôles, slots des deux agents,
-   configuration et `pg_hba` ; le premier passage exige un redémarrage court
-   (`wal_log_hints`), fenêtre d'EP8.1/EP8.3. Aucun standby n'existe encore :
-   `synchronous_standby_names` reste **vide**, donc les `CREATE ROLE`,
-   `ALTER ROLE` et la création des slots ne s'attendent pas (B1 de revue
-   #6868) :
+1. **Sur le hub (`manaty-mesh-1`), primaire permanent** : rôles, slots des
+   deux agents, configuration et `pg_hba` ; le premier passage exige un
+   redémarrage court (`wal_log_hints`), fenêtre d'EP8.1/EP8.3. Aucun standby
+   n'existe encore : `synchronous_standby_names` reste **vide**, donc les
+   `CREATE ROLE`, `ALTER ROLE` et la création des slots ne s'attendent pas
+   (B1 de revue #6868) :
 
    ```bash
    deploy/serveur/replication/configurer-noeud.sh --redemarrer manaty-mesh-1
@@ -142,7 +154,8 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
 3. **Activer le synchrone sur le hub**, une fois `ameesh-agents-2` en flux :
    rejouer la configuration (sans redémarrage). Le script ne pose `ANY 1` que
    s'il voit un candidat en `streaming` ; `etat.sh` doit alors afficher
-   `sync_state = quorum` (valeur de `ANY 1` en PG17), le hub restant `async` :
+   `sync_state = quorum` (valeur de `ANY 1` en PG17) sur le ou les agents en
+   flux ; le hub, primaire, ne figure jamais dans la liste :
 
    ```bash
    deploy/serveur/replication/configurer-noeud.sh manaty-mesh-1
@@ -156,20 +169,37 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
    (liste vide + rechargement) ; rétablir par un passage normal dès le flux
    revenu. `etat.sh` signale les deux cas.
 
-4. **Bascule planifiée** (fenêtre d'EP8.3, aucun client ne doit écrire
-   pendant la promotion) :
+4. **Bascule de secours, puis retour planifié sur le hub** (le hub est le
+   primaire permanent : on ne planifie plus une bascule *vers* un agent).
+   Si le hub est perdu, promouvoir un agent avec la borne WAL relevée sur le
+   hub avant sa perte, ou `--force` en désastre assumé :
 
    ```bash
-   # sur manaty-mesh-1, écritures client arrêtées : relever la borne WAL
+   # sur le hub, écritures client arrêtées si possible : relever la borne
    psql -Atc 'SELECT pg_current_wal_flush_lsn()'   # ex. 0/1A2B3C4, à noter
-   # puis arrêt propre de l'ancien primaire
+   # puis arrêt propre de l'ancien primaire (si possible)
    pg_ctlcluster 17 main stop
    # sur ameesh-agents-1 : promotion avec la borne relevée
    deploy/serveur/replication/promouvoir.sh --borne 0/1A2B3C4 ameesh-agents-1
-   # sur manaty-mesh-1 : réintégration par pg_rewind
+   ```
+
+   Quand le hub revient, il est réintégré en standby de l'agent primaire, puis
+   le retour planifié le ramène primaire ; `--retour-nofailover` lève le seul
+   `nofailover` et exige la borne :
+
+   ```bash
+   # sur manaty-mesh-1 : réintégration par pg_rewind derrière l'agent primaire
    deploy/serveur/replication/reintegrer.sh --source ameesh-agents-1 manaty-mesh-1
-   # sur ameesh-agents-2 : suivre le nouveau primaire
-   deploy/serveur/replication/suivre-primaire.sh --source ameesh-agents-1 ameesh-agents-2
+   # retour planifié : sur ameesh-agents-1, écritures arrêtées, relever la borne et arrêter
+   psql -Atc 'SELECT pg_current_wal_flush_lsn()'
+   pg_ctlcluster 17 main stop
+   # sur manaty-mesh-1 : promotion de retour
+   deploy/serveur/replication/promouvoir.sh --retour-nofailover --borne <LSN> manaty-mesh-1
+   # sur ameesh-agents-1, puis ameesh-agents-2
+   deploy/serveur/replication/reintegrer.sh --source manaty-mesh-1 ameesh-agents-1
+   deploy/serveur/replication/suivre-primaire.sh --source manaty-mesh-1 ameesh-agents-2
+   # sur manaty-mesh-1, les deux agents en flux : ANY 1
+   deploy/serveur/replication/configurer-noeud.sh manaty-mesh-1
    ```
 
    La borne est **obligatoire** pour une bascule planifiée : `ANY 1` ne
@@ -186,40 +216,109 @@ L'ordre ci-dessous est la cible ; il suppose le réseau #6859 posé et
    sa liste synchrone est vide. La rejouer (`configurer-noeud.sh
    ameesh-agents-1`) une fois `ameesh-agents-2` en flux.
 
-   **Aller-retour d'EP8.3 (décision pilote, #6860)** : tant que Patroni et
-   le DSN multi-hôte (EP8.4/EP8.5) ne sont pas là, les clients restent sur
-   le hub. Après l'aller ci-dessus, une seconde fenêtre ramène le primaire
-   sur le hub, avec les mêmes gardes ; `--retour-nofailover` lève le seul
-   `nofailover` et exige la borne :
+5. **Contrôle final** sur le primaire : `etat.sh` doit montrer le hub primaire,
+   deux standbys en flux, deux slots actifs, `wal_log_hints = on`, et le hub
+   jamais dans la liste synchrone. En régime nominal, les deux agents sont en
+   `quorum` ; si `etat.sh` signale un primaire effectif sur un agent, c'est
+   une bascule de secours : le mode veille refuse tant que le hub n'est pas
+   revenu primaire. Un seul primaire répond ; les clients se reconnectent par
+   le DSN multi-hôte (EP8.4/EP8.5).
 
-   ```bash
-   # sur ameesh-agents-1, écritures client arrêtées : relever la borne, puis arrêt
-   psql -Atc 'SELECT pg_current_wal_flush_lsn()'
-   pg_ctlcluster 17 main stop
-   # sur manaty-mesh-1 : promotion de retour
-   deploy/serveur/replication/promouvoir.sh --retour-nofailover --borne <LSN> manaty-mesh-1
-   # sur ameesh-agents-1, puis ameesh-agents-2
-   deploy/serveur/replication/reintegrer.sh --source manaty-mesh-1 ameesh-agents-1
-   deploy/serveur/replication/suivre-primaire.sh --source manaty-mesh-1 ameesh-agents-2
-   # sur manaty-mesh-1, les deux agents en flux : ANY 1
-   deploy/serveur/replication/configurer-noeud.sh manaty-mesh-1
-   ```
+## Mode veille (#8027)
 
-5. **Contrôle final** sur le primaire : `etat.sh` doit montrer deux standbys
-   en flux, deux slots actifs, `wal_log_hints = on`, et le hub jamais dans la
-   liste synchrone. Après l'aller-retour (primaire `manaty-mesh-1`), les deux
-   agents sont en `quorum` ; à EP8.6 (primaire `ameesh-agents-1`),
-   `ameesh-agents-2` est en `quorum` et le hub en `async`. Un seul primaire
-   répond ; les clients se reconnectent par le DSN multi-hôte (EP8.4/EP8.5).
+Au repos, le mesh n'a qu'un hôte allumé : le hub. La base doit donc rester
+servie par le hub, et l'arrêt d'`ameesh-agents-1`/`-2` ne doit bloquer aucun
+`COMMIT`. Le déclencheur de veille (#8029, `lifecycle_hook` du `vm_adapter`)
+appelle ce script **une fois** avant d'arrêter le premier hôte qui porte une
+réplique, puis une fois au réveil, après le retour des deux agents :
+
+```bash
+deploy/serveur/replication/mode-veille.sh entrer
+# … arrêt des VM agents (déclencheur) …
+deploy/serveur/replication/mode-veille.sh sortir
+# … réveil des VM agents, puis sortir quand elles sont de retour …
+```
+
+**Contrat** : sortie 0 = le déclencheur peut arrêter (ou rendre) les agents ;
+sortie non nulle = ne pas arrêter les agents, l'état est consigné. Le script
+est idempotent : le rejouer ne change rien d'utile.
+
+`entrer` :
+
+1. refuse si le primaire effectif n'est pas le hub (**jamais** arrêter les
+   agents dans ce cas : une bascule de secours doit d'abord ramener le
+   primaire sur le hub) ;
+2. exige une sauvegarde logique de moins de 26 h dans
+   `/home/ameesh/sauvegardes` (`ameesh-sauvegarde.timer`) ; la dérogation
+   `--sans-sauvegarde "<raison>"` est consignée ;
+3. écrit le marqueur `/etc/ameesh/mode-veille` (0644, clé=valeur) **avant** la
+   configuration, puis réécrit le fragment avec
+   `synchronous_standby_names = ''` et recharge. Le marqueur est relu par
+   `configurer-noeud.sh` : un passage pendant la veille ne repose pas la liste ;
+4. vérifie que `SHOW synchronous_standby_names` est bien vide après le
+   rechargement ; si un autre gestionnaire (Patroni) tient la valeur, le script
+   refuse et les agents ne doivent pas être arrêtés ;
+5. attend qu'aucun **tour** ne soit réellement en cours (statut `running` et
+   bail vivant dans `agent_registry`, base `ameesh`) ; les runners *idle*
+   gardent leur bail et ne comptent pas, sinon la veille ne pourrait jamais
+   être prise avant l'arrêt des agents. L'attente est bornée par
+   `AMEESH_REPLICATION_ATTENTE_TOURS` (600 s par défaut) ; un tour restant est
+   un refus, pas un arrêt forcé ;
+6. consigne `mode=veille`, l'heure, le nœud, la liste avant, la sauvegarde, le
+   compte de tours et le résultat dans `/etc/ameesh/mode-veille`.
+
+Si l'entrée échoue après la pose du marqueur (tours restants, autre
+gestionnaire, rechargement), elle est **annulée** : le marqueur est retiré, la
+liste synchrone rétablie si un candidat est en flux, et l'échec consigné en
+`mode=actif` — les agents ne sont pas arrêtés et la durabilité n'est pas
+laissée dégradée sans échéance. Un rejeu sur une veille **déjà active** ne
+défait jamais l'état existant : en cas d'échec, le marqueur et la liste vide
+restent en place.
+
+`sortir` :
+
+1. refuse si le primaire n'est pas le hub ;
+2. attend qu'au moins un candidat synchrone soit **en flux et rattrapé**
+   (`replay_lsn >= pg_current_wal_flush_lsn()`), borné par
+   `AMEESH_REPLICATION_ATTENTE_REVEIL` (900 s : démarrage des VM et
+   rattrapage) ; sans réplique rattrapée, la liste reste vide et le script
+   échoue (les agents ne sont pas « rendus ») ;
+3. retire le marqueur, réécrit le fragment (`ANY 1` avec les agents en flux),
+   recharge, vérifie que la liste n'est plus vide ; en cas d'échec, le
+   marqueur de veille est reposé (état sûr : liste vide) ;
+4. consigne `mode=actif`, la liste rétablie, les répliques rattrapées.
+
+Le mode veille ne touche **aucune donnée** : il ne fait que lire (baux,
+`pg_stat_replication`) et réécrire le fragment de configuration. La sauvegarde
+logique est lue, pas produite. `etat.sh` affiche le mode et ne signale pas la
+liste vide comme une dégradation quand la veille est active ; il signale en
+revanche un primaire effectif hors du hub.
+
+En cas d'urgence hors veille (standby perdu, `COMMIT` qui attendent), le geste
+immédiat reste `configurer-noeud.sh --sans-synchrone` : il vide la liste pour
+le passage courant, sans marqueur persistant ; `mode-veille.sh entrer` est le
+geste durable qui survit à un `configurer-noeud.sh` pendant l'arrêt.
+
+Le plan Patroni (EP8.4, #6959) n'est **pas** applicable en l'état : il prévoit
+`ameesh-agents-1` comme primaire préféré et une promotion préalable du hub
+vers AG1, ce que #8027 interdit. `adoption.py topologie` compare
+`topologie.json` à `noeuds.conf` et refuse désormais l'adoption (écart
+« primaire d'EP8.3 manaty-mesh-1, primaire préféré de Patroni
+ameesh-agents-1 ») ; #6959 reste en attente d'une révision du plan Patroni et
+d'une décision owner. Ne pas promouvoir un agent pour rendre l'adoption
+possible.
 
 ## Promotion manuelle
 
 `promouvoir.sh` est un geste **d'exploitant**, pas une décision d'agent
-(étude §4 : Patroni fera le code en EP8.4). Gardes :
+(étude §4 : Patroni fera le code en EP8.4). Depuis #8027, promouvoir un agent
+est une **bascule de secours** (le hub primaire est perdu) ; l'opération
+planifiée est le **retour** du primaire sur le hub (`--retour-nofailover`).
+Gardes :
 
 - un nœud `nofailover` (le hub) est refusé sans `--force`, sauf le retour
-  planifié d'un aller-retour (`--retour-nofailover`, borne exigée, autres
-  gardes intactes) ;
+  planifié sur le hub (`--retour-nofailover`, borne exigée, autres gardes
+  intactes) ;
 - le serveur local doit tourner et être en récupération ;
 - **aucun autre nœud joignable ne doit répondre comme primaire** ; un nœud
   joignable dont le rôle est illisible arrête aussi (on ne parie pas) ;
@@ -316,12 +415,15 @@ Deux niveaux, à ne pas confondre :
 `sync_state`, LSN), les slots (`active`, `wal_status`) ; sur un standby, le
 flux (`pg_stat_wal_receiver`, source, slot, `written_lsn`/`flushed_lsn`/
 `latest_end_lsn`, date du dernier message — les colonnes `*_lag` n'existent
-que dans `pg_stat_replication`, côté primaire). Il avertit si `wal_log_hints`
-est off, si un nœud `nofailover` apparaît dans `synchronous_standby_names`, si
-la liste synchrone est active sans candidat en flux (risque de `COMMIT`
-bloqués, B1) ou vide (RPO dégradé), si aucun standby n'est `sync`/`quorum`, si
-un slot est inactif ou perdu. Il sort 0 si le serveur répond, 1 sinon : il
-n'est pas une sonde de supervision.
+que dans `pg_stat_replication`, côté primaire). Il affiche le mode veille
+(#8027) et, sur un primaire, si le primaire effectif est bien le hub de
+l'inventaire. Il avertit si `wal_log_hints` est off, si un nœud `nofailover`
+apparaît dans `synchronous_standby_names`, si la liste synchrone est active
+sans candidat en flux (risque de `COMMIT` bloqués, B1) ou vide hors veille
+(RPO dégradé), si aucun standby n'est `sync`/`quorum`, si un slot est inactif
+ou perdu. En veille, la liste vide n'est pas une dégradation : les slots
+inactifs restent signalés (ils retiennent du WAL). Il sort 0 si le serveur
+répond, 1 sinon : il n'est pas une sonde de supervision.
 
 Les alertes `db_replication_lag`, `db_slot_lost`, `db_no_primary` et
 `db_archive_stale` sont du lot EP8.4/EP8.5 (étude §7) : ce lot ne fixe pas de
@@ -354,7 +456,12 @@ perdu impose un re-seed, pas une augmentation silencieuse de la borne.
 Aucun test ne touche un hôte réel ni le réseau : `tests/test_6868_replication.py`
 remplace `psql`, `pg_ctlcluster`, `pg_isready`, `pg_basebackup`, `pg_rewind`,
 `runuser` et `hostname` par des doublures sous un répertoire jetable, et
-vérifie aussi que les mots de passe ne passent jamais en argument.
+vérifie aussi que les mots de passe ne passent jamais en argument. Les témoins
+du mode veille (#8027) couvrent le refus hors du hub, la sauvegarde logique,
+la liste vidée et rechargée, l'attente des tours réellement en cours (les
+baux des runners idle ne comptent pas), l'annulation d'une entrée échouée
+avec liste rétablie, le rejeu sur une veille active, le rattrapage au réveil
+et la consignation dans le marqueur.
 
 ```bash
 PYTHONPATH=src python -m unittest tests.test_6868_replication -v
@@ -363,10 +470,15 @@ PYTHONPATH=src python -m unittest tests.test_6868_replication -v
 ## Limites connues
 
 - Pas de Patroni/etcd : la promotion est manuelle et le split brain est gardé
-  par un contrôle de rôle, pas par un quorum (EP8.4).
+  par un contrôle de rôle, pas par un quorum (EP8.4). Le plan Patroni actuel
+  (#6959) suppose le primaire sur AG1 et est **suspendu** par #8027 tant
+  qu'il n'est pas révisé (voir « Mode veille »).
 - Le réseau privé (#6859) et l'archivage/PITR (#6858) sont des prérequis
   d'autres lots ; les hôtes de `noeuds.conf` sont les adresses privées de
   #6859 (EP8.3, #6860).
+- Le mode veille (#8027) n'est pas encore branché sur le déclencheur
+  d'arrêt/réveil des VM (#8029) : il fournit l'interface (`entrer`/`sortir`)
+  et ses témoins, mais aucun hôte réel n'a été arrêté par ce lot.
 - Aucune alerte ni sonde de supervision : `etat.sh` est un outil
   d'exploitation, pas un service (EP8.4/EP8.5).
 - La bascule réelle, la fenêtre et la recette sur les trois nœuds restent le
