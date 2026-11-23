@@ -144,6 +144,7 @@ Tout est journalisé (`housekeeping_log`, migration 0045) et visible dans
 from __future__ import annotations
 
 import getpass
+import hashlib
 import json
 import math
 import os
@@ -388,6 +389,19 @@ DEFAULT_SWEEP_AGE_S = 6 * 3600.0
 DEFAULT_SWEEP_PREFIXES = ("ameesh-",)
 #: #8020 : sous-dossier temporaire d'un lot, sous le dossier de l'agent
 LOT_TMP_PREFIX = "ameesh-lot-"
+#: #8128 : longueur maximale d'un chemin de socket AF_UNIX (`sun_path` du
+#: noyau, NUL compris) et marge qu'un `TMPDIR` doit laisser sous cette borne
+#: aux noms que les outils ajoutent (`multiprocessing` :
+#: `pymp-…/listener-…`). `len(TMPDIR) + 40 <= 107`.
+AF_UNIX_PATH_MAX = 107
+LOT_TMP_SOCKET_MARGIN = 40
+#: #8128 : racine courte des alias de `TMPDIR` par lot, sur disque et hors
+#: /tmp et /dev/shm (sous le home, sinon sous l'état d'ameesh)
+LOT_TMP_SHORT_DIR = ".t"
+#: #8128 : alias court `<l><lot>-<empreinte de l'agent>` sous la racine courte
+LOT_TMP_LINK_PREFIX = "l"
+LOT_TMP_LINK_HASH = 6
+LOT_TMP_LINK_RE = re.compile(r"^l\d+-[0-9a-f]{%d}$" % LOT_TMP_LINK_HASH)
 #: #8020 : alerte de remplissage d'un tmpfs autre que le /tmp de l'hôte
 #: (/dev/shm), en part du système de fichiers
 DEFAULT_SHM_ALERT = 0.5
@@ -1206,6 +1220,231 @@ def lot_tmp_name(lot) -> str:
     return LOT_TMP_PREFIX + ident if ident.isdigit() else ""
 
 
+def _short_path_ok(path: str) -> bool:
+    """#8128 : `path` laisse la marge AF_UNIX sous la borne du noyau."""
+    return len(os.fsencode(path)) + LOT_TMP_SOCKET_MARGIN <= AF_UNIX_PATH_MAX
+
+
+def lot_tmp_link_roots(cfg) -> list[str]:
+    """#8128 : racines courtes candidates pour l'alias de `TMPDIR` d'un lot.
+
+    D'abord `<home>/.t/<mesh>`, puis `<état>/.t/<mesh>` : hors `/tmp` et
+    `/dev/shm`, sur disque (vérifié à la création), et assez courtes pour
+    laisser la marge AF_UNIX. Le sous-dossier par mesh empêche deux meshes
+    d'un même utilisateur de partager leurs alias."""
+    key = mesh_key(cfg)[:8]
+    home = os.path.expanduser("~")
+    roots = []
+    if home and home != "~":              # pas de home résolu : l'état suffit
+        roots.append(os.path.join(home, LOT_TMP_SHORT_DIR, key))
+    roots.append(os.path.join(str(cfg.state_dir), LOT_TMP_SHORT_DIR, key))
+    out: list[str] = []
+    for root in roots:
+        root = os.path.abspath(root)
+        if root not in out:
+            out.append(root)
+    return out
+
+
+def lot_tmp_link_name(agent: str, ident: str) -> str:
+    """#8128 : nom stable et court de l'alias d'un lot pour un agent."""
+    digest = hashlib.sha256(("%s|%s" % (agent, ident)).encode("utf-8")).hexdigest()
+    return "%s%s-%s" % (LOT_TMP_LINK_PREFIX, ident, digest[:LOT_TMP_LINK_HASH])
+
+
+def existing_lot_tmp_link(cfg, agent: str, ident: str) -> str:
+    """#8128 : alias court existant de ce lot pour cet agent, sinon ""."""
+    name = lot_tmp_link_name(agent, ident)
+    for root in lot_tmp_link_roots(cfg):
+        link = os.path.join(root, name)
+        if os.path.islink(link):
+            return link
+    return ""
+
+
+def _ensure_short_root(root: str) -> bool:
+    """#8128 : crée et vérifie la racine courte privée (0700, à nous, sur
+    disque). Un lien symbolique, un propriétaire étranger ou un tmpfs la font
+    écarter (l'appelant essaie la candidate suivante)."""
+    base = os.path.dirname(root)
+    if not base or in_memory(base):
+        return False
+    for directory in (base, root):
+        try:
+            st = os.lstat(directory)
+        except FileNotFoundError:
+            try:
+                os.mkdir(directory, 0o700)
+            except FileExistsError:
+                pass
+            except OSError:
+                return False
+            try:
+                st = os.lstat(directory)
+            except OSError:
+                return False
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            return False
+        if st.st_uid != os.getuid():
+            return False
+        if st.st_mode & 0o077:
+            try:
+                os.chmod(directory, 0o700)
+                st = os.lstat(directory)
+            except OSError:
+                return False
+            if st.st_mode & 0o077:
+                return False
+    if in_memory(root):
+        return False
+    marker = os.path.join(root, MARKER)
+    if not os.path.exists(marker):
+        try:
+            with open(marker, "x", encoding="utf-8") as fh:
+                fh.write("ameesh short lot temporary aliases (#8128); "
+                         "dangling links may be removed by housekeeping\n")
+        except FileExistsError:
+            pass
+        except OSError:
+            return False
+    return True
+
+
+def _publish_lot_link(link: str, target: str) -> bool:
+    """#8128 : publie `link -> target` sans écraser une entrée qui n'est pas
+    un lien (remplacement atomique d'un ancien lien)."""
+    try:
+        st = os.lstat(link)
+    except FileNotFoundError:
+        st = None
+    except OSError:
+        return False
+    if st is not None:
+        if not stat.S_ISLNK(st.st_mode):
+            return False
+        try:
+            if os.readlink(link) == target:
+                return True
+        except OSError:
+            return False
+    temporary = "%s.%d.%d" % (link, os.getpid(), time.time_ns())
+    try:
+        os.symlink(target, temporary)
+        os.replace(temporary, link)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return False
+    try:
+        return stat.S_ISLNK(os.lstat(link).st_mode) and os.readlink(link) == target
+    except OSError:
+        return False
+
+
+def short_lot_tmp(cfg, agent: str, ident: str, target: str) -> str:
+    """#8128 : alias court du dossier temporaire réel `target` d'un lot.
+
+    Rend le chemin court, ou "" quand aucune racine candidate ne tient la
+    marge AF_UNIX (l'appelant garde alors le chemin long de #8020 ; la
+    ceinture de `freeze-checks` reste le filet de #8124)."""
+    name = lot_tmp_link_name(agent, ident)
+    for root in lot_tmp_link_roots(cfg):
+        link = os.path.join(root, name)
+        if not _short_path_ok(link):
+            continue
+        if not _ensure_short_root(root):
+            continue
+        if _publish_lot_link(link, target):
+            return link
+    return ""
+
+
+def remove_lot_tmp_link(cfg, agent: str, ident: str, target: str = "") -> str:
+    """#8128 : retire l'alias court d'un lot (seulement s'il pointe encore
+    `target`, quand elle est donnée). Rend le lien retiré, sinon ""."""
+    name = lot_tmp_link_name(agent, ident)
+    for root in lot_tmp_link_roots(cfg):
+        link = os.path.join(root, name)
+        try:
+            st = os.lstat(link)
+        except OSError:
+            continue
+        if not stat.S_ISLNK(st.st_mode):
+            continue
+        try:
+            dest = os.readlink(link)
+        except OSError:
+            continue
+        if not os.path.isabs(dest):
+            continue
+        if target:
+            try:
+                if os.path.realpath(dest) != os.path.realpath(target):
+                    continue
+            except OSError:
+                continue
+        try:
+            os.unlink(link)
+            return link
+        except OSError:
+            continue
+    return ""
+
+
+def sweep_lot_links(cfg, *, dry_run: bool = False) -> dict:
+    """#8128 : retire les alias courts dont la cible n'existe plus.
+
+    Ne touche qu'aux racines marquées par ameesh et aux noms d'alias de lot
+    (`l<id>-<empreinte>`) : un lien ordinaire ou une cible encore présente
+    reste. `dry_run` remplit `plan` sans rien retirer. Rend `entries`
+    (journal), `plan` (essai) et `skipped`."""
+    entries: list[dict] = []
+    plan: list[dict] = []
+    skipped: list[str] = []
+    for root in lot_tmp_link_roots(cfg):
+        if not _managed(root) or os.path.islink(root):
+            continue
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            if not LOT_TMP_LINK_RE.match(name):
+                continue
+            link = os.path.join(root, name)
+            try:
+                st = os.lstat(link)
+            except OSError:
+                continue
+            if not stat.S_ISLNK(st.st_mode):
+                continue
+            try:
+                dest = os.readlink(link)
+            except OSError:
+                continue
+            if not os.path.isabs(dest) or os.path.lexists(dest):
+                continue
+            if dry_run:
+                plan.append({"kind": "tmp", "action": "suppression",
+                             "path": link, "bytes": 0,
+                             "detail": "dangling short lot temporary alias"})
+                continue
+            try:
+                os.unlink(link)
+            except OSError as exc:
+                skipped.append("short lot temporary link %s kept: %s"
+                               % (link, exc.strerror or type(exc).__name__))
+                continue
+            entries.append({"kind": "tmp", "action": "deleted", "path": link,
+                            "bytes": 0,
+                            "detail": "dangling short lot temporary alias removed"})
+    return {"entries": entries, "plan": plan, "skipped": skipped}
+
+
 def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
              hold: TmpHold | None = None, lot=None) -> dict:
     """Variables à poser dans l'environnement d'un tour (crée les dossiers).
@@ -1225,7 +1464,16 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
     disque, L162) ; il est supprimé à la fin du lot (`cleanup_lot_dirs`) ou à
     l'arrêt de l'agent pour un lot déjà terminé ; un lot ouvert le garde,
     borné par `tmp_quota`. Un tour sans lot garde le dossier de l'agent, comme
-    avant."""
+    avant.
+
+    #8128 : le sous-dossier du lot est atteint par un **alias court** sous
+    `<home>/.t/<mesh>/l<lot>-<empreinte>` (ou, à défaut, sous
+    `<état>/.t/<mesh>`), pour que `len(TMPDIR) + 40 <= 107` et qu'une socket
+    AF_UNIX du forkserver tienne. L'alias est un lien vers le dossier géré :
+    le quota, le verrou, la lecture des processus et les copies Git de #8020
+    restent donc inchangés. Sans racine candidate qui tienne la marge,
+    `TMPDIR` garde le chemin long de #8020 (la ceinture de `freeze-checks`,
+    #8124, est alors le filet)."""
     if not policy.redirect or disabled(base_env):
         return {}
     if hold is None:
@@ -1236,8 +1484,9 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
     mine = hold.path
     lot_name = lot_tmp_name(lot)
     if lot_name:
-        mine = os.path.join(mine, lot_name)
-        os.makedirs(mine, mode=0o700, exist_ok=True)
+        real = os.path.join(mine, lot_name)
+        os.makedirs(real, mode=0o700, exist_ok=True)
+        mine = short_lot_tmp(cfg, agent, lot_name[len(LOT_TMP_PREFIX):], real) or real
     out = {"TMPDIR": mine, "TMP": mine, "TEMP": mine,
            "AMEESH_TMPDIR": mine, "AMEESH_CACHE_DIR": croot}
     for name, variables in cache_names(policy):
@@ -1281,6 +1530,9 @@ def cleanup_lot_dirs(cfg, policy: Policy, *, agents=None, db=None, host: str = "
     retrait d'agent décidé, jamais pour un simple redémarrage. `dry_run` rend
     le plan sans rien supprimer.
 
+    Retire aussi, quand `dry_run` est faux, les alias courts de #8128 dont la
+    cible a disparu (et l'alias d'un lot dont le dossier vient d'être retiré).
+
     Rend `entries` (journal), `plan` (essai), `skipped`, `bytes` libérés et
     `dirs` retirés."""
     entries: list[dict] = []
@@ -1289,6 +1541,10 @@ def cleanup_lot_dirs(cfg, policy: Policy, *, agents=None, db=None, host: str = "
     deleted: list[dict] = []
     total = 0
     troot = tmp_root(cfg, policy)
+    links = sweep_lot_links(cfg, dry_run=dry_run)
+    entries.extend(links["entries"])
+    plan.extend(links["plan"])
+    skipped.extend(links["skipped"])
     if not os.path.isdir(troot) or not _managed(troot):
         return {"entries": entries, "plan": plan, "skipped": skipped,
                 "bytes": 0, "dirs": deleted}
@@ -1341,6 +1597,12 @@ def cleanup_lot_dirs(cfg, policy: Policy, *, agents=None, db=None, host: str = "
                     if state not in LOT_ENDED:
                         continue
                 held = tmp_holder(path, allow=policy.unreadable_ok)
+                if not held:
+                    # #8128 : un processus peut ne nommer que l'alias court
+                    # (ligne de commande) ; le dossier réel est le même.
+                    link = existing_lot_tmp_link(cfg, agent, ident)
+                    if link:
+                        held = tmp_holder(link, allow=policy.unreadable_ok)
                 if held:
                     skipped.append("lot temp %s kept: %s" % (path, held))
                     continue
@@ -1384,11 +1646,16 @@ def cleanup_lot_dirs(cfg, policy: Policy, *, agents=None, db=None, host: str = "
                         continue
                 freed = _safe_rmtree(path, troot)
                 total += freed
+                alias = ""
+                if not os.path.lexists(path):
+                    alias = remove_lot_tmp_link(cfg, agent, ident, target=path)
                 deleted.append({"path": path, "lot": ident, "bytes": freed})
                 entries.append({"kind": "tmp", "action": "deleted", "path": path,
                                 "bytes": freed, "agent": agent,
                                 "detail": "lot #%s %s: per-lot temporary directory "
-                                          "removed" % (ident, reason)})
+                                          "removed%s" % (ident, reason,
+                                                         "; short alias removed"
+                                                         if alias else "")})
         finally:
             if lock is not None:
                 lock.close()
