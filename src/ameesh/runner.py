@@ -12051,6 +12051,7 @@ class AgentWorker(threading.Thread):
         de cinq minutes). Le pas est alors `IDLE_SAFETY_S`, raccourci aux
         échéances connues sans requête : réveil programmé, relance au repos,
         premier réveil de lot inactif. Sinon : `_idle_wait`, comme avant."""
+        self._idle_gated = False
         pas = self._idle_wait()
         runner = self.runner
         alive = getattr(runner, "idle_sweep_alive", None)
@@ -12060,8 +12061,14 @@ class AgentWorker(threading.Thread):
             return pas
         if self._local_work_pending():
             return pas  # B P2 dev3 : travail en attente hors de la base
-        self._idle_gated = True  # avant le contrôle : un changement ensuite réveille
         row = runner.idle_row(self.name)
+        wake_ts = (row or {}).get("wake_ts")
+        if wake_ts is not None and float(wake_ts) <= time.time():
+            # B P2 dev3 (2) : réveil programmé dû — pas encore réclamé (lecture
+            # bridée à SCHEDULED_WAKE_CHECK_S), réclamé ailleurs ou masquant un
+            # réveil futur (min) : le pas ordinaire, jamais le filet
+            return pas
+        self._idle_gated = True  # avant le contrôle : un changement ensuite réveille
         mark = getattr(self, "_idle_mark", None)
         if row is None or row.get("pending") or mark is None or self._idle_generation() != mark:
             self._idle_gated = False

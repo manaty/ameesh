@@ -371,11 +371,11 @@ class FilDuWorkerCouvert(unittest.TestCase):
 
 
 class BattementGroupeReel(PgTestCase):
-    """Trois workers au repos, bail de 3 s : le battement groupé les tient
+    """Trois workers au repos, bail de 6 s : le battement groupé les tient
     seul, sans renouvellement par worker."""
 
     def test_baux_tenus_par_le_battement_groupe(self):
-        cfg = dataclasses.replace(self.cfg, idle_passes_per_s=0.01, lease_ttl=3.0)
+        cfg = dataclasses.replace(self.cfg, idle_passes_per_s=0.01, lease_ttl=6.0)
         runner = Runner(cfg, self.db)
         runner.poll = 1.0
         runner.listener = object()  # écoute établie : pas de repos long
@@ -400,8 +400,8 @@ class BattementGroupeReel(PgTestCase):
                 mock.patch.object(type(storage.of(self.db).leases), "renew_many", renew_many):
             runner.start_group_beat()
             workers = []
-            for name in names:  # prise et départ aussitôt : bail de 3 s
-                lease = registry.claim(self.db, name, runner.runner_id, 3)
+            for name in names:  # prise et départ aussitôt : bail de 6 s
+                lease = registry.claim(self.db, name, runner.runner_id, 6)
                 worker = AgentWorker(runner, registry.get(self.db, name), lease)
                 runner.workers[name] = worker
                 workers.append(worker)
@@ -412,7 +412,7 @@ class BattementGroupeReel(PgTestCase):
                     self.assertLess(time.monotonic(), deadline, "workers never rested")
                     time.sleep(0.05)
                 debut = len(par_worker)
-                time.sleep(8)  # plus de deux baux
+                time.sleep(14)  # plus de deux baux
                 au_repos = par_worker[debut:]
                 vivants = [registry.get(self.db, w.name) for w in workers]
             finally:
@@ -563,9 +563,21 @@ class PasDuWorkerCouvert(unittest.TestCase):
         self.assertAlmostEqual(worker._idle_pace(), 200.0, delta=1)
         worker = self._worker(row=dict(self.ROW), lot_wake=True)
         self.assertAlmostEqual(worker._idle_pace(), 90.0, delta=1)  # 30 + 60
-        # échéance passée : le filet
+        # réveil dû (passé, non réclamé ou réclamé ailleurs) : le pas court
         worker = self._worker(row=dict(self.ROW, wake_ts=time.time() - 5))
-        self.assertEqual(worker._idle_pace(), 900.0)
+        self.assertEqual(worker._idle_pace(), 45.0)
+        self.assertFalse(worker._idle_gated)
+
+    def test_reveil_du_entre_deux_lectures(self):
+        # B P2 dev3 : passe à T-5 (dort 5 s), passe à T+0,05 sans réclamation
+        # (lecture bridée à 10 s) : pas court, jamais le filet
+        t = [1000.0]
+        worker = self._worker(row=dict(self.ROW, wake_ts=1005.0))
+        with mock.patch("ameesh.runner.time.time", lambda: t[0]):
+            self.assertAlmostEqual(worker._idle_pace(), 5.05, delta=0.01)
+            t[0] = 1005.05
+            self.assertEqual(worker._idle_pace(), 45.0)
+            self.assertFalse(worker._idle_gated)
 
     def test_pas_regle_plus_long_que_le_filet(self):
         worker = self._worker(row=dict(self.ROW))
