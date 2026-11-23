@@ -300,6 +300,10 @@ class RetireTest(PgTestCase):
             self.assertEqual(row["meta"]["retired"]["by"], ALICE)
             self.assertEqual(row["meta"]["retired"]["reason"], "décision #135690 a")
             self.assertIn("at", row["meta"]["retired"])
+            # la file durable est soldée : le retour a été remis
+            self.assertEqual(row["meta"]["retired"]["notified"]["to"], ["other"])
+            self.assertEqual(row["meta"]["retired"]["notified"]["by"], ALICE)
+        self.assertEqual(storage.of(self.db).mailbox.returns_pending("worker"), [])
         [notice] = self.unread("other")
         self.assertEqual(notice["kind"], "event")
         self.assertIn("were not delivered", notice["body"])
@@ -339,7 +343,8 @@ class RetireTest(PgTestCase):
 
     def test_retirement_warns_when_the_sender_has_no_live_mailbox(self):
         """#8113 : un expéditeur système n'a pas de boîte lue ; le courrier est
-        tout de même clos et l'auteur du retrait voit l'avertissement."""
+        tout de même clos, le retour part au pilote et l'auteur du retrait
+        voit l'avertissement."""
         mail.send(self.db, "ameesh", "worker", "notification système", kind="event")
         out = self.retire()
         self.assertEqual(out["mail"]["closed"], 1)
@@ -347,6 +352,75 @@ class RetireTest(PgTestCase):
         self.assertIn("ameesh", out["mail"]["unreachable"])
         self.assertTrue(any("sender(s) with no live mailbox" in w for w in out["warnings"]))
         self.assertEqual(self.unread(), [])
+        # le relais est durable : chaque pilote du projet a le retour en boîte
+        pilots = agent_retire._pilots(self.cfg, self.db, "worker")
+        self.assertEqual(out["mail"]["pilots"], pilots)
+        for pilot in pilots:
+            [relay] = self.unread(pilot)
+            self.assertEqual(relay["kind"], "event")
+            self.assertIn("no live mailbox", relay["body"])
+            self.assertIn("notification système", relay["body"])
+        self.assertEqual(storage.of(self.db).mailbox.returns_pending("worker"), [])
+        # rejouer ne double ni le relais ni l'avis
+        again = agent_retire.replay_returns(self.cfg, self.db, agent="worker")
+        self.assertEqual(again["closed"], 0)
+        for pilot in pilots:
+            self.assertEqual(len(self.unread(pilot)), 1)
+
+    def test_the_return_queue_survives_a_crash_and_replays_without_duplicates(self):
+        """#8113 (avis B) : la file durable est écrite dans la transaction du
+        retrait ; un envoi raté après le commit la laisse à rejouer, et le
+        rejeu rend l'avis sans jamais le doubler."""
+        registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        mail.send(self.db, "other", "worker", "à rendre malgré l'arrêt.")
+        with mock.patch.object(agent_retire, "_deliver_batch",
+                               side_effect=RuntimeError("crash after commit")):
+            out = self.retire()
+        self.assertTrue(out["changed"])
+        self.assertEqual(out["mail"]["closed"], 1)
+        self.assertTrue(any("return notices not sent" in w for w in out["warnings"]))
+        pending = storage.of(self.db).mailbox.returns_pending("worker")
+        self.assertEqual([row["sender"] for row in pending], ["other"])
+        self.assertEqual(pending[0]["retired_by"], ALICE)
+        self.assertEqual(pending[0]["retired_reason"], "décision #135690 a")
+        self.assertEqual(self.unread("other"), [])
+        # le rejeu solde la file et remet l'avis
+        result = agent_retire.replay_returns(self.cfg, self.db, agent="worker")
+        self.assertEqual((result["closed"], result["batches"], result["marked"]),
+                         (1, 1, 1))
+        self.assertEqual(result["informed"], ["other"])
+        [notice] = self.unread("other")
+        payload = mail.message_payload(notice)
+        self.assertEqual(payload["returned"]["recipient"], "worker")
+        self.assertEqual(storage.of(self.db).mailbox.returns_pending("worker"), [])
+        # un second rejeu ne trouve plus rien et ne double pas l'avis
+        again = agent_retire.replay_returns(self.cfg, self.db, agent="worker")
+        self.assertEqual(again["closed"], 0)
+        self.assertEqual(len(self.unread("other")), 1)
+
+    def test_mail_returns_lists_then_replays_the_durable_queue(self):
+        """#8113 : `ameesh mail returns` montre la file, `--replay` la solde."""
+        registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        mail.send(self.db, "other", "worker", "à rendre par la commande.")
+        with mock.patch.object(agent_retire, "_deliver_batch",
+                               side_effect=RuntimeError("crash after commit")):
+            self.retire()
+        listed = self.cli("returns", "--agent", "worker")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("return not yet delivered", listed.stdout)
+        self.assertIn("other", listed.stdout)
+        replayed = self.cli("returns", "--replay", "--agent", "worker",
+                            "--json")
+        self.assertEqual(replayed.returncode, 0, replayed.stderr)
+        result = json.loads(replayed.stdout)
+        self.assertEqual((result["closed"], result["marked"]), (1, 1))
+        self.assertEqual(result["informed"], ["other"])
+        self.assertEqual(len(self.unread("other")), 1)
+        again = self.cli("returns", "--agent", "worker")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("no pending return notice", again.stdout)
 
     def test_copy_to_a_retired_agent_is_refused_nothing_deposited(self):
         registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,

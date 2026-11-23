@@ -1080,9 +1080,7 @@ class Mailbox(interface.Mailbox):
             """
             UPDATE agent_mailbox AS m
                SET delivered_at = clock_timestamp(), status = 'delivered',
-                   meta = m.meta || jsonb_build_object(
-                       'retired', %s::jsonb || jsonb_build_object(
-                           'at', extract(epoch from clock_timestamp())::float8))
+                   meta = m.meta || jsonb_build_object('retired', %s::jsonb)
              WHERE m.recipient = %s
                AND m.delivered_at IS NULL
                AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
@@ -1092,10 +1090,53 @@ class Mailbox(interface.Mailbox):
                               AND coalesce(r.mode, 'execute') <> 'externe')
              RETURNING m.id, m.sender, m.kind, m.work_item_id,
                        extract(epoch from m.created_at)::float8 AS created_ts,
-                       left(m.body, 200) AS excerpt
+                       left(m.body, 200) AS excerpt,
+                       (m.meta -> 'retired' ->> 'at')::float8 AS closed_ts
             """,
             (json.dumps(note or {}, ensure_ascii=False), recipient))
         return sorted(rows, key=lambda row: int(row["id"]))
+
+    def returns_pending(self, agent=None, limit=500) -> list[dict]:
+        """#8113 : voir `interface.Mailbox.returns_pending`.
+
+        La file est écrite par `close_for_retired` dans la transaction du
+        retrait : un arrêt de l'exécuteur après le commit ne la perd pas, et
+        aucun message n'est repris (le filtre est le marqueur durable, pas
+        l'âge)."""
+        sql = """
+            SELECT m.id, m.recipient, m.sender, m.kind,
+                   coalesce(btrim(m.work_item_id), '') AS work_item_id,
+                   extract(epoch from m.created_at)::float8 AS created_ts,
+                   left(m.body, 200) AS excerpt,
+                   (m.meta -> 'retired' ->> 'at')::float8 AS closed_ts,
+                   m.meta -> 'retired' ->> 'by' AS retired_by,
+                   m.meta -> 'retired' ->> 'reason' AS retired_reason
+              FROM agent_mailbox m
+             WHERE m.delivered_at IS NOT NULL
+               AND m.meta ? 'retired'
+               AND NOT (m.meta -> 'retired' ? 'notified')
+        """
+        params: list = []
+        if agent:
+            sql += " AND m.recipient = %s"
+            params.append(agent)
+        sql += (" ORDER BY (m.meta -> 'retired' ->> 'at')::float8,"
+                " m.recipient, m.id LIMIT %s")
+        params.append(int(limit))
+        return self.db.query(sql, tuple(params))
+
+    def mark_returned(self, ids, note) -> int:
+        """#8113 : voir `interface.Mailbox.mark_returned`."""
+        clean = sorted({int(i) for i in ids})
+        if not clean:
+            return 0
+        rows = self.db.query(
+            "UPDATE agent_mailbox SET meta = jsonb_set("
+            "meta, '{retired,notified}', %s::jsonb, true)"
+            " WHERE id IN (" + ",".join(str(i) for i in clean) + ")"
+            " AND meta ? 'retired' RETURNING id",
+            (json.dumps(note or {}, ensure_ascii=False),))
+        return len(rows)
 
     def forward(self, old, new, by) -> list[dict]:
         # UNE transaction : verrou des messages en attente de `old` (hors

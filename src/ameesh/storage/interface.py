@@ -2115,8 +2115,36 @@ class Mailbox(Domain):
         `sender`, `kind`, `work_item_id`, `created_ts`, `excerpt`.
 
         Lecture locale au pilote Postgres : un stockage qui ne la sert pas
-        (exécuteur médié) rend `[]` ; le retrait n'y ferme pas le courrier."""
+        (exécuteur médié) rend `[]` ; le retrait n'y ferme pas le courrier.
+
+        Le `note` reçu fixe l'instant du lot (`at`, l'heure de la transaction) :
+        toutes les lignes d'une même fermeture le partagent, et c'est lui qui
+        groupe le retour."""
         return []
+
+    def returns_pending(self, agent: str | None = None,
+                        limit: int = 500) -> list[dict]:
+        """#8113 : le courrier clos au retrait dont le retour n'est pas encore
+        remis — la file durable du retour, écrite dans la transaction du
+        retrait (`meta.retired`), soldée par `meta.retired.notified`.
+
+        Rend une ligne par message non encore rendu (`id`, `recipient`,
+        `sender`, `kind`, `work_item_id`, `created_ts`, `excerpt`,
+        `closed_ts` = instant du lot de fermeture, `retired_by`,
+        `retired_reason`), du plus ancien lot au plus récent. `agent`
+        restreint la lecture au retiré nommé ; `limit` borne la passe. Un
+        stockage médié qui ne la sert pas rend `[]`."""
+        return []
+
+    def mark_returned(self, ids: Sequence[int], note: dict) -> int:
+        """#8113 : marque des messages d'un lot de retour comme rendus
+        (`meta.retired.notified = note`) ; rend le nombre de lignes marquées.
+
+        Le retour est dit rendu quand chaque expéditeur vivant a son avis et
+        que les injoignables ont leur relais au pilote. Appelée seulement
+        après un envoi réussi : une erreur laisse la ligne en file, et un
+        rejeu la reprend sous la même clé d'idempotence (jamais de doublon)."""
+        return 0
 
     @abc.abstractmethod
     def dead_letters(self) -> list[dict]:
