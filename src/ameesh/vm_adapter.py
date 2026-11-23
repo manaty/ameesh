@@ -645,6 +645,16 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
         due = wake_due(host, control, listing, lots, controls, holds, now=now,
                        horizon=delay, target=target, ci=ci)
         if due or control.get('return_requested_ts') is not None or control['mode'] == 'returning':
+            deadline = control.get('return_ts')
+            deadline_only = (due and isinstance(deadline, (float, int))
+                             and deadline <= now + delay
+                             and not wake_due(host, dict(control, return_ts=None), listing,
+                                              lots, controls, holds, now=now,
+                                              horizon=delay, target=target, ci=ci))
+            if deadline_only:
+                for row in q.pending_all(host):
+                    if row['state'] == 'idle-drained' and current(control, row):
+                        q.finish(row, 'obsolete', 'return deadline within wake horizon')
             q.return_intent(host)
             q.request(host, control['generation'], control['release_epoch'], 'busy')
         pending = q.pending(host)
@@ -705,7 +715,16 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             if state != 'running':
                 return 'provider transition'
             quiet_s = max(cfg.idle_after_s, policy['min_on_s'], 2 * delay)
-            fp = evidence(cfg, tx, host, control, now=now, quiet_s=quiet_s)
+            try:
+                fp = evidence(cfg, tx, host, control, now=now, quiet_s=quiet_s)
+            except Refused as exc:
+                if str(exc) != 'canon unavailable':
+                    raise
+                if request.get('result') != 'canon unavailable':
+                    q.finish(request, 'pending', 'canon unavailable')
+                return 'canon unavailable'
+            if request.get('result') == 'canon unavailable':
+                q.finish(request, 'pending', 'canon available')
             quiet = fp.get('idle_since')
             if (quiet is None or now - quiet < quiet_s
                     or observed['on_ts'] is None or now - observed['on_ts'] < policy['min_on_s']):
@@ -874,6 +893,7 @@ def main(argv=None):
         provider = Scaleway(credentials['secret_key'], timeout=policy['io_timeout_s'])
         for host in policy['targets']:
             try:
+                Queue(db).publish_drain_policy(host, cfg.idle_after_s, policy)
                 result = tick_host(cfg, db, policy, host, provider)
                 print(host + ': ' + result)
             except Exception as error:

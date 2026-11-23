@@ -355,6 +355,41 @@ class AdapterTest(PgTestCase):
         self.assertFalse(self.q.control('burst')['claims_open'])
         self.assertIsNotNone(self.db.query('SELECT wake_delay_s FROM vm_adapter_observations')[0]['wake_delay_s'])
 
+    def test_published_drain_policy_expires_and_uses_observed_wake(self):
+        self.q.publish_drain_policy('burst', 1800, policy())
+        self.q.observe('burst', 'running', 90)
+        self.db.execute("UPDATE vm_adapter_observations SET wake_delay_s=1200 WHERE host='burst'")
+        self.assertEqual(self.q.drain_policy('burst')['wake_delay_s'], 1200)
+        self.db.execute("UPDATE vm_adapter_drain_policy SET updated_at=now()-interval '6 minutes' "
+                        "WHERE host='burst'")
+        self.assertIsNone(self.q.drain_policy('burst'))
+
+    def test_canon_failure_is_recorded_and_cleared_on_recovery(self):
+        self.request()
+        self.observe_old()
+        with mock.patch('ameesh.vm_adapter.storage.of', return_value=self.store):
+            self.assertEqual(vm.tick_host(
+                self.cfg, self.db, policy(), 'burst', self.provider,
+                probe=self.probe, evidence=mock.Mock(side_effect=vm.Refused('canon unavailable'))),
+                'canon unavailable')
+        self.assertEqual(self.q.pending('burst')[0]['result'], 'canon unavailable')
+        self.provider.action.assert_not_called()
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.assertNotEqual(self.q.pending('burst')[0]['result'], 'canon unavailable')
+
+    def test_deadline_records_why_stop_was_superseded(self):
+        self.request()
+        self.db.execute("UPDATE host_lifecycle SET return_at=clock_timestamp()+interval '5 minutes' "
+                        "WHERE host='burst'")
+        self.operations.listing.return_value = [dict(name='worker', admitted_hosts=['burst'],
+                                                      releve=None, mode='execute', status='idle')]
+        with mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value=None):
+            self.tick()
+        rows = self.db.query("SELECT status,result FROM vm_adapter_requests WHERE state='idle-drained'")
+        self.assertEqual(rows[0]['status'], 'obsolete')
+        self.assertEqual(rows[0]['result'], 'return deadline within wake horizon')
+        self.provider.action.assert_not_called()
+
     def test_operator_return_supersedes_queued_stop(self):
         self.request()
         self.observe_old()

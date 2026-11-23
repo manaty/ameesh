@@ -181,6 +181,24 @@ class Queue:
                         (status, result, request['host'], request['generation'],
                          request['release_epoch'], request['state']))
 
+    def publish_drain_policy(self, host, idle_after_s, policy):
+        self.db.execute("INSERT INTO vm_adapter_drain_policy "
+                        "(host,idle_after_s,min_on_s,min_off_s,wake_delay_s) "
+                        "VALUES (%s,%s,%s,%s,%s) ON CONFLICT(host) DO UPDATE SET "
+                        "idle_after_s=excluded.idle_after_s,min_on_s=excluded.min_on_s,"
+                        "min_off_s=excluded.min_off_s,wake_delay_s=excluded.wake_delay_s,"
+                        "updated_at=clock_timestamp()",
+                        (host, idle_after_s, policy['min_on_s'], policy['min_off_s'],
+                         policy['wake_delay_s']))
+
+    def drain_policy(self, host):
+        rows = self.db.query("SELECT p.idle_after_s,p.min_on_s,p.min_off_s, "
+                             "greatest(p.wake_delay_s,coalesce(o.wake_delay_s,0)) AS wake_delay_s "
+                             "FROM vm_adapter_drain_policy p LEFT JOIN vm_adapter_observations o "
+                             "ON o.host=p.host WHERE p.host=%s "
+                             "AND p.updated_at > clock_timestamp()-interval '5 minutes'", (host,))
+        return rows[0] if rows else None
+
     def observe(self, host, state, max_gap_s):
         return self.db.query("""
             INSERT INTO vm_adapter_observations(host,provider_state,on_since,off_since)

@@ -111,6 +111,19 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
         hook = host_release.hook_for(cfg, canons, host)
     except ValueError:
         hook = True  # ambiguous adapter config: fail closed
+    if hook and duration is not None:
+        from .storage.postgres.vm_adapter import Queue
+        policy = Queue(db).drain_policy(host)
+        if policy is None:
+            raise ValueError('drain refused: adapter timing unavailable or stale; '
+                             'start the VM adapter worker and retry')
+        wake = policy['wake_delay_s']
+        quiet = max(policy['idle_after_s'], policy['min_on_s'], 2 * wake)
+        minimum = quiet + wake + policy['min_off_s']
+        if duration < minimum:
+            raise ValueError('drain refused: minimum %.0f seconds = quiet %.0f '
+                             '(max idle_after, min_on, 2*wake_delay) + wake_delay %.0f '
+                             '+ min_off %.0f' % (minimum, quiet, wake, policy['min_off_s']))
     # A configured canon that did not load may hold the only Host card with
     # the hook: fail closed rather than reopen the gate.
     close_claims = bool(hook) or (configured and not canons)

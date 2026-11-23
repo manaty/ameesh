@@ -163,6 +163,13 @@ class WaitStateTest(PgTestCase):
         self.assertEqual(alerts[0]["generation"], self.generation)
         self.assertFalse(self.api.get("vm")["claims_open"])
 
+    def test_worker_canon_failure_alerts_immediately(self):
+        self.queue(result='canon unavailable')
+        alerts = self.alerts()
+        self.assertEqual([a['type'] for a in alerts], ['host_release_adapter_stalled'])
+        self.assertEqual(alerts[0]['reason'], 'canon_unavailable')
+        self.assertIn('controller cannot read', alerts[0]['detail'])
+
     def test_a_young_poweroff_intent_is_a_normal_trailing_wait(self):
         self.queue(result='poweroff intent', age_s=60)
         self.db.execute("UPDATE host_lifecycle SET requested_at=now()-"

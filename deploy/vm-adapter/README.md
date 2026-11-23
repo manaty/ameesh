@@ -690,6 +690,19 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      (`inventory:ValueError`, R1 du 22/11), et un retour prises fermées le
      laisserait rouge faute de bail des autres runners. Retirer `units` de
      la carte reste facultatif ; ce geste est au bureau.
+Avant le feu R1, vérifier aussi sur l'hôte du contrôleur VM que son canon est
+synchronisé et lisible par la version réellement lancée du worker (`ameesh
+canon check` avec sa configuration). Un canon périmé bloque le halt.
+
+La fenêtre doit couvrir le repos `max(idle_after_s, min_on_s, 2 ×
+wake_delay_s)`, puis l'archivage, la restauration et la santé. Le drainage
+avec retour programmé doit couvrir au moins ce repos plus le délai de réveil
+et, si l'arrêt doit être observé, `min_off_s`. Le worker publie les seules
+temporisations, sans secret, à chaque passage ; un drainage temporisé avec
+hook est refusé si cette politique manque ou date de plus de cinq minutes.
+Démarrer le worker et vérifier sa connexion à la base avant le drainage. Relever les durées mesurées
+dès le premier cycle réel ; elles déterminent la largeur des cycles suivants.
+
 2. Le bureau active l'inscription (`enabled: true`, copie avant) et démarre
    le timer (R1 de D1). Avant l'étape 3, vérifier ses passes dans le journal :
    les ticks inactifs ne produisent pas de `vm_adapter_observations`. Après
