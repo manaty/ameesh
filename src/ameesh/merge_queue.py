@@ -3436,6 +3436,20 @@ def _is_doc_path(name: str, manifest: str) -> bool:
             and not any(part.startswith(".") for part in parts))
 
 
+def doc_only_changes(changes, manifest: str = "") -> bool:
+    """#5428/#8175 : le diff ne touche que la documentation sans CI.
+
+    `changes` est la liste `(ancien mode, nouveau mode, nom)` rendue par
+    `ci_parts.raw_changes`. La liste blanche est celle de `_is_doc_path` :
+    le `.md` de `docs/` (ni fichier ni répertoire caché), plus le manifeste
+    du paquet quand il y en a un ; tout ce qui peut être exécuté retombe sur
+    la CI. Un diff vide n'est pas une preuve doc seule.
+    """
+    return bool(changes) and all(
+        old in _DOC_MODES and new in _DOC_MODES and _is_doc_path(name, manifest)
+        for old, new, name in changes)
+
+
 def _no_declared_sensitive_path(klass: dict) -> bool:
     """#5428 : la classe ne nomme aucun chemin sensible. Un `sensitive` que le
     seul défaut donne (Nexlink : `docs/roadmap.md`, aucune règle) garde ses avis
@@ -3478,9 +3492,7 @@ def doc_only_packet(project, row, repo: str, target: str, sha: str, clone, *, kl
     except ci_parts.PartsError as exc:
         raise QueueError("the change set of the frozen head %s cannot be read: %s"
                          % (sha[:12], exc)) from exc
-    if not changes or not all(old in _DOC_MODES and new in _DOC_MODES
-                              and _is_doc_path(name, manifest)
-                              for old, new, name in changes):
+    if not doc_only_changes(changes, manifest):
         return None
     try:
         runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=row["branch"])))(sha)

@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta
 import types
 import unittest
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 from ameesh import train
@@ -425,6 +426,28 @@ class CutoffTest(unittest.TestCase):
         self.ports.entries = None
         self.assertEqual(engine.step(stamp("2026-10-15T11:11:00"))["result"], "paused")
         self.assertEqual(self.ports.document["phase"], "paused")
+
+    def test_publication_refusal_recomposes_at_the_next_cutoff(self):
+        """#8175 : le bail est rendu, le créneau consommé ne recompose pas en
+        boucle, le créneau suivant recompose depuis la file courante."""
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 7200)
+        engine = self.engine([admitted(1)], schedule=schedule)
+        self.ports.published = lambda plan: ""   # aucune référence distante
+        self.ports.publish = mock.Mock(side_effect=train.PublicationRefused(
+            "full-suite source differs from audited CI contract"))
+        outcome = engine.step(stamp("2026-10-15T12:00:00"))
+        self.assertEqual(outcome["result"], "invalidated", outcome)
+        self.assertFalse(self.ports.held)
+        self.assertEqual(self.ports.document["phase"], "invalidated")
+        self.assertIsNone(self.ports.document.get("recompose"))
+        # Le même créneau est déjà consommé : aucune recomposition en boucle.
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:01"))["result"], "idle")
+        # Le créneau suivant recompose le plan courant sur la tête à jour.
+        self.ports.publish = lambda plan, epoch: self.ports.effects.append(
+            ("publish", plan["head"]))
+        result = engine.step(stamp("2026-10-15T14:00:00"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
 
     def test_policy_without_compiled_calendar_refuses_a_cutoff(self):
         # #2451: no local 11:00/23:00 fallback survives in the engine

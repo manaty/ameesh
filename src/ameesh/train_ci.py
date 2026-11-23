@@ -736,6 +736,16 @@ class GitHub:
         self.verify(plan)
         evidence, pending, red, absent = [], False, False, False
         due = self._due(plan)
+        # #8175 : une liste due vide n'est acceptée que si le contrat a prouvé
+        # le diff doc seule dans `resolve` ; la preuve est portée à part pour
+        # que le plan ne se lise pas « CI verte » sans dire pourquoi.
+        doc_only = not due and callable(getattr(self.workflows, "doc_only", None)) \
+            and self.workflows.doc_only(plan)
+        if not due and not doc_only:
+            # Un contrat dynamique qui ne rend aucune part due doit prouver le
+            # diff doc seule (#8175) ; sinon une sélection vide serait un vert
+            # sans preuve, jamais un paquet sans CI.
+            raise TrainError("empty due part set without a doc-only proof")
         try:
             for position, workflow in enumerate(due):
                 remaining = due[position + 1:]
@@ -827,5 +837,9 @@ class GitHub:
             # passe suivante relira et conclura (jamais deux CI de paquet).
             pending = True
         status = "absent" if absent else "pending" if pending else "red" if red else "green"
-        return dict(head=plan["head"], tree=plan["tree"], complete=not absent and not pending,
-                    status=status, workflows=evidence)
+        proof = dict(head=plan["head"], tree=plan["tree"],
+                     complete=not absent and not pending,
+                     status=status, workflows=evidence)
+        if doc_only:
+            proof["doc_only"] = True
+        return proof
