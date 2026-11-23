@@ -17587,6 +17587,71 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
     return env
 
 
+def _attach_config_env(cfg: Config, env: dict) -> str:
+    """#8123 : le harnais attaché lit la configuration que l'attach a chargée.
+
+    `_attach_env` copie l'environnement du processus d'attach ; un
+    `AMEESH_CONFIG` hérité d'ailleurs (unité, profil, ancien shell) pouvait
+    nommer un fichier disparu : chaque hook `agent-mail` échouait alors sur
+    « config file not found ». Le chemin réellement lu (`config_file`) est
+    posé sous les deux noms ; s'il n'existe plus, le lancement est refusé
+    (message rendu). Sans fichier lu (valeurs par défaut), les deux variables
+    sont retirées : le harnais lit comme l'attach."""
+    path = getattr(cfg, "config_file", "") or ""
+    if not path:
+        env.pop("AMEESH_CONFIG", None)
+        env.pop("AGENT_MESH_CONFIG", None)
+        return ""
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        return ("attach: configuration file %s (loaded by attach) not found; "
+                "the harness is not launched" % path)
+    env["AMEESH_CONFIG"] = path
+    env["AGENT_MESH_CONFIG"] = path
+    return ""
+
+
+class _WinchRelay:
+    """#8123 : relaie les redimensionnements du terminal au harnais attaché.
+
+    Le harnais est lancé dans sa propre session (`start_new_session`), sans
+    terminal de contrôle : le noyau envoie SIGWINCH au groupe de premier plan
+    du terminal, c'est-à-dire à l'attach. Le gestionnaire renvoie le signal au
+    groupe du harnais (`pgid`, posé après le `Popen`). Hors du fil principal
+    (tests, hôte), aucun gestionnaire n'est posé ; l'ancien est rendu à la
+    sortie."""
+
+    def __init__(self) -> None:
+        self.pgid: int | None = None
+        self._previous = None
+        self._armed = False
+
+    def _forward(self, _signum, _frame) -> None:
+        pgid = self.pgid
+        if pgid:
+            try:
+                os.killpg(pgid, signal.SIGWINCH)
+            except OSError:
+                pass
+
+    def arm(self) -> "_WinchRelay":
+        try:
+            self._previous = signal.signal(signal.SIGWINCH, self._forward)
+            self._armed = True
+        except (ValueError, OSError, AttributeError):
+            self._armed = False
+        return self
+
+    def disarm(self) -> None:
+        self.pgid = None
+        if self._armed:
+            try:
+                signal.signal(signal.SIGWINCH, self._previous)
+            except (ValueError, OSError, TypeError):
+                pass
+            self._armed = False
+
+
 def _attach_tmp_env(cfg: Config, name: str, base_env: dict, holds: list) -> dict:
     """L162 : le dossier temporaire de l'agent (sur disque) et les caches gérés
     pour une session `attach`, comme pour un tour de l'exécuteur — sans vider
@@ -18364,6 +18429,9 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         if not account_turn.apply_env_attach(env, compte, cfg):
             return refuse("account_unavailable",
                           "attach: no usable account for %s" % name)  # `finally` rend le bail
+        config_refusal = _attach_config_env(cfg, env)
+        if config_refusal:
+            return refuse("config_missing", config_refusal)
         if limit.expired():
             return refuse("max_duration", "attach: maximum duration reached", 124)
         if perdu.is_set() or stop_event.is_set():
@@ -18442,12 +18510,15 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         # session, avant le diagnostic de sortie.
         terminal = _HarnessTerminal(cfg.agent_dir(name))
         terminal.enter()
+        winch = _WinchRelay()
         try:
+            winch.arm()
             proc = subprocess.Popen(
                 argv, cwd=cwd, env=child_environment.harness(
                     env, harness_revendique, compte, auditor=auditor),
                 stdout=terminal.fd(1), stderr=terminal.fd(2),
                 start_new_session=True)
+            winch.pgid = proc.pid  # start_new_session : le groupe porte son pid
             # Course de publication (même correctif que B5a-P) : le veilleur a
             # pu conclure pendant que ce Popen n'était pas encore publié.
             if etat["deadline"] > 0 and time.time() >= etat["deadline"]:
@@ -18463,6 +18534,7 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
                 time.sleep(0.2)
             code = proc.wait()
         finally:
+            winch.disarm()
             terminal.restore()
         if (code and not expired.is_set() and not perdu.is_set()
                 and not stop_event.is_set()

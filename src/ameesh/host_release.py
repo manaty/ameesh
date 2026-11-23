@@ -1114,6 +1114,22 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
         # (auditeur B1 on #5932).
         gate_closed = (control.get("mode") in ("draining", "returning")
                        and not control.get("claims_open"))
+        if (gate_closed and control.get('mode') == 'draining'
+                and control.get('release_state') != 'idle-drained'):
+            try:
+                from .storage.postgres.vm_adapter import Queue
+                short = Queue(db).short_drain(host, generation, epoch)
+            except Exception:
+                short = None
+            if short:
+                since = resources.finite_float(short.get('updated_ts')) or now
+                out.append(_alert('host_release_adapter_stalled', None, since,
+                                  max(0.0, now - since), 0.0,
+                                  'Host %s: VM adapter reports %s; the scheduled return '
+                                  'prevents halt. Extend the drain if a halt is needed.' %
+                                  (host, short['result']), host=host, state='draining',
+                                  generation=generation, release_epoch=epoch,
+                                  reason='drain_too_short', orchestrators=list(orchestrators)))
         pending = _pending_adapter_requests(db, host) if gate_closed else []
         live = [row for row in pending
                 if row.get("generation") == generation
@@ -1140,12 +1156,14 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                              if row.get("result") in ADAPTER_AGING), None)
             oldest = live[0]
             immediate = next((row for row in live
-                              if row.get("result") in ADAPTER_IMMEDIATE), None)
+                              if row.get("result") in ADAPTER_IMMEDIATE
+                              or row.get("result") == "canon unavailable"), None)
             refused = next((row for row in live
                             if row.get("result") == ADAPTER_POWERON_REFUSED), None)
             provider = _adapter_provider_state(db, host)
             if immediate is not None:
-                stalled, reason = immediate, ADAPTER_IMMEDIATE[immediate["result"]]
+                stalled, reason = immediate, ("canon_unavailable" if immediate["result"] == "canon unavailable"
+                                              else ADAPTER_IMMEDIATE[immediate["result"]])
             elif provider == "locked":
                 stalled, reason = oldest, "provider_locked"
             elif refused is not None and (_age(refused) or 0.0) > stall:
@@ -1183,7 +1201,7 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                               int(_age(stalled) or 0.0), generation, epoch,
                               "open" if control.get("claims_open") else "closed",
                               control.get("hook_state") or "none"))
-            elif reason in ("halt_deadline", "archive_refused",
+            elif reason in ("halt_deadline", "archive_refused", "canon_unavailable",
                             "provider_locked", "stopped_in_place",
                             "poweron_refused"):
                 what = {
@@ -1191,6 +1209,9 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                                      "enrolled halt deadline (provider not `stopped "
                                      "in place`, or SSH still answers); no provider "
                                      "poweroff is sent",
+                    "canon_unavailable": "the VM adapter controller cannot read its "
+                                         "configured canon; synchronize it and verify "
+                                         "it with the worker version before retrying",
                     "archive_refused": "the OS halt is proven but the server "
                                        "GET does not allow `poweroff` "
                                        "(allowed_actions); no archive is sent and "

@@ -203,6 +203,13 @@ class Measure:
     wakeable: list = field(default_factory=list)
     idle: list = field(default_factory=list)
     startable: list = field(default_factory=list)
+    #: #8119 : les paniers de la file d'amélioration que L165 peut prendre
+    #: maintenant. Un panier n'est pas un « lot de roadmap » (il n'appelle pas
+    #: de découpage), mais il occupe un agent au repos : le sommeil
+    #: « feuille de route épuisée » ne doit pas retirer la capacité tant qu'il
+    #: attend un preneur (constat du 22/11 : des paniers 6 à 11 h sans
+    #: assigné pendant que les exécutants dormaient).
+    baskets: list = field(default_factory=list)
 
     def share(self) -> float:
         return len(self.idle) / len(self.wakeable) if self.wakeable else 0.0
@@ -210,7 +217,7 @@ class Measure:
     def to_dict(self) -> dict:
         return {"project": self.project, "wakeable": list(self.wakeable),
                 "idle": list(self.idle), "startable": list(self.startable),
-                "share": round(self.share(), 3)}
+                "baskets": list(self.baskets), "share": round(self.share(), 3)}
 
 
 def wakeable(listing: list, canons, *, configured: bool, closed_hosts=()) -> list:
@@ -259,7 +266,7 @@ def wakeable(listing: list, canons, *, configured: bool, closed_hosts=()) -> lis
 
 def measure(listing: list, lots: list, waits: dict, now: float, canons, *,
             configured: bool, footprint: dict | None = None,
-            closed_hosts=()) -> dict:
+            closed_hosts=(), baskets=()) -> dict:
     """`{projet: Measure}` pour chaque projet d'au moins un agent réveillable.
 
     Au repos : `idle_agents` (sans lot actionnable, #1677). Démarrable : un
@@ -269,7 +276,13 @@ def measure(listing: list, lots: list, waits: dict, now: float, canons, *,
     lecture partagée `sous_utilisation.footprint_blockers` (#4717).
 
     #5867 : `closed_hosts` (`host_lifecycle.closed_hosts`) sortent de la
-    capacité — un hôte en drainage ne réveillera personne."""
+    capacité — un hôte en drainage ne réveillera personne.
+
+    #8119 : `baskets` (la file d'amélioration prête, `work.backlog`) sont du
+    travail pour un agent au repos. Un panier de l'équipe n'appelle pas un
+    découpage, mais il interdit le sommeil « feuille de route épuisée » tant
+    qu'il attend : sans cela, les dormeurs ne sont jamais candidats à sa
+    prise, et il reste sans assigné jusqu'au prochain lot de roadmap."""
     from . import projects as projects_mod
     pool = wakeable(listing, canons, configured=configured,
                     closed_hosts=closed_hosts)
@@ -291,10 +304,17 @@ def measure(listing: list, lots: list, waits: dict, now: float, canons, *,
         project = projects_mod.lot_project(lot)
         if project in out:
             out[project].startable.append(int(lot["id"]))
+    # #8119 : un panier prêt est du travail prenable par L165 ; il compte
+    # dans la condition de sommeil, pas dans le déclencheur de découpage.
+    for item in baskets or ():
+        project = projects_mod.lot_project(item)
+        if project in out:
+            out[project].baskets.append(int(item["id"]))
     for item in out.values():
         item.wakeable.sort()
         item.idle.sort()
         item.startable.sort()
+        item.baskets.sort()
     return out
 
 
@@ -302,14 +322,16 @@ def held(measures: dict, since: dict, now: float, part: float, repos_s: float) -
     """(projets dont la condition tient depuis `repos_s`, nouvel état).
 
     Condition : au moins `part` des réveillables au repos ET aucun lot
-    démarrable. L'état garde le début de chaque condition en cours ; une
+    démarrable ni panier prenable (#8119 : un panier qui attend un preneur
+    occupe la capacité, il ne demande pas un découpage mais interdit le
+    sommeil). L'état garde le début de chaque condition en cours ; une
     condition interrompue repart de zéro."""
     state = {}
     due = []
     for project, item in sorted(measures.items()):
-        if not item.wakeable or item.startable or item.share() < part:
+        if not item.wakeable or item.startable or item.baskets or item.share() < part:
             continue
-        start = float(since.get(project) or now)
+        start = float(since[project]) if project in since else now
         state[project] = start
         if now - start >= repos_s:
             due.append(project)
@@ -1543,8 +1565,17 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     # pas un lot démarrable offert aux agents au repos.
     footprint = (su.footprint_blockers(db, su.waiting_project_lots(lots), lots)
                  if lots else {})
+    # #8119 : la file d'amélioration prête est du travail prenable par L165.
+    # Elle ne déclenche pas de découpage, mais elle interdit le sommeil
+    # « feuille de route épuisée » tant qu'un panier de l'équipe attend un
+    # preneur : sinon les dormeurs ne sont jamais candidats à sa prise.
+    try:
+        baskets = st.work.backlog(open_only=True, limit=200, ready_only=True) or ()
+    except Exception:  # noqa: BLE001 - une file illisible ne change pas le sommeil
+        baskets = ()
     measures = measure(listing, lots, waits, now, canons, configured=configured,
-                       footprint=footprint, closed_hosts=closed_hosts)
+                       footprint=footprint, closed_hosts=closed_hosts,
+                       baskets=baskets)
     due, since = held(measures, state.get(STATE_KEY) or {}, now,
                       settings.repos_part, settings.repos_s)
     state[STATE_KEY] = since
@@ -1573,7 +1604,7 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
                 split["created_ts"] = (match or {}).get("created_ts")
             notes = roadmap_notes(db, int(split["id"]))
             verdict = roadmap_state(notes, project)
-        if item.startable or verdict == REOPENED_STATE:
+        if item.startable or item.baskets or verdict == REOPENED_STATE:
             reason = REOPEN_REASON % project if verdict == REOPENED_STATE else None
             woken = [] if dry_run else _wake(db, project, listing, reason=reason)
             if woken:
@@ -1581,7 +1612,7 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
             if verdict == REOPENED_STATE and not dry_run:
                 _journal_reopen(db, int(split["id"]), project, notes, woken)
         if verdict == EXHAUSTED_STATE:
-            if not item.startable and item.idle and not dry_run:
+            if not item.startable and not item.baskets and item.idle and not dry_run:
                 slept = _sleep(db, project, item, by_name, now,
                                split_id=int(split["id"]), lots=lots, listing=listing,
                                cfg=cfg, canons=canons,

@@ -163,6 +163,34 @@ class WaitStateTest(PgTestCase):
         self.assertEqual(alerts[0]["generation"], self.generation)
         self.assertFalse(self.api.get("vm")["claims_open"])
 
+    def test_completed_short_drain_raises_immediate_alert(self):
+        self.queue(state='draining', result='drain too short for halt: needs 4500 s')
+        self.db.execute("UPDATE vm_adapter_requests SET status='done' WHERE state='draining'")
+        alerts = self.alerts()
+        self.assertEqual([a['reason'] for a in alerts], ['drain_too_short'])
+        self.assertIn('needs 4500 s', alerts[0]['detail'])
+
+    def test_short_drain_alert_clears_when_idle_drained_acknowledged(self):
+        self.db.execute("UPDATE host_lifecycle SET return_at=clock_timestamp()+interval '40 minutes' "
+                        "WHERE host='vm'")
+        self.queue(state='draining', result='drain too short for halt: needs 4500 s')
+        self.db.execute("UPDATE vm_adapter_requests SET status='done' WHERE state='draining'")
+        self.assertTrue(any(a.get('reason') == 'drain_too_short' for a in self.alerts()))
+        self.ack_draining()
+        self.begin()
+        row = self.api.finish_transition('vm', self.generation, 'idle-drained',
+                                         release_epoch=self.epoch, actor='vm-adapter',
+                                         detail={'adapter': 'test'})
+        self.assertEqual(row['release_state'], 'idle-drained')
+        self.assertFalse(any(a.get('reason') == 'drain_too_short' for a in self.alerts()))
+
+    def test_worker_canon_failure_alerts_immediately(self):
+        self.queue(result='canon unavailable')
+        alerts = self.alerts()
+        self.assertEqual([a['type'] for a in alerts], ['host_release_adapter_stalled'])
+        self.assertEqual(alerts[0]['reason'], 'canon_unavailable')
+        self.assertIn('controller cannot read', alerts[0]['detail'])
+
     def test_a_young_poweroff_intent_is_a_normal_trailing_wait(self):
         self.queue(result='poweroff intent', age_s=60)
         self.db.execute("UPDATE host_lifecycle SET requested_at=now()-"

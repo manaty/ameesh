@@ -1618,6 +1618,17 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     dir_notes = _DirNotes(st.work, [item["id"] for item in lots]
                                    + [item["id"] for item in queue])
     listing = st.operations.listing() if listing is None else listing
+    # #8119 : un lot démarrable sans assigné depuis plus d'une heure alors que
+    # des agents éligibles dorment réveille ces agents AVANT la sélection ; la
+    # passe les voit ensuite dans son relevé relu. Le sommeil automatique seul
+    # est levé (une pause humaine ou budgétaire n'est jamais touchée).
+    if not dry_run and (lots or queue):
+        from . import take_refusals
+        try:
+            if take_refusals.wake_deadline(cfg, db, now=now, listing=listing):
+                listing = st.operations.listing()
+        except Exception:  # noqa: BLE001 - l'échéance ne fait pas tomber la prise
+            pass
     from . import auditor as auditor_mod
     try:
         canons = auditor_mod.load_all(cfg, strict=False) if cfg is not None else []
