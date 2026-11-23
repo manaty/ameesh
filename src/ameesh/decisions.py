@@ -1805,7 +1805,7 @@ def _recheck_production_review(db, cfg, lot: int) -> None:
     """Recheck under the lot lock in the transaction that signs the decision."""
     from . import merge_queue
     item = work.get(db, lot)
-    if not item or item.get("state") not in ("validated", "waiting_human"):
+    if not item or item.get("state") not in work.OPEN_STATES:
         return
     gate = merge_queue.review_gate_for_item(
         db, cfg, item, work.milestones(db, lot), refresh_target=False)

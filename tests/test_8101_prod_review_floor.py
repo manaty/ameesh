@@ -123,10 +123,10 @@ class SignedProductionFloorTest(fixtures._Base):
         self.assertEqual(klass['production_reviews_floor'], 2)
         self.assertEqual(merge_queue.required_verdicts(klass), 2)
 
-    def test_signing_withdraws_queued_lot_in_both_review_states(self):
+    def test_signing_withdraws_queued_lot_in_open_review_states(self):
         from ameesh import land, storage
         ops = storage.of(self.db).work
-        for state in ("validated", "waiting_human"):
+        for state in ("validated", "waiting_human", "qa", "blocked"):
             with self.subTest(state=state):
                 view = self.ask(question=self.question(), options=['a=Proceed'])
                 self.db.execute("UPDATE work_items SET state = %s WHERE id = %s",
