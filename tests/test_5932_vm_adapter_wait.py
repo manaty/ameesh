@@ -191,6 +191,14 @@ class WaitStateTest(PgTestCase):
         self.assertEqual(alerts[0]['reason'], 'canon_unavailable')
         self.assertIn('controller cannot read', alerts[0]['detail'])
 
+    def test_worker_missing_canon_alerts_with_its_own_reason(self):
+        self.queue(result='no canon configured')
+        alerts = self.alerts()
+        self.assertEqual([a['type'] for a in alerts], ['host_release_adapter_stalled'])
+        self.assertEqual(alerts[0]['reason'], 'canon_not_configured')
+        self.assertIn('declares no canon', alerts[0]['detail'])
+        self.assertIn('same file', alerts[0]['detail'])
+
     def test_a_young_poweroff_intent_is_a_normal_trailing_wait(self):
         self.queue(result='poweroff intent', age_s=60)
         self.db.execute("UPDATE host_lifecycle SET requested_at=now()-"

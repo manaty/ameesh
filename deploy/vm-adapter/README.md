@@ -47,6 +47,12 @@ Un retour bloqué en veille (#6080, motif `poweron_refused`) alerte une fois
 passé `host_release_adapter_stall` depuis le premier refus : `allowed_actions`
 ne permet pas `poweron` (ou manque). La VM n'est pas démarrée, les claims
 restent fermés ; dès que `poweron` est permis, le démarrage reprend.
+Un canon refusé alerte aussi sans attendre le seuil : `canon unavailable`
+quand un canon configuré ne se lit pas (le synchroniser puis le vérifier avec
+la version du worker), `no canon configured` quand la configuration du service
+n'a pas de clé `canons` (déclarer le clone et sa référence dans le fichier
+pointé par `database.env`, que lit aussi la veille GitHub). Aucune VM n'est
+arrêtée sans canon lisible.
 
 Un seul hôte opérateur, externe aux VM qu'il gère, exécute le timer. Son
 inscription privée fixe les UUID VM/projet et la zone ; aucune identité,
@@ -178,7 +184,17 @@ premier geste, comme le mode.
    une copie root 0440 avec ACL de lecture limitée à ce compte, jamais aux runners. Pas de token en argument,
    dans les courriers, dans le dépôt ou dans les erreurs. Écrire
    `database.env` (0600) avec le chemin `AMEESH_CONFIG` de la connexion mesh
-   de l'opérateur. Le DSN ne contient aucune clé cloud.
+   de l'opérateur. Le DSN ne contient aucune clé cloud. Ce fichier de
+   configuration doit déclarer `canons` : le chemin du clone synchronisé et sa
+   référence, par exemple
+   `"canons": [{"path": "/home/agent/canon", "ref": "origin/main"}]`. Sans
+   cette clé, l'adaptateur refuse tout arrêt (`no canon configured`, distinct
+   d'un canon configuré mais illisible) et la veille GitHub (#8059), qui lit
+   la même configuration et donc les mêmes cartes, ne collecte rien. Vérifier
+   les deux lectures sous le compte du service avec sa configuration
+   (`AMEESH_CONFIG=… ameesh canon check`) avant le premier drainage ; le
+   résultat doit nommer le ou les canons attendus, jamais `no canon
+   configured`.
 5. Avant d'inscrire **chaque cible burst**, préparer son journal systemd
    persistant : poser un drop-in `/etc/systemd/journald.conf.d/persistent.conf`
    repris du modèle `remote/journald.conf.example` (`Storage=persistent` et un

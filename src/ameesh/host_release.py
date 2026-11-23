@@ -64,6 +64,12 @@ ADAPTER_HALTING = ("halt intent", "halt sent", "halt deadline passed",
                    "archive intent", "archive refused")
 ADAPTER_IMMEDIATE = {"halt deadline passed": "halt_deadline",
                      "archive refused": "archive_refused"}
+# #8126: the adapter's canon refusals alert at once too, but keep their cause
+# apart: an absent `canons` key is a configuration to write (the GitHub watch
+# reads the same file), an unreadable canon is one to synchronize. They stay
+# out of ADAPTER_IMMEDIATE, which #6074 keeps within the halt phases.
+ADAPTER_CANON = {"canon unavailable": "canon_unavailable",
+                 "no canon configured": "canon_not_configured"}
 # #6080: a return blocked in standby (poweron not allowed) ages against the
 # stall bound from its first refusal.
 ADAPTER_POWERON_REFUSED = "poweron refused"
@@ -1157,13 +1163,14 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
             oldest = live[0]
             immediate = next((row for row in live
                               if row.get("result") in ADAPTER_IMMEDIATE
-                              or row.get("result") == "canon unavailable"), None)
+                              or row.get("result") in ADAPTER_CANON), None)
             refused = next((row for row in live
                             if row.get("result") == ADAPTER_POWERON_REFUSED), None)
             provider = _adapter_provider_state(db, host)
             if immediate is not None:
-                stalled, reason = immediate, ("canon_unavailable" if immediate["result"] == "canon unavailable"
-                                              else ADAPTER_IMMEDIATE[immediate["result"]])
+                stalled = immediate
+                reason = (ADAPTER_IMMEDIATE.get(immediate["result"])
+                          or ADAPTER_CANON[immediate["result"]])
             elif provider == "locked":
                 stalled, reason = oldest, "provider_locked"
             elif refused is not None and (_age(refused) or 0.0) > stall:
@@ -1202,8 +1209,8 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                               "open" if control.get("claims_open") else "closed",
                               control.get("hook_state") or "none"))
             elif reason in ("halt_deadline", "archive_refused", "canon_unavailable",
-                            "provider_locked", "stopped_in_place",
-                            "poweron_refused"):
+                            "canon_not_configured", "provider_locked",
+                            "stopped_in_place", "poweron_refused"):
                 what = {
                     "halt_deadline": "the OS halt was not proven before the "
                                      "enrolled halt deadline (provider not `stopped "
@@ -1212,6 +1219,14 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                     "canon_unavailable": "the VM adapter controller cannot read its "
                                          "configured canon; synchronize it and verify "
                                          "it with the worker version before retrying",
+                    "canon_not_configured": "the VM adapter service configuration "
+                                            "declares no canon (`canons` absent or "
+                                            "empty in the file `AMEESH_CONFIG` points "
+                                            "to); declare the synchronized clone path "
+                                            "and its ref there — the GitHub watch "
+                                            "reads the same file, so it has no cards "
+                                            "either, and no VM is halted without a "
+                                            "canon",
                     "archive_refused": "the OS halt is proven but the server "
                                        "GET does not allow `poweroff` "
                                        "(allowed_actions); no archive is sent and "
