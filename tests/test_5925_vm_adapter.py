@@ -205,10 +205,11 @@ class AdapterTest(PgTestCase):
         control = self.q.control('burst')
         return self.q.request('burst', control['generation'], control['release_epoch'], state)
 
-    def tick(self, **extra):
+    def tick(self, target=None, **extra):
         with mock.patch('ameesh.vm_adapter.storage.of', return_value=self.store):
-            return vm.tick_host(self.cfg, self.db, policy(), 'burst', self.provider,
-                               probe=self.probe, evidence=lambda *a, **k: {'idle_since': k['now']-7200}, **extra)
+            return vm.tick_host(self.cfg, self.db,
+                                policy(targets={'burst': dict(target or TARGET)}), 'burst', self.provider,
+                                probe=self.probe, evidence=lambda *a, **k: {'idle_since': k['now']-7200}, **extra)
 
     def observe_old(self, state='running'):
         self.q.observe('burst', state, 90)
@@ -434,8 +435,16 @@ class AdapterTest(PgTestCase):
                         "WHERE host='burst'")
         self.operations.listing.return_value = [dict(name='worker', admitted_hosts=['burst'],
                                                       releve=None, mode='execute', status='idle')]
-        with mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value=None):
-            self.tick()
+        # #8136: the only wake reason must be the return deadline. The enrolled
+        # release windows are wall-clock inputs: a run inside the 15 min horizon
+        # of 11:00/23:00 Paris made `due` true for a release window too, so the
+        # deadline-only branch was skipped and the row stayed pending (CI run
+        # 45149593735, 23/11 09:44Z). No window, no measured CI queue here.
+        target = dict(TARGET, release_windows=[])
+        with mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value=None), \
+                mock.patch('ameesh.vm_adapter.host_release.ci_wake_evidence',
+                           return_value={'state': 'inert'}):
+            self.tick(target=target)
         rows = self.db.query("SELECT status,result FROM vm_adapter_requests WHERE state='idle-drained'")
         self.assertEqual(rows[0]['status'], 'obsolete')
         self.assertEqual(rows[0]['result'], 'return deadline within wake horizon')
