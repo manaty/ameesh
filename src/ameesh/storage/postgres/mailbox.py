@@ -932,6 +932,11 @@ class Mailbox(interface.Mailbox):
         B #231383 : la demande de relecture doit encore attendre livraison
         (`delivered_at IS NULL`) — une demande livrée n'est plus un réveil en
         attente, et une réponse de l'auteur doit ouvrir le tour du relecteur.
+        B #231450 : une demande seulement RÉSERVÉE pour un tour
+        (`meta.consigne`, posée par `reserve` sous le verrou du registre)
+        attend encore — le tour déjà réservé ne contient pas l'avis déposé
+        maintenant. `release` retire la consigne : la demande redevient un
+        réveil en attente.
         Seul l'auteur du contenu gelé (acteur du jalon `frozen` ou assigné du
         lot) est concerné : une consigne du pilote ou de mesh-design garde son
         réveil. Le verdict doit être encore dû sur la tête — un relecteur qui a
@@ -965,6 +970,7 @@ class Mailbox(interface.Mailbox):
                        AND r.kind = 'request'
                        AND btrim(r.work_item_id) = w.id::text
                        AND r.delivered_at IS NULL
+                       AND r.meta->'consigne' IS NULL
                        AND lower(coalesce(r.payload->'review_designation'->>'sha', ''))
                            = lower(coalesce(f.sha, '')))
              LIMIT 1

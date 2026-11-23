@@ -20,7 +20,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import mail, work
+from ameesh import mail, storage, work
 from ameesh.storage.postgres import mailbox as _pg
 from ameesh.work_reviewers import designated
 
@@ -194,6 +194,28 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
                   "#%d : l'option A te va-t-elle ?" % self.lot,
                   kind="notify", work_item_id=str(self.lot))
         self.assertEqual(len(self._wakes("r1")), before + 1)
+
+    def test_a_reserved_request_still_counts_as_waiting(self):
+        # B #231450 (auditeur) : le runner a réservé la demande pour un tour
+        # (`meta.consigne`, sous FOR UPDATE du registre) mais ne l'a pas encore
+        # livrée : le tour déjà réservé ne contient pas l'avis déposé
+        # maintenant. L'avis reste actif ; une réservation relâchée redevient
+        # « en attente » et l'avis passif redevient permis.
+        self.freeze()
+        request_id = self.db.query(
+            "SELECT id FROM agent_mailbox"
+            " WHERE recipient = 'r1' AND kind = 'request'"
+            "   AND work_item_id = %s ORDER BY id DESC LIMIT 1",
+            (str(self.lot),))[0]["id"]
+        mailbox = storage.of(self.db).mailbox
+        mailbox.reserve("r1", None, None, "token", ids=[request_id],
+                        porteur="test", ttl_seconds=60)
+        self._author_note("r1")
+        self.assertEqual(mail.passive_reason(self._notifies("r1")[0]), "")
+        mailbox.release("r1", "token", [request_id])
+        self._author_note("r1")
+        self.assertEqual(len(self._notifies("r1")), 2)
+        self.assertTrue(mail.passive_reason(self._notifies("r1")[1]))
 
     def test_delivery_between_the_read_and_the_deposit_keeps_the_wake(self):
         # B #231419 : la livraison gagne entre la lecture de la demande et le

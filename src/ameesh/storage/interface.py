@@ -1878,6 +1878,8 @@ class Mailbox(Domain):
         une demande de relecture de cette tête lui a été déposée **sans être
         encore livrée** (`delivered_at IS NULL`). Une demande déjà livrée
         n'est plus un réveil en attente : l'avis doit réveiller (B #231383).
+        Une demande seulement réservée pour un tour l'est aussi : le tour en
+        cours ne contient pas l'avis déposé maintenant (B #231450).
 
         Lecture locale au pilote Postgres : un stockage qui ne la sert pas
         (exécuteur médié) rend "", et l'avis reste actif."""
