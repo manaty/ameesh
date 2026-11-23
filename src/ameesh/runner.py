@@ -12034,11 +12034,12 @@ class AgentWorker(threading.Thread):
         en mémoire sont relus (aucune requête). Sortie anticipée : réveil
         (NOTIFY, échéance métier), arrêt, drainage, bail perdu ou échu — la
         passe qui suit les traite. Rend vrai si un réveil l'a interrompue."""
-        fin = time.monotonic() + max(0.0, pas)
+        horloge = _clock_of(self)
+        fin = horloge.monotonic() + max(0.0, pas)
         tranche = max(1.0, self.lease_ttl / 3.0)
         runner = self.runner
         while True:
-            reste = fin - time.monotonic()
+            reste = fin - horloge.monotonic()
             if reste <= 0:
                 return False
             if self.wake.wait(timeout=self.wait_timeout(min(reste, tranche))):

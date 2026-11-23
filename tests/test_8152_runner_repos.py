@@ -97,68 +97,88 @@ class DebitDeRepos(unittest.TestCase):
         self.assertEqual(worker._idle_wait(), 3.0)
 
 
+class _Horloge:
+    """Horloge simulée (#2600) : le temps n'avance que par les attentes."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def time(self):
+        return self.t
+
+    def monotonic(self):
+        return self.t
+
+
+class _Reveil:
+    """`wake` simulé : chaque attente avance l'horloge de son délai ; le
+    battement (si actif) repousse l'échéance du bail ; `apres` attentes, un
+    réveil ou un drapeau tombe."""
+
+    def __init__(self, worker, horloge, *, battement=True, apres=None, effet=None):
+        self.worker, self.horloge = worker, horloge
+        self.battement, self.apres, self.effet = battement, apres, effet
+        self.attentes = []
+
+    def wait(self, timeout=None):
+        self.attentes.append(timeout)
+        if self.apres is not None and len(self.attentes) > self.apres:
+            return True  # réveil (NOTIFY) arrivé pendant cette attente
+        self.horloge.t += timeout
+        if self.battement:
+            self.worker.lease_deadline = self.horloge.t + self.worker.lease_ttl
+        if self.effet is not None and len(self.attentes) == 1:
+            self.effet()
+        return False
+
+
 class AttenteMalgreLesRenouvellements(unittest.TestCase):
     """B impl-11 : le pas réglé est tenu même s'il dépasse le bail."""
 
-    TTL = 0.3
+    TTL = 180.0
 
-    def _worker(self):
+    def _worker(self, **reveil):
         worker = AgentWorker.__new__(AgentWorker)
         worker.runner = types.SimpleNamespace(stop=threading.Event(),
                                               draining=threading.Event())
-        worker.wake, worker.stopping = threading.Event(), threading.Event()
-        worker.lease_lost = threading.Event()
-        worker.lease_deadline = time.time() + self.TTL
+        worker.stopping, worker.lease_lost = threading.Event(), threading.Event()
+        worker.clock = _Horloge()
+        worker.lease_deadline = worker.clock.t + self.TTL
         patcher = mock.patch.object(AgentWorker, "lease_ttl",
                                     new_callable=mock.PropertyMock, return_value=self.TTL)
         patcher.start()
         self.addCleanup(patcher.stop)
+        worker.wake = _Reveil(worker, worker.clock, **reveil)
         return worker
 
-    def _renew(self, worker, stop):
-        # le battement : repousse l'échéance sans toucher l'attente du worker
-        def battement():
-            while not stop.wait(self.TTL / 3):
-                worker.lease_deadline = time.time() + self.TTL
-        thread = threading.Thread(target=battement, daemon=True)
-        thread.start()
-        self.addCleanup(thread.join, 2)
-        self.addCleanup(stop.set)
-
     def test_le_pas_entier_malgre_un_bail_plus_court(self):
-        worker, stop = self._worker(), threading.Event()
-        self._renew(worker, stop)
-        debut = time.monotonic()
-        self.assertFalse(worker._idle_sleep(1.5))
-        # ni coupé à l'échéance du premier bail (0,3 s), ni rejoué
-        self.assertGreaterEqual(time.monotonic() - debut, 1.45)
+        # 128 agents à 0,2 passe/s : 640 s, bail de 180 s renouvelé
+        worker = self._worker()
+        self.assertFalse(worker._idle_sleep(640.0))
+        attentes = worker.wake.attentes
+        self.assertAlmostEqual(sum(attentes), 640.0)
+        self.assertTrue(all(a <= self.TTL / 3 for a in attentes), attentes)
+        self.assertEqual(len(attentes), 11)  # tranches sans requête, une passe
 
     def test_un_reveil_interrompt(self):
-        worker, stop = self._worker(), threading.Event()
-        self._renew(worker, stop)
-        threading.Timer(0.2, worker.wake.set).start()
-        debut = time.monotonic()
-        self.assertTrue(worker._idle_sleep(5.0))
-        self.assertLess(time.monotonic() - debut, 1.0)
+        worker = self._worker(apres=1)
+        self.assertTrue(worker._idle_sleep(640.0))
+        self.assertEqual(len(worker.wake.attentes), 2)
 
     def test_bail_echu_sans_battement(self):
-        worker = self._worker()  # personne ne renouvelle
-        debut = time.monotonic()
-        self.assertFalse(worker._idle_sleep(5.0))
-        self.assertLess(time.monotonic() - debut, 1.0)
+        worker = self._worker(battement=False)
+        self.assertFalse(worker._idle_sleep(640.0))
+        # l'attente s'arrête à l'échéance du bail : la passe la traite
+        self.assertAlmostEqual(sum(worker.wake.attentes), self.TTL)
 
     def test_arret_drainage_perte_de_bail(self):
         for drapeau in ("stop", "draining", "lease_lost", "stopping"):
-            worker, stop = self._worker(), threading.Event()
-            self._renew(worker, stop)
+            worker = self._worker()
             event = (getattr(worker.runner, drapeau) if drapeau in ("stop", "draining")
                      else getattr(worker, drapeau))
-            threading.Timer(0.1, event.set).start()
-            debut = time.monotonic()
-            self.assertFalse(worker._idle_sleep(5.0), drapeau)
-            # vu à la fin de la tranche en cours (bornée par le bail)
-            self.assertLess(time.monotonic() - debut, 2.0, drapeau)
-            stop.set()
+            worker.wake.effet = event.set
+            self.assertFalse(worker._idle_sleep(640.0), drapeau)
+            self.assertEqual(len(worker.wake.attentes), 1, drapeau)
 
 
 class ConfigDuDebit(unittest.TestCase):
@@ -290,15 +310,20 @@ class PasseAuReposReelle(PgTestCase):
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
         runner.workers[name] = worker
         passes = []
+        premiere = threading.Event()
         original_pick = AgentWorker._pick_for_turn
 
         def pick(self_):
-            passes.append(time.monotonic())
+            passes.append(1)
+            premiere.set()
             return original_pick(self_)
 
         with mock.patch.object(AgentWorker, "_pick_for_turn", pick):
             worker.start()
             try:
+                self.assertTrue(premiere.wait(60), "first idle pass expected")
+                # plus de deux baux après la première passe : avant le
+                # correctif, au moins une passe de plus
                 time.sleep(8)
                 vivant = registry.get(self.db, name)
             finally:
