@@ -2102,6 +2102,22 @@ class Mailbox(Domain):
         """Nombre de messages non remis, hors boîtes d'agents en mode `externe`
         (#6424 ; `doctor`)."""
 
+    def close_for_retired(self, recipient: str, note: dict) -> list[dict]:
+        """#8113 : ferme le courrier EN ATTENTE de `recipient` au moment de son
+        retrait, dans la transaction qui pose `retired_at`.
+
+        Les messages non remis (hors demande de décision, qui attend un
+        humain, et hors boîte `externe`, qui est une session humaine) passent
+        remis, `status = 'delivered'`, avec `note` sous `meta.retired`.
+        L'appelant fait le retrait sous le verrou de la ligne du registre : un
+        dépôt concurrent attend puis voit `retired_at` et refuse, donc rien ne
+        se glisse après la fermeture. Rend une ligne par message fermé : `id`,
+        `sender`, `kind`, `work_item_id`, `created_ts`, `excerpt`.
+
+        Lecture locale au pilote Postgres : un stockage qui ne la sert pas
+        (exécuteur médié) rend `[]` ; le retrait n'y ferme pas le courrier."""
+        return []
+
     @abc.abstractmethod
     def dead_letters(self) -> list[dict]:
         """Courrier en souffrance : non remis, dont le destinataire est absent du

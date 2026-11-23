@@ -1063,6 +1063,40 @@ class Mailbox(interface.Mailbox):
     def dead_letters(self) -> list[dict]:
         return self.db.query(DEAD_LETTERS_SQL + " ORDER BY m.recipient, m.sender")
 
+    def close_for_retired(self, recipient, note) -> list[dict]:
+        """#8113 : voir `interface.Mailbox.close_for_retired`.
+
+        Appelée dans la transaction de `registry.retire`, qui tient la ligne
+        du registre en `FOR UPDATE` : un dépôt concurrent prend le même verrou
+        en partagé (`_insert`) et attend notre commit, puis voit `retired_at`
+        et refuse. La condition `retired_at IS NOT NULL` est relue dans
+        l'instruction elle-même : appelée hors d'un retrait, elle ne ferme
+        rien. Une requête de décision attend un humain (L124), une boîte
+        `externe` est une session humaine (#6424) : ni l'une ni l'autre n'est
+        fermée. Le corps n'est rendu que par ses 200 premiers caractères : le
+        retour à l'expéditeur s'en sert pour désigner le message, pas pour le
+        recopier."""
+        rows = self.db.query(
+            """
+            UPDATE agent_mailbox AS m
+               SET delivered_at = clock_timestamp(), status = 'delivered',
+                   meta = m.meta || jsonb_build_object(
+                       'retired', %s::jsonb || jsonb_build_object(
+                           'at', extract(epoch from clock_timestamp())::float8))
+             WHERE m.recipient = %s
+               AND m.delivered_at IS NULL
+               AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
+               AND EXISTS (SELECT 1 FROM agent_registry r
+                            WHERE r.name = m.recipient
+                              AND r.retired_at IS NOT NULL
+                              AND coalesce(r.mode, 'execute') <> 'externe')
+             RETURNING m.id, m.sender, m.kind, m.work_item_id,
+                       extract(epoch from m.created_at)::float8 AS created_ts,
+                       left(m.body, 200) AS excerpt
+            """,
+            (json.dumps(note or {}, ensure_ascii=False), recipient))
+        return sorted(rows, key=lambda row: int(row["id"]))
+
     def forward(self, old, new, by) -> list[dict]:
         # UNE transaction : verrou des messages en attente de `old` (hors
         # réservation active), copie pour `new` (expéditeur, corps, nature,

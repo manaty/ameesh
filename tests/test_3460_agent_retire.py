@@ -4,6 +4,8 @@
 Un agent retiré n'est plus désigné, réclamé ni joint ; son historique reste
 lisible et `restore` rend l'état d'avant. `veille` (watch.SENDER) reste une
 identité d'émission système : retirée, elle émet toujours les veilles.
+#8113 : le retrait ferme le courrier en attente et le rend à l'expéditeur
+vivant ; une boîte retirée n'est jamais à relancer (`ameesh resume`).
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import time
 from unittest import mock
 
 from ameesh import (agent_retire, backend, db as db_mod, mail, registry,
@@ -212,6 +215,16 @@ class RetireTest(PgTestCase):
         mail.send(self.db, "ameesh", "worker", "de retour", kind="event")
         self.assertEqual([m["body"] for m in self.unread()], ["de retour"])
 
+    def test_closing_retired_mail_does_nothing_for_a_live_agent(self):
+        """#8113 : la fermeture relit `retired_at` dans son instruction ; un
+        appel hors retrait ne touche pas la boîte d'un vivant."""
+        registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        mail.send(self.db, "other", "worker", "à lire")
+        self.assertEqual(storage.of(self.db).mailbox.close_for_retired(
+            "worker", {"by": ALICE, "reason": "hors retrait"}), [])
+        self.assertEqual([m["body"] for m in self.unread()], ["à lire"])
+
     def test_a_retirement_between_the_precheck_and_the_deposit_wins(self):
         registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
                         cwd=self.tmp)
@@ -262,6 +275,78 @@ class RetireTest(PgTestCase):
             self.assertIn("statement timeout", str(ctx.exception))
         self.assertIsNone(registry.get(self.db, "worker")["retired_ts"])
         self.assertEqual([m["body"] for m in self.unread()], ["en cours"])
+
+    def test_retirement_closes_pending_mail_and_returns_it_to_the_sender(self):
+        """#8113 : le courrier en attente est clos dans la transaction du
+        retrait, avec un statut explicite, et rendu à l'expéditeur vivant.
+        Plus rien n'attend : l'alerte `mail_undeliverable` ne peut pas naître."""
+        registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        first = mail.send(self.db, "other", "worker", "Rapport avant retrait.")
+        second = mail.send(self.db, "other", "worker", "Second envoi.", kind="event",
+                           payload={"urgent": True})
+        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '4 days'")
+        out = self.retire()
+        self.assertTrue(out["changed"])
+        self.assertEqual(out["mail"]["closed"], 2)
+        self.assertEqual(out["mail"]["informed"], ["other"])
+        self.assertEqual(self.unread(), [])
+        rows = self.db.query(
+            "SELECT status, delivered_at, meta FROM agent_mailbox"
+            " WHERE recipient = 'worker' ORDER BY id")
+        self.assertEqual([row["status"] for row in rows], ["delivered", "delivered"])
+        for row in rows:
+            self.assertIsNotNone(row["delivered_at"])
+            self.assertEqual(row["meta"]["retired"]["by"], ALICE)
+            self.assertEqual(row["meta"]["retired"]["reason"], "décision #135690 a")
+            self.assertIn("at", row["meta"]["retired"])
+        [notice] = self.unread("other")
+        self.assertEqual(notice["kind"], "event")
+        self.assertIn("were not delivered", notice["body"])
+        self.assertIn("worker", notice["body"])
+        self.assertIn("retired", notice["body"])
+        self.assertNotIn("ameesh resume", notice["body"])
+        payload = mail.message_payload(notice)
+        self.assertEqual(payload["returned"]["recipient"], "worker")
+        self.assertEqual(payload["returned"]["messages"], [first, second])
+        self.assertEqual(undeliverable.alerts(
+            self.cfg, self.db, registry.overview(self.db), time.time()), [])
+
+    def test_a_retired_box_is_never_alerted_as_an_agent_to_resume(self):
+        """#8113 : une boîte laissée en attente par la version d'avant reste
+        une alerte, mais elle dit le geste inverse (`restore`/`forward`), jamais
+        `ameesh resume` : un retiré ne se relance pas."""
+        self.db.execute("UPDATE agent_registry SET status = 'stopped' WHERE name = 'worker'")
+        registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        self.retire()
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, created_at)"
+            " VALUES ('other', 'worker', 'resté en attente', 'notify',"
+            " now() - interval '4 days')")
+        alerts = [a for a in undeliverable.alerts(
+            self.cfg, self.db, registry.overview(self.db), time.time())
+            if a["type"] == "mail_undeliverable"]
+        self.assertEqual([a["agent"] for a in alerts], ["worker"])
+        alert = alerts[0]
+        self.assertEqual(alert["reason"], "retire")
+        self.assertNotIn("ameesh resume", alert["detail"])
+        self.assertIn("ameesh agent restore worker", alert["detail"])
+        self.assertIn("ameesh mail forward worker", alert["detail"])
+        text = undeliverable.brief_text(alert)
+        self.assertNotIn("ameesh resume", text)
+        self.assertIn("ameesh agent restore worker", text)
+
+    def test_retirement_warns_when_the_sender_has_no_live_mailbox(self):
+        """#8113 : un expéditeur système n'a pas de boîte lue ; le courrier est
+        tout de même clos et l'auteur du retrait voit l'avertissement."""
+        mail.send(self.db, "ameesh", "worker", "notification système", kind="event")
+        out = self.retire()
+        self.assertEqual(out["mail"]["closed"], 1)
+        self.assertEqual(out["mail"]["informed"], [])
+        self.assertIn("ameesh", out["mail"]["unreachable"])
+        self.assertTrue(any("sender(s) with no live mailbox" in w for w in out["warnings"]))
+        self.assertEqual(self.unread(), [])
 
     def test_copy_to_a_retired_agent_is_refused_nothing_deposited(self):
         registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
