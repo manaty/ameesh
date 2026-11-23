@@ -109,6 +109,17 @@ pour un nom d'hôte déclaré ne prouve pas qu'un hôte est sans ameesh et une
 session et un hôte inventés contourneraient les liaisons réelles du commit.
 L'owner qui doit attester un commit d'un hôte sans ameesh y installe la CLI et
 lie la session, ou recrée le commit après une liaison régulière.
+
+#8170 — un commit **antérieur à toute liaison de session de son hôte** (les
+huit commits de juillet de manaty-its, #8095) n'a aucune liaison à citer : la
+voie `record --signed --historic` est une attestation d'autorité distincte,
+signée par la clé owner en personne, qui porte le SHA complet, l'auteur
+déclaré (`human:<id>`, ou un agent du registre et son harnais), l'hôte et le
+lot, et écrit `turn = "signed-historic:<approbation>"`. La date de committer
+doit précéder la première liaison connue de l'hôte ; la session déclarée n'a
+aucune liaison ; la première écriture fait foi et la signature se consomme une
+fois. La famille lue par la porte est celle attestée ; un auteur humain
+n'exclut aucune famille.
 """
 from __future__ import annotations
 
@@ -139,6 +150,16 @@ SIGNED_ACTION = "provenance"
 SIGNED_KIND = "commit"
 #: version du texte canonique signé ; la changer invalide les anciennes preuves.
 SIGNED_VERSION = 1
+#: #8170 : reçu d'un commit antérieur aux liaisons de session de son hôte,
+#: attesté par la clé owner en personne — l'approbation consommée le suit.
+HISTORIC_TURN_PREFIX = "signed-historic:"
+HISTORIC_KIND = "commit-historic"
+HISTORIC_VERSION = 1
+#: le harnais d'un auteur humain : aucune famille d'agent (`family_of` → "").
+HUMAN_HARNESS = "human"
+HUMAN_ACTOR_PREFIX = "human:"
+#: le libellé de session d'une attestation historique qui n'en déclare pas.
+UNBOUND_SESSION = "unbound"
 #: un nom d'hôte dans l'attestation : simple et borné (jamais une option).
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 
@@ -1019,12 +1040,15 @@ def _approval_row(db, approval_id, digest: str) -> dict:
 
 
 def _signed_meta(db, turn: str) -> dict:
-    """Le meta de l'approbation qui porte un reçu signé (`signed:<id>`)."""
+    """Le meta de l'approbation qui porte un reçu signé (`signed:<id>`, ou
+    `signed-historic:<id>` depuis #8170)."""
     turn = str(turn or "")
-    if not turn.startswith(SIGNED_TURN_PREFIX):
+    prefix = next((value for value in (SIGNED_TURN_PREFIX, HISTORIC_TURN_PREFIX)
+                   if turn.startswith(value)), "")
+    if not prefix:
         return {}
     try:
-        approval_id = int(turn[len(SIGNED_TURN_PREFIX):])
+        approval_id = int(turn[len(prefix):])
     except ValueError:
         return {}
     row = storage.of(db).approvals.get(approval_id)
@@ -1113,6 +1137,112 @@ def _refuse_delegated_attestation(db, row, ident: dict) -> None:
             % (approval, key.get("name") or "?"))
 
 
+def _consume_signed_approval(db, *, full: str, statement: str, digest: str,
+                             kind: str, ident: dict, work_item_id,
+                             approval_id, approver: str, key_path: str,
+                             expires, source: str) -> int:
+    """Signe (`key_path`) ou relit (`approval_id`) l'approbation owner qui
+    couvre `digest`, la vérifie et la consomme une fois ; rend son id.
+
+    Partagé par la voie signée (#4485, `kind = SIGNED_KIND`) et la voie
+    historique (#8170, `kind = HISTORIC_KIND`) : le type d'artefact sépare les
+    deux textes, une approbation de l'une ne se consomme jamais par l'autre."""
+    from . import authority, signing
+    if approval_id is not None and key_path:
+        raise ProvenanceError("--key and --approval are mutually exclusive")
+    if approval_id is None and not key_path:
+        raise ProvenanceError(
+            "a signed receipt requires --key (sign now) or --approval ID")
+    pre_signed = approval_id is not None
+    if key_path:
+        if not approver:
+            raise ProvenanceError("--key requires --as <owner>")
+        try:
+            seed = signing.read_private(os.path.expanduser(key_path))
+        except (OSError, ValueError) as exc:
+            raise ProvenanceError("cannot read the signing key: %s" % exc) from exc
+        meta = {"statement": statement, "host": ident["host"],
+                "lot": work_item_id or 0, "source": source}
+        # #6873 : la déclaration du détenteur et de l'hôte de signature reste
+        # lisible pour l'audit ; elle ne remplace pas la clé distincte que la
+        # décision #164261 demande pour séparer l'owner de son délégataire.
+        meta["holder"] = approver
+        signing_host = str(getattr(getattr(db, "cfg", None), "host", "") or "").strip()
+        if signing_host:
+            meta["signing_host"] = signing_host
+        # #5756 : le texte signé ne bouge pas (version 1) ; le harnais courant
+        # du registre, quand il diverge, reste lisible dans l'approbation.
+        if ident.get("registry_harness"):
+            meta["registry_harness"] = ident["registry_harness"]
+        # #7741 : la liaison datée qui a fondé l'acteur est un diagnostic
+        # d'audit, hors du texte signé (version 1) comme `registry_harness`.
+        if ident.get("binding"):
+            meta["binding"] = ident["binding"]
+        # #8170 : la première liaison connue de l'hôte, qui borne un commit
+        # historique, est un diagnostic d'audit hors du texte signé.
+        if ident.get("first_binding"):
+            meta["first_binding"] = ident["first_binding"]
+        try:
+            built = authority.create_approval(
+                db, seed, approver=approver, action=SIGNED_ACTION,
+                artifact_kind=kind, artifact_hash=digest,
+                ttl=authority.parse_ttl(expires), meta=meta)
+        except authority.AuthorityError as exc:
+            raise ProvenanceError(str(exc)) from exc
+        approval_id = int(built["id"])
+    row = _approval_row(db, approval_id, digest)
+    if (str(row.get("action") or "") != SIGNED_ACTION
+            or str(row.get("artifact_kind") or "") != kind):
+        raise ProvenanceError(
+            "approval #%s is not a signed provenance statement" % approval_id)
+    if str(row.get("decision") or "") != "approved":
+        # Un refus signé est une signature valide (authority.build_approval
+        # accepte `rejected`) : la décision portée par la ligne et signée dans
+        # son payload doit être « approved ». Sinon le refus deviendrait une
+        # preuve de provenance (B P1 de la relecture cx3, #4485).
+        raise ProvenanceError(
+            "approval #%s is %r, not an approved statement"
+            % (approval_id, row.get("decision") or "?"))
+    if str(row.get("artifact_hash") or "").lower() != digest:
+        raise ProvenanceError(
+            "approval #%s does not cover this signed statement" % approval_id)
+    verdict = authority.verify_approval(db, row)
+    if not verdict.ok:
+        raise ProvenanceError(
+            "approval #%s is not valid: %s" % (approval_id, verdict.reason))
+    # #6873 : avant toute consommation. Le contrôle est une déclaration de
+    # bonne foi (la même clé privée ne distingue pas l'owner de son
+    # délégataire) ; il ferme l'auto-attestation et les copies enregistrées.
+    _refuse_delegated_attestation(db, row, ident)
+    if not authority.consume_approval(db, int(approval_id),
+                                      "provenance:%s" % full):
+        raise ProvenanceError(
+            "approval #%s was already consumed" % approval_id)
+    # #5759 : une approbation pré-signée ne porte que le texte signé. Le
+    # harnais courant divergent est un diagnostic hors signature : il est
+    # écrit après une consommation réussie par CET appel, pour que
+    # `provenance show` lise le contexte de la consommation sans le
+    # recalculer à la lecture. Une seconde tentative échoue avant cette
+    # écriture : elle ne peut pas réécrire le diagnostic d'une approbation
+    # déjà consommée. Le texte version 1 et l'empreinte signée ne changent pas.
+    # #6873 : l'hôte qui a enregistré l'approbation pré-signée est consigné de
+    # même, sans toucher au texte signé.
+    meta_update = {}
+    if pre_signed and ident.get("registry_harness"):
+        meta_update["registry_harness"] = ident["registry_harness"]
+    if pre_signed and ident.get("binding"):
+        meta_update["binding"] = ident["binding"]
+    if pre_signed and ident.get("first_binding"):
+        meta_update["first_binding"] = ident["first_binding"]
+    if pre_signed:
+        signing_host = str(getattr(getattr(db, "cfg", None), "host", "") or "").strip()
+        if signing_host:
+            meta_update["signing_host"] = signing_host
+    if meta_update:
+        storage.of(db).approvals.merge_meta(int(approval_id), meta_update)
+    return int(approval_id)
+
+
 def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
                          host: str, families, lot=None,
                          approval_id: int | None = None,
@@ -1143,7 +1273,6 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
     refusé comme sur la voie de session. Une session sans liaison est refusée :
     la dérogation « hôte sans ameesh » de #4485 est retirée (B/P1 de la revue
     #43307), l'absence de lignes pour un nom d'hôte déclaré ne prouvant rien."""
-    from . import authority, signing
     from . import work as work_mod
     full = resolve_commit(sha, cwd=cwd)
     if full is None:
@@ -1186,92 +1315,11 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
         if item is None:
             raise ProvenanceError("work item #%s not found" % lot)
         work_item_id = int(item["id"])
-    if approval_id is not None and key_path:
-        raise ProvenanceError("--key and --approval are mutually exclusive")
-    if approval_id is None and not key_path:
-        raise ProvenanceError(
-            "a signed receipt requires --key (sign now) or --approval ID")
-    pre_signed = approval_id is not None
-    if key_path:
-        if not approver:
-            raise ProvenanceError("--key requires --as <owner>")
-        try:
-            seed = signing.read_private(os.path.expanduser(key_path))
-        except (OSError, ValueError) as exc:
-            raise ProvenanceError("cannot read the signing key: %s" % exc) from exc
-        meta = {"statement": statement, "host": ident["host"],
-                "lot": work_item_id or 0, "source": "provenance --signed"}
-        # #6873 : la déclaration du détenteur et de l'hôte de signature reste
-        # lisible pour l'audit ; elle ne remplace pas la clé distincte que la
-        # décision #164261 demande pour séparer l'owner de son délégataire.
-        meta["holder"] = approver
-        signing_host = str(getattr(getattr(db, "cfg", None), "host", "") or "").strip()
-        if signing_host:
-            meta["signing_host"] = signing_host
-        # #5756 : le texte signé ne bouge pas (version 1) ; le harnais courant
-        # du registre, quand il diverge, reste lisible dans l'approbation.
-        if ident.get("registry_harness"):
-            meta["registry_harness"] = ident["registry_harness"]
-        # #7741 : la liaison datée qui a fondé l'acteur est un diagnostic
-        # d'audit, hors du texte signé (version 1) comme `registry_harness`.
-        if ident.get("binding"):
-            meta["binding"] = ident["binding"]
-        try:
-            built = authority.create_approval(
-                db, seed, approver=approver, action=SIGNED_ACTION,
-                artifact_kind=SIGNED_KIND, artifact_hash=digest,
-                ttl=authority.parse_ttl(expires), meta=meta)
-        except authority.AuthorityError as exc:
-            raise ProvenanceError(str(exc)) from exc
-        approval_id = int(built["id"])
-    row = _approval_row(db, approval_id, digest)
-    if (str(row.get("action") or "") != SIGNED_ACTION
-            or str(row.get("artifact_kind") or "") != SIGNED_KIND):
-        raise ProvenanceError(
-            "approval #%s is not a signed provenance statement" % approval_id)
-    if str(row.get("decision") or "") != "approved":
-        # Un refus signé est une signature valide (authority.build_approval
-        # accepte `rejected`) : la décision portée par la ligne et signée dans
-        # son payload doit être « approved ». Sinon le refus deviendrait une
-        # preuve de provenance (B P1 de la relecture cx3, #4485).
-        raise ProvenanceError(
-            "approval #%s is %r, not an approved statement"
-            % (approval_id, row.get("decision") or "?"))
-    if str(row.get("artifact_hash") or "").lower() != digest:
-        raise ProvenanceError(
-            "approval #%s does not cover this signed statement" % approval_id)
-    verdict = authority.verify_approval(db, row)
-    if not verdict.ok:
-        raise ProvenanceError(
-            "approval #%s is not valid: %s" % (approval_id, verdict.reason))
-    # #6873 : avant toute consommation. Le contrôle est une déclaration de
-    # bonne foi (la même clé privée ne distingue pas l'owner de son
-    # délégataire) ; il ferme l'auto-attestation et les copies enregistrées.
-    _refuse_delegated_attestation(db, row, ident)
-    if not authority.consume_approval(db, int(approval_id),
-                                      "provenance:%s" % full):
-        raise ProvenanceError(
-            "approval #%s was already consumed" % approval_id)
-    # #5759 : une approbation pré-signée ne porte que le texte signé. Le
-    # harnais courant divergent est un diagnostic hors signature : il est
-    # écrit après une consommation réussie par CET appel, pour que
-    # `provenance show` lise le contexte de la consommation sans le
-    # recalculer à la lecture. Une seconde tentative échoue avant cette
-    # écriture : elle ne peut pas réécrire le diagnostic d'une approbation
-    # déjà consommée. Le texte version 1 et l'empreinte signée ne changent pas.
-    # #6873 : l'hôte qui a enregistré l'approbation pré-signée est consigné de
-    # même, sans toucher au texte signé.
-    meta_update = {}
-    if pre_signed and ident.get("registry_harness"):
-        meta_update["registry_harness"] = ident["registry_harness"]
-    if pre_signed and ident.get("binding"):
-        meta_update["binding"] = ident["binding"]
-    if pre_signed:
-        signing_host = str(getattr(getattr(db, "cfg", None), "host", "") or "").strip()
-        if signing_host:
-            meta_update["signing_host"] = signing_host
-    if meta_update:
-        storage.of(db).approvals.merge_meta(int(approval_id), meta_update)
+    approval_id = _consume_signed_approval(
+        db, full=full, statement=statement, digest=digest, kind=SIGNED_KIND,
+        ident=ident, work_item_id=work_item_id, approval_id=approval_id,
+        approver=approver, key_path=key_path, expires=expires,
+        source="provenance --signed")
     receipt = storage.of(db).provenance.add(
         subject, full, ident["actor"], ident["session"],
         SIGNED_TURN_PREFIX + str(approval_id), ident["harness"],
@@ -1290,6 +1338,215 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
             "%s: already recorded for %s/%s, not %s/%s"
             % (subject, receipt["actor"], receipt["session"],
                ident["actor"], ident["session"]))
+    return receipt
+
+
+# --------------------------------------------------------------------------
+# #8170 : attestation owner d'un commit antérieur à toute liaison de session
+# --------------------------------------------------------------------------
+#
+# Huit commits de juillet (manaty-its, pc-smichea) précèdent les liaisons de
+# session : `record --signed` les refuse à juste titre (une session sans liaison
+# n'est pas une preuve, #43307), et le rejeu sous un autre agent est un lavage
+# de provenance que la garde author-families (#2924) refuse aussi. La voie
+# historique est une **attestation d'autorité** de l'owner, distincte : texte
+# propre (`kind = "historic"`, type d'artefact `HISTORIC_KIND`), reçu
+# `turn = "signed-historic:<approbation>"`. Ses bornes :
+#
+# * la date de committer précède la **première liaison connue de l'hôte**
+#   (révoquées comprises) : un commit qu'une liaison aurait pu couvrir passe
+#   par la voie signée ordinaire, jamais par celle-ci. Un hôte sans aucune
+#   liaison est refusé : un nom d'hôte inventé ne borne rien ;
+# * la session déclarée, quand elle est donnée, n'a aucune liaison : c'est un
+#   libellé, pas une preuve ;
+# * l'auteur déclaré est un humain (`human:<id>`, harnais `human`, qui n'exclut
+#   aucune famille d'agent à la porte) ou un agent du registre sous un harnais
+#   du canon (la famille lue par `review_authors` est celle attestée) ;
+# * clé owner en personne (`_refuse_delegated_attestation`), approbation
+#   consommée une fois, première écriture qui fait foi, révocation définitive,
+#   committer d'un autre agent enregistré refusé — comme la voie signée.
+
+def historic_statement(*, commit, actor: str, harness: str, host: str,
+                       session: str = "", lot=None) -> str:
+    """Le texte canonique que la clé `owner` signe pour un commit historique.
+
+    Distinct de `signed_statement` (champ `kind`) : une approbation de la voie
+    signée ne couvre jamais un commit historique, ni l'inverse."""
+    fields = {
+        "version": HISTORIC_VERSION,
+        "kind": "historic",
+        "commit": full_sha(commit),
+        "actor": str(actor or "").strip(),
+        "session": str(session or "").strip() or UNBOUND_SESSION,
+        "harness": str(harness or "").strip().lower(),
+        "host": str(host or "").strip(),
+        "lot": int(lot) if lot is not None else 0,
+    }
+    return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+
+
+def historic_digest(**fields) -> str:
+    """L'empreinte sha256 de `historic_statement`."""
+    return hashlib.sha256(
+        historic_statement(**fields).encode("utf-8")).hexdigest()
+
+
+def _first_host_binding(bindings, host: str) -> dict | None:
+    """La plus ancienne liaison de session connue sur `host` (révoquées comprises)."""
+    rows = [row for row in bindings or ()
+            if str(row.get("host") or "") == host and row.get("created_ts")]
+    if not rows:
+        return None
+    first = min(rows, key=lambda row: (float(row.get("created_ts") or 0.0),
+                                       int(row.get("id") or 0)))
+    return {"id": int(first.get("id") or 0),
+            "agent": str(first.get("agent") or ""),
+            "session": str(first.get("session_id") or ""),
+            "created_ts": float(first.get("created_ts") or 0.0)}
+
+
+def _historic_identity(db, *, actor, harness, host, session, families,
+                       commit_ts) -> dict:
+    """L'auteur déclaré d'un commit historique, contrôlé avant toute signature."""
+    from . import agent_names
+    from . import registry
+    from . import session_bindings
+    actor = str(actor or "").strip()
+    harness = str(harness or "").strip().lower()
+    host = str(host or "").strip()
+    session = str(session or "").strip() or UNBOUND_SESSION
+    if not actor or not host:
+        raise ProvenanceError(
+            "a historic receipt requires an actor (human:<id> or an agent) "
+            "and a host")
+    if not HOST_RE.fullmatch(host):
+        raise ProvenanceError("invalid host: %r" % host)
+    if not session_bindings.SESSION_RE.match(session):
+        raise ProvenanceError("invalid session label: %r" % session)
+    if actor.lower().startswith(HUMAN_ACTOR_PREFIX):
+        who = actor[len(HUMAN_ACTOR_PREFIX):].strip()
+        if not who or not HOST_RE.fullmatch(who):
+            raise ProvenanceError("invalid human author: %r" % actor)
+        if harness not in ("", HUMAN_HARNESS):
+            raise ProvenanceError(
+                "a human author has no model harness (got %r): declare "
+                "human:<id> alone, or the agent and its harness" % harness)
+        name, harness = HUMAN_ACTOR_PREFIX + who, HUMAN_HARNESS
+    else:
+        if not families:
+            raise ProvenanceError("no model families: the canon cannot be read")
+        if harness not in families or harness not in session_bindings.HARNESSES:
+            raise ProvenanceError("unknown harness %r (expected %s)"
+                                  % (harness, ", ".join(sorted(families))))
+        name = agent_names.resolve(actor, db=db,
+                                   operation="review_provenance.historic")
+        if not name or not (registry.get(db, name) or {}):
+            raise ProvenanceError(
+                "historic author %s is absent from the registry: declare a "
+                "registered agent, or human:<id>" % actor)
+    if not commit_ts:
+        raise ProvenanceError("a historic receipt requires the commit creation time")
+    try:
+        bindings = session_bindings.listing(db, include_revoked=True)
+    except Exception as exc:  # noqa: BLE001 - une lecture impossible ne prouve rien
+        raise ProvenanceError(
+            "cannot read the session bindings of %s: %s"
+            % (host, " ".join(str(exc).split())[:160])) from exc
+    if any(str(row.get("session_id") or "").strip() == session
+           for row in bindings or ()):
+        raise ProvenanceError(
+            "session %s has a binding: a bound session is attested by "
+            "record --signed, on the binding that covered the commit" % session)
+    first = _first_host_binding(bindings, host)
+    if first is None:
+        raise ProvenanceError(
+            "host %s has no known session binding: a historic statement is "
+            "bounded by the host's first binding, and an unknown host bounds "
+            "nothing" % host)
+    # Même tolérance d'une seconde que `_binding_covers_row` : un commit à la
+    # seconde de la première liaison aurait pu être couvert par elle.
+    if float(commit_ts) + 1.0 >= first["created_ts"]:
+        raise ProvenanceError(
+            "commit was created at %s, not before the first session binding "
+            "known on %s (#%s, %s): a binding could have covered it, use "
+            "record --signed"
+            % (_at_text(commit_ts), host, first["id"],
+               _at_text(first["created_ts"])))
+    return {"actor": name, "session": session, "harness": harness,
+            "host": host, "first_binding": first}
+
+
+def record_historic_commit(db, sha, *, actor: str, harness: str, host: str,
+                           families, lot, session: str = "",
+                           approval_id: int | None = None,
+                           approver: str = "", key_path: str = "",
+                           cwd: str | None = None,
+                           expires: str | None = None) -> dict:
+    """Écrit le reçu `signed-historic:<approbation>` d'un commit antérieur
+    aux liaisons de session de son hôte (#8170).
+
+    Le lot est obligatoire : l'attestation dit pourquoi elle est faite. Sans
+    signature owner valide, rien n'est écrit ; la première preuve du commit
+    fait foi et un reçu révoqué n'est pas ressuscité."""
+    from . import work as work_mod
+    if lot is None:
+        raise ProvenanceError("a historic receipt requires --lot")
+    full = resolve_commit(sha, cwd=cwd)
+    if full is None:
+        raise ProvenanceError(
+            "commit %r does not resolve to a commit in %s (fetch it first)"
+            % (sha, cwd or os.getcwd()))
+    info = _commit_git_identity(cwd, full)
+    ident = _historic_identity(
+        db, actor=actor, harness=harness, host=host, session=session,
+        families=families, commit_ts=info["committer_ts"])
+    _refuse_foreign_committer(db, sha=full, cwd=cwd, actor=ident["actor"],
+                              info=info)
+    item = work_mod.get(db, int(lot))
+    if item is None:
+        raise ProvenanceError("work item #%s not found" % lot)
+    work_item_id = int(item["id"])
+    statement = historic_statement(
+        commit=full, actor=ident["actor"], session=ident["session"],
+        harness=ident["harness"], host=ident["host"], lot=work_item_id)
+    digest = hashlib.sha256(statement.encode("utf-8")).hexdigest()
+    subject = subject_of_commit(full)
+    ops = storage.of(db).provenance
+    revoked = ops.revocation(subject)
+    if revoked is not None:
+        raise _revoked_error(subject, revoked)
+    existing = ops.get(subject)
+    if existing is not None:
+        if (existing["actor"] == ident["actor"]
+                and existing["session"] == ident["session"]
+                and existing["harness"] == ident["harness"]
+                and str(existing["turn"] or "").startswith(HISTORIC_TURN_PREFIX)):
+            return dict(existing, recorded=False)
+        raise ProvenanceError(
+            "%s: already recorded for %s/%s (turn %s): the first proof stands"
+            % (subject, existing["actor"], existing["session"],
+               str(existing["turn"] or "")[:40]))
+    approval_id = _consume_signed_approval(
+        db, full=full, statement=statement, digest=digest, kind=HISTORIC_KIND,
+        ident=ident, work_item_id=work_item_id, approval_id=approval_id,
+        approver=approver, key_path=key_path, expires=expires,
+        source="provenance --signed --historic")
+    receipt = ops.add(
+        subject, full, ident["actor"], ident["session"],
+        HISTORIC_TURN_PREFIX + str(approval_id), ident["harness"],
+        work_item_id=work_item_id)
+    revoked = ops.revocation(subject)
+    if revoked is not None:
+        raise _revoked_error(subject, revoked)
+    if not receipt.get("recorded") and not (
+            receipt["actor"] == ident["actor"]
+            and receipt["session"] == ident["session"]
+            and receipt["harness"] == ident["harness"]
+            and str(receipt["turn"] or "") == HISTORIC_TURN_PREFIX + str(approval_id)):
+        raise ProvenanceError(
+            "%s: already recorded for %s/%s (turn %s): the first proof stands"
+            % (subject, receipt["actor"], receipt["session"],
+               str(receipt["turn"] or "")[:40]))
     return receipt
 
 
@@ -2182,6 +2439,10 @@ def build_parser():
     # champs sont signés ensemble.
     rec.add_argument("--signed", action="store_true",
                      help="owner-signed provenance, outside a managed turn")
+    # #8170 : un commit antérieur à toute liaison de session de son hôte.
+    rec.add_argument("--historic", action="store_true",
+                     help="with --signed: commit older than the host's first "
+                          "session binding (author human:<id> or agent+harness)")
     rec.add_argument("--actor", default="", help="signed actor (external agent)")
     rec.add_argument("--session", default="",
                      help="signed session id, or the linked session (#7719)")
@@ -2202,8 +2463,10 @@ def build_parser():
         help="print the canonical signed statement and its digest (#4485)")
     stmt.add_argument("--commit", required=True)
     stmt.add_argument("--actor", required=True)
-    stmt.add_argument("--session", required=True)
-    stmt.add_argument("--harness", required=True)
+    stmt.add_argument("--historic", action="store_true",
+                      help="the historic statement (#8170)")
+    stmt.add_argument("--session", default="")
+    stmt.add_argument("--harness", default="")
     stmt.add_argument("--host", required=True)
     stmt.add_argument("--lot", type=int, default=None)
     stmt.add_argument("--json", action="store_true")
@@ -2239,9 +2502,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "statement":
         fields = dict(commit=args.commit, actor=args.actor, session=args.session,
                       harness=args.harness, host=args.host, lot=args.lot)
+        if args.historic:
+            # le texte signé nomme le harnais tel que la voie l'écrira
+            if args.actor.strip().lower().startswith(HUMAN_ACTOR_PREFIX):
+                fields["harness"] = fields["harness"] or HUMAN_HARNESS
+            if args.lot is None:
+                print("provenance refused: a historic statement requires --lot",
+                      file=sys.stderr)
+                return 1
+        elif not (args.session and args.harness):
+            print("error: the signed statement requires --session and --harness",
+                  file=sys.stderr)
+            return 2
         try:
-            text = signed_statement(**fields)
-            digest = signed_digest(**fields)
+            text = (historic_statement if args.historic else signed_statement)(**fields)
+            digest = (historic_digest if args.historic else signed_digest)(**fields)
         except ProvenanceError as exc:
             print("provenance refused: %s" % exc, file=sys.stderr)
             return 1
@@ -2287,6 +2562,33 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     db = _connect()
     try:
+        if args.command == "record" and args.historic:
+            if not args.signed:
+                print("error: --historic requires --signed", file=sys.stderr)
+                return 2
+            if not (args.commit and args.actor and args.host
+                    and args.lot is not None):
+                print("error: --signed --historic requires --commit, --actor, "
+                      "--host and --lot", file=sys.stderr)
+                return 2
+            if bool(args.key) == (args.approval is not None):
+                print("error: --signed requires exactly one of --key or --approval",
+                      file=sys.stderr)
+                return 2
+            row = record_historic_commit(
+                db, args.commit, actor=args.actor, harness=args.harness,
+                host=args.host, session=args.session,
+                families=compiled_families(db), lot=args.lot,
+                approval_id=args.approval, approver=args.as_agent,
+                key_path=args.key, cwd=os.path.abspath(args.repo),
+                expires=args.expires)
+            if args.json:
+                print(json.dumps(row, default=str))
+            elif not args.quiet:
+                print("provenance recorded (signed, historic): %s by %s/%s on %s, turn %s"
+                      % (row["subject"], row["actor"], row["harness"],
+                         args.host, row["turn"]))
+            return 0
         if args.command == "record" and args.signed:
             if not args.commit:
                 print("error: --signed requires --commit", file=sys.stderr)
@@ -2412,17 +2714,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         registry_harness = ""
         binding_meta = {}
+        first_binding = {}
         if recu is not None:
             meta = _signed_meta(db, recu.get("turn") or "")
             registry_harness = str(meta.get("registry_harness") or "")
             if isinstance(meta.get("binding"), dict):
                 binding_meta = meta["binding"]
+            if isinstance(meta.get("first_binding"), dict):
+                first_binding = meta["first_binding"]
         if args.json:
             extra = {}
             if registry_harness:
                 extra["registry_harness"] = registry_harness
             if binding_meta:
                 extra["binding"] = binding_meta
+            if first_binding:
+                extra["first_binding"] = first_binding
             if extra:
                 recu = dict(recu, **extra)
             print(json.dumps(recu, default=str))
@@ -2447,6 +2754,12 @@ def main(argv: list[str] | None = None) -> int:
                          ("revoked %s" % _at_text(binding_meta["revoked_ts"]))
                          if binding_meta.get("revoked_ts") is not None
                          else "active"))
+            if first_binding:
+                # #8170 : la borne d'un reçu historique, hors du texte signé.
+                print("before the first binding of the host: #%s %s, %s"
+                      % (first_binding.get("id") or "?",
+                         first_binding.get("agent") or "?",
+                         _at_text(first_binding.get("created_ts") or 0)))
         return 0 if recu is not None else 3
     except ProvenanceError as exc:
         print("provenance refused: %s" % exc, file=sys.stderr)
