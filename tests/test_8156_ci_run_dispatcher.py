@@ -214,6 +214,8 @@ class Api:
 
 
 class ComposeTest(DispatcherRepo):
+    @unittest.skipUnless(shutil.which("node"),
+                         "the dispatcher plan needs the node runtime")
     def test_compose_pushes_then_dispatches_the_composed_head(self):
         api = self.api()
         decision = self.plan(api)
@@ -259,6 +261,8 @@ class ComposeTest(DispatcherRepo):
                          "aucune étiquette : le dispatcher est le chemin")
         self.assertEqual(decision["verdicts"], ["relecteur"])
 
+    @unittest.skipUnless(shutil.which("node"),
+                         "the dispatcher plan needs the node runtime")
     def test_a_clean_merge_after_the_freeze_keeps_the_reviews(self):
         # Le cas réel #7678 (b6f18dcc) : le porteur a avancé par une fusion
         # propre de la cible après le gel. L'avance ne retire pas les avis et
@@ -277,6 +281,8 @@ class ComposeTest(DispatcherRepo):
         self.assertEqual((decision["sha"], decision["reviewed"]), (merged, self.freeze))
         self.assertEqual(decision["verdicts"], ["relecteur"])
 
+    @unittest.skipUnless(shutil.which("node"),
+                         "the dispatcher plan needs the node runtime")
     def test_target_already_ancestor_dispatches_the_freeze_without_composition(self):
         # Après une première composition poussée, la pointe de la cible est
         # ancêtre de la tête : pas de nouvelle composition, dispatch sur elle.
@@ -397,6 +403,8 @@ class CommandTest(DispatcherRepo):
             code = ci.cmd_ci_run(self.cfg, args)
         return code, output.getvalue()
 
+    @unittest.skipUnless(shutil.which("node"),
+                         "the dispatcher plan needs the node runtime")
     def test_cmd_pushes_the_composition_then_requests_the_dispatch(self):
         api = self.api()
         seen = {}
